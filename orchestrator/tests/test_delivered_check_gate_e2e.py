@@ -33,12 +33,13 @@ exclusively through ``acquire_next()``'s returned ``TaskAssignment`` / None
 
 from __future__ import annotations
 
+import asyncio
 import json
-import os
 import subprocess
 from pathlib import Path
 
 import pytest
+from _delivered_check_fixtures import install_delivered_check_script, script_check
 from _recording_event_store import _RecordingEventStore
 from escalation.queue import EscalationQueue
 
@@ -140,37 +141,11 @@ def _commit_marker(project_root: Path, rel_path: str, token: str) -> str:
     return _run_git(project_root, 'rev-parse', 'main').stdout.strip()
 
 
-def _write_exec_script(project_root: Path, rel_path: str, body: str) -> None:
-    """Write *body* to *rel_path* under *project_root* and mark it
-    executable (0o755) — the real recovery leg of row 7: a missing script
-    produces a genuine ``FileNotFoundError`` from the subprocess spawn
-    (-> ``DeliveredCheckResult.ERRORED``); writing + chmod-ing it here makes
-    the real (unmocked) runner succeed on the very next tick. Deliberately
-    NOT committed to git — the script kind is evaluated against the WORKING
-    CHECKOUT, not the committed ``main`` tree (unlike the grep kind; see
-    ``orchestrator.delivered_checks``'s module docstring).
-    """
-    target = project_root / rel_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(body, encoding='utf-8')
-    os.chmod(target, 0o755)
-
-
 def _grep_check(name: str, token: str, paths: list[str]) -> dict:
     """Build a grep-kind ``delivered_checks`` entry — the same shape
     gamma's ``commit_planning`` stamps from a capability-manifest sidecar
     (``fused-memory/tests/test_manifest_stamping.py``)."""
     return {'name': name, 'kind': 'grep', 'pattern': token, 'expect': 'present', 'paths': paths}
-
-
-def _script_check(name: str, script_rel_path: str, *, timeout_secs: float = 5) -> dict:
-    """Build a script-kind ``delivered_checks`` entry — the same shape
-    gamma's ``commit_planning`` stamps from a capability-manifest sidecar's
-    script capability."""
-    return {
-        'name': name, 'kind': 'script', 'script': script_rel_path,
-        'args': [], 'timeout_secs': timeout_secs,
-    }
 
 
 class _LocalDepMcpSession:
@@ -466,7 +441,7 @@ class TestScriptRunnerErrorFailSafe:
         session = _LocalDepMcpSession()
         _register_producer(
             session, 'P7', status='done',
-            checks=[_script_check(_CAP_NAME_7, _SCRIPT_REL_PATH_7)],
+            checks=[script_check(_CAP_NAME_7, _SCRIPT_REL_PATH_7)],
         )
         _register_dependent(session, 'D7', dep_id='P7')
 
@@ -493,7 +468,7 @@ class TestScriptRunnerErrorFailSafe:
             )
 
         # --- real recovery: create the script as an executable exit-0 file ---
-        _write_exec_script(project_root, _SCRIPT_REL_PATH_7, '#!/bin/sh\nexit 0\n')
+        install_delivered_check_script(project_root, _SCRIPT_REL_PATH_7, '#!/bin/sh\nexit 0\n')
 
         result = await _run_tick(harness)
         assert result == 'D7', (
@@ -592,3 +567,273 @@ class TestCancelledProducerSameLaneAsDone:
             f'once the capability lands on main, a cancelled dep must '
             f'satisfy the gate exactly like a done one; got {result!r}'
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestAuthoringDefectIsDistinguishable — task 3500's headline complaint
+# ─────────────────────────────────────────────────────────────────────────────
+
+_GRACE_CYCLES_3500 = 2
+
+# MIS-AUTHORED (the measured task-3536 MODE 3 shape): the pattern names a
+# tracked FILE whose contents never mention it. A grep check reads file
+# CONTENTS, so this one can never go green however much work lands — and a
+# test module famously does not mention its own name.
+_MISAUTHORED_REL_PATH = 'src/row3500_strand.py'
+_MISAUTHORED_CAP = 'row3500_filename_cap'
+_MISAUTHORED_PATTERN = 'row3500_strand'
+
+# GENUINELY UNDELIVERED: a well-formed forward-looking check on a token that
+# simply has not landed yet. Identical gate behaviour, entirely different
+# remedy — which is the whole point.
+_UNDELIVERED_REL_PATH = 'src/row3500_marker.py'
+_UNDELIVERED_CAP = 'row3500_token_cap'
+_UNDELIVERED_TOKEN = 'ROW3500_CAPABILITY_TOKEN_V1'
+
+
+def _drive_to_l2(
+    root: Path,
+    escalation_dir: Path,
+    *,
+    marker_rel_path: str,
+    check: dict,
+    producer_id: str,
+    dependent_id: str,
+) -> tuple[Harness, _LocalDepMcpSession]:
+    """Build one producer/dependent pair on its own real git repo.
+
+    Returns ``(harness, session)``; the caller drives the grace arc with
+    :func:`_tick_through_grace` and reads the dependent's status back off the
+    session, so each specimen gets an independent repo, escalation queue and
+    tick clock rather than sharing one and cross-contaminating.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    project_root = _init_git_repo(root, marker_rel_path=marker_rel_path)
+    session = _LocalDepMcpSession()
+    _register_producer(session, producer_id, status='done', checks=[check])
+    _register_dependent(session, dependent_id, dep_id=producer_id)
+    harness = _build_harness(
+        project_root, session, escalation_dir, grace_cycles=_GRACE_CYCLES_3500,
+    )
+    return harness, session
+
+
+async def _tick_through_grace(harness: Harness, dependent_id: str) -> list:
+    """Tick until grace is exhausted; assert the withhold arc; return the L2s."""
+    for tick in range(1, _GRACE_CYCLES_3500):
+        assert await _run_tick(harness) is None, f'tick {tick} must withhold'
+        assert _l2_for(harness, dependent_id) == [], (
+            f'tick {tick}: no L2 before grace_cycles is reached'
+        )
+    assert await _run_tick(harness) is None
+    return _l2_for(harness, dependent_id)
+
+
+class TestAuthoringDefectIsDistinguishable:
+    """Task 3500's OPENING COMPLAINT, closed end to end.
+
+    Before this, a mis-authored check and a genuinely undelivered capability
+    produced IDENTICAL critical escalations: both said
+    ``DEP_CAPABILITY_NOT_DELIVERED``, both named the check, and nothing in
+    either told a reader which one they were looking at. The two need
+    opposite responses — one is repaired by editing the producer's metadata,
+    the other by waiting for (or chasing) real work — so a reader who cannot
+    tell them apart either waits on a check that can never go green or
+    "fixes" a descriptor that was correct all along.
+    """
+
+    @pytest.mark.asyncio
+    async def test_misauthored_and_undelivered_escalations_differ(
+        self, tmp_path: Path
+    ) -> None:
+        """(a)+(b) THE DISTINGUISHABILITY PROPERTY. Two producers, identical
+        gate behaviour (grace -> born-at-L2 -> dependent blocked), different
+        escalation detail: only the mis-authored one carries an authoring
+        diagnosis naming the code and a remedy."""
+        # --- (a) MIS-AUTHORED: pattern matches a FILENAME, never contents ---
+        bad_harness, bad_session = _drive_to_l2(
+            tmp_path / 'misauthored', tmp_path / 'esc-bad',
+            marker_rel_path=_MISAUTHORED_REL_PATH,
+            check=_grep_check(
+                _MISAUTHORED_CAP, _MISAUTHORED_PATTERN, [_MISAUTHORED_REL_PATH],
+            ),
+            producer_id='P3500A', dependent_id='D3500A',
+        )
+        bad_escs = await _tick_through_grace(bad_harness, 'D3500A')
+
+        assert len(bad_escs) == 1, bad_escs
+        bad = bad_escs[0]
+        # The load-bearing signal is UNCHANGED — the diagnosis is additive.
+        assert 'DEP_CAPABILITY_NOT_DELIVERED' in bad.summary, bad.summary
+        assert _MISAUTHORED_CAP in bad.summary, bad.summary
+        assert bad.level == 2 and bad.severity == 'critical'
+        # ...and the detail now says WHICH authoring defect fired, plus a
+        # remedy. A code without a remedy is a diagnosis a reader cannot act on.
+        assert 'AUTHORING DIAGNOSIS' in bad.detail, bad.detail
+        assert 'filename_shaped' in bad.detail, bad.detail
+        assert _MISAUTHORED_REL_PATH in bad.detail, bad.detail
+
+        bad_status = next(
+            (t['status'] for t in bad_session.tasks if str(t.get('id')) == 'D3500A'), None,
+        )
+        assert bad_status == 'blocked'
+
+        # --- (b) GENUINELY UNDELIVERED: well-formed, simply not landed ---
+        good_harness, good_session = _drive_to_l2(
+            tmp_path / 'undelivered', tmp_path / 'esc-good',
+            marker_rel_path=_UNDELIVERED_REL_PATH,
+            check=_grep_check(
+                _UNDELIVERED_CAP, _UNDELIVERED_TOKEN, [_UNDELIVERED_REL_PATH],
+            ),
+            producer_id='P3500B', dependent_id='D3500B',
+        )
+        good_escs = await _tick_through_grace(good_harness, 'D3500B')
+
+        assert len(good_escs) == 1, good_escs
+        good = good_escs[0]
+        assert 'DEP_CAPABILITY_NOT_DELIVERED' in good.summary, good.summary
+        # NO diagnosis: nothing is wrong with this descriptor. Emitting one
+        # here would be the mirror-image failure — an operator "repairing" a
+        # correct check instead of chasing the work that never landed.
+        assert 'AUTHORING DIAGNOSIS' not in good.detail, good.detail
+
+        good_status = next(
+            (t['status'] for t in good_session.tasks if str(t.get('id')) == 'D3500B'), None,
+        )
+        assert good_status == 'blocked'
+
+        # --- the property itself ---
+        assert bad.detail != good.detail, (
+            'a mis-authored check and a genuinely undelivered capability must '
+            'not produce identical escalation details — that indistinguishability '
+            'IS the defect task 3500 exists to close'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unmet_path_check_escalates_undiagnosed(self, tmp_path: Path) -> None:
+        """A kind='path' check (task 4743) reaching the diagnosis consumer.
+
+        Its escalation detail carries no ``pattern:`` line, and no
+        reject-tier rule fires on a path check that FAILED (the vacuous codes
+        fire only on one that passes), so the right outcome is the plain
+        escalation — filed, critical, dependent blocked — with no diagnosis
+        and no crash."""
+        harness, session = _drive_to_l2(
+            tmp_path / 'path-kind', tmp_path / 'esc',
+            marker_rel_path=_UNDELIVERED_REL_PATH,
+            check={
+                'name': 'row3500_path_cap',
+                'kind': 'path',
+                'expect': 'present',
+                'paths': ['src/row3500_never_created.py'],
+            },
+            producer_id='P3500E', dependent_id='D3500E',
+        )
+        escs = await _tick_through_grace(harness, 'D3500E')
+
+        assert len(escs) == 1, escs
+        esc = escs[0]
+        assert 'DEP_CAPABILITY_NOT_DELIVERED' in esc.summary, esc.summary
+        assert esc.level == 2 and esc.severity == 'critical'
+        assert 'src/row3500_never_created.py' in esc.detail, esc.detail
+        assert 'AUTHORING DIAGNOSIS' not in esc.detail, esc.detail
+        status = next(
+            (t['status'] for t in session.tasks if str(t.get('id')) == 'D3500E'), None,
+        )
+        assert status == 'blocked'
+
+    @pytest.mark.asyncio
+    async def test_a_raising_lint_never_costs_the_escalation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """(c) THE DIAGNOSIS IS AN ENHANCEMENT, THE ESCALATION IS THE SIGNAL.
+
+        If classification can abort the file, this change has made the system
+        strictly worse than the indistinguishable-escalations state it set out
+        to fix: an operator would get NO notification at all instead of an
+        ambiguous one. So the lint is driven to raise and every load-bearing
+        property is re-asserted.
+        """
+        import shared.delivered_check_polarity as polarity
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError('lint exploded')
+
+        monkeypatch.setattr(polarity, 'lint_delivered_checks', _boom)
+
+        harness, session = _drive_to_l2(
+            tmp_path / 'raising', tmp_path / 'esc',
+            marker_rel_path=_MISAUTHORED_REL_PATH,
+            check=_grep_check(
+                _MISAUTHORED_CAP, _MISAUTHORED_PATTERN, [_MISAUTHORED_REL_PATH],
+            ),
+            producer_id='P3500C', dependent_id='D3500C',
+        )
+        escs = await _tick_through_grace(harness, 'D3500C')
+
+        assert len(escs) == 1, escs
+        esc = escs[0]
+        assert 'DEP_CAPABILITY_NOT_DELIVERED' in esc.summary, esc.summary
+        assert esc.level == 2 and esc.severity == 'critical'
+        assert 'AUTHORING DIAGNOSIS' not in esc.detail, esc.detail
+        status = next(
+            (t['status'] for t in session.tasks if str(t.get('id')) == 'D3500C'), None,
+        )
+        assert status == 'blocked'
+
+    @pytest.mark.asyncio
+    async def test_the_diagnosis_runs_off_the_event_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The lint shells out to git (bounded at 30 s per probe); run on the
+        orchestrator's event loop it would stall every other coroutine for
+        that long. It must run in a worker thread."""
+        import shared.delivered_check_polarity as polarity
+
+        real_lint = polarity.lint_delivered_checks
+        loop_running_in_lint_thread: list[bool] = []
+
+        def _recording_lint(*args, **kwargs):
+            try:
+                asyncio.get_running_loop()
+                loop_running_in_lint_thread.append(True)
+            except RuntimeError:
+                loop_running_in_lint_thread.append(False)
+            return real_lint(*args, **kwargs)
+
+        monkeypatch.setattr(polarity, 'lint_delivered_checks', _recording_lint)
+
+        harness, _session = _drive_to_l2(
+            tmp_path / 'off-loop', tmp_path / 'esc',
+            marker_rel_path=_MISAUTHORED_REL_PATH,
+            check=_grep_check(
+                _MISAUTHORED_CAP, _MISAUTHORED_PATTERN, [_MISAUTHORED_REL_PATH],
+            ),
+            producer_id='P3500F', dependent_id='D3500F',
+        )
+        escs = await _tick_through_grace(harness, 'D3500F')
+
+        assert len(escs) == 1 and 'AUTHORING DIAGNOSIS' in escs[0].detail
+        assert loop_running_in_lint_thread == [False]
+
+    @pytest.mark.asyncio
+    async def test_dedupe_is_unchanged_by_the_diagnosis(self, tmp_path: Path) -> None:
+        """(d) The pending-scoped dedupe still holds. The diagnosis is built
+        AFTER the dedupe read, so it can neither trigger a second file nor
+        change what the existing one matches on."""
+        harness, session = _drive_to_l2(
+            tmp_path / 'dedupe', tmp_path / 'esc',
+            marker_rel_path=_MISAUTHORED_REL_PATH,
+            check=_grep_check(
+                _MISAUTHORED_CAP, _MISAUTHORED_PATTERN, [_MISAUTHORED_REL_PATH],
+            ),
+            producer_id='P3500D', dependent_id='D3500D',
+        )
+        assert len(await _tick_through_grace(harness, 'D3500D')) == 1
+
+        # Re-pend and drive a second full grace arc: still exactly one open L2.
+        await _flip_status(session, 'D3500D', 'pending')
+        for _ in range(_GRACE_CYCLES_3500):
+            await _run_tick(harness)
+
+        assert len(_l2_for(harness, 'D3500D')) == 1

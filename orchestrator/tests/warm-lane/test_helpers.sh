@@ -195,7 +195,7 @@ make_isolated_lane() {
 # $X_WORKTREES and the record lands at $X_WORKTREES/.lane-state/<lane>.json.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# make_lane_state <mount> <lane> <state> [task_id] [branch]
+# make_lane_state <mount> <lane> <state> [task_id] [branch] [updated_at]
 # Writes <mount>/.lane-state/<lane>.json in the EXACT byte shape dark-factory's
 # LaneRecord.to_json() emits (orchestrator/src/orchestrator/lane_lifecycle.py:
 # json.dumps(to_dict(), indent=2) -- dataclass field order state/task_id/title/
@@ -206,10 +206,24 @@ make_isolated_lane() {
 # that is the real producer's shape for an unassigned lane, and it is the
 # fixture the record-vs-branch pin fallback is asserted against.
 #
-# updated_at is a FIXED timestamp, not `date`: no fixture in this suite may
-# depend on wall-clock (DD5); the audit never reads this field.
+# updated_at is stamped from the CLOCK when the 6th argument is omitted, and
+# emitted verbatim when supplied (that is how a caller writes a deliberately
+# stale record -- see test_warm_lane_gc.sh Block S-age).
+#
+# That field used to be the frozen literal 2026-07-26T12:43:10.704531+00:00,
+# justified by "the audit never reads this field". Task 5504 retired that
+# justification: warm-lane-gc.sh's Pass-1 record gate now bounds an ASSIGNED
+# preserve by the record's age, so a frozen past literal would make every
+# fixture here lie about being fresh and would fail Block S for a reason that
+# has nothing to do with the code under test. This is NOT the wall-clock
+# dependence DD5 forbids -- DD5 forbids fixed sleeps and wall-clock TIMING
+# bounds (which is why the suites wait causally, e.g. _wait_for_reader_lock),
+# not stamping a field whose real producer stamps it from the clock at every
+# transition (lane_lifecycle.py::LaneLifecycle.transition, datetime.now(UTC)).
+# The stale fixtures keep a ~386-day margin against a 14-day bound, so there
+# is no clock race to lose.
 make_lane_state() {
-    local mount="$1" lane="$2" state="$3" task_id="${4:-}" branch="${5:-}"
+    local mount="$1" lane="$2" state="$3" task_id="${4:-}" branch="${5:-}" updated_at="${6:-}"
     local state_dir="$mount/.lane-state"
     mkdir -p "$state_dir"
     # Plain `if`, not `[ -n .. ] && ..`: an AND-list whose left side fails
@@ -223,8 +237,13 @@ make_lane_state() {
     if [ -n "$branch" ]; then
         branch_json="\"$branch\""
     fi
-    printf '{\n  "state": "%s",\n  "task_id": %s,\n  "title": %s,\n  "branch": %s,\n  "seeded_from_sha": null,\n  "updated_at": "2026-07-26T12:43:10.704531+00:00"\n}' \
-        "$state" "$task_json" "$title_json" "$branch_json" \
+    if [ -z "$updated_at" ]; then
+        # Microseconds stay present (.000000) so the byte shape still matches
+        # the producer's isoformat() output, which always carries them.
+        updated_at="$(date -u +%Y-%m-%dT%H:%M:%S.000000+00:00)"
+    fi
+    printf '{\n  "state": "%s",\n  "task_id": %s,\n  "title": %s,\n  "branch": %s,\n  "seeded_from_sha": null,\n  "updated_at": "%s"\n}' \
+        "$state" "$task_json" "$title_json" "$branch_json" "$updated_at" \
         > "$state_dir/$lane.json"
 }
 

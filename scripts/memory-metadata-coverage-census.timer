@@ -8,7 +8,6 @@ Description=Nightly timer for the canonical/topic coverage census + retro-stamp 
 #   03:00  legibility-trickle@
 #   03:30  fused-memory-flag-marker-sweep
 #   04:00  reclaim-orphaned-worktrees  AND  legibility-transcript-check@
-#   04:30  reify-closure-staleness-sweep
 #   05:00  this job
 #
 # The stagger is deliberate: these jobs share a machine and, in several cases,

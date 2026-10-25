@@ -18,19 +18,15 @@ committed template while the arms served a frozen tree. Reinstalling did not
 clear it and nothing reported it. This checker closes both halves: it compares
 the files AND asks systemd what will really be applied.
 
-Exit codes (the family vocabulary, so setup-host.sh branches the same way)
--------------------------------------------------------------------------
-0 — parity: the files match AND the committed template is the effective
-    configuration (and something was actually compared).
-1 — drift, OR the committed template vanished, OR a drop-in override, OR the
-    effective configuration disagrees, OR the probe could not be run.
-    "I could not verify" belongs here with "I found a difference", never with
-    the benign 2 — a run that could not ask systemd has established nothing.
-2 — the unit is not installed on this host. Benign and expected: most hosts
-    never install the arms.
-
-Drift DOMINATES absence: a run hitting both returns 1, with the absence still
-reported rather than hidden.
+Exit codes
+----------
+The family's codes are defined once, in
+``systemd_unit_parity.py::ParityExit``. This checker's probe adds two findings:
+``[effective]`` means systemd resolves the unit to a WorkingDirectory other
+than the committed template's, and ``[unverifiable]`` means the probe could not
+get an answer from systemd. A
+run that could not ask systemd has established nothing. Not installed is the
+common case, because most hosts never install the arms.
 
 Read-only, and NO --fix
 -----------------------
@@ -69,28 +65,33 @@ keyed on live host state would encode host state rather than checker behaviour.
 
 import argparse
 import dataclasses
+import functools
 import pathlib
 import subprocess
 import sys
 from collections.abc import Sequence
 
-# find_dropins and the parser both live in scripts/systemd_unit_parity.py.
-# find_dropins in particular was already forked, code-identical, between
-# check_dashboard_unit_parity.py and check_orchestrator_unit_parity.py; this
-# module would have been the third copy, inside the tooling built to catch
-# exactly that kind of silent divergence. Imported by bare name, which resolves
+# The parser, the drift record and the parity driver live in
+# scripts/systemd_unit_parity.py, imported by bare name, which resolves
 # under CLI (scripts/ lands at sys.path[0]), under pytest (tests/scripts/
 # conftest.py inserts scripts/ explicitly, load-bearing because pyproject sets
 # --import-mode=importlib) and under pyright ([tool.pyright] extraPaths).
 #
-# What is NOT shared yet: Drift, UnitSpec's compared/present_only core and
-# compare_unit below are still duplicated with check_dashboard_unit_parity.py.
-# That is KNOWN, and the obstacle is recorded in systemd_unit_parity.py's own
-# docstring next to this rationale (the two copies already render Drift values
-# differently, so one shared compare_unit would change a report text both
-# suites assert on) with a filed follow-up. Do not read the import above as
-# evidence the lift is finished.
-from systemd_unit_parity import find_dropins, parse_unit_directives
+# What stays per-checker, and why: plans/review-all-s25-scripts-instruments-prd.md
+# (finding fk-3042baa5983e).
+from systemd_unit_parity import (
+    ABSENT,
+    BlockText,
+    Drift,
+    ParityRun,
+    Probe,
+    ProbeFinding,
+    ProbeOutcome,
+    ReportText,
+    UnitRef,
+    parse_unit_directives,
+    run_parity,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -105,12 +106,6 @@ LOG_TAG = "lms_unit_parity"
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent
 _DEFAULT_INSTALLED_DIR = pathlib.Path.home() / ".config" / "systemd" / "user"
-
-# Rendered in place of a value on whichever side does not declare the
-# directive at all. Deliberately not '' or None: it appears verbatim in the
-# operator's report, where "<absent>" reads unambiguously and an empty string
-# would look like a directive set to nothing.
-_ABSENT = "<absent>"
 
 # The instance suffix probed in place of the bare template. `systemctl show`
 # on `lms-arm@.service` does not resolve %i-dependent state the way an
@@ -129,49 +124,9 @@ _PROBE_KEYS = ("WorkingDirectory", "DropInPaths")
 _PROBE_TIMEOUT_SECONDS = 20
 
 
-def _log(message: str, *, stream=None) -> None:
-    """Print *message* prefixed with the log tag."""
-    print(f"[{LOG_TAG}] {message}", file=stream if stream is not None else sys.stdout)
-
-
-def _same_file_key(path: str | pathlib.Path) -> str:
-    """Return a spelling-INDEPENDENT identity for *path*.
-
-    Used only to decide whether a drop-in systemd named is one the filesystem
-    glob already found. The two sides arrive spelled differently by
-    construction: ``find_dropins`` builds paths from ``--installed-dir``
-    verbatim, while systemd reports its own canonical path. So a symlinked
-    ``$HOME``, an ``XDG_CONFIG_HOME`` with a trailing slash, or a doubled
-    separator makes one file arrive under two names, and a raw string compare
-    would append it a second time — listing the same drop-in TWICE in a report
-    whose entire value is that every applying drop-in is named exactly once. An
-    operator reading a duplicate cannot tell whether there are two files or
-    one, and "fix all of these" is the instruction the report exists to give.
-
-    ``resolve()`` (not ``absolute()``) because the symlink case is the one that
-    actually differs beyond lexical normalisation; pathlib already collapses
-    ``//`` and ``/./`` at construction. Never used for REPORTING — the paths
-    printed stay the ones their source named, so the operator sees the spelling
-    their own tools will show them.
-    """
-    return str(pathlib.Path(path).resolve())
-
-
 # ---------------------------------------------------------------------------
 # Drift records and unit specs
 # ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass(frozen=True)
-class Drift:
-    """One disagreement between the repo copy and the installed copy."""
-
-    unit: str
-    section: str
-    key: str
-    repo_value: str
-    installed_value: str
-    reason: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -262,7 +217,7 @@ def compare_unit(spec: UnitSpec, repo_text: str, installed_text: str) -> list[Dr
 
     Comparison is SYMMETRIC over the curated key set: a compared directive the
     installed copy declares and the committed one does not is drift just as
-    much as the reverse. A missing key is treated as ``_ABSENT`` on its side,
+    much as the reverse. A missing key is treated as ``ABSENT`` on its side,
     so both asymmetric cases fall out of the same equality test.
 
     The full values LIST is compared, not just the first value: systemd
@@ -286,9 +241,9 @@ def compare_unit(spec: UnitSpec, repo_text: str, installed_text: str) -> list[Dr
                 unit=spec.name,
                 section=section,
                 key=key,
-                repo_value=", ".join(repo_values) if repo_values else _ABSENT,
+                repo_value=", ".join(repo_values) if repo_values else ABSENT,
                 installed_value=(
-                    ", ".join(installed_values) if installed_values else _ABSENT
+                    ", ".join(installed_values) if installed_values else ABSENT
                 ),
                 reason="value differs between the committed and installed copies",
             )
@@ -304,8 +259,8 @@ def compare_unit(spec: UnitSpec, repo_text: str, installed_text: str) -> list[Dr
                 unit=spec.name,
                 section=section,
                 key=key,
-                repo_value="<declared>" if in_repo else _ABSENT,
-                installed_value="<declared>" if in_installed else _ABSENT,
+                repo_value="<declared>" if in_repo else ABSENT,
+                installed_value="<declared>" if in_installed else ABSENT,
                 reason=(
                     f"{key} declared in the installed copy, absent from the "
                     "committed copy"
@@ -443,6 +398,109 @@ def read_effective_config(template_name: str, probe_runner) -> EffectiveConfig:
     return EffectiveConfig(working_directory, dropin_paths)
 
 
+EFFECTIVE = BlockText(
+    "effective",
+    "{count} unit(s) resolve to a WorkingDirectory that is NOT the one the committed "
+    "template declares:",
+    (
+        "An arm started now would run from the resolved path, not the committed one. "
+        "Inspect with: systemctl --user cat lms-arm@<arm>.service",
+    ),
+)
+
+UNVERIFIABLE = BlockText(
+    "unverifiable",
+    "could not verify the effective configuration for {count} unit(s):",
+    (
+        "The unit files may well match; what this run could NOT establish is what "
+        "systemd would actually apply. Check that a systemd user manager is running "
+        "for this user (systemctl --user is-system-running).",
+    ),
+)
+
+
+def _effective_outcome(probe_runner, unit: UnitRef, repo_text: str) -> ProbeOutcome:
+    """Ask systemd what it would apply for *unit* and judge it against the committed text.
+
+    EXPECTED comes from the committed template's own WorkingDirectory, never
+    from --repo-root: the template hardcodes the main checkout, so keying off
+    --repo-root would false-red on every worktree run.
+    """
+    effective = read_effective_config(unit.name, probe_runner)
+    if effective.unverifiable is not None:
+        return ProbeOutcome(
+            findings=(ProbeFinding(UNVERIFIABLE, (f"  {unit.name}: {effective.unverifiable}",)),)
+        )
+    dropins = tuple(pathlib.Path(path) for path in effective.dropin_paths)
+    declared = parse_unit_directives(repo_text).get("Service", {}).get("WorkingDirectory")
+    expected = declared[0] if declared else None
+    if expected is None:
+        reason = "the committed template declares no [Service] WorkingDirectory"
+        finding = ProbeFinding(UNVERIFIABLE, (f"  {unit.name}: {reason}",))
+        return ProbeOutcome(findings=(finding,), dropins=dropins)
+    if effective.working_directory != expected:
+        finding = ProbeFinding(
+            EFFECTIVE,
+            (
+                f"  {unit.name}",
+                f"      committed template: {expected}",
+                f"      systemd resolved:   {effective.working_directory or ABSENT}",
+            ),
+        )
+        return ProbeOutcome(findings=(finding,), dropins=dropins)
+    if dropins:
+        return ProbeOutcome(dropins=dropins)
+    # An affirmative claim, not the absence of a complaint: silence would read
+    # as success the day the probe broke.
+    return ProbeOutcome(
+        confirmation=(
+            f"[effective] {unit.name}: the committed template IS the effective "
+            f"configuration — systemd resolves WorkingDirectory={expected} and merges "
+            "no drop-in."
+        )
+    )
+
+
+def _compare(unit: UnitRef, repo_text: str, installed_text: str) -> list[Drift]:
+    return compare_unit(UNITS[unit.name], repo_text, installed_text)
+
+
+_REPORT = ReportText(
+    drift=BlockText(
+        "drift",
+        "{count} directive(s) differ between the committed and installed units:",
+        (
+            "To propagate the committed template to this host, run: "
+            "scripts/local-model-serving/install-lms-units.sh  (this checker is "
+            "read-only by design — see the module docstring for why there is no --fix)",
+        ),
+    ),
+    vanished=dataclasses.replace(
+        ReportText.vanished,
+        tail=(
+            "The committed template is this checker's source of truth. Check "
+            "--repo-root, and whether the unit was renamed or moved (the paths live "
+            "in UNITS in this script).",
+        ),
+    ),
+    override=BlockText(
+        "override",
+        "{count} unit(s) have drop-in overrides — the unit files were compared, but "
+        "the EFFECTIVE configuration was NOT verified by that comparison:",
+        (
+            "systemd merges these over the unit at load time, so a directive set here "
+            "silently wins over the committed value. Inspect the merged result with: "
+            "systemctl --user cat lms-arm@<arm>.service",
+            "Nothing was removed: this checker is read-only BY DESIGN, because a "
+            "drop-in can be load-bearing (task 3750). To remove the known worktree "
+            "drop-in, run scripts/remove-lms-arm-worktree-dropin.sh, which gates "
+            "removal behind the preconditions that make it safe.",
+        ),
+    ),
+    repo_label="committed",
+)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -451,8 +509,7 @@ def read_effective_config(template_name: str, probe_runner) -> EffectiveConfig:
 def main(argv: Sequence[str], *, probe_runner=None) -> int:
     """Parse args and run the parity check.
 
-    Returns 0/1/2 per the exit-code table in the module docstring. Drift
-    DOMINATES absence, and a run that compared ZERO units never reports parity.
+    Exit codes: see ``systemd_unit_parity.ParityExit``.
 
     *probe_runner* is the injection seam for the effective-config probe: a
     callable taking an argv list and returning ``(returncode, stdout)``. Tests
@@ -477,259 +534,15 @@ def main(argv: Sequence[str], *, probe_runner=None) -> int:
         help="Repo root holding the committed units (default: %(default)s)",
     )
     args = parser.parse_args(argv)
-
-    installed_dir: pathlib.Path = args.installed_dir
-    repo_root: pathlib.Path = args.repo_root
-    selected = sorted(UNITS)
-
-    if probe_runner is None:
-        probe_runner = _default_probe_runner
-
-    drifts: list[tuple[Drift, pathlib.Path, pathlib.Path]] = []
-    missing: list[pathlib.Path] = []
-    vanished: list[tuple[str, pathlib.Path]] = []
-    overridden: list[tuple[str, list[pathlib.Path]]] = []
-    # (unit, expected, actual) — the effective WorkingDirectory disagreed.
-    effective_drifts: list[tuple[str, str, str]] = []
-    # (unit, reason) — the probe established nothing at all.
-    unverifiable: list[tuple[str, str]] = []
-    # (unit, [paths]) — drop-ins systemd itself named, a SUPERSET of the glob.
-    systemd_dropins: list[tuple[str, tuple[str, ...]]] = []
-    # (unit, resolved WorkingDirectory) — the affirmative clean confirmation.
-    confirmed: list[tuple[str, str]] = []
-    # Units that actually reached compare_unit. The success line reports THIS
-    # count, never len(selected): a report may only claim what it verified.
-    compared: list[str] = []
-
-    for name in selected:
-        spec = UNITS[name]
-        repo_path = repo_root / spec.repo_relpath
-        installed_path = installed_dir / name
-
-        if not repo_path.is_file():
-            # The committed template is the source of truth; without it there
-            # is nothing to compare against, so this unit was NOT checked.
-            vanished.append((name, repo_path))
-            continue
-
-        if not installed_path.is_file():
-            missing.append(installed_path)
-            continue
-
-        # Consulted even when the unit file itself is at parity: a drop-in is
-        # layered OVER a matching unit file, so it is invisible to every text
-        # comparison below.
-        dropins = find_dropins(installed_dir, name)
-        if dropins:
-            overridden.append((name, dropins))
-
-        compared.append(name)
-        repo_text = repo_path.read_text(encoding="utf-8")
-        for drift in compare_unit(
-            spec,
-            repo_text,
-            installed_path.read_text(encoding="utf-8"),
-        ):
-            drifts.append((drift, repo_path, installed_path))
-
-        # Ask systemd what it would ACTUALLY apply. Reached only once the
-        # installed unit is confirmed present: with nothing installed there is
-        # nothing to resolve, and that run already took the exit-2 path above.
-        effective = read_effective_config(name, probe_runner)
-        if effective.unverifiable is not None:
-            unverifiable.append((name, effective.unverifiable))
-            continue
-
-        if effective.dropin_paths:
-            systemd_dropins.append((name, effective.dropin_paths))
-
-        # EXPECTED comes from the committed template's own WorkingDirectory,
-        # never from --repo-root. The template hardcodes the main checkout, so
-        # running this from a worktree gives a --repo-root that is NOT the
-        # declared value — keying off it would false-red on every worktree run,
-        # and a gate that is red every time gets switched off. Sourcing it from
-        # the template also states the claim precisely: not "the unit points at
-        # this checkout" but "the committed template is the effective
-        # configuration".
-        declared = parse_unit_directives(repo_text).get("Service", {}).get(
-            "WorkingDirectory"
-        )
-        expected = declared[0] if declared else None
-        if expected is None:
-            unverifiable.append(
-                (name, "the committed template declares no [Service] WorkingDirectory")
-            )
-        elif effective.working_directory != expected:
-            effective_drifts.append(
-                (name, expected, effective.working_directory or _ABSENT)
-            )
-        elif not effective.dropin_paths:
-            confirmed.append((name, expected))
-
-    for path in missing:
-        _log(f"[skip] installed unit not found: {path} (not installed on this host)")
-
-    if vanished:
-        # Worded apart from the drift block below. Both exit 1, but they send
-        # the operator to different places: a drift is a directive diff to
-        # propagate, whereas this is "the file I compare against is gone".
-        _log(
-            f"[vanished] {len(vanished)} committed unit(s) not found — "
-            "nothing was verified for them:"
-        )
-        for name, repo_path in vanished:
-            _log(f"  {name}: expected committed copy at {repo_path}")
-        _log(
-            "[vanished] The committed template is this checker's source of "
-            "truth. Check --repo-root, and whether the unit was renamed or "
-            "moved (the paths live in UNITS in this script)."
-        )
-
-    # Fold systemd's own answer into the SAME [override] finding as the
-    # filesystem glob, merged per unit so one overridden unit stays one
-    # finding. systemd's list is a SUPERSET: it also merges
-    # /etc/systemd/user/ and /run/systemd/user/, which globbing
-    # --installed-dir can never see. Anything it names that the glob did not
-    # is therefore a real drop-in from outside the directory we read.
-    for name, paths in systemd_dropins:
-        merged = dict(overridden)
-        # Compared by resolved identity, not by raw string: see _same_file_key.
-        # `known` is also EXTENDED as fresh paths are accepted, so two spellings
-        # of one file WITHIN systemd's own list collapse the same way.
-        known = {_same_file_key(p) for p in merged.get(name, [])}
-        fresh: list[pathlib.Path] = []
-        for raw in paths:
-            key = _same_file_key(raw)
-            if key in known:
-                continue
-            known.add(key)
-            fresh.append(pathlib.Path(raw))
-        if not fresh:
-            continue
-        for index, (existing_name, existing) in enumerate(overridden):
-            if existing_name == name:
-                overridden[index] = (existing_name, [*existing, *fresh])
-                break
-        else:
-            overridden.append((name, fresh))
-
-    if overridden:
-        # Worded apart from [drift] for the same reason [vanished] is: this is
-        # NOT a directive diff to propagate. The unit files may match exactly;
-        # what the run could not establish is that the EFFECTIVE configuration
-        # matches, because systemd merges these over the unit at load time.
-        # It shares exit 1 because "I could not verify" belongs with "I found
-        # a difference", not with the benign "not installed here" that 2
-        # denotes — reporting parity here would overstate what was checked.
-        _log(
-            f"[override] {len(overridden)} unit(s) have drop-in overrides — "
-            "the unit files were compared, but the EFFECTIVE configuration "
-            "was NOT verified by that comparison:"
-        )
-        for name, dropins in overridden:
-            # EVERY applying drop-in, by absolute path. systemd merges all of
-            # them, so naming a count or only the first leaves the operator
-            # fixing half the problem and re-running into the same red.
-            for dropin in dropins:
-                _log(f"  {name}: {dropin}")
-        _log(
-            "[override] systemd merges these over the unit at load time, so a "
-            "directive set here silently wins over the committed value. "
-            "Inspect the merged result with: systemctl --user cat "
-            "lms-arm@<arm>.service"
-        )
-        _log(
-            "[override] Nothing was removed: this checker is read-only BY "
-            "DESIGN, because a drop-in can be load-bearing (task 3750). To "
-            "remove the known worktree drop-in, run "
-            "scripts/remove-lms-arm-worktree-dropin.sh, which gates removal "
-            "behind the preconditions that make it safe."
-        )
-
-    if drifts:
-        _log(
-            f"[drift] {len(drifts)} directive(s) differ between the committed "
-            "and installed units:"
-        )
-        for drift, repo_path, installed_path in drifts:
-            _log(f"  {drift.unit} [{drift.section}] {drift.key}")
-            _log(f"      {drift.reason}")
-            _log(f"      committed {repo_path}: {drift.repo_value}")
-            _log(f"      installed {installed_path}: {drift.installed_value}")
-        _log(
-            "[drift] To propagate the committed template to this host, run: "
-            "scripts/local-model-serving/install-lms-units.sh  (this checker "
-            "is read-only by design — see the module docstring for why there "
-            "is no --fix)"
-        )
-
-    if effective_drifts:
-        # Its own block, not folded into [drift]: a [drift] is a difference
-        # between two FILES the operator can diff and propagate. This is a
-        # difference between the committed template and what systemd resolved,
-        # which the files cannot show — the merged result is the only place it
-        # is visible.
-        _log(
-            f"[effective] {len(effective_drifts)} unit(s) resolve to a "
-            "WorkingDirectory that is NOT the one the committed template "
-            "declares:"
-        )
-        for name, expected, actual in effective_drifts:
-            _log(f"  {name}")
-            _log(f"      committed template: {expected}")
-            _log(f"      systemd resolved:   {actual}")
-        _log(
-            "[effective] An arm started now would run from the resolved path, "
-            "not the committed one. Inspect with: systemctl --user cat "
-            "lms-arm@<arm>.service"
-        )
-
-    if unverifiable:
-        # NEVER falls through to parity. A run that could not ask systemd has
-        # established nothing, so reporting success would be a green claim
-        # covering exactly zero verification — this task's own bug, one level
-        # up. Shares exit 1 with drift for the same reason [override] does.
-        _log(
-            f"[unverifiable] could not verify the effective configuration for "
-            f"{len(unverifiable)} unit(s):"
-        )
-        for name, reason in unverifiable:
-            _log(f"  {name}: {reason}")
-        _log(
-            "[unverifiable] The unit files may well match; what this run could "
-            "NOT establish is what systemd would actually apply. Check that a "
-            "systemd user manager is running for this user "
-            "(systemctl --user is-system-running)."
-        )
-
-    if drifts or vanished or overridden or effective_drifts or unverifiable:
-        return 1
-
-    if missing:
-        return 2
-
-    if not compared:
-        # A run that verified nothing must never report parity. Unreachable
-        # while UNITS is non-empty — every unit that was not compared took an
-        # earlier `continue` into `vanished` or `missing`, both of which
-        # return above — but the invariant it holds is one a future early
-        # `continue` could quietly break, and it costs three lines.
-        _log("[error] no units were compared — nothing was verified.")
-        return 1
-
-    # An affirmative claim, not the absence of a complaint. "No complaint" and
-    # "verified clean" look identical in a log until the checker breaks, at
-    # which point silence reads as success — which is precisely how the old
-    # file-presence self-verify passed over a live override.
-    for name, working_directory in confirmed:
-        _log(
-            f"[effective] {name}: the committed template IS the effective "
-            f"configuration — systemd resolves WorkingDirectory="
-            f"{working_directory} and merges no drop-in."
-        )
-
-    _log(f"[ok] parity — {len(compared)} unit(s) match their committed copies.")
-    return 0
+    probe = Probe(
+        (EFFECTIVE, UNVERIFIABLE),
+        functools.partial(_effective_outcome, probe_runner or _default_probe_runner),
+    )
+    units = [
+        UnitRef(name, args.repo_root / UNITS[name].repo_relpath, args.installed_dir / name)
+        for name in sorted(UNITS)
+    ]
+    return run_parity(ParityRun(LOG_TAG, units, _compare, _REPORT, (probe,)), out=sys.stdout)
 
 
 if __name__ == "__main__":

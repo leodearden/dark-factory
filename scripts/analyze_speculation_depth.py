@@ -9,9 +9,14 @@ Mines the EXISTING event store (no schema migration) for:
   - p_good bracket: [1 - genuine-conflict-rate, eventual-verify-pass-rate]
   - attempts-to-first-pass retry histogram
   - terminal merge_attempt outcome tally
-  - real per-depth P(pass|depth) when merge_verify events carry a depth
-    field (task 2340 instrumentation); otherwise a CONFOUNDED runner-split
-    fallback (runner is a broken depth proxy — flips sign across windows).
+  - real per-chain_items P(pass|chain_items) when merge_verify events carry
+    ``chain_items`` (task 3185 γ), plus a count of legacy ``depth>=2`` rows
+    that carry no ``chain_items`` (task 3188 ε); otherwise a CONFOUNDED
+    runner-split fallback (runner is a broken depth proxy — flips sign
+    across windows).
+
+Read-only: the runs.db is opened via a ``mode=ro`` SQLite URI, so the script is
+structurally incapable of writing to a live, continuously-written event store.
 
 Ported from the Phase-0 calibration-mining scratchpad prototype.
 """
@@ -23,6 +28,7 @@ import sqlite3
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 
@@ -123,51 +129,73 @@ def compute_calibration(
     }
 
 
-def compute_per_depth(
+def _usable_chain_items(data: dict[str, Any]) -> int | None:
+    value = data.get('chain_items')
+    return value if type(value) is int and value >= 1 else None
+
+
+def is_legacy_deep_label(data: dict[str, Any]) -> bool:
+    """True for a row whose only depth signal is a legacy ``depth >= 2`` label.
+
+    The rules are stated once in
+    orchestrator/src/orchestrator/chain_telemetry.py::summarize_chain_telemetry;
+    this stdlib-only copy is locked to them by
+    scripts/tests/test_chain_telemetry_agreement.py.
+    """
+    depth = data.get('depth')
+    if _usable_chain_items(data) is not None or not isinstance(depth, (int, str)):
+        return False
+    try:
+        return int(depth) >= 2
+    except ValueError:
+        return False
+
+
+def compute_per_chain_items(
     merge_verify_events: list[dict[str, Any]],
 ) -> dict[int, dict[str, Any]] | None:
-    """Bucket merge_verify events by depth and compute real P(pass|depth).
+    """Bucket merge_verify events by ``chain_items`` and compute P(pass|chain_items).
 
-    Coerces each event's ``data['depth']`` with a None-safe ``int()``:
-    absent, ``None``, or unparseable depths are skipped rather than
-    raising — merge_verify emits a native int, ``_emit_speculative``
-    str-converts (speculative_merge stores depth as e.g. ``"1"``), and all
-    historical (pre-task-2340) events carry no depth field at all.
+    A row without a usable ``chain_items`` contributes to no bucket.  The
+    rules are stated once in
+    orchestrator/src/orchestrator/chain_telemetry.py::summarize_chain_telemetry;
+    this stdlib-only copy is locked to them by
+    scripts/tests/test_chain_telemetry_agreement.py.
 
-    Returns ``None`` when no event contributes a usable depth (the trigger
-    for :func:`format_report`'s CONFOUNDED runner-split fallback), else a
-    dict ``{depth: {'pass': int, 'total': int, 'rate': float}}``.
+    Returns ``None`` when no event contributes (the trigger for
+    :func:`format_report`'s CONFOUNDED runner-split fallback), else
+    ``{chain_items: {'pass': int, 'total': int, 'rate': float}}``.
     """
-    buckets: dict[int, list[int]] = defaultdict(lambda: [0, 0])  # depth -> [pass, total]
+    buckets: dict[int, list[int]] = defaultdict(lambda: [0, 0])  # chain_items -> [pass, total]
     for e in merge_verify_events:
-        raw_depth = e['data'].get('depth')
-        if raw_depth is None:
+        chain_items = _usable_chain_items(e['data'])
+        if chain_items is None:
             continue
-        try:
-            depth = int(raw_depth)
-        except (TypeError, ValueError):
-            continue
-        buckets[depth][1] += 1
-        buckets[depth][0] += bool(e['data'].get('passed'))
+        buckets[chain_items][1] += 1
+        buckets[chain_items][0] += bool(e['data'].get('passed'))
 
     if not buckets:
         return None
 
     return {
-        depth: {'pass': p, 'total': t, 'rate': p / t}
-        for depth, (p, t) in buckets.items()
+        chain_items: {'pass': p, 'total': t, 'rate': p / t}
+        for chain_items, (p, t) in buckets.items()
     }
 
 
 def format_report(
-    calibration: dict[str, Any], per_depth: dict[int, dict[str, Any]] | None,
+    calibration: dict[str, Any],
+    per_chain_items: dict[int, dict[str, Any]] | None,
+    legacy_deep_label_rows: int = 0,
 ) -> str:
     """Render a human-readable report from a :func:`compute_calibration`
-    result and an optional :func:`compute_per_depth` result.
+    result and an optional :func:`compute_per_chain_items` result.
 
-    When *per_depth* is non-empty (>=1 windowed merge_verify event carried a
-    real ``depth``), prints the real per-depth P(pass|depth) block.
-    Otherwise falls back to a runner-split section explicitly labelled
+    When *per_chain_items* is non-empty (>=1 windowed merge_verify event
+    carried a usable ``chain_items``), prints the P(pass|chain_items) block.
+    A positive *legacy_deep_label_rows* (rows counted by
+    :func:`is_legacy_deep_label`) adds one line saying how many rows the
+    curve leaves out.  Otherwise falls back to a runner-split section explicitly labelled
     CONFOUNDED with a warning — runner is a broken depth proxy (prefer-local
     scheduling correlates runner with depth, but the correlation is
     confounded by host-env/cold-build effects and flips sign across
@@ -231,12 +259,12 @@ def format_report(
 
     lines.append('')
 
-    if per_depth:
-        lines.append('=== per-depth P(pass|depth) [real depth signal] ===')
-        for depth in sorted(per_depth):
-            entry = per_depth[depth]
+    if per_chain_items:
+        lines.append('=== per-chain_items P(pass|chain_items) ===')
+        for chain_items in sorted(per_chain_items):
+            entry = per_chain_items[chain_items]
             lines.append(
-                f"  depth={depth}: {entry['pass']}/{entry['total']} = "
+                f"  chain_items={chain_items}: {entry['pass']}/{entry['total']} = "
                 f"{entry['rate']:.3f}"
             )
     else:
@@ -245,9 +273,14 @@ def format_report(
             'WARNING: runner is a broken depth proxy — it tracks laptop '
             'infra/host-env health, not verify-frontier depth, and flips '
             'sign across windows. No merge_verify event in this window '
-            'carries a depth field, so no per-depth P(pass|depth) can be '
-            'computed; deepen instrumentation (task 2340) before trusting '
-            'any runner-based split.'
+            'carries chain_items >= 1 (a pre-chain_items window), so no '
+            'P(pass|chain_items) can be computed; do not trust any '
+            'runner-based split.'
+        )
+    if legacy_deep_label_rows:
+        lines.append(
+            f'legacy depth>=2 rows (pre-chain_items, not in the curve): '
+            f'{legacy_deep_label_rows}'
         )
 
     return '\n'.join(lines)
@@ -271,7 +304,7 @@ def main(argv: Sequence[str]) -> int:
     )
     args = parser.parse_args(argv)
 
-    conn = sqlite3.connect(args.db_path)
+    conn = sqlite3.connect(f'{Path(args.db_path).resolve().as_uri()}?mode=ro', uri=True)
     try:
         merge_verify_events = load_events(conn, 'merge_verify', args.since)
         merge_attempt_events = load_events(conn, 'merge_attempt', args.since)
@@ -279,8 +312,9 @@ def main(argv: Sequence[str]) -> int:
         conn.close()
 
     calibration = compute_calibration(merge_verify_events, merge_attempt_events)
-    per_depth = compute_per_depth(merge_verify_events)
-    print(format_report(calibration, per_depth))
+    per_chain_items = compute_per_chain_items(merge_verify_events)
+    legacy_rows = sum(1 for e in merge_verify_events if is_legacy_deep_label(e['data']))
+    print(format_report(calibration, per_chain_items, legacy_rows))
     return 0
 
 

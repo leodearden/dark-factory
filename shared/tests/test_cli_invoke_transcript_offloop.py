@@ -3,9 +3,9 @@
 THE INVARIANT UNDER TEST
 ────────────────────────
 Every on-disk transcript read reachable from ``_run_subprocess`` —
-``count_transcript_turns`` in the startup-regime poll, in the working-regime
-progress-extension poll, and in the post-kill ``except TimeoutError:`` re-read,
-plus ``read_transcript_records`` on the normal-exit path — must execute on a
+``count_transcript_turns`` in the startup-regime poll and in the working-regime
+progress-extension poll, plus ``read_transcript_records`` in the post-kill
+``except TimeoutError:`` re-read and on the normal-exit path — must execute on a
 worker thread (``asyncio.to_thread``), NOT on the thread running the event loop.
 
 WHY IT MATTERS.  The orchestrator runs every role of every concurrent task on
@@ -89,7 +89,14 @@ def _make_hanging_proc():
     return proc, call_count
 
 
-def _make_delayed_success_proc(delay_secs, stdout_bytes=b'{"type":"result","subtype":"success"}'):
+def _make_delayed_success_proc(
+    delay_secs,
+    stdout_bytes=b'{"type":"result","subtype":"success"}',
+    *,
+    reads_observed=None,
+    min_reads=0,
+    max_extra_wait_secs=2.0,
+):
     """Return a proc whose communicate() sleeps *delay_secs* then succeeds once.
 
     Mirrors ``TestRunSubprocessWorkingRegimeProgressExtension._make_delayed_success_proc``
@@ -97,10 +104,32 @@ def _make_delayed_success_proc(delay_secs, stdout_bytes=b'{"type":"result","subt
     reads in isolation: the run leaves the loop via ``comm_task in done`` and
     never enters the ``except TimeoutError:`` handler, so the handler's own
     one-shot re-read cannot land in the recorded-ident list.
+
+    READS GATE — why *delay_secs* alone is not enough.  A test that asserts "at
+    least N reads happened" needs the process to stay pending across N watchdog
+    iterations, and *delay_secs* only buys that by WALL-CLOCK proxy: it assumes
+    the loop gets N turns inside the delay.  That assumption is exactly the one
+    this module's header docstring warns against.  When the host is
+    oversubscribed the loop is descheduled past *delay_secs*, its first
+    ``asyncio.wait`` returns with ``comm_task`` already done, the loop ``break``s
+    BEFORE the read, and the run ends with zero or one read — code under test
+    entirely innocent (observed: a 0.7 s first poll at a patched 5 ms cadence,
+    load average 57 on 32 cores).
+
+    Passing *reads_observed* (the list the patched ``count_transcript_turns``
+    appends to) and *min_reads* makes the precondition causal instead: the
+    process stays pending until the reads have actually been observed.  The wait
+    is bounded by *max_extra_wait_secs* so a genuine regression — reads that
+    never happen — still fails loudly on the caller's own assertion rather than
+    hanging until the suite timeout.
     """
 
     async def communicate_side_effect(input=None):  # noqa: A002
         await asyncio.sleep(delay_secs)
+        if reads_observed is not None:
+            deadline = time.monotonic() + max_extra_wait_secs
+            while len(reads_observed) < min_reads and time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
         return (stdout_bytes, b'')
 
     proc = MagicMock()
@@ -143,8 +172,9 @@ def _ident_recorder_growing(recorded: list[int]):
 
 
 def _ident_recorder(recorded: list[int], return_value):
-    """A sync ``count_transcript_turns`` stand-in appending the CALLING thread's
-    ident to *recorded* and returning *return_value*.
+    """A sync transcript-read stand-in (``count_transcript_turns`` or
+    ``read_transcript_records``) appending the CALLING thread's ident to
+    *recorded* and returning *return_value*.
 
     Same closure shape as the existing ``_always_growing_turns`` side-effect
     idiom in ``test_cli_invoke.py``.  Under
@@ -187,8 +217,8 @@ class TestStartupRegimePollOffLoop:
         cfg_dir = tmp_path / 'cfg'
         cfg_dir.mkdir()
 
-        proc = _make_delayed_success_proc(0.3)
         recorded: list[int] = []
+        proc = _make_delayed_success_proc(0.3, reads_observed=recorded, min_reads=1)
 
         with (
             patch(
@@ -328,8 +358,11 @@ class TestWorkingRegimeExtensionPollOffLoop:
         cfg_dir = tmp_path / 'cfg'
         cfg_dir.mkdir()
 
-        proc = _make_delayed_success_proc(0.3)
         recorded: list[int] = []
+        # min_reads=2 matches the `len(recorded) >= 2` assertion below; the gate
+        # makes that precondition causal rather than a wall-clock bet, and its
+        # 2.0s bound keeps the worst case (0.3 + 2.0 = 2.3s) under absolute_cap_secs=5.0.
+        proc = _make_delayed_success_proc(0.3, reads_observed=recorded, min_reads=2)
 
         with (
             patch(
@@ -377,31 +410,29 @@ class TestTimeoutPathRereadOffLoop:
     """The one-shot post-kill re-read inside ``_run_subprocess``'s
     ``except TimeoutError:`` handler must run off the loop.
 
-    This read stamps ``transcript_turns`` onto the returned ``_SubprocessResult``,
-    which ``classify_agent_failure`` surfaces in its ``diagnostic_detail`` — so
-    the value must still arrive intact across the thread hop, not just off-loop.
+    This read stamps ``transcript_turns`` (surfaced in
+    ``classify_agent_failure``'s ``diagnostic_detail``) and ``model_id`` onto the
+    returned ``_SubprocessResult`` — so both values must still arrive intact
+    across the thread hop, not just off-loop.
+
+    NOTE ON ISOLATION.  The watchdog polls read through ``count_transcript_turns``,
+    patched here to a fixed 7 so ``seen_turn`` latches on the first poll and the
+    run is killed by the flat ``timeout_seconds`` ceiling.  Because that patch
+    replaces the whole function, every entry recorded by the
+    ``read_transcript_records`` stand-in came from the handler's re-read.
     """
 
     async def test_timeout_path_transcript_reread_runs_off_the_loop_thread(self, tmp_path):
-        """The post-kill re-read runs on a worker thread, and its value still lands.
-
-        The fake returns a fixed sentinel 7 on every call.  7 >= 1 latches
-        ``seen_turn`` on the first poll, so the run is killed by the flat
-        ``timeout_seconds`` ceiling rather than the startup-wedge branch — either
-        route reaches the same ``except TimeoutError:`` handler and its re-read.
-
-        Because the extension params are NOT passed, ``extension_engaged`` stays
-        False and no further poll reads happen after the latch: ``recorded`` is
-        the (off-loop, post-step-2) latching poll plus the handler's re-read, so
-        any loop-thread ident in it can only have come from the handler.
-        """
+        """The post-kill re-read runs on a worker thread, ONCE, and both derived
+        signals still fall out of the thread-returned list."""
         loop_ident = threading.get_ident()
         sid = str(uuid.uuid4())
         cfg_dir = tmp_path / 'cfg'
         cfg_dir.mkdir()
 
         proc, _ = _make_hanging_proc()
-        recorded: list[int] = []
+        handler_reads: list[int] = []
+        records = [{'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}}] * 7
 
         with (
             patch(
@@ -409,9 +440,10 @@ class TestTimeoutPathRereadOffLoop:
                 side_effect=_fake_exec_returning(proc),
             ),
             patch('shared.cli_invoke.terminate_process_group', AsyncMock()),
+            patch('shared.cli_invoke.count_transcript_turns', return_value=7),
             patch(
-                'shared.cli_invoke.count_transcript_turns',
-                side_effect=_ident_recorder(recorded, 7),
+                'shared.cli_invoke.read_transcript_records',
+                side_effect=_ident_recorder(handler_reads, records),
             ),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
         ):
@@ -422,16 +454,22 @@ class TestTimeoutPathRereadOffLoop:
             )
 
         assert result.timed_out is True, 'Expected the ceiling kill to fire'
-        assert result.transcript_turns == 7, (
-            f'The one-shot re-read must still execute and its value still reach the '
-            f'_SubprocessResult stamp across the thread hop; got '
-            f'transcript_turns={result.transcript_turns}'
+        assert len(handler_reads) == 1, (
+            f'Expected exactly ONE post-kill transcript read feeding both stamped '
+            f'signals; got {len(handler_reads)} read(s).'
         )
-        assert loop_ident not in recorded, (
-            f'count_transcript_turns ran on the event-loop thread ({loop_ident}) — the '
+        assert loop_ident not in handler_reads, (
+            f'read_transcript_records ran on the event-loop thread ({loop_ident}) — the '
             f'post-kill re-read in the except-TimeoutError handler blocks the shared '
             f'loop. '
-            f'Recorded idents: {sorted(set(recorded))}'
+            f'Recorded idents: {sorted(set(handler_reads))}'
+        )
+        assert result.transcript_turns == 7, (
+            f'Expected the assistant-turn count derived from the thread-returned list, '
+            f'got transcript_turns={result.transcript_turns}'
+        )
+        assert result.model_id == 'claude-sonnet-5', (
+            f'Expected the served model id derived from the same list, got {result.model_id!r}'
         )
 
     async def test_timeout_path_skips_read_when_session_id_missing(self, tmp_path):
@@ -458,6 +496,10 @@ class TestTimeoutPathRereadOffLoop:
             patch(
                 'shared.cli_invoke.count_transcript_turns',
                 side_effect=_ident_recorder(recorded, 7),
+            ),
+            patch(
+                'shared.cli_invoke.read_transcript_records',
+                side_effect=_ident_recorder(recorded, []),
             ),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
         ):

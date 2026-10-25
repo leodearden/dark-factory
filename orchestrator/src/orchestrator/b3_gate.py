@@ -14,6 +14,7 @@ import argparse
 import fcntl
 import json
 import logging
+import re
 import sqlite3
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from shared import safe_io
+from shared.project_layout import escalation_queue_dir, tasks_db
 from shared.safe_io import load_json_or_warn
 
 from orchestrator.stop_instruction import detect_stop_instruction
@@ -35,12 +37,31 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-STATE_REL_PATH = 'data/escalations/b3-state.json'
+STATE_FILENAME = 'b3-state.json'
 B3_CATEGORIES: frozenset[str] = frozenset({'task_failure', 'review_issues'})
 
 FRESH = 'fresh'
 DRIFT = 'drift'
 ABORT = 'abort'
+
+# Closed domain for check_proposal's 'age_state' key — WHY a proposal's age is
+# or is not known.  Before task 5361 all four causes collapsed to a bare
+# 'age_seconds': None, indistinguishable to every consumer.
+#
+# THREE non-parsed states cover FOUR causes, not four states: an absent
+# timestamp and an absent clock each get their own, while BOTH awareness
+# mismatches — a naive investigated_at against an aware clock, and an aware
+# investigated_at against a naive operator-supplied --now — land on
+# AGE_UNPARSEABLE alongside a genuinely malformed string.  They are not split
+# because the fault is the PAIR, not one operand; _age_of's warning names both
+# so the shared state cannot misdirect an operator to the wrong one.
+#
+# AGE_NO_CLOCK is unreachable through the `check` CLI — _parse_now always
+# returns a datetime — and exists for in-process callers that pass now=None.
+AGE_PARSED = 'parsed'
+AGE_UNPARSEABLE = 'unparseable'
+AGE_ABSENT = 'absent'
+AGE_NO_CLOCK = 'no_clock'
 
 POST_MERGE_RED_MAIN_REASON_PREFIX = 'Post-merge unscoped type-check failed'
 """Prefix that identifies the post-merge-red-main fix-forward class.
@@ -57,13 +78,22 @@ DEFAULT_TAG = 'master'
 DEFAULT_CAP = 6
 _LAUNCH_RETENTION_DAYS = 30  # prune launches older than this many days (bound state-file growth)
 
+_FAILURE_REPORT_CAPTURED_HEADINGS = (
+    'Test Failures', 'Test Output', 'Lint Issues', 'Type Errors', 'Type Check Output',
+)
+_CAPTURED_OUTPUT_RE = re.compile(
+    r'^(## (?:' + '|'.join(map(re.escape, _FAILURE_REPORT_CAPTURED_HEADINGS)) + r')\n\n)'
+    r'```\n.*?^```[ \t]*$',
+    re.MULTILINE | re.DOTALL,
+)
+
 # ---------------------------------------------------------------------------
 # State path
 # ---------------------------------------------------------------------------
 
 def _state_path(project_root: str | Path) -> Path:
     """Return the canonical state-file path for a given project root."""
-    return Path(project_root) / STATE_REL_PATH
+    return escalation_queue_dir(project_root) / STATE_FILENAME
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +318,55 @@ def _run_git(args: list[str], cwd: str) -> tuple[int, str]:
         return 1, str(exc)
 
 
+def _age_of(
+    entry: dict[str, Any] | None, now: datetime | None,
+) -> tuple[float | None, str]:
+    """Return ``(age_seconds, age_state)`` for a proposal entry's investigated_at.
+
+    The state names WHY an age is unavailable, replacing a bare ``None`` that
+    told a consumer nothing.  THREE non-parsed states cover FOUR causes:
+    ``AGE_ABSENT`` (no timestamp), ``AGE_NO_CLOCK`` (no clock), and
+    ``AGE_UNPARSEABLE`` for an unreadable string AND for either direction of an
+    awareness mismatch.  The two mismatch causes share one state because the
+    fault is the PAIR, not one operand — an aware ``investigated_at`` against a
+    naive operator-supplied ``--now`` is the operator's bug, not the producer's.
+
+    Warns rather than swallowing — a pair this gate cannot subtract is a bug
+    worth surfacing, and siting the warning here means no caller can silently
+    drop it.  The message names BOTH operands precisely because the state does
+    not say which one is at fault.
+    """
+    investigated_at = (entry or {}).get('investigated_at')
+    if not investigated_at:
+        return None, AGE_ABSENT
+    if now is None:
+        return None, AGE_NO_CLOCK
+    try:
+        return (now - datetime.fromisoformat(investigated_at)).total_seconds(), AGE_PARSED
+    except Exception as exc:
+        logger.warning(
+            'check_proposal: could not compute proposal age from investigated_at '
+            '%r against now %r — treating age as unknown; either operand may be '
+            'at fault (a naive --now fails against an aware timestamp): %s',
+            investigated_at, now, exc,
+        )
+        return None, AGE_UNPARSEABLE
+
+
+def _strip_captured_output(text: str | None) -> str | None:
+    """Return *text* without the fenced output of its failure-report sections.
+
+    Only a fence opened directly under a _FAILURE_REPORT_CAPTURED_HEADINGS
+    heading starts captured output, and the first fence line after it ends
+    it.  A stray fence line inside captured output therefore only ends the
+    excerpt early: it cannot pair with a later fence and hide authored text.
+    An opening fence with no closing line excludes nothing.
+    """
+    if not text:
+        return text
+    return _CAPTURED_OUTPUT_RE.sub(r'\1', text)
+
+
 def check_proposal(
     entry: dict[str, Any] | None,
     *,
@@ -314,10 +393,19 @@ def check_proposal(
           legacy prose/status sniffs (those stay gated on `block_class is
           None`, not on validity).
       1c. EXPLICIT STOP INSTRUCTION (task 2509, reconciliation finding
-          0aac21b4): if entry['proposal_text'], entry['block_reason'], or any
-          string in extra_texts (e.g. the task description — see
-          b3_gate.run_check) contains a phrase from
+          0aac21b4): if any AUTHORED text contains a phrase from
           orchestrator.stop_instruction.STOP_INSTRUCTION_PHRASES -> abort.
+          Authored, scanned whole: entry['proposal_text'] and every string in
+          extra_texts (e.g. the task description — see b3_gate.run_check).
+          Captured, excluded: in entry['block_reason'], the fenced output
+          under each _FAILURE_REPORT_CAPTURED_HEADINGS section — tool output
+          from
+          orchestrator/src/orchestrator/verify.py::VerifyResult.failure_report,
+          not a directive (task 6933).  Authored, scanned: the rest of
+          block_reason, including any other fence, an unterminated one, and
+          whatever follows a stray fence line inside captured output.  Pinned
+          by
+          orchestrator/tests/test_b3_gate.py::TestStopScanExcludesCapturedOutput.
           Hard-aborted before risk_label/git checks, same shape as 1b, and
           takes precedence even over an otherwise-fresh low-risk entry — a
           stop instruction is the highest-authority human directive and must
@@ -340,9 +428,14 @@ def check_proposal(
       5. head_sha or main_sha missing/None -> drift 'no sha anchor'
       6. HEAD != head_sha -> abort (git-anchored; P1)
       7. diff main_sha..main -- files_referenced non-empty -> drift (P2)
+      7b. age_state != AGE_PARSED -> abort.  A gate authorising unattended
+          edits and merges to main must not certify a proposal fresh when it
+          cannot determine the proposal's age at all.  Placed last so every
+          earlier verdict keeps its more specific reason; abort and drift are
+          both already non-launching, so only the FRESH path needs gating.
       8. else fresh
 
-    Keys: verdict, reason, head_sha, main_sha, age_seconds.
+    Keys: verdict, reason, head_sha, main_sha, age_seconds, age_state.
     The 'run_git' parameter defaults to _run_git; tests inject a fake.
     """
     if run_git is None:
@@ -356,26 +449,24 @@ def check_proposal(
             'head_sha': None,
             'main_sha': None,
             'age_seconds': None,
+            'age_state': AGE_ABSENT,
         }
 
     head_sha = entry.get('head_sha')
     main_sha = entry.get('main_sha')
 
+    # Parsed once per call and shared by every return path, so an unparseable
+    # timestamp warns exactly once no matter which verdict the entry lands on.
+    age_seconds, age_state = _age_of(entry, now)
+
     def _result(verdict, reason):
-        age = None
-        try:
-            investigated_at = entry.get('investigated_at')
-            if investigated_at and now is not None:
-                ts = datetime.fromisoformat(investigated_at)
-                age = (now - ts).total_seconds()
-        except Exception:
-            pass
         return {
             'verdict': verdict,
             'reason': reason,
             'head_sha': head_sha,
             'main_sha': main_sha,
-            'age_seconds': age,
+            'age_seconds': age_seconds,
+            'age_state': age_state,
         }
 
     # --- (1b) Post-merge red-main fix-forward class (dual-read) ---
@@ -413,8 +504,11 @@ def check_proposal(
     # single source of truth for the phrase set — also reused by
     # DeterministicRunner's before_done guard and the /unblock +
     # unblock-low-risk runbook prose, so it cannot drift between surfaces.
+    # The authored/captured line is stated in the docstring's item 1c.
     stop_phrase = detect_stop_instruction(
-        entry.get('proposal_text'), entry.get('block_reason'), *(extra_texts or []),
+        entry.get('proposal_text'),
+        _strip_captured_output(entry.get('block_reason')),
+        *(extra_texts or []),
     )
     if stop_phrase:
         return _result(
@@ -458,6 +552,17 @@ def check_proposal(
             return _result(DRIFT, f'could not verify footprint drift (git diff rc={rc})')
         if diff_out.strip():
             return _result(DRIFT, 'main moved within proposal footprint (files_referenced)')
+
+    # --- (7b) Fail closed on an undeterminable age ---
+    # Deliberately last: abort and drift are already non-launching for every
+    # consumer, so gating only the FRESH path is sufficient, and every entry
+    # that fails for a more specific reason keeps that reason verbatim.
+    if age_state != AGE_PARSED:
+        return _result(
+            ABORT,
+            f'proposal age is not determinable (age_state={age_state}) — B3 never '
+            f'certifies a proposal fresh without a parsed investigated_at',
+        )
 
     # --- (8) Fresh ---
     return _result(FRESH, 'sha anchors valid and footprint unchanged')
@@ -519,7 +624,7 @@ def _read_latest_proposal(
     try:
         owns_conn = conn is None
         if owns_conn:
-            db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+            db_path = tasks_db(project_root)
             if not db_path.exists():
                 return None
             # Open read-only via URI
@@ -589,7 +694,7 @@ def _read_task_description(
     try:
         owns_conn = conn is None
         if owns_conn:
-            db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+            db_path = tasks_db(project_root)
             if not db_path.exists():
                 return None
             uri = f'file:{db_path}?mode=ro'
@@ -687,7 +792,7 @@ def run_check(args: argparse.Namespace) -> None:
     # tasks.db twice per invocation, once per reader). Falls back to each
     # reader's own independent open (and its existing fail-closed-to-None
     # behavior) when this shared connection can't be established.
-    db_path = Path(args.project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    db_path = tasks_db(args.project_root)
     shared_conn: sqlite3.Connection | None = None
     if db_path.exists():
         try:
@@ -786,7 +891,7 @@ def _build_parser() -> argparse.ArgumentParser:
             sp_parser.add_argument('--worktree', required=True,
                                    help='path to the blocked task\'s worktree')
         sp_parser.add_argument('--project-root', required=True,
-                               help='project root dir (contains data/escalations/)')
+                               help='project root dir (holds the escalation queue)')
         sp_parser.add_argument('--config', default=None,
                                help='optional path to orchestrator config YAML')
         sp_parser.add_argument('--now', default=None,

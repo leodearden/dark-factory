@@ -2,9 +2,11 @@
 """Predicate: is the legibility trickle pipeline for <project_id> actually
 PRODUCING anything? Exit 0 = signal is flowing, non-zero = escalate.
 
-Usage: check_trickle_progress.py <project_id> <max_barren_runs> [max_age_hours]
+Usage: check_trickle_progress.py <project_id> <max_barren_runs>
+           [max_age_hours] [max_failed_runs]
 
   max_age_hours defaults to 72, matching PRD task kappa's liveness window.
+  max_failed_runs defaults to trickle_state.DEFAULT_MAX_FAILED_RUNS.
 
 SIBLING, NOT REPLACEMENT, of check_trickle_liveness.sh. The two answer
 DIFFERENT questions and neither subsumes the other:
@@ -31,14 +33,29 @@ inferred-absent from a missing commit. Decision 7's rationale is
 satisfied, not circumvented.
 
 Every failure verdict is DISTINCT: never-recorded vs unreadable vs
-stale-recorder vs barren streak, and a barren streak names the specific
-door and ITS OWN remedy. A probe that cannot say WHICH absence it found is
-the trap this script exists to close.
+stale-recorder vs FAILED streak vs barren streak vs a barren streak
+CARRIED FORWARD under a crashed or a cap-deferred run, and each names ITS
+OWN remedy — a barren streak the specific door it left by, a failed streak
+the journal, a streak carried under a crash the journal first and no door
+at all, one carried under a deferral a completed run and no door. Each
+verdict on a readable record, and the OK line, prints the recorded
+``barren_escalated`` (True, False, or ``unrecorded`` before the field
+existed), so an operator can read whether the nightly escalated. A probe that
+cannot say WHICH absence it found is the trap this script exists to close,
+and a verdict that reads the LAST night's door counters as though they
+described an EARLIER night's streak is that same trap wearing the right
+label.
+
+A run can flow signal IN and still break downstream, which is why
+``failed`` is an outcome of its own: ``selected_count > 0`` answers "did
+signal flow", never "did the night finish". A ``deferred`` night (the usage
+cap deferred its coding) is weather: it reads OK on its own and never moves
+a streak.
 """
 from __future__ import annotations
 
 import sys
-from datetime import UTC, datetime
+from dataclasses import dataclass
 from pathlib import Path
 
 # The deterministic runner EXECs a bound predicate directly
@@ -50,139 +67,212 @@ from pathlib import Path
 # predicate at DISPATCH time, not at test time.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import trickle_state  # noqa: E402  (must follow the sys.path shim above)
+import state_docs
+import trickle_state
 
 USAGE = (
     'usage: check_trickle_progress.py <project_id> <max_barren_runs> '
-    '[max_age_hours]'
+    '[max_age_hours] [max_failed_runs]'
 )
+
+DEFAULT_MAX_AGE_HOURS = 72
+
+
+@dataclass(frozen=True)
+class _Thresholds:
+    max_barren_runs: int
+    max_age_hours: int
+    max_failed_runs: int
 
 
 def main(argv: list[str]) -> int:
     args = argv[1:]
     # Arity + numeric guard, mirroring check_trickle_liveness.sh's
     # `[ $# -ne 2 ]` shape.
-    if len(args) not in (2, 3):
+    if len(args) not in (2, 3, 4):
         print(USAGE, file=sys.stderr)
         return 1
 
     project_id = args[0]
     try:
-        max_barren_runs = int(args[1])
-        max_age_hours = int(args[2]) if len(args) == 3 else 72
+        limits = _Thresholds(
+            max_barren_runs=int(args[1]),
+            max_age_hours=int(args[2]) if len(args) >= 3 else DEFAULT_MAX_AGE_HOURS,
+            max_failed_runs=(
+                int(args[3]) if len(args) == 4
+                else trickle_state.DEFAULT_MAX_FAILED_RUNS
+            ),
+        )
     except ValueError:
         print(
             f'{USAGE}\n'
-            f'ERROR: max_barren_runs and max_age_hours must be integers',
+            f'ERROR: max_barren_runs, max_age_hours and max_failed_runs '
+            f'must be integers',
             file=sys.stderr,
         )
         return 1
 
     path = trickle_state.trickle_state_path(project_id)
-    status, doc = trickle_state.load_state(path)
+    match trickle_state.load_state(path):
+        case state_docs.Missing():
+            return _fail(
+                f'ERROR: legibility trickle for {project_id} has never recorded '
+                f'a run (no state file at {path}). Either the nightly pipeline '
+                f'has never run for this project, or it is running a build that '
+                f'predates run-state recording.'
+            )
+        case state_docs.Malformed(reason=reason):
+            return _fail(
+                f'ERROR: legibility trickle state for {project_id} is '
+                f'unreadable/corrupt at {path}: {reason}. The pipeline may be '
+                f'healthy; the RECORD is not, so progress cannot be assessed.'
+            )
+        case state_docs.Ok(value=state):
+            return _judge(project_id, path, state, limits)
 
-    # 1. Never recorded a run at all. Distinct from a barren streak: the
-    #    recorder itself has never fired for this project.
-    if status == 'missing':
-        print(
-            f'ERROR: legibility trickle for {project_id} has never recorded '
-            f'a run (no state file at {path}). Either the nightly pipeline '
-            f'has never run for this project, or it is running a build that '
-            f'predates run-state recording.',
-            file=sys.stderr,
-        )
-        return 1
 
-    # 2. Recorded, but the record cannot be read. Fail loud rather than
-    #    guessing at a verdict from a document we do not understand.
-    if status != 'ok' or doc is None:
-        print(
-            f'ERROR: legibility trickle state for {project_id} is '
-            f'unreadable/corrupt at {path}. The pipeline may be healthy; the '
-            f'RECORD is not, so progress cannot be assessed.',
-            file=sys.stderr,
-        )
-        return 1
+def _judge(
+    project_id: str, path: Path, state: trickle_state.TrickleState,
+    limits: _Thresholds,
+) -> int:
+    """The verdict on a readable record; the first failing check wins.
 
-    # 3. Stale recorder: the pipeline stopped writing state at all. The
-    #    recorded outcome alone would still read healthy here, which is
-    #    exactly why freshness is checked before the streak.
-    recorded_at = doc.get('recorded_at')
-    try:
-        stamp = datetime.fromisoformat(str(recorded_at))
-    except (TypeError, ValueError):
-        print(
-            f'ERROR: legibility trickle state for {project_id} has an '
-            f'unparseable recorded_at {recorded_at!r} at {path}; freshness '
-            f'cannot be assessed.',
-            file=sys.stderr,
-        )
-        return 1
-
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=UTC)
-    age_hours = (datetime.now(UTC) - stamp).total_seconds() / 3600.0
-
-    if age_hours > max_age_hours:
-        print(
+    Freshness comes first because a recorder that stopped writing leaves a
+    record that still reads healthy. The failed streak comes before the
+    barren one because the barren streak is carried across failed runs, so
+    during a failure window it is stale by construction."""
+    age_hours = trickle_state.recorded_age_hours(state)
+    if age_hours > limits.max_age_hours:
+        return _fail(
             f'ERROR: legibility trickle for {project_id} last recorded a run '
-            f'{age_hours:.0f}h ago, exceeding the {max_age_hours}h window '
-            f'(state file {path}). The pipeline has stopped recording '
-            f'state — check the timer with check_trickle_liveness.sh.',
-            file=sys.stderr,
+            f'{age_hours:.0f}h ago, exceeding the {limits.max_age_hours}h '
+            f'window (state file {path}). The pipeline has stopped recording '
+            f'state — check the timer with check_trickle_liveness.sh. '
+            f'{_escalation_fact(state)}.'
         )
-        return 1
+    if state.consecutive_failed_runs >= limits.max_failed_runs:
+        return _fail(_failed_streak_verdict(project_id, path, state, limits))
+    if trickle_state.barren_streak_due(state, limits.max_barren_runs):
+        return _fail(_barren_streak_verdict(project_id, path, state, limits))
 
-    # 4. Barren streak: signal reached the sampling/budget stage and
-    #    NOTHING was digested, for max_barren_runs consecutive runs.
-    streak = doc.get('consecutive_barren_runs')
-    streak = streak if isinstance(streak, int) else 0
-    outcome = doc.get('outcome')
-    counters = doc.get('counters') or {}
-    budget_skipped = counters.get('budget_skipped') or 0
-    below_sampling_cut = counters.get('below_sampling_cut') or 0
-
-    if streak >= max_barren_runs:
-        # Door-SPECIFIC remedy. SampleResult's docstring is explicit that
-        # the two doors have different fixes: raising the byte budget
-        # recovers a budget_skipped record and does nothing whatever for a
-        # below_sampling_cut one. Never conflate them.
-        remedies = []
-        if budget_skipped > 0:
-            remedies.append(
-                'raise budgets.max_daily_digest_bytes (candidates competed '
-                'and were ALL discarded on the byte budget)'
-            )
-        if below_sampling_cut > 0:
-            remedies.append(
-                'raise sampling.top_fraction / sampling.per_stratum_min '
-                '(real signal ranked below its stratum cut and never '
-                'reached the budget phase)'
-            )
-        remedy = '; '.join(remedies) or (
-            'inspect the recorded counters — no door counter is set, which '
-            'should be impossible for a barren run'
-        )
-
-        print(
-            f'ERROR: legibility trickle for {project_id} has been {outcome} '
-            f'for {streak} consecutive runs (threshold {max_barren_runs}): '
-            f'real signal reached the sampling/budget stage and nothing was '
-            f'digested. Doors: below_sampling_cut={below_sampling_cut} '
-            f'budget_skipped={budget_skipped}. Remedy: {remedy}. '
-            f'State file: {path}',
-            file=sys.stderr,
-        )
-        return 1
-
-    # 5. Healthy.
     print(
-        f'OK: legibility trickle for {project_id} last run was {outcome} '
-        f'{age_hours:.0f}h ago, consecutive_barren_runs={streak} '
-        f'(threshold {max_barren_runs}), '
-        f'last_productive_at={doc.get("last_productive_at")}.'
+        f'OK: legibility trickle for {project_id} last run was '
+        f'{state.outcome} {age_hours:.0f}h ago, '
+        f'consecutive_barren_runs={state.consecutive_barren_runs} '
+        f'(threshold {limits.max_barren_runs}), '
+        f'consecutive_failed_runs={state.consecutive_failed_runs} '
+        f'(threshold {limits.max_failed_runs}), '
+        f'last_productive_at={trickle_state.isoformat_or_none(state.last_productive_at)}, '
+        f'{_escalation_fact(state)}.'
     )
     return 0
+
+
+def _failed_streak_verdict(
+    project_id: str, path: Path, state: trickle_state.TrickleState,
+    limits: _Thresholds,
+) -> str:
+    # WHERE the pipeline broke is conditional on the recorded counter: a
+    # night that raised before selecting anything records `failed` with
+    # selected_count=0, and then where signal stopped is unknown. Neither
+    # wording names a barren-door config key, not even to disclaim it: this
+    # verdict steers the operator AWAY from them.
+    selected_count = state.counters.selected_count
+    if selected_count > 0:
+        flow = (
+            f'Signal DID reach the digest stage '
+            f'(selected_count={selected_count}) and the pipeline broke '
+            f'DOWNSTREAM of it, so this is NOT a budget or sampling-cut '
+            f'problem and the barren-streak remedies do not apply.'
+        )
+    else:
+        flow = (
+            'The run selected nothing (selected_count=0) AND did not '
+            'complete, so the recorded counters describe an UNFINISHED '
+            'night and where signal stopped is UNKNOWN — which is also '
+            'why no barren-streak remedy can be read off this record.'
+        )
+    failed_streak = state.consecutive_failed_runs
+    return (
+        f'ERROR: legibility trickle for {project_id} has not COMPLETED '
+        f'for {failed_streak} consecutive runs (threshold '
+        f'{limits.max_failed_runs}); last recorded exit_code='
+        f'{state.exit_code}. {flow} Remedy: read '
+        f'journalctl --user -u legibility-trickle@{project_id} --since '
+        f"'{failed_streak + 1} days ago'. "
+        f'last_productive_at={trickle_state.isoformat_or_none(state.last_productive_at)}. '
+        f'{_escalation_fact(state)}. State file: {path}'
+    )
+
+
+def _barren_streak_verdict(
+    project_id: str, path: Path, state: trickle_state.TrickleState,
+    limits: _Thresholds,
+) -> str:
+    """The door counters belong to the LAST recorded night, so only a barren
+    last night names a door. A streak carried under a deferred or failed
+    night stays loud, with a verdict of its own and no door."""
+    streak = state.consecutive_barren_runs
+    counters = state.counters
+    facts = (
+        f'last_productive_at={trickle_state.isoformat_or_none(state.last_productive_at)}. '
+        f'{_escalation_fact(state)}. State file: {path}'
+    )
+    match state.outcome:
+        case trickle_state.RunOutcome.BARREN:
+            return (
+                f'ERROR: legibility trickle for {project_id} has been '
+                f'{state.outcome} for {streak} consecutive runs (threshold '
+                f'{limits.max_barren_runs}): real signal reached the '
+                f'sampling/budget stage and nothing was digested. Doors: '
+                f'below_sampling_cut={counters.below_sampling_cut} '
+                f'budget_skipped={counters.budget_skipped}. Remedy: '
+                f'{trickle_state.barren_remedy(counters)}. {facts}'
+            )
+        case trickle_state.RunOutcome.DEFERRED:
+            return (
+                f'ERROR: legibility trickle for {project_id} is carrying a '
+                f'barren streak of {streak} runs (threshold '
+                f'{limits.max_barren_runs}) under a last run whose coding was '
+                f'deferred by a usage cap: the streak is UNRESOLVED, and the '
+                f'deferred night coded nothing, so it re-observed neither '
+                f'sampling/budget door and no door-specific remedy can be read '
+                f'off this record. The deferral needs no action and clears at '
+                f'the cap reset; re-read this probe once a run has COMPLETED. '
+                f'{facts}'
+            )
+        case _:
+            failed_streak = state.consecutive_failed_runs
+            return (
+                f'ERROR: legibility trickle for {project_id} is carrying a '
+                f'barren streak of {streak} runs forward (threshold '
+                f'{limits.max_barren_runs}) under a last recorded outcome of '
+                f'{state.outcome.value!r}: the barren streak is UNRESOLVED, '
+                f'and the recorded doors (below_sampling_cut='
+                f'{counters.below_sampling_cut} budget_skipped='
+                f'{counters.budget_skipped}) describe that {state.outcome} '
+                f'run rather than the barren ones, so no door-specific remedy '
+                f'can be read off this record. Clear the {state.outcome} run '
+                f'first — read journalctl --user -u '
+                f'legibility-trickle@{project_id} --since '
+                f"'{streak + failed_streak + 1} days ago' — then re-read "
+                f'this probe once a run has COMPLETED and re-observed the '
+                f'sampling/budget doors. consecutive_failed_runs='
+                f'{failed_streak} (threshold {limits.max_failed_runs}). '
+                f'{facts}'
+            )
+
+
+def _escalation_fact(state: trickle_state.TrickleState) -> str:
+    """Whether the nightly escalated this night's barren streak, as
+    recorded; ``unrecorded`` for a document written before the field."""
+    recorded = 'unrecorded' if state.barren_escalated is None else state.barren_escalated
+    return f'barren_escalated={recorded}'
+
+
+def _fail(verdict: str) -> int:
+    print(verdict, file=sys.stderr)
+    return 1
 
 
 if __name__ == '__main__':

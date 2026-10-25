@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import anyio
 import httpx
-from shared.mcp_idempotency import maybe_inject_client_op_id
+from shared.jcodemunch_launch import jcodemunch_server_config
+from shared.mcp_session import McpSession
 from shared.proc_group import terminate_process_group
 
 from orchestrator.config import OrchestratorConfig
@@ -452,378 +453,48 @@ async def verify_plan_tools_startup(
     return PlanToolsStartupReport(probes=probes)
 
 
-# ---------------------------------------------------------------------------
-# jcodemunch-mcp launch contract (single source of truth for all projects)
-# ---------------------------------------------------------------------------
+def tool_error_text(reply: Mapping[str, Any]) -> str | None:
+    """The error prose of a tool-level failure, or None if the tool succeeded.
 
-# Prebuilt, version-pinned launcher on PATH (installed via
-# `uv tool install --python 3.13 jcodemunch-mcp==<pin>`; see
-# reify scripts/setup-dev.sh).  Named constants centralise the launch contract
-# so every project's mcp_config_json() injection references one definition and
-# a regression test can lock this against reverting to the unpinned uvx form.
-#
-# JCODEMUNCH_GIT_ROOT_IDENTITY=0: jcodemunch ships `git_root_identity: True`
-# as a DEFAULT, so any checkout with a `.git` and a parseable `origin`
-# resolves to the repo's single `<owner>/<repo>` index identity. A linked
-# worktree's `.git` FILE is treated like a directory and reads the SHARED
-# config, so every DF agent worktree of a repo collapses onto ONE identity —
-# the first writer claims that index and the upstream collision guard then
-# refuses all others, leaving them unindexed while the shared index reflects
-# whichever branch the first worktree happened to be on. '0' selects
-# per-worktree `local/<basename>-<sha1[:8]>` identity instead. The shared
-# jcodemunch-watcher systemd unit adopted this same lever on 2026-06-11 for
-# the same reason; this is the per-agent stdio path catching up.
-# Deprecated upstream ("will be removed in v2.0. Use config.jsonc instead."),
-# verified working at the installed 1.108.55 — a pin bump past v2.0 must
-# re-establish this lever via `"git_root_identity": false` in config.jsonc.
-# Note `"identity_mode": "local"` is NOT a substitute at 1.108.55: that key is
-# absent from the package's CONFIG_TYPES and is discarded silently despite
-# the shipped config template advertising it.
-# Shadowing risk: the env fallback is skipped for any key explicitly set in
-# ~/.code-index/config.jsonc. That host file does not currently set
-# git_root_identity, so this env var wins today — but a future host-config
-# edit could silently shadow this fix without any test going red.
-# Adoption precondition: this only stops NEW git-root indexes — jcodemunch's
-# resolve_index_identity (git_root.py) still returns a PRE-EXISTING legacy
-# "<owner>/<repo>" index if one is already on disk (e.g. reify's
-# ~/.code-index/leodearden-reify.db), making this env var INERT there until
-# `jcodemunch-mcp delete-index <owner>/<repo>` is run — see
-# scripts/jcodemunch-watcher.service.template's identical caveat. Dark
-# Factory has no such legacy index today, so the fix is effective here now.
-# Known gap: two sibling launch sites skip this lever and re-spell
-# command/args instead of importing these constants —
-# fused_memory/reconciliation/stages/base.py's recon-stage launch and
-# scripts/setup-host.sh's user-scope `claude mcp add` registration. Either
-# creating a legacy git-root index would silently re-collapse that repo's
-# worktrees per the precondition above, undermining this fix. Out of this
-# task's two-file scope; tracked at tkt_0RSRDYZ75MPVYJP76093P7PYWQ
-# (fused-memory site) and tkt_0RSY9MNEMSYK2GBPQ0MJDTYKCQ (setup-host.sh site
-# + this compounding risk).
-JCODEMUNCH_COMMAND: str = 'jcodemunch-mcp'
-JCODEMUNCH_ENV: dict[str, str] = {
-    'JCODEMUNCH_NO_VERSION_HINT': '1',
-    'JCODEMUNCH_GIT_ROOT_IDENTITY': '0',
-}
-
-# ---------------------------------------------------------------------------
-# Retry settings for transient MCP failures (e.g. server restarting).
-#
-# The attempt count and backoff schedule come from the shared
-# orchestrator.fm_retry.fm_retry_backoffs() (task 2706) so this loop spans
-# fm's own restart window instead of a too-small, independently-guessed
-# budget — see orchestrator/src/orchestrator/fm_retry.py.
-#
-# Scope of the ~120s fm-restart window (deliberate — task 2706 review
-# amendment): McpSession is a generic Streamable-HTTP transport, so the
-# window is applied to every session this class drives rather than gated
-# per-URL. That is intentional AND, in the orchestrator, effectively
-# fm-scoped in practice: the module-level singleton (McpLifecycle.start()
-# below) is McpSession(self.config.url) with config.url == fused-memory, and
-# mcp_call() reuses that singleton for ALL calls regardless of its url arg
-# (the McpSession(url) one-shot fallback fires only pre-singleton). So the
-# widened budget lands on fused-memory traffic, not sprayed across arbitrary
-# MCP servers. Accepted trade-off: a persistently-hung endpoint now blocks a
-# single call for up to ~attempts*per_attempt_timeout + sum(backoffs)
-# (minutes) versus the old ~7s. No outer cadence assumption is violated by
-# that stall — the scheduler drives dispatch as a sequential poll loop
-# (acquire_next() then asyncio.sleep(idle_poll_secs), harness.py), so a slow
-# call serializes the next poll rather than racing a fixed-interval tick
-# deadline; and multi-attempt durations already exceeded any single
-# per-attempt timeout under the old budget too. Per-URL gating is deferred
-# as a larger transport-layer refactor outside this task's scope.
-#
-# One URL is exempted from this window (task 2880): the D8 null sentinel
-# (fm_retry.FM_NULL_SENTINEL_URL) that eval runs point fused-memory at. It is
-# non-routable by construction, so it can never host a *restarting* fm — the
-# window's whole premise is inapplicable and riding it out just burns ~120s
-# per logical call. McpSession._retry_backoffs() collapses the schedule to a
-# single attempt for that URL; every other endpoint keeps the full window.
-_RETRYABLE_STATUS = frozenset({502, 503, 504})
-
-# Exceptions treated as transient for retry purposes.
-#
-# httpx.NetworkError is the parent of ConnectError, ReadError, WriteError and
-# CloseError — cover them all so mid-transfer drops on a 6MB response also
-# retry instead of blowing up the caller.  We also include bare OSError
-# because httpx's map_httpcore_exceptions() only re-wraps exceptions it
-# recognises from httpcore; low-level asyncio/anyio socket failures can
-# occasionally surface as raw OSError (including FileNotFoundError, which
-# stringifies to the unhelpful "[Errno 2] No such file or directory" with
-# no filename).  Retrying these lets the client recover transparently and,
-# if it keeps failing, the wrapped RuntimeError preserves the type name
-# so the top-level catch-all logs something diagnostic.
-_RETRYABLE_EXCEPTIONS: tuple[type[Exception], ...] = (
-    httpx.ConnectError,
-    httpx.RemoteProtocolError,
-    httpx.TimeoutException,
-    httpx.NetworkError,
-    OSError,
-)
-
-MCP_HEADERS = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json, text/event-stream',
-}
-
-# Mutating task tools that must carry a client-supplied idempotency key so a
-# transport-level retry (after an ambiguous timeout/reset) dedupes server-side
-# instead of double-applying (task 2712). Reads/initialize are untouched.
-#
-# Hoisted into shared.mcp_idempotency (task 2766) — this and the dashboard
-# McpSession twin (dashboard/src/dashboard/data/memory.py) import the same
-# injection helper (maybe_inject_client_op_id, imported above; it consults
-# the shared MUTATING_TASK_TOOLS frozenset internally) so the two copies
-# cannot drift.
-# maybe_inject_client_op_id is called ONCE per logical ``_raw_call`` below,
-# before the transport retry loop, so every transport retry within that call
-# reuses the same key (``payload`` holds ``params`` by reference and is
-# re-serialized each attempt) — see shared.mcp_idempotency's module
-# docstring for the general contract and the dashboard twin's caveat (no
-# retry loop there).
+    An MCP tool reports its own failure in the response body, as a
+    well-formed envelope carrying ``isError``, not by breaking the transport.
+    Nothing about that envelope's shape says it failed, so a reader that
+    checks only the shape would take the error prose for a result.
+    """
+    if not reply.get('isError'):
+        return None
+    texts = tool_text_blocks(reply)
+    return texts[0] if texts else ''
 
 
-class McpSession:
-    """Manages a single MCP Streamable HTTP session with initialization handshake."""
+def tool_text_blocks(reply: Mapping[str, Any]) -> tuple[str, ...]:
+    """The text of each ``text`` content block of a tool result, in order.
 
-    def __init__(self, base_url: str):
-        self.base_url = base_url.rstrip('/')
-        self.mcp_endpoint = f'{self.base_url}/mcp'
-        self._session_id: str | None = None
-        self._initialized = False
-        self._request_id = 0
-
-    def _next_id(self) -> int:
-        self._request_id += 1
-        return self._request_id
-
-    def _retry_backoffs(self) -> list[float]:
-        """Backoff schedule for this session's transport retries.
-
-        Returns ``[]`` (a single attempt, zero sleeps) for the D8 null
-        sentinel (``is_fm_null_sentinel(self.base_url)``): that address is
-        non-routable and can never host a *restarting* fused-memory, so the
-        shared fm-restart retry window is inapplicable — riding it out just
-        burns ~FM_RESTART_RETRY_WINDOW_SECS per logical call (task 2880; see
-        the "Scope of the ~120s fm-restart window" note by ``_RETRYABLE_STATUS``
-        above). Every other endpoint delegates to the shared
-        ``fm_retry_backoffs()`` unchanged. The module-level name is called here
-        so tests that patch ``orchestrator.mcp_lifecycle.fm_retry_backoffs``
-        for non-sentinel URLs still take effect.
-        """
-        if is_fm_null_sentinel(self.base_url):
-            return []
-        return fm_retry_backoffs()
-
-    async def initialize(self) -> None:
-        """Perform MCP initialize + initialized handshake."""
-        if self._initialized:
-            return
-
-        # Step 1: initialize request (no session ID)
-        result = await self._raw_call(
-            'initialize',
-            {
-                'protocolVersion': '2025-03-26',
-                'capabilities': {},
-                'clientInfo': {'name': 'orchestrator', 'version': '0.1.0'},
-            },
-        )
-        logger.debug(f'MCP initialize response: {json.dumps(result)[:200]}')
-
-        # Step 2: Send initialized notification
-        await self._raw_notify('notifications/initialized')
-
-        self._initialized = True
-        logger.info(f'MCP session initialized (session_id={self._session_id})')
-
-    async def call_tool(
-        self,
-        name: str,
-        arguments: dict[str, Any],
-        timeout: float = 30,
-    ) -> dict:
-        """Call an MCP tool and return the result."""
-        if not self._initialized:
-            await self.initialize()
-
-        result = await self._raw_call(
-            'tools/call',
-            {'name': name, 'arguments': arguments},
-            timeout=timeout,
-        )
-        return result
-
-    async def _raw_call(
-        self,
-        method: str,
-        params: dict[str, Any] | None = None,
-        timeout: float = 30,
-    ) -> dict:
-        """Send a JSON-RPC request with retry on transient failures."""
-        request_id = self._next_id()
-        payload: dict[str, Any] = {
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'method': method,
-        }
-        if params is not None:
-            payload['params'] = params
-
-        # Generate the idempotency key ONCE, before the retry loop, so all
-        # transport retries of this logical call post the same key (payload
-        # holds params by reference; each attempt re-serializes json=payload).
-        maybe_inject_client_op_id(method, params)
-
-        # Shared fm-restart retry window, applied to this generic transport by
-        # design (fm-scoped in practice) — see the "Scope of the ~120s
-        # fm-restart window" note by _RETRYABLE_STATUS above. Collapses to a
-        # single attempt for the D8 null sentinel (task 2880).
-        backoffs = self._retry_backoffs()
-        attempts = len(backoffs) + 1
-        last_exc: Exception | None = None
-        for attempt in range(attempts):
-            headers = dict(MCP_HEADERS)
-            if self._session_id:
-                headers['Mcp-Session-Id'] = self._session_id
-
-            try:
-                async with httpx.AsyncClient(follow_redirects=True) as client:
-                    resp = await client.post(
-                        self.mcp_endpoint,
-                        json=payload,
-                        headers=headers,
-                        timeout=timeout,
-                    )
-                    if resp.status_code in _RETRYABLE_STATUS:
-                        logger.warning(
-                            'MCP %s returned %d (attempt %d/%d)',
-                            method, resp.status_code, attempt + 1, attempts,
-                        )
-                        self._session_id = None
-                        self._initialized = False
-                        last_exc = httpx.HTTPStatusError(
-                            f'{resp.status_code}', request=resp.request, response=resp,
-                        )
-                        if attempt < len(backoffs):
-                            await asyncio.sleep(backoffs[attempt])
-                        continue
-
-                    resp.raise_for_status()
-
-                    # Track session ID
-                    resp_session_id = resp.headers.get('mcp-session-id')
-                    if resp_session_id:
-                        self._session_id = resp_session_id
-
-                    return self._parse_response(resp)
-
-            except _RETRYABLE_EXCEPTIONS as exc:
-                logger.warning(
-                    'MCP %s transient error (attempt %d/%d): %s: %s',
-                    method, attempt + 1, attempts,
-                    type(exc).__name__, exc,
-                )
-                self._session_id = None
-                self._initialized = False
-                last_exc = exc
-                if attempt < len(backoffs):
-                    await asyncio.sleep(backoffs[attempt])
-
-        # Wrap exhausted retries so downstream log lines carry real context
-        # even when str(last_exc) is empty (httpx.ReadTimeout has no message).
-        if last_exc is not None:
-            raise RuntimeError(
-                f'MCP {method} failed after {attempts} attempts: '
-                f'{type(last_exc).__name__}: {last_exc}'
-            ) from last_exc
-        raise RuntimeError('_raw_call exhausted retries')
-
-    async def _raw_notify(
-        self,
-        method: str,
-        params: dict[str, Any] | None = None,
-    ) -> None:
-        """Send a JSON-RPC notification with retry on transient failures."""
-        payload: dict[str, Any] = {
-            'jsonrpc': '2.0',
-            'method': method,
-        }
-        if params is not None:
-            payload['params'] = params
-
-        # Shared fm-restart retry window, applied to this generic transport by
-        # design (fm-scoped in practice) — see the "Scope of the ~120s
-        # fm-restart window" note by _RETRYABLE_STATUS above. Collapses to a
-        # single attempt for the D8 null sentinel (task 2880).
-        backoffs = self._retry_backoffs()
-        attempts = len(backoffs) + 1
-        last_exc: Exception | None = None
-        for attempt in range(attempts):
-            headers = dict(MCP_HEADERS)
-            if self._session_id:
-                headers['Mcp-Session-Id'] = self._session_id
-
-            try:
-                async with httpx.AsyncClient(follow_redirects=True) as client:
-                    resp = await client.post(
-                        self.mcp_endpoint,
-                        json=payload,
-                        headers=headers,
-                        timeout=10,
-                    )
-                    # Notifications may return 200 or 202
-                    if resp.status_code not in (200, 202, 204):
-                        logger.warning(
-                            f'Notification {method} returned {resp.status_code}: {resp.text[:200]}'
-                        )
-                    return
-
-            except _RETRYABLE_EXCEPTIONS as exc:
-                logger.warning(
-                    'MCP notify %s transient error (attempt %d/%d): %s: %s',
-                    method, attempt + 1, attempts,
-                    type(exc).__name__, exc,
-                )
-                self._session_id = None
-                self._initialized = False
-                last_exc = exc
-                if attempt < len(backoffs):
-                    await asyncio.sleep(backoffs[attempt])
-
-        if last_exc is not None:
-            raise RuntimeError(
-                f'MCP notify {method} failed after {attempts} attempts: '
-                f'{type(last_exc).__name__}: {last_exc}'
-            ) from last_exc
-        raise RuntimeError('_raw_notify exhausted retries')
-
-    @staticmethod
-    def _parse_response(resp: httpx.Response) -> dict:
-        """Parse JSON or SSE response."""
-        content_type = resp.headers.get('content-type', '')
-
-        if 'text/event-stream' in content_type:
-            return _parse_sse_response(resp.text)
-        elif 'application/json' in content_type:
-            return resp.json()
-        else:
-            try:
-                return resp.json()
-            except (json.JSONDecodeError, ValueError):
-                return _parse_sse_response(resp.text)
+    An envelope whose ``content`` is missing, null or not a list carries no text.
+    """
+    content = reply.get('content')
+    if not isinstance(content, list):
+        return ()
+    return tuple(
+        str(block.get('text', ''))
+        for block in content
+        if isinstance(block, dict) and block.get('type') == 'text'
+    )
 
 
-def _parse_sse_response(text: str) -> dict:
-    """Parse SSE text to extract the JSON-RPC result."""
-    last_data = None
-    for line in text.split('\n'):
-        if line.startswith('data: '):
-            last_data = line[6:]
-        elif line.startswith('data:'):
-            last_data = line[5:]
-    if last_data:
-        return json.loads(last_data)
-    raise ValueError(f'No data line found in SSE response: {text[:200]}')
+# The orchestrator's one self-identification spelling. clientInfo reaches only
+# a stateful session; a stateless-HTTP server sees this identity only when a
+# tool call's arguments carry it (Scheduler.set_task_status does).
+ORCHESTRATOR_MCP_IDENTITY: str = 'orchestrator'
+
+def fm_session(base_url: str) -> McpSession:
+    """The orchestrator's fused-memory session: it identifies as ORCHESTRATOR_MCP_IDENTITY
+    and rides fm's restart window, except at the D8 null sentinel (task 2880)."""
+    return McpSession(
+        base_url,
+        client_name=ORCHESTRATOR_MCP_IDENTITY,
+        retry_backoffs=() if is_fm_null_sentinel(base_url) else fm_retry_backoffs(),
+    )
 
 
 # Module-level session singleton (created by McpLifecycle after server starts)
@@ -849,25 +520,12 @@ async def mcp_call(
 
     Uses the module-level session if available, otherwise creates a one-shot session.
     """
-    global _session
-
-    if _session is not None:
-        # Use existing session — extract tool name and args from params
-        if method == 'tools/call' and params:
-            return await _session.call_tool(
-                params['name'], params.get('arguments', {}), timeout=timeout
-            )
-        else:
-            return await _session._raw_call(method, params, timeout=timeout)
-
-    # Fallback: create a one-shot session
-    session = McpSession(url.rstrip('/mcp').rstrip('/'))
-    await session.initialize()
+    session = _session if _session is not None else fm_session(url.rstrip('/mcp').rstrip('/'))
     if method == 'tools/call' and params:
         return await session.call_tool(
             params['name'], params.get('arguments', {}), timeout=timeout
         )
-    return await session._raw_call(method, params, timeout=timeout)
+    return await session.call(method, params, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -1002,7 +660,7 @@ class McpLifecycle:
             logger.info(f'Fused-memory HTTP server ready at {self.config.url}')
 
         # Initialize MCP session
-        _session = McpSession(self.config.url)
+        _session = fm_session(self.config.url)
         await _session.initialize()
 
     async def stop(self) -> None:
@@ -1074,21 +732,7 @@ class McpLifecycle:
                     'type': 'http',
                     'url': f'{self.config.url}/mcp',
                 },
-                # jcodemunch: launch the PREBUILT, version-pinned tool installed
-                # via `uv tool install --python 3.13 jcodemunch-mcp==<pin>` (see
-                # reify scripts/setup-dev.sh). Invoking the installed launcher on
-                # PATH (~/.local/bin, same dir as the `uv`/`uvx` resolved above)
-                # avoids `uvx`'s per-launch re-resolve + from-source build of
-                # tree-sitter C-extension sdists, which under host load stalled
-                # agent startup past the 1200s wall — the 0-turn MCP-startup wedge
-                # (reify esc-4415-232). Missing prebuild now fails fast instead of
-                # hanging. JCODEMUNCH_NO_VERSION_HINT silences the stderr drift note.
-                # Launch contract is centralised in JCODEMUNCH_COMMAND/JCODEMUNCH_ENV
-                # (module constants above) so all projects share one source of truth.
-                'jcodemunch': {
-                    'command': JCODEMUNCH_COMMAND,
-                    'env': dict(JCODEMUNCH_ENV),
-                },
+                'jcodemunch': jcodemunch_server_config(),
             },
         }
         if escalation_url:

@@ -1288,7 +1288,11 @@ class TestConflictsAreReportedNotEnforced:
     def test_a_superset_conflicts_per_ref(self):
         """The adjacent-number typo is caught even when another declared
         referent IS corroborated — which is precisely what a set-level
-        "declared and scanned are disjoint" verdict would miss."""
+        "declared and scanned are disjoint" verdict would miss.
+
+        3129 conflicts because the scan supplies POSITIVE evidence of a typo,
+        not mere silence: it is one substitution from the scanned 3127, and
+        3129 is written nowhere in the content."""
         resolution = resolve_referents(
             declared=[{'kind': 'task', 'id': 3127}, {'kind': 'task', 'id': 3129}],
             metadata={},
@@ -1435,13 +1439,13 @@ class TestConflictsAreReportedNotEnforced:
         local axis in ``test_the_prd_headline_row_names_the_declared_referent``.
         """
         resolution = resolve_referents(
-            declared=[{'kind': 'task', 'id': 132, 'project_id': 'reify'}],
+            declared=[{'kind': 'task', 'id': 3128, 'project_id': 'reify'}],
             metadata={},
             content='mirrors reify:3129',
             group_id=GROUP,
         )
         assert resolution.conflicts == (
-            Referent(kind='task', project_id='reify', number='132'),
+            Referent(kind='task', project_id='reify', number='3128'),
         )
 
     def test_an_own_project_declaration_keeps_the_whole_kind_bucket(self):
@@ -1455,11 +1459,15 @@ class TestConflictsAreReportedNotEnforced:
         cross-project collapse this PRD exists to detect. Narrowing this side
         too would make ``test_the_project_axis_conflicts`` unreachable and
         silently retire that detection.
+
+        The whole-kind bucket applies to BOTH evidence axes: the foreign
+        reify:3128 is a near-miss of the own-project 3129, so it is evidence
+        of a typo exactly as a bare 'Task 3128' would be.
         """
         resolution = resolve_referents(
             declared=[{'kind': 'task', 'id': 3129}],
             metadata={},
-            content='mirrors reify:5000',
+            content='mirrors reify:3128',
             group_id=GROUP,
         )
         assert resolution.conflicts == (Referent(kind='task', number='3129'),)
@@ -1505,7 +1513,7 @@ class TestConflictsAreReportedNotEnforced:
         resolution = resolve_referents(
             declared=[
                 {'kind': 'task', 'id': 3129},
-                {'kind': 'task', 'id': 2500},
+                {'kind': 'task', 'id': 3172},
                 {'kind': 'task', 'id': '3129'},
             ],
             metadata={},
@@ -1514,7 +1522,7 @@ class TestConflictsAreReportedNotEnforced:
         )
         assert resolution.conflicts == (
             Referent(kind='task', number='3129'),
-            Referent(kind='task', number='2500'),
+            Referent(kind='task', number='3172'),
         )
 
     @pytest.mark.parametrize(
@@ -1534,6 +1542,109 @@ class TestConflictsAreReportedNotEnforced:
         assert resolution.conflicts == ()
 
 
+#: The PRD's headline content: the scan sees exactly Task 3127.
+_CITES_3127 = 'Fixed the bug in Task 3127.'
+#: The 2026-10-08 sighting (e): 6185 is written but unscannable, 6186 is
+#: written nowhere, and the scan sees only Task 6182.
+_SIGHTING_E = 'δm (6185) and the Γ_A gate (task 6182)'
+
+
+class TestSilenceIsUninformativePerReferent:
+    """A declared referent the scan did not name conflicts only on POSITIVE
+    evidence, never because the scan happened to see some OTHER task.
+
+    The scanner's blind spots (slugs, branch names, list continuations,
+    non-task vocabulary) are as blind beside a scannable task as they are
+    alone, so a per-kind reading of its silence rejected honest mixed writes
+    (task 6059).
+    """
+
+    @pytest.mark.parametrize(
+        'content,declared,group_id',
+        [
+            ('Merged task-173-fillet-fix after task 170 landed.', [173], 'reify'),
+            ('gate 184 passed; task 190 unblocked.', [184, 190], 'reify'),
+            ('branch task/173 merged; task 5 noted', [173], 'reify'),
+            ('Tasks 5949/5849 both landed.', [5949, 5849], GROUP),
+            ('tasks 3659 and 3500 overlap', [3659, 3500], GROUP),
+            ('Tasks 4754 and 4755 closed the lease gap', [4754, 4755], GROUP),
+            ("5811's fix superseded task 5800", [5811], GROUP),
+            ('via carrier 6033, task 6035 landed', [6033, 6035], GROUP),
+            ('task 6181 executor and the 6182 β sitting', [6181, 6182], GROUP),
+            ('(task 6182) renamed 3626 → 6326 (6188)', [6182, 6326, 6188], GROUP),
+            ('matched the live plan exactly: 15+4 detaches', [6182], GROUP),
+            (_CITES_3127, [2500], GROUP),
+            ('Fixed the bug in Task 3127; 3129 tests pass.', [3129], GROUP),
+            ('Task 3127 broke 31290; 3129 fixed it.', [3129], GROUP),
+            (_SIGHTING_E + ' (task 6186)', [6185, 6186, 6182], GROUP),
+        ],
+        ids=[
+            'slug-beside-a-near-miss',
+            'non-task-vocabulary',
+            'branch-name',
+            'slash-list',
+            'and-list',
+            'consecutive-siblings',
+            'possessive',
+            'carrier',
+            'sighting-a',
+            'sighting-b',
+            'sighting-c-foreign-qualified-noise',
+            'an-unrelated-number',
+            'the-prose-wrote-the-declared-number',
+            'written-after-an-embedded-occurrence',
+            'sighting-e-remedied-by-spelling-the-task',
+        ],
+    )
+    def test_an_honest_mixed_declaration_is_accepted(self, content, declared, group_id):
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': number} for number in declared],
+            metadata={},
+            content=content,
+            group_id=group_id,
+        )
+
+        assert resolution.conflicts == ()
+        assert resolution.referents == tuple(
+            Referent(kind='task', number=str(number)) for number in declared
+        )
+
+    @pytest.mark.parametrize(
+        'declared',
+        ['3129', '3172', '312', '127', '31277'],
+        ids=[
+            'substitution',
+            'adjacent-transposition',
+            'deletion-a-prefix-is-not-a-written-run',
+            'deletion-a-suffix-is-not-a-written-run',
+            'insertion',
+        ],
+    )
+    def test_a_one_edit_typo_written_nowhere_still_conflicts(self, declared):
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': declared}],
+            metadata={},
+            content=_CITES_3127,
+            group_id=GROUP,
+        )
+
+        assert resolution.conflicts == (Referent(kind='task', number=declared),)
+
+    def test_an_unwritten_sibling_of_a_scanned_task_is_the_documented_residual(self):
+        """Indistinguishable from the superset typo ``[3127, 3129]``: 6186 is one
+        substitution from the scanned 6182 and written nowhere. 6185 is written,
+        so it is exempt. Writing 'task 6186' is the remedy (see the accept row
+        above)."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': n} for n in (6185, 6186, 6182)],
+            metadata={},
+            content=_SIGHTING_E,
+            group_id=GROUP,
+        )
+
+        assert resolution.conflicts == (Referent(kind='task', number='6186'),)
+
+
 class TestConflictingReferentsHelperDirectly:
     """``_conflicting_referents`` promises a de-duplicated result on ITS OWN
     terms, not on its caller's.
@@ -1551,7 +1662,7 @@ class TestConflictingReferentsHelperDirectly:
     hands back to an agent.
     """
 
-    #: One scanned local task, so any declaration NOT naming 3127 conflicts.
+    #: One scanned local task, so any near-miss of 3127 conflicts.
     SCAN = LabelScan(refs=(Referent(kind='task', number='3127'),))
 
     def test_a_duplicated_declared_tuple_collapses(self):
@@ -1559,7 +1670,7 @@ class TestConflictingReferentsHelperDirectly:
             Referent(kind='task', number='3129'),
             Referent(kind='task', number='3129'),
         )
-        assert _conflicting_referents(duplicated, self.SCAN) == (
+        assert _conflicting_referents(duplicated, self.SCAN, content='') == (
             Referent(kind='task', number='3129'),
         )
 
@@ -1569,12 +1680,12 @@ class TestConflictingReferentsHelperDirectly:
         order the duplicate happened to close."""
         duplicated = (
             Referent(kind='task', number='3129'),
-            Referent(kind='task', number='2500'),
+            Referent(kind='task', number='3128'),
             Referent(kind='task', number='3129'),
         )
-        assert _conflicting_referents(duplicated, self.SCAN) == (
+        assert _conflicting_referents(duplicated, self.SCAN, content='') == (
             Referent(kind='task', number='3129'),
-            Referent(kind='task', number='2500'),
+            Referent(kind='task', number='3128'),
         )
 
     def test_an_empty_scan_still_never_conflicts_at_the_helper_boundary(self):
@@ -1584,7 +1695,7 @@ class TestConflictingReferentsHelperDirectly:
             Referent(kind='task', number='3129'),
             Referent(kind='task', number='3129'),
         )
-        assert _conflicting_referents(duplicated, LabelScan()) == ()
+        assert _conflicting_referents(duplicated, LabelScan(), content='') == ()
 
 
 class TestStructuralInputsAreRejectedLoudly:
@@ -1706,3 +1817,169 @@ class TestStructuralInputsAreRejectedLoudly:
             declared=None, metadata={}, content='Fixed Task 3127.', group_id=''
         )
         assert resolution.source in REFERENT_SOURCES
+
+
+class TestKnownProjectIdsNarrowing:
+    """The optional project registry, wired from ``MemoryService._known_projects``.
+
+    This is the wiring the module's own docstring used to DEFER — "threading a
+    live project registry is a wiring concern belonging to the leaf that owns
+    the wiring" — which no leaf's decomposed scope ever actually contained.
+    The parameter forwards verbatim to the ONE ``scan_content`` call, so
+    ``.referents``, ``.conflicts`` and ``.ambiguous`` all narrow together and
+    no second scan site can drift from it.
+    """
+
+    REGISTRY = {'dark_factory': '/src/dark-factory', 'reify': '/src/reify'}
+
+    def test_a_junk_qualified_foreign_referent_is_narrowed_out(self):
+        resolution = resolve_referents(
+            declared=None,
+            metadata={},
+            content='mirrors evil_proj:132',
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        assert resolution.referents == ()
+        assert resolution.source == 'none'
+
+    def test_a_genuine_in_registry_foreign_referent_is_preserved(self):
+        resolution = resolve_referents(
+            declared=None,
+            metadata={},
+            content='mirrors reify:132',
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        assert resolution.referents == (Referent(kind='task', project_id='reify', number='132'),)
+        assert resolution.source == 'derived'
+
+    def test_the_subtractive_invariant_holds_end_to_end(self):
+        """The A3(ii) guarantee, observed at the boundary a caller uses rather
+        than at ``scan_content``'s: a body whose only task mention is contested
+        by a junk qualifier still resolves EMPTY under a live registry, exactly
+        as it does permissively. A registry that MINTED a referent here would
+        hand the downstream verifier a set to act on where today it no-ops."""
+        content = 'Restarted redis at localhost:6379 while finishing task 6379.'
+        narrowed = resolve_referents(
+            declared=None,
+            metadata={},
+            content=content,
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        permissive = resolve_referents(
+            declared=None, metadata={}, content=content, group_id=GROUP
+        )
+        assert narrowed.referents == ()
+        assert narrowed.source == 'none'
+        assert permissive.referents == ()
+        assert permissive.source == 'none'
+
+    def test_ambiguous_reflects_the_same_narrowed_scan(self):
+        """``.ambiguous`` is the value that now rides the wire, so it must come
+        from the SAME narrowed scan as ``.referents`` — one scan, one answer.
+        The junk qualifier is gone from it while the bare number it contested
+        remains."""
+        resolution = resolve_referents(
+            declared=None,
+            metadata={},
+            content='Restarted redis at localhost:6379 while finishing task 6379.',
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        assert resolution.ambiguous == (Referent(kind='task', number='6379'),)
+
+    def test_a_mapping_of_project_id_to_root_is_accepted_directly(self):
+        """The caller's registry IS a ``{project_id: project_root}`` dict —
+        the shape ``MemoryService._known_projects`` actually holds — not a set
+        the caller has to remember to convert."""
+        resolution = resolve_referents(
+            declared=None,
+            metadata={},
+            content='mirrors reify:132 and evil_proj:9',
+            group_id=GROUP,
+            known_project_ids={'dark_factory': '/src/dark-factory', 'reify': '/src/reify'},
+        )
+        assert resolution.referents == (Referent(kind='task', project_id='reify', number='132'),)
+
+    @pytest.mark.parametrize(
+        'registry_kwargs',
+        [{}, {'known_project_ids': None}, {'known_project_ids': {}}],
+        ids=['omitted', 'none', 'empty'],
+    )
+    @pytest.mark.parametrize(
+        ('declared', 'metadata', 'content', 'expected_source'),
+        [
+            ([{'kind': 'task', 'id': 3127}], {}, 'mirrors evil_proj:132', 'declared'),
+            (None, {'task_id': 3127}, 'mirrors evil_proj:132', 'metadata'),
+            (None, {}, 'mirrors evil_proj:132', 'derived'),
+            (None, {}, 'no reference at all', 'none'),
+        ],
+        ids=['declared', 'metadata', 'derived', 'none'],
+    )
+    def test_the_permissive_fallback_is_kept_on_every_precedence_path(
+        self, registry_kwargs, declared, metadata, content, expected_source
+    ):
+        """Omitted, None and ``{}`` are byte-identical to HEAD. The
+        empty-registry permissiveness belongs to ``_canonical_allowlist`` and
+        needs no second emptiness check here."""
+        baseline = resolve_referents(
+            declared=declared, metadata=metadata, content=content, group_id=GROUP
+        )
+        resolution = resolve_referents(
+            declared=declared,
+            metadata=metadata,
+            content=content,
+            group_id=GROUP,
+            **registry_kwargs,
+        )
+        assert resolution == baseline
+        assert resolution.source == expected_source
+
+    def test_precedence_is_undisturbed_by_a_live_registry(self):
+        """``declared`` still outranks ``metadata['task_id']``, which still
+        outranks the scan — narrowing changes what the SCAN sees, never which
+        source wins."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3127}],
+            metadata={'task_id': 2500},
+            content='mirrors reify:132',
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        assert resolution.source == 'declared'
+        assert resolution.referents == (Referent(kind='task', number='3127'),)
+
+    def test_conflicts_are_still_computed_against_the_scan_when_declared(self):
+        """``.conflicts`` is DEFINED as declared-versus-scan, and the scan it is
+        computed against is the narrowed one — so a junk-qualified mention is
+        no longer evidence of a conflict, while an in-registry one still is.
+
+        The result holds the contradicted DECLARED referents, not the scanned
+        ones (``_conflicting_referents``), so both arms assert on 'Task 132'
+        — contradicted on the project axis — and the registry moves it between
+        present and absent.
+        """
+        genuine = resolve_referents(
+            declared=[{'kind': 'task', 'id': 132}],
+            metadata={},
+            content='mirrors reify:132',
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        assert genuine.conflicts == (Referent(kind='task', number='132'),)
+        junk = resolve_referents(
+            declared=[{'kind': 'task', 'id': 132}],
+            metadata={},
+            content='mirrors evil_proj:132',
+            group_id=GROUP,
+            known_project_ids=self.REGISTRY,
+        )
+        assert junk.conflicts == ()
+
+    def test_the_parameter_is_keyword_only(self):
+        """``resolve_referents`` is ``*``-only today; a fifth parameter must not
+        become the one a caller can pass positionally."""
+        with pytest.raises(TypeError):
+            resolve_referents(None, {}, 'mirrors reify:132', GROUP, self.REGISTRY)  # type: ignore[misc]

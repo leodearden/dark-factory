@@ -10,25 +10,44 @@ scripts/tests/conftest.py's sys.path insertion (both scripts/ and
 scripts/legibility/ are on sys.path; no package __init__ needed) — mirrors
 test_legibility_digest.py's import style.
 
-The LLM is ALWAYS mocked in this file: every code_digest/code_digests call
-below injects a fake `invoke` callable (or monkeypatches mod._invoke_cli)
-rather than ever shelling out to a real `claude` process.
+No real `claude` is ever reached from this file: every code_digest/code_digests
+call injects a fake `invoke` callable, and main() runs over conftest's fake
+JSON-mode CLI (`fake_claude_cli`, first on PATH) and a hermetic roster.
 """
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 import logging
-import os
-import shutil
+import subprocess
+import sys
+from enum import StrEnum
 from pathlib import Path
 
 import codebook as codebook_mod
 import coder as mod
 import digest as digest_mod
 import pytest
+from cli_subprocess_timeout import cli_timeout_from_env
+from legibility import invariants, session_runner
+from quality_doc_texts import code_quality, definition_body, heuristic_headlines
+
+# Imported AFTER `coder`, deliberately: it is coder.py's own module-level
+# sys.path bootstrap that puts this checkout's shared/src on the path, so this
+# line doubles as proof the bootstrap works under the scripts test harness.
+# The corpus is imported, never restated -- a second hand-maintained copy of a
+# verbatim transcript is the drift trap that let a weekly cap through the
+# census preflight (task 3645), and deriving from the one home means a CLI
+# rewording the markers stop covering turns THIS suite red too.
+from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, REAL_CLI_CAP_MESSAGES
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LIVE_CODEBOOK_PATH = _REPO_ROOT / "docs" / "legibility" / "confusion-codebook.yaml"
+
+# The vocabulary of a project declaring no invariant slugs, for every test
+# that is not about the slug list.
+_NO_SLUGS: tuple[str, ...] = ()
 
 # ---------------------------------------------------------------------------
 # Shared fixture helpers — synthetic transcript -> real digest text, mirrors
@@ -235,14 +254,14 @@ def test_build_prompt_embeds_digest_and_index_verbatim():
     digest_text = '---\nsession: "s1"\n---\n\n## User Corrections\n- unique marker UC123'
     index = "- entry-a: Title A — cause a\n- entry-b: Title B — cause b"
 
-    prompt = mod.build_prompt(digest_text, index)
+    prompt = mod.build_prompt(digest_text, index, invariant_slugs=_NO_SLUGS)
 
     assert digest_text in prompt
     assert index in prompt
 
 
 def test_build_prompt_embeds_phase_enum_including_unknown():
-    prompt = mod.build_prompt("digest text", "codebook index")
+    prompt = mod.build_prompt("digest text", "codebook index", invariant_slugs=_NO_SLUGS)
 
     for phase in codebook_mod.PHASES:
         assert phase in prompt
@@ -326,7 +345,7 @@ def test_code_digest_happy_path_success(tmp_path):
 
     result = mod.code_digest(
         digest_text, live_codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is True
@@ -361,7 +380,7 @@ def test_code_digest_unparseable_output_is_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -394,7 +413,7 @@ def test_code_digest_schema_invalid_record_is_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -410,13 +429,13 @@ def test_code_digest_invocation_error_is_failure_not_fabricated():
     codebook = _tiny_codebook()
 
     def fake_invoke(prompt, model):
-        raise mod.CoderInvocationError(
+        raise session_runner.InvocationFailed(
             "claude CLI exited 1 (model='haiku'): simulated backend outage"
         )
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -438,7 +457,7 @@ def test_code_digest_malformed_frontmatter_is_failure_not_raised():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -456,7 +475,7 @@ def test_code_digest_empty_judgment_is_success_not_failure():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is True
@@ -485,8 +504,424 @@ def _make_batch_invoke(fail_sessions):
     return fake_invoke
 
 
+# ---------------------------------------------------------------------------
+# task 4736 / GAP 1: a capped digest is a DISTINGUISHABLE per-digest outcome
+#
+# It is a strict refinement of ok=False, never a third success state: the
+# never-fabricate contract is untouched and `record` stays None.  What the
+# label buys is that the night's storm arithmetic can tell "the account had no
+# headroom" from "the coder is broken" -- the distinction whose absence made
+# 2026-08-24 read as 17 of 20 hard failures and page an operator for expected
+# weather.
+# ---------------------------------------------------------------------------
+
+def test_code_digest_cap_exhausted_is_a_labelled_failure_not_fabricated():
+    digest_text = _hand_digest(_SESSION_ID, "a confusing correction happened here")
+    codebook = _tiny_codebook()
+
+    def fake_invoke(prompt, model):
+        raise session_runner.NoHeadroom(
+            "claude CLI exited 1 (model='haiku', ...): "
+            "stdout=\"You've hit your weekly limit - resets 2pm\" stderr=''",
+        )
+
+    result = mod.code_digest(
+        digest_text, codebook, project="dark_factory", model="haiku",
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
+    )
+
+    assert result.capped is True, (
+        "a cap must be DISTINGUISHABLE from a coder failure; without the "
+        "label the night's storm arithmetic cannot tell an account with no "
+        "headroom from a broken coder"
+    )
+    # Still a failure, and still never fabricated -- capped REFINES ok=False,
+    # it does not soften it into a success.
+    assert result.ok is False
+    assert result.record is None
+    assert result.reason, "a capped digest must still record WHY"
+    assert "weekly limit" in result.reason, (
+        f"the reason must carry the banner the CLI actually printed, or the "
+        f"morning journal says 'deferred' and nothing else; got "
+        f"{result.reason!r}"
+    )
+    # The digest is still attributable: session comes from the frontmatter,
+    # which was parsed long before the invocation was attempted.
+    assert result.session == _SESSION_ID
+
+
+def _capped_flag_for(invoke):
+    digest_text = _hand_digest(_SESSION_ID, "a confusing correction happened here")
+    return mod.code_digest(
+        digest_text, _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=invoke, invariant_slugs=_NO_SLUGS,
+    )
+
+
+def _raise_ordinary_invocation_error(prompt, model):
+    raise session_runner.InvocationFailed(
+        "claude CLI exited 1 (model='haiku'): simulated backend outage"
+    )
+
+
+def _return_unparseable(prompt, model):
+    return "I'm sorry, I cannot help with that request."
+
+
+def _return_schema_invalid(prompt, model):
+    return json.dumps({
+        "matches": [{"entry_id": "x", "confidence": "high", "origin_phase": "NOT_A_PHASE"}],
+        "candidates": [],
+    })
+
+
+def _return_empty_judgment(prompt, model):
+    return json.dumps({"matches": [], "candidates": []})
+
+
+@pytest.mark.parametrize(
+    "invoke, label",
+    [
+        (_raise_ordinary_invocation_error, "an ordinary backend outage"),
+        (_return_unparseable, "unparseable model output"),
+        (_return_schema_invalid, "a schema-invalid record"),
+        (_return_empty_judgment, "a legitimately empty SUCCESS"),
+    ],
+)
+def test_code_digest_non_cap_outcomes_are_never_labelled_capped(invoke, label):
+    """The label must not spread.  Every other outcome -- three failure modes
+    and a success -- reports capped=False.
+
+    This is the guard on the deferral branch downstream: a capped label is
+    what buys exit_code=0 and a WARNING instead of a red night, so a label
+    that leaked onto ordinary failures would silently convert a real coder
+    regression into "we were capped, nothing to see here" -- fail-quiet, which
+    is exactly what this module's never-fabricate contract forbids.
+    """
+    result = _capped_flag_for(invoke)
+    assert result.capped is False, (
+        f"{label} was labelled as a usage cap; that silently converts a real "
+        f"regression into a deferred night"
+    )
+
+
+def test_code_digest_malformed_frontmatter_is_never_labelled_capped():
+    """The pre-invocation failure path too -- it returns before `invoke` is
+    ever called, so it has its own construction site to keep honest."""
+    def fake_invoke(prompt, model):
+        raise AssertionError("invoke must never be reached")
+
+    result = mod.code_digest(
+        "no frontmatter here, just prose", _tiny_codebook(),
+        project="dark_factory", model="haiku", invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
+    )
+    assert result.ok is False
+    assert result.capped is False
+    assert result.session is None
+
+
+# ---------------------------------------------------------------------------
+# task 4736: the EXIT-0 banner, and the guard that bounds where it is scanned
+#
+# A banner that reaches code_digest as a reply is prose that parse_coder_output
+# cannot turn into a verdict.  A real usage cap never arrives that way (task
+# 6213: the runner's gate sees it as a failed result), so this scan only LABELS
+# a digest that is already failing.  It is reached ONLY after the parse has
+# already failed.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_code_digest_exit_zero_cap_banner_is_labelled_capped(message):
+    """A banner that arrives as a successful-looking reply is labelled a cap.
+
+    Every corpus message is plain prose, so parse_coder_output cannot parse
+    it -- the same premise the census side already pins in
+    test_every_real_cli_cap_message_fails_to_parse_as_a_verdict.  Without
+    this, an exit-0 capped night looks like twenty digests of garbled model
+    output: a coder defect, investigated as one.
+    """
+    def fake_invoke(prompt, model):
+        return message
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "a confusing correction happened here"),
+        _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
+    )
+
+    assert result.capped is True, (
+        f"an exit-0 reply that is nothing but a cap banner must be labelled "
+        f"a cap, not filed as garbled model output; got {result.reason!r}"
+    )
+    assert result.ok is False
+    assert result.record is None
+    assert result.reason, "a capped digest must still record WHY"
+
+
+def test_code_digest_exit_zero_cap_reason_names_the_marker():
+    def fake_invoke(prompt, model):
+        return "You've hit your weekly limit - resets 2pm (Europe/London)"
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "a confusing correction happened here"),
+        _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
+    )
+    assert result.capped is True
+    assert result.reason is not None, "a capped digest must still record WHY"
+    assert "weekly limit" in result.reason.lower(), (
+        f"the reason must quote WHICH signal fired -- 'deferred: weekly "
+        f"limit' and 'deferred' are different messages to the operator "
+        f"reading the morning journal; got {result.reason!r}"
+    )
+
+
+def test_code_digest_a_verdict_QUOTING_cap_text_is_never_read_as_a_banner():
+    """THE load-bearing guard.  A reply that parses into a verdict IS a
+    verdict.
+
+    This is census.py's own recorded defect, adopted as a rule rather than
+    rediscovered: scanning arbitrary model output with the loose marker list
+    aborted the census on cap-THEMED clusters, because this repo's codebook is
+    dominated by clusters ABOUT usage and weekly limits, so the markers match
+    ordinary HEALTHY content.  The coder is exposed to exactly the same
+    hazard -- its judgments carry model-authored title/cause/evidence_quote
+    fields that legitimately quote capped sessions, since "an agent stalled on
+    a usage limit" is a real confusion worth coding.
+
+    A pre-parse scan here would silently discard genuine findings about
+    capped-agent confusions -- the one cluster class this codebook most needs
+    -- and would do it quietly, labelled as a cap.
+    """
+    judgment = {
+        "matches": [],
+        "candidates": [{
+            "title": "agent stalled on a usage limit",
+            "cause": "You've hit your weekly limit - resets 2pm (Europe/London)",
+            "area": "orchestrator",
+            "origin_phase": "unknown",
+            "manifested_phase": "unknown",
+            "evidence_quote": "You've hit your usage limit for Claude Pro.",
+        }],
+    }
+
+    def fake_invoke(prompt, model):
+        return json.dumps(judgment)
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "a confusing correction happened here"),
+        _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
+    )
+
+    assert result.capped is False, (
+        "a WELL-FORMED judgment that merely QUOTES cap text was read as a cap "
+        "banner -- that discards a genuine finding about a capped-agent "
+        "confusion and labels the loss a deferral.  Split on parse success: a "
+        "reply that parses into a verdict is a verdict."
+    )
+    # Whether it codes cleanly or trips schema validation is not this test's
+    # business -- either is an honest disposition.  What must not happen is
+    # the cap label, and the record must not silently vanish into a deferral.
+    assert result.ok is True or result.reason, (
+        "a parsed verdict must end up either coded or explicitly rejected, "
+        "never quietly dropped"
+    )
+
+
+def test_code_digest_ordinary_garbage_stays_an_unlabelled_parse_failure():
+    """NEGATIVE.  Unparseable output carrying no marker keeps its existing
+    disposition: a plain parse failure, capped=False."""
+    def fake_invoke(prompt, model):
+        return "I'm sorry, I cannot help with that request."
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "a confusing correction happened here"),
+        _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
+    )
+    assert result.ok is False
+    assert result.capped is False
+    assert result.reason
+
+
 def _batch_digests(n):
     return [_hand_digest(f"batch-sess-{i}", f"body marker {i}") for i in range(n)]
+
+
+# ---------------------------------------------------------------------------
+# task 4736: the batch tally and the deferral predicate
+#
+# `status` is the two-member CodingStatus, and the cap arrives as a COUNT plus
+# one predicate: census treats anything but CodingStatus.FAILURE as a
+# non-storm batch, so a third member would make a capped mining batch count
+# as saturated.
+# ---------------------------------------------------------------------------
+
+def test_coding_status_is_a_two_member_str_enum():
+    assert issubclass(mod.CodingStatus, StrEnum)
+    assert {member.value for member in mod.CodingStatus} == {"ok", "failure"}
+    assert mod.CodingStatus.OK == "ok"
+    assert mod.CodingStatus.FAILURE == "failure"
+
+
+def _mixed_batch_invoke(*, capped, failed):
+    """Return an *invoke* for a batch whose first *capped* digests hit a cap,
+    the next *failed* return unparseable garbage, and the rest code cleanly.
+
+    Dispatch matches the QUOTED session as it appears in the frontmatter
+    (`session: "batch-sess-7"`), not the bare id.  A bare-substring match is
+    ambiguous the moment a batch reaches ten digests -- "batch-sess-1" is a
+    prefix of "batch-sess-19" -- and these batches deliberately run to twenty
+    to exercise the storm threshold.
+    """
+    def fake_invoke(prompt, model):
+        for i in range(capped):
+            if f'"batch-sess-{i}"' in prompt:
+                raise session_runner.NoHeadroom(
+                    "claude CLI exited 1 (model='haiku', ...): "
+                    "stdout=\"You've hit your weekly limit - resets 2pm\" stderr=''",
+                )
+        for i in range(capped, capped + failed):
+            if f'"batch-sess-{i}"' in prompt:
+                return "not parseable as json, sorry"
+        return json.dumps({"matches": [], "candidates": []})
+    return fake_invoke
+
+
+def _run_mixed(*, capped, failed, ok):
+    digests = _batch_digests(capped + failed + ok)
+    return mod.code_digests(
+        digests, _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=_mixed_batch_invoke(capped=capped, failed=failed), invariant_slugs=_NO_SLUGS,
+    )
+
+
+def test_code_digests_tallies_capped_alongside_the_existing_counts():
+    result = _run_mixed(capped=3, failed=2, ok=5)
+    assert result.total == 10
+    assert result.succeeded == 5
+    # A cap is still a FAILURE of coding this digest -- capped refines the
+    # failure count, it does not carve digests out of it.
+    assert result.failed == 5
+    assert result.capped == 3
+
+
+def test_code_digests_with_no_caps_reports_zero_capped():
+    result = _run_mixed(capped=0, failed=1, ok=3)
+    assert result.capped == 0
+    assert result.status == mod.CodingStatus.OK
+
+
+@pytest.mark.parametrize(
+    "capped, failed, ok, expected, why",
+    [
+        # The 2026-08-24 shape: every digest capped.
+        (20, 0, 0, True, "an all-accounts-capped night is a deferral"),
+        # A storm whose failures are MAJORITY capped, with genuine failures
+        # mixed in -- still a deferral: 8 of 11 failures were never coded at
+        # all.
+        (8, 3, 0, True, "a majority-capped storm is still a deferral"),
+        # A storm that is majority GENUINE failure.  A coder regression that
+        # merely coincides with a cap must still read as a storm and still
+        # exit non-zero, or the deferral branch becomes a place for real bugs
+        # to hide.
+        (3, 8, 0, False, "a majority-genuine storm is a storm"),
+        # Non-storm: failed/total == 0.1.  Not a deferral, because the night
+        # was overwhelmingly productive.
+        (2, 0, 18, False, "a minority of caps in a healthy run is not a deferral"),
+        (0, 0, 5, False, "an all-ok run is not a deferral"),
+        (0, 5, 0, False, "an all-genuine-failure storm is not a deferral"),
+        # Empty batch: total == 0, and must not ZeroDivisionError anywhere.
+        (0, 0, 0, False, "an empty batch is not a deferral"),
+    ],
+)
+def test_is_cap_deferral_truth_table(capped, failed, ok, expected, why):
+    result = _run_mixed(capped=capped, failed=failed, ok=ok)
+    assert mod.is_cap_deferral(result) is expected, (
+        f"{why} (capped={capped} failed={failed} ok={ok} -> "
+        f"status={result.status!r} capped={result.capped} "
+        f"failed={result.failed})"
+    )
+
+
+@pytest.mark.parametrize(
+    "capped, failed, ok, status, deferral",
+    [
+        (8, 3, 0, "FAILURE", True),
+        (3, 8, 0, "FAILURE", False),
+        (2, 1, 17, "OK", False),
+    ],
+)
+def test_is_cap_deferral_reads_the_typed_status(capped, failed, ok, status, deferral):
+    """Only a FAILURE run whose failures are a majority of caps defers; a
+    sub-storm OK run with caps among its failures does not."""
+    result = _run_mixed(capped=capped, failed=failed, ok=ok)
+    assert isinstance(result.status, mod.CodingStatus)
+    assert result.status == mod.CodingStatus[status]
+    assert mod.is_cap_deferral(result) is deferral
+
+
+def test_code_digests_sub_storm_cap_taints_and_excludes_but_still_merges():
+    """TAINT-AND-EXCLUDE, the shape evals/runner.py already uses for a capped
+    cell: label it and drop it from the reported result, never score it zero
+    and never discard its healthy siblings.
+
+    2 capped of 20 leaves 18 genuine records that cost real tokens to produce.
+    Throwing them away because two digests found no headroom would be its own
+    kind of fabrication -- reporting less than was actually learned.
+    """
+    result = _run_mixed(capped=2, failed=0, ok=18)
+
+    assert result.status == mod.CodingStatus.OK, "2 of 20 is not a storm"
+    assert mod.is_cap_deferral(result) is False
+    assert result.capped == 2
+    assert len(result.records) == 18, (
+        "the 18 genuinely coded records must still merge -- a capped digest is "
+        "excluded from the output, not a reason to discard the batch"
+    )
+    # And the excluded two are not silently gone: they are in `failures`.
+    assert len(result.failures) == 2
+
+
+def test_code_digests_announces_each_cap_through_the_existing_funnel(caplog):
+    """Every capped digest is still announced at WARNING through the ONE
+    append+log funnel, and the line NAMES the cap.
+
+    Naming it is the point: 20 identical cap lines must stay distinguishable
+    from 20 distinct model errors, which is the same property task 4511 added
+    per-digest lines to preserve.  The 2026-08-24 journal had 17 lines that
+    named nothing at all.
+    """
+    with caplog.at_level(logging.WARNING, logger="legibility.coder"):
+        result = _run_mixed(capped=3, failed=0, ok=1)
+
+    assert result.capped == 3
+    lines = [r.getMessage() for r in caplog.records
+             if r.name == "legibility.coder"]
+    assert len(lines) == 3, (
+        f"one WARNING per failed digest, through the single funnel; got "
+        f"{lines!r}"
+    )
+    for line in lines:
+        assert "weekly limit" in line.lower(), (
+            f"the announcement must NAME the cap, or the journal reads like "
+            f"three anonymous failures; got {line!r}"
+        )
+
+
+def test_run_result_failures_stay_two_tuples():
+    """`failures` keeps its (session, reason) shape.
+
+    nightly and epsilon both unpack these pairs; widening the tuple to carry
+    the cap flag would break every consumer for a fact the batch-level
+    `capped` count already reports.
+    """
+    result = _run_mixed(capped=2, failed=1, ok=1)
+    for failure in result.failures:
+        assert len(failure) == 2, failure
+        session, reason = failure
+        assert reason
 
 
 def test_code_digests_all_succeed_batch_status_ok():
@@ -495,10 +930,11 @@ def test_code_digests_all_succeed_batch_status_ok():
 
     result = mod.code_digests(
         digests, codebook, project="dark_factory", model="haiku",
-        invoke=_make_batch_invoke(fail_sessions=set()),
+        invoke=_make_batch_invoke(fail_sessions=set()), invariant_slugs=_NO_SLUGS,
     )
 
-    assert result.status == "ok"
+    assert isinstance(result.status, mod.CodingStatus)
+    assert result.status == mod.CodingStatus.OK
     assert result.total == 3
     assert result.succeeded == 3
     assert result.failed == 0
@@ -515,10 +951,11 @@ def test_code_digests_majority_failure_batch_status_failure():
 
     result = mod.code_digests(
         digests, codebook, project="dark_factory", model="haiku",
-        invoke=_make_batch_invoke(fail_sessions),
+        invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
     )
 
-    assert result.status == "failure"
+    assert isinstance(result.status, mod.CodingStatus)
+    assert result.status == mod.CodingStatus.FAILURE
     assert result.total == 4
     assert result.succeeded == 1
     assert result.failed == 3
@@ -537,10 +974,10 @@ def test_code_digests_exactly_half_failure_is_not_a_storm():
 
     result = mod.code_digests(
         digests, codebook, project="dark_factory", model="haiku",
-        invoke=_make_batch_invoke(fail_sessions),
+        invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
     )
 
-    assert result.status == "ok"
+    assert result.status == mod.CodingStatus.OK, "exactly half failed is not a storm"
     assert result.total == 4
     assert result.succeeded == 2
     assert result.failed == 2
@@ -571,7 +1008,7 @@ def _coder_warnings(caplog):
 
 
 def _make_crashing_invoke(crash_sessions):
-    """Fake invoke that raises a BARE RuntimeError (not CoderInvocationError)
+    """Fake invoke that raises a BARE RuntimeError (not InvocationFailed)
     for the named sessions -- the exception class code_digest does NOT catch,
     so it escapes to code_digests' own isolating `except Exception` and lands
     as a `(None, reason)` failure."""
@@ -594,10 +1031,10 @@ def test_code_digests_logs_every_failure_in_a_sub_storm_batch(caplog):
     with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
         result = mod.code_digests(
             digests, _tiny_codebook(), project="dark_factory", model="haiku",
-            invoke=_make_batch_invoke(fail_sessions),
+            invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
         )
 
-    assert result.status == "ok", (
+    assert result.status == mod.CodingStatus.OK, (
         "if this ever became a storm the test would be pinning the wrong "
         "case -- the whole point is that nightly.py stays silent here"
     )
@@ -634,10 +1071,10 @@ def test_code_digests_logs_one_record_per_failure_in_a_storm(caplog):
     with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
         result = mod.code_digests(
             digests, _tiny_codebook(), project="dark_factory", model="haiku",
-            invoke=_make_batch_invoke(fail_sessions),
+            invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
         )
 
-    assert result.status == "failure"
+    assert result.status == mod.CodingStatus.FAILURE
 
     warned = _coder_warnings(caplog)
     assert len(warned) == 3, (
@@ -661,11 +1098,11 @@ def test_code_digests_logs_the_isolated_crash_path_too(caplog):
     with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
         result = mod.code_digests(
             digests, _tiny_codebook(), project="dark_factory", model="haiku",
-            invoke=_make_crashing_invoke({"batch-sess-1"}),
+            invoke=_make_crashing_invoke({"batch-sess-1"}), invariant_slugs=_NO_SLUGS,
         )
 
     # The batch kept going: the other two digests still coded.
-    assert result.status == "ok"
+    assert result.status == mod.CodingStatus.OK
     assert result.total == 3
     assert result.succeeded == 2
     assert len(result.failures) == 1
@@ -686,314 +1123,66 @@ def test_code_digests_logs_the_isolated_crash_path_too(caplog):
 
 
 # ---------------------------------------------------------------------------
-# step-15: RED — _invoke_cli() via the fake-`claude`-binary-on-PATH idiom
-# (per tests/scripts/test_spawn_claude.py's _write_fake_claude* idiom)
+# The invocation seam, as code_digest relies on it
 # ---------------------------------------------------------------------------
 
-def _write_fake_claude_capturing(bin_dir, *, argv_file, stdin_file, stdout_path):
-    """Fake `claude` binary: records its own argv (one per line, via "$@",
-    which excludes $0/the binary path itself) and its stdin to files, then
-    echoes the contents of *stdout_path* to stdout and exits 0."""
-    p = bin_dir / "claude"
-    p.write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$@" > "{argv_file}"\n'
-        f'cat > "{stdin_file}"\n'
-        f'cat "{stdout_path}"\n'
-    )
-    p.chmod(0o755)
+def test_no_headroom_is_a_subclass_of_invocation_failed():
+    """Every ``except InvocationFailed`` site keeps catching a missing headroom.
 
-
-def _write_fake_claude_recording_cwd(bin_dir, *, cwd_file, stdout_path):
-    """Fake `claude` binary: records the directory it was RUN IN to
-    *cwd_file*, then echoes the contents of *stdout_path* and exits 0.
-
-    Separate from _write_fake_claude_capturing so the cwd tests assert the
-    one thing they are about; `pwd` is the honest probe here because the
-    working directory is a property of the spawned process, not of anything
-    _invoke_cli could report about itself."""
-    p = bin_dir / "claude"
-    p.write_text(
-        "#!/usr/bin/env bash\n"
-        f'pwd > "{cwd_file}"\n'
-        f'cat > /dev/null\n'
-        f'cat "{stdout_path}"\n'
-    )
-    p.chmod(0o755)
-
-
-def _write_fake_claude_failing(bin_dir, *, exit_code=1, stderr_text="simulated failure"):
-    p = bin_dir / "claude"
-    p.write_text(
-        "#!/usr/bin/env bash\n"
-        f'echo "{stderr_text}" >&2\n'
-        f"exit {exit_code}\n"
-    )
-    p.chmod(0o755)
-
-
-def _write_fake_claude_sleeping(bin_dir, *, sleep_secs):
-    """Fake `claude` binary: sleeps past any reasonable test timeout before
-    ever producing output, to exercise _invoke_cli's
-    subprocess.TimeoutExpired -> CoderInvocationError path."""
-    p = bin_dir / "claude"
-    p.write_text(
-        "#!/usr/bin/env bash\n"
-        f"sleep {sleep_secs}\n"
-        'printf \'{"matches": [], "candidates": []}\'\n'
-    )
-    p.chmod(0o755)
-
-
-def test_invoke_cli_argv_and_prompt_delivery(tmp_path):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    argv_file = tmp_path / "argv.txt"
-    stdin_file = tmp_path / "stdin.txt"
-    stdout_path = tmp_path / "stdout.txt"
-    stdout_path.write_text('{"matches": [], "candidates": []}')
-
-    _write_fake_claude_capturing(
-        bin_dir, argv_file=argv_file, stdin_file=stdin_file, stdout_path=stdout_path,
-    )
-
-    raw = mod._invoke_cli(
-        "the prompt text UNIQUE_MARKER_UC999", "haiku",
-        claude_bin=str(bin_dir / "claude"), timeout=10,
-    )
-
-    argv = argv_file.read_text().splitlines()
-    assert "-p" in argv, argv
-    assert "--model" in argv, argv
-    assert "haiku" in argv, argv
-
-    # Prompt delivery: stdin, per code_digest's `input=prompt` contract --
-    # not necessarily present in argv.
-    assert "the prompt text UNIQUE_MARKER_UC999" in stdin_file.read_text()
-
-    assert raw == '{"matches": [], "candidates": []}'
-
-
-def test_invoke_cli_nonzero_exit_raises_invocation_error(tmp_path):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _write_fake_claude_failing(bin_dir, exit_code=1, stderr_text="boom, the model backend is down")
-
-    with pytest.raises(mod.CoderInvocationError):
-        mod._invoke_cli(
-            "prompt text", "haiku",
-            claude_bin=str(bin_dir / "claude"), timeout=10,
-        )
-
-
-def test_invoke_cli_timeout_raises_invocation_error(tmp_path):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _write_fake_claude_sleeping(bin_dir, sleep_secs=2)
-
-    with pytest.raises(mod.CoderInvocationError):
-        mod._invoke_cli(
-            "prompt text", "haiku",
-            claude_bin=str(bin_dir / "claude"), timeout=0.2,
-        )
-
-
-def _cwd_probe(tmp_path, monkeypatch):
-    """Set up the two-sibling-directory fixture the cwd tests share:
-    chdir into `launcher/`, and return (target_dir, cwd_file, claude_bin)
-    for a fake `claude` that records where it ran."""
-    bin_dir = tmp_path / "bin"
-    launcher = tmp_path / "launcher"
-    target = tmp_path / "target"
-    for d in (bin_dir, launcher, target):
-        d.mkdir()
-
-    cwd_file = tmp_path / "cwd.txt"
-    stdout_path = tmp_path / "stdout.txt"
-    stdout_path.write_text('{"matches": [], "candidates": []}')
-    _write_fake_claude_recording_cwd(bin_dir, cwd_file=cwd_file, stdout_path=stdout_path)
-
-    monkeypatch.chdir(launcher)
-    return launcher, target, cwd_file, str(bin_dir / "claude")
-
-
-def test_invoke_cli_runs_in_given_cwd(tmp_path, monkeypatch):
-    """A caller can scope the headless CLI subprocess to a directory other
-    than the launcher's — the knob census needs to verify a project that is
-    not the one it was launched from."""
-    launcher, target, cwd_file, claude_bin = _cwd_probe(tmp_path, monkeypatch)
-
-    mod._invoke_cli(
-        "prompt text", "haiku", claude_bin=claude_bin, timeout=10, cwd=str(target),
-    )
-
-    # .resolve() on both sides: a symlinked tmp dir (/tmp -> /private/tmp on
-    # non-Linux hosts) must not make this flaky.
-    recorded = Path(cwd_file.read_text().strip()).resolve()
-    assert recorded == target.resolve()
-    assert recorded != launcher.resolve()
-
-
-def test_invoke_cli_without_cwd_inherits_the_launcher_cwd(tmp_path, monkeypatch):
-    """The new parameter's default is EXACTLY today's behavior, so the
-    existing callers (code_digest, the trickle, nightly) are provably
-    unchanged by its introduction."""
-    launcher, target, cwd_file, claude_bin = _cwd_probe(tmp_path, monkeypatch)
-
-    mod._invoke_cli("prompt text", "haiku", claude_bin=claude_bin, timeout=10)
-
-    recorded = Path(cwd_file.read_text().strip()).resolve()
-    assert recorded == launcher.resolve()
-    assert recorded != target.resolve()
-
-
-def test_invoke_cli_missing_cwd_raises_invocation_error(tmp_path, monkeypatch):
-    """A cwd that does not exist must fail as a CoderInvocationError, not
-    as a raw FileNotFoundError escaping the documented contract.
-
-    This is not cosmetic typing. census's first invoke is the headroom
-    probe, and preflight_headroom folds ANY probe exception into
-    HeadroomResult(ok=False) — so an unwrapped OSError from a typo'd
-    --project-root would exit 0 as "census deferred", indistinguishable
-    from a usage-limit banner.
+    code_digest catches NoHeadroom FIRST and labels the digest capped, while
+    census's verify and headroom-probe seams catch only InvocationFailed. A
+    sibling type would escape those as an uncaught crash that takes down a
+    whole batch: strictly worse than the storm it exists to prevent.
     """
-    _launcher, target, _cwd_file, claude_bin = _cwd_probe(tmp_path, monkeypatch)
-
-    with pytest.raises(mod.CoderInvocationError) as excinfo:
-        mod._invoke_cli(
-            "prompt text", "haiku",
-            claude_bin=claude_bin, timeout=10, cwd=str(target / "does-not-exist"),
-        )
-
-    # The message must NAME the directory, so an operator reading the
-    # failure does not have to infer which path was rejected.
-    assert "does-not-exist" in str(excinfo.value)
+    assert issubclass(session_runner.NoHeadroom, session_runner.InvocationFailed)
 
 
-def test_invoke_cli_cwd_that_is_a_file_raises_invocation_error(tmp_path, monkeypatch):
-    """Same contract for the not-a-directory case (NotADirectoryError on
-    Linux), which is a different OSError subclass than the missing-dir
-    one — pinning both keeps the except-arm from being narrowed to
-    FileNotFoundError alone."""
-    _launcher, target, _cwd_file, claude_bin = _cwd_probe(tmp_path, monkeypatch)
-    not_a_dir = target / "regular-file.txt"
-    not_a_dir.write_text("i am not a directory", encoding="utf-8")
+@pytest.mark.parametrize("entry", [mod.code_digest, mod.code_digests])
+def test_the_invoke_seam_is_required_never_defaulted(entry):
+    """No fallback invoke: a caller that forgets one fails at the call rather
+    than spawning a CLI under whatever login the process happens to hold.
 
-    with pytest.raises(mod.CoderInvocationError):
-        mod._invoke_cli(
-            "prompt text", "haiku",
-            claude_bin=claude_bin, timeout=10, cwd=str(not_a_dir),
-        )
-
-
-# ---------------------------------------------------------------------------
-# task 4510: characterization pins over _invoke_cli's LEGIBILITY_CLAUDE_BIN
-# branch — the seam scripts/legibility-trickle@.service's Environment= line
-# depends on. NOT a RED: coder.py already implements this branch. These make
-# the pin undeletable from the CODE side, so dropping the env-var lookup
-# (which would silently re-open the 2026-08-18 outage even with the unit line
-# present) fails here.
-# ---------------------------------------------------------------------------
-
-def _scrub_path_of_claude(tmp_path, monkeypatch):
-    """Point PATH somewhere the REAL `claude` is NOT resolvable, and prove it.
-
-    Load-bearing test SAFETY, not tidiness. The real
-    /home/leo/.local/bin/claude is on the test runner's PATH, so if
-    _invoke_cli's resolution order (`claude_bin or
-    os.environ.get(_CLAUDE_BIN_ENV_VAR) or "claude"`) ever regresses, an
-    unscrubbed PATH would let the bare-name fallback spawn the GENUINE claude
-    CLI — real LLM spend, real wall-clock, and a test that passes for the
-    wrong reason, silently breaking this module's docstring promise that the
-    LLM is ALWAYS mocked here. With `claude` unresolvable, that same
-    regression instead ENOENTs into CoderInvocationError: loud and cheap.
-
-    Deliberately NOT a fully empty PATH, though that is the obvious spelling.
-    The fake binaries above are `#!/usr/bin/env bash` scripts and `env` needs
-    PATH to find `bash`, so an empty PATH makes every fake die with exit 127
-    ("env: 'bash': No such file or directory") — failing these tests for a
-    reason with nothing to do with the branch under test. PATH therefore keeps
-    a stdlib bin dir and drops ~/.local/bin, and the assertion below pins the
-    property that actually matters instead of trusting the spelling to imply
-    it.
+    Read off the signature, deliberately: calling without one would, on a
+    regression, spawn exactly that real CLI from inside a unit test.
     """
-    empty_bin = tmp_path / "empty_bin"
-    empty_bin.mkdir()
-    monkeypatch.setenv("PATH", f"{empty_bin}{os.pathsep}/usr/bin")
-    assert shutil.which("claude") is None, (
-        "PATH scrub failed: a real `claude` is still resolvable, so a "
-        "regression in _invoke_cli's env-var branch would silently spawn the "
-        "GENUINE CLI (real spend) instead of failing loudly"
-    )
+    invoke = inspect.signature(entry).parameters["invoke"]
 
-
-def test_invoke_cli_honours_claude_bin_env_var(tmp_path, monkeypatch):
-    """With no explicit claude_bin=, the binary comes from
-    LEGIBILITY_CLAUDE_BIN — the exact seam the trickle systemd unit pins so
-    the coder survives a `systemd --user` manager whose PATH lacks
-    ~/.local/bin (2026-08-18: 6/6 selected digests ENOENT'd on reify, 38/38
-    on dark_factory)."""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    argv_file = tmp_path / "argv.txt"
-    stdin_file = tmp_path / "stdin.txt"
-    stdout_path = tmp_path / "stdout.txt"
-    stdout_path.write_text('{"matches": [], "candidates": []}')
-    _write_fake_claude_capturing(
-        bin_dir, argv_file=argv_file, stdin_file=stdin_file, stdout_path=stdout_path,
-    )
-
-    _scrub_path_of_claude(tmp_path, monkeypatch)
-    monkeypatch.setenv(mod._CLAUDE_BIN_ENV_VAR, str(bin_dir / "claude"))
-
-    raw = mod._invoke_cli("the prompt text UNIQUE_MARKER_ENV777", "haiku", timeout=10)
-
-    # The env-var-resolved binary actually RAN, and got the real argv/stdin.
-    argv = argv_file.read_text().splitlines()
-    assert "-p" in argv, argv
-    assert "--model" in argv, argv
-    assert "haiku" in argv, argv
-    assert "the prompt text UNIQUE_MARKER_ENV777" in stdin_file.read_text()
-    assert raw == '{"matches": [], "candidates": []}'
-
-
-def test_invoke_cli_explicit_claude_bin_beats_the_env_var(tmp_path, monkeypatch):
-    """Pins the precedence order _invoke_cli's docstring promises: explicit
-    argument > env var > bare name. The env var points at a FAILING fake, so
-    if precedence ever inverted this would raise CoderInvocationError."""
-    good_dir = tmp_path / "good-bin"
-    bad_dir = tmp_path / "bad-bin"
-    good_dir.mkdir()
-    bad_dir.mkdir()
-
-    argv_file = tmp_path / "argv.txt"
-    stdin_file = tmp_path / "stdin.txt"
-    stdout_path = tmp_path / "stdout.txt"
-    stdout_path.write_text('{"matches": [], "candidates": []}')
-    # Separate directories on purpose: both helpers write a file literally
-    # named "claude", so a shared bin_dir would have the loser overwrite the
-    # winner and the test would prove nothing.
-    _write_fake_claude_capturing(
-        good_dir, argv_file=argv_file, stdin_file=stdin_file, stdout_path=stdout_path,
-    )
-    _write_fake_claude_failing(bad_dir, exit_code=1, stderr_text="env var fake must not win")
-
-    _scrub_path_of_claude(tmp_path, monkeypatch)
-    monkeypatch.setenv(mod._CLAUDE_BIN_ENV_VAR, str(bad_dir / "claude"))
-
-    raw = mod._invoke_cli(
-        "the prompt text UNIQUE_MARKER_PREC555", "haiku",
-        claude_bin=str(good_dir / "claude"), timeout=10,
-    )
-
-    assert raw == '{"matches": [], "candidates": []}'
-    assert "the prompt text UNIQUE_MARKER_PREC555" in stdin_file.read_text()
+    assert invoke.kind is inspect.Parameter.KEYWORD_ONLY
+    assert invoke.default is inspect.Parameter.empty
 
 
 # ---------------------------------------------------------------------------
-# step-17: RED — main(argv) end-to-end, LLM mocked via monkeypatch of
-# mod._invoke_cli (never a real subprocess)
+# main(argv) end to end over the fake JSON-mode CLI (conftest's
+# `fake_claude_cli`) and a hermetic two-account roster. main() opens its own
+# pooled SessionRunner; the only seam replaced is that factory, bound to the
+# tmp roster and an empty env file so the repo's .env is never read, while the
+# operator's login is a sentinel no call may use.
 # ---------------------------------------------------------------------------
+
+_P, _Q = "max-p", "max-q"
+_EMPTY_VERDICT = json.dumps({"matches": [], "candidates": []})
+_UNPARSEABLE = "not parseable as json, sorry"
+_CAPPED = {"is_error": True, "rc": 1, "result": REAL_CLI_CAP_HIT_MESSAGES[2]}
+"""A verbatim cap whose "resets in 3 hours" parses to a FUTURE reset, so the
+gate's reset sweep cannot reopen an account mid-test."""
+_AUTH_401 = {
+    "is_error": True, "rc": 1, "api_error_status": 401,
+    "result": "Failed to authenticate. API Error: 401 OAuth access token is invalid.",
+}
+
+
+@pytest.fixture
+def pooled_main(fake_claude_cli, pool_roster, sentinel_login, monkeypatch):
+    """The fake CLI, with every runner main() opens drawing on a two-account
+    tmp roster. Returns the fake, for ``.plan(...)`` and ``.calls()``."""
+    accounts_file, env_file = pool_roster(_P, _Q)
+    monkeypatch.setattr(session_runner, "open_pooled_runner", functools.partial(
+        session_runner.open_pooled_runner,
+        accounts_file=accounts_file, env_file=env_file,
+    ))
+    monkeypatch.setenv("USAGE_ACCOUNTS_FILE", str(accounts_file))
+    return fake_claude_cli
+
 
 def _write_main_digest(tmp_path, session_id, marker, name):
     """Build a real digest file (via digest.build_digest, mirroring
@@ -1006,85 +1195,108 @@ def _write_main_digest(tmp_path, session_id, marker, name):
     return digest_path
 
 
-def test_main_happy_path_writes_valid_jsonl_and_returns_0(tmp_path, monkeypatch, capsys):
-    digest1 = _write_main_digest(tmp_path, "main-sess-1", "first session confusion", "d1")
-    digest2 = _write_main_digest(tmp_path, "main-sess-2", "second session confusion", "d2")
+def _main_digests(tmp_path, prefix, count):
+    return [
+        _write_main_digest(tmp_path, f"{prefix}-{i}", f"session {i} confusion", f"{prefix}{i}")
+        for i in range(count)
+    ]
 
+
+def _run_main(tmp_path, *args):
+    """Run main() with *tmp_path* as the observed project's root."""
     codebook_path = tmp_path / "codebook.yaml"
     codebook_mod.dump(_tiny_codebook(), codebook_path)
-
-    def fake_invoke_cli(prompt, model, **kwargs):
-        return json.dumps({"matches": [], "candidates": []})
-
-    monkeypatch.setattr(mod, "_invoke_cli", fake_invoke_cli)
-
-    out_path = tmp_path / "out.jsonl"
-    rc = mod.main([
-        str(digest1), str(digest2),
-        "--codebook", str(codebook_path),
-        "--project", "dark_factory",
-        "--out", str(out_path),
+    return mod.main([
+        *map(str, args), "--codebook", str(codebook_path), "--project", "dark_factory",
+        "--project-root", str(tmp_path),
     ])
+
+
+def test_main_happy_path_writes_valid_jsonl_and_returns_0(
+    tmp_path, pooled_main, pool_roster, sentinel_login, capsys,
+):
+    pooled_main.plan(default={"result": _EMPTY_VERDICT})
+    digests = [
+        _write_main_digest(tmp_path, "main-sess-1", "first session confusion", "d1"),
+        _write_main_digest(tmp_path, "main-sess-2", "second session confusion", "d2"),
+    ]
+    out_path = tmp_path / "out.jsonl"
+
+    rc = _run_main(tmp_path, *digests, "--out", out_path)
 
     assert rc == 0
     lines = [line for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert len(lines) == 2
-    sessions = set()
-    for line in lines:
-        record = json.loads(line)
-        assert codebook_mod.validate_coding_record(record) == []
-        sessions.add(record["session"])
-    assert sessions == {"main-sess-1", "main-sess-2"}
-
+    records = [json.loads(line) for line in lines]
+    assert [codebook_mod.validate_coding_record(record) for record in records] == [[], []]
+    assert {record["session"] for record in records} == {"main-sess-1", "main-sess-2"}
     captured = capsys.readouterr()
+    assert "status=ok " in captured.err, "a StrEnum status renders as its value"
     assert "total=2" in captured.err
     assert "failed=0" in captured.err
+    calls = pooled_main.calls()
+    assert len(calls) == 2
+    for call in calls:
+        assert call["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == pool_roster.token(_P)
+        assert not call["env"]["CLAUDE_CONFIG_DIR"].startswith(str(sentinel_login)), (
+            "a coded digest must run under the runner's own config dir, never "
+            "the operator's login"
+        )
 
 
-def test_main_storm_writes_zero_records_and_returns_nonzero(tmp_path, monkeypatch, capsys):
-    digests = [
-        _write_main_digest(tmp_path, f"main-storm-{i}", f"session {i} confusion", f"storm{i}")
-        for i in range(3)
-    ]
-
-    codebook_path = tmp_path / "codebook.yaml"
-    codebook_mod.dump(_tiny_codebook(), codebook_path)
-
-    def fake_invoke_cli(prompt, model, **kwargs):
-        return "not parseable as json, sorry"
-
-    monkeypatch.setattr(mod, "_invoke_cli", fake_invoke_cli)
-
+def test_main_every_account_capped_defers_with_exit_zero_and_an_honest_tally(
+    tmp_path, pooled_main, capsys,
+):
+    """A capped night is not a failed night (task 4736; Leo's directive,
+    sibling task 4503): exit 0 and ``coder: DEFERRED``. The tally stays
+    honest — status=failure, nothing coded, every digest counted capped —
+    because "deferred, nothing coded" must never read as "coded fine, found
+    nothing"."""
+    pooled_main.plan(default=_CAPPED)
     out_path = tmp_path / "out.jsonl"
-    rc = mod.main([
-        *[str(d) for d in digests],
-        "--codebook", str(codebook_path),
-        "--project", "dark_factory",
-        "--out", str(out_path),
-    ])
 
-    assert rc != 0
-    # zero downstream coding records written (PRD §8.6 storm fixture)
-    assert not out_path.exists() or out_path.read_text(encoding="utf-8").strip() == ""
+    rc = _run_main(tmp_path, *_main_digests(tmp_path, "main-capped", 3), "--out", out_path)
 
-    captured = capsys.readouterr()
-    assert captured.err, "expected a failure summary on stderr"
-    assert "3/3" in captured.err or "failed=3" in captured.err
+    assert rc == 0, (
+        "a capped night must not exit non-zero -- that is what turned "
+        "2026-08-24 into an infra incident for a condition ruled normal"
+    )
+    assert out_path.read_text(encoding="utf-8") == "", (
+        "a deferred night writes ZERO records -- nothing was ever coded"
+    )
+    err = capsys.readouterr().err
+    assert "coder: DEFERRED" in err, err
+    assert "FAILURE" not in err, err
+    assert "all 2 pool accounts capped" in err, (
+        f"the exhaustion reason must reach the operator; got {err!r}"
+    )
+    for field in ("status=failure ", "total=3", "succeeded=0", "failed=3", "capped=3"):
+        assert field in err, (field, err)
 
 
-def test_main_storm_truncates_stale_out_from_prior_run(tmp_path, monkeypatch, capsys):
-    # A storm must never leave a --out from a PRIOR successful run lying
-    # around looking like this run's (empty) output -- a downstream
-    # consumer that reads the file instead of gating on the exit code
-    # must see the current run's true outcome.
-    digests = [
-        _write_main_digest(tmp_path, f"main-stale-{i}", f"session {i} confusion", f"stale{i}")
-        for i in range(3)
-    ]
+def test_main_every_account_rejecting_its_credentials_fails_loudly(
+    tmp_path, pooled_main, capsys,
+):
+    """Rejected credentials never clear at the weekly reset, so they are not
+    weather: exit 1 and ``coder: FAILURE``, never a deferral (task 5947)."""
+    pooled_main.plan(default=_AUTH_401)
 
-    codebook_path = tmp_path / "codebook.yaml"
-    codebook_mod.dump(_tiny_codebook(), codebook_path)
+    rc = _run_main(tmp_path, *_main_digests(tmp_path, "main-auth", 3))
 
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "coder: FAILURE" in err, err
+    assert "DEFERRED" not in err, err
+    assert "credentials rejected" in err, err
+    assert "capped=0" in err, err
+
+
+def test_main_storm_writes_zero_records_truncates_a_stale_out_and_fails_loudly(
+    tmp_path, pooled_main, capsys,
+):
+    """A genuine storm carrying no caps exits 1 with ``coder: FAILURE`` -- the
+    boundary the deferral rests on -- and never leaves a PRIOR run's --out
+    looking like this run's output."""
+    pooled_main.plan(default={"result": _UNPARSEABLE})
     out_path = tmp_path / "out.jsonl"
     out_path.write_text(
         json.dumps({
@@ -1095,61 +1307,288 @@ def test_main_storm_truncates_stale_out_from_prior_run(tmp_path, monkeypatch, ca
         encoding="utf-8",
     )
 
-    def fake_invoke_cli(prompt, model, **kwargs):
-        return "not parseable as json, sorry"
+    rc = _run_main(tmp_path, *_main_digests(tmp_path, "main-storm", 3), "--out", out_path)
 
-    monkeypatch.setattr(mod, "_invoke_cli", fake_invoke_cli)
-
-    rc = mod.main([
-        *[str(d) for d in digests],
-        "--codebook", str(codebook_path),
-        "--project", "dark_factory",
-        "--out", str(out_path),
-    ])
-
-    assert rc != 0
+    assert rc == 1
     assert out_path.read_text(encoding="utf-8") == "", (
         "a stale --out from a prior run must be truncated on a storm, "
         "never left holding a previous run's records"
     )
+    err = capsys.readouterr().err
+    assert "coder: FAILURE" in err, err
+    assert "DEFERRED" not in err, err
+    assert "failed=3" in err, err
+    assert "capped=0" in err, err
 
 
-# ---------------------------------------------------------------------------
-# main(--digests DIR) -- amendment: iterdir() must skip subdirectories and
-# other non-file entries rather than crash on read_text(IsADirectoryError)
-# ---------------------------------------------------------------------------
-
-def test_main_digests_dir_skips_subdirectories(tmp_path, monkeypatch, capsys):
+def test_main_digests_dir_skips_subdirectories(tmp_path, pooled_main, capsys):
+    """iterdir() also yields subdirectories, and read_text() on one raises
+    IsADirectoryError -- they must be filtered out, not crash the run."""
+    pooled_main.plan(default={"result": _EMPTY_VERDICT})
     digests_dir = tmp_path / "digests"
     digests_dir.mkdir()
-
     records = [_user_text("a confusing correction", session_id="dir-sess-1")]
     transcript_path = _write_jsonl(tmp_path, records, name="dir.transcript.jsonl")
     text = digest_mod.build_digest(transcript_path, agent_class_override="interactive")
     (digests_dir / "d1.md").write_text(text, encoding="utf-8")
-
-    # A stray subdirectory alongside the real digest file -- iterdir()
-    # yields it too; read_text() on a directory raises IsADirectoryError
-    # if it isn't filtered out first.
     (digests_dir / "a_subdir").mkdir()
-
-    codebook_path = tmp_path / "codebook.yaml"
-    codebook_mod.dump(_tiny_codebook(), codebook_path)
-
-    def fake_invoke_cli(prompt, model, **kwargs):
-        return json.dumps({"matches": [], "candidates": []})
-
-    monkeypatch.setattr(mod, "_invoke_cli", fake_invoke_cli)
-
     out_path = tmp_path / "out.jsonl"
-    rc = mod.main([
-        "--digests", str(digests_dir),
-        "--codebook", str(codebook_path),
-        "--project", "dark_factory",
-        "--out", str(out_path),
-    ])
+
+    rc = _run_main(tmp_path, "--digests", digests_dir, "--out", out_path)
 
     assert rc == 0
     lines = [line for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(lines) == 1
     assert json.loads(lines[0])["session"] == "dir-sess-1"
+
+
+# ---------------------------------------------------------------------------
+# task 6400: the quality Definition is the minting test, and the coder is told
+# the observed project's invariant slugs (plans/census-incremental-prd.md R9,
+# §4.8 rows 15 and 17). Expected texts are computed from the normative doc at
+# test time (quality_doc_texts), never restated.
+# ---------------------------------------------------------------------------
+
+
+def _block(prompt, name):
+    lines = prompt.splitlines()
+    start = lines.index(f"=== {name} ===")
+    body = []
+    for line in lines[start + 1:]:
+        if line.startswith("=== "):
+            break
+        body.append(line)
+    return body
+
+
+def _bullets(block):
+    return [line for line in block if line.startswith("- ")]
+
+
+def _slugged_prompt(invariant_slugs):
+    return mod.build_prompt("digest text", "codebook index", invariant_slugs=invariant_slugs)
+
+
+def _never_invoked(*args, **kwargs):
+    pytest.fail("invoke reached: invariant_slugs acquired a default")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: mod.build_prompt("digest text", "codebook index"),  # pyright: ignore[reportCallIssue]
+        lambda: mod.code_digest("digest text", {}, project="p", invoke=_never_invoked),  # pyright: ignore[reportCallIssue]
+        lambda: mod.code_digests([], {}, project="p", invoke=_never_invoked),  # pyright: ignore[reportCallIssue]
+    ],
+    ids=["build_prompt", "code_digest", "code_digests"],
+)
+def test_the_invariant_slugs_are_required_never_defaulted(call):
+    """A default would tell the miner a project declares no slugs, silently."""
+    with pytest.raises(TypeError):
+        call()
+
+
+def test_the_prompt_carries_the_quality_definition_and_no_heuristic():
+    prompt = _slugged_prompt(("a-slug", "b-slug"))
+
+    assert definition_body() in prompt
+    for headline in heuristic_headlines():
+        assert headline not in prompt
+
+
+def test_the_prompt_lists_the_invariant_slugs_in_order():
+    block = _block(_slugged_prompt(("a-slug", "b-slug")), "INVARIANT SLUGS")
+
+    assert _bullets(block) == ["- a-slug", "- b-slug"]
+
+
+def test_a_project_without_slugs_is_stated_not_omitted():
+    block = _block(_slugged_prompt(()), "INVARIANT SLUGS")
+
+    assert _bullets(block) == []
+    assert any(str(invariants.DOC_RELPATH) in line for line in block)
+
+
+@pytest.mark.parametrize("invariant_slugs", [("a-slug",), ()])
+def test_the_prompt_prescribes_exactly_one_json_reply_line(invariant_slugs):
+    lines = _slugged_prompt(invariant_slugs).splitlines()
+
+    assert len([line for line in lines if line.startswith("{")]) == 1
+
+
+def _recording_invoke(prompts):
+    def fake_invoke(prompt, model):
+        prompts.append(prompt)
+        return json.dumps({"matches": [], "candidates": []})
+
+    return fake_invoke
+
+
+def test_code_digest_passes_the_slugs_to_the_prompt():
+    prompts = []
+
+    result = mod.code_digest(
+        _hand_digest("slug-sess", "marker"), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=("a-slug",), invoke=_recording_invoke(prompts),
+    )
+
+    assert result.ok
+    assert _bullets(_block(prompts[0], "INVARIANT SLUGS")) == ["- a-slug"]
+
+
+def test_code_digests_passes_the_slugs_to_every_prompt():
+    prompts = []
+
+    mod.code_digests(
+        [_hand_digest("slug-a", "one"), _hand_digest("slug-b", "two")], _tiny_codebook(),
+        project="dark_factory", invariant_slugs=("a-slug",), invoke=_recording_invoke(prompts),
+    )
+
+    assert len(prompts) == 2
+    assert all(_bullets(_block(p, "INVARIANT SLUGS")) == ["- a-slug"] for p in prompts)
+
+
+@pytest.mark.parametrize(
+    "definition_section",
+    ["## Definition\n\n", "## Renamed definition\n\nSome text.\n\n"],
+    ids=["emptied", "renamed"],
+)
+def test_a_broken_quality_definition_fails_every_digest(
+    tmp_path, monkeypatch, definition_section
+):
+    """Minting against no Definition would be silent; a failed batch is not."""
+    doc = tmp_path / "code_quality.md"
+    doc.write_text(
+        "# Code quality\n\n" + definition_section + "## The fourteen heuristics\n\n1. **One**\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(code_quality, "NORMATIVE_DOC", doc)
+    prompts = []
+
+    run = mod.code_digests(
+        _batch_digests(2), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=("a-slug",), invoke=_recording_invoke(prompts),
+    )
+
+    assert prompts == []
+    assert run.records == []
+    assert run.status == mod.CodingStatus.FAILURE
+    assert len(run.failures) == 2
+    assert all("## Definition" in reason for _session, reason in run.failures)
+
+
+def test_main_reads_the_slugs_from_the_project_root(tmp_path, pooled_main):
+    pooled_main.plan(default={"result": _EMPTY_VERDICT})
+    doc = tmp_path / invariants.DOC_RELPATH
+    doc.parent.mkdir(parents=True)
+    doc.write_text("## INV-1 `cli-visible-slug`\n", encoding="utf-8")
+
+    rc = _run_main(tmp_path, *_main_digests(tmp_path, "main-slug", 1))
+
+    assert rc == 0
+    assert any(
+        "cli-visible-slug" in call["stdin"] or "cli-visible-slug" in " ".join(call["argv"])
+        for call in pooled_main.calls()
+    )
+
+
+def test_coder_runs_standalone_and_takes_a_project_root():
+    """Outside pytest nothing else puts orchestrator/src on sys.path, so this
+    proves coder.py's own bootstrap resolves the code-quality slicer."""
+    completed = subprocess.run(
+        [sys.executable, str(_REPO_ROOT / "scripts" / "legibility" / "coder.py"), "--help"],
+        cwd=_REPO_ROOT, capture_output=True, text=True,
+        timeout=cli_timeout_from_env("LEGIBILITY_CODER_CLI_TEST_TIMEOUT"),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--project-root" in completed.stdout
+
+
+# ---------------------------------------------------------------------------
+# task 5791: the reply build_prompt prescribes is the reply code_digest reads.
+# ---------------------------------------------------------------------------
+
+
+def _prescribed_reply():
+    prompt = mod.build_prompt("digest text", "codebook index", invariant_slugs=_NO_SLUGS)
+    [line] = [line for line in prompt.splitlines() if line.startswith("{")]
+    return json.loads(line)
+
+
+def _filled(field, value):
+    if value != "...":
+        return value
+    if field == "entry_id":
+        return "one-shot-subagent-contract"
+    if field.endswith("_phase"):
+        return "unknown"
+    return f"populated {field}"
+
+
+def test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger():
+    reply = {
+        key: [{field: _filled(field, value) for field, value in item.items()} for item in items]
+        for key, items in _prescribed_reply().items()
+    }
+    populated = [
+        value
+        for items in reply.values()
+        for item in items
+        for value in item.values()
+        if isinstance(value, str) and value.startswith("populated ")
+    ]
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "marker"), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=_NO_SLUGS, invoke=lambda prompt, model: json.dumps(reply),
+    )
+
+    assert result.ok, result.reason
+    assert result.record is not None
+    merge = codebook_mod.apply_coding_records(
+        _tiny_codebook(), [result.record], invariant_slugs=(),
+    )
+    assert merge.invalid_records == ()
+    assert merge.skipped_deletions == ()
+    assert merge.counts.matched == 1
+    assert merge.counts.candidates_applied == 1
+    merged_text = json.dumps(merge.codebook)
+    assert populated
+    assert [value for value in populated if value not in merged_text] == []
+
+
+@pytest.mark.parametrize(
+    ("reply", "named_keys"),
+    [
+        ({"verified": False, "reason": "cannot verify the cluster"}, ("matches", "candidates")),
+        ({}, ("matches", "candidates")),
+        ({"matches": []}, ("candidates",)),
+        ({"hits": [{"entry_id": "one-shot-subagent-contract"}], "candidates": []}, ("matches",)),
+        ({"matches": None, "candidates": []}, ("matches",)),
+        ({"verified": False, "reason": REAL_CLI_CAP_MESSAGES[0]}, ("matches", "candidates")),
+    ],
+    ids=[
+        "foreign_verdict_shape",
+        "empty_object",
+        "candidates_missing",
+        "renamed_key",
+        "null_where_a_list_is_prescribed",
+        "foreign_verdict_quoting_a_banner",
+    ],
+)
+def test_code_digest_a_reply_off_the_prescribed_schema_is_a_failure_not_an_empty_verdict(
+    reply, named_keys
+):
+    """A parsed reply missing a key build_prompt prescribes is not "coded fine,
+    found nothing" (never-fabricate)."""
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "marker"), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=_NO_SLUGS, invoke=lambda prompt, model: json.dumps(reply),
+    )
+
+    assert result.ok is False
+    assert result.record is None
+    assert result.capped is False
+    assert result.session == _SESSION_ID
+    assert [key for key in named_keys if key not in result.reason] == []

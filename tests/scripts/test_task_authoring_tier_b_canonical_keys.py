@@ -55,6 +55,10 @@ silent by design) is orthogonal to this invariant and is not contradicted by it:
 this guard constrains the Canonical column only. Parser BEHAVIOUR for the
 individual keys is pinned by ``shared/tests/test_task_metadata.py``; neither
 implies the other.
+
+Marker plumbing lives in ``task_authoring_marker_span.marked_span`` (task 4999),
+shared with the task-3780 guard next door; read that module for why the markers
+are explicit and why every failure is loud.
 """
 from __future__ import annotations
 
@@ -63,15 +67,16 @@ import re
 
 import pytest
 from shared.task_metadata import _BLESSED_METADATA_KEYS
+from task_authoring_marker_span import marked_span
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 TASK_AUTHORING_PATH = REPO_ROOT / "docs" / "task-authoring.md"
 
-# The full HTML-comment forms, not the bare slug: the begin literal is not a
-# substring of the end literal (the `/` differs), so `.count()` on each is
-# unambiguous. Distinct slug from the `tier-a-blessed-keys-mirror` pair higher
-# up the same document — the two marker pairs are independent.
+# The full HTML-comment forms, not the bare slug: `marked_span` requires the two
+# literals not to overlap as substrings, and the bare slug sits inside both.
+# Distinct slug from the `tier-a-blessed-keys-mirror` pair higher up the same
+# document — the two marker pairs are independent.
 MARKER_BEGIN = "<!-- tier-b-canonical-keys -->"
 MARKER_END = "<!-- /tier-b-canonical-keys -->"
 
@@ -86,43 +91,18 @@ _SEPARATOR = re.compile(r"^\|[\s:|-]+\|$")
 def _table_rows(markdown_text):
     """The markdown table rows between the Tier-B markers, header/separator dropped.
 
-    Anchored on an EXPLICIT marker pair rather than positionally ("the table
-    after the Tier-B heading"). A positional match quietly guards nothing the
-    moment the section is renamed, reordered, or gains a second table; an
-    explicit marker fails loudly instead, and the failure names what to restore.
-
-    Every failure is a loud ``AssertionError`` naming the marker literal and the
-    doc, never a ``[]``/``None`` return. That is the vacuity hazard and the whole
-    point: an extractor that silently yields nothing turns the invariant
-    downstream green while pinning nothing at all — strictly worse than having no
-    guard, because the suite still reports success.
+    Everything below the ``marked_span`` call is this guard's OWN table-content
+    extraction; it raises loudly rather than returning ``[]`` for the same reason
+    ``marked_span`` does.
     """
-    begin_count = markdown_text.count(MARKER_BEGIN)
-    assert begin_count == 1, (
-        f"expected exactly one {MARKER_BEGIN!r} marker in docs/task-authoring.md, "
-        f"found {begin_count} (task 4303). This marker opens the Tier-B table "
-        f"whose Canonical column must be Tier-A blessed. If it was deleted, "
-        f"restore it immediately above that table; if it was duplicated, one of "
-        f"the two tables is unpinned and free to drift."
+    marked = marked_span(
+        markdown_text,
+        MARKER_BEGIN,
+        MARKER_END,
+        doc_path="docs/task-authoring.md",
+        task="task 4303",
+        delimits="the Tier-B table",
     )
-    end_count = markdown_text.count(MARKER_END)
-    assert end_count == 1, (
-        f"expected exactly one {MARKER_END!r} marker to close {MARKER_BEGIN!r} in "
-        f"docs/task-authoring.md, found {end_count} (task 4303) — restore the "
-        f"closing marker immediately below the Tier-B table, and ABOVE the "
-        f"qualifying paragraphs, which are deliberately outside the marker."
-    )
-
-    begin_at = markdown_text.index(MARKER_BEGIN)
-    end_at = markdown_text.index(MARKER_END)
-    assert begin_at < end_at, (
-        f"the Tier-B markers are INVERTED in docs/task-authoring.md: "
-        f"{MARKER_END!r} appears before {MARKER_BEGIN!r} (task 4303). Swap them "
-        f"back around the table — as written they delimit an empty span and this "
-        f"guard would pin nothing."
-    )
-
-    marked = markdown_text[begin_at + len(MARKER_BEGIN):end_at]
     rows = [
         line.strip()
         for line in marked.splitlines()
@@ -305,9 +285,22 @@ def test_canonical_keys_fails_loudly_on_a_broken_marker(markdown_text, case):
     A silent ``[]`` would turn the invariant below green while pinning nothing —
     the vacuity failure that makes a guard worse than no guard, because the suite
     still reports success.
+
+    The message must tell a human what to restore and where, so the assertions
+    check the marker slug, the doc path and this guard's task are all named. That
+    is not prose-wording pedantry: ``doc_path`` and ``task`` are ARGUMENTS
+    threaded into ``marked_span``, so a copy-paste from the task-3780 caller next
+    door would otherwise leave all 11 tests here green while sending every
+    broken-marker reader to the wrong guard and the wrong document. Identifiers
+    only, so any rewording of the shared message templates stays green.
     """
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError) as excinfo:
         _canonical_keys(markdown_text)
+
+    message = str(excinfo.value)
+    assert "tier-b-canonical-keys" in message, case
+    assert "task-authoring.md" in message, case
+    assert "4303" in message, case
 
 
 def test_canonical_keys_fails_loudly_on_a_row_naming_no_canonical_key():

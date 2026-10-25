@@ -10,16 +10,14 @@ own tiny state file is absent or corrupt.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
-import os
-import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from orchestrator.session_registry import fleet_root
+from shared import safe_io
 
 logger = logging.getLogger(__name__)
 
@@ -74,29 +72,19 @@ def load_ui_config(root: Path | str | None = None) -> CockpitUIConfig:
 
 
 def save_ui_config(cfg: CockpitUIConfig, root: Path | str | None = None) -> None:
-    """Atomically write *cfg* to ``ui_config_path(root)``.
+    """Atomically write *cfg* to ``ui_config_path(root)``, owner-only (0600).
 
-    Mirrors orchestrator.session_registry's _atomic_write_text idiom (tmp
-    file in the target's own parent dir, then os.replace, unlink-on-
-    failure) so a save is never observed half-written. Fail-soft: any
-    error is logged and swallowed rather than raised -- the cockpit's own
-    UI-state write must never crash the view.
+    Never raises: ANY exception during the write -- e.g. a json.dumps
+    TypeError from a non-serializable field -- is logged and swallowed,
+    because a view must never be a dependency (PRD §2).
+
+    This write is synchronous, and is deliberately NOT called once per UI
+    event: ``cockpit/src/cockpit/app.py::CockpitApp._flush_ui_config``
+    debounces it onto the poll tick. Do not reintroduce a per-keypress call
+    site.
     """
     path = ui_config_path(root)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path_str = tempfile.mkstemp(
-            suffix='.tmp',
-            prefix=path.stem,
-            dir=str(path.parent),
-        )
-        try:
-            with os.fdopen(fd, 'w') as f:
-                json.dump(cfg.to_dict(), f)
-            os.replace(tmp_path_str, str(path))
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path_str)
-            raise
-    except OSError as exc:
+        safe_io.atomic_write_text(path, json.dumps(cfg.to_dict()), mode=0o600, mkdir=True)
+    except Exception as exc:
         logger.warning('save_ui_config: failed to write %s: %s', path, exc)

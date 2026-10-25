@@ -139,31 +139,59 @@ absorbed into `detail`. They survive there as inert text that nothing reads:
 Neither value was ever restored to the live queue. The fixtures are the only
 place they are now preserved.
 
-### What blocks recovery — the self-referential blind spot
+### What USED to block recovery — the self-referential blind spot
+
+> **Updated 2026-08-28 (task 4502).** This section recorded that both records
+> were unrepairable. That was true when measured; it is not true now. The
+> diagnosis below is what identified the blocker and got it fixed, so it is
+> rewritten rather than deleted.
 
 Replayed through `shared.toolcall_markup.repair` with `escalate_info`'s real
-parameter set, **both records return `None`** — unrepairable. Under task 3690's
-`RepairPolicy.FORWARD_REPAIR` that routes to `_refuse_unrepairable`, so a
-filing of this shape today would be REFUSED rather than repaired.
-
-The cause is isolated by a controlled experiment the test performs. Inside the
-swallowed `evidence` value the report quotes the very `matched_pattern` that
-tripped the memory tripwire — a `content` closer, in prose. `repair()` rejects
-any candidate whose parsed tail contains a second mis-close, so that quotation
-defeats the tail parser. Replacing **only** that one quoted literal with an
-inert placeholder, leaving every other byte untouched, flips the outcome:
+parameter set, **both records now repair**, recovering both swallowed
+siblings. Under task 3690's `RepairPolicy.FORWARD_REPAIR` that routes to
+`_forward`, so a filing of this shape today LANDS with both arguments
+recovered:
 
     repair(...) -> Repair(recovered={'evidence', 'suggested_action'})
       suggested_action  261 chars, the real recommendation text
-      evidence         1016 / 1077 chars, the three entries
+      evidence         1010 / 1071 chars, the three entries
       clean_value      1453 chars, detect(clean_value) is None
 
-So the quote is the SOLE blocker. Generalised: **an escalation that REPORTS a
-markup leak is the one payload class the repairer structurally cannot
-recover**, because a faithful report quotes the pattern. This independently
-confirms, on a second pair of records, the "doubly corrupted" PRD boundary row
-B5 shape that `test_markup_middleware_registration.py` describes for
-`esc-3184-2` and says could never demonstrate a successful recovery.
+> **Correction to an earlier count (task 4502).** This block previously gave
+> the recovered `evidence` as **1016 / 1077** chars. Those are the SCRUBBED
+> control's lengths, inflated by a 16-character placeholder standing in for the
+> 10-character literal it replaces. The VERBATIM lengths — what `repair()`
+> actually returns for the specimens as stored — are **1010 / 1071**. The
+> scrubbed figures were correct for the experiment they came from and are
+> superseded here, not contradicted; `test_the_specimen_is_repairable_as_stored`
+> now pins the verbatim lengths against the bytes.
+
+**Why it used to fail**, isolated by a controlled experiment the test performs.
+Inside the swallowed `evidence` value the report quotes the very
+`matched_pattern` that tripped the memory tripwire — a `content` closer, in
+prose. `repair()` used to reject any candidate whose parsed tail contained a
+closing tag **anywhere** in a recovered value, so that quotation defeated the
+tail parser. Replacing **only** that one quoted literal with an inert
+placeholder, leaving every other byte untouched, flipped the outcome — which
+isolated the quote as the sole blocker and routed the defect to task 4502. The
+experiment is retained as the regression control that the blocker is gone: it
+now asserts that scrubbing changes nothing but the placeholder.
+
+Generalised, rewritten because the class is real: **an escalation that REPORTS
+a markup leak is a distinct payload class**, because a faithful report quotes
+the pattern that tripped the tripwire, so the quote lands inside a swallowed
+argument. A guard refusing on the mere PRESENCE of a closing tag in a recovered
+value cannot tell that apart from a genuine second mis-close, and so destroys
+exactly the reports documenting its own failures. Task 4502 restored PRD
+boundary row B5 to its own stated rule — refuse when the value's *boundary is a
+guess* — so an inner closer blocks recovery only when it mis-closes the item
+itself, spans a tool-call boundary, or yields an equally valid alternative
+parse. The recovered `evidence` still contains the quoted closer, because it is
+the caller's own text; the middleware names it in `quoted_markup_params`.
+
+`test_markup_middleware_registration.py` describes the same "doubly corrupted"
+B5 shape for `esc-3184-2` and says it could never demonstrate a successful
+recovery. This pair is now that demonstration for the recoverable half of it.
 
 ## The control caveat — do not read `evidence == []` as corruption
 
@@ -217,7 +245,12 @@ For future consolidation, janitor, lint and formatting passes:
   `escalation/tests/test_markup_specimen_3514.py`. Any edit that changes a
   parsed value fails that test, by design. If an edit is genuinely intended,
   re-measure and update the digest deliberately — do not delete the assertion.
-- **`repair()` returning `None` is a recorded verdict, not a bug to fix here.**
-  If a future repairer improves and the unrepairable pin starts failing, that
-  is the intended signal: revisit `docs/escalation-markup-write-boundary.md`
-  and update the recorded answer rather than deleting the test.
+- **`repair()`'s verdict on these records is RECORDED, not a bug to fix here.**
+  The pin fired as designed under task 4502: it used to assert `repair()`
+  returned `None`, that stopped being true, and the test was INVERTED rather
+  than deleted. The current verdict is that both records repair, recovering
+  `{evidence, suggested_action}` — see the section above and
+  `docs/escalation-markup-write-boundary.md` part 4. If
+  `test_the_specimen_is_repairable_as_stored` starts failing, that is the same
+  intended signal pointing the other way: revisit and update the recorded
+  answer rather than deleting the test.

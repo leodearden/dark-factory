@@ -13,6 +13,10 @@ gate without any other test failing.
 
 from __future__ import annotations
 
+from fused_memory.reconciliation.dangling_citation import (
+    DanglingCitation,
+    build_dangling_citation_finding,
+)
 from fused_memory.reconciliation.harness import _derive_affected_ids
 
 
@@ -195,3 +199,37 @@ class TestDeriveAffectedIds:
         }
         result = _derive_affected_ids(finding)
         assert result == ['valid-mem']
+
+    # ------------------------------------------------------------------ #
+    # Top-level task_id is not an identity source (task 4772)
+    # ------------------------------------------------------------------ #
+
+    def test_top_level_task_id_alone_contributes_no_identity(self):
+        """add_finding(task_id=X) with no cite_* call derives no identity."""
+        result = _derive_affected_ids({'task_id': '598'})
+        assert result == [], f'top-level task_id must not contribute identity; got {result!r}'
+
+    def test_top_level_task_id_not_merged_into_cited_identity(self):
+        """With cite_task present, only the cited ids form the identity."""
+        finding = {
+            'task_id': '598',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '3839', 'title': 'T'}],
+        }
+        result = _derive_affected_ids(finding)
+        assert result == ['3839'], f'top-level task_id must not merge into cited identity; got {result!r}'
+
+    # ------------------------------------------------------------------ #
+    # The dangling-citation handoff record is an identity source (task 5749)
+    # ------------------------------------------------------------------ #
+
+    def test_dangling_citation_record_contributes_its_ids(self):
+        """A Stage-3 dangling-citation finding cites nothing, so its record is its identity."""
+        record = DanglingCitation(
+            target_run_id='06a4466d-cdc0-49ac-8e99-e6723be39392',
+            finding_id='a1a1a1a1-0000-4000-8000-000000000001',
+            memory_id='beacf7fc-b76a-4c0b-876d-f4cf6d906d42',
+            store='mem0',
+        )
+        result = _derive_affected_ids(build_dangling_citation_finding(record))
+        for value in (record.target_run_id, record.finding_id, record.memory_id):
+            assert value in result, f'{value} missing from derived identity {result!r}'

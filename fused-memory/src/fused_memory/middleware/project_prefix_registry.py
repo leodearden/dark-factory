@@ -21,7 +21,10 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 
-from fused_memory.models.scope import resolve_project_id_for_root
+from fused_memory.models.scope import (
+    is_phantom_project_root,
+    resolve_project_id_for_root,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,9 +102,11 @@ def _candidate_prefixes_for_root(root: Path) -> list[str]:
     Hyphenated names get an underscore alias (mirrors the original guard
     listing both ``fused-memory/`` and ``fused_memory/``).
     """
-    if not root.is_dir():
+    if is_phantom_project_root(root):
         logger.warning(
-            'project_prefix_registry: project_root %s is not a directory; skipping',
+            'project_prefix_registry: project_root %s is not a directory; '
+            'registering its project with no prefixes (phantom roots are '
+            'admitted, see fused_memory.models.scope::build_known_projects_map)',
             root,
         )
         return []

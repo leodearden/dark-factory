@@ -60,6 +60,7 @@ import json
 import shlex
 import shutil
 import subprocess
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -77,6 +78,7 @@ import pytest
 # fixtures; test_golden_diffs_match_test_verify_plan_source() near the end of
 # the plan-golden section turns that copy's silent-drift risk into a loud
 # test failure instead.
+from _merge_lane_fakes import FakeVerifier, VerifyScript
 from test_dry_run_unblock import _make_agent_result, _RecordingScheduler
 from test_verify_plan import (
     DATA_MODULE_DIFF as _SRC_DATA_MODULE_DIFF,
@@ -91,8 +93,9 @@ from test_verify_plan import (
 from orchestrator import verify
 from orchestrator.b3_gate import ABORT, FRESH, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WorktreeKind, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     MergeRequest,
     QueuedBranch,
     _DryRunInvestigationHandles,
@@ -224,7 +227,7 @@ _PYTEST_UV_DIRECTORY_RAW = (
 
 # The historical broken lint/type_check &&-chain (orchestrator/config.yaml:50)
 # — recognised-but-unstructurable (ruff + a follow-up script, not pytest/cargo
-# chain-aware), classifies OPAQUE, and must never be scoped (P1).
+# chain-aware), resolves RUFF raw-retained, and must never be scoped (P1).
 _LINT_CHAIN_RAW = (
     'uv run ruff check shared escalation fused-memory orchestrator dashboard && '
     'python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests '
@@ -242,7 +245,7 @@ class TestVerifyCmdRoundTrip:
     and ACTUALLY EXECUTED (runner side) against a throwaway probe file,
     proving the two sides agree on what "scoped" means. Row 2/P1 pins the
     real historical broken lint/type_check &&-chain (orchestrator/config.yaml:50)
-    as OPAQUE and never scoped.
+    as raw-retained and never scoped.
 
     RED until step-2 GREEN imports parse_config_command/render/ToolKind/
     scope_to/strip_cwd/VerifyCmd from orchestrator.verify_cmd and adds the
@@ -327,16 +330,17 @@ class TestVerifyCmdRoundTrip:
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert '1 passed' in proc.stdout
 
-    # ── scenario 2 / Row 2 / P1: OPAQUE is never scoped ──────────────────────
-    def test_opaque_lint_chain_is_never_scoped(self):
-        """The historical broken &&-chain classifies OPAQUE and scope_to no-ops on it.
+    # ── scenario 2 / Row 2 / P1: a raw-retained chain is never scoped ────────
+    def test_raw_retained_lint_chain_is_never_scoped(self):
+        """The historical broken &&-chain resolves RUFF, raw-retained, and scope_to no-ops on it.
 
         render(parse(x)) == x verbatim (raw retained unchanged) — this is the
         exact lint_command value at orchestrator/config.yaml:50 that regressed
         under the old string-surgery scoper.
         """
         cmd = parse_config_command(_LINT_CHAIN_RAW)
-        assert cmd.tool is ToolKind.OPAQUE
+        assert cmd.tool is ToolKind.RUFF
+        assert cmd.raw is not None
         assert scope_to(cmd, ['orchestrator/src/orchestrator/foo.py']) is cmd
         assert render(parse_config_command(_LINT_CHAIN_RAW)) == _LINT_CHAIN_RAW
 
@@ -750,6 +754,19 @@ class TestCheckRunTimeoutConsistency:
 #               coverage gap + B4); Boundary-test sketch row 9 ──────────────
 
 
+class _RealInvestigationVerifier(FakeVerifier):
+    """FakeVerifier that still runs the REAL dry-run investigation.
+
+    Stock FakeVerifier RECORDS an investigation instead of running it, which
+    would silently vacate this scenario's proposal assertions: the whole point
+    here is that run_dry_run_unblock really executes against the real
+    worktree, with only invoke_agent faked at the agent edge.
+    """
+
+    def dry_run_unblock(self, **investigation):
+        return run_dry_run_unblock(**investigation)
+
+
 class TestMergeVerifyBlockProducesGateableProposal:
     """Scenario 9 — GOLDEN: a merge-verify RED (generic task-fault, non-timeout)
 
@@ -771,7 +788,7 @@ class TestMergeVerifyBlockProducesGateableProposal:
     for real.
 
     RED until step-16 imports _run_post_merge_verify/_DryRunInvestigationHandles
-    from orchestrator.merge_queue, check_proposal/ABORT from
+    from orchestrator.merge_lane.worker, check_proposal/ABORT from
     orchestrator.b3_gate, BlockClass from orchestrator.unblock_types,
     VerifyResult from orchestrator.verify, and _RecordingScheduler/
     _make_agent_result from test_dry_run_unblock (cross-file convention
@@ -811,11 +828,7 @@ class TestMergeVerifyBlockProducesGateableProposal:
             reqs.append(req)
             with (
                 patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=compile_error_result),
-                ),
-                patch(
-                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
                     new=AsyncMock(return_value=(False, '')),
                 ),
                 patch(
@@ -842,6 +855,9 @@ class TestMergeVerifyBlockProducesGateableProposal:
                     max_enospc=1,
                     dry_run_handles=handles,
                     event_store=MagicMock(),
+                    verifier=_RealInvestigationVerifier(
+                        default=VerifyScript(result=compile_error_result),
+                    ),
                 )
                 # Drain the fire-and-forget investigation (real
                 # run_dry_run_unblock, real git subprocess calls against
@@ -859,9 +875,13 @@ class TestMergeVerifyBlockProducesGateableProposal:
         assert outcome is not None
         assert outcome.status == 'blocked'
 
-        proposals = scheduler._meta.get('dry_run_proposals', [])
-        assert proposals, 'Expected a dry_run_proposals entry to be written'
-        entry = proposals[-1]
+        proposal_writes = [
+            call['metadata']['dry_run_proposals']
+            for call in scheduler.update_task_calls
+            if 'dry_run_proposals' in call['metadata']
+        ]
+        assert proposal_writes, 'Expected a dry_run_proposals entry to be written'
+        entry = proposal_writes[-1][-1]
         assert entry['block_class'] == BlockClass.MERGE_VERIFY_RED, (
             f"Expected block_class=MERGE_VERIFY_RED; got {entry.get('block_class')!r}"
         )
@@ -877,7 +897,7 @@ class TestMergeVerifyBlockProducesGateableProposal:
 
         verdict = check_proposal(
             entry, worktree=str(req.worktree), category='task_failure',
-            run_git=_fake_run_git,
+            run_git=_fake_run_git, now=datetime.now(UTC),
         )
         assert verdict['verdict'] != ABORT, (
             f'Expected a non-ABORT (gateable) verdict; got {verdict!r}'
@@ -998,6 +1018,7 @@ class TestB3GateProposalRouting:
         }
         verdict = check_proposal(
             entry, worktree='/tmp', category=None, run_git=_fake_git_fresh,
+            now=datetime.fromisoformat(self._INVESTIGATED_AT),
         )
         assert verdict['verdict'] == FRESH, (
             f'status-key presence must not abort the typed path, got {verdict!r}'

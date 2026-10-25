@@ -19,12 +19,9 @@ server-side on the live path.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import errno
 import hashlib
-import importlib.util
-import io
 import json
 import os
 import random
@@ -36,37 +33,19 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _fm_helpers import falkor_skipif
+from _fm_helpers import falkor_skipif, load_script_module
+from shared.testing_streams import (
+    StdoutWithAFailingFlush,
+    StdoutWithAFailingWrite,
+    closed_pipe_stdout,
+)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'local_memory_models_eval' / 'build_corpus.py'
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load build_corpus.py from its file path.
-
-    The module is registered in sys.modules under its name BEFORE
-    ``exec_module`` so that ``@dataclass`` and other reflection-based
-    decorators work correctly (they call ``sys.modules.get(cls.__module__)``),
-    and build_corpus.py defines frozen dataclasses. See the note at
-    test_memory_eval_retrieval_probe.py's copy of this helper.
-    """
-    mod_name = 'lme_build_corpus'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='lme_build_corpus')
 
 
 # ===========================================================================
@@ -151,12 +130,102 @@ class TestPayloadKind:
     def test_temporal_context_prefix_is_stripped(self):
         """``graphiti_client`` prepends ``[temporal:<ctx>] `` when set.
 
-        Verified absent from dark_factory today — all rows are bare
-        ``add_memory:*`` — but the parser must not mis-bucket it if it appears.
+        A writer annotation, not part of the category: the parser must not
+        mis-bucket a temporally-tagged write into its own payload stratum.
         """
         assert _mod.payload_kind('[temporal:2026-05-16] add_memory:temporal_facts') == (
             'temporal_facts'
         )
+
+    def test_unverified_claim_annotation_is_stripped(self):
+        """The exact source_description measured on live dark_factory, 2026-10-01.
+
+        ``graphiti_client`` prepends ``[unverified_claim] `` to a write the
+        completion-claim gate flagged (task 3142). It is a write-time
+        annotation, not a caller string, so the write stays in its category.
+        """
+        assert _mod.payload_kind('[unverified_claim] add_memory:decisions_and_rationale') == (
+            'decisions_and_rationale'
+        )
+
+    def test_composed_writer_annotations_are_stripped(self):
+        """``[unverified_claim]`` outermost, then ``[temporal:<ctx>]``.
+
+        The composition order the writer emits, pinned writer-side by
+        fused-memory/tests/test_unverified_claim_tag_propagation.py::TestGraphitiBackendUnverifiedClaimTag::test_tag_composes_with_the_temporal_prefix.
+        """
+        assert _mod.payload_kind(
+            '[unverified_claim] [temporal:planning] add_memory:temporal_facts'
+        ) == 'temporal_facts'
+
+    @pytest.mark.parametrize(
+        'bad',
+        [
+            '[unverified_claim]',
+            '[unverified_claim] ',
+            '[unverified_claim] [temporal:x]',
+            '[temporal:x]',
+        ],
+    )
+    def test_annotation_only_description_raises_naming_the_offender(self, bad):
+        """Annotations alone identify no writer, so there is no defensible bucket."""
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _mod.payload_kind(bad)
+        assert 'source_description' in str(exc.value)
+        assert repr(bad) in str(exc.value)
+
+    def test_unrecognised_bracket_tag_stays_a_caller_string(self):
+        """The stripped annotation set is closed: an unknown tag is not guessed away.
+
+        A new writer annotation therefore lands in ``add_episode`` and turns the
+        live smoke's payload-axis equality red, rather than being silently
+        absorbed into a category stratum.
+        """
+        assert _mod.payload_kind('[some_future_tag] add_memory:temporal_facts') == (
+            'add_episode'
+        )
+
+    @pytest.mark.parametrize(
+        ('temporal_context', 'unverified_claim'),
+        [(None, True), ('planning', False), ('planning', True)],
+    )
+    def test_classifies_what_the_episode_writer_persists(
+        self, mock_config, monkeypatch, temporal_context, unverified_claim
+    ):
+        """The reader's annotation set tracks the writer's real output, offline.
+
+        ``GraphitiBackend.add_episode`` spells its annotations inline, so the
+        literal pins here and in test_unverified_claim_tag_propagation.py could
+        both be respelled while still agreeing with themselves. Classifying the
+        description the writer actually hands graphiti_core makes a respelling
+        fail in the change that makes it, not later on the live smoke.
+        """
+        from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: PLC0415
+
+        class _RecordingClient:
+            def __init__(self):
+                self.source_descriptions: list[str] = []
+
+            async def add_episode(self, **kwargs):
+                self.source_descriptions.append(kwargs['source_description'])
+
+        client = _RecordingClient()
+        backend = GraphitiBackend(mock_config)
+        monkeypatch.setattr(backend, '_client_for', lambda group_id: client)
+
+        asyncio.run(
+            backend.add_episode(
+                name='e',
+                content='c',
+                group_id='g',
+                source_description='add_memory:decisions_and_rationale',
+                temporal_context=temporal_context,
+                unverified_claim=unverified_claim,
+            )
+        )
+
+        [persisted] = client.source_descriptions
+        assert _mod.payload_kind(persisted) == 'decisions_and_rationale', persisted
 
     @pytest.mark.parametrize('bad', ['', None, 17, '   '])
     def test_unusable_value_raises_naming_the_offender(self, bad):
@@ -2718,65 +2787,6 @@ class TestAWriteFailureIsNotBlamedOnTheStore:
         assert code == _mod.EXIT_CODES['bad_manifest']
 
 
-@contextlib.contextmanager
-def _closed_pipe_stdout(monkeypatch, *, buffering: int | None = None, quiet_close: bool = True):
-    """Point ``sys.stdout`` at a pipe whose reader is already gone (the ``| head`` shape).
-
-    A REAL closed ``os.pipe()``, never a mocked ``print``: a fix that only
-    satisfies a mock cannot pass through here, because the assertion is on the
-    actual OS-level write failure.
-
-    *buffering* is the load-bearing knob, not a detail — it selects WHICH of
-    the two failure regimes the test exercises, so every caller states it:
-
-    * ``None`` (block buffering, the default) — a short write stays in the
-      buffer, nothing fails in-band, and only an explicit flush can surface it.
-    * ``1`` (line buffering) — every print does a real ``write()``, so the
-      failure is raised during the run.
-
-    The exit is itself an assertion. Closing the wrapper stands in for the
-    interpreter's finalization-time flush of ``sys.stdout``, which is where a
-    closed pipe would otherwise resurface as "Exception ignored ..." noise and
-    a forced exit status no ``return`` can override. It runs in a ``finally``
-    so a failing assertion in the body cannot skip it or leak the write fd;
-    the verdict on it is checked only when the body passed, so a real failure
-    is never masked by a second one here.
-
-    *quiet_close* says which LAYER is under test. ``True`` (``_cli``, the
-    process boundary) means that flush must not raise, because ``_cli`` owns
-    fd 1 and redirects it to ``os.devnull``. ``False`` (``main`` alone) means
-    it must raise: ``main(argv) -> int`` deliberately does not mutate a
-    process-global fd on behalf of a caller that only asked for an exit code.
-    """
-    read_fd, write_fd = os.pipe()
-    os.close(read_fd)  # the reader is already gone, like `head` after its window
-    if buffering is None:
-        pipe_stdout = os.fdopen(write_fd, 'w')
-    else:
-        pipe_stdout = os.fdopen(write_fd, 'w', buffering=buffering)
-    original_stdout = sys.stdout
-    monkeypatch.setattr(sys, 'stdout', pipe_stdout)
-    close_failure: BaseException | None = None
-    try:
-        yield pipe_stdout
-    finally:
-        sys.stdout = original_stdout
-        try:
-            pipe_stdout.close()
-        except BrokenPipeError as exc:
-            close_failure = exc
-    if quiet_close:
-        assert close_failure is None, (
-            'the interpreter\'s shutdown flush would have raised a second, '
-            f'uncatchable BrokenPipeError: {close_failure!r}'
-        )
-    else:
-        assert close_failure is not None, (
-            'this layer took over the caller\'s stdout fd — only the process '
-            'boundary may do that'
-        )
-
-
 class TestBrokenPipeIsARunFailureNotATraceback:
     """A downstream reader closing stdout early (``--verify | head``) must not traceback.
 
@@ -2797,7 +2807,7 @@ class TestBrokenPipeIsARunFailureNotATraceback:
     ):
         out = tmp_path / 'corpus_manifest.json'
         capsys.readouterr()
-        with _closed_pipe_stdout(monkeypatch, buffering=1):
+        with closed_pipe_stdout(monkeypatch, buffering=1):
             code, _ = _run_cli(
                 monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), entry=_mod._cli
             )
@@ -2824,7 +2834,7 @@ class TestBrokenPipeIsARunFailureNotATraceback:
         """
         out = tmp_path / 'corpus_manifest.json'
         capsys.readouterr()
-        with _closed_pipe_stdout(monkeypatch, buffering=1, quiet_close=False):
+        with closed_pipe_stdout(monkeypatch, buffering=1, quiet_close=False):
             code, _ = _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
 
         assert code == _mod.EXIT_RUN_FAILED
@@ -2836,7 +2846,7 @@ class TestBrokenPipeIsARunFailureNotATraceback:
         """CONTROL: not specific to the write path — the report print itself is the hazard."""
         out = tmp_path / 'corpus_manifest.json'
         capsys.readouterr()
-        with _closed_pipe_stdout(monkeypatch, buffering=1):
+        with closed_pipe_stdout(monkeypatch, buffering=1):
             code, _ = _run_cli(
                 monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run',
                 entry=_mod._cli,
@@ -2881,7 +2891,7 @@ class TestAShortBufferedWriteIntoAClosedPipeIsAlsoARunFailure:
         """
         out = self._built_manifest(monkeypatch, tmp_path)
         capsys.readouterr()
-        with _closed_pipe_stdout(monkeypatch):
+        with closed_pipe_stdout(monkeypatch):
             code, _ = _run_cli(
                 monkeypatch, '--verify', '--out', str(out), entry=_mod._cli
             )
@@ -2928,7 +2938,7 @@ class TestAPipeThatBrokeAfterTheManifestLandedSaysSo:
     ):
         out = tmp_path / 'corpus_manifest.json'
         capsys.readouterr()
-        with _closed_pipe_stdout(monkeypatch):  # block-buffered: nothing fails in-band
+        with closed_pipe_stdout(monkeypatch):  # block-buffered: nothing fails in-band
             code, _ = _run_cli(
                 monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), entry=_mod._cli
             )
@@ -2953,7 +2963,7 @@ class TestAPipeThatBrokeAfterTheManifestLandedSaysSo:
         out.unlink()
 
         capsys.readouterr()
-        with _closed_pipe_stdout(monkeypatch):
+        with closed_pipe_stdout(monkeypatch):
             code, _ = _run_cli(
                 monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run',
                 entry=_mod._cli,
@@ -2965,56 +2975,130 @@ class TestAPipeThatBrokeAfterTheManifestLandedSaysSo:
         assert str(out) not in err
 
 
-class _StdoutWithAFailingFlush(io.StringIO):
-    """A stdout that accepts every write and fails on flush — ENOSPC, not a closed reader.
+class TestTheCorpusCliConsumesTheSharedBoundaryHelper:
+    """build_corpus.py must USE ``shared.cli_boundary``, not carry its own copy.
 
-    ``StringIO.fileno()`` raises ``io.UnsupportedOperation``, so this doubles as
-    a pin on the handler's fd guard: a stream with no real descriptor must not
-    turn the reported failure into a second, different traceback out of the
-    code meant to prevent the first one.
+    Asserted BEHAVIOURALLY rather than by introspection: an ``import``-scanning
+    or ``hasattr``-based test would pass against a module that imported the
+    helper and then went on using its own private duplicate, which is the exact
+    regression this class exists to catch (INV-5).
+
+    The lever is the shared module's per-run state. If build_corpus is really
+    the consumer, then a run of ITS CLI spends the SHARED once-only budget and
+    installs its manifest detail on the SHARED reporter — both observable from
+    here by calling into ``shared.cli_boundary`` directly afterwards. If it
+    kept a private copy, the shared reporter is untouched and still armed.
+
+    The five spec classes above are deliberately NOT modified: their unchanged
+    passing is the evidence that this hoist preserved behaviour, and rewriting
+    them would destroy it at the moment it is needed.
     """
 
-    def __init__(self, exc: OSError):
-        super().__init__()
-        self._exc = exc
+    @pytest.fixture(autouse=True)
+    def _fresh_shared_reporter_state(self):
+        """Leave ``shared.cli_boundary``'s per-run state as clean as it was found.
 
-    def flush(self) -> None:
-        raise self._exc
+        This class is the ONLY place in this file that reaches into another
+        module's per-run state, and every test in it ends by calling a shared
+        reporter DIRECTLY — which is the point (that call is the observation),
+        but it also leaves ``_STDOUT_FAILURE_REPORTED`` spent and ``_DETAIL``
+        bound to ``build_corpus._manifest_detail``, whose ``_WRITTEN_MANIFEST``
+        points into a ``tmp_path`` pytest is about to delete.
 
+        Every OTHER test in this file enters through ``main``/``_cli``, which
+        reset on the way in, so the leak is latent rather than live. It stays
+        latent only until some future test calls a shared reporter directly or
+        asserts on stderr from a path that does not go through ``main``.
 
-class _StdoutWithAFailingWrite(io.StringIO):
-    """A stdout whose LARGE writes fail outright — the IN-BAND half of the pair above.
+        MEASURED, because the obvious check gives the wrong answer here. This
+        package runs ``-n auto --dist loadgroup`` (fused-memory/pyproject.toml
+        addopts), so a probe appended after this class usually lands in a
+        DIFFERENT xdist worker process and sees pristine module state no matter
+        what this class did — the leak reads as absent. Forced into one process
+        with ``-n 0`` and this fixture disabled, that same probe fails with the
+        reporter already spent; re-enabled, it passes. So the hazard is not
+        merely collection order: it is which worker drew the straw, which is
+        the worst possible way to find out.
 
-    ``_StdoutWithAFailingFlush`` accepts every write and defers the failure to
-    the flush, which is what a *block-buffered* full disk does. A real
-    ``> /full/disk/report.txt`` also fails the other way: once the write is big
-    enough to reach the device — over the 8 KiB buffer, or on any write at all
-    when unbuffered — the ``write()`` itself raises, mid-run, with no flush
-    involved. Same errno, different frame, different handler needed.
+        Cleared on both edges, mirroring ``_fresh_reporter_state`` in
+        ``shared/tests/test_cli_boundary.py``: entry so this class cannot
+        inherit someone else's spent flag and assert nothing, exit so it cannot
+        hand one on.
+        """
+        import shared.cli_boundary as cli_boundary
 
-    *min_length* gates which writes fail, so the double stays usable for the
-    rest of the run rather than exploding on the first character. MEASURED on
-    ``--n 20 --dry-run``: the four stdout writes are 759, 0, 70 and 1
-    characters — the ``render_report`` body, then the ``dry-run: ...`` line and
-    its newline — so any threshold between 71 and 759 fails exactly the report
-    write. 200 is used, comfortably clear of both edges.
+        cli_boundary.reset_stdout_failure_state()
+        yield
+        cli_boundary.reset_stdout_failure_state()
 
-    Keeps ``_StdoutWithAFailingFlush``'s ``io.StringIO`` base for the same
-    second job: ``StringIO.fileno()`` raises ``io.UnsupportedOperation``, so
-    this re-pins the handler's fd guard — a stream with no real descriptor must
-    not turn the reported failure into a different traceback out of the code
-    meant to prevent the first one.
-    """
+    def test_the_corpus_cli_spends_the_shared_reporters_once_only_budget(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """One ``error: ...`` line per run — counted across the MODULE boundary.
 
-    def __init__(self, exc: OSError, *, min_length: int):
-        super().__init__()
-        self._exc = exc
-        self._min_length = min_length
+        After the CLI has reported its line, a direct call into the shared
+        reporter must return the code and stay silent, because the run already
+        spent that budget. With a private duplicate flag the shared reporter is
+        still armed and prints a second line.
+        """
+        import shared.cli_boundary as cli_boundary
 
-    def write(self, s: str) -> int:
-        if len(s) >= self._min_length:
-            raise self._exc
-        return super().write(s)
+        out = tmp_path / 'corpus_manifest.json'
+        capsys.readouterr()
+        with closed_pipe_stdout(monkeypatch):  # block-buffered: nothing fails in-band
+            code, _ = _run_cli(
+                monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), entry=_mod._cli
+            )
+        err = capsys.readouterr().err
+
+        assert code == _mod.EXIT_RUN_FAILED
+        assert len([line for line in err.splitlines() if line.strip()]) == 1
+
+        assert cli_boundary.report_broken_pipe() == cli_boundary.EXIT_STDOUT_FAILED
+        assert capsys.readouterr().err == '', 'the run had already spent the shared budget'
+
+    def test_the_manifest_detail_is_installed_on_the_shared_reporter(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """``main()`` installs the corpus's detail callback on the SHARED module.
+
+        The sentence stays with the caller that knows the artifact; the shared
+        reporter supplies only the parenthesised suffix. Driven through
+        ``main`` rather than ``_cli`` because ``main`` is where the install
+        must happen — it runs first, and it is the seam an in-process caller
+        drives.
+        """
+        import shared.cli_boundary as cli_boundary
+
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        assert out.exists(), 'premise: the run landed a manifest to name'
+
+        capsys.readouterr()
+        assert cli_boundary.report_broken_pipe() == cli_boundary.EXIT_STDOUT_FAILED
+        assert str(out) in capsys.readouterr().err
+
+    def test_a_later_run_that_wrote_nothing_clears_the_shared_detail(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """CONTROL, guarding the reset seam across the move to another module.
+
+        The cross-run staleness hazard ``test_a_run_that_wrote_nothing_does_
+        not_claim_a_manifest`` already guards must survive the state living in
+        ``shared.cli_boundary`` rather than here: a stale path reported as this
+        run's output is a worse lie than the bare exit code.
+        """
+        import shared.cli_boundary as cli_boundary
+
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        out.unlink()
+
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run')
+
+        capsys.readouterr()
+        assert cli_boundary.report_broken_pipe() == cli_boundary.EXIT_STDOUT_FAILED
+        assert str(out) not in capsys.readouterr().err
 
 
 class TestAStdoutFailureThatIsNotAClosedPipeIsAlsoReported:
@@ -3042,7 +3126,7 @@ class TestAStdoutFailureThatIsNotAClosedPipeIsAlsoReported:
         monkeypatch.setattr(
             sys,
             'stdout',
-            _StdoutWithAFailingFlush(OSError(errno.ENOSPC, 'No space left on device')),
+            StdoutWithAFailingFlush(OSError(errno.ENOSPC, 'No space left on device')),
         )
         capsys.readouterr()
         code, _ = _run_cli(
@@ -3079,10 +3163,19 @@ class TestAStdoutFailureThatIsNotAClosedPipeIsAlsoReported:
         site differ and nothing else.
         """
         out = tmp_path / 'corpus_manifest.json'
+        # min_length is MEASURED against THIS CLI, which is why the shared
+        # double leaves the threshold to its caller. On ``--n 20 --dry-run``
+        # build_corpus makes four stdout writes — 759, 0, 70 and 1 characters:
+        # the ``render_report`` body, then the ``dry-run: ...`` line and its
+        # newline. Any threshold between 71 and 759 fails exactly the report
+        # write; 200 sits comfortably clear of both edges. Too low and the
+        # double explodes on the first character, so the run never reaches the
+        # write under test; too high and nothing fails at all and the test goes
+        # green while asserting nothing.
         monkeypatch.setattr(
             sys,
             'stdout',
-            _StdoutWithAFailingWrite(
+            StdoutWithAFailingWrite(
                 OSError(errno.ENOSPC, 'No space left on device'), min_length=200
             ),
         )
@@ -3227,7 +3320,7 @@ class TestArgparseOutputIntoAClosedPipeExitsCleanlyToo:
       which discards it (``BrokenPipeError`` is an ``OSError``). ``_cli``'s
       flush then finds an empty buffer and the process exits **0** — a success
       status for a run whose output went nowhere. Closed by
-      ``_LoudArgumentParser``.
+      ``shared/src/shared/cli_boundary.py::LoudArgumentParser``.
 
     The controls matter as much as the assertion. ``--help`` must keep exiting
     0 and an unrecognized flag must keep exiting 2 — a fix that routed every
@@ -3329,10 +3422,11 @@ class TestArgparseOutputOntoAFullDiskExitsCleanlyToo:
 
     * BLOCK-buffered — the help text fits the buffer, ``parse_args`` raises
       nothing, and ``_cli``'s explicit flush finds the ENOSPC. Already handled
-      by ``_flush_stdout``'s widened ``except OSError``, so this id is a
-      CONTROL that must stay green.
+      by ``shared/src/shared/cli_boundary.py::_flush_stdout``'s widened
+      ``except OSError``, so this id is a CONTROL that must stay green.
     * UNBUFFERED — the write reaches ``/dev/full`` during ``parse_args``,
-      ``_LoudArgumentParser.print_help`` re-raises it, and it arrives at
+      ``shared/src/shared/cli_boundary.py::LoudArgumentParser``'s
+      ``print_help`` re-raises it, and it arrives at
       ``_cli`` as a plain ``OSError`` where only ``BrokenPipeError`` and
       ``SystemExit`` are being caught. This id is the RED: measured as a full
       argparse traceback with NO ``error: `` line, which falsifies both the
@@ -3486,10 +3580,17 @@ def test_live_dark_factory_population_smoke(monkeypatch):
         f'sample rather than a census'
     )
 
-    kinds = {_mod.payload_kind(r.source_description) for r in population}
+    classified = [
+        (r.source_description, _mod.payload_kind(r.source_description)) for r in population
+    ]
+    kinds = {kind for _, kind in classified}
+    unexpected_descriptions = sorted(
+        {description for description, kind in classified if kind not in LIVE_PAYLOAD_KINDS}
+    )
     assert kinds == LIVE_PAYLOAD_KINDS, (
-        f'the payload axis changed: {kinds ^ LIVE_PAYLOAD_KINDS} — re-measure the '
-        f'census before building the next corpus'
+        f'the payload axis changed: {kinds ^ LIVE_PAYLOAD_KINDS} '
+        f'(source_descriptions outside it: {unexpected_descriptions[:5]}) — '
+        f're-measure the census before building the next corpus'
     )
 
     months = {_mod.month_bucket(r.created_at) for r in population}

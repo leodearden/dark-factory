@@ -1,0 +1,33 @@
+[Unit]
+Description=Daily timer for the legibility trickle health probe (%i)
+
+[Timer]
+# THE NIGHTLY LADDER (OPERATIONS.md §12 carries the authoritative table):
+#   03:00  legibility-trickle@            -- the night's run
+#   03:30  fused-memory-flag-marker-sweep
+#   04:00  reclaim-orphaned-worktrees + legibility-transcript-check (double-booked)
+#   04:30  THIS PROBE
+#   05:00  memory-metadata-coverage-census
+#
+# WHY HEALTH MUST BE STRICTLY AFTER THE TRICKLE: this probe reads the state
+# file the night's run WRITES. Ordering it earlier would make it report on the
+# previous night forever -- stale by exactly one day, and never wrong in a way
+# that looks wrong. Pinned as a RELATION between the two timers, not as a
+# literal, by
+# scripts/tests/test_install_trickle_health_timer.py::test_health_probe_runs_strictly_after_the_nightly_trickle,
+# so a future re-cadence of the TRICKLE past this slot fails there.
+#
+# 04:30 was freed by task 5247 and is taken by this job as of task 4514.
+OnCalendar=*-*-* 04:30:00
+# Catches up a probe missed to a sleeping laptop instead of silently skipping
+# it. Safe to catch up out of order: the progress probe's freshness window is
+# max_age_hours=72, which leaves enough slack that a health catch-up firing
+# BEFORE the nightly's own catch-up reports staleness rather than a false
+# alarm. (Contrast legibility-trickle@.timer, where Persistent=true has a
+# sharper edge -- its one catch-up attempt CONSUMES the missed target_date.)
+Persistent=true
+# Keeps every project's instance of this timer from firing at the same instant.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

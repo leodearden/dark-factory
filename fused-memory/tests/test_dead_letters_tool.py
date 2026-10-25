@@ -16,7 +16,7 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
-from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.event_journal import EventJournal
 from fused_memory.reconciliation.event_queue import EventQueue
 from fused_memory.server.tools import (
     _DEAD_LETTER_PAYLOAD_MAX_BYTES,
@@ -107,6 +107,49 @@ class TestGetDeadLettersDurableQueue:
         )
 
     @pytest.mark.asyncio
+    async def test_durable_queue_items_forward_the_executed_fact(self):
+        """The replay decision's one fact must survive the MCP boundary.
+
+        ``get_dead_letters`` re-projects each ``get_dead_items`` row into a
+        fixed dict, so any key it does not list never leaves the process.
+        Dropping ``executed`` there reduces an operator back to string-matching
+        ``error`` prose — which for a durable_queue row never carries
+        POST_EXECUTE_DEAD_PREFIX at all, since the prefix is applied only to
+        the terminal-hook error that lands in ``write_ops.terminal_error``.
+
+        All three values must forward UNCHANGED, the unknown one especially:
+        ``None`` has to arrive as a present key whose value is None, not
+        absent and not False, or the operator reads "unknown" as "safe to
+        replay".
+        """
+        rows = [
+            {**_FAKE_DEAD_ITEMS[0], 'id': 21, 'executed': True},
+            {**_FAKE_DEAD_ITEMS[0], 'id': 22, 'executed': False},
+            {**_FAKE_DEAD_ITEMS[0], 'id': 23, 'executed': None},
+        ]
+        svc = _make_mock_service(get_dead_items_return=rows)
+        server = create_mcp_server(svc)
+
+        result = await server._tool_manager.call_tool(
+            'get_dead_letters',
+            {'project_id': 'proj1', 'limit': 50},
+        )
+
+        forwarded = {
+            item['id']: item
+            for item in result['items']
+            if item['source'] == 'durable_queue'
+        }
+        assert set(forwarded) == {21, 22, 23}
+        assert forwarded[21]['executed'] is True
+        assert forwarded[22]['executed'] is False
+        assert 'executed' in forwarded[23], (
+            'the unknown row must still carry the key — an absent key reads '
+            'the same as False to every caller that uses .get()'
+        )
+        assert forwarded[23]['executed'] is None
+
+    @pytest.mark.asyncio
     async def test_no_durable_queue_returns_empty(self):
         """When durable_queue is None, tool returns empty items without raising."""
         svc = AsyncMock()
@@ -141,6 +184,17 @@ def _make_failing_buf() -> AsyncMock:
     """A mock EventBuffer whose push raises non-retriable ValueError."""
     buf = AsyncMock()
     buf.push = AsyncMock(side_effect=ValueError('schema mismatch'))
+    return buf
+
+
+def _make_parked_buf(released: asyncio.Event) -> AsyncMock:
+    """A mock EventBuffer whose push parks until *released* is set — holds the drainer still."""
+
+    async def _park(_event):
+        await released.wait()
+
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=_park)
     return buf
 
 
@@ -801,15 +855,23 @@ class TestReplayEventDeadLettersTool:
     @pytest.mark.asyncio
     async def test_replays_dead_lettered_events_back_into_queue(self, tmp_path):
         """With dead-lettered recon events present, the tool returns
-        {'status':'replayed','replayed':N,'failed':0} and the events re-enter
-        the queue (drainer commits them to the buffer; file is cleared)."""
+        {'status':'replayed','replayed':3,'failed':0}, every replayed event is
+        durably back in the queue (journaled, observed with the drainer held
+        parked so the state is settled rather than raced), and the dead-letter
+        file no longer holds them.
+
+        Replayed events re-enter through the ordinary enqueue path, whose drainer
+        commit is covered by
+        fused-memory/tests/test_event_queue.py::test_drainer_marks_processed_on_commit.
+        """
         dl = tmp_path / 'dl.jsonl'
-        buf = EventBuffer(db_path=tmp_path / 'buf.db', buffer_size_threshold=100)
-        await buf.initialize()
+        ej = tmp_path / 'ej.db'
+        released = asyncio.Event()
+        buf = _make_parked_buf(released)
         eq = EventQueue(
             buf,
             dead_letter_path=dl,
-            journal_path=tmp_path / 'ej.db',
+            journal_path=ej,
             maxsize=100,
             retry_initial_seconds=0.01,
             retry_max_seconds=0.05,
@@ -818,10 +880,9 @@ class TestReplayEventDeadLettersTool:
         await eq.start()
         try:
             # Seed 3 dead-letter records for proj-a directly.
-            for _ in range(3):
-                eq._write_dead_letter(
-                    _make_recon_event('proj-a'), reason='non_retriable', attempts=1,
-                )
+            seeded = [_make_recon_event('proj-a') for _ in range(3)]
+            for event in seeded:
+                eq._write_dead_letter(event, reason='non_retriable', attempts=1)
             assert len(dl.read_text().strip().splitlines()) == 3
 
             svc = AsyncMock()
@@ -835,14 +896,20 @@ class TestReplayEventDeadLettersTool:
             assert result == {'status': 'replayed', 'replayed': 3, 'failed': 0}, (
                 f'Unexpected replay result: {result}'
             )
-            # Drainer commits the replayed events to the buffer.
-            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
-            assert (await buf.get_buffer_stats('proj-a'))['size'] == 3
+            reader = EventJournal(ej)
+            try:
+                journaled_ids = {e.id for e in reader.load_unprocessed()}
+            finally:
+                reader.close()
+            seeded_ids = {e.id for e in seeded}
+            assert journaled_ids == seeded_ids, (
+                f'journaled ids {journaled_ids} != replayed ids {seeded_ids}'
+            )
             # The dead-letter file no longer holds the replayed records.
             assert (dl.read_text().strip() if dl.exists() else '') == ''
         finally:
+            released.set()
             await eq.close()
-            await buf.close()
 
     @pytest.mark.asyncio
     async def test_replay_enqueue_stays_on_loop_thread(self, tmp_path):
@@ -857,8 +924,8 @@ class TestReplayEventDeadLettersTool:
         post-fix (enqueue marshalled onto the loop).
         """
         dl = tmp_path / 'dl.jsonl'
-        buf = EventBuffer(db_path=tmp_path / 'buf.db', buffer_size_threshold=100)
-        await buf.initialize()
+        released = asyncio.Event()
+        buf = _make_parked_buf(released)
         eq = EventQueue(
             buf,
             dead_letter_path=dl,
@@ -906,11 +973,9 @@ class TestReplayEventDeadLettersTool:
                 'put_nowait was invoked off the event-loop thread during replay: '
                 f'loop={loop_thread_id} put_threads={put_threads}'
             )
-            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
-            assert (await buf.get_buffer_stats('proj-a'))['size'] == 3
         finally:
+            released.set()
             await eq.close()
-            await buf.close()
 
     @pytest.mark.asyncio
     async def test_project_id_forwarded_to_event_queue(self, tmp_path):

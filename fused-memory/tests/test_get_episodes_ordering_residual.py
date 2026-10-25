@@ -56,7 +56,7 @@ class TestRetrieveEpisodesTieBreaker:
         async def _uuids_for(upstream_order: list[types.SimpleNamespace]) -> list[str]:
             with patch(
                 'fused_memory.backends.graphiti_client.EpisodicNode.get_by_group_ids',
-                AsyncMock(return_value=upstream_order),
+                AsyncMock(side_effect=[upstream_order, []]),
             ):
                 result = await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=3)
             return [ep.uuid for ep in result]
@@ -91,7 +91,7 @@ class TestRetrieveEpisodesNaiveDatetimeRobustness:
         ]
         with patch(
             'fused_memory.backends.graphiti_client.EpisodicNode.get_by_group_ids',
-            AsyncMock(return_value=episodes),
+            AsyncMock(side_effect=[episodes, []]),
         ):
             # Must not raise TypeError from comparing a naive datetime against
             # timezone-aware ones in the sort key.

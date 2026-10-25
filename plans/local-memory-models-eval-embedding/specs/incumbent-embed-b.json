@@ -1,0 +1,18 @@
+{
+  "arm_id": "incumbent-embed-b",
+  "arm_role": "control",
+  "axis": "embedding",
+  "code_sha": "8bb8c8893b0f58957753954ab0338d47f4b609b9",
+  "corpus_sha": "1eb3ed883afb5396fcba47a240e41f4b501d5b678789c48541325eb7c811b287",
+  "embedding_dim": 1536,
+  "model_id": "text-embedding-3-small",
+  "preregistration_sha": null,
+  "query_prefix": null,
+  "scratch_group_id": "evalmem_lme_emb_ctl_b",
+  "serving": {
+    "base_url": "https://api.openai.com/v1",
+    "quant": null,
+    "stack": "openai",
+    "unit_name": null
+  }
+}

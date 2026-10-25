@@ -39,7 +39,7 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.verify import VerifyResult
 
@@ -78,6 +78,17 @@ INTERNALERROR_RESULT = VerifyResult(
     summary='pytest_internalerror',
     cause_hint='INTERNALERROR> KeyError: <WorkerController gw3>',
     category='pytest_internalerror',
+)
+
+TIMEOUT_RESULT = VerifyResult(
+    passed=False,
+    test_output='',
+    lint_output='',
+    type_output='',
+    summary='Verification timed out',
+    timed_out=True,
+    category='infra_timeout',
+    cause_hint='Command timed out',
 )
 
 
@@ -424,6 +435,107 @@ class TestRunMainTipSweepRetryOnFlake:
             f'got {rfv.call_count}'
         )
 
+    def test_run_main_tip_sweep_logs_confirmed_deterministic_drift(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The deterministic-drift exit must SAY SO (2026-09-22 incident).
+
+        On that day this branch was the one actually taken and it logged
+        NOTHING: the last journal line was the first-pass WARNING, the retry
+        then ran for 5h16m, and from outside the process "detected and handed
+        to the harness" was indistinguishable from the outer ``except
+        Exception`` swallow, which also produces no line and returns the "no
+        signal" sentinel.
+        """
+        import logging
+
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(
+                verify_module, 'run_full_verification',
+                AsyncMock(side_effect=[FAILING_RESULT, FAILING_RESULT]),
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is not None and result[1].passed is False
+        confirmations = [
+            r for r in caplog.records
+            if 'REPRODUCED on retry' in r.getMessage()
+        ]
+        assert len(confirmations) == 1, (
+            f'expected exactly one deterministic-drift confirmation line, got '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+        msg = confirmations[0].getMessage()
+        assert MAIN_SHA[:12] in msg, f'line must name the swept SHA: {msg!r}'
+        assert confirmations[0].levelno >= logging.WARNING, (
+            'the confirmation must be at WARNING or above, or the journal '
+            'will not carry it'
+        )
+
+    def test_run_main_tip_sweep_swallowed_exception_is_loud(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The bare ``except Exception`` swallow must log at ERROR.
+
+        It collapses a possibly-real red-main signal into the None "no signal"
+        sentinel, so the harness files nothing and the drift is dropped on the
+        floor.  At DEBUG that was below the journal's effective level and
+        therefore completely invisible.  Control flow is unchanged: the
+        sentinel is still returned.
+        """
+        import logging
+
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify'),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(
+                verify_module, 'run_full_verification',
+                AsyncMock(side_effect=RuntimeError('boom')),
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is None, (
+            f'control flow must be unchanged — still the sentinel, got {result!r}'
+        )
+        swallows = [
+            r for r in caplog.records
+            if 'unexpected error during the main-tip sweep' in r.getMessage()
+        ]
+        assert len(swallows) == 1, (
+            f'expected exactly one swallow line, got '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+        assert swallows[0].levelno >= logging.ERROR, (
+            f'the swallow must be at ERROR or above (it was DEBUG, i.e. '
+            f'invisible in the journal); got {swallows[0].levelname}'
+        )
+        assert MAIN_SHA[:12] in swallows[0].getMessage(), (
+            'the swallow line must name the SHA whose signal was dropped'
+        )
+        assert swallows[0].exc_info is not None, (
+            'the swallow line must carry the traceback'
+        )
+
     def test_run_main_tip_sweep_passes_first_time_no_retry(
         self, tmp_path: Path
     ) -> None:
@@ -613,6 +725,91 @@ class TestRunMainTipSweepRoleStamp:
             "Expected the real run_full_verification to thread role='background' "
             f'down to run_verification; got kwargs={run_verification_calls[0]!r}'
         )
+
+
+class TestRunMainTipSweepNoTimeoutRetries:
+    """task 5812: host CPU is the throughput bottleneck, so neither sweep pass
+    re-runs on a timeout, and a timed-out first pass is not retried in full."""
+
+    def _sweep(self, tmp_path: Path, rfv: AsyncMock):
+        from orchestrator import verify as verify_module
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_full_verification', rfv),
+        ):
+            return asyncio.run(verify_module.run_main_tip_sweep(
+                _make_config(tmp_path), _make_git_ops(tmp_path),
+            ))
+
+    def test_both_sweep_passes_disable_timeout_retries(self, tmp_path: Path) -> None:
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+
+        self._sweep(tmp_path, rfv)
+
+        assert rfv.call_count == 2, 'expected first pass + full retry'
+        for call_index, one_call in enumerate(rfv.call_args_list):
+            assert one_call.kwargs.get('max_retries') == 0, (
+                f'call #{call_index} to run_full_verification must pass '
+                f'max_retries=0; got kwargs={one_call.kwargs!r}'
+            )
+
+    def test_max_retries_zero_reaches_run_verification_through_real_run_full_verification(
+        self, tmp_path: Path,
+    ) -> None:
+        """Only run_verification is faked, so the real run_full_verification
+        must carry the sweep's max_retries=0 the whole way down."""
+        from orchestrator import verify as verify_module
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        run_verification_calls: list = []
+
+        async def _fake_run_verification(project_root, cfg, module_config=None, **kwargs):
+            run_verification_calls.append(kwargs)
+            return PASSING_RESULT
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify_module, 'run_verification', side_effect=_fake_run_verification),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(
+                _make_config(tmp_path), _make_git_ops(tmp_path),
+            ))
+
+        assert result is not None
+        assert len(run_verification_calls) == 1
+        assert run_verification_calls[0]['max_retries'] == 0, run_verification_calls[0]
+
+    def test_first_pass_infra_timeout_returns_its_verdict_without_a_full_retry(
+        self, tmp_path: Path,
+    ) -> None:
+        rfv = AsyncMock(return_value=TIMEOUT_RESULT)
+
+        result = self._sweep(tmp_path, rfv)
+
+        assert result == (MAIN_SHA, TIMEOUT_RESULT)
+        assert rfv.call_count == 1, (
+            'a timed-out first pass must not pay for a second full-suite run; '
+            f'got {rfv.call_count} run_full_verification calls'
+        )
+
+    def test_non_timeout_first_pass_failure_still_pays_the_full_retry(
+        self, tmp_path: Path,
+    ) -> None:
+        """Control: only INFRA_TIMEOUT short-circuits the retry."""
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+
+        result = self._sweep(tmp_path, rfv)
+
+        assert rfv.call_count == 2
+        assert result is not None
+        _, vr = result
+        assert vr.passed is True
 
 
 # ---------------------------------------------------------------------------
@@ -1514,20 +1711,24 @@ class TestGroupNodeIdsBySubproject:
 
         return _discover_module_configs(root)
 
+    @staticmethod
+    def _group(root: Path, module_configs, node_ids: list[str], *, log_label: str = 'unit'):
+        from orchestrator import verify as verify_module
+
+        return verify_module._group_node_ids_by_subproject(
+            root, module_configs, node_ids, log_label=log_label,
+        )
+
     def test_subproject_relative_node_id_resolves_to_qualified_id(
         self, tmp_path: Path
     ) -> None:
         """(a) A bare subproject-relative node-id resolves to its owning
         prefix, and the returned id is PREFIX-QUALIFIED (worktree-root
         relative) so the scoped re-run command names a real path."""
-        from orchestrator import verify as verify_module
-
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
 
-        groups = verify_module._group_node_ids_by_subproject(
-            tmp_path, mcs, ['tests/test_a.py::test_a'], log_label='unit',
-        )
+        groups = self._group(tmp_path, mcs, ['tests/test_a.py::test_a'])
 
         assert groups == {'alpha': ['alpha/tests/test_a.py::test_a']}, groups
 
@@ -1536,14 +1737,10 @@ class TestGroupNodeIdsBySubproject:
     ) -> None:
         """(b) An ALREADY prefix-qualified node-id maps to that prefix and is
         returned verbatim (never double-prefixed)."""
-        from orchestrator import verify as verify_module
-
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
 
-        groups = verify_module._group_node_ids_by_subproject(
-            tmp_path, mcs, ['beta/tests/test_b.py::test_b'], log_label='unit',
-        )
+        groups = self._group(tmp_path, mcs, ['beta/tests/test_b.py::test_b'])
 
         assert groups == {'beta': ['beta/tests/test_b.py::test_b']}, groups
 
@@ -1552,12 +1749,10 @@ class TestGroupNodeIdsBySubproject:
     ) -> None:
         """(c) Node-ids owned by different subprojects land in separate
         groups, with input order preserved WITHIN each group."""
-        from orchestrator import verify as verify_module
-
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
 
-        groups = verify_module._group_node_ids_by_subproject(
+        groups = self._group(
             tmp_path,
             mcs,
             [
@@ -1565,7 +1760,6 @@ class TestGroupNodeIdsBySubproject:
                 'tests/test_b.py::test_two',
                 'tests/test_a.py::test_three',
             ],
-            log_label='unit',
         )
 
         assert groups == {
@@ -1580,16 +1774,13 @@ class TestGroupNodeIdsBySubproject:
         """(d) A node-id whose file exists under NO discovered subproject
         returns the None sentinel — the caller's fail-safe signal. One bad
         node-id poisons the whole batch (no partial guessing)."""
-        from orchestrator import verify as verify_module
-
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
 
-        groups = verify_module._group_node_ids_by_subproject(
+        groups = self._group(
             tmp_path,
             mcs,
             ['tests/test_a.py::test_a', 'tests/test_nonexistent.py::test_ghost'],
-            log_label='unit',
         )
 
         assert groups is None, f'Expected None for an unmapped node-id, got {groups!r}'
@@ -1606,7 +1797,7 @@ class TestGroupNodeIdsBySubproject:
         assert list(mcs) == ['alpha', 'beta'], f'fixture precondition: {list(mcs)}'
 
         with patch.object(verify_module, 'logger') as mock_logger:
-            groups = verify_module._group_node_ids_by_subproject(
+            groups = self._group(
                 tmp_path, mcs, [CONFIRM_AMBIGUOUS_NODE_ID], log_label='my-call-site',
             )
 
@@ -1628,16 +1819,63 @@ class TestGroupNodeIdsBySubproject:
         """(f) An empty node-id list is NOT the unmapped sentinel — it returns
         an empty dict, so callers distinguish "nothing to run" from
         "unmappable" via their own cheap early-out."""
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+
+        groups = self._group(tmp_path, mcs, [])
+
+        assert groups == {}, f'Expected {{}} for an empty node-id list, got {groups!r}'
+
+    def test_empty_prefix_config_is_not_a_universal_matcher(
+        self, tmp_path: Path
+    ) -> None:
+        """(g) A ModuleConfig keyed on prefix='' must not match every node-id
+        (pathlib drops the empty component) nor yield a '/'-leading qualified
+        id: it is skipped with a WARNING, real prefixes still map unambiguously,
+        and an id only the empty prefix could own is unmapped (None). The
+        WARNING names the caller's log_label and the stray config's
+        test_command, once per call."""
         from orchestrator import verify as verify_module
 
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
+        stray = ModuleConfig(prefix='', test_command='pytest stray-root')
+        expected_warning_args = [('unit', 'pytest stray-root')]
 
-        groups = verify_module._group_node_ids_by_subproject(
-            tmp_path, mcs, [], log_label='unit',
-        )
+        with patch.object(verify_module, 'logger') as mock_logger:
+            groups = self._group(
+                tmp_path, {'': stray, **mcs}, ['tests/test_a.py::test_a'],
+            )
+        assert groups == {'alpha': ['alpha/tests/test_a.py::test_a']}, groups
+        assert [
+            call.args[1:] for call in mock_logger.warning.call_args_list
+        ] == expected_warning_args, mock_logger.warning.call_args_list
 
-        assert groups == {}, f'Expected {{}} for an empty node-id list, got {groups!r}'
+        with patch.object(verify_module, 'logger') as mock_logger:
+            only_empty = self._group(
+                tmp_path, {'': stray}, ['tests/test_a.py::test_a'],
+            )
+        assert only_empty is None, only_empty
+        assert [
+            call.args[1:] for call in mock_logger.warning.call_args_list
+        ] == expected_warning_args, mock_logger.warning.call_args_list
+
+    def test_empty_prefix_config_does_not_warn_without_node_ids(
+        self, tmp_path: Path
+    ) -> None:
+        """(h) With nothing to map, the empty-prefix config is never consulted,
+        so it costs no WARNING and the result stays ``{}``."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+        stray = ModuleConfig(prefix='', test_command='pytest stray-root')
+
+        with patch.object(verify_module, 'logger') as mock_logger:
+            groups = self._group(tmp_path, {'': stray, **mcs}, [])
+
+        assert groups == {}, groups
+        mock_logger.warning.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

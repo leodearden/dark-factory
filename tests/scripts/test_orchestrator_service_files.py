@@ -25,15 +25,16 @@ That split was gated on a helper extraction this docstring previously called
 tests/scripts/systemd_unit_invariants.py, because the split leaves a consumer
 on both sides of each.  They are imported back below under their public names.
 
-Extraction state of the rest is unchanged.  CANONICAL_CONFIG_BASENAME,
-MalformedExecStart and the ``--config`` token scan live in
-systemd_unit_invariants.py (task 3773), a second consumer having hand-copied
-them (tests/scripts/test_know_live_installed_unit_parity.py) and drifted.
-``_exec_start_line`` did NOT move — it still has exactly one consumer, and
-this directory's lift trigger is a second consumer, not proximity.
+Extraction state of the rest.  CANONICAL_CONFIG_BASENAME, MalformedExecStart
+and the ``--config`` token scan live in systemd_unit_invariants.py (task
+3773), a second consumer having hand-copied them
+(tests/scripts/test_know_live_installed_unit_parity.py) and drifted.  So does
+``logical_exec_start``, which locates the effective ExecStart= command; this
+module's fixture-string section owns its negative cases.
 ``shell_statements`` had already moved to the sibling setup_host_parsing.py
-for the same reason; it is no longer imported here at all, having left with
-the installer suite that was its only consumer in this module.
+for the same second-consumer reason; it is no longer imported here at all,
+having left with the installer suite that was its only consumer in this
+module.
 
 tests/scripts/test_orchestrator_watchdog.py's ``_unit_sections`` was the
 third hand-copy of the section parse; task 3913 retired it, and that module
@@ -58,9 +59,10 @@ import pytest
 # ALL_ORCHESTRATOR_SERVICE_FILES joined them under task 3746, when the
 # installer and operator-doc suites moved to
 # tests/scripts/test_setup_host_unit_installation.py and left a consumer on
-# BOTH sides of them.  Importable by name only because
-# tests/scripts/conftest.py puts this directory on sys.path, which pytest's
-# --import-mode=importlib deliberately does not.
+# BOTH sides of them.  logical_exec_start joined them when this module's
+# ExecStart= locator and two sibling copies became one.  Importable by name
+# only because tests/scripts/conftest.py puts this directory on sys.path,
+# which pytest's --import-mode=importlib deliberately does not.
 # Imported UNALIASED: the sibling modules import these under exactly these
 # public names, and a private alias here would obscure that they are one
 # definition rather than several.
@@ -69,6 +71,7 @@ from systemd_unit_invariants import (
     CANONICAL_CONFIG_BASENAME,
     MalformedExecStart,
     config_arg_from_exec_start,
+    logical_exec_start,
     parse_sections,
 )
 
@@ -125,15 +128,18 @@ def test_dark_factory_orchestrator_service_structure() -> None:
         in content
     ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/dark-factory/dark-factory-orchestrator.yaml"
+        "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/dark-factory/dark-factory-orchestrator.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the df config, frozen"
-    # --frozen: process start must NEVER implicitly re-sync the shared
-    # dark-factory/.venv (the 2026-05-29 ghost-venv fix — a frozen start fails
-    # fast instead of bootstrapping/mutating the runtime interpreter).
-    assert "uv run --frozen" in content, (
-        "ExecStart must pass --frozen so unit start never re-syncs the shared venv"
-    )
+    ), "ExecStart must invoke the orchestrator with the df config, no-sync"
+    # --no-sync, and its position before the command token, are pinned by the
+    # contiguous substring above. CORRECTION (task 5553): this pinned --frozen
+    # from the 2026-05-29 ghost-venv fix until then, believing a frozen start
+    # could not bootstrap the runtime interpreter — measured false; --frozen is
+    # a lockfile option (scripts/orchestrator-autopilot-video.service holds the
+    # measurement). The INVARIANT now lives fleet-wide in
+    # tests/scripts/test_uv_run_venv_isolation.py, which checks both arms
+    # (--no-sync present, no lockfile flag) against every committed unit; what
+    # stays here is this unit's config path, which no sweep can know.
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
@@ -208,14 +214,11 @@ def test_reify_orchestrator_service_structure() -> None:
         in content
     ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/reify/dark-factory-orchestrator.yaml"
+        "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/reify/dark-factory-orchestrator.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the reify config, frozen"
-    # --frozen: see the df structure test — unit start must never re-sync the
-    # shared dark-factory/.venv that the reify orchestrator also runs under.
-    assert "uv run --frozen" in content, (
-        "ExecStart must pass --frozen so unit start never re-syncs the shared venv"
-    )
+    ), "ExecStart must invoke the orchestrator with the reify config, no-sync"
+    # --no-sync: see the df structure test above, and
+    # tests/scripts/test_uv_run_venv_isolation.py for the fleet-wide arm.
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
@@ -237,11 +240,20 @@ def test_reify_orchestrator_service_structure() -> None:
 
 def test_reify_and_df_differ_only_in_config_and_description() -> None:
     """The two orchestrator service files must be identical except Description,
-    --config path, and the reify-only warm-lane mount gate.
+    --config path, the reify-only warm-lane mount gate, and the df-only
+    pytest-xdist worker cap.
 
     This guards the 'same shape' invariant: any structural drift (missing key,
     different Restart policy, etc.) that appears in one but not the other will
     break this test.
+
+    The two carve-outs below are per-project blocks, not drift. Each is stripped
+    from the file that carries it before the line-for-line comparison, so the
+    invariant still catches genuine drift in everything else. Ruled 2026-09-08
+    (esc-5063-5, option b): a degree of divergence between the units is
+    inevitable, so a new project-specific block belongs here as a named
+    carve-out rather than being mirrored into the other unit to keep the
+    line counts equal.
     """
     df_lines = DF_SERVICE.read_text(encoding="utf-8").splitlines()
     reify_lines = REIFY_SERVICE.read_text(encoding="utf-8").splitlines()
@@ -262,6 +274,25 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
         # Drop the comment block, the directive itself, and the single
         # trailing blank line that separates it from the next block.
         del reify_lines[start_idx : end_idx + 2]
+
+    # orchestrator-dark-factory.service alone caps pytest-xdist's `-n auto` for
+    # env inheritors that are NOT verify legs (the offline lane and agent-shell
+    # pytest runs). It is df-only because df's dark-factory-orchestrator.yaml
+    # carries a `verify_env: PYTEST_XDIST_AUTO_NUM_WORKERS` entry that overlays
+    # this value last and so keeps verify legs at their own width; reify's
+    # config has no such entry, so mirroring the cap here would silently narrow
+    # reify's verify legs instead of only its offline lane. Stripped rather than
+    # mirrored, per the esc-5063-5 ruling above.
+    xdist_cap_block_start = (
+        "# Cap pytest-xdist `-n auto` for everything that inherits this unit's env and is"
+    )
+    xdist_cap_directive = "Environment=PYTEST_XDIST_AUTO_NUM_WORKERS=8"
+    if xdist_cap_block_start in df_lines:
+        start_idx = df_lines.index(xdist_cap_block_start)
+        end_idx = df_lines.index(xdist_cap_directive, start_idx)
+        # Drop the comment block, the directive itself, and the single
+        # trailing blank line that separates it from the next block.
+        del df_lines[start_idx : end_idx + 2]
 
     assert len(df_lines) == len(reify_lines), (
         f"Service files have different line counts: df={len(df_lines)} reify={len(reify_lines)}"
@@ -289,12 +320,26 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
     expected_df_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-dark-factory.service"
     expected_reify_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-reify.service"
 
+    # Each unit also Wants=/After= and (in [Install]) Also= its OWN
+    # `orchestrator-<project>.socket` (escalation socket activation), so every
+    # line naming that socket differs by project the same way the ORCH_UNIT
+    # line does. Checked by SUBSTITUTION rather than another allowed-fragment
+    # pair: those lines are not fixed strings (After= carries a
+    # space-separated list, the comment above Wants= is prose), so the only
+    # exact claim available is "this line becomes reify's line if you swap in
+    # reify's socket name" — which still fails on any OTHER difference on the
+    # same line.
+    df_socket = "orchestrator-dark-factory.socket"
+    reify_socket = "orchestrator-reify.socket"
+
     unexpected: list[tuple[int, str, str]] = []
     for lineno, dl, rl in diff_lines:
         if (
             dl.strip() == expected_df_orch_unit_line
             and rl.strip() == expected_reify_orch_unit_line
         ):
+            continue
+        if df_socket in dl and dl.replace(df_socket, reify_socket) == rl:
             continue
         df_ok = any(frag in dl for frag in allowed_df_fragments)
         reify_ok = any(frag in rl for frag in allowed_reify_fragments)
@@ -318,8 +363,9 @@ def test_autopilot_video_service_exists_and_structure() -> None:
 
     Until the 2026-05-29 venv-isolation fix this unit was live in
     ~/.config/systemd/user/ but had NO source template in scripts/ — so
-    setup-host.sh would never reinstall it and it could not pick up --frozen.
-    This test guards the now-tracked template going forward.
+    setup-host.sh would never reinstall it and it could not pick up a fleet-wide
+    ExecStart change at all. This test guards the now-tracked template going
+    forward.
     """
     assert AUTOPILOT_SERVICE.exists(), (
         "scripts/orchestrator-autopilot-video.service must exist as a tracked "
@@ -353,10 +399,9 @@ def test_autopilot_video_service_exists_and_structure() -> None:
         in content
     )
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/dark-factory-orchestrator.yaml"
+        "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/dark-factory-orchestrator.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the autopilot-video config, frozen"
-    assert "uv run --frozen" in content
+    ), "ExecStart must invoke the orchestrator with the autopilot-video config, no-sync"
     assert "Restart=on-failure" in content
     assert "StartLimitIntervalSec=600" in content
     assert "StartLimitBurst=10" in content
@@ -535,12 +580,13 @@ _EXPECTED_ORCHESTRATOR_SERVICE_BASENAMES = {
     "orchestrator-autopilot-video.service",
     "orchestrator-know-live.service",
     "orchestrator-pump-web-ui.service",
+    "orchestrator-stream-touch.service",
     "orchestrator-watchdog.service",
 }
 
 
 def test_orchestrator_service_glob_covers_all_known_units() -> None:
-    """Coverage guard: the glob must be non-empty and include all eight known units.
+    """Coverage guard: the glob must be non-empty and include all nine known units.
 
     A wrong CWD or other glob mishap would silently shrink the parametrized
     ORCH_UNIT lint below to zero cases — a zero-case parametrize collects no
@@ -583,88 +629,46 @@ def test_orchestrator_service_sets_own_orch_unit(
 # ---------------------------------------------------------------------------
 # Canonical orchestrator-config filename (task 3641; completes task 3512's sweep)
 #
-# CANONICAL_CONFIG_BASENAME, MalformedExecStart and the token scan itself are
-# imported from tests/scripts/systemd_unit_invariants.py, where the parse
-# contract is stated once (config_arg_from_exec_start). What stays here is the
-# FILE-CONTENT half: finding the effective ExecStart= line, which has exactly
-# one consumer and so did not meet this directory's lift trigger.
+# CANONICAL_CONFIG_BASENAME, MalformedExecStart, the token scan and the
+# FILE-CONTENT half — locating the effective ExecStart= command
+# (logical_exec_start) — are all imported from
+# tests/scripts/systemd_unit_invariants.py, where the parse contract is stated
+# once (config_arg_from_exec_start).
 # ---------------------------------------------------------------------------
-
-
-def _exec_start_line(content: str, unit_name: str = "<unit>") -> str:
-    """The unit's EFFECTIVE ExecStart= line, stripped.  Raises if it has none.
-
-    LAST occurrence wins, matching systemd itself and
-    systemd_unit_invariants.restart_directive — which is what the sibling
-    parity module feeds the shared scan from, so a first-match read here would
-    have the two layers disagreeing about the same unit.  A drop-in override
-    lands as an empty ``ExecStart=`` list RESET followed by the real command;
-    reading the reset line would find no ``--config`` token and answer None,
-    i.e. silently skip a unit whose real command may well be wrong — the exact
-    direction the shared parser's contract refuses (see
-    systemd_unit_invariants.config_arg_from_exec_start).  An effective
-    ExecStart= with no command after the ``=`` raises for that same reason
-    instead of degrading to that None.
-
-    Lines are stripped before matching because systemd permits leading
-    whitespace on a directive; the trailing ``=`` in the prefix is what keeps
-    ExecStartPre= out of the match.
-    """
-    exec_lines = [
-        stripped
-        for ln in content.splitlines()
-        if (stripped := ln.strip()).startswith("ExecStart=")
-    ]
-    if not exec_lines:
-        raise MalformedExecStart(
-            f"{unit_name} declares no ExecStart= line. Every orchestrator unit "
-            "must have one — systemd refuses to start a Type=simple service "
-            "without it. Treating this as 'takes no --config' would silently "
-            "skip the unit out of the canonical-config-filename guard below."
-        )
-    exec_line = exec_lines[-1]
-    if not exec_line.partition("=")[2].strip():
-        raise MalformedExecStart(
-            f"{unit_name}'s effective ExecStart= carries no command "
-            f"({exec_line!r}): the last assignment is a list RESET with nothing "
-            "appended after it, so systemd has no command to run at all. "
-            "Treating this as 'takes no --config' would silently skip a unit "
-            "that cannot start."
-        )
-    return exec_line
 
 
 def _exec_start_config_arg(content: str, unit_name: str = "<unit>") -> str | None:
     """Return the `--config` argument of the unit's ExecStart=, or None if absent.
 
-    This wrapper owns only the locating half — the effective ExecStart= line
-    inside unit FILE CONTENT (``_exec_start_line`` above).  When None comes
-    back and when MalformedExecStart is raised is the contract of
-    systemd_unit_invariants.config_arg_from_exec_start, stated there once.
+    Composes the two shared halves: logical_exec_start locates the effective
+    command inside unit FILE CONTENT, and config_arg_from_exec_start scans it.
+    When None comes back and when MalformedExecStart is raised is the latter's
+    contract, stated there once.
 
     The sibling parity module hands that same scan an already-extracted value
     instead (a ``restart_directive`` result, or a ``systemctl show`` ``argv[]``
-    segment); the scan is prefix-agnostic, so both shapes reach it without
-    either side normalising first.
+    segment); the scan is prefix-agnostic, so every shape reaches it without
+    normalising first.
     """
-    return config_arg_from_exec_start(_exec_start_line(content, unit_name), unit_name)
+    return config_arg_from_exec_start(logical_exec_start(content, unit_name), unit_name)
 
 
 # ---------------------------------------------------------------------------
 # Fixture-string coverage for the FILE-CONTENT half of the --config parse
 #
-# The token scan itself is shared (systemd_unit_invariants.config_arg_from_
-# exec_start) and its negative cases are owned ONCE, by the PARSER-layer
-# section of tests/scripts/test_know_live_installed_unit_parity.py — this
-# directory's one-owner convention — so they are deliberately NOT re-pinned
-# here.  What these fixtures own is the OTHER half: locating the effective
-# ExecStart= line inside unit FILE CONTENT (_exec_start_line), which had no
-# fixture-string coverage at all.  Its only exercise was the parametrized
-# sweep over real committed templates, every one of which is well-formed and
-# carries exactly one ExecStart=, so its raise branches, its
-# last-occurrence rule and the None branch reached through file content were
-# asserted nowhere.  One positive case is kept, to pin that file content
-# reaches the shared scan at all.
+# These fixtures are systemd_unit_invariants.logical_exec_start's
+# negative-case guard: locating the effective ExecStart= command inside unit
+# FILE CONTENT.  The committed orchestrator templates cannot stand in for it —
+# each is well-formed with exactly one single-line ExecStart=, so the raise
+# branches, the last-occurrence rule, the continuation join and the None
+# branch reached through file content would be asserted nowhere.
+#
+# The token scan's own negative cases (config_arg_from_exec_start) are owned
+# ONCE, by the PARSER-layer section of
+# tests/scripts/test_know_live_installed_unit_parity.py — this directory's
+# one-owner convention — so they are deliberately NOT re-pinned here.  One
+# positive case is kept, to pin that file content reaches the shared scan at
+# all.
 #
 # Inline fixtures rather than tmp_path files, matching how sibling guards in
 # this directory build unit text (cf. test_check_dashboard_unit_parity.py's
@@ -727,13 +731,12 @@ def test_exec_start_config_arg_answers_from_unit_content(exec_start: str, expect
         ),
     ],
 )
-def test_exec_start_line_raises_on_unit_with_no_usable_command(content: str) -> None:
+def test_unit_content_with_no_usable_exec_start_raises(content: str) -> None:
     """A unit with no usable ExecStart= FAILS, naming itself — it does not skip.
 
-    _exec_start_line's own negative cases, owned here because that helper
-    stayed local when the token scan was lifted (the scan's negative cases
-    stayed with THEIR owner, the parity module, and are not duplicated here).
-    Neither may be answered with None: the canonical-filename guard SKIPs on
+    logical_exec_start's own negative cases (the token scan's stay with THEIR
+    owner, the parity module, and are not duplicated here).  Neither may be
+    answered with None: the canonical-filename guard SKIPs on
     None, so a unit systemd could not even start would be waved straight
     through it.  Both must raise the SHARED MalformedExecStart that the
     parser's callers already catch, not a locally redefined look-alike.
@@ -773,8 +776,8 @@ def test_exec_start_config_arg_reads_the_last_execstart_assignment() -> None:
 def test_exec_start_config_arg_ignores_exec_start_pre() -> None:
     """ExecStartPre= must not be mistaken for ExecStart=, --config and all.
 
-    Pins the trailing-``=`` discrimination _exec_start_line's docstring calls
-    out.  A prefix match on "ExecStart" alone reads the FIRST ExecStartPre=
+    Pins systemd_unit_invariants.EXEC_START_PREFIX's trailing-``=``
+    discrimination.  A prefix match on "ExecStart" alone reads the FIRST ExecStartPre=
     line as the unit's command, so a pre-command that happens to carry its own
     --config (a config-rendering or validation step, exactly the shape a
     preparatory ExecStartPre= takes) silently answers for the real one — and
@@ -786,6 +789,41 @@ def test_exec_start_config_arg_ignores_exec_start_pre() -> None:
         "--config /home/leo/src/x/dark-factory-orchestrator.yaml",
     )
     assert _exec_start_config_arg(content, "fixture.service") == (
+        "/home/leo/src/x/dark-factory-orchestrator.yaml"
+    )
+
+
+_CONTINUED_ORCHESTRATOR_RUN = (
+    "ExecStart=/usr/bin/uv run --no-sync --project orchestrator \\",
+    "  orchestrator run \\",
+    "  --config /home/leo/src/x/dark-factory-orchestrator.yaml",
+)
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        pytest.param(_CONTINUED_ORCHESTRATOR_RUN, id="config-on-a-continuation-line"),
+        pytest.param(
+            (
+                "ExecStart = /usr/bin/uv run orchestrator run "
+                "--config /home/leo/src/x/dark-factory-orchestrator.yaml",
+            ),
+            id="whitespace-around-separator",
+        ),
+        pytest.param(
+            ("ExecStart=", *_CONTINUED_ORCHESTRATOR_RUN),
+            id="reset-then-continued-command",
+        ),
+    ],
+)
+def test_exec_start_config_arg_reads_the_logical_command(lines: tuple[str, ...]) -> None:
+    """The --config parse reads the whole LOGICAL command systemd runs.
+
+    These are the continuation-line variants the coverage guard below names,
+    plus the whitespace around ``=`` that systemd.syntax accepts.
+    """
+    assert _exec_start_config_arg(_unit_fixture(*lines), "fixture.service") == (
         "/home/leo/src/x/dark-factory-orchestrator.yaml"
     )
 
@@ -825,7 +863,7 @@ def test_exec_start_config_parser_answers_for_every_orchestrator_run_unit() -> N
         # A malformed ExecStart= raises out of here — deliberately, so it is a
         # hard failure of this guard rather than a skipped parametrized case.
         parsed[path.name] = _exec_start_config_arg(content, path.name)
-        if _ORCHESTRATOR_RUN_MARKER in _exec_start_line(content, path.name):
+        if _ORCHESTRATOR_RUN_MARKER in logical_exec_start(content, path.name):
             runs_orchestrator.add(path.name)
 
     assert runs_orchestrator, (

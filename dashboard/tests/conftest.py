@@ -132,7 +132,7 @@ def two_url_config(tmp_path):
     """Create a DashboardConfig with two test URLs (ports 9000, 9001).
 
     Port 9000 is used as the failing server in fallback tests; port 9001
-    responds successfully. Using ports distinct from the default (8002)
+    responds successfully. Using ports distinct from the suite-wide default
     makes the test intent explicit.
     """
     from dashboard.config import DashboardConfig
@@ -144,11 +144,29 @@ def two_url_config(tmp_path):
 
 
 @pytest.fixture()
-def client():
+def samplers_off(monkeypatch):
+    """Any app lifespan started later in this test runs without the two background samplers.
+
+    Request it from a test that builds its own ``TestClient(app)`` and asserts
+    on a patched MCP seam (task 5826).
+    """
+    monkeypatch.setenv('DASHBOARD_SAMPLERS', 'off')
+
+
+@pytest.fixture()
+def client(samplers_off):
     """Create a TestClient for the dashboard FastAPI app.
 
-    Its lifespan runs against the session-scoped ``_isolated_project_root``
-    temp dir, never the operator's live checkout (task 3503).
+    Its lifespan is isolated on BOTH axes by the session-scoped
+    ``_isolated_project_root`` fixture: the DB paths it opens resolve under a
+    pytest-owned temp dir rather than the operator's live checkout (task
+    3503), and its fused-memory fan-out dials a measured-dead loopback port
+    rather than the operator's live instance on 8002 (task 5185).  The second
+    half is not cosmetic: without it every lifespan here makes two real MCP
+    round trips, and one slow response wedges ``TestClient.__exit__``.
+
+    The samplers are off, because their discovery ``ps``-scans the real host
+    and their reads land on whatever MCP seam the test patched (task 5826).
     """
     from dashboard.app import app
 
@@ -157,7 +175,7 @@ def client():
 
 
 @pytest.fixture()
-def two_url_client(monkeypatch):
+def two_url_client(monkeypatch, samplers_off):
     """TestClient running the lifespan with a two-URL fused-memory config.
 
     Uses monkeypatch.setenv so DashboardConfig.from_env() inside the lifespan
@@ -167,6 +185,9 @@ def two_url_client(monkeypatch):
     Only the fused-memory URLs are overridden here; project_root still comes
     from the session-scoped ``_isolated_project_root`` temp dir, so this
     lifespan does not touch the operator's live checkout either (task 3503).
+
+    The samplers are off, because their discovery ``ps``-scans the real host
+    and their reads land on whatever MCP seam the test patched (task 5826).
     """
     from dashboard.app import app
 
@@ -399,11 +420,24 @@ async def empty_recon_conn(empty_reconciliation_db):
 # module-scoped TestClient like this one cannot request a function-scoped
 # monkeypatch.
 #
-# SHADOWING IS INTENDED.  A module that defines its own ``_client`` overrides
-# this one; that is not a leftover to be cleaned up.  test_fixture_isolation.py
-# in particular MUST keep its copy — there the module-scoped TestClient is the
-# SUBJECT UNDER TEST (its docstring: "only a *session*-scoped fix satisfies
-# both" scopes), so deleting it would delete the coverage.
+# SHADOWING IS INTENDED, BUT IT MUST SAY SO AT THE SITE.  A module that defines
+# its own ``_client`` overrides this one; that is not automatically a leftover to
+# be cleaned up.  test_fixture_isolation.py in particular MUST keep its copy —
+# there the module-scoped TestClient is the SUBJECT UNDER TEST (its docstring:
+# "only a *session*-scoped fix satisfies both" scopes), so deleting it would
+# delete the coverage.
+#
+# The MECHANISM that records such an exception is a
+# ``# noqa: module-local-testclient — <reason>`` pragma on the line above the
+# construction, enforced by
+# ``fused-memory/scripts/check_module_local_testclient.py`` (task 4485) from
+# dashboard's ``lint_command`` and ``hooks/project-checks``.  Without that pragma
+# the lint rejects the fixture and names conftest's shared ``_client`` as the
+# remedy — so this note and the gate cannot drift apart, which is exactly what
+# happened before: task 3571 deleted five copies, asserted in its own commit
+# message that conftest and test_fixture_isolation.py were the only survivors,
+# and left a byte-identical copy in test_tab_tasks_offline_banner.py that no
+# human reviewer or purpose-built guard caught.  Task 4485 burned that copy down.
 #
 # APPEND ONLY BELOW THE sys.path BLOCK.  Adding a top-level non-stdlib import
 # above it fails test_conftest_import_guard.py's AST ordering guard.
@@ -454,6 +488,11 @@ def charts_jsx_body(_client):
 @pytest.fixture(scope='module')
 def tab_analytics_jsx_body(_client):
     return _client.get('/static/redux/tab_escalation_analytics.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tab_overview_jsx_body(_client):
+    return _client.get('/static/redux/tab_overview.jsx').text
 
 
 @pytest.fixture(scope='module')

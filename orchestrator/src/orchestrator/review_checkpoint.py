@@ -2,18 +2,32 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AllAccountsCappedException,
+    classify_cap_kill,
+    invoke_with_cap_retry,
+)
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import DEEP_REVIEWER, submit_only_instructions
 from orchestrator.config import OrchestratorConfig
+from orchestrator.relocated_venv import retire_relocated_venvs
+from orchestrator.review_working_tree import (
+    Phase1WorkingTree,
+    attribute_phase1,
+    qualified_phase1_summary,
+    read_working_tree_state,
+    render_working_tree_section,
+)
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.verify import VerifyResult, run_full_verification
@@ -30,18 +44,82 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def render_reflection_instructions(*, project_id: str, review_id: str) -> str:
+    """Step 4 of the deep-review prompt: preserve the review's insights as memories.
+
+    Public because ``fused-memory/tests/test_referent_declaration_examples.py``
+    runs its ``add_memory`` example through the live entities_gate.
+    """
+    return f"""\
+4. **Reflect on your findings** — write separate memories for each insight worth preserving:
+   - **Patterns and surprises** — recurring issues, unexpected gaps, systemic weaknesses
+     (`category="observations_and_summaries"`)
+   - **Discovered conventions** — implicit rules you noticed in the code that aren't documented
+     (`category="preferences_and_norms"`)
+   - **Architectural insights** — structural observations about how modules interact, where
+     coupling is tight or loose, where the design is fragile
+     (`category="decisions_and_rationale"`)
+   - Use `add_memory(content=..., category=..., project_id="{project_id}", agent_id="claude-review-{review_id}")`,
+     adding `entities` to declare the task(s) the insight is about, for example:
+     `add_memory(content="Task 3127's retry loop swallows the timeout error", category="observations_and_summaries", project_id="{project_id}", agent_id="claude-review-{review_id}", entities=[{{'kind': 'task', 'id': 3127}}])`
+   - Declare only the referents the insight is about, and pass `[]` when none apply. Omitting
+     `entities` always succeeds; a declaration that your own content contradicts is rejected
+   - Write each insight as its own memory — don't batch into one blob
+   - Skip anything obvious from the code itself; focus on what a future agent couldn't easily rediscover"""
+
+
+NO_BRIEFING_NOTICE = (
+    'No review briefing is available for this project, so there are no declared '
+    '`known_gaps`, `conventions` or `stability_concerns`. Judge findings from the '
+    'code alone.'
+)
+
+
+class ReviewOutcome(StrEnum):
+    RAN = 'ran'
+    SKIPPED_CAPPED = 'skipped_capped'
+
+
+def _render_briefing_section(briefing: str | None) -> str:
+    if briefing is None:
+        return f"""\
+## Review Briefing
+
+{NO_BRIEFING_NOTICE}
+"""
+    return f"""\
+## Review Briefing
+
+The following is the project's review briefing — it describes purpose, key scenarios,
+conventions, known gaps, and stability concerns. Use it to contextualise your review.
+Respect `known_gaps` — do not flag intentionally deferred work. Enforce `conventions` —
+violations are always bugs. Pay special attention to `stability_concerns`.
+
+```yaml
+{briefing}
+```
+"""
+
+
 @dataclass
 class ReviewReport:
     review_id: str
     mode: str  # 'focused' or 'full'
     changed_modules: list[str]
     phase1: VerifyResult
+    outcome: ReviewOutcome
+    briefing_missing: bool
     findings_count: int = 0
     tasks_created: list[str] = field(default_factory=list)
     escalated_findings: int = 0
     cost_usd: float = 0.0
     duration_ms: int = 0
     parse_failed: bool = False
+    phase1_working_tree: Phase1WorkingTree | None = None
+
+    @property
+    def ran(self) -> bool:
+        return self.outcome is ReviewOutcome.RAN
 
 
 class ReviewCheckpoint:
@@ -75,9 +153,9 @@ class ReviewCheckpoint:
         self._reports: list[ReviewReport] = []
 
         # Full-review rate-limit state (run-forever idle path).  Kept SEPARATE
-        # from the focused counters above because run_focused() resets
-        # _last_review_at_merge on every focused checkpoint; the full-review
-        # ceiling must not be perturbed by focused cadence.
+        # from the focused counters above because run_focused() advances
+        # _last_review_at_merge on every focused checkpoint that ran; the
+        # full-review ceiling must not be perturbed by focused cadence.
         self._last_full_review_time: float | None = None
         self._last_full_review_at_merge: int = 0
 
@@ -104,9 +182,9 @@ class ReviewCheckpoint:
         """Run a focused review scoped to modules that merged since the last checkpoint."""
         modules = list(self._merged_modules)
         report = await self._run_review('focused', modules)
-        # Reset accumulators
-        self._last_review_at_merge = self._merge_count
-        self._merged_modules.clear()
+        if report.ran:
+            self._last_review_at_merge = self._merge_count
+            self._merged_modules.clear()
         self._reports.append(report)
         return report
 
@@ -137,11 +215,12 @@ class ReviewCheckpoint:
     async def run_full(self) -> ReviewReport:
         """Run a full review of the entire project."""
         report = await self._run_review('full', [])
-        self._last_review_at_merge = self._merge_count
-        # Record full-review trackers so should_run_full() re-closes the gate.
-        self._last_full_review_time = time.monotonic()
-        self._last_full_review_at_merge = self._merge_count
-        self._merged_modules.clear()
+        if report.ran:
+            self._last_review_at_merge = self._merge_count
+            # Record full-review trackers so should_run_full() re-closes the gate.
+            self._last_full_review_time = time.monotonic()
+            self._last_full_review_at_merge = self._merge_count
+            self._merged_modules.clear()
         self._reports.append(report)
         return report
 
@@ -162,16 +241,16 @@ class ReviewCheckpoint:
             review_id, mode, modules or 'all',
         )
 
-        # Phase 1: mechanical verification
-        logger.info('Review [%s]: Phase 1 — running full verification', review_id)
-        phase1 = await run_full_verification(self.config.project_root, self.config)
-        logger.info('Review [%s]: Phase 1 complete — %s', review_id, phase1.summary)
+        phase1, working_tree = await self._run_phase1(review_id)
 
-        # Load review briefing
         briefing_content = self._load_briefing()
+        briefing_missing = briefing_content is None
 
         # Phase 2+3: architectural coherence + triage (Opus agent)
-        prompt = self._build_prompt(mode, phase1, modules, briefing_content, review_id)
+        prompt = self._build_prompt(
+            mode, phase1, modules, briefing_content, review_id,
+            working_tree=working_tree,
+        )
 
         # Build MCP config for fused-memory + escalation access
         escalation_url = None
@@ -206,6 +285,7 @@ class ReviewCheckpoint:
             event_store=self.event_store,
             cost_store=self.cost_store,
         )
+        backend = getattr(self.config.backends, 'deep_reviewer', 'claude')
         try:
             result = await invoke_with_cap_retry(
                 usage_gate=self.usage_gate,
@@ -221,32 +301,34 @@ class ReviewCheckpoint:
                 disallowed_tools=DEEP_REVIEWER.disallowed_tools or None,
                 mcp_config=mcp_config,
                 effort=decision.effort,
-                backend=getattr(self.config.backends, 'deep_reviewer', 'claude'),
+                backend=backend,
             )
         except AllAccountsCappedException as e:
             # BD-1: the reason text is single-sourced from the SAME
             # classify_failure(e) table workflow.py/steward.py/
             # dry_run_unblock.py all consult for an AllAccountsCappedException
             # — review_checkpoint keeps its own distinct degraded control
-            # flow (skip review, reset accumulators) unchanged.
+            # flow: skip the review and leave the trigger armed, so the
+            # checkpoint re-fires at the next trigger point.
             disp = classify_failure(e)
             logger.warning(
-                'Review %s: skipped — %s (%d retries in %.1fs)',
+                'Review %s: skipped — %s (%d retries in %.1fs); trigger kept for '
+                'the next checkpoint',
                 review_id, disp.reason_prefix.lower(), e.retries, e.elapsed_secs,
             )
-            # Reset accumulators so next trigger doesn't immediately re-fire
-            self._last_review_at_merge = self._merge_count
-            self._merged_modules.clear()
             return ReviewReport(
                 review_id=review_id,
                 mode=mode,
                 changed_modules=modules,
                 phase1=phase1,
+                outcome=ReviewOutcome.SKIPPED_CAPPED,
+                briefing_missing=briefing_missing,
                 findings_count=0,
                 tasks_created=[],
                 escalated_findings=0,
                 cost_usd=0.0,
                 duration_ms=int((time.monotonic() - start) * 1000),
+                phase1_working_tree=working_tree,
             )
         completed_at = datetime.now(UTC).isoformat()
 
@@ -256,7 +338,13 @@ class ReviewCheckpoint:
             try:
                 # Report the RESOLVED model (task η) — diverges from raw
                 # config.models.deep_reviewer under a policy rule / override.
+                # `model` is that routing-resolved lineage alias; `model_id` is
+                # the exact version the CLI actually served (task 4826).
                 model_name = decision.model
+                capped_reason = classify_cap_kill(
+                    result, budget_usd=decision.budget_usd, max_turns=decision.max_turns,
+                    backend=backend,
+                )
                 await self.cost_store.save_invocation(
                     run_id=self.run_id,
                     task_id=None,
@@ -270,7 +358,9 @@ class ReviewCheckpoint:
                     cache_read_tokens=result.cache_read_tokens,
                     cache_create_tokens=result.cache_create_tokens,
                     duration_ms=elapsed_ms,
-                    capped=False,
+                    capped=capped_reason is not None,
+                    capped_reason=capped_reason,
+                    model_id=result.model_id,
                     started_at=started_at,
                     completed_at=completed_at,
                 )
@@ -314,12 +404,15 @@ class ReviewCheckpoint:
             mode=mode,
             changed_modules=modules,
             phase1=phase1,
+            outcome=ReviewOutcome.RAN,
+            briefing_missing=briefing_missing,
             findings_count=findings_count,
             tasks_created=tasks_created,
             escalated_findings=escalated,
             cost_usd=result.cost_usd,
             duration_ms=elapsed_ms,
             parse_failed=parse_failed,
+            phase1_working_tree=working_tree,
         )
 
         self._save_report(report, result.output)
@@ -332,6 +425,31 @@ class ReviewCheckpoint:
         )
 
         return report
+
+    async def _run_phase1(
+        self, review_id: str,
+    ) -> tuple[VerifyResult, Phase1WorkingTree | None]:
+        """Mechanical verification, plus the working-tree state it measured."""
+        logger.info('Review [%s]: Phase 1 — running full verification', review_id)
+        await asyncio.to_thread(
+            retire_relocated_venvs,
+            self.config.project_root, tuple(self.config.module_configs_or_empty),
+        )
+        state = await read_working_tree_state(self.config.project_root)
+        # A periodic project-wide review of the main checkout, not a task's verify: it queues as background.
+        phase1 = await run_full_verification(
+            self.config.project_root, self.config, role='background', event_store=self.event_store,
+        )
+        working_tree = None if state is None else await asyncio.to_thread(
+            attribute_phase1, phase1, state,
+            root=self.config.project_root,
+            run_dirs=tuple(self.config.module_configs_or_empty),
+        )
+        logger.info(
+            'Review [%s]: Phase 1 complete — %s',
+            review_id, qualified_phase1_summary(phase1, working_tree),
+        )
+        return phase1, working_tree
 
     def _promote_reviewer_escalations(self, review_id: str) -> int:
         """Promote pending L0 escalations from this review run to level 1.
@@ -383,36 +501,42 @@ class ReviewCheckpoint:
         )
         return promoted
 
-    def _load_briefing(self) -> str:
-        """Read the review briefing file, or return a warning if absent."""
+    def _load_briefing(self) -> str | None:
+        """The review briefing's text, or None when there is no usable briefing."""
         briefing_path = self.config.project_root / self.config.review.briefing_path
-        if not briefing_path.exists():
-            logger.warning(
-                'No review briefing at %s — review will rely on code inspection only',
-                briefing_path,
-            )
-            return (
-                'No review briefing found. Proceed with best-effort code inspection. '
-                'Focus on obvious integration issues, stubs, and cross-module consistency.'
-            )
         try:
-            return briefing_path.read_text()
+            content = briefing_path.read_text()
+        except FileNotFoundError:
+            reason = 'absent'
         except OSError as e:
-            logger.warning('Failed to read review briefing: %s', e)
-            return f'Failed to read review briefing: {e}'
+            reason = f'unreadable ({e})'
+        else:
+            if content.strip():
+                return content
+            reason = 'empty'
+        logger.warning(
+            'No usable review briefing at %s: %s — review will rely on code inspection only',
+            briefing_path, reason,
+        )
+        return None
 
     def _build_prompt(
         self,
         mode: str,
         phase1: VerifyResult,
         modules: list[str],
-        briefing_content: str,
+        briefing_content: str | None,
         review_id: str,
+        *,
+        working_tree: Phase1WorkingTree | None = None,
     ) -> str:
         """Assemble the user prompt for the deep review agent."""
         project_root = str(self.config.project_root)
         project_id = self.config.fused_memory.project_id
 
+        reflection_block = render_reflection_instructions(
+            project_id=project_id, review_id=review_id
+        )
         submit_resolve_block = submit_only_instructions(
             f'{{"source": "review-cycle", "review_id": "{review_id}", '
             f'"files": ["path/to/file-or-directory", ...], '
@@ -450,8 +574,9 @@ These tests/lint/typecheck results were run automatically. Use them as input —
 do NOT re-run these checks yourself.
 
 **Status:** {'PASSED' if phase1.passed else 'FAILED'}
-**Summary:** {phase1.summary}
+**Summary:** {qualified_phase1_summary(phase1, working_tree)}
 """
+        phase1_block += render_working_tree_section(phase1, working_tree)
         if not phase1.passed:
             if phase1.test_output:
                 phase1_block += f"""
@@ -486,17 +611,7 @@ do NOT re-run these checks yourself.
 
 {phase1_block}
 
-## Review Briefing
-
-The following is the project's review briefing — it describes purpose, key scenarios,
-conventions, known gaps, and stability concerns. Use it to contextualise your review.
-Respect `known_gaps` — do not flag intentionally deferred work. Enforce `conventions` —
-violations are always bugs. Pay special attention to `stability_concerns`.
-
-```yaml
-{briefing_content}
-```
-
+{_render_briefing_section(briefing_content)}
 ## Your Task
 
 1. **Search project memory** for recent decisions and known issues before starting:
@@ -510,17 +625,7 @@ violations are always bugs. Pay special attention to `stability_concerns`.
    - Ambiguous/architectural → `escalate_info(category=..., summary=...)`
    - Known/accepted → dismiss (don't report)
 
-4. **Reflect on your findings** — write separate memories for each insight worth preserving:
-   - **Patterns and surprises** — recurring issues, unexpected gaps, systemic weaknesses
-     (`category="observations_and_summaries"`)
-   - **Discovered conventions** — implicit rules you noticed in the code that aren't documented
-     (`category="preferences_and_norms"`)
-   - **Architectural insights** — structural observations about how modules interact, where
-     coupling is tight or loose, where the design is fragile
-     (`category="decisions_and_rationale"`)
-   - Use `add_memory(content=..., category=..., project_id="{project_id}", agent_id="claude-review-{review_id}")`
-   - Write each insight as its own memory — don't batch into one blob
-   - Skip anything obvious from the code itself; focus on what a future agent couldn't easily rediscover
+{reflection_block}
 
 5. **Output** structured JSON at the end of your response:
 
@@ -549,9 +654,13 @@ violations are always bugs. Pay special attention to `stability_concerns`.
         data = {
             'review_id': report.review_id,
             'mode': report.mode,
+            'outcome': report.outcome.value,
+            'briefing_missing': report.briefing_missing,
             'changed_modules': report.changed_modules,
             'phase1_passed': report.phase1.passed,
-            'phase1_summary': report.phase1.summary,
+            'phase1_summary': qualified_phase1_summary(
+                report.phase1, report.phase1_working_tree,
+            ),
             'findings_count': report.findings_count,
             'parse_failed': report.parse_failed,
             'tasks_created': report.tasks_created,
@@ -560,6 +669,8 @@ violations are always bugs. Pay special attention to `stability_concerns`.
             'duration_ms': report.duration_ms,
             'agent_output': agent_output[:10000],  # truncate for storage
         }
+        if report.phase1_working_tree is not None:
+            data['phase1_working_tree'] = report.phase1_working_tree.to_dict()
 
         path = reports_dir / f'review-{report.review_id}.json'
         path.write_text(json.dumps(data, indent=2))

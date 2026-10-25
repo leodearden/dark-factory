@@ -4,7 +4,9 @@ import fnmatch
 import hashlib
 import importlib.resources
 import logging
+import math
 import os
+import posixpath
 import re
 import stat
 from dataclasses import dataclass
@@ -27,7 +29,15 @@ from pydantic_settings import (
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+from shared.project_id import project_id_for_root
+from shared.project_layout import (
+    ESCALATION_QUEUE_RELPATH,
+    park_eviction_requests_db,
+    scheduler_overrides_db,
+)
 from shared.task_metadata import KNOWN_ROLE_NAMES
+
+from orchestrator.agents.review_briefing import ReviewBriefing
 
 # Strictly one-way (config -> config_census_ignore): the census-ignore grammar
 # and audit are kept OUT of this already-oversized module, and that module
@@ -40,8 +50,21 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     parse_census_ignore_entries,
 )
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
+from orchestrator.verify_admission_gate import AdmissionOrder
 
 logger = logging.getLogger(__name__)
+
+
+# --- Merge-verify host selection policy (Lever C) ---
+#
+# Defined ONCE here and imported by verify_runner.py, so the config field and
+# HostAllocator.acquire's parameter share one vocabulary: acquire's match ends
+# in assert_never, so a future third policy added here is a pyright error until
+# the allocator handles it, and pyright rejects a typo'd policy string at every
+# call site.  The import direction is
+# one-way (verify_runner -> config); config.py imports nothing from
+# verify_runner.py, so there is no cycle.
+VerifyHostPolicy = Literal['prefer_local', 'prefer_remote']
 
 
 # --- Priority-tier constants (value/h scheduler) ---
@@ -67,6 +90,17 @@ TIER_BASE: dict[str, int] = {
     'low': 2000,
     'polish': 1000,
 }
+
+# Defaults of ScoringConfig's sub-budgets (plans/scheduler-dispatch-scoring-and-
+# lock-layer-prd.md C2).  Each bonus term is bounded by its own budget, and the
+# budgets together stay inside one TIER_WIDTH (I-1), so no term masks another.
+CPM_BUDGET: float = 300.0
+CPM_D_CAP: int = 32
+AGE_BUDGET: float = 500.0
+AGE_HALF_SECS: float = 259200.0
+CONTINUITY_CREDIT: float = 120.0
+CONTINUITY_PROBE_TTL_SECS: float = 300.0
+CONTINUITY_CREDIT_MAX_AGE_SECS: float = 604800.0
 
 # Per-process warn-once dedup for coerce_tier()'s unrecognized-value WARNING
 # below, keyed by a length-capped repr(value) (safe for unhashable/non-str
@@ -496,6 +530,10 @@ class ReviewConfig(BaseModel):
     # --until-idle post-loop review stays unconditional.
     full_review_min_interval_secs: float = Field(default=86400.0)
     full_review_min_tasks: int = Field(default=20)
+    # Which reviewer generation a task's review dispatches (task 5369): the
+    # incumbent diff-only briefing, or the context-complete 'd2' one. Read
+    # fresh at each review, so a reload flips it — or kills it — live.
+    reviewer_briefing: ReviewBriefing = Field(default=ReviewBriefing.DIFF_ONLY)
 
 
 _DEFAULT_SKIP_THRESHOLD: dict[str, int] = {
@@ -567,6 +605,105 @@ class FairnessConfig(BaseModel):
                 )
             )
         return int(self.skip_threshold)
+
+
+class ScoringConfig(BaseModel):
+    """Dispatch-score sub-budgets (task 3819; plans/scheduler-dispatch-scoring-and-lock-layer-prd.md C2).
+
+    A candidate scores ``TIER_BASE[tier]`` plus three bonus terms, each capped
+    by its own budget, so a saturated term can never mask the others:
+    critical-path weight (``cpm_budget``), pending age (``age_budget``) and
+    work-product continuity (``continuity_credit``).  The scheduler arms this
+    formula only on ticks where at least ``new_scoring_min_anchor_coverage``
+    of the candidates carry a usable ``pending_since`` anchor (PRD I-6); the
+    two ``continuity_*`` probe leaves pace and age out work-product detection
+    (PRD C3).
+
+    Plain BaseModel (no ``validate_assignment``) so ``_set_leaf`` can write a
+    multi-leaf retune one leaf at a time — see :class:`MergeDeepConfig`.  The
+    cross-leaf invariants still bind a reload: ``apply_reload`` re-validates
+    the whole config afterwards and rolls back on failure.  Every leaf is
+    green-tier (PRD D8).
+    """
+
+    cpm_budget: float = Field(
+        default=CPM_BUDGET,
+        gt=0,
+        description='Ceiling of the critical-path term, reached at cpm_d_cap transitive dependents (PRD C2).',
+    )
+    cpm_d_cap: int = Field(
+        default=CPM_D_CAP,
+        ge=1,
+        description='Transitive-dependent count at which the critical-path term saturates (PRD C2).',
+    )
+    age_budget: float = Field(
+        default=AGE_BUDGET,
+        gt=0,
+        description='Ceiling the pending-age term approaches as a task waits (PRD C2).',
+    )
+    age_half_secs: float = Field(
+        default=AGE_HALF_SECS,
+        gt=0,
+        description='Seconds pending at which the age term reaches half of age_budget (PRD C2).',
+    )
+    continuity_credit: float = Field(
+        default=CONTINUITY_CREDIT,
+        ge=0,
+        description='Flat credit for a task that already carries work product (PRD C2).',
+    )
+    continuity_probe_ttl_secs: float = Field(
+        default=CONTINUITY_PROBE_TTL_SECS,
+        ge=60.0,
+        description=(
+            'Seconds between refreshes of the one git for-each-ref probe that detects '
+            'task-branch work product; the floor bounds git subprocess occupancy '
+            'whatever the tuning (PRD C3).'
+        ),
+    )
+    continuity_credit_max_age_secs: float = Field(
+        default=CONTINUITY_CREDIT_MAX_AGE_SECS,
+        gt=0,
+        description=(
+            "Seconds after a task branch's newest commit at which its continuity "
+            'credit lapses, so stale work product stops paying rent (PRD C3).'
+        ),
+    )
+    new_scoring_min_anchor_coverage: float = Field(
+        default=0.90,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Share of a tick\'s candidates that must carry a usable pending_since '
+            'anchor for that tick to score on the sub-budget formula; below it the '
+            'whole tick falls back to the legacy formula (PRD D12, I-6).'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def _reject_budget_sum_crossing_tier(self) -> 'ScoringConfig':
+        total = self.cpm_budget + self.age_budget + self.continuity_credit
+        if total > TIER_WIDTH - 1:
+            raise ValueError(
+                'ScoringConfig.cpm_budget + age_budget + continuity_credit '
+                f'({self.cpm_budget} + {self.age_budget} + {self.continuity_credit} '
+                f'= {total}) must be <= TIER_WIDTH - 1 ({TIER_WIDTH - 1}); a larger '
+                'sum lets a bonus lift a task across a priority-tier boundary. '
+                'Lower one of the three budgets.'
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _reject_continuity_above_cpm_d4(self) -> 'ScoringConfig':
+        cpm_at_d4 = self.cpm_budget * math.log1p(4) / math.log1p(self.cpm_d_cap)
+        if self.continuity_credit >= cpm_at_d4:
+            raise ValueError(
+                f'ScoringConfig.continuity_credit ({self.continuity_credit}) must be '
+                f'< the critical-path term at four dependents ({cpm_at_d4:.4f}, from '
+                f'cpm_budget={self.cpm_budget} and cpm_d_cap={self.cpm_d_cap}); '
+                'otherwise resuming a half-done task outranks unblocking four others. '
+                'Lower continuity_credit, or raise cpm_budget.'
+            )
+        return self
 
 
 class StarvationWatchdogConfig(BaseModel):
@@ -715,16 +852,17 @@ class WarmBaseHardDownConfig(BaseModel):
 
 class PsiAdmissionConfig(BaseModel):
     """L3b dispatch-admission load-cap gate configuration (task 2327, PRD
-    docs/prds/dispatch-admission-load-cap.md, task DA2).
+    docs/prds/dispatch-admission-load-cap.md, task DA2; v2 task 3590).
 
     The dispatch-admission gate (DA3) reads these thresholds live each tick
-    to decide whether the host is saturated enough to hold new dispatch.
-    Memory ranks above io (DA-D1): ``mem_some_avg10`` is deliberately
-    TIGHTER than ``io_some_avg10``, and ``mem_full_avg10`` is a separate
-    memory `full` hard-trip. ``min_inflight_floor`` (DA-D3) is an
-    anti-deadlock floor — the gate must never hold when fewer than this many
-    tasks are in flight on this orchestrator, so a value < 1 (which could
-    wedge the queue with nothing running) is rejected at load.
+    to decide whether the host is saturated enough to hold new HEAVY
+    dispatch. Each threshold is one saturation arm of
+    ``shared.psi.PsiSample`` and ``None`` switches that arm off. The field
+    set, code defaults and ranges are owned by PRD
+    plans/load-throttle-harmonisation-prd.md §6.2. Out-of-range values are
+    rejected because ``enabled: false`` and ``None`` are the sanctioned ways
+    to switch the gate or an arm off: a negative threshold would silently
+    disable an arm and one over 100 would pin it.
 
     All fields are green-tier hot-tunable via RELOADABLE_FIELDS — an
     operator may adjust thresholds post-observation via
@@ -737,24 +875,58 @@ class PsiAdmissionConfig(BaseModel):
         default=True,
         description='Set to false to disable the dispatch-admission gate entirely.',
     )
-    cpu_some_avg10: float = Field(
-        default=85.0,
-        description='PSI cpu "some" avg10 (%) threshold — primary CPU saturation signal.',
-    )
-    mem_some_avg10: float = Field(
-        default=15.0,
+    cpu_some_avg10: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
         description=(
-            'PSI memory "some" avg10 (%) threshold. Deliberately tighter than '
-            'io_some_avg10 — memory ranks above io per DA-D1.'
+            'PSI cpu "some" avg10 (%) threshold — the legacy CPU arm, off by '
+            'default because runqueue_ratio is the host CPU arm (PRD '
+            'load-throttle-harmonisation D1). None = arm off.'
         ),
     )
-    mem_full_avg10: float = Field(
-        default=3.0,
-        description='PSI memory "full" avg10 (%) threshold — memory hard-trip.',
+    mem_some_avg10: float | None = Field(
+        default=15.0,
+        ge=0,
+        le=100,
+        description=(
+            'PSI memory "some" avg10 (%) threshold. Deliberately tighter than '
+            'io_some_avg10 — memory ranks above io per DA-D1. None = arm off.'
+        ),
     )
-    io_some_avg10: float = Field(
+    mem_full_avg10: float | None = Field(
+        default=3.0,
+        ge=0,
+        le=100,
+        description='PSI memory "full" avg10 (%) threshold — memory hard-trip. None = arm off.',
+    )
+    io_some_avg10: float | None = Field(
         default=40.0,
-        description='PSI io "some" avg10 (%) threshold — looser than mem_some_avg10.',
+        ge=0,
+        le=100,
+        description=(
+            'PSI io "some" avg10 (%) threshold — looser than mem_some_avg10. '
+            'None = arm off.'
+        ),
+    )
+    runqueue_ratio: float | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            'Host CPU arm (PRD load-throttle-harmonisation D1): procs_running '
+            'from /proc/stat divided by len(os.sched_getaffinity(0)). Any value '
+            'is provisional until calibrated (D9). None = arm off.'
+        ),
+    )
+    own_cpu_some_avg10: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description=(
+            'cpu "some" avg10 (%) of the orchestrator\'s own cgroup — its '
+            'df-<project_id>.slice when present, else its own unit (PRD '
+            'load-throttle-harmonisation D2). None = arm off.'
+        ),
     )
     min_inflight_floor: int = Field(
         default=1,
@@ -853,6 +1025,17 @@ class SessionResumeConfig(BaseModel):
     ``enabled=false`` is the kill switch: no ``--resume`` is ever injected
     (B6), and no ``session_resume_*`` event or streak is produced.
 
+    Since task 3730 (PRD leaf δ) reachability OUTRANKS freshness: a durable
+    transcript archive corroborates a session on its own, so
+    ``freshness_window_secs`` is consulted only when NO archive exists, and
+    ``absolute_resume_age_secs`` is the unconditional backstop that stops that
+    from meaning "no age limit at all". A session past the backstop reports
+    ``aged_out`` — a distinct, by-design reason from ``stale``, because the two
+    are actioned differently: ``stale`` means "old, with no archive to redeem
+    it" (worth asking why the archive is missing) while ``aged_out`` means "old
+    past the point where resuming is safe regardless of reachability" (the
+    backstop working as designed).
+
     ``restore_from_archive=false`` is the NARROWER kill switch (task 3578):
     the ``_invoke`` arm site stops rehydrating a missing transcript from the
     durable archive, but eligibility, corroboration and every
@@ -886,7 +1069,16 @@ class SessionResumeConfig(BaseModel):
             'harness guard. With this false, an ineligible resume still '
             'degrades to fresh dispatch and still emits its event, so an '
             'operator can disable restoration without going blind on the '
-            'population it was meant to fix. '
+            'population it was meant to fix — the fallbacks carrying '
+            'archive_available=true, which this switch deliberately does NOT '
+            'suppress. '
+            'Since task 3730 (δ) it also withholds the archive from the '
+            'ELIGIBILITY predicate, so pulling it reverts δ in full: an '
+            'archive-only-reachable session falls back with its pre-δ reasons '
+            'instead of being armed for a resume the arm site would then '
+            'refuse to rehydrate — which would have moved that whole '
+            'population from session_resume_fallback to session_resume and '
+            'made D8\'s ratio read 100% resumed while 0% resumed. '
             'Deliberately does NOT consult transcript_archive.enabled, reusing '
             "Harness._archive_available's recorded argument: with archival off "
             'there is simply nothing on disk to find, and gating on the flag '
@@ -905,9 +1097,48 @@ class SessionResumeConfig(BaseModel):
             'its data.reasons list — alongside any OTHER reason the same '
             'session failed, since the reasons are reported as a set rather '
             'than a first match (task 3728). '
-            'Must be >= 1. Default 86400 (1 day) sits at/above the invocation '
+            'Must be >= 1, and STRICTLY BELOW absolute_resume_age_secs '
+            '(enforced by a model_validator, so an inverted pair fails at load '
+            'and a hot reload that would invert it is rolled back). '
+            'Default 86400 (1 day) sits at/above the invocation '
             'absolute cap plus slack, so a sidecar is rejected only once it '
             'clearly outlives any legitimate in-flight invocation.'
+        ),
+    )
+    absolute_resume_age_secs: int = Field(
+        default=432000,
+        ge=1,
+        description=(
+            'ABSOLUTE outer bound on a recovered sidecar\'s age: past this many '
+            'seconds a session is never resumed, and the fallback event carries '
+            '"aged_out" in its data.reasons (task 3730 / PRD leaf δ, D3). '
+            'DISTINCT FROM freshness_window_secs, and the pair is what keeps '
+            '"a durable archive outranks age" from becoming "no age limit at '
+            'all": freshness applies ONLY when no durable archive exists (D2 — '
+            'an archive does not decay with wall-clock, so age is the wrong '
+            'question for a session that is still reachable), while this '
+            'backstop applies UNCONDITIONALLY, archive or not. It must '
+            'therefore sit STRICTLY ABOVE freshness_window_secs — at or below '
+            'it, the backstop fires first on the no-archive path too and '
+            'freshness becomes unreachable config — which a model_validator '
+            'enforces rather than leaving to the shipped defaults. '
+            'A DERIVED bound, not a chosen number. Two MEASURED terms: the '
+            'longest legitimate in-flight invocation, plus the longest '
+            'observed orchestrator downtime — a sidecar\'s started_at is '
+            'stamped per invocation, so its age when the guard evaluates it is '
+            'in-flight-time-at-crash PLUS however long the orchestrator was '
+            'down before re-dispatching, and the sidecar accrues that age while '
+            'nothing runs. The derivation, the safety factor and its '
+            'measurement provenance live in '
+            'orchestrator/resume_age_bound.py::RESUME_AGE_SAFETY_FACTOR; '
+            'orchestrator/tests/test_resume_age_bound.py re-derives it against '
+            'the live runs.db every run and goes red when the fleet outgrows '
+            'it, so this default tracks measured behaviour rather than sitting '
+            'still. Default 432000 (5 days) is the 2026-09-07 requirement '
+            '(355,803s = 4.12 days) rounded up to the next whole day. Must be '
+            '>= 1: a zero or negative bound would reject every recovered '
+            'session and silently disable the feature through a knob that '
+            'reads as a tuning dial.'
         ),
     )
     max_resumes_per_task: int = Field(
@@ -925,54 +1156,103 @@ class SessionResumeConfig(BaseModel):
         default=5,
         ge=1,
         description=(
-            'Consecutive UNEXPLAINED session_resume_fallback degradations '
-            'before one L1 escalation is filed (INV-4 storm escape). Only a '
-            'reason OUTSIDE harness.py::_BY_DESIGN_SESSION_RESUME_REASONS '
-            'counts: every by-design outcome — the per-task cap, a lane '
-            'reseed, an out-of-window sidecar, an uncorroborable transcript — '
-            'is excluded by construction, so reaching this threshold means a '
-            'genuinely unexplained failure mode fired repeatedly. A reason '
-            'is genuine BY DEFAULT: a new one feeds this streak unless it is '
-            'added to that constant. The run is chained within '
-            'storm_window_secs (and reset to 0 on any eligible resume) rather '
-            'than accumulating unbounded per boot. Must be >= 1. Default 5 is '
-            'above both the resume cap and ordinary collision noise, so only '
-            'systematic breakage trips it. '
-            'NOT CURRENTLY REACHABLE, by design and only for now: with '
-            "today's reason vocabulary EVERY producible reason is by-design, "
-            'so the streak has no feeder and this threshold cannot fire at '
-            'any value. Tuning it changes nothing until PRD leaf epsilon '
-            '(task 3733) installs the first genuine feeder '
-            '(archive-restore failure); the mechanism is retained unfed so '
-            'that lands on a tested path. Until then, watch the '
-            'session_resume_fallback event rate directly.'
+            'Consecutive ELIGIBLE-BUT-FAILED resumes before one L1 '
+            'escalation is filed (INV-4 storm escape). The feeder (task '
+            '3733) is every armed resume that did not survive: an archive '
+            'restore that faulted, and every CLI rejection of a resume we '
+            'armed. Only outcomes OUTSIDE the two by-design carve-outs count '
+            "— harness.py::_BY_DESIGN_SESSION_RESUME_REASONS for the "
+            'pre-dispatch eligibility predicate and '
+            'harness.py::_BY_DESIGN_RESTORE_OUTCOMES for the archive restore '
+            "('disabled', the kill switch, and 'miss', the archive-coverage "
+            'signal, which belongs on a rate watch rather than a '
+            'consecutive-run detector). A new value in either vocabulary is '
+            'GENUINE BY DEFAULT and feeds this streak unless it is added to '
+            'the constant. The run is chained within storm_window_secs (and '
+            'reset to 0 on any resume that survives) rather than accumulating '
+            'unbounded per boot. Must be >= 1. '
+            'Default 5 STAYS where task 2774 put it, and the re-derivation '
+            'behind the window (see storm_window_secs) is why: the WINDOW, '
+            'not the threshold, was the binding constraint — at the old 3600s '
+            'nothing chained at ANY threshold. 5 sits two above the measured '
+            "null's longest run of 3 inside the shipped 24h window, and "
+            'reset-on-success rather than the clock is what suppresses false '
+            'alarms. '
+            'ALSO EXCLUDED: the recovered-config-dir ambiguity L1 '
+            '(session_config_dir_ambiguous) does NOT feed this streak — it is '
+            'deduped one-open-at-a-time rather than thresholded, so this knob '
+            'has no effect on it and an ambiguity L1 alone is not evidence of '
+            'a resume storm; see event_store.py::EventType.'
+            'session_config_dir_ambiguous.'
         ),
     )
     storm_window_secs: int = Field(
-        default=3600,
+        default=86400,
         ge=1,
         description=(
-            'Maximum gap, in seconds, between two consecutive unexplained '
-            'session-resume fallbacks for them to count as the same storm '
-            'run; a larger gap decays the streak to 0 before the next '
-            'fallback is counted. Without this the streak is cumulative '
-            'rather than consecutive, so a slow drip of isolated failures '
-            'accumulates into a false storm. Must be >= 1. Default 3600 is '
-            'read off the measured signature: real bursts land ~17 fallbacks '
-            'inside one hour, while quiet gaps between isolated failures run '
-            '~7h and ~39h — so a 1h chain window separates burst from drip '
-            'with a wide margin on both sides. Measured on the monotonic '
-            'clock, deliberately: the stale reason is itself PRODUCED by '
-            'clock skew, so a wall-clock decay would be corrupted by the very '
-            'failure mode it must detect. '
-            'Its ESCALATION-driving role is inert for the same reason '
-            'fallback_storm_threshold is (see above) — nothing feeds the '
-            'streak until task 3733 — but the window is still LIVE as the '
-            'expiry clock: it is evaluated on every dispatch carrying a '
-            'recovered session, so shortening it still changes when a run '
-            'is considered over.'
+            'Maximum gap, in seconds, between two consecutive '
+            'eligible-but-FAILED resumes for them to count as the same storm '
+            'run; a larger gap retires the run before the next failure is '
+            'counted. Without this the streak is cumulative rather than '
+            'consecutive, so a slow drip of isolated failures accumulates '
+            'into a false storm. Must be >= 1. Measured on the MONOTONIC '
+            'clock, deliberately: clock skew is one of the failure modes this '
+            'seam must survive, so a wall-clock decay could be corrupted by '
+            'the very thing it detects. '
+            'A DERIVED bound, not a chosen number (task 3733). The previous '
+            '3600s was read off the session_resume_fallback burst signature '
+            '("~17 fallbacks inside one hour") — a population task 3728 '
+            'entirely carved out of the streak, leaving the number a stale '
+            'inheritance describing a feeder that no longer exists, and one '
+            'so narrow the escape could not fire at any threshold. It is '
+            're-derived against the population that actually feeds the streak '
+            '(session_resume_failed), and the bound is TWO-SIDED: the window '
+            'must be at least the smallest observed interval between two such '
+            'failures (below it nothing can ever chain), and small enough '
+            "that the longest run the measured NULL produces stays strictly "
+            'below fallback_storm_threshold. Neither side is a safety factor. '
+            'The derivation, its provenance and the guard that RE-DERIVES it '
+            'against live runs.db on every run live in '
+            'orchestrator/storm_window_bound.py and '
+            'orchestrator/tests/test_storm_window_bound.py — read the numbers '
+            'there rather than trusting this sentence, and re-derive before '
+            'retuning.'
         ),
     )
+
+    @model_validator(mode='after')
+    def _reject_backstop_at_or_below_freshness(self) -> 'SessionResumeConfig':
+        """The two age thresholds must stay ORDERED, at any operator setting.
+
+        ``freshness_window_secs`` is consulted only on the no-archive path,
+        ``absolute_resume_age_secs`` unconditionally (D2/D3), so the backstop
+        firing first would make freshness dead config: an operator could
+        retune it with no observable effect and no error anywhere, while
+        fallbacks silently switched from 'stale' to 'aged_out'. Equality is
+        rejected for the same reason — at equal values 'stale' can never fire
+        without 'aged_out' beside it, so the knob is still unreachable.
+
+        Enforced HERE rather than only on the shipped defaults because both
+        leaves are settable from dark-factory-orchestrator.yaml and both are
+        green-tier hot-reloadable: this is the boundary where the relation can
+        actually be violated. A reload that would invert the pair fails
+        validation and is rolled back whole by ``apply_reload``.
+        """
+        if self.absolute_resume_age_secs <= self.freshness_window_secs:
+            raise ValueError(
+                'SessionResumeConfig.absolute_resume_age_secs '
+                f'({self.absolute_resume_age_secs}s) must be > '
+                f'freshness_window_secs ({self.freshness_window_secs}s); the '
+                'absolute backstop applies unconditionally while freshness '
+                'applies only when no durable archive exists, so a backstop '
+                'at or below the freshness window fires first on the '
+                'no-archive path too and leaves freshness_window_secs '
+                'unreachable config. Raise absolute_resume_age_secs (it is a '
+                'DERIVED bound — see '
+                'orchestrator/resume_age_bound.py::RESUME_AGE_SAFETY_FACTOR) '
+                'or lower freshness_window_secs.'
+            )
+        return self
 
 
 class SpeculationProbeConfig(BaseModel):
@@ -988,7 +1268,7 @@ class SpeculationProbeConfig(BaseModel):
     P(pass|depth) curve.
 
     ``probe_fraction=0.0`` (the default) disables the mechanism entirely:
-    :func:`orchestrator.merge_queue.select_probe_depth` always returns
+    :func:`orchestrator.merge_lane.worker.select_probe_depth` always returns
     ``None`` at fraction<=0, so dispatch falls through to the unchanged
     ``_verify_frontier_depth()`` path -- byte-identical to pre-task-2359
     behaviour.
@@ -1209,7 +1489,13 @@ class FusedMemoryConfig(BaseModel):
     """Fused-memory HTTP server connection."""
 
     url: str = Field(default='http://localhost:8002')
-    project_id: str = Field(default='dark_factory')
+    project_id: str = Field(
+        default='',
+        description=(
+            'Empty means derived from project_root by OrchestratorConfig '
+            '(shared.project_id.project_id_for_root); a declared value wins.'
+        ),
+    )
     config_path: str = Field(default='fused-memory/config/config.yaml')
     server_command: list[str] = Field(
         default_factory=lambda: [
@@ -1224,10 +1510,16 @@ class SandboxConfig(BaseModel):
     """Filesystem sandbox configuration.
 
     ``backend`` selects the enforcement mechanism:
-    - ``auto`` (default): prefer landlock if available, else bwrap, else unsandboxed
-    - ``landlock``: kernel LSM; works in all namespaces. Requires kernel 5.13+
-    - ``bwrap``: bubblewrap + user namespace. Bun v1.3.13 crashes under this
-      on kernel 6.17; prefer landlock on affected hosts
+    - ``auto`` (default): prefer landlock if available, else bwrap; a sandboxed
+      role that resolves to neither is refused, not run unsandboxed
+      (``agents/sandbox_dispatch.py::resolve_backend_or_refuse``, PRD D4)
+    - ``landlock``: kernel LSM; works in all namespaces. Requires kernel 5.13+.
+      Validated on x86_64 only: its syscall numbers are hardcoded with no
+      architecture gate (``agents/landlock.py::SYS_landlock_create_ruleset``).
+      The fleet's posture: ``docs/sandbox-fleet-status.md``
+    - ``bwrap``: bubblewrap + user namespace; legacy passthrough (PRD D10).
+      Bun v1.3.13 crashes under this on kernel 6.17; prefer landlock on
+      affected hosts
     - ``none``: explicit opt-out — run unsandboxed (same effect as ``enabled: false``)
     """
 
@@ -1236,11 +1528,28 @@ class SandboxConfig(BaseModel):
 
 
 class EscalationConfig(BaseModel):
-    """Escalation MCP server configuration."""
+    """Escalation MCP server configuration.
 
-    queue_dir: str = Field(default='data/escalations')
+    ``queue_dir`` is kept only so existing yamls load; the queue is always
+    ``shared.project_layout.escalation_queue_dir(project_root)``.
+    """
+
+    queue_dir: str = Field(default=ESCALATION_QUEUE_RELPATH)
     port: int = Field(default=8100)
     host: str = Field(default='127.0.0.1')
+
+    @field_validator('queue_dir', mode='after')
+    @classmethod
+    def _refuse_a_non_layout_queue_dir(cls, v: str) -> str:
+        if posixpath.normpath(v) == ESCALATION_QUEUE_RELPATH:
+            return ESCALATION_QUEUE_RELPATH
+        raise ValueError(
+            f'escalation.queue_dir {v!r} is not the layout value '
+            f'{ESCALATION_QUEUE_RELPATH!r}: every package reads the escalation queue '
+            f'at shared.project_layout.escalation_queue_dir(project_root), so another '
+            f'value would split the queue; remove the key or set it to '
+            f'{ESCALATION_QUEUE_RELPATH!r}.'
+        )
 
 
 from shared.config_models import AccountConfig, UsageCapConfig  # noqa: F401, E402
@@ -1561,9 +1870,15 @@ class LaneCommand(BaseModel):
     (a shell string, via ``sh -c``) at idle nice/ionice in ``<worktree>/<cwd>``
     with ``DF_VERIFY_ROLE=offline``, off the merge hot path, always from the
     current ``main`` head. A red result routes through the existing
-    ``OfflineLaneWorker`` red path (confirm → fingerprint → dedup'd fix task →
-    staged L2), filing the fix task at ``fix_task_priority`` — no new mechanism
-    (INV-5). This generalizes the previously reify-hard-coded run seams to
+    ``OfflineLaneWorker`` red path: a red detection run is confirmed and
+    narrowed to the named tests; a command that declares ``outage_probe``
+    runs it first, and a probe that exits 75 naming a dependency makes the
+    pass an outage, escalated rather than filed; each failing test is a
+    per-test episode; an episode is filed as one fix task (at ``fix_task_priority``) once it is
+    reproduced on ``git.offline_lane_persist_passes`` spaced passes, with one
+    bounded level-1 escalation if the fix is unlanded after
+    ``git.offline_lane_red_unlanded_hours`` (plans/offline-lane-red-path-prd.md).
+    This generalizes the previously reify-hard-coded run seams to
     per-project config (PRD plans/integration-test-lane-prd.md, task alpha).
     """
 
@@ -1576,14 +1891,11 @@ class LaneCommand(BaseModel):
     command: str = Field(
         description=(
             'Shell command string launched via ``sh -c`` for this sub-run '
-            '(e.g. ``pytest -m integration``). Required. NOTE: the default '
-            'confirm/dedup path is pytest-oriented — it serializes via '
-            '``_serial_pytest_str`` and extracts still-failing pytest '
-            'node-ids. A non-pytest command that reproduces red (non-zero '
-            'exit, no parseable node-ids) is filed under a stable '
-            '``<name>::nonzero-exit`` sentinel rather than being swallowed as '
-            'a flake; inject a custom ``command_confirmation_runner`` for '
-            'richer per-failure dedup.'
+            '(e.g. ``pytest -m integration``). Required. A command that '
+            'exits non-zero while naming no test is held and filed under the '
+            "lane's unconfirmable pseudo-test "
+            '(``offline_lane_episode_state.py::UNCONFIRMABLE_SUFFIX``) rather '
+            'than being swallowed as a flake.'
         ),
     )
     cwd: str = Field(
@@ -1608,6 +1920,37 @@ class LaneCommand(BaseModel):
         description=(
             'When False this command is skipped by the offline-lane runner '
             '(a config-only off switch that leaves the entry in place).'
+        ),
+    )
+    outage_probe: str | None = Field(
+        default=None,
+        description=(
+            'Optional shell command run via ``sh -c`` once after a red '
+            'detection run, in ``<worktree>/<cwd>`` with the command\'s '
+            'environment but at normal priority (no idle nice/ionice). Exit 0 '
+            'means every external service the tests use is usable, and the red '
+            'goes to the confirm. Exit 75 '
+            '(``shared/src/shared/lane_probe.py::OUTAGE_EXIT_STATUS``) with a '
+            'first stdout line naming the failed dependency makes the pass an '
+            'outage, escalated rather than filed. Anything else, the timeout '
+            'included, is a broken probe, and the red goes to the confirm as if '
+            'none were declared (plans/offline-lane-red-path-prd.md D7). Read '
+            'by ``offline_lane_pass.py::run_pass`` at each red pass and by '
+            '``LaneEngine.tick`` while the command is in an outage. Green '
+            'tier: part of the ``git.offline_lane_commands`` leaf, hot-reloaded '
+            'by ``reload_config``.'
+        ),
+    )
+    outage_probe_timeout_secs: int = Field(
+        default=180,
+        ge=1,
+        description=(
+            'Seconds (default 180) the outage probe may run before its process '
+            'group is killed; a timeout is a broken probe. Read by '
+            '``offline_lane_pass.py::run_pass`` at each red pass and by '
+            '``LaneEngine.tick`` while the command is in an outage. Green '
+            'tier: part of the ``git.offline_lane_commands`` leaf, hot-reloaded '
+            'by ``reload_config``.'
         ),
     )
 
@@ -1842,15 +2185,41 @@ class GitConfig(BaseModel):
             'included) never widens what counts as a stale lock.'
         ),
     )
-    offline_lane_red_advances_before_blocker: int = Field(
-        default=3,
+    offline_lane_persist_passes: int = Field(
+        default=2,
         ge=1,
         description=(
-            'N = number of consecutive confirmed-red advances (same failing-'
-            'test-set fingerprint) the offline-deep lane worker (β3, PRD '
-            '§11.3 / C4) tolerates before promoting its filed fix task to a '
-            'born-at-L2 escalate_blocker. Not frozen — retunable via '
-            'orchestrator.yaml without a code change.'
+            'Number of counted passes (default 2) on which a per-test red '
+            'must reproduce before the offline-deep lane files its fix task '
+            '(PRD plans/offline-lane-red-path-prd.md D5); 1 restores filing '
+            'on the first reproduced pass. Read by '
+            '``offline_lane_episodes.lane_policy`` at every pass and tick, '
+            'never cached. Green tier: a ``git.offline_lane_*`` leaf, '
+            'hot-reloaded by ``reload_config`` and read on the next pass.'
+        ),
+    )
+    offline_lane_recheck_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description=(
+            'Minimum start-to-start spacing (seconds, default 1800.0) of '
+            'counted offline-lane passes, and the delay before a held red is '
+            're-observed (PRD D5, D12). '
+            'Read by ``offline_lane_episodes.lane_policy`` at every pass and '
+            'tick, never cached. Green tier: a ``git.offline_lane_*`` leaf, '
+            'hot-reloaded by ``reload_config`` and read on the next pass.'
+        ),
+    )
+    offline_lane_red_unlanded_hours: float = Field(
+        default=24.0,
+        gt=0,
+        description=(
+            'Hours (default 24.0) a filed red may stay unlanded before the '
+            'lane raises its one bounded level-1 escalation (PRD D11); also '
+            'the expiry of a held episode (D5), one knob serving both. Read '
+            'by ``offline_lane_episodes.lane_policy`` at every pass and '
+            'tick, never cached. Green tier: a ``git.offline_lane_*`` leaf, '
+            'hot-reloaded by ``reload_config`` and read on the next pass.'
         ),
     )
     offline_lane_commands: list[LaneCommand] = Field(
@@ -1860,8 +2229,9 @@ class GitConfig(BaseModel):
             'entry drives one additional offline-lane sub-run — launched at '
             'idle nice/ionice via ``sh -c`` in ``<worktree>/<cwd>`` with '
             '``DF_VERIFY_ROLE=offline``, off the merge hot path, always from '
-            'head — that reuses the existing red path (confirm → dedup fix '
-            'task → staged L2). Generic commands run IN ADDITION to whichever '
+            'head — that reuses the existing red path (confirm → per-test '
+            'episodes → fix task filed on persistence); a declared '
+            '``outage_probe`` can turn a red into an escalated outage. Generic commands run IN ADDITION to whichever '
             'legacy seams (numeric / infra) are enabled. Defaults to [] '
             '(opt-in, byte-identical no-op). Uses default_factory to avoid a '
             'shared mutable default across model instances.'
@@ -2571,6 +2941,21 @@ class RecoveryEmissionConfig(BaseModel):
             'auto-resolves when its veto stops.'
         ),
     )
+    streak_escalation_suppress_human_parked: bool = Field(
+        default=True,
+        description=(
+            'Skip the veto-streak L1 when the hold is escalation_pinned and '
+            'every record pinning the task is already an L2 in front of a '
+            'human. Without this the alarm re-fires forever on a queue where '
+            'L2s legitimately stay parked for days, since its trigger is '
+            'exactly "a human-facing escalation is still open" (re-filed twice '
+            'inside one hour on 2026-08-19; 27 of 94 pending records on '
+            '2026-08-31). Set to false to restore the pre-4541 behaviour. It '
+            'suppresses only the queue WRITE: recovery_vetoed rows and the '
+            'per-sweep summary line keep flowing, and a hold that includes '
+            'any unpromoted pin still alarms.'
+        ),
+    )
     landing_git_error_rate_per_hour: int = Field(
         default=10,
         ge=1,
@@ -2603,6 +2988,18 @@ class RecoveryEmissionConfig(BaseModel):
     )
 
 
+class RemoteGatePaths(NamedTuple):
+    """Where one runner's remote gates live (task 6565, design D2).
+
+    ``source`` is the remote Dark-Factory repository gate checkouts are cloned
+    from; ``root`` holds one immutable checkout per deployed sha.  Both are
+    absolute paths on the remote host.
+    """
+
+    source: str
+    root: str
+
+
 class VerifyRunnerConfig(BaseModel):
     """Configuration for a single remote verify runner (Lever C).
 
@@ -2629,20 +3026,23 @@ class VerifyRunnerConfig(BaseModel):
     df_checkout_path: str | None = Field(
         default=None,
         description=(
-            'Remote-host filesystem path to the Dark-Factory orchestrator '
-            '*code* checkout — the tree whose `orchestrator verify-merge` gate '
-            'this runner executes over ssh.  Distinct from git_remote (the '
-            'PROJECT checkout where the merge sha is pushed/tested).  When set, '
-            'enables the INV-2 contract-currency auto-sync at dispatch '
-            '(HEAD-compare vs the dispatcher, then git pull --ff-only + uv sync '
-            '--all-packages when stale, then a probe that the remote '
-            '`orchestrator` CLI still answers; plans/merge-verdict-integrity-prd.md '
-            '§1, §3.1).  The sync is --all-packages because a DF checkout is a uv '
-            'WORKSPACE, in which a bare `uv sync` exits 0 while pruning the '
-            'members\' console scripts — including the very entry point this '
-            'runner invokes over ssh (task 4539).  '
-            'Default None keeps auto-sync OFF (opt-in), byte-identical to the '
-            'pre-INV-2 behaviour for every not-yet-migrated runner.'
+            'Absolute remote-host path of the Dark-Factory repository the gate '
+            'checkouts are cloned from.  The dispatcher pushes its deployed sha '
+            'there as refs/gate/<sha>, and each verify runs in an immutable '
+            'checkout of that sha under gate_checkouts_path (task 6565, '
+            'plans/6565-remote-checkout-sync-design-2026-10-20.md D2).  Distinct '
+            'from git_remote (the PROJECT repo the merge sha is pushed to).  '
+            'REQUIRED for an enabled runner: a runner that cannot be gated is a '
+            'configuration error, never a dispatch through a shared tree.'
+        ),
+    )
+    gate_checkouts_path: str | None = Field(
+        default=None,
+        description=(
+            'Absolute remote-host directory holding one gate checkout per '
+            'deployed sha (task 6565, design D2).  None means the sibling '
+            '`dark-factory-gate` of df_checkout_path.  Restart-tier like the '
+            'rest of the runner.'
         ),
     )
     enabled: bool = Field(
@@ -2650,6 +3050,72 @@ class VerifyRunnerConfig(BaseModel):
         description=(
             'When False, this runner is excluded from the active pool.  '
             'Allows temporary disabling without removing the entry.'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def _require_gate_paths_when_enabled(self) -> 'VerifyRunnerConfig':
+        if self.enabled:
+            self.gate_paths()
+        return self
+
+    def gate_paths(self) -> RemoteGatePaths:
+        """This runner's absolute gate source and root; raises ValueError naming the runner."""
+        source = self.df_checkout_path
+        if not source or not posixpath.isabs(source):
+            raise ValueError(
+                f'verify_runners[{self.name!r}]: df_checkout_path must be an absolute '
+                f'remote path for an enabled runner (task 6565), got {source!r}'
+            )
+        root = self.gate_checkouts_path or posixpath.join(
+            posixpath.dirname(source.rstrip('/')), 'dark-factory-gate',
+        )
+        if not posixpath.isabs(root):
+            raise ValueError(
+                f'verify_runners[{self.name!r}]: gate_checkouts_path must be an '
+                f'absolute remote path, got {root!r}'
+            )
+        return RemoteGatePaths(source=source, root=root)
+
+
+class EnvProbeConfig(BaseModel):
+    """One operator-declared OS-level environment probe (Lever C, task 4537).
+
+    Each entry in OrchestratorConfig.verify_env_probes names a command whose
+    output is captured on BOTH the local dispatcher and the remote verify
+    runner at the drift-check cadence, and compared.  A difference means the
+    two hosts are not running the same tool, so their verify verdicts are not
+    interchangeable even when they happen to agree today.
+
+    Probes are declared per project rather than hardcoded: the hardcoded
+    rustc/cargo/sccache dimensions of EnvFingerprint are meaningless for a
+    Python project and would manufacture false drift (see
+    verify_runner.compare_env_fingerprints' `dimensions` parameter).  A Rust
+    project that wants them simply declares them here explicitly.
+    """
+
+    key: str = Field(
+        min_length=1,
+        description=(
+            'Key this probe\'s trimmed stdout is recorded under in the '
+            'EnvFingerprint.extra_probes mapping, and the name an env-divergence '
+            'escalation reports.  Choose something an operator will recognise '
+            '(e.g. "pyright", "uv").  Must be non-empty (min_length=1) for the '
+            'same reason argv must be: an empty key renders the divergence '
+            'escalation summary as a dangling "Host env divergence in '
+            'extra_probes:" with nothing after the colon — the unreadable-L1 '
+            'failure the summary fallback exists to prevent.'
+        ),
+    )
+    argv: list[str] = Field(
+        min_length=1,
+        description=(
+            'Command to execute, in argv form (e.g. ["uv", "--version"]).  '
+            'argv rather than a shell string so the local path needs no quoting '
+            'and the ssh path can shlex-join explicitly.  Must be non-empty — a '
+            'probe with no command is a config error, not a silent no-op.  Keep '
+            'it short, read-only and fast: it runs on both hosts on every drift '
+            'check.'
         ),
     )
 
@@ -2829,6 +3295,12 @@ _DEFAULT_PRICES: dict[str, dict[str, float]] = {
     # config is threaded in. Kept in lockstep with defaults.yaml's `prices:`
     # block by test_config.py's test_default_price_table_matches_defaults_yaml.
     'gpt-5.4': {'input_per_1m': 2.50, 'output_per_1m': 10.00},
+    # Codex sticker rates. codex reports cached_input_tokens inside input_tokens and astra prices
+    # that split; sol and terra have no cached rate yet, so theirs is an uncached upper bound.
+    # gpt-5.6-sol's rate is promotional through at least 2026-11-21.
+    'gpt-6-astra': {'input_per_1m': 10.00, 'output_per_1m': 50.00, 'cached_input_per_1m': 1.00},
+    'gpt-5.6-sol': {'input_per_1m': 4.00, 'output_per_1m': 20.00},
+    'gpt-5.6-terra': {'input_per_1m': 2.00, 'output_per_1m': 12.00},
     'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40},
     'gemini-3.1-pro-preview': {'input_per_1m': 1.25, 'output_per_1m': 5.00},
     'gemini-3-flash': {'input_per_1m': 0.075, 'output_per_1m': 0.30},
@@ -2844,6 +3316,11 @@ class PriceEntry(BaseModel):
 
     input_per_1m: float = Field(ge=0, description='USD per 1M input tokens.')
     output_per_1m: float = Field(ge=0, description='USD per 1M output tokens.')
+    cached_input_per_1m: float | None = Field(
+        default=None,
+        ge=0,
+        description='USD per 1M cached input tokens; None prices them at input_per_1m.',
+    )
 
 
 def default_price_table() -> dict[str, dict[str, float]]:
@@ -3018,6 +3495,15 @@ class OrchestratorConfig(BaseSettings):
     # separate from the paused-idle constant (_PAUSED_IDLE_POLL_SECS) so the
     # poll cadence can be tuned independently of the pause-recovery cadence.
     idle_poll_secs: float = Field(default=15.0)
+    # Cadences of the merge-heartbeat and stale-service-restart background
+    # services, which run whatever the dispatch loop is doing (task 5344).
+    # The heartbeat must refresh well inside the drain gate's fresh window
+    # (ORCH_DRAIN_FRESH_WINDOW_SECS, scripts/drain_check.py --fresh-window);
+    # the restart interval bounds how late an owed force-fire can be.
+    # Restart-only (not in RELOADABLE_FIELDS): captured once by
+    # Harness._build_lifecycle_registry.
+    merge_heartbeat_interval_secs: float = Field(default=15.0, gt=0)
+    stale_service_restart_interval_secs: float = Field(default=15.0, gt=0)
 
     # Iteration limits
     max_execute_iterations: int = Field(default=10)
@@ -3092,6 +3578,11 @@ class OrchestratorConfig(BaseSettings):
     # Merge conflict reduction
     max_advance_attempts: int = Field(default=3)
     max_pre_merge_retries: int = Field(default=2)
+    # Rollback switch only (task 6580, Leo ruling 2026-10-09): the merge
+    # phase rebases and submits; the merge gate verifies every landing
+    # (task 1724). True restores the advisory task-role re-verify of the
+    # rebased tip. OPERATIONS.md §"Config reload vs restart" (green tier).
+    pre_merge_reverify: bool = Field(default=False)
     max_merge_retries: int = Field(default=3)
     inter_iteration_rebase: bool = Field(default=True)
     # Fix 3 — rebase onto main before each verify (including the first) so
@@ -3387,6 +3878,10 @@ class OrchestratorConfig(BaseSettings):
     # verify_env): read fresh each verify with no in-flight-split risk.
     # Deliberately NOT in _OVERRIDABLE_FIELDS — it is a whole-worktree concern,
     # not a per-module override.
+    # Remote verifies receive this value in their spec (MergeVerifySpec /
+    # TaskVerifySpec, applied by verify_spec_shared.py::apply_spec_to_host_config),
+    # so the deployed value still lives only in dark-factory-orchestrator.yaml,
+    # and a remote host's copy is a fallback.
     verify_cold_preprovision_command: str = Field(default='')
 
     # Per-model USD/1M-token prices for backends without native cost
@@ -3453,6 +3948,59 @@ class OrchestratorConfig(BaseSettings):
     # load-bearing lane.  Flipped 'scoped' → 'full' by the σ capstone and
     # activated by the τ deterministic-deploy fleet restart.
     merge_verify_breadth: Literal['scoped', 'full'] = Field(default='scoped')
+    # Soundness narrowing for the CAS-loop disjoint-delta fast path (the
+    # 2026-09-22 whole-tree-drift incident).  ``merge_gates._reverify_rebased_tree``
+    # skips the post-rebase re-verify when the branch's touched files and the
+    # intervening main delta are DISJOINT.  That inference needs two premises,
+    # and the overlap probe checks neither:
+    #
+    #   P1 (compositionality) — the gate's verdict decomposes over disjoint
+    #       file sets, i.e. every check it runs is diff-scoped.  A WHOLE-TREE
+    #       check (one whose whole premise is that an unrelated file can fail
+    #       you) violates P1 by construction.
+    #   P2 (the drift is itself green) — main at ``rebased_onto`` passes the
+    #       gate on its own.  Even a perfectly diff-scoped gate returns red on
+    #       a merge whose BASE is already red.
+    #
+    # When True (default) the fast path additionally requires P2 to be
+    # positively observed: ``rebased_onto`` must be a SHA this orchestrator's
+    # own merge queue landed, which is exactly the set of main tips a green
+    # gate run has been observed on.  Drift from ANY other writer — an
+    # unattended nightly job, a direct human commit, a push — has unknown
+    # health, so the rebase re-verifies.  Set False to restore the pre-fix
+    # behaviour (disjointness alone clears the gate) if the extra re-verifies
+    # ever have to be traded away under load; the P1 arm keyed on
+    # ``merge_verify_breadth == 'full'`` is NOT covered by this switch,
+    # because a project that has declared a whole-tree gate has declared the
+    # skip unsound outright.
+    #
+    # GREEN TIER (see RELOADABLE_FIELDS below, and OPERATIONS.md
+    # section "Config reload vs restart").  Unlike its restart-only
+    # ``merge_verify_breadth`` neighbour this knob cannot split an in-flight
+    # merge's BREADTH — it only ever decides whether ONE more verify is run
+    # before an advance, is read fresh off ``req.config`` at each gate
+    # evaluation, and is a safety kill switch: a switch you can only pull by
+    # restarting the fleet is not a kill switch (the argument already written
+    # for ``config_key_census.*`` and ``merge_deep.chain_cap``).
+    merge_disjoint_skip_requires_verified_drift: bool = Field(default=True)
+    # The project's merge gate verdict is a function of the tree alone: every
+    # gate leg judges the tree, except the tests
+    # ``merge_gate_history_test_command`` selects, which read git history
+    # (ancestry of HEAD, a merge-base, a log) and so re-run on the same tree.
+    # Only then may ``merge_lane/gates.py::_reverify_rebased_tree`` forgo the
+    # full re-verify of a rebased tree byte-identical to the one that just
+    # passed (tasks 6647, 7248).  False (the default) re-verifies it.  GREEN
+    # TIER for the reason given for
+    # ``merge_disjoint_skip_requires_verified_drift`` above: read fresh off
+    # ``req.config`` at each gate evaluation, and it only ever decides
+    # whether one more verify runs before an advance.
+    merge_gate_history_pure: bool = Field(default=False)
+    # The shell command, run from the merge worktree root, that runs exactly
+    # the merge gate's history-reading tests (task 7248).  Consulted only
+    # when ``merge_gate_history_pure`` is True, on a same-tree rebase, where
+    # it runs instead of skipping.  None (the default) declares no history
+    # leg, so that rebase skips.
+    merge_gate_history_test_command: str | None = Field(default=None)
     # Fix (b), task 2822 — per-land cross-check of a REMOTE merge-verify green.
     # When True (default), after a remote two-host verify returns a real-suite
     # PASS that would DECIDE a land, the merge worker re-runs the LOCAL
@@ -3526,6 +4074,15 @@ class OrchestratorConfig(BaseSettings):
     # the existing test suite are unchanged; opt in per project where
     # `systemd-run --user` is available.
     verify_use_cgroup_scope: bool = Field(default=False)
+    # Per-role cgroup v2 cpu.weight each verify scope is spawned with
+    # (`systemd-run -p CPUWeight=`), only when verify_use_cgroup_scope is on.
+    # nice orders threads only INSIDE one cgroup, so without a weight the role
+    # tiers are inert across sibling scopes. task/background are lowered rather than merge raised, so the
+    # merge scope stays at parity (100) with each orchestrator unit and the
+    # operator's terminals under app.slice; 33/10 keep the 3:1 merge:task intent.
+    verify_cgroup_cpu_weight_merge: int = Field(default=100, ge=1, le=10000)
+    verify_cgroup_cpu_weight_task: int = Field(default=33, ge=1, le=10000)
+    verify_cgroup_cpu_weight_background: int = Field(default=10, ge=1, le=10000)
 
     # ── Verify admission control (task 2390 T2; PRD
     # plans/verify-oversubscription-control-prd.md) ────────────────────────
@@ -3570,6 +4127,15 @@ class OrchestratorConfig(BaseSettings):
     # load/reload instead of silently reaching pytest-xdist and failing the
     # whole test leg at verify time.
     verify_admission_pytest_n: str = Field(default='auto')
+    # The in-process admission gate in front of that flock slot (task 5628;
+    # plans/verify-admission-fifo-prd.md). The code default 'unordered' keeps
+    # today's random winner; a project flips to 'arrival' in its yaml. Promote
+    # is the gate age at which a background waiter ranks with task verifies,
+    # keeping its own arrival stamp. The alarm age sits above today's p90 wait
+    # (about 11h), so it is not a standing alarm.
+    verify_admission_order: AdmissionOrder = Field(default='unordered')
+    verify_admission_background_promote_secs: float = Field(default=7200.0, gt=0)
+    verify_admission_wait_alarm_secs: float = Field(default=43200.0, gt=0)
 
     # Steward lifecycle
     steward_lifetime_budget: float = Field(default=12.0)
@@ -3587,6 +4153,16 @@ class OrchestratorConfig(BaseSettings):
     # files. The orchestrator updates _revalidated_at and base_commit
     # directly, mirroring the confirm_plan MCP write semantics.
     revalidation_skip_enabled: bool = Field(default=True)
+    plan_text_fp_gate_enabled: bool = Field(
+        default=True,
+        description=(
+            'Task 4031: when the task description/details no longer '
+            'fingerprint to the plan _task_text_fp (or the plan has none), '
+            'decline the Lever-B revalidation skip and tell the revalidating '
+            'architect. OFF restores the pre-4031 skip; plans are still '
+            'stamped.'
+        ),
+    )
     max_revalidation_age_hours: float = Field(
         default=24.0,
         description=(
@@ -3616,6 +4192,16 @@ class OrchestratorConfig(BaseSettings):
         description='Deprecated — set max_turns.simple_task instead.',
     )
 
+    strict_mcp_config: bool = Field(
+        default=False,
+        description=(
+            'Scope every TaskWorkflow agent invocation to ONLY the orchestrator-built '
+            'mcp_config (--strict-mcp-config), ignoring the ambient project .mcp.json. '
+            'False in production (argv unchanged); EVAL_PROFILE sets it True so an eval '
+            'agent cannot reach live escalation / task DB / fused-memory (task 4757).'
+        ),
+    )
+
     # Auto-eval — when the optimistic path (B-skip or C-simple) blocks at
     # plan/execute/verify/review, automatically rerun the same task from the
     # same branchpoint via the full architect path. The original branch and
@@ -3635,7 +4221,10 @@ class OrchestratorConfig(BaseSettings):
         default_factory=lambda: {'plan', 'execute', 'verify', 'review'},
         description=(
             'Block phases that trigger auto-eval. Merge/infra failures are '
-            'excluded — they are unlikely to differ on the full path.'
+            'excluded — they are unlikely to differ on the full path; '
+            'infra-class block categories are excluded by '
+            'orchestrator/src/orchestrator/harness.py::'
+            '_AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES whatever their phase.'
         ),
     )
 
@@ -3664,23 +4253,14 @@ class OrchestratorConfig(BaseSettings):
     fused_memory_restart_script: str = Field(
         default='scripts/restart-fused-memory.sh'
     )
-    # Force-fire escape for the fused-memory coordinator (task 2817): once a
-    # restart is pending, the coordinator normally only fires from the polite
-    # idle path (agents_idle + debounce). Under chronic fleet saturation
-    # agents_idle is rarely true, so that path can starve indefinitely and the
-    # armed restart never fires (fire-once-or-never) — the operator then has to
-    # restart fused-memory by hand (born-at-L2 esc-2814-1). Once a pending
-    # restart has been owed for this many seconds, maybe_restart bypasses
-    # agents_idle and the debounce and force-fires even on the busy-wait branch,
-    # while still preferring the polite idle path for the common (healthy) case.
-    # fused-memory keeps no min_interval rate cap, so nothing throttles the
-    # force-fire. 0 disables force-fire (byte-identical prior behaviour); the
-    # 15-min default caps the worst-case stale-bytecode window under saturation
-    # (far below the orchestrator's 4500s bound — a `--drain` fused-memory
-    # restart is far cheaper than a full orchestrator fleet redeploy).
-    # Deliberately NOT in RELOADABLE_FIELDS: red-tier / restart-only, captured
-    # once at coordinator construction (_build_service_restart_coordinator),
-    # matching its orchestrator_restart_force_fire_after_secs sibling.
+    # Force-fire escape for the fused-memory coordinator (task 2817): the
+    # polite path needs agents_idle, which chronic fleet saturation can deny
+    # indefinitely (esc-2814-1). Once a restart has been owed this long,
+    # maybe_restart bypasses agents_idle and the debounce; the
+    # stale-service-restart service evaluates it whatever the dispatch loop
+    # is doing (task 5344). 0 disables. No
+    # min_interval cap throttles it. Restart-only (not in RELOADABLE_FIELDS),
+    # like orchestrator_restart_force_fire_after_secs.
     fused_memory_restart_force_fire_after_secs: float = Field(
         default=900.0,
         description=(
@@ -3746,17 +4326,19 @@ class OrchestratorConfig(BaseSettings):
     orchestrator_restart_on_active_secs: int = Field(default=10)
     # Rate-cap on the orchestrator's own deploy-on-commit self-redeploy: the
     # minimum wall-clock interval (seconds) enforced between successive fires.
-    # Unlike the debounce (which coalesces a *single* merge burst), this cap is
+    # 72h since Leo's 2026-10-19 ruling (it was 8h); an explicit deterministic
+    # deploy task is the way to go live sooner. Unlike the debounce (which
+    # coalesces a *single* merge burst), this cap is
     # restart-safe — persisted to disk — so a stream of orchestrator/src merges
     # over hours can't churn the daemon through repeated redeploys. 0 disables
     # the cap (restoring pure debounce behaviour). Deliberately NOT in
     # RELOADABLE_FIELDS: red-tier / restart-only, matching its sibling
     # orchestrator_restart_* fields.
     orchestrator_restart_min_interval_secs: float = Field(
-        default=28800.0,
+        default=259200.0,
         description=(
             'Minimum wall-clock seconds between successive orchestrator '
-            'self-redeploys; 8h default caps deploy-on-commit churn. '
+            'self-redeploys; 72h default caps deploy-on-commit churn. '
             '0 disables.'
         ),
     )
@@ -3767,7 +4349,7 @@ class OrchestratorConfig(BaseSettings):
     # rarely true, so the polite path can starve indefinitely. Once a pending
     # restart has been owed for this many seconds, maybe_restart bypasses
     # agents_idle, the debounce, and the merge-drain preference — but NEVER
-    # the min_interval 8h clock above, which is still enforced unchanged.
+    # the min_interval 72h clock above, which is still enforced unchanged.
     # 0 disables force-fire (byte-identical behaviour); 75-min default.
     # Deliberately NOT in RELOADABLE_FIELDS: red-tier / restart-only,
     # matching its sibling orchestrator_restart_min_interval_secs.
@@ -3776,7 +4358,7 @@ class OrchestratorConfig(BaseSettings):
         description=(
             'Max seconds a pending orchestrator self-redeploy stays owed '
             'before force-firing (bypassing agents_idle + debounce + the '
-            'merge-drain preference, but NOT the min_interval 8h clock); '
+            'merge-drain preference, but NOT the min_interval 72h clock); '
             '75-min default.'
         ),
     )
@@ -3800,6 +4382,32 @@ class OrchestratorConfig(BaseSettings):
             'is deferred to let a pre-enqueue MERGE-phase workflow reach the '
             'durable merge journal; bounds the force-fire hold to '
             'force_fire_after_secs + this. 0 disables. 10-min default.'
+        ),
+    )
+    # Max age of the in-flight fleet-redeploy lease (task 4755) before the
+    # orchestrator's own coordinator stops believing it. While
+    # scripts/restart-all-orchestrators.sh is mid-sweep it holds that lease and
+    # the coordinator stands down; the bound is what keeps a lease stranded by
+    # a SIGKILLed sweep (whose EXIT trap cannot run, by construction) from
+    # wedging the fleet. FIXED: a --drain sweep is fitted under it at
+    # scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS.
+    # Far below the 72h orchestrator_restart_min_interval_secs, so a leaked
+    # lease delays at most ONE redeploy window. Deliberately NOT
+    # in RELOADABLE_FIELDS:
+    # red-tier / restart-only, matching its siblings
+    # orchestrator_restart_merge_phase_grace_secs /
+    # orchestrator_restart_force_fire_after_secs /
+    # orchestrator_restart_min_interval_secs (captured at coordinator
+    # construction).
+    orchestrator_restart_lease_max_age_secs: float = Field(
+        default=14400.0,
+        description=(
+            'Max age of the in-flight fleet-redeploy lease before the '
+            'orchestrator coordinator stops honouring it and redeploys anyway. '
+            'Fixed; a --drain sweep is fitted under it at '
+            'scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS. '
+            'Kept far below the 72h min-interval, so a lease stranded by a '
+            'SIGKILLed sweep delays at most one window. 4h default.'
         ),
     )
 
@@ -3841,6 +4449,39 @@ class OrchestratorConfig(BaseSettings):
     # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
     orphan_l0_merge_phase_freshness_secs: float = Field(default=600.0)
 
+    # Info-L0 disposition router (plans/info-l0-disposition-router-prd.md
+    # D5/D9/D12, plus beta's reviewer block): routes info-severity L0s at
+    # workflow exit, in the orphan-L0 reaper, and at restart.  The kill switch
+    # disables routing; the ticket timeout bounds a D9 curator hold; the
+    # conversion cap bounds curator tickets per sweep (D12); the detail
+    # budget bounds each note shown to the reviewer.  All four are green-tier
+    # hot-reloadable (see RELOADABLE_FIELDS).
+    info_l0_router_enabled: bool = Field(
+        default=True,
+        description='Set to false to leave info-severity L0s on their pre-router paths.',
+    )
+    info_l0_router_ticket_timeout_secs: float = Field(
+        default=900.0,
+        gt=0,
+        description=(
+            'Max seconds a D9 hold waits on a curator ticket before promoting; '
+            'the default matches steward_completion_timeout.'
+        ),
+    )
+    info_l0_router_max_conversions_per_sweep: int = Field(
+        default=20,
+        ge=0,
+        description='Curator conversions per routing sweep (D12); overflow is promoted under D5.',
+    )
+    info_l0_note_detail_chars: int = Field(
+        default=1200,
+        ge=0,
+        description=(
+            "Detail prefix shown per note in the reviewer's notes block; the "
+            'full text stays reachable by escalation id.'
+        ),
+    )
+
     # Terminal-status watcher — periodically polls fused-memory for active
     # workflow tasks whose status has gone terminal out-of-band (typical
     # cause: a human marked a task ``done`` and removed its worktree while
@@ -3863,6 +4504,46 @@ class OrchestratorConfig(BaseSettings):
             'asyncio.Task.cancel(); at the 30s default poll this is ~90s.'
         ),
     )
+    terminal_cleanup_cancel_grace_secs: float = Field(
+        default=120.0,
+        gt=0,
+        description=(
+            'How long one terminal-cleanup entry (CancellationScope on_terminal) '
+            'may keep running once its slot has been hard-cancelled, before it '
+            'is cancelled and abandoned; the cancel is itself bounded by two '
+            'further windows of the same length. Normal cleanup takes about 1s.'
+        ),
+    )
+    terminal_status_force_release_polls: int = Field(
+        default=15,
+        ge=1,
+        description=(
+            'Watcher polls past terminal_status_hard_cancel_polls after which the '
+            'harness force-releases a slot that still has not ended, with its '
+            'module locks, and files a workflow_slot_wedged L1. Keep '
+            'polls x terminal_status_poll_interval_secs above '
+            '3 x terminal_cleanup_cancel_grace_secs (one abandoned entry: its '
+            'grace plus two bounded cancels), so the backstop only fires on '
+            'a wedge the bounded cleanup cannot end; the defaults give 450s '
+            'against 360s. Enforced by a model_validator.'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def _force_release_waits_out_the_bounded_cleanup(self) -> 'OrchestratorConfig':
+        backstop = self.terminal_status_force_release_polls * self.terminal_status_poll_interval_secs
+        bounded = 3 * self.terminal_cleanup_cancel_grace_secs
+        if backstop <= bounded:
+            raise ValueError(
+                'terminal_status_force_release_polls x terminal_status_poll_interval_secs '
+                f'({self.terminal_status_force_release_polls} x '
+                f'{self.terminal_status_poll_interval_secs} = {backstop}s) must exceed '
+                f'3 x terminal_cleanup_cancel_grace_secs ({bounded}s): one abandoned '
+                'terminal-cleanup entry may take its grace plus two bounded cancels, '
+                'and the slot force-release must not pre-empt a cleanup that is still '
+                'ending on its own. Raise the polls or lower the grace.'
+            )
+        return self
 
     # Stranded-in-progress reconcile sweep — periodic re-run of the
     # startup ``_reconcile_stranded_in_progress`` pass during a long run.
@@ -3884,6 +4565,12 @@ class OrchestratorConfig(BaseSettings):
     # full builds when main hasn't advanced within the interval.
     main_tip_sweep_enabled: bool = Field(default=True)
     main_tip_sweep_interval_secs: float = Field(default=1800.0)
+    # The sweep builds WARM (CoW-seeded from the warm-lane base) by default and
+    # COLD, as the ground-truth control, at most once per this many seconds since
+    # the last cold sweep that reached a verdict (persisted in runs.db; task 5812,
+    # superseding task 2567's always-cold sweep).  0 = every sweep cold.
+    # Restart-only (not in RELOADABLE_FIELDS), like the rest of the family.
+    main_tip_sweep_cold_interval_secs: float = Field(default=86400.0, ge=0.0)
 
     # Periodic deterministic-strand reconciliation sweep (task 2074).
     # Defensive/non-blocking background recovery sweep for deterministic
@@ -4094,6 +4781,28 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
 
+    # Task 3542 — observe-before-enforce gate for the run()-exit contract, flat
+    # like its neighbour above: no `defaults.yaml` stanza and no
+    # `RELOADABLE_FIELDS` entry.  The canonical WHY is
+    # orchestrator/src/orchestrator/exit_contract.py (module docstring).
+    #
+    # THE PROMOTION PATH:
+    #   1. OBSERVE.  With the default False, count the `would-violate` rows
+    #      (`workflow_exit_contract` events, verdict='violation', mode='log').
+    #   2. ENFORCE.  Task mu flips this default to True after the soak.
+    #   3. KEEP.  Unlike convert_to_blocked_enforce, never delete this field:
+    #      enforce is the steady state, and the log mode is its escape hatch.
+    workflow_exit_contract_enforce: bool = Field(
+        default=False,
+        description=(
+            'Enforce the run()-exit contract (task 3542; spec §5).  False — the '
+            'shipped default — is LOG MODE: a violating exit logs a '
+            '`would-violate` WARNING and emits a `workflow_exit_contract` event. '
+            'True also files one deduped L1 (category workflow_exit_contract). '
+            'In neither mode does the check write the task status or raise.'
+        ),
+    )
+
     # Kill-switch for the verified-green merge-queue-direct remediation
     # (stranding-remediation-scheduler-ergonomics-prd.md leaf α).  When enabled
     # (default), a stranded-`blocked` task whose warm lane holds an ASSIGNED,
@@ -4224,6 +4933,46 @@ class OrchestratorConfig(BaseSettings):
             'substantial fraction of an era while still admitting backfill in '
             'the fresh window where most grants occur. Green-tier, so a replay '
             'can retune it from production data without a deploy.'
+        ),
+    )
+
+    # Pin reservations (task 6040): the head lock-blocked pin(s) hold a
+    # reservation on their modules — see orchestrator/pin_reservation.py.
+    # Flat top-level fields beside backfill_*, read from self.config at tick
+    # time, so green-tier membership is the whole reload story.
+    pin_reservations_enabled: bool = Field(
+        default=True,
+        description=(
+            'Kill switch for pin reservations. When False the pin loop behaves '
+            'as before task 6040: a lock-blocked pinned task is granted no '
+            'reservation and emits no pin_blocked event, and any pin '
+            'reservations left over from before the switch flipped are released '
+            'once, on the next tick (reservation_expired reason '
+            "'pin_reservations_disabled')."
+        ),
+    )
+    pin_reservation_max_active: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            'How many of the lowest-pin_order, eligible, lock-blocked pins may '
+            'hold a pin reservation at once. The default of 1 is the EASY-'
+            'backfill head reservation: one operator-chosen reservation cannot '
+            'gridlock with itself, its idle cost is one footprint, and backfill '
+            'still borrows through it. Raising it moves toward the general '
+            'below-rank-1 park installation that '
+            'plans/scheduler-dispatch-scoring-and-lock-layer-prd.md section 7 '
+            'measured as harmful. ge=1 because pin_reservations_enabled is the '
+            'single off lever.'
+        ),
+    )
+    pin_blocked_emit_interval_secs: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            'pin_blocked is emitted when a pinned task becomes blocked, then at '
+            'most once per this many seconds while it stays blocked. A dispatch, '
+            'or the task leaving the pin queue, resets it.'
         ),
     )
 
@@ -4464,6 +5213,11 @@ class OrchestratorConfig(BaseSettings):
     # Scheduler fairness / anti-starvation
     fairness: FairnessConfig = Field(default_factory=FairnessConfig)
 
+    # Dispatch-score sub-budgets (task 3819).  An absent stanza yields the
+    # default instance; age_alpha / cpm_beta below remain the legacy formula's
+    # knobs, which the anchor-coverage gate still falls back to.
+    scoring: ScoringConfig = Field(default_factory=ScoringConfig)
+
     # Scheduler starvation watchdog (task 1880).
     starvation_watchdog: StarvationWatchdogConfig = Field(
         default_factory=StarvationWatchdogConfig,
@@ -4595,6 +5349,35 @@ class OrchestratorConfig(BaseSettings):
             'warm_verify_shadow_compare_every_n_merges cadence knob pattern.'
         ),
     )
+
+    # Lever C, task 4537: the HOST-ENVIRONMENT divergence detector's probe set.
+    # The existing drift check compares VERDICTS; these probes compare the two
+    # hosts' actual tooling at the same cadence, so a version skew is named
+    # before it silently produces divergent verdicts.
+    #
+    # [] (the default) means the env detector is OFF and touches no host — the
+    # check returns INCONCLUSIVE before probing.  Rust probes are deliberately
+    # NOT hardcoded here: only `extra_probes` is compared, so a Rust project
+    # declares rustc/cargo in this list explicitly and a Python project is not
+    # false-alarmed by a stray ~/.cargo/bin/rustc on one host.
+    #
+    # Deliberately NOT in RELOADABLE_FIELDS (restart-only), by choice rather
+    # than necessity: merge_lane/drift.py::_run_drift_check reads it live at
+    # each drift check, so a reload WOULD apply, but the probe set describes
+    # the verify_runners pool (itself restart-only) and is kept changing in
+    # the same restart as the hosts it compares.
+    verify_env_probes: list[EnvProbeConfig] = Field(
+        default_factory=list,
+        description=(
+            'Operator-declared OS-level probes (key + argv) captured on both the '
+            'local dispatcher and the remote verify runner at the drift-check '
+            'cadence and compared.  A difference emits a verify_env_divergence '
+            'event and files one deduped L1.  Default [] means the env detector '
+            'is off (no host is probed).  Only these probes are compared — the '
+            'hardcoded rustc/cargo/sccache dimensions are skipped, so a non-Rust '
+            'project is never false-alarmed; a Rust project declares them here.'
+        ),
+    )
     verify_host_unreachable_escalate_after_n: int = Field(
         default=3,
         ge=1,
@@ -4619,14 +5402,36 @@ class OrchestratorConfig(BaseSettings):
             'when merges are sparse and RU events are infrequent.'
         ),
     )
+    verify_host_policy: VerifyHostPolicy = Field(
+        default='prefer_local',
+        description=(
+            'When Lever C is on, which host the NEXT merge-verify dispatch prefers.  '
+            "'prefer_local' (default) keeps today's order byte-for-byte: take the "
+            'local slot when it is free, overflow to the first eligible remote '
+            "otherwise.  'prefer_remote' inverts it: take the first eligible remote "
+            '(FREE, not quarantined, not PARKED) and fall back to local when no '
+            'remote is available, so a free remote host absorbs verify load instead '
+            'of idling while the lane serialises on local.  Eligibility rules are '
+            'unchanged in both directions, so a busy/quarantined/PARKED remote still '
+            'falls through to local and the queue never stalls.  '
+            'TRUST-ANCHOR CAVEAT: prefer-local exists because local is the trust '
+            'anchor — a laptop false-green once landed a red commit.  Under '
+            "'prefer_remote' nearly every verdict becomes a REMOTE verdict, so "
+            'verify_drift_check_every_n_lands becomes the standing fidelity guard '
+            'rather than a spot check.  This field changes no cadence; set that one '
+            'deliberately before flipping this one.'
+        ),
+    )
     verify_host_reprobe_interval_s: float = Field(
         default=120.0,
         ge=1,
         description=(
-            'When Lever C is on, the _reprobe_loop checks quarantined remote hosts '
-            'for reachability (via RemoteRunner.health()) every this many seconds.  '
-            'On recovery the quarantine is cleared and the host re-enters the live '
-            'pool without an orchestrator restart.  Must be >= 1.'
+            'When Lever C is on, the _reprobe_loop re-probes benched remote hosts '
+            'every this many seconds: an unreachable (\'ru\') bench by '
+            'RemoteRunner.health() (ssh true), a gate-skew (\'skew\') bench by '
+            'RemoteRunner.ensure_gate(); a sticky skew bench is not probed (task '
+            '6565).  On a passing probe the host re-enters the live pool without '
+            'an orchestrator restart.  Must be >= 1.'
         ),
     )
 
@@ -4689,6 +5494,37 @@ class OrchestratorConfig(BaseSettings):
     @classmethod
     def _resolve_project_root(cls, v: Path) -> Path:
         return v.resolve()
+
+    @field_validator('verify_env_probes', mode='after')
+    @classmethod
+    def _reject_duplicate_env_probe_keys(
+        cls, v: list[EnvProbeConfig],
+    ) -> list[EnvProbeConfig]:
+        """Reject colliding probe keys at load time (task 4537).
+
+        capture_env_fingerprint writes each probe into ``extra_probes[key]``,
+        which is LAST-WRITE-WINS.  A duplicated key therefore drops one of the
+        operator's probes from the comparison on BOTH hosts while still paying
+        its ssh round trip — a tool the operator believes is watched but is
+        not.  That is the same silent-no-op class the ``argv`` min_length and
+        the empty-``dimensions`` guard reject, and it is invisible from the
+        emitted events (they report the surviving value under the shared key),
+        so it has to fail at construction/reload instead.
+        """
+        seen: set[str] = set()
+        dupes: list[str] = []
+        for probe in v:
+            if probe.key in seen and probe.key not in dupes:
+                dupes.append(probe.key)
+            seen.add(probe.key)
+        if dupes:
+            raise ValueError(
+                f'verify_env_probes has duplicate key(s): {dupes!r}.  '
+                f'extra_probes[key] is last-write-wins, so each collision '
+                f'silently drops a declared probe from the comparison.  Give '
+                f'each probe a distinct key.'
+            )
+        return v
 
     @field_validator('verify_admission_pytest_n', mode='before')
     @classmethod
@@ -4776,6 +5612,23 @@ class OrchestratorConfig(BaseSettings):
                 self,
                 'verify_admission_slots_dir',
                 f'/tmp/df-verify-slots-{os.getuid()}-{digest}',
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _derive_fused_memory_project_id(self) -> 'OrchestratorConfig':
+        """Fill an empty ``fused_memory.project_id`` from ``project_root``.
+
+        Same sentinel idiom as ``_default_verify_admission_slots_dir``. The
+        submodel is replaced by a copy, never mutated, so an instance shared
+        with another config keeps its own id.
+        """
+        if not self.fused_memory.project_id:
+            derived = project_id_for_root(self.project_root)
+            object.__setattr__(
+                self,
+                'fused_memory',
+                self.fused_memory.model_copy(update={'project_id': derived}),
             )
         return self
 
@@ -5047,7 +5900,7 @@ class OrchestratorConfig(BaseSettings):
         Stored separately from runs.db so reify cycles and set_task_status
         writes cannot wipe override rows.
         """
-        return self.project_root / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+        return scheduler_overrides_db(self.project_root)
 
     @property
     def park_eviction_requests_db_path(self) -> Path:
@@ -5056,7 +5909,7 @@ class OrchestratorConfig(BaseSettings):
         Stored in a dedicated file isolated from the overrides schema to
         keep the operator eviction lever narrow-blast-radius (PRD D3).
         """
-        return self.project_root / 'data' / 'orchestrator' / 'park_eviction_requests.db'
+        return park_eviction_requests_db(self.project_root)
 
     model_config = SettingsConfigDict(
         env_prefix='ORCH_',
@@ -5444,6 +6297,22 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
     return config
 
 
+PROJECT_CONFIG_FILENAME = 'dark-factory-orchestrator.yaml'
+"""The canonical name of a project's orchestrator config, at its project root."""
+
+
+def project_review_config(project_root: Path) -> ReviewConfig:
+    """The ``review`` block the orchestrator of the project at *project_root* runs with.
+
+    Layered the way OrchestratorConfig layers its YAML source (defaults.yaml,
+    then the project's own file, then ``${VAR}`` expansion), but without
+    setting ``ORCH_CONFIG_PATH``, so one process can read another project's
+    setting. A project with no config file gets the shipped defaults.
+    """
+    layered = YamlSettingsSource(OrchestratorConfig, project_root / PROJECT_CONFIG_FILENAME)()
+    return ReviewConfig.model_validate(layered.get('review') or {})
+
+
 # ---------------------------------------------------------------------------
 # Config hot-reload (plans/config-hot-reload-prd.md, task alpha): RELOADABLE_FIELDS
 # ---------------------------------------------------------------------------
@@ -5541,11 +6410,22 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # whole-submodel-group precedent.
     _submodel_leaf_paths('transcript_archive', TranscriptArchiveConfig),
     # Warm-lane session-resume guard (task γ) — a new dedicated submodel, same
-    # whole-submodel-group idiom as routing/chronic_flake above: the kill switch
-    # and all three ge-bounded knobs (freshness_window_secs / max_resumes_per_task
-    # / fallback_storm_threshold) are green-tier hot-reloadable with no separate
-    # RELOADABLE_FIELDS edit.
+    # whole-submodel-group idiom as routing/chronic_flake above: both kill
+    # switches (enabled / restore_from_archive) and all FIVE ge-bounded knobs
+    # (freshness_window_secs / absolute_resume_age_secs / max_resumes_per_task /
+    # fallback_storm_threshold / storm_window_secs) are green-tier
+    # hot-reloadable with no separate RELOADABLE_FIELDS edit. This comment
+    # undercounted at "all three" until task 3730; the enumeration is
+    # documentation only, since _submodel_leaf_paths reads model_fields, but a
+    # count that drifts reads as a checked claim and is not one — the check is
+    # test_config.py::TestSessionResumeConfig::test_leaves_in_reloadable_fields.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
+    # Dispatch-score sub-budgets (task 3819, PRD D8) — same whole-submodel
+    # idiom.  Green-tier because a scoring retune used to cost a fleet restart,
+    # which is why the old age_alpha / cpm_beta constants were never tuned.
+    # I-1 / I-3 still bind a reload through apply_reload's whole-config
+    # re-validation.
+    _submodel_leaf_paths('scoring', ScoringConfig),
     # Unknown-config-key census escape hatch (task 2989) — same whole-submodel
     # idiom.  Green-tier ON PURPOSE: the born-at-L2 this census files tells the
     # operator to add a path to config_key_census.ignore and hot-reload, and a
@@ -5575,6 +6455,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # useless at the moment it matters.
         'transient_requeue_backoff_base_secs',
         'transient_requeue_backoff_cap_secs',
+        # Merge-phase re-verify rollback switch (task 6580).  Flat field read
+        # by TaskWorkflow._rebase_before_enqueue at each merge attempt from
+        # the shared live config object, so a flip applies from the next
+        # merge attempt.
+        'pre_merge_reverify',
         # EASY-backfill admission (task 3823 / PRD C7).  Explicit literals, not
         # a _submodel_leaf_paths group: these are FLAT top-level fields, not a
         # submodel.  Green-tier on purpose — PRD Open Q3 ships safety_factor
@@ -5584,6 +6469,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'backfill_safety_factor',
         'backfill_min_samples',
         'backfill_max_park_age_secs',
+        # Pin reservations (task 6040).  Explicit literals for the same reason
+        # as the backfill_* group: FLAT top-level fields.  Read from
+        # self.config at tick time, so no reload hook is needed.
+        'pin_reservations_enabled',
+        'pin_reservation_max_active',
+        'pin_blocked_emit_interval_secs',
         # Digest + EWA breaker knobs (task 4559).  Explicit literals for the
         # same reason as the backfill_* group above: these are FLAT top-level
         # fields, not a submodel, so _submodel_leaf_paths does not apply.
@@ -5628,6 +6519,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # hot-reloadable so the merge-phase FP-suppression window can be tuned
         # without a redeploy.
         'orphan_l0_merge_phase_freshness_secs',
+        # Siblings of orphan_l0_timeout_secs, read live on each sweep or exit:
+        # a retune lands on the next routing pass, and the kill switch must not need a restart.
+        'info_l0_router_enabled',
+        'info_l0_router_ticket_timeout_secs',
+        'info_l0_router_max_conversions_per_sweep',
+        'info_l0_note_detail_chars',
         'watcher_rotation_escalations',
         'watcher_rotation_hours',
         'watcher_max_crashloop_restarts',
@@ -5641,6 +6538,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'review.full_review_on_complete',
         'review.full_review_min_interval_secs',
         'review.full_review_min_tasks',
+        'review.reviewer_briefing',
         # Verify env (fresh config's value already carries the sccache fold)
         'verify_env',
         # Cold-verify shared-venv pre-provision command (task 2997) — green-tier
@@ -5653,6 +6551,29 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # siblings: it only ever ADDS a second-opinion local verify, so flipping
         # it mid-process cannot split an in-flight merge's breadth.
         'verify_cross_check_remote_green',
+        # Disjoint-delta fast-path soundness gate (2026-09-22 whole-tree-drift
+        # incident) — green-tier for the same reason as its
+        # verify_cross_check_remote_green neighbour directly above: it only
+        # ever ADDS a re-verify before an advance, never changes an in-flight
+        # merge's breadth, and is read fresh off req.config at each gate
+        # evaluation.  A safety kill switch behind a restart is not one.
+        'merge_disjoint_skip_requires_verified_drift',
+        # Same-tree gate skip precondition (task 6647) — green-tier for the
+        # reason given directly above.
+        'merge_gate_history_pure',
+        # Same-tree history leg (task 7248) — read fresh off req.config at each
+        # gate evaluation, and it only decides what one gate run executes.
+        'merge_gate_history_test_command',
+        # Task-text amendment gate on the Lever-B skip (task 4031) — read off
+        # self.config at each revalidation decision and never captured, so a
+        # flip affects only the next decision.
+        'plan_text_fp_gate_enabled',
+        # Merge-verify host selection order (task 5097, Lever C) — green-tier
+        # because the policy is read per HostAllocator.acquire call and never
+        # captured on the allocator, so a flip only changes which host the NEXT
+        # dispatch prefers and cannot split an in-flight merge.  Read the
+        # field's trust-anchor caveat before flipping it live.
+        'verify_host_policy',
         # Per-model USD/1M-token price table (task 2459) — green-tier like
         # verify_env above. Threaded into every task-workflow role
         # invocation via the shared TaskWorkflow._invoke chokepoint (task
@@ -5660,10 +6581,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # picked up by the very next invocation.
         'prices',
         # Offline-lane tunables (leaf fields on the existing `git` submodel —
-        # leaf-mutation only per I3)
+        # leaf-mutation only per I3); the persistence trio is read by
+        # `offline_lane_episodes.lane_policy` at every pass, never cached
         'git.offline_lane_test_threads',
         'git.offline_lane_poll_interval_secs',
-        'git.offline_lane_red_advances_before_blocker',
+        'git.offline_lane_persist_passes',
+        'git.offline_lane_recheck_secs',
+        'git.offline_lane_red_unlanded_hours',
         # advance_main's foreign-index-lock stand-off budget (task 3060) —
         # a leaf-mutation-only tuning knob re-read per advance (never
         # captured at startup), so a reload takes effect on the very next
@@ -5680,7 +6604,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # Verify admission control (task 2390 T2; task 2394 T6 adds the
         # seventh, `_pytest_n`) — all seven knobs are green-tier: an operator
         # can retune slot counts / nice tiers / the -n cap / toggle the gate
-        # without a process restart.
+        # without a process restart. The admission gate's knobs (task 5628)
+        # are read at each grant (slots/order/promote) or each watch tick
+        # (alarm), so a reload applies to the next grant or tick.
         'verify_admission_enabled',
         'verify_admission_task_slots',
         'verify_admission_slots_dir',
@@ -5688,6 +6614,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'verify_admission_nice_task',
         'verify_admission_nice_background',
         'verify_admission_pytest_n',
+        'verify_admission_order',
+        'verify_admission_background_promote_secs',
+        'verify_admission_wait_alarm_secs',
+        # Per-role verify scope CPUWeight (task 5205): read at each verify scope
+        # spawn (verify.py::_resolve_scope_cpu_weight), so a reload applies from
+        # the next spawn; a scope already running keeps the weight it started with.
+        'verify_cgroup_cpu_weight_merge',
+        'verify_cgroup_cpu_weight_task',
+        'verify_cgroup_cpu_weight_background',
         # Merge-role internal-fanout cap (task 2393, T5) — same knob family:
         # read fresh per run_scoped_verification call, so a live reload
         # lowers the merge fan-out without a restart.

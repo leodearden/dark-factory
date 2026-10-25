@@ -80,6 +80,18 @@ assert "A1: --help prints 'usage' or 'Usage' on stderr" \
 run_helper --nope
 assert "A2: unknown flag exits 2" test "$RC" -eq 2
 
+# A3-A4: a multi-line value is rejected even when each line alone would pass.
+A_MOUNT="$(mktemp -d /tmp/test-warm-lane-audit-a-XXXXXX)"
+_TMPDIRS+=("$A_MOUNT")
+run_helper --mount "$A_MOUNT" --stale-age-min $'60\nx'
+assert "A3: multi-line --stale-age-min exits 2" test "$RC" -eq 2
+assert "A3: multi-line --stale-age-min names its validator" \
+    bash -c 'grep -qF -- "--stale-age-min" <<<"$1"' _ "$ERR_OUT"
+run_helper --mount "$A_MOUNT" --safety $'2\n3'
+assert "A4: multi-line --safety exits 2" test "$RC" -eq 2
+assert "A4: multi-line --safety names its validator" \
+    bash -c 'grep -qF -- "--safety" <<<"$1"' _ "$ERR_OUT"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared fixture scaffolding: make_lane + _wait_for_reader_lock
 # ──────────────────────────────────────────────────────────────────────────────

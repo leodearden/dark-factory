@@ -25,10 +25,11 @@ import pytest
 # scripts/ on sys.path for exactly this. See the comment above
 # HARDCODED_SERVICE_REPO_ROOT for why this module renders through the
 # installer's own code rather than replaying the substitution.
-import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+import render_systemd_unit
 from systemd_unit_invariants import (
     assert_restart_backoff_effective as _assert_restart_backoff_effective,
 )
+from systemd_unit_invariants import logical_exec_start
 from systemd_unit_invariants import (
     restart_directive as _restart_directive,
 )
@@ -97,7 +98,7 @@ HARDCODED_EXPECTED_PROJECT_ROOT_ENV_LINE = (
 # alternate machine may legitimately differ — the test is not asserting anything
 # about the runtime install environment.
 #
-# Substitution semantics: scripts/render_dashboard_unit.py::render_template,
+# Substitution semantics: scripts/render_systemd_unit.py::render_template,
 # which is the code setup-host.sh section 8 actually runs to install this unit.
 # Both sentinels are replaced globally, unanchored and literally.
 #
@@ -291,12 +292,13 @@ def test_project_root_env_var_is_pinned_in_both_unit_files() -> None:
 
     The template must carry the __REPO_ROOT__ sentinel, never a hardcoded path,
     so the installer's __REPO_ROOT__ substitution
-    (scripts/render_dashboard_unit.py::render_template) makes the installed
+    (scripts/render_systemd_unit.py::render_template) makes the installed
     value track the real checkout — the same treatment
     DASHBOARD_KNOWN_PROJECT_ROOTS' self entry already gets. NOTE the treatment
     is only the same for the SUBSTITUTION: DASHBOARD_KNOWN_PROJECT_ROOTS is
     additionally PRESERVED from the installed unit across a reinstall
-    (render_dashboard_unit.HOST_LOCAL_ENVIRONMENT), and this variable
+    (systemd_unit_parity.ENV_POLICY's host-local rows, preserved by
+    scripts/render_systemd_unit.py), and this variable
     deliberately is not — its value must equal the SAME copy's
     WorkingDirectory=, which the next test pins.
     """
@@ -583,7 +585,7 @@ def test_template_renders_to_hardcoded_file() -> None:
     """Rendered template must match the committed hardcoded service file verbatim.
 
     This is the canonical drift-prevention invariant, and it is made THROUGH the
-    installer's own renderer: scripts/render_dashboard_unit.py::render_template
+    installer's own renderer: scripts/render_systemd_unit.py::render_template
     is the function setup-host.sh section 8 runs to install this unit, so the
     two repo-side files are held in lockstep by the same code that renders the
     host-side one. A replayed copy of the substitution would be a third
@@ -593,7 +595,7 @@ def test_template_renders_to_hardcoded_file() -> None:
     If this test fails, the template and hardcoded file have drifted.  Re-render
     with::
 
-        python3 scripts/render_dashboard_unit.py --no-preserve \\
+        python3 scripts/render_systemd_unit.py --no-preserve \\
             --template  scripts/dashboard.service.template \\
             --repo-root /home/leo/src/dark-factory \\
             --uv-path   /home/leo/.local/bin/uv \\
@@ -614,7 +616,7 @@ def test_template_renders_to_hardcoded_file() -> None:
     rendering an INSTALLED unit; that is the clobber the renderer exists to
     prevent, and setup-host.sh does not pass it.
     """
-    rendered = render_dashboard_unit.render_template(
+    rendered = render_systemd_unit.render_template(
         TEMPLATE.read_text(encoding="utf-8"),
         repo_root=HARDCODED_SERVICE_REPO_ROOT,
         uv_path=HARDCODED_SERVICE_UV_PATH,
@@ -624,7 +626,7 @@ def test_template_renders_to_hardcoded_file() -> None:
         f"Rendered template does not match {HARDCODED}.\n"
         f"Template path: {TEMPLATE}\n"
         "The files have drifted.  Re-render with "
-        "scripts/render_dashboard_unit.py — see this test's docstring for the "
+        "scripts/render_systemd_unit.py — see this test's docstring for the "
         "exact invocation."
     )
 
@@ -1026,39 +1028,6 @@ def _unclassified_setinterval_sites(
     return unclassified, stale
 
 
-def _logical_exec_start(path: pathlib.Path) -> str:
-    """Return the ExecStart= command in *path* as a single logical line.
-
-    The dashboard unit writes ExecStart as a systemd backslash continuation
-    spanning several physical lines, so a naive per-line regex would miss any
-    flag that lives on a continuation line.  Joins the ExecStart= line with
-    each following line while the current line ends in a backslash, dropping
-    the trailing ``\\`` and collapsing continuation indentation to a single
-    space.
-    """
-    lines = path.read_text(encoding="utf-8").splitlines()
-    start_idx = next(
-        (i for i, ln in enumerate(lines) if ln.startswith("ExecStart=")),
-        None,
-    )
-    assert start_idx is not None, f"No ExecStart= line found in {path}"
-
-    parts: list[str] = []
-    idx = start_idx
-    while True:
-        line = lines[idx].rstrip()
-        continued = line.endswith("\\")
-        if continued:
-            line = line[:-1]
-        # The first line keeps its ExecStart= prefix verbatim; continuation
-        # lines are stripped so the join yields single-space separation.
-        parts.append(line.rstrip() if idx == start_idx else line.strip())
-        if not continued or idx + 1 >= len(lines):
-            break
-        idx += 1
-    return " ".join(parts)
-
-
 def _uvicorn_int_flag(path: pathlib.Path, flag: str) -> int | None:
     """Return the integer argument of ``--<flag>`` in *path*'s ExecStart, or None.
 
@@ -1071,9 +1040,11 @@ def _uvicorn_int_flag(path: pathlib.Path, flag: str) -> int | None:
     The lookup is deliberately scoped to the logical ExecStart line rather than
     the whole file: both unit files discuss these same flags in the explanatory
     comment block above ExecStart, so a whole-file regex would keep reporting a
-    value after the flag had actually been deleted from the command.
+    value after the flag had actually been deleted from the command.  None
+    means the command lacks the flag, never that there is no command: a unit
+    with no effective ExecStart= raises MalformedExecStart instead.
     """
-    command = _logical_exec_start(path)
+    command = logical_exec_start(path.read_text(encoding="utf-8"), str(path))
     match = re.search(rf"--{re.escape(flag)}[=\s]+(\d+)", command)
     return int(match.group(1)) if match else None
 
@@ -1223,7 +1194,7 @@ def test_drain_bound_guard_rejects_unbounded_units(tmp_path: pathlib.Path) -> No
 
     # Good: 8 vs 15 with the flag on a CONTINUATION line — must not raise.
     # Guards against over-tightening, and exercises the continuation join in
-    # _logical_exec_start (a per-line regex would miss this flag entirely).
+    # logical_exec_start (a per-line regex would miss this flag entirely).
     good = _write_synthetic_unit(
         tmp_path / "good.service",
         "ExecStart=/usr/bin/uv run --project dashboard \\\n"
@@ -1269,11 +1240,35 @@ def test_uvicorn_flag_lookup_is_scoped_to_exec_start(tmp_path: pathlib.Path) -> 
     assert _uvicorn_int_flag(commented, "timeout-keep-alive") is None, (
         "_uvicorn_int_flag found --timeout-keep-alive in a unit whose ExecStart "
         "does not carry it — the lookup is matching the comment block instead of "
-        "the command. Scope it to _logical_exec_start()."
+        "the command. Scope it to logical_exec_start()."
     )
     # The flag that IS on the command is still found, so the scoping did not
     # over-tighten into finding nothing at all.
     assert _uvicorn_int_flag(commented, "timeout-graceful-shutdown") == 8
+
+
+def test_uvicorn_flag_lookup_reads_the_effective_exec_start(tmp_path: pathlib.Path) -> None:
+    """_uvicorn_int_flag must read the LAST ExecStart=, the one systemd runs.
+
+    A drop-in under <unit>.d/ merges by appending an empty reset and then the
+    real command, so a first-match read reports a value systemd discards (the
+    reasoning lives on systemd_unit_invariants.logical_exec_start).  This pins
+    the deliberate first-to-last change in this suite's ExecStart= lookup.
+    """
+    overridden = _write_synthetic_unit(
+        tmp_path / "overridden.service",
+        "ExecStart=/usr/bin/uv run python -m uvicorn app:app --timeout-graceful-shutdown 20\n"
+        "ExecStart=\n"
+        "ExecStart=/usr/bin/uv run python -m uvicorn app:app \\\n"
+        "  --timeout-graceful-shutdown 8",
+    )
+    graceful = _uvicorn_int_flag(overridden, "timeout-graceful-shutdown")
+    assert graceful == 8, (
+        f"_uvicorn_int_flag read --timeout-graceful-shutdown {graceful} from an "
+        "overridden ExecStart= rather than the command systemd runs (8): the "
+        "lookup must take the LAST ExecStart= assignment, joined across "
+        "continuations."
+    )
 
 
 def test_timeout_stop_sec_parses_systemd_time_specs(tmp_path: pathlib.Path) -> None:

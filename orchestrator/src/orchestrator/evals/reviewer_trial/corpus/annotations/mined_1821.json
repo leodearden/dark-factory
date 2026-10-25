@@ -49,5 +49,40 @@
         "path": "/home/leo/src/dark-factory/data/escalations/archive/2026-06-18/esc-1821-20.json"
       }
     ]
+  },
+  "context": {
+    "task": {
+      "title": "Fix stage1.py:160 latent dedup-trap: nonce-prepend retry for per-cycle summary (sibling of task 1796)",
+      "description": "stage1.py:160 instructs Stage 1 to retry the per-cycle summary add_memory write with identical content when count_memories_by_metadata returns 0 after the first write. Retrying with identical content re-triggers Mem0's ~0.92 cosine-similarity dedup and silently loses the retry (memory_ids=[]). Task 1796 applied the correct nonce-prepend fix to stage2.py:287-297 but explicitly left stage1.py out of scope. Apply the same fix to stage1.py:160.",
+      "test_strategy": "",
+      "details": "In fused-memory/src/fused_memory/reconciliation/prompts/stage1.py at line ~160, find the instruction that reads (approximately): \"retry the add_memory write once with the same content and metadata\". Replace it with the nonce-prepend retry pattern identical to what task 1796 implemented for stage2.py:287-297:\n\nThe new instruction should read: \"retry the add_memory write once, this time PREPENDING a deterministic retry_nonce line as a new first line of the content (metadata unchanged) \u2014 construct using the pattern RETRY_&lt;full_run_id_UUID&gt;_1_&lt;iso_timestamp_with_seconds&gt;. Example first line: RETRY_7ec2e500-fc7a-478e-a82e-7c60ee382e3a_1_2026-06-18T09:00:50\"\n\nThis shifts the embedding enough to defeat cosine-similarity dedup (~0.92 threshold) while preserving the metadata keys (including the required stage='memory_consolidator', kind='cycle_summary', run_id, recon_pool='stage1_cycle_summary' keys needed for Stage 3 verification).\n\nEvidence:\n- Two Mem0 memories documenting the latent bug: 526c6cdd-efc0-4e5a-89c7-d7950ac2bfe8, ee773e38-ad3d-487a-b795-95726ebca615 (created 2026-06-18)\n- Task 1796 (done, merged 2026-06-18) applied the same fix to stage2.py and documented the nonce pattern\n- Stage 1 flagged this gap in reconciliation run 7ec2e500 (finding afefb6f9)",
+      "authored": false,
+      "id": "1821",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-06-18T11:29:01.590Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py"
+    ],
+    "base_sha": "50db20417d54f11f6e8b1ff6426efd81abc3794c",
+    "branch_sha": "d5b66924771b7a1bb3f397af26eed52601bfccb6",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "eb9326f316d9eac4f26a29c67805f33fa369a833",
+      "merge_base_sha": "50db20417d54f11f6e8b1ff6426efd81abc3794c",
+      "diff_reproduces_from": "git diff 50db20417d eb9326f316",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

@@ -16,6 +16,9 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+import yaml
+
+from orchestrator.evals.results import CellName, ResultStore
 
 # Stub out runpod_toolkit BEFORE importing the launcher. The real package has
 # a transitive paramiko dependency that's not installed in the orchestrator
@@ -228,7 +231,7 @@ def _write_result(
         "metrics": extra.pop("metrics", {"cost_usd": 1.23, "tests_pass": True}),
     }
     payload.update(extra)
-    p = results_dir / f"{task_id}__{config_name}__{run_id}.json"
+    p = results_dir / CellName(task_id, config_name, run_id).filename
     p.write_text(json.dumps(payload))
     return p
 
@@ -237,7 +240,7 @@ class TestFindNewResultFile:
     def test_returns_newest_after_watermark(self, tmp_path, monkeypatch):
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         old = _write_result(results, "df_task_12", "cfg", "old00000")
         watermark = old.stat().st_mtime
@@ -250,7 +253,7 @@ class TestFindNewResultFile:
     def test_ignores_files_at_or_before_watermark(self, tmp_path, monkeypatch):
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         only = _write_result(results, "df_task_12", "cfg", "only00000")
         watermark = only.stat().st_mtime + 1.0  # in the future
@@ -260,13 +263,13 @@ class TestFindNewResultFile:
     def test_returns_none_when_no_new_file(self, tmp_path, monkeypatch):
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
         assert find_new_result_file("df_task_99", "cfg", 0.0) is None
 
     def test_isolates_by_task_id(self, tmp_path, monkeypatch):
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         _write_result(results, "df_task_13", "cfg", "abcd1234")
         assert find_new_result_file("df_task_12", "cfg", 0.0) is None
@@ -274,7 +277,7 @@ class TestFindNewResultFile:
     def test_isolates_by_config_name(self, tmp_path, monkeypatch):
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         _write_result(results, "df_task_12", "other-cfg", "abcd1234")
         assert find_new_result_file("df_task_12", "cfg", 0.0) is None
@@ -289,7 +292,7 @@ class TestFindNewResultFileExclude:
     def test_excludes_pre_files_paths(self, tmp_path, monkeypatch):
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         a = _write_result(results, "df_task_12", "cfg", "aaaa0000")
         watermark = a.stat().st_mtime - 1.0  # both files are above the watermark
@@ -316,7 +319,7 @@ class TestFindNewResultFileExclude:
         """Old 3-positional-arg call sites still work."""
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         only = _write_result(results, "df_task_12", "cfg", "only00000")
         # No exclude_paths arg at all — must still find the file.
@@ -329,7 +332,7 @@ class TestFindNewResultFileExclude:
 
         results = tmp_path / "results"
         results.mkdir()
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         # Write 5 files all with mtime = 1000.0
         files = {}
@@ -499,7 +502,7 @@ class TestPodLifecycle:
         self, monkeypatch, tmp_path, concurrency
     ):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
         fake_tasks = tmp_path / "tasks"
@@ -539,7 +542,7 @@ class TestPodLifecycle:
 
     def test_pod_terminated_when_middle_task_crashes(self, monkeypatch, tmp_path):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -593,7 +596,7 @@ class TestPodLifecycle:
 
     def test_pod_terminated_on_keyboard_interrupt(self, monkeypatch, tmp_path):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -633,7 +636,7 @@ class TestPodLifecycle:
 
     def test_pod_bringup_failure_short_circuits(self, monkeypatch, tmp_path):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -693,7 +696,7 @@ class TestPodLifecycle:
 
     def test_single_task_path_runs_subprocess_once(self, monkeypatch, tmp_path):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -753,7 +756,7 @@ class TestPerTaskLogFiles:
 
     def _setup_one_task(self, monkeypatch, tmp_path):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -1054,13 +1057,13 @@ def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
 def _setup_concurrent_fixture(
     monkeypatch, tmp_path: Path, task_ids: list[str]
 ) -> tuple[Path, _FakeClient]:
-    """Shared RESULTS_DIR / EVAL_LOG_DIR / TASKS_DIR / pod-infra wiring for
+    """Shared RESULT_STORE / EVAL_LOG_DIR / TASKS_DIR / pod-infra wiring for
     the ordering-sensitive TestConcurrentLoop tests below.
 
     Returns ``(results_dir, fake_client)``.
     """
     results = tmp_path / "results"
-    monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+    monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
     monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
     fake_tasks = tmp_path / "tasks"
@@ -1161,7 +1164,7 @@ class TestConcurrentLoop:
         deterministic on any CPU load.
         """
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
         task_ids = ["df_task_12", "df_task_13", "df_task_18"]
@@ -1211,7 +1214,7 @@ class TestConcurrentLoop:
         wave 1; later waves pass through the already-open event immediately.
         """
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
         task_ids = [f"df_task_{i}" for i in (12, 13, 14, 15, 18)]
@@ -1248,7 +1251,7 @@ class TestConcurrentLoop:
         import os
 
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
         task_ids = ["df_task_12", "df_task_13", "df_task_14", "df_task_15"]
@@ -1502,7 +1505,7 @@ class TestConcurrentLoop:
         signal injection from another thread.
         """
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
         monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
 
         task_ids = ["df_task_12", "df_task_13", "df_task_18"]
@@ -1686,7 +1689,7 @@ class TestPreflightBaseline:
         repo, sha = tmp_repo
 
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -1727,7 +1730,7 @@ class TestPreflightBaseline:
     def test_warn_policy_proceeds(self, monkeypatch, tmp_path, tmp_repo):
         repo, sha = tmp_repo
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -1744,6 +1747,16 @@ class TestPreflightBaseline:
         monkeypatch.setattr(launcher, "PROJECT_ROOT", repo)
         # See test_strict_policy_aborts_before_pod for why this env var is set.
         monkeypatch.setenv("RUNPOD_API_KEY", "rpa_test_fake_key")
+        # Unlike the strict case, warn PROCEEDS — so this test runs on past
+        # preflight into `build_eval_env`, which rosters
+        # `PROJECT_ROOT/config/usage-accounts.yaml` and aborts when that
+        # roster resolves no credential (task 4945). PROJECT_ROOT is redirected
+        # to a bare tmp repo above, so the roster and its token have to be
+        # seeded here; without them the run dies on the account precondition
+        # before it can demonstrate anything about the warn policy.
+        (repo / "config").mkdir()
+        (repo / "config" / "usage-accounts.yaml").write_text(_SHARED_POOL_YAML)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_B", "SENTINEL-POOL-B")
 
         fake_client = _patch_pod_infra(monkeypatch)
         _patch_subprocess_run_success(monkeypatch, results)
@@ -1766,7 +1779,7 @@ class TestPreflightBaseline:
 
     def test_skip_policy_does_not_run_lint(self, monkeypatch, tmp_path):
         results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+        monkeypatch.setattr(launcher, "RESULT_STORE", ResultStore(results))
 
         fake_tasks = tmp_path / "tasks"
         fake_tasks.mkdir()
@@ -2147,4 +2160,257 @@ class TestPyrightScopeParity:
             "narrowing the root config — removing `scripts` from root would "
             "achieve parity by deleting all type checking of this module "
             f"instead; resolved: {[str(p) for p in resolved]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# build_eval_env: the eval account roster
+# ---------------------------------------------------------------------------
+
+
+_SHARED_POOL_YAML = """\
+accounts:
+  - name: max-b
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_B
+  - name: max-g
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_G
+"""
+
+
+class TestBuildEvalEnvSharedPool:
+    """``build_eval_env`` must roster the SHARED fleet pool, unmodified.
+
+    Task 4945, discharging the follow-up filed from the 2026-08-30 ruling
+    (task 4741). Account A is Leo's INTERACTIVE account, not an eval
+    reserve: his own sessions exhaust its weekly cap most weeks, so it
+    cannot double as a private eval reserve. Evals have no dedicated
+    account — they draw on the same pool as the rest of the fleet and
+    tolerate cap/429 events via ``invoke_with_cap_retry``'s shared default
+    cap-wait patience
+    (``shared/src/shared/cli_invoke.py::_DEFAULT_CAP_WAIT_SANITY_SECS``,
+    reached from ``orchestrator.evals.runner``) instead.
+
+    The ``USAGE_ACCOUNTS_FILE`` override itself is NOT the defect and is
+    deliberately kept (see the plan's design decision): it is the
+    established cross-project seam for "which roster does this run use",
+    read by ``shared.config_models.UsageCapConfig`` and by reify's own
+    orchestrator config. What is retired is APPENDING max-a to the roster
+    it points at.
+    """
+
+    @staticmethod
+    def _fake_project_root(
+        monkeypatch,
+        tmp_path: Path,
+        dotenv: str = "RUNPOD_API_KEY=rpa_test_fake_key\n",
+        roster: str = _SHARED_POOL_YAML,
+    ) -> Path:
+        """A tmp PROJECT_ROOT holding a shared pool config and a ``.env``.
+
+        THE ``PROJECT_ROOT`` MONKEYPATCH IS HERMETICITY, NOT EVIDENCE OF
+        DYNAMISM. ``launcher.PROJECT_ROOT`` is a module constant hardcoded
+        to the main checkout; it is redirected here only so a test reads a
+        roster and a ``.env`` it owns instead of the real ones. Nothing in
+        this class should be read as a claim that the launcher resolves its
+        root at runtime — it does not, and ``build_eval_env``'s docstring
+        says so.
+
+        A pool credential is seeded by default because ``build_eval_env``
+        now ABORTS when the roster resolves none (see
+        ``test_a_missing_pool_credential_aborts_the_run``); tests that want
+        a different arrangement re-clear and set their own.
+        """
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / "usage-accounts.yaml").write_text(roster)
+        # Exercise the dotenv branch. It overwrites os.environ values into
+        # the returned dict, so the fixture must control its content to keep
+        # the token assertions deterministic; the default body deliberately
+        # sets no CLAUDE_OAUTH_TOKEN_*, leaving monkeypatch.setenv in charge.
+        (tmp_path / ".env").write_text(dotenv)
+        monkeypatch.setattr(launcher, "PROJECT_ROOT", tmp_path)
+        TestBuildEvalEnvSharedPool._clear_oauth_tokens(monkeypatch)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_G", "SENTINEL-POOL-G")
+        return tmp_path
+
+    @staticmethod
+    def _clear_oauth_tokens(monkeypatch) -> None:
+        """Drop every ambient ``CLAUDE_OAUTH_TOKEN_*`` so a case is closed."""
+        for letter in "ABCDEFGH":
+            monkeypatch.delenv(f"CLAUDE_OAUTH_TOKEN_{letter}", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+    def test_usage_accounts_file_points_at_the_shared_config(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        root = self._fake_project_root(monkeypatch, tmp_path)
+
+        env = launcher.build_eval_env()
+
+        shared = root / "config" / "usage-accounts.yaml"
+        assert env["USAGE_ACCOUNTS_FILE"] == str(shared), (
+            "build_eval_env must point USAGE_ACCOUNTS_FILE at the repo's own "
+            "shared config/usage-accounts.yaml, not at a generated tempfile "
+            f"(got {env['USAGE_ACCOUNTS_FILE']!r}). Task 4945: the temp-file "
+            "generator existed only to append account A to the roster, which "
+            "the 2026-08-30 ruling retires."
+        )
+
+    def test_roster_contains_no_interactive_account(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        self._fake_project_root(monkeypatch, tmp_path)
+
+        env = launcher.build_eval_env()
+        rostered = yaml.safe_load(
+            Path(env["USAGE_ACCOUNTS_FILE"]).read_text()
+        )["accounts"]
+
+        assert [a.get("name") for a in rostered] == ["max-b", "max-g"], (
+            "the eval roster must be the shared pool verbatim; got "
+            f"{[a.get('name') for a in rostered]!r}"
+        )
+        assert not any(a.get("name") == "max-a" for a in rostered), (
+            "account max-a is reserved for INTERACTIVE use and must never be "
+            f"rostered for an eval run (ruling 2026-08-30, task 4741): {rostered!r}"
+        )
+        assert not any(
+            a.get("oauth_token_env") == "CLAUDE_OAUTH_TOKEN_A" for a in rostered
+        ), (
+            "no eval-rostered account may reference the interactive account's "
+            f"token env var CLAUDE_OAUTH_TOKEN_A: {rostered!r}"
+        )
+
+    def test_shared_roster_file_is_passed_through_byte_identical(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        root = self._fake_project_root(monkeypatch, tmp_path)
+
+        env = launcher.build_eval_env()
+
+        assert Path(env["USAGE_ACCOUNTS_FILE"]).read_bytes() == (
+            root / "config" / "usage-accounts.yaml"
+        ).read_bytes(), (
+            "the launcher must not rewrite, reorder or append to the shared "
+            "roster — pointing at it is the whole mechanism. Order matters: "
+            "UsageGate tries accounts in list order during failover."
+        )
+
+    def test_seed_oauth_token_does_not_prefer_the_interactive_account(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The bootstrap seed must be a POOL credential, never account A.
+
+        ``CLAUDE_CODE_OAUTH_TOKEN`` is only the BOOTSTRAP credential — per
+        invocation account selection is UsageGate's job, driven by the
+        roster in ``USAGE_ACCOUNTS_FILE``. But seeding it from A still
+        spends A on an eval, which is exactly what the 2026-08-30 ruling
+        forbids: A is interactive-only.
+        """
+        self._fake_project_root(monkeypatch, tmp_path)
+        self._clear_oauth_tokens(monkeypatch)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_A", "SENTINEL-INTERACTIVE-A")
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_G", "SENTINEL-POOL-G")
+
+        env = launcher.build_eval_env()
+
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "SENTINEL-POOL-G", (
+            "an eval run must bootstrap from a shared-pool credential; got "
+            f"{env['CLAUDE_CODE_OAUTH_TOKEN']!r}. Account A is reserved for "
+            "INTERACTIVE use only (ruling 2026-08-30, task 4741) — Leo's own "
+            "sessions exhaust its weekly cap most weeks, so spending it on an "
+            "eval costs him the account it was held back for."
+        )
+
+    def test_a_missing_pool_credential_aborts_the_run(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """With no pool token, ABORT — a print-and-continue is not loud.
+
+        The first version of this test pinned a warning plus an empty seed.
+        That is not failing loud: nothing stopped, and ``env[...] = ""``
+        additionally clobbered any valid ``CLAUDE_CODE_OAUTH_TOKEN``
+        inherited from the ambient environment, so the campaign launched a
+        pod and only then failed, at an invocation boundary, with a much
+        less legible error. An eval run with no credential cannot succeed;
+        continuing only defers and disguises the failure.
+        """
+        self._fake_project_root(monkeypatch, tmp_path)
+        self._clear_oauth_tokens(monkeypatch)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_A", "SENTINEL-INTERACTIVE-A")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "SENTINEL-AMBIENT-SEED")
+
+        with pytest.raises(SystemExit) as excinfo:
+            launcher.build_eval_env()
+
+        message = str(excinfo.value)
+        assert "CLAUDE_OAUTH_TOKEN_B" in message and "CLAUDE_OAUTH_TOKEN_G" in message, (
+            "the abort must name the pool credentials it tried, or an "
+            f"operator cannot tell which one to set: {message!r}"
+        )
+        assert "SENTINEL-INTERACTIVE-A" not in message, (
+            "the interactive account's token must never be adopted OR echoed; "
+            f"it is not rostered, so it is not a candidate at all: {message!r}"
+        )
+
+    def test_the_seed_is_drawn_from_the_roster_in_failover_order(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Any POOL credential will do — take the first the roster names.
+
+        The seed used to be hardcoded to one account, which contradicted
+        the stated contract ("it only needs to be a valid pool credential,
+        not a specific one") and stranded a whole campaign the day that one
+        token was rotated or absent. Deriving it from the roster honours
+        the contract, keeps UsageGate's failover order as the tie-break,
+        and excludes account A structurally rather than by name.
+        """
+        self._fake_project_root(monkeypatch, tmp_path)
+        self._clear_oauth_tokens(monkeypatch)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_B", "SENTINEL-POOL-B")
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_G", "SENTINEL-POOL-G")
+
+        first = launcher.build_eval_env()["CLAUDE_CODE_OAUTH_TOKEN"]
+
+        assert first == "SENTINEL-POOL-B", (
+            "with both rostered credentials present the seed must be the "
+            "roster's FIRST entry, matching the order UsageGate fails over "
+            f"in: {first!r}"
+        )
+
+        # ...and the roster's later entries are real fallbacks, not decoration.
+        monkeypatch.delenv("CLAUDE_OAUTH_TOKEN_B")
+        fallback = launcher.build_eval_env()["CLAUDE_CODE_OAUTH_TOKEN"]
+
+        assert fallback == "SENTINEL-POOL-G", (
+            "with the roster's first credential absent the seed must fall "
+            "through to the next rostered one; pinning a single hardcoded "
+            f"env var strands the campaign on a rotation: {fallback!r}"
+        )
+
+    def test_an_ambient_usage_accounts_file_is_overridden(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Setting the var is what stops a stale roster choosing the accounts.
+
+        This is the load-bearing half of "why set it rather than leave it
+        unset": ``env`` starts as ``os.environ.copy()`` and the ``.env``
+        loader writes into it too, so a shell still pointing at a retired
+        campaign's roster — exactly the kind that carried the injected
+        account this task removed — would otherwise silently win.
+        """
+        root = self._fake_project_root(monkeypatch, tmp_path)
+        stale = tmp_path / "retired-campaign-accounts.yaml"
+        stale.write_text(
+            "accounts:\n  - name: max-a\n    oauth_token_env: CLAUDE_OAUTH_TOKEN_A\n"
+        )
+        monkeypatch.setenv("USAGE_ACCOUNTS_FILE", str(stale))
+
+        env = launcher.build_eval_env()
+
+        assert env["USAGE_ACCOUNTS_FILE"] == str(
+            root / "config" / "usage-accounts.yaml"
+        ), (
+            "an ambient USAGE_ACCOUNTS_FILE must not survive: the launcher "
+            "states the roster for the run it is launching, and the ambient "
+            f"value here rosters the retired interactive account: {env['USAGE_ACCOUNTS_FILE']!r}"
         )

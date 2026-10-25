@@ -100,6 +100,9 @@ class TestConfigDefaults:
         cfg = DashboardConfig()
         assert isinstance(cfg.known_project_roots, list)
 
+    def test_samplers_enabled_by_default(self):
+        assert DashboardConfig().samplers_enabled is True
+
     def test_config_derived_paths(self):
         cfg = DashboardConfig()
         root = cfg.project_root
@@ -114,6 +117,11 @@ class TestConfigEnvOverrides:
         monkeypatch.setenv('DASHBOARD_HOST', '0.0.0.0')
         monkeypatch.setenv('DASHBOARD_PORT', '9090')
         monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', '/tmp/test')
+        # The suite's session-scoped isolation SETS DASHBOARD_FUSED_MEMORY_URLS
+        # (apply_isolated_env, task 5185), and an operator shell may set it too.
+        # Delete it so the assertion below exercises from_env()'s own fallback
+        # rather than whatever the ambient environment happens to hold.
+        monkeypatch.delenv('DASHBOARD_FUSED_MEMORY_URLS', raising=False)
 
         cfg = DashboardConfig.from_env()
         assert cfg.host == '0.0.0.0'
@@ -186,6 +194,31 @@ class TestConfigEnvOverrides:
         assert cfg.known_project_roots == []
         # verify other overrides still apply
         assert cfg.host == '0.0.0.0'
+
+    def test_samplers_unset_means_on(self, monkeypatch):
+        monkeypatch.delenv('DASHBOARD_SAMPLERS', raising=False)
+        assert DashboardConfig.from_env().samplers_enabled is True
+
+    @pytest.mark.parametrize(('raw', 'expected'), [('off', False), ('on', True)])
+    def test_samplers_on_off(self, monkeypatch, raw, expected):
+        monkeypatch.setenv('DASHBOARD_SAMPLERS', raw)
+        assert DashboardConfig.from_env().samplers_enabled is expected
+
+    def test_samplers_value_is_stripped_and_case_folded(self, monkeypatch):
+        monkeypatch.setenv('DASHBOARD_SAMPLERS', ' OFF ')
+        assert DashboardConfig.from_env().samplers_enabled is False
+
+    def test_samplers_unrecognised_value_raises_naming_var_value_and_spellings(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv('DASHBOARD_SAMPLERS', 'banana')
+        with pytest.raises(ValueError) as excinfo:
+            DashboardConfig.from_env()
+        message = str(excinfo.value)
+        assert 'DASHBOARD_SAMPLERS' in message
+        assert 'banana' in message
+        assert "'on'" in message
+        assert "'off'" in message
 
     def test_env_derived_paths_update(self, monkeypatch):
         monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', '/tmp/test')

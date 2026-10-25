@@ -7,9 +7,10 @@ Note on queue_depth_timeseries approximation
 --------------------------------------------
 The events table only records completions: ``EventStore.emit()`` is called
 synchronously *after* an attempt finishes.  We therefore approximate
-"queue depth" as the count of ``merge_attempt`` events per 15-minute bucket
-(throughput proxy), *not* true in-flight queue depth.  The MergeWorker's
-in-flight queue state is in-memory and not persisted to the events table.
+"queue depth" as the count of ``merge_attempt`` events per bucket, its width
+chosen from ``BUCKET_LADDER`` by the window length (throughput proxy), *not*
+true in-flight queue depth.  The MergeWorker's in-flight queue state is
+in-memory and not persisted to the events table.
 """
 
 from __future__ import annotations
@@ -18,19 +19,22 @@ import asyncio
 import json
 import logging
 import math
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any, TypedDict, TypeVar
 
 import aiosqlite
 import httpx
 
-from dashboard.config import DashboardConfig
 from dashboard.data.chart_utils import ChartData
+from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.db import with_db
-from dashboard.data.mcp_fanout import TTLCache
+from dashboard.data.mcp_fanout import describe_exc
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.stats_utils import percentile
-from dashboard.data.tasks import fetch_tasks
+from dashboard.data.task_lookup import FETCHED_ROW_FRESHNESS_BOUND_SECONDS, TaskRef
 from dashboard.data.utils import parse_utc, resolve_now, safe_gather_result
 
 logger = logging.getLogger(__name__)
@@ -48,31 +52,28 @@ def _ts_sort_key(entry: dict) -> datetime:
     except (TypeError, ValueError):
         return datetime.min.replace(tzinfo=UTC)
 
-# _ACTIVE_ONLY mirrors the non-terminal members of orchestrator merge_types.OutcomeKind
-# (_NON_TERMINAL_OUTCOMES in orchestrator/src/orchestrator/merge_types.py). The dashboard
-# has NO dependency on the orchestrator package, so this is a hand-maintained mirror, not an
-# import; the orchestrator-side frozen-contract test
-# (tests/test_outcome_kind.py::TestOutcomeKindFrozenContract) is the drift tripwire. A latest
-# merge_attempt event is TERMINAL (drops off the active panel) UNLESS its outcome is listed
-# here — new/unknown terminal outcomes fail SAFE instead of phantoming for the full TTL.
-# MAINTENANCE: no test or CI check enforces this mirror across the package boundary — if a
-# change to orchestrator's _NON_TERMINAL_OUTCOMES lands, this frozenset must be updated to
-# match by hand (see test_active_only_set_contents in test_merge_queue_data.py for the
-# dashboard-side pin).
-_ACTIVE_ONLY: frozenset[str] = frozenset({
-    'cas_retry', 'gate_retry', 'post_merge_generation_chained', 'plan_files_narrowed',
-})
-_ACTIVE_EVENT_TYPES: tuple[str, ...] = ('merge_queued', 'merge_dequeued', 'merge_attempt')
+# How many of a window's merge_attempt rows the Recent-merges table shows
+# (PRD open question 5). Measured 19 / 228 / 982 / 4901 events at
+# 24h / 7d / 30d / all, so the cap never bites at the default 24h and bites
+# from 7d — which is when "showing N of M" carries information.
+RECENT_MERGES_CAP = 200
 
-# Soft operational-warning threshold: warn when recent_merges returns more rows
-# than this while running unbounded (limit=None).  Signals a possible producer
-# burst worth investigating before memory pressure is reached.
-_RECENT_MERGES_BURST_WARN = 1_000
+LIVE_QUEUE_FRESHNESS_BOUND_SECONDS = 30
+"""How long a live queue reading stays fresh.
 
-# Hard memory-safety bound for recent_merges(limit=None).  Enforced via a
-# SQL LIMIT probe (_RECENT_MERGES_HARD_CAP + 1) so that a probe result of
-# exactly hard_cap rows does NOT fire a false-positive WARN.
-_RECENT_MERGES_HARD_CAP = 100_000
+Equal to ``task_snapshot.FRESHNESS_BOUND_SECONDS`` and for the same reason:
+it must outlast the route's own worst-case fan-out — the probes, then the
+task lookup's deadline — so the routine slow path does not serve its own
+probe stale. Ageing in the browser is the client's age badge's job.
+"""
+
+RUNS_DB_READ_FRESHNESS_BOUND_SECONDS = LIVE_QUEUE_FRESHNESS_BOUND_SECONDS
+"""How long a runs.db window read stays fresh.
+
+A window read is stamped at the route's ``render_at``, the same instant the
+live probe is stamped, so it must outlast the same fan-out — hence the same
+number, held once.
+"""
 
 # ---------------------------------------------------------------------------
 # Adaptive bucket ladder: (max_hours | None, bucket_minutes)
@@ -127,6 +128,17 @@ def _bucket_minutes_for_window(hours: int) -> int:
     return 1440  # unreachable — BUCKET_LADDER always ends with (None, ...)
 
 
+class DepthSeries(ChartData):
+    """merge_attempt counts per bucket, and the width in minutes each bucket spans."""
+
+    bucket_minutes: int
+
+
+def _empty_depth(hours: int) -> DepthSeries:
+    """Return the empty depth series of an *hours* window, still naming its width."""
+    return {'labels': [], 'values': [], 'bucket_minutes': _bucket_minutes_for_window(hours)}
+
+
 def _align_bucket(t: datetime, bucket_min: int) -> datetime:
     """Floor *t* to the nearest bucket boundary using epoch-based arithmetic.
 
@@ -155,7 +167,7 @@ def _align_bucket(t: datetime, bucket_min: int) -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# 1. Queue depth timeseries (15-min bins)
+# 1. Queue depth timeseries (adaptive BUCKET_LADDER bins)
 # ---------------------------------------------------------------------------
 
 async def queue_depth_timeseries(
@@ -163,10 +175,11 @@ async def queue_depth_timeseries(
     *,
     hours: int = 24,
     now: datetime | None = None,
-) -> ChartData:
+) -> DepthSeries:
     """Approximate merge queue throughput as adaptive-width bucket counts.
 
-    Returns ChartData with ISO bucket-start labels and integer counts.
+    Returns a DepthSeries with ISO bucket-start labels, integer counts and
+    the ``bucket_minutes`` they were counted at.
     Bucket width is chosen adaptively via ``_bucket_minutes_for_window`` so
     the point count stays manageable for all window sizes:
 
@@ -179,16 +192,16 @@ async def queue_depth_timeseries(
     inclusive.  The current bucket is always included.
 
     Args:
-        db: aiosqlite connection, or None (returns empty ChartData).
+        db: aiosqlite connection, or None (returns the window's empty series).
         hours: Look-back window in hours (default 24).
         now: Reference timestamp for bucket alignment.  When None (the default),
             ``datetime.now(UTC)`` is used.  Pass an explicit value in tests to
             get deterministic bucket counts and eliminate boundary flakiness.
     """
     if db is None:
-        return {'labels': [], 'values': []}
+        return _empty_depth(hours)
 
-    async def _query(conn: aiosqlite.Connection) -> ChartData:
+    async def _query(conn: aiosqlite.Connection) -> DepthSeries:
         effective_now = resolve_now(now)
         cutoff = effective_now - timedelta(hours=hours)
 
@@ -233,215 +246,183 @@ async def queue_depth_timeseries(
 
         labels = [b.isoformat() for b in buckets]
         values: list[int | float] = [counts[lbl] for lbl in labels]
-        return {'labels': labels, 'values': values}
+        return {'labels': labels, 'values': values, 'bucket_minutes': bucket_min}
 
-    return await with_db(db, _query, {'labels': [], 'values': []})
+    return await with_db(db, _query, _empty_depth(hours))
 
 
 # ---------------------------------------------------------------------------
-# 2. Outcome distribution
+# 2. Merge attempts — one window read behind the outcome chart and the latency
 # ---------------------------------------------------------------------------
 
-async def outcome_distribution(
+@dataclass(frozen=True, slots=True)
+class MergeAttempts:
+    """Every merge_attempt of one window, read once.
+
+    The outcome chart and the latency block are two projections of this one
+    row set, so the chart's total always equals ``with_duration +
+    without_duration`` — a headline can never count a subset of what the
+    donut beside it counts (PRD dashboard-one-datum-one-path, sketch #9).
+
+    Attributes:
+        outcomes: Every attempt counted by outcome; an unrecorded outcome
+            counts as ``'unknown'``.
+        durations: The attempts' positive ``duration_ms`` values, sorted
+            ascending. Attempts with a NULL or zero duration are counted in
+            :attr:`outcomes` and absent here.
+    """
+
+    outcomes: Mapping[str, int] = field(default_factory=dict)
+    durations: tuple[float, ...] = ()
+
+    def outcome_chart(self) -> ChartData:
+        """Outcomes by count descending, ties alphabetical, zero counts omitted."""
+        ordered = sorted(
+            ((label, count) for label, count in self.outcomes.items() if count),
+            key=lambda item: (-item[1], item[0]),
+        )
+        return {
+            'labels': [label for label, _ in ordered],
+            'values': [count for _, count in ordered],
+        }
+
+    def latency(self) -> dict:
+        """Centiles and mean over the timed attempts, and the timed/untimed split."""
+        with_duration = len(self.durations)
+        without_duration = sum(self.outcomes.values()) - with_duration
+        if not self.durations:
+            return {
+                'p50': 0, 'p95': 0, 'p99': 0, 'mean_ms': 0.0,
+                'with_duration': 0, 'without_duration': without_duration,
+            }
+        return {
+            'p50': round(percentile(self.durations, 50)),
+            'p95': round(percentile(self.durations, 95)),
+            'p99': round(percentile(self.durations, 99)),
+            'mean_ms': sum(self.durations) / with_duration,
+            'with_duration': with_duration,
+            'without_duration': without_duration,
+        }
+
+
+async def merge_attempts(
     db: aiosqlite.Connection | None,
     *,
     hours: int = 24,
     now: datetime | None = None,
-) -> ChartData:
-    """Count merge_attempt events by outcome within the window.
-
-    Returns ChartData with outcomes ordered by count descending; ties are
-    broken alphabetically. Outcomes with no events in the window are omitted
-    (count=0 entries are dropped).
+) -> MergeAttempts:
+    """Read every merge_attempt in the window with ONE query.
 
     Args:
-        db: aiosqlite connection, or None (returns empty ChartData).
+        db: aiosqlite connection, or None (returns an empty record).
         hours: Look-back window in hours (default 24).
         now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
-            is used. Pass an explicit value to get deterministic results or to
-            share a single timestamp across concurrent per-DB calls.
+            is used. Pass an explicit value to share a timestamp with sibling calls.
     """
     if db is None:
-        return {'labels': [], 'values': []}
+        return MergeAttempts()
 
-    async def _query(conn: aiosqlite.Connection) -> ChartData:
-        since = _cutoff_iso(hours, now=now)
+    async def _query(conn: aiosqlite.Connection) -> MergeAttempts:
         rows = await conn.execute_fetchall(
-            "SELECT json_extract(data, '$.outcome') AS outcome, COUNT(*) AS cnt "
+            "SELECT json_extract(data, '$.outcome') AS outcome, duration_ms "
             "FROM events "
-            "WHERE event_type = 'merge_attempt' AND timestamp >= ? "
-            "GROUP BY outcome",
-            (since,),
+            "WHERE event_type = 'merge_attempt' AND timestamp >= ?",
+            (_cutoff_iso(hours, now=now),),
         )
-
-        counts: dict[str, int] = {}
-        for row in rows:
-            outcome = row['outcome'] or 'unknown'
-            counts[outcome] = row['cnt']
-
-        if not counts:
-            return {'labels': [], 'values': []}
-
-        # Count descending; ties broken alphabetically.
-        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-        labels: list[str] = [k for k, _ in ordered]
-        values: list[int | float] = [v for _, v in ordered]
-
-        return {'labels': labels, 'values': values}
-
-    return await with_db(db, _query, {'labels': [], 'values': []})
-
-
-# ---------------------------------------------------------------------------
-# 3. Latency stats
-# ---------------------------------------------------------------------------
-
-async def _get_durations(
-    db: aiosqlite.Connection | None,
-    *,
-    hours: int = 24,
-    now: datetime | None = None,
-) -> list[float]:
-    """Return sorted list of non-null merge_attempt duration_ms values.
-
-    Args:
-        db: aiosqlite connection, or None (returns empty list).
-        hours: Look-back window in hours (default 24).
-        now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
-            is used. Pass an explicit value to share a timestamp with sibling calls.
-    """
-    if db is None:
-        return []
-
-    async def _query(conn: aiosqlite.Connection) -> list[float]:
-        since = _cutoff_iso(hours, now=now)
-        rows = await conn.execute_fetchall(
-            "SELECT duration_ms FROM events "
-            "WHERE event_type = 'merge_attempt' "
-            "  AND timestamp >= ? "
-            "  AND duration_ms IS NOT NULL "
-            "  AND duration_ms > 0 "
-            "ORDER BY duration_ms",
-            (since,),
+        outcomes = Counter(row['outcome'] or 'unknown' for row in rows)
+        durations = sorted(
+            float(row['duration_ms']) for row in rows
+            if row['duration_ms'] is not None and row['duration_ms'] > 0
         )
-        return [float(row['duration_ms']) for row in rows]
+        return MergeAttempts(outcomes=dict(outcomes), durations=tuple(durations))
 
-    return await with_db(db, _query, [])
-
-
-def _compute_latency_stats(durations: list[float]) -> dict:
-    """Compute latency stats dict from a sorted list of durations."""
-    if not durations:
-        return {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
-    return {
-        'p50': round(percentile(durations, 50)),
-        'p95': round(percentile(durations, 95)),
-        'p99': round(percentile(durations, 99)),
-        'count': len(durations),
-        'mean_ms': sum(durations) / len(durations),
-    }
-
-
-async def latency_stats(
-    db: aiosqlite.Connection | None,
-    *,
-    hours: int = 24,
-    now: datetime | None = None,
-) -> dict:
-    """P50/P95/P99 latency and count for merge_attempt events.
-
-    Returns {'p50': int, 'p95': int, 'p99': int, 'count': int,
-             'mean_ms': float}.
-    When no rows have non-null duration_ms, returns all zeros with count=0.
-
-    Args:
-        db: aiosqlite connection, or None (returns all-zeros dict).
-        hours: Look-back window in hours (default 24).
-        now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
-            is used. Pass an explicit value to share a timestamp with sibling calls.
-    """
-    durations = await _get_durations(db, hours=hours, now=now)
-    return _compute_latency_stats(durations)
+    return await with_db(db, _query, MergeAttempts())
 
 
 # ---------------------------------------------------------------------------
 # 4. Recent merges
 # ---------------------------------------------------------------------------
 
+class RecentMerges(TypedDict):
+    """The newest merge_attempt rows of a window, and how many the window holds."""
+
+    rows: list[dict]
+    total: Datum[int]
+
+
 async def recent_merges(
     db: aiosqlite.Connection | None,
     *,
-    limit: int | None = 20,
-    hours: int = 168,
+    limit: int,
+    hours: int,
     now: datetime | None = None,
-) -> list[dict]:
-    """Most recent merge_attempt events, newest first.
+) -> RecentMerges:
+    """The newest ``limit`` merge_attempt events of the window, plus the window's total.
+
+    ``total`` comes from ``COUNT(*) OVER ()`` in the same statement as the
+    rows. The window function is evaluated before ``LIMIT``, so it counts
+    every event in the window, and ``len(rows) <= total`` holds by
+    construction — no second query can see a different window.
 
     Args:
-        db: Async SQLite connection, or None (returns []).
-        limit: Maximum number of rows to return.  When ``None``, rows are
-            bounded by ``_RECENT_MERGES_HARD_CAP`` (enforced via a SQL probe)
-            rather than returned without bound.  A WARNING is logged if the
-            hard cap is reached.  The SQL WHERE window (``hours``) is the
-            primary bound; the hard cap is a memory-safety backstop.  When an
-            explicit ``limit`` exceeds ``_RECENT_MERGES_HARD_CAP`` it is
-            clamped to the cap and a WARNING is logged on actual truncation
-            (symmetric with the ``limit=None`` branch).
-        hours: Look-back window in hours (default 168 = 7 days).  Only
-            events with ``timestamp >= now - hours`` are included.
+        db: Async SQLite connection, or None (no runs.db is open for the
+            project: no rows, and an unknown total).
+        limit: Maximum number of rows to return. Must be at least 1: with
+            ``LIMIT 0`` no row carries the window total, so it would read 0.
+        hours: Look-back window in hours. Only events with
+            ``timestamp >= now - hours`` are included.
         now: Reference timestamp for the cutoff window (default:
-            ``datetime.now(UTC)``).  Pass an explicit value in tests for
-            full determinism.
+            ``datetime.now(UTC)``).
 
-    Returns list of {'task_id', 'run_id', 'outcome', 'duration_ms',
-                     'timestamp'} dicts.
+    Returns ``{'rows': [...], 'total': Datum[int]}``, each row a
+    ``{'task_id', 'run_id', 'outcome', 'duration_ms', 'timestamp'}`` dict,
+    newest first. ``total`` is FRESH at *now* when the window was read — a
+    readable empty window is a measured zero — and UNKNOWN, beside no rows,
+    when there is no runs.db or the read fails.
+
+    Raises:
+        ValueError: ``limit`` is less than 1.
     """
+    if limit < 1:
+        raise ValueError(f'recent_merges limit must be at least 1, got {limit}')
+    bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
     if db is None:
-        return []
+        return {'rows': [], 'total': unknown_datum('no runs.db is open for this project', bound)}
 
-    async def _query(conn: aiosqlite.Connection) -> list[dict]:
-        since = _cutoff_iso(hours, now=now)
-        base_sql = (
+    async def _query(conn: aiosqlite.Connection) -> RecentMerges:
+        rows = list(await conn.execute_fetchall(
             "SELECT task_id, run_id, "
             "       json_extract(data, '$.outcome') AS outcome, "
-            "       duration_ms, timestamp "
+            "       duration_ms, timestamp, "
+            "       COUNT(*) OVER () AS total "
             "FROM events "
             "WHERE event_type = 'merge_attempt' "
             "  AND timestamp >= ? "
-            "ORDER BY timestamp DESC"
-        )
-        # cap_in_effect: hard-cap backstop applies when limit is None OR when
-        # an explicit limit exceeds the hard cap (so the cap is truly hard).
-        cap_in_effect = limit is None or limit > _RECENT_MERGES_HARD_CAP
-        if cap_in_effect:
-            # Probe with hard_cap + 1 rows so we can distinguish "exactly
-            # hard_cap rows existed" from "window exceeded hard_cap".
-            probe = _RECENT_MERGES_HARD_CAP + 1
-            sql, params = base_sql + " LIMIT ?", (since, probe)
-        else:
-            sql, params = base_sql + " LIMIT ?", (since, limit)
-        rows = list(await conn.execute_fetchall(sql, params))
-        if cap_in_effect and len(rows) > _RECENT_MERGES_HARD_CAP:
-            logger.warning(
-                'recent_merges: hard cap %d reached; window contained more rows '
-                'than the cap and was truncated to %d — consider adding a tighter '
-                'time window or rate-limiting the producer',
-                _RECENT_MERGES_HARD_CAP,
-                _RECENT_MERGES_HARD_CAP,
-            )
-            rows = rows[:_RECENT_MERGES_HARD_CAP]
-        return [
-            {
-                'task_id': row['task_id'],
-                'run_id': row['run_id'],
-                'outcome': row['outcome'],
-                'duration_ms': row['duration_ms'],
-                'timestamp': row['timestamp'],
-            }
-            for row in rows
-        ]
+            "ORDER BY timestamp DESC "
+            "LIMIT ?",
+            (_cutoff_iso(hours, now=now), limit),
+        ))
+        return {
+            'rows': [
+                {
+                    'task_id': row['task_id'],
+                    'run_id': row['run_id'],
+                    'outcome': row['outcome'],
+                    'duration_ms': row['duration_ms'],
+                    'timestamp': row['timestamp'],
+                }
+                for row in rows
+            ],
+            'total': Datum(
+                rows[0]['total'] if rows else 0, resolve_now(now), DatumState.FRESH, None, bound,
+            ),
+        }
 
-    return await with_db(db, _query, [])
+    unread: RecentMerges = {
+        'rows': [],
+        'total': unknown_datum('the merge_attempt events could not be read from runs.db', bound),
+    }
+    return await with_db(db, _query, unread)
 
 
 async def recent_train_events(
@@ -503,22 +484,27 @@ async def speculative_stats(
     *,
     hours: int = 24,
     now: datetime | None = None,
-) -> dict:
+) -> Datum[dict]:
     """Hit/discard counts and hit rate for speculative merge events.
 
-    Returns {'hit_count': int, 'discard_count': int, 'total': int,
-             'hit_rate': float}.
-
     Args:
-        db: aiosqlite connection, or None (returns all-zeros dict).
+        db: aiosqlite connection, or None (no runs.db is open for the project).
         hours: Look-back window in hours (default 24).
         now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
             is used. Pass an explicit value to share a timestamp with sibling calls.
-    """
-    if db is None:
-        return {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
 
-    async def _query(conn: aiosqlite.Connection) -> dict:
+    Returns:
+        One ``Datum`` over ``{'hit_count', 'discard_count', 'total',
+        'hit_rate'}``, FRESH at *now* when the window was read. ``hit_rate`` is
+        None for a zero-attempt window, which has no rate. With no runs.db, or
+        when the read fails, the Datum is UNKNOWN with a reason saying which —
+        never measured-looking zeros.
+    """
+    bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+    if db is None:
+        return unknown_datum('no runs.db is open for this project', bound)
+
+    async def _query(conn: aiosqlite.Connection) -> Datum[dict]:
         since = _cutoff_iso(hours, now=now)
         rows = await conn.execute_fetchall(
             "SELECT event_type, COUNT(*) AS cnt "
@@ -536,15 +522,18 @@ async def speculative_stats(
             else:
                 discard_count = row['cnt']
         total = hit_count + discard_count
-        hit_rate = hit_count / total if total > 0 else 0.0
-        return {
+        stats = {
             'hit_count': hit_count,
             'discard_count': discard_count,
             'total': total,
-            'hit_rate': hit_rate,
+            'hit_rate': hit_count / total if total > 0 else None,
         }
+        return Datum(stats, resolve_now(now), DatumState.FRESH, None, bound)
 
-    return await with_db(db, _query, {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0})
+    return await with_db(
+        db, _query,
+        unknown_datum('the speculative-merge events could not be read from runs.db', bound),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -709,201 +698,74 @@ async def train_throughput_stats(
 
 
 # ---------------------------------------------------------------------------
-# 6. Active queued merges
-# ---------------------------------------------------------------------------
-
-
-async def active_queued_merges(
-    db: aiosqlite.Connection | None,
-    *,
-    ttl_minutes: int = 30,
-    now: datetime | None = None,
-) -> list[dict]:
-    """Return tasks whose latest merge-lifecycle event is not a terminal outcome.
-
-    Queries events with event_type IN ('merge_queued', 'merge_dequeued',
-    'merge_attempt'), picks the latest row per task_id within the TTL window,
-    and excludes tasks whose latest event is a terminal merge_attempt outcome.
-    A merge_attempt outcome is terminal UNLESS it is listed in _ACTIVE_ONLY
-    (cas_retry, gate_retry, post_merge_generation_chained, plan_files_narrowed)
-    — this fails safe: new or unrecognized outcomes drop off the active panel
-    instead of phantoming as in_flight for the full TTL.
-
-    Args:
-        db:  Async SQLite connection, or None (returns []).
-        ttl_minutes:  Drop tasks whose latest relevant event is older than
-            this many minutes.  Acts as a safety net for crashed orchestrators
-            that left dangling merge_queued rows.
-        now:  Reference timestamp for the TTL cutoff.  Defaults to
-            ``datetime.now(UTC)`` when None.
-
-    Returns:
-        List of dicts with keys: task_id, run_id, state, timestamp, branch,
-        outcome.  ``state`` is 'queued' when latest event is merge_queued;
-        'in_flight' for merge_dequeued or merge_attempt(cas_retry).
-    """
-    if db is None:
-        return []
-
-    effective_now = resolve_now(now)
-    cutoff = (effective_now - timedelta(minutes=ttl_minutes)).isoformat()
-    et_placeholders = ','.join('?' * len(_ACTIVE_EVENT_TYPES))
-
-    async def _query(conn: aiosqlite.Connection) -> list[dict]:
-        # Use ROW_NUMBER() window function for a single-pass plan that:
-        # (a) avoids the O(N²) correlated-subquery scan, and
-        # (b) deterministically picks one row per task_id when two events
-        #     share an identical timestamp (ties broken by insertion order
-        #     via id DESC, which is unique by AUTOINCREMENT).
-        sql = f"""
-            WITH ranked AS (
-                SELECT task_id, run_id, event_type,
-                       json_extract(data, '$.outcome') AS outcome,
-                       json_extract(data, '$.branch') AS branch,
-                       timestamp,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY task_id
-                           ORDER BY timestamp DESC, id DESC
-                       ) AS rn
-                FROM events
-                WHERE event_type IN ({et_placeholders})
-                  AND timestamp >= ?
-            )
-            SELECT task_id, run_id, event_type, outcome, branch, timestamp
-            FROM ranked
-            WHERE rn = 1
-        """
-        params = (*_ACTIVE_EVENT_TYPES, cutoff)
-        rows = await conn.execute_fetchall(sql, params)
-
-        result = []
-        for row in rows:
-            et = row['event_type']
-            outcome = row['outcome']
-            # Exclude terminal merge_attempt rows (terminal-unless-listed: fail safe)
-            if et == 'merge_attempt' and outcome not in _ACTIVE_ONLY:
-                continue
-            # Derive state
-            state = 'queued' if et == 'merge_queued' else 'in_flight'
-            result.append({
-                'task_id': row['task_id'],
-                'run_id': row['run_id'],
-                'state': state,
-                'timestamp': row['timestamp'],
-                'branch': row['branch'],
-                'outcome': outcome,
-            })
-        return result
-
-    return await with_db(db, _query, [])
-
-
-# ---------------------------------------------------------------------------
 # 7. Per-project helpers
 # ---------------------------------------------------------------------------
 
 
-def filter_merges_within(
-    merges: list[dict],
-    *,
-    minutes: int,
-    now: datetime | None = None,
-) -> list[dict]:
-    """Return only the rows whose timestamp falls within the last *minutes*.
+def merge_task_refs(project_root: str, rows: Iterable[Mapping[str, Any]]) -> set[TaskRef]:
+    """The task each of *rows* names, for the ids that parse as one."""
+    refs: set[TaskRef] = set()
+    for row in rows:
+        task_id = _task_id_of(row)
+        if task_id is not None:
+            refs.add(TaskRef(project_root, task_id))
+    return refs
 
-    Args:
-        merges: List of merge-row dicts.  Each dict must have a 'timestamp' key
-            whose value is an ISO-8601 string parseable by :func:`parse_utc`.
-        minutes: Sliding-window width in minutes.  Rows older than
-            ``now - timedelta(minutes=minutes)`` are excluded.
-        now: Reference timestamp.  Defaults to ``datetime.now(UTC)`` when None.
 
-    Returns:
-        A new list preserving the input order.  Rows with missing or malformed
-        timestamps are silently dropped.
-    """
-    effective_now = resolve_now(now)
-    cutoff = effective_now - timedelta(minutes=minutes)
-    result: list[dict] = []
-    for row in merges:
-        try:
-            ts = parse_utc(row.get('timestamp')).astimezone(UTC)
-            if ts >= cutoff:
-                result.append(row)
-        except (ValueError, TypeError, AttributeError):
-            pass  # malformed timestamp or parse_utc returned None → drop row
-    return result
+def _task_id_of(row: Mapping[str, Any]) -> int | None:
+    raw = row.get('task_id')
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def enrich_merges_with_titles(
-    merges: list[dict],
-    task_title_map: dict[str, str],
-) -> list[dict]:
-    """Return a new list of merge rows with a 'title' field added to each.
-
-    For each row, the key ``str(row['task_id'])`` is looked up in
-    *task_title_map*.  Rows with ``task_id=None`` or an unknown task_id get
-    ``title=''``.  Input rows are NOT mutated (a shallow copy is made for
-    each row).
-
-    Args:
-        merges: List of merge-row dicts (from :func:`recent_merges` or similar).
-        task_title_map: Mapping of ``str(task_id) → title`` built by
-            :func:`load_task_titles`.
-
-    Returns:
-        New list of dicts, each with an added 'title' key.
-    """
-    result: list[dict] = []
-    for row in merges:
-        raw_id = row.get('task_id')
-        title = task_title_map.get(str(raw_id), '') if raw_id is not None else ''
-        result.append({**row, 'title': title})
-    return result
-
-
-# Per-project TTL cache for load_task_titles.  Keyed on project_root_str.
-# 10s window comfortably covers the dashboard's poll cadence (one refresh
-# per few seconds) without introducing user-visible staleness on title
-# lookups.  Cache is in-process; multi-worker deployments will each pay
-# their own MCP roundtrip on first lookup.
-_TASK_TITLES_TTL_SECONDS = 10.0
-_task_titles_cache: TTLCache[dict[str, str] | None] = TTLCache(
-    ttl_seconds=lambda: _TASK_TITLES_TTL_SECONDS
-)
-
-
-def _task_titles_cache_clear() -> None:
-    """Clear the task-titles TTL cache (test/admin hook)."""
-    _task_titles_cache.clear()
-
-
-async def load_task_titles(
-    client: httpx.AsyncClient,
-    config: DashboardConfig,
+    rows: Sequence[Mapping[str, Any]],
     project_root: str,
-) -> dict[str, str]:
-    """Return a ``{str(task_id): title}`` map for *project_root* via fused-memory MCP.
+    lookup: Mapping[TaskRef, Datum[dict]],
+) -> list[dict]:
+    """Copies of *rows*, each with its task's ``title`` as a ``Datum[str]``.
 
-    Fetches the dashboard-shaped task list and projects out (id → title) for
-    rows that have a non-empty title.  Results are cached per project_root
-    for ``_TASK_TITLES_TTL_SECONDS`` (~10 s) so that the dashboard's per-poll
-    enrichment doesn't hammer the MCP server.  An MCP failure returns ``{}``
-    so the merge-queue tab still renders (titles fall back to empty strings).
-    Concurrent cold callers for the same project_root collapse onto one
-    in-flight fetch_tasks call (TTLCache single-flight).
+    The title carries its lookup's provenance unchanged: ``as_of``, state,
+    reason and bound are the row datum's own. A row naming no task, or a task
+    the lookup did not answer, gets an ``unknown`` title that says which.
     """
+    titled: list[dict] = []
+    for row in rows:
+        task_id = _task_id_of(row)
+        if task_id is None:
+            title = _unknown_title(f'this merge row names no task id ({row.get("task_id")!r})')
+        elif (found := lookup.get(TaskRef(project_root, task_id))) is None:
+            title = _unknown_title(f'task {task_id} was not looked up')
+        else:
+            title = Datum(
+                None if found.value is None else str(found.value.get('title') or ''),
+                found.as_of, found.state, found.reason, found.freshness_bound_seconds,
+            )
+        titled.append({**row, 'title': title})
+    return titled
 
-    async def _refresh() -> dict[str, str] | None:
-        fetched = await fetch_tasks(client, config, project_root)
-        if not isinstance(fetched, list):
-            return None
-        return {str(t['id']): t['title'] for t in fetched if t.get('title')}
 
-    result = await _task_titles_cache.get_or_refresh(
-        project_root, _refresh, cache_ok=lambda v: v is not None,
-    )
-    return dict(result) if isinstance(result, dict) else {}
+def _unknown_title(reason: str) -> Datum[str]:
+    return unknown_datum(reason, FETCHED_ROW_FRESHNESS_BOUND_SECONDS)
+
+
+_Leg = TypeVar('_Leg')
+
+
+def _leg_or_unread(result: _Leg | BaseException, unread: Callable[[str], _Leg], label: str) -> _Leg:
+    """*result*, or — when its leg raised — ``unread(cause)``, the leg's unread reading.
+
+    The fallback is built only for a failed leg, from the cause as
+    :func:`describe_exc` renders it. :func:`safe_gather_result` still logs the
+    failure and re-raises a cancellation.
+    """
+    if isinstance(result, BaseException):
+        return safe_gather_result(result, unread(describe_exc(result)), label)
+    return result
 
 
 async def build_per_project_merge_queue(
@@ -911,84 +773,74 @@ async def build_per_project_merge_queue(
     *,
     hours: int,
     now: datetime,
-    recent_window_minutes: int,
 ) -> dict[str, dict]:
     """Build per-project merge queue stats by querying each project's DB independently.
 
-    For each ``(pid, db)`` pair, gathers the 5 per-DB stats concurrently and
-    applies :func:`filter_merges_within` to the recent-merges list.  Pairs with
-    ``db=None`` produce empty/default stats (the per-DB functions handle None
-    gracefully by returning declared defaults).  All per-project gathers also
-    run concurrently across projects via a single top-level :func:`asyncio.gather`.
+    For each ``(pid, db)`` pair, gathers the per-DB stats concurrently. Pairs
+    with ``db=None`` produce empty/default stats (the per-DB functions handle
+    None gracefully by returning declared defaults). All per-project gathers
+    also run concurrently across projects via a single top-level
+    :func:`asyncio.gather`.
 
-    The recent-merges SQL query uses an hour-granular window derived from
-    ``recent_window_minutes`` (``max(1, ceil(recent_window_minutes / 60))``
-    hours) with ``limit=None`` so that bursts exceeding any fixed row cap are
-    not silently truncated.  :func:`filter_merges_within` then tightens the
-    result to the precise ``recent_window_minutes`` boundary.
+    ``recent`` is the newest :data:`RECENT_MERGES_CAP` merge_attempt rows in
+    the same ``hours`` window every other leg uses, and ``recent_total`` is
+    how many that window holds (see :func:`recent_merges`).
+
+    ``speculative`` and ``recent_total`` are Datums: a leg that raises, or a
+    project whose whole build fails, serves them UNKNOWN with a reason rather
+    than zeros that read as measured.
 
     Args:
         project_dbs: List of ``(project_root_str, connection_or_None)`` tuples
             from :func:`_project_scoped_dbs_labeled`.
         hours: Look-back window in hours (forwarded to each per-DB function).
         now: Shared reference timestamp captured once per request.
-        recent_window_minutes: Sliding window for recent-merges trimming.  The
-            SQL WHERE uses ``max(1, ceil(recent_window_minutes / 60))`` hours;
-            the Python post-filter tightens to the exact minute boundary.
 
     Returns:
-        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, speculative, active, train_events, train_throughput}}``.
+        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, recent_total, speculative, train_events, train_throughput}}``,
+        where ``depth_timeseries`` is a :class:`DepthSeries` carrying its
+        ``bucket_minutes``, ``speculative`` a ``Datum[dict]`` and
+        ``recent_total`` a ``Datum[int]``.
     """
-    _DEFAULT_DEPTH: ChartData = {'labels': [], 'values': []}
-    _DEFAULT_OUTCOMES: ChartData = {'labels': [], 'values': []}
-    _DEFAULT_LATENCY = {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
-    _DEFAULT_SPEC = {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
-
-    recent_hours = max(1, math.ceil(recent_window_minutes / 60))
+    bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
 
     async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
         try:
-            depth_r, outcomes_r, latency_r, recent_r, spec_r, active_r, train_r, throughput_r = await asyncio.gather(
+            depth_r, attempts_r, recent_r, spec_r, train_r, throughput_r = await asyncio.gather(
                 queue_depth_timeseries(db, hours=hours, now=now),
-                outcome_distribution(db, hours=hours, now=now),
-                latency_stats(db, hours=hours, now=now),
-                recent_merges(db, limit=None, hours=recent_hours, now=now),
+                merge_attempts(db, hours=hours, now=now),
+                recent_merges(db, limit=RECENT_MERGES_CAP, hours=hours, now=now),
                 speculative_stats(db, hours=hours, now=now),
-                active_queued_merges(db, ttl_minutes=30, now=now),
                 recent_train_events(db, hours=hours, now=now),
                 train_throughput_stats(db, hours=hours, now=now),
                 return_exceptions=True,
             )
-            depth = safe_gather_result(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
-            outcomes = safe_gather_result(outcomes_r, _DEFAULT_OUTCOMES, f'{pid}/outcomes')
-            latency = safe_gather_result(latency_r, _DEFAULT_LATENCY, f'{pid}/latency')
-            recent_raw = safe_gather_result(recent_r, [], f'{pid}/recent')
-            spec = safe_gather_result(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
-            active_list = safe_gather_result(active_r, [], f'{pid}/active')
+            depth = safe_gather_result(depth_r, _empty_depth(hours), f'{pid}/depth')
+            attempts = safe_gather_result(attempts_r, MergeAttempts(), f'{pid}/attempts')
+            recent = _leg_or_unread(
+                recent_r,
+                lambda cause: {
+                    'rows': [],
+                    'total': unknown_datum(f'{pid} recent merges could not be read: {cause}', bound),
+                },
+                f'{pid}/recent',
+            )
+            spec = _leg_or_unread(
+                spec_r,
+                lambda cause: unknown_datum(
+                    f'{pid} speculative-merge stats could not be read: {cause}', bound,
+                ),
+                f'{pid}/speculative',
+            )
             train_events_list = safe_gather_result(train_r, [], f'{pid}/train_events')
             train_throughput = safe_gather_result(throughput_r, dict(_TRAIN_THROUGHPUT_DEFAULT), f'{pid}/train_throughput')
-            if len(recent_raw) > _RECENT_MERGES_BURST_WARN:  # type: ignore[arg-type]
-                logger.warning(
-                    'build_per_project_merge_queue %s: recent_merges returned %d rows'
-                    ' (limit=None, hours=%d) — possible runaway burst; consider'
-                    ' rate-limiting the producer or adding capacity monitoring',
-                    pid,
-                    len(recent_raw),  # type: ignore[arg-type]
-                    recent_hours,
-                )
-
-            recent_trimmed = filter_merges_within(
-                recent_raw,  # type: ignore[arg-type]
-                minutes=recent_window_minutes,
-                now=now,
-            )
             return pid, {
                 'depth_timeseries': depth,
-                'outcomes': outcomes,
-                'latency': latency,
-                'recent': recent_trimmed,
+                'outcomes': attempts.outcome_chart(),
+                'latency': attempts.latency(),
+                'recent': recent['rows'],
+                'recent_total': recent['total'],
                 'speculative': spec,
-                'active': active_list,
                 'train_events': train_events_list,
                 'train_throughput': train_throughput,
             }
@@ -998,13 +850,16 @@ async def build_per_project_merge_queue(
                 pid,
                 exc,
             )
+            unread = unknown_datum(
+                f'the merge history of {pid} could not be read: {describe_exc(exc)}', bound,
+            )
             return pid, {
-                'depth_timeseries': _DEFAULT_DEPTH,
-                'outcomes': _DEFAULT_OUTCOMES,
-                'latency': _DEFAULT_LATENCY,
+                'depth_timeseries': _empty_depth(hours),
+                'outcomes': MergeAttempts().outcome_chart(),
+                'latency': MergeAttempts().latency(),
                 'recent': [],
-                'speculative': _DEFAULT_SPEC,
-                'active': [],
+                'recent_total': unread,
+                'speculative': unread,
                 'train_events': [],
                 'train_throughput': dict(_TRAIN_THROUGHPUT_DEFAULT),
             }
@@ -1071,7 +926,8 @@ async def fetch_live_merge_queues(
     """Fan out get_merge_queue to every escalation URL concurrently.
 
     Returns ``{project_label: {entries, reachable, [error]}}``.  Keys match
-    the labels from ``config.escalation_urls`` (project basenames).  Failures
+    the labels from ``config.escalation_urls`` (project label —
+    ``dashboard/project_labels.py::ProjectLabels``).  Failures
     (transport errors, timeouts, or orchestrator/worker down) produce
     ``{entries: [], reachable: False, error: ...}`` — an authoritative empty
     queue produces ``{entries: [], reachable: True}``.
@@ -1088,28 +944,78 @@ async def fetch_live_merge_queues(
     return dict(zip(labels, results, strict=True))
 
 
+@dataclass(frozen=True, slots=True)
+class ActiveQueue:
+    """One project's "In queue now": the count as a Datum, and the live entries.
+
+    ``entries`` is what the probe returned and nothing else — empty whenever
+    the count is not a live reading. ``probe_configured`` is false for a
+    project no live ``get_merge_queue`` probe exists for: it has no queue the
+    dashboard can read, so it is outside every multi-project in-queue total
+    rather than a permanent hole in one.
+    """
+
+    in_queue: Datum[int]
+    entries: list[dict]
+    probe_configured: bool
+
+
 def resolve_active(
     label: str,
-    live_map: dict[str, dict],
-    fallback_active: list[dict],
-) -> dict:
-    """Choose between the live queue snapshot and the event-derived fallback.
+    live_map: Mapping[str, Mapping[str, Any]],
+    history: Mapping[str, Sequence[Any]],
+    *,
+    now: datetime,
+) -> ActiveQueue:
+    """*label*'s queue: the live probe, else its own history's last sample.
 
-    Returns ``{entries, approximate}`` where:
-      - ``entries``     is the chosen list of active-queue entries.
-      - ``approximate`` is True when the entries come from the event-derived
-                        fallback (orchestrator unreachable / not running).
-
-    Selection logic:
-      - If ``live_map[label]`` exists and ``reachable`` is True → use live
-        entries (may be empty) with ``approximate=False``.
-      - Otherwise (label absent or reachable=False) → use ``fallback_active``
-        with ``approximate=True``.
+    *live_map* holds one answer per configured probe
+    (:func:`fetch_live_merge_queues`). A reachable probe is a ``fresh`` count
+    at *now*, the probe instant. A failed probe serves the last
+    ``merge_snapshots`` sample in *history* (``get_merge_active_series``,
+    which records this same probe) ``stale`` at the sample's own instant, with
+    the probe's error verbatim as the reason. With no parseable sample the
+    count is ``unknown``. A label with no probe configured is ``unknown`` and
+    reads no history: the sampler records only probes, so it has none.
     """
     live = live_map.get(label)
-    if live is not None and live.get('reachable'):
-        return {'entries': live['entries'], 'approximate': False}
-    return {'entries': fallback_active, 'approximate': True}
+    if live is None:
+        return ActiveQueue(
+            unknown_datum(
+                f'no live get_merge_queue probe is configured for {label}',
+                LIVE_QUEUE_FRESHNESS_BOUND_SECONDS,
+            ),
+            [],
+            probe_configured=False,
+        )
+    if live.get('reachable'):
+        entries = list(live.get('entries') or [])
+        return ActiveQueue(
+            Datum(len(entries), now, DatumState.FRESH, None, LIVE_QUEUE_FRESHNESS_BOUND_SECONDS),
+            entries,
+            probe_configured=True,
+        )
+    why = f'the live get_merge_queue probe for {label} failed: {live.get("error")}'
+    return ActiveQueue(_last_sample(history, why), [], probe_configured=True)
+
+
+def _last_sample(history: Mapping[str, Sequence[Any]], why: str) -> Datum[int]:
+    labels, values = history.get('labels') or (), history.get('values') or ()
+    if not labels or not values:
+        return unknown_datum(
+            f'{why}; no sample in the history window', LIVE_QUEUE_FRESHNESS_BOUND_SECONDS,
+        )
+    try:
+        sampled_at = parse_utc(labels[-1])
+    except (TypeError, ValueError):
+        return unknown_datum(
+            f'{why}; the last sample has no readable instant ({labels[-1]!r})',
+            LIVE_QUEUE_FRESHNESS_BOUND_SECONDS,
+        )
+    return Datum(
+        int(values[-1]), sampled_at, DatumState.STALE,
+        f'{why}; last sampled count shown', LIVE_QUEUE_FRESHNESS_BOUND_SECONDS,
+    )
 
 
 def _normalize_entry(raw: dict) -> dict:
@@ -1123,15 +1029,17 @@ def _normalize_entry(raw: dict) -> dict:
     KeyError on partially-populated entries:
       - position  defaults to 0   (unknown position)
       - waiter_alive defaults to True  (assume waiter alive when unknown)
-      - age_secs  defaults to 0.0
+      - age_secs  is None when the snapshot omits it: an absent age is not
+        "queued just now"
     """
     waiter_alive = raw.get('waiter_alive')
     position = raw.get('position')
+    age_secs = raw.get('age_secs')
     return {
         'task_id': raw.get('task_id'),
         'branch': raw.get('branch'),
         'state': raw.get('state'),
-        'age_secs': float(raw.get('age_secs') or 0.0),
+        'age_secs': float(age_secs) if age_secs is not None else None,
         'position': int(position) if position is not None else 0,
         'waiter_alive': bool(waiter_alive) if waiter_alive is not None else True,
     }

@@ -8,17 +8,41 @@ import os
 import re
 import shutil
 import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 from shared import safe_io
+from shared.plan_deviation import DeviationRecord
 
+from orchestrator import file_mutex
 from orchestrator.config import TASK_META_DIRNAME
 
 logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
+PLAN_TASK_TEXT_FP_KEY = '_task_text_fp'
+
+# Must exceed the longest legitimate critical section: plan_tools._mark_step_done's two timeout=10 git probes.
+PLAN_MUTEX_TIMEOUT_SECS = 60.0
+
+ORCHESTRATOR_ITERATION_SOURCES: frozenset[str] = frozenset({'orchestrator', 'amendment'})
+"""The only ``source`` values :meth:`TaskArtifacts.append_iteration_log` writes."""
+
+
+def iteration_entry_written_by_orchestrator(entry: object) -> bool:
+    """Whether an iterations.jsonl entry went through ``TaskArtifacts.append_iteration_log``.
+
+    Agents also append to iterations.jsonl by hand from their own shell
+    (task 5726); only entries passing this check are orchestrator-written.
+    Total over arbitrary JSON: any non-dict entry or non-str source is False.
+    """
+    if not isinstance(entry, dict):
+        return False
+    source = entry.get('source')
+    return isinstance(source, str) and source in ORCHESTRATOR_ITERATION_SOURCES
 
 
 class ArtifactWriteError(OSError):
@@ -38,6 +62,13 @@ class ArtifactWriteError(OSError):
     Subclasses ``OSError`` so existing ``except OSError`` handlers keep
     working, and is a DISTINCT type so ``_write_json``'s vanished-root
     ``except FileNotFoundError`` tolerance cannot accidentally swallow it.
+    """
+
+
+class PlanMutexNotHeld(RuntimeError):
+    """A plan.json read-modify-write reached its write without holding ``plan_mutex()``.
+
+    Raised before anything is written: the alternative is a silently lost update.
     """
 
 
@@ -235,13 +266,6 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
 
 _VALID_VERDICT_ROLE_RE = re.compile(r'^[A-Za-z0-9_-]+$')
 
-#: How many consecutive residue filenames ``write_markup_residue`` will probe
-#: before giving up LOUDLY. Every probe past the first means another writer
-#: claimed that index in the same instant, so this is a bound on simultaneous
-#: writers against one artifacts root — a reviewer panel is a handful, and the
-#: orchestrator runs one guarded MCP server per subprocess.
-_MARKUP_RESIDUE_MAX_PROBES = 64
-
 
 def _validate_verdict_role(role: str) -> None:
     """Guard ``verdicts/<role>.json`` against escaping the ``verdicts/`` dir.
@@ -279,22 +303,33 @@ class ReviewAggregation:
         return bool(self.reviewer_errors) and not self.reviews
 
     def format_for_replan(self) -> str:
-        """Format blocking issues for the architect to address."""
-        lines = ['# Review Feedback — Blocking Issues\n']
-        for issue in self.blocking_issues:
-            reviewer = issue.get('reviewer', 'unknown')
-            location = issue.get('location', '')
-            category = issue.get('category', '')
-            description = issue.get('description', '')
-            fix = issue.get('suggested_fix', '')
-            lines.append(f'## [{reviewer}] {category}')
-            if location:
-                lines.append(f'**Location:** {location}')
-            lines.append(f'**Issue:** {description}')
-            if fix:
-                lines.append(f'**Suggested fix:** {fix}')
-            lines.append('')
-        return '\n'.join(lines)
+        """Blocking issues only — the architect's input (TaskWorkflow._replan)."""
+        return _format_issue_section('# Review Feedback — Blocking Issues\n', self.blocking_issues)
+
+    def format_for_escalation(self) -> str:
+        """Blocking issues then suggestions — the steward's review_issues detail (TaskWorkflow._escalate_review_issues)."""
+        text = self.format_for_replan()
+        if self.suggestions:
+            text += '\n' + _format_issue_section('# Review Feedback — Suggestions\n', self.suggestions)
+        return text
+
+
+def _format_issue_section(heading: str, issues: list[dict]) -> str:
+    lines = [heading]
+    for issue in issues:
+        reviewer = issue.get('reviewer', 'unknown')
+        location = issue.get('location', '')
+        category = issue.get('category', '')
+        description = issue.get('description', '')
+        fix = issue.get('suggested_fix', '')
+        lines.append(f'## [{reviewer}] {category}')
+        if location:
+            lines.append(f'**Location:** {location}')
+        lines.append(f'**Issue:** {description}')
+        if fix:
+            lines.append(f'**Suggested fix:** {fix}')
+        lines.append('')
+    return '\n'.join(lines)
 
 
 class TaskArtifacts:
@@ -341,6 +376,32 @@ class TaskArtifacts:
         """
         return worktree_base / TASK_META_DIRNAME / worktree_name
 
+    @staticmethod
+    def read_lane_task_id(meta_root: Path) -> str | None:
+        """The task id ``<meta_root>/metadata.json`` was dispatched for, else None.
+
+        The lane->task key of ``GitOps``'s disk backstop. One root, no
+        ``plan.json`` and no legacy fallback: PRD
+        ``plans/task-meta-task-keying-prd.md`` decision 7. Never raises.
+        """
+        meta_path = meta_root / 'metadata.json'
+        if not meta_path.exists():
+            return None
+        try:
+            metadata = json.loads(meta_path.read_text())
+        except (ValueError, OSError) as exc:
+            logger.warning('Unreadable metadata.json at %s: %s', meta_path, exc)
+            return None
+        if not isinstance(metadata, dict):
+            logger.warning('Malformed metadata.json at %s: not an object', meta_path)
+            return None
+        task_id = metadata.get('task_id')
+        if isinstance(task_id, str):
+            return task_id or None
+        if isinstance(task_id, int) and not isinstance(task_id, bool):
+            return str(task_id)
+        return None
+
     def init(
         self,
         task_id: str,
@@ -379,16 +440,11 @@ class TaskArtifacts:
         """Read the created_at timestamp stored at init time.
 
         Mirrors ``read_base_commit``'s shape, but is exception-tolerant for a
-        corrupt/unreadable metadata.json (returns ``None`` instead of
-        raising) so a runtime "started" lookup never raises.
+        corrupt/unreadable or malformed metadata.json (returns ``None``
+        instead of raising) so a runtime "started" lookup never raises.
         """
-        meta_path = self._read_path('metadata.json')
-        if not meta_path.exists():
-            return None
-        try:
-            metadata = json.loads(meta_path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning('Corrupt metadata.json at %s: %s', meta_path, exc)
+        metadata = self._read_json_object('metadata.json')
+        if metadata is None:
             return None
         return metadata.get('created_at')
 
@@ -401,9 +457,56 @@ class TaskArtifacts:
         metadata['base_commit'] = new_base
         self._write_json(self.root / 'metadata.json', metadata)
 
-    def write_plan(self, plan: dict) -> None:
-        """Write .task/plan.json — the structured plan."""
+    @contextmanager
+    def plan_mutex(self) -> Iterator[None]:
+        """The cross-writer lock every plan.json read-modify-write holds.
+
+        Reentrant per thread and honoured across processes
+        (``orchestrator.file_mutex``). Keyed on the RESOLVED plan path, so the
+        lane symlink view and the meta-root view share one lock. Distinct from
+        the ownership lock ``lock_plan`` (plan.lock). A vanished root takes no
+        lock: it holds no plan to lose an update of, and must not be
+        re-materialized by locking.
+
+        A WAIT BLOCKS THE CALLING THREAD, for up to PLAN_MUTEX_TIMEOUT_SECS. The
+        orchestrator calls its plan methods synchronously on its event-loop
+        thread, so while a plan-tools process holds the mutex, every task
+        workflow in the orchestrator stalls. Keep critical sections short, and
+        never hold one across a subprocess the plan does not depend on.
+        """
+        lock_path = self._plan_mutex_path()
+        if lock_path is None:
+            yield
+            return
+        with file_mutex.exclusive(lock_path, timeout=PLAN_MUTEX_TIMEOUT_SECS):
+            yield
+
+    def _plan_mutex_path(self) -> Path | None:
+        lock_path = Path(os.path.realpath(self.root / 'plan.json')).with_name('plan.json.mutex')
+        return lock_path if lock_path.parent.is_dir() else None
+
+    def write_plan(self, plan: dict, *, mutex_held: bool = False) -> None:
+        """Write .task/plan.json — the structured plan.
+
+        A bare overwrite holds ``plan_mutex()`` for the write alone. The write
+        that ends a read-modify-write passes ``mutex_held=True``, a claim that
+        is VERIFIED: if the calling thread does not hold the mutex it raises
+        :class:`PlanMutexNotHeld` and writes nothing.
+        """
         plan['_schema_version'] = PLAN_SCHEMA_VERSION
+        if mutex_held:
+            self._write_held_plan(plan)
+            return
+        with self.plan_mutex():
+            self._write_held_plan(plan)
+
+    def _write_held_plan(self, plan: dict) -> None:
+        lock_path = self._plan_mutex_path()
+        if lock_path is not None and not file_mutex.held(lock_path):
+            raise PlanMutexNotHeld(
+                f'{self.root / "plan.json"} reached its write without {lock_path} held: '
+                'run the whole read-modify-write inside plan_mutex()'
+            )
         self._write_json(self.root / 'plan.json', plan)
 
     def ensure_lane_plan_symlink(self) -> None:
@@ -628,28 +731,19 @@ class TaskArtifacts:
 
         Returns a fresh default state ``{'amendment_rounds_total': 0,
         'review_cycles_total': 0, 'verdicts': {}}`` when the file is absent,
-        and — mirroring ``read_created_at``'s fail-safe (:264-279) — logs a
-        warning and returns those same defaults on a corrupt/unreadable or
-        malformed file rather than raising.  A present-but-partial file is
-        merged over the defaults so all canonical keys are always exposed.
+        and returns those same defaults, logging a warning, when the file is
+        corrupt, unreadable, not valid UTF-8, or not a JSON object — the
+        fail-safe every ``_read_json_object`` reader shares.  A
+        present-but-partial file is merged over the defaults so all canonical
+        keys are always exposed.
         """
         default = {
             'amendment_rounds_total': 0,
             'review_cycles_total': 0,
             'verdicts': {},
         }
-        path = self._read_path('review_state.json')
-        if not path.exists():
-            return default
-        try:
-            data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning('Corrupt review_state.json at %s: %s', path, exc)
-            return default
-        if not isinstance(data, dict):
-            logger.warning(
-                'Malformed review_state.json at %s: not an object', path
-            )
+        data = self._read_json_object('review_state.json')
+        if data is None:
             return default
         merged = {**default, **data}
         if not isinstance(merged.get('verdicts'), dict):
@@ -760,43 +854,111 @@ class TaskArtifacts:
         """Resolve *name* under ``self.root``."""
         return self.root / name
 
+    def _read_json_object(self, name: str) -> dict | None:
+        """The single fail-safe read seam for the whole-file JSON-object
+        sidecars written by ``_write_json``.
+
+        Returns ``None`` for an absent, unreadable, undecodable, malformed or
+        non-object file, logging a warning for every case except absent.
+        Decodes as UTF-8 to match ``shared.safe_io.atomic_write_text``.
+        """
+        path = self._read_path(name)
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+            logger.warning('Corrupt %s at %s: %s', name, path, exc)
+            return None
+        if not isinstance(data, dict):
+            logger.warning('Malformed %s at %s: not an object', name, path)
+            return None
+        return data
+
     def _clear_path(self, name: str) -> None:
         """Remove *name* from ``self.root`` if present."""
         (self.root / name).unlink(missing_ok=True)
 
     def read_plan(self) -> dict:
         """Read current plan state, auto-normalizing malformed shapes."""
+        plan, modified = self._read_normalized_plan()
+        if not modified:
+            return plan
+        with self.plan_mutex():
+            plan, modified = self._read_normalized_plan()
+            if modified:
+                logger.warning(
+                    'Plan normalization applied — writing corrected plan to %s',
+                    self.root / 'plan.json',
+                )
+                self._write_held_plan(plan)
+        return plan
+
+    def _read_normalized_plan(self) -> tuple[dict, bool]:
         plan_path = self._read_path('plan.json')
         if not plan_path.exists():
-            return {}
-        plan = json.loads(plan_path.read_text())
-        plan, modified = _normalize_plan(plan)
-        if modified:
-            logger.warning(
-                'Plan normalization applied — writing corrected plan to %s',
-                self.root / 'plan.json',
-            )
-            self._write_json(self.root / 'plan.json', plan)
-        return plan
+            return {}, False
+        return _normalize_plan(json.loads(plan_path.read_text()))
 
     def update_step_status(
         self, step_id: str, status: str, commit: str | None = None
     ) -> None:
-        """Update ONLY status and commit fields in plan.json. Structure is immutable."""
-        plan = self.read_plan()
+        """Update ONLY the status and commit fields of one step in plan.json.
 
-        for collection in ('prerequisites', 'steps'):
-            for item in plan.get(collection, []):
-                if not isinstance(item, dict):
-                    continue
-                if item.get('id') == step_id:
-                    item['status'] = status
-                    if commit is not None:
-                        item['commit'] = commit
-                    self._write_json(self.root / 'plan.json', plan)
-                    return
+        Plan structure changes only through the architect-role revalidation
+        tools (``orchestrator/mcp/plan_tools.py::_remove_plan_step`` /
+        ``::_replace_plan_step``), and only on steps that are not done.
+        Per-step deviation records go through :meth:`append_step_deviation`.
+        """
+        with self.plan_mutex():
+            plan = self.read_plan()
+
+            for collection in ('prerequisites', 'steps'):
+                for item in plan.get(collection, []):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get('id') == step_id:
+                        item['status'] = status
+                        if commit is not None:
+                            item['commit'] = commit
+                        self._write_held_plan(plan)
+                        return
 
         logger.warning(f'Step {step_id} not found in plan')
+
+    def append_step_deviation(
+        self, step_id: str, record: DeviationRecord
+    ) -> int | None:
+        """Append *record* to the matching step's ``deviations`` list.
+
+        Returns the list's new length, or ``None`` (with a warning, and no
+        write) when no step or prerequisite has ``id == step_id``. Any step
+        status is accepted, including ``done``.
+
+        Append-only: this class never edits or removes a record. ``status``,
+        ``commit``, ``type`` and ``description`` are never touched, so
+        :meth:`update_step_status` stays "status and commit only".
+
+        Markup-repair limits: ``plans/plan-deviation-recording-prd.md`` D4.
+        """
+        with self.plan_mutex():
+            plan = self.read_plan()
+
+            for collection in ('prerequisites', 'steps'):
+                for item in plan.get(collection, []):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get('id') == step_id:
+                        existing = item.get('deviations')
+                        item['deviations'] = [
+                            *(existing if isinstance(existing, list) else []),
+                            record.to_dict(),
+                        ]
+                        self.write_plan(plan, mutex_held=True)
+                        return len(item['deviations'])
+
+        logger.warning(f'Step {step_id} not found in plan')
+        return None
 
     def mark_step_committed(self, step_id: str, sha: str) -> bool:
         """Pre-satisfy a plan step/prerequisite at AUTHORING time.
@@ -819,24 +981,25 @@ class TaskArtifacts:
         lives in ``plan_tools._sha_exists_on_branch``; this method does NOT
         prove the step's semantics (VERIFY remains the gate).
         """
-        plan = self.read_plan()
         tag = f'[COMMITTED {sha[:12]}]'
+        with self.plan_mutex():
+            plan = self.read_plan()
 
-        for collection in ('prerequisites', 'steps'):
-            for item in plan.get(collection, []):
-                if not isinstance(item, dict):
-                    continue
-                if item.get('id') == step_id:
-                    item['status'] = 'done'
-                    item['commit'] = sha
-                    # Strip any existing leading [COMMITTED <sha>] tag(s) before
-                    # prepending the current one: idempotent for a repeat of the
-                    # same sha, and a clean replace (no stacking) for a re-mark
-                    # with a different sha.
-                    description = _COMMITTED_TAG_RE.sub('', item.get('description') or '')
-                    item['description'] = f'{tag} {description}'
-                    self.write_plan(plan)
-                    return True
+            for collection in ('prerequisites', 'steps'):
+                for item in plan.get(collection, []):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get('id') == step_id:
+                        item['status'] = 'done'
+                        item['commit'] = sha
+                        # Strip any existing leading [COMMITTED <sha>] tag(s) before
+                        # prepending the current one: idempotent for a repeat of the
+                        # same sha, and a clean replace (no stacking) for a re-mark
+                        # with a different sha.
+                        description = _COMMITTED_TAG_RE.sub('', item.get('description') or '')
+                        item['description'] = f'{tag} {description}'
+                        self.write_plan(plan, mutex_held=True)
+                        return True
 
         logger.warning(f'Step {step_id} not found in plan')
         return False
@@ -862,7 +1025,17 @@ class TaskArtifacts:
         return completed
 
     def append_iteration_log(self, entry: dict) -> None:
-        """Append to .task/iterations.jsonl — one JSON object per line."""
+        """Append to iterations.jsonl — one JSON object per line.
+
+        A missing ``source`` is stamped ``'orchestrator'``; any source outside
+        :data:`ORCHESTRATOR_ITERATION_SOURCES` is refused before writing.
+        """
+        entry.setdefault('source', 'orchestrator')
+        if not iteration_entry_written_by_orchestrator(entry):
+            raise ValueError(
+                f'iteration-log source must be one of '
+                f'{sorted(ORCHESTRATOR_ITERATION_SOURCES)}, got {entry["source"]!r}'
+            )
         entry['timestamp'] = datetime.now(UTC).isoformat()
         log_path = self.root / 'iterations.jsonl'
         with open(log_path, 'a') as f:
@@ -1018,44 +1191,52 @@ class TaskArtifacts:
             ValueError: if plan.json is missing or has no ``steps`` —
                 callers should never invoke this on an empty plan.
         """
-        plan = self.read_plan()
-        if not plan.get('steps'):
-            raise ValueError(
-                'bump_revalidation_stamp called before plan.json contains a '
-                'valid plan (missing or empty steps).'
-            )
-        plan['_revalidated_at'] = datetime.now(UTC).isoformat()
-        plan['_revalidated_by_session'] = session_id
-        self._write_json(self.root / 'plan.json', plan)
+        with self.plan_mutex():
+            plan = self.read_plan()
+            if not plan.get('steps'):
+                raise ValueError(
+                    'bump_revalidation_stamp called before plan.json contains a '
+                    'valid plan (missing or empty steps).'
+                )
+            plan['_revalidated_at'] = datetime.now(UTC).isoformat()
+            plan['_revalidated_by_session'] = session_id
+            self._write_held_plan(plan)
         if base_commit is not None:
             self.update_base_commit(base_commit)
 
-    def stamp_plan_provenance(self, session_id: str) -> None:
+    def stamp_plan_provenance(
+        self, session_id: str, *, task_text_fp: str | None = None,
+    ) -> None:
         """Stamp _session_id and _created_at into plan.json.
 
         Reads current plan.json, adds provenance fields, writes back.
+        ``task_text_fp=None`` leaves an existing fingerprint untouched (the
+        per-iteration and recovered-plan stamps rely on this).
 
         Raises:
             ValueError: if plan.json is missing or does not contain a 'steps' list.
                 This prevents silently creating a provenance-only stub that passes
                 bool() checks but has no actual plan content.
         """
-        plan = self.read_plan()
-        if not plan.get('steps'):
-            raise ValueError(
-                'stamp_plan_provenance called before plan.json contains a valid plan '
-                '(missing or empty steps). '
-                'Ensure the architect has written a complete plan before stamping provenance.'
-            )
-        plan['_session_id'] = session_id
-        plan['_created_at'] = datetime.now(UTC).isoformat()
-        # Invariant: a provenance-stamped plan is a complete plan, so it must
-        # carry the completeness marker.  The architect's confirm_plan normally
-        # sets this already (idempotent setdefault); paths that inject a
-        # ready-made plan (eval initial_plan, SIMPLE_TASK) rely on this so the
-        # plan is not mistaken for an interrupted partial on a later requeue.
-        plan.setdefault('_finalized_at', plan['_created_at'])
-        self._write_json(self.root / 'plan.json', plan)
+        with self.plan_mutex():
+            plan = self.read_plan()
+            if not plan.get('steps'):
+                raise ValueError(
+                    'stamp_plan_provenance called before plan.json contains a valid plan '
+                    '(missing or empty steps). '
+                    'Ensure the architect has written a complete plan before stamping provenance.'
+                )
+            plan['_session_id'] = session_id
+            plan['_created_at'] = datetime.now(UTC).isoformat()
+            # Invariant: a provenance-stamped plan is a complete plan, so it must
+            # carry the completeness marker.  The architect's confirm_plan normally
+            # sets this already (idempotent setdefault); paths that inject a
+            # ready-made plan (eval initial_plan, SIMPLE_TASK) rely on this so the
+            # plan is not mistaken for an interrupted partial on a later requeue.
+            plan.setdefault('_finalized_at', plan['_created_at'])
+            if task_text_fp is not None:
+                plan[PLAN_TASK_TEXT_FP_KEY] = task_text_fp
+            self._write_held_plan(plan)
 
     def validate_plan_owner(self, session_id: str) -> bool:
         """Return True if *session_id* owns plan.json.
@@ -1102,16 +1283,17 @@ class TaskArtifacts:
         left untouched: the original planner's ``_session_id`` is preserved
         for audit rather than being promoted.
         """
-        plan = self.read_plan()
-        plan['files'] = files
-        already_owner = (
-            plan.get('_session_id') == session_id
-            or plan.get('_revalidated_by_session') == session_id
-        )
-        if not already_owner:
-            plan['_session_id'] = session_id
-            plan.setdefault('_created_at', datetime.now(UTC).isoformat())
-        self._write_json(self.root / 'plan.json', plan)
+        with self.plan_mutex():
+            plan = self.read_plan()
+            plan['files'] = files
+            already_owner = (
+                plan.get('_session_id') == session_id
+                or plan.get('_revalidated_by_session') == session_id
+            )
+            if not already_owner:
+                plan['_session_id'] = session_id
+                plan.setdefault('_created_at', datetime.now(UTC).isoformat())
+            self._write_held_plan(plan)
 
     # ──────────────────────────────────────────────────────────────────
     # Agent-session sidecar — marker for "an agent subprocess is in flight".
@@ -1153,25 +1335,16 @@ class TaskArtifacts:
         """Return the parsed ``.task/agent_session.json`` as a typed
         :class:`AgentSession`, or ``None`` if missing/corrupt.
 
-        Fail-safe: a missing file, corrupt/unreadable JSON, a present-but-
-        non-object payload, or a payload whose numeric fields
+        Fail-safe: a missing file, corrupt/unreadable or non-UTF-8 JSON, a
+        present-but-non-object payload, or a payload whose numeric fields
         (``resume_count`` / ``schema_version``) cannot be coerced to ``int``
         all return ``None`` (the caller reads absence as "no in-flight
         session").  A v1 sidecar (missing v2 keys) is tolerated via
         :meth:`AgentSession.from_mapping`, which supplies legacy defaults.
         """
-        path = self._read_path('agent_session.json')
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning('Corrupt agent_session.json at %s: %s', path, exc)
-            return None
-        if not isinstance(data, dict):
-            logger.warning(
-                'Malformed agent_session.json at %s: not an object', path
-            )
+        name = 'agent_session.json'
+        data = self._read_json_object(name)
+        if data is None:
             return None
         try:
             return AgentSession.from_mapping(data)
@@ -1180,8 +1353,8 @@ class TaskArtifacts:
             # makes from_mapping's int() coercion raise; map that to the same
             # fail-safe None as any other corruption rather than propagating.
             logger.warning(
-                'Malformed agent_session.json at %s: unparseable field (%s)',
-                path, exc,
+                'Malformed %s at %s: unparseable field (%s)',
+                name, self._read_path(name), exc,
             )
             return None
 
@@ -1207,22 +1380,12 @@ class TaskArtifacts:
         ``{"emitted_done_step_escalations": [[step_id, commit], ...]}``; each
         2-element list is re-tupled here and malformed entries are skipped.
 
-        Fail-safe: a missing file, corrupt/unreadable JSON, or a non-object
-        payload all return an empty ``set`` (mirrors ``read_agent_session``),
-        so a corrupt sidecar re-files rather than silently suppressing.
+        Fail-safe: a missing file, corrupt/unreadable or non-UTF-8 JSON, or a
+        non-object payload all return an empty ``set``, so a corrupt sidecar
+        re-files rather than silently suppressing.
         """
-        path = self._read_path('reconcile_state.json')
-        if not path.exists():
-            return set()
-        try:
-            data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning('Corrupt reconcile_state.json at %s: %s', path, exc)
-            return set()
-        if not isinstance(data, dict):
-            logger.warning(
-                'Malformed reconcile_state.json at %s: not an object', path
-            )
+        data = self._read_json_object('reconcile_state.json')
+        if data is None:
             return set()
         result: set[tuple[str, str]] = set()
         for entry in data.get('emitted_done_step_escalations', []):
@@ -1297,21 +1460,14 @@ class TaskArtifacts:
         self._write_json(verdict_path, envelope)
 
     def read_verdict(self, role: str) -> dict | None:
-        """Return parsed ``.task/verdicts/{role}.json``, or ``None`` if
-        missing/corrupt.
+        """Return parsed ``.task/verdicts/{role}.json``, or ``None`` if the
+        file is missing, corrupt, or not a JSON object.
 
         Raises:
             ValueError: if *role* is invalid — see ``_validate_verdict_role``.
         """
         _validate_verdict_role(role)
-        path = self._read_path(f'verdicts/{role}.json')
-        if not path.exists():
-            return None
-        try:
-            return json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning('Corrupt verdicts/%s.json at %s: %s', role, path, exc)
-            return None
+        return self._read_json_object(f'verdicts/{role}.json')
 
     def clear_verdict(self, role: str) -> None:
         """Remove ``.task/verdicts/{role}.json`` if present (idempotent).
@@ -1324,138 +1480,6 @@ class TaskArtifacts:
         """
         _validate_verdict_role(role)
         self._clear_path(f'verdicts/{role}.json')
-
-    def write_markup_residue(self, record: dict) -> str | None:
-        """Preserve the residue of a tool call refused for unrepairable markup.
-
-        This is the ONLY surviving copy of a payload the calling agent could not
-        re-emit: the leak is, by construction, a serialization defect that
-        mangled text the agent produced once. Preserving it is what makes
-        refusing a corrupted call NON-DESTRUCTIVE (PRD C2 L187 / INV-7) rather
-        than a silent data loss dressed up as a clean error.
-
-        IT IS THE LAST RESORT, NOT THE CHANNEL. The primary channel for both
-        orchestrator-side boundary guards is the real escalation queue, via
-        ``orchestrator.mcp.markup_sink.make_escalation_sink`` — a queued record
-        names an owner, carries the standing L2 age bound, and is actually READ.
-        This writer is what a guard falls back to when that queue cannot be
-        opened at all (an unresolvable project root, a missing ``escalation``
-        package). Its root lives inside the task's own worktree/meta root, which
-        the orchestrator destroys at teardown with ``git worktree remove
-        --force`` and which a pooled lane clears on acquisition — so a payload
-        parked here survives only until the lane is reaped and nothing
-        proactively surfaces it. Strictly better than losing the payload the
-        instant the queue is down; strictly worse than a queued escalation.
-        Callers must wire it as ``last_resort=``, never as the sink itself.
-        ``.task/`` is gitignored, so a residue file can never contaminate a
-        task's diff or its verify.
-
-        Returns the bare FILENAME (e.g. ``markup_residue-3.json``), not an
-        absolute path: the id stays stable across the worktree/``.task-meta``
-        split and is short enough to sit legibly in a refusal payload, which
-        quotes it so a bounced agent can point an operator at its own data.
-        Returns ``None`` when the root has vanished and nothing was written —
-        never a name for a file that does not exist, because the middleware's
-        hint is conditional on exactly this value, and a caller pointed at a
-        missing file is told its data is safe when it is gone.
-
-        The next index is derived by SCANNING the directory rather than from
-        in-process state: a fresh subprocess's counter would restart at 1 and
-        clobber the previous invocation's evidence. The scan only picks where to
-        START, though — the name itself is CLAIMED with ``O_CREAT | O_EXCL``,
-        the same primitive ``lock_plan`` uses below and for the same reason.
-        Scanning then writing would leave a window a re-check cannot close: a
-        reviewer panel runs several verdict-tools subprocesses against ONE
-        artifacts root (only ``verdicts/<role>.json`` is per-role), a
-        serialization leak is bursty and correlated across panel members, and
-        two writers that both scan before either writes would both choose the
-        same index — the second write silently destroying the first payload.
-
-        There is deliberately no ``read_markup_residue``/``clear_markup_residue``
-        pair. The ``write_*``/``read_*``/``clear_*`` triads in this class exist
-        for records the orchestrator CONSUMES to make a routing decision;
-        residue is durable evidence for an operator, and inventing a consumer
-        API with no consumer would imply a sweep that does not exist. Wiring
-        proactive surfacing is follow-up work, filed against this task.
-        """
-        # The same root-gone guard write_review/write_verdict carry, and for the
-        # same reason. MEASURED: _write_json's FileNotFoundError tolerance does
-        # NOT cover this on its own, because its mkdir(parents=True) RE-CREATES
-        # a root that was deleted out-of-band — resurrecting a worktree
-        # directory as a side effect of a best-effort write. Both siblings guard
-        # explicitly ahead of the call for exactly that reason; this is that one
-        # policy, not a second one.
-        if not self.root.is_dir():
-            logger.info(
-                'TaskArtifacts: skipping write_markup_residue for %s.%s — '
-                'root %s no longer exists; %d chars of residue are NOT preserved',
-                record.get('tool'), record.get('field'), self.root,
-                len(record.get('raw_value') or ''),
-            )
-            return None
-
-        existing = sorted(self.root.glob('markup_residue-*.json'))
-        highest = 0
-        for path in existing:
-            suffix = path.stem.removeprefix('markup_residue-')
-            if suffix.isdigit():
-                highest = max(highest, int(suffix))
-
-        name = None
-        # Bounded, and the bound is stated rather than assumed: this many
-        # writers would have to hold consecutive names at once to exhaust it,
-        # and a real reviewer panel is a handful. Exhaustion is LOUD below
-        # rather than silently rolling over to a second naming scheme.
-        for index in range(highest + 1, highest + 1 + _MARKUP_RESIDUE_MAX_PROBES):
-            candidate = self.root / f'markup_residue-{index}.json'
-            try:
-                # The claim IS the atomicity: O_EXCL fails rather than truncates
-                # if the name was taken between the scan and here, so a loser
-                # moves to the next index instead of overwriting a winner. It
-                # also skips a non-numeric or out-of-band file for free — such a
-                # name must never cost an operator the record.
-                os.close(os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
-            except FileExistsError:
-                continue
-            except OSError:
-                # A vanished root between the guard above and here, or any other
-                # storage failure. _call_sink's never-raises contract makes this
-                # a heads-up, not a crash on the caller's refusal path.
-                logger.info(
-                    'TaskArtifacts: could not claim a residue name under %s for '
-                    '%s.%s; %d chars of residue are NOT preserved',
-                    self.root, record.get('tool'), record.get('field'),
-                    len(record.get('raw_value') or ''),
-                )
-                return None
-            name = candidate.name
-            break
-
-        if name is None:
-            logger.error(
-                'TaskArtifacts: %d consecutive residue names from %d are taken '
-                'under %s; %d chars of residue are NOT preserved for %s.%s',
-                _MARKUP_RESIDUE_MAX_PROBES, highest + 1, self.root,
-                len(record.get('raw_value') or ''),
-                record.get('tool'), record.get('field'),
-            )
-            return None
-
-        # Via _write_json, NOT a hand-rolled write_text: it already carries the
-        # mkdir, the indent+newline convention and the vanished-root tolerance
-        # every other writer in this class relies on. One write policy. It
-        # overwrites the empty claim, which is what the claim is for.
-        self._write_json(self.root / name, record)
-        # A claim with nothing in it is worse than no claim: it holds an index
-        # AND reads as a preserved record that is in fact empty. Only a file
-        # with content earns the name this returns.
-        try:
-            if (self.root / name).stat().st_size == 0:
-                (self.root / name).unlink()
-                return None
-        except OSError:
-            return None
-        return name
 
     def lock_plan(self, session_id: str, *, run_id: str | None = None) -> bool:
         """Atomically acquire the plan lock.
@@ -1525,7 +1549,12 @@ class TaskArtifacts:
     def clear_stale_plan_lock(
         self, current_task_id: str, stale_threshold_secs: float = 600.0
     ) -> bool:
-        """Remove plan.lock if it's stale. Returns True if lock was cleared."""
+        """Remove plan.lock if it's stale. Returns True if lock was cleared.
+
+        *stale_threshold_secs* is plan.lock's own eviction window; its default
+        equals ``shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL`` only
+        coincidentally and is deliberately not derived from it.
+        """
         lock_data = self.read_plan_lock()
         if lock_data is None:
             return False
@@ -1645,7 +1674,8 @@ class TaskArtifacts:
         the pattern (its unique-per-writer O_CREAT|O_EXCL temp, fchmod on the
         still-open fd, and BaseException-safe cleanup are all things a local
         copy would have to re-earn), and the consolidation is machine-enforced
-        by ``TestNoRegrownAtomicWriters`` in shared/tests/test_safe_io.py.
+        by ``TestNoRegrownAtomicWriters`` in
+        ``tests/scripts/test_atomic_write_regrowth.py``.
 
         ``append_iteration_log`` is deliberately NOT routed through here: it
         is genuinely append-only, and tmp+rename would turn an O(1) append

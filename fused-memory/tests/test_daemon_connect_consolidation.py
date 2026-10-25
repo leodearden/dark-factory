@@ -61,7 +61,7 @@ async def _std_lifecycle(store, tmp_path: Path) -> None:  # noqa: ARG001
 
 
 async def _backend_lifecycle(store: SqliteTaskBackend, tmp_path: Path) -> None:
-    """SqliteTaskBackend lifecycle: start() then trigger _get_connection via get_tasks()."""
+    """SqliteTaskBackend lifecycle: start() then trigger _get_write_access via get_tasks()."""
     await store.start()
     await store.get_tasks(project_root=str(tmp_path))
 
@@ -74,43 +74,43 @@ _DAEMON_CASES = [
     pytest.param(
         lambda tmp: TicketStore(tmp / 'tickets.db'),
         _std_lifecycle,
-        lambda store, _root: store._db,
+        lambda store, _root: store._require_access().connection,
         id='TicketStore',
     ),
     pytest.param(
         lambda tmp: DurableWriteQueue(data_dir=tmp / 'queue', execute_write=AsyncMock()),
         _std_lifecycle,
-        lambda store, _root: store._db,
+        lambda store, _root: store._require_access().connection,
         id='DurableWriteQueue',
     ),
     pytest.param(
         lambda tmp: PlannedEpisodeRegistry(data_dir=tmp / 'registry'),
         _std_lifecycle,
-        lambda store, _root: store._db,
+        lambda store, _root: store._require_access().connection,
         id='PlannedEpisodeRegistry',
     ),
     pytest.param(
         lambda tmp: WriteJournal(data_dir=tmp / 'journal'),
         _std_lifecycle,
-        lambda store, _root: store._db,
+        lambda store, _root: store._require_access().connection,
         id='WriteJournal',
     ),
     pytest.param(
         lambda tmp: EventBuffer(db_path=tmp / 'eb.db'),  # noqa: ARG005
         _std_lifecycle,
-        lambda store, _root: store._db,
+        lambda store, _root: store._require_access().connection,
         id='EventBuffer',
     ),
     pytest.param(
         lambda tmp: ReconciliationJournal(data_dir=tmp / 'journal'),  # noqa: ARG005
         _std_lifecycle,
-        lambda store, _root: store._db,
+        lambda store, _root: store._require_access().connection,
         id='ReconciliationJournal',
     ),
     pytest.param(
         lambda tmp: SqliteTaskBackend(),  # noqa: ARG005
         _backend_lifecycle,
-        lambda store, root: store._connections[root],
+        lambda store, root: store._write_accesses[root].connection,
         id='SqliteTaskBackend',
     ),
 ]

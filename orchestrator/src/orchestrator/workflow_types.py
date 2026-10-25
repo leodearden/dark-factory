@@ -2,8 +2,8 @@
 
 Extracted verbatim from :mod:`orchestrator.workflow`: the ``WorkflowState``
 phase enum and the ``WorkflowOutcome`` enum, following the types-module +
-re-export-shim precedent established by :mod:`orchestrator.merge_types`
-(extracted from ``orchestrator.merge_queue``).  ``orchestrator.workflow``
+re-export-shim precedent established by :mod:`orchestrator.merge_lane.types`
+(extracted from ``orchestrator.merge_lane.worker``).  ``orchestrator.workflow``
 re-exports every name here through a top-level shim so existing importers
 (``from orchestrator.workflow import WorkflowState``, etc.) keep working
 unchanged.
@@ -29,6 +29,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, TypeVar
 
+from shared.asyncio_tasks import cancel_bounded
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import (
     ActorClass,
@@ -116,6 +117,11 @@ class TerminalReport:
     (``config.auto_eval_phases``) keeps matching plan/execute/verify/review
     blocks instead of seeing the terminal ``'blocked'`` state (REVIEW-CYCLE-1
     fix — see that design decision).
+
+    ``block_category`` is ``_mark_blocked``'s ``category=`` argument — the
+    ESCALATION taxonomy (``'task_failure'``, ``'wip_conflict'``,
+    ``'infra_issue'``, ...), unrelated to ``category`` above — and ``''`` on
+    every exit that did not pass through ``_mark_blocked``.
     """
 
     outcome: WorkflowOutcome
@@ -124,6 +130,7 @@ class TerminalReport:
     detail: str
     category: FailureCategory | None
     blocked_from_phase: WorkflowState | None = None
+    block_category: str = ''
     # Task 2988 (PRD ε / W3): whether this terminal outcome's requeue counts
     # against the per-task requeue cap.  Set from
     # ``BlockDisposition.counts_against_requeue_cap`` at the REQUEUED
@@ -181,7 +188,7 @@ class BlockDisposition:
     catch sites (workflow.py/steward.py/review_checkpoint.py/
     dry_run_unblock.py) now consult instead of hand-writing their own.
 
-    ``category`` is the ``verify_classify.classify_failure`` 12-value
+    ``category`` is the ``verify_classify.classify_failure``
     output domain (:class:`FailureCategory`) — a DISTINCT concept from the
     escalation-taxonomy string (``'infra_issue'``/``'wip_conflict'``/
     ``'task_failure'``) ``_mark_blocked`` separately accepts as its
@@ -256,6 +263,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
     from shared.cli_invoke import AllAccountsCappedException
     from shared.usage_gate import (
         IllegalTransitionError,
+        PoolFrozen,
         ProbeSpawnError,
         SessionBudgetExhausted,
     )
@@ -270,14 +278,18 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         MergeVerifyLeaseContended,
         MergeVerifyLeaseHeld,
         WarmLaneDiskPressure,
+        WarmLaneLockContention,
+        WarmLaneLockTimeout,
         WarmLanePoolExhausted,
         WarmLanePoolHardDown,
         WarmLaneRequeue,
         WarmLaneReseedContaminated,
         WarmLaneSoftPressure,
+        WarmLaneStealFailed,
         WorktreeConflictError,
         WorktreeMissing,
     )
+    from orchestrator.recut_ruling import RecutRulingUnreadable, RecutRulingViolation
     from orchestrator.verify import VerifyInfraError
 
     _disposition_table_cache = {
@@ -301,6 +313,19 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Session budget exhausted',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Raised only to a park=False caller; no orchestrator site opts in
+        # (only scripts/legibility/session_runner.py does), so this row
+        # mirrors AllAccountsCappedException's. Its message names any
+        # AUTH_FAILED accounts, so a credential freeze stays legible in the
+        # block reason without paging a human for an ordinary all-capped pool.
+        PoolFrozen: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Account pool frozen',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # ── Warm-lane requeue family ─────────────────────────────────────
@@ -378,6 +403,39 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             reason_prefix='warm_lane_pool_hard_down',
             block_class=BlockClass.AGENT_FAILURE,
         ),
+        # Lane-lock contention (task 4211): seed exited 77 under reify's
+        # opt-in --distinct-lock-refusal-rc (reify 5568) because another live
+        # consumer holds <lane_dir>.lock, so it refused rather than seeded.
+        #
+        # An EXPLICIT own-key row, not MRO inheritance, and that is the whole
+        # point of the row.  _lookup_disposition walks __mro__, so a
+        # WarmLaneRequeue subclass with no row of its own resolves to the base
+        # row above — whose reason_prefix is literally
+        # 'warm_lane_disk_pressure (transient infra)'.  Inheriting it would
+        # keep rendering a lane-lock refusal as disk pressure, which is
+        # precisely the operator-facing defect this task fixes (the misleading
+        # string operators read throughout reify esc-5556-1, when seed's two
+        # refusal arms both exited 75 and seed has no disk-pressure exit-75
+        # path at all).  BD-2 completeness does NOT catch this — MRO
+        # resolution already satisfies it — so the guard is the OWN-KEY
+        # assertion in test_block_disposition.py, mirroring the
+        # LaneLockSelfOwnedLeak precedent.
+        #
+        # counts_against_requeue_cap=False: the DISK_PRESSURE / HARD_DOWN /
+        # SOFT_PRESSURE shared-resource shape, deliberately NOT
+        # WarmLaneReseedContaminated's =True.  Per the family comment above,
+        # only per-task DATA-INTEGRITY faults burn the cap; a lock held by
+        # ANOTHER live consumer is a shared-resource condition and no fault of
+        # the requeued task, so charging its cap would punish the wrong party
+        # and recreate the retry-cap-escalation storm task 2988 fixed.
+        WarmLaneLockContention: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='warm_lane_lock_contention (transient contention)',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
         # θ proactive soft-floor throttle (task 2443, §9.5 inv.11): pure
         # backpressure/defer for a FRESH allocation — deliberately weaker
         # than ε's hard-floor WarmLaneDiskPressure exit-75 row above, so it
@@ -403,6 +461,62 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.REQUEUE,
             counts_against_requeue_cap=False,
             reason_prefix='warm_lane_soft_pressure (backpressure)',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # ── Steal-path family (task 4930) ────────────────────────────────
+        # Both come from the reclaim-on-exhaustion steal path and neither is
+        # the requeued task's fault, but they split on the requeue cap:
+        #
+        # WarmLaneLockTimeout is transient SHARED-RESOURCE CONTENTION — the
+        # seed lost the bounded <lane>.lock wait to a concurrent GC reseed /
+        # thin / seed (rc=124). In the measured producer the holder is a GC
+        # reseed that DOES finish (holds 25-88s, median ~34s, against a 30s
+        # wait), so the condition clears on its own and must not burn the
+        # requeued task's cap; exactly the shape of its WarmLaneDiskPressure /
+        # WarmLaneSoftPressure neighbours above.
+        #
+        # ACCEPTED RISK — the live-but-wedged holder. flock releases a lock on
+        # holder *death*, never on a stuck-but-live process (the reason
+        # GitOps._seed_warm_lane bounds the wait at all), so a hung thin
+        # `rm -rf`, a stalled GC reclaim, or a caller that seeds with the
+        # default lane_lock=SeedLaneLock.TAKE while already holding the lock
+        # produces rc=124 on EVERY attempt and does NOT self-clear. On the
+        # steal path the retry driver moves to a DIFFERENT lane
+        # (LANE_LOCK_TIMEOUT is in git_ops._STEAL_RETRYABLE), but a FREE-lane
+        # acquire re-picks the same lowest-index lane, so this uncounted row
+        # lets such a task requeue indefinitely with no cap escalation. That
+        # is accepted rather than overlooked: counting the common
+        # (self-clearing) case would charge every task caught behind an
+        # ordinary GC overlap for contention it did not cause, and the wedged
+        # case is not silent — each attempt logs an `acquire_warm_lane:`
+        # WARNING naming rc=124 and the lane, and every requeue carries the
+        # greppable reason_prefix below. If chronic rc=124 on a single lane is
+        # ever observed in the journal, the fix is to unwedge the holder (or
+        # flip this row to counts_against_requeue_cap=True, as
+        # WarmLaneStealFailed does), NOT to widen the bounded wait.
+        #
+        # WarmLaneStealFailed is NOT self-clearing. Chronic pool pressure keeps
+        # the valve stealing, and a pool that is handing out hostile lanes goes
+        # on doing so until an operator intervenes — so counting it (like
+        # WarmLaneReseedContaminated below) preserves a bounded LOUD path via
+        # the requeue-cap escalation, in place of the per-task BLOCKED+L1 that
+        # task 4930 removes. Without the count the task would trade "always
+        # escalates" for "requeues forever in silence", which is the worse
+        # failure of the two.
+        WarmLaneLockTimeout: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='warm_lane_lock_timeout (transient infra)',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        WarmLaneStealFailed: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=True,
+            reason_prefix='warm_lane_steal_failed (pool pressure)',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # Reseed contamination (task 2854): a fresh-reseed acquire left the
@@ -453,6 +567,25 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Branch reset: rebase wiped committed task work',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Re-cut rulings (task 3154): a human ruled "re-cut fresh off main",
+        # so a refused or unreadable ruling goes back to a human, never to a
+        # quiet default block.
+        RecutRulingViolation: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Re-cut ruling refused provisioning',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        RecutRulingUnreadable: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Re-cut ruling unreadable',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # ── BD-2 completeness rows: exported by the 4 covered modules, but
@@ -886,6 +1019,10 @@ class WorkflowCancelled(Exception):
 # `kind` is None for a normal (non-cancelled) exit.
 OnTerminalEntry = tuple[str, Callable[[Literal['hard', 'soft'] | None], Awaitable[None]]]
 
+# Cleanup entries that outlived ``cancel_bounded``'s two cancels. The event loop
+# holds tasks only weakly, so this keeps each one referenced until it ends.
+_UNDRAINED_CLEANUP_ENTRIES: set[asyncio.Task[None]] = set()
+
 
 class CancellationScope:
     """Supervises a workflow body coroutine and turns either a hard
@@ -902,15 +1039,32 @@ class CancellationScope:
     Hard-cancel is the outer ``await`` (this coroutine's own await point)
     being cancelled, or the body itself spontaneously raising
     ``CancelledError`` (a shutdown-race teardown) — both typed ``'hard'``.
+
+    Terminal cleanup survives any number of outer cancels, but not for ever
+    (task 6660): from the first outer cancel on, each cleanup entry may run at
+    most *cancel_grace_secs* before it is cancelled under
+    ``shared.asyncio_tasks.cancel_bounded`` and named in
+    :attr:`abandoned_entries`. The remaining entries still run.
     """
 
     def __init__(
         self,
         cancel_event: asyncio.Event,
         on_terminal: Sequence[OnTerminalEntry],
+        *,
+        cancel_grace_secs: float,
     ) -> None:
         self._cancel_event = cancel_event
         self._on_terminal = on_terminal
+        self._cancel_grace_secs = cancel_grace_secs
+        self._outer_cancel_seen = False
+        self._task_name_prefix = 'cancellation-scope'
+        self._abandoned: list[str] = []
+
+    @property
+    def abandoned_entries(self) -> tuple[str, ...]:
+        """Names of the ``on_terminal`` entries cut off after their grace, in order."""
+        return tuple(self._abandoned)
 
     async def supervise(self, body_coro: Awaitable[_T]) -> _T:
         """Run *body_coro* under supervision; return its result, or raise
@@ -920,7 +1074,12 @@ class CancellationScope:
         always passed to every ``on_terminal`` entry, in order, exactly
         once — via the ``finally`` below, so it runs on every exit path.
         """
+        current = asyncio.current_task()
+        if current is not None:
+            self._task_name_prefix = current.get_name()
         body = asyncio.ensure_future(body_coro)
+        if isinstance(body, asyncio.Task):
+            body.set_name(self._child_task_name('body'))
         waiter = asyncio.create_task(self._cancel_event.wait())
         kind: Literal['hard', 'soft'] | None = None
         try:
@@ -935,6 +1094,7 @@ class CancellationScope:
                 # (it never cancels its member futures on our behalf), so
                 # both are handled uniformly by the finally below.
                 kind = 'hard'
+                self._outer_cancel_seen = True
                 raise WorkflowCancelled('hard') from None
             if body in done:
                 if body.cancelled():
@@ -995,13 +1155,16 @@ class CancellationScope:
     async def _run_on_terminal(self, kind: Literal['hard', 'soft'] | None) -> None:
         """Run every ``on_terminal`` entry, in order, passing *kind*.
 
-        Runs the whole ordered list as a background task shielded behind a
-        retry loop, so it survives being cancelled REPEATEDLY (the harness's
-        ``hard_cancel_workflow`` polls, calling ``task.cancel()`` more than
-        once on the same slot task): each ``asyncio.shield`` only ever
-        detaches OUR await from the background task, never cancels the
-        background task itself, so a second (or third) cancel here can
-        never truncate an in-flight cleanup entry.
+        Each entry runs as its own task, awaited through ``asyncio.wait``,
+        which never cancels what it waits on: an outer cancel (the harness's
+        ``hard_cancel_workflow`` polls call ``task.cancel()`` more than once on
+        the same slot task) is absorbed with ``uncancel()`` and can never
+        truncate an in-flight entry. The first such cancel bounds the cleanup
+        instead: from then on an entry still running *cancel_grace_secs* after
+        the later of its start and that cancel is abandoned (see
+        :meth:`_abandon`) and the next entry starts. Without the bound a single
+        cancel-proof await in one entry held the slot and its module locks
+        until restart (task 6660). With no outer cancel nothing is bounded.
 
         Each entry is also individually try/except-``Exception``-and-logged,
         so a failure in one cleanup step can never skip the REMAINING
@@ -1012,30 +1175,82 @@ class CancellationScope:
         the harness report BLOCKED instead of CANCELLED). This generalizes
         ``_stop_claimant_heartbeat``'s own bespoke catch-and-log into one
         uniform per-entry policy, keyed on the entry name — a genuine
-        ``CancelledError`` is deliberately NOT caught here so the
-        done/cancelled bookkeeping below still sees it.
+        ``CancelledError`` raised by an entry itself is deliberately NOT
+        caught: it stops the remaining entries and propagates.
         """
-        async def _run_all() -> None:
-            for name, fn in self._on_terminal:
-                try:
-                    await fn(kind)
-                except Exception:
-                    logger.exception(
-                        f'CancellationScope on_terminal entry {name!r} '
-                        f'failed (non-fatal — continuing remaining '
-                        f'terminal cleanup)'
-                    )
+        for name, fn in self._on_terminal:
+            entry = asyncio.create_task(self._run_entry(name, fn, kind), name=self._child_task_name(name))
+            if not await self._await_entry(name, entry):
+                continue
+            if entry.cancelled():
+                raise asyncio.CancelledError()
+            exc = entry.exception()
+            if exc is not None:
+                raise exc
 
-        task = asyncio.ensure_future(_run_all())
-        while not task.done():
+    @staticmethod
+    async def _run_entry(
+        name: str,
+        fn: Callable[[Literal['hard', 'soft'] | None], Awaitable[None]],
+        kind: Literal['hard', 'soft'] | None,
+    ) -> None:
+        try:
+            await fn(kind)
+        except Exception:
+            logger.exception(
+                f'CancellationScope on_terminal entry {name!r} '
+                f'failed (non-fatal — continuing remaining '
+                f'terminal cleanup)'
+            )
+
+    async def _await_entry(self, name: str, entry: asyncio.Task[None]) -> bool:
+        """Wait for *entry*, absorbing outer cancels; False iff it was abandoned."""
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + self._cancel_grace_secs if self._outer_cancel_seen else None
+        while not entry.done():
+            remaining = None if deadline is None else deadline - loop.time()
+            if remaining is not None and remaining <= 0:
+                await self._abandon(name, entry, loop.time() - started)
+                return False
             try:
-                await asyncio.shield(task)
+                await asyncio.wait({entry}, timeout=remaining)
             except asyncio.CancelledError:
-                current = asyncio.current_task()
-                if current is not None:
-                    current.uncancel()
-        if task.cancelled():
-            raise asyncio.CancelledError()
-        exc = task.exception()
-        if exc is not None:
-            raise exc
+                self._absorb_outer_cancel()
+                if deadline is None:
+                    deadline = loop.time() + self._cancel_grace_secs
+        return True
+
+    async def _abandon(self, name: str, entry: asyncio.Task[None], elapsed: float) -> None:
+        """Cancel *entry* under a bound and record it in :attr:`abandoned_entries`."""
+        drain = asyncio.create_task(
+            cancel_bounded(entry, _UNDRAINED_CLEANUP_ENTRIES, grace_secs=self._cancel_grace_secs),
+        )
+        while not drain.done():
+            try:
+                await asyncio.wait({drain})
+            except asyncio.CancelledError:
+                self._absorb_outer_cancel()
+        self._abandoned.append(name)
+        current = asyncio.current_task()
+        logger.error(
+            'CancellationScope abandoned on_terminal entry %r of %s after %.1fs '
+            'past a hard-cancel (grace %.1fs); it %s; continuing with the '
+            'remaining terminal cleanup',
+            name,
+            current.get_name() if current is not None else 'an unnamed task',
+            elapsed,
+            self._cancel_grace_secs,
+            'ended once cancelled' if drain.result() else 'outlived two bounded cancels',
+        )
+
+    def _child_task_name(self, role: str) -> str:
+        """``<supervising task>/<role>``: a wedged slot's report finds its children by this
+        prefix (``orchestrator/src/orchestrator/slot_lease.py::suspended_slot_tasks``)."""
+        return f'{self._task_name_prefix}/{role}'
+
+    def _absorb_outer_cancel(self) -> None:
+        current = asyncio.current_task()
+        if current is not None:
+            current.uncancel()
+        self._outer_cancel_seen = True

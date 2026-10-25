@@ -14,24 +14,100 @@ wired for the live transport (a ``verdict-tools`` MCP server, no
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from shared.usage_gate import UsageGate
+from test_reviewer_trial_checkout import _CHANGE_AT_BASE, _commit, _git, _Source
 
+from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.agents.roles import build_reviewer_role
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.evals.reviewer_trial.corpus import CorpusDiff
+from orchestrator.config import OrchestratorConfig, project_review_config
+from orchestrator.evals.reviewer_trial.checkout import (
+    FixtureEnrichmentMissing,
+    fixture_checkout,
+)
+from orchestrator.evals.reviewer_trial.corpus import (
+    CorpusDiff,
+    CorpusManifest,
+    FixtureContext,
+    FixtureTaskRecord,
+)
 from orchestrator.evals.reviewer_trial.runner import (
+    DIFF_CAP_CHARS,
     REVIEW_SCHEMA,
     PanelRunResult,
-    _build_reviewer_prompt,
     _run_single_reviewer,
     run_panel,
+    run_trial,
 )
 from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
     VariantConfig,
+    with_briefing,
 )
+from orchestrator.review_inputs import gather_review_subject
+
+
+@pytest.fixture
+def source(tmp_path: Path) -> _Source:
+    """A real source repository every panel's scratch clone is cut from."""
+    return _Source(tmp_path / 'source')
+
+
+def _diff_in(
+    source: _Source,
+    *,
+    diff_id: str = 'd1',
+    diff_text: str = 'diff',
+    context: FixtureContext | None = None,
+) -> CorpusDiff:
+    return CorpusDiff(
+        diff_id=diff_id, language='python', source='synthetic',
+        diff_text=diff_text, description='Test', ground_truth=[],
+        cwd=source.root, context=context,
+    )
+
+
+def _enriched(
+    source: _Source,
+    *,
+    diff_id: str = 'fx_1',
+    base_sha: str | None,
+    base_sha_reason: str | None = None,
+    plan: dict | None = None,
+    plan_reason: str | None = None,
+) -> CorpusDiff:
+    return _diff_in(
+        source,
+        diff_id=diff_id,
+        diff_text=_CHANGE_AT_BASE,
+        context=FixtureContext(
+            task=FixtureTaskRecord(
+                id='77',
+                title='Raise x to ten and add the n module',
+                description='x must read 10, and a new module n carries the companion value.',
+                test_strategy='Import a and assert x == 10; import new and assert n == 1.',
+            ),
+            changed_files=['a.py', 'new.py'],
+            base_sha=base_sha,
+            base_sha_reason=base_sha_reason,
+            plan=plan,
+            plan_reason=plan_reason,
+        ),
+    )
+
+
+def _one_reviewer(name: str = 'r1_panel') -> VariantConfig:
+    return VariantConfig(
+        name=name, description='Test',
+        reviewers=[ReviewerSpec(name='r1', model='sonnet', specialization='Testing.')],
+    )
 
 
 def _make_review(name: str = 'test', verdict: str = 'PASS') -> dict:
@@ -122,32 +198,6 @@ def _make_retry_then_succeed_invoke():
         return await delegate(**kwargs)
 
     return _invoke
-
-
-class TestBuildReviewerPrompt:
-    def test_contains_diff(self) -> None:
-        prompt = _build_reviewer_prompt('--- a/f.py\n+++ b/f.py')
-        assert '--- a/f.py' in prompt
-        assert '```diff' in prompt
-
-    def test_truncates_long_diff(self) -> None:
-        long_diff = 'x' * 60_000
-        prompt = _build_reviewer_prompt(long_diff)
-        assert '... [diff truncated] ...' in prompt
-        assert len(prompt) < 55_000
-
-    def test_action_instruction(self) -> None:
-        prompt = _build_reviewer_prompt('diff')
-        assert 'Review the diff' in prompt
-
-    def test_no_json_output_instruction(self) -> None:
-        """Post-2493: the reviewer's SYSTEM prompt (roles.build_reviewer_prompt_spec)
-        instructs it to call submit_review_verdict; this action prompt must no
-        longer also tell it to "output pure JSON" — that would contradict the
-        frozen CONTRACT and leave the agent unsure which channel to use.
-        """
-        prompt = _build_reviewer_prompt('diff')
-        assert 'Output your review as pure JSON' not in prompt
 
 
 class TestReviewSchema:
@@ -313,7 +363,7 @@ class TestRunSingleReviewerLiveTransport:
 
 class TestRunPanel:
     @pytest.mark.asyncio
-    async def test_single_reviewer_live_verdict(self) -> None:
+    async def test_single_reviewer_live_verdict(self, source: _Source) -> None:
         variant = VariantConfig(
             name='test_variant',
             description='Test',
@@ -321,14 +371,7 @@ class TestRunPanel:
                 ReviewerSpec(name='r1', model='sonnet', specialization='Testing.'),
             ],
         )
-        diff = CorpusDiff(
-            diff_id='d1',
-            language='python',
-            source='synthetic',
-            diff_text='--- a/f.py\n+++ b/f.py',
-            description='Test',
-            ground_truth=[],
-        )
+        diff = _diff_in(source)
 
         with patch(
             'orchestrator.evals.reviewer_trial.runner.invoke_agent',
@@ -344,7 +387,7 @@ class TestRunPanel:
         assert result.errors == []
 
     @pytest.mark.asyncio
-    async def test_multiple_reviewers(self) -> None:
+    async def test_multiple_reviewers(self, source: _Source) -> None:
         variant = VariantConfig(
             name='multi',
             description='Test',
@@ -353,14 +396,7 @@ class TestRunPanel:
                 ReviewerSpec(name='r2', model='sonnet', specialization='S2.'),
             ],
         )
-        diff = CorpusDiff(
-            diff_id='d1',
-            language='python',
-            source='synthetic',
-            diff_text='diff',
-            description='Test',
-            ground_truth=[],
-        )
+        diff = _diff_in(source)
 
         with patch(
             'orchestrator.evals.reviewer_trial.runner.invoke_agent',
@@ -372,7 +408,7 @@ class TestRunPanel:
         assert result.total_cost_usd == pytest.approx(1.0)
 
     @pytest.mark.asyncio
-    async def test_reviewer_error_recorded(self) -> None:
+    async def test_reviewer_error_recorded(self, source: _Source) -> None:
         variant = VariantConfig(
             name='error_test',
             description='Test',
@@ -380,14 +416,7 @@ class TestRunPanel:
                 ReviewerSpec(name='r1', model='sonnet', specialization='S.'),
             ],
         )
-        diff = CorpusDiff(
-            diff_id='d1',
-            language='python',
-            source='synthetic',
-            diff_text='diff',
-            description='Test',
-            ground_truth=[],
-        )
+        diff = _diff_in(source)
 
         with patch(
             'orchestrator.evals.reviewer_trial.runner.invoke_agent',
@@ -400,7 +429,7 @@ class TestRunPanel:
         assert 'r1' not in result.reviews
 
     @pytest.mark.asyncio
-    async def test_missing_verdict_recorded_as_error_review_not_absence(self) -> None:
+    async def test_missing_verdict_recorded_as_error_review_not_absence(self, source: _Source) -> None:
         """A reviewer that never calls submit_review_verdict still produces
         a (non-None) {verdict: 'ERROR'} review — mirrors production's
         _run_reviewer, which always writes SOME review (never drops the
@@ -413,14 +442,7 @@ class TestRunPanel:
                 ReviewerSpec(name='r1', model='sonnet', specialization='S.'),
             ],
         )
-        diff = CorpusDiff(
-            diff_id='d1',
-            language='python',
-            source='synthetic',
-            diff_text='diff',
-            description='Test',
-            ground_truth=[],
-        )
+        diff = _diff_in(source)
 
         with patch(
             'orchestrator.evals.reviewer_trial.runner.invoke_agent',
@@ -438,7 +460,7 @@ class TestRunnerCrossFamilyThreading:
     oauth_token + a prices table into invoke_agent (task 2476)."""
 
     @pytest.mark.asyncio
-    async def test_cross_family_kwargs_threaded(self, monkeypatch) -> None:
+    async def test_cross_family_kwargs_threaded(self, monkeypatch, source: _Source) -> None:
         monkeypatch.setenv('TOK', 'secret')
         prices = {'gpt-5.4': {'input_per_1m': 1.0, 'output_per_1m': 2.0}}
 
@@ -454,10 +476,7 @@ class TestRunnerCrossFamilyThreading:
                 ),
             ],
         )
-        diff = CorpusDiff(
-            diff_id='d1', language='python', source='synthetic',
-            diff_text='diff', description='Test', ground_truth=[],
-        )
+        diff = _diff_in(source)
 
         with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke:
             mock_invoke.side_effect = _make_verdict_writing_invoke(verdict='PASS')
@@ -471,7 +490,7 @@ class TestRunnerCrossFamilyThreading:
         assert kwargs['prices'] == prices
 
     @pytest.mark.asyncio
-    async def test_default_claude_backend_no_token_no_prices(self) -> None:
+    async def test_default_claude_backend_no_token_no_prices(self, source: _Source) -> None:
         variant = VariantConfig(
             name='claude_variant',
             description='Test',
@@ -479,10 +498,7 @@ class TestRunnerCrossFamilyThreading:
                 ReviewerSpec(name='r1', model='sonnet', specialization='Testing.'),
             ],
         )
-        diff = CorpusDiff(
-            diff_id='d1', language='python', source='synthetic',
-            diff_text='diff', description='Test', ground_truth=[],
-        )
+        diff = _diff_in(source)
 
         with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke:
             mock_invoke.side_effect = _make_verdict_writing_invoke(verdict='PASS')
@@ -495,7 +511,7 @@ class TestRunnerCrossFamilyThreading:
         assert kwargs.get('prices') is None
 
     @pytest.mark.asyncio
-    async def test_missing_oauth_token_env_fails_loudly(self, monkeypatch) -> None:
+    async def test_missing_oauth_token_env_fails_loudly(self, monkeypatch, source: _Source) -> None:
         """A spec naming oauth_token_env whose var is unset must fail loudly
         (and never dispatch), not silently resolve oauth_token=None and let
         the failure surface as a confusing downstream auth error (task 2476
@@ -513,10 +529,7 @@ class TestRunnerCrossFamilyThreading:
                 ),
             ],
         )
-        diff = CorpusDiff(
-            diff_id='d1', language='python', source='synthetic',
-            diff_text='diff', description='Test', ground_truth=[],
-        )
+        diff = _diff_in(source)
 
         with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke:
             result = await run_panel(variant, diff, stagger_secs=0, max_retries=1)
@@ -525,3 +538,274 @@ class TestRunnerCrossFamilyThreading:
         assert 'r1' not in result.reviews
         assert len(result.errors) == 1
         assert 'MISSING_TOK' in result.errors[0]
+
+
+class TestRunnerIsolation:
+    """The trial runs under bypassPermissions at a cwd that carries the
+    project .mcp.json (live escalation + fused-memory servers). Only
+    ``--strict-mcp-config`` keeps the reviewer scoped to its verdict-tools
+    server, so the runner must pass it and the argv it builds must carry it.
+    """
+
+    @staticmethod
+    def _variant() -> VariantConfig:
+        return VariantConfig(
+            name='iso_variant', description='Test',
+            reviewers=[ReviewerSpec(name='r1', model='opus', specialization='Testing.')],
+        )
+
+    @pytest.mark.asyncio
+    async def test_strict_mcp_config_reaches_the_built_argv(self, source: _Source) -> None:
+        from shared.cli_invoke import build_claude_argv
+
+        with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.side_effect = _make_verdict_writing_invoke(verdict='PASS')
+            await run_panel(self._variant(), _diff_in(source), stagger_secs=0)
+
+        kwargs = mock_invoke.call_args.kwargs
+        assert kwargs['strict_mcp_config'] is True
+        assert {'Edit', 'Write'} <= set(kwargs['disallowed_tools'])
+
+        cmd, temp_files = build_claude_argv(
+            model=kwargs['model'], max_budget_usd=kwargs['max_budget_usd'],
+            system_prompt=kwargs['system_prompt'], max_turns=kwargs['max_turns'],
+            permission_mode='bypassPermissions',
+            allowed_tools=kwargs['allowed_tools'], disallowed_tools=kwargs['disallowed_tools'],
+            mcp_config=kwargs['mcp_config'], output_schema=None, effort=kwargs['effort'],
+            resume_session_id=None, session_id=None,
+            strict_mcp_config=kwargs['strict_mcp_config'],
+        )
+        for f in temp_files:
+            Path(f).unlink(missing_ok=True)
+        assert '--strict-mcp-config' in cmd
+        assert cmd.index('--strict-mcp-config') == cmd.index('--mcp-config') + 2
+
+    @pytest.mark.asyncio
+    async def test_usage_gate_routes_through_cap_retry(self, source: _Source) -> None:
+        """With a gate the reviewer draws on the account pool via
+        invoke_with_cap_retry (failover on cap hits) instead of the CLI's
+        default login; the isolation kwarg rides along."""
+        gate = cast(UsageGate, object())
+        captured: dict = {}
+
+        async def _cap_retry(usage_gate, label, *, invoke_fn, backend, **kwargs):
+            captured.update(usage_gate=usage_gate, label=label, invoke_fn=invoke_fn, backend=backend, **kwargs)
+            return await _make_verdict_writing_invoke(verdict='PASS')(**kwargs)
+
+        with (
+            patch('orchestrator.evals.reviewer_trial.runner.invoke_with_cap_retry', side_effect=_cap_retry),
+            patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+        ):
+            result = await run_panel(self._variant(), _diff_in(source), stagger_secs=0, usage_gate=gate)
+
+        mock_invoke.assert_not_awaited()
+        assert captured['usage_gate'] is gate
+        assert captured['backend'] == 'claude'
+        assert captured['strict_mcp_config'] is True
+        assert 'oauth_token' not in captured
+        assert result.reviews['r1']['verdict'] == 'PASS'
+
+
+def _capturing_invoke(seen: list[dict]):
+    """A live-transport reviewer stub that also records what the clone looked like."""
+    write_verdict = _make_verdict_writing_invoke(verdict='PASS')
+
+    async def _invoke(**kwargs):
+        clone = Path(kwargs['cwd'])
+        seen.append({**kwargs, 'head_parent': _git(clone, 'rev-parse', 'HEAD^')})
+        return await write_verdict(**kwargs)
+
+    return _invoke
+
+
+class TestPanelBriefsLikeProduction:
+    """Every arm is briefed by the production builders, in a scratch clone of the fixture."""
+
+    @pytest.mark.asyncio
+    async def test_a_diff_only_arm_gets_the_production_prompt_in_a_scratch_clone(
+        self, source: _Source,
+    ) -> None:
+        variant = _one_reviewer()
+        diff = _enriched(source, base_sha=source.base)
+        seen: list[dict] = []
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_capturing_invoke(seen),
+        ):
+            result = await run_panel(variant, diff, stagger_secs=0)
+
+        [call] = seen
+        assert call['prompt'] == await BriefingAssembler(OrchestratorConfig()).build_reviewer_prompt(
+            'reviewer_r1', diff.diff_text, context='', diff_cap_chars=DIFF_CAP_CHARS,
+        )
+        clone = Path(call['cwd'])
+        assert clone.resolve() != source.root.resolve()
+        assert call['head_parent'] == source.base
+        assert not clone.exists()
+        assert result.reviews['r1']['verdict'] == 'PASS'
+
+    @pytest.mark.parametrize('cap', [DIFF_CAP_CHARS, 0, 1_000])
+    @pytest.mark.asyncio
+    async def test_the_diff_cap_reaches_the_production_builder(
+        self, source: _Source, cap: int,
+    ) -> None:
+        big = 'x' * 60_000
+        diff = _diff_in(source, diff_text=big)
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock,
+        ) as mock_invoke:
+            mock_invoke.side_effect = _make_verdict_writing_invoke(verdict='PASS')
+            await run_panel(_one_reviewer(), diff, stagger_secs=0, diff_cap_chars=cap)
+
+        prompt = mock_invoke.call_args.kwargs['prompt']
+        assert prompt == await BriefingAssembler(OrchestratorConfig()).build_reviewer_prompt(
+            'reviewer_r1', big, context='', diff_cap_chars=cap,
+        )
+        assert ('[diff truncated]' in prompt) == (cap != 0)
+
+    @pytest.mark.parametrize(
+        ('plan', 'plan_reason'),
+        [
+            pytest.param({'title': 'Raise x', 'files': ['a.py', 'new.py']}, None, id='plan'),
+            pytest.param(None, 'plan.json was reclaimed with its worktree', id='no-plan'),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_d2_arm_gets_the_production_context_complete_prompt(
+        self, source: _Source, plan: dict | None, plan_reason: str | None,
+    ) -> None:
+        variant = with_briefing(_one_reviewer(), ReviewBriefing.CONTEXT_COMPLETE)
+        diff = _enriched(source, base_sha=source.base, plan=plan, plan_reason=plan_reason)
+        assert diff.context is not None
+        seen: list[dict] = []
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_capturing_invoke(seen),
+        ):
+            await run_panel(variant, diff, stagger_secs=0)
+
+        async with fixture_checkout(diff) as checkout:
+            assert checkout.change_base == source.base
+            subject = await gather_review_subject(
+                checkout.root, source.base,
+                task=diff.context.task.as_task_dict(),
+                plan=diff.context.plan,
+                plan_absent_reason=diff.context.plan_reason or '',
+                conventions_relpath=project_review_config(source.root).briefing_path,
+            )
+        expected = await BriefingAssembler(OrchestratorConfig()).build_context_complete_reviewer_prompt(
+            'reviewer_r1', subject, context='',
+        )
+        [call] = seen
+        assert call['prompt'] == expected
+        assert diff.context.task.title in call['prompt']
+        assert diff.context.task.test_strategy in call['prompt']
+        for path in ('a.py', 'new.py'):
+            assert f'`{path}`' in call['prompt']
+        assert call['head_parent'] == source.base
+        spec = variant.reviewers[0]
+        assert call['system_prompt'] == build_reviewer_role(
+            spec.name, spec.specialization, ReviewBriefing.CONTEXT_COMPLETE,
+        ).system_prompt
+
+    @pytest.mark.asyncio
+    async def test_a_d2_arm_reads_conventions_where_the_fixture_project_configures_them(
+        self, source: _Source,
+    ) -> None:
+        _git(source.root, 'checkout', '-q', '-b', 'conventions', source.base)
+        base = _commit(source.root, {
+            'review/briefing.yaml': _conventions_yaml('DEFAULT-PATH RULE'),
+            'docs/review-conventions.yaml': _conventions_yaml('PROJECT-PATH RULE'),
+        }, 'conventions at two paths')
+        (source.root / 'dark-factory-orchestrator.yaml').write_text(
+            'review:\n  briefing_path: docs/review-conventions.yaml\n',
+        )
+        variant = with_briefing(_one_reviewer(), ReviewBriefing.CONTEXT_COMPLETE)
+        seen: list[dict] = []
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_capturing_invoke(seen),
+        ):
+            await run_panel(variant, _enriched(source, base_sha=base), stagger_secs=0)
+
+        [call] = seen
+        assert 'PROJECT-PATH RULE' in call['prompt']
+        assert 'DEFAULT-PATH RULE' not in call['prompt']
+
+
+def _conventions_yaml(rule: str) -> str:
+    return f'conventions:\n  - rule: {rule}\n    why: the project says so\n'
+
+
+class TestTrialFixtureReadiness:
+    """A D2 arm fails loudly on unenriched fixtures and skips unmaterialisable ones."""
+
+    @pytest.mark.asyncio
+    async def test_a_d2_arm_refuses_a_corpus_missing_enrichment_before_any_spend(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        corpus = CorpusManifest(diffs=[
+            _diff_in(source, diff_id='bare_one'),
+            _enriched(source, diff_id='enriched', base_sha=source.base),
+            _diff_in(source, diff_id='bare_two'),
+        ])
+        arms = [_one_reviewer(), with_briefing(_one_reviewer(), ReviewBriefing.CONTEXT_COMPLETE)]
+        results_dir = tmp_path / 'results'
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock,
+        ) as mock_invoke, pytest.raises(FixtureEnrichmentMissing) as raised:
+            await run_trial(arms, corpus, results_dir=results_dir)
+
+        mock_invoke.assert_not_called()
+        assert 'bare_one' in str(raised.value)
+        assert 'bare_two' in str(raised.value)
+        assert 'enriched' not in str(raised.value)
+        assert not list(results_dir.glob('*.json'))
+
+    @pytest.mark.asyncio
+    async def test_a_diff_only_trial_still_runs_unenriched_fixtures(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        corpus = CorpusManifest(diffs=[_diff_in(source, diff_id='bare_one')])
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(verdict='PASS'),
+        ):
+            results = await run_trial([_one_reviewer()], corpus, results_dir=tmp_path / 'results')
+
+        assert [(r.variant_name, r.diff_id) for r in results] == [('r1_panel', 'bare_one')]
+
+    @pytest.mark.asyncio
+    async def test_an_unmaterialisable_fixture_is_skipped_for_the_d2_arm_only(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        reason = 'synthetic diff never applied to any commit'
+        corpus = CorpusManifest(diffs=[
+            _enriched(source, diff_id='fx_nobase', base_sha=None, base_sha_reason=reason),
+        ])
+        diff_only = _one_reviewer()
+        d2 = with_briefing(diff_only, ReviewBriefing.CONTEXT_COMPLETE)
+        results_dir = tmp_path / 'results'
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.evals.reviewer_trial.runner'),
+            patch(
+                'orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock,
+            ) as mock_invoke,
+        ):
+            mock_invoke.side_effect = _make_verdict_writing_invoke(verdict='PASS')
+            results = await run_trial([diff_only, d2], corpus, results_dir=results_dir)
+
+        assert [(r.variant_name, r.diff_id) for r in results] == [(diff_only.name, 'fx_nobase')]
+        assert mock_invoke.await_count == 1
+        assert sorted(p.name for p in results_dir.glob('*.json')) == [
+            f'{diff_only.name}__fx_nobase.json',
+        ]
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(reason in message and d2.name in message for message in warnings), warnings

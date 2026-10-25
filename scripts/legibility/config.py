@@ -20,9 +20,10 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Annotated
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 LOG_LEVEL_ENV_VAR = 'LEGIBILITY_LOG_LEVEL'
 LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
@@ -46,12 +47,17 @@ class Sampling(BaseModel):
 
 
 class NoveltySpike(BaseModel):
-    """``census.novelty_spike`` — the (c) census-trigger condition (PRD §5.2 point 6)."""
+    """``census.novelty_spike`` — the relative novelty-spike trigger condition
+    (plans/census-incremental-prd.md §4.7 (b)): ``count`` is the absolute
+    minimum, and ``multiple`` x the median of the daily window counts over
+    the trailing ``baseline_days`` is the relative bar."""
 
     model_config = ConfigDict(extra='allow')
 
-    count: int = 4
-    window_hours: int = 72
+    count: int = Field(default=4, ge=0, strict=True)
+    window_hours: int = Field(default=72, ge=0, strict=True)
+    multiple: int = Field(default=2, ge=0, strict=True)
+    baseline_days: int = Field(default=30, ge=0, strict=True)
 
 
 class Saturation(BaseModel):
@@ -63,17 +69,74 @@ class Saturation(BaseModel):
     consecutive_batches: int = 2
 
 
+class TrickleCensusCaps(BaseModel):
+    """``census.trickle_caps`` — the cost caps the NIGHTLY TRICKLE forwards to
+    the census it launches, as census.py's existing ``--max-batches`` /
+    ``--max-verify-clusters`` flags.
+
+    ``null`` omits that flag (uncapped — an explicit per-project opt-out).
+    A manual census.py run never reads this block; its caps are the flags the
+    operator types. The 50/150 defaults are the bound ratified for reify's
+    attended first census (skills/census/SKILL.md), so an unattended census
+    is bounded unless a project says otherwise. Frozen, so one instance can be
+    shared as a default without any holder being able to uncap it.
+    """
+
+    model_config = ConfigDict(extra='allow', frozen=True)
+
+    max_batches: int | None = Field(default=50, ge=1, strict=True)
+    max_verify_clusters: int | None = Field(default=150, ge=1, strict=True)
+
+
+class Adjudication(BaseModel):
+    """``census.adjudication`` — the census similarity stage
+    (plans/census-incremental-prd.md D3, D4, T1): the cosine at which a novel
+    cluster or a pending candidate attaches to an entry, the cosine at which
+    pending candidates cluster into one queue item, the most queue clusters
+    one run verifies, and the embedding model. Both thresholds are
+    provisional: no signal asserts their precision, so every attach is
+    audited in the report. ``embedding_model`` has its one home here; the
+    vector cache key and the report read it from this block.
+    """
+
+    model_config = ConfigDict(extra='allow', frozen=True)
+
+    attach_min_similarity: float = Field(default=0.90, ge=0.0, le=1.0)
+    cluster_min_similarity: float = Field(default=0.85, ge=0.0, le=1.0)
+    max_clusters_per_run: int = Field(default=10, ge=0, strict=True)
+    embedding_model: str = 'text-embedding-3-small'
+
+
+class LandingGate(BaseModel):
+    """``census.landing_gate`` — the command run in the project's checkout
+    before a census output lands (scripts/legibility/landing_gate.py). Only
+    exit 0 lands; an omitted block means ungated."""
+
+    model_config = ConfigDict(extra='allow', frozen=True)
+
+    argv: tuple[Annotated[str, StringConstraints(min_length=1)], ...] = Field(min_length=1)
+    timeout_secs: int = Field(default=900, ge=1, strict=True)
+
+
 class Census(BaseModel):
-    """``census`` block — census-trigger (ζ) and saturation tuning (PRD §5.2 points 6-7)."""
+    """``census`` block — census-trigger (ζ), saturation tuning (PRD §5.2
+    points 6-7), the nightly trickle's census launch caps, the similarity
+    stage, the length of the census mining window (which is also the
+    session ledger's retention), and the landing gate a census output must
+    pass before it lands."""
 
     model_config = ConfigDict(extra='allow')
 
+    ledger_retention_days: int = Field(default=30, ge=1, strict=True)
     max_interval_days: int = 10
     tasks_landed_threshold: int = 120
     tasks_landed_min_days: int = 7
     novelty_spike: NoveltySpike = Field(default_factory=NoveltySpike)
     floor_days: int = 5
     saturation: Saturation = Field(default_factory=Saturation)
+    trickle_caps: TrickleCensusCaps = Field(default_factory=TrickleCensusCaps)
+    adjudication: Adjudication = Field(default_factory=Adjudication)
+    landing_gate: LandingGate | None = None
 
 
 class Models(BaseModel):
@@ -92,8 +155,8 @@ class Timeouts(BaseModel):
     budgets (seconds).
 
     The census runs three claude-CLI-backed stages with very different
-    shapes, but originally handed every stage ``coder._invoke_cli``'s single
-    module default of 120s (sized for one Haiku trickle-coding call). That
+    shapes, but originally handed every stage the trickle coder's single
+    default of 120s (sized for one Haiku trickle-coding call). That
     default demonstrably killed the first dark_factory census: every Sonnet
     verify-vs-``main`` call (one per novel cluster, exploring current
     ``main`` via targeted reads) and the final large Fable synthesis call
@@ -105,6 +168,7 @@ class Timeouts(BaseModel):
     cluster exploring current ``main``), ``census_synthesis_secs`` (1800 —
     one large Fable call over all verified clusters). An omitted block loads
     with all three defaults, so a pre-existing legibility.yaml keeps working.
+    ``census.census_stage_specs`` binds each to its stage.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -112,6 +176,24 @@ class Timeouts(BaseModel):
     census_mining_secs: int = 120
     census_verify_secs: int = 900
     census_synthesis_secs: int = 1800
+
+
+class PlanDeviationCensus(BaseModel):
+    """``plan_deviation_census`` block — the plan-deviation census's defaults
+    and the settings type it evaluates with. Validated not by pydantic but by
+    ``scripts/legibility/plan_deviation_census.py::settings_from_mapping``;
+    rationale: plans/plan-deviation-recording-prd.md D8."""
+
+    model_config = ConfigDict(extra='allow', frozen=True)
+
+    enabled: bool = True
+    rate_rise_factor: float = 2.0
+    min_records: int = 10
+    pattern_share: float = 0.5
+    prose_only_min: int = 3
+    cooldown_days: int = 7
+    horizon_days: int = 28
+    meta_roots: tuple[str, ...] = ('.worktrees/.task-meta',)
 
 
 def _require_absolute(value: str, *, field_name: str, detail: str) -> str:
@@ -142,7 +224,9 @@ class LegibilityConfig(BaseModel):
     list of additional archive roots the miner enumerates alongside
     ``~/.claude/projects`` (the ``shared.transcript_archive`` fleet-transcript
     tree); it defaults to ``[]`` — the byte-parity baseline in which only
-    ``~/.claude/projects`` is read.
+    ``~/.claude/projects`` is read. ``plan_deviation_census`` is kept RAW so a
+    bad value never fails ``load_config``; it is validated by
+    ``plan_deviation_census.py::settings_from_mapping``.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -157,13 +241,14 @@ class LegibilityConfig(BaseModel):
     census: Census = Field(default_factory=Census)
     models: Models = Field(default_factory=Models)
     timeouts: Timeouts = Field(default_factory=Timeouts)
+    plan_deviation_census: object = None
 
     @field_validator('project_root')
     @classmethod
     def _project_root_must_be_absolute(cls, value: str) -> str:
         """Reject a relative ``project_root`` at config-load time.
 
-        Every consumer (sampling.py, census.py's ``default_batch_source``,
+        Every consumer (sampling.py, census_window.py's ``WindowBatchSource``,
         digest.py, ...) resolves ``cfg.project_root`` against its OWN
         process cwd. ``scripts/legibility-trickle@.service`` pins
         ``WorkingDirectory=/home/leo/src/dark-factory`` for every ``%i``
@@ -271,8 +356,8 @@ def configure_logging(default_level: str = 'INFO') -> None:
     tinguishable from genuine no-change nights.
 
     ``LEGIBILITY_LOG_LEVEL`` overrides *default_level* (matching the
-    ``LEGIBILITY_SEARCH_ROOTS`` / ``LEGIBILITY_CLAUDE_BIN`` env convention
-    already used across these modules). Either spelling operators reach for
+    ``LEGIBILITY_SEARCH_ROOTS`` env convention already used across these
+    modules). Either spelling operators reach for
     is accepted — a level NAME (``DEBUG``, case-insensitive) or a numeric
     level (``10``, which is what ``logging``'s own API takes). An
     unparseable value degrades to *default_level* and logs one warning — it

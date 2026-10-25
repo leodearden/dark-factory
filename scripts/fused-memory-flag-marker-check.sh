@@ -61,12 +61,29 @@
 #
 # Unlike the nightly sweep wrapper this performs NO deletions (--check
 # without --apply is a dry-run census + verdict), so resolve/resume re-runs
-# are harmless. NOTE the sweep script's own caveat: undated markers can never
-# be drained by age, so a --max-backlog 0 predicate against a population
-# containing undated markers fails forever -- verify the census first or set
-# the ceiling accordingly. Historical narrative for the retired 2902 watch:
+# are harmless. It also means the verdict HERE compares before.total_source
+# -- the WHOLE enumerated residual, since nothing is deleted -- so a ceiling
+# tuned to the structural floor alone is not enough for this wrapper.
+# NOTE that floor: part of the enumerated population cannot be drained by
+# ANY invocation of the sweep, and since task 4436 the sweep CHECKS it
+# (structural_floor.gate_unsatisfiable in the JSON, plus an ERROR naming the
+# floor, the ceiling and the per-arm remedy) instead of merely warning. The
+# arms, their remedies and the sufficient ceiling are stated once in
+# docs/flag-marker-sweep-recurring.md -- don't restate them here.
+# Historical narrative for the retired 2902 watch:
 # plans/reify-flag-marker-backlog-rca-2026-07-22.md §6a.
+#
+# `uv` is resolved to an absolute path by
+# scripts/lib/resolve_uv.sh::require_uv_bin rather than trusted to be on PATH
+# (task 4591; see that lib for the ladder and the boot-catch-up cause). The
+# call runs AFTER `source "$REPO/.env"` so a UV_BIN or PATH set in .env is
+# honored -- the remedy an operator reaches for after a boot-PATH 127.
 set -euo pipefail
+
+case "${BASH_SOURCE[0]}" in */*) _self_dir="${BASH_SOURCE[0]%/*}" ;; *) _self_dir=. ;; esac
+_uv_lib="$_self_dir/lib/resolve_uv.sh"
+# shellcheck source=lib/resolve_uv.sh
+source "$_uv_lib" || { echo "${0##*/}: ERROR: cannot load the shared uv resolver $_uv_lib -- refusing to guess which uv to run." >&2; exit 127; }
 
 REPO="${REPO:-/home/leo/src/dark-factory}"
 FM="$REPO/fused-memory"
@@ -78,7 +95,17 @@ export CONFIG_PATH="${CONFIG_PATH:-$FM/config/config.yaml}"
 export PROJECT_ROOT="${PROJECT_ROOT:-$REPO}"
 export FALKORDB_URI="${FALKORDB_URI:-redis://localhost:6379}"
 
-# shellcheck disable=SC2206
-CHECK_CMD=(${FLAG_MARKER_SWEEP_CMD:-uv run --frozen --project "$FM" python})
+if [ -n "${FLAG_MARKER_SWEEP_CMD:-}" ]; then
+  # The documented test seam: an unquoted expansion so a multi-word prefix
+  # word-splits into the array.
+  # shellcheck disable=SC2206
+  CHECK_CMD=(${FLAG_MARKER_SWEEP_CMD})
+else
+  UV_RESOLVED="$(require_uv_bin)" || exit $?
+  # Built literally (not via a \${X:-...} default inside an unquoted array
+  # expansion) so "$FM" survives verbatim even when the repo path contains
+  # spaces.
+  CHECK_CMD=("$UV_RESOLVED" run --frozen --project "$FM" python)
+fi
 
 exec "${CHECK_CMD[@]}" "$FM/scripts/sweep_orphan_flag_markers.py" --check "$@"

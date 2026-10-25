@@ -16,9 +16,10 @@ import logging
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from shared.cli_invoke import (
+    BUDGET_EXHAUSTED_SUBTYPE,
     AgentFailureKind,
     AllAccountsCappedException,
     classify_agent_failure,
@@ -31,7 +32,7 @@ from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
-from orchestrator.merge_completion import merge_completion_eligible
+from orchestrator.merge_lane.completion import merge_completion_eligible
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.unblock_types import BlockClass, BlockRecord, classify_block_reason
@@ -67,13 +68,6 @@ DRY_RUN_PROPOSAL_SCHEMA: dict[str, Any] = {
 _RISK_LABELS: frozenset[str] = frozenset({'low', 'medium', 'human-review-required'})
 _HUMAN_REVIEW_REQUIRED: str = 'human-review-required'
 
-# Stable subtype values emitted by the CLI when the cost cap fires.
-# Mirrors the canonical value used in shared/src/shared/usage_gate.py and
-# fused-memory/src/fused_memory/middleware/task_curator.py — the Claude CLI
-# emits ``error_max_budget_usd`` (with the ``_usd`` suffix) on cost-cap
-# exhaustion, not ``error_max_budget``.
-_BUDGET_SUBTYPES: frozenset[str] = frozenset({'error_max_budget_usd'})
-
 # Transient HOST infra wedges (e.g. a pre-turn-1 kill at the
 # UnblockAutoConfig.timeout ceiling -> empty stdout + timed_out) are
 # retryable and operationally distinct from a substantive
@@ -104,12 +98,13 @@ _INFRA_FAILURE_KINDS: frozenset[AgentFailureKind] = frozenset({
     AgentFailureKind.CLI_INPUT_REJECTED,
 })
 
-# Outer wall-clock sanity bound for invoke_with_cap_retry's cap-hit patience
-# (shared/src/shared/cli_invoke.py cap-wait policy table). This is a
+# Outer wall-clock sanity bound for invoke_with_cap_retry's cap patience,
+# covering both its cap-retry loop and the gate's park on a pool frozen at
+# spawn (shared/src/shared/cli_invoke.py cap-wait policy table). This is a
 # fire-and-forget, best-effort block-time investigation — it must NOT inherit
 # the 14-day default, which would leave a background task pending for weeks
 # under a sustained cap storm. Mirrors the 1800s reconciliation-stage
-# precedent (short-lived stage runners; see cli_invoke.py:82-94).
+# precedent (short-lived stage runners, same table).
 _DRY_RUN_CAP_WAIT_SANITY_SECS: float = 1800.0
 
 
@@ -121,8 +116,7 @@ def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG00
     which would mis-classify those failures as 'budget_exhausted' and produce
     misleading operator-visible status fields in metadata.
     """
-    subtype = getattr(result, 'subtype', '') or ''
-    return subtype in _BUDGET_SUBTYPES
+    return getattr(result, 'subtype', None) == BUDGET_EXHAUSTED_SUBTYPE
 
 
 def _failure_diagnostics(result: Any) -> dict[str, Any]:
@@ -161,15 +155,113 @@ def _failure_diagnostics(result: Any) -> dict[str, Any]:
     }
 
 
-# Read-only tools the dry-run agent is allowed to use.
-# Bash(pytest:*) and Bash(cargo:*) are intentionally omitted: both can
-# write .pyc/__pycache__/target/ files or fetch from the network, which
-# contradicts the read-only safety contract advertised in SKILL.md.
-# The agent can read existing test output from .task/iterations.jsonl instead.
-# Explicit read-only git subcommands instead of a wildcard — Bash(git:*) would
-# permit mutating subcommands (commit, push, reset, checkout, restore, clean)
-# which contradict the read-only contract for this autonomous, no-human-
-# checkpoint invocation where the threat profile is higher than interactive use.
+_TASK_TEXT_FIELD_CHARS = 4000
+"""Per-field cap on rendered task text in the investigation prompt.
+
+Generous enough that ordinary task text survives whole — unlike the 160/120-
+char clips the block `detail` already suffers — but bounded, so one oversized
+task record cannot crowd out the rest of the prompt.
+"""
+
+_TASK_UNAVAILABLE_STATE = '**Task record:** unavailable'
+
+_TASK_UNAVAILABLE_MARKER = (
+    f'{_TASK_UNAVAILABLE_STATE} — the task fetch failed, so this '
+    'investigation is running WITHOUT the task\'s title, description, details '
+    'or declared file scope. Judge scope creep conservatively.'
+)
+
+_TASK_EMPTY_STATE = '**Task record:** fetched but empty'
+
+_TASK_EMPTY_MARKER = (
+    f'{_TASK_EMPTY_STATE} — the task carries no title, '
+    'description, details or declared file scope, so this investigation is '
+    'running WITHOUT them. Judge scope creep conservatively.'
+)
+"""Distinct from _TASK_UNAVAILABLE_MARKER: the fetch SUCCEEDED and told us
+nothing.  Rendering a blank gap instead would read to the investigator as
+"this task has no description" when the truth is "we learned nothing" — the
+same ambiguity the marker exists to remove, one level in."""
+
+
+def _clip(value: str, label: str) -> str:
+    """Cap one rendered field, marking the clip the way the repo marks clips."""
+    text = str(value)
+    if len(text) <= _TASK_TEXT_FIELD_CHARS:
+        return text
+    return text[:_TASK_TEXT_FIELD_CHARS] + f'\n\n... [{label} truncated] ...'
+
+
+class _TaskContext(NamedTuple):
+    """The blocked task as the investigator sees it, and whether that view is
+    degraded.
+
+    One value from one decision point: the prompt's block and the entry's
+    ``task_context_unavailable`` flag are decided together, so the surface the
+    investigator reads and the surface an operator reads cannot drift apart.
+    """
+
+    block: str
+    degraded: bool
+
+
+def _task_context(task: dict[str, Any] | None) -> _TaskContext:
+    """Render the blocked task's own text for the investigation prompt.
+
+    THREE states, not two.  A fetch that failed and a record that carries
+    nothing are both degradations, and both are marked; only a record with
+    something to say is healthy.
+
+    The label vocabulary is INDEPENDENT of ``agents/briefing.py::_format_task``
+    rather than a mirror of it.  That renderer is an uncapped instance method
+    serving a different purpose, and the two have already diverged exactly
+    where the purposes do — ``**Declared files:**`` here against ``**Files:**``
+    there, because this reader is asked to judge a fix against the scope the
+    architect DECLARED.  Nothing needs to keep the two aligned.  What DOES need
+    to stay aligned is these labels and state phrases against
+    ``skills/unblock-auto/SKILL.md``, which tells the investigator how to read
+    them; that is guarded by
+    ``orchestrator/tests/test_dry_run_unblock.py::TestSkillPromptExplainsEveryTaskBlockState``.
+
+    ``metadata.files`` IS included here even though ``build_architect_prompt``
+    passes ``include_files=False`` to omit it.  Anti-anchoring applies to
+    deriving a NEW footprint, which is the architect's job; this investigator
+    does the opposite one — judging whether a proposed fix falls OUTSIDE the
+    footprint the architect already declared, which is exactly
+    ``skills/unblock-auto/SKILL.md``'s `human-review-required` scope-creep
+    trigger.  It cannot apply that rule with no scope to compare against.
+    """
+    if not task:
+        return _TaskContext(_TASK_UNAVAILABLE_MARKER, True)
+    lines = []
+    for label, value in (
+        ('Title', task.get('title')),
+        ('Description', task.get('description')),
+        ('Details', task.get('details')),
+    ):
+        if value:
+            lines.append(f'**{label}:** {_clip(value, label.lower())}')
+    metadata = task.get('metadata')
+    files = metadata.get('files') if isinstance(metadata, dict) else None
+    if files:
+        lines.append(
+            f'**Declared files:** '
+            f'{_clip(", ".join(str(f) for f in files), "declared files")}',
+        )
+    if not lines:
+        return _TaskContext(_TASK_EMPTY_MARKER, True)
+    return _TaskContext('\n'.join(lines), False)
+
+
+# The investigation's enforced envelope: it runs under --permission-mode
+# dontAsk, so the CLI denies, without a prompt, any tool call no allow rule
+# admits. Every entry is therefore a grant, and each must be read-only.
+# Bash(pytest:*) and Bash(cargo:*) are omitted: both write build artefacts or
+# fetch from the network. Git is granted per read-only subcommand, never as a
+# wildcard and never `git branch`, which creates and deletes refs. A prefix
+# rule admits any flag after its subcommand, so the one file-writing flag of
+# diff, log and show, --output, is denied below wherever it appears. Residual:
+# `git status` may refresh the index's stat cache, which changes no content.
 _ALLOWED_TOOLS: list[str] = [
     'Read',
     'Glob',
@@ -179,19 +271,18 @@ _ALLOWED_TOOLS: list[str] = [
     'Bash(git status:*)',
     'Bash(git show:*)',
     'Bash(git rev-parse:*)',
-    'Bash(git branch:*)',
     'Bash(git ls-files:*)',
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
 ]
 
-# Mutating tools explicitly blocked.
-# Defence-in-depth: list the most dangerous git mutations alongside the
-# write-capable MCP tools so the allowlist and denylist are consistent.
+# Defence-in-depth against allow rules the CLI merges from ambient settings
+# files: a deny rule beats an allow rule wherever it came from.
 _DISALLOWED_TOOLS: list[str] = [
     'Edit',
     'Write',
+    'NotebookEdit',
     'Bash(git commit:*)',
     'Bash(git push:*)',
     'Bash(git reset:*)',
@@ -200,6 +291,9 @@ _DISALLOWED_TOOLS: list[str] = [
     'Bash(git clean:*)',
     'Bash(git merge:*)',
     'Bash(git rebase:*)',
+    'Bash(git diff *--output*)',
+    'Bash(git log *--output*)',
+    'Bash(git show *--output*)',
     'mcp__fused-memory__set_task_status',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__delete_memory',
@@ -210,6 +304,8 @@ _DISALLOWED_TOOLS: list[str] = [
     # would falsify it.
     'mcp__fused-memory__consolidate_memories',
     'mcp__fused-memory__remove_task',
+    # Unscoped on purpose: removes the tool from the CLI registry, so no skill loads; SKILL.md invokes none.
+    'Skill',
 ]
 
 # ---------------------------------------------------------------------------
@@ -298,6 +394,9 @@ async def run_dry_run_unblock(
 
     config_dir: TaskConfigDir | None = None
     preserve_config_dir = False
+    # Initialised before the try: the stamp site below runs on EVERY path,
+    # including an exception raised ahead of the task fetch.
+    task_context_unavailable = False
     try:
         # Per-investigation isolated CLAUDE_CONFIG_DIR, named distinctly from
         # the main task's `claude-config-{task_id}` dir so this background
@@ -308,12 +407,61 @@ async def run_dry_run_unblock(
         # is forced True and a pre-turn-1 wedge burns the full timeout ceiling.
         config_dir = TaskConfigDir(f'{task_id}-unblock', base_dir=Path(worktree) / '.task')
 
+        # Fetched ONCE, above the prompt build, so the single fetch serves both
+        # the prompt's task-context block and the route resolution below.
+        # A failure degrades this investigation in two ways that are invisible
+        # at the call site — no task text in the prompt, and the task's
+        # model_overrides['unblock_auto'] routing pin silently dropped — so it
+        # is both logged and recorded on the entry rather than swallowed.
+        #
+        # The signal is the FALSY RESULT, not the exception: scheduler.py::
+        # get_task is documented to return None on failure or absence and
+        # catches its own exceptions, so an MCP timeout, a malformed reply and
+        # an absent task all arrive here as None. The `except` remains only for
+        # a scheduler implementation that does raise — this suite's
+        # non-awaitable MagicMock shape being the live example. Both causes
+        # converge on the one check below so the two surfaces an operator and
+        # the investigator read (the entry's flag and the prompt's
+        # _TASK_UNAVAILABLE_MARKER) can never disagree.
+        fetch_error: Exception | None = None
+        try:
+            task_doc = await scheduler.get_task(task_id)
+        except Exception as exc:
+            fetch_error = exc
+            task_doc = None
+        # The flag is READ OFF the renderer, never computed a second time —
+        # a degraded prompt and a healthy-looking entry is the exact incoherence
+        # this pairing exists to prevent.  Two causes, two accurate messages,
+        # still exactly one warning per run.
+        task_context = _task_context(task_doc)
+        task_context_unavailable = task_context.degraded
+        if not task_doc:
+            logger.warning(
+                'dry_run_unblock: task fetch failed for task %s — investigating '
+                'without task text and with routing overrides dropped: %s',
+                task_id, fetch_error or 'scheduler returned no task record',
+            )
+        elif task_context.degraded:
+            logger.warning(
+                'dry_run_unblock: task record for task %s carries no title, '
+                'description, details or declared files — investigating '
+                'without task text',
+                task_id,
+            )
+        # isinstance, not `or {}`: a non-dict metadata would otherwise flow
+        # into route resolution, and `.get` on it would raise past the outer
+        # handler — downgrading a working investigation to investigation_failed
+        # rather than degrading it.
+        raw_md = task_doc.get('metadata') if task_doc else None
+        md = raw_md if isinstance(raw_md, dict) else {}
+
         system_prompt = _load_skill_system_prompt()
         user_prompt = (
             f'Task ID: {task_id}\n'
             f'Worktree: {worktree}\n'
             f'Block reason: {reason}\n'
             f'Detail: {detail or "(none)"}\n\n'
+            f'{task_context.block}\n\n'
             'Investigate and emit your structured proposal.'
         )
 
@@ -331,11 +479,7 @@ async def run_dry_run_unblock(
         # read is skipped and this RoleDefaults base stands (byte-equivalent to
         # pre-η at stock config). Resolved ONCE here (not inside _one_attempt)
         # so the single zero-output-timeout retry does not double-emit.
-        try:
-            _fetched = await scheduler.get_task(task_id)
-            md = (_fetched or {}).get('metadata') or {}
-        except Exception:
-            md = {}
+        # `md` comes from the single task fetch above the prompt build.
         decision = await resolve_and_record_route(
             role_name='unblock_auto',
             role_defaults=RoleDefaults(
@@ -360,6 +504,9 @@ async def run_dry_run_unblock(
                 project_id=project_id,
                 role='unblock_auto',
                 cap_wait_sanity_secs=_DRY_RUN_CAP_WAIT_SANITY_SECS,
+                # A fire-and-forget read-only investigation has no mid-work
+                # state worth resuming.
+                resume_on_cap_hit=False,
                 invoke_fn=invoke_agent,
                 backend=ua_cfg.backend,
                 session_id=session_id,
@@ -369,6 +516,7 @@ async def run_dry_run_unblock(
                 model=decision.model,
                 max_turns=decision.max_turns,
                 max_budget_usd=decision.budget_usd,
+                permission_mode='dontAsk',
                 allowed_tools=_ALLOWED_TOOLS,
                 disallowed_tools=_DISALLOWED_TOOLS,
                 mcp_config=mcp_config,
@@ -412,8 +560,8 @@ async def run_dry_run_unblock(
             # the entry's proposal_text/block_class.
             disp = classify_failure(cap_exc)
             logger.warning(
-                'dry_run_unblock: %s for task %s: %s',
-                disp.reason_prefix.lower(), task_id, cap_exc,
+                'dry_run_unblock: %s for task %s (%.1fs elapsed)',
+                _cap_wedge(cap_exc, disp), task_id, cap_exc.elapsed_secs,
             )
             entry = _cap_exhausted_entry(reason=reason, exc=cap_exc, disp=disp)
             # This entry's block_class reflects THIS cap-hit, not the
@@ -628,6 +776,26 @@ async def run_dry_run_unblock(
             task_id, entry.get('status'),
         )
     entry.update(record.to_dict())
+    # Same single stamp point, same guarantee: outside DRY_RUN_PROPOSAL_SCHEMA
+    # (additionalProperties:False), so the investigating agent cannot forge it.
+    # Always present — False on the healthy path — matching the shape-parity
+    # convention _failure_diagnostics sets, so a consumer never has to
+    # distinguish an absent key from an old entry from a healthy one.
+    entry['task_context_unavailable'] = task_context_unavailable
+    # DIAGNOSTIC ONLY, and deferred on purpose — not an oversight. Review asked
+    # why b3_gate fails closed on an undeterminable AGE (step 7b) while an
+    # undeterminable TASK still certifies FRESH. Both offered remedies conflict
+    # with something already pinned: clamping risk_label here, beside the
+    # MERGE_VERIFY_RED clamp above, contradicts
+    # test_clamp_scoped_to_merge_verify_red_agent_failure_untouched (which pins
+    # that clamp as scoped, on a bare-MagicMock scheduler that takes this
+    # degraded path incidentally), and it would flip every other low-risk
+    # assertion sharing that fixture; teaching check_proposal this key instead
+    # would pull a dry_run_unblock-specific field into a module kept
+    # deliberately dependency-light. Either is a policy change owed its own
+    # plan. Until then this flag tells an operator reading the entry that the
+    # investigation was blind — strictly more than the silent fallback it
+    # replaced, and the input any such gate would need.
 
     try:
         await scheduler.update_task(
@@ -778,21 +946,32 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
     }
 
 
+def _cap_wedge(exc: AllAccountsCappedException, disp: BlockDisposition) -> str:
+    """What spent the investigation's cap patience, for its log and its entry.
+
+    A deadline spent parked names the gate's frozen-pool snapshot instead of
+    *disp*'s cap phrase: a pool frozen on rejected credentials is not a cap.
+    """
+    if exc.pool_frozen is None:
+        return f'{disp.reason_prefix.lower()} after {exc.retries} retries'
+    return f'cap-wait bound spent parked ({exc.pool_frozen})'
+
+
 def _cap_exhausted_entry(
     *, reason: str, exc: AllAccountsCappedException, disp: BlockDisposition,
 ) -> dict[str, Any]:
     """Build the retryable infra_failure entry for a cap-exhausted investigation.
 
-    AllAccountsCappedException means invoke_with_cap_retry exceeded the
-    ``_DRY_RUN_CAP_WAIT_SANITY_SECS`` bound (all accounts capped) — no
-    AgentResult was ever produced, so this reuses the None-safe
-    ``_failure_diagnostics(None)`` shape rather than the AgentResult-derived
-    one, matching the task-2020 infra_failure entry shape.
+    AllAccountsCappedException means invoke_with_cap_retry spent the
+    ``_DRY_RUN_CAP_WAIT_SANITY_SECS`` bound, retrying caps or parked on a
+    frozen pool — no AgentResult was ever produced, so this reuses the
+    None-safe ``_failure_diagnostics(None)`` shape rather than the
+    AgentResult-derived one, matching the task-2020 infra_failure entry shape.
 
     *disp* (BD-1) is ``classify_failure(exc)`` — the SAME disposition-table
     lookup workflow.py/steward.py/review_checkpoint.py all consult for an
     ``AllAccountsCappedException``, single-sourcing ``proposal_text``'s
-    leading phrase (the caller separately rebinds the outer ``block_class``
+    cap phrase (the caller separately rebinds the outer ``block_class``
     from ``disp.block_class`` too — see ``run_dry_run_unblock``'s except
     clause).
     """
@@ -801,8 +980,7 @@ def _cap_exhausted_entry(
         'status': 'infra_failure',
         'proposal_text': (
             f'Infra wedge (retryable, not a human-review conclusion): '
-            f'{disp.reason_prefix.lower()} after {exc.retries} retries '
-            f'({exc.elapsed_secs:.1f}s elapsed)'
+            f'{_cap_wedge(exc, disp)} ({exc.elapsed_secs:.1f}s elapsed)'
         ),
         'risk_label': _HUMAN_REVIEW_REQUIRED,
         'files_referenced': [],

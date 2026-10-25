@@ -1,0 +1,538 @@
+"""ACCEPTANCE 2 (task 4808): the operator CLI derives `unstamped_live_ids` too.
+
+WHY THIS FILE LIVES HERE AND NOT IN ``scripts/tests/``.
+``scripts/check_consolidation_closure.py`` imports ``TaskInterceptor`` at
+MODULE scope — that is the INV-5 single-sourcing of
+``_CONSOLIDATION_SCROLL_LIMIT`` and ``_extract_metadata_dict`` which makes
+"the same mechanical check" literally true rather than aspirational.  That
+import transitively pulls in ``services.memory_service`` and therefore
+``graphiti_core``, which is absent from the ``shared`` venv that runs
+``scripts/tests/``.  Measured: ``uv run --project shared python -c "import
+check_consolidation_closure"`` dies with ``ModuleNotFoundError: No module
+named 'graphiti_core'``.  The fused-memory venv has it, so the script is
+testable here and only here.
+
+The script is driven through its own ``run(args, *, memory=...)`` injection
+seam with a fake store, so no Qdrant is required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sqlite3
+import subprocess
+import sys
+import types
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+from _fm_helpers import load_script_module
+from shared.project_id import project_id_for_root
+from shared.project_layout import default_project_root, tasks_db
+
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.reconciliation.consolidation_gate import (
+    GATE_METADATA_KEY,
+    closure_exists_probe,
+)
+from fused_memory.reconciliation.event_buffer import EventBuffer
+
+_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT_PATH = _ROOT / 'scripts' / 'check_consolidation_closure.py'
+
+
+def _load_module() -> types.ModuleType:
+    """Load the script from its path, with ``scripts/`` on ``sys.path``.
+
+    The ``sys.path`` insert is REQUIRED, not tidiness: the script imports its
+    flat sibling ``_task_db_scan``, which normally resolves only from a
+    DIRECTLY-EXECUTED script's ``sys.path[0]``.
+    """
+    scripts_dir = str(_ROOT / 'scripts')
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    return load_script_module(SCRIPT_PATH, mod_name='check_consolidation_closure')
+
+
+mod = _load_module()
+TaskDbUnreadable = mod.TaskDbUnreadable
+TaskDbProblem = sys.modules[mod.connect_ro.__module__].TaskDbProblem
+
+_TOPIC = 'cli-demo-topic'
+_PROJECT_ID = 'dark_factory'
+
+
+def _uuid(n):
+    return f'00000000-0000-4000-8000-{n:012d}'
+
+
+def _member(mid, *, canonical=None, supersedes=None):
+    meta = {'topic': _TOPIC}
+    if canonical is not None:
+        meta['canonical'] = canonical
+    if supersedes is not None:
+        meta['supersedes'] = supersedes
+    return {'id': mid, 'created_at': '2026-08-24T00:00:00+00:00', 'metadata': meta}
+
+
+_WELL_FORMED = [_member(_uuid(1), canonical=True), _member(_uuid(2))]
+
+
+def _gate_blob(observed=None, members_override=None):
+    block: dict[str, Any] = {'topic': _TOPIC}
+    if observed is not None:
+        block['provenance'] = {
+            'report_run': 'run-abc',
+            'observed_members': list(observed),
+            'detector': 'topic-cluster-scan',
+            'authoritative': False,
+        }
+    if members_override:
+        block.update(members_override)
+    return {
+        'execution_class': 'operational',
+        'operational_mode': 'gate',
+        GATE_METADATA_KEY: block,
+    }
+
+
+class FakeMemory:
+    """The three store methods the CLI calls, and nothing else.
+
+    ``get_memory_by_id`` returns a payload dict for a live id and ``None``
+    for an absent one — ``MemoryService.get_memory_by_id``'s real contract,
+    whose docstring makes the timeout-propagates-not-collapses rule explicit.
+    """
+
+    def __init__(self, members=_WELL_FORMED, *, live_ids=(), raises=None):
+        self.members = list(members)
+        self.live = {str(i).lower() for i in live_ids}
+        self.raises = raises
+        self.point_reads = []
+        self.counted_projects = []
+
+    async def count_memories_by_metadata(self, project_id, filters):
+        self.counted_projects.append(project_id)
+        return len(self.members)
+
+    async def get_memories_by_metadata(self, project_id, filters, limit=None):
+        return list(self.members)
+
+    async def get_memory_by_id(self, project_id, memory_id):
+        self.point_reads.append((project_id, memory_id))
+        if self.raises is not None:
+            raise self.raises
+        if str(memory_id).lower() in self.live:
+            return {'id': memory_id, 'content': 'x', 'metadata': {}}
+        return None
+
+
+def _args(metadata, *, as_json=False):
+    return argparse.Namespace(
+        task_id=None,
+        metadata_file=None,
+        metadata_json=metadata,
+        project_root=str(_ROOT),
+        tag='master',
+        project_id=_PROJECT_ID,
+        as_json=as_json,
+    )
+
+
+def _run(metadata, memory, *, as_json=False):
+    return asyncio.run(mod.run(_args(metadata, as_json=as_json), memory=memory))
+
+
+class TestCliUnstampedClusterMember:
+    def test_a_stray_is_reported_and_named(self, capsys):
+        stray = _uuid(42)
+        memory = FakeMemory(live_ids=[stray])
+        rc = _run(_gate_blob([stray]), memory)
+        out = capsys.readouterr().out
+        assert rc == mod.EXIT_NOT_CLOSED == 1
+        assert '[unstamped_cluster_member]' in out
+        assert stray in out
+
+    def test_json_mode_carries_the_reason_and_discloses_the_derivation(
+        self, capsys
+    ):
+        import json  # noqa: PLC0415
+
+        stray = _uuid(42)
+        memory = FakeMemory(live_ids=[stray])
+        rc = _run(_gate_blob([stray]), memory, as_json=True)
+        payload = json.loads(capsys.readouterr().out)
+
+        assert rc == mod.EXIT_NOT_CLOSED
+        named = [
+            r for r in payload['reasons']
+            if r['code'] == 'unstamped_cluster_member'
+        ]
+        assert named and named[0]['ids'] == [stray]
+        # The scroll facts must DISCLOSE what was derived, or an operator
+        # cannot see what the check probed.
+        assert payload['scroll']['unstamped'] == [stray]
+
+    def test_a_stamped_observed_member_still_closes(self):
+        """The measured corpus shape: zero derived candidates, zero reads."""
+        memory = FakeMemory()
+        rc = _run(_gate_blob([_uuid(1), _uuid(2)]), memory)
+        assert rc == mod.EXIT_CLOSED == 0
+        assert memory.point_reads == []
+
+    @staticmethod
+    def _claiming(absorbed):
+        return [
+            _member(_uuid(1), canonical=True, supersedes=[absorbed]),
+            _member(_uuid(2)),
+        ]
+
+    def test_a_correctly_executed_delete_arm_closes_after_one_probe(self):
+        absorbed = _uuid(42)
+        memory = FakeMemory(self._claiming(absorbed), live_ids=[])
+        rc = _run(_gate_blob([_uuid(1), absorbed]), memory)
+        assert rc == mod.EXIT_CLOSED
+        assert memory.point_reads == [(_PROJECT_ID, absorbed)]
+
+    def test_a_claimed_id_still_live_is_absorbed_member_still_live(self, capsys):
+        absorbed = _uuid(42)
+        memory = FakeMemory(self._claiming(absorbed), live_ids=[absorbed])
+        rc = _run(_gate_blob([_uuid(1), absorbed]), memory)
+        out = capsys.readouterr().out
+        assert rc == mod.EXIT_NOT_CLOSED
+        assert '[absorbed_member_still_live]' in out
+        assert absorbed in out
+        assert '[unstamped_cluster_member]' not in out
+
+    def test_a_hard_deleted_unclaimed_id_closes_after_one_probe(self):
+        gone = _uuid(42)
+        memory = FakeMemory(live_ids=[])
+        rc = _run(_gate_blob([gone]), memory)
+        assert rc == mod.EXIT_CLOSED
+        assert memory.point_reads == [(_PROJECT_ID, gone)]
+
+    def test_the_probe_is_scoped_to_the_requested_project(self):
+        """An argument-order slip would probe the wrong scope and silently
+        report every candidate absent."""
+        stray = _uuid(42)
+        memory = FakeMemory(live_ids=[stray])
+        _run(_gate_blob([stray]), memory)
+        assert memory.point_reads == [(_PROJECT_ID, stray)]
+
+    def test_a_probe_failure_is_EXIT_USAGE_not_EXIT_NOT_CLOSED(self, capsys):
+        """The script's own EXIT-CODE CONTRACT: an unreachable store and a
+        genuinely malformed cluster are different facts and must not share an
+        exit code."""
+        memory = FakeMemory(live_ids=[], raises=TimeoutError('qdrant point read'))
+        rc = _run(_gate_blob([_uuid(42)]), memory)
+        assert rc == mod.EXIT_USAGE == 2
+        assert 'COULD NOT CHECK' in capsys.readouterr().out
+
+    def test_a_block_less_blob_still_exits_usage(self, capsys):
+        """The operator-facing half of the SECOND gap, unchanged by step-14."""
+        rc = _run({'execution_class': 'operational', 'operational_mode': 'gate'}, FakeMemory())
+        out = capsys.readouterr().out
+        assert rc == mod.EXIT_USAGE
+        assert GATE_METADATA_KEY in out
+
+
+class TestCliAndSeamAgree:
+    """The CLI's verdict and the REAL seam's verdict, over one cluster.
+
+    The comparison is deliberately CLI-output versus
+    ``TaskInterceptor.set_task_status(..., 'done')`` — the actual chokepoint
+    an operator is predicting — and NOT versus a local
+    ``evaluate_closure(unstamped_live_ids=<list comprehension>)`` call. A
+    hand-rolled reference derivation can only agree with production by
+    accident: an earlier version of this test omitted the canonical's
+    ``supersedes`` rule entirely (the subtlest rule in
+    ``unstamped_candidates``) and stayed green only because no case exercised
+    it. Both sides now run the same production code, and the delete-arm cases
+    below exercise exactly that rule: the claim is probed, and a live hit is
+    ``absorbed_member_still_live``.
+
+    The two sides are wired to ONE ``FakeMemory``: the CLI reaches it through
+    ``scroll_cluster``, the seam through the three injected collaborators
+    ``server/main.py::_wire_closure_collaborators`` binds in production.
+    """
+
+    @staticmethod
+    async def _seam_codes(metadata, memory, tmp_path):
+        """Drive the real chokepoint and return its reason codes."""
+        buf = EventBuffer(db_path=tmp_path / 'cli_seam_eb.db', buffer_size_threshold=100)
+        await buf.initialize()
+        try:
+            taskmaster = AsyncMock()
+            taskmaster.get_task = AsyncMock(
+                return_value={'id': '9001', 'status': 'pending', 'metadata': metadata}
+            )
+            taskmaster.set_task_status = AsyncMock(return_value={'success': True})
+            taskmaster.set_status_and_stamp_audit = AsyncMock(
+                return_value={'success': True}
+            )
+            interceptor = TaskInterceptor(taskmaster, AsyncMock(), buf)
+
+            async def scroll(filters, *, limit, project_id):
+                return await memory.get_memories_by_metadata(
+                    project_id, filters, limit=limit
+                )
+
+            async def count(filters, *, project_id):
+                return await memory.count_memories_by_metadata(project_id, filters)
+
+            interceptor.set_consolidation_scroll(
+                scroll, count=count, exists=closure_exists_probe(memory)
+            )
+            result = await interceptor.set_task_status(
+                '9001', 'done', project_root=str(_ROOT)
+            )
+            return [r['code'] for r in (result.get('reasons') or [])]
+        finally:
+            await buf.close()
+
+    @pytest.mark.parametrize(
+        'observed,live_ids,members',
+        [
+            ([_uuid(42)], [_uuid(42)], _WELL_FORMED),          # stray, live
+            ([_uuid(42)], [], _WELL_FORMED),                    # stray, gone
+            ([_uuid(1), _uuid(2)], [], _WELL_FORMED),           # all stamped
+            # THE DELETE ARM, claim still LIVE: the canonical claims it
+            # absorbed _uuid(42) but the store holds it. Both sides must probe
+            # the claim and refuse — if one side forgets, the CLI reassures an
+            # operator the seam is about to refuse (or the reverse).
+            (
+                [_uuid(1), _uuid(42)],
+                [_uuid(42)],
+                [
+                    _member(_uuid(1), canonical=True, supersedes=[_uuid(42)]),
+                    _member(_uuid(2)),
+                ],
+            ),
+            # THE DELETE ARM, claim really gone: both sides read it once and
+            # close.
+            (
+                [_uuid(1), _uuid(42)],
+                [],
+                [
+                    _member(_uuid(1), canonical=True, supersedes=[_uuid(42)]),
+                    _member(_uuid(2)),
+                ],
+            ),
+        ],
+    )
+    def test_same_inputs_same_reason_codes(
+        self, observed, live_ids, members, tmp_path, capsys
+    ):
+        import json  # noqa: PLC0415
+
+        metadata = _gate_blob(observed)
+
+        cli_memory = FakeMemory(members, live_ids=live_ids)
+        _run(metadata, cli_memory, as_json=True)
+        cli_codes = [
+            r['code'] for r in json.loads(capsys.readouterr().out)['reasons']
+        ]
+
+        seam_memory = FakeMemory(members, live_ids=live_ids)
+        seam_codes = asyncio.run(
+            self._seam_codes(metadata, seam_memory, tmp_path)
+        )
+
+        assert cli_codes == seam_codes
+        # Same verdict AND same store traffic: a side that reached a matching
+        # verdict while probing a different set of ids has a different
+        # derivation and would diverge on the next case.
+        assert [c[1] for c in cli_memory.point_reads] == [
+            c[1] for c in seam_memory.point_reads
+        ]
+
+    def test_the_live_claim_case_is_not_vacuous(self, tmp_path):
+        """Guards the guard: the live-claim case above must actually refuse
+        and read the claim, so two clean closes cannot satisfy its equality."""
+        claiming = [
+            _member(_uuid(1), canonical=True, supersedes=[_uuid(42)]),
+            _member(_uuid(2)),
+        ]
+        memory = FakeMemory(claiming, live_ids=[_uuid(42)])
+        codes = asyncio.run(
+            self._seam_codes(_gate_blob([_uuid(1), _uuid(42)]), memory, tmp_path)
+        )
+        assert codes == ['absorbed_member_still_live']
+        assert [c[1] for c in memory.point_reads] == [_uuid(42)]
+
+
+class TestLoadTaskMetadataSurfacesTheRefusal:
+    """load_task_metadata reads ONE named store, so connect_ro's structured
+    refusal must reach the operator as the UsageError's cause."""
+
+    def test_an_absent_store_is_refused_as_absent(self, tmp_path):
+        with pytest.raises(mod.UsageError) as raised:
+            mod.load_task_metadata(str(tmp_path), '1', 'master')
+
+        cause = raised.value.__cause__
+        assert isinstance(cause, TaskDbUnreadable)
+        assert cause.reason is TaskDbProblem.ABSENT
+
+    def test_a_zero_byte_store_is_refused_as_an_empty_stub(self, tmp_path):
+        db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+        db.parent.mkdir(parents=True)
+        db.write_bytes(b'')
+
+        with pytest.raises(mod.UsageError) as raised:
+            mod.load_task_metadata(str(tmp_path), '1', 'master')
+
+        cause = raised.value.__cause__
+        assert isinstance(cause, TaskDbUnreadable)
+        assert cause.reason is TaskDbProblem.EMPTY_STUB
+
+    def test_a_real_store_returns_the_tasks_raw_metadata(self, tmp_path):
+        db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+        db.parent.mkdir(parents=True)
+        con = sqlite3.connect(db)
+        try:
+            con.execute('CREATE TABLE tasks (tag TEXT, id INTEGER, metadata TEXT)')
+            con.execute(
+                'INSERT INTO tasks VALUES (?, ?, ?)', ('master', 1, '{"k": 1}')
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        assert mod.load_task_metadata(str(tmp_path), '1', 'master') == '{"k": 1}'
+
+
+_LINKED_WORKTREE_COPY = load_script_module(
+    _ROOT / 'scripts' / 'tests' / 'linked_worktree_copy.py', mod_name='linked_worktree_copy'
+)
+
+# Run inside a probe subprocess: a store that records the project_id it is
+# scrolled under, then the script's own run() for --task-id 1 with the verdict
+# swallowed, so stdout carries only that record.
+_SCOPE_PROBE = """
+import asyncio, contextlib, importlib, io, json
+m = importlib.import_module('check_consolidation_closure')
+
+class Memory:
+    def __init__(self):
+        self.counted_projects = []
+
+    async def count_memories_by_metadata(self, project_id, filters):
+        self.counted_projects.append(project_id)
+        return 0
+
+memory = Memory()
+with contextlib.redirect_stdout(io.StringIO()):
+    asyncio.run(m.run(m.build_parser().parse_args(['--task-id', '1']), memory=memory))
+print(json.dumps(memory.counted_projects))
+"""
+
+
+class TestProjectArgsResolveAtUse:
+    """--project-root defaults to the MAIN checkout and --project-id to that
+    root's id. run() resolves both itself, so a parsed Namespace is enough
+    (task 6713).
+
+    The worktree probe sits here rather than in
+    scripts/tests/test_scripts_default_root.py because importing this script
+    needs fused_memory, which only this venv installs.
+    """
+
+    @staticmethod
+    def _scrolled_projects(*argv: str) -> list[str]:
+        memory = FakeMemory()
+        args = mod.build_parser().parse_args(['--metadata-json', json.dumps(_gate_blob()), *argv])
+        asyncio.run(mod.run(args, memory=memory))
+        return memory.counted_projects
+
+    def test_an_unset_project_id_is_the_main_checkouts_id(self):
+        root = default_project_root()
+        assert self._scrolled_projects() == [project_id_for_root(root)]
+
+    def test_an_unset_project_id_follows_an_explicit_project_root(self):
+        assert self._scrolled_projects('--project-root', '/x/y/Know-Live') == ['know_live']
+
+    def test_an_explicit_project_id_wins(self):
+        scrolled = self._scrolled_projects('--project-root', '/x/y/Know-Live', '--project-id', 'reify')
+        assert scrolled == ['reify']
+
+    def test_a_relative_project_root_derives_the_id_of_the_directory_it_names(self, tmp_path, monkeypatch):
+        project = tmp_path / 'Know-Live'
+        (project / 'sub').mkdir(parents=True)
+        monkeypatch.chdir(project)
+        assert self._scrolled_projects('--project-root', '.') == ['know_live']
+        monkeypatch.chdir(project / 'sub')
+        assert self._scrolled_projects('--project-root', '..') == ['know_live']
+
+    def test_a_project_root_with_no_basename_is_could_not_check(self, capsys):
+        memory = FakeMemory()
+        args = mod.build_parser().parse_args(
+            ['--metadata-json', json.dumps(_gate_blob()), '--project-root', '/']
+        )
+        rc = asyncio.run(mod.run(args, memory=memory))
+        assert rc == mod.EXIT_USAGE
+        assert capsys.readouterr().out.startswith('COULD NOT CHECK')
+        assert memory.counted_projects == []
+
+    def test_a_project_root_with_no_basename_is_could_not_check_in_json(self, capsys):
+        memory = FakeMemory()
+        args = mod.build_parser().parse_args(
+            ['--metadata-json', json.dumps(_gate_blob()), '--project-root', '/', '--json']
+        )
+        rc = asyncio.run(mod.run(args, memory=memory))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == mod.EXIT_USAGE
+        assert payload['checked'] is False
+        assert payload['exit_code'] == mod.EXIT_USAGE
+        assert memory.counted_projects == []
+
+    @pytest.mark.parametrize(
+        'argv',
+        [['--task-id', '1'], ['--metadata-json', json.dumps(_gate_blob())]],
+        ids=['store-read', 'id-derivation'],
+    )
+    def test_a_copy_outside_any_checkout_is_could_not_check(self, tmp_path, argv):
+        loose = _LINKED_WORKTREE_COPY.checkout_copy(tmp_path / 'loose', _ROOT)
+        proc = subprocess.run(
+            [sys.executable, '-s', str(loose / 'scripts' / 'check_consolidation_closure.py'), *argv],
+            cwd=tmp_path,
+            env=_LINKED_WORKTREE_COPY.probe_env(),
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        assert proc.returncode == mod.EXIT_USAGE, f'exited {proc.returncode}\n{proc.stderr}'
+        assert 'COULD NOT CHECK' in proc.stdout
+        assert 'no git checkout encloses' in proc.stdout
+
+    def test_a_copy_in_a_linked_worktree_reads_the_main_checkouts_task_store(self, tmp_path):
+        """The copy's worktree holds no task store, so reaching the scroll at
+        all means task 1 was read from the main checkout's."""
+        main = tmp_path / 'Dark-Factory'
+        tree = _LINKED_WORKTREE_COPY.linked_worktree_copy(main, _ROOT)
+        store = tasks_db(main)
+        store.parent.mkdir(parents=True)
+        con = sqlite3.connect(store)
+        try:
+            con.execute('CREATE TABLE tasks (tag TEXT, id INTEGER, metadata TEXT)')
+            con.execute('INSERT INTO tasks VALUES (?, ?, ?)', ('master', 1, json.dumps(_gate_blob())))
+            con.commit()
+        finally:
+            con.close()
+
+        proc = subprocess.run(
+            [sys.executable, '-s', '-c', _SCOPE_PROBE],
+            cwd=tree / 'scripts',
+            env=_LINKED_WORKTREE_COPY.probe_env(),
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+
+        assert proc.returncode == 0, f'probe exited {proc.returncode}\n{proc.stderr}'
+        assert json.loads(proc.stdout) == ['dark_factory']

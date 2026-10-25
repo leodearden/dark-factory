@@ -7,13 +7,18 @@ check and refuses when the cluster is not in the PRD §3 Option-C end state
 enforcement; this script is the same question asked *before* you try, so a
 curator can see the offending ids without burning a refused transition.
 
-It is deliberately a THIN wrapper, not a second opinion. The verdict comes
-from ``fused_memory.reconciliation.consolidation_gate.evaluate_closure`` —
-the same pure predicate the seam calls — and the scroll cap is imported
-from ``TaskInterceptor._CONSOLIDATION_SCROLL_LIMIT`` rather than restated
-(INV-5). Those two imports are what make "the same mechanical check"
-literally true: a CLI with its own predicate, or merely its own cap, could
-report ``closed`` on a view the seam would reject as ``scroll_incomplete``,
+It is deliberately a THIN wrapper, not a second opinion. The CLI and the
+seam are single-sourced on FOUR things (INV-5): the PREDICATE
+(``consolidation_gate.py::evaluate_closure``), the SCROLL CAP (imported
+from ``TaskInterceptor._CONSOLIDATION_SCROLL_LIMIT`` rather than restated),
+and — since task 4808 — the UNSTAMPED DERIVATION
+(``consolidation_gate.py::resolve_unstamped_live_ids``) together with the
+EXISTENCE PROBE it awaits (``consolidation_gate.py::closure_exists_probe``,
+which owns the ``project_id``-first argument adaptation both callers would
+otherwise each re-spell). Those four imports are what make "the same
+mechanical check" literally true: a CLI with its own predicate, merely its
+own cap, its own idea of which observed members are strays, or its own
+probe scoping could report ``closed`` on a view the seam would reject,
 which is exactly the false reassurance this whole gate exists to prevent.
 
 This replaces the old prose "re-search before merging" guard with something
@@ -33,8 +38,10 @@ alone):
               the seam would refuse the ``done`` transition with.
   - exit 2  — COULD NOT CHECK (usage or infra). Bad arguments, no such
               task, an unreadable ``tasks.db``, a task that is not a
-              consolidation gate, a gate block with no usable ``topic``, or
-              a store that did not answer.
+              consolidation gate, a gate block with no usable ``topic``, a
+              project root that names no directory or no
+              ``--project-root`` outside any checkout, or a store that did
+              not answer.
 
 Exit 2 is a SEPARATE code on purpose. An unreachable Qdrant and a
 genuinely malformed cluster are different facts and must not share an exit
@@ -60,8 +67,12 @@ Usage
   python scripts/check_consolidation_closure.py --task-id 3092 --json
 
 READ-ONLY. Every database handle this script opens is a read-only SQLite
-URI and the only store call is a metadata scroll; it never writes a task,
-a memory or a status.
+URI, and the only store calls are a metadata scroll plus (task 4808) one
+raw point read per unstamped CANDIDATE — ``get_memory_by_id``, a
+non-semantic Qdrant point read. It never writes a task, a memory or a
+status. A retain-arm gate whose observed members are all stamped into the
+topic probes nothing; a delete-arm gate costs one point read per id its
+canonical claims in ``supersedes`` that is absent from the scroll.
 """
 
 from __future__ import annotations
@@ -74,31 +85,24 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# IMPORT-RESOLUTION CONTRACT (same idiom, and the same precedence argument,
-# as scripts/scan_task_toolcall_leaks.py:92-116): bind `fused_memory` and
-# `shared` to THIS checkout via a __file__-relative path. The fused-memory
-# editable install is an ordinary .pth entry, so sys.path ORDER decides the
-# winner — without these inserts a worktree run would silently check its
-# cluster against the MAIN checkout's copy of the predicate.
-_FM_SRC = Path(__file__).resolve().parent.parent / "fused-memory" / "src"
-if str(_FM_SRC) not in sys.path:
-    sys.path.insert(0, str(_FM_SRC))
-
-_SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
-if str(_SHARED_SRC) not in sys.path:
-    sys.path.insert(0, str(_SHARED_SRC))
+import _checkout as _checkout
 
 # `_task_db_scan` is a flat sibling in scripts/ and resolves solely because a
 # DIRECTLY-EXECUTED script puts its own directory at sys.path[0] — so never
-# invoke this via `python -m`. It is the single home for the tasks.db path.
-from _task_db_scan import tasks_db_path  # noqa: E402
-from fused_memory.middleware.task_interceptor import TaskInterceptor  # noqa: E402
-from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
+# invoke this via `python -m`. It is the single home for the tasks.db path and
+# its read-only open.
+from _task_db_scan import TaskDbUnreadable, connect_ro, tasks_db_path
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.reconciliation.consolidation_gate import (
     EXIT_CLOSED,
     EXIT_NOT_CLOSED,
     GATE_METADATA_KEY,
+    closure_exists_probe,
     evaluate_closure,
+    resolve_unstamped_live_ids,
 )
+from shared.project_id import project_id_for_root
+from shared.project_layout import CheckoutRootError, default_project_root
 
 #: "I could not run the check." Distinct from EXIT_NOT_CLOSED by design —
 #: see the EXIT-CODE CONTRACT above.
@@ -108,9 +112,6 @@ EXIT_USAGE = 2
 #: exactly as much of the cluster as the seam does, or the two can disagree
 #: about `scroll_incomplete` on the very cluster the operator is checking.
 SCROLL_LIMIT = TaskInterceptor._CONSOLIDATION_SCROLL_LIMIT
-
-DEFAULT_PROJECT_ROOT = "/home/leo/src/dark-factory"
-DEFAULT_PROJECT_ID = "dark_factory"
 
 
 class UsageError(Exception):
@@ -160,7 +161,8 @@ def render_human(verdict: Any, *, scroll: dict) -> str:
         f"closed: {verdict.closed}",
         (
             "scroll: returned={returned} total={total} truncated={truncated} "
-            "available={available} limit={limit}".format(**scroll)
+            "available={available} limit={limit} "
+            "unstamped={unstamped}".format(**scroll)
         ),
         "",
         verdict.message,
@@ -191,12 +193,17 @@ def render_human(verdict: Any, *, scroll: dict) -> str:
 
 
 def load_task_metadata(project_root: str, task_id: str, tag: str) -> Any:
-    """Read one task's raw metadata column from tasks.db, READ-ONLY."""
+    """Read one task's raw metadata column from tasks.db, READ-ONLY.
+
+    Opens through ``_task_db_scan.py::connect_ro``, whose refusal of a wrong
+    file already names the path and the remedy, so it becomes the UsageError
+    verbatim.
+    """
     db_path = tasks_db_path(project_root)
-    if not db_path.exists():
-        raise UsageError(f"no tasks.db at {db_path}")
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con = connect_ro(db_path)
+    except TaskDbUnreadable as refusal:
+        raise UsageError(str(refusal)) from refusal
     except sqlite3.Error as exc:
         raise UsageError(f"could not open {db_path} read-only: {exc}") from exc
     try:
@@ -213,12 +220,34 @@ def load_task_metadata(project_root: str, task_id: str, tag: str) -> Any:
     return row[0]
 
 
-async def scroll_cluster(memory: Any, project_id: str, topic: str) -> dict:
+async def scroll_cluster(
+    memory: Any, project_id: str, topic: str, *, block: Any
+) -> dict:
     """Bind the real fused-memory scroll for one topic.
 
     COST ORDERING copies the seam: count first, scroll only on a non-zero
     count, and DISCLOSE truncation — so the common path is cheap and a
     capped scroll never reads as complete.
+
+    Also derives ``unstamped`` (task 4808) from *block*'s inert provenance
+    and the canonical's ``supersedes`` claim, through the SHARED
+    ``consolidation_gate.py::resolve_unstamped_live_ids`` (over the SHARED
+    ``consolidation_gate.py::closure_exists_probe``) — never a second copy of
+    that candidate derivation nor of that argument adaptation, so the CLI and
+    the seam cannot disagree about which off-scroll ids (observed members or
+    claimed-absorbed ids) are live.
+    It stays INSIDE this function on purpose: ``run()``'s existing
+    ``except Exception -> available: False -> EXIT_USAGE`` wrapper then
+    covers a probe failure with no new branch, matching the store-outage
+    asymmetry with the seam this module's docstring already argues for.
+
+    *block* is REQUIRED and KEYWORD-ONLY, matching the convention
+    ``consolidation_gate.py::evaluate_closure`` sets for its own
+    completeness arguments. A defaulted *block* would let a caller silently
+    fall back to pre-4808 behaviour — ``resolve_unstamped_live_ids`` treats a
+    non-Mapping gate block as "no observed members" by design — and reintroduce
+    exactly the SILENT DORMANCY this task exists to remove, with no error and
+    no log line to notice it by.
     """
     filters = {"topic": topic}
     total = await memory.count_memories_by_metadata(project_id, filters)
@@ -229,11 +258,18 @@ async def scroll_cluster(memory: Any, project_id: str, topic: str) -> dict:
             await memory.get_memories_by_metadata(project_id, filters, limit=SCROLL_LIMIT)
         )
     )
+    unstamped = await resolve_unstamped_live_ids(
+        block,
+        members=members,
+        exists=closure_exists_probe(memory),
+        project_id=project_id,
+    )
     return {
         "members": members,
         "total": total,
         "truncated": len(members) >= SCROLL_LIMIT or total > len(members),
         "available": True,
+        "unstamped": unstamped,
     }
 
 
@@ -273,21 +309,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--project-root",
-        default=DEFAULT_PROJECT_ROOT,
-        help="project root owning tasks.db (default: %(default)s)",
+        default=None,
+        help="project root owning tasks.db (default: the main checkout)",
     )
     parser.add_argument(
         "--tag", default="master", help="taskmaster tag (default: %(default)s)"
     )
     parser.add_argument(
         "--project-id",
-        default=DEFAULT_PROJECT_ID,
-        help="memory project_id to scroll (default: %(default)s)",
+        default=None,
+        help="memory project_id to scroll (default: the project id of --project-root)",
     )
     parser.add_argument(
         "--json", action="store_true", dest="as_json", help="emit the verdict as JSON"
     )
     return parser
+
+
+def _project_root(args: argparse.Namespace) -> str:
+    if args.project_root is not None:
+        return str(Path(args.project_root).resolve())
+    try:
+        return str(default_project_root())
+    except CheckoutRootError as exc:
+        raise UsageError(f"no --project-root given and {exc}") from exc
+
+
+def _project_id(args: argparse.Namespace) -> str:
+    if args.project_id is not None:
+        return args.project_id
+    try:
+        return project_id_for_root(_project_root(args))
+    except ValueError as exc:
+        raise UsageError(f"{exc}, or pass --project-id") from exc
 
 
 def _emit(payload: dict, *, as_json: bool, human: str) -> None:
@@ -298,21 +352,15 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
     try:
         if args.task_id:
             raw_metadata: Any = load_task_metadata(
-                args.project_root, args.task_id, args.tag
+                _project_root(args), args.task_id, args.tag
             )
         elif args.metadata_file:
             raw_metadata = Path(args.metadata_file).read_text()
         else:
             raw_metadata = args.metadata_json
         block = extract_gate_block(raw_metadata)
-    except UsageError as exc:
-        _emit(
-            {"checked": False, "exit_code": EXIT_USAGE, "error": str(exc)},
-            as_json=args.as_json,
-            human=f"COULD NOT CHECK: {exc}",
-        )
-        return EXIT_USAGE
-    except OSError as exc:
+        project_id = _project_id(args)
+    except (UsageError, OSError) as exc:
         _emit(
             {"checked": False, "exit_code": EXIT_USAGE, "error": str(exc)},
             as_json=args.as_json,
@@ -326,10 +374,18 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
 
     store_error: str | None = None
     try:
-        scrolled = await scroll_cluster(memory, args.project_id, topic)
+        scrolled = await scroll_cluster(
+            memory, project_id, topic, block=block
+        )
     except Exception as exc:  # noqa: BLE001 — any store failure is "could not check"
         store_error = f"{type(exc).__name__}: {exc}"
-        scrolled = {"members": [], "total": None, "truncated": False, "available": False}
+        scrolled = {
+            "members": [],
+            "total": None,
+            "truncated": False,
+            "available": False,
+            "unstamped": (),
+        }
 
     verdict = evaluate_closure(
         block,
@@ -337,6 +393,7 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
         scroll_total=scrolled["total"],
         scroll_truncated=scrolled["truncated"],
         scroll_available=scrolled["available"],
+        unstamped_live_ids=scrolled["unstamped"],
     )
     scroll_facts = {
         "returned": len(scrolled["members"]),
@@ -344,6 +401,7 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
         "truncated": scrolled["truncated"],
         "available": scrolled["available"],
         "limit": SCROLL_LIMIT,
+        "unstamped": list(scrolled["unstamped"]),
     }
     payload = {
         "checked": store_error is None,
@@ -378,8 +436,7 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    return asyncio.run(run(args))
+    return asyncio.run(run(build_parser().parse_args(argv)))
 
 
 if __name__ == "__main__":

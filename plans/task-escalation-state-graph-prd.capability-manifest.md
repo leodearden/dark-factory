@@ -73,3 +73,25 @@ against working tree `298556cc25` (2026-08-02). YAML sidecar twin:
 - soak evidence sources → β's events + θ's would-violate counter (upstream producers) — PASS
 
 No FAIL bindings. All producer references are upstream in the DAG.
+
+## Unbound task labels (task 4907 adjudication)
+
+**Class C — an agent follow-up with a synthesized label. This is the only live
+row.** One task, `pending` when measured on 2026-09-23, carries this PRD's
+`metadata.prd_path` and a `prd_task_label` the YAML sidecar does not declare:
+**4172** `kappa-followup`. `commit_planning`'s label→task-id stamper binds
+nothing for it.
+
+Evidence. The PRD's "Decomposition plan" declares exactly the sidecar's 14
+labels (α, η0, β, γ1, γ2, γ3, δ, ζ, η, θ, ι, κ, λ, μ; stamped 3533–3546). κ is
+bound to 3544, and neither document has a follow-up label. 4172 is an agent
+follow-up (`source: agent-followup`, `spawned_from: 3544`) whose only file is
+`ARCHITECTURE.md`. It is a docs tense refresh that delivers no capability, not
+a plan task, and its label was built from its parent's.
+
+**Verdict: spurious.** Remedy: clear `metadata.prd_task_label` on 4172 and KEEP
+its `prd_path`, which is the norm for a task filed against a PRD from outside
+its decomposition plan (`skills/prd/references/decompose-mode.md`, Step 3).
+That is a live task-store write, outside the work task 4907 commits. It was
+raised as esc-4907-3 and queued at L1 as esc-4907-4. Until the write is made,
+`scripts/audit_manifest_descriptor_drift.py` reports this row as LIVE.

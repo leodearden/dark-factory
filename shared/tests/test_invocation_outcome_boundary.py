@@ -397,7 +397,6 @@ class TestB2OpenInvariantProperty:
 _CORPUS = load_corpus()
 _CORPUS_IDS = [r['id'] for r in _CORPUS]
 _CAP_HIT_RECORDS = [r for r in _CORPUS if r['expected'] == 'CapHit']
-_CAP_HIT_IDS = [r['id'] for r in _CAP_HIT_RECORDS]
 
 
 class TestB3ClassifierGoldenCorpus:
@@ -485,14 +484,68 @@ async def _drive_caphit_record_to_capped(record: dict) -> None:
     )
 
 
+_CLAUDE_CAP_HIT_RECORDS = [r for r in _CAP_HIT_RECORDS if r.get('backend', 'claude') == 'claude']
+_BACKEND_WINDOW_CAP_HIT_RECORDS = [
+    r for r in _CAP_HIT_RECORDS if r.get('backend') in ('codex', 'gemini')
+]
+
+
+def test_b3_cap_hit_partition_covers_every_record():
+    """A CapHit row for any other backend must be placed in a partition on
+    purpose: whether its cap is a Claude account's decides which side it asserts."""
+    assert len(_CLAUDE_CAP_HIT_RECORDS) + len(_BACKEND_WINDOW_CAP_HIT_RECORDS) == len(
+        _CAP_HIT_RECORDS
+    )
+
+
 @pytest.mark.asyncio
 class TestB3CapHitDrivesAccountCapped:
-    """Consumer side (two-way): every CapHit corpus record, replayed through
-    the fake-CLI harness, transitions the selected account to CAPPED."""
+    """Consumer side (two-way): every claude CapHit corpus record, replayed
+    through the fake-CLI harness, transitions the selected account to CAPPED."""
 
-    @pytest.mark.parametrize('record', _CAP_HIT_RECORDS, ids=_CAP_HIT_IDS)
+    @pytest.mark.parametrize(
+        'record', _CLAUDE_CAP_HIT_RECORDS, ids=[r['id'] for r in _CLAUDE_CAP_HIT_RECORDS],
+    )
     async def test_cap_hit_record_drives_account_to_capped(self, record):
         await _drive_caphit_record_to_capped(record)
+
+
+@pytest.mark.asyncio
+class TestB3BackendWindowCapLeavesAccountAvailable:
+    """Consumer side (two-way): a codex or gemini CapHit record leaves the
+    leased Claude account AVAILABLE; the loop sleeps, then succeeds on it.
+
+    codex bills the ChatGPT login and gemini a Google account. Neither ever
+    spends the leased Claude token, so their cap is the backend's own window:
+    capping the Claude account for it would park a healthy account and fail
+    over to another that hits the very same window.
+    """
+
+    @pytest.mark.parametrize(
+        'record',
+        _BACKEND_WINDOW_CAP_HIT_RECORDS,
+        ids=[r['id'] for r in _BACKEND_WINDOW_CAP_HIT_RECORDS],
+    )
+    async def test_backend_window_cap_record_waits_on_the_same_account(self, record):
+        gate = make_boundary_gate(['acct-0', 'acct-1'])
+        cli = scripted_cli(
+            agent_result_from_record(record),
+            AgentResult(success=True, output='done', cost_usd=0.01),
+        )
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+            result = await invoke_with_cap_retry(
+                gate, f'B3[{record["id"]}]',
+                invoke_fn=cli,
+                backend=record['backend'],
+                prompt='hi',
+            )
+
+        assert result.success is True
+        assert mock_sleep.await_count == 1
+        assert [c['oauth_token'] for c in cli.calls] == ['fake-token-acct-0'] * 2
+        assert gate.capped_account_names == ()
+        assert gate.active_account_name == 'acct-0'
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +761,7 @@ class TestB6ReportAtomicity:
 # shared seam rather than by importing orchestrator.steward (shared/ must
 # not import orchestrator/ -- see this task's plan design_decisions). A
 # cap-hit resume that then wedges (zero-output timeout on the resumed
-# session) triggers the rebuild_prompt(True) fresh-session fallback and
+# session) triggers a fresh-session fallback on the rebuilt prompt and
 # clears the wedged resume_session_id rather than perpetuating it (consumer
 # side); the loop terminates bounded, and the gate is left consistent
 # afterward (producer side).
@@ -745,10 +798,11 @@ class TestB7StewardWedgeGuardInherited:
 
         gate = make_boundary_gate(['acct-0', 'acct-1'])
         cli = scripted_cli(cap_result, wedge_result, ok_result)
-        rebuild_calls: list[bool] = []
+        builds = 0
 
-        async def rebuild_prompt(session_lost: bool) -> str:
-            rebuild_calls.append(session_lost)
+        async def rebuild_prompt() -> str:
+            nonlocal builds
+            builds += 1
             return 'rebuilt fresh prompt'
 
         with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
@@ -763,10 +817,11 @@ class TestB7StewardWedgeGuardInherited:
 
         # Consumer side: the fresh-session fallback fired exactly once, the
         # wedged session was never re-resumed, and the loop terminated
-        # bounded with the eventual success.
+        # bounded with the eventual success.  The builder is consulted once
+        # per re-dispatch: the resume discards its build, the fallback sends it.
         assert result.success is True
         assert len(cli.calls) == 3
-        assert rebuild_calls == [True]
+        assert builds == 2
         assert cli.calls[1].get('resume_session_id') == 'sess-cap-123'
         assert cli.calls[2].get('resume_session_id') is None
         assert cli.calls[2]['prompt'] == 'rebuilt fresh prompt'

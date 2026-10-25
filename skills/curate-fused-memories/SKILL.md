@@ -60,9 +60,11 @@ they are short and they are the law:
 
 - `fused-memory/src/fused_memory/config/schema.py`, `Mem0UpdateConfig` — since
   2026-08-12 the `curator-` grant is the **schema default**: both arms'
-  `default_factory` lists are `['recon-stage-', 'curator-']`, and
-  `config.yaml`'s `mem0_update:` block ships fully commented out (an active
-  block there is an operator override that trips a deliberate tripwire test).
+  `default_factory` lists are `['recon-stage-', 'curator-']`. In
+  `config.yaml`'s `mem0_update:` block only the metadata-patch list is active
+  (it adds `link-heal-` for the link-heal executor, task 6181); the
+  content-amend list stays at the schema default (an active override of it
+  trips a deliberate tripwire test).
   The field descriptions record Leo's ruling (b) on esc-3524-1 and why **both**
   arms must carry `curator-`: retain-and-tag needs the preserving half, not
   just the destructive half.
@@ -440,12 +442,15 @@ For each gate with real work, in this order:
 
 ## Hygiene the sitting must respect
 
-- **Search before any `procedural_knowledge` write.** `add_memory` soft-blocks
-  near-duplicates (`allow_near_duplicate: True` override only for genuinely
-  distinct content) and rejects writes matching a known-contradictory topic
-  cluster (`ProceduralKnowledgeKnownTopicClusterWriteRejected`) — see CLAUDE.md's
-  Memory Usage section. A curation sitting that itself plants a near-duplicate
-  is the ouroboros.
+- **Search before any `procedural_knowledge` or `preferences_and_norms`
+  write.** `add_memory` enforces two guards of different scope: a
+  topic-cluster guard (covering BOTH categories) rejects a known-contradictory
+  topic match (`ProceduralKnowledgeKnownTopicClusterWriteRejected`); a cosine
+  guard, `procedural_knowledge`-only, soft-blocks a write matching an existing
+  entry at high similarity (`ProceduralKnowledgeNearDuplicateWriteRejected`).
+  Override either with `allow_near_duplicate: True` for genuinely distinct
+  content — see CLAUDE.md's Memory Usage section. A curation sitting that
+  itself plants a near-duplicate is the ouroboros.
 - **Never run `git stash`** in any dark-factory checkout — `refs/stash` is
   shared across worktrees and the merge worker consumes it (incident
   `13674d3c68`). This sitting should not need git at all; if it somehow does,

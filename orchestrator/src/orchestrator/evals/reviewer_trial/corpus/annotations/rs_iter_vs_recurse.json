@@ -33,5 +33,29 @@
       "description": "lower_expr_iterative() duplicates the dispatch logic from lower_expr() (matching on node.kind()) without reusing it. Any new expression types added to lower_expr() would need to be added to both functions.",
       "mutation_type": "iter_vs_recurse"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Lower expressions with an explicit stack so deep sources do not overflow",
+      "description": "`TsParser::lower_expr` in `crates/reify-syntax/src/ts_parser.rs` lowers the tree-sitter CST into `Expr` by direct recursion, one Rust stack frame per nesting level, so a source with a long operator chain or deeply nested parentheses and calls can exhaust the thread stack before the parser returns. Add `lower_expr_iterative(&self, root: tree_sitter::Node) -> Option<Expr>` that covers the same node kinds using an explicit work stack and returns the lowered root expression. Observable outcome: a source nested thousands of levels deep lowers successfully, and for every input both entry points yield the same `Expr` tree, so the iterative path can replace the recursive one at the call sites without changing parse results.",
+      "test_strategy": "Add `reify-syntax` unit tests that lower a spread of representative expressions (number/string/bool literals, identifiers, binary and unary operators, calls, parenthesized groups, and a mixed nested expression) through both entry points and assert the resulting `Expr` trees are equal, plus a generated deep-nesting case (e.g. 10k chained `+` operands) that must return `Some` rather than abort the process. `cargo test -p reify-syntax`.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "crates/reify-syntax/src/ts_parser.rs"
+    ],
+    "base_sha": null,
+    "branch_sha": null,
+    "base_sha_reason": "Unrecoverable. Tested 16 candidates (TIP 7cc4491f plus the 15 first-parent-main commits touching crates/reify-syntax/src/ts_parser.rs between 2026-03-27T08:57:43+00:00 and 2026-04-02T03:31:02+01:00, including fb47d4d -- the last commit to touch the file before cutoff, whose blob is byte-identical to TIP's) -- every one fails, even with --recount, with 'patch failed: crates/reify-syntax/src/ts_parser.rs:1700'. The hunk's pre-image assumes `fn lower_expr_iterative` is inserted immediately after two nested closing braces and a blank line (`        }` / `    }` / blank) directly preceding `fn lower_expr(&self, node: tree_sitter::Node) -> Option<Expr> {`. In every real candidate checked, the actual boundary is: one closing brace, blank, a section-divider comment (`    // \u2500\u2500 Expression lowering \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500`), blank, then `fn lower_expr`. `git log --first-parent --before=2026-04-07T16:36:49+01:00 -S'// \u2500\u2500 Expression lowering' main -- crates/reify-syntax/src/ts_parser.rs` shows that divider was introduced at file creation (ede1b28c, 2026-03-16T21:56:47+00:00) and was never removed through cutoff, so the diff's assumed two-brace/no-divider boundary never existed at this insertion point in reify's history. The new function body itself (`lower_expr_iterative`) is plausible, hand-authored content, but its splice point is fictional.",
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": null
+  }
 }

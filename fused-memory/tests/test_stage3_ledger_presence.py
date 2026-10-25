@@ -10,20 +10,39 @@ faked (PRD plans/stage3-ledger-presence-prd.md §12).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
-from fused_memory.models.reconciliation import StageId, StageReport
-from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+from fused_memory.models.reconciliation import (
+    ReconciliationRun,
+    RunStatus,
+    RunType,
+    StageId,
+    StageReport,
+)
+from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+from fused_memory.reconciliation.recon_pool_map import CYCLE_SUMMARY_TTL_DAYS
 from fused_memory.reconciliation.summary_pool import write_cycle_summary
 from fused_memory.services.memory_service import MemoryService
 
 _PROJECT_ID = 'dark_factory'
 _STAGE = 'task_knowledge_sync'
+
+#: Every run status whose `stage_reports` blob the harness has flushed, so the
+#: classifier may read it as evidence. Spelled out rather than imported from
+#: `ReconciliationJournal._STAGE_REPORTS_PERSISTED_STATUSES`: parametrizing over
+#: the roster under test would let a narrowing edit drop a status while this
+#: suite stayed green, which is precisely the regression these arms pin.
+#: `interrupted` belongs here because `_start_run` never adopts the run — the
+#: adopted variant is covered by
+#: `test_adopted_resumed_run_is_inconclusive_not_stage_not_run`.
+_SETTLED_STATUSES = ['completed', 'failed', 'rolled_back', 'circuit_breaker', 'interrupted']
 
 
 class TestWriteThenReadLedgerSeam:
@@ -135,3 +154,696 @@ class TestWriteThenReadLedgerSeam:
                 )
         finally:
             await store.close()
+
+
+class TestTypedAbsenceClassification:
+    """``present=false`` conflates four unrelated situations (task 3731).
+
+    A missing ``cycle_summary`` ledger row can mean the stage ran and lost its
+    write (a real gap), the stage never ran at all, the row was reaped by the
+    TTL ``gc()``, or nothing is wired to answer with. Only the first is a
+    defect, but the old payload reported all four identically — which is why
+    Stage 1 check A and Stage 3 filed false "missing stage 2 summary" findings
+    against runs that never reached Stage 2.
+
+    ``reason`` names which situation it is; ``expected`` is the gate consumers
+    act on. Real ``ReconLedgerStore`` and real ``ReconciliationJournal``
+    throughout, on the one shared SQLite file production uses.
+    """
+
+    @staticmethod
+    async def _wire(mock_config, tmp_path, *, ledger=True, journal=True):
+        """Real service + real stores, returning ``(service, store, journal)``.
+
+        ``store``/``journal`` are returned even when not wired into the
+        service, so the caller can still write rows through them and close
+        them in a ``finally``.
+        """
+        service = MemoryService(mock_config)
+        store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await store.initialize()
+        recon_journal = ReconciliationJournal(tmp_path)
+        await recon_journal.initialize()
+        if ledger:
+            service.set_recon_ledger(store)
+        if journal:
+            service.set_recon_journal(recon_journal)
+        return service, store, recon_journal
+
+    @staticmethod
+    async def _start_run(journal, run_id, *, status='running', stage_ran=False):
+        now = datetime.now(UTC)
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id=_PROJECT_ID,
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=now,
+                status=RunStatus.running,
+            )
+        )
+        if stage_ran:
+            await journal.update_run_stage_reports(
+                run_id,
+                {
+                    _STAGE: StageReport(
+                        stage=StageId.task_knowledge_sync,
+                        started_at=now,
+                        completed_at=now,
+                    )
+                },
+            )
+        if status != 'running':
+            await journal.complete_run(run_id, status)
+
+    @staticmethod
+    async def _write_row(store, run_id, *, remediation=False, stage=_STAGE):
+        await store.upsert(
+            ReconLedgerRecord(
+                project_id=_PROJECT_ID,
+                record_kind='cycle_summary',
+                payload_json=json.dumps({'remediation': remediation}),
+                state='active',
+                created_at=datetime.now(UTC).isoformat(),
+                flag_type=stage,
+                run_id=run_id,
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_present_row_needs_no_explanation(self, mock_config, tmp_path):
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            await self._write_row(store, 'run-present')
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-present', stage=_STAGE,
+            )
+
+            assert result['present'] is True
+            assert result['reason'] == 'present'
+            assert result['expected'] is True
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_unwired_ledger_is_typed_inconclusive(self, mock_config, tmp_path):
+        service, store, journal = await self._wire(
+            mock_config, tmp_path, ledger=False,
+        )
+        try:
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-any', stage=_STAGE,
+            )
+
+            assert result['present'] is False
+            assert result['ledger_available'] is False
+            assert result['reason'] == 'ledger_unavailable'
+            assert result['expected'] is None
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_unwired_journal_cannot_explain_an_absence(self, mock_config, tmp_path):
+        service, store, journal = await self._wire(
+            mock_config, tmp_path, journal=False,
+        )
+        try:
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-any', stage=_STAGE,
+            )
+
+            assert result['present'] is False
+            assert result['ledger_available'] is True
+            assert result['reason'] == 'run_unknown'
+            assert result['expected'] is None
+            assert result['run_lookup_available'] is False
+            assert result['run_status'] is None
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_no_runs_row_is_run_unknown_not_a_gap(self, mock_config, tmp_path):
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-never-recorded', stage=_STAGE,
+            )
+
+            assert result['reason'] == 'run_unknown'
+            assert result['expected'] is None
+            assert result['run_lookup_available'] is True
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('run_status', _SETTLED_STATUSES)
+    async def test_stage_that_never_ran_is_not_a_gap(
+        self, mock_config, tmp_path, run_status,
+    ):
+        """The 61-of-64 majority in live data, and the esc-3421-1 shape: a
+        settled run whose stage_reports never names Stage 2 simply never
+        reached it. Nothing was lost, so nothing should be flagged."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            run_id = f'run-never-reached-stage2-{run_status}'
+            await self._start_run(journal, run_id, status=run_status)
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id=run_id, stage=_STAGE,
+            )
+
+            assert result['present'] is False
+            assert result['reason'] == 'stage_not_run'
+            assert result['expected'] is False
+            assert result['run_status'] == run_status
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_adopted_resumed_run_is_inconclusive_not_stage_not_run(
+        self, mock_config, tmp_path,
+    ):
+        """The in-flight shape the ``running`` gate alone does NOT catch, and
+        the fleet redeploys every 8h so it recurs: the startup adopt-and-resume
+        pass (``harness.py::_resume_interrupted_runs``) marks the run running
+        only IN MEMORY — ``run_full_cycle`` sets ``run.status`` on the object
+        while the row stays ``'interrupted'`` on disk, and the only writer of
+        that column is ``complete_run``. So a resumed run re-running this very
+        stage reads back a TERMINAL status paired with the stale blob its
+        interrupted attempt flushed, which is positively misleading rather than
+        merely empty: the key is absent precisely because this attempt has not
+        re-filed it yet. Must stay inconclusive, or a lost ledger write during
+        a resumed cycle is suppressed exactly as it was before the fix."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            await self._start_run(journal, 'run-resumed', status='interrupted')
+            # The adopt pass persists its bookkeeping BEFORE resuming, and
+            # never touches the status column.
+            await journal.update_run_stage_reports(
+                'run-resumed', {'_resume': {'count': 1, 'last_stage': 'stage_1'}},
+            )
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-resumed', stage=_STAGE,
+            )
+
+            assert result['present'] is False
+            assert result['reason'] == 'run_unknown'
+            assert result['expected'] is None
+            assert result['run_status'] == 'interrupted'
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_in_flight_run_is_inconclusive_not_stage_not_run(
+        self, mock_config, tmp_path,
+    ):
+        """The current-cycle shape, and the one that matters most: Stage 3
+        verifies the run it is running INSIDE, whose stage_reports the harness
+        has not persisted yet (it writes the blob once, after the stage loop).
+        The column therefore reads '{}' no matter how many stages have run, so
+        reading an absent key as "the stage never ran" would type every
+        in-flight run as a non-gap and silently suppress exactly the
+        current-cycle ledger loss this check exists to catch. Must stay
+        inconclusive so the consumer falls through to its Mem0 fallback."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            await self._start_run(journal, 'run-in-flight', status='running')
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-in-flight', stage=_STAGE,
+            )
+
+            assert result['present'] is False
+            assert result['reason'] == 'run_unknown'
+            assert result['expected'] is None
+            assert result['run_status'] == 'running'
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_current_cycle_loss_is_an_accepted_false_negative(
+        self, mock_config, tmp_path,
+    ):
+        """The sensitivity this task GIVES UP, pinned so a later reader cannot
+        mistake it for an oversight (PRD §8.3).
+
+        Stage 3's dominant call site is the run it is executing inside, and for
+        that run the durable evidence does not exist yet — the harness flushes
+        `stage_reports` once, after the stage loop. So a Stage-2 row that is
+        genuinely lost RIGHT NOW still types as `run_unknown` and is never
+        reported on the authoritative path. The fixture rules out the innocent
+        explanation: this run wrote its Stage-1 row, so the ledger is live and
+        reachable for it, and the Stage-2 absence is real.
+
+        Before the widening, this absence was actionable on the primary path.
+        The trade — lose current-cycle sensitivity, kill 61-of-64 false
+        `stage_not_run` findings, fall back to the weaker Mem0 paths — is
+        deliberate and is the fail-safe direction: never flag on uncertainty.
+        """
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            await self._start_run(journal, 'run-current-cycle-loss', status='running')
+            await self._write_row(
+                store, 'run-current-cycle-loss', stage='memory_consolidator',
+            )
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-current-cycle-loss', stage=_STAGE,
+            )
+
+            assert result['present'] is False
+            assert result['reason'] == 'run_unknown'
+            assert result['expected'] is None
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_in_flight_run_with_present_row_still_reads_present(
+        self, mock_config, tmp_path,
+    ):
+        """The in-flight guard must only widen the ABSENCE verdict: a row the
+        current cycle's Stage 2 already wrote is still authoritative evidence
+        of presence, so the healthy current-cycle case keeps its definitive
+        answer rather than degrading to the fallback."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            await self._start_run(journal, 'run-in-flight-present', status='running')
+            await self._write_row(store, 'run-in-flight-present')
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-in-flight-present', stage=_STAGE,
+            )
+
+            assert result['present'] is True
+            assert result['reason'] == 'present'
+            assert result['expected'] is True
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('run_status', _SETTLED_STATUSES)
+    async def test_stage_ran_but_row_absent_is_a_real_gap(
+        self, mock_config, tmp_path, run_status,
+    ):
+        """Regression guard for the CRITICAL constraint: run_status must NOT
+        gate the verdict. Three measured `failed` runs really did execute
+        Stage 2 and lose the ledger write, so a status-gated implementation
+        would suppress every one of them. Every settled status must flag."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            run_id = f'run-lost-write-{run_status}'
+            await self._start_run(journal, run_id, status=run_status, stage_ran=True)
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id=run_id, stage=_STAGE,
+            )
+
+            assert result['present'] is False
+            assert result['reason'] == 'missing'
+            assert result['expected'] is True
+            assert result['run_status'] == run_status
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_raising_journal_degrades_loudly_without_propagating(
+        self, mock_config, tmp_path, caplog,
+    ):
+        """The journal is a best-effort EXPLANATION of an absence the ledger
+        already established. A broken runs lookup must never crash presence
+        detection — but it must not be silent either, or a fault reads as an
+        ordinary state."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        journal.get_run_stage_execution = AsyncMock(
+            side_effect=RuntimeError('runs read boom')
+        )
+        try:
+            with caplog.at_level('WARNING'):
+                result = await service.get_cycle_summary_presence(
+                    project_id=_PROJECT_ID, run_id='run-any', stage=_STAGE,
+                )
+
+            assert result['reason'] == 'run_unknown'
+            assert result['expected'] is None
+            assert any(r.levelname == 'WARNING' for r in caplog.records)
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_widening_is_strictly_additive(self, mock_config, tmp_path):
+        """Every pre-existing key keeps its exact meaning — including
+        `remediation`, which is orthogonal to the new discriminator and must
+        still report on a present row."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            await self._write_row(store, 'run-remediation', remediation=True)
+
+            present = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-remediation', stage=_STAGE,
+            )
+            absent = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id='run-absent', stage=_STAGE,
+            )
+
+            for result in (present, absent):
+                assert set(result) >= {
+                    'present', 'ledger_available', 'project_id', 'run_id',
+                    'stage', 'remediation',
+                }
+                assert result['project_id'] == _PROJECT_ID
+                assert result['stage'] == _STAGE
+                assert result['ledger_available'] is True
+            assert present['run_id'] == 'run-remediation'
+            assert present['remediation'] is True
+            assert present['reason'] == 'present'
+            assert absent['remediation'] is None
+        finally:
+            await store.close()
+            await journal.close()
+
+
+class TestRetentionCliff:
+    """``expired``: the arm that stops reaped rows reading as data loss (task 3731).
+
+    No longer prophylactic. As of 2026-09-14 the first reaping is long past:
+    20287 runs older than the retention window hold no ``cycle_summary`` row,
+    and 6875 of those carry ``stage_reports`` proving Stage 2 ran. Without this
+    arm every one of them classifies as ``missing``/``expected=True`` and
+    becomes a false "data loss" finding — making it the highest-volume arm in
+    the ladder.
+
+    Driven END TO END through the real writer and the real ``gc()`` rather than
+    against a hardcoded 30, so this is a genuine writer/reader agreement seam:
+    the ``expires_at`` stamp comes from ``write_cycle_summary`` and the
+    classification from the presence reader, and a drift between the two breaks
+    these tests.
+    """
+
+    _T0 = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+
+    def _report(self) -> StageReport:
+        return StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=self._T0,
+            completed_at=self._T0,
+            stats={},
+            llm_calls=1,
+            tokens_used=10,
+        )
+
+    async def _wire(self, mock_config, tmp_path):
+        service = MemoryService(mock_config)
+        store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await store.initialize()
+        journal = ReconciliationJournal(tmp_path)
+        await journal.initialize()
+        service.set_recon_ledger(store)
+        service.set_recon_journal(journal)
+        # Stub only the best-effort Mem0 paths — the ledger write runs fully real.
+        service.add_system_record = AsyncMock(
+            return_value=SimpleNamespace(memory_ids=['m1'])
+        )
+        service.get_memories_by_metadata = AsyncMock(return_value=[])
+        return service, store, journal
+
+    async def _write_summary(self, service, run_id):
+        await write_cycle_summary(
+            service,
+            _PROJECT_ID,
+            self._report(),
+            run_id,
+            stage=_STAGE,
+            recon_pool='stage2_cycle_summary',
+            trim_source='stage2_cycle_summary_trim',
+            cap=2,
+            now=self._T0,
+        )
+
+    async def _record_run(
+        self, journal, run_id, *, stage_ran, started_at=None, completed_at=None
+    ):
+        started = started_at or self._T0
+        await journal.start_run(
+            ReconciliationRun(
+                id=run_id,
+                project_id=_PROJECT_ID,
+                run_type=RunType.full,
+                trigger_reason='test',
+                started_at=started,
+                status=RunStatus.running,
+            )
+        )
+        if stage_ran:
+            await journal.update_run_stage_reports(
+                run_id, {_STAGE: self._report()}
+            )
+        # journal.complete_run stamps wall-clock time and takes no clock — it
+        # is a WRITER, and this task does not touch writers (PRD §11) — so the
+        # completion timestamp is stamped directly here instead. Otherwise the
+        # run would age from real-now while the reader is handed an injected
+        # `now` in the past, and the retention comparison would be meaningless.
+        async with journal._require_access().write() as db:
+            await db.execute(
+                "UPDATE runs SET status = 'completed', completed_at = ? WHERE id = ?",
+                ((completed_at or started).isoformat(), run_id),
+            )
+
+    @pytest.mark.asyncio
+    async def test_reaped_row_is_expired_not_missing(self, mock_config, tmp_path):
+        """The headline case. Anti-inversion: the same fixture is asserted live
+        BEFORE gc, so the test cannot pass by never having written a row."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            run_id = 'run-reaped'
+            await self._write_summary(service, run_id)
+            await self._record_run(journal, run_id, stage_ran=True)
+
+            before = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id=run_id, stage=_STAGE, now=self._T0,
+            )
+            assert before['present'] is True
+            assert before['reason'] == 'present'
+
+            past_expiry = self._T0 + timedelta(days=CYCLE_SUMMARY_TTL_DAYS + 1)
+            # gc()'s `now` is an ISO STRING, not a datetime.
+            await store.gc(_PROJECT_ID, past_expiry.isoformat(), [])
+
+            after = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id=run_id, stage=_STAGE, now=past_expiry,
+            )
+
+            assert after['present'] is False
+            assert after['reason'] == 'expired'
+            assert after['expected'] is None
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_a_late_completion_never_pushes_the_reader_past_gcs_cliff(
+        self, mock_config, tmp_path,
+    ):
+        """The two cliffs must not cross, and only one direction is safe.
+
+        ``write_cycle_summary`` stamps ``expires_at`` from ITS OWN write time —
+        Stage 2, mid-loop — while the run row is completed only after the whole
+        stage loop, i.e. after Stage 3's LLM turn and far later still for an
+        interrupted-then-resumed run. Aging the absence from ``completed_at``
+        would therefore put the reader's cliff AFTER gc()'s, and every absence
+        in the window between them would read as a confident ``missing`` for a
+        row that was merely reaped — the exact false data-loss class this task
+        exists to remove. Aging from ``started_at`` (always <= the write time)
+        keeps the reader at or behind gc().
+        """
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            run_id = 'run-completed-long-after-its-stage2-write'
+            await self._write_summary(service, run_id)
+            await self._record_run(
+                journal,
+                run_id,
+                stage_ran=True,
+                completed_at=self._T0 + timedelta(hours=6),
+            )
+
+            # Anti-inversion: the row really was written, so a later `expired`
+            # cannot be a test that simply never created one.
+            before = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id=run_id, stage=_STAGE, now=self._T0,
+            )
+            assert before['present'] is True
+
+            # Between the two cliffs: past the writer's expires_at (T0 + TTL),
+            # short of completed_at + TTL.
+            between = self._T0 + timedelta(days=CYCLE_SUMMARY_TTL_DAYS, hours=1)
+            await store.gc(_PROJECT_ID, between.isoformat(), [])
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID, run_id=run_id, stage=_STAGE, now=between,
+            )
+
+            assert result['present'] is False
+            assert result['reason'] == 'expired'
+            assert result['expected'] is None
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_the_exact_retention_boundary_is_not_yet_expired(
+        self, mock_config, tmp_path,
+    ):
+        """Reader and writer must agree on the boundary itself, not just on
+        either side of it: ``gc()`` deletes on ``expires_at < now``, so at
+        exactly the cliff the row still exists and its absence is still a
+        genuine gap."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            run_id = 'run-exactly-at-the-cliff'
+            await self._record_run(journal, run_id, stage_ran=True)
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID,
+                run_id=run_id,
+                stage=_STAGE,
+                now=self._T0 + timedelta(days=CYCLE_SUMMARY_TTL_DAYS),
+            )
+
+            assert result['reason'] == 'missing'
+            assert result['expected'] is True
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_a_naive_run_timestamp_is_read_as_utc_not_raised(
+        self, mock_config, tmp_path,
+    ):
+        """A tz-less ``runs.started_at`` parses fine and then blows up the
+        comparison against an aware ``now``. Every other reader of this column
+        already reads naive as UTC (``throughput.py``,
+        ``summary_pool.py::_assume_utc``), and a read-only presence check must
+        classify rather than raise ``TypeError`` at its caller."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            run_id = 'run-with-a-naive-timestamp'
+            await self._record_run(journal, run_id, stage_ran=True)
+            async with journal._require_access().write() as db:
+                await db.execute(
+                    'UPDATE runs SET started_at = ?, completed_at = NULL WHERE id = ?',
+                    (self._T0.replace(tzinfo=None).isoformat(), run_id),
+                )
+
+            inside = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID,
+                run_id=run_id,
+                stage=_STAGE,
+                now=self._T0 + timedelta(days=CYCLE_SUMMARY_TTL_DAYS - 1),
+            )
+            past = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID,
+                run_id=run_id,
+                stage=_STAGE,
+                now=self._T0 + timedelta(days=CYCLE_SUMMARY_TTL_DAYS + 1),
+            )
+
+            assert inside['reason'] == 'missing'
+            assert past['reason'] == 'expired'
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_absence_inside_the_window_is_still_a_gap(self, mock_config, tmp_path):
+        """The boundary must not smear into blanket suppression: a run still
+        inside retention that ran the stage and has no row IS data loss."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            run_id = 'run-inside-window'
+            await self._record_run(journal, run_id, stage_ran=True)
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID,
+                run_id=run_id,
+                stage=_STAGE,
+                now=self._T0 + timedelta(days=CYCLE_SUMMARY_TTL_DAYS - 1),
+            )
+
+            assert result['reason'] == 'missing'
+            assert result['expected'] is True
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_stage_not_run_outranks_expired(self, mock_config, tmp_path):
+        """esc-3421-1's run 745f2ffb-020c-4409-9543-e99980b9f1e9 exactly as it
+        stands today: its ledger rows have been reaped, but its runs row
+        survives with stage_reports={}. The durable positive fact outranks the
+        destroyed-evidence fact — an expired-first ladder would report
+        "evidence destroyed" when the evidence is intact and conclusive."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            run_id = 'run-old-and-never-ran-stage2'
+            await self._record_run(journal, run_id, stage_ran=False)
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID,
+                run_id=run_id,
+                stage=_STAGE,
+                now=self._T0 + timedelta(days=CYCLE_SUMMARY_TTL_DAYS + 1),
+            )
+
+            assert result['reason'] == 'stage_not_run'
+            assert result['expected'] is False
+        finally:
+            await store.close()
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_incomplete_run_ages_from_started_at(self, mock_config, tmp_path):
+        """A still-running run has completed_at IS NULL. The absence is aged
+        from started_at unconditionally, so the NULL is simply never read —
+        there is no fallback to get wrong."""
+        service, store, journal = await self._wire(mock_config, tmp_path)
+        try:
+            run_id = 'run-never-completed'
+            await journal.start_run(
+                ReconciliationRun(
+                    id=run_id,
+                    project_id=_PROJECT_ID,
+                    run_type=RunType.full,
+                    trigger_reason='test',
+                    started_at=self._T0,
+                    status=RunStatus.running,
+                )
+            )
+            await journal.update_run_stage_reports(run_id, {_STAGE: self._report()})
+
+            result = await service.get_cycle_summary_presence(
+                project_id=_PROJECT_ID,
+                run_id=run_id,
+                stage=_STAGE,
+                now=self._T0 + timedelta(days=CYCLE_SUMMARY_TTL_DAYS + 1),
+            )
+
+            assert result['run_status'] == 'running'
+            assert result['reason'] == 'expired'
+            assert result['expected'] is None
+        finally:
+            await store.close()
+            await journal.close()

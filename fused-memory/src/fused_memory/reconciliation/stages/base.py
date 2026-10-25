@@ -5,31 +5,40 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Awaitable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
 from shared.cli_invoke import read_transcript_records
 from shared.config_dir import TaskConfigDir
+from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.safe_io import load_json_or_warn
+from shared.transcript_archive import archive_task_transcripts
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
+    StageAgentOutcome,
     StageId,
     StageReport,
     Watermark,
 )
 from fused_memory.reconciliation.citation_verifier import (
     STAGE_STAT_PREFIX,
+    make_memory_resolver,
+    scan_prose_citations,
     verify_cited_memories,
 )
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE_REPORT_SCHEMA,
+    recon_archive_root,
     recon_config_base_dir,
+    recon_transcript_archive_key,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.sqlite_failures import await_best_effort
 from fused_memory.utils.validation import require_project_id, require_run_id
 
 if TYPE_CHECKING:
@@ -41,6 +50,18 @@ if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
+
+
+class RequiredSection(NamedTuple):
+    """One inference-bearing payload section every payload builder of a stage must emit (tasks 4708, 5113).
+
+    A stage declares these in a class-level ``REQUIRED_SECTIONS`` tuple; the
+    inclusion criterion (the shipped stage prompt draws an inference from the
+    section's absence) is recorded beside each such tuple.
+    """
+
+    header: str  # exact markdown header the shipped stage prompt names
+    renderer: str  # name of the stage method that renders it, dispatched via getattr
 
 
 class BaseStage:
@@ -217,14 +238,17 @@ class BaseStage:
 
         if start_report_failed:
             completed = datetime.now(UTC)
-            # Stamp the zeroed citation triple even here. This is the ONE path
-            # that returns without reaching the shared assembly below, so it is
-            # the ONE path that would otherwise omit the counters — and a
-            # consumer that took the explicit-zero convention at face value and
-            # indexed report.stats['stageN_citations_verified'] would KeyError
-            # on exactly the degraded run it most wants to account for. Zero is
-            # the honest value: there were no findings, so nothing was verified,
-            # dropped, or errored.
+            # Stamp the zeroed citation triple — and the four zeroed PROSE
+            # counters (task 4818) — even here. This is the ONE path that
+            # returns without reaching the shared assembly below, so it is the
+            # ONE path that would otherwise omit the counters — and a consumer
+            # that took the explicit-zero convention at face value and indexed
+            # report.stats['stageN_citations_verified'] would KeyError on
+            # exactly the degraded run it most wants to account for. That
+            # rationale applies verbatim to the prose keys, which is why they
+            # are stamped here rather than only on the assembly path. Zero is
+            # the honest value throughout: there were no findings, so nothing
+            # was verified, dropped, errored, or scanned.
             _prefix = STAGE_STAT_PREFIX.get(self.stage_id, self.stage_id.value)
             return StageReport(
                 stage=self.stage_id,
@@ -235,9 +259,14 @@ class BaseStage:
                     f'{_prefix}_phantom_citations_dropped': 0,
                     f'{_prefix}_citations_verified': 0,
                     f'{_prefix}_citation_verification_errors': 0,
+                    f'{_prefix}_prose_citations_verified': 0,
+                    f'{_prefix}_prose_citations_tombstoned': 0,
+                    f'{_prefix}_prose_phantom_citations': 0,
+                    f'{_prefix}_prose_citation_verification_errors': 0,
                 },
                 llm_calls=0,
                 tokens_used=0,
+                agent_outcome=StageAgentOutcome.not_launched,
             )
 
         # When recon_report_state is active, drop the output_schema requirement —
@@ -255,13 +284,18 @@ class BaseStage:
         # The config dir is derived deterministically from (data_dir, run_id) so
         # all three stages of a run share it and the harness GCs the same path;
         # attempt auto-increments per launch as durable history for task σ (resume).
+        # Both snapshot writes are best-effort (task 5561).
         session_id = str(uuid4())
         config_dir = TaskConfigDir(
             task_id=run_id,
             base_dir=recon_config_base_dir(self.journal.data_dir),
         )
-        await self.journal.record_run_session(
-            run_id, session_id=session_id, stage_cursor=self.stage_id.value
+        await self._write_session_snapshot_best_effort(
+            'record_run_session',
+            run_id,
+            self.journal.record_run_session(
+                run_id, session_id=session_id, stage_cursor=self.stage_id.value
+            ),
         )
 
         # Task σ resume seam: when the startup adopt-and-resume pass supplies the
@@ -317,20 +351,24 @@ class BaseStage:
             cancelled = True
             raise
         finally:
+            self._archive_stage_transcripts(config_dir, run_id)
             if not cancelled:
-                await self.journal.clear_run_session(run_id)
+                await self._write_session_snapshot_best_effort(
+                    'clear_run_session', run_id, self.journal.clear_run_session(run_id),
+                )
 
         completed = datetime.now(UTC)
 
         # PRD γ: read assembled report from in-process state (overrides stage_result.report).
         # Falls back to stage_result.report when recon_report_state is not configured
         # (back-compat path for non-recon stages) or when start_report degraded to None.
+        report_data = stage_result.report
         if _active_rrs is not None:
             assembled = _active_rrs.get_assembled_report(
                 run_id, self.stage_id.value
             )
             if assembled is not None:
-                stage_result.report = assembled
+                report_data = assembled
             else:
                 # Agent crashed / timed out before calling recon_report.complete.
                 # Substitute empty assembled dict — matches today's malformed-JSON outcome.
@@ -339,12 +377,12 @@ class BaseStage:
                     '(agent may have crashed before calling recon_report.complete)',
                     self.stage_id.value, run_id,
                 )
-                stage_result.report = {'summary': '', 'stats': {}, 'flagged_items': []}
+                report_data = {'summary': '', 'stats': {}, 'flagged_items': []}
 
         # Schema consistency (reviewer finding schema_consistency): warn when a
         # flagged item lacks both dedup keys — compute_flag_signature will return
         # None for these findings, silently bypassing cross-run recurrence tracking.
-        for _item in stage_result.report.get('flagged_items', []):
+        for _item in report_data.get('flagged_items', []):
             if not _item.get('task_id') and not _item.get('cited_tasks'):
                 logger.warning(
                     'Stage %s run_id=%s: finding lacks task_id and cited_tasks — '
@@ -353,7 +391,6 @@ class BaseStage:
                     _item.get('description', '<no description>'),
                 )
 
-        report_data = stage_result.report
         _flagged = report_data.get('flagged_items', [])
         _stats = report_data.get('stats', {})
 
@@ -379,10 +416,44 @@ class BaseStage:
         # remediation early-return), full and remediation passes alike are
         # verified and the citation stats are always present on report.stats.
         _cite_prefix = STAGE_STAT_PREFIX.get(self.stage_id, self.stage_id.value)
+
+        # ONE memoised resolver, shared by BOTH halves of the invariant
+        # (reviewer finding, task 4818 amendment pass). `make_memory_resolver`
+        # was extracted precisely so the two passes cannot disagree about what
+        # a backend timeout means, but sharing the FACTORY and not the INSTANCE
+        # left that only half done: two independent memos meant an id that is
+        # both structurally cited and named in the same report's prose cost two
+        # Qdrant point reads per stage run — on the critical path, for all
+        # three stages — and the two reads could straddle a concurrent delete
+        # and return contradictory verdicts for the same id in the same report.
+        # One instance closes both, and its memo is still scoped to this run.
+        _cite_resolve = make_memory_resolver(self.memory, self.project_id)
+
         _cite_stats = await verify_cited_memories(
             _flagged, self.memory, self.project_id, stat_prefix=_cite_prefix,
+            resolve=_cite_resolve,
         )
         _stats.update(_cite_stats)
+
+        # The PROSE half of the same invariant (task 4818), at the SAME
+        # placement and for every reason the comment above already gives: it is
+        # the one placement a new stage cannot skip by forgetting to add it, it
+        # converges BOTH the RRS-assembled report and the structured-output JSON
+        # fallback, and it precedes every subclass's post-processing including
+        # Stage 1's remediation early-return. It takes the same `_cite_prefix`,
+        # so Stages 1-3 all get it from the one STAGE_STAT_PREFIX resolution.
+        #
+        # It runs AFTER the structured pass on purpose. A phantom just dropped
+        # from `cited_memories` that is STILL named in the finding's prose is a
+        # real, separate fact worth reporting — the structured drop removes the
+        # machine-readable claim, but the human-readable one survives into the
+        # journal and will be chased by a reader. The two counters are therefore
+        # not double-counting the same claim.
+        _prose_stats = await scan_prose_citations(
+            _flagged, self.memory, self.project_id,
+            stat_prefix=_cite_prefix, run_id=run_id, resolve=_cite_resolve,
+        )
+        _stats.update(_prose_stats)
 
         # Write the outcome back to the AUTHORITATIVE recon_report record
         # (task 2979). verify_cited_memories above mutated the projection
@@ -402,6 +473,13 @@ class BaseStage:
         # upserts EVERY entry of the run. Only findings carrying a
         # `citation_failures` marker can have moved (a drop and an error each
         # append one), so those are the only ones worth sending.
+        #
+        # Deliberately NOT widened to the prose scan (task 4818). That pass is
+        # WARN-ONLY: it appends no `citation_failures` marker and mutates no
+        # finding, so there is literally nothing for `apply_citation_verification`
+        # to write back, and no way for a prose warning to make the in-memory
+        # report and the durable SQLite row disagree. Widening the gate would
+        # only trigger byte-identical rewrites of every entry in the run.
         _cite_changed = (
             _cite_stats.get(f'{_cite_prefix}_phantom_citations_dropped', 0)
             or _cite_stats.get(f'{_cite_prefix}_citation_verification_errors', 0)
@@ -444,6 +522,7 @@ class BaseStage:
             stats=_stats,
             llm_calls=stage_result.llm_calls,
             tokens_used=stage_result.tokens_used,
+            agent_outcome=stage_result.outcome,
         )
 
         duration = (completed - started).total_seconds()
@@ -457,16 +536,55 @@ class BaseStage:
                 'cost_usd': stage_result.cost_usd,
                 'llm_calls': stage_result.llm_calls,
                 'success': stage_result.success,
+                'agent_outcome': stage_result.outcome,
                 'error': stage_result.error or None,
             },
         )
 
         if not stage_result.success:
             logger.error(
-                f'Stage {self.stage_id.value} failed: {stage_result.error}'
+                f'Stage {self.stage_id.value} failed '
+                f'(agent outcome: {stage_result.outcome}): {stage_result.error}'
             )
 
         return stage_report
+
+    async def _write_session_snapshot_best_effort(
+        self, op: str, run_id: str, write: Awaitable[None],
+    ) -> None:
+        """Await one session-snapshot journal write, logging rather than raising on failure.
+
+        The snapshot is advisory: the task-σ resume gate
+        (``harness.py::ReconciliationHarness._resume_guard_reason`` and the
+        transcript check in ``run``) validates the transcript on disk instead
+        of trusting it. Cancellation propagates.
+        """
+        await await_best_effort(
+            write,
+            what=f'Stage {self.stage_id.value} session-snapshot write {op}',
+            run_id=run_id, logger=logger, level=logging.WARNING,
+        )
+
+    def _archive_stage_transcripts(self, config_dir: TaskConfigDir, run_id: str) -> None:
+        """Producer half of recon transcript archival (task 3972).
+
+        COPIES, so the σ ``--resume`` seam can still read the source. Runs on
+        every exit, cancellation included, because interrupted runs skip the
+        teardown half (``cli_stage_runner.py::gc_run_config_dir``) and
+        fused-memory has no boot-time orphan sweeper. ``session_id=None``
+        archives the whole per-run dir, so a resumed session's file and
+        subagent transcripts are covered; ``_archive_one``'s mtime-equality
+        skip makes repeats nearly free. Synchronous and total by contract.
+        """
+        archive_root = recon_archive_root(self.config)
+        if archive_root is None:
+            return
+        archive_task_transcripts(
+            config_dir.path,
+            recon_transcript_archive_key(run_id),
+            None,
+            archive_root=archive_root,
+        )
 
     def _build_recovery_prompt(self, run_id: str, stage_payload: str) -> str:
         """Build the continuation prompt delivered to a ``--resume``d stage (task σ).
@@ -501,8 +619,10 @@ class BaseStage:
     def _build_mcp_config(self) -> dict:
         """Assemble MCP server config for Claude CLI.
 
-        Includes the fused-memory server (HTTP or stdio), and optionally
-        the escalation HTTP server if an escalation URL is configured.
+        Always includes the fused-memory server (HTTP or stdio), the
+        jcodemunch stdio server, and the in-process recon-report HTTP server
+        on ``self._recon_report_port``.  The escalation HTTP server is added
+        only if an escalation URL is configured.
         """
         fm_config = _find_fused_memory_server()
 
@@ -525,17 +645,14 @@ class BaseStage:
 
         servers: dict = {
             'fused-memory': fm_entry,
-            'jcodemunch': {
-                'command': 'uvx',
-                'args': ['jcodemunch-mcp'],
-            },
+            'jcodemunch': jcodemunch_server_config(),
             # PRD γ: recon_report MCP server — in-process only, not in any
             # disallow list because mcp__recon-report__* tools only mutate
             # in-process state (not Graphiti / Mem0 / Taskmaster).
             # See STAGE3_DISALLOWED comment in cli_stage_runner.py for rationale.
             'recon-report': {
                 'type': 'http',
-                'url': f'http://127.0.0.1:{self._recon_report_port}/mcp/',
+                'url': f'http://127.0.0.1:{self._recon_report_port}/mcp/',  # mcp-url-sweep: allow MCP config entry for the Claude CLI's own client, which follows redirects natively
             },
         }
 

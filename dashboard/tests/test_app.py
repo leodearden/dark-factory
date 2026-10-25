@@ -9,31 +9,77 @@ response *shape*, not the contents, which exercises the shape adapters.
 
 from __future__ import annotations
 
+import dataclasses
+from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _dashboard_helpers import bug_warnings
 
-from dashboard.app import _parse_window
+from dashboard.api.burndown import _BURNDOWN_WINDOWS
+from dashboard.api.window import ServedWindow, _parse_window, with_window
+from dashboard.config import DashboardConfig
 from dashboard.data import redux_api
 
 # ---------------------------------------------------------------------------
-# _parse_window helper
+# _parse_window: the served-window record, for both vocabularies
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize('value, expected', [
-    ('24h', 1),
-    ('7d', 7),
-    ('30d', 30),
-    ('all', 3650),
-    ('weird', 30),  # default
-    (None, 30),
+@pytest.mark.parametrize('params, expected', [
+    ({'window': '24h'}, ServedWindow(requested='24h', served='24h', days=1)),
+    ({'window': '7d'}, ServedWindow(requested='7d', served='7d', days=7)),
+    ({'window': '30d'}, ServedWindow(requested='30d', served='30d', days=30)),
+    ({'window': 'all'}, ServedWindow(requested='all', served='all', days=3650)),
+    ({'window': '90d'}, ServedWindow(requested='90d', served='30d', days=30)),
+    ({'window': 'weird'}, ServedWindow(requested='weird', served='30d', days=30)),
+    ({}, ServedWindow(requested='30d', served='30d', days=30)),
+    ({'window': ''}, ServedWindow(requested='30d', served='30d', days=30)),
 ])
-def test_parse_window_known_and_unknown(value, expected):
-    query_params: dict[str, str] = {}
-    if value is not None:
-        query_params['window'] = value
-    assert _parse_window(query_params) == expected
+def test_parse_window_standard_vocabulary(params, expected):
+    assert _parse_window(params) == expected
+
+
+@pytest.mark.parametrize('params, expected', [
+    ({}, ServedWindow(requested='7d', served='7d', days=7)),
+    ({'window': '90d'}, ServedWindow(requested='90d', served='7d', days=7)),
+])
+def test_parse_window_caller_default(params, expected):
+    assert _parse_window(params, default='7d') == expected
+
+
+@pytest.mark.parametrize('params, expected', [
+    ({'window': '90d'}, ServedWindow(requested='90d', served='90d', days=90)),
+    ({'window': 'all'}, ServedWindow(requested='all', served='30d', days=30)),
+])
+def test_parse_window_burndown_vocabulary(params, expected):
+    assert _parse_window(params, vocabulary=_BURNDOWN_WINDOWS) == expected
+
+
+def test_parse_window_refuses_a_default_the_vocabulary_cannot_serve():
+    with pytest.raises(ValueError, match='90d'):
+        _parse_window({'window': '7d'}, default='90d')
+
+
+def test_served_window_wire_shape_and_immutability():
+    window = ServedWindow(requested='90d', served='30d', days=30)
+    assert window.to_wire() == {'requested': '90d', 'served': '30d', 'days': 30}
+    with pytest.raises(AttributeError):
+        window.served = '90d'  # type: ignore[misc]
+
+
+def test_with_window_echoes_without_mutating_the_payload():
+    payload = {'COSTS': {'total': 1}, 'served_at': 'S'}
+    window = ServedWindow(requested='7d', served='7d', days=7)
+    echoed = with_window(payload, window)
+    assert echoed == {
+        'COSTS': {'total': 1},
+        'served_at': 'S',
+        'WINDOW': {'requested': '7d', 'served': '7d', 'days': 7},
+    }
+    assert payload == {'COSTS': {'total': 1}, 'served_at': 'S'}
+    assert echoed is not payload
 
 
 # ---------------------------------------------------------------------------
@@ -67,15 +113,17 @@ def test_health_endpoint(client):
 
 
 def test_orchestrators_returns_orchestrators_and_projects(client):
-    """Even with no running orchestrators the response carries both keys."""
+    """Even with no running orchestrators the response carries every key."""
     with patch(
-        'dashboard.app.discover_orchestrators',
+        'dashboard.api.orchestrators.discover_orchestrators',
         new=AsyncMock(return_value=[]),
     ):
         resp = client.get('/api/v2/dashboard/orchestrators')
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body) == {'ORCHESTRATORS', 'PROJECTS', 'ORCHESTRATORS_SPARK'}
+    assert set(body) == {
+        'ORCHESTRATORS', 'PROJECTS', 'ORCHESTRATORS_SPARK', 'served_at',
+    }
     assert isinstance(body['ORCHESTRATORS'], list)
     assert isinstance(body['PROJECTS'], list)
     assert isinstance(body['ORCHESTRATORS_SPARK'], dict)
@@ -83,43 +131,483 @@ def test_orchestrators_returns_orchestrators_and_projects(client):
     assert 'values' in body['ORCHESTRATORS_SPARK']
 
 
-def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
+def test_orchestrators_payload_is_stamped_and_carries_no_task_summary(client):
+    """The endpoint says when it looked, and claims no task count at all.
+
+    ``summary`` used to be the whole reason discovery fetched every root's
+    task tree. The tree is gone, so the key must be gone too — an all-zero
+    summary shaped from an absent one would read as a measured "no tasks",
+    which is the fabricated zero this PRD exists to remove.
+    """
+    from datetime import datetime
+
+    raw = [{
+        'pids': [4321],
+        'prd': '/proj/dark-factory/prd.md',
+        'label': '/proj/dark-factory/prd.md',
+        'project_root': '/proj/dark-factory',
+        'running': True,
+        'started': 'Mar18',
+    }]
     with patch(
-        'dashboard.app.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], [], {}, [], [])),
+        'dashboard.api.orchestrators.discover_orchestrators',
+        new=AsyncMock(return_value=raw),
+    ):
+        resp = client.get('/api/v2/dashboard/orchestrators')
+
+    assert resp.status_code == 200
+    body = resp.json()
+    served_at = datetime.fromisoformat(body['served_at'])
+    assert served_at.utcoffset() is not None, (
+        'served_at must name one moment, not a local-clock reading'
+    )
+    [orch] = body['ORCHESTRATORS']
+    assert 'summary' not in orch, f'no task count is measured here: {orch}'
+    assert orch['pids'] == [4321]
+    assert orch['project'] == 'dark-factory'
+
+
+def _snapshot(*, health='ok', done=0):
+    """A ``TaskSnapshot`` in the state *health* names, as the collector emits one.
+
+    Built through the real ``Datum``/``build_census`` types rather than a mock,
+    because the handler validates every emitted datum against the payload's own
+    ``served_at`` — a mock would sail past exactly the contract these tests are
+    about. Stamped at the live clock so a FRESH half is inside its own
+    freshness bound at the instant the handler serves it.
+    """
+    from datetime import UTC, datetime
+    from types import MappingProxyType
+
+    from dashboard.data.census import build_census
+    from dashboard.data.datum import Datum, DatumState
+    from dashboard.data.task_snapshot import (
+        FRESHNESS_BOUND_SECONDS,
+        SnapshotFailure,
+        TaskSnapshot,
+    )
+
+    as_of = datetime.now(UTC)
+    status_map = {task_id: 'done' for task_id in range(1, done + 1)}
+    fresh_rows = Datum([], as_of, DatumState.FRESH, None, FRESHNESS_BOUND_SECONDS)
+    fresh_census = Datum(
+        build_census(status_map), as_of, DatumState.FRESH, None,
+        FRESHNESS_BOUND_SECONDS,
+    )
+    unknown = Datum(
+        None, None, DatumState.UNKNOWN, f'canned {health} root',
+        FRESHNESS_BOUND_SECONDS,
+    )
+    failure, rows, census = {
+        'ok': (SnapshotFailure.NONE, fresh_rows, fresh_census),
+        'offline': (SnapshotFailure.UNREACHABLE, unknown, unknown),
+        'degraded': (SnapshotFailure.BUDGET, unknown, unknown),
+        'count_unknown': (SnapshotFailure.NONE, fresh_rows, unknown),
+    }[health]
+    return TaskSnapshot(
+        census=census, rows=rows,
+        in_progress_live=None if rows is unknown else 0,
+        in_progress_stranded=None if rows is unknown else 0,
+        skew_seconds=None if unknown in (rows, census) else 0,
+        status_map=MappingProxyType(status_map), failure=failure,
+    )
+
+
+def _snapshots(labels, *, offline=(), degraded=(), count_unknown=(), done=None):
+    """``{label: TaskSnapshot}`` for *labels*, in order, routed by membership."""
+    counts = done or {}
+    health = dict.fromkeys(offline, 'offline')
+    health.update(dict.fromkeys(degraded, 'degraded'))
+    health.update(dict.fromkeys(count_unknown, 'count_unknown'))
+    return {
+        label: _snapshot(health=health.get(label, 'ok'), done=counts.get(label, 0))
+        for label in labels
+    }
+
+
+_TASKS_KEYS = {
+    'TASKS_SNAPSHOT', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+    'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
+    'TASKS_PROJECT_COUNT', 'served_at',
+}
+"""The default render's whole payload. DONE_COUNTS and ACTIVE_TASKS are gone,
+and their ABSENCE is asserted rather than an empty value. Both were top-level
+keys, and ``data.js::applyKey`` returns early on a missing key, so the client
+keeps its seeded default and nothing reads it; ``{}`` would instead read as a
+measured "no project has any done tasks". The rows travel only as
+``TASKS_SNAPSHOT[p].rows``."""
+
+
+def test_tasks_endpoint_carries_no_flat_row_list(client):
+    with patch(
+        'dashboard.api.tasks.collect_tasks_with_counts',
+        new=AsyncMock(return_value=([], {})),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body) == {
-        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
-        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
-    }
+    assert set(body) == _TASKS_KEYS
     assert 'FILE_LOCKS' not in body
-    assert isinstance(body['ACTIVE_TASKS'], list)
+    assert 'DONE_COUNTS' not in body
+    assert 'ACTIVE_TASKS' not in body
     assert body['TASKS_OFFLINE'] is False
     assert body['TASKS_OFFLINE_PROJECTS'] == []
-    assert body['DONE_COUNTS'] == {}
+    assert body['TASKS_SNAPSHOT'] == {}
 
 
-def test_tasks_endpoint_includes_done_counts(client):
-    """DONE_COUNTS payload carries the per-project done count from collect_tasks_with_counts."""
+def test_tasks_endpoint_carries_a_validated_census_per_root(client):
+    """The server, not the client, owns the count — and says when it measured it.
+
+    Replaces ``test_tasks_endpoint_includes_done_counts``: the fact that test
+    protected (a per-project done count comes from the SERVER) is unchanged,
+    but it now travels inside a ``Datum`` that says how fresh it is, so a
+    client can tell a measured zero from a failed read.
+    """
+    from datetime import datetime
+
+    from dashboard.data.datum import Datum, DatumState, validate_datum
+
     with patch(
-        'dashboard.app.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], [], {'dark-factory': 7}, [], [])),
+        'dashboard.api.tasks.collect_tasks_with_counts',
+        new=AsyncMock(return_value=([], _snapshots(['dark-factory'], done={'dark-factory': 7}))),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
     body = resp.json()
-    assert body['DONE_COUNTS'] == {'dark-factory': 7}
+
+    served_at = datetime.fromisoformat(body['served_at'])
+    assert served_at.utcoffset() is not None, (
+        'served_at must name one moment, not a local-clock reading'
+    )
+
+    entry = body['TASKS_SNAPSHOT']['dark-factory']
+    assert set(entry) == {
+        'census', 'rows', 'in_progress_live', 'in_progress_stranded',
+        'skew_seconds',
+    }
+    census = entry['census']
+    assert census['state'] == 'fresh'
+    assert census['value']['counts']['done'] == 7
+    assert census['value']['total'] == 7
+
+    # Every emitted datum must satisfy the envelope's contract against the
+    # payload's OWN served_at — the user-observable signal this leaf delivers.
+    for key in ('census', 'rows'):
+        half = entry[key]
+        as_of = datetime.fromisoformat(half['as_of'])
+        assert as_of <= served_at, f'{key} claims to be measured after it was served'
+        validate_datum(
+            Datum(
+                half['value'], as_of, DatumState(half['state']), half['reason'],
+                half['freshness_bound_seconds'],
+            ),
+            served_at,
+        )
+
+
+def test_tasks_default_render_issues_no_terminal_fetch(client):
+    """No ``?terminal=``, no terminal row — asserted at the MCP wire.
+
+    The default render's whole point is that its cost stops growing with the
+    terminal tree, so "the handler discards the done rows afterwards" would be
+    precisely the defect.
+    """
+    calls: list[dict] = []
+
+    async def _mcp(http_client, url, tool, args, **_kw):
+        calls.append({'tool': tool, 'args': dict(args)})
+        if tool == 'get_statuses':
+            return {'statuses': {}}
+        return {'tasks': []}
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=_mcp):
+        resp = client.get('/api/v2/dashboard/tasks')
+
+    assert resp.status_code == 200
+    for call in calls:
+        requested = call['args'].get('statuses') or []
+        assert 'done' not in requested and 'cancelled' not in requested, (
+            f'the default render must ask for no terminal row: {call}'
+        )
+
+
+def _render_through_the_real_collector(client, canned):
+    """GET /api/v2/dashboard/tasks with only ``mcp_tool_call`` canned, on a cold unit.
+
+    Everything above the substrate is real: the handler, the collector,
+    ``acquire_snapshot`` and its cache. The unit cache starts EMPTY because a
+    cache miss is the render that measures during the request, which is the
+    render production serves every 15 s.
+    """
+    import dashboard.data.task_snapshot as snapshot_mod
+
+    snapshot_mod._snapshot_cache_clear()
+    try:
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            return client.get('/api/v2/dashboard/tasks')
+    finally:
+        snapshot_mod._snapshot_cache_clear()
+
+
+def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, caplog):
+    """``served_at`` must be the instant the COLLECTOR stamps, not merely the one it is checked against.
+
+    Drives the REAL ``collect_tasks_with_counts``: only
+    ``dashboard.data.tasks.mcp_tool_call`` is replaced, by the paging-aware
+    ``CannedMCP``, so every ``Datum`` on this payload is measured DURING the
+    request, the way production measures it. The root list is the app's own
+    configured one, which is what the collector fans out over. Patching only
+    the handler's root enumerator would give the handler and the collector two
+    different populations.
+
+    WHY THE REST OF THIS FILE CANNOT CATCH THIS. ``_snapshot`` stamps ``as_of``
+    at ``datetime.now(UTC)`` BEFORE the request, so every fixture datum is a
+    little OLDER than the handler's ``served_at``. That inverts production's
+    ordering. In production the handler resolved ``served_at``, and the
+    collector then read the clock again and stamped every fresh half
+    microseconds AFTER it. ``validate_datum`` refuses a negative age, so
+    ``_validated`` routed every project to ``unknown`` on every cache-miss
+    render, and 350 green dashboard tests sat over that handler.
+    ``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state``
+    already forwards ``now``; ``api_tasks`` was the only call site that did
+    not.
+    """
+    import logging
+    from datetime import datetime
+
+    from test_task_snapshot import CannedMCP, _raw_row
+
+    label = client.app.state.config.project_root.name
+    pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'done'))
+    canned = CannedMCP(
+        rows=[_raw_row(task_id, status) for task_id, status in pairs],
+        status_map=dict(pairs),
+        status_page_size=2000,
+    )
+    with caplog.at_level(logging.WARNING):
+        resp = _render_through_the_real_collector(client, canned)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    entry = body['TASKS_SNAPSHOT'][label]
+    # (a) Both halves were measured, and the payload says so.
+    assert entry['census']['state'] == 'fresh', entry['census']
+    assert entry['rows']['state'] == 'fresh', entry['rows']
+    # (b) A healthy tree is named in no banner.
+    assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == []
+    assert body['TASKS_OFFLINE_PROJECTS'] == []
+    # (c) Nothing on the payload claims to have been measured after it was served.
+    served_at = datetime.fromisoformat(body['served_at'])
+    for project, wire in body['TASKS_SNAPSHOT'].items():
+        for half in ('census', 'rows'):
+            as_of = wire[half]['as_of']
+            assert as_of is not None, f'{project}.{half} was never measured: {wire[half]}'
+            assert datetime.fromisoformat(as_of) <= served_at, (
+                f'{project}.{half} claims as_of={as_of}, after served_at={body["served_at"]}'
+            )
+    # (d) The fallback that reports a contract break never fired.
+    broken = [
+        record.getMessage() for record in caplog.records
+        if 'this is a BUG, not an outage' in record.getMessage()
+    ]
+    assert broken == []
+
+
+def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, caplog):
+    """Two renders share one unit cache, and the later-resolved one can refresh first.
+
+    Render B resolves its instant, then render A resolves a later one and
+    refreshes the root before B reaches it. B is then served A's unit, whose
+    ``as_of`` is AFTER the instant B resolved. B's ``served_at`` must still
+    postdate it: a negative age is a contract break, and it used to route a
+    healthy root to TASKS_OFFLINE_PROJECTS.
+    """
+    import logging
+    from datetime import datetime, timedelta
+
+    from test_task_snapshot import CannedMCP, _raw_row
+
+    import dashboard.data.task_snapshot as snapshot_mod
+    from dashboard.data.utils import resolve_now
+
+    config = client.app.state.config
+    root = config.project_root
+    pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'done'))
+    canned = CannedMCP(
+        rows=[_raw_row(task_id, status) for task_id, status in pairs],
+        status_map=dict(pairs),
+        status_page_size=2000,
+    )
+    instants = iter(())
+
+    def b_clock(now):
+        return next(instants, None) or resolve_now(now)
+
+    snapshot_mod._snapshot_cache_clear()
+    try:
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            render_a = client.get('/api/v2/dashboard/tasks')
+            assert render_a.status_code == 200, render_a.text
+            a_as_of = datetime.fromisoformat(
+                render_a.json()['TASKS_SNAPSHOT'][root.name]['rows']['as_of']
+            )
+            render_b = a_as_of - timedelta(seconds=1)
+            instants = iter([render_b])
+            with (
+                patch('dashboard.api.tasks.resolve_now', new=b_clock),
+                caplog.at_level(logging.WARNING),
+            ):
+                resp = client.get('/api/v2/dashboard/tasks')
+    finally:
+        snapshot_mod._snapshot_cache_clear()
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    label = root.name
+    assert body['TASKS_OFFLINE_PROJECTS'] == []
+    entry = body['TASKS_SNAPSHOT'][label]
+    assert entry['rows']['state'] == 'fresh', entry['rows']
+    assert entry['census']['state'] == 'fresh', entry['census']
+    assert datetime.fromisoformat(entry['rows']['as_of']) == a_as_of
+    assert datetime.fromisoformat(body['served_at']) >= a_as_of
+    assert not [
+        record for record in caplog.records
+        if 'this is a BUG, not an outage' in record.getMessage()
+    ]
+
+
+def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog):
+    """A root whose unit breaks the contract is unknown on BOTH halves, by construction.
+
+    The stand-in used to come from ``unmeasured_snapshot(label, ...)``, whose
+    first argument keys the ROOT-keyed last-good store. A label never matched a
+    real root's key, so the stand-in came out unknown only because the two key
+    spaces happened not to meet. Here they meet: a last good sits under the
+    very key the label spells. The stand-in must still borrow nothing, because
+    no half of a unit that broke its own envelope can be trusted.
+    """
+    import asyncio
+    import logging
+    from dataclasses import replace
+    from datetime import UTC, datetime, timedelta
+
+    import httpx
+    from test_task_snapshot import CannedMCP, _raw_row
+
+    import dashboard.data.task_snapshot as snapshot_mod
+    from dashboard.data.datum import DatumInvariant
+
+    label = 'p0'
+    config = client.app.state.config
+    canned = CannedMCP(
+        rows=[_raw_row(1, 'in-progress')], status_map={1: 'in-progress', 2: 'done'},
+        status_page_size=2000,
+    )
+
+    async def _measure_earlier():
+        async with httpx.AsyncClient() as http_client:
+            await snapshot_mod.acquire_snapshot(
+                http_client, config, label, now=datetime.now(UTC) - timedelta(seconds=10),
+            )
+
+    healthy = _snapshot()
+    broken = replace(
+        healthy,
+        census=replace(healthy.census, as_of=datetime.now(UTC) + timedelta(hours=1)),
+    )
+    snapshot_mod._snapshot_cache_clear()
+    try:
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            asyncio.run(_measure_earlier())
+        _install_roots(client, [Path('/proj') / label])
+        with patch(
+            'dashboard.api.tasks.collect_tasks_with_counts',
+            new=AsyncMock(return_value=([], {label: broken})),
+        ), caplog.at_level(logging.WARNING):
+            resp = client.get('/api/v2/dashboard/tasks')
+    finally:
+        snapshot_mod._snapshot_cache_clear()
+
+    assert resp.status_code == 200, resp.text
+    entry = resp.json()['TASKS_SNAPSHOT'][label]
+    for half in ('census', 'rows'):
+        assert entry[half]['state'] == 'unknown', entry[half]
+        assert entry[half]['value'] is None and entry[half]['as_of'] is None
+    assert DatumInvariant.FRESHNESS_BOUND.value in entry['census']['reason']
+    assert (entry['in_progress_live'], entry['in_progress_stranded']) == (None, None)
+    assert entry['skew_seconds'] is None
+    assert len(bug_warnings(caplog)) == 1, bug_warnings(caplog)
+
+
+_TASK_ROW_KEYS = frozenset({
+    'id', 'project', 'title', 'status', 'agent',
+    'loops', 'attempts', 'lane', 'phase', 'lane_state', 'runtime_offline',
+    'runtime_status', 'claimant_run_id', 'heartbeat_at', 'stranded',
+    'meta_files', 'train', 'external_deps', 'prd', 'started', 'deps',
+})
+"""One active ``TaskRow``'s keys: ``_build_task_row``'s plus ``started`` and ``deps``.
+
+A literal rather than a derivation, so that adding a field to the wire is a
+deliberate edit here.
+"""
+
+_DEFERRED_TASK_ROW_KEYS = _TASK_ROW_KEYS | {'deferral'}
+"""A deferred row's keys: every active row's plus ``deferral``, which no other row carries."""
+
+_RAW_ONLY_KEYS = frozenset({
+    'description', 'priority', 'dependencies', 'metadata', 'updated_at',
+})
+"""The raw ``_shape_task`` fields the shaper narrows away, ``metadata`` the heaviest."""
+
+
+def test_the_snapshot_rows_on_the_wire_are_the_shaped_task_rows(client):
+    """``TASKS_SNAPSHOT[p].rows`` carries the shaped task rows, not raw MCP rows.
+
+    ``Datum.to_wire()`` renders ``value`` verbatim. So the unit's RAW rows used
+    to ship beside the shaped ones: every active row twice per render, the
+    second copy with the whole ``metadata`` blob, on the endpoint this leaf
+    exists to shrink. That also broke the PRD's declared
+    ``Datum[list[TaskRow]]``. The snapshot is now the rows' only exposure, so
+    each one must carry exactly the shaped fields.
+    """
+    from datetime import UTC
+
+    from shared.task_deferral import PlanningDeferral, record_to_json
+    from test_task_snapshot import CannedMCP, _raw_row
+
+    label = client.app.state.config.project_root.name
+    pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'blocked'), (4, 'deferred'))
+    stamped = datetime.now(UTC)
+    planning = record_to_json(PlanningDeferral(deferred_at=stamped, stamped_at=stamped))
+    canned = CannedMCP(
+        rows=[
+            _raw_row(task_id, status, metadata={
+                'files': ['a.py'], 'prd': 'plans/x.md', 'deferral': planning,
+            })
+            for task_id, status in pairs
+        ],
+        status_map=dict(pairs),
+        status_page_size=2000,
+    )
+
+    resp = _render_through_the_real_collector(client, canned)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    wire_rows = body['TASKS_SNAPSHOT'][label]['rows']['value']
+    assert len(wire_rows) == len(pairs)
+    for row in wire_rows:
+        keys = _DEFERRED_TASK_ROW_KEYS if row['status'] == 'deferred' else _TASK_ROW_KEYS
+        assert set(row) == keys, sorted(set(row) ^ keys)
+        assert not set(row) & _RAW_ONLY_KEYS
 
 
 def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
-    """When the tasks collector reports offline projects, the payload sets ``offline=True``."""
+    """When every root's read demonstrably failed, the payload sets ``offline=True``."""
+    _install_roots(client, _fake_roots(1))
     with patch(
-        'dashboard.app.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], ['dark-factory'], {}, [], [])),
+        'dashboard.api.tasks.collect_tasks_with_counts',
+        new=AsyncMock(return_value=([], _snapshots(['dark-factory'], offline=['dark-factory']))),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -130,23 +618,32 @@ def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
 
 def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(client):
     """api_tasks must call collect_tasks_with_counts with resolve_external=True
-    and forward the external_deps field in ACTIVE_TASKS rows unchanged.
+    and forward the external_deps field in the snapshot rows unchanged.
 
     Asserts:
     (a) collect_tasks_with_counts is called with resolve_external=True
-    (b) ACTIVE_TASKS[0]['external_deps'] contains the resolved dep
+    (b) TASKS_SNAPSHOT[label]['rows']['value'][0]['external_deps'] contains
+        the resolved dep
     (c) Top-level key set is unchanged (non-breaking)
     """
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    from dashboard.data.datum import Datum, DatumState
+    from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
+
+    label = 'dark-factory'
     mock_row = {
         'id': 'dark-factory/T-5',
-        'project': 'dark-factory',
+        'project': label,
         'title': 'waits on upstream',
         'status': 'pending',
         'external_deps': [{'id': 'dark_factory:13', 'status': 'done'}],
     }
-    mock = AsyncMock(return_value=([mock_row], [], {}, [], []))
+    rows = Datum([mock_row], datetime.now(UTC), DatumState.FRESH, None, FRESHNESS_BOUND_SECONDS)
+    mock = AsyncMock(return_value=([mock_row], {label: replace(_snapshot(), rows=rows)}))
 
-    with patch('dashboard.app.collect_tasks_with_counts', new=mock):
+    with patch('dashboard.api.tasks.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
 
     assert resp.status_code == 200
@@ -159,62 +656,34 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
     )
 
     # (b) external_deps passes through unmodified
-    assert body['ACTIVE_TASKS'][0]['external_deps'] == [
+    assert body['TASKS_SNAPSHOT'][label]['rows']['value'][0]['external_deps'] == [
         {'id': 'dark_factory:13', 'status': 'done'}
     ]
 
     # (c) top-level key set unchanged
-    assert set(body) == {
-        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
-        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
-    }
+    assert set(body) == _TASKS_KEYS
 
 
-def test_tasks_endpoint_passes_max_cancelled_per_project(client):
-    """api_tasks must call collect_tasks_with_counts with max_cancelled_per_project=_MAX_CANCELLED_PER_PROJECT.
+def test_tasks_endpoint_asks_for_no_terminal_cap(client):
+    """The handler passes no render cap, because there is no cap left to pass.
 
-    Asserts:
-    (a) max_cancelled_per_project == _MAX_CANCELLED_PER_PROJECT is passed in call kwargs
-    (b) existing kwargs still present: max_done_per_project == _MAX_DONE_PER_PROJECT,
-        resolve_external == True
-    (c) top-level payload key-set is unchanged BY THIS BEHAVIOUR — no new key
-        is added for cancelled (the set itself is stated in the assertion)
-
-    RED today: app.py does not yet pass max_cancelled_per_project.
+    Replaces ``test_tasks_endpoint_passes_max_cancelled_per_project``: the
+    per-bucket caps retired with the default-render terminal fetch, so the
+    contract to protect is now the ABSENCE of those arguments — passing one
+    would be the handler re-imposing a server-side render policy on a request
+    that no longer asks for terminal rows at all.
     """
-    from dashboard.data.active_tasks import _MAX_CANCELLED_PER_PROJECT, _MAX_DONE_PER_PROJECT
+    mock = AsyncMock(return_value=([], {}))
 
-    mock = AsyncMock(return_value=([], [], {}, [], []))
-
-    with patch('dashboard.app.collect_tasks_with_counts', new=mock):
+    with patch('dashboard.api.tasks.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
 
     assert resp.status_code == 200
-    body = resp.json()
-
     call_kwargs = mock.call_args.kwargs
-
-    # (a) max_cancelled_per_project
-    assert call_kwargs.get('max_cancelled_per_project') == _MAX_CANCELLED_PER_PROJECT, (
-        f'expected max_cancelled_per_project={_MAX_CANCELLED_PER_PROJECT} in call kwargs, '
-        f'got: {call_kwargs}'
-    )
-
-    # (b) existing kwargs unchanged
-    assert call_kwargs.get('max_done_per_project') == _MAX_DONE_PER_PROJECT, (
-        f'expected max_done_per_project={_MAX_DONE_PER_PROJECT} in call kwargs, got: {call_kwargs}'
-    )
-    assert call_kwargs.get('resolve_external') is True, (
-        f'expected resolve_external=True in call kwargs, got: {call_kwargs}'
-    )
-
-    # (c) payload key-set unchanged
-    assert set(body) == {
-        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
-        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
-    }
+    assert 'max_done_per_project' not in call_kwargs
+    assert 'max_cancelled_per_project' not in call_kwargs
+    assert call_kwargs.get('resolve_external') is True
+    assert set(resp.json()) == _TASKS_KEYS
 
 
 # ---------------------------------------------------------------------------
@@ -223,33 +692,64 @@ def test_tasks_endpoint_passes_max_cancelled_per_project(client):
 
 
 def _fake_roots(n):
-    """N distinct project roots, for patching ``app._all_project_roots``.
+    """N distinct project roots: the roster ``_install_roots`` puts on the running config.
 
     The route-level ``client`` fixture runs against a single isolated temp
     root, so "k of N failed with k < N" is not expressible against the real
-    config at all. Patching the root enumerator is the seam ``api_tasks``
-    itself uses to learn N, so a test that patches it is asserting on the same
-    fact the handler reads — not on a parallel fixture that could drift.
+    config at all. The installed config is the same one ``api_tasks`` reads to
+    learn N, so a test that installs it is asserting on the same fact the
+    handler reads — not on a parallel fixture that could drift.
     """
-    from pathlib import Path
-
     return [Path(f'/proj/p{i}') for i in range(n)]
+
+
+class _NoRoots(DashboardConfig):
+    """The degenerate empty roster, which no stock config can spell: it always names a primary."""
+
+    @property
+    def all_project_roots(self) -> tuple[Path, ...]:
+        return ()
+
+
+def _install_roots(client, roots):
+    """Install, on the running app, a config whose roster is exactly *roots*."""
+    config = client.app.state.config
+    if roots:
+        client.app.state.config = dataclasses.replace(
+            config, project_root=roots[0], known_project_roots=list(roots[1:]),
+        )
+    else:
+        client.app.state.config = _NoRoots(**dataclasses.asdict(config))
 
 
 def _tasks_body(
     client, *, offline_projects, degraded_projects=(),
     count_unknown_projects=(), total_roots,
 ):
-    """GET /api/v2/dashboard/tasks with a canned collector result and N roots."""
+    """GET /api/v2/dashboard/tasks with a canned collector result and N roots.
+
+    The three lists are no longer RETURNED by the collector — they are derived
+    from the per-root units — so the fixture builds the units that must yield
+    them. A test that could only state the lists directly would be asserting
+    the handler copies a list; this one asserts it reads a state machine.
+    """
+    labels = sorted(
+        {*offline_projects, *degraded_projects, *count_unknown_projects}
+        | {f'p{i}' for i in range(total_roots)}
+    )
     collector = AsyncMock(
         return_value=(
-            [], list(offline_projects), {},
-            list(degraded_projects), list(count_unknown_projects),
+            [],
+            _snapshots(
+                labels,
+                offline=offline_projects,
+                degraded=degraded_projects,
+                count_unknown=count_unknown_projects,
+            ),
         )
     )
-    with patch('dashboard.app.collect_tasks_with_counts', new=collector), patch(
-        'dashboard.app._all_project_roots', new=lambda config: _fake_roots(total_roots)
-    ):
+    _install_roots(client, _fake_roots(total_roots))
+    with patch('dashboard.api.tasks.collect_tasks_with_counts', new=collector):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
     return resp.json()
@@ -340,7 +840,7 @@ def test_tasks_payload_carries_the_root_count_the_banner_denominates_with(client
 
     The partial-outage notice reads "k of N projects". ``k`` counts entries in
     ``TASKS_OFFLINE_PROJECTS`` — task project roots, from
-    ``active_tasks._all_project_roots``. ``N`` was
+    ``DashboardConfig.all_project_roots``. ``N`` was
     ``(DF_T.PROJECTS || []).length``, the ORCHESTRATOR-derived project list
     from /api/v2/dashboard/orchestrators — a different population. A root with
     no orchestrator, or an orchestrator with no task root, makes them diverge,
@@ -378,12 +878,12 @@ def test_tasks_payload_keeps_file_locks_out_and_carries_the_banner_facts(client)
     """The payload carries every banner fact, and FILE_LOCKS stays gone."""
     body = _tasks_body(client, offline_projects=[], total_roots=1)
 
-    assert set(body) == {
-        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
-        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
-    }
+    assert set(body) == _TASKS_KEYS
     assert 'FILE_LOCKS' not in body
+    assert 'DONE_COUNTS' not in body, (
+        'an absent key leaves the client on its seeded default; an empty dict '
+        'would read as a measured "no project has any done tasks"'
+    )
 
 
 def test_memory_returns_memory_status(client):
@@ -393,25 +893,25 @@ def test_memory_returns_memory_status(client):
         new=AsyncMock(return_value={'offline': True, 'error': 'no fused-memory'}),
     ), patch(
         'dashboard.data.memory.get_queue_stats',
-        new=AsyncMock(return_value={'counts': {}, 'oldest_pending_age_seconds': None}),
+        new=AsyncMock(return_value={
+            'counts': {'pending': 2, 'retry': 0, 'dead': 0},
+            'oldest_pending_age_seconds': None,
+        }),
     ):
         resp = client.get('/api/v2/dashboard/memory')
     assert resp.status_code == 200
     body = resp.json()
     assert 'MEMORY_STATUS' in body
     ms = body['MEMORY_STATUS']
-    for key in ('graphiti', 'mem0', 'taskmaster', 'queue'):
+    for key in ('graphiti', 'mem0', 'queue'):
         assert key in ms
-
-
-def test_memory_graphs_returns_timeseries_and_breakdown(client):
-    resp = client.get('/api/v2/dashboard/memory-graphs')
-    assert resp.status_code == 200
-    body = resp.json()
-    assert {'MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN'} <= set(body)
-    ts = body['MEMORY_TIMESERIES']
-    assert {'labels', 'reads', 'writes'} <= set(ts)
-    assert isinstance(body['MEMORY_OPS_BREAKDOWN'], list)
+    assert 'taskmaster' not in ms
+    # get_status offline, get_queue_stats online: the queue renders its own
+    # measured state, not the offline branch's zeros.
+    stats = ms['queue']['stats']
+    assert stats['state'] == 'fresh'
+    assert stats['value']['pending'] == 2
+    assert 'served_at' in body
 
 
 def test_recon_returns_recon_state_and_agents(client):
@@ -432,22 +932,51 @@ def test_merge_queue_returns_merge_queue(client):
     assert isinstance(body['MERGE_QUEUE'], dict)
 
 
-def test_merge_queue_uses_24h_recent_window(client):
-    """The /api/v2/dashboard/merge-queue endpoint must pass recent_window_minutes=1440
-    to build_per_project_merge_queue.  Asserted via call-site kwargs because the
-    test fixture carries no per-project DBs, so the window is not observable in
-    the JSON payload (it returns an empty MERGE_QUEUE map regardless of window)."""
+@pytest.mark.parametrize('query, expected_hours', [
+    ('?window=7d', 168),
+    ('?window=24h', 24),
+])
+def test_merge_queue_threads_the_chip_window(client, query, expected_hours):
+    """Every merge-queue leg, recent merges included, follows the chip window.
+
+    Asserted via call-site kwargs because the test fixture carries no
+    per-project DBs, so the window is not observable in the JSON payload.
+    There is no separate recent-merges window to pass: the smallest chip is
+    24h, so following the chip can only widen what the old fixed 1440-minute
+    recent window showed."""
     mock_build = AsyncMock(return_value={})
     with (
-        patch('dashboard.app.build_per_project_merge_queue', new=mock_build),
-        patch('dashboard.app.get_merge_halt_status', new=AsyncMock(return_value=None)),
+        patch('dashboard.api.merge_queue.build_per_project_merge_queue', new=mock_build),
+        patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value=None)),
     ):
-        resp = client.get('/api/v2/dashboard/merge-queue')
+        resp = client.get(f'/api/v2/dashboard/merge-queue{query}')
     assert resp.status_code == 200
     assert mock_build.await_args is not None, "build_per_project_merge_queue was never awaited"
-    assert mock_build.await_args.kwargs['recent_window_minutes'] == 1440, (
-        f"expected recent_window_minutes=1440, got: {mock_build.await_args.kwargs}"
-    )
+    assert mock_build.await_args.kwargs['hours'] == expected_hours
+    assert 'recent_window_minutes' not in mock_build.await_args.kwargs
+
+
+@pytest.mark.parametrize('path, payload_key, expected_window', [
+    ('/api/v2/dashboard/costs?window=90d', 'COSTS', {'requested': '90d', 'served': '30d', 'days': 30}),
+    ('/api/v2/dashboard/costs?window=7d', 'COSTS', {'requested': '7d', 'served': '7d', 'days': 7}),
+    ('/api/v2/dashboard/performance', 'PERFORMANCE', {'requested': '7d', 'served': '7d', 'days': 7}),
+    ('/api/v2/dashboard/performance?window=all', 'PERFORMANCE',
+     {'requested': 'all', 'served': 'all', 'days': 3650}),
+    ('/api/v2/dashboard/merge-queue?window=24h', 'MERGE_QUEUE',
+     {'requested': '24h', 'served': '24h', 'days': 1}),
+    ('/api/v2/dashboard/burndown?window=90d', 'BURNDOWN', {'requested': '90d', 'served': '90d', 'days': 90}),
+    ('/api/v2/dashboard/burndown?window=all', 'BURNDOWN', {'requested': 'all', 'served': '30d', 'days': 30}),
+])
+def test_windowed_payload_echoes_the_served_window(client, path, payload_key, expected_window):
+    """Sketch #8: every windowed payload says which window it was computed over."""
+    with patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value=None)):
+        resp = client.get(path)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body['WINDOW'] == expected_window
+    assert payload_key in body
+    if payload_key in ('BURNDOWN', 'PERFORMANCE'):
+        assert 'served_at' in body
 
 
 def test_costs_returns_full_costs_block(client):
@@ -540,6 +1069,56 @@ def test_costs_route_includes_by_model_role(client):
     assert by_model_role['turn_cap_saturation'] == fake_rollup['turn_cap_saturation']
 
 
+@pytest.fixture()
+def curator_ledger_row(client):
+    """One ``task_curator`` invocation in the running app's curator ledger.
+
+    The ledger sits under the session-scoped project root every ``client``
+    shares, so the db file (and its directory, if this fixture made it) is
+    deleted afterwards.
+    """
+    import asyncio
+    from datetime import UTC
+
+    from shared.cost_store import CostStore
+
+    ledger = client.app.state.config.curator_events_db
+    assert not ledger.exists(), f'{ledger} already exists; refusing to delete it afterwards'
+    made_dir = not ledger.parent.exists()
+    now = datetime.now(UTC).isoformat()
+
+    async def _write() -> None:
+        store = CostStore(ledger)
+        await store.open()
+        try:
+            await store.save_invocation(
+                run_id='fused-memory-x', task_id=None, project_id='dark_factory',
+                account_name='a', model='opus', role='task_curator', cost_usd=0.02,
+                input_tokens=None, output_tokens=None, cache_read_tokens=None,
+                cache_create_tokens=None, duration_ms=1234, capped=False,
+                started_at=now, completed_at=now,
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(_write())
+    yield
+    for suffix in ('', '-wal', '-shm'):
+        ledger.with_name(ledger.name + suffix).unlink(missing_ok=True)
+    if made_dir:
+        ledger.parent.rmdir()
+
+
+def test_costs_by_role_includes_curator_ledger(client, curator_ledger_row):
+    """The cost view reads the fused-memory curator's ledger as well as each
+    project's runs.db, labelling the curator's spend by its role."""
+    resp = client.get('/api/v2/dashboard/costs?window=7d')
+
+    assert resp.status_code == 200
+    roles = [entry['role'] for entry in resp.json()['COSTS']['by_role']]
+    assert 'task_curator' in roles, roles
+
+
 def test_shape_costs_places_model_role_rollup_under_by_model_role():
     """shape_costs(..., by_model_role=<aggregate_model_role_rollup output>)
     places rows+turn_cap_saturation under COSTS.by_model_role without
@@ -580,13 +1159,61 @@ def test_performance_returns_performance(client):
     body = resp.json()
     assert 'PERFORMANCE' in body
     assert isinstance(body['PERFORMANCE'], dict)
+    assert 'PERFORMANCE_LISTING' in body
+
+
+def test_performance_route_threads_one_now_and_the_window_to_both_aggregates(client):
+    """api_performance must hand the cards and the sparkline history the SAME
+    `now` and the chip's `days`, so both count one window; and it serves that
+    instant as served_at (mirrors test_costs_route_threads_shared_now_to_all_aggregates)."""
+    from dashboard.data.performance import unread_listing
+
+    mocks = {
+        'aggregate_performance_cards': AsyncMock(return_value=unread_listing('fixture', days=30)),
+        'aggregate_performance_history': AsyncMock(return_value={}),
+    }
+    with (
+        patch('dashboard.app.aggregate_performance_cards', new=mocks['aggregate_performance_cards']),
+        patch(
+            'dashboard.app.aggregate_performance_history',
+            new=mocks['aggregate_performance_history'],
+        ),
+    ):
+        resp = client.get('/api/v2/dashboard/performance?window=30d')
+
+    assert resp.status_code == 200
+    nows = []
+    for name, mock in mocks.items():
+        assert mock.await_args is not None, f'{name} was never awaited'
+        assert mock.await_args.kwargs['days'] == 30, name
+        now = mock.await_args.kwargs['now']
+        assert now is not None and now.tzinfo is not None, f'{name} received now={now!r}'
+        nows.append(now)
+    assert nows[0] == nows[1]
+    assert resp.json()['served_at'] == nows[0].isoformat()
+
+
+def test_performance_route_serves_an_unknown_listing_when_cards_raise(client):
+    """A cards read that raises is an unread listing naming the failure, never a silently empty one."""
+    with (
+        patch('dashboard.app.aggregate_performance_cards',
+              new=AsyncMock(side_effect=RuntimeError('boom'))),
+        patch('dashboard.app.aggregate_performance_history', new=AsyncMock(return_value={})),
+    ):
+        resp = client.get('/api/v2/dashboard/performance')
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body['PERFORMANCE'] == {}
+    assert body['PERFORMANCE_LISTING']['state'] == 'unknown'
+    assert 'RuntimeError: boom' in body['PERFORMANCE_LISTING']['reason']
 
 
 def test_burndown_returns_aggregate_and_per_project(client):
     resp = client.get('/api/v2/dashboard/burndown?window=30d')
     assert resp.status_code == 200
     body = resp.json()
-    assert {'BURNDOWN', 'BURNDOWN_BY_PROJECT'} <= set(body)
+    assert {'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'served_at'} <= set(body)
     aggregate = body['BURNDOWN']
     assert {'labels', 'done', 'in_progress', 'blocked', 'pending'} <= set(aggregate)
 
@@ -604,8 +1231,8 @@ def test_burndown_route_threads_shared_now_to_all_aggregates(client):
     })
 
     with (
-        patch('dashboard.app.aggregate_burndown_projects', new=mock_projects),
-        patch('dashboard.app.aggregate_burndown_series', new=mock_series),
+        patch('dashboard.api.burndown.aggregate_burndown_projects', new=mock_projects),
+        patch('dashboard.api.burndown.aggregate_burndown_series', new=mock_series),
     ):
         resp = client.get('/api/v2/dashboard/burndown?window=30d')
 
@@ -632,322 +1259,447 @@ def test_burndown_route_threads_shared_now_to_all_aggregates(client):
     )
 
 
-# ---------------------------------------------------------------------------
-# Escalations endpoint
-# ---------------------------------------------------------------------------
+def test_burndown_route_lists_projects_over_the_series_window(client):
+    """The listing and every series share one cutoff, so a project the window
+    never sampled is neither listed nor counted as unmeasured."""
+    mock_projects = AsyncMock(return_value=['p1'])
+    mock_series = AsyncMock(return_value={'labels': [], 'done': [], 'pending': []})
 
-_EMPTY_SUMMARY = {
-    'by_level': {0: 0, 1: 0, 2: 0},
-    'by_status': {'pending': 0, 'resolved': 0, 'dismissed': 0},
-}
-
-_EMPTY_QUEUES = {
-    'subsections': [],
-    'summary': _EMPTY_SUMMARY,
-}
-
-
-def test_escalations_endpoint_returns_escalations_block(client):
-    """GET /api/v2/dashboard/escalations returns 200 with ESCALATIONS key."""
-    with patch(
-        'dashboard.app.build_escalation_queues',
-        return_value=_EMPTY_QUEUES,
-    ), patch(
-        'dashboard.app.fetch_tasks',
-        new=AsyncMock(return_value=[]),
+    with (
+        patch('dashboard.api.burndown.aggregate_burndown_projects', new=mock_projects),
+        patch('dashboard.api.burndown.aggregate_burndown_series', new=mock_series),
     ):
-        resp = client.get('/api/v2/dashboard/escalations')
-    assert resp.status_code == 200
-    body = resp.json()
-    assert 'ESCALATIONS' in body
-    esc = body['ESCALATIONS']
-    assert 'subsections' in esc
-    assert 'summary' in esc
-    assert esc['subsections'] == []
+        assert client.get('/api/v2/dashboard/burndown?window=7d').status_code == 200
+
+    (listing,) = mock_projects.await_args_list
+    (series,) = mock_series.await_args_list
+    assert listing.kwargs == {'days': 7, 'now': series.kwargs['now']}
+    assert series.kwargs['days'] == 7
 
 
-def test_escalations_endpoint_attaches_task_cards_and_resolves_recon(client, tmp_path):
-    """Full endpoint→shaper integration: task attachment + reconciliation resolution."""
-    from dashboard.app import _task_cards_cache_clear
-    _task_cards_cache_clear()
+def test_burndown_route_serves_its_datums_at_the_window_instant(client):
+    """The one captured instant is the window cutoff AND the instant every
+    burndown Datum is judged at, and it crosses the wire as ``served_at`` —
+    which data.js::refreshOne reads into the receipt datum.js ages against."""
+    mock_projects = AsyncMock(return_value=['p1'])
+    mock_series = AsyncMock(return_value={'labels': [], 'done': [], 'pending': []})
 
-    proj_a = tmp_path / 'projA'
-    task_dict = {
-        'id': 11, 'title': 'wired', 'description': '', 'details': '',
-        'status': 'pending', 'priority': 'med', 'dependencies': [], 'metadata': {},
-    }
-    sub_summary = {
-        'by_level': {0: 1, 1: 1, 2: 0},
-        'by_status': {'pending': 2, 'resolved': 0, 'dismissed': 0},
-    }
-    queues = {
-        'subsections': [
-            {
-                'id': str(proj_a),
-                'label': 'projA',
-                'kind': 'orchestrator',
-                'escalations': [{'id': 'e1', 'task_id': 11, 'level': 0, 'status': 'pending', 'summary': 'oops'}],
-                'summary': sub_summary,
-            },
-            {
-                'id': 'reconciliation',
-                'label': 'fused-memory',
-                'kind': 'reconciliation',
-                'escalations': [{
-                    'id': 'er1', 'task_id': 11,
-                    'worktree': str(proj_a / '.worktrees' / '11'),
-                    'level': 1, 'status': 'pending',
-                }],
-                'summary': sub_summary,
-            },
-        ],
-        'summary': {
-            'by_level': {0: 1, 1: 1, 2: 0},
-            'by_status': {'pending': 2, 'resolved': 0, 'dismissed': 0},
-        },
-    }
-
-    with patch(
-        'dashboard.app.build_escalation_queues',
-        return_value=queues,
-    ), patch(
-        'dashboard.app.fetch_tasks',
-        new=AsyncMock(return_value=[task_dict]),
+    with (
+        patch('dashboard.api.burndown.aggregate_burndown_projects', new=mock_projects),
+        patch('dashboard.api.burndown.aggregate_burndown_series', new=mock_series),
     ):
-        resp = client.get('/api/v2/dashboard/escalations')
+        body = client.get('/api/v2/dashboard/burndown?window=30d').json()
 
-    assert resp.status_code == 200
-    body = resp.json()
-    subs = body['ESCALATIONS']['subsections']
-    assert len(subs) == 2
-
-    orch_sub = next(s for s in subs if s['kind'] == 'orchestrator')
-    assert len(orch_sub['escalations']) == 1
-    orch_row = orch_sub['escalations'][0]
-    assert orch_row['project'] == 'projA'
-    assert orch_row['task']['title'] == 'wired'
-    assert orch_row['task_unresolved'] is False
-
-    recon_sub = next(s for s in subs if s['kind'] == 'reconciliation')
-    assert len(recon_sub['escalations']) == 1
-    recon_row = recon_sub['escalations'][0]
-    assert recon_row['project'] == 'projA'
-    assert recon_row['task']['title'] == 'wired'
-    assert recon_row['task_unresolved'] is False
-
-
-def test_load_task_cards_caches_within_ttl(client, tmp_path):
-    """_load_task_cards: cache hit within TTL + offline result not cached."""
-    from dashboard.app import _task_cards_cache_clear
-
-    proj_a = tmp_path / 'projA'
-    orch_sub = {
-        'id': str(proj_a),
-        'label': 'projA',
-        'kind': 'orchestrator',
-        'escalations': [],
-        'summary': _EMPTY_SUMMARY,
+    assert isinstance(body['served_at'], str)
+    (call,) = mock_series.await_args_list
+    assert datetime.fromisoformat(body['served_at']) == call.kwargs['now']
+    assert set(body['BURNDOWN']['latest']) == {
+        'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds',
     }
-    recon_sub = {
-        'id': 'reconciliation',
-        'label': 'fused-memory',
-        'kind': 'reconciliation',
-        'escalations': [],
-        'summary': _EMPTY_SUMMARY,
-    }
-    one_orch_queues = {
-        'subsections': [orch_sub, recon_sub],
-        'summary': _EMPTY_SUMMARY,
-    }
-    task_list = [{'id': 1, 'title': 't', 'description': '', 'details': '', 'status': 'pending',
-                  'priority': 'low', 'dependencies': [], 'metadata': {}}]
-
-    # Case 1: cache hit — second request should NOT call fetch_tasks again.
-    _task_cards_cache_clear()
-    mock_ft = AsyncMock(return_value=task_list)
-    with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
-         patch('dashboard.app.fetch_tasks', new=mock_ft):
-        client.get('/api/v2/dashboard/escalations')
-        client.get('/api/v2/dashboard/escalations')
-    assert mock_ft.call_count == 1, f'expected 1 fetch_tasks call, got {mock_ft.call_count}'
-
-    # Case 2: offline result NOT cached — each request should call fetch_tasks.
-    _task_cards_cache_clear()
-    mock_offline = AsyncMock(return_value={'offline': True, 'error': 'x'})
-    with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
-         patch('dashboard.app.fetch_tasks', new=mock_offline):
-        r1 = client.get('/api/v2/dashboard/escalations')
-        r2 = client.get('/api/v2/dashboard/escalations')
-    assert r1.status_code == 200
-    assert r2.status_code == 200
-    assert mock_offline.call_count == 2, f'expected 2 fetch_tasks calls, got {mock_offline.call_count}'
 
 
-def test_load_task_cards_ttl_expiry(client, tmp_path):
-    """_load_task_cards: after TTL expires, fetch_tasks is called again."""
-    import dashboard.app as app_module
-    from dashboard.app import _task_cards_cache_clear
+# ---------------------------------------------------------------------------
+# Escalations + escalation-analytics: one corpus, one cache, cards by id
+#
+# Both routes read ONE walk of every queue through
+# ``escalation_corpus.acquire_corpus`` (PRD decision 13); the Escalations
+# tab's cards are read through ``task_lookup.lookup_tasks`` (decision 12).
+# The fused-memory substrate is the shared CannedMCP, patched at
+# ``dashboard.data.tasks.mcp_tool_call`` as test_task_lookup.py does, so the
+# real snapshot unit, ``fetch_task`` and every cache run underneath.
+#
+# No autouse fixture clears these caches in this suite: every route test
+# below requests ``escalation_caches``, which clears them before and after.
+# ---------------------------------------------------------------------------
 
-    proj_a = tmp_path / 'projA'
-    one_orch_queues = {
-        'subsections': [
-            {'id': str(proj_a), 'label': 'projA', 'kind': 'orchestrator',
-             'escalations': [], 'summary': _EMPTY_SUMMARY},
-            {'id': 'reconciliation', 'label': 'fused-memory', 'kind': 'reconciliation',
-             'escalations': [], 'summary': _EMPTY_SUMMARY},
-        ],
-        'summary': _EMPTY_SUMMARY,
-    }
-    task_list = [{'id': 1, 'title': 't', 'description': '', 'details': '',
-                  'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}}]
 
-    _task_cards_cache_clear()
-    original_ttl = app_module._TASK_CARDS_TTL_SECONDS
-    mock_ft = AsyncMock(return_value=task_list)
-    try:
-        with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
-             patch('dashboard.app.fetch_tasks', new=mock_ft):
-            # First request: cache miss — fetch_tasks called once, result cached.
-            client.get('/api/v2/dashboard/escalations')
-            assert mock_ft.call_count == 1
+@pytest.fixture()
+def escalation_caches():
+    """Clear the corpus, the analytics memo, the snapshot units and the per-id cache."""
+    from dashboard.api import escalations as escalation_routes
+    from dashboard.data import escalation_corpus, task_lookup, task_snapshot
 
-            # Zero out TTL so the cached entry is immediately treated as expired.
-            app_module._TASK_CARDS_TTL_SECONDS = 0.0
+    def _clear() -> None:
+        escalation_corpus._corpus_cache_clear()
+        escalation_routes._analytics_memo_clear()
+        task_snapshot._snapshot_cache_clear()
+        task_lookup._lookup_cache_clear()
 
-            # Second request: TTL expired — fetch_tasks called again.
-            resp = client.get('/api/v2/dashboard/escalations')
-    finally:
-        app_module._TASK_CARDS_TTL_SECONDS = original_ttl
+    _clear()
+    yield
+    _clear()
 
-    assert resp.status_code == 200
-    assert mock_ft.call_count == 2, (
-        f'expected 2 fetch_tasks calls after TTL expiry, got {mock_ft.call_count}'
+
+def _esc_record(esc_id: str, *, task_id: str = '11', status: str = 'pending',
+                worktree: str | None = None) -> dict:
+    """One escalation exactly as the escalation server writes it."""
+    from escalation.models import Escalation
+
+    return Escalation(
+        id=esc_id, task_id=task_id, agent_role='implementer', severity='blocking',
+        category='design_concern', summary=f'summary of {esc_id}',
+        timestamp='2026-09-01T00:00:00+00:00', status=status, worktree=worktree,
+    ).to_dict()
+
+
+def _write_esc(queue_dir, record: dict, *, archived: bool = False) -> None:
+    import json
+
+    directory = queue_dir / 'archive' / '2026-09-01' if archived else queue_dir
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{record['id']}.json").write_text(json.dumps(record))
+
+
+def _esc_config(root, *, known=(), escalation_urls=None):
+    """A config over *root* whose every queue dir exists, so a clean walk is fresh."""
+    from dashboard.config import DashboardConfig
+
+    config = DashboardConfig(
+        project_root=root, known_project_roots=list(known),
+        escalation_urls=escalation_urls or {},
+    )
+    for queue_root in (config.project_root, *config.known_project_roots):
+        (queue_root / 'data' / 'escalations').mkdir(parents=True, exist_ok=True)
+    config.reconciliation_escalations_dir.mkdir(parents=True, exist_ok=True)
+    return config
+
+
+def _canned_tasks(*pairs):
+    """A fused-memory substrate holding one row per ``(id, status)``, map agreeing."""
+    from _canned_mcp import CannedMCP, _raw_row
+
+    return CannedMCP(
+        rows=[_raw_row(tid, status) for tid, status in pairs],
+        status_map=dict(pairs),
+        status_page_size=2000,
     )
 
 
-# ---------------------------------------------------------------------------
-# task-2218 step-9: _load_task_cards single-flight (direct calls, no endpoint)
-# ---------------------------------------------------------------------------
+def _no_pins(monkeypatch) -> list[str]:
+    """Answer every escalation-MCP pins read with no annotation; return the call log."""
+    calls: list[str] = []
 
-
-async def test_load_task_cards_single_flight_collapses_concurrent_cold_callers(
-    dummy_client, dummy_config
-):
-    """Concurrent cold callers for one project_root collapse onto one fetch_tasks call.
-
-    Case 1: three concurrent asyncio tasks hitting a cold cache for the same
-    project_root must share a single in-flight fetch_tasks call and all
-    receive the same result (TTLCache single-flight — the plain-dict cache
-    this replaces has no refresh lock, so today each of the three fetches).
-
-    Case 2 (reuse of existing behavior): an offline dict result from
-    fetch_tasks is never cached, so each direct call re-fetches.
-    """
-    import asyncio
-
-    from dashboard.app import _load_task_cards, _task_cards_cache_clear
-
-    # Case 1: single-flight collapse
-    _task_cards_cache_clear()
-    task_list = [{'id': 1, 'title': 't', 'description': '', 'details': '',
-                  'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}}]
-    started = asyncio.Event()
-    release = asyncio.Event()
-    call_count = 0
-
-    async def slow_fetch_tasks(client, config, project_root):
-        nonlocal call_count
-        call_count += 1
-        started.set()
-        await release.wait()
-        return list(task_list)
-
-    with patch('dashboard.app.fetch_tasks', new=AsyncMock(side_effect=slow_fetch_tasks)):
-        tasks = [
-            asyncio.create_task(_load_task_cards(dummy_client, dummy_config, '/proj/X'))
-            for _ in range(3)
-        ]
-        await started.wait()
-        await asyncio.sleep(0)  # let the other two queue on the lock
-        release.set()
-        results = await asyncio.gather(*tasks)
-
-    assert call_count == 1, f'expected a single fetch_tasks call, got {call_count}'
-    assert all(r == task_list for r in results)
-
-    # Case 2: offline result NOT cached — each direct call re-fetches.
-    _task_cards_cache_clear()
-    mock_offline = AsyncMock(return_value={'offline': True, 'error': 'x'})
-    with patch('dashboard.app.fetch_tasks', new=mock_offline):
-        r1 = await _load_task_cards(dummy_client, dummy_config, '/proj/Y')
-        r2 = await _load_task_cards(dummy_client, dummy_config, '/proj/Y')
-
-    assert r1 == [] and r2 == []
-    assert mock_offline.call_count == 2, f'expected 2 fetch_tasks calls, got {mock_offline.call_count}'
-
-
-def test_escalations_endpoint_multi_root_gather(client, tmp_path):
-    """Endpoint fetches each orchestrator root separately and maps tasks to the right subsection."""
-    from dashboard.app import _task_cards_cache_clear
-
-    _task_cards_cache_clear()
-
-    proj_a = tmp_path / 'projA'
-    proj_b = tmp_path / 'projB'
-
-    task_a = {'id': 11, 'title': 'task-A', 'description': '', 'details': '',
-              'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}}
-    task_b = {'id': 22, 'title': 'task-B', 'description': '', 'details': '',
-              'status': 'pending', 'priority': 'high', 'dependencies': [], 'metadata': {}}
-
-    queues = {
-        'subsections': [
-            {'id': str(proj_a), 'label': 'projA', 'kind': 'orchestrator',
-             'escalations': [{'id': 'esc-a1', 'task_id': 11, 'level': 0,
-                              'status': 'pending', 'summary': 'a-issue'}],
-             'summary': _EMPTY_SUMMARY},
-            {'id': str(proj_b), 'label': 'projB', 'kind': 'orchestrator',
-             'escalations': [{'id': 'esc-b1', 'task_id': 22, 'level': 1,
-                              'status': 'pending', 'summary': 'b-issue'}],
-             'summary': _EMPTY_SUMMARY},
-        ],
-        'summary': _EMPTY_SUMMARY,
-    }
-
-    async def fetch_side_effect(_client, _config, root_id):
-        if 'projA' in root_id:
-            return [task_a]
-        if 'projB' in root_id:
-            return [task_b]
+    async def _pins(client, url, tool, args, **kwargs):
+        calls.append(url)
         return []
 
-    with patch('dashboard.app.build_escalation_queues', return_value=queues), \
-         patch('dashboard.app.fetch_tasks', side_effect=fetch_side_effect):
+    monkeypatch.setattr('dashboard.data.escalations.mcp_tool_call', _pins)
+    return calls
+
+
+def _get_both(client, canned) -> tuple[dict, dict]:
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        escalations = client.get('/api/v2/dashboard/escalations')
+        analytics = client.get('/api/v2/dashboard/escalation-analytics')
+    assert escalations.status_code == analytics.status_code == 200
+    return escalations.json(), analytics.json()
+
+
+def _row(body: dict, esc_id: str) -> dict:
+    return next(
+        row
+        for sub in body['ESCALATIONS']['subsections']
+        for row in sub['escalations']
+        if row['id'] == esc_id
+    )
+
+
+_WIRE_KEYS = {'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds'}
+
+
+def test_escalations_endpoint_returns_escalations_block(client, tmp_path, escalation_caches):
+    """An empty corpus still serves every subsection, its summary and its views."""
+    client.app.state.config = _esc_config(tmp_path)
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=_canned_tasks()):
         resp = client.get('/api/v2/dashboard/escalations')
 
     assert resp.status_code == 200
     body = resp.json()
-    subs = body['ESCALATIONS']['subsections']
-    assert len(subs) == 2
+    assert isinstance(body['served_at'], str)
+    esc = body['ESCALATIONS']
+    assert [(s['label'], s['kind']) for s in esc['subsections']] == [
+        (tmp_path.name, 'orchestrator'), ('fused-memory', 'reconciliation'),
+    ]
+    assert all(s['escalations'] == [] for s in esc['subsections'])
+    assert esc['summary']['by_status'] == {'pending': 0, 'resolved': 0, 'dismissed': 0}
+    for views in (esc['views'], *(s['views'] for s in esc['subsections'])):
+        assert set(views) == {'queue_pending', 'open_in_history'}
+        for wired in views.values():
+            assert set(wired) == _WIRE_KEYS
+            assert (wired['value'], wired['state']) == (0, 'fresh')
 
-    sub_a = next(s for s in subs if s['label'] == 'projA')
-    sub_b = next(s for s in subs if s['label'] == 'projB')
 
-    # projA subsection gets task-A (id=11), not task-B.
-    assert len(sub_a['escalations']) == 1
-    row_a = sub_a['escalations'][0]
-    assert row_a['project'] == 'projA'
-    assert row_a['task']['id'] == 11
-    assert row_a['task']['title'] == 'task-A'
-    assert row_a['task_unresolved'] is False
+def test_sketch_10_one_walk_serves_both_views_at_one_instant(client, tmp_path, monkeypatch,
+                                                              escalation_caches):
+    """Sketch #10: 2 pending at the root and 3 in the archive read 2 and 5, as of one walk.
 
-    # projB subsection gets task-B (id=22), not task-A.
-    assert len(sub_b['escalations']) == 1
-    row_b = sub_b['escalations'][0]
-    assert row_b['project'] == 'projB'
-    assert row_b['task']['id'] == 22
-    assert row_b['task']['title'] == 'task-B'
-    assert row_b['task_unresolved'] is False
+    "Pending in the live queue" and "open in history" are two views over the
+    same walk, so they share its instant, and no TTL can change either number.
+    """
+    import dashboard.data.escalation_corpus as escalation_corpus
+
+    _no_pins(monkeypatch)
+    config = _esc_config(tmp_path)
+    for n in (1, 2):
+        _write_esc(config.escalations_dir, _esc_record(f'esc-1-{n}'))
+    for n in (3, 4, 5):
+        _write_esc(config.escalations_dir, _esc_record(f'esc-1-{n}'), archived=True)
+    _write_esc(config.escalations_dir, _esc_record('esc-1-6', status='resolved'))
+    client.app.state.config = config
+
+    readings = []
+    for ttl in (escalation_corpus.CORPUS_TTL_SECONDS, 600.0, 0.0):
+        monkeypatch.setattr(escalation_corpus, 'CORPUS_TTL_SECONDS', ttl)
+        escalation_corpus._corpus_cache_clear()
+        escalations, analytics = _get_both(client, _canned_tasks((11, 'in-progress')))
+        queue_pending = escalations['ESCALATIONS']['views']['queue_pending']
+        (project,) = analytics['ESCALATION_ANALYTICS']['per_project']
+        open_in_history = project['views']['open_in_history']
+        readings.append((ttl, queue_pending, open_in_history))
+
+    for ttl, queue_pending, open_in_history in readings:
+        assert (queue_pending['value'], open_in_history['value']) == (2, 5), f'TTL {ttl}'
+        assert queue_pending['state'] == open_in_history['state'] == 'fresh', f'TTL {ttl}'
+    for ttl, queue_pending, open_in_history in readings[:2]:
+        assert queue_pending['as_of'] == open_in_history['as_of'], (
+            f'TTL {ttl}: the live-queue count and the history count came from '
+            'two different walks'
+        )
+
+
+def test_the_escalations_request_reads_no_whole_task_tree(client, tmp_path, escalation_caches):
+    """Owner probe and cards read active rows and ids only — never an unfiltered get_tasks."""
+    config = _esc_config(tmp_path)
+    _write_esc(config.escalations_dir, _esc_record('esc-11-1', task_id='11'))
+    _write_esc(config.reconciliation_escalations_dir, _esc_record('esc-12-1', task_id='12'))
+    client.app.state.config = config
+    canned = _canned_tasks((11, 'in-progress'), (12, 'pending'), (3, 'done'))
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        resp = client.get('/api/v2/dashboard/escalations')
+
+    assert resp.status_code == 200
+    reads = canned.calls_to('get_tasks')
+    assert reads, 'the owner probe never read the active rows — the check is vacuous'
+    assert [call for call in reads if call['args'].get('statuses') is None] == [], (
+        'an unfiltered get_tasks is a whole-tree read on the request path'
+    )
+
+
+def test_escalation_cards_read_task_lookup(client, tmp_path, escalation_caches):
+    """A terminal id is one get_task; an absent id and a non-numeric id are unknown, saying why."""
+    config = _esc_config(tmp_path)
+    for esc_id, task_id in (('esc-3-1', '3'), ('esc-999-1', '999'), ('esc-x-1', 'abc')):
+        _write_esc(config.escalations_dir, _esc_record(esc_id, task_id=task_id))
+    client.app.state.config = config
+    canned = _canned_tasks((3, 'done'), (11, 'in-progress'))
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        body = client.get('/api/v2/dashboard/escalations').json()
+
+    terminal = _row(body, 'esc-3-1')['task']
+    assert set(terminal) == _WIRE_KEYS
+    assert terminal['state'] == 'fresh'
+    assert (terminal['value']['title'], terminal['value']['status']) == ('task 3', 'done')
+    reads_of_3 = [
+        call for call in canned.calls_to('get_task')
+        if call['args'] == {'id': '3', 'project_root': str(config.project_root)}
+    ]
+    assert len(reads_of_3) == 1
+
+    absent = _row(body, 'esc-999-1')['task']
+    assert (absent['value'], absent['state']) == (None, 'unknown')
+    assert '999' in absent['reason']
+
+    non_numeric = _row(body, 'esc-x-1')['task']
+    assert (non_numeric['value'], non_numeric['state']) == (None, 'unknown')
+    assert 'not a number' in non_numeric['reason']
+    assert 'task_unresolved' not in _row(body, 'esc-3-1')
+
+
+def test_a_reconciliation_row_belongs_to_the_root_its_task_is_active_in(
+    client, tmp_path, escalation_caches,
+):
+    """No worktree: the active rows decide the owner; a task active nowhere has none."""
+    config = _esc_config(tmp_path / 'projA')
+    _write_esc(config.escalations_dir, _esc_record('esc-11-1', task_id='11'))
+    _write_esc(config.reconciliation_escalations_dir, _esc_record('esc-11-2', task_id='11'))
+    _write_esc(config.reconciliation_escalations_dir, _esc_record('esc-3-1', task_id='3'))
+    client.app.state.config = config
+
+    with patch('dashboard.data.tasks.mcp_tool_call',
+               new=_canned_tasks((11, 'in-progress'), (3, 'done'))):
+        body = client.get('/api/v2/dashboard/escalations').json()
+
+    orch_row = _row(body, 'esc-11-1')
+    assert orch_row['project'] == 'projA'
+    assert orch_row['task']['value']['title'] == 'task 11'
+
+    recon_row = _row(body, 'esc-11-2')
+    assert recon_row['project'] == 'projA'
+    assert recon_row['task']['value']['title'] == 'task 11'
+
+    orphan = _row(body, 'esc-3-1')
+    assert orphan['project'] is None
+    assert (orphan['task']['value'], orphan['task']['state']) == (None, 'unknown')
+    assert 'no owning project' in orphan['task']['reason']
+
+
+def test_each_root_reads_its_own_cards(client, tmp_path, escalation_caches):
+    """Two orchestrator roots: each row's card is read against the root that holds it."""
+    proj_a, proj_b = tmp_path / 'projA', tmp_path / 'projB'
+    config = _esc_config(proj_a, known=[proj_b])
+    _write_esc(proj_a / 'data' / 'escalations', _esc_record('esc-a1', task_id='11'))
+    _write_esc(proj_b / 'data' / 'escalations', _esc_record('esc-b1', task_id='22'))
+    client.app.state.config = config
+    canned = _canned_tasks((11, 'done'), (22, 'done'))
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        body = client.get('/api/v2/dashboard/escalations').json()
+
+    row_a, row_b = _row(body, 'esc-a1'), _row(body, 'esc-b1')
+    assert (row_a['project'], row_a['task']['value']['id']) == ('projA', 11)
+    assert (row_b['project'], row_b['task']['value']['id']) == ('projB', 22)
+    assert sorted(
+        (call['args']['id'], call['args']['project_root'])
+        for call in canned.calls_to('get_task')
+    ) == [('11', str(config.project_root)), ('22', str(config.known_project_roots[0]))]
+
+
+def test_the_corpus_is_walked_once_per_ttl_across_both_routes(client, tmp_path, monkeypatch,
+                                                              escalation_caches):
+    """A file landing inside the TTL is unseen by BOTH routes until the next walk."""
+    import dashboard.data.escalation_corpus as escalation_corpus
+
+    _no_pins(monkeypatch)
+    config = _esc_config(tmp_path)
+    _write_esc(config.escalations_dir, _esc_record('esc-1-1'))
+    client.app.state.config = config
+    canned = _canned_tasks((11, 'in-progress'))
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        first = client.get('/api/v2/dashboard/escalations').json()
+    _write_esc(config.escalations_dir, _esc_record('esc-1-2'))
+    escalations, analytics = _get_both(client, canned)
+
+    walked = first['ESCALATIONS']['views']['queue_pending']
+    assert walked['value'] == 1
+    assert escalations['ESCALATIONS']['views']['queue_pending'] == walked
+    (project,) = analytics['ESCALATION_ANALYTICS']['per_project']
+    assert project['views']['open_in_history']['value'] == 1
+    assert (
+        datetime.fromisoformat(analytics['ESCALATION_ANALYTICS']['generated_at'])
+        == datetime.fromisoformat(walked['as_of'])
+    )
+
+    monkeypatch.setattr(escalation_corpus, 'CORPUS_TTL_SECONDS', 0.0)
+    escalations, analytics = _get_both(client, canned)
+    assert escalations['ESCALATIONS']['views']['queue_pending']['value'] == 2
+    (project,) = analytics['ESCALATION_ANALYTICS']['per_project']
+    assert project['views']['open_in_history']['value'] == 2
+
+
+def test_escalation_analytics_is_derived_once_per_corpus_generation(
+    client, tmp_path, monkeypatch, escalation_caches,
+):
+    """Inside one walk's TTL the payload, pins fan-out included, is derived once.
+
+    A NEW walk is a new generation, and is derived afresh: the memo can never
+    serve numbers from a different walk than the one /escalations reads.
+    """
+    import dashboard.data.escalation_corpus as escalation_corpus
+
+    pins_calls = _no_pins(monkeypatch)
+    config = _esc_config(tmp_path, escalation_urls={tmp_path.name: 'http://127.0.0.1:9/mcp'})
+    _write_esc(config.escalations_dir, _esc_record('esc-1-1'))
+    client.app.state.config = config
+
+    first = client.get('/api/v2/dashboard/escalation-analytics').json()
+    second = client.get('/api/v2/dashboard/escalation-analytics').json()
+
+    generated_at = first['ESCALATION_ANALYTICS']['generated_at']
+    assert second['ESCALATION_ANALYTICS']['generated_at'] == generated_at
+    assert len(pins_calls) == 1, f'the pins fan-out ran {len(pins_calls)} times in one generation'
+
+    escalation_corpus._corpus_cache_clear()
+    third = client.get('/api/v2/dashboard/escalation-analytics').json()
+    assert third['ESCALATION_ANALYTICS']['generated_at'] != generated_at
+    assert len(pins_calls) == 2
+
+
+def test_a_raising_pins_fan_out_serves_the_analytics_unannotated(
+    client, tmp_path, monkeypatch, caplog, escalation_caches,
+):
+    """An exception escaping the pins fan-out costs the annotation, never the tab.
+
+    The unannotated payload is that generation's derivation: the memo serves
+    it for the rest of the walk's TTL rather than re-running the fan-out.
+    """
+    import logging
+
+    from dashboard.api import escalations as escalation_routes
+
+    calls: list[str] = []
+
+    async def _raising(client, escalation_urls, **kwargs):
+        calls.append('pins')
+        raise RuntimeError('fan-out exploded')
+
+    monkeypatch.setattr(escalation_routes, 'fetch_pins_recovery', _raising)
+    config = _esc_config(tmp_path, escalation_urls={tmp_path.name: 'http://127.0.0.1:9/mcp'})
+    _write_esc(config.escalations_dir, _esc_record('esc-1-1'))
+    client.app.state.config = config
+
+    with caplog.at_level(logging.WARNING, logger='dashboard.api.escalations'):
+        first = client.get('/api/v2/dashboard/escalation-analytics')
+    second = client.get('/api/v2/dashboard/escalation-analytics')
+
+    assert first.status_code == second.status_code == 200
+    (project,) = first.json()['ESCALATION_ANALYTICS']['per_project']
+    (item,) = project['lifespan']['open_items']
+    assert item['id'] == 'esc-1-1'
+    assert 'pins_recovery' not in item and 'pins_recovery_task_ids' not in item
+    assert any(
+        'pins_recovery fan-out failed' in record.getMessage()
+        and 'fan-out exploded' in record.getMessage()
+        for record in caplog.records
+    )
+    assert second.json()['ESCALATION_ANALYTICS'] == first.json()['ESCALATION_ANALYTICS']
+    assert calls == ['pins']
+
+
+def test_a_hung_card_read_bounds_the_escalations_request(client, tmp_path, monkeypatch,
+                                                         escalation_caches):
+    """A get_task that never answers costs the lookup budget once, and is retried next poll.
+
+    The card is UNKNOWN with the budget's reason — on the wire, where the
+    operator reads it, not only in a log line — and nothing is cached, so the
+    next request re-enters the read rather than pinning the gap for a TTL.
+    """
+    import time
+
+    from dashboard.data import task_lookup
+
+    config = _esc_config(tmp_path)
+    _write_esc(config.escalations_dir, _esc_record('esc-3-1', task_id='3'))
+    client.app.state.config = config
+    canned = _canned_tasks((3, 'done'))
+    canned.task_delays = {3: 30.0}
+    monkeypatch.setattr(task_lookup, 'LOOKUP_BUDGET_SECONDS', 0.3)
+
+    started = time.monotonic()
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        first = client.get('/api/v2/dashboard/escalations')
+        client.get('/api/v2/dashboard/escalations')
+    elapsed = time.monotonic() - started
+
+    assert first.status_code == 200
+    assert elapsed < 5.0, f'two polls took {elapsed:.1f}s against a 0.3s lookup budget'
+    card = _row(first.json(), 'esc-3-1')['task']
+    assert (card['value'], card['state']) == (None, 'unknown')
+    assert card['reason'].startswith(task_lookup.LOOKUP_BUDGET_REASON)
+    assert len(canned.calls_to('get_task')) == 2, 'a timed-out read must not be cached'
 
 
 # ---------------------------------------------------------------------------
@@ -987,14 +1739,14 @@ def test_load_endpoint_returns_known_metric_shape(client) -> None:
 
 
 # ---------------------------------------------------------------------------
-# api_merge_queue — live fetch integration (task-1606 step-11)
+# api_merge_queue — "In queue now" is one served Datum (task-1606, task 5595)
 # ---------------------------------------------------------------------------
 
 # Fake project root; label = basename('proj-a') = 'proj-a'
 _PROJ_ROOT = '/home/test/proj-a'
 _PROJ_LABEL = 'proj-a'
 
-# A live entry that would be TTL-dropped by the event-derived fallback (4h old)
+# A live entry an event-derived TTL would have dropped (4h old)
 _LIVE_ENTRY_4H = {
     'task_id': '3112', 'branch': 'task/3112', 'state': 'queued',
     'age_secs': 14400.0, 'position': 1, 'waiter_alive': True,
@@ -1004,35 +1756,84 @@ _LIVE_ENTRY_RETRY = {
     'task_id': '3112', 'branch': 'task/3112-retry', 'state': 'queued',
     'age_secs': 300.0, 'position': 2, 'waiter_alive': True,
 }
-# Event-derived fallback entry
-_EVENT_ENTRY = {
-    'task_id': '7', 'branch': 'task/7', 'state': 'queued',
-    'timestamp': '2026-06-04T10:00:00+00:00',
-}
 
 
-def _proj_raw(active: list, *, active_approximate: bool = False) -> dict:
-    """Build a minimal build_per_project_merge_queue output for one project."""
+def _proj_raw(*roots: str) -> dict:
+    """A minimal build_per_project_merge_queue output for each root.
+
+    Its runs.db readings are stamped just before the request, so they are
+    served fresh, as a readable runs.db's are.
+    """
+    from datetime import UTC
+
+    from dashboard.data.datum import Datum, DatumState
+
+    read_at = datetime.now(UTC)
     return {
-        _PROJ_ROOT: {
+        root: {
             'depth_timeseries': {'labels': [], 'values': []},
             'outcomes': {'labels': [], 'values': []},
             'latency': {},
             'recent': [],
-            'speculative': {},
-            'active': active,
-            'active_approximate': active_approximate,
+            'recent_total': Datum(0, read_at, DatumState.FRESH, None, 30),
+            'speculative': Datum(
+                {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None},
+                read_at, DatumState.FRESH, None, 30,
+            ),
             'train_events': [],
-        },
+        }
+        for root in roots or (_PROJ_ROOT,)
     }
 
 
-def test_merge_queue_live_path_uses_live_entries(client):
-    """Case A: fetch_live_merge_queues reachable → active reflects LIVE entries.
+def _merge_queue_body(client, live_map: dict, raw: dict | None = None) -> dict:
+    with (
+        patch('dashboard.api.merge_queue.build_per_project_merge_queue',
+              new=AsyncMock(return_value=raw or _proj_raw())),
+        patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.fetch_live_merge_queues',
+              new=AsyncMock(return_value=live_map)),
+        patch('dashboard.api.merge_queue.lookup_tasks', new=AsyncMock(return_value={})),
+    ):
+        resp = client.get('/api/v2/dashboard/merge-queue')
+    assert resp.status_code == 200
+    body = resp.json()
+    assert _PROJ_LABEL in body['MERGE_QUEUE'], (
+        f'{_PROJ_LABEL} missing from MERGE_QUEUE; got {list(body["MERGE_QUEUE"])}'
+    )
+    return body
 
-    AC1: 4h-old entry visible (not TTL-dropped).
+
+@pytest.fixture()
+def sampled_queue(client):
+    """One merge_snapshots row for _PROJ_ROOT in the running app's metrics.db.
+
+    Yields the sample's instant. The metrics db sits under the session-scoped
+    project root every ``client`` shares, so the row is deleted afterwards.
+    """
+    import sqlite3
+    from contextlib import closing
+    from datetime import UTC, timedelta
+
+    sampled_at = datetime.now(UTC) - timedelta(minutes=10)
+    metrics_db = client.app.state.config.metrics_db
+    with closing(sqlite3.connect(metrics_db, timeout=5)) as conn:
+        row_id = conn.execute(
+            'INSERT INTO merge_snapshots (ts, project_id, active_count) VALUES (?, ?, ?)',
+            (sampled_at.isoformat(), _PROJ_ROOT, 3),
+        ).lastrowid
+        conn.commit()
+    yield sampled_at
+    with closing(sqlite3.connect(metrics_db, timeout=5)) as conn:
+        conn.execute('DELETE FROM merge_snapshots WHERE id = ?', (row_id,))
+        conn.commit()
+
+
+def test_merge_queue_live_path_uses_live_entries(client):
+    """Case A: a reachable probe is the queue, FRESH at the probe instant.
+
+    AC1: the 4h-old entry is visible (no event-derived TTL drops it).
     AC2: two same-task entries both appear.
-    active_approximate is False (live data).
     """
     live_map = {
         _PROJ_LABEL: {
@@ -1040,68 +1841,65 @@ def test_merge_queue_live_path_uses_live_entries(client):
             'entries': [_LIVE_ENTRY_4H, _LIVE_ENTRY_RETRY],
         },
     }
-    with (
-        patch('dashboard.app.build_per_project_merge_queue',
-              new=AsyncMock(return_value=_proj_raw([_EVENT_ENTRY]))),
-        patch('dashboard.app.get_merge_halt_status', new=AsyncMock(return_value={})),
-        patch('dashboard.app.load_task_titles', new=AsyncMock(return_value={})),
-        patch('dashboard.app.fetch_live_merge_queues', new=AsyncMock(return_value=live_map)),
-    ):
-        resp = client.get('/api/v2/dashboard/merge-queue')
 
-    assert resp.status_code == 200
-    mq = resp.json()['MERGE_QUEUE']
-    assert _PROJ_LABEL in mq, f'{_PROJ_LABEL} missing from MERGE_QUEUE; got {list(mq)}'
-    proj = mq[_PROJ_LABEL]
+    body = _merge_queue_body(client, live_map)
 
-    active = proj['active']
-    task_ids = [e['task_id'] for e in active]
-    # AC1: long-queued entry is visible
-    assert '3112' in task_ids, (
-        f'AC1: expected task 3112 (4h old) in active; got {task_ids}'
+    proj = body['MERGE_QUEUE'][_PROJ_LABEL]
+    task_ids = [e['task_id'] for e in proj['active']]
+    assert task_ids == ['3112', '3112'], f'AC1/AC2: expected both 3112 rows; got {task_ids}'
+    assert (proj['in_queue']['state'], proj['in_queue']['value']) == ('fresh', 2)
+    assert 'active_approximate' not in proj
+    assert datetime.fromisoformat(proj['in_queue']['as_of']) <= (
+        datetime.fromisoformat(body['served_at'])
     )
-    # AC2: two entries for the same task_id
-    assert task_ids.count('3112') == 2, (
-        f'AC2: expected 2 entries for task_id=3112; got {task_ids}'
-    )
-    # Event-derived fallback entry must NOT appear (live path supersedes it)
-    assert '7' not in task_ids, (
-        f'Expected event-derived task 7 absent when live path is active; got {task_ids}'
-    )
-    assert proj['active_approximate'] is False
 
 
-def test_merge_queue_fallback_path_when_unreachable(client):
-    """Case B: fetch_live_merge_queues unreachable → fallback with active_approximate=True.
+def test_merge_queue_failed_probe_serves_the_last_sample_stale(client, sampled_queue):
+    """Case B: the probe failed, so the headline is its own history's last sample.
 
-    AC3: no fabricated rows; the event-derived list is used and labelled approximate.
+    THE SIGNAL. The tile and its spark are one datum: a failed probe serves
+    the merge_snapshots value at that sample's own instant, marked stale and
+    saying why — never an approximation from another source, and never an
+    entry list the probe did not return.
     """
-    # fetch_live_merge_queues returns {} (no live data) → resolve_active falls back
-    with (
-        patch('dashboard.app.build_per_project_merge_queue',
-              new=AsyncMock(return_value=_proj_raw([_EVENT_ENTRY]))),
-        patch('dashboard.app.get_merge_halt_status', new=AsyncMock(return_value={})),
-        patch('dashboard.app.load_task_titles', new=AsyncMock(return_value={})),
-        patch('dashboard.app.fetch_live_merge_queues', new=AsyncMock(return_value={})),
-    ):
-        resp = client.get('/api/v2/dashboard/merge-queue')
+    live_map = {_PROJ_LABEL: {'reachable': False, 'entries': [], 'error': 'connect refused'}}
 
-    assert resp.status_code == 200
-    mq = resp.json()['MERGE_QUEUE']
-    assert _PROJ_LABEL in mq, f'{_PROJ_LABEL} missing; got {list(mq)}'
-    proj = mq[_PROJ_LABEL]
+    body = _merge_queue_body(client, live_map)
 
-    active = proj['active']
-    task_ids = [e['task_id'] for e in active]
-    # Event-derived entry appears
-    assert '7' in task_ids, (
-        f'Expected event-derived task 7 in fallback active; got {task_ids}'
+    proj = body['MERGE_QUEUE'][_PROJ_LABEL]
+    in_queue = proj['in_queue']
+    assert in_queue['state'] == 'stale', in_queue
+    assert in_queue['value'] == 3
+    assert datetime.fromisoformat(in_queue['as_of']) == sampled_queue
+    assert 'connect refused' in in_queue['reason']
+    assert proj['active'] == []
+    assert proj['live_probe_configured'] is True
+    assert datetime.fromisoformat(in_queue['as_of']) <= (
+        datetime.fromisoformat(body['served_at'])
     )
-    # AC3: no fabricated live entries
-    assert '3112' not in task_ids, (
-        f'AC3: live entry 3112 must not appear in fallback path; got {task_ids}'
-    )
-    assert proj['active_approximate'] is True
+
+
+def test_merge_queue_marks_a_project_with_no_configured_probe(client):
+    """One project unprobed, the other fresh: the payload says which is which.
+
+    A configured root may legitimately run no orchestrator, so it has no
+    escalation URL and no live probe. Its own in_queue is unknown and says
+    why, and ``live_probe_configured`` is false, which is what keeps it out
+    of the fleet total merge_queue.js sums (merge_queue.test.mjs pins that
+    half). The probed project beside it reads exactly as it would alone.
+    """
+    raw = _proj_raw(_PROJ_ROOT, '/home/test/proj-b')
+    live_map = {_PROJ_LABEL: {'reachable': True, 'entries': [_LIVE_ENTRY_4H]}}
+
+    body = _merge_queue_body(client, live_map, raw)
+
+    probed, unprobed = body['MERGE_QUEUE'][_PROJ_LABEL], body['MERGE_QUEUE']['proj-b']
+    assert probed['live_probe_configured'] is True
+    assert (probed['in_queue']['state'], probed['in_queue']['value']) == ('fresh', 1)
+    assert unprobed['live_probe_configured'] is False
+    assert unprobed['in_queue']['state'] == 'unknown'
+    assert 'proj-b' in unprobed['in_queue']['reason']
+    assert unprobed['active'] == []
 
 
 def test_tasks_offline_flag_survives_a_hang_that_degrades_most_roots(client):
@@ -1136,9 +1934,9 @@ def test_tasks_offline_flag_survives_a_hang_that_degrades_most_roots(client):
 def test_tasks_one_healthy_root_vetoes_the_outage_flag(client):
     """A single root that produced rows blocks the global claim, however bad the rest.
 
-    The flag's conjunct is "NO root produced rows" — a root missing from both
-    failure lists produced rows (the three lists are disjoint by
-    construction), so "task data unavailable" would be false.
+    The flag's conjunct is "no root was measured this render". A root missing
+    from both failure lists had its rows read (classify routes each root to at
+    most one list), so "task data unavailable" would be false.
     """
     body = _tasks_body(
         client,
@@ -1167,3 +1965,38 @@ def test_tasks_count_unknown_root_vetoes_the_outage_flag(client):
         'different (and separately reported) fact from an outage'
     )
     assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['p1']
+
+
+def test_last_good_rows_do_not_veto_the_outage_flag(client):
+    """Rows served from a root's last good were not measured this render.
+
+    An offline root still serves its last good rows, aged, in its ``rows``
+    Datum. The flag asks whether THIS render measured any root. So when every
+    root is offline, the banner stands over those rows, and each root's
+    ``rows`` Datum says how old they are.
+    """
+    from dataclasses import replace
+    from datetime import UTC, datetime, timedelta
+
+    from dashboard.data.datum import Datum, DatumState
+    from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
+
+    row = {'id': 'p0/T-1', 'project': 'p0', 'status': 'in-progress'}
+    last_good = Datum(
+        [row], datetime.now(UTC) - timedelta(minutes=5), DatumState.STALE,
+        'canned offline root', FRESHNESS_BOUND_SECONDS,
+    )
+    offline = replace(_snapshot(health='offline'), rows=last_good)
+    _install_roots(client, _fake_roots(1))
+    with patch(
+        'dashboard.api.tasks.collect_tasks_with_counts',
+        new=AsyncMock(return_value=([row], {'p0': offline})),
+    ):
+        resp = client.get('/api/v2/dashboard/tasks')
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body['TASKS_SNAPSHOT']['p0']['rows']['value'] == [row]
+    assert body['TASKS_SNAPSHOT']['p0']['rows']['state'] == 'stale'
+    assert body['TASKS_OFFLINE_PROJECTS'] == ['p0']
+    assert body['TASKS_OFFLINE'] is True

@@ -27,6 +27,8 @@ from typing import Any
 
 from shared.task_statuses import ACTIVE as ACTIVE_TASK_STATUSES
 
+from fused_memory.utils.clip_disclosure import window_note
+
 # --------------------------------------------------------------------------- #
 # Count-snapshot detection
 # --------------------------------------------------------------------------- #
@@ -282,8 +284,29 @@ def extract_batch_plan_task_ids(text: str) -> set[int]:
 # references; audit_duplicate_memories' untasked-snapshot accounting depends on
 # it. The trailing '\b' on the digit group is what stops 'task/339' being read
 # out of 'task/3399'.
+#
+# The bare '#' arm refuses a '#' preceded by a foreign-number cue word ('PR
+# #4521', 'issue #123', 'MR #7') and a '#' attached to a word or path
+# ('PR#4521', 'owner/repo#12', 'dark_factory#2748'), task 4853. A PR, issue or
+# GitHub number is never a task id, and 'project#N' belongs to consumers that
+# know the project registry. Python lookbehinds must be fixed-width, so one is
+# generated per cue in _FOREIGN_NUMBER_CUES and per cue-to-'#' gap in
+# _FOREIGN_CUE_GAPS ('PR #1', 'PR  #1', 'issue:#1', 'issue: #1'); the leading
+# (?=#) keeps them from running at positions that hold no '#'. Residuals: a
+# wider gap ('PR   #1', 'PRs:  #1', 'PR (#1)'), and in a coordinated list ('PRs
+# #1 and #2') only the first number is excluded.
+_FOREIGN_NUMBER_CUES: tuple[str, ...] = (
+    'pr', 'prs', 'pull', 'request', 'issue', 'issues', 'gh', 'mr',
+)
+_FOREIGN_CUE_GAPS: tuple[str, ...] = (r'\s', r'\s\s', ':', r':\s')
 TASK_REF_RE: re.Pattern[str] = re.compile(
-    r'(?:\btask\b|\bdf\b|#)\s*[#/]?\s*(\d+)\b',
+    r'(?:\btask\b|\bdf\b|(?=#)(?<![\w/])'
+    + ''.join(
+        rf'(?<!\b{cue}{gap})'
+        for cue in _FOREIGN_NUMBER_CUES
+        for gap in _FOREIGN_CUE_GAPS
+    )
+    + r'#)\s*[#/]?\s*(\d+)\b',
     re.IGNORECASE,
 )
 
@@ -296,6 +319,8 @@ NON_TERMINAL_STATUS_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# Out-of-module importer: reconciliation/stale_gate_citation_guard.py
+# (retrospective cue after a gate-citation id list).
 TERMINAL_OUTCOME_RE: re.Pattern[str] = re.compile(
     r'\b(?:merged|landed|merge\s+commit|done|cancell?ed|completed|shipped)\b',
     re.IGNORECASE,
@@ -305,9 +330,12 @@ TERMINAL_OUTCOME_RE: re.Pattern[str] = re.compile(
 # is a consistent NON-terminal statement, not a contradiction. Spans matching
 # this are stripped from a clause before running TERMINAL_OUTCOME_RE against it,
 # so a task described only as "not yet merged" isn't mis-tagged terminal.
+# The second alternative is a terminal verb whose object is 'nothing' ("has
+# landed nothing"), the same denial with the negation after the verb.
 NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
     r"\b(?:not|never|hasn't|has\s+not|yet\s+to\s+be)\s+(?:yet\s+|been\s+)*"
-    r'(?:merged|landed|done|cancell?ed|completed|shipped)\b',
+    r'(?:merged|landed|done|cancell?ed|completed|shipped)\b'
+    r'|\b(?:merged|landed|done|cancell?ed|completed|shipped)\s+nothing\b',
     re.IGNORECASE,
 )
 
@@ -344,8 +372,8 @@ NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
 #         so the trade-off stays visible.
 #
 #         What bounds that over-fire is the CONSUMER SET, not any property of
-#         the detectors — this constant is module-private BY CONTRACT, and the
-#         bound holds only while its consumers are exactly:
+#         the detectors — this constant is for ALLOWLISTED consumers only. Its
+#         in-module consumers are:
 #           - find_conflicting_task_status_ids       -> server/tools.py,
 #             conflicting_task_status_framing_write_blocked
 #           - find_present_tense_completion_claim_task_ids -> server/tools.py,
@@ -353,38 +381,43 @@ NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
 #         Both are early-return SOFT-BLOCK write gates: a hit costs the author
 #         a rephrase-and-retry. No exception, no write, no data corruption.
 #
-#         That claim is VOID the moment a consumer on a destructive or
-#         corpus-tagging path imports this. It already happened once: the
-#         task 3403 review found services/completion_claim_gate.py importing
-#         this constant while tagging episodes durably and filing operator
-#         escalations, which made the shipped bounded-blast-radius claim false.
-#         Such a consumer takes STRICT_CLAUSE_BOUNDARY_RE below instead — the
-#         original alphabet, exported once so the divergence needs neither a
-#         second copy of the pattern nor a second copy of the argument. A new
-#         importer of THIS constant must first show its fail-safe direction
-#         matches; the property is enforced by
-#         TestClauseSplitRe.test_clause_split_re_has_no_out_of_module_consumers.
+#         A consumer on a destructive or corpus-tagging path may import this
+#         only when its attribution does not scale with clause length;
+#         otherwise it takes STRICT_CLAUSE_BOUNDARY_RE below — the original
+#         alphabet, exported once so the divergence needs neither a second copy
+#         of the pattern nor a second copy of the argument.
+#         services/completion_claim_gate qualifies: it binds each completion
+#         marker to its one nearest ref (task 4853), so a longer clause adds
+#         candidate refs without adding claims. (The task 3403 review had found
+#         it importing this constant with clause-wide attribution, which made
+#         the bounded-blast-radius claim false.) Every out-of-module importer
+#         must show its fail-safe direction, and is held to the AST allowlist
+#         in TestClauseSplitRe.test_clause_split_re_has_no_out_of_module_consumers.
 #   (ii)  'e.g.' / 'i.e.' still split at their SECOND dot (the right-side-only
 #         rule). Harmless — that is a genuine phrase boundary, not a break
 #         between a ref and its status.
 #   (iii) A missing-space sentence boundary ('done.Task') no longer splits;
 #         rare in LLM prose, and the direction is the same over-firing as (i).
-_CLAUSE_SPLIT_RE: re.Pattern[str] = re.compile(r'\.(?!\w)|[;\n!?]')
+WIDE_CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'\.(?!\w)|[;\n!?]')
+# The old private spelling, kept only for scripts/audit_duplicate_memories.py,
+# which task 4853 could not edit; tkt_0RVBV2PMGFWETFNDCRYB4TRFW1 migrates it
+# and deletes this alias. The allowlist test scans both names.
+_CLAUSE_SPLIT_RE = WIDE_CLAUSE_BOUNDARY_RE
 
 # The ORIGINAL, pre-task-3403 clause alphabet: the fail-safe-STRICT variant,
-# exported PUBLICLY for the consumers that must NOT track _CLAUSE_SPLIT_RE's
-# widening. This is the canonical home of that divergence rationale — importers
+# for the consumers that must NOT track WIDE_CLAUSE_BOUNDARY_RE's widening.
+# This is the canonical home of that divergence rationale — importers
 # carry a one-line pointer here plus their own path-specific consequence, and
 # nothing else. (Hoisted here by the task 3403 review, which found the same
 # ~20-line argument written out twice, next to two byte-identical copies of
 # this pattern: free to drift apart, and needing every future fix applied
 # twice.)
 #
-# WHY A SECOND CONSTANT RATHER THAN JUST _CLAUSE_SPLIT_RE:
+# WHY A SECOND CONSTANT RATHER THAN JUST WIDE_CLAUSE_BOUNDARY_RE:
 #
-#   _CLAUSE_SPLIT_RE (above) scopes a task-ref-to-status association read by
-#   find_conflicting_task_status_ids / find_present_tense_completion_claim_
-#   task_ids, both of which feed early-return SOFT-BLOCK write gates in
+#   WIDE_CLAUSE_BOUNDARY_RE (above) scopes a task-ref-to-status association
+#   read by find_conflicting_task_status_ids /
+#   find_present_tense_completion_claim_task_ids, both of which feed early-return SOFT-BLOCK write gates in
 #   server/tools.py. A LONGER clause there costs the author a
 #   rephrase-and-retry and nothing else, so trading a little precision for the
 #   recall win of not shattering dotted technical tokens is the right trade.
@@ -402,14 +435,12 @@ _CLAUSE_SPLIT_RE: re.Pattern[str] = re.compile(r'\.(?!\w)|[;\n!?]')
 #   - reconciliation/stale_status_snapshot_edge_sweep._list_segment — closes a
 #     segment from which BARE DIGITS are harvested as task ids, ending in
 #     memory_service.update_edge(invalid_at=...)
-#   - services/completion_claim_gate._iter_clauses — scopes a claim written as
-#     extra['unverified_claim'] into the Graphiti source_description and every
-#     derived Mem0 fact's metadata, plus an operator escalation, on EVERY
-#     add_episode regardless of agent
+#   - middleware/dependency_direction_check.extract_dependency_assertions —
+#     scopes a dependency-direction assertion that can end in a retired edge
 #
 # A THIRD importer must first show the same fail-safe direction. Wanting the
-# WIDENING instead means wanting _CLAUSE_SPLIT_RE, which is module-private by
-# contract (residual (i) above) — that is a design conversation, not an import.
+# WIDENING instead means joining WIDE_CLAUSE_BOUNDARY_RE's allowlist (residual
+# (i) above) — that is a design conversation, not an import.
 STRICT_CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'[.;\n!?]')
 
 
@@ -433,7 +464,7 @@ def find_conflicting_task_status_ids(text: str) -> set[int]:
     non_terminal_ids: set[int] = set()
     terminal_ids: set[int] = set()
 
-    for clause in _CLAUSE_SPLIT_RE.split(text):
+    for clause in WIDE_CLAUSE_BOUNDARY_RE.split(text):
         if not clause:
             continue
         ids_in_clause = {int(m) for m in TASK_REF_RE.findall(clause)}
@@ -553,7 +584,7 @@ def frames_live_task_status_as_current_fact(text: str) -> bool:
 # runs on the rare write that actually contains a completion claim.
 #
 # Detection mirrors find_conflicting_task_status_ids exactly: clause-split on
-# _CLAUSE_SPLIT_RE, extract explicit task refs per clause via TASK_REF_RE
+# WIDE_CLAUSE_BOUNDARY_RE, extract explicit task refs per clause via TASK_REF_RE
 # ('task N'/'df N'/'#N'/'task/N', NOT bare digits), and tag a clause's ids when
 # PRESENT_TENSE_COMPLETION_RE matches a copy of the clause with the
 # NEGATED_TERMINAL_RE and FUTURE_ASPIRATIONAL_RE spans stripped out. Requiring
@@ -591,7 +622,8 @@ PRESENT_TENSE_COMPLETION_RE: re.Pattern[str] = re.compile(
     # commonly transitive-capable words ("resolved"/"completed") are deliberately
     # NOT here — they match only in copula form below, so "task N resolved <obj>"
     # does not false-fire (task 2824 review; see the module comment above).
-    r'landed|merged|shipped|'
+    # The (?<!-) keeps a hyphenated compound ("a merge-landed fix") out.
+    r'(?<!-)(?:landed|merged|shipped)|'
     # copula/auxiliary + (been/already/now/fully)* + completion word
     r'(?:is|are|was|were|has|have|had|been)\s+(?:been\s+|already\s+|now\s+|fully\s+)*'
     r'(?:done|complete|completed|resolved|merged|fixed|landed|shipped|closed)|'
@@ -650,7 +682,7 @@ def find_present_tense_completion_claim_task_ids(text: str) -> set[int]:
     """
     result: set[int] = set()
 
-    for clause in _CLAUSE_SPLIT_RE.split(text):
+    for clause in WIDE_CLAUSE_BOUNDARY_RE.split(text):
         if not clause:
             continue
         ids_in_clause = {int(m) for m in TASK_REF_RE.findall(clause)}
@@ -817,6 +849,9 @@ MAX_CANCELLED_TASKS_RETAINED: int = 15
 # task_knowledge_sync's hint-attention section slice, ensuring the two sections
 # always reference the same set of tasks — see task_knowledge_sync.assemble_payload().
 MAX_ACTIVE_TASKS_RENDERED: int = 50
+
+ACTIVE_TASK_TREE_TITLE: str = 'Active Task Tree'
+ACTIVE_TASK_TREE_HEADER: str = f'### {ACTIVE_TASK_TREE_TITLE}'
 
 # Status priority for sorting: lower value = higher priority.
 # Matches _select_proactive_sample in task_knowledge_sync.py.
@@ -1485,6 +1520,30 @@ def format_task_list(tasks: list[Any]) -> str:
     return '\n'.join(_render_task_line(t) for t in tasks if isinstance(t, dict)) or 'No tasks.'
 
 
+def _retained_window_note(*, status: str, cap_name: str, cap: int, count: int, retained: list[dict]) -> str:
+    return window_note(
+        shown=len(retained),
+        total=count,
+        noun=f'{status} task(s)',
+        window='highest-id (most recent)',
+        cap_name=cap_name,
+        cap=cap,
+    )
+
+
+def render_retained_done_tasks(tree: FilteredTaskTree) -> str:
+    """Render ``tree.done_tasks``, ending with a window note when MAX_DONE_TASKS_RETAINED left some out."""
+    listing = format_task_list(tree.done_tasks)
+    note = _retained_window_note(
+        status='done',
+        cap_name='MAX_DONE_TASKS_RETAINED',
+        cap=MAX_DONE_TASKS_RETAINED,
+        count=tree.done_count,
+        retained=tree.done_tasks,
+    )
+    return f'{listing}\n\n{note}' if note else listing
+
+
 # --------------------------------------------------------------------------- #
 # Surrounding-strings helper
 # --------------------------------------------------------------------------- #
@@ -1508,7 +1567,7 @@ def _format_header(shown: int, omitted_active: int, tree: FilteredTaskTree) -> s
         tree: FilteredTaskTree supplying the done/cancelled/other/total counts.
     """
     return (
-        f'### Active Task Tree\n'
+        f'{ACTIVE_TASK_TREE_HEADER}\n'
         f'({shown} active shown'
         + (f', {omitted_active} more active omitted by max_tasks cap' if omitted_active > 0 else '')
         + f', {tree.done_count} done, {tree.cancelled_count} cancelled, '
@@ -1554,6 +1613,15 @@ def _build_surrounding(
 
     if tree.cancelled_tasks:
         cancelled_lines = '\n'.join(_render_task_line(t) for t in tree.cancelled_tasks)
+        note = _retained_window_note(
+            status='cancelled',
+            cap_name='MAX_CANCELLED_TASKS_RETAINED',
+            cap=MAX_CANCELLED_TASKS_RETAINED,
+            count=tree.cancelled_count,
+            retained=tree.cancelled_tasks,
+        )
+        if note:
+            cancelled_lines = f'{cancelled_lines}\n\n{note}'
         cancelled_section = f'\n### Recently Cancelled Tasks\n{cancelled_lines}\n'
         summary_line = f'{tree.done_count} done — omitted'
     else:
@@ -1793,6 +1861,9 @@ def format_filtered_task_tree(
     - When tree.cancelled_tasks is empty, the section is omitted and the
       summary retains the format '{done_count} done, {cancelled_count}
       cancelled — omitted' for backward compatibility.
+
+    When MAX_CANCELLED_TASKS_RETAINED left cancelled tasks out, the section ends
+    with a note naming the window it shows.
 
     The cancelled section is never truncated by the max_chars clamp — only
     active task lines are trimmed. The cancelled section length is subtracted

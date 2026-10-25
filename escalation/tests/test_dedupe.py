@@ -2,7 +2,36 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
+
 import pytest
+
+
+@contextlib.contextmanager
+def _collect_log(name: str, level: int = logging.INFO):
+    """Yield a growing list of ``(levelno, message)`` emitted on the logger *name*.
+
+    A handler attached to the named logger rather than pytest's ``caplog``:
+    the suite runs under xdist and asserts on exactly one logger, so the
+    capture stays independent of global log-level state.
+    """
+    records: list[tuple[int, str]] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append((record.levelno, record.getMessage()))
+
+    handler = _Collect(level=level)
+    log = logging.getLogger(name)
+    previous = log.level
+    log.addHandler(handler)
+    log.setLevel(level)
+    try:
+        yield records
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(previous)
 
 
 class TestSummaryDedupeKey:
@@ -868,6 +897,80 @@ class TestDedupeConfigForRecon:
         assert result == 'esc-1-1'
 
 
+class TestDedupeConfigForContentFingerprint:
+    """DedupeConfig.for_content_fingerprint(category) — the unbounded content-fingerprint fold policy."""
+
+    _CATEGORY = 'design_concern'
+
+    def _make_esc(
+        self,
+        esc_id: str,
+        fingerprint: str | None = 'fp',
+        category: str = _CATEGORY,
+        ts: str | None = None,
+    ):
+        from escalation.models import Escalation
+        esc = Escalation(
+            id=esc_id,
+            task_id='42',
+            agent_role='reconciler',
+            severity='blocking',
+            category=category,
+            summary='Recurring finding on subject 42',
+            level=1,
+        )
+        esc.dedupe_fingerprint = fingerprint
+        if ts is not None:
+            esc.timestamp = ts
+        return esc
+
+    def test_config_shape(self):
+        import math
+
+        from escalation.dedupe import DedupeConfig, content_fingerprint_key
+
+        cfg = DedupeConfig.for_content_fingerprint(self._CATEGORY)
+        assert cfg.infra_dedupe_enabled is True
+        assert math.isinf(cfg.infra_dedupe_window_secs)
+        assert cfg.infra_dedupe_window_secs > 0
+        assert cfg.infra_dedupe_categories == (self._CATEGORY,)
+        assert cfg.key_fn is content_fingerprint_key
+
+    def test_folds_matching_fingerprint_regardless_of_age(self, tmp_path):
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        three_days_ago = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        queue.submit(self._make_esc('esc-42-1', ts=three_days_ago))
+
+        cfg = DedupeConfig.for_content_fingerprint(self._CATEGORY)
+        assert find_dedupe_parent(queue, self._make_esc('esc-42-2'), cfg) == 'esc-42-1'
+        assert find_dedupe_parent(
+            queue, self._make_esc('esc-42-3', fingerprint='other-fp'), cfg,
+        ) is None
+
+    def test_other_category_is_not_folded(self, tmp_path):
+        from escalation.dedupe import DedupeConfig, resolve_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_esc('esc-42-1', category='risk_identified'))
+
+        candidate = self._make_esc('esc-42-2', category='risk_identified')
+        cfg = DedupeConfig.for_content_fingerprint(self._CATEGORY)
+        assert resolve_dedupe_parent(queue, candidate, cfg) is None
+
+    def test_for_recon_is_derived_from_it(self):
+        from escalation.dedupe import DedupeConfig
+
+        assert DedupeConfig.for_recon() == DedupeConfig.for_content_fingerprint(
+            'recon_integrity_issue',
+        )
+
+
 class TestDedupeConfigForGateBacklog:
     """DedupeConfig.for_gate_backlog() — sibling constructor for stale-gate dedup.
 
@@ -1537,6 +1640,323 @@ class TestSubmitOrDedupe:
         files = self._queue_files(queue)
         assert len(files) == 1  # only the new esc (parent was archived)
         assert result2['id'] == files[0].stem
+
+
+class TestDedupeHalves:
+    """``submit_or_dedupe``'s two halves, named and independently callable.
+
+    ``resolve_dedupe_parent`` is the pure READ — the two gates plus the
+    ``find_dedupe_parent`` scan — and ``attach_or_submit`` is the WRITE — the
+    TOCTOU guard, the fold, and the submit fall-through.  They are separately
+    named because only the READ half moves to a worker thread (task 5648), so
+    each has to be reachable on its own, and the read half has to be provably
+    free of writes.  That second property is not asserted once in a test of its
+    own: ``_resolve`` below re-checks it on EVERY call this class makes, so a
+    write that creeps into the read half fails whichever test introduced it.
+    """
+
+    def _make_infra_esc(self, esc_id: str, task_id: str = '42', summary: str = 'fused-memory connection timeout on port 8002'):
+        from escalation.models import Escalation
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+        )
+
+    def _queue_files(self, queue):
+        return sorted(queue.queue_dir.glob('esc-*.json'))
+
+    def _resolve(self, queue, esc, config, now=None):
+        """``resolve_dedupe_parent``, with its read-only contract enforced.
+
+        The queue root is snapshotted across the call, so the property step 4
+        relies on when it moves this function to a worker thread — it writes
+        nothing — is checked at every use rather than in one test a later
+        change could route around.
+        """
+        from escalation.dedupe import resolve_dedupe_parent
+
+        before = self._queue_files(queue)
+        result = resolve_dedupe_parent(queue, esc, config, now=now)
+        assert self._queue_files(queue) == before, (
+            'resolve_dedupe_parent is the READ half and must write nothing'
+        )
+        return result
+
+    # --- resolve_dedupe_parent: the one outcome that finds a parent ---
+
+    def test_resolve_returns_the_oldest_matching_parent(self, tmp_path):
+        """Both gates open and two same-key parents pending => the OLDER id."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        older = self._make_infra_esc('esc-1-1')
+        older.timestamp = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+        queue.submit(older)
+        newer = self._make_infra_esc('esc-1-2')
+        newer.timestamp = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+        queue.submit(newer)
+
+        candidate = self._make_infra_esc('esc-1-3', summary='Fused-memory  CONNECTION timeout!')
+
+        assert self._resolve(queue, candidate, DedupeConfig()) == older.id
+
+    # --- resolve_dedupe_parent: the three outcomes that return None ---
+
+    def test_resolve_returns_none_when_the_enabled_gate_is_shut(self, tmp_path):
+        """Gate 1 — a same-key pending parent exists and is still not returned."""
+        from escalation.dedupe import DedupeConfig
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+        candidate = self._make_infra_esc('esc-1-2', summary='Fused-memory  CONNECTION timeout!')
+
+        assert self._resolve(queue, candidate, DedupeConfig(infra_dedupe_enabled=False)) is None
+
+    def test_resolve_returns_none_for_a_category_outside_the_gate(self, tmp_path):
+        """Gate 2 — same summary tokens, category the stock config does not fold."""
+        from escalation.dedupe import DedupeConfig
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        parent.category = 'design_concern'
+        queue.submit(parent)
+        candidate = self._make_infra_esc('esc-1-2')
+        candidate.category = 'design_concern'
+
+        assert self._resolve(queue, candidate, DedupeConfig()) is None
+
+    def test_resolve_returns_none_when_both_gates_open_but_nothing_matches(self, tmp_path):
+        """The scan itself found no parent — the outcome the two gates cannot produce."""
+        from escalation.dedupe import DedupeConfig
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1', summary='falkordb refused the connection'))
+        candidate = self._make_infra_esc('esc-1-2')
+
+        assert self._resolve(queue, candidate, DedupeConfig()) is None
+
+    # --- attach_or_submit: the three branches of the WRITE half ---
+
+    def test_attach_or_submit_folds_into_a_real_pending_parent(self, tmp_path):
+        """A live parent id yields the dedup_skipped shape and no second file."""
+        from escalation.dedupe import attach_or_submit
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        queue.submit(parent)
+        child = self._make_infra_esc('esc-1-2', summary='Fused-memory  CONNECTION timeout!')
+
+        result = attach_or_submit(queue, child, parent.id)
+
+        assert result == {
+            'id': parent.id,
+            'status': 'dedup_skipped',
+            'parent_id': parent.id,
+            'child_id': child.id,
+            'level': child.level,
+        }
+        assert len(self._queue_files(queue)) == 1
+
+    def test_attach_or_submit_with_no_parent_submits(self, tmp_path):
+        """parent_id=None is the submit fall-through, reported from observed state."""
+        from escalation.dedupe import attach_or_submit
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_infra_esc('esc-1-1')
+
+        result = attach_or_submit(queue, esc, None)
+
+        assert result['id'] == esc.id
+        assert result['status'] == 'queued'
+        # 'level' is on every branch — the documented "the echo confirms the
+        # level landed" contract, which the halves must not drop.
+        assert result['level'] == esc.level
+        assert [p.stem for p in self._queue_files(queue)] == [esc.id]
+
+    def test_attach_or_submit_falls_through_when_the_parent_was_resolved(self, tmp_path):
+        """The TOCTOU guard, now exercised through the named half.
+
+        A parent resolved between the resolve and the attach must produce a
+        real submit, never a dropped record — which is why step 4 can put an
+        ``await`` between the two halves without adding race handling.
+        """
+        from escalation.dedupe import attach_or_submit
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        queue.submit(parent)
+        queue.resolve(parent.id, resolution='raced')
+        child = self._make_infra_esc('esc-1-2', summary='Fused-memory  CONNECTION timeout!')
+
+        result = attach_or_submit(queue, child, parent.id)
+
+        assert result['status'] == 'queued', (
+            f'a stale parent id must fall through to submit; got: {result}'
+        )
+        assert [p.stem for p in self._queue_files(queue)] == [child.id]
+
+    # --- the composition ---
+
+    def test_submit_or_dedupe_is_exactly_the_two_halves_composed(self, tmp_path):
+        """Same inputs, same response — on the fold branch and the queued one.
+
+        Stated as an equality against the composition rather than by re-pinning
+        response shapes: ``TestSubmitOrDedupe`` above already owns those four
+        branches, and 15+ sync callers outside this package depend on them, so
+        a second copy of the expectations here would be the thing that drifts.
+        """
+        from escalation.dedupe import DedupeConfig, attach_or_submit, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        def _seeded(root):
+            queue = EscalationQueue(root)
+            queue.submit(self._make_infra_esc('esc-1-1'))
+            return queue
+
+        cfg = DedupeConfig()
+        for child_id, summary in (
+            ('esc-1-2', 'Fused-memory  CONNECTION timeout!'),   # folds
+            ('esc-1-3', 'falkordb refused the connection'),      # queues
+        ):
+            whole = _seeded(tmp_path / f'whole-{child_id}')
+            halves = _seeded(tmp_path / f'halves-{child_id}')
+
+            via_whole = submit_or_dedupe(whole, self._make_infra_esc(child_id, summary=summary), cfg)
+            esc = self._make_infra_esc(child_id, summary=summary)
+            via_halves = attach_or_submit(halves, esc, self._resolve(halves, esc, cfg))
+
+            assert via_whole == via_halves, (
+                f'submit_or_dedupe diverged from its halves on {summary!r}: '
+                f'{via_whole} != {via_halves}'
+            )
+
+
+class TestFileOrFoldL1:
+    """file_or_fold_l1 — the shared L1 file-or-fold filer, driven against a REAL queue.
+
+    A MagicMock cannot witness a fold or a dedupe_count, and those are the
+    contract on every cycle after the first.
+    """
+
+    _LOGGER = 'test_dedupe.file_or_fold_l1'
+
+    @pytest.fixture
+    def queue(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        return EscalationQueue(tmp_path / 'escalations')
+
+    def _file(self, queue, **overrides):
+        from escalation.dedupe import file_or_fold_l1
+
+        kwargs = {
+            'project_id': 'p',
+            'subject': '3105',
+            'category': 'design_concern',
+            'finding_category': 'fc_a',
+            'agent_role': 'role-x',
+            'summary': 'S1',
+            'detail': 'D1',
+            'log': logging.getLogger(self._LOGGER),
+            'log_label': 'label-x',
+        }
+        kwargs.update(overrides)
+        return file_or_fold_l1(queue, **kwargs)
+
+    @staticmethod
+    def _pending(queue, subject='3105'):
+        return queue.get_by_task(subject, status='pending', level=1)
+
+    def test_first_filing_mints_one_l1_record(self, queue):
+        from escalation.dedupe import compute_content_fingerprint
+
+        assert self._file(queue) is True
+
+        pending = self._pending(queue)
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert esc.category == 'design_concern'
+        assert esc.agent_role == 'role-x'
+        assert esc.task_id == '3105'
+        assert esc.summary == 'S1'
+        assert esc.detail == 'D1'
+        # The identity formula live parents on disk were stamped with.
+        assert esc.dedupe_fingerprint == compute_content_fingerprint(
+            'design_concern', 'fc_a', ['p:3105'],
+        )
+
+    def test_recurrence_folds_and_logs_info_on_the_callers_logger(self, queue):
+        assert self._file(queue) is True
+        parent_id = self._pending(queue)[0].id
+
+        with _collect_log(self._LOGGER) as records:
+            assert self._file(queue, summary='S2', detail='D2') is False
+
+        pending = self._pending(queue)
+        assert len(pending) == 1
+        assert pending[0].dedupe_count == 1
+        assert pending[0].summary == 'S1'
+        infos = [message for level, message in records if level == logging.INFO]
+        assert len(infos) == 1
+        assert 'label-x' in infos[0]
+        assert '3105' in infos[0]
+        assert parent_id in infos[0]
+
+    def test_distinct_finding_category_is_its_own_record(self, queue):
+        assert self._file(queue) is True
+        assert self._file(queue, finding_category='fc_b') is True
+
+        pending = self._pending(queue)
+        assert len(pending) == 2
+        assert pending[0].dedupe_fingerprint != pending[1].dedupe_fingerprint
+
+    def test_distinct_subject_is_its_own_record(self, queue):
+        assert self._file(queue) is True
+        assert self._file(queue, subject='4102') is True
+
+        assert len(self._pending(queue)) == 1
+        assert len(self._pending(queue, '4102')) == 1
+
+    def test_project_is_part_of_the_fold_key(self, queue):
+        assert self._file(queue) is True
+        assert self._file(queue, project_id='other') is True
+
+        assert len(self._pending(queue)) == 2
+
+    def test_submit_failure_is_logged_on_the_callers_logger_and_not_raised(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        class _BrokenQueue(EscalationQueue):
+            def submit(self, escalation):
+                raise RuntimeError('boom')
+
+        queue = _BrokenQueue(tmp_path / 'escalations')
+        with (
+            _collect_log(self._LOGGER) as records,
+            _collect_log('escalation.dedupe') as module_records,
+        ):
+            assert self._file(queue) is False
+
+        warnings = [message for level, message in records if level == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'label-x' in warnings[0]
+        assert '3105' in warnings[0]
+        assert module_records == []
 
 
 class TestEscalationDedupeFingerprint:

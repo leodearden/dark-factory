@@ -1,13 +1,23 @@
 """Canonical cap / auth banner markers — the loose-substring detection contract.
 
 The single home for "does this CLI reply mean no useful model output is
-coming?".  Two independent consumers share it:
+coming?".  Three independent consumers share it:
 
 * ``shared/tests/_capacity_skip.py`` (task 3483) — the ``pytest.skip`` guard
   for real-CLI integration tests.  Matches CAPACITY only.
 * ``scripts/legibility/census.py`` — the usage-headroom probe that gates the
   legibility census's mining and verify stages.  Matches capacity OR auth,
   since either means the probe reply is a banner rather than a model turn.
+* ``scripts/legibility/coder.py`` (task 4736) — the trickle coder's defer
+  gate, on its one remaining path: a reply that failed to parse as a
+  verdict.  Matches capacity OR auth for the same reason the census does.
+  Deciding whether an ACCOUNT is out is not the coder's: every trickle and
+  census call runs through the shared session runner
+  (``shared.cli_invoke.invoke_with_cap_retry``, task 6042), whose strict
+  detector owns that — and which sees only FAILED results (a real cap always
+  arrives as one, task 6213), so a banner delivered as a successful reply
+  reaches this loose scan instead.  Two contracts, two consequences, two
+  matchers.
 
 **Why this lives in ``src/`` rather than ``tests/``.**  The list started in
 ``shared/tests/_capacity_skip.py``, which is importable solely via that
@@ -118,9 +128,23 @@ REAL_CLI_CAP_HIT_MESSAGES: tuple[str, ...] = (
     # Observed 2026-08-01, claude CLI 2.1.220, task 3454, during the
     # cross-account resume probe: account B answered the resumed turn with
     # this and no model turn ever ran.  Recorded verbatim in the measurement
-    # comment at ``shared/src/shared/cli_invoke.py`` L1435.  This is the ONLY
-    # entry observed as a transcript first-hand.
+    # comment at ``shared/src/shared/cli_invoke.py`` L1435.  One of the two
+    # entries observed as a transcript first-hand.
     "You've hit your weekly limit · resets Aug 5, 11am",
+    # Observed 2026-08-24, task 4736, on the all-accounts-capped trickle
+    # night: 43 session transcripts written under
+    # ``~/.claude/projects/-home-leo-src-dark-factory/`` in the 03:03-03:08
+    # BST window (= 20 reify + 23 dark_factory digests), each terminating in
+    # an assistant message with the synthetic sentinel model and zero tokens,
+    # carrying exactly this line.  The CLI wrote it to STDOUT and exited 1, so
+    # the coder's stderr-only error text reached the journal, the escalation
+    # and ``run.failures`` as an EMPTY string on 17 of 20 digests — the second
+    # half of what task 4736 fixes.  The corpus's second first-hand-observed
+    # entry, and the reason this module asks for "a transcript to cite".
+    # Note the plain ASCII hyphen: the 08-01 entry above separates with a
+    # U+00B7 middle dot and this one does not, which is exactly why no marker
+    # may depend on the separator.
+    "You've hit your weekly limit - resets 2pm (Europe/London)",
     # The cap-hit messages that motivated the marker list.  Their original
     # provenance pointer read "shared.usage_gate inline comments, lines 64-75";
     # task 2129 moved those string tables to ``shared.invocation_outcome``

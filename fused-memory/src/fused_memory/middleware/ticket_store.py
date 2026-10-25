@@ -1,21 +1,78 @@
 """Ticket persistence store for two-phase add_task submit/resolve flow.
 
 Tickets survive fused-memory restarts via SQLite (sibling DB to reconciliation.db).
-On startup, any tickets left in 'pending' state from a prior run are marked as
-'failed' with reason='server_restart'.
+
+Two statuses are non-terminal. ``pending`` is queued for, or in, curation.
+``awaiting_curation`` is parked: the curator could not judge the submission,
+so it waits for its ``next_attempt_at`` and the ticket janitor requeues it to
+``pending``. ``attempts`` counts its deferrals and ``defer_reason`` holds the
+:class:`DeferReason` of the latest one, which says why it could not; both
+survive the requeue. A parked ticket has no terminal bound: it waits for a
+verdict.
+
+A ``pending`` row whose worker is gone (a restart, or a dead worker) is
+recovered by one rule: one already deferred (``attempts > 0``) is re-parked,
+due now; one never deferred is failed. A restart also makes every parked row
+due now.
 """
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import secrets
+import statistics
 import time
+from collections import Counter
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING, Final
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
+from shared.async_sqlite_base import (
+    AtomicConnection,
+    CheckpointResult,
+    apply_full_durability_pragmas,
+    connect_daemon,
+)
+from shared.sqlite_column_migration import add_column_if_missing
+
+from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
+
+if TYPE_CHECKING:
+    from fused_memory.middleware.curation_deferral import CurationRetryPolicy
+
+AWAITING_CURATION: Final = 'awaiting_curation'
+
+
+@dataclass(frozen=True)
+class DedupHealth:
+    """One project's curator verdicts over a window (see :meth:`TicketStore.dedup_health`)."""
+
+    resolved: int
+    combined: int
+    median_resolve_seconds: float | None
+    top_create_reasons: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True)
+class CurationBacklog:
+    """One project's parked tickets for one reason (see :meth:`TicketStore.summarise_awaiting_curation`)."""
+
+    project_id: str
+    defer_reason: DeferReason
+    count: int
+    oldest_created_at: str
+    max_attempts: int
+
+
+@dataclass(frozen=True)
+class OrphanedPendingRecovery:
+    """What recovering a gone worker's ``pending`` rows did to each of them."""
+
+    failed_ids: tuple[str, ...]
+    reparked_ids: tuple[str, ...]
+
 
 # Crockford Base32 alphabet — omits I, L, O, U to reduce transcription errors.
 _CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
@@ -60,7 +117,10 @@ CREATE TABLE IF NOT EXISTS tickets (
     created_at  TEXT NOT NULL,
     resolved_at TEXT,
     expires_at  TEXT NOT NULL,
-    escalated_at TEXT
+    escalated_at TEXT,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    defer_reason TEXT
 );
 """
 
@@ -73,6 +133,21 @@ CREATE INDEX IF NOT EXISTS ix_tickets_status_created
 
 CREATE INDEX IF NOT EXISTS ix_tickets_status_escalated
     ON tickets (status, escalated_at);
+
+CREATE INDEX IF NOT EXISTS ix_tickets_project_status_resolved
+    ON tickets (project_id, status, resolved_at);
+
+CREATE INDEX IF NOT EXISTS ix_tickets_status_next_attempt
+    ON tickets (status, next_attempt_at);
+"""
+
+# The window read behind :meth:`TicketStore.dedup_health`. It runs once a
+# janitor tick per project, so ``ix_tickets_project_status_resolved`` keeps
+# its cost bounded by the window rather than by the unpruned table.
+DEDUP_HEALTH_SQL = """
+SELECT status, reason, created_at, resolved_at FROM tickets
+WHERE project_id = ? AND status IN ('created', 'combined')
+  AND resolved_at IS NOT NULL AND resolved_at >= ?
 """
 
 # Back-compat alias — third-party code (and old tests) imported SCHEMA_SQL
@@ -80,22 +155,71 @@ CREATE INDEX IF NOT EXISTS ix_tickets_status_escalated
 SCHEMA_SQL = TABLE_SQL + INDEX_SQL
 
 
+_CURATION_RETRY_COLUMNS: Final = {
+    'attempts': 'INTEGER NOT NULL DEFAULT 0',
+    'next_attempt_at': 'TEXT',
+    'defer_reason': 'TEXT',
+}
+
+
+def _placeholders(values: tuple[str, ...]) -> str:
+    return ', '.join('?' * len(values))
+
+
+def _utc_iso(moment: datetime) -> str:
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError(f'expected a timezone-aware datetime, got naive {moment.isoformat()}')
+    return moment.astimezone(UTC).isoformat()
+
+
+async def _recover_orphaned_pending(
+    db: aiosqlite.Connection, *, reason: str, project_id: str | None = None,
+) -> OrphanedPendingRecovery:
+    """Re-park every deferred ``pending`` row, due now; fail the rest with *reason*.
+
+    Runs inside the caller's write unit. *project_id* None covers every project.
+    """
+    scope_sql, scope_params = ('', ()) if project_id is None else (' AND project_id = ?', (project_id,))
+    rows = await db.execute_fetchall(
+        f"SELECT ticket_id, attempts FROM tickets WHERE status = 'pending'{scope_sql} "
+        'ORDER BY created_at, ticket_id',
+        scope_params,
+    )
+    reparked_ids = tuple(row['ticket_id'] for row in rows if row['attempts'] > 0)
+    failed_ids = tuple(row['ticket_id'] for row in rows if row['attempts'] == 0)
+    await db.execute(
+        f"""
+        UPDATE tickets SET status = ?, next_attempt_at = NULL
+        WHERE status = 'pending' AND attempts > 0{scope_sql}
+        """,
+        (AWAITING_CURATION, *scope_params),
+    )
+    await db.execute(
+        f"""
+        UPDATE tickets SET status = 'failed', reason = ?, resolved_at = ?
+        WHERE status = 'pending' AND attempts = 0{scope_sql}
+        """,
+        (reason, datetime.now(UTC).isoformat(), *scope_params),
+    )
+    return OrphanedPendingRecovery(failed_ids=failed_ids, reparked_ids=reparked_ids)
+
+
 class TicketStore:
     """SQLite-backed store for two-phase add_task tickets."""
 
     def __init__(self, db_path: Path | str) -> None:
         self._db_path = Path(db_path)
-        self._db: aiosqlite.Connection | None = None
+        self._access: AtomicConnection | None = None
 
     async def initialize(self) -> None:
         """Open the SQLite connection and create the schema.
 
         Idempotent at both the connection level and the schema level:
 
-        * **Connection-level** — if ``self._db`` is already set (e.g. from a
+        * **Connection-level** — if the store is already open (e.g. from a
           prior ``initialize()`` or a reconnect-via-reinit pattern), the
           existing connection is closed first via :meth:`close` (which also
-          checkpoints the WAL and nulls ``self._db``) before a fresh one is
+          checkpoints the WAL and nulls ``self._access``) before a fresh one is
           opened.  This prevents orphaning the aiosqlite worker thread, which
           would otherwise raise ``"Event loop is closed"`` on GC (tasks 1560,
           1562).
@@ -104,55 +228,52 @@ class TicketStore:
           ``CREATE INDEX IF NOT EXISTS`` make repeated calls safe on an
           already-initialised database.
         """
-        if self._db is not None:
+        if self._access is not None:
             # Idempotent / reconnect-safe: close (checkpoint WAL + close +
             # null out) any prior connection before reassigning.  Orphaning it
             # leaks the aiosqlite worker thread and raises "Event loop is
             # closed" on GC (tasks 1560, 1562).
             await self.close()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await connect_daemon(str(self._db_path))
-        self._db.row_factory = aiosqlite.Row
-        await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
+        conn = await connect_daemon(str(self._db_path))
+        conn.row_factory = aiosqlite.Row
+        await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+        self._access = AtomicConnection(conn)
         # Tables first, then in-place migrate, then indexes — the
         # escalated_at index references the column added by the migration.
-        await self._db.executescript(TABLE_SQL)
+        async with self._access.write() as db:
+            await db.executescript(TABLE_SQL)
         await self._migrate_add_escalated_at()
-        await self._db.executescript(INDEX_SQL)
-        await self._db.commit()
+        await self._migrate_add_curation_retry_columns()
+        async with self._access.write() as db:
+            await db.executescript(INDEX_SQL)
         logger.info('TicketStore initialized at %s', self._db_path)
 
     async def _migrate_add_escalated_at(self) -> None:
         """Add the ``escalated_at`` column to existing DBs that pre-date it.
 
         ``CREATE TABLE IF NOT EXISTS`` is a no-op on existing tables, so the
-        column needs an explicit ALTER for legacy DBs. Idempotent: probes
-        ``PRAGMA table_info`` first.
+        column needs an explicit ALTER for legacy DBs.
         """
-        db = self._require_db()
-        cursor = await db.execute('PRAGMA table_info(tickets)')
-        rows = await cursor.fetchall()
-        cols = {row[1] for row in rows}
-        if 'escalated_at' not in cols:
-            await db.execute('ALTER TABLE tickets ADD COLUMN escalated_at TEXT')
+        async with self._require_access().write() as db:
+            added = await add_column_if_missing(db, 'tickets', 'escalated_at', 'TEXT')
+        if added:
             logger.info('TicketStore: migrated tickets table — added escalated_at column')
 
-    def _require_db(self) -> aiosqlite.Connection:
-        if self._db is None:
-            raise RuntimeError('TicketStore not initialized — call initialize() first')
-        return self._db
+    async def _migrate_add_curation_retry_columns(self) -> None:
+        async with self._require_access().write() as db:
+            added = [
+                column
+                for column, column_ddl in _CURATION_RETRY_COLUMNS.items()
+                if await add_column_if_missing(db, 'tickets', column, column_ddl)
+            ]
+        if added:
+            logger.info('TicketStore: migrated tickets table — added %s', ', '.join(added))
 
-    @contextlib.asynccontextmanager
-    async def _txn(self):
-        """Explicit transaction: commit on success, rollback on any exception."""
-        db = self._require_db()
-        try:
-            yield db
-            await db.commit()
-        except BaseException:
-            with contextlib.suppress(Exception):
-                await db.rollback()
-            raise
+    def _require_access(self) -> AtomicConnection:
+        if self._access is None:
+            raise RuntimeError('TicketStore not initialized — call initialize() first')
+        return self._access
 
     async def submit(
         self,
@@ -170,7 +291,7 @@ class TicketStore:
         now = datetime.now(UTC)
         # Advisory placeholder; reaper is worker-liveness based, not TTL.
         expires_at = now + timedelta(days=365)
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 """
                 INSERT INTO tickets
@@ -189,57 +310,164 @@ class TicketStore:
         task_id: str | None = None,
         reason: str | None = None,
         result_json: str | None = None,
+        from_statuses: tuple[str, ...] = ('pending',),
     ) -> bool:
         """Update the ticket to a terminal status.
 
-        Only updates rows that are still ``pending``; a double-resolve attempt
-        returns ``False`` without clobbering the existing terminal data.
+        Only updates a row whose status is one of *from_statuses*; a
+        double-resolve attempt returns ``False`` without clobbering the
+        existing terminal data.
         """
+        if not from_statuses:
+            raise ValueError('mark_resolved needs at least one status to resolve from')
         now = datetime.now(UTC).isoformat()
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             cursor = await db.execute(
-                """
+                f"""
                 UPDATE tickets
-                SET status = ?, task_id = ?, reason = ?, result_json = ?, resolved_at = ?
-                WHERE ticket_id = ? AND status = 'pending'
+                SET status = ?, task_id = ?, reason = ?, result_json = ?, resolved_at = ?,
+                    next_attempt_at = NULL
+                WHERE ticket_id = ? AND status IN ({_placeholders(from_statuses)})
                 """,
-                (status, task_id, reason, result_json, now, ticket_id),
+                (status, task_id, reason, result_json, now, ticket_id, *from_statuses),
             )
             if cursor.rowcount == 0:
                 logger.warning(
-                    'mark_resolved: ticket %s not in pending state (double-resolve or unknown)',
-                    ticket_id,
+                    'mark_resolved: ticket %s not in %s (double-resolve or unknown)',
+                    ticket_id, '/'.join(from_statuses),
                 )
                 return False
         return True
 
-    async def flush_pending_on_startup(self) -> int:
-        """Mark all pending tickets as failed/server_restart.
+    async def mark_awaiting_curation(
+        self,
+        ticket_id: str,
+        *,
+        reason: DeferReason,
+        policy: CurationRetryPolicy,
+        now: datetime | None = None,
+    ) -> int | None:
+        """Park a ``pending`` ticket the curator could not judge, for *reason*.
 
-        Called once at startup to clean up tickets left over from a previous
-        server run.  Returns the number of rows updated.
+        Returns the ticket's new ``attempts``, or ``None`` when the row is not
+        ``pending`` (unknown, cancelled, resolved, or already parked).
         """
-        now = datetime.now(UTC).isoformat()
-        async with self._txn() as db:
-            cursor = await db.execute(
+        now = datetime.now(UTC) if now is None else now
+        async with self._require_access().write() as db:
+            row = next(iter(await db.execute_fetchall(
+                "SELECT attempts FROM tickets WHERE ticket_id = ? AND status = 'pending'",
+                (ticket_id,),
+            )), None)
+            if row is None:
+                return None
+            attempts = row['attempts'] + 1
+            next_attempt_at = policy.next_attempt_at(attempts=attempts, now=now)
+            await db.execute(
                 """
                 UPDATE tickets
-                SET status = 'failed', reason = 'server_restart', resolved_at = ?
-                WHERE status = 'pending'
+                SET status = ?, attempts = ?, next_attempt_at = ?, defer_reason = ?, reason = ?
+                WHERE ticket_id = ? AND status = 'pending'
                 """,
-                (now,),
+                (
+                    AWAITING_CURATION, attempts, _utc_iso(next_attempt_at),
+                    reason.value, deferral_justification(reason), ticket_id,
+                ),
             )
-        count = cursor.rowcount
-        logger.info('flush_pending_on_startup: marked %d pending tickets as failed', count)
-        return count
+        return attempts
+
+    async def requeue_awaiting_curation(self, ticket_id: str) -> bool:
+        """Hand a parked ticket back to curation: ``awaiting_curation`` → ``pending``.
+
+        Keeps ``attempts``. Returns ``False``, changing nothing, when the row is
+        not parked, so a second requeue of one ticket is a no-op.
+        """
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                """
+                UPDATE tickets SET status = 'pending', next_attempt_at = NULL
+                WHERE ticket_id = ? AND status = ?
+                """,
+                (ticket_id, AWAITING_CURATION),
+            )
+        return cursor.rowcount == 1
+
+    async def fetch_due_awaiting_curation(self, *, now: datetime, limit: int) -> list[dict]:
+        """Return parked tickets due at *now*, oldest ``created_at`` first.
+
+        A NULL ``next_attempt_at`` is due at once.
+        """
+        rows = await self._require_access().read_all(
+            """
+            SELECT * FROM tickets
+            WHERE status = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+            ORDER BY created_at, ticket_id
+            LIMIT ?
+            """,
+            (AWAITING_CURATION, _utc_iso(now), limit),
+        )
+        return [dict(r) for r in rows]
+
+    async def summarise_awaiting_curation(self) -> list[CurationBacklog]:
+        """Return the parked-ticket backlog per ``(project_id, defer_reason)``, in that order."""
+        rows = await self._require_access().read_all(
+            """
+            SELECT project_id, defer_reason, COUNT(*) AS count,
+                   MIN(created_at) AS oldest_created_at, MAX(attempts) AS max_attempts
+            FROM tickets WHERE status = ?
+            GROUP BY project_id, defer_reason ORDER BY project_id, defer_reason
+            """,
+            (AWAITING_CURATION,),
+        )
+        return [
+            CurationBacklog(
+                project_id=row['project_id'],
+                defer_reason=DeferReason(row['defer_reason']),
+                count=row['count'],
+                oldest_created_at=row['oldest_created_at'],
+                max_attempts=row['max_attempts'],
+            )
+            for row in rows
+        ]
+
+    async def oldest_awaiting_curation(
+        self, project_id: str, *, defer_reason: DeferReason, limit: int,
+    ) -> list[dict]:
+        """Return the project's tickets parked for *defer_reason*, oldest ``created_at`` first."""
+        rows = await self._require_access().read_all(
+            """
+            SELECT * FROM tickets
+            WHERE project_id = ? AND status = ? AND defer_reason = ?
+            ORDER BY created_at, ticket_id
+            LIMIT ?
+            """,
+            (project_id, AWAITING_CURATION, defer_reason.value, limit),
+        )
+        return [dict(r) for r in rows]
+
+    async def flush_pending_on_startup(self) -> int:
+        """Recover the tickets a previous server run left non-terminal.
+
+        Called once at startup. Every parked row becomes due now, and every
+        ``pending`` row is recovered by the module's one rule, failing as
+        ``server_restart``. Returns the number of rows failed.
+        """
+        async with self._require_access().write() as db:
+            await db.execute(
+                'UPDATE tickets SET next_attempt_at = NULL WHERE status = ?',
+                (AWAITING_CURATION,),
+            )
+            recovery = await _recover_orphaned_pending(db, reason='server_restart')
+        logger.info(
+            'flush_pending_on_startup: failed %d pending ticket(s), re-parked %d',
+            len(recovery.failed_ids), len(recovery.reparked_ids),
+        )
+        return len(recovery.failed_ids)
 
     async def get(self, ticket_id: str) -> dict | None:
         """Return the ticket row as a plain dict, or None if not found."""
-        db = self._require_db()
-        cursor = await db.execute(
+        row = await self._require_access().read_one(
             'SELECT * FROM tickets WHERE ticket_id = ?', (ticket_id,)
         )
-        row = await cursor.fetchone()
         if row is None:
             return None
         return dict(row)
@@ -252,52 +480,22 @@ class TicketStore:
         liveness probe whether the per-project worker is still alive; dead
         workers' rows get terminalised as ``failed/worker_dead``.
         """
-        db = self._require_db()
-        cursor = await db.execute(
+        rows = await self._require_access().read_all(
             "SELECT DISTINCT project_id FROM tickets WHERE status = 'pending'",
         )
-        rows = await cursor.fetchall()
         return [row['project_id'] for row in rows]
 
-    async def mark_pending_failed_for_project(
+    async def recover_pending_for_dead_worker(
         self, project_id: str, *, reason: str,
-    ) -> list[str]:
-        """Bulk-terminalise every pending ticket in a project.
+    ) -> OrphanedPendingRecovery:
+        """Recover every ``pending`` ticket of a project whose curator worker is gone.
 
-        Used by the worker-liveness reaper when the project's curator worker
-        is gone. ``resolved_at`` is stamped so downstream consumers can
-        attribute failure timing.
-
-        Returns the list of ``ticket_id`` values that were pending (and are
-        now terminalised as ``failed``).  Both the SELECT and the UPDATE run
-        inside the same ``_txn()``.  On the store's single shared aiosqlite
-        connection the ids will exactly match the rows changed absent concurrent
-        writers; if another coroutine (e.g. a worker calling ``mark_resolved``)
-        races between the SELECT and the UPDATE, the UPDATE's ``WHERE
-        status='pending'`` guard silently skips that ticket, so ``reaped_ids``
-        may contain an id whose terminal status is not ``worker_dead``.  The
-        practical impact is benign: any woken ``resolve_ticket`` caller
-        re-reads the persisted terminal row (whatever it is), so correctness is
-        preserved — only the log count is off by the number of raced tickets.
+        The module's one rule: a deferred row is re-parked due now, the rest
+        fail with *reason*. The read and the writes run in ONE write unit, so
+        the returned ids exactly match the rows this call changed.
         """
-        now = datetime.now(UTC).isoformat()
-        async with self._txn() as db:
-            cursor = await db.execute(
-                "SELECT ticket_id FROM tickets "
-                "WHERE project_id = ? AND status = 'pending'",
-                (project_id,),
-            )
-            rows = await cursor.fetchall()
-            reaped_ids = [row['ticket_id'] for row in rows]
-            await db.execute(
-                """
-                UPDATE tickets
-                SET status = 'failed', reason = ?, resolved_at = ?
-                WHERE project_id = ? AND status = 'pending'
-                """,
-                (reason, now, project_id),
-            )
-        return reaped_ids
+        async with self._require_access().write() as db:
+            return await _recover_orphaned_pending(db, reason=reason, project_id=project_id)
 
     async def list_tickets(
         self,
@@ -310,13 +508,13 @@ class TicketStore:
         """Return tickets for a project, newest-first, optionally filtered.
 
         ``status`` matches against the status column literal ('pending',
-        'created', 'failed', 'combined', 'refused'). A ``refused`` row is
+        'awaiting_curation', 'created', 'failed', 'combined', 'refused',
+        'cancelled'). A ``refused`` row is
         terminal and has a NULL ``task_id`` — a deterministic guard rejected
         the candidate and no task was created. ``since`` filters by
         ``created_at``.
         Default window when ``since`` is None: last 7 days.
         """
-        db = self._require_db()
         if since is None:
             since = datetime.now(UTC) - timedelta(days=7)
         sql_parts = [
@@ -329,9 +527,37 @@ class TicketStore:
             params.append(status)
         sql_parts.append('ORDER BY created_at DESC LIMIT ?')
         params.append(limit)
-        cursor = await db.execute(' '.join(sql_parts), tuple(params))
-        rows = await cursor.fetchall()
+        rows = await self._require_access().read_all(' '.join(sql_parts), tuple(params))
         return [dict(r) for r in rows]
+
+    async def dedup_health(self, project_id: str, *, since: datetime) -> DedupHealth:
+        """Summarise ``created`` / ``combined`` verdicts resolved at or after *since*.
+
+        Latency is raw wall clock (``resolved_at - created_at``), so a verdict
+        reached after parking counts its parked time. Pending and parked rows
+        and ``failed`` / ``refused`` / ``cancelled`` rows are not curator dedup
+        verdicts and are excluded. A NULL create reason counts as
+        ``'(unrecorded)'``.
+        """
+        rows = await self._require_access().read_all(
+            DEDUP_HEALTH_SQL, (project_id, since.isoformat()),
+        )
+        latencies = [
+            (
+                datetime.fromisoformat(row['resolved_at'])
+                - datetime.fromisoformat(row['created_at'])
+            ).total_seconds()
+            for row in rows
+        ]
+        create_reasons = Counter(
+            row['reason'] or '(unrecorded)' for row in rows if row['status'] == 'created'
+        )
+        return DedupHealth(
+            resolved=len(rows),
+            combined=sum(1 for row in rows if row['status'] == 'combined'),
+            median_resolve_seconds=statistics.median(latencies) if latencies else None,
+            top_create_reasons=tuple(create_reasons.most_common(5)),
+        )
 
     async def fetch_unescalated_failures(
         self,
@@ -363,7 +589,6 @@ class TicketStore:
             limit: Maximum rows per call (default 100). Aligns with
                 ``curator.janitor.batch_limit``.
         """
-        db = self._require_db()
         sql = (
             "SELECT * FROM tickets "
             "WHERE status = 'failed' "
@@ -376,8 +601,7 @@ class TicketStore:
             params = (project_id,)
         sql += " ORDER BY resolved_at LIMIT ?"
         params = (*params, limit)
-        cursor = await db.execute(sql, params)
-        rows = await cursor.fetchall()
+        rows = await self._require_access().read_all(sql, params)
         return [dict(r) for r in rows]
 
     async def mark_escalated(self, ticket_ids: list[str] | tuple[str, ...]) -> int:
@@ -391,7 +615,7 @@ class TicketStore:
             return 0
         now = datetime.now(UTC).isoformat()
         placeholders = ','.join('?' * len(ticket_ids))
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             cursor = await db.execute(
                 f"UPDATE tickets SET escalated_at = ? "
                 f"WHERE ticket_id IN ({placeholders})",
@@ -406,19 +630,9 @@ class TicketStore:
         empty WAL and the main DB is fully up to date. Best-effort —
         failures don't block the close.
         """
-        if self._db is not None:
-            with contextlib.suppress(Exception):
-                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            await self._db.close()
-            self._db = None
+        if self._access is not None:
+            await self._access.close()
+            self._access = None
 
-    async def checkpoint(self) -> tuple[int, int, int]:
-        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return ``(busy, log,
-        checkpointed)``. Called by the periodic checkpoint loop in
-        ``server/main.py``."""
-        db = self._require_db()
-        cursor = await db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        row = await cursor.fetchone()
-        if row is None:
-            return (-1, -1, -1)
-        return int(row[0]), int(row[1]), int(row[2])
+    async def checkpoint(self) -> CheckpointResult:
+        return await AtomicConnection.checkpoint_or_unavailable(self._access)

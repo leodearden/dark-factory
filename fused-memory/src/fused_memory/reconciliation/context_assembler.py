@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -22,7 +23,12 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     Watermark,
 )
+from fused_memory.services.read_telemetry import (
+    summarize_search_query,
+    summarize_search_results,
+)
 from fused_memory.utils.async_utils import gather_collect
+from fused_memory.utils.clip_disclosure import elide_text
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -30,6 +36,26 @@ if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
+
+#: Per-query result limit for a memory_hints execution. Named because the value
+#: is both PASSED to the search and JOURNALLED with it, and a journalled limit
+#: that disagrees with the real one would misreport what the search could have
+#: returned (SPOT).
+_HINT_SEARCH_LIMIT = 3
+
+#: How many leading memory_hints queries a reconciliation run executes.
+#: audit_trail_rotation.py never sheds this prefix.
+HINT_QUERIES_EXECUTED = 3
+
+#: `write_ops.source` for a memory_hints execution. A distinct value from the
+#: MCP boundary's 'mcp_tool' so a consumer can tell a reconciliation-originated
+#: read from an agent-originated one without re-deriving it from `operation`.
+_HINT_JOURNAL_SOURCE = 'reconciliation_hint'
+
+#: Per-item render caps. Budget-relevant: ContextItem derives token_estimate from
+#: the clipped text, so raising either spends token_budget that buys whole events.
+_TASK_DESC_CHARS = 300
+_MEMORY_BODY_CHARS = 500
 
 
 def estimate_tokens(text: str) -> int:
@@ -44,7 +70,7 @@ def format_event(event: ReconciliationEvent) -> str:
 
 def _format_memory_result(result) -> str:
     """Format a MemoryResult into a context line."""
-    content = (result.content or '')[:500]
+    content = elide_text(result.content, _MEMORY_BODY_CHARS, field='content').text
     source = result.source_store.value if result.source_store else '?'
     cat = result.category.value if result.category else '?'
     return f'- [{result.id}] ({source}/{cat}): {content}'
@@ -64,7 +90,7 @@ def _format_task(task: dict, *, display_id: str | None = None) -> str:
     title = task.get('title', '?')
     status = task.get('status', '?')
     deps = task.get('dependencies', [])
-    desc = (task.get('description') or '')[:300]
+    desc = elide_text(task.get('description'), _TASK_DESC_CHARS, field='description').text
     hints = task.get('metadata', {}).get('memory_hints', '')
     parts = [f'- [task:{tid}] ({status}) {title} deps={deps}']
     if desc:
@@ -180,6 +206,7 @@ class ContextAssembler:
             total_tokens=used,
             events_remaining=events_remaining,
             effective_watermark=effective_wm,
+            token_budget=budget,
         )
 
     def _compute_effective_watermark(
@@ -292,13 +319,18 @@ class ContextAssembler:
         # If task has memory hints with queries, search for each
         hints = (task.get('metadata') or {}).get('memory_hints', {})
         queries = hints.get('queries', []) if isinstance(hints, dict) else []
+        # Resolved ONCE, not per query, and via the public accessor rather than
+        # MemoryService's private attribute. None means an unwired deployment,
+        # which must journal nothing rather than fail.
+        journal = getattr(self.memory, 'write_journal', None)
         _hint_exc_logged = False
-        for query in queries[:3]:  # cap hint queries
+        _hint_journal_exc_logged = False
+        for query in queries[:HINT_QUERIES_EXECUTED]:
             try:
                 results = await self.memory.search(
                     query=query,
                     project_id=project_id,
-                    limit=3,
+                    limit=_HINT_SEARCH_LIMIT,
                 )
                 for r in results:
                     items.append(ContextItem(
@@ -312,6 +344,56 @@ class ContextAssembler:
                     _hint_exc_logged = True
                 else:
                     logger.warning('memory.search failed for hint query; skipping')
+                continue
+            if journal is None:
+                continue
+            try:
+                # The THIRD producer of the shape whose single home is
+                # fused_memory/services/read_telemetry.py::summarize_search_results
+                # (INV-5).  Raw results — grouping is applied only at the MCP
+                # boundary, and reconciliation reads below it.
+                #
+                # `caller_task_id` is the ONE identity in scope here: the
+                # assembler has no run_id or causation_id at assemble() time,
+                # and gaining one would mean a 5th __init__ parameter that
+                # tests/test_harness.py's six assembler stubs do not accept.
+                #
+                # degraded/failed_stores is recorded here exactly as the other
+                # two producers record it.  Without it a hint search that ran
+                # against a downed store journals a row indistinguishable from
+                # one that genuinely found nothing — a wrong answer rather than
+                # a missing one, in the field leaf eta reads first.  getattr
+                # because a back-compat plain list carries no degrade metadata,
+                # and a plain list never degrades.
+                hint_failed_stores = getattr(results, 'failed_stores', None)
+                await journal.log_write_op(
+                    write_op_id=str(uuid.uuid4()),
+                    source=_HINT_JOURNAL_SOURCE,
+                    operation='search',
+                    project_id=project_id,
+                    kind='read',
+                    params={
+                        **summarize_search_query(query),
+                        'limit': _HINT_SEARCH_LIMIT,
+                        'caller_task_id': str(task_id),
+                    },
+                    result_summary=summarize_search_results(
+                        results, failed_stores=hint_failed_stores,
+                    ),
+                    success=not getattr(results, 'degraded', False),
+                )
+            except Exception:
+                # Telemetry must never cost the caller its hint results. The
+                # rows lost here are counted by WriteJournal's drop counter, so
+                # a burst is visible rather than silently starving leaf eta.
+                if not _hint_journal_exc_logged:
+                    logger.warning(
+                        'journalling failed for hint query; hint results kept',
+                        exc_info=True,
+                    )
+                    _hint_journal_exc_logged = True
+                else:
+                    logger.warning('journalling failed for hint query; hint results kept')
         return items
 
     async def _ctx_task_deleted(

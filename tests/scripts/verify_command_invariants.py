@@ -3,6 +3,15 @@
 This module holds NO test functions of its own. Its own unit tests live in
 ``test_verify_command_invariants.py`` beside it.
 
+Since task 4108 it also holds :func:`marked_span`, the marker-delimited document
+extraction the two CONTRIBUTING.md MIRROR guards share. That is a deliberate
+widening past "command parsing": the four marker assertions were about to exist
+in a second hand-written copy for exactly the reason the five command-parsing
+copies below did, and the same rule applies to both. Everything in the WHY IT
+EXISTS and IMPORT ME sections is written about the command helpers, but is meant
+about this module. Since task 5769 it also holds :func:`marked_body`, the
+slug-keyed form of that extraction.
+
 WHY IT EXISTS. A trio of command-parsing helpers — pick the ``&&`` segment that
 invokes the checker, extract that checker's positional targets, decide whether a
 path is covered by one of them — was hand-maintained in FIVE copies:
@@ -65,8 +74,12 @@ precedent, as ``systemd_unit_invariants.py``, ``setup_host_parsing.py`` and
 """
 from __future__ import annotations
 
+import os
 import pathlib
+import re
 import shlex
+
+from orchestrator.verify import _AND_CLAUSE_SPLIT_RE, _cd_clause_target
 
 from orchestrator import verify_cmd
 
@@ -285,39 +298,59 @@ def positional_targets(
     ``'scripts/' in cmd`` for both.
 
     *value_flags* is the caller's POLICY, and its default is the reason one
-    implementation serves five call sites unchanged. With it EMPTY, ``consume``
+    implementation serves every call site unchanged. With it EMPTY, ``consume``
     can never become True and the loop below reduces byte-for-byte to
-    ``[t for t in post if not t.startswith('-')]`` — exactly what
-    ``test_root_lint_covers_nonmember_py.py``, ``test_scripts_module_config.py``
-    and ``test_fallback_verify_config.py`` do today, phantom flag values
-    included. Supplying a set (the CONTRIBUTING guard's
-    ``_RUFF_FLAGS_TAKING_A_VALUE``, the skills guard's ``_PYTEST_VALUE_FLAGS``)
-    drops the following token instead. The
+    ``[t for t in post if not t.startswith('-')]``, phantom flag values
+    included. Supplying a set drops the following token instead. The
     ``--flag=value`` spelling needs no entry either way: ``shlex`` keeps it as
-    one token and the ``-`` prefix drops it whole.
+    one token and the ``-`` prefix drops it whole. Which call site passes which
+    set is the census below, counted per call site rather than per file: one
+    file can pass a set at one site and none at another.
 
     WHAT THIS GUARANTEES, stated no more strongly than it holds: every returned
     token was a positional argument after the anchor. It is NOT a proof that no
     unlisted value-taking flag exists — an unknown one still donates its value as
     a PHANTOM target, and nothing here can tell that phantom from a real path.
 
+    THE CALLER CENSUS. Each row is one call site: the set it passes, then what
+    it asserts of the returned targets.
+
+      * ``test_root_lint_covers_nonmember_py.py::_ruff_targets`` — none; each
+        EXISTS.
+      * ``test_fallback_verify_config.py::_lint_leg_targets`` — none; each
+        EXISTS.
+      * ``test_hook_ruff_targets_drift.py::_gate_ruff_targets`` — none; the
+        list EQUALS the hook's ``RUFF_TARGETS``.
+      * ``test_hook_magicmock_test_dirs_drift.py::_gate_magicmock_test_dirs``
+        — none; the list EQUALS the hook's ``MAGICMOCK_TEST_DIRS``.
+      * ``test_scripts_module_config.py::_targets`` — none for the ruff and
+        pyright legs, which check MEMBERSHIP; its own ``_PYTEST_VALUE_FLAGS``
+        for the pytest leg via ``_pytest_targets``, which checks MEMBERSHIP
+        and EQUALITY.
+      * ``test_contributing_lint_command_drift.py::_ruff_targets`` —
+        ``_RUFF_FLAGS_TAKING_A_VALUE``; each EXISTS.
+      * ``test_skills_module_config_decision.py::_pytest_collected_dirs`` —
+        its own ``_PYTEST_VALUE_FLAGS``; each EXISTS.
+      * ``test_fallback_verify_config.py::_fleet_pytest_suite_names`` — its
+        own ``_PYTEST_VALUE_FLAGS``; the suite keys EQUAL its measured tables.
+      * ``test_member_scripts_type_gate.py``'s one inline call —
+        ``_PYRIGHT_VALUE_FLAGS``; COVERAGE via :func:`covers`.
+
     A PHANTOM IS NOT UNIFORMLY HARMLESS, and which callers can tolerate one does
-    NOT partition by which ones supply a set. Against a COVERAGE check a phantom
-    is inert: :func:`covers` over an extra target can only ever pass spuriously,
-    never fail. But a caller that ALSO asserts each target exists on disk reads
-    the list for exactly what a phantom adds, and goes red naming a flag value as
-    a missing path — a misleading diagnosis on a change that broke nothing.
-    Measured across the five callers: FOUR assert existence
-    (``test_root_lint_covers_nonmember_py.py``,
-    ``test_contributing_lint_command_drift.py``,
-    ``test_skills_module_config_decision.py``,
-    ``test_fallback_verify_config.py``) while only two of those four supply a
-    set; ``test_scripts_module_config.py`` supplies none and asserts no
-    existence. The remaining exposure is therefore root_lint's AND fallback's,
-    and each is recorded on that guard's own extractor —
-    ``test_root_lint_covers_nonmember_py.py::_ruff_targets`` and
-    ``test_fallback_verify_config.py::_lint_leg_targets`` — rather than papered
-    over here.
+    NOT partition by which ones supply a set. Against a COVERAGE or MEMBERSHIP
+    check a phantom is inert: :func:`covers` over an extra target can only ever
+    pass spuriously, never fail. But a check that each target EXISTS on disk, or
+    that the list EQUALS a second copy, reads the list for exactly what a
+    phantom adds, and goes red naming a flag value as a path — a misleading
+    diagnosis on a change that broke nothing. A set narrows that exposure to
+    UNLISTED flags only. Four call sites assert existence, and only two of
+    those four supply a set at that call site:
+    ``test_fallback_verify_config.py`` passes one at
+    ``_fleet_pytest_suite_names``, which asserts no existence, and none at
+    ``_lint_leg_targets``, which does. The remaining exposure is therefore
+    every set-less EXISTS or EQUALS row. The two set-less EXISTS rows each
+    record it on their own extractor rather than papering over it here; the
+    two hook-drift EQUALS rows carry no such record yet.
 
     Discarding unrecognised tokens instead is not an option: that would silently
     shrink the target list and re-open the false-pass hazard the parsing exists
@@ -416,3 +449,173 @@ def flag_args(tokens: list[str], prefixes: tuple[str, ...]) -> list[str]:
     choice stays visible at the call site.
     """
     return [t for t in tokens if t.startswith(prefixes)]
+
+
+def pyright_clause_cwds(cmd: str, *, skip_uv_project: bool = True) -> list[str]:
+    """Return, in order, the normalised cwd of each pyright clause in *cmd*.
+
+    Walks the ``&&``-chain tracking cwd through ``cd <dir>`` clauses using the
+    PRODUCTION helpers ``orchestrator/src/orchestrator/verify.py::_AND_CLAUSE_SPLIT_RE``
+    and ``orchestrator/src/orchestrator/verify.py::_cd_clause_target`` — the same
+    pair ``orchestrator/src/orchestrator/verify.py::_scope_fallback_tool_to_subproject``
+    (task 3022) itself uses to read this exact command. So no caller of this
+    function can drift from how the scoper interprets the chain at runtime.
+
+    ``_cd_clause_target`` recognises only an exact two-token ``cd <dir>``.
+    Anything else — an unbalanced quote, a bare ``cd``, a clause holding more
+    than a lone ``cd`` — leaves cwd tracking unchanged rather than raising.
+    That degradation is load-bearing rather than incidental since task 4108,
+    because one caller now reads a command out of HUMAN-EDITED PROSE
+    (``test_contributing_type_check_command_drift.py``), where a stray
+    apostrophe is ordinary input and not a programming error.
+
+    *skip_uv_project* is a PARAMETER rather than a second variant of this
+    function, per this module's own "add a PARAMETER here rather than a variant
+    there" rule. The two callers ask genuinely different questions of the same
+    walk:
+
+      * ``True`` (the default) — "which clauses resolve their interpreter from
+        that directory's ``[tool.pyright]`` block?" A ``uv run --project <member>
+        pyright`` clause is pinned by uv, which selects the workspace venv
+        itself, so it is EXCLUDED. This is the semantic
+        ``test_fallback_verify_config.py::_pyright_clause_cwds`` has had since
+        task 3397, preserved byte-for-byte by the default.
+      * ``False`` — "which directories does this command type-check?" For that
+        question a ``--project`` spelling is a real answer, so it is INCLUDED.
+        This is what the CONTRIBUTING.md mirror needs (task 4108).
+
+    NO *label* PARAMETER, deliberately. This module's other helpers
+    (:func:`required_segment`, :func:`anchor_split`, :func:`positional_targets`)
+    take one because they thread it into ASSERTION messages; this one raises
+    nothing, so a *label* here would be unread surface whose only effect is to
+    mislead a caller into believing it improves a diagnostic. Task 4108 briefly
+    carried one "for signature symmetry" and dropped it on review. Add it back in
+    the same change that gives this function something to raise, so the name
+    keeps one meaning across the module.
+
+    THIS FUNCTION PARSES; IT DOES NOT DECIDE. It reports what the chain says and
+    makes no claim that the answer is non-empty or correct. NON-VACUITY is
+    asserted by each caller, never here: an empty return is a legitimate parse of
+    a command with no pyright clause, and only the caller knows whether that
+    means "nothing to check" or "this guard just went vacuous".
+    """
+    parts = _AND_CLAUSE_SPLIT_RE.split(cmd)
+    cwd = "."
+    cwds: list[str] = []
+    for i in range(0, len(parts), 2):
+        clause = parts[i]
+        cd_target = _cd_clause_target(clause)
+        if cd_target is not None:
+            cwd = os.path.normpath(os.path.join(cwd, cd_target))
+            continue
+        if PYRIGHT not in clause:
+            continue
+        if skip_uv_project and "uv run --project" in clause:
+            continue
+        cwds.append(cwd)
+    return cwds
+
+
+def marked_span(
+    text: str,
+    *,
+    begin: str,
+    end: str,
+    pattern: re.Pattern[str],
+    what: str,
+    source: str,
+    label: str,
+    task: str,
+) -> str:
+    """The single *pattern* match between the *begin* and *end* markers in *text*.
+
+    The extraction half of a tier-2 MIRROR guard, as
+    ``docs/legibility/design-invariants.md`` INV-10 defines the tier: a
+    marker-delimited span of a document, checked against the live artifact it
+    restates. Two such guards read CONTRIBUTING.md —
+    ``test_contributing_lint_command_drift.py`` (task 3558: the Lint bullet's
+    inline-code span against ``lint_command``) and
+    ``test_contributing_type_check_command_drift.py`` (task 4108: the Type-check
+    bullet's fenced ```` ```bash ```` block against ``type_check_command``) — and
+    their extractors were the SAME four assertions over two different regexes.
+    That is the N-copy shape the rest of this module exists to close, so it is
+    closed here rather than by a third hand-written copy.
+
+    EVERY FAILURE IS A LOUD ``AssertionError`` naming the marker literal, the
+    *source* artifact and the *task*, never a ``''``/``None`` return. All three
+    in EVERY message, not just in most: the helper must not depend on a caller
+    having happened to spell the filename into its *label*, which is how the
+    begin-count message was missing *source* when this was extracted. That is the vacuity hazard and the
+    whole point: an extractor that silently yields nothing turns the drift
+    assertion green while pinning nothing — strictly worse than no guard, since
+    the check still reports success. The assertions are, in order: exactly one
+    *begin*; exactly one *end*; exactly one *pattern* match in the slice between
+    them; and a non-blank match. INVERTED markers need no case of their own —
+    they yield an empty slice, so the match assertion catches them with the same
+    remedy.
+
+    Returns the match VERBATIM — not stripped, not otherwise normalised. Only the
+    caller's downstream comparison knows how much normalisation is safe, and
+    canonicalising here could hide a real difference from it.
+
+    POLICY STAYS WITH THE CALLER, per this module's contract. The *pattern* (an
+    inline-code span, a fenced block), the marker literals, the artifact *source*
+    and the *label*/*what* remedy wording all arrive as arguments; what is shared
+    is only the four-assertion marker mechanic. *task* is the filing this guard
+    belongs to, carried into every message so a human meets the rationale rather
+    than a bare mismatch.
+    """
+    begin_count = text.count(begin)
+    assert begin_count == 1, (
+        f"expected exactly one {begin!r} marker in {source}, found "
+        f"{begin_count} (task {task}). This marker delimits {label}. If it was "
+        f"deleted, restore it around that span; if it was duplicated, one of "
+        f"the two mirrors is unpinned and free to drift."
+    )
+    end_count = text.count(end)
+    assert end_count == 1, (
+        f"expected exactly one {end!r} marker to close {begin!r} in {source}, "
+        f"found {end_count} (task {task}) — restore the closing marker below "
+        f"{label}"
+    )
+
+    # Inverted markers yield an empty slice, so the next assertion catches that
+    # too, loudly and with the same remedy.
+    marked = text[text.index(begin) : text.index(end)]
+    spans: list[str] = pattern.findall(marked)
+    assert len(spans) == 1, (
+        f"expected exactly one {what} between {begin!r} and {end!r} in "
+        f"{source}, found {len(spans)}: {spans!r} (task {task}). The marker "
+        f"must wrap {label} and nothing else; if it was restructured or the "
+        f"markers were inverted, move the marker back around it."
+    )
+    assert spans[0].strip(), (
+        f"the {what} between {begin!r} and {end!r} in {source} is blank "
+        f"(task {task})"
+    )
+    return spans[0]
+
+
+_AFTER_THE_OPENING_COMMENT = re.compile(r"\A.*?-->(.*)\Z", re.DOTALL)
+
+
+def marked_body(text: str, *, slug: str, source: str, label: str, task: str) -> str:
+    """The body of the ``<!-- {slug}:begin ... -->`` / ``<!-- {slug}:end -->`` span.
+
+    The opener is matched as a PREFIX, not as a whole comment, so it may carry
+    its own prose; the body starts where that comment closes. Every malformed
+    shape raises through :func:`marked_span`: an unterminated opener and
+    inverted markers both leave no pattern match, and a blank body fails its
+    non-blank assertion. The body is returned verbatim: comment and whitespace
+    policy belong to the caller.
+    """
+    return marked_span(
+        text,
+        begin=f"<!-- {slug}:begin",
+        end=f"<!-- {slug}:end -->",
+        pattern=_AFTER_THE_OPENING_COMMENT,
+        what="body after the closed opening-marker comment",
+        source=source,
+        label=label,
+        task=task,
+    )

@@ -262,7 +262,7 @@ class TestTasksTabRuntimeProbeBanner:
             )
 
     def test_probe_banner_is_not_a_tasksbannernotices_kind(self, tasks_tab_code):
-        """The probe verdict must NOT be routed through ``tasksBannerNotices``.
+        """The probe verdict must NOT be routed through ``tasksBannerNoticesFor``.
 
         Not a style preference — a code fact.  ``tasks_offline_banner.js``
         short-circuits: when its ``offline`` input is true it returns a SINGLE
@@ -274,8 +274,13 @@ class TestTasksTabRuntimeProbeBanner:
 
         That module also scopes itself to a distinction decided SERVER-SIDE in
         app.api_tasks, whereas the probe summary is by design a client-side
-        derivation over the ACTIVE_TASKS rows.  So the probe banner stays an
+        derivation over the snapshot rows.  So the probe banner stays an
         independent sibling of ``bannerNotices.map(...)``.
+
+        The call site hands over ``DF_T`` whole, so which keys reach the
+        pipeline is decided in
+        ``tasks_offline_banner.js::tasksBannerNoticesFor``; its exact key set
+        (no probe key) is pinned in ``dashboard/tests/js/tasks_offline_banner.test.mjs``.
         """
         testids = _balanced_slice(tasks_tab_code, 'const bannerTestIds', '{', '}')
         assert 'tasks-runtime-probe-banner' not in testids, (
@@ -285,10 +290,10 @@ class TestTasksTabRuntimeProbeBanner:
             'no probe-flavoured notice kind may be introduced into the '
             'tasksBannerNotices vocabulary'
         )
-        call_args = _balanced_slice(tasks_tab_code, 'tasksBannerNotices(', '(', ')')
+        call_args = _balanced_slice(tasks_tab_code, 'tasksBannerNoticesFor(', '(', ')')
         assert 'probe' not in call_args.lower(), (
-            'the probe fact must not be fed into tasksBannerNotices; that '
-            f'function short-circuits on offline. Call was {call_args!r}'
+            'the probe fact must not be fed into tasksBannerNoticesFor; the '
+            f'pipeline short-circuits on offline. Call was {call_args!r}'
         )
 
     def test_banner_accent_derives_from_tone_not_selfinflicted(self, tasks_tab_body):
@@ -339,6 +344,17 @@ class TestTasksTabRuntimeProbeBanner:
         assert 'visibleProjectIds' not in tasks_tab_code, (
             'visibleProjectIds existed only to scope the summary; a lingering '
             'binding invites the scoped form to be silently reintroduced'
+        )
+
+    def test_the_unfiltered_rows_are_every_snapshot_row(self, tasks_tab_code):
+        """``allTasks`` is every row the /tasks snapshot holds, across projects.
+
+        The retired ACTIVE_TASKS key carried exactly that list;
+        task_snapshot.js::snapshotRowsOver reads it off the snapshot instead,
+        and task_snapshot.test.mjs executes that it is the same concatenation.
+        """
+        assert re.search(r'\bconst\s+allTasks\s*=\s*snapshotRowsOver\(\s*DF_T\s*\)', tasks_tab_code), (
+            'TasksTab does not bind allTasks = snapshotRowsOver(DF_T)'
         )
 
 

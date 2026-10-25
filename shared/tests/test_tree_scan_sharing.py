@@ -1,0 +1,1051 @@
+"""The first-party tree is read and parsed ONCE per session, and shared.
+
+WHY THIS FILE EXISTS (task 4520). Two gate modules each grew their own
+whole-first-party-tree scan: ``test_silent_fallthrough_gate.tree_scan_data``
+and ``test_config_dir_archival_gate._scan``. Neither was wrong on its own, but
+together they read the same 461 files twice, parsed them three times, and built
+922 AST parent maps where 24 suffice — and because ``pytest-timeout`` arms its
+timer over the WHOLE runtest protocol (``func_only=False``), that duplicated
+work is charged to whichever single test item happens to trigger the fixture.
+Measured at 23.68s of setup against a 60s budget: 2.5x headroom, which a loaded
+host consumes, producing a burst of ERROR-at-setup that looks like flake and is
+actually arithmetic.
+
+THE CONTRACT PINNED HERE. ``silent_fallthrough_scan.parse_first_party_tree`` is
+the ONE place the first-party tree is read and parsed; both gates walk the ASTs
+it hands out. Every assertion in this file counts WORK (``ast.parse`` calls,
+``Path.read_text`` calls, parent maps built) rather than wall-clock time — a
+timing assertion on a host whose load average swung between 70 and 289 during
+the investigation would be the exact flaky shape this task exists to remove.
+
+Mirrors this directory's established gate idiom (``silent_fallthrough_scan`` +
+``silent_fallthrough_allowlist`` + ``test_silent_fallthrough_gate``;
+``test_safe_io.TestNoRegrownAtomicWriters``): scan, name the offender, and
+carry a floor so the guard cannot pass vacuously.
+"""
+
+from __future__ import annotations
+
+import ast
+from collections import Counter
+from collections.abc import Sequence
+from pathlib import Path
+
+import pytest
+import silent_fallthrough_scan as sfs
+import test_config_dir_archival_gate as archival_gate
+from silent_fallthrough_scan import (
+    SCOPE_ROOTS,
+    ParsedFile,
+    ScopeRootsMissingError,
+    iter_first_party_files,
+)
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+# ---------------------------------------------------------------------------
+# Helpers — a fabricated repo root, so the provider's contract can be pinned
+# without re-reading (or evicting the memo for) the real 461-file tree.
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_repo(tmp_path: Path, files: dict[str, str | bytes]) -> Path:
+    """Build a minimal repo root carrying every ``SCOPE_ROOTS`` directory.
+
+    Every scope root is required: ``iter_first_party_files`` RAISES if any one
+    is absent, so all of them are created even when no file is placed in them.
+    """
+    root = tmp_path / 'repo'
+    for scope_root in SCOPE_ROOTS:
+        (root / scope_root).mkdir(parents=True)
+    for rel, content in files.items():
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            target.write_bytes(content)
+        else:
+            target.write_text(content, encoding='utf-8')
+    return root
+
+
+@pytest.fixture
+def isolated_parse_cache(monkeypatch):
+    """Give the test a private, empty provider memo.
+
+    Deliberately NOT ``_reset_parse_cache()``: clearing the real memo mid-session
+    would make the next consumer re-read and re-parse all 461 files, resurrecting
+    the very cost this task removes. Swapping the dict leaves the session's warm
+    entry for ``_REPO_ROOT`` untouched and restores it on teardown.
+    """
+    cache: dict = {}
+    monkeypatch.setattr(sfs, '_PARSE_CACHE', cache)
+    return cache
+
+
+def _parsed_tree(record: ParsedFile) -> ast.Module:
+    """The record's tree, with the ParsedFile XOR invariant narrowed and checked.
+
+    ``tree`` is ``ast.Module | None`` and only prose says it is set whenever
+    ``syntax_error`` is not — which a type checker cannot see. Asserting it here
+    both narrows the type and turns a broken invariant into a named failure
+    instead of an ``AttributeError`` several frames deeper.
+    """
+    assert record.tree is not None, (
+        f'{record.relpath}: ParsedFile carries neither a tree nor a '
+        f'syntax_error — silent_fallthrough_scan.ParsedFile invariant broken'
+    )
+    return record.tree
+
+
+class _WorkCounter:
+    """Count ``ast.parse`` / ``Path.read_text`` calls made by the provider."""
+
+    def __init__(self, monkeypatch):
+        self.parses: list[str] = []
+        self.reads: list[str] = []
+        real_parse = ast.parse
+        real_read_text = Path.read_text
+
+        def counting_parse(source, filename='<unknown>', *args, **kwargs):
+            self.parses.append(str(filename))
+            return real_parse(source, filename, *args, **kwargs)
+
+        def counting_read_text(self_path, *args, **kwargs):
+            self.reads.append(str(self_path))
+            return real_read_text(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(sfs.ast, 'parse', counting_parse)
+        monkeypatch.setattr(sfs.Path, 'read_text', counting_read_text)
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — the shared provider's contract
+# ---------------------------------------------------------------------------
+
+
+class TestParseFirstPartyTreeContract:
+    """One immutable record per first-party file, carrying tree XOR syntax_error."""
+
+    def test_one_record_per_first_party_file(self, tmp_path, isolated_parse_cache):
+        """Enumeration is delegated verbatim to iter_first_party_files."""
+        root = _make_fake_repo(tmp_path, {
+            'shared/src/shared/alpha.py': 'x = 1\n',
+            'orchestrator/src/orchestrator/beta.py': 'y = 2\n',
+            'orchestrator/src/orchestrator/tests/gamma.py': 'z = 3\n',   # excluded
+            'orchestrator/src/orchestrator/test_delta.py': 'w = 4\n',    # excluded
+            'orchestrator/src/orchestrator/conftest.py': 'v = 5\n',      # excluded
+        })
+        records = sfs.parse_first_party_tree(root)
+        assert [r.path for r in records] == list(iter_first_party_files(root))
+        assert sorted(r.relpath for r in records) == [
+            'orchestrator/src/orchestrator/beta.py',
+            'shared/src/shared/alpha.py',
+        ]
+
+    def test_record_field_shapes(self, tmp_path, isolated_parse_cache):
+        """path absolute, relpath posix-relative, source verbatim, tree XOR error."""
+        root = _make_fake_repo(tmp_path, {'shared/src/shared/alpha.py': 'x = 1\n'})
+        (record,) = sfs.parse_first_party_tree(root)
+        assert isinstance(record.path, Path) and record.path.is_absolute()
+        assert record.relpath == 'shared/src/shared/alpha.py'
+        assert record.path == root / record.relpath
+        assert record.source == 'x = 1\n'
+        assert isinstance(record.tree, ast.Module)
+        assert record.syntax_error is None
+        assert (record.tree is None) != (record.syntax_error is None), (
+            'a record must carry exactly one of tree / syntax_error'
+        )
+
+    def test_records_are_immutable(self, tmp_path, isolated_parse_cache):
+        """A consumer walking the shared ASTs must not be able to rewrite a record."""
+        root = _make_fake_repo(tmp_path, {'shared/src/shared/alpha.py': 'x = 1\n'})
+        records = sfs.parse_first_party_tree(root)
+        assert isinstance(records, tuple)
+        with pytest.raises(AttributeError):
+            # The write is rejected STATICALLY too (ParsedFile is a NamedTuple, so
+            # `source` is read-only) — that is the same contract this test pins at
+            # runtime, not a defect being papered over. Suppressed narrowly, by
+            # rule, so the assertion stays executable.
+            records[0].source = 'mutated'  # pyright: ignore[reportAttributeAccessIssue]
+
+    def test_syntax_error_is_recorded_not_raised(self, tmp_path, isolated_parse_cache):
+        """test_no_unparseable_files reports every bad file at once — so record, don't raise."""
+        root = _make_fake_repo(tmp_path, {
+            'shared/src/shared/ok.py': 'x = 1\n',
+            'shared/src/shared/broken.py': 'def f(:\n',
+        })
+        by_rel = {r.relpath: r for r in sfs.parse_first_party_tree(root)}
+        broken = by_rel['shared/src/shared/broken.py']
+        assert isinstance(broken.syntax_error, SyntaxError)
+        assert broken.tree is None
+        assert broken.source == 'def f(:\n'
+        assert isinstance(by_rel['shared/src/shared/ok.py'].tree, ast.Module)
+
+    def test_undecodable_file_propagates(self, tmp_path, isolated_parse_cache):
+        """A first-party file that cannot be DECODED is a real breakage — stay loud.
+
+        The archival gate's documented contract: silently skipping an unreadable
+        file would let a TaskConfigDir construction site hide behind it.
+        """
+        root = _make_fake_repo(tmp_path, {
+            'shared/src/shared/binary.py': b'x = "\xff\xfe not utf-8"\n',
+        })
+        with pytest.raises(UnicodeDecodeError):
+            sfs.parse_first_party_tree(root)
+
+    def test_unreadable_file_propagates(self, tmp_path, isolated_parse_cache, monkeypatch):
+        """An OSError on read propagates too — same loudness contract as decode."""
+        root = _make_fake_repo(tmp_path, {'shared/src/shared/alpha.py': 'x = 1\n'})
+        real_read_text = Path.read_text
+
+        def boom(self_path, *args, **kwargs):
+            if self_path.name == 'alpha.py':
+                raise PermissionError('unreadable first-party file')
+            return real_read_text(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(sfs.Path, 'read_text', boom)
+        with pytest.raises(PermissionError):
+            sfs.parse_first_party_tree(root)
+
+
+class TestParseFirstPartyTreeIsMemoized:
+    """The whole point: the tree is read once and parsed once per session."""
+
+    def test_second_call_returns_the_identical_object(self, tmp_path, isolated_parse_cache):
+        root = _make_fake_repo(tmp_path, {'shared/src/shared/alpha.py': 'x = 1\n'})
+        first = sfs.parse_first_party_tree(root)
+        assert sfs.parse_first_party_tree(root) is first
+
+    def test_memo_key_is_the_resolved_root(self, tmp_path, isolated_parse_cache):
+        """An unresolved spelling of the same root must hit the same entry."""
+        root = _make_fake_repo(tmp_path, {'shared/src/shared/alpha.py': 'x = 1\n'})
+        first = sfs.parse_first_party_tree(root)
+        assert sfs.parse_first_party_tree(root / 'shared' / '..') is first
+        assert len(isolated_parse_cache) == 1
+
+    def test_each_file_is_read_once_and_parsed_once(self, tmp_path, isolated_parse_cache,
+                                                    monkeypatch):
+        """Across TWO calls, each file is read once and ast.parse'd once."""
+        root = _make_fake_repo(tmp_path, {
+            'shared/src/shared/alpha.py': 'x = 1\n',
+            'orchestrator/src/orchestrator/beta.py': 'y = 2\n',
+        })
+        counter = _WorkCounter(monkeypatch)
+        sfs.parse_first_party_tree(root)
+        sfs.parse_first_party_tree(root)
+        assert len(counter.parses) == 2, f'expected 2 parses, got {counter.parses}'
+        assert len(counter.reads) == 2, f'expected 2 reads, got {counter.reads}'
+        assert sorted(Path(p).name for p in counter.parses) == ['alpha.py', 'beta.py']
+
+    def test_reset_parse_cache_forces_a_reparse(self, tmp_path, isolated_parse_cache,
+                                                monkeypatch):
+        """The test hook is real: after a reset the tree is read and parsed again."""
+        root = _make_fake_repo(tmp_path, {'shared/src/shared/alpha.py': 'x = 1\n'})
+        first = sfs.parse_first_party_tree(root)
+        sfs._reset_parse_cache()
+        assert isolated_parse_cache == {}
+        counter = _WorkCounter(monkeypatch)
+        second = sfs.parse_first_party_tree(root)
+        assert second is not first
+        assert len(counter.parses) == 1
+        assert len(counter.reads) == 1
+
+
+class TestEveryScopeRootIsRequired:
+    """An absent scope root RAISES; it is never skipped.
+
+    A skipped root is a green gate over less code — the silent fallthrough the
+    flagship gate exists to catch — so every ``SCOPE_ROOTS`` entry is required,
+    not just the two the enumerator once treated as sentinels.
+    """
+
+    @pytest.mark.parametrize('removed_root', SCOPE_ROOTS)
+    def test_each_absent_root_raises_naming_it(self, tmp_path, removed_root):
+        root = _make_fake_repo(tmp_path, {})
+        (root / removed_root).rmdir()
+        with pytest.raises(ScopeRootsMissingError) as excinfo:
+            list(iter_first_party_files(root))
+        assert excinfo.value.missing == (removed_root,)
+        assert excinfo.value.repo_root == root
+        assert isinstance(excinfo.value, RuntimeError)
+
+    def test_every_absent_root_is_named_in_one_error(self, tmp_path):
+        """Report them all at once, in declaration order — not first-hit-only."""
+        with pytest.raises(ScopeRootsMissingError) as excinfo:
+            list(iter_first_party_files(tmp_path))
+        assert excinfo.value.missing == SCOPE_ROOTS
+
+    def test_provider_propagates_and_memoizes_nothing(self, tmp_path,
+                                                      isolated_parse_cache):
+        """The raise reaches conftest's prebuild through the provider, uncached."""
+        root = _make_fake_repo(tmp_path, {'shared/src/shared/alpha.py': 'x = 1\n'})
+        (root / 'scripts').rmdir()
+        with pytest.raises(ScopeRootsMissingError) as excinfo:
+            sfs.parse_first_party_tree(root)
+        assert excinfo.value.missing == ('scripts',)
+        assert isolated_parse_cache == {}
+
+
+class TestSessionFixtureSharesTheProvider:
+    """conftest's ``first_party_tree`` hands out the memoized real-tree records."""
+
+    def test_fixture_is_the_memoized_provider_result(self, first_party_tree):
+        assert first_party_tree is sfs.parse_first_party_tree(_REPO_ROOT)
+
+    def test_fixture_covers_the_real_tree(self, first_party_tree):
+        """Floor guard, mirroring the gates' own anti-vacuity floors."""
+        assert len(first_party_tree) > 150, (
+            f'Only {len(first_party_tree)} first-party files parsed — is repo_root '
+            f'correct? ({_REPO_ROOT})'
+        )
+        assert all(r.syntax_error is None for r in first_party_tree), (
+            'unparseable first-party file(s): '
+            + ', '.join(r.relpath for r in first_party_tree if r.syntax_error)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — the parent map is built LAZILY, and a pre-parsed tree is reusable
+# ---------------------------------------------------------------------------
+
+#: A signature-(a) violation nested two scopes deep, so a degraded qualname
+#: resolution shows up as a wrong ANSWER rather than merely a missing one.
+_SIG_A_SOURCE = '''class Harness:
+    async def run(self):
+        value, _ = await get_statuses()
+        return value
+'''
+
+#: A signature-(b) violation, likewise nested.
+_SIG_B_SOURCE = '''class Loader:
+    def load(self):
+        try:
+            return parse()
+        except Exception:
+            return None
+'''
+
+#: A file with neither signature — the 451-of-461 case in the real tree.
+_CLEAN_SOURCE = '''class Quiet:
+    def run(self):
+        try:
+            return compute()
+        except KeyError as exc:
+            logger.warning('missed: %s', exc)
+            raise
+'''
+
+
+class TestParentMapIsLazy:
+    """97.8% of the real tree yields no violation — so build no parent map for it.
+
+    Measured: 10 of 461 first-party files produce at least one violation, while
+    the pre-4520 scanner built a parent map for every one of them (3.73s per
+    full pass, done twice per session).
+    """
+
+    def test_a_clean_file_builds_no_parent_map(self, monkeypatch):
+        """The parent map is needed only to name a violation's enclosing scope."""
+        def boom(_tree):
+            raise AssertionError(
+                'a file with no violation must not pay for a parent map'
+            )
+
+        monkeypatch.setattr(sfs, '_build_parent_map', boom)
+        assert sfs.find_violations(_CLEAN_SOURCE, 'fake/quiet.py') == []
+
+    def test_a_syntax_error_builds_no_parent_map(self, monkeypatch):
+        """find_violations still returns [] on SyntaxError, without any map work."""
+        def boom(_tree):
+            raise AssertionError('an unparseable file must not pay for a parent map')
+
+        monkeypatch.setattr(sfs, '_build_parent_map', boom)
+        assert sfs.find_violations('def f(:\n', 'fake/broken.py') == []
+
+    def test_signature_a_qualname_survives_laziness(self):
+        """The nested qualname still resolves — pinned against the pre-4520 value.
+
+        ``qualname`` is the ONLY thing the parent map feeds, so it is the only
+        assertion that can detect a laziness regression here. ``content_hash``
+        was pinned alongside it and is not: ``_content_hash`` is
+        ``sha256(ast.unparse(node))[:12]`` over the node alone, never consulting
+        the map, so it would survive any degradation this test exists to catch
+        while binding the suite to ``ast.unparse``'s output — not a stability
+        guarantee across CPython minors, and this repo really does run
+        worktrees on different interpreters (3.13 in the main checkout, 3.14 in
+        several worktrees). Whole-record equality between the two scanner entry
+        points is pinned by
+        :meth:`TestFindViolationsInTree.test_matches_find_violations_exactly`.
+        """
+        (violation,) = sfs.find_violations(_SIG_A_SOURCE, 'fake/module.py')
+        assert violation.signature == 'a'
+        assert violation.qualname == 'Harness.run'
+
+    def test_signature_b_qualname_survives_laziness(self):
+        """The other half: a sig-(b) violation's nested qualname still resolves."""
+        (violation,) = sfs.find_violations(_SIG_B_SOURCE, 'fake/module.py')
+        assert violation.signature == 'b'
+        assert violation.qualname == 'Loader.load'
+
+    def test_module_scope_violation_still_resolves(self):
+        """The <module> fallback needs the map too — it must still be built."""
+        (violation,) = sfs.find_violations('x, _ = get_statuses()\n', 'fake/module.py')
+        assert violation.qualname == '<module>'
+
+    def test_the_map_is_built_at_most_once_per_file(self, monkeypatch):
+        """Two violations in one file share one parent map, as they did before."""
+        calls = []
+        real = sfs._build_parent_map
+
+        def counting(tree):
+            calls.append(tree)
+            return real(tree)
+
+        monkeypatch.setattr(sfs, '_build_parent_map', counting)
+        source = _SIG_A_SOURCE + '\n' + _SIG_B_SOURCE
+        assert len(sfs.find_violations(source, 'fake/module.py')) == 2
+        assert len(calls) == 1, f'expected one parent map, built {len(calls)}'
+
+
+class TestFindViolationsInTree:
+    """The already-parsed entry point the shared provider feeds."""
+
+    @pytest.mark.parametrize(
+        'source',
+        [_SIG_A_SOURCE, _SIG_B_SOURCE, _CLEAN_SOURCE],
+        ids=['sig-a', 'sig-b', 'clean'],
+    )
+    def test_matches_find_violations_exactly(self, source):
+        tree = ast.parse(source, filename='fake/module.py')
+        assert sfs.find_violations_in_tree(tree, 'fake/module.py', source) == (
+            sfs.find_violations(source, 'fake/module.py')
+        )
+
+    def test_source_argument_is_optional(self):
+        """The scanner works off the tree; *source* is context, not input."""
+        tree = ast.parse(_SIG_B_SOURCE, filename='fake/module.py')
+        assert sfs.find_violations_in_tree(tree, 'fake/module.py') == (
+            sfs.find_violations(_SIG_B_SOURCE, 'fake/module.py')
+        )
+
+    def test_filename_is_what_lands_in_the_record(self):
+        """The gate keys on relpath, so the caller's filename must be honoured."""
+        tree = ast.parse(_SIG_A_SOURCE, filename='ignored.py')
+        (violation,) = sfs.find_violations_in_tree(tree, 'shared/src/shared/x.py')
+        assert violation.filename == 'shared/src/shared/x.py'
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — the silent-fallthrough gate consumes the shared provider
+# ---------------------------------------------------------------------------
+
+
+def _prefix_tree_scan_reference(
+    records: Sequence[ParsedFile],
+) -> tuple[list[Path], list[sfs.Violation], list[str]]:
+    """Recompute the gate's inputs with the PRE-4520 loop's plumbing.
+
+    Reproduces the old fixture statement for statement — the same
+    ``iter_first_party_files`` enumeration and order, the same
+    ``str(filepath.relative_to(REPO_ROOT))`` filename spelling (NOT the
+    provider's posix ``relpath``, which is the thing being changed), the same
+    ``f'{path}: {e}'`` parse-failure message, the same skip-a-broken-file
+    structure — and then compares that against what the rewritten gate
+    produces. So every piece of PLUMBING the rewrite touches is re-derived
+    independently, whole-tree.
+
+    ONE THING IS DELIBERATELY NOT RE-DERIVED: the ``ast.parse`` itself. The old
+    loop reached the scanner through ``find_violations(source, rel)``, which
+    since task 4520 is a two-line wrapper that parses and then calls
+    ``find_violations_in_tree(tree, filename, source)`` — the exact function
+    the new gate calls. ``source`` is unused by the scan and ``filename``
+    reaches only ``Violation.filename`` (which IS re-derived here, in the old
+    spelling), so a second ``ast.parse`` of the same bytes could only prove
+    that ``ast.parse`` is deterministic. On this tree that ceremony measured
+    18.87s in a single test item under load — against the 60s budget whose
+    thin headroom is the entire defect this task exists to remove, and worse
+    than the 23.68s item it replaces once the provider's own setup lands on
+    the same item. Re-parsing is therefore done only where it could actually
+    differ: :meth:`TestSilentFallthroughGateUsesTheSharedTree.
+    test_recorded_violations_survive_a_real_reparse` pushes every file that
+    produces a violation back through the full ``find_violations`` entry point.
+
+    The read is not re-derived either: the provider reads with STRICT utf-8,
+    so a file the old ``errors='replace'`` loop would have papered over now
+    RAISES rather than yielding different text (``test_undecodable_file_
+    propagates``).
+    """
+    files = list(iter_first_party_files(_REPO_ROOT))
+    by_path = {record.path: record for record in records}
+    violations: list[sfs.Violation] = []
+    parse_failures: list[str] = []
+    for filepath in files:
+        record = by_path[filepath]
+        rel = str(filepath.relative_to(_REPO_ROOT))
+        if record.syntax_error is not None:
+            parse_failures.append(f'{filepath}: {record.syntax_error}')
+            continue
+        violations.extend(
+            sfs.find_violations_in_tree(_parsed_tree(record), rel, record.source)
+        )
+    return files, violations, parse_failures
+
+
+class TestSilentFallthroughGateUsesTheSharedTree:
+    """tree_scan_data walks the shared ASTs and parses nothing itself."""
+
+    def test_building_the_scan_data_does_no_io_and_no_parsing(
+        self, first_party_tree, monkeypatch
+    ):
+        """With the memo warm, the gate's own work must be a WALK and nothing more."""
+        import test_silent_fallthrough_gate as gate
+
+        counter = _WorkCounter(monkeypatch)
+        data = gate._build_tree_scan_data(first_party_tree)
+        assert counter.parses == [], (
+            f'tree_scan_data re-parsed {len(counter.parses)} file(s): '
+            f'{counter.parses[:5]}'
+        )
+        assert counter.reads == [], (
+            f'tree_scan_data re-read {len(counter.reads)} file(s): '
+            f'{counter.reads[:5]}'
+        )
+        assert len(data.files) == len(first_party_tree)
+
+    def test_parse_failure_message_shape_is_preserved(self):
+        """test_no_unparseable_files prints these — keep the pre-4520 shape.
+
+        Non-vacuous by construction: the real tree has zero parse failures
+        today, so whole-tree parity alone would assert ``[] == []``.
+        """
+        import test_silent_fallthrough_gate as gate
+
+        source = 'def f(:\n'
+        try:
+            ast.parse(source, filename='fake/broken.py')
+        except SyntaxError as exc:
+            error = exc
+        record = sfs.ParsedFile(
+            path=Path('/repo/shared/src/shared/broken.py'),
+            relpath='shared/src/shared/broken.py',
+            source=source,
+            tree=None,
+            syntax_error=error,
+        )
+        data = gate._build_tree_scan_data((record,))
+        assert data.parse_failures == [f'{record.path}: {error}']
+        assert data.violations == []
+
+    def test_output_parity_with_the_prefix_computation(self, first_party_tree):
+        """files, violation_key_counts and parse_failures are unchanged.
+
+        Whole-tree, against an independent re-derivation of the pre-4520
+        loop's plumbing — including its ``str(relative_to)`` filename spelling,
+        which the rewrite replaces with the provider's posix ``relpath`` and
+        which ``violation_key`` keys on. See
+        :func:`_prefix_tree_scan_reference` for exactly what is and is not
+        re-derived, and why.
+        """
+        import test_silent_fallthrough_gate as gate
+
+        expected_files, expected_violations, expected_failures = (
+            _prefix_tree_scan_reference(first_party_tree)
+        )
+        data = gate._build_tree_scan_data(first_party_tree)
+
+        assert data.files == expected_files
+        assert data.parse_failures == expected_failures
+        expected_counts = Counter(sfs.violation_key(v) for v in expected_violations)
+        assert sorted(data.violation_key_counts.items()) == sorted(
+            expected_counts.items()
+        ), (
+            'the consolidated scan sees a different violation multiset than the '
+            'pre-4520 read-then-parse-then-find_violations loop did'
+        )
+        assert sum(expected_counts.values()) > 0, (
+            'parity would be vacuous with no violations in the tree — the '
+            'allowlist records 14 today'
+        )
+
+    def test_recorded_violations_survive_a_real_reparse(self, first_party_tree):
+        """The one place a second ast.parse could differ — so do it there, only there.
+
+        For every file that actually produces a violation, push the source back
+        through the full pre-4520 ``find_violations`` entry point (which parses
+        from scratch) and require the identical records. Fourteen files today,
+        microseconds; re-parsing the other 447 would only re-prove that
+        ``ast.parse`` is deterministic.
+        """
+        producing = [
+            record for record in first_party_tree
+            if record.tree is not None
+            and sfs.find_violations_in_tree(record.tree, record.relpath, record.source)
+        ]
+        assert producing, (
+            'no first-party file produces a violation — this cross-check would '
+            'be vacuous; the allowlist records 14 today'
+        )
+        for record in producing:
+            rel = str(record.path.relative_to(_REPO_ROOT))
+            assert sfs.find_violations(record.source, rel) == (
+                sfs.find_violations_in_tree(record.tree, rel, record.source)
+            ), f'a real re-parse of {rel} yields different violations'
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — the archival gate consumes the shared provider, and nothing grows
+# a third private whole-tree parse
+# ---------------------------------------------------------------------------
+
+# The tracked-name set is read through to ``archival_gate._TRACKED_NAMES``
+# rather than copied here — mirroring how :func:`_unfiltered_archival_scan`
+# already reaches through to ``archival_gate._ARCHIVAL_NAMES``. It is the exact
+# set whose behaviour this file exists to pin, and it has already grown once
+# (task 3619 added ``archive_before_delete``); a local copy would go stale on
+# the next entry, silently narrowing the ``tracked`` list below until
+# ``len(built) <= len(tracked)`` failed spuriously — a drift-triggered false
+# alarm in the guard whose whole job is to catch drift.
+#
+# Why the gate's prefilter is EXACT rather than a heuristic, which is what
+# makes the budget below meaningful: every tracked name is a Python
+# identifier, and the scan only ever matches ``ast.Name.id`` /
+# ``ast.Attribute.attr``, so a node carrying one cannot exist unless the
+# literal substring is present in the file's source.
+
+#: Ceiling on how many first-party files may mention a tracked name. 14 of 461
+#: today. A budget rather than an equality so ordinary churn does not turn this
+#: into a nuisance ratchet reviewers re-bless blindly — the same reasoning the
+#: archival gate already applies to its own ``>= 6`` site floor.
+_TRACKED_FILE_BUDGET = 40
+
+
+def _unfiltered_archival_scan(
+    records: Sequence[ParsedFile],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """The archival scan with NO prefilter — a parent map for every file.
+
+    The pre-4520 ``_scan`` body, verbatim apart from taking already-parsed
+    records. Exists so the prefiltered scan can be pinned against it as a
+    multiset: the argument that a source-text prefilter cannot drop a site is
+    sound, but this asserts it rather than trusting it.
+    """
+    sites: list[tuple[str, str]] = []
+    archival_refs: list[tuple[str, str]] = []
+    for record in records:
+        tree = _parsed_tree(record)
+        parent_map = sfs._build_parent_map(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id in archival_gate._ARCHIVAL_NAMES:
+                archival_refs.append(
+                    (record.relpath, sfs._compute_qualname(node, parent_map))
+                )
+                continue
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                callee = func.id
+            elif isinstance(func, ast.Attribute):
+                callee = func.attr
+            else:
+                continue
+            if callee != 'TaskConfigDir':
+                continue
+            sites.append((record.relpath, sfs._compute_qualname(node, parent_map)))
+    return sites, archival_refs
+
+
+class TestArchivalGateUsesTheSharedTree:
+    """_scan walks the shared ASTs, prefilters on source text, and drops no site."""
+
+    def test_prefilter_changes_no_answer(self, first_party_tree):
+        """Multiset parity against the unfiltered scan — sites AND archival refs.
+
+        Counter, not set: two byte-distinct constructions can share one
+        (path, qualname) key (``UsageGate.__init__`` legitimately has two), and
+        set equality would hide a prefilter that dropped one of them.
+        """
+        expected_sites, expected_refs = _unfiltered_archival_scan(first_party_tree)
+        sites, refs = archival_gate._scan(first_party_tree)
+        assert Counter(sites) == Counter(expected_sites)
+        assert Counter(refs) == Counter(expected_refs)
+        assert len(expected_sites) >= 6, (
+            f'only {len(expected_sites)} TaskConfigDir sites — parity would be '
+            f'near-vacuous; is repo_root correct? ({_REPO_ROOT})'
+        )
+        assert len(set(expected_refs)) >= 5, (
+            f'only {len(set(expected_refs))} archival reference sites — parity '
+            f'would be near-vacuous; is repo_root correct? ({_REPO_ROOT})'
+        )
+
+    def test_parent_maps_are_built_only_for_tracked_files(
+        self, first_party_tree, monkeypatch
+    ):
+        """3% of the tree mentions a tracked name; the other 97% must cost nothing."""
+        tracked = [
+            record for record in first_party_tree
+            if any(name in record.source for name in archival_gate._TRACKED_NAMES)
+        ]
+        assert len(tracked) <= _TRACKED_FILE_BUDGET, (
+            f'{len(tracked)} first-party files mention one of '
+            f'{sorted(archival_gate._TRACKED_NAMES)} (budget '
+            f'{_TRACKED_FILE_BUDGET}). Either '
+            f'the names leaked into general use or the prefilter has stopped '
+            f'being selective — the archival gate pays a parent map for each.'
+        )
+        assert tracked, 'no file mentions a tracked name — the gate is vacuous'
+
+        # Patch the binding ``_scan`` actually resolves. The gate does
+        # ``from silent_fallthrough_scan import _build_parent_map``, so it holds
+        # its OWN module-level reference and a ``setattr(sfs, ...)`` never
+        # reaches it — that spelling counted 0 maps forever and made the budget
+        # below pass vacuously (measured: 0 via sfs, 14 via the gate).
+        built = []
+        real = archival_gate._build_parent_map
+        monkeypatch.setattr(
+            archival_gate,
+            '_build_parent_map',
+            lambda tree: (built.append(tree), real(tree))[1],
+        )
+        archival_gate._scan(first_party_tree)
+        assert built, (
+            'the parent-map counter intercepted nothing — _scan no longer '
+            'resolves _build_parent_map through test_config_dir_archival_gate, '
+            'so this budget would pass no matter what the prefilter did'
+        )
+        assert len(built) <= len(tracked), (
+            f'_scan built {len(built)} parent maps for {len(tracked)} files that '
+            f'mention a tracked name — the source prefilter is not being applied'
+        )
+
+    def test_scan_does_no_io_and_no_parsing(self, first_party_tree, monkeypatch):
+        """With the memo warm, the archival gate reads nothing and parses nothing."""
+        counter = _WorkCounter(monkeypatch)
+        archival_gate._scan(first_party_tree)
+        assert counter.parses == [], (
+            f'_scan re-parsed {len(counter.parses)} file(s): {counter.parses[:5]}'
+        )
+        assert counter.reads == [], (
+            f'_scan re-read {len(counter.reads)} file(s): {counter.reads[:5]}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# The anti-regrowth ratchet
+# ---------------------------------------------------------------------------
+
+#: Modules exempt from the ratchet below:
+#:
+#:   silent_fallthrough_scan.py  — IS the provider. It owns the enumeration (an
+#:       rglob over each scope root) and the one parse; that is the whole point.
+#:   test_tree_scan_sharing.py   — this file, which pins the provider's
+#:       contract. It must name the enumerator and must parse synthetic sources
+#:       to assert what the provider does with them.
+#:
+#: Nothing else. The defect this task fixed was not that someone wrote a slow
+#: scan — it was that a SECOND scan grew alongside the first and nothing
+#: noticed until the two collided with a wall-clock budget under load.
+_PRIVATE_PARSE_EXEMPT = frozenset({
+    'silent_fallthrough_scan.py',
+    'test_tree_scan_sharing.py',
+})
+
+_TESTS_DIR = Path(__file__).resolve().parent
+
+
+def _names_referenced(tree: ast.Module) -> set[str]:
+    """Every identifier the module names — as a Name, an Attribute, or an import."""
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            found.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            found.add(node.attr)
+        elif isinstance(node, ast.alias):
+            found.add(node.asname or node.name.split('.')[-1])
+    return found
+
+
+def _calls_ast_parse(tree: ast.Module) -> bool:
+    """True if the module calls ``ast.parse`` — attribute or from-import form."""
+    bare_parse_is_ast = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == 'ast'
+        and any(alias.name == 'parse' for alias in node.names)
+        for node in ast.walk(tree)
+    )
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == 'parse'
+            and isinstance(func.value, ast.Name)
+            and func.value.id == 'ast'
+        ):
+            return True
+        if bare_parse_is_ast and isinstance(func, ast.Name) and func.id == 'parse':
+            return True
+    return False
+
+
+def _os_module_names(tree: ast.Module) -> set[str]:
+    """``os`` plus every alias an ``import os as <x>`` binds."""
+    return {'os'} | {
+        alias.asname
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if alias.name == 'os' and alias.asname
+    }
+
+
+def _bare_os_walk_names(tree: ast.Module) -> set[str]:
+    """Every name a ``from os import walk [as <x>]`` binds."""
+    return {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == 'os'
+        for alias in node.names
+        if alias.name == 'walk'
+    }
+
+
+_GLOB_NAMES = frozenset({'glob', 'iglob'})
+
+
+def _is_recursive_glob(call: ast.Call) -> bool:
+    """A glob that descends: a literal ``**`` pattern, or ``recursive=True``."""
+    pattern = call.args[0] if call.args else None
+    if isinstance(pattern, ast.Constant) and isinstance(pattern.value, str) and '**' in pattern.value:
+        return True
+    return any(
+        keyword.arg == 'recursive'
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for keyword in call.keywords
+    )
+
+
+def _is_walk_call(call: ast.Call, os_names: set[str], bare_walks: set[str]) -> bool:
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        receiver = func.value.id if isinstance(func.value, ast.Name) else None
+        return (
+            func.attr == 'rglob'
+            or (func.attr == 'walk' and receiver in os_names)
+            or (func.attr in _GLOB_NAMES and _is_recursive_glob(call))
+        )
+    if isinstance(func, ast.Name):
+        return func.id in bare_walks or (func.id in _GLOB_NAMES and _is_recursive_glob(call))
+    return False
+
+
+def _walks_a_directory_tree(tree: ast.Module) -> bool:
+    """True if the module calls a recursive directory walk.
+
+    The walks are ``<x>.rglob(...)``, ``os.walk(...)`` under any import
+    spelling or alias, and a ``glob``/``iglob`` call that recurses (a ``**``
+    pattern on ``Path.glob``, or ``glob.glob(..., recursive=True)``). A flat
+    ``<dir>.glob('*.py')`` lists one directory and is not a walk. Only
+    ``ast.Call`` nodes count, so a string constant naming ``'os.walk'``
+    (test_loop_blocking_gate's primitive table) is not a walk.
+    """
+    os_names = _os_module_names(tree)
+    bare_walks = _bare_os_walk_names(tree)
+    return any(
+        isinstance(node, ast.Call) and _is_walk_call(node, os_names, bare_walks)
+        for node in ast.walk(tree)
+    )
+
+
+def _names_the_enumerator(tree: ast.Module) -> bool:
+    """Rule 1: enumerating the first-party tree is the provider's job alone.
+
+    Keyed on the NAME, not on a parse in the same module: a module that
+    enumerates and hands sources to a scanner that parses elsewhere is still a
+    second whole-tree parse.
+    """
+    return 'iter_first_party_files' in _names_referenced(tree)
+
+
+def _rolls_its_own_root_parse(tree: ast.Module) -> bool:
+    """Rule 2: walk a directory tree yourself AND parse."""
+    return _walks_a_directory_tree(tree) and _calls_ast_parse(tree)
+
+
+def _is_private_tree_parse_offender(tree: ast.Module) -> bool:
+    return _names_the_enumerator(tree) or _rolls_its_own_root_parse(tree)
+
+
+def _could_offend(source: str) -> bool:
+    """Exact source-text prefilter for :func:`_is_private_tree_parse_offender`.
+
+    Every identifier the detectors match must appear literally in the source,
+    so a module failing this test cannot offend and need not be parsed.
+    """
+    return 'iter_first_party_files' in source or (
+        'parse' in source and ('glob' in source or 'walk' in source)
+    )
+
+
+def _offends(source: str, filename: str = '<synthetic>') -> bool:
+    """The ratchet's whole verdict on one module: the prefilter, then the detectors."""
+    return _could_offend(source) and _is_private_tree_parse_offender(
+        ast.parse(source, filename=filename)
+    )
+
+
+class TestNoRegrownWholeTreeParse:
+    """No shared/tests module may grow a SECOND private whole-tree parse.
+
+    Written in this directory's established ratchet idiom (the
+    silent-fallthrough gate, the archival gate): AST scan, name the offender,
+    carry an anti-vacuity floor. Two shapes offend: naming
+    ``iter_first_party_files`` at all (rule 1), and walking a directory tree
+    yourself (``rglob``, ``os.walk``, a recursive glob) and parsing (rule 2).
+    ``test_safe_io``'s
+    cross-tree sweep left shared/tests in task 3388 (now
+    ``tests/scripts/test_atomic_write_regrowth.py``), and ``test_auth_failed``
+    now walks the shared tree.
+    """
+
+    def test_no_module_enumerates_and_parses_the_tree_itself(self):
+        offenders = []
+        scanned = 0
+        for module_path in sorted(_TESTS_DIR.glob('*.py')):
+            if module_path.name in _PRIVATE_PARSE_EXEMPT:
+                continue
+            scanned += 1
+            source = module_path.read_text(encoding='utf-8')
+            if _offends(source, filename=str(module_path)):
+                offenders.append(module_path.name)
+        assert scanned >= 50, (
+            f'only {scanned} modules scanned — is the tests dir correct? '
+            f'({_TESTS_DIR})'
+        )
+        assert not offenders, (
+            'These shared/tests modules name iter_first_party_files, or walk '
+            'a directory tree (rglob, os.walk, a recursive glob) AND call '
+            'ast.parse:\n'
+            + '\n'.join(f'  {name}' for name in offenders)
+            + '\n\nEither is a SECOND whole-tree parse. Two of them already '
+              'collided with the 60s pytest-timeout budget under load (task '
+              '4520). Take the session-scoped `first_party_tree` fixture '
+              '(conftest.py) instead: its records carry each file\'s relpath, '
+              'source and parsed tree, built once at collection, outside every '
+              'item\'s pytest-timeout timer.'
+        )
+
+    def test_the_detector_actually_fires(self):
+        """Anti-vacuity: a synthetic offender must be caught."""
+        assert _offends(
+            'import ast\n'
+            'from silent_fallthrough_scan import iter_first_party_files\n'
+            'def scan(root):\n'
+            '    return [ast.parse(p.read_text()) for p in iter_first_party_files(root)]\n'
+        )
+
+    def test_naming_the_enumerator_alone_fires(self):
+        """Rule 1: a consumer never needs the enumerator; paths are on the records."""
+        assert _offends(
+            'from silent_fallthrough_scan import iter_first_party_files\n'
+            'def files(root):\n'
+            '    return list(iter_first_party_files(root))\n'
+        )
+
+    def test_the_split_enumerate_here_parse_elsewhere_shape_fires(self):
+        """The loop-blocking gate's old shape: enumerate, then a scanner parses."""
+        assert _offends(
+            'from loop_blocking_scan import find_loop_blocking_sites\n'
+            'from silent_fallthrough_scan import iter_first_party_files\n'
+            'def scan(root):\n'
+            '    sources = {str(p): p.read_text() for p in iter_first_party_files(root)}\n'
+            '    return find_loop_blocking_sites(sources)\n'
+        )
+
+    def test_the_detector_catches_the_from_import_spelling(self):
+        """`from ast import parse` must not evade rule 2."""
+        assert _offends(
+            'from ast import parse\n'
+            'def scan(root):\n'
+            "    return [parse(p.read_text()) for p in root.rglob('*.py')]\n"
+        )
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param(
+                'import ast\n'
+                'def scan(root):\n'
+                "    return [ast.parse(p.read_text()) for p in root.rglob('*.py')]\n",
+                id='rglob',
+            ),
+            pytest.param(
+                'import ast, os\n'
+                'def scan(root):\n'
+                '    for dirpath, _dirs, names in os.walk(root):\n'
+                '        for name in names:\n'
+                '            ast.parse(open(os.path.join(dirpath, name)).read())\n',
+                id='os-walk',
+            ),
+            pytest.param(
+                'import ast\n'
+                'import os as o\n'
+                'def scan(root):\n'
+                '    for dirpath, _dirs, names in o.walk(root):\n'
+                '        for name in names:\n'
+                '            ast.parse(open(o.path.join(dirpath, name)).read())\n',
+                id='aliased-os-walk',
+            ),
+            pytest.param(
+                'import ast\n'
+                'from os import walk as w\n'
+                'def scan(root):\n'
+                '    return [ast.parse(name) for _d, _s, names in w(root) for name in names]\n',
+                id='aliased-from-os-import-walk',
+            ),
+            pytest.param(
+                'import ast\n'
+                'def scan(root):\n'
+                "    return [ast.parse(p.read_text()) for p in root.glob('**/*.py')]\n",
+                id='double-star-path-glob',
+            ),
+            pytest.param(
+                'import ast, glob, os\n'
+                'def scan(root):\n'
+                "    paths = glob.glob(os.path.join(root, '**', '*.py'), recursive=True)\n"
+                '    return [ast.parse(open(p).read()) for p in paths]\n',
+                id='recursive-glob-module',
+            ),
+        ],
+    )
+    def test_the_detector_catches_every_directory_walk_spelling(self, source):
+        """Rule 2 keys on the walk, whichever spelling rolls it."""
+        assert _offends(source)
+
+    def test_a_flat_glob_is_not_a_walk(self):
+        """One directory level is not a tree: this ratchet itself globs '*.py' and parses."""
+        flat = ast.parse(
+            'import ast\n'
+            'def scan(directory):\n'
+            "    return [ast.parse(p.read_text()) for p in directory.glob('*.py')]\n"
+        )
+        assert not _is_private_tree_parse_offender(flat)
+
+    def test_a_walk_or_a_parse_alone_does_not_fire(self):
+        walks_only = ast.parse(
+            "def files(root):\n    return sorted(root.rglob('*.py'))\n"
+        )
+        parses_only = ast.parse('import ast\nast.parse("x = 1")\n')
+        assert not _is_private_tree_parse_offender(walks_only)
+        assert not _is_private_tree_parse_offender(parses_only)
+
+    def test_a_string_naming_os_walk_is_not_a_walk(self):
+        """Only calls count: test_loop_blocking_gate's primitive table names 'os.walk'."""
+        names_it = ast.parse(
+            "import ast\nPRIMITIVES = ('os.walk',)\nast.parse('x = 1')\n"
+        )
+        assert not _is_private_tree_parse_offender(names_it)

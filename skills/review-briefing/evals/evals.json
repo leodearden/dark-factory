@@ -19,7 +19,7 @@
       "id": 2,
       "name": "validate-existing",
       "prompt": "/review-briefing --validate",
-      "expected_output": "Reads existing review/briefing.yaml and checks all references (files, functions, task IDs). Reports pass/fail with specific stale or missing references. Does not modify the briefing.",
+      "expected_output": "Reads existing review/briefing.yaml and runs the per-section checks: last_updated is a real key; every workspace member has a subprojects entry (a missing member such as cockpit is reported); every known_gaps entry has an accepted_by task that exists and is not done; tasks, paths and path::symbol citations in conventions resolve. Reports one line per defect and pass/fail. Uses no commit-count rule and reads tasks by id, never the whole tree. Does not modify the briefing.",
       "files": []
     }
   ]

@@ -12,6 +12,8 @@ Steps covered in this file:
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -104,7 +106,7 @@ class TestHostAllocatorConstructionAsync:
         """acquire(local_factory) with all slots free returns a local HostLease."""
         from orchestrator.verify_runner import HostLease
         alloc = self._make_allocator()
-        lease = await alloc.acquire(self._local_factory)
+        lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert lease is not None
         assert isinstance(lease, HostLease)
         assert lease.is_local is True
@@ -118,14 +120,14 @@ class TestHostAllocatorConstructionAsync:
             return sentinel
 
         alloc = self._make_allocator()
-        lease = await alloc.acquire(factory)
+        lease = await alloc.acquire(factory, policy='prefer_local')
         assert lease is not None
         assert lease.runner is sentinel
 
     async def test_local_busy_after_acquire(self):
         """After acquire, the local slot is marked busy."""
         alloc = self._make_allocator()
-        await alloc.acquire(self._local_factory)
+        await alloc.acquire(self._local_factory, policy='prefer_local')
         assert alloc.is_busy('local') is True
         assert alloc.free_host_count() == 2
 
@@ -152,10 +154,10 @@ class TestHostAllocatorAcquireRelease:
         """With local busy, acquire() returns the first remote lease."""
         from orchestrator.verify_runner import HostLease
         alloc = self._make_allocator()
-        local_lease = await alloc.acquire(self._local_factory)
+        local_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert local_lease is not None and local_lease.is_local
 
-        remote_lease = await alloc.acquire(self._local_factory)
+        remote_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert remote_lease is not None
         assert isinstance(remote_lease, HostLease)
         assert remote_lease.is_local is False
@@ -164,31 +166,31 @@ class TestHostAllocatorAcquireRelease:
     async def test_third_acquire_returns_second_remote(self):
         """local busy + remoteA busy → third acquire returns remoteB."""
         alloc = self._make_allocator()
-        await alloc.acquire(self._local_factory)           # local
-        await alloc.acquire(self._local_factory)           # remoteA
-        third = await alloc.acquire(self._local_factory)
+        await alloc.acquire(self._local_factory, policy='prefer_local')           # local
+        await alloc.acquire(self._local_factory, policy='prefer_local')           # remoteA
+        third = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert third is not None
         assert third.name == 'remoteB'
 
     async def test_fourth_acquire_returns_none_all_busy(self):
         """All slots busy → acquire returns None (≤1 in-flight per host)."""
         alloc = self._make_allocator()
-        await alloc.acquire(self._local_factory)           # local
-        await alloc.acquire(self._local_factory)           # remoteA
-        await alloc.acquire(self._local_factory)           # remoteB
-        fourth = await alloc.acquire(self._local_factory)
+        await alloc.acquire(self._local_factory, policy='prefer_local')           # local
+        await alloc.acquire(self._local_factory, policy='prefer_local')           # remoteA
+        await alloc.acquire(self._local_factory, policy='prefer_local')           # remoteB
+        fourth = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert fourth is None
 
     async def test_free_host_count_tracks_busy_slots(self):
         """free_host_count decrements as slots are acquired."""
         alloc = self._make_allocator()
         assert alloc.free_host_count() == 3
-        l1 = await alloc.acquire(self._local_factory)
+        l1 = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert l1 is not None
         assert alloc.free_host_count() == 2
-        await alloc.acquire(self._local_factory)
+        await alloc.acquire(self._local_factory, policy='prefer_local')
         assert alloc.free_host_count() == 1
-        await alloc.acquire(self._local_factory)
+        await alloc.acquire(self._local_factory, policy='prefer_local')
         assert alloc.free_host_count() == 0
 
         # release local → local slot freed → prefer-local again
@@ -198,13 +200,13 @@ class TestHostAllocatorAcquireRelease:
     async def test_release_local_then_acquire_returns_local(self):
         """After releasing the local slot, the next acquire again returns local."""
         alloc = self._make_allocator()
-        local_lease = await alloc.acquire(self._local_factory)
+        local_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert local_lease is not None
-        await alloc.acquire(self._local_factory)
+        await alloc.acquire(self._local_factory, policy='prefer_local')
         await alloc.release(local_lease)
 
         # Local slot freed — next acquire should prefer local
-        new_lease = await alloc.acquire(self._local_factory)
+        new_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert new_lease is not None
         assert new_lease.is_local is True
         assert new_lease.name == 'local'
@@ -212,7 +214,7 @@ class TestHostAllocatorAcquireRelease:
     async def test_release_is_idempotent(self):
         """Double-release is a no-op — no error, slot stays FREE."""
         alloc = self._make_allocator()
-        lease = await alloc.acquire(self._local_factory)
+        lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert lease is not None
         await alloc.release(lease)
         await alloc.release(lease)  # idempotent
@@ -243,34 +245,37 @@ class TestHostAllocatorQuarantine:
         shared_q: set[str] = set()
         alloc = self._make_allocator(shared_quarantine=shared_q)
         # Acquire local first so we can get remoteA
-        await alloc.acquire(self._local_factory)
-        remote_lease = await alloc.acquire(self._local_factory)
+        await alloc.acquire(self._local_factory, policy='prefer_local')
+        remote_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert remote_lease is not None and remote_lease.name == 'remoteA'
 
         await alloc.quarantine_and_release(remote_lease)
         assert 'remoteA' in shared_q
 
     async def test_quarantine_frees_the_slot(self):
-        """After quarantine_and_release, the remote slot is freed (count increments)."""
+        """After quarantine_and_release the remote slot is freed, but a
+        quarantined slot is not acquirable, so free_host_count() does not rise.
+        """
         alloc = self._make_allocator()
-        await alloc.acquire(self._local_factory)           # local
-        remote_lease = await alloc.acquire(self._local_factory)   # remoteA
+        await alloc.acquire(self._local_factory, policy='prefer_local')           # local
+        remote_lease = await alloc.acquire(self._local_factory, policy='prefer_local')   # remoteA
         assert remote_lease is not None
         before = alloc.free_host_count()
         await alloc.quarantine_and_release(remote_lease)
-        assert alloc.free_host_count() == before + 1
+        assert alloc.is_busy('remoteA') is False
+        assert alloc.free_host_count() == before
 
     async def test_quarantined_host_not_acquired(self):
         """A quarantined remote is skipped by acquire_remote()."""
         shared_q: set[str] = set()
         alloc = self._make_allocator(shared_quarantine=shared_q)
-        await alloc.acquire(self._local_factory)           # local
-        remote_a_lease = await alloc.acquire(self._local_factory)  # remoteA
+        await alloc.acquire(self._local_factory, policy='prefer_local')           # local
+        remote_a_lease = await alloc.acquire(self._local_factory, policy='prefer_local')  # remoteA
         assert remote_a_lease is not None
         await alloc.quarantine_and_release(remote_a_lease)  # quarantine remoteA
 
         # Next acquire (local still busy) should return remoteB, not remoteA
-        next_lease = await alloc.acquire(self._local_factory)
+        next_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert next_lease is not None
         assert next_lease.name == 'remoteB'
 
@@ -278,15 +283,15 @@ class TestHostAllocatorQuarantine:
         """With all remotes quarantined and local busy, acquire returns None."""
         shared_q: set[str] = {'remoteA', 'remoteB'}
         alloc = self._make_allocator(shared_quarantine=shared_q)
-        await alloc.acquire(self._local_factory)           # local BUSY
-        result = await alloc.acquire(self._local_factory)
+        await alloc.acquire(self._local_factory, policy='prefer_local')           # local BUSY
+        result = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert result is None
 
     async def test_quarantine_local_lease_does_not_add_to_set(self):
         """quarantine_and_release on a LOCAL lease only frees the slot — 'local' NOT added to set."""
         shared_q: set[str] = set()
         alloc = self._make_allocator(shared_quarantine=shared_q)
-        local_lease = await alloc.acquire(self._local_factory)
+        local_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert local_lease is not None
         await alloc.quarantine_and_release(local_lease)
 
@@ -298,11 +303,11 @@ class TestHostAllocatorQuarantine:
         shared_q: set[str] = {'remoteA'}
         alloc = self._make_allocator(shared_quarantine=shared_q)
         # local slot is free; remoteA quarantined; remoteB free
-        local_lease = await alloc.acquire(self._local_factory)
+        local_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert local_lease is not None and local_lease.is_local
 
         # With local busy, remoteA quarantined → next should be remoteB
-        next_lease = await alloc.acquire(self._local_factory)
+        next_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert next_lease is not None
         assert next_lease.name == 'remoteB'
 
@@ -350,8 +355,8 @@ class TestHostAllocatorCancelRelease:
         remote_a = _FakeRemoteRunnerCancellable('remoteA', cancel_rc=0)
         alloc = HostAllocator([remote_a], quarantine=set())
 
-        await alloc.acquire(self._local_factory)     # local busy
-        remote_lease = await alloc.acquire(self._local_factory)   # remoteA
+        await alloc.acquire(self._local_factory, policy='prefer_local')     # local busy
+        remote_lease = await alloc.acquire(self._local_factory, policy='prefer_local')   # remoteA
         assert remote_lease is not None
 
         result = await alloc.cancel_and_release(remote_lease)
@@ -366,13 +371,13 @@ class TestHostAllocatorCancelRelease:
         remote_a = _FakeRemoteRunnerCancellable('remoteA', cancel_rc=0)
         alloc = HostAllocator([remote_a], quarantine=set())
 
-        await alloc.acquire(self._local_factory)    # local
-        remote_lease = await alloc.acquire(self._local_factory)   # remoteA
+        await alloc.acquire(self._local_factory, policy='prefer_local')    # local
+        remote_lease = await alloc.acquire(self._local_factory, policy='prefer_local')   # remoteA
         assert remote_lease is not None
         await alloc.cancel_and_release(remote_lease)
 
         # Still local-busy; remoteA should be acquirable
-        new_lease = await alloc.acquire(self._local_factory)
+        new_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert new_lease is not None
         assert new_lease.name == 'remoteA'
 
@@ -382,7 +387,7 @@ class TestHostAllocatorCancelRelease:
 
         # No cancel_verify on this runner — if called, AttributeError would surface
         alloc = HostAllocator([], quarantine=set())
-        local_lease = await alloc.acquire(self._local_factory)
+        local_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert local_lease is not None and local_lease.is_local
 
         result = await alloc.cancel_and_release(local_lease)
@@ -409,8 +414,8 @@ class TestHostAllocatorCancelFail:
         remote_a = _FakeRemoteRunnerCancellable('remoteA', cancel_rc=1, probe_sequence=[True])
         alloc = HostAllocator([remote_a], quarantine=set())
 
-        await alloc.acquire(self._local_factory)
-        remote_lease = await alloc.acquire(self._local_factory)
+        await alloc.acquire(self._local_factory, policy='prefer_local')
+        remote_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert remote_lease is not None
 
         async def noop_sleep(_: float) -> None:
@@ -437,8 +442,8 @@ class TestHostAllocatorCancelFail:
         remote_b = _FakeRemoteRunner('remoteB')
         alloc = HostAllocator([remote_a, remote_b], quarantine=set())
 
-        await alloc.acquire(self._local_factory)
-        remote_lease = await alloc.acquire(self._local_factory)  # remoteA
+        await alloc.acquire(self._local_factory, policy='prefer_local')
+        remote_lease = await alloc.acquire(self._local_factory, policy='prefer_local')  # remoteA
         assert remote_lease is not None
 
         # We'll run cancel_and_release in a task so we can probe mid-flight
@@ -447,7 +452,7 @@ class TestHostAllocatorCancelFail:
 
         async def checking_sleep(secs: float) -> None:
             # After first probe(False), the slot should be PARKED (not acquirable)
-            lease = await alloc.acquire(self._local_factory)
+            lease = await alloc.acquire(self._local_factory, policy='prefer_local')
             if lease is None:
                 acquired_while_parked.append(None)
             else:
@@ -466,8 +471,8 @@ class TestHostAllocatorCancelFail:
         remote_a = _FakeRemoteRunnerCancellable('remoteA', cancel_rc=1, probe_sequence=[False, True])
         alloc = HostAllocator([remote_a], quarantine=set())
 
-        await alloc.acquire(self._local_factory)
-        remote_lease = await alloc.acquire(self._local_factory)
+        await alloc.acquire(self._local_factory, policy='prefer_local')
+        remote_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert remote_lease is not None
 
         async def noop_sleep(_: float) -> None:
@@ -478,7 +483,7 @@ class TestHostAllocatorCancelFail:
         # After probe_clean returns True: un-parked + freed
         assert alloc.is_busy('remoteA') is False
         # And it should be acquirable
-        new_lease = await alloc.acquire(self._local_factory)
+        new_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert new_lease is not None
         assert new_lease.name == 'remoteA'
 
@@ -489,8 +494,8 @@ class TestHostAllocatorCancelFail:
         remote_a = _FakeRemoteRunnerCancellable('remoteA', cancel_rc=1, probe_sequence=[False] * 20)
         alloc = HostAllocator([remote_a], quarantine=set())
 
-        await alloc.acquire(self._local_factory)
-        remote_lease = await alloc.acquire(self._local_factory)
+        await alloc.acquire(self._local_factory, policy='prefer_local')
+        remote_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert remote_lease is not None
 
         async def noop_sleep(_: float) -> None:
@@ -607,8 +612,8 @@ class TestHostAllocatorClearQuarantineAsync:
         shared_q: set[str] = set()
         alloc = self._make_allocator(shared_quarantine=shared_q)
         # Fill local so overflow goes to remote
-        await alloc.acquire(self._local_factory)       # local busy
-        remote_lease = await alloc.acquire(self._local_factory)   # remoteA
+        await alloc.acquire(self._local_factory, policy='prefer_local')       # local busy
+        remote_lease = await alloc.acquire(self._local_factory, policy='prefer_local')   # remoteA
         assert remote_lease is not None and remote_lease.name == 'remoteA'
 
         await alloc.quarantine_and_release(remote_lease)
@@ -648,8 +653,8 @@ class TestHostAllocatorCancelReleaseIdempotent:
         remote_a = _FakeRemoteRunnerCancellable('remoteA', cancel_rc=0)
         alloc = HostAllocator([remote_a], quarantine=set())
 
-        await alloc.acquire(self._local_factory)                  # local busy (force overflow)
-        remote_lease = await alloc.acquire(self._local_factory)   # remoteA
+        await alloc.acquire(self._local_factory, policy='prefer_local')                  # local busy (force overflow)
+        remote_lease = await alloc.acquire(self._local_factory, policy='prefer_local')   # remoteA
         assert remote_lease is not None
 
         first = await alloc.cancel_and_release(remote_lease)
@@ -679,8 +684,8 @@ class TestHostAllocatorCancelReleaseIdempotent:
         remote_a = _FirstCancelCleanThenFailing('remoteA', probe_sequence=[False] * 20)
         alloc = HostAllocator([remote_a], quarantine=set())
 
-        await alloc.acquire(self._local_factory)
-        remote_lease = await alloc.acquire(self._local_factory)   # remoteA
+        await alloc.acquire(self._local_factory, policy='prefer_local')
+        remote_lease = await alloc.acquire(self._local_factory, policy='prefer_local')   # remoteA
         assert remote_lease is not None
 
         async def noop_sleep(_: float) -> None:
@@ -719,7 +724,7 @@ class TestHostAllocatorCancelReleaseIdempotent:
         from orchestrator.verify_runner import HostAllocator
 
         alloc = HostAllocator([], quarantine=set())
-        local_lease = await alloc.acquire(self._local_factory)
+        local_lease = await alloc.acquire(self._local_factory, policy='prefer_local')
         assert local_lease is not None and local_lease.is_local
 
         first = await alloc.cancel_and_release(local_lease)
@@ -1311,6 +1316,31 @@ class TestHostAllocatorReadmit:
         assert [h['name'] for h in alloc.host_states()] == before
         assert 'no-such-host' not in {h['name'] for h in alloc.host_states()}
 
+    async def test_readmit_refuses_a_park_episode_newer_than_the_probe(self):
+        """A probe vouches for one park episode; a re-PARK across its await is not re-admitted."""
+        from orchestrator.verify_runner import HostAllocator
+
+        shared_q: set[str] = set()
+        runner = _ReachabilityRunner('remoteA', reachable=False)
+        alloc = HostAllocator([runner], quarantine=shared_q)
+        first = alloc.acquire_remote()
+        assert first is not None
+        await alloc.cancel_and_release(first, sleep=_noop_sleep, max_attempts=1)
+        probed_epoch = alloc.park_epoch('remoteA')
+
+        assert alloc.unpark('remoteA') is True
+        second = alloc.acquire_remote()
+        assert second is not None
+        await alloc.cancel_and_release(second, sleep=_noop_sleep, max_attempts=1)
+        shared_q.add('remoteA')
+
+        assert alloc.readmit('remoteA', expect_epoch=probed_epoch) is False
+        assert alloc.is_parked('remoteA') is True
+        assert alloc.is_quarantined('remoteA') is True
+        assert alloc.readmit('remoteA', expect_epoch=alloc.park_epoch('remoteA')) is True
+        assert alloc.is_parked('remoteA') is False
+        assert alloc.is_quarantined('remoteA') is False
+
     # -- (e) REGRESSION PIN: why clear_quarantine alone is not enough -----------
 
     async def test_clear_quarantine_alone_leaves_parked_host_unusable(self):
@@ -1340,3 +1370,895 @@ class TestHostAllocatorReadmit:
         alloc.readmit('remoteA')
         recovered = alloc.acquire_remote()
         assert recovered is not None and recovered.name == 'remoteA'
+
+
+# ---------------------------------------------------------------------------
+# 5097/step-5 RED: acquire(policy=...) selection matrix + prefer_remote fallback
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorAcquirePolicy:
+    """acquire() takes the host-selection policy as a REQUIRED keyword-only
+    argument and honours it per call.
+
+    'prefer_local' is today's order, now stated explicitly rather than assumed;
+    'prefer_remote' inverts it so a free remote absorbs verify load instead of
+    idling while the lane serialises on local.  Eligibility is unchanged in both
+    directions — acquire_remote() already demands FREE, non-quarantined and
+    non-PARKED — so every ineligible-remote shape falls through to local on its
+    own, with no second eligibility check to drift out of step.
+    """
+
+    def _make_allocator(self, *, remotes=('remoteA', 'remoteB'), quarantine=None):
+        from orchestrator.verify_runner import HostAllocator
+
+        q = quarantine if quarantine is not None else set()
+        return HostAllocator([_FakeRemoteRunner(n) for n in remotes], quarantine=q)
+
+    def _local_factory(self):
+        return _FakeLocalRunner()
+
+    # -- (a) the two orders ---------------------------------------------------
+
+    async def test_prefer_local_takes_local_first(self):
+        """'prefer_local' is today's behaviour, byte-for-byte."""
+        alloc = self._make_allocator()
+
+        lease = await alloc.acquire(self._local_factory, policy='prefer_local')
+
+        assert lease is not None
+        assert lease.name == 'local'
+        assert lease.is_local is True
+
+    async def test_prefer_remote_takes_first_remote_first(self):
+        """The user-observable signal of this task: with a free remote,
+        'prefer_remote' dispatches there and local stays untouched.
+        """
+        alloc = self._make_allocator()
+
+        lease = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        assert lease is not None
+        assert lease.name == 'remoteA'
+        assert lease.is_local is False
+        assert alloc.is_busy('local') is False
+
+    async def test_prefer_remote_exhausts_remotes_before_falling_back(self):
+        """Remote exhaustion PRECEDES the local fallback: the second
+        prefer_remote acquire takes remoteB, not local.
+        """
+        alloc = self._make_allocator()
+
+        first = await alloc.acquire(self._local_factory, policy='prefer_remote')
+        second = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        assert first is not None and first.name == 'remoteA'
+        assert second is not None and second.name == 'remoteB'
+        assert alloc.is_busy('local') is False
+
+        third = await alloc.acquire(self._local_factory, policy='prefer_remote')
+        assert third is not None and third.name == 'local'
+
+    # -- (b) every ineligible-remote shape falls through to local -------------
+
+    async def test_prefer_remote_falls_back_to_local_when_remotes_busy(self):
+        alloc = self._make_allocator()
+        assert alloc.acquire_remote() is not None   # remoteA busy
+        assert alloc.acquire_remote() is not None   # remoteB busy
+
+        lease = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        assert lease is not None
+        assert lease.name == 'local'
+        assert lease.is_local is True
+
+    async def test_prefer_remote_never_selects_a_quarantined_host(self):
+        shared_q = {'remoteA'}
+        alloc = self._make_allocator(remotes=('remoteA',), quarantine=shared_q)
+
+        lease = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        assert lease is not None
+        assert lease.name == 'local'
+        # The quarantine is untouched by the fallback — the host stays out of
+        # the pool until a real recovery path readmits it.
+        assert 'remoteA' in shared_q
+        assert alloc.is_busy('remoteA') is False
+
+    async def test_prefer_remote_never_selects_a_parked_host(self):
+        """PARKED is reached through the REAL cancel-fail path, not by hand-
+        mutating a slot, so the fallback is exercised against production state.
+        """
+        from orchestrator.verify_runner import HostAllocator
+
+        remote_a = _FakeRemoteRunnerCancellable(
+            'remoteA', cancel_rc=1, probe_sequence=[False] * 20,
+        )
+        alloc = HostAllocator([remote_a], quarantine=set())
+        remote_lease = alloc.acquire_remote()
+        assert remote_lease is not None
+
+        async def noop_sleep(_: float) -> None:
+            pass
+
+        parked = await alloc.cancel_and_release(
+            remote_lease, sleep=noop_sleep, max_attempts=2,
+        )
+        assert parked is False
+        assert alloc.is_parked('remoteA') is True
+
+        lease = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        assert lease is not None
+        assert lease.name == 'local'
+        assert alloc.is_parked('remoteA') is True
+
+    async def test_prefer_remote_returns_none_when_nothing_is_eligible(self):
+        """Local busy AND every remote ineligible → None, exactly as
+        'prefer_local' returns None in the same situation.  The caller puts the
+        item back; it is not a stall.
+        """
+        shared_q = {'remoteA'}
+        alloc = self._make_allocator(remotes=('remoteA',), quarantine=shared_q)
+        assert alloc.acquire_local(self._local_factory) is not None
+
+        lease = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        assert lease is None
+
+    # -- (c) the policy is read PER CALL, never captured ----------------------
+
+    async def test_policy_is_read_per_call_not_captured(self):
+        """ONE allocator, alternating policies: the selection order changes on
+        every call.
+
+        This is what keeps the RELOADABLE_FIELDS registration honest.
+        _ensure_host_allocator caches the allocator for the worker's whole
+        lifetime, so a constructor-captured policy would not change until a
+        process restart — "reloadable in name only".  Reading it per call is
+        what makes a green-tier flip land on the next dispatch.
+        """
+        alloc = self._make_allocator()
+
+        for expected in ['local', 'remoteA', 'local', 'remoteA']:
+            policy = 'prefer_local' if expected == 'local' else 'prefer_remote'
+            lease = await alloc.acquire(self._local_factory, policy=policy)
+            assert lease is not None
+            assert lease.name == expected, (
+                f'policy={policy!r} selected {lease.name!r}, expected '
+                f'{expected!r} — the policy must not be captured on the allocator'
+            )
+            await alloc.release(lease)
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorPreferRemoteFallbackBoundary:
+    """INV-10 boundary: the prefer_remote → local fallback is EXECUTED, not
+    merely asserted about.
+
+    Amendment R11 item 2: pinning the policy string is not enough.  Between two
+    real acquires this calls quarantine_and_release, the allocator primitive
+    that merge_queue.py::SpeculativeMergeWorker._finalize_inflight invokes on
+    RunnerUnavailable, so the allocator half of the fallback is executed: a
+    remote that failed mid-dispatch under prefer_remote hands the re-dispatch to
+    local instead of stalling the queue.  The merge-lane half (a real
+    RunnerUnavailable reaching _finalize_inflight) is not driven here; the
+    public seam that would let a test do so without private access is task 5453.
+    """
+
+    def _local_factory(self):
+        return _FakeLocalRunner()
+
+    async def test_runner_unavailable_under_prefer_remote_redispatches_local(self):
+        from orchestrator.verify_runner import HostAllocator
+
+        shared_q: set[str] = set()
+        alloc = HostAllocator([_FakeRemoteRunner('remoteA')], quarantine=shared_q)
+
+        first = await alloc.acquire(self._local_factory, policy='prefer_remote')
+        assert first is not None
+        assert first.name == 'remoteA'
+        assert first.is_local is False
+
+        # What _finalize_inflight does with a lease whose runner raised
+        # RunnerUnavailable.
+        await alloc.quarantine_and_release(first)
+
+        assert 'remoteA' in shared_q
+        # The slot was freed, not leaked, but a quarantined remote is not
+        # acquirable, so only local counts.
+        assert alloc.is_busy('remoteA') is False
+        assert alloc.free_host_count() == 1
+
+        second = await alloc.acquire(self._local_factory, policy='prefer_remote')
+
+        # The re-dispatch lands — the queue drains rather than stalling on a
+        # sick remote, even though the policy still says prefer_remote.
+        assert second is not None
+        assert second.name == 'local'
+        assert second.is_local is True
+        assert 'remoteA' in shared_q
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorFreeHostCountMatchesAcquire:
+    """free_host_count() counts exactly the slots acquire() could hand out
+    (task 5303, absorbing 4929 defect 2).
+
+    The merge lane's dispatch fast path trusts this count before paying for a
+    main-SHA read and a re-merge; counting a FREE-but-quarantined remote sent
+    it past the guard into an acquire() that returned None.
+    """
+
+    def _local_factory(self):
+        return _FakeLocalRunner()
+
+    def _make_allocator(self, quarantine: set[str]):
+        from orchestrator.verify_runner import HostAllocator
+
+        return HostAllocator(
+            [_FakeRemoteRunner('remoteA'), _FakeRemoteRunner('remoteB')],
+            quarantine=quarantine,
+        )
+
+    async def _drain(self, alloc, policy) -> list[str]:
+        names = []
+        while (lease := await alloc.acquire(self._local_factory, policy=policy)) is not None:
+            names.append(lease.name)
+        return names
+
+    async def test_free_but_quarantined_remote_is_not_counted(self):
+        alloc = self._make_allocator({'remoteA'})
+        local = await alloc.acquire(self._local_factory, policy='prefer_local')
+        remote_b = await alloc.acquire(self._local_factory, policy='prefer_local')
+        assert local is not None and remote_b is not None
+        assert alloc.is_busy('remoteA') is False, 'precondition: remoteA is FREE'
+
+        assert alloc.free_host_count() == 0
+        assert await alloc.acquire(self._local_factory, policy='prefer_local') is None
+
+    async def test_quarantined_local_name_is_still_counted(self):
+        """Local is the trust anchor: a stray 'local' in the shared set does not
+        stop acquire_local, so it must not stop the count either."""
+        alloc = self._make_allocator({'local', 'remoteA', 'remoteB'})
+
+        assert alloc.free_host_count() == 1
+        assert await self._drain(alloc, 'prefer_local') == ['local']
+
+    @pytest.mark.parametrize('policy', ['prefer_local', 'prefer_remote'])
+    @pytest.mark.parametrize(
+        'quarantine', [set(), {'remoteA'}, {'remoteB'}, {'remoteA', 'remoteB'}],
+    )
+    async def test_count_equals_what_acquire_yields(self, policy, quarantine):
+        alloc = self._make_allocator(set(quarantine))
+        counted = alloc.free_host_count()
+
+        acquired = await self._drain(alloc, policy)
+
+        assert counted == len(acquired), (
+            f'free_host_count()={counted} but acquire() handed out {acquired} '
+            f'under {policy} with quarantine={sorted(quarantine)}'
+        )
+
+    async def test_cleared_quarantine_is_counted_again(self):
+        alloc = self._make_allocator({'remoteA'})
+        assert alloc.free_host_count() == 2
+
+        alloc.clear_quarantine('remoteA')
+
+        assert alloc.free_host_count() == 3
+
+    async def test_readmitted_parked_remote_is_counted_again(self):
+        alloc = self._make_allocator(set())
+        remote = await alloc.acquire(self._local_factory, policy='prefer_remote')
+        assert remote is not None
+        await alloc.quarantine_and_release(remote)
+        assert alloc.free_host_count() == 2
+
+        alloc.readmit(remote.name)
+
+        assert alloc.free_host_count() == 3
+
+
+# ---------------------------------------------------------------------------
+# 3310: park identity (park_epoch / unpark) and the inline-probe ABA
+# ---------------------------------------------------------------------------
+
+
+async def _noop_sleep(_: float) -> None:
+    pass
+
+
+class _ConcurrentWriterRunner(_FakeRemoteRunnerCancellable):
+    """A remote whose cancel always fails and whose FIRST probe_clean() runs
+    ``during_first_probe`` — a concurrent writer acting inside the inline
+    probe loop's await window — before answering ``first_probe_clean``.
+    Every later probe (including any the writer itself triggers) answers
+    ``later_probes_clean``."""
+
+    def __init__(
+        self, name: str, *, first_probe_clean: bool = True, later_probes_clean: bool = False,
+    ) -> None:
+        super().__init__(name, cancel_rc=1)
+        self._first_probe_clean = first_probe_clean
+        self._later_probes_clean = later_probes_clean
+        self.during_first_probe: Callable[[], Awaitable[None]] | None = None
+
+    async def probe_clean(self) -> bool:
+        self.probe_clean_called += 1
+        if self.probe_clean_called > 1:
+            return self._later_probes_clean
+        assert self.during_first_probe is not None
+        await self.during_first_probe()
+        return self._first_probe_clean
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorParkIdentity:
+    """park_epoch(name) / unpark(name, expect_epoch=) — the park episode as an
+    identity, so a PARKED→FREE write that crosses an await can tell whether the
+    PARK it was clearing is still the current one."""
+
+    async def _parked(self):
+        """(alloc, quarantine_set, lease) with remoteA's slot left PARKED."""
+        from orchestrator.verify_runner import HostAllocator
+
+        runner = _FakeRemoteRunnerCancellable('remoteA', cancel_rc=1, probe_sequence=[False] * 20)
+        q: set[str] = set()
+        alloc = HostAllocator([runner], quarantine=q)
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteA'
+        assert await alloc.cancel_and_release(lease, sleep=_noop_sleep, max_attempts=2) is False
+        assert alloc.is_parked('remoteA') is True
+        return alloc, q, lease
+
+    async def _repark_after_unpark(self, alloc) -> None:
+        """Free the PARKED slot, re-acquire it and park it again: a new episode."""
+        assert alloc.unpark('remoteA') is True
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteA'
+        assert await alloc.cancel_and_release(lease, sleep=_noop_sleep, max_attempts=2) is False
+        assert alloc.is_parked('remoteA') is True
+
+    # -- (a) ---------------------------------------------------------------------
+
+    async def test_unpark_frees_a_parked_slot_for_acquisition(self):
+        alloc, _q, _lease = await self._parked()
+
+        assert alloc.unpark('remoteA') is True
+
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteA'
+
+    # -- (b) ---------------------------------------------------------------------
+
+    async def test_unpark_refuses_free_slot_without_mutating(self):
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([_FakeRemoteRunner('remoteA')], quarantine=set())
+        before = alloc.host_states()
+
+        assert alloc.unpark('remoteA') is False
+        assert alloc.host_states() == before
+
+    async def test_unpark_refuses_busy_slot_without_mutating(self):
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([_FakeRemoteRunner('remoteA')], quarantine=set())
+        assert alloc.acquire_remote() is not None
+        before = alloc.host_states()
+
+        assert alloc.unpark('remoteA') is False
+        assert alloc.host_states() == before
+        assert alloc.acquire_remote() is None
+
+    @pytest.mark.parametrize('local_busy', [False, True])
+    async def test_unpark_refuses_local_without_mutating(self, local_busy):
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([_FakeRemoteRunner('remoteA')], quarantine=set())
+        if local_busy:
+            assert alloc.acquire_local(_FakeLocalRunner) is not None
+        before = alloc.host_states()
+
+        assert alloc.unpark('local') is False
+        assert alloc.host_states() == before
+
+    async def test_unpark_unknown_name_fabricates_no_slot(self):
+        alloc, _q, _lease = await self._parked()
+        before = alloc.host_states()
+
+        assert alloc.unpark('no-such-host') is False
+        assert alloc.host_states() == before
+        assert alloc.park_epoch('no-such-host') is None
+
+    # -- (c) ---------------------------------------------------------------------
+
+    async def test_unpark_never_touches_the_quarantine(self):
+        """Invariant 5: a divergence quarantine is operator-only, so un-PARKing a
+        quarantined host frees the slot but leaves the host refused."""
+        alloc, q, _lease = await self._parked()
+        q.add('remoteA')
+
+        assert alloc.unpark('remoteA') is True
+
+        assert 'remoteA' in q
+        row = {h['name']: h for h in alloc.host_states()}['remoteA']
+        assert row['slot_state'] == 'free'
+        assert row['quarantined'] is True
+        assert alloc.acquire_remote() is None
+
+    # -- (d) ---------------------------------------------------------------------
+
+    async def test_park_epoch_is_none_unless_parked(self):
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator(
+            [_FakeRemoteRunner('remoteA'), _FakeRemoteRunner('remoteB')], quarantine=set(),
+        )
+        assert alloc.acquire_remote() is not None   # remoteA BUSY, remoteB FREE
+
+        assert alloc.park_epoch('remoteA') is None
+        assert alloc.park_epoch('remoteB') is None
+        assert alloc.park_epoch('local') is None
+        assert alloc.park_epoch('no-such-host') is None
+
+        parked, _q, _lease = await self._parked()
+        assert isinstance(parked.park_epoch('remoteA'), int)
+
+    async def test_reentrant_cancel_retry_keeps_the_same_episode(self):
+        alloc, _q, lease = await self._parked()
+        episode = alloc.park_epoch('remoteA')
+
+        assert await alloc.cancel_and_release(lease, sleep=_noop_sleep, max_attempts=2) is False
+
+        assert alloc.is_parked('remoteA') is True
+        assert alloc.park_epoch('remoteA') == episode
+
+    async def test_a_fresh_park_is_a_new_episode(self):
+        alloc, _q, _lease = await self._parked()
+        first = alloc.park_epoch('remoteA')
+
+        await self._repark_after_unpark(alloc)
+
+        assert alloc.park_epoch('remoteA') != first
+
+    # -- (e) ---------------------------------------------------------------------
+
+    async def test_unpark_with_a_stale_epoch_is_refused(self):
+        alloc, _q, _lease = await self._parked()
+        stale = alloc.park_epoch('remoteA')
+        await self._repark_after_unpark(alloc)
+
+        assert alloc.unpark('remoteA', expect_epoch=stale) is False
+        assert alloc.is_parked('remoteA') is True
+
+        assert alloc.unpark('remoteA', expect_epoch=alloc.park_epoch('remoteA')) is True
+        assert alloc.is_parked('remoteA') is False
+
+    # -- (f) inline-loop ABA, BUSY variant ----------------------------------------
+
+    async def test_inline_loop_never_steals_a_slot_reacquired_during_its_probe(self):
+        from orchestrator.verify_runner import HostAllocator
+
+        runner = _ConcurrentWriterRunner('remoteA', first_probe_clean=True)
+        alloc = HostAllocator([runner], quarantine=set())
+
+        async def free_and_reacquire() -> None:
+            assert alloc.unpark('remoteA') is True
+            assert alloc.acquire_remote() is not None
+
+        runner.during_first_probe = free_and_reacquire
+        lease = alloc.acquire_remote()
+
+        assert await alloc.cancel_and_release(lease, sleep=_noop_sleep, max_attempts=3) is False
+
+        assert {h['name']: h for h in alloc.host_states()}['remoteA']['slot_state'] == 'busy'
+        assert alloc.acquire_remote() is None
+        assert runner.probe_clean_called == 1
+
+    async def test_inline_loop_stops_polling_once_its_episode_is_gone(self):
+        """A dirty first probe would normally poll again; once the episode has
+        been freed and re-acquired the loop must stop rather than keep probing
+        (and later free) a slot it no longer owns."""
+        from orchestrator.verify_runner import HostAllocator
+
+        runner = _ConcurrentWriterRunner(
+            'remoteA', first_probe_clean=False, later_probes_clean=True,
+        )
+        alloc = HostAllocator([runner], quarantine=set())
+
+        async def free_and_reacquire() -> None:
+            assert alloc.unpark('remoteA') is True
+            assert alloc.acquire_remote() is not None
+
+        runner.during_first_probe = free_and_reacquire
+        lease = alloc.acquire_remote()
+
+        assert await alloc.cancel_and_release(lease, sleep=_noop_sleep, max_attempts=3) is False
+
+        assert {h['name']: h for h in alloc.host_states()}['remoteA']['slot_state'] == 'busy'
+        assert runner.probe_clean_called == 1
+
+    # -- (g) inline-loop ABA, re-park variant -------------------------------------
+
+    async def test_inline_loop_never_unparks_a_newer_park_episode(self):
+        from orchestrator.verify_runner import HostAllocator
+
+        runner = _ConcurrentWriterRunner('remoteA', first_probe_clean=True)
+        alloc = HostAllocator([runner], quarantine=set())
+        new_episode: list[int | None] = []
+
+        async def free_reacquire_and_repark() -> None:
+            assert alloc.unpark('remoteA') is True
+            relet = alloc.acquire_remote()
+            assert relet is not None
+            assert await alloc.cancel_and_release(relet, sleep=_noop_sleep, max_attempts=1) is False
+            new_episode.append(alloc.park_epoch('remoteA'))
+
+        runner.during_first_probe = free_reacquire_and_repark
+        lease = alloc.acquire_remote()
+        assert lease is not None
+
+        assert await alloc.cancel_and_release(lease, sleep=_noop_sleep, max_attempts=3) is False
+
+        assert alloc.is_parked('remoteA') is True
+        assert new_episode and new_episode[0] is not None
+        assert alloc.park_epoch('remoteA') == new_episode[0]
+
+
+# ---------------------------------------------------------------------------
+# 3310: PARK / un-PARK transition logging
+# ---------------------------------------------------------------------------
+
+_ALLOCATOR_LOGGER = 'orchestrator.verify_runner'
+
+
+class _ReachabilityRunner(_FakeRemoteRunner):
+    """A remote whose cancel and probe both answer from one ``reachable`` flag:
+    cancel_verify() is 0 when reachable else 255 (ssh's own failure rc), and
+    probe_clean() is ``reachable``.  Counts its probes."""
+
+    def __init__(self, name: str, *, reachable: bool = False) -> None:
+        super().__init__(name)
+        self.reachable = reachable
+        self.probe_clean_called = 0
+
+    async def cancel_verify(self) -> int:
+        return 0 if self.reachable else 255
+
+    async def probe_clean(self) -> bool:
+        self.probe_clean_called += 1
+        return self.reachable
+
+
+def _allocator_records(caplog, level: int) -> list:
+    return [r for r in caplog.records if r.name == _ALLOCATOR_LOGGER and r.levelno == level]
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorParkTransitionLog:
+    """A genuine PARK logs a WARNING (verify capacity lost); every PARKED→FREE
+    logs an INFO carrying its source, so the two balance for a log reader."""
+
+    async def _park_unreachable(self, caplog):
+        """(alloc, runner, lease) with remoteA PARKED while unreachable."""
+        import logging
+
+        from orchestrator.verify_runner import HostAllocator
+
+        caplog.set_level(logging.INFO, logger=_ALLOCATOR_LOGGER)
+        runner = _ReachabilityRunner('remoteA', reachable=False)
+        alloc = HostAllocator([runner], quarantine=set())
+        lease = alloc.acquire_remote()
+        assert lease is not None
+        assert await alloc.cancel_and_release(lease, sleep=_noop_sleep, max_attempts=1) is False
+        assert alloc.is_parked('remoteA') is True
+        return alloc, runner, lease
+
+    def _assert_one_unpark_info(self, caplog, source: str) -> None:
+        import logging
+
+        infos = [r.getMessage() for r in _allocator_records(caplog, logging.INFO)]
+        assert len(infos) == 1, infos
+        assert 'remoteA' in infos[0]
+        assert f'source={source}' in infos[0]
+
+    # -- (a) / (b) ---------------------------------------------------------------
+
+    async def test_a_genuine_park_logs_one_warning_naming_host_and_rc(self, caplog):
+        import logging
+
+        await self._park_unreachable(caplog)
+
+        warnings = [r.getMessage() for r in _allocator_records(caplog, logging.WARNING)]
+        assert len(warnings) == 1, warnings
+        assert 'remoteA' in warnings[0]
+        assert '255' in warnings[0]
+
+    async def test_a_reentrant_cancel_retry_logs_no_further_park(self, caplog):
+        import logging
+
+        alloc, _runner, lease = await self._park_unreachable(caplog)
+
+        assert await alloc.cancel_and_release(lease, sleep=_noop_sleep, max_attempts=1) is False
+
+        assert alloc.is_parked('remoteA') is True
+        assert len(_allocator_records(caplog, logging.WARNING)) == 1
+
+    # -- (c) ---------------------------------------------------------------------
+
+    async def test_inline_probe_unpark_logs_its_source(self, caplog):
+        import logging
+
+        from orchestrator.verify_runner import HostAllocator
+
+        caplog.set_level(logging.INFO, logger=_ALLOCATOR_LOGGER)
+        runner = _FakeRemoteRunnerCancellable('remoteA', cancel_rc=1, probe_sequence=[True])
+        alloc = HostAllocator([runner], quarantine=set())
+        lease = alloc.acquire_remote()
+
+        assert await alloc.cancel_and_release(lease, sleep=_noop_sleep) is False
+
+        assert alloc.is_parked('remoteA') is False
+        self._assert_one_unpark_info(caplog, 'inline_probe')
+
+    async def test_public_unpark_logs_its_source(self, caplog):
+        alloc, _runner, _lease = await self._park_unreachable(caplog)
+        caplog.clear()
+
+        assert alloc.unpark('remoteA') is True
+
+        self._assert_one_unpark_info(caplog, 'unpark')
+
+    async def test_readmit_unpark_logs_its_source(self, caplog):
+        alloc, _runner, _lease = await self._park_unreachable(caplog)
+        caplog.clear()
+
+        alloc.readmit('remoteA')
+
+        assert alloc.is_parked('remoteA') is False
+        self._assert_one_unpark_info(caplog, 'readmit')
+
+    async def test_release_of_a_parked_slot_logs_its_source(self, caplog):
+        alloc, runner, lease = await self._park_unreachable(caplog)
+        caplog.clear()
+        runner.reachable = True
+
+        assert await alloc.cancel_and_release(lease, sleep=_noop_sleep) is True
+
+        assert alloc.is_parked('remoteA') is False
+        self._assert_one_unpark_info(caplog, 'release')
+
+    # -- (d) ---------------------------------------------------------------------
+
+    async def test_paths_that_never_park_log_nothing(self, caplog):
+        import logging
+
+        from orchestrator.verify_runner import HostAllocator
+
+        caplog.set_level(logging.INFO, logger=_ALLOCATOR_LOGGER)
+        runner = _ReachabilityRunner('remoteA', reachable=True)
+        alloc = HostAllocator([runner], quarantine=set())
+
+        busy = alloc.acquire_remote()
+        assert busy is not None
+        await alloc.release(busy)                                    # BUSY→FREE
+        cancelled = alloc.acquire_remote()
+        assert await alloc.cancel_and_release(cancelled) is True     # clean cancel
+        assert await alloc.cancel_and_release(cancelled) is True     # FREE short-circuit
+        local = alloc.acquire_local(_FakeLocalRunner)
+        assert await alloc.cancel_and_release(local) is True         # local lease
+
+        assert [
+            r.getMessage() for r in caplog.records
+            if r.name == _ALLOCATOR_LOGGER and r.levelno >= logging.INFO
+        ] == []
+
+    # -- (e) ---------------------------------------------------------------------
+
+    async def test_an_epoch_refusal_logs_that_the_episode_changed(self, caplog):
+        import logging
+
+        alloc, _runner, _lease = await self._park_unreachable(caplog)
+        stale = alloc.park_epoch('remoteA')
+        assert alloc.unpark('remoteA') is True
+        relet = alloc.acquire_remote()
+        assert await alloc.cancel_and_release(relet, sleep=_noop_sleep, max_attempts=1) is False
+        caplog.clear()
+
+        assert alloc.unpark('remoteA', expect_epoch=stale) is False
+
+        infos = [r.getMessage() for r in _allocator_records(caplog, logging.INFO)]
+        assert len(infos) == 1, infos
+        assert 'remoteA' in infos[0]
+        assert 'episode' in infos[0]
+        assert 'source=' not in infos[0]
+
+
+# ---------------------------------------------------------------------------
+# 3310: reprobe_parked_slots — the _slots-driven backstop sweep
+# ---------------------------------------------------------------------------
+
+
+class _ConcurrentSweepWriterRunner(_ReachabilityRunner):
+    """A _ReachabilityRunner whose next probe, once ``during_next_probe`` is
+    set, runs it (a concurrent writer acting inside the sweep's await window)
+    and then answers clean.  The hook fires once."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name, reachable=False)
+        self.during_next_probe: Callable[[], Awaitable[None]] | None = None
+
+    async def probe_clean(self) -> bool:
+        hook, self.during_next_probe = self.during_next_probe, None
+        if hook is None:
+            return await super().probe_clean()
+        self.probe_clean_called += 1
+        await hook()
+        return True
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorReprobeParkedSlots:
+    """reprobe_parked_slots(exclude=) frees every PARKED remote that now probes
+    clean — the recovery for a PARK no caller is tracking, with no restart."""
+
+    async def _park_every_remote(self, alloc) -> None:
+        """Acquire each remote and fail its cancel, so every remote ends PARKED."""
+        leases = []
+        while (lease := alloc.acquire_remote()) is not None:
+            leases.append(lease)
+        for lease in leases:
+            assert await alloc.cancel_and_release(lease, sleep=_noop_sleep, max_attempts=1) is False
+            assert alloc.is_parked(lease.name) is True
+
+    def _states(self, alloc) -> dict[str, str]:
+        return {h['name']: h['slot_state'] for h in alloc.host_states()}
+
+    # -- (a) ---------------------------------------------------------------------
+
+    async def test_a_parked_host_recovers_once_it_probes_clean(self):
+        from orchestrator.verify_runner import HostAllocator
+
+        runner = _ReachabilityRunner('remoteA', reachable=False)
+        alloc = HostAllocator([runner], quarantine=set())
+        await self._park_every_remote(alloc)
+
+        assert await alloc.reprobe_parked_slots() == []
+        assert alloc.is_parked('remoteA') is True
+
+        runner.reachable = True
+        assert await alloc.reprobe_parked_slots() == ['remoteA']
+
+        assert self._states(alloc)['remoteA'] == 'free'
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteA'
+
+    # -- (b) ---------------------------------------------------------------------
+
+    async def test_an_excluded_host_is_neither_probed_nor_freed(self):
+        from orchestrator.verify_runner import HostAllocator
+
+        runner = _ReachabilityRunner('remoteA', reachable=False)
+        alloc = HostAllocator([runner], quarantine=set())
+        await self._park_every_remote(alloc)
+        runner.reachable = True
+        probes_before = runner.probe_clean_called
+
+        assert await alloc.reprobe_parked_slots(exclude=frozenset({'remoteA'})) == []
+
+        assert runner.probe_clean_called == probes_before
+        assert alloc.is_parked('remoteA') is True
+
+    # -- (c) ---------------------------------------------------------------------
+
+    async def test_a_quarantined_host_is_freed_but_stays_quarantined(self):
+        from orchestrator.verify_runner import HostAllocator
+
+        runner = _ReachabilityRunner('remoteA', reachable=False)
+        q: set[str] = set()
+        alloc = HostAllocator([runner], quarantine=q)
+        await self._park_every_remote(alloc)
+        q.add('remoteA')
+        runner.reachable = True
+
+        assert await alloc.reprobe_parked_slots() == ['remoteA']
+
+        assert self._states(alloc)['remoteA'] == 'free'
+        assert 'remoteA' in q
+        assert alloc.acquire_remote() is None
+
+    # -- (d) ---------------------------------------------------------------------
+
+    async def test_slots_that_are_not_parked_are_never_probed(self):
+        from orchestrator.verify_runner import HostAllocator
+
+        busy_runner = _ReachabilityRunner('remoteA', reachable=True)
+        free_runner = _ReachabilityRunner('remoteB', reachable=True)
+        alloc = HostAllocator([busy_runner, free_runner], quarantine=set())
+        busy = alloc.acquire_remote()
+        assert busy is not None and busy.name == 'remoteA'
+        assert alloc.acquire_local(_FakeLocalRunner) is not None
+        before = alloc.host_states()
+
+        assert await alloc.reprobe_parked_slots() == []
+
+        assert busy_runner.probe_clean_called == 0
+        assert free_runner.probe_clean_called == 0
+        assert alloc.host_states() == before
+
+    # -- (e) ---------------------------------------------------------------------
+
+    async def test_a_newer_park_episode_opened_during_the_probe_is_not_freed(self):
+        from orchestrator.verify_runner import HostAllocator
+
+        runner = _ConcurrentSweepWriterRunner('remoteA')
+        alloc = HostAllocator([runner], quarantine=set())
+        await self._park_every_remote(alloc)
+        new_episode: list[int | None] = []
+
+        async def free_reacquire_and_repark() -> None:
+            assert alloc.unpark('remoteA') is True
+            relet = alloc.acquire_remote()
+            assert relet is not None
+            assert await alloc.cancel_and_release(relet, sleep=_noop_sleep, max_attempts=1) is False
+            new_episode.append(alloc.park_epoch('remoteA'))
+
+        runner.during_next_probe = free_reacquire_and_repark
+
+        assert await alloc.reprobe_parked_slots() == []
+
+        assert alloc.is_parked('remoteA') is True
+        assert new_episode and new_episode[0] is not None
+        assert alloc.park_epoch('remoteA') == new_episode[0]
+
+    # -- (f) ---------------------------------------------------------------------
+
+    async def test_one_failing_probe_does_not_stop_the_sweep(self, caplog):
+        import logging
+
+        from orchestrator.verify_runner import HostAllocator
+
+        runner_a = _ReachabilityRunner('remoteA', reachable=False)
+        runner_b = _ReachabilityRunner('remoteB', reachable=False)
+        alloc = HostAllocator([runner_a, runner_b], quarantine=set())
+        await self._park_every_remote(alloc)
+
+        async def exploding_probe() -> bool:
+            raise RuntimeError('ssh exploded')
+
+        runner_a.probe_clean = exploding_probe
+        runner_b.reachable = True
+        caplog.set_level(logging.INFO, logger=_ALLOCATOR_LOGGER)
+        caplog.clear()
+
+        assert await alloc.reprobe_parked_slots() == ['remoteB']
+
+        assert alloc.is_parked('remoteA') is True
+        assert self._states(alloc)['remoteB'] == 'free'
+        warnings = [r.getMessage() for r in _allocator_records(caplog, logging.WARNING)]
+        assert len(warnings) == 1, warnings
+        assert 'remoteA' in warnings[0]
+
+    # -- (g) ---------------------------------------------------------------------
+
+    async def test_a_freed_host_logs_the_sweep_as_its_source(self, caplog):
+        import logging
+
+        from orchestrator.verify_runner import HostAllocator
+
+        runner = _ReachabilityRunner('remoteA', reachable=False)
+        alloc = HostAllocator([runner], quarantine=set())
+        await self._park_every_remote(alloc)
+        runner.reachable = True
+        caplog.set_level(logging.INFO, logger=_ALLOCATOR_LOGGER)
+        caplog.clear()
+
+        assert await alloc.reprobe_parked_slots() == ['remoteA']
+
+        infos = [r.getMessage() for r in _allocator_records(caplog, logging.INFO)]
+        assert len(infos) == 1, infos
+        assert 'remoteA' in infos[0]
+        assert 'source=reprobe_sweep' in infos[0]

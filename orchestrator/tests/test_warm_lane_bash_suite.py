@@ -141,15 +141,28 @@ SCRIPT_COVERAGE = {
 #: no python3: its whole point is that the pin prevents the render, and it is
 #: NON-VACUOUS by construction — removing the pin from ``run_sweep`` flips Y2/Y3
 #: to ``88 passed, 2 failed`` (task 3655's negative control).
+#:
+#: Dark-factory task 5566 then ported reify's K1–K6 block (esc-7244-16), which
+#: pins the conventional-commit arm of the citation grammar
+#: ``warm-lane-degenerate-ref-check.sh`` now sources from
+#: ``lib_task_citation.sh``, so the degenerate-ref floor moved 70 → 81.
+#: RE-MEASURED both sides: ``Results: 70 passed, 0 failed`` before the port, and
+#: ``Results: 81 passed, 0 failed`` after the script was rewired.  The block
+#: carries no skip guard, so 81 is both floor and measured count on any host
+#: that satisfies ``REQUIRED_HOST_TOOLS`` — it needs only ``git``.  NON-VACUOUS
+#: by construction: against the pre-port inline predicate the same block reports
+#: ``75 passed, 6 failed`` (K1/K5/K6, two asserts each).
 ASSERT_FLOORS = {
-    'test_warm_lane_disk_guard.sh': 62,
-    'test_warm_lane_degenerate_ref.sh': 70,
+    'test_warm_lane_disk_guard.sh': 89,  # 79 + 10 (A10, task 5940)
+    'test_warm_lane_degenerate_ref.sh': 84,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
+                                             # + 3 (U8, task 5940)
     'test_thin_warm_lane.sh': 45,
-    'test_warm_lane_gc.sh': 214,  # 198 + 16 (Block X: X-band 7 + X-degrade 9)
-    'test_warm_lane_gc_sweep.sh': 90,  # 86 + 4 (Block Y: bridge-cost seam contract)
-    'test_warm_lane_audit.sh': 225,  # 228 measured − 3 (L9, root-guarded)
+    'test_warm_lane_gc.sh': 280,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
+                                 #           + A11 12 + A11-boundary 5) + 2 (A11m/A11n, task 5940)
+    'test_warm_lane_gc_sweep.sh': 102,  # 99 + 3 (G6g, task 5940)
+    'test_warm_lane_audit.sh': 229,  # 232 measured − 3 (L9, root-guarded)
     'test_warm_lane_sizing_lifecycle.sh': 65,
-    'test_provision_warm_lane_fs.sh': 106,  # 111 measured − 5 (Block I, xfsprogs)
+    'test_provision_warm_lane_fs.sh': 110,  # 115 measured − 5 (Block I, xfsprogs)
 }
 
 #: ``test_helpers.sh::test_summary``'s pass/fail protocol line, verbatim.
@@ -310,12 +323,27 @@ def test_every_invocable_script_has_ported_coverage() -> None:
     removes one whose test is still listed.  PRD leaf κ needs that condition to
     be false before it deletes reify's originals.
 
-    ``lib_live_refs.sh`` and ``lib_portable.sh`` are excluded from the key set by
-    decision, not oversight: both are ``source``-only, neither has a ``--help``
-    or any invocable entry point, and both are covered *transitively* — the
-    gc/gc-sweep ``exit 2``-on-missing-sibling assertions (``test_warm_lane_gc.sh``
-    A9) exercise ``lib_live_refs.sh``, and ``test_warm_lane_audit.sh`` exercises
-    ``lib_portable.sh`` on every audit invocation.
+    The ``lib_`` prefix is excluded from the key set by decision, not oversight:
+    every one of those files is ``source``-only, none has a ``--help`` or any
+    invocable entry point, and each is covered *transitively* by the script that
+    sources it —
+
+    * ``lib_live_refs.sh`` by the gc/gc-sweep ``exit 2``-on-missing-sibling
+      assertions (``test_warm_lane_gc.sh`` A9);
+    * ``lib_portable.sh`` by ``test_warm_lane_audit.sh``, on every audit
+      invocation;
+    * ``lib_lane_state.sh`` by the same audit suite's Block L and by
+      ``test_lane_state_lib.py``, which pins it directly;
+    * ``lib_task_citation.sh`` — TWO of its three exports, by
+      ``test_warm_lane_degenerate_ref.sh``: every classification runs through
+      ``task_citation_message_cites``, and the ``--branch-prefix``
+      metacharacter block through ``task_citation_regex_escape``.  Its third,
+      ``task_citation_peer_ids``, has no dark-factory caller (the sole one is
+      reify's ``task-branch-contamination-sweep.sh``, which is not among the
+      relocated scripts) and therefore travels UNEXERCISED — the standing gap
+      ``lib_portable.sh``'s ``allocate_free_port`` and ``portable_timeout``
+      already carry, recorded in
+      ``orchestrator/scripts/warm-lane/README.md`` Delta 11 (task 5566).
     """
     invocable = {
         p.name for p in WARM_LANE_SCRIPT_DIR.glob('*.sh')
@@ -427,7 +455,8 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
             # stale the moment the kernel may recycle that pid.  So dispatch no
             # signal at all once the process has been reaped, mirroring
             # `shared.proc_group.terminate_process_group` step 1 and
-            # `deterministic_runner._terminate_process_tree`.
+            # `shared.proc_group.sigkill_process_group`'s reaped-leader
+            # short-circuit.
             #
             # `Popen.communicate(timeout=...)` deliberately does NOT reap on
             # timeout, so `returncode` is normally None here and the kill still
@@ -440,9 +469,9 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
             # pipe open times out with the leader an unreaped zombie whose pid
             # the kernel cannot recycle — so the frozen pgid is still valid and
             # the group must be killed, or the helper holds a lane flock for
-            # minutes and turns one timeout into a cascade.  This spelling is a
-            # literal mirror of `deterministic_runner._terminate_process_tree`,
-            # so both sites this task closed enforce the same two-part rule the
+            # minutes and turns one timeout into a cascade.  This spelling
+            # mirrors `shared.proc_group.sigkill_process_group`'s reaped-leader
+            # short-circuit, so both sites enforce the same two-part rule the
             # killpg guard's failure message states.
             if proc.returncode is None:
                 try:

@@ -530,6 +530,5331 @@
           "canonical": 1
         }
       }
+    },
+    {
+      "stamp": "2026-09-25T04:03:22+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 29292,
+          "topic_present": 1352,
+          "topic_coverage_pct": 4.6156,
+          "distinct_topics": 354,
+          "topics_with_one_canonical": 79,
+          "topics_with_zero_canonical": 275,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 79,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 273,
+          "slug_non_conforming": 81,
+          "canonical_slug_conforming": 79,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 12,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 10,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 36281,
+          "topic_present": 1082,
+          "topic_coverage_pct": 2.9823,
+          "distinct_topics": 436,
+          "topics_with_one_canonical": 114,
+          "topics_with_zero_canonical": 322,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 114,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 370,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 112,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::g7-design-invariants": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 20,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 29,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-09-26T04:02:11+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 29390,
+          "topic_present": 1369,
+          "topic_coverage_pct": 4.658,
+          "distinct_topics": 368,
+          "topics_with_one_canonical": 81,
+          "topics_with_zero_canonical": 287,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 81,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 275,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 81,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 12,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 10,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 36342,
+          "topic_present": 1090,
+          "topic_coverage_pct": 2.9993,
+          "distinct_topics": 438,
+          "topics_with_one_canonical": 115,
+          "topics_with_zero_canonical": 323,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 115,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 372,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 113,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::g7-design-invariants": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 20,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 29,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-09-27T04:02:02+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 29486,
+          "topic_present": 1374,
+          "topic_coverage_pct": 4.6598,
+          "distinct_topics": 369,
+          "topics_with_one_canonical": 82,
+          "topics_with_zero_canonical": 287,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 82,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 276,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 82,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 12,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 10,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 36397,
+          "topic_present": 1108,
+          "topic_coverage_pct": 3.0442,
+          "distinct_topics": 440,
+          "topics_with_one_canonical": 118,
+          "topics_with_zero_canonical": 322,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 118,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 374,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 116,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::g7-design-invariants": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 20,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-09-28T04:01:44+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 29615,
+          "topic_present": 1392,
+          "topic_coverage_pct": 4.7003,
+          "distinct_topics": 372,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 287,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 279,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 12,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 10,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 36446,
+          "topic_present": 1112,
+          "topic_coverage_pct": 3.0511,
+          "distinct_topics": 442,
+          "topics_with_one_canonical": 119,
+          "topics_with_zero_canonical": 323,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 119,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 376,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 117,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::g7-design-invariants": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 20,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-09-29T04:01:54+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 29676,
+          "topic_present": 1396,
+          "topic_coverage_pct": 4.7041,
+          "distinct_topics": 372,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 287,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 279,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 12,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 10,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 36482,
+          "topic_present": 1117,
+          "topic_coverage_pct": 3.0618,
+          "distinct_topics": 444,
+          "topics_with_one_canonical": 121,
+          "topics_with_zero_canonical": 323,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 121,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 378,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 119,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::g7-design-invariants": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 20,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-09-30T04:00:38+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 29803,
+          "topic_present": 1398,
+          "topic_coverage_pct": 4.6908,
+          "distinct_topics": 372,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 287,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 279,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 12,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 10,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 36536,
+          "topic_present": 1118,
+          "topic_coverage_pct": 3.06,
+          "distinct_topics": 444,
+          "topics_with_one_canonical": 121,
+          "topics_with_zero_canonical": 323,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 121,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 378,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 119,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::g7-design-invariants": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 20,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-01T04:04:00+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 29937,
+          "topic_present": 1399,
+          "topic_coverage_pct": 4.6731,
+          "distinct_topics": 372,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 287,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 279,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 36652,
+          "topic_present": 1120,
+          "topic_coverage_pct": 3.0558,
+          "distinct_topics": 444,
+          "topics_with_one_canonical": 121,
+          "topics_with_zero_canonical": 323,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 121,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 378,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 119,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 20,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-02T04:03:34+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 30117,
+          "topic_present": 1404,
+          "topic_coverage_pct": 4.6618,
+          "distinct_topics": 372,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 287,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 279,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 36769,
+          "topic_present": 1123,
+          "topic_coverage_pct": 3.0542,
+          "distinct_topics": 444,
+          "topics_with_one_canonical": 121,
+          "topics_with_zero_canonical": 323,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 121,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 378,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 119,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 20,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-03T04:02:25+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 30318,
+          "topic_present": 1407,
+          "topic_coverage_pct": 4.6408,
+          "distinct_topics": 372,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 287,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 279,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 36837,
+          "topic_present": 1123,
+          "topic_coverage_pct": 3.0486,
+          "distinct_topics": 444,
+          "topics_with_one_canonical": 121,
+          "topics_with_zero_canonical": 323,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 121,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 378,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 119,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 20,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-04T04:05:11+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 30451,
+          "topic_present": 1410,
+          "topic_coverage_pct": 4.6304,
+          "distinct_topics": 373,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 288,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 280,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 36884,
+          "topic_present": 1123,
+          "topic_coverage_pct": 3.0447,
+          "distinct_topics": 444,
+          "topics_with_one_canonical": 121,
+          "topics_with_zero_canonical": 323,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 121,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 378,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 119,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 20,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-05T04:02:46+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 30611,
+          "topic_present": 1455,
+          "topic_coverage_pct": 4.7532,
+          "distinct_topics": 411,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 326,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 318,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 36966,
+          "topic_present": 1178,
+          "topic_coverage_pct": 3.1867,
+          "distinct_topics": 496,
+          "topics_with_one_canonical": 121,
+          "topics_with_zero_canonical": 375,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 121,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 430,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 119,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 21,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-06T04:01:30+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 30736,
+          "topic_present": 1499,
+          "topic_coverage_pct": 4.877,
+          "distinct_topics": 445,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 360,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 352,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 37070,
+          "topic_present": 1225,
+          "topic_coverage_pct": 3.3046,
+          "distinct_topics": 540,
+          "topics_with_one_canonical": 121,
+          "topics_with_zero_canonical": 419,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 121,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 474,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 119,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 21,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-07T04:00:26+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 30875,
+          "topic_present": 1539,
+          "topic_coverage_pct": 4.9846,
+          "distinct_topics": 477,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 392,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 384,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 37175,
+          "topic_present": 1251,
+          "topic_coverage_pct": 3.3652,
+          "distinct_topics": 564,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 442,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 498,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 21,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-08T04:03:39+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 31014,
+          "topic_present": 1591,
+          "topic_coverage_pct": 5.1299,
+          "distinct_topics": 520,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 435,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 427,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 37266,
+          "topic_present": 1298,
+          "topic_coverage_pct": 3.4831,
+          "distinct_topics": 600,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 478,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 534,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 21,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-09T04:01:21+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 31181,
+          "topic_present": 1634,
+          "topic_coverage_pct": 5.2404,
+          "distinct_topics": 560,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 475,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 467,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 37405,
+          "topic_present": 1336,
+          "topic_coverage_pct": 3.5717,
+          "distinct_topics": 631,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 509,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 565,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 22,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-10T04:01:47+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 31464,
+          "topic_present": 1706,
+          "topic_coverage_pct": 5.4221,
+          "distinct_topics": 616,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 531,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 523,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 37477,
+          "topic_present": 1359,
+          "topic_coverage_pct": 3.6262,
+          "distinct_topics": 650,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 528,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 584,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 23,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-11T04:03:51+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 31647,
+          "topic_present": 1755,
+          "topic_coverage_pct": 5.5455,
+          "distinct_topics": 652,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 567,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 559,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 37592,
+          "topic_present": 1406,
+          "topic_coverage_pct": 3.7402,
+          "distinct_topics": 694,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 572,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 628,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 23,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-12T04:01:35+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 31780,
+          "topic_present": 1800,
+          "topic_coverage_pct": 5.6639,
+          "distinct_topics": 687,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 602,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 594,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 37708,
+          "topic_present": 1460,
+          "topic_coverage_pct": 3.8719,
+          "distinct_topics": 741,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 619,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 675,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 23,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-13T04:03:42+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 31968,
+          "topic_present": 1883,
+          "topic_coverage_pct": 5.8903,
+          "distinct_topics": 748,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 663,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 655,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 37816,
+          "topic_present": 1523,
+          "topic_coverage_pct": 4.0274,
+          "distinct_topics": 795,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 673,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 729,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 23,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-14T04:02:17+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 32126,
+          "topic_present": 1931,
+          "topic_coverage_pct": 6.0107,
+          "distinct_topics": 784,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 699,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 691,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 37922,
+          "topic_present": 1561,
+          "topic_coverage_pct": 4.1163,
+          "distinct_topics": 826,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 704,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 760,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 23,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-15T04:00:42+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 32255,
+          "topic_present": 1968,
+          "topic_coverage_pct": 6.1014,
+          "distinct_topics": 806,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 721,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 713,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 38048,
+          "topic_present": 1618,
+          "topic_coverage_pct": 4.2525,
+          "distinct_topics": 870,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 748,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 804,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 23,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-16T04:01:18+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 32338,
+          "topic_present": 2000,
+          "topic_coverage_pct": 6.1847,
+          "distinct_topics": 826,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 741,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 733,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 38154,
+          "topic_present": 1653,
+          "topic_coverage_pct": 4.3324,
+          "distinct_topics": 900,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 778,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 834,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 23,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-17T04:01:52+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 32450,
+          "topic_present": 2022,
+          "topic_coverage_pct": 6.2311,
+          "distinct_topics": 840,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 755,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 747,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 38246,
+          "topic_present": 1693,
+          "topic_coverage_pct": 4.4266,
+          "distinct_topics": 933,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 811,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 867,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 23,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-18T04:00:44+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 32565,
+          "topic_present": 2059,
+          "topic_coverage_pct": 6.3227,
+          "distinct_topics": 867,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 782,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 774,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 38305,
+          "topic_present": 1721,
+          "topic_coverage_pct": 4.4929,
+          "distinct_topics": 959,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 837,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 893,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 24,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-19T04:03:36+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 32670,
+          "topic_present": 2092,
+          "topic_coverage_pct": 6.4034,
+          "distinct_topics": 894,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 809,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 801,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 38414,
+          "topic_present": 1749,
+          "topic_coverage_pct": 4.553,
+          "distinct_topics": 984,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 862,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 918,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 24,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-20T04:05:02+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 32889,
+          "topic_present": 2143,
+          "topic_coverage_pct": 6.5159,
+          "distinct_topics": 937,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 852,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 844,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 38508,
+          "topic_present": 1761,
+          "topic_coverage_pct": 4.5731,
+          "distinct_topics": 994,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 872,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 928,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 24,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-21T04:03:41+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 33037,
+          "topic_present": 2190,
+          "topic_coverage_pct": 6.6289,
+          "distinct_topics": 972,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 887,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 879,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 38584,
+          "topic_present": 1797,
+          "topic_coverage_pct": 4.6574,
+          "distinct_topics": 1023,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 901,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 957,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 24,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-22T04:02:40+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 33206,
+          "topic_present": 2256,
+          "topic_coverage_pct": 6.794,
+          "distinct_topics": 1017,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 932,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 924,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 38627,
+          "topic_present": 1818,
+          "topic_coverage_pct": 4.7066,
+          "distinct_topics": 1040,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 918,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 974,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 24,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-23T04:03:27+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 33381,
+          "topic_present": 2294,
+          "topic_coverage_pct": 6.8722,
+          "distinct_topics": 1049,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 964,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 956,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 38699,
+          "topic_present": 1840,
+          "topic_coverage_pct": 4.7546,
+          "distinct_topics": 1060,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 938,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 994,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 24,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-24T04:03:22+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 33569,
+          "topic_present": 2353,
+          "topic_coverage_pct": 7.0094,
+          "distinct_topics": 1095,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 1010,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 1002,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 38779,
+          "topic_present": 1872,
+          "topic_coverage_pct": 4.8274,
+          "distinct_topics": 1090,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 968,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 1024,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 24,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
+    },
+    {
+      "stamp": "2026-10-25T05:01:50+00:00",
+      "canonical_uniqueness_enforced": false,
+      "registry_error": null,
+      "projects": {
+        "dark_factory": {
+          "records": 33682,
+          "topic_present": 2391,
+          "topic_coverage_pct": 7.0987,
+          "distinct_topics": 1126,
+          "topics_with_one_canonical": 85,
+          "topics_with_zero_canonical": 1041,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 85,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 1033,
+          "slug_non_conforming": 93,
+          "canonical_slug_conforming": 85,
+          "canonical_slug_non_conforming": 0,
+          "registry_topics_total": 11,
+          "registry_topics_with_exactly_one_canonical": 2,
+          "registry_topics_with_zero_canonical": 9,
+          "registry_topics_with_multiple_canonical": 0
+        },
+        "reify": {
+          "records": 38855,
+          "topic_present": 1901,
+          "topic_coverage_pct": 4.8925,
+          "distinct_topics": 1116,
+          "topics_with_one_canonical": 122,
+          "topics_with_zero_canonical": 994,
+          "topics_with_multiple_canonical": 0,
+          "canonical_true": 122,
+          "canonical_true_without_topic": 0,
+          "slug_conforming": 1050,
+          "slug_non_conforming": 66,
+          "canonical_slug_conforming": 120,
+          "canonical_slug_non_conforming": 2,
+          "registry_topics_total": 20,
+          "registry_topics_with_exactly_one_canonical": 18,
+          "registry_topics_with_zero_canonical": 2,
+          "registry_topics_with_multiple_canonical": 0
+        }
+      },
+      "registry_topics": {
+        "dark_factory::architect-report-task-already-done-main-reachability": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::escalation-store-ambiguity": {
+          "records": 8,
+          "canonical": 0
+        },
+        "dark_factory::eval-worktree-plan-tools-missing": {
+          "records": 1,
+          "canonical": 1
+        },
+        "dark_factory::eval-worktree-venv-shadowing": {
+          "records": 0,
+          "canonical": 0
+        },
+        "dark_factory::git-conventions": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::memory-hygiene": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::patch_import_site_testing": {
+          "records": 6,
+          "canonical": 0
+        },
+        "dark_factory::prd-gates": {
+          "records": 1,
+          "canonical": 0
+        },
+        "dark_factory::pytest-xdist-serial-override": {
+          "records": 24,
+          "canonical": 1
+        },
+        "dark_factory::pytest_importlib_relative_import_gotcha": {
+          "records": 4,
+          "canonical": 0
+        },
+        "dark_factory::reconciliation_cost_model": {
+          "records": 7,
+          "canonical": 0
+        },
+        "reify::architect-plan-files-write-set": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::background-task-reaping-and-wake-mechanisms": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::boolean-operand-consumption-edges": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-fmt-no-gate": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::cargo-rerun-if-changed-warm-lane-mtime": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::compiled-module-functions-user-source-only": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::docs-prd-landing": {
+          "records": 2,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-decision-rule": {
+          "records": 30,
+          "canonical": 1
+        },
+        "reify::harness-layout-gate-move-gotchas": {
+          "records": 4,
+          "canonical": 0
+        },
+        "reify::inv-geo-1-mesh-contract-mock": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::nextest-less-host-simulation": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::pkill-pgrep-self-match": {
+          "records": 10,
+          "canonical": 1
+        },
+        "reify::recon-project-root-misroute-retired": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-audit-ptodo-from-worktree": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-driving": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::reify-debug-mcp-gotchas": {
+          "records": 1,
+          "canonical": 0
+        },
+        "reify::reify-debug-mcp-tool-addition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::task-5422-fabrication-episode-disposition": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::tracing-interest-cache-poisoning": {
+          "records": 1,
+          "canonical": 1
+        },
+        "reify::warm-lane-plan-json-loss-reconstruction": {
+          "records": 1,
+          "canonical": 1
+        }
+      }
     }
   ]
 }

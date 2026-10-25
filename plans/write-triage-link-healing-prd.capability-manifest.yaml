@@ -1,0 +1,485 @@
+prd: plans/write-triage-link-healing-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 6181
+  title: Link-heal executor, ledger, caps, escapes and the link-heal- prefix
+  capabilities:
+  - name: update-memory-patch-and-delete-routes
+    binding: capability→substrate (wired) — fused-memory/src/fused_memory/server/tools.py::update_memory
+      (metadata_patch, metadata_delete_keys) → services/memory_service.py::MemoryService._apply_metadata_delta
+      → backends/mem0_client.py::Mem0Backend.set_payload / delete_payload; verified
+      on main 0a9870b604 (2026-10-02)
+    verdict: PASS
+  - name: mem0-update-prefix-allowlist
+    binding: capability→substrate (wired) — fused-memory/src/fused_memory/server/mem0_update_authz.py::resolve_mem0_update_authorization
+      keyed on config/schema.py::Mem0UpdateConfig.metadata_patch_allowed_agent_prefixes
+      (default ['recon-stage-', 'curator-']); the config.yaml block is commented out
+      today; verified on main 0a9870b604 (2026-10-02)
+    verdict: PASS
+  - name: script-to-server-transport
+    binding: capability→substrate (wired) — shared/src/shared/mcp_post.py::post_mcp_tool_call;
+      tools.py::_extract_causation carries _causation_id; verified on main 0a9870b604
+      (2026-10-02)
+    verdict: PASS
+  - name: child-kinds-and-contested-key
+    binding: capability→substrate (wired) — fused-memory/src/fused_memory/server/grouped_read.py::CHILD_KINDS
+      (amendment, sighting), CONTESTED_METADATA_KEY (x_contested), _carve_outs_allow_suppression;
+      verified on main 0a9870b604 (2026-10-02)
+    verdict: PASS
+  - name: raw-read-and-child-count
+    binding: capability→substrate (wired) — services/memory_service.py::MemoryService.get_memory_by_id,
+      count_memories_by_metadata, _count_children, _apply_memory_metadata_validation
+      (parent liveness, task 3197); verified on main 0a9870b604 (2026-10-02)
+    verdict: PASS
+  - name: folded-escalation-filer
+    binding: capability→substrate (wired) — fused-memory/src/fused_memory/middleware/_folded_escalation.py::file_folded_escalation;
+      fused-memory/tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor;
+      verified on main 0a9870b604 (2026-10-02)
+    verdict: PASS
+  - name: reloadable-config-registry
+    binding: capability→substrate (wired) — fused-memory/src/fused_memory/config/reload.py::RELOADABLE_FIELDS;
+      verified on main 0a9870b604 (2026-10-02)
+    verdict: PASS
+  - &id001
+    name: hand-link-verdict-corpus
+    binding: capability→producer (upstream) — fused-memory/calibration/hand_link_verdicts.jsonl
+      + .summary.json, committed with the PRD (8faca80c27, merge carrier 6180); commit_planning
+      waits for it on main
+    verdict: PASS
+  - name: link-heal-executor-and-cli
+    binding: built by this leaf — maintenance/link_heal.py + scripts/link_heal.py
+      (plan/apply/undo/status)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - fused-memory/src/fused_memory/maintenance/link_heal.py
+      - fused-memory/scripts/link_heal.py
+  - name: link-heal-prefix-admitted
+    binding: built by this leaf — an uncommented config.yaml line admits 'link-heal-'
+      beside recon-stage-/curator-
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^[^#]*link-heal-
+      expect: present
+      paths:
+      - fused-memory/config/config.yaml
+  - name: link-heal-knobs-reloadable
+    binding: built by this leaf — link_heal.* leaves registered in RELOADABLE_FIELDS
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: link_heal\.
+      expect: present
+      paths:
+      - fused-memory/src/fused_memory/config/reload.py
+  - name: status-names-the-no-producer-state
+    binding: built by this leaf — `status` on an empty ledger prints "no link-heal
+      run has written here"
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioural; asserted by α's own boundary test and observed live by
+        β
+- label: β
+  task_id: 6182
+  title: 'Cleanup sitting: plan from the corpus, Leo approves, apply'
+  capabilities:
+  - name: link-heal-cli
+    binding: capability→producer (upstream) — α (plan --from-corpus, apply --approved-plan-sha,
+      status)
+    verdict: PASS
+  - *id001
+  - name: writing-corpus-run-in-ledger
+    binding: built by this leaf — a writing corpus run whose applied = approved plan
+      − skipped_stale
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: live-store ledger state after Leo's go-ahead; not on the git tree
+- label: γ
+  task_id: 6183
+  title: add_memory kind guidance and typed inert-link ack
+  capabilities:
+  - name: add-memory-tool
+    binding: capability→substrate (wired) — fused-memory/src/fused_memory/server/tools.py::add_memory;
+      verified on main 0a9870b604 (2026-10-02)
+    verdict: PASS
+  - name: child-kinds
+    binding: capability→substrate (wired) — fused-memory/src/fused_memory/server/grouped_read.py::CHILD_KINDS;
+      verified on main 0a9870b604 (2026-10-02)
+    verdict: PASS
+  - name: add-memory-typed-link-ack
+    binding: 'built by this leaf — ack field link: {status: ''child'' | ''inert'',
+      reason}'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[''"]inert[''"]'
+      expect: present
+      paths:
+      - fused-memory/src/fused_memory/server/
+- label: δ
+  task_id: 6184
+  title: Link adjudicator over the Claude CLI, its escapes, and the confusion-count
+    eval
+  capabilities:
+  - name: claude-cli-over-oauth
+    binding: capability→substrate (wired) — shared/src/shared/cli_invoke.py::invoke_with_cap_retry
+      (output_schema, strips ANTHROPIC_API_KEY); shared/src/shared/neutral_cwd.py::neutral_cli_cwd;
+      precedent fused-memory/src/fused_memory/middleware/path_scope_adjudicator.py::PathScopeAdjudicator;
+      verified on main 0a9870b604 (2026-10-02)
+    verdict: PASS
+  - name: shard-failure-storm-counter
+    binding: capability→substrate (wired) — shared/src/shared/storm_counter.py::StormCounter;
+      verified on main 0a9870b604 (2026-10-02)
+    verdict: PASS
+  - name: rater-brief
+    binding: capability→producer (upstream) — fused-memory/calibration/write_triage_rater_brief.md,
+      committed with the PRD (8faca80c27, carrier 6180), byte-identical to the 2026-09-29
+      brief
+    verdict: PASS
+  - name: heal-executor
+    binding: capability→producer (upstream) — α (same files; δ adds the second plan
+      source)
+    verdict: PASS
+  - name: lambda-pairs-shape
+    binding: capability→producer (upstream) — 6152 verdicts {entry_id, target_id,
+      verdict, rater, batch}; texts from 6151's write_triage_pairs_to_rate.jsonl,
+      whose text field names 6151 does not pin — δ reads them from 6151's committed
+      file or script if landed and records its assumption; ζ (human) verifies before
+      running
+    verdict: PASS
+  - name: adjudicator-and-eval-modules
+    binding: built by this leaf — maintenance/link_adjudicator.py + scripts/eval_link_adjudicator.py
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - fused-memory/src/fused_memory/maintenance/link_adjudicator.py
+      - fused-memory/scripts/eval_link_adjudicator.py
+  - name: adjudicate-links-entry-point
+    binding: built by this leaf — link_adjudicator.py::adjudicate_links(pairs, *,
+      model, shard_size)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def adjudicate_links\(
+      expect: present
+      paths:
+      - fused-memory/src/fused_memory/maintenance/link_adjudicator.py
+  - name: link-heal-cli-adjudicator-source
+    binding: built by this leaf — scripts/link_heal.py gains --from-adjudicator
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from-adjudicator
+      expect: present
+      paths:
+      - fused-memory/scripts/link_heal.py
+  - name: report-figures-readable-by-the-gate
+    binding: built by this leaf — each H3 figure is a plain number at its own key
+      (Γ_A/θ --require fails closed on a non-number), bounds and counts beside it
+      as <figure>_ci95 / _num / _den
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: δ's boundary test runs the readiness-gate script with Γ_A's requires
+        over a fake-arm report
+- label: δm
+  task_id: 6185
+  title: Measure the adjudicator on the 359 rated hand links
+  capabilities:
+  - name: eval-script
+    binding: capability→producer (upstream) — δ (scripts/eval_link_adjudicator.py
+      --corpus --arms)
+    verdict: PASS
+  - *id001
+  - name: hand-link-adjudicator-report
+    binding: built by this leaf — committed link_adjudicator_report.json (+ .md)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - fused-memory/calibration/link_adjudicator_report.json
+- label: Γ_A
+  task_id: 6186
+  title: 'Gate: adjudicator fit to drive the sweep'
+  capabilities:
+  - name: adjudicator-report
+    binding: capability→producer (upstream) — δm (committed report) with δ's key contract
+    verdict: PASS
+  - name: readiness-gate-predicate
+    binding: capability→substrate (wired) — scripts/check_write_triage_readiness_gate.py
+      (--report/--require; exit code is the contract); verified on main 0a9870b604
+      (2026-10-02)
+    verdict: PASS
+  - name: gamma-a-adjudicator-fit
+    binding: built by this leaf — the gate's own predicate, re-run so a cancelled
+      Γ_A cannot release ε (D9)
+    verdict: PASS
+    delivered_check:
+      kind: script
+      script: scripts/check_write_triage_readiness_gate.py
+      args:
+      - --gate
+      - Gamma-A
+      - --report
+      - r
+      - fused-memory/calibration/link_adjudicator_report.json
+      - --require
+      - r
+      - selection.misfile_recall
+      - '>='
+      - '0.60'
+      - --require
+      - r
+      - selection.false_detach_rate
+      - <=
+      - '0.02'
+      - --require
+      - r
+      - selection.corrects_recall
+      - '>='
+      - '0.60'
+      - --require
+      - r
+      - selection.false_corrects_rate
+      - <=
+      - '0.10'
+      - --require
+      - r
+      - selection.parse_failure_rate
+      - <=
+      - '0.05'
+      - --require
+      - r
+      - population.n_pairs
+      - '>='
+      - '300'
+      - --on-pass
+      - epsilon's Gamma-A dependency is satisfied; epsilon still waits on phi
+      - --on-fail
+      - hold (this escalation owns it); re-base args per PRD D9 with a dated line
+        in PRD section 9, or keep holding; beta unaffected; never cancel this gate
+      timeout_secs: 60
+- label: φ
+  task_id: 6187
+  title: 'Gate: the write-triage flip is live on main'
+  capabilities:
+  - name: the-flip
+    binding: 'capability→producer (upstream) — task 3169 sets write_triage.enabled:
+      true in fused-memory/config/config.yaml'
+    verdict: PASS
+  - name: flag-subcheck
+    binding: 'capability→producer (upstream) — scripts/check_write_triage_enabled.py,
+      committed by this decompose session (lands before 3169 can close); exits non-zero
+      on the 2026-10-02 tree (enabled: false), 0 on a flipped copy'
+    verdict: PASS
+  - name: readiness-gate-predicate
+    binding: capability→substrate (wired) — scripts/check_write_triage_readiness_gate.py
+      (--subcheck, --subcheck-timeout); verified on main 0a9870b604 (2026-10-02)
+    verdict: PASS
+  - name: phi-write-triage-flip-live
+    binding: built by this leaf — the gate's own predicate, re-run so a cancelled
+      3169 or φ cannot release ε (D9)
+    verdict: PASS
+    delivered_check:
+      kind: script
+      script: scripts/check_write_triage_readiness_gate.py
+      args:
+      - --gate
+      - phi
+      - --subcheck
+      - uv run --frozen --project fused-memory python scripts/check_write_triage_enabled.py
+      - --subcheck-timeout
+      - '60'
+      - --on-pass
+      - epsilon dispatches once Gamma-A is also done
+      - --on-fail
+      - 'hold: 3169 closed without write_triage.enabled true on main; this escalation
+        owns re-ruling epsilon; never cancel this gate'
+      timeout_secs: 100
+- label: ε
+  task_id: 6188
+  title: Nightly link-heal sweep in report mode
+  capabilities:
+  - name: executor-and-adjudicator
+    binding: capability→producer (upstream) — α and δ (upstream through Γ_A ← δm ←
+      δ ← α)
+    verdict: PASS
+  - name: metric-series-writer
+    binding: capability→substrate (wired) — shared/src/shared/memory_eval_metrics.py;
+      verified on main 0a9870b604 (2026-10-02)
+    verdict: PASS
+  - name: nightly-timer-convention
+    binding: capability→substrate (wired) — OPERATIONS.md §12 (wrapper .sh, oneshot
+      .service, .timer Persistent=true, scripts/install-<job>-timer.sh); 03:00–05:30
+      taken, 02:00–02:30 free; verified on main 0a9870b604 (2026-10-02)
+    verdict: PASS
+  - name: sweep-timer-files
+    binding: built by this leaf — wrapper, service, timer and installer
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - scripts/fused-memory-link-heal.sh
+      - scripts/fused-memory-link-heal.service
+      - scripts/fused-memory-link-heal.timer
+      - scripts/install-link-heal-timer.sh
+  - name: operations-ladder-row
+    binding: built by this leaf — OPERATIONS.md §12 row at 02:15
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^\| 02:15 \|.*link-heal
+      expect: present
+      paths:
+      - OPERATIONS.md
+  - name: summary-7d-keys
+    binding: built by this leaf — summary.json keys runs_7d … skipped_cap_7d that
+      θ reads
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: runs_7d
+      expect: present
+      paths:
+      - fused-memory/src/fused_memory/maintenance/
+      - fused-memory/scripts/link_heal.py
+- label: η
+  task_id: 6189
+  title: Install the sweep and observe a night
+  capabilities:
+  - name: sweep-and-installer
+    binding: capability→producer (upstream) — ε
+    verdict: PASS
+  - name: timer-installed-and-ran
+    binding: built by this leaf — a non-writing adjudicator run from the timer with
+      adjudicated > 0
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: live systemd + ledger state; θ's runs_7d >= 6 re-checks it a week later
+- label: ζ
+  task_id: 6190
+  title: Measure the adjudicator on λ's triage pairs
+  capabilities:
+  - name: eval-lambda-mode
+    binding: capability→producer (upstream) — δ (λ reader; see δ lambda-pairs-shape
+      note)
+    verdict: PASS
+  - name: lambda-verdict-corpus
+    binding: capability→producer (upstream) — task 6152 (fused-memory/calibration/write_triage_pair_verdicts.jsonl),
+      external to this batch, wired as ζ's dependency
+    verdict: PASS
+  - name: triage-adjudicator-report
+    binding: built by this leaf — committed link_adjudicator_report_triage.json
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - fused-memory/calibration/link_adjudicator_report_triage.json
+- label: θ
+  task_id: 6191
+  title: 'Gate: the sweep may write'
+  capabilities:
+  - name: triage-report
+    binding: capability→producer (upstream) — ζ
+    verdict: PASS
+  - name: sweep-summary
+    binding: capability→producer (upstream) — ε writes fused-memory/data/memory-evals/link-heal/summary.json
+      (gitignored, main checkout) with runs_7d, would_escape_7d, adjudication_failure_rate_7d;
+      η installs it
+    verdict: PASS
+  - name: theta-sweep-may-write
+    binding: built by this leaf — the gate's own predicate, re-run so a cancelled
+      θ cannot release ξ (D9)
+    verdict: PASS
+    delivered_check:
+      kind: script
+      script: scripts/check_write_triage_readiness_gate.py
+      args:
+      - --gate
+      - theta
+      - --report
+      - t
+      - fused-memory/calibration/link_adjudicator_report_triage.json
+      - --report
+      - s
+      - fused-memory/data/memory-evals/link-heal/summary.json
+      - --require
+      - t
+      - selection.misfile_recall
+      - '>='
+      - '0.60'
+      - --require
+      - t
+      - selection.false_detach_rate
+      - <=
+      - '0.02'
+      - --require
+      - t
+      - selection.corrects_recall
+      - '>='
+      - '0.60'
+      - --require
+      - t
+      - selection.false_corrects_rate
+      - <=
+      - '0.10'
+      - --require
+      - t
+      - selection.parse_failure_rate
+      - <=
+      - '0.05'
+      - --require
+      - t
+      - population.n_pairs
+      - '>='
+      - '300'
+      - --require
+      - s
+      - runs_7d
+      - '>='
+      - '6'
+      - --require
+      - s
+      - would_escape_7d
+      - <=
+      - '0'
+      - --require
+      - s
+      - adjudication_failure_rate_7d
+      - <=
+      - '0.05'
+      - --on-pass
+      - 'xi dispatches: the nightly sweep may write'
+      - --on-fail
+      - the sweep stays non-writing; this escalation owns the hold; re-base args per
+        PRD D9 or keep holding; never cancel this gate
+      timeout_secs: 60
+- label: ξ
+  task_id: 6192
+  title: Let the sweep write
+  capabilities:
+  - name: writes-knob
+    binding: 'capability→producer (upstream) — ε ships link_heal.writes: false in
+      fused-memory/config/config.yaml'
+    verdict: PASS
+  - name: sweep-writes-on
+    binding: 'built by this leaf — link_heal.writes: true'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^  writes: true'
+      expect: present
+      paths:
+      - fused-memory/config/config.yaml

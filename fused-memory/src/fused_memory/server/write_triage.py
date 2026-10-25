@@ -46,18 +46,21 @@ inject their own fakes.
 The pure/impure split mirrors ``near_duplicate_guard``: pure synchronous
 selectors and defensive ``getattr``-at-every-hop config resolvers, with the
 one async retrieval helper and the async orchestrator kept separate from them.
+The attach guard (task 7158) follows the same split: :class:`AttachGuard` owns
+its rules purely, and only the lookup of an unretrieved parent's cosine is I/O.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, replace
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from shared.storm_counter import StormCounter
 
+from fused_memory.middleware._folded_escalation import file_folded_escalation
 from fused_memory.models.enums import MEM0_PRIMARY
 from fused_memory.server.grouped_read import (
     CHILD_KINDS,
@@ -75,30 +78,21 @@ from fused_memory.server.grouped_read import (
 # from a genuinely novel corpus. If that module is ever deleted rather than
 # left dormant, this import fails LOUDLY at import time, which is the right
 # way to be told to hoist the helper. (Hoisting it into a shared home is the
-# better end state and is deliberately NOT done here: near_duplicate_guard.py
-# is outside this task's lock set.)
-from fused_memory.server.near_duplicate_guard import _cosine_of
+# better end state and is still NOT done. Task 3127, which added this import,
+# did not hold near_duplicate_guard.py in its lock set; task 4734 did, and
+# took the cheaper move instead — renaming ``_cosine_of`` to the public
+# ``cosine_of`` in place, so this cross-module import no longer reaches into
+# another module's private surface — because that module is dormant rather
+# than deleted, and one home for the reader beats a third file to keep in
+# sync.)
+from fused_memory.server.near_duplicate_guard import cosine_of
+from fused_memory.utils.clip_disclosure import TruncationFact
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from collections.abc import Callable, Iterable, Sequence
 
     from fused_memory.models.memory import MemoryResult
     from fused_memory.services.memory_service import SearchResults
-
-# Defensive import of the optional ``escalation`` workspace package, copied
-# from markup_tripwire.py (which took it from middleware/candidate_key_
-# escalation.py): when it is missing — minimal CI envs, deployments that never
-# installed it — the storm escalation degrades to a logged no-op. This module
-# sits on the MCP write path, and by the time escalation is attempted the
-# write has ALREADY been stored, so nothing here may change its outcome.
-try:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
-    HAS_ESCALATION = True
-except ImportError:  # pragma: no cover — exercised only in minimal envs
-    HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +139,9 @@ FAIL_OPEN_ESCALATION_ID_KEY = 'triage_fail_open_escalation_id'
 #: flagged in a way nothing reads.
 #: ``tests/server/test_add_memory_write_triage_gate.py`` pins this set against
 #: the keys ``tools.py`` actually writes, so a FOURTH key added to the attach
-#: without widening this set fails there rather than silently.
+#: without widening this set fails there rather than silently. The
+#: triage-contest marker is the one exception: see that suite's
+#: ``TestOnlyTriageWritesTheTriageContestMarker``.
 ATTACH_OWNED_KEYS: frozenset[str] = frozenset({
     PARENT_ID_KEY, 'kind', CONTESTED_METADATA_KEY,
 })
@@ -181,6 +177,38 @@ TRIAGE_OUTCOMES: frozenset[str] = frozenset({
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
 })
+
+
+class JudgeUsage(NamedTuple):
+    """What the provider reported for ONE judge call.
+
+    Output includes reasoning, as both OpenAI APIs bill it.
+    """
+
+    input_tokens: int
+    output_tokens: int
+    #: ``None`` when the provider does not report reasoning separately.
+    reasoning_tokens: int | None = None
+
+
+class TriageJudgeVerdict(NamedTuple):
+    """The middle-band judge's answer: a verdict and the candidate it is about.
+
+    This is the judge's return contract, so it lives beside the outcomes it is
+    drawn from. ``write_triage_judge`` imports it; this module never imports
+    the judge, so the import direction stays one-way.
+    """
+
+    #: A :data:`TRIAGE_OUTCOMES` member.
+    outcome: str
+    #: The id of the RETRIEVED record the verdict is about; ``None`` names none.
+    candidate_id: str | None = None
+    #: What the provider reported for the call that produced the verdict;
+    #: ``None`` when no call was made or none was reported. Triage ignores it;
+    #: the eval prices a write from it.
+    usage: JudgeUsage | None = None
+    #: Comparable candidates the judge was not shown; ``()`` when it saw them all.
+    truncation_facts: tuple[TruncationFact, ...] = ()
 
 
 def attach_write_landed(result: Any) -> bool:
@@ -303,19 +331,46 @@ def resolve_bands(memory_service: Any) -> tuple[float | None, float | None]:
     re-calibration must take effect on a running server without a restart.
     """
     return (
-        _coerce_band(_write_triage_attr(memory_service, 't_high')),
-        _coerce_band(_write_triage_attr(memory_service, 't_low')),
+        _number_or_none(_write_triage_attr(memory_service, 't_high')),
+        _number_or_none(_write_triage_attr(memory_service, 't_low')),
     )
 
 
-def _coerce_band(value: Any) -> float | None:
-    """One band edge as a float, or ``None`` for anything that is not a number."""
+def resolve_min_parent_cosine(memory_service: Any) -> float | None:
+    """Read the attach-guard floor from *memory_service*'s config, live per write.
+
+    An absent or non-numeric leaf reads as ``None``, i.e. the rule OFF: an
+    unreadable config leaves the pre-guard routing in place, the same rule as
+    the ``enabled`` flag's. The shipped default lives only in the schema.
+    """
+    return _number_or_none(_write_triage_attr(memory_service, 'min_parent_cosine'))
+
+
+def resolve_hoist_max_cosine_gap(memory_service: Any) -> float | None:
+    """Read the attach-guard hoist gap from *memory_service*'s config, live per write.
+
+    Same reading as :func:`resolve_min_parent_cosine`: an absent or
+    non-numeric leaf is ``None``, the rule OFF.
+    """
+    return _number_or_none(_write_triage_attr(memory_service, 'hoist_max_cosine_gap'))
+
+
+def _number_or_none(value: Any) -> float | None:
+    """*value* as a float, or ``None`` for anything that is not a number (``bool`` included)."""
     if isinstance(value, int | float) and not isinstance(value, bool):
         return float(value)
     return None
 
 
 # --- pure band routing ------------------------------------------------------
+
+
+class AttachRefusal(StrEnum):
+    """Why an attach was refused and the write stored standalone (task 7158)."""
+
+    BELOW_MIN_PARENT_COSINE = 'below_min_parent_cosine'
+    HOIST_COSINE_GAP = 'hoist_cosine_gap'
+    TARGET_COSINE_UNAVAILABLE = 'target_cosine_unavailable'
 
 
 @dataclass(frozen=True)
@@ -331,13 +386,80 @@ class BandDecision:
 
     #: One of the outcome constants, or the internal :data:`OUTCOME_JUDGE`.
     outcome: str
-    #: The best comparable candidate's id, or ``None`` when nothing compared.
+    #: The id a write attaches to, or ``None`` when nothing is attached.
     canonical_id: str | None
-    #: That candidate's per-store cosine, or ``None``.
+    #: The band winner's per-store cosine — the number that routed this write.
+    #: On a judged attach it need not be the cosine of ``canonical_id``'s record.
     similarity: float | None
     #: The band edges this decision was made against, echoed as read.
     t_high: float | None
     t_low: float | None
+    #: The slate id the judge named, before hoisting; ``None`` on every
+    #: non-judged path and for a bare-word verdict.
+    judged_candidate_id: str | None = None
+    #: Where the evidence behind this decision was clipped; ``()`` when nowhere.
+    truncation_facts: tuple[TruncationFact, ...] = ()
+    #: The band winner's own slate id, before hoisting; ``None`` when no band
+    #: attached anything.
+    winner_id: str | None = None
+    #: Why the attach guard refused this write's attach; empty when it did not.
+    attach_refusals: frozenset[AttachRefusal] = frozenset()
+
+    @property
+    def attach_source_id(self) -> str | None:
+        """The slate record the attach target was derived from, before hoisting."""
+        return self.judged_candidate_id if self.judged_candidate_id is not None else self.winner_id
+
+
+@dataclass(frozen=True)
+class AttachGuard:
+    """Which attach-guard rules are in force for one write, and what they refuse.
+
+    The FLOOR refuses any attach whose target's cosine to the write is below
+    ``min_parent_cosine``. The HOIST GAP refuses, in the judge band only, a
+    hoist whose parent's cosine is more than ``hoist_max_cosine_gap`` below
+    the matched child's. ``None`` switches a rule off. The evidence for each
+    value is its field description on ``config/schema.py::WriteTriageConfig``.
+    """
+
+    min_parent_cosine: float | None
+    hoist_max_cosine_gap: float | None
+
+    def _gap_applies(self, *, hoisted: bool, judged: bool) -> bool:
+        return hoisted and judged and self.hoist_max_cosine_gap is not None
+
+    def needs_target_cosine(self, *, hoisted: bool, judged: bool) -> bool:
+        """Does any rule in force need the target's cosine to decide this attach?"""
+        return self.min_parent_cosine is not None or self._gap_applies(hoisted=hoisted, judged=judged)
+
+    def refusals(
+        self,
+        *,
+        source_cosine: float | None,
+        target_cosine: float | None,
+        hoisted: bool,
+        judged: bool,
+    ) -> frozenset[AttachRefusal]:
+        """Every rule this attach trips; an unscorable target trips them all as one reason."""
+        if not self.needs_target_cosine(hoisted=hoisted, judged=judged):
+            return frozenset()
+        if target_cosine is None:
+            return frozenset({AttachRefusal.TARGET_COSINE_UNAVAILABLE})
+        refused: set[AttachRefusal] = set()
+        if self.min_parent_cosine is not None and target_cosine < self.min_parent_cosine:
+            refused.add(AttachRefusal.BELOW_MIN_PARENT_COSINE)
+        gap = self.hoist_max_cosine_gap if self._gap_applies(hoisted=hoisted, judged=judged) else None
+        if gap is not None and source_cosine is not None and target_cosine < source_cosine - gap:
+            refused.add(AttachRefusal.HOIST_COSINE_GAP)
+        return frozenset(refused)
+
+
+def resolve_attach_guard(memory_service: Any) -> AttachGuard:
+    """The attach guard *memory_service*'s config puts in force, read live per write."""
+    return AttachGuard(
+        min_parent_cosine=resolve_min_parent_cosine(memory_service),
+        hoist_max_cosine_gap=resolve_hoist_max_cosine_gap(memory_service),
+    )
 
 
 def declares_attach_keys(metadata: Any) -> bool:
@@ -388,7 +510,7 @@ def declares_attach_keys(metadata: Any) -> bool:
     return any(key in metadata for key in ATTACH_OWNED_KEYS)
 
 
-def _canonical_id_of(result: MemoryResult) -> str:
+def canonical_id_of(result: MemoryResult) -> str:
     """The id a write should attach to for *result* — hoisting a CHILD.
 
     A sighting or amendment record is itself attached to something, and
@@ -409,7 +531,9 @@ def _canonical_id_of(result: MemoryResult) -> str:
     parent id whose record was since deleted. That is at worst the
     pre-existing dangling-parent condition ``grouped_read`` already tolerates,
     whereas attaching to a child creates a guaranteed-broken grandchild that
-    one-level grouping can NEVER fold.
+    one-level grouping can NEVER fold. With the attach guard on, an unscorable
+    (deleted) parent now refuses to ``stored`` instead
+    (:attr:`AttachRefusal.TARGET_COSINE_UNAVAILABLE`).
 
     The child rule mirrors ``grouped_read._parent_id_in_meta`` rule-for-rule —
     a child ``kind`` AND a non-empty ``str`` ``parent_id``, with a malformed
@@ -478,7 +602,7 @@ def decide_band(
 
     ``canonical_id`` is a CANONICAL id, not merely "the winning result's id":
     a winner that is itself a sighting or amendment child is HOISTED to its
-    parent by :func:`_canonical_id_of`, so the attach can never produce a
+    parent by :func:`canonical_id_of`, so the attach can never produce a
     grandchild that one-level grouping cannot fold. Only the attach TARGET
     moves — ``similarity`` stays the winner's own measured cosine, because
     that is the evidence actually observed against the submitted text.
@@ -489,7 +613,7 @@ def decide_band(
     scored = [
         (cosine, r)
         for r in results
-        if (cosine := _cosine_of(r)) is not None
+        if (cosine := cosine_of(r)) is not None
     ]
     if not scored:
         return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)
@@ -506,11 +630,13 @@ def decide_band(
     # from t_low up. See the docstring: this is measured, not a fallback.
     if t_high is not None and similarity >= t_high:
         return BandDecision(
-            OUTCOME_RESTATED, _canonical_id_of(best), similarity, t_high, t_low,
+            OUTCOME_RESTATED, canonical_id_of(best), similarity, t_high, t_low,
+            winner_id=best.id,
         )
 
     return BandDecision(
-        OUTCOME_JUDGE, _canonical_id_of(best), similarity, t_high, t_low,
+        OUTCOME_JUDGE, canonical_id_of(best), similarity, t_high, t_low,
+        winner_id=best.id,
     )
 
 
@@ -723,7 +849,9 @@ async def _stub_judge(
     The real judge (D3) is synchronous-in-``add_memory``, fail-open,
     closed-output over :data:`TRIAGE_OUTCOMES`, and DETECTS rather than
     adjudicates — it classifies the relationship between the write and the
-    candidate, it does not decide which text is true.
+    candidate, it does not decide which text is true. It answers a
+    :class:`TriageJudgeVerdict` naming its candidate; a bare outcome word, like this
+    stub's, is a verdict naming no candidate.
 
     Storing is also the right stub answer on the merits: with no judge, the
     only alternative is to attach on a similarity the calibration explicitly
@@ -754,12 +882,11 @@ async def triage_write(
     judge: Any = None,
     allow_near_duplicate: bool = False,
     caller_owns_attach_keys: bool = False,
-    is_recon_stage_agent: bool = False,
 ) -> BandDecision:
     """Route one ``add_memory`` write. NEVER raises, NEVER blocks, NEVER errors.
 
-    Force-store → retrieve → band → (judge slot) → decision. Every stage is
-    wrapped after the force-store checks: any
+    Force-store → retrieve → band → (judge slot) → guard → decision. Every
+    stage is wrapped after the force-store checks: any
     exception whatsoever yields :data:`OUTCOME_STORED` plus exactly one
     counted fail-open and a logged warning with ``exc_info``. Nothing escapes,
     because C1 is absolute — from the caller's side a fail-open is
@@ -775,12 +902,18 @@ async def triage_write(
     fail-open — so a changed ``MemoryService.search`` signature surfaces as a
     storm escalation rather than as a stream of errored writes.
 
-    *allow_near_duplicate*, *caller_owns_attach_keys* and
-    *is_recon_stage_agent* are passed IN rather than recomputed:
-    ``add_memory`` already derives all three from the metadata and the
-    agent_id it holds, and a second derivation here is a second place for them
-    to disagree about who is exempt. :func:`declares_attach_keys` is the one
-    spelling of the *caller_owns_attach_keys* predicate.
+    *allow_near_duplicate* and *caller_owns_attach_keys* are passed IN rather
+    than recomputed: ``add_memory`` already derives both from the metadata it
+    holds, and a second derivation here is a second place for them to disagree
+    about who is exempt. :func:`declares_attach_keys` is the one spelling of
+    the *caller_owns_attach_keys* predicate.
+
+    There is deliberately no recon-stage arm. It was retired by task 3134
+    (leaf iota) once Stage-1 consolidation moved onto ``consolidate_memories``,
+    whose canonical write goes through ``MemoryService.add_memory`` and never
+    reaches this seam, and which writes that canonical BEFORE any delete —
+    supplying the ordering guarantee whose absence was the arm's whole
+    justification. A recon-stage caller now triages like any other.
     """
     if allow_near_duplicate:
         # D2 reinterprets the retired guard's bypass flag as triage's
@@ -812,21 +945,6 @@ async def triage_write(
         #
         # Returned before retrieval for the same reason as the flag above: no
         # candidate can change the answer, so no round-trip is spent asking.
-        return BandDecision(OUTCOME_STORED, None, None, None, None)
-
-    if is_recon_stage_agent:
-        # The recon-stage exemption SURVIVES this leaf; LEAF IOTA owns its
-        # removal, and its explicit signal is "a recon-agent direct near-dup
-        # add_memory now triages like anyone else".
-        #
-        # Why it must survive until then: Stage-1 consolidation writes a merged
-        # canonical that is EXPECTED to closely resemble the duplicates it
-        # replaces, and there is no ordering guarantee that those duplicates are
-        # deleted first. Attaching the merged entry as a sighting of one of them
-        # would INVERT consolidation — the entry written to supersede a memory
-        # would become its child — and the inversion would be invisible, because
-        # a sighting of a near-identical parent is exactly what a real
-        # restatement looks like.
         return BandDecision(OUTCOME_STORED, None, None, None, None)
 
     try:
@@ -864,16 +982,44 @@ async def triage_write(
                 stage='retrieve',
             )
             return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)
-        decision = decide_band(results, t_high=t_high, t_low=t_low)
+        decision = replace(
+            decide_band(results, t_high=t_high, t_low=t_low),
+            truncation_facts=_retrieval_cap_facts(results, k, t_low),
+        )
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
         _record_fail_open(counter, project_id, exc, stage='retrieve')
         return BandDecision(OUTCOME_STORED, None, None, None, None)
 
-    if decision.outcome != OUTCOME_JUDGE:
-        return decision
+    judged = decision.outcome == OUTCOME_JUDGE
+    if judged:
+        decision = await _judge_band(
+            memory_service, decision, results, counter, judge,
+            content=content, project_id=project_id,
+        )
 
     try:
-        verdict = await (judge or _stub_judge)(
+        return await _guard_attach(
+            memory_service, decision, results,
+            content=content, project_id=project_id, judged=judged,
+        )
+    except Exception as exc:  # C1: nothing escapes this path.
+        _record_fail_open(counter, project_id, exc, stage='attach_guard')
+        return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
+
+
+async def _judge_band(
+    memory_service: Any,
+    decision: BandDecision,
+    results: SearchResults,
+    counter: TriageFailOpenCounter,
+    judge: Any,
+    *,
+    content: str,
+    project_id: str,
+) -> BandDecision:
+    """The middle band's judge slot: the judged decision, or ``stored`` plus one counted fail-open."""
+    try:
+        answer = await (judge or _stub_judge)(
             memory_service=memory_service,
             content=content,
             project_id=project_id,
@@ -888,26 +1034,190 @@ async def triage_write(
             # here -- one home for that decision.
             candidates=results,
         )
+        judged = _apply_judge_verdict(decision, answer, results)
+        _log_retarget(decision, judged, project_id)
+        return judged
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
         _record_fail_open(counter, project_id, exc, stage='judge')
         return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
 
-    if verdict not in TRIAGE_OUTCOMES:
-        # A closed output set (D3) means an unrecognised verdict is a BUG, not
-        # an extension point — counted as a fail-open so it cannot pass as a
-        # routing decision nobody notices.
-        _record_fail_open(
-            counter, project_id,
-            ValueError(f'judge returned {verdict!r}, not in TRIAGE_OUTCOMES'),
-            stage='judge',
-        )
-        return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
 
-    # `stored` carries no canonical: nothing was attached, so naming one would
-    # invite a caller to attach to a candidate the judge declined to endorse.
-    canonical_id = None if verdict == OUTCOME_STORED else decision.canonical_id
-    return BandDecision(
-        verdict, canonical_id, decision.similarity, decision.t_high, decision.t_low,
+async def _guard_attach(
+    memory_service: Any,
+    decision: BandDecision,
+    results: Sequence[MemoryResult],
+    *,
+    content: str,
+    project_id: str,
+    judged: bool,
+) -> BandDecision:
+    """*decision*, or ``stored`` with its :class:`AttachRefusal` reasons when the guard refuses its attach.
+
+    A refusal is a measured fact about the corpus, not a dependency failure,
+    so it never touches the fail-open counter; a lookup that raises propagates
+    to the caller, which counts it.
+    """
+    target_id = decision.canonical_id
+    if target_id is None:
+        return decision
+    guard = resolve_attach_guard(memory_service)
+    source_id = decision.attach_source_id
+    hoisted = target_id != source_id
+    if not guard.needs_target_cosine(hoisted=hoisted, judged=judged):
+        return decision
+    source_cosine = _slate_cosine(results, source_id)
+    target_cosine = (
+        await _parent_cosine(
+            memory_service, target_id, results, content=content, project_id=project_id,
+        )
+        if hoisted
+        else source_cosine
+    )
+    refusals = guard.refusals(
+        source_cosine=source_cosine, target_cosine=target_cosine, hoisted=hoisted, judged=judged,
+    )
+    if not refusals:
+        return decision
+    _log_attach_refusal(
+        decision, refusals,
+        target_cosine=target_cosine, source_cosine=source_cosine,
+        judged=judged, guard=guard, project_id=project_id,
+    )
+    return replace(decision, outcome=OUTCOME_STORED, canonical_id=None, attach_refusals=refusals)
+
+
+async def _parent_cosine(
+    memory_service: Any,
+    parent_id: str,
+    results: Sequence[MemoryResult],
+    *,
+    content: str,
+    project_id: str,
+) -> float | None:
+    """The write's cosine to *parent_id*: from the slate when retrieved, else ONE by-id lookup.
+
+    ``None`` when the parent is not in the store. A lookup error propagates.
+    """
+    cosine = _slate_cosine(results, parent_id)
+    if cosine is not None:
+        return cosine
+    scores = await memory_service.cosine_to_memories(
+        query=content, memory_ids=[parent_id], project_id=project_id,
+    )
+    return _number_or_none(scores.get(parent_id))
+
+
+def _slate_cosine(results: Sequence[MemoryResult], memory_id: str | None) -> float | None:
+    """The retrieved cosine of *memory_id*, or ``None`` when it was not retrieved with one."""
+    return next((cosine_of(result) for result in results if result.id == memory_id), None)
+
+
+def _log_attach_refusal(
+    decision: BandDecision,
+    refusals: frozenset[AttachRefusal],
+    *,
+    target_cosine: float | None,
+    source_cosine: float | None,
+    judged: bool,
+    guard: AttachGuard,
+    project_id: str,
+) -> None:
+    """One INFO line per refused attach: each rule's rate is measured from these."""
+    logger.info(
+        'write_triage attach refused: project=%s outcome=%s reasons=%s target=%r '
+        'target_cosine=%s source=%r source_cosine=%s judged=%s min_parent_cosine=%s '
+        'hoist_max_cosine_gap=%s; write stored standalone (not a fail-open)',
+        project_id, decision.outcome, ','.join(sorted(refusals)), decision.canonical_id,
+        target_cosine, decision.attach_source_id, source_cosine, judged,
+        guard.min_parent_cosine, guard.hoist_max_cosine_gap,
+    )
+
+
+def _retrieval_cap_facts(
+    results: Sequence[MemoryResult], k: int, t_low: float | None,
+) -> tuple[TruncationFact, ...]:
+    """A full top-*k* whose weakest comparable candidate still reached ``t_low`` may have cut in-band ones.
+
+    Nothing past rank *k* scores above the weakest kept candidate, so when that one
+    is below the band the cut hid nothing comparable. How many were cut is unknowable.
+    """
+    scores = [score for score in map(cosine_of, results) if score is not None]
+    if len(results) < k or t_low is None or not scores or min(scores) < t_low:
+        return ()
+    return (TruncationFact(field='triage_candidates', cap=k, elided=None),)
+
+
+def _apply_judge_verdict(
+    decision: BandDecision,
+    answer: object,
+    results: Iterable[MemoryResult],
+) -> BandDecision:
+    """The judged band's attach rule: file the write against the candidate named.
+
+    *answer* is what the judge returned — a :class:`TriageJudgeVerdict` (its
+    ``usage`` is ignored here), any ``(outcome, candidate_id)`` pair, or a bare
+    outcome word naming no candidate. A verdict naming a candidate attaches to that retrieved record,
+    hoisted by :func:`canonical_id_of` exactly as the band's winner is; one
+    naming none attaches to the band's winner. ``stored`` attaches nothing, so
+    it carries no canonical a caller could mistake for an endorsement.
+
+    Every breach of that contract RAISES, naming the offending value, so
+    :func:`triage_write` counts it as exactly one fail-open. The output set is
+    closed (D3): an unrecognised verdict is a bug, not an extension point.
+    """
+    verdict = _judge_verdict_of(answer)
+    decision = replace(decision, truncation_facts=decision.truncation_facts + verdict.truncation_facts)
+    if verdict.outcome not in TRIAGE_OUTCOMES:
+        raise ValueError(f'judge returned {verdict.outcome!r}, not in TRIAGE_OUTCOMES')
+    if verdict.outcome == OUTCOME_STORED:
+        if verdict.candidate_id is not None:
+            raise ValueError(
+                f'a stored verdict attaches nothing, yet names {verdict.candidate_id!r}',
+            )
+        return replace(decision, outcome=OUTCOME_STORED, canonical_id=None)
+    if verdict.candidate_id is None:
+        return replace(decision, outcome=verdict.outcome)
+    if not isinstance(verdict.candidate_id, str) or not verdict.candidate_id:
+        raise ValueError(f'candidate_id {verdict.candidate_id!r} is not a non-empty str')
+    judged = next(
+        (result for result in results if result.id == verdict.candidate_id), None,
+    )
+    if judged is None:
+        raise ValueError(
+            f'judge named {verdict.candidate_id!r}, which is not a retrieved candidate',
+        )
+    return replace(
+        decision,
+        outcome=verdict.outcome,
+        canonical_id=canonical_id_of(judged),
+        judged_candidate_id=verdict.candidate_id,
+    )
+
+
+def _judge_verdict_of(answer: object) -> TriageJudgeVerdict:
+    """Read a judge's *answer* as a verdict: a bare word names no candidate."""
+    if isinstance(answer, TriageJudgeVerdict):
+        return answer
+    if isinstance(answer, str):
+        return TriageJudgeVerdict(answer)
+    if isinstance(answer, tuple) and len(answer) == 2:
+        return TriageJudgeVerdict(*answer)
+    raise TypeError(f'judge returned {answer!r}, not an (outcome, candidate_id) pair')
+
+
+def _log_retarget(band: BandDecision, judged: BandDecision, project_id: str) -> None:
+    """Log a judged attach the named candidate moved off the band winner's canonical.
+
+    How often the judge overrules the max-cosine winner is what an operator
+    reads to decide whether the judge earns its call.
+    """
+    if judged.judged_candidate_id is None or judged.canonical_id == band.canonical_id:
+        return
+    logger.info(
+        'write_triage judged attach retargeted: project=%s outcome=%s judge named '
+        '%r -> canonical=%r, not the band winner canonical=%r',
+        project_id, judged.outcome, judged.judged_candidate_id,
+        judged.canonical_id, band.canonical_id,
     )
 
 
@@ -946,24 +1256,11 @@ def _record_fail_open(
 
 # --- the storm escalation (INV-4) ------------------------------------------
 #
-# Escalation wiring copied shape-for-shape from
-# ``markup_tripwire.emit_markup_storm_escalation``, which took it from
-# ``middleware/candidate_key_escalation.py``.
-#
 # _ANCHOR_TASK_ID is a stable per-project anchor (not a real task id) so the
 # resulting ids form one greppable ``esc-write-triage-fail-open-N`` series and
-# the dedup check has something to key on.
-#
-# It is THIS LEAF'S OWN and is shared with nobody, which is load-bearing rather
-# than tidy. Measured: the L1 escalation watcher files its own cluster records
-# under the ``markup-tripwire`` anchor and SQUATS it — the tripwire filed
-# nothing 2026-08-16..2026-08-19 while 41 rejections occurred, all 17 records
-# sitting at dedupe_count 0. A filer that dedupes against an anchor somebody
-# else keeps open never files again, and the resulting silence is
-# indistinguishable from health. That incident is why
-# ``emit_markup_storm_escalation`` grew its ``anchor_task_id`` parameter, and
-# it is why "simplifying" this into a shared anchor would disable the alarm.
-_QUEUE_DIRNAME: str = 'data/escalations'
+# the dedup check has something to key on. It must be shared with nobody: a
+# filer deduping against an anchor somebody else keeps open never files again
+# — see the ``middleware/_folded_escalation`` module docstring.
 _ANCHOR_TASK_ID: str = 'write-triage-fail-open'
 _AGENT_ROLE: str = 'fused-memory/write-triage'
 _CATEGORY: str = 'write_triage_fail_open_storm'
@@ -995,51 +1292,6 @@ def emit_triage_fail_open_storm_escalation(
     window, so those collapse into the single open record until an operator
     resolves it.
     """
-    if project_root is None:
-        logger.debug(
-            'write_triage: no project_root resolved; fail-open storm %r will '
-            'not be escalated',
-            storm,
-        )
-        return None
-    if not HAS_ESCALATION:
-        logger.debug(
-            'write_triage: escalation package unavailable; fail-open storm %r '
-            'in project_root=%r will not be escalated',
-            storm, project_root,
-        )
-        return None
-
-    try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
-    except Exception:
-        logger.exception(
-            'write_triage: failed to open the escalation queue for '
-            'project_root=%r; fail-open storm %r not escalated',
-            project_root, storm,
-        )
-        return None
-
-    # Best-effort dedup: a read failure falls THROUGH to filing rather than
-    # bailing out — losing duplicate-suppression is strictly better than losing
-    # the alarm for a degradation that is happening right now.
-    try:
-        existing = queue.get_by_task(_ANCHOR_TASK_ID, status='pending')
-    except Exception:
-        logger.exception(
-            'write_triage: failed to check for an existing open fail-open '
-            'escalation for project_root=%r; proceeding to file a new one',
-            project_root,
-        )
-        existing = []
-    if existing:
-        logger.info(
-            'write_triage: %s already open for project_root=%r (storm %r now); '
-            'not filing a duplicate',
-            existing[0].id, project_root, storm,
-        )
-        return existing[0].id
-
     count = storm.get('count')
     window_seconds = storm.get('window_seconds')
     detail = '\n'.join([
@@ -1086,41 +1338,27 @@ def emit_triage_fail_open_storm_escalation(
         "against that PRD's open leaves.",
     ])
 
-    try:
-        esc = Escalation(  # type: ignore[possibly-unbound]
-            id=queue.make_id(_ANCHOR_TASK_ID),
-            task_id=_ANCHOR_TASK_ID,
-            agent_role=_AGENT_ROLE,
-            severity='blocking',
-            category=_CATEGORY,
-            summary=(
-                f'{count} add_memory write(s) triaged WITHOUT triage in '
-                f'{window_seconds}s — write triage is failing open '
-                f'(see {_PRD_PATH})'
-            ),
-            detail=detail,
-            suggested_action=(
-                'check MemoryService.search / mem0 reachability, then the '
-                "judge; grep the logs for 'write_triage fail-open at stage=' "
-                'for the failing stage. To stop triage deliberately, set '
-                'write_triage.enabled: false (green-tier hot-reloadable)'
-            ),
-            level=1,
-        )
-        esc_id = queue.submit(esc)
-    except Exception:
-        # A queue I/O failure must not propagate: the write has already been
-        # stored, and the WARNING/ERROR log at the fail-open site has already
-        # recorded the burst. The operator simply loses the queued heads-up.
-        logger.exception(
-            'write_triage: failed to submit fail-open storm escalation for '
-            'project_root=%r (storm %r)',
-            project_root, storm,
-        )
-        return None
 
-    logger.warning(
-        'write_triage: queued %s for project_root=%r (fail-open storm %r)',
-        esc_id, project_root, storm,
+    return file_folded_escalation(
+        project_root,
+        anchor_task_id=_ANCHOR_TASK_ID,
+        agent_role=_AGENT_ROLE,
+        category=_CATEGORY,
+        severity='blocking',
+        summary=(
+            f'{count} add_memory write(s) triaged WITHOUT triage in '
+            f'{window_seconds}s — write triage is failing open '
+            f'(see {_PRD_PATH})'
+        ),
+        detail=detail,
+        suggested_action=(
+            'check MemoryService.search / mem0 reachability, then the '
+            "judge; grep the logs for 'write_triage fail-open at stage=' "
+            'for the failing stage. To stop triage deliberately, set '
+            'write_triage.enabled: false (green-tier hot-reloadable)'
+        ),
+        logger=logger,
+        log_label='write_triage',
+        context=f'fail-open storm {storm!r}',
+        level=1,
     )
-    return esc_id

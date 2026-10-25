@@ -44,9 +44,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from shared.cli_invoke import (
+    BUDGET_EXHAUSTED_SUBTYPE,
     AgentResult,  # noqa: F401 (re-exported for tests)
     invoke_with_cap_retry,
     is_zero_output_timeout,
+    no_mcp_servers_config,
 )
 from shared.neutral_cwd import neutral_cli_cwd
 
@@ -363,6 +365,8 @@ class PathScopeAdjudicator:
                 max_budget_usd=self._config.max_budget_usd,
                 disallowed_tools=['*'],
                 output_schema=ADJUDICATION_SCHEMA,
+                mcp_config=no_mcp_servers_config(),
+                strict_mcp_config=True,
                 permission_mode='bypassPermissions',
                 timeout_seconds=self._config.timeout_seconds,
                 cap_wait_sanity_secs=_ADJUDICATOR_CAP_WAIT_SANITY_SECS,
@@ -391,7 +395,7 @@ class PathScopeAdjudicator:
             #       _record_zero_output_timeout (the ZOT breaker path);
             #   (b) zero-cost error_max_budget_usd from a schema-tool-denied
             #       pre-turn failure are NOT misclassified as a budget defect.
-            if agent_result.subtype == 'error_max_budget_usd' and agent_result.cost_usd > 0:
+            if agent_result.subtype == BUDGET_EXHAUSTED_SUBTYPE and agent_result.cost_usd > 0:
                 misconfig_reason = (
                     f'budget-misconfig: error_max_budget_usd '
                     f'cost_usd={agent_result.cost_usd} turns={agent_result.turns} '

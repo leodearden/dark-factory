@@ -1,7 +1,11 @@
 [Unit]
 Description=Fused Memory MCP Server (dark-factory)
 Documentation=file:///home/leo/src/dark-factory/DESIGN.md
-After=network.target
+After=network.target fused-memory.socket
+# fused-memory.socket holds the port so it stays bound across restarts (see
+# that unit). Wants=, not Requires=: if the socket cannot start, the service
+# still starts and binds the port itself.
+Wants=fused-memory.socket
 
 # Restart-rate guard: 10 starts within 600s is generous enough for cap-rotation
 # churn and recoverable cascades, but blocks a true tight loop. No
@@ -25,10 +29,14 @@ Type=notify
 NotifyAccess=all
 WatchdogSec=120
 WorkingDirectory=/home/leo/src/dark-factory
-ExecStart=/home/leo/.local/bin/uv run --project fused-memory \
+ExecStart=/home/leo/.local/bin/uv run --no-sync --project fused-memory \
   python -m fused_memory.server.main \
   --transport http \
   --config /home/leo/src/dark-factory/fused-memory/config/config.yaml
+
+# A deliberate stop also stops fused-memory.socket, so no later connection
+# can restart the service; a restart or crash keeps the port bound.
+ExecStopPost=-/home/leo/src/dark-factory/scripts/stop-socket-unless-restarting.sh %n
 
 # Environment: secrets loaded by dotenv from fused-memory/.env
 # These are the non-secret vars the config.yaml ${} expansion needs
@@ -43,6 +51,16 @@ Environment=TASKMASTER_DIR=/home/leo/src/dark-factory/taskmaster-ai
 # execve(), independent of Python startup order. Both mechanisms remain active
 # (belt-and-suspenders). NOTE: the live/deployed unit must carry this identical line.
 Environment=MEM0_TELEMETRY=false
+
+# Pin PATH explicitly rather than inheriting the systemd user manager's.
+# On 2026-08-13->08-18 this line was absent, the inherited manager PATH lacked
+# ~/.local/bin, and so the `claude` CLI the task curator shells out to did not
+# resolve: every curation degraded to 'create' and the fleet-wide dedupe
+# function was down for >=80h with no signal. The %h specifier keeps this
+# host-portable AND byte-identical between this file and the rendered unit --
+# scripts/render_systemd_unit.py substitutes only __REPO_ROOT__/__UV_PATH__,
+# so the parity checker's exact match still holds.
+Environment=PATH=%h/.local/bin:%h/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Restart policy: always restart on failure (including watchdog-triggered),
 # back off up to 60s. main() in fused_memory/server/main.py exits 0 only when
@@ -71,3 +89,4 @@ StandardError=journal
 
 [Install]
 WantedBy=default.target
+Also=fused-memory.socket

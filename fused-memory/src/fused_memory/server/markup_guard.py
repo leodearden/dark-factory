@@ -78,11 +78,16 @@ the gate named. There was no gap to close.
 The rejections use two vocabularies, both this guard's: ``mcp_markup_detected``
 carries a repair, ``mcp_markup_unrepairable`` refuses without one. The split is
 :func:`shared.toolcall_markup.repair`'s NO SILENT PARTIAL REPAIR contract, not
-a hole — ``</invoke>`` closes the ENVELOPE rather than a parameter, and an
+a hole — ``\x3c/invoke>`` closes the ENVELOPE rather than a parameter, and an
 opener with no preceding mis-close leaves the repairer nothing to attribute the
 residue to. Either way nothing is written and the residue is escalated rather
 than dropped. ``tests/server/test_markup_tripwire_gate.py`` holds the
 expectation table and the per-specimen reasoning.
+
+The envelope closer above is spelled with the ``\\x3c`` escape, never a raw
+bracket: the "Sentinel-literal hazard" section of
+``shared/src/shared/toolcall_markup.py``, the owner of this convention, says
+why.
 """
 
 from __future__ import annotations
@@ -93,7 +98,11 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+)
 
 from fused_memory.server.markup_tripwire import (
     _MARKUP_STORM_THRESHOLD,
@@ -153,16 +162,6 @@ _STORM_ERROR_TYPE = 'mcp_markup_storm'
 #: holds one caller's payload rather than summarising a burst, and it is never
 #: deduped (folding two residue records together would destroy one payload).
 _RESIDUE_ANCHOR_TASK_ID = 'markup-residue'
-
-#: Where an operator should take a recurrence. DF 3083 delivered the root cause
-#: and the corpus sweep but is DONE and CLOSED to appends, so a reader sent there
-#: reports it nowhere. This text carries forward the correction commit e0ea6e3fe9
-#: made to the ERROR line inside tools.py's ``_markup_gate`` closure, which is
-#: deleted when the in-line gates retire — so it has to live here to survive.
-_STORM_ROUTING = (
-    'report the recurrence against plans/toolcall-markup-containment-prd.md '
-    '(DF 3083 is done and closed to appends, so not against 3083)'
-)
 
 
 def _resolve_project_root(project: Any, known_projects: dict[str, str] | None) -> str | None:
@@ -332,14 +331,14 @@ def install_markup_guard(
                 'markup_guard_residue: refused an unrepairable %s.%s and '
                 'preserved its payload in %s (%d chars); %s',
                 record.get('tool'), record.get('field'), escalation_id,
-                len(record.get('raw_value') or ''), _STORM_ROUTING,
+                len(record.get('raw_value') or ''), MARKUP_RECURRENCE_ROUTING,
             )
             return escalation_id
         logger.error(
             'markup_guard_residue: refused an unrepairable call and could NOT '
             'file its payload (project=%r), so THIS LOG LINE is the only copy '
             'and the caller was handed a null escalation_id: %r; %s',
-            record.get('project'), record, _STORM_ROUTING,
+            record.get('project'), record, MARKUP_RECURRENCE_ROUTING,
         )
         return None
 
@@ -384,7 +383,7 @@ def install_markup_guard(
                 'not be resolved to a project_root, so NO escalation was filed — '
                 'the serialization leak is ACTIVE; %s',
                 record.get('count'), record.get('outcome'),
-                record.get('window_seconds'), record.get('project'), _STORM_ROUTING,
+                record.get('window_seconds'), record.get('project'), MARKUP_RECURRENCE_ROUTING,
             )
             return None
 
@@ -397,7 +396,7 @@ def install_markup_guard(
             'markup_guard_storm: %s %s outcome(s) in %ss for project_root=%r '
             '(threshold=%s) — the serialization leak is ACTIVE; %s',
             record.get('count'), record.get('outcome'), record.get('window_seconds'),
-            project_root, record.get('threshold'), _STORM_ROUTING,
+            project_root, record.get('threshold'), MARKUP_RECURRENCE_ROUTING,
         )
 
         # Purely additive: the rejection is already decided, so a queue failure

@@ -5,14 +5,18 @@ uniquely-named sibling module — so they can be imported from test files
 without conflicting with sibling subprojects' conftests under
 `sys.modules['conftest']`.
 """
+import asyncio
 import itertools
 import json
 import os
 import shutil
 import sys
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import _async_mock_orphans
 import pytest
 import pytest_asyncio
 
@@ -51,13 +55,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 # Suite-wide single-writer debug asserts (task 1999 / MQ-invariants ξ, I7).
-# Must be set BEFORE any `orchestrator.merge_queue` import so the module-level
+# Must be set BEFORE any `orchestrator.merge_lane.worker` import so the module-level
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
+from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
-    drain_async_mock_coroutines,
+    ExitContractViolationCollector,
+    ample_disk_usage,
     idle_psi_sample,
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
@@ -74,7 +80,6 @@ from df_pytest_isolation import (  # noqa: E402
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
 
-from orchestrator import merge_queue  # noqa: E402
 from orchestrator.agents.briefing import BriefingAssembler  # noqa: E402
 from orchestrator.config import (  # noqa: E402
     EscalationConfig,
@@ -84,41 +89,60 @@ from orchestrator.config import (  # noqa: E402
     ReviewConfig,
     SandboxConfig,
 )
+from orchestrator.merge_lane import worker  # noqa: E402
 
 # Belt-and-braces direct assignment: defeats any import-order race where
-# orchestrator.merge_queue was imported (by another conftest/plugin) before
+# orchestrator.merge_lane.worker was imported (by another conftest/plugin) before
 # the os.environ.setdefault above took effect, which would have frozen its
 # module-level _DEBUG_ASSERTS seed at False.
-merge_queue._DEBUG_ASSERTS = True
+worker._DEBUG_ASSERTS = True
+
+_async_mock_orphans.track_async_mock_coroutines()
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _reap_leaked_merge_workers():
-    """Gracefully stop any MergeWorker orphaned onto the test event loop (task 1907).
+async def _drain_leaked_tasks(_no_unexpected_exit_contract_violation):
+    """Cancel every task a test left pending, then wait, before its loop closes.
 
-    A merge-queue test that raises before its own ``await worker.stop()`` (e.g. an
-    assertion fails partway through) leaks the worker's ``run()`` task and its
-    four background loops, which do real ``git`` subprocess work. If
-    pytest-asyncio's per-test loop teardown (``asyncio.runners._cancel_all_tasks``)
-    then cancels a loop caught mid-subprocess-spawn
-    (``BaseSubprocessTransport._connect_pipes``), the cancellation ``gather``
-    deadlocks and the whole ``pytest tests/`` process HANGS forever at teardown
-    (this is the remaining full-suite teardown stall once the worker-kill hang is
-    fixed; there are 100+ ``create_task(worker.run())`` sites with inline-only
-    cleanup, so per-test ``try/finally`` is not tractable).
+    A task cancelled between spawning a subprocess and connecting its pipes
+    survives ONE cancel: asyncio then awaits a transport exit that an
+    unconnected pipe can never signal. pytest-asyncio's ``Runner.close``
+    delivers exactly one, and hung on it. This cancel is the first of the two
+    such a task needs, and the bounded wait lets it land before ``Runner.close``
+    throws the second. Pinned end to end by test_leaked_task_drain.py.
+    Requesting ``_no_unexpected_exit_contract_violation`` keeps that guard
+    tearing down AFTER this drain, so a leaked run() that exits while being
+    cancelled is judged against the test that leaked it.
+    """
+    yield
+    own = asyncio.current_task()
+    pending = [t for t in asyncio.all_tasks() if t is not own and not t.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.wait(pending, timeout=5.0)
 
-    Reaping here — in the test's own loop, before it is closed — via the graceful
-    ``worker.stop()`` (sets ``_running=False`` + sends sentinels + bounded drain)
-    lets each loop FINISH its in-flight subprocess and exit cleanly, instead of
-    being abruptly cancelled mid-spawn. Best-effort and bounded: it never fails a
-    test and is a cheap no-op for the (vast majority of) tests that leak nothing.
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reap_leaked_merge_workers(_drain_leaked_tasks):
+    """Gracefully stop any merge worker orphaned onto the test event loop (task 1907).
+
+    A merge-queue test that raises before its own ``await worker.stop()`` leaks
+    the worker's ``run()`` task and its background loops, which do real ``git``
+    subprocess work. The graceful ``worker.stop()`` (sets ``_running=False`` +
+    sends sentinels + bounded drain) lets each loop FINISH its in-flight
+    subprocess and exit cleanly; the abrupt cancel that loop teardown would
+    apply instead can wedge. Requesting ``_drain_leaked_tasks`` keeps that net
+    tearing down AFTER this one even if fixture names change. There are 100+
+    ``create_task(worker.run())`` sites with inline-only cleanup, so per-test
+    ``try/finally`` is not tractable. Best-effort and bounded: it never fails a
+    test and is a cheap no-op for tests that leak nothing.
 
     Works for sync and async tests alike: pytest-asyncio (strict mode) provides a
     loop for this async fixture even under a sync test, where ``all_tasks()`` is
     simply empty.
     """
     yield
-    import asyncio
     import contextlib
 
     for task in list(asyncio.all_tasks()):
@@ -247,6 +271,23 @@ def repo_root() -> Path | None:
     return None
 
 
+@pytest.fixture(scope='session', autouse=True)
+def pristine_repo_templates(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[RepoTemplates]:
+    """Install the process-wide ``_git_fixtures`` templates that ``seed_repo`` copies from.
+
+    AUTOUSE because the shared ``_workflow_helpers`` seeders are awaited as
+    ``helper(repo)`` by ~20 modules and cannot request a fixture.  SESSION scope
+    under basetemp, so pytest owns the templates' lifetime and each xdist worker
+    gets its own, mirroring the set-and-restore shape of
+    ``df_pytest_isolation.py::_df_git_ceiling_at_basetemp``.  Templates build
+    lazily: an unused worker pays one mkdir.
+    """
+    with session_templates(tmp_path_factory.mktemp('git-templates')) as templates:
+        yield templates
+
+
 @pytest.fixture
 def briefing(tmp_path: Path) -> BriefingAssembler:
     """Minimal BriefingAssembler over a stub OrchestratorConfig (no I/O).
@@ -276,17 +317,9 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     ``dark-factory-orchestrator.yaml`` (absolute path) so tests load the
     operational config deterministically, independent of the process CWD.
 
-    Config source (task 2719): previously this fixture *deleted*
-    ORCH_CONFIG_PATH and relied on ``settings_customise_sources`` falling back
-    to the *relative* ``Path('config.yaml')`` — which, under ``cd orchestrator
-    && pytest`` (how the per-subproject test command invokes us), resolved via
-    the ``orchestrator/config.yaml`` symlink to the operational config.  That
-    transitional symlink was retired, so we now pin the absolute canonical path
-    explicitly.  It is byte-identical to the removed symlink's target, so the
-    operational values every test relies on (e.g. ``lock_depth``,
-    ``merge_verify_breadth='full'``) are unchanged; the absolute path is also
-    CWD-independent, so the config no longer depends on running from
-    ``orchestrator/``.
+    Config source (task 2719): the absolute path (not the retired relative
+    ``config.yaml`` symlink) keeps the operational values every test relies on
+    (e.g. ``lock_depth``, ``merge_verify_breadth='full'``) CWD-independent.
 
     project_root isolation (the other load-bearing part): any test that builds a
     bare ``OrchestratorConfig()`` and drives ``acquire_next`` writes
@@ -295,10 +328,10 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     state.  Pin ``project_root`` (via the ``ORCH_`` env prefix) to this test's
     ``tmp_path`` so those writes land in tmp instead.
 
-    Precedence keeps this safe: ``init_settings`` (explicit ``project_root=...``
-    kwargs) still win over the env, and ``env_settings`` only overrides
-    ``project_root`` — every other field still loads from config.yaml/defaults,
-    so tests that depend on config values (e.g. lock_depth) are unaffected.
+    Precedence keeps this safe: explicit kwargs still win over the env, which overrides
+    only ``project_root`` and the host-reaching knobs: laptop runner, ``prefer_remote``
+    (task 5053) and ``verify_use_cgroup_scope`` (task 5206), so a bare config never
+    ssh's the laptop or spawns a real systemd scope; all else loads from yaml/defaults.
     Config-loading tests already use ``tmp_path`` as their project_root, so the
     env value agrees with the YAML they write.  The opt-in
     ``code_default_config`` fixture runs after this autouse fixture and still
@@ -307,6 +340,9 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setenv("ORCH_VERIFY_RUNNERS", "[]")
+    monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
+    monkeypatch.setenv("ORCH_VERIFY_USE_CGROUP_SCOPE", "false")
 
 
 @pytest.fixture
@@ -342,6 +378,9 @@ def code_default_config(monkeypatch, tmp_path):
     rely on it.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
+    monkeypatch.delenv("ORCH_VERIFY_RUNNERS", raising=False)
+    monkeypatch.delenv("ORCH_VERIFY_HOST_POLICY", raising=False)
+    monkeypatch.delenv("ORCH_VERIFY_USE_CGROUP_SCOPE", raising=False)
 
 
 #: Guaranteed-absent path for the autouse warm-lane script-dir pin below.
@@ -441,6 +480,40 @@ def _no_mock_derived_stray_dirs(request):
         "(e.g. `git_ops.project_root = tmp_path`) rather than leaving the "
         "attribute to auto-spec into a child mock. The stray tree has been "
         "removed so following tests are unaffected."
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_unexpected_exit_contract_violation(request):
+    """Fail any test whose ``TaskWorkflow.run()`` exit breaks the spec §5 exit
+    contract (docs/task-escalation-state-spec.md).
+
+    Until task 3542, SM-2 raised ``AssertionError`` out of ``run()`` on an
+    inconsistent exit, which failed whichever test drove it. ``run()`` now
+    RECORDS the verdict instead (a WARNING in the shipped log mode), so this
+    guard restores that oracle: it collects the real recorder's VIOLATION
+    records and fails at teardown.
+
+    **Opt-out via ``exit_contract_violation_expected`` marker**, in the style
+    of ``real_verify_admission`` above: only for a test that DELIBERATELY
+    drives a violation.
+    """
+    with ExitContractViolationCollector.listening() as collector:
+        yield
+    if not collector.violations:
+        return
+    if request.node.get_closest_marker('exit_contract_violation_expected') is not None:
+        return
+    records = '\n'.join(f'  - {r.getMessage()}' for r in collector.violations)
+    pytest.fail(
+        f"{request.node.nodeid}: a TaskWorkflow.run() exit left a status the "
+        "spec §5 exit contract forbids "
+        "(shared/src/shared/task_transitions.py::outcome_allows_status):\n"
+        f"{records}\n"
+        "Fix the producer that wrote (or skipped) the row, or the test double "
+        "that does not write it the way the real collaborator does. The "
+        "`exit_contract_violation_expected` marker is only for a test that "
+        "DELIBERATELY drives a violation, never a fix for this failure."
     )
 
 
@@ -564,6 +637,18 @@ def _hermetic_psi_reader(monkeypatch, request):
     monkeypatch.setattr('orchestrator.scheduler.read_psi_sample', idle_psi_sample)
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_disk_usage(monkeypatch):
+    """Every ``shutil.disk_usage`` reads ``_orch_helpers.py::ample_disk_usage`` (task 7032).
+
+    The free-space guards read the host's disk, so a verify host under the 10 GiB
+    floor of ``orchestrator/src/orchestrator/merge_lane/worker.py::_ensure_verify_disk_space``
+    failed lane and workflow tests on every branch (esc-5509-2). A test of a guard
+    patches ``shutil.disk_usage`` over this one with its own numbers.
+    """
+    monkeypatch.setattr(shutil, 'disk_usage', ample_disk_usage)
+
+
 @pytest.fixture
 def forbid_live_mcp(monkeypatch):
     """Opt-in guard: fail the test if a live fused-memory MCP round-trip is attempted.
@@ -574,23 +659,23 @@ def forbid_live_mcp(monkeypatch):
     through to the LIVE ``mcp_call(...)`` HTTP branch, which — because the
     module-global ``mcp_lifecycle._session`` is ``None`` in unit tests —
     constructs a one-shot ``McpSession`` and calls ``initialize()`` /
-    ``_raw_call()`` against the real ``http://localhost:8002``.  Under
+    ``call()`` against the real ``http://localhost:8002``.  Under
     ``pytest -n auto`` that shared server saturates under load (observed
     ~100x latency), and these multi-call paths can exceed the suite's 60s
     per-test timeout — which (``timeout_method='thread'``) ``os._exit()``s
     the xdist worker rather than just failing the one test.
 
-    Patches the ``McpSession`` CLASS in ``orchestrator.mcp_lifecycle`` —
+    Patches the ``McpSession`` CLASS (``shared.mcp_session``) —
     NOT ``orchestrator.scheduler.mcp_call`` — because ``scheduler.py`` binds
     ``mcp_call`` via ``from ... import``, a distinct binding from the
     canonical ``orchestrator.mcp_lifecycle.mcp_call`` (and
-    ``orchestrator.agents.briefing.mcp_call``).  Every alias, however,
+    ``orchestrator.agents.memory_recall.mcp_call``).  Every alias, however,
     ultimately constructs/uses an ``McpSession`` and issues its first
-    network I/O through ``McpSession.initialize`` -> ``_raw_call`` (the
-    one-shot fallback path inside ``mcp_call``, since the module-global
-    ``_session`` is ``None`` in unit tests) — patching the class methods is
-    the single binding-independent network chokepoint every alias funnels
-    through.
+    network I/O through ``McpSession.initialize`` -> ``call`` (``call_tool``
+    delegates to ``call``; the one-shot fallback inside ``mcp_call`` applies,
+    as the module-global ``_session`` is ``None`` in unit tests) — patching
+    the class methods is the single binding-independent network chokepoint
+    every alias funnels through.
 
     RECORDS each attempt into the yielded list (rather than only raising)
     because the two dominant live seams here swallow exceptions:
@@ -618,7 +703,7 @@ def forbid_live_mcp(monkeypatch):
             'Scheduler under test (see _orch_helpers.HermeticMcpSession)'
         )
 
-    async def _fake_raw_call(self, method: str, params=None, timeout: float = 30) -> dict:
+    async def _fake_call(self, method: str, params=None, *, timeout: float = 30) -> dict:
         recorder.append((self.base_url, method))
         raise AssertionError(
             f'live fused-memory MCP round-trip attempted: {method!r} at '
@@ -626,8 +711,8 @@ def forbid_live_mcp(monkeypatch):
             'Scheduler under test (see _orch_helpers.HermeticMcpSession)'
         )
 
-    monkeypatch.setattr('orchestrator.mcp_lifecycle.McpSession.initialize', _fake_initialize)
-    monkeypatch.setattr('orchestrator.mcp_lifecycle.McpSession._raw_call', _fake_raw_call)
+    monkeypatch.setattr('shared.mcp_session.McpSession.initialize', _fake_initialize)
+    monkeypatch.setattr('shared.mcp_session.McpSession.call', _fake_call)
 
     yield recorder
 
@@ -674,7 +759,7 @@ def _restore_sandbox_backend():
 
 @pytest.fixture(autouse=True)
 def _clear_probe_cache():
-    """Clear verify._PROBE_CACHE (and its sibling _BASELINE_FAILING_IDS_CACHE)
+    """Reset verify's main-probe caches (``verify.clear_main_probe_caches``)
     before and after every test.
 
     ``verify_failure_is_preexisting_on_main`` stores results in the
@@ -685,12 +770,12 @@ def _clear_probe_cache():
     short-circuits the probe path in the later test — causing it to skip
     worktree creation / cleanup and return the wrong result.
 
-    ``_BASELINE_FAILING_IDS_CACHE`` (task μ, verify-scope-inversion-prd.md) is
-    the sibling per-main-SHA failing-test-id baseline cache keyed on
-    ``main_sha`` alone — the same cross-test-pollution hazard applies (an
-    earlier test's seeded/probed baseline for a reused MAIN_SHA would
-    silently serve a later test's ``main_baseline_failing_ids`` call from
-    cache instead of exercising its own probe/seed path).
+    The per-main-SHA failing- and skipped-test-id baselines (task μ,
+    verify-scope-inversion-prd.md; task 3226) are keyed on ``main_sha`` alone
+    — the same cross-test-pollution hazard applies (an earlier test's
+    seeded/probed baseline for a reused MAIN_SHA would silently serve a later
+    test's ``main_baseline_failing_ids`` call from cache instead of
+    exercising its own probe/seed path).
 
     Clearing the caches before *and* after each test ensures:
     - every test starts with empty caches regardless of prior teardown;
@@ -701,26 +786,38 @@ def _clear_probe_cache():
 
     **Maintainer note — adding new verify.py process-globals:**
     If ``orchestrator/src/orchestrator/verify.py`` gains additional
-    module-level caches (e.g. a sibling result cache), add a matching
-    ``.clear()`` call here so they are also reset between tests.  The
-    relevant globals are defined near ``_PROBE_CACHE``/``_PROBE_CACHE_TTL``
-    and ``_BASELINE_FAILING_IDS_CACHE``.
+    module-level caches (e.g. a sibling result cache), clear them in
+    ``verify.clear_main_probe_caches`` — the single reset this fixture calls
+    — so they are also reset between tests.
     """
     from orchestrator import verify
-    verify._PROBE_CACHE.clear()
-    verify._BASELINE_FAILING_IDS_CACHE.clear()
+    verify.clear_main_probe_caches()
     yield
-    verify._PROBE_CACHE.clear()
-    verify._BASELINE_FAILING_IDS_CACHE.clear()
+    verify.clear_main_probe_caches()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_merge_provenance(tmp_path_factory):
+    """Start every test with MergeProvenance on a fresh, empty landed outbox.
+
+    MergeProvenance is process-global, and every lane built over a real repo
+    binds its own outbox there (SpeculativeMergeWorker.__init__) with nothing
+    to unbind it, so a row one test's lane recorded would answer a later test's
+    lookup in the same worker (task 5034). The file is never created unless
+    something records through the facade.
+    """
+    from orchestrator.merge_lane.landed_outbox import LandedOutbox, MergeProvenance
+    basetemp = tmp_path_factory.getbasetemp()
+    MergeProvenance.bind(LandedOutbox(basetemp / f'landed-outbox-{uuid.uuid4().hex}.json'))
 
 
 @pytest.fixture(autouse=True)
 def _mock_merge_queue_verification(monkeypatch, request):
     """Patch merge_queue's run_scoped_verification to return passed=True by default.
 
-    MergeWorker hardcodes orchestrator.merge_queue.run_scoped_verification in its
-    internal calls; tests that create a live MergeWorker need this patched or
-    pytest/ruff/pyright (not in PATH in test environments) cause BLOCKED outcomes.
+    A lane on the production verifier (``ports.py::ProductionVerifier``) resolves
+    orchestrator.merge_lane.worker.run_scoped_verification on every call; tests that run
+    one need it patched or pytest/ruff/pyright cause BLOCKED outcomes.
     Tests that need specific merge-verification behaviour override this with their
     own monkeypatch.setattr call in the test body.
 
@@ -738,7 +835,7 @@ def _mock_merge_queue_verification(monkeypatch, request):
     which use the marker as the SOLE restore mechanism (no in-body patch):
       - test_train_integration.py::TestTrainIntegrationB2::test_lower_member_break_blocks_train
       - test_atomic_train_merge.py::TestScenario5GroupMergeVerify::test_group_merge_workspace_verify_red
-    Do NOT add a redundant in-body ``patch('orchestrator.merge_queue.run_scoped_verification',
+    Do NOT add a redundant in-body ``patch('orchestrator.merge_lane.worker.run_scoped_verification',
     ...)`` to these tests — the marker is sufficient and is the authoritative mechanism
     (pinned by test_merge_verify_mock_autouse.py).
     Every other test that drives the real merge path either overrides
@@ -753,7 +850,7 @@ def _mock_merge_queue_verification(monkeypatch, request):
 
     from orchestrator.verify import VerifyResult
     monkeypatch.setattr(
-        'orchestrator.merge_queue.run_scoped_verification',
+        'orchestrator.merge_lane.worker.run_scoped_verification',
         AsyncMock(return_value=VerifyResult(
             passed=True, test_output='', lint_output='',
             type_output='', summary='mocked merge verify',
@@ -800,36 +897,17 @@ def _neutralize_verify_admission(monkeypatch, request):
 
 @pytest.fixture(autouse=True)
 def _drain_async_mock_coroutines():
-    """Drain orphaned AsyncMock._execute_mock_call coroutines after every test.
+    """Fail this test if it called an AsyncMock without awaiting it, closing the orphan first.
 
-    Task 1714 / esc-1702-13: prevents order-dependent orchestrator test failures
-    caused by un-awaited AsyncMock coroutines surviving GC cycles into sibling
-    tests.  CPython emits RuntimeWarning("coroutine '...' was never awaited")
-    when GC finalizes such an orphan; orchestrator/pyproject.toml promotes this
-    (and pytest's PytestUnraisableExceptionWarning wrapper) to hard errors via
-    filterwarnings — failing whichever test the GC ran during.
+    Tasks 1714 / 5669; rationale in ``_async_mock_orphans.py``.
+    ``track_async_mock_coroutines()`` runs at conftest import, so collection-time mocks are covered.
 
-    By closing every CORO_CREATED ``_execute_mock_call`` coroutine at each test's
-    own teardown boundary, orphans are reclaimed before they can be promoted into
-    a sibling.  Product coroutines (co_name != _execute_mock_call) are untouched,
-    preserving the real-leak safety net.
-
-    KNOWN LIMITATION — module/session-scoped fixture teardowns: pytest finalises
-    fixtures in reverse setup order.  An orphaned AsyncMock coroutine created in
-    the *teardown* of a fixture set up BEFORE this one (e.g. a module- or
-    session-scoped fixture) will be finalised AFTER drain's teardown runs, so it
-    is reclaimed at the *next* test's drain boundary rather than the current one.
-    This is an edge case: function-scoped fixtures (the majority) tear down in
-    definition order before this fixture's teardown, so they are covered.  If a
-    module/session fixture teardown is found to create AsyncMock orphans, either
-    add an explicit ``await`` there or register an additional
-    ``pytest_runtest_teardown`` hook that fires after all finalizers.
-
-    See drain_async_mock_coroutines() in _orch_helpers.py for full rationale and
-    performance notes.
+    KNOWN LIMITATION: an orphan created in the teardown of a fixture set up
+    BEFORE this one (module- or session-scoped) is created after this check has
+    run, so the NEXT test fails instead; the message names where it was created.
     """
     yield
-    drain_async_mock_coroutines()
+    _async_mock_orphans.fail_on_orphaned_async_mock_calls()
 
 
 @pytest.fixture
@@ -876,18 +954,18 @@ def make_steward(tmp_path: Path):
       serve exactly one consumer.  That factory instead adopted this one's
       ``project_root`` recipe directly (task 3551), so the sandbox invariant is
       shared even though the construction is not;
-    * a THIRD sanctioned site exists, which the lineage had missed:
-      ``test_verdict_servers_integration_gate.py``'s
-      ``_build_steward_for_triage``, added by task 2488 AFTER the 3514
-      consolidation.  It takes a REAL ``OrchestratorConfig`` and a real on-disk
-      meta-root, which this fixture's ``spec_set`` ``MagicMock`` cannot supply;
-      whether to grow a ``config=`` passthrough for it is filed as a follow-up,
-      not decided here.
+    * ``test_verdict_servers_integration_gate.py``'s ``_build_steward_for_triage``
+      (task 2488, after 3514) was FOLDED onto this fixture by task 4452 with NO
+      ``config=`` passthrough: its real config was only needed for
+      ``config.routing.*``, which ``stamp_stock_routing_config`` supplies, and its
+      meta-root pre-init is test-side seeding (``triage_steward``).  A passthrough
+      is a second mode with no consumer; add one only when a caller needs a real
+      config's VALUES, not just its routing containers.
 
     ENFORCEMENT, so the ruling is checkable rather than merely asserted in prose
     a fourth time: ``test_steward_scaffolding_guards.py`` censuses every steward
     construction in this tree against an allowlist that carries the reason for
-    each.  A fourth idiom cannot appear silently — its author must either use
+    each.  Another idiom cannot appear silently — its author must either use
     this fixture or record why they cannot.  That module also owns the
     recurrence guard for the sandboxed-``project_root`` block; the assertion
     itself is ``_orch_helpers.assert_sandboxed_project_root``, which the
@@ -1184,4 +1262,7 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # Same failure mode as overrides_db_path above (tasks 1313/1339); this
     # instance of it is task 2045.
     config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
+    # Production default (task 4757). Unassigned, TaskWorkflow._invoke would
+    # read a truthy Mock and run every mock-config workflow test strictly scoped.
+    config.strict_mcp_config = False
     return config

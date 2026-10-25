@@ -8,11 +8,15 @@
 # reserve. Evals have NO dedicated account: they share this same pool
 # and must be robust to cap/429 events (ruling 2026-08-30, task 4741).
 
+# max-b and max-h are switched off on the Anthropic side by Leo's deliberate
+# choice (ruling 2026-10-06, task 5944). They stay listed, at the end of the
+# order, so switching them back on there is the whole restore: a long-running
+# gate re-probes an auth-failed account (usage_cap.auth_reprobe_secs) and
+# re-admits it once a probe is served, and the nightly legibility trickle
+# starts each run afresh.
+# Do not comment them out. max-c was off too on 2026-09-29 and was measured
+# served again on 2026-09-30.
 accounts:
-  - name: max-b
-    oauth_token_env: CLAUDE_OAUTH_TOKEN_B
-  - name: max-c
-    oauth_token_env: CLAUDE_OAUTH_TOKEN_C
   - name: max-d
     oauth_token_env: CLAUDE_OAUTH_TOKEN_D
   - name: max-e
@@ -21,6 +25,10 @@ accounts:
     oauth_token_env: CLAUDE_OAUTH_TOKEN_F
   - name: max-g
     oauth_token_env: CLAUDE_OAUTH_TOKEN_G
+  - name: max-b
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_B
+  - name: max-c
+    oauth_token_env: CLAUDE_OAUTH_TOKEN_C
   - name: max-h
     oauth_token_env: CLAUDE_OAUTH_TOKEN_H
 # max-b previously believed permanently dead (HTTP 403 since 2026-04-20);

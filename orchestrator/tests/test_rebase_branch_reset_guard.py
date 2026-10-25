@@ -31,7 +31,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -551,11 +551,11 @@ class TestRequeueReuseSitesRouteThroughGuard:
         assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
         lane = info.path
 
-        # Write .task/plan.json with task_id='WLW' — forces the disk-backstop
-        # route on re-acquire below.
-        task_dir = lane / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text(_json.dumps({'task_id': 'WLW'}))
+        # Seed the lane's meta root with task_id='WLW' — forces the
+        # disk-backstop route on re-acquire below.
+        meta_root = TaskArtifacts.meta_root_for(warm_git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(_json.dumps({'task_id': 'WLW'}))
 
         await _commit_unique_work(lane, filename='wlw_feature.txt')
         assert await _commits_over_main(lane) == 1
@@ -728,7 +728,7 @@ def _make_branch_reset_workflow(*, task_id: str = '2403') -> TaskWorkflow:
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
-    config.project_root = Path('/tmp/non-existent-for-test')
+    config.project_root = MOCK_WORKFLOW_PROJECT_ROOT
 
     scheduler = MagicMock()
     scheduler.update_task = AsyncMock(return_value=True)

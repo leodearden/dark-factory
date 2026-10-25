@@ -1,24 +1,31 @@
 // prd_grouping.js — pure PRD-grouping-view logic for the Tasks tab's
 // per-project "group by PRD" view (tab_tasks.jsx).
 //
-// This is a plain-JS module: no JSX, no Babel. It is loaded two ways:
-//   - In the browser, via a classic `<script src="/static/redux/prd_grouping.js">`
-//     tag (like graph_layout.js), which assigns `window.DF_PRD_GROUPING`.
-//   - In node (no package.json in this repo, so this file resolves as
-//     CommonJS), via `require`/`import` for the `node --test` suite under
-//     dashboard/tests/js/.
+// A PLAIN-JS CLASSIC SCRIPT, NOT A .jsx MODULE, so its decisions are
+// EXECUTABLE: dashboard/tests/js/prd_grouping.test.mjs runs them.
+// pins_recovery.js's header holds the CANONICAL statement of why.
 //
-// Both export paths are guarded so this file has no effect outside the
-// environment it's actually running in.
+// LOAD CONTRACT. It destructures window.DF_DATUM, window.DF_TASK_VOCAB and
+// window.DF_TASK_SNAPSHOT at module scope with no fallback, so index.html loads
+// it after datum.js, task_vocab.js and task_snapshot.js and before
+// tab_tasks.jsx (test_index_html.py pins the order). A browser classic
+// `<script>` assigns `window.DF_PRD_GROUPING`; node requires the same file as
+// CommonJS once its test has put those globals on a window shim.
 //
-// index.html loads this file (classic script, before the Babel JSX tags) so
-// `window.DF_PRD_GROUPING` is defined before tab_tasks.jsx executes its
-// top-level destructure of it.
+// ONE TALLY, OVER THE GENERATED VOCABULARY. summarizePrdMembers counts a PRD's
+// members in the served census's shape, and every box decision reads that
+// tally, so no status string is bucketed here (PRD decisions 3 and 8,
+// plans/dashboard-one-datum-one-path-prd.md).
 //
 // orderPrdGroups takes graph_layout.js's computeTiers as an INJECTED
-// parameter rather than importing/reading window.DF_GRAPH_LAYOUT internally
-// — see the plan's design decisions for why (keeps this module independently
-// unit-testable and avoids a hard cross-module load-order/require coupling).
+// parameter rather than reading window.DF_GRAPH_LAYOUT, which keeps this
+// module unit-testable without that module on the shim.
+
+// Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
+// header.
+const { combinedDatum: combinePrdParts } = window.DF_DATUM;
+const { MEMBERS: PRD_MEMBERS, VIEWS: PRD_VIEWS, SUB_VIEWS: PRD_SUB_VIEWS, TONES: PRD_TONES } = window.DF_TASK_VOCAB;
+const { terminalOfTotal: prdTerminalOfTotal } = window.DF_TASK_SNAPSHOT;
 
 // ── Derive a PRD box title from its path/ref ──
 // basename (the substring after the last '/'), with a trailing '-prd.md'
@@ -31,35 +38,53 @@ function prdTitle(prdPath) {
   return base;
 }
 
-// ── Aggregate a single status for a PRD box from its member tasks ──
-// Precedence: any-blocked > any-(in-progress|merge-deferred) >
-// any-(pending|deferred) > all-done > cancelled (the catch-all fallback,
-// covering an all-cancelled group or a done+cancelled mix that isn't ALL
-// done).
-function aggregatePrdStatus(tasks) {
-  if (tasks.some(t => t.status === 'blocked')) return 'blocked';
-  if (tasks.some(t => t.status === 'in-progress' || t.status === 'merge-deferred')) return 'in-progress';
-  if (tasks.some(t => t.status === 'pending' || t.status === 'deferred')) return 'pending';
-  if (tasks.every(t => t.status === 'done')) return 'done';
+// ── A PRD's members, tallied like a served census ──
+// {counts, total, views, sub_views}, the shape data/census.py::TaskCensus
+// emits, so task_snapshot.js's census readings apply to it unchanged. A status
+// outside the vocabulary counts in `total` only, so it can never pass as a
+// member of some view.
+function summarizePrdMembers(tasks) {
+  const counts = Object.fromEntries(PRD_MEMBERS.map(member => [member, 0]));
+  for (const t of tasks) {
+    if (Object.hasOwn(counts, t.status)) counts[t.status] += 1;
+  }
+  return {
+    counts,
+    total: tasks.length,
+    views: prdViewTally(PRD_VIEWS, counts),
+    sub_views: prdViewTally(PRD_SUB_VIEWS, counts),
+  };
+}
+
+function prdViewTally(views, counts) {
+  return Object.fromEntries(
+    Object.entries(views).map(([view, members]) => [view, members.reduce((sum, member) => sum + counts[member], 0)]),
+  );
+}
+
+// ── The box's status class ──
+// any blocked > any in-flight > any backlog > all done > cancelled. The
+// outputs are the `.prd-box.s-*` classes styles.css defines.
+function aggregatePrdStatus(summary) {
+  if (summary.counts.blocked > 0) return 'blocked';
+  if (summary.views.in_flight > 0) return 'in-progress';
+  if (summary.views.backlog > 0) return 'pending';
+  if (summary.counts.done === summary.total) return 'done';
   return 'cancelled';
 }
 
-// ── Per-bucket member counts for a PRD box ──
-// Single pass over `tasks` bucketing by status: done, inProgress
-// ('in-progress' or 'merge-deferred'), blocked, pending ('pending' or
-// 'deferred'), total (every member, including cancelled/anything-else,
-// which are counted in total but no other bucket). Source of both the
-// "n/m done" count (done/total) and the stacked-bar segment sizes.
-function summarizePrdMembers(tasks) {
-  const counts = { done: 0, inProgress: 0, blocked: 0, pending: 0, total: tasks.length };
-  for (const t of tasks) {
-    if (t.status === 'done') counts.done++;
-    else if (t.status === 'in-progress' || t.status === 'merge-deferred') counts.inProgress++;
-    else if (t.status === 'blocked') counts.blocked++;
-    else if (t.status === 'pending' || t.status === 'deferred') counts.pending++;
-    // cancelled (or any other/unrecognized status) is counted in total only.
-  }
-  return counts;
+// PRD decision 3: a PRD is finished when every member is terminal.
+function prdIsFinished(summary) {
+  return summary.total > 0 && summary.views.terminal === summary.total;
+}
+
+// One segment per member present, in vocabulary order, as a share of the
+// total. An unrecognised status has no segment, so its share leaves the track
+// showing.
+function prdBarSegments(summary) {
+  return PRD_MEMBERS
+    .filter(member => summary.counts[member] > 0)
+    .map(member => ({ member, tone: PRD_TONES[member], share: (summary.counts[member] / summary.total) * 100 }));
 }
 
 // ── Bucket tasks by their `prd` field into ordered {prd, tasks, noPrd} groups ──
@@ -93,20 +118,6 @@ function groupTasksByPrd(tasks) {
   return groups;
 }
 
-// Literal (not status-bucket) activity counts used only by orderPrdGroups'
-// tiebreak — deliberately narrower than summarizePrdMembers/aggregatePrdStatus:
-// 'merge-deferred' is NOT folded into blocked+in-progress here, and 'deferred'
-// is NOT folded into pending, per the plan's explicit wording.
-function prdActivity(tasks) {
-  let blockedOrInProgress = 0;
-  let pending = 0;
-  for (const t of tasks) {
-    if (t.status === 'blocked' || t.status === 'in-progress') blockedOrInProgress++;
-    else if (t.status === 'pending') pending++;
-  }
-  return { blockedOrInProgress, pending };
-}
-
 // ── Order PRD groups for box layout ──
 // Splits off the "no PRD" group (if any) before tiering, builds a
 // taskId->prd map across the remaining (non-null) groups, and synthesizes
@@ -115,7 +126,7 @@ function prdActivity(tasks) {
 // null-prd — has no resolvable prd and is simply ignored, mirroring
 // graph_layout.js's "dep outside the known set" convention). The injected
 // computeTiers tiers that mini-DAG; groups are then sorted by
-// (tier asc, blocked+in-progress desc, pending desc, stable insertion index),
+// (tier asc, in-flight desc, backlog desc, stable insertion index),
 // and the "no PRD" group (if present) is force-appended last regardless of
 // its own tasks' tier/activity.
 function orderPrdGroups(groups, computeTiers) {
@@ -140,13 +151,11 @@ function orderPrdGroups(groups, computeTiers) {
   const tiers = computeTiers(syntheticNodes);
 
   const ordered = nonNullGroups
-    .map((g, index) => ({ g, index, tier: tiers.get(g.prd) || 0, activity: prdActivity(g.tasks) }))
+    .map((g, index) => ({ g, index, tier: tiers.get(g.prd) || 0, views: summarizePrdMembers(g.tasks).views }))
     .sort((a, b) => {
       if (a.tier !== b.tier) return a.tier - b.tier;
-      if (a.activity.blockedOrInProgress !== b.activity.blockedOrInProgress) {
-        return b.activity.blockedOrInProgress - a.activity.blockedOrInProgress;
-      }
-      if (a.activity.pending !== b.activity.pending) return b.activity.pending - a.activity.pending;
+      if (a.views.in_flight !== b.views.in_flight) return b.views.in_flight - a.views.in_flight;
+      if (a.views.backlog !== b.views.backlog) return b.views.backlog - a.views.backlog;
       return a.index - b.index; // stable insertion-order final tiebreak
     })
     .map(entry => entry.g);
@@ -154,12 +163,43 @@ function orderPrdGroups(groups, computeTiers) {
   return noPrdGroup ? [...ordered, noPrdGroup] : ordered;
 }
 
+// ── The PRD box count (PRD decision 8) ──
+// A Datum whose value maps each PRD (null for the no-PRD bucket) to the tally
+// over its rows from BOTH parts: the snapshot's in-flight and backlog rows and
+// the on-demand terminal window. combinedDatum lets the worst part decide, so
+// the window's lower_bound renders as '≥', and a hole in either part is a hole
+// in the count rather than an under-count passed off as a total.
+function prdProgress(rowsDatum, terminalDatum) {
+  return combinePrdParts(
+    [['in-flight and backlog rows', rowsDatum], ['terminal rows', terminalDatum]],
+    ([active, terminal]) => new Map(
+      groupTasksByPrd([...active, ...terminal]).map(g => [g.prd, summarizePrdMembers(g.tasks)]),
+    ),
+    'no rows in scope',
+  );
+}
+
+// The datumView `format` for one PRD's box: its 'n/m' terminal-of-total.
+function prdProgressReading(prd) {
+  return byPrd => prdTerminalOfTotal(byPrd.get(prd) || summarizePrdMembers([]));
+}
+
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced by
 // dashboard/tests/js/classic_script_scope.test.mjs. A collision here would
 // leave window.DF_PRD_GROUPING undefined and break tab_tasks.jsx's top-level
 // destructure of it.
-const PRD_GROUPING_API = { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups };
+const PRD_GROUPING_API = {
+  prdTitle,
+  aggregatePrdStatus,
+  summarizePrdMembers,
+  prdIsFinished,
+  prdBarSegments,
+  prdProgress,
+  prdProgressReading,
+  groupTasksByPrd,
+  orderPrdGroups,
+};
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = PRD_GROUPING_API;

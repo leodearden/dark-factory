@@ -1,10 +1,23 @@
 """Tests for MCP scheduler-override tool behavior.
 
-Covers four tools:
-- get_pin_queue         (read-only, no audit)
-- set_task_priority_override  (write, emits audit)
-- clear_task_priority_override (write, emits audit)
-- reorder_pin_queue     (write, emits audit)
+Covers four tools, none of which emits a memory write:
+- get_pin_queue                 (read-only)
+- set_task_priority_override    (write)
+- clear_task_priority_override  (write)
+- reorder_pin_queue             (write)
+
+The three write tools used to mint a durable Graphiti edge per call via
+``add_memory(category='decisions_and_rationale')``.  Task 3853 (the esc-3834-1
+ruling) deleted that audit side effect: pin order, pinned status, boost tier,
+reserve_now and TTL churn and are cleared without any corresponding write, so
+the edges went stale within the hour, and extraction produced facts naming no
+task at all.  No audit value was lost — the structural per-change trail lives
+in ``data/orchestrator/runs.db`` (``priority_override_set`` /
+``priority_override_cleared`` / ``task_pinned`` / ``task_unpinned`` /
+``pin_queue_reordered``, surfaced by the ``get_scheduler_events`` MCP tool).
+Do not restore the audit, and do not substitute a Mem0-category write: the
+ruling rejects that too.  ``test_override_write_tools_emit_no_memory_write`` is
+the regression lock.
 
 All tools open ``<project_root>/data/orchestrator/scheduler_overrides.db``
 via aiosqlite; these tests use a ``tmp_path``-rooted project_root with the
@@ -21,7 +34,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from fused_memory.models.scope import resolve_project_id
 from fused_memory.server.tools import create_mcp_server
 
 # ---------------------------------------------------------------------------
@@ -99,7 +111,7 @@ def _row_count(project_root: str | Path) -> int:
 
 
 # ===========================================================================
-# get_pin_queue — read-only, no audit emit
+# get_pin_queue — read-only
 # ===========================================================================
 
 
@@ -118,7 +130,38 @@ async def test_get_pin_queue_empty_returns_empty_list(tmp_path, mcp_server, memo
 
 
 # ===========================================================================
-# set_task_priority_override — write + audit
+# override write tools emit no memory write (task 3853, esc-3834-1)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tool_name,tool_kwargs,pre_pins', [
+    ('set_task_priority_override',
+     {'task_id': '5', 'boost_tier': 'high', 'pinned': True}, []),
+    ('clear_task_priority_override', {'task_id': '5'}, ['5']),
+    ('reorder_pin_queue', {'ordered_task_ids': ['C', 'A', 'B']}, ['A', 'B', 'C']),
+])
+async def test_override_write_tools_emit_no_memory_write(
+    tmp_path, mcp_server, memory_service, tool_name, tool_kwargs, pre_pins,
+):
+    """Each override write tool's happy path reaches neither add_memory nor add_episode."""
+    if pre_pins:
+        await _populate_pins(mcp_server, tmp_path, pre_pins)
+    memory_service.add_memory.reset_mock()
+    memory_service.add_episode.reset_mock()
+
+    result = await mcp_server._tool_manager.call_tool(
+        tool_name,
+        {'project_root': str(tmp_path), **tool_kwargs},
+    )
+    assert 'error' not in result
+
+    memory_service.add_memory.assert_not_called()
+    memory_service.add_episode.assert_not_called()
+
+
+# ===========================================================================
+# set_task_priority_override — write
 # ===========================================================================
 
 
@@ -128,11 +171,10 @@ async def test_get_pin_queue_empty_returns_empty_list(tmp_path, mcp_server, memo
     ({'pinned': True}, {'pinned': 1}),
     ({'reserve_now': True}, {'reserve_now': 1}),
 ])
-async def test_set_task_priority_override_writes_row_and_emits_audit(
+async def test_set_task_priority_override_writes_row(
     tmp_path, mcp_server, memory_service, extra_kwargs, extra_row_checks,
 ):
-    """Happy-path: a row is written to SQLite and an audit add_memory is emitted."""
-    memory_service.add_memory.reset_mock()
+    """Happy-path: a row is written to SQLite."""
     result = await mcp_server._tool_manager.call_tool(
         'set_task_priority_override',
         {'project_root': str(tmp_path), 'task_id': '5', 'boost_tier': 'high', **extra_kwargs},
@@ -156,14 +198,6 @@ async def test_set_task_priority_override_writes_row_and_emits_audit(
     for col, val in extra_row_checks.items():
         idx = {'pinned': 3, 'reserve_now': 4}[col]
         assert row[idx] == val, f'{col} mismatch: expected {val}, got {row[idx]}'
-
-    memory_service.add_memory.assert_called_once()
-    _, audit_kwargs = memory_service.add_memory.call_args
-    assert audit_kwargs['category'] == 'decisions_and_rationale'
-    assert audit_kwargs['project_id'] == resolve_project_id(str(tmp_path))
-    assert audit_kwargs['agent_id'] == 'scheduler-overrides'
-    assert audit_kwargs['metadata']['task_id'] == '5'
-    assert audit_kwargs['metadata']['fields']['boost_tier'] == 'high'
 
 
 # ===========================================================================
@@ -253,9 +287,6 @@ async def test_set_task_priority_override_ttl_secs_converts_to_absolute_iso(
     low = before + timedelta(seconds=3600) - timedelta(seconds=5)
     high = after + timedelta(seconds=3600) + timedelta(seconds=5)
     assert low <= parsed <= high
-
-    _, audit_kwargs = memory_service.add_memory.call_args
-    assert audit_kwargs['metadata']['fields']['ttl_secs'] == 3600
 
 
 @pytest.mark.asyncio
@@ -431,15 +462,14 @@ async def test_set_task_priority_override_concurrent_pins_no_collision(
 
 
 @pytest.mark.asyncio
-async def test_clear_task_priority_override_field_none_deletes_row_and_emits_audit(
+async def test_clear_task_priority_override_field_none_deletes_row(
     tmp_path, mcp_server, memory_service,
 ):
-    """clear_task_priority_override with no field deletes the row and emits audit."""
+    """clear_task_priority_override with no field deletes the row."""
     await mcp_server._tool_manager.call_tool(
         'set_task_priority_override',
         {'project_root': str(tmp_path), 'task_id': '5', 'boost_tier': 'high'},
     )
-    memory_service.add_memory.reset_mock()
 
     result = await mcp_server._tool_manager.call_tool(
         'clear_task_priority_override',
@@ -456,12 +486,6 @@ async def test_clear_task_priority_override_field_none_deletes_row_and_emits_aud
         assert row is None
     finally:
         conn.close()
-
-    memory_service.add_memory.assert_called_once()
-    _, audit_kwargs = memory_service.add_memory.call_args
-    assert audit_kwargs['category'] == 'decisions_and_rationale'
-    assert audit_kwargs['agent_id'] == 'scheduler-overrides'
-    assert audit_kwargs['metadata'] == {'task_id': '5', 'field': None}
 
 
 @pytest.mark.asyncio
@@ -487,7 +511,6 @@ async def test_clear_task_priority_override_field_specific_clears_one_column(
             'ttl_secs': 3600,
         },
     )
-    memory_service.add_memory.reset_mock()
 
     result = await mcp_server._tool_manager.call_tool(
         'clear_task_priority_override',
@@ -518,10 +541,6 @@ async def test_clear_task_priority_override_field_specific_clears_one_column(
             assert cols[col] == expected, f'{col}: expected {expected}, got {cols[col]}'
         else:
             assert cols[col] == expected, f'{col}: expected {expected!r}, got {cols[col]!r}'
-
-    memory_service.add_memory.assert_called_once()
-    _, audit_kwargs = memory_service.add_memory.call_args
-    assert audit_kwargs['metadata'] == {'task_id': '5', 'field': field}
 
 
 @pytest.mark.asyncio
@@ -594,12 +613,11 @@ def _pin_orders(tmp_path, task_ids):
 
 
 @pytest.mark.asyncio
-async def test_reorder_pin_queue_rewrites_pin_order_and_emits_audit(
+async def test_reorder_pin_queue_rewrites_pin_order(
     tmp_path, mcp_server, memory_service,
 ):
-    """reorder_pin_queue with a list rewrites pin_order columns and emits audit."""
+    """reorder_pin_queue with a list rewrites pin_order columns."""
     await _populate_pins(mcp_server, tmp_path, ['A', 'B', 'C'])
-    memory_service.add_memory.reset_mock()
 
     result = await mcp_server._tool_manager.call_tool(
         'reorder_pin_queue',
@@ -610,12 +628,6 @@ async def test_reorder_pin_queue_rewrites_pin_order_and_emits_audit(
     orders = _pin_orders(tmp_path, ['A', 'B', 'C'])
     assert orders == {'A': 2, 'B': 3, 'C': 1}
 
-    memory_service.add_memory.assert_called_once()
-    _, audit_kwargs = memory_service.add_memory.call_args
-    assert audit_kwargs['category'] == 'decisions_and_rationale'
-    assert audit_kwargs['agent_id'] == 'scheduler-overrides'
-    assert audit_kwargs['metadata'] == {'ordered_task_ids': ['C', 'A', 'B']}
-
 
 @pytest.mark.asyncio
 async def test_reorder_pin_queue_accepts_csv_string(
@@ -623,7 +635,6 @@ async def test_reorder_pin_queue_accepts_csv_string(
 ):
     """reorder_pin_queue also accepts a CSV string."""
     await _populate_pins(mcp_server, tmp_path, ['A', 'B', 'C'])
-    memory_service.add_memory.reset_mock()
 
     result = await mcp_server._tool_manager.call_tool(
         'reorder_pin_queue',
@@ -633,9 +644,6 @@ async def test_reorder_pin_queue_accepts_csv_string(
 
     orders = _pin_orders(tmp_path, ['A', 'B', 'C'])
     assert orders == {'A': 2, 'B': 3, 'C': 1}
-
-    _, audit_kwargs = memory_service.add_memory.call_args
-    assert audit_kwargs['metadata']['ordered_task_ids'] == ['C', 'A', 'B']
 
 
 @pytest.mark.asyncio

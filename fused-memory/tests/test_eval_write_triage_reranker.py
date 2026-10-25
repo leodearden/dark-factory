@@ -1,0 +1,747 @@
+"""Tests for eval_write_triage_reranker.py — the ρ1 reranker measurement core.
+
+Every arm here is a fake, and every expected number is hand-computable from the
+literals in the test. Nothing touches the network, torch or a live store.
+"""
+from __future__ import annotations
+
+import contextlib
+import functools
+import itertools
+import json
+import types
+from pathlib import Path
+
+import pytest
+from _fm_helpers import load_script_module
+
+from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.models.memory import MemoryResult
+from fused_memory.server.grouped_read import PARENT_ID_KEY, SIGHTING_KIND
+
+SCRIPTS = Path(__file__).parent.parent / 'scripts'
+
+
+@functools.cache
+def _mod() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'eval_write_triage_reranker.py', 'eval_write_triage_reranker')
+
+
+@functools.cache
+def _arms() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'eval_write_triage_reranker_arms.py', 'eval_write_triage_reranker_arms',
+    )
+
+
+def _record(memory_id: str, cluster_id: str, label: str = 'duplicate') -> dict:
+    return {
+        'memory_id': memory_id, 'cluster_id': cluster_id, 'label': label,
+        'content': f'the entry {memory_id}',
+    }
+
+
+def _row(memory_id: str, cosine: float | None, **metadata) -> MemoryResult:
+    """A post-RRF search row: the cosine lives in ``metadata['store_score']``."""
+    return MemoryResult(
+        id=memory_id, content=f'the text of {memory_id}',
+        category=MemoryCategory.procedural_knowledge, source_store=SourceStore.mem0,
+        metadata={'store_score': cosine, **metadata},
+    )
+
+
+def _child(memory_id: str, cosine: float, parent_id: str) -> MemoryResult:
+    return _row(memory_id, cosine, kind=SIGHTING_KIND, **{PARENT_ID_KEY: parent_id})
+
+
+def _retrieval(
+    rows: list[MemoryResult],
+    *,
+    canonical_present: bool = True,
+    degraded: bool = False,
+    self_retrieved: bool = False,
+) -> dict:
+    """One entry of ``prefetch_retrievals``' output."""
+    return {
+        'results': list(rows), 'canonical_present': canonical_present,
+        'degraded': degraded, 'self_retrieved': self_retrieved,
+    }
+
+
+def _case(record: dict, rows: list[MemoryResult], **flags):
+    [case] = _mod().build_cases([record], {record['memory_id']: _retrieval(rows, **flags)})
+    return case
+
+
+def _rank1(cases: list, scores: list, aliases: dict | None = None):
+    return _mod().ranking_metrics(cases, scores, aliases=aliases).rank1
+
+
+class TestBuildCases:
+    def test_one_case_per_record_carrying_its_slate_in_retrieval_order(self) -> None:
+        records = [_record('d1', 'c1'), _record('d2', 'c2', label='distinct')]
+        retrievals = {
+            'd1': _retrieval([_row('x', 0.4), _row('c1', 0.9)]),
+            'd2': _retrieval([_row('c2', 0.7)]),
+        }
+        first, second = _mod().build_cases(records, retrievals)
+        assert (first.memory_id, first.label, first.entry) == ('d1', 'duplicate', 'the entry d1')
+        assert first.canonical_id == 'c1'
+        assert first.candidate_ids == ('x', 'c1')
+        assert first.candidate_texts == ('the text of x', 'the text of c1')
+        assert first.candidate_cosines == (0.4, 0.9)
+        assert (second.memory_id, second.label, second.canonical_id) == ('d2', 'distinct', 'c2')
+        assert second.candidate_ids == ('c2',)
+
+    def test_only_children_map_to_their_hoisted_parent(self) -> None:
+        case = _case(_record('d1', 'c1'), [_row('x', 0.9), _child('s', 0.8, 'c1')])
+        assert case.candidate_parents == {'s': 'c1'}
+
+    def test_retrieval_flags_are_carried_through(self) -> None:
+        case = _case(
+            _record('d1', 'gone'), [],
+            canonical_present=False, degraded=True, self_retrieved=True,
+        )
+        assert case.canonical_present is False
+        assert case.degraded is True
+        assert case.self_retrieved is True
+        assert case.candidate_ids == ()
+
+
+class TestRankingMetrics:
+    def test_the_top_scored_candidate_is_rank_one_whatever_its_retrieval_position(self) -> None:
+        case = _case(_record('d1', 'c1'), [_row('x', 0.9), _row('y', 0.8), _row('c1', 0.7)])
+        rank1 = _rank1([case], [[0.1, 0.2, 0.9]])
+        assert (rank1.hits, rank1.total, rank1.rate) == (1, 1, 1.0)
+
+    def test_tied_scores_keep_retrieval_order(self) -> None:
+        behind = _case(_record('d1', 'c1'), [_row('x', 0.9), _row('c1', 0.8)])
+        ahead = _case(_record('d2', 'c1'), [_row('c1', 0.9), _row('x', 0.8)])
+        assert _rank1([behind], [[0.5, 0.5]]).hits == 0
+        assert _rank1([ahead], [[0.5, 0.5]]).hits == 1
+
+    def test_a_sighting_child_of_the_canonical_reaches_it(self) -> None:
+        case = _case(_record('d1', 'c1'), [_row('x', 0.9), _child('s', 0.8, 'c1')])
+        assert _rank1([case], [[0.1, 0.9]]).hits == 1
+
+    def test_the_canonicals_alias_reaches_it(self) -> None:
+        case = _case(
+            _record('d1', 'old'), [_row('x', 0.9), _row('new', 0.8)], canonical_present=False,
+        )
+        assert _rank1([case], [[0.1, 0.9]], aliases={'old': 'new'}).hits == 1
+
+    @staticmethod
+    def _hit_and_absent() -> list:
+        return [
+            _case(_record('d1', 'c1'), [_row('c1', 0.9)]),
+            _case(_record('d2', 'gone'), [_row('x', 0.9)], canonical_present=False),
+        ]
+
+    @pytest.mark.parametrize('aliases', [None, {}, {'gone': 'elsewhere'}])
+    def test_by_default_an_absent_unreached_canonical_is_a_miss_whatever_the_aliases(
+        self, aliases: dict | None,
+    ) -> None:
+        rank1 = _rank1(self._hit_and_absent(), [[0.9], [0.9]], aliases=aliases)
+        assert (rank1.hits, rank1.total, rank1.rate) == (1, 2, 0.5)
+
+    def test_an_absent_canonical_can_be_left_out_of_the_denominator(self) -> None:
+        metrics = _mod().ranking_metrics(
+            self._hit_and_absent(), [[0.9], [0.9]], aliases=None, count_absent_as_miss=False,
+        )
+        assert (metrics.rank1.hits, metrics.rank1.total, metrics.rank1.rate) == (1, 1, 1.0)
+
+    def test_rank_five_counts_a_hit_anywhere_in_the_top_five(self) -> None:
+        ids = ['a', 'b', 'c', 'd', 'e', 'f', 'c1']
+        case = _case(_record('d1', 'c1'), [_row(i, 0.5) for i in ids])
+        fifth = _mod().ranking_metrics([case], [[7, 6, 5, 4, 2, 1, 3]], aliases=None)
+        sixth = _mod().ranking_metrics([case], [[7, 6, 5, 4, 3, 2, 1]], aliases=None)
+        assert (fifth.rank1.hits, fifth.rank5.hits) == (0, 1)
+        assert (sixth.rank1.hits, sixth.rank5.hits) == (0, 0)
+
+    def test_no_cases_is_an_unmeasured_rate_not_a_zero(self) -> None:
+        metrics = _mod().ranking_metrics([], [], aliases={'a': 'b'})
+        assert (metrics.rank1.hits, metrics.rank1.total, metrics.rank1.rate) == (0, 0, None)
+        assert metrics.rank5.rate is None
+
+
+class TestAucTrueVsHardNegative:
+    @pytest.mark.parametrize(('positives', 'negatives', 'expected'), [
+        ([0.9, 0.8], [0.1], 1.0),
+        ([0.1], [0.9], 0.0),
+        ([0.5], [0.5], 0.5),
+        ([0.9, 0.2], [0.5], 0.5),
+    ])
+    def test_it_is_the_probability_a_positive_outscores_a_negative(
+        self, positives: list, negatives: list, expected: float,
+    ) -> None:
+        assert _mod().auc_true_vs_hard_negative(positives, negatives) == expected
+
+    @pytest.mark.parametrize(('positives', 'negatives'), [([], [0.5]), ([0.5], []), ([], [])])
+    def test_an_empty_class_is_unmeasured_not_zero(self, positives: list, negatives: list) -> None:
+        assert _mod().auc_true_vs_hard_negative(positives, negatives) is None
+
+
+class TestRankingMetricsAuc:
+    def test_pair_scores_split_by_label_and_an_unreached_canonical_is_unscored(self) -> None:
+        reached = _case(_record('d1', 'c1'), [_row('x', 0.9), _row('c1', 0.8)])
+        negative = _case(_record('n1', 'c2', label='distinct'), [_row('c2', 0.9), _row('y', 0.8)])
+        unreached = _case(_record('d2', 'c3'), [_row('z', 0.9)])
+        auc = _mod().ranking_metrics(
+            [reached, negative, unreached], [[0.1, 0.9], [0.2, 0.8], [0.7]], aliases=None,
+        ).auc
+        assert (auc.value, auc.n_true, auc.n_hard_negative, auc.unscored) == (1.0, 1, 1, 1)
+
+    def test_the_pair_score_is_the_first_reaching_candidate_in_the_arms_order(self) -> None:
+        child_first = _case(
+            _record('d1', 'c1'), [_row('c1', 0.9), _child('s', 0.8, 'c1')],
+        )
+        negative = _case(
+            _record('n1', 'c2', label='pseudo_contradiction'), [_row('c2', 0.9)],
+        )
+        auc = _mod().ranking_metrics(
+            [child_first, negative], [[0.2, 0.9], [0.5]], aliases=None,
+        ).auc
+        assert auc.value == 1.0
+
+    def test_an_alias_reaches_the_canonical_for_the_pair_score(self) -> None:
+        aliased = _case(
+            _record('d1', 'old'), [_row('new', 0.9)], canonical_present=False,
+        )
+        negative = _case(_record('n1', 'c2', label='distinct'), [_row('c2', 0.9)])
+        auc = _mod().ranking_metrics(
+            [aliased, negative], [[0.9], [0.1]], aliases={'old': 'new'},
+        ).auc
+        assert (auc.value, auc.n_true, auc.unscored) == (1.0, 1, 0)
+
+    def test_no_hard_negative_leaves_the_auc_unmeasured(self) -> None:
+        case = _case(_record('d1', 'c1'), [_row('c1', 0.9)])
+        auc = _mod().ranking_metrics([case], [[0.9]], aliases=None).auc
+        assert (auc.value, auc.n_true, auc.n_hard_negative) == (None, 1, 0)
+
+
+class TestBaselineScores:
+    def test_the_baseline_score_is_each_candidates_store_score(self) -> None:
+        case = _case(_record('d1', 'c1'), [_row('x', 0.4), _row('c1', 0.9)])
+        assert tuple(_mod().baseline_scores(case)) == (0.4, 0.9)
+
+    def test_the_baseline_ranks_by_cosine_not_retrieval_order(self) -> None:
+        case = _case(_record('d1', 'c1'), [_row('x', 0.4), _row('c1', 0.9)])
+        assert _rank1([case], [_mod().baseline_scores(case)]).hits == 1
+
+    def test_a_missing_cosine_ranks_last(self) -> None:
+        case = _case(_record('d1', 'c1'), [_row('c1', None), _row('x', 0.3)])
+        metrics = _mod().ranking_metrics([case], [_mod().baseline_scores(case)], aliases=None)
+        assert (metrics.rank1.hits, metrics.rank5.hits) == (0, 1)
+
+
+class _FakeScorer:
+    """Answers each entry from *answers*; ``calls`` lists the entries it was asked about."""
+
+    def __init__(self, answers: dict, *, facts=None, fail_on_call: int | None = None) -> None:
+        self.answers = answers
+        self.calls: list[str] = []
+        self.fail_on_call = fail_on_call
+        self._facts = facts or _arms().ScorerFacts(device='cpu', vram_peak_mib=None, max_length=None)
+
+    def score(self, entry: str, candidate_texts):
+        self.calls.append(entry)
+        if self.fail_on_call == len(self.calls):
+            raise RuntimeError('boom')
+        return self.answers[entry]
+
+    def facts(self):
+        return self._facts
+
+
+def _spec(
+    scorer: _FakeScorer | _ConstantScorer | None = None,
+    *,
+    name: str = 'fake',
+    unavailable=None,
+    log=None,
+    arm_class=None,
+):
+    arms = _arms()
+
+    @contextlib.contextmanager
+    def open_(context):
+        if unavailable is not None:
+            raise unavailable
+        try:
+            yield scorer
+        finally:
+            if log is not None:
+                log.append('closed')
+
+    return arms.ArmSpec(
+        name=name, arm_class=arm_class or arms.ArmClass.local_cross_encoder,
+        model='fake-model', open=open_,
+    )
+
+
+def _context():
+    return _arms().ArmContext(
+        device='cpu', local_batch_size=4, vram_cap_gib=8.0, pairwise_concurrency=20,
+    )
+
+
+def _slate(scores: tuple, cost: float | None = 0.0, over: int | None = 0):
+    return _arms().SlateScores(scores=scores, cost_usd=cost, pairs_over_max_length=over)
+
+
+def _measure(spec, cases: list, clock: list, *, max_spend_usd: float = 10.0, aliases=None):
+    return _mod().measure_arm(
+        spec, cases, aliases=aliases, count_absent_as_miss=True, context=_context(),
+        clock=iter(clock).__next__, max_spend_usd=max_spend_usd,
+    )
+
+
+_METRIC_KEYS = (
+    'rank1_rate', 'rank5_rate', 'rank1', 'rank5', 'auc', 'p50_seconds', 'p95_seconds',
+    'latency', 'cost_per_write_usd', 'device', 'vram_peak_mib', 'max_length',
+    'pairs_over_max_length',
+)
+
+
+class TestMeasureArm:
+    @staticmethod
+    def _cases() -> list:
+        return [
+            _case(_record('d3', 'c4'), []),
+            _case(_record('d1', 'c1'), [_row('x', 0.9), _row('c1', 0.8)]),
+            _case(
+                _record('n1', 'c2', label='distinct'),
+                [_row('c2', 0.9), _row('y', 0.8), _row('z', 0.7)],
+            ),
+            _case(_record('d2', 'c3'), [_row('w', 0.9)]),
+        ]
+
+    @staticmethod
+    def _answers(*, b_cost: float | None = 0.5, b_over: int | None = 0) -> dict:
+        return {
+            'the entry d1': _slate((0.2, 0.9), cost=0.25, over=1),
+            'the entry n1': _slate((0.1, 0.8, 0.3), cost=b_cost, over=b_over),
+            'the entry d2': _slate((0.6,), cost=0.75, over=2),
+        }
+
+    _CLOCK = [0.0, 1.5, 10.0, 10.25, 20.0, 20.5, 30.0, 31.0]
+
+    def test_a_measured_row_carries_ranking_latency_cost_and_facts(self) -> None:
+        facts = _arms().ScorerFacts(device='cuda:0 fake', vram_peak_mib=512.0, max_length=8192)
+        scorer = _FakeScorer(self._answers(), facts=facts)
+        row = _measure(_spec(scorer), self._cases(), self._CLOCK).to_json()
+        assert (row['arm'], row['arm_class'], row['model']) == (
+            'fake', 'local_cross_encoder', 'fake-model',
+        )
+        assert (row['status'], row['skip_reason'], row['skip_detail']) == ('measured', None, None)
+        assert (row['rank1_rate'], row['rank1']) == (0.25, {'hits': 1, 'total': 4})
+        assert (row['rank5_rate'], row['rank5']) == (0.5, {'hits': 2, 'total': 4})
+        assert row['auc'] == {'value': 1.0, 'n_true': 1, 'n_hard_negative': 1, 'unscored': 2}
+        assert (row['p50_seconds'], row['p95_seconds']) == (0.5, 1.0)
+        assert row['latency'] == {
+            'slates_timed': 3, 'pairs_per_slate_min': 1, 'pairs_per_slate_max': 3,
+            'load_seconds': 1.5, 'warmup_slates': 1,
+        }
+        assert row['cost_per_write_usd'] == pytest.approx(0.5)
+        assert row['pairs_over_max_length'] == 3
+        assert (row['device'], row['vram_peak_mib'], row['max_length']) == (
+            'cuda:0 fake', 512.0, 8192,
+        )
+
+    def test_the_first_non_empty_slate_warms_up_and_an_empty_slate_is_never_sent(self) -> None:
+        scorer = _FakeScorer(self._answers())
+        _measure(_spec(scorer), self._cases(), self._CLOCK)
+        assert scorer.calls == ['the entry d1', 'the entry d1', 'the entry n1', 'the entry d2']
+
+    def test_an_unpriced_slate_leaves_the_cost_unmeasured(self) -> None:
+        scorer = _FakeScorer(self._answers(b_cost=None))
+        assert _measure(_spec(scorer), self._cases(), self._CLOCK).to_json()[
+            'cost_per_write_usd'
+        ] is None
+
+    def test_an_unreported_truncation_count_stays_unmeasured(self) -> None:
+        scorer = _FakeScorer(self._answers(b_over=None))
+        assert _measure(_spec(scorer), self._cases(), self._CLOCK).to_json()[
+            'pairs_over_max_length'
+        ] is None
+
+    def test_an_unavailable_arm_is_skipped_with_every_metric_unmeasured(self) -> None:
+        arms = _arms()
+        spec = _spec(unavailable=arms.ArmUnavailable(
+            arms.SkipReason.no_credential, 'JINA_API_KEY unset',
+        ))
+        row = _measure(spec, self._cases(), [0.0]).to_json()
+        assert (row['status'], row['skip_reason'], row['skip_detail']) == (
+            'skipped', 'no_credential', 'JINA_API_KEY unset',
+        )
+        assert {key: row[key] for key in _METRIC_KEYS} == dict.fromkeys(_METRIC_KEYS)
+
+    def test_a_scorer_failure_mid_run_is_skipped_as_an_error_with_no_partial_numbers(self) -> None:
+        log: list[str] = []
+        scorer = _FakeScorer(self._answers(), fail_on_call=2)
+        row = _measure(_spec(scorer, log=log), self._cases(), self._CLOCK).to_json()
+        assert (row['status'], row['skip_reason']) == ('skipped', 'error')
+        assert row['skip_detail'] == 'RuntimeError: boom'
+        assert {key: row[key] for key in _METRIC_KEYS} == dict.fromkeys(_METRIC_KEYS)
+        assert log == ['closed']
+
+    def test_spend_past_the_ceiling_stops_the_arm_as_over_budget(self) -> None:
+        scorer = _FakeScorer(self._answers())
+        row = _measure(_spec(scorer), self._cases(), self._CLOCK, max_spend_usd=0.4).to_json()
+        assert (row['status'], row['skip_reason']) == ('skipped', 'over_budget')
+        assert '0.5000' in row['skip_detail']
+        assert scorer.calls == ['the entry d1', 'the entry d1']
+        assert {key: row[key] for key in _METRIC_KEYS} == dict.fromkeys(_METRIC_KEYS)
+
+    def test_a_score_list_not_matching_the_slate_is_an_error_never_padded(self) -> None:
+        answers = {**self._answers(), 'the entry n1': _slate((0.1, 0.8))}
+        row = _measure(_spec(_FakeScorer(answers)), self._cases(), self._CLOCK).to_json()
+        assert (row['status'], row['skip_reason']) == ('skipped', 'error')
+        assert row['skip_detail'].startswith('ValueError: ')
+
+
+def _arm_json(arm: str, rank1: float | None, p95: float | None, status: str = 'measured') -> dict:
+    return {'arm': arm, 'status': status, 'rank1_rate': rank1, 'p95_seconds': p95}
+
+
+def _best(rows: list, ceiling: float = 3.0) -> dict:
+    return _mod().choose_best(rows, p95_ceiling_seconds=ceiling)
+
+
+class TestChooseBest:
+    def test_the_most_accurate_arm_under_the_ceiling_wins(self) -> None:
+        rows = [
+            _arm_json('fast', 0.3, 1.0), _arm_json('accurate', 0.5, 2.0),
+            _arm_json('slow', 0.9, 4.0),
+        ]
+        assert _best(rows) == {
+            'arm': 'accurate', 'rank1_rate': 0.5, 'p95_seconds': 2.0,
+            'qualified': True, 'p95_ceiling_seconds': 3.0,
+        }
+
+    def test_a_p95_exactly_at_the_ceiling_qualifies(self) -> None:
+        rows = [_arm_json('fast', 0.3, 1.0), _arm_json('edge', 0.6, 3.0)]
+        assert (_best(rows)['arm'], _best(rows)['qualified']) == ('edge', True)
+
+    def test_a_rank1_tie_goes_to_the_lower_p95(self) -> None:
+        rows = [_arm_json('slower', 0.5, 2.0), _arm_json('quicker', 0.5, 1.0)]
+        assert _best(rows)['arm'] == 'quicker'
+
+    def test_a_full_tie_goes_to_the_earlier_row(self) -> None:
+        rows = [_arm_json('first', 0.5, 1.0), _arm_json('second', 0.5, 1.0)]
+        assert _best(rows)['arm'] == 'first'
+
+    def test_with_nothing_under_the_ceiling_the_fastest_measured_arm_is_unqualified(self) -> None:
+        rows = [_arm_json('slow', 0.9, 5.0), _arm_json('less_slow', 0.2, 4.0)]
+        assert _best(rows) == {
+            'arm': 'less_slow', 'rank1_rate': 0.2, 'p95_seconds': 4.0,
+            'qualified': False, 'p95_ceiling_seconds': 3.0,
+        }
+
+    def test_with_nothing_measured_every_value_is_null_never_zero(self) -> None:
+        rows = [_arm_json('a', None, None, 'skipped'), _arm_json('b', None, None, 'skipped')]
+        assert _best(rows, ceiling=2.5) == {
+            'arm': None, 'rank1_rate': None, 'p95_seconds': None,
+            'qualified': False, 'p95_ceiling_seconds': 2.5,
+        }
+
+    def test_a_skipped_row_is_never_selected_even_carrying_numbers(self) -> None:
+        rows = [_arm_json('stale', 0.99, 0.1, 'skipped'), _arm_json('real', 0.3, 1.0)]
+        assert _best(rows)['arm'] == 'real'
+        assert _best([_arm_json('stale', 0.99, 0.1, 'skipped')])['arm'] is None
+
+
+_COMMITTED_REPORT = Path(__file__).parent.parent / 'calibration' / 'write_triage_reranker_report.json'
+
+
+class TestRunRerankerEval:
+    @staticmethod
+    def _cases() -> list:
+        return [
+            _case(_record('d1', 'c1'), [_row('x', 0.5), _row('c1', 0.9)]),
+            _case(_record('n1', 'c2', label='distinct'), [_row('c2', 0.8), _row('y', 0.4)]),
+            _case(
+                _record('d9', 'gone'), [],
+                canonical_present=False, degraded=True, self_retrieved=True,
+            ),
+        ]
+
+    @staticmethod
+    def _specs(log: list | None = None) -> list:
+        arms = _arms()
+        answers = {'the entry d1': _slate((0.9, 0.1)), 'the entry n1': _slate((0.9, 0.1))}
+        return [
+            _spec(_FakeScorer(answers), name='good', log=log),
+            _spec(name='locked', unavailable=arms.ArmUnavailable(
+                arms.SkipReason.no_credential, 'JINA_API_KEY unset',
+            )),
+            _spec(_FakeScorer(answers, fail_on_call=2), name='flaky', log=log),
+        ]
+
+    def _run(
+        self, report_path: Path, *, specs: list | None = None, count_absent_as_miss: bool = True,
+    ) -> dict:
+        return _mod().run_reranker_eval(
+            cases=self._cases(), arms=specs if specs is not None else self._specs(),
+            aliases=None, count_absent_as_miss=count_absent_as_miss, context=_context(),
+            provenance={'project_id': 'reify', 'record_count': 5},
+            report_path=report_path, clock=itertools.count(0.0, 0.5).__next__,
+            max_spend_usd=1.0, p95_ceiling_seconds=2.5,
+        )
+
+    def test_the_report_has_its_sections_in_order(self, tmp_path: Path) -> None:
+        report = self._run(tmp_path / 'r.json')
+        assert list(report) == ['arms', 'baseline', 'best', 'caveats', 'provenance']
+
+    def test_one_row_per_arm_in_spec_order_with_its_status(self, tmp_path: Path) -> None:
+        rows = self._run(tmp_path / 'r.json')['arms']
+        assert [(r['arm'], r['status'], r['skip_reason']) for r in rows] == [
+            ('good', 'measured', None),
+            ('locked', 'skipped', 'no_credential'),
+            ('flaky', 'skipped', 'error'),
+        ]
+
+    def test_the_cosine_baseline_is_reported_but_never_best(self, tmp_path: Path) -> None:
+        report = self._run(tmp_path / 'r.json')
+        baseline = report['baseline']
+        assert (baseline['arm'], baseline['status']) == ('cosine', 'measured')
+        assert baseline['rank1'] == {'hits': 2, 'total': 3}
+        assert report['arms'][0]['rank1'] == {'hits': 1, 'total': 3}
+        assert (baseline['p50_seconds'], baseline['p95_seconds'], baseline['latency']) == (
+            None, None, None,
+        )
+        assert (baseline['cost_per_write_usd'], baseline['device']) == (None, None)
+        assert report['best']['arm'] == 'good'
+
+    def test_best_is_the_selection_rule_over_the_arm_rows(self, tmp_path: Path) -> None:
+        report = self._run(tmp_path / 'r.json')
+        assert report['best'] == _mod().choose_best(report['arms'], p95_ceiling_seconds=2.5)
+
+    def test_provenance_carries_the_callers_keys_and_the_run_it_measured(
+        self, tmp_path: Path,
+    ) -> None:
+        provenance = self._run(tmp_path / 'r.json')['provenance']
+        assert (provenance['project_id'], provenance['record_count']) == ('reify', 5)
+        assert provenance['case_count'] == 3
+        assert (
+            provenance['canonical_absent'], provenance['degraded_retrievals'],
+            provenance['self_retrieved'],
+        ) == (1, 1, 1)
+        assert (provenance['p95_ceiling_seconds'], provenance['max_arm_spend_usd']) == (2.5, 1.0)
+        assert (
+            provenance['local_batch_size'], provenance['vram_cap_gib'],
+            provenance['pairwise_concurrency'],
+        ) == (4, 8.0, 20)
+
+    @pytest.mark.parametrize(('absent_in_denominator', 'total'), [(True, 3), (False, 2)])
+    def test_the_rank_population_is_the_one_asked_for_and_recorded(
+        self, tmp_path: Path, absent_in_denominator: bool, total: int,
+    ) -> None:
+        report = self._run(tmp_path / 'r.json', count_absent_as_miss=absent_in_denominator)
+        assert report['provenance']['absent_in_denominator'] is absent_in_denominator
+        assert report['baseline']['rank1']['total'] == total
+        assert report['arms'][0]['rank1']['total'] == total
+
+    def test_caveats_are_strings(self, tmp_path: Path) -> None:
+        caveats = self._run(tmp_path / 'r.json')['caveats']
+        assert caveats
+        assert all(isinstance(caveat, str) and caveat for caveat in caveats)
+
+    _SLATE_NORMALISED = 'slate-normalised'
+
+    def test_a_measured_jev_choice_arm_is_caveated_as_slate_normalised(
+        self, tmp_path: Path,
+    ) -> None:
+        arms = _arms()
+        answers = {'the entry d1': _slate((0.9, 0.1)), 'the entry n1': _slate((0.9, 0.1))}
+        jev = _spec(_FakeScorer(answers), name='jev', arm_class=arms.ArmClass.jev_choice)
+        caveats = self._run(tmp_path / 'r.json', specs=[jev])['caveats']
+        [caveat] = [caveat for caveat in caveats if self._SLATE_NORMALISED in caveat]
+        assert caveat.startswith('jev ')
+
+    def test_no_slate_normalised_caveat_without_a_measured_jev_choice_arm(
+        self, tmp_path: Path,
+    ) -> None:
+        arms = _arms()
+        skipped_jev = _spec(
+            name='jev', arm_class=arms.ArmClass.jev_choice,
+            unavailable=arms.ArmUnavailable(arms.SkipReason.no_credential, 'TYPESAFE_API_KEY unset'),
+        )
+        caveats = self._run(tmp_path / 'r.json', specs=[*self._specs(), skipped_jev])['caveats']
+        assert not [caveat for caveat in caveats if self._SLATE_NORMALISED in caveat]
+
+    def test_the_json_and_its_markdown_sibling_are_written(self, tmp_path: Path) -> None:
+        path = tmp_path / 'r.json'
+        report = self._run(path)
+        text = path.read_text()
+        assert text == json.dumps(report, indent=2) + '\n'
+        assert json.loads(text) == report
+        assert path.with_suffix('.md').read_text() == _mod().render_markdown(report)
+
+    def test_the_markdown_has_a_row_per_arm_and_the_best_line(self, tmp_path: Path) -> None:
+        markdown = _mod().render_markdown(self._run(tmp_path / 'r.json'))
+        lines = markdown.splitlines()
+        for arm in ('cosine', 'good', 'locked', 'flaky'):
+            assert len([line for line in lines if line.startswith(f'| {arm} |')]) == 1
+        [locked] = [line for line in lines if line.startswith('| locked |')]
+        assert 'skipped' in locked and 'no_credential' in locked and 'n/a' in locked
+        assert any(line.startswith('**Best:**') and 'good' in line for line in lines)
+
+    def test_a_report_path_not_ending_in_json_is_refused_before_any_arm_opens(
+        self, tmp_path: Path,
+    ) -> None:
+        log: list[str] = []
+        with pytest.raises(ValueError, match='.json'):
+            self._run(tmp_path / 'r.txt', specs=self._specs(log))
+        assert log == []
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestGuardReportPath:
+    def test_a_limited_run_at_the_committed_path_is_refused(self) -> None:
+        with pytest.raises(ValueError):
+            _mod().guard_report_path(_COMMITTED_REPORT, limit=3)
+
+    def test_the_relative_spelling_is_refused_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(_COMMITTED_REPORT.parent.parent)
+        with pytest.raises(ValueError):
+            _mod().guard_report_path(
+                Path('calibration/write_triage_reranker_report.json'), limit=3,
+            )
+
+    def test_a_limited_run_elsewhere_is_allowed(self, tmp_path: Path) -> None:
+        path = tmp_path / 'smoke.json'
+        assert _mod().guard_report_path(path, limit=3) == path
+
+    def test_a_full_run_at_the_committed_path_is_allowed(self) -> None:
+        assert _mod().guard_report_path(_COMMITTED_REPORT, limit=None) == _COMMITTED_REPORT
+
+    @pytest.mark.parametrize('limit', [None, 3])
+    def test_a_path_not_ending_in_json_is_refused(self, tmp_path: Path, limit: int | None) -> None:
+        with pytest.raises(ValueError, match='.json'):
+            _mod().guard_report_path(tmp_path / 'out.md', limit=limit)
+
+
+_PACKAGE = Path(__file__).parent.parent
+
+
+def _factory_of(service):
+    @contextlib.asynccontextmanager
+    async def open_(config):
+        yield service
+
+    return open_
+
+
+def _refusing_factory(config):
+    raise AssertionError('the memory service must not be opened')
+
+
+class _ConstantScorer:
+    def score(self, entry: str, candidate_texts):
+        return _slate(tuple(0.5 for _ in candidate_texts))
+
+    def facts(self):
+        return _arms().ScorerFacts(device='cpu', vram_peak_mib=None, max_length=None)
+
+
+class TestCli:
+    def test_the_defaults_are_the_committed_run(self) -> None:
+        args = _mod().build_parser().parse_args([])
+        assert Path(args.fixture) == _PACKAGE / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'
+        assert Path(args.canonical_aliases) == (
+            _PACKAGE / 'tests' / 'fixtures' / 'write_triage_calibration.canonical_aliases.json'
+        )
+        assert Path(args.report_path) == _COMMITTED_REPORT
+        assert (args.project_id, args.limit) == ('reify', None)
+        assert (args.p95_ceiling_seconds, args.max_arm_spend_usd) == (3.0, 2.0)
+        assert (args.pairwise_concurrency, args.local_batch_size) == (20, 4)
+        assert (args.device, args.vram_cap_gib) == ('auto', 8.0)
+
+    def test_a_limited_run_at_the_committed_path_is_refused_before_the_store_opens(self) -> None:
+        args = _mod().build_parser().parse_args(['--limit', '3'])
+        with pytest.raises(ValueError):
+            _mod().run_cli(args, memory_service_factory=_refusing_factory)
+
+    def test_a_report_path_not_ending_in_json_is_refused_before_the_store_opens(
+        self, tmp_path: Path,
+    ) -> None:
+        args = _mod().build_parser().parse_args(['--report-path', str(tmp_path / 'out.md')])
+        with pytest.raises(ValueError, match='.json'):
+            _mod().run_cli(args, memory_service_factory=_refusing_factory)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_a_limited_run_records_what_it_measured(self, tmp_path: Path) -> None:
+        from _write_triage_store_fake import FakeMemoryService
+
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.server.write_triage import resolve_candidate_k
+
+        calibrate = load_script_module(SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
+        service = FakeMemoryService([_row('x', 0.9), _row('y', 0.5)])
+        spec = _spec(_ConstantScorer(), name='constant')
+        args = _mod().build_parser().parse_args([
+            '--limit', '2', '--report-path', str(tmp_path / 'x.json'),
+        ])
+        assert _mod().run_cli(
+            args, memory_service_factory=_factory_of(service), arms=(spec,),
+        ) == 0
+        report = json.loads((tmp_path / 'x.json').read_text())
+        provenance = report['provenance']
+        assert provenance['fixture_path'] == 'tests/fixtures/write_triage_calibration.jsonl'
+        assert provenance['canonical_aliases_path'] == (
+            'tests/fixtures/write_triage_calibration.canonical_aliases.json'
+        )
+        assert provenance['canonical_aliases_count'] == 3
+        assert provenance['absent_in_denominator'] is True
+        assert (provenance['project_id'], provenance['limit']) == ('reify', 2)
+        assert (provenance['record_count'], provenance['case_count']) == (104, 2)
+        assert provenance['candidate_k'] == resolve_candidate_k(
+            types.SimpleNamespace(config=FusedMemoryConfig()),
+        )
+        assert provenance['retrieval_call'] == calibrate.RETRIEVAL_CALLS[
+            calibrate.RETRIEVAL_PRODUCTION
+        ]
+        assert [row['arm'] for row in report['arms']] == ['constant']
+
+
+class TestCommittedRerankerReport:
+    """The committed report is traceable to this code. It asserts no measured value: Γ2 does."""
+
+    @pytest.fixture(scope='class')
+    def report(self) -> dict:
+        return json.loads(_COMMITTED_REPORT.read_text())
+
+    _METRICS = ('rank1_rate', 'rank5_rate', 'p50_seconds', 'p95_seconds')
+
+    def test_one_row_per_d1_arm_in_registry_order(self, report: dict) -> None:
+        assert [row['arm'] for row in report['arms']] == [spec.name for spec in _arms().D1_ARMS]
+
+    def test_each_row_is_either_measured_or_skipped_with_a_reason(self, report: dict) -> None:
+        arms = _arms()
+        case_count = report['provenance']['case_count']
+        for row in report['arms']:
+            assert row['status'] in set(arms.ArmStatus)
+            if row['status'] == arms.ArmStatus.skipped:
+                assert row['skip_reason'] in set(arms.SkipReason)
+                assert row['skip_detail']
+                assert {key: row[key] for key in _METRIC_KEYS} == dict.fromkeys(_METRIC_KEYS)
+            else:
+                assert all(isinstance(row[key], float | int) for key in self._METRICS)
+                assert row['rank1']['total'] == case_count
+
+    def test_best_is_the_selection_rule_over_the_committed_rows(self, report: dict) -> None:
+        best = report['best']
+        assert best == _mod().choose_best(
+            report['arms'], p95_ceiling_seconds=best['p95_ceiling_seconds'],
+        )
+        assert {'arm', 'rank1_rate', 'p95_seconds', 'qualified'} <= set(best)
+
+    def test_it_measured_the_whole_labelled_fixture(self, report: dict) -> None:
+        provenance = report['provenance']
+        assert (provenance['case_count'], provenance['record_count']) == (84, 104)
+        assert provenance['limit'] is None
+        assert provenance['canonical_aliases_count'] == 3
+
+    def test_the_markdown_is_rendered_from_the_json(self, report: dict) -> None:
+        assert _COMMITTED_REPORT.with_suffix('.md').read_text() == _mod().render_markdown(report)

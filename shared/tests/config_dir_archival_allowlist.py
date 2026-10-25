@@ -111,49 +111,59 @@ AUDITED_SITES: tuple[dict[str, Any], ...] = (
     },
     # -------------------------------------------------------------------- 3
     {
-        'path': 'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'qualname': 'ReconciliationHarness._resume_guard_reason',
-        'destroyed_by': (
-            'cli_stage_runner.gc_run_config_dir -> shutil.rmtree'
-        ),
-        'disposition': UNARCHIVED_GAP,
-        'rationale': (
-            'Per-run reconciliation config dir (~:2067). No archival exists '
-            'anywhere in fused-memory: archive_task_transcripts is imported '
-            'only by orchestrator/workflow.py, orchestrator/git_ops.py and '
-            'orchestrator/dry_run_unblock.py, so every completed recon run\'s '
-            'CLI transcript is destroyed. These are substantive multi-turn '
-            'stage transcripts, unlike the usage_gate probes — a genuine loss, '
-            'not a design choice. Deferred rather than swept into task 3271: it '
-            'is a different package with its own data-dir conventions, no '
-            'shared.transcript_archive dependency edge today, and it needs an '
-            'archive-root config decision of its own.'
-        ),
-        'follow_up': (
-            'Filed as a task-3271 follow-up: archive fused-memory reconciliation '
-            'run config dirs before gc_run_config_dir rmtrees them.'
-        ),
-    },
-    # -------------------------------------------------------------------- 4
-    {
         'path': 'fused-memory/src/fused_memory/reconciliation/stages/base.py',
         'qualname': 'BaseStage.run',
         'destroyed_by': (
-            'cli_stage_runner.gc_run_config_dir -> shutil.rmtree'
+            'cli_stage_runner.gc_run_config_dir, called from '
+            'ReconciliationHarness._persist_stage_reports_then_gc_config_dir '
+            '(the shared finally tail of run_full_cycle and '
+            '_run_remediation_pass) and ReconciliationHarness._recover_one_run'
         ),
-        'disposition': UNARCHIVED_GAP,
+        'disposition': ARCHIVED,
+        'archives_in': (
+            (
+                'fused-memory/src/fused_memory/reconciliation/stages/base.py',
+                'BaseStage._archive_stage_transcripts',
+            ),
+            (
+                'fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py',
+                'gc_run_config_dir',
+            ),
+        ),
         'rationale': (
-            'Per-stage reconciliation config dir (~:242). Same destroyer and '
-            'same gap as the harness site above — fused-memory has no archival '
-            'path at all. Shares one follow-up with entry 3, since a single '
-            'archive-root decision covers both.'
+            'Per-run reconciliation config dir (~:281), shared by every stage '
+            'of the run. ARCHIVED as of task 3972, into '
+            '`<explore_codebase_root>/data/orchestrator/agent-transcripts` under '
+            'the key `recon-<run_id>` (reconciliation.transcript_archive_root, '
+            'resolved by cli_stage_runner.py::recon_archive_root). That is the '
+            'root the orchestrator and the legibility miner already use. Two '
+            'hooks, because neither is enough alone:'
+            '\n\n'
+            'The PRODUCER hook, BaseStage._archive_stage_transcripts, runs in '
+            'the finally of BaseStage.run and COPIES each stage transcript as '
+            'the stage exits, cancellation included. It copies rather than '
+            'moves because the σ --resume seam must still read the source. It '
+            'is what covers interrupted runs, which skip the terminal GC by '
+            'design.'
+            '\n\n'
+            'The TEARDOWN hook, gc_run_config_dir, calls archive_before_delete, '
+            'so deletion is conditional on archival: each transcript is moved '
+            'and unlinked only once its durable copy exists. Both harness call '
+            'sites pass the resolved root; archive_root=None is the disabled '
+            'branch, and only it keeps the plain rmtree.'
+            '\n\n'
+            'Not covered: a transcript that archive_before_delete HELD after a '
+            'failed move, and a stage killed by SIGKILL before its finally ran. '
+            'Both stay on disk with nothing to collect them, because '
+            'fused-memory has no boot-time orphan sweeper (task 4906, filed '
+            'from task 3972).'
         ),
         'follow_up': (
-            'Filed as a task-3271 follow-up: same fused-memory recon archival '
-            'work as entry 3.'
+            'CLOSED by task 3972; recorded UNARCHIVED_GAP by task 3271. The '
+            'remaining SIGKILL / held-transcript tail is task 4906.'
         ),
     },
-    # -------------------------------------------------------------------- 5
+    # -------------------------------------------------------------------- 4
     {
         'path': 'orchestrator/src/orchestrator/dry_run_unblock.py',
         'qualname': 'run_dry_run_unblock',
@@ -182,7 +192,7 @@ AUDITED_SITES: tuple[dict[str, Any], ...] = (
             'TestDryRunTranscriptArchival.'
         ),
     },
-    # -------------------------------------------------------------------- 6
+    # -------------------------------------------------------------------- 5
     {
         'path': 'orchestrator/src/orchestrator/workflow.py',
         'qualname': 'TaskWorkflow._setup_worktree_and_artifacts',
@@ -207,8 +217,8 @@ AUDITED_SITES: tuple[dict[str, Any], ...] = (
             'TaskWorkflow._archive_then_cleanup_config_dir archives at the '
             'config-dir teardown itself. _shutdown_steps orders '
             'cleanup_done_worktree BEFORE cleanup_config_dir, so the archiving '
-            'path runs first. This is the reference shape the dry_run_unblock '
-            'hook (entry 5) was modelled on.'
+            'path runs first. This is the reference shape the '
+            'run_dry_run_unblock hook was modelled on.'
             '\n\n'
             'The third entry is the one that makes this disposition hold '
             'unconditionally, and it is a different KIND of coverage from the '
@@ -224,7 +234,7 @@ AUDITED_SITES: tuple[dict[str, Any], ...] = (
             'the sidecar pointed at, leaving --resume with a dangling id.'
         ),
     },
-    # -------------------------------------------------------------------- 7
+    # -------------------------------------------------------------------- 6
     {
         'path': 'orchestrator/src/orchestrator/workflow.py',
         'qualname': 'TaskWorkflow._recycle_config_dir',
@@ -254,7 +264,7 @@ AUDITED_SITES: tuple[dict[str, Any], ...] = (
             '\n\n'
             'That is what landed: the bare cleanup() here became a call to '
             'TaskWorkflow._archive_then_cleanup_config_dir, the single '
-            'teardown primitive this function and _cleanup_config_dir (entry 6) '
+            'teardown primitive this function and _cleanup_config_dir '
             'now share — so neither can acquire the archival guard while the '
             'other quietly keeps deleting. The recycle semantics are unchanged; '
             'only what is provably durable is unlinked.'
@@ -262,8 +272,9 @@ AUDITED_SITES: tuple[dict[str, Any], ...] = (
             'Why archives_in names the HELPER and not this function: the gate '
             'scans for NAME references, not a call graph, so archival reached '
             'through a `self._archive_then_cleanup_config_dir()` hop is '
-            'credited where the archiver is actually named. The '
-            'same-module-as-entry-6 caution that used to sit here still holds '
+            'credited where the archiver is actually named. The caution that '
+            'used to sit here, that this site shares a module with '
+            'TaskWorkflow._setup_worktree_and_artifacts, still holds '
             'and still matters — the gate checks the enclosing FUNCTION, so a '
             'module-level import cannot launder a future regression here into a '
             'false ARCHIVED. What it means in the other direction is that this '
@@ -283,11 +294,70 @@ AUDITED_SITES: tuple[dict[str, Any], ...] = (
             'that task 3271 filed and 3619 discharged.'
         ),
     },
+    {
+        'path': 'fused-memory/src/fused_memory/middleware/task_curator.py',
+        'qualname': 'TaskCurator._transcript_config_dir',
+        'destroyed_by': (
+            'task_curator.py::_sweep_stale_curator_config_dirs_once -> '
+            'config_dir.py::sweep_stale_pid_dirs in a later process (owner pid '
+            'dead, dir >=300s old); cleanup_at_exit=False'
+        ),
+        'disposition': UNARCHIVED_GAP,
+        'rationale': (
+            'Per-pid curator dir, built only on the gated path (usage_cap '
+            'enabled, i.e. production). Nothing archives it. Per-failure '
+            'evidence survives: at failure time transcript_turns/tools_used are '
+            'copied into the escalation. The population corpus does not — it '
+            'used to accumulate indefinitely under '
+            '~/.claude/projects/-tmp-fm-neutral-classifier-cwd-*, and is now '
+            'deleted at the first sweep after the owning process dies. Not '
+            'archived in task 3995 because fused-memory had no archive root '
+            'then. Task 3972 has since introduced one, '
+            'reconciliation.transcript_archive_root, resolved by '
+            'cli_stage_runner.py::recon_archive_root (see the BaseStage.run '
+            'entry). That is the root the follow-up below should reuse; '
+            'curator archival itself stays out of 3972\'s scope.'
+        ),
+        'follow_up': (
+            'Filed from esc-3995-8 (ticket tkt_0RV5C7TGH7495ZW43KCPSE38KH): '
+            'archive the curator dir before the dead-pid sweep; reuse task '
+            "3972's fused-memory archive-root decision."
+        ),
+    },
+    {
+        'path': 'scripts/legibility/session_runner.py',
+        'qualname': 'SessionRunner.__init__',
+        'destroyed_by': (
+            'session_runner.py::SessionRunner.close -> TaskConfigDir.cleanup on '
+            'every exit path (nightly run_nightly try/finally, census.main and '
+            'coder.main `with`); cleanup_at_exit=True atexit rmtree; '
+            'session_runner.py::_sweep_stale_session_config_dirs_once -> '
+            'config_dir.py::sweep_stale_pid_dirs in a later process (owner pid '
+            'dead)'
+        ),
+        'disposition': UNARCHIVED_BY_DESIGN,
+        'rationale': (
+            'Per-process legibility trickle / census / coder-CLI dir (task '
+            '6042). Trickle digests are one-shot classifier calls with no '
+            'tools, and census mining and synthesis are classifiers; their '
+            'product (the coding record, the census verdict) is persisted by '
+            'the caller. Census verify calls are bounded read-only '
+            'explorations whose only product is the per-cluster verdict that '
+            'the census records. Archiving would also be harmful, not just '
+            'redundant: scripts/legibility/inventory.py walks the archive '
+            'roots as well as ~/.claude/projects, so archived sessions, which '
+            'quote codebook clusters by construction, would be fed back into '
+            'the corpus the trickle codes. Retention changed knowingly: before '
+            'task 6042 the text-mode `claude -p` left these sessions under the '
+            'operator\'s ambient ~/.claude/projects indefinitely; they are now '
+            'deleted at close.'
+        ),
+    },
 )
 
 
 # ---------------------------------------------------------------------------
-# Module-level notes — NOT site entries (neither constructs a TaskConfigDir),
+# Module-level notes — NOT site entries (none constructs a TaskConfigDir),
 # recorded here so the audit is not re-derived from scratch next time.
 # ---------------------------------------------------------------------------
 
@@ -329,4 +399,16 @@ NOTES = (
     Conclusion: merge-speculation lanes produce no agent transcripts, so the
     absence of `-warm-lanes-worktrees--merge-*` dirs from reify's archive is
     EXPECTED, not missing archival.""",
+
+    """ReconciliationHarness._resume_guard_reason: a REMOVED site, recorded
+    here so its entry is not re-added.
+
+    Task 3271 audited it as a per-run UNARCHIVED_GAP site. It was really a
+    read-only resume-eligibility probe that built a TaskConfigDir only to
+    derive a path. TaskConfigDir.__init__ mkdirs and symlinks, so the probe
+    re-created the very dir it was probing for, resurrecting runs that had
+    already been GC'd, with nothing left to GC them again. Task 3972 replaced
+    the construction with the pure derivation
+    cli_stage_runner.py::run_config_dir_path, so the function no longer builds
+    a config dir and has no entry above.""",
 )

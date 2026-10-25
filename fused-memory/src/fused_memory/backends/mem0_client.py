@@ -2,17 +2,21 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Sequence
 from contextlib import aclosing
-from typing import Any
+from typing import Any, TypeVar
 
 from mem0 import AsyncMemory
 
+from fused_memory.backends.timeout_budget import await_within
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
 
 logger = logging.getLogger(__name__)
+
+#: Return type of whatever a timed call is awaiting — see Mem0Backend._timed_read.
+_T = TypeVar('_T')
 
 # The canonical Qdrant payload key for a memory's text, with the historical
 # fallbacks. Mirrors memory_service._MEM0_CONTENT_KEYS and
@@ -25,7 +29,7 @@ _MEM0_TEXT_KEYS = (_MEM0_TEXT_KEY, 'memory', 'content')
 _EXCERPT_LEN = 240
 
 
-def _extract_payload_text(payload: dict[str, Any]) -> str | None:
+def extract_payload_text(payload: dict[str, Any]) -> str | None:
     """Return a Qdrant payload's memory text, in canonical key order."""
     for key in _MEM0_TEXT_KEYS:
         value = payload.get(key)
@@ -101,9 +105,9 @@ def is_missing_collection_error(exc: BaseException) -> bool:
     construction (404 AND the message), so a 404 raised about some other
     Qdrant resource can never be read as an empty collection.
 
-    Callers that degrade on this predicate should still say so out loud (log
-    the missing collection), so an operator can tell "collection absent" from
-    "collection genuinely empty".
+    :meth:`Mem0Backend._timed_collection_read` is the degrade-and-disclose
+    home for the Scope-addressed metadata reads; any other caller that
+    degrades on this predicate should likewise log the missing collection.
     """
     from qdrant_client.http.exceptions import UnexpectedResponse  # noqa: PLC0415
 
@@ -209,7 +213,35 @@ _MEM0_DEFAULT_EMBEDDING_DIMS = 1536
 
 
 class Mem0Backend:
-    """Lazily creates AsyncMemory instances keyed by project_id."""
+    """Lazily creates AsyncMemory instances keyed by project_id.
+
+    TIMEOUT POSTURE, uniform across this class (task 5265), in two halves.
+
+    PROPAGATION.  EVERY read and write here surfaces a timeout as
+    ``TimeoutError`` and never degrades it into a falsy return — the semantic
+    mem0-instance reads (``search``, ``get_all``, ``get``) alongside the
+    deterministic direct-to-Qdrant ones (``count_by_metadata``,
+    ``scroll_by_metadata``, ``get_point_by_id``, the payload writes).  INV-11
+    ``no-silent-fail-soft``: a log is not a return value, and a timed-out read
+    that returns ``{}`` / ``None`` is indistinguishable from a genuinely empty
+    store or a genuine not-found.
+
+    ATTRIBUTABILITY.  Every one of those timeouts NAMES itself — the operation
+    and the budget it blew.  ``asyncio.wait_for``'s own ``TimeoutError``
+    stringifies EMPTY, so a bare one reaches an operator's log, and
+    ``MemoryService._store_failure_diagnostics['error']``, as no text at all.
+    Propagating a fault while discarding the one detail that attributes it is
+    only half a fix, so both halves are enforced in one place: every timed
+    call on this class goes through :meth:`_timed_read` / :meth:`_timed_write`
+    to ``backends/timeout_budget.py::await_within``, the single home of the
+    message format.
+
+    This paragraph is the CANONICAL statement of the rule, and a method's own
+    ``Raises:`` line adds only the consequence specific to IT — so there is one
+    copy of the rule to keep accurate rather than one per method.  Several
+    methods predating task 5265 do still restate their own propagation inline;
+    that is tolerated drift, not licence to add more.
+    """
 
     def __init__(self, config: FusedMemoryConfig):
         self.config = config
@@ -330,6 +362,40 @@ class Mem0Backend:
             logger.info(f'Mem0 instance created for project {project_id} (collection: {collection_name})')
         return self._instances[project_id]
 
+    async def _timed_read(self, awaitable: Awaitable[_T], op: str) -> _T:
+        """``await_within`` under this backend's READ budget."""
+        return await await_within(
+            awaitable, store='Mem0', op=op, budget_s=self._read_timeout,
+        )
+
+    async def _timed_write(self, awaitable: Awaitable[_T], op: str) -> _T:
+        """``await_within`` under this backend's WRITE budget."""
+        return await await_within(
+            awaitable, store='Mem0', op=op, budget_s=self._write_timeout,
+        )
+
+    async def _timed_collection_read(
+        self, awaitable: Awaitable[_T], op: str, collection_name: str, *, if_absent: _T,
+    ) -> _T:
+        """:meth:`_timed_read`, reading a provably-absent collection as *if_absent*.
+
+        Only :func:`is_missing_collection_error` degrades: it returns
+        *if_absent* and logs the collection at INFO.  A timeout and every other
+        failure propagate per the class TIMEOUT POSTURE.
+        """
+        try:
+            return await self._timed_read(awaitable, op)
+        except Exception as exc:
+            if not is_missing_collection_error(exc):
+                raise
+            logger.info(
+                'Mem0 %s: collection %s does not exist; reading it as empty',
+                op,
+                collection_name,
+                extra={'collection': collection_name},
+            )
+            return if_absent
+
     async def add(
         self,
         content: str,
@@ -348,7 +414,7 @@ class Mem0Backend:
         ``{'results': []}`` with no error.
         """
         instance = await self._get_instance(scope)
-        return await asyncio.wait_for(
+        return await self._timed_write(
             instance.add(
                 messages=content,
                 user_id=scope.mem0_user_id,
@@ -357,7 +423,7 @@ class Mem0Backend:
                 metadata=metadata,
                 infer=False,
             ),
-            timeout=self._write_timeout,
+            'add',
         )
 
     async def add_system_record(
@@ -389,7 +455,7 @@ class Mem0Backend:
         similarity-based dedup this method exists to be exempt from.
         """
         instance = await self._get_instance(scope)
-        return await asyncio.wait_for(
+        return await self._timed_write(
             instance.add(
                 messages=content,
                 user_id=scope.mem0_user_id,
@@ -398,7 +464,7 @@ class Mem0Backend:
                 metadata=metadata,
                 infer=False,
             ),
-            timeout=self._write_timeout,
+            'add_system_record',
         )
 
     async def search(
@@ -423,6 +489,15 @@ class Mem0Backend:
                 higher-similarity memories belonging to other categories.
                 Single-category → ``{'category': 'name'}`` (equality).
                 Multi-category → ``{'category': {'in': [...]}}`` (OR match).
+
+        Raises:
+            TimeoutError: Per the class-wide timeout posture.  The consequence
+                specific to THIS read: it used to return ``{}``, which
+                ``MemoryService._search_mem0`` turned into ``[]`` without ever
+                raising, so ``MemoryService.search``'s per-task
+                ``except Exception`` never ran and the ``search`` MCP response
+                was a bare ``{'results': []}`` — byte-identical to a genuinely
+                empty store.
         """
         instance = await self._get_instance(scope)
         # Build Qdrant payload filter for category scoping.
@@ -435,54 +510,72 @@ class Mem0Backend:
             filters = {'category': categories[0]}
         elif categories and len(categories) > 1:
             filters = {'category': {'in': list(categories)}}
-        try:
-            return await asyncio.wait_for(
-                instance.search(
-                    query=query,
-                    user_id=scope.mem0_user_id,
-                    agent_id=None,
-                    run_id=None,
-                    limit=limit,
-                    filters=filters,
-                ),
-                timeout=self._read_timeout,
-            )
-        except TimeoutError:
-            logger.warning(f'Mem0 search timed out after {self._read_timeout}s')
-            return {}
+        return await self._timed_read(
+            instance.search(
+                query=query,
+                user_id=scope.mem0_user_id,
+                agent_id=None,
+                run_id=None,
+                limit=limit,
+                filters=filters,
+            ),
+            'search',
+        )
 
     async def get_all(
         self,
         scope: Scope,
         limit: int = 100,
     ) -> dict[str, Any]:
-        """Get all memories for a scope."""
+        """Get all memories for a scope.
+
+        Raises:
+            TimeoutError: Per the class-wide timeout posture.  The consequence
+                specific to THIS read: both consumers already act on a raised
+                exception and were only ever starved of one, so under the old
+                ``{}`` neither could see the fault —
+                ``MemoryConsolidator.assemble_payload`` now marks mem0 a
+                degraded fetch source, and ``MemoryService.replay_from_store``
+                stops reporting a false "0 queued".
+        """
         instance = await self._get_instance(scope)
-        try:
-            return await asyncio.wait_for(
-                instance.get_all(
-                    user_id=scope.mem0_user_id,
-                    agent_id=scope.agent_id,
-                    run_id=scope.session_id,
-                    limit=limit,
-                ),
-                timeout=self._read_timeout,
-            )
-        except TimeoutError:
-            logger.warning(f'Mem0 get_all timed out after {self._read_timeout}s')
-            return {}
+        return await self._timed_read(
+            instance.get_all(
+                user_id=scope.mem0_user_id,
+                agent_id=scope.agent_id,
+                run_id=scope.session_id,
+                limit=limit,
+            ),
+            'get_all',
+        )
 
     async def get(self, memory_id: str, scope: Scope) -> dict[str, Any] | None:
-        """Get a single memory by ID."""
+        """Get a single memory by ID, or ``None`` when it genuinely does not exist.
+
+        THE FALSE-ABSENCE CHAIN, stated once for the whole tree.  Four other
+        sites discuss this timeout (``MemoryService.get_memory``, and the three
+        tests that pin the chain); they point HERE rather than re-deriving it,
+        so there is one copy to keep accurate.  Under the swallow, ``None``
+        reached ``MemoryService.get_memory`` as a genuine miss and became
+        ``MemoryNotFoundError``, which ``ReconReportState.cite_memory`` renders
+        as ``memory_not_found`` — a FALSE ABSENCE written into a durable
+        reconciliation report, indistinguishable by a later reader from a real
+        one.  It stopped there, and not by luck:
+        ``repair_memory_citation(reason='memory_not_found')`` does DELETE a
+        citation on that signal, but only after independently re-reading the
+        victim through ``get_memory_by_id`` (a propagating Qdrant read),
+        answering ``citation_not_dangling`` when the memory still resolves and
+        a verification error when that read itself raises — INV-3, corroborate
+        before acting.  So the harm this fixes is the false absence in the
+        record, and the bound on it is one gate in another module.
+
+        Raises:
+            TimeoutError: Per the class-wide timeout posture.  The consequence
+                specific to THIS read is the chain above: a timeout must never
+                be reported as "this memory does not exist".
+        """
         instance = await self._get_instance(scope)
-        try:
-            return await asyncio.wait_for(
-                instance.get(memory_id),
-                timeout=self._read_timeout,
-            )
-        except TimeoutError:
-            logger.warning(f'Mem0 get timed out after {self._read_timeout}s')
-            return None
+        return await self._timed_read(instance.get(memory_id), 'get')
 
     async def update(
         self,
@@ -505,9 +598,9 @@ class Mem0Backend:
         as ``metadata=``.
         """
         instance = await self._get_instance(scope)
-        return await asyncio.wait_for(
+        return await self._timed_write(
             instance.update(memory_id, data, metadata=metadata),
-            timeout=self._write_timeout,
+            'update',
         )
 
     async def set_payload(
@@ -526,10 +619,9 @@ class Mem0Backend:
         what may be a purely cosmetic tag.
 
         A write timeout PROPAGATES (raises ``TimeoutError``) rather than being
-        swallowed into a falsy return — the posture of
-        :meth:`get_point_by_id` / :meth:`count_by_metadata`, in deliberate
-        contrast to :meth:`get`. A caller must never mistake an unreachable
-        Qdrant for a completed write (no-silent-fail invariant).
+        swallowed into a falsy return — the posture of every read and write on
+        this class. A caller must never mistake an unreachable Qdrant for a
+        completed write (no-silent-fail invariant).
 
         NOTE: Qdrant answers ``acknowledged``/``completed`` for an UNKNOWN point
         id — a no-op, not an error. Callers must confirm the point exists (see
@@ -538,13 +630,13 @@ class Mem0Backend:
         """
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        await asyncio.wait_for(
+        await self._timed_write(
             client.set_payload(
                 collection_name=collection_name,
                 payload=payload,
                 points=[memory_id],
             ),
-            timeout=self._write_timeout,
+            'set_payload',
         )
 
     async def delete_payload(
@@ -561,13 +653,13 @@ class Mem0Backend:
         """
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        await asyncio.wait_for(
+        await self._timed_write(
             client.delete_payload(
                 collection_name=collection_name,
                 keys=keys,
                 points=[memory_id],
             ),
-            timeout=self._write_timeout,
+            'delete_payload',
         )
 
     async def overwrite_payload(
@@ -589,21 +681,21 @@ class Mem0Backend:
         """
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        await asyncio.wait_for(
+        await self._timed_write(
             client.overwrite_payload(
                 collection_name=collection_name,
                 payload=payload,
                 points=[memory_id],
             ),
-            timeout=self._write_timeout,
+            'overwrite_payload',
         )
 
     async def delete(self, memory_id: str, scope: Scope) -> dict[str, Any]:
         """Delete a memory."""
         instance = await self._get_instance(scope)
-        return await asyncio.wait_for(
+        return await self._timed_write(
             instance.delete(memory_id),
-            timeout=self._write_timeout,
+            'delete',
         )
 
     async def _get_async_qdrant(self):
@@ -621,12 +713,12 @@ class Mem0Backend:
         """Count memories using native async Qdrant count API."""
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        result = await asyncio.wait_for(
+        result = await self._timed_read(
             client.count(
                 collection_name=collection_name,
                 exact=True,
             ),
-            timeout=self._read_timeout,
+            'count',
         )
         return result.count
 
@@ -762,10 +854,13 @@ class Mem0Backend:
         Qdrant payload, so ``filters={'source': 'X', 'flag_id': 'Y'}`` matches
         against ``payload.source == 'X' AND payload.flag_id == 'Y'``.
 
-        Returns the exact match count.  Empty ``filters`` is rejected (would
-        otherwise count every memory in the collection — almost certainly a
-        bug at the caller).
+        Returns the exact match count; an unprovisioned collection reads as 0
+        (see :meth:`_timed_collection_read`).  Empty ``filters`` is rejected
+        (would otherwise count every memory in the collection — almost
+        certainly a bug at the caller).
         """
+        from qdrant_client.http import models as qmodels
+
         if not filters:
             raise ValueError(
                 'count_by_metadata requires at least one filter; '
@@ -774,13 +869,15 @@ class Mem0Backend:
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
         qdrant_filter = self._build_payload_filter(filters)
-        result = await asyncio.wait_for(
+        result = await self._timed_collection_read(
             client.count(
                 collection_name=collection_name,
                 count_filter=qdrant_filter,
                 exact=True,
             ),
-            timeout=self._read_timeout,
+            'count_by_metadata',
+            collection_name,
+            if_absent=qmodels.CountResult(count=0),
         )
         return result.count
 
@@ -832,7 +929,8 @@ class Mem0Backend:
             returned that point without one.  A vector-less point is still
             returned (degraded, not dropped) so the caller can count and
             report it rather than losing it silently; the ``'vector'`` key is
-            absent entirely when *with_vectors* is False.
+            absent entirely when *with_vectors* is False.  An unprovisioned
+            collection reads as ``[]`` (see :meth:`_timed_collection_read`).
 
         Raises:
             ValueError: If *filters* is empty.
@@ -849,7 +947,7 @@ class Mem0Backend:
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
         qdrant_filter = self._build_payload_filter(filters)
-        points, _next_offset = await asyncio.wait_for(
+        points, _next_offset = await self._timed_collection_read(
             client.scroll(
                 collection_name=collection_name,
                 scroll_filter=qdrant_filter,
@@ -857,7 +955,9 @@ class Mem0Backend:
                 with_vectors=with_vectors,
                 limit=limit,
             ),
-            timeout=self._read_timeout,
+            'scroll_by_metadata',
+            collection_name,
+            if_absent=([], None),
         )
 
         result = [self._normalise_point(point, with_vectors=with_vectors) for point in points]
@@ -1089,10 +1189,10 @@ class Mem0Backend:
                 async for point in pages:
                     scanned += 1
                     payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-                    hits = find_toolcall_xml_leak(_extract_payload_text(payload))
+                    hits = find_toolcall_xml_leak(extract_payload_text(payload))
                     if not hits:
                         continue
-                    text = _extract_payload_text(payload) or ''
+                    text = extract_payload_text(payload) or ''
                     matches.append({
                         'id': point.id,
                         'created_at': payload.get('created_at'),
@@ -1137,6 +1237,7 @@ class Mem0Backend:
         max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
         max_points: int | None = None,
         with_vectors: bool = False,
+        with_payload: bool = True,
     ) -> AsyncGenerator[Any, None]:
         """Yield every Qdrant point in *collection_name*, paging on ``next_offset``.
 
@@ -1202,6 +1303,10 @@ class Mem0Backend:
                 only by pulling a point past the cap.
             with_vectors: Fetch each point's stored vector.  Costs bandwidth,
                 so it is opt-in.
+            with_payload: Fetch each point's payload.  ``False`` is an
+                ids-only walk, how id enumeration keeps its data access
+                minimal; it exists for ``services/id_resolver.py`` (PRD C2's
+                single substrate extension).
 
         Yields:
             Raw Qdrant point objects, in page order.  Annotated
@@ -1282,16 +1387,16 @@ class Mem0Backend:
             page_limit = page_size if max_points is None else min(page_size, max_points - yielded)
             # Bound each PAGE, not the whole scan: a per-scan bound would
             # abort a long-but-healthy multi-page enumeration.
-            points, next_offset = await asyncio.wait_for(
+            points, next_offset = await self._timed_read(
                 client.scroll(
                     collection_name=collection_name,
                     scroll_filter=scroll_filter,
-                    with_payload=True,
+                    with_payload=with_payload,
                     with_vectors=with_vectors,
                     limit=page_limit,
                     offset=offset,
                 ),
-                timeout=self._read_timeout,
+                'scroll_collection_pages',
             )
             pages += 1
             for point in points:
@@ -1429,12 +1534,19 @@ class Mem0Backend:
         dict — bypassing both semantic ranking (``search``) and metadata-equality
         filtering (``count_by_metadata`` / ``scroll_by_metadata``).
 
-        Unlike :meth:`get` (mem0 ``AsyncMemory.get``, which swallows a read
-        timeout into ``None``), a Qdrant read-timeout is PROPAGATED (raises
-        ``TimeoutError``), never swallowed — mirroring ``count_by_metadata`` /
-        ``scroll_by_metadata`` so a timed-out read is never mistaken for a
-        genuine not-found (no-silent-fail invariant). That timeout-distinguishing
-        behaviour is the whole reason this bypasses ``get``.
+        Timeout posture is the class-wide one, and since task 5265 it is no
+        longer anything that distinguishes this method from :meth:`get`.
+
+        What DOES distinguish them, and the reason this bypasses ``get``, is
+        the SHAPE of what comes back: this returns the full RAW Qdrant payload
+        with every key at one level, whereas ``get`` returns mem0's PROCESSED
+        record, which lifts ``promoted_payload_keys`` (``user_id``,
+        ``agent_id``, ``run_id``, ``actor_id``, ``role``) to the record's top
+        level and excludes them from ``metadata``.  A caller that needs a
+        promoted key alongside the custom payload keys at one level wants this
+        method; a caller that wants mem0's normalisations (notably
+        ``created_at`` through ``_normalize_iso_timestamp_to_utc``) wants
+        ``get``.
 
         Returns the point's full raw payload dict, or ``None`` when the point is
         absent (empty ``retrieve`` result). A single-id ``retrieve`` returning
@@ -1444,14 +1556,14 @@ class Mem0Backend:
         """
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
-        records = await asyncio.wait_for(
+        records = await self._timed_read(
             client.retrieve(
                 collection_name=collection_name,
                 ids=[memory_id],
                 with_payload=True,
                 with_vectors=False,
             ),
-            timeout=self._read_timeout,
+            'get_point_by_id',
         )
         if not records:
             return None
@@ -1465,6 +1577,65 @@ class Mem0Backend:
                 memory_id,
             )
         return dict(records[0].payload or {})
+
+    async def get_points_by_ids(
+        self, memory_ids: Sequence[str], scope: Scope,
+    ) -> dict[str, dict[str, Any]]:
+        """Several points' raw payloads in ONE ``retrieve``: ``{id: payload}``, absent ids omitted.
+
+        The batched sibling of :meth:`get_point_by_id`, with the same payload
+        shape and timeout posture; no ids is no read.
+        """
+        if not memory_ids:
+            return {}
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        records = await self._timed_read(
+            client.retrieve(
+                collection_name=collection_name,
+                ids=list(memory_ids),
+                with_payload=True,
+                with_vectors=False,
+            ),
+            'get_points_by_ids',
+        )
+        return {str(record.id): dict(record.payload or {}) for record in records}
+
+    async def cosine_to_points(
+        self, query: str, memory_ids: Sequence[str], scope: Scope,
+    ) -> dict[str, float]:
+        """The cosine of *query* to each listed point: ``{id: cosine}``, absent ids omitted.
+
+        On the same scale as :meth:`search`'s scores (``store_score``): the
+        query is embedded by the project's own mem0 embedder exactly as mem0
+        search embeds it, and scored by the same Qdrant cosine.  No ids is no
+        embedding; an unprovisioned collection reads as no scores.
+        """
+        from qdrant_client.http import models as qmodels
+
+        if not memory_ids:
+            return {}
+        instance = await self._get_instance(scope)
+        vector = await self._timed_read(
+            asyncio.to_thread(instance.embedding_model.embed, query, 'search'),
+            'cosine_to_points',
+        )
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        response = await self._timed_collection_read(
+            client.query_points(
+                collection_name=collection_name,
+                query=vector,
+                query_filter=qmodels.Filter(must=[qmodels.HasIdCondition(has_id=list(memory_ids))]),
+                limit=len(memory_ids),
+                with_payload=False,
+                with_vectors=False,
+            ),
+            'cosine_to_points',
+            collection_name,
+            if_absent=qmodels.QueryResponse(points=[]),
+        )
+        return {str(point.id): float(point.score) for point in response.points}
 
     async def close(self) -> None:
         """Close all cached AsyncMemory instances and release their connections."""

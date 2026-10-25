@@ -7,18 +7,24 @@ Design decisions:
 - Tests are self-contained unit tests of the helper itself (not a cross-test
   polluter→victim pair), so they are deterministic under -n auto --dist loadgroup
   without requiring an xdist_group co-location tag.
-- The _count_open_mock_coros() probe and drain use the same selection predicate
-  (cr_code.co_name == "_execute_mock_call", state CORO_CREATED), so the test
-  is a direct behavioral assertion of the helper's correctness.
+- The _count_open_mock_coros() probe searches the heap for CORO_CREATED
+  ``_execute_mock_call`` coroutines; the drain finds them through the registry
+  ``track_async_mock_coroutines`` fills.  The two share no selection logic, so
+  the probe is an independent observation of what the drain left behind.
 """
 from __future__ import annotations
 
 import gc
 import inspect
-from unittest.mock import AsyncMock
+import threading
+from unittest.mock import AsyncMock, AsyncMockMixin, MagicMock
 
 import pytest
-from _orch_helpers import drain_async_mock_coroutines
+from _async_mock_orphans import (
+    drain_async_mock_coroutines,
+    fail_on_orphaned_async_mock_calls,
+    track_async_mock_coroutines,
+)
 
 
 def _count_open_mock_coros() -> int:
@@ -63,8 +69,9 @@ def test_drain_closes_orphaned_asyncmock_coroutine_in_cycle():
         'Expected at least one orphaned _execute_mock_call coroutine in the GC graph'
     )
 
-    closed = drain_async_mock_coroutines()
-    assert closed >= 1, 'drain_async_mock_coroutines() should have closed >= 1 coroutine'
+    assert len(drain_async_mock_coroutines()) >= 1, (
+        'drain_async_mock_coroutines() should have closed >= 1 coroutine'
+    )
     assert _count_open_mock_coros() == 0, (
         'After drain, no orphaned _execute_mock_call coroutines should remain'
     )
@@ -80,16 +87,74 @@ def test_drain_closes_orphaned_asyncmock_coroutine_in_cycle():
 
 
 def test_drain_is_safe_when_no_orphans():
-    """drain_async_mock_coroutines() returns 0 when there are no orphaned coroutines."""
+    """drain_async_mock_coroutines() returns no records when there are no orphaned coroutines."""
     # First drain to flush any residual orphans from prior tests
     drain_async_mock_coroutines()
     gc.collect()
 
-    count = drain_async_mock_coroutines()
-    assert count == 0, (
-        f'Expected 0 orphaned coroutines but got {count}. '
+    orphans = drain_async_mock_coroutines()
+    assert orphans == (), (
+        f'Expected no orphaned coroutines but got {orphans}. '
         'A prior test may have leaked an un-awaited AsyncMock call.'
     )
+
+
+def test_drain_names_the_mock_and_the_test_that_created_each_orphan(request):
+    drain_async_mock_coroutines()
+    scheduler = MagicMock(name='scheduler')
+    scheduler.notify = AsyncMock()
+    coro = scheduler.notify('task-1')
+
+    orphans = drain_async_mock_coroutines()
+
+    assert [orphan.mock_name for orphan in orphans] == ['scheduler.notify']
+    assert request.node.nodeid in orphans[0].created_during
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+
+
+def test_an_orphan_created_outside_any_test_phase_is_attributed_to_none(monkeypatch):
+    drain_async_mock_coroutines()
+    monkeypatch.delenv('PYTEST_CURRENT_TEST')
+    coro = AsyncMock(name='collection_time_mock')()
+
+    [orphan] = drain_async_mock_coroutines()
+
+    assert orphan.created_during is None
+    assert orphan.mock_name == 'collection_time_mock'
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+
+
+def test_enforcement_fails_naming_the_mock_and_still_closes_the_orphan():
+    drain_async_mock_coroutines()
+    coro = AsyncMock(name='planted_notifier')('task-1')
+
+    with pytest.raises(pytest.fail.Exception, match='planted_notifier'):
+        fail_on_orphaned_async_mock_calls()
+
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+
+
+def test_enforcement_still_fails_when_the_frame_no_longer_names_the_mock(monkeypatch, request):
+    drain_async_mock_coroutines()
+
+    async def drifted_execute_mock_call(mock, /, *args, **kwargs):
+        return None
+
+    monkeypatch.setattr(AsyncMockMixin, '_execute_mock_call', drifted_execute_mock_call)
+    track_async_mock_coroutines()
+    coro = AsyncMock(name='drifted_notifier')()
+
+    with pytest.raises(pytest.fail.Exception, match=request.node.name):
+        fail_on_orphaned_async_mock_calls()
+
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+
+
+@pytest.mark.asyncio
+async def test_enforcement_is_silent_when_every_call_was_awaited():
+    assert await AsyncMock(return_value=7)() == 7
+
+    fail_on_orphaned_async_mock_calls()
 
 
 @pytest.mark.asyncio
@@ -112,8 +177,8 @@ async def test_awaited_asyncmock_is_not_an_orphan():
 def test_product_coroutine_is_not_closed_by_drain():
     """drain_async_mock_coroutines() does NOT close product (non-mock) coroutines.
 
-    A genuine product async def has co_name == 'product_coro' (not
-    '_execute_mock_call'), so it must survive a drain call intact.  This is the
+    A genuine product async def is never registered by
+    ``track_async_mock_coroutines``, so it must survive a drain call intact.  This is the
     safety-net assertion: a forgotten `await` on product code must still trip
     filterwarnings=error and fail the test; drain must not silently swallow it.
     """
@@ -133,7 +198,7 @@ def test_product_coroutine_is_not_closed_by_drain():
         # The product coroutine must still be CORO_CREATED after the drain
         assert inspect.getcoroutinestate(coro) == inspect.CORO_CREATED, (
             'drain_async_mock_coroutines() must not close product coroutines '
-            '(co_name != "_execute_mock_call")'
+            '(only AsyncMock call coroutines are registered for draining)'
         )
     finally:
         # Close the coro explicitly here to avoid "was never awaited" warning
@@ -153,3 +218,64 @@ def test_autouse_drain_fixture_is_active(request):
         'in conftest.py so it runs after every test and prevents orphaned '
         'AsyncMock coroutines from being GC-promoted into sibling tests.'
     )
+
+
+def test_orphan_created_on_a_background_thread_is_closed():
+    created = []
+    thread = threading.Thread(target=lambda: created.append(AsyncMock()()))
+    thread.start()
+    thread.join()
+
+    assert len(drain_async_mock_coroutines()) >= 1
+    assert inspect.getcoroutinestate(created[0]) == inspect.CORO_CLOSED
+
+
+def test_drain_tolerates_a_thread_calling_mocks_while_it_runs():
+    """Task 5668: a registry that is iterated raised here in 170 of 8,139 drains on CPython 3.13.9.
+
+    The thread's coroutines are born and die while the drain works through the
+    long-lived ones, which is what resizes an iterated container under it.
+    """
+    long_lived = [AsyncMock()() for _ in range(2000)]
+    stop = threading.Event()
+
+    def churn_mock_coroutines():
+        mock = AsyncMock()
+        while not stop.is_set():
+            mock().close()
+
+    thread = threading.Thread(target=churn_mock_coroutines)
+    thread.start()
+    try:
+        for _ in range(200):
+            drain_async_mock_coroutines()
+    finally:
+        stop.set()
+        thread.join()
+
+    assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in long_lived)
+
+
+def test_drain_finds_orphans_without_searching_the_heap(monkeypatch):
+    """Task 5668: a per-test gc.get_objects() search was 88% of a full-suite run's CPU."""
+    coro = AsyncMock()()
+
+    def heap_search_is_forbidden():
+        raise AssertionError('drain_async_mock_coroutines searched the heap')
+
+    monkeypatch.setattr(gc, 'get_objects', heap_search_is_forbidden)
+
+    assert len(drain_async_mock_coroutines()) >= 1
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+
+
+def test_tracking_does_not_hide_a_leak_that_refcounting_reclaims():
+    with pytest.warns(RuntimeWarning, match='never awaited'):
+        AsyncMock()()
+
+
+def test_tracking_refuses_an_interpreter_whose_mock_call_path_it_cannot_follow(monkeypatch):
+    monkeypatch.setattr(AsyncMockMixin, '_execute_mock_call', lambda self, *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match='_execute_mock_call'):
+        track_async_mock_coroutines()

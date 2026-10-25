@@ -230,7 +230,8 @@ guard+lifecycle.
 - **γ (intermediate — consumed by H).** Killing the orchestrator **and** dropping the SSH
   connection mid-build **each** terminate the whole laptop build subtree (no lingering
   `rustc`/`cargo`) within `T` s; a heartbeat-starved (simulated hard partition) build likewise
-  dies within ~2H; the live path is unaffected (heartbeat flows, build completes normally).
+  dies within ~~~2H~~ `T` (**superseded 2026-09-17, task 4195:** see §8.1 Timing); the live path
+  is unaffected (heartbeat flows, build completes normally).
   *Unlocks:* H's lifecycle scenarios.
 - **H (LEAF — integration gate).** The §9 boundary-test suite's observable postconditions all
   hold end-to-end against the real dispatch↔CLI seam (not synthetic-input unit tests): the
@@ -254,10 +255,18 @@ further discussion.
 ### 8.1 Connection-death (Change B)
 
 **Dispatcher (`RemoteRunner.run_merge_verify`, workstation):**
-- Opens the ssh child with `stdin=PIPE` (today stdin is unset/inherited).
-- Writes a heartbeat token (e.g. a newline) to the ssh child's stdin every `H` seconds for the
-  full duration of the verify. Heartbeat write failure (EPIPE) is benign — the child is already
+- ~~Opens the ssh child with `stdin=PIPE` (today stdin is unset/inherited).~~
+- ~~Writes a heartbeat token (e.g. a newline) to the ssh child's stdin every `H` seconds for the
+  full duration of the verify.~~ Heartbeat write failure (EPIPE) is benign — the child is already
   gone; log and proceed to normal transport-failure handling.
+  **Superseded 2026-09-17 (task 4195):** the dispatcher opens the child on the read end of a pipe
+  it OWNS (`stdin=<read fd>`, so `proc.stdin` is `None`) and writes the beat from a **dedicated OS
+  thread** on a `threading.Event` timed wait, not an `asyncio.sleep` task. The original shape put
+  the producer on the orchestrator's single shared event loop, which was measured stalling past
+  the watchdog's own deadline (p50 0.001–0.003 s / MAX 14.8–16.1 s over 657 samples per port,
+  2026-08-12) — so the beat stopped for exactly as long as any stall lasted and the remote
+  correctly read a healthy channel as dead. Owning the pipe is what makes the thread possible:
+  `proc.stdin` is a loop-bound `StreamWriter` that must not be written from another thread.
 - **Invariant:** the existing best-effort main push, merge-sha push, stdout→`VerifyResult`
   parse (824–829), and ref cleanup (843–849) are unchanged. Adding stdin=PIPE + a heartbeat
   writer must not alter the returned `VerifyResult` on the happy path.
@@ -265,16 +274,25 @@ further discussion.
 **Remote (`verify-merge` CLI, laptop):**
 - When `--request-id` is set (i.e. dispatched, `setsid`'d, pgid-file written), spawn a
   **watchdog** before the build begins. The watchdog owns fd 0.
-- Watchdog fires on **EOF on fd 0** (channel closed) **OR** **no heartbeat within `2H`**.
+- Watchdog fires on **EOF on fd 0** (channel closed) **OR** no heartbeat within ~~`2H`~~ `T`
+  (**superseded 2026-09-17, task 4195:** the starvation deadline is derived from the transport,
+  not from `H` — see the Timing bullet below).
 - On fire: `killpg(pgid, SIGTERM)`, brief grace, `killpg(pgid, SIGKILL)`, then `os._exit`
   non-zero. `pgid` is the same value written to the pgid file (`os.getpgrp()` after `setsid`).
 - **Invariant (B2):** `setsid` and the pgid file are **unchanged**, so
   `cancel-verify --request-id` (`verify_cancel.cancel_request`, /proc-tree SIGKILL + `killpg`
   backstop) continues to tree-kill. The watchdog and `cancel-verify` may both fire; killing an
   already-dead group is idempotent.
-- **Timing:** `T ≈ 2H + kill-grace`. With `H = 5 s` and a ~5 s SIGTERM→SIGKILL grace,
-  `T ≈ 15 s`. `T` is **derived from the mechanism**, not a guessed constant; `H` is tunable
+- ~~**Timing:** `T ≈ 2H + kill-grace`. With `H = 5 s` and a ~5 s SIGTERM→SIGKILL grace,
+  `T ≈ 15 s`.~~ `T` is **derived from the mechanism**, not a guessed constant; `H` is tunable
   (§Open questions).
+  **Superseded 2026-09-17 (task 4195):** `T` is now derived from the **transport**, not from `H`:
+  `T = 1.5 × ServerAliveInterval × ServerAliveCountMax` = `1.5 × 15 × 4` = **90 s**, plus the
+  unchanged ~5 s kill grace. `2H` made the watchdog out-vote ssh by 6x — ssh declares the peer
+  dead at 60 s and exits non-zero into the dispatcher's existing re-dispatch path, so a 10 s
+  deadline opened a 10–60 s band in which the remote killed healthy builds on links ssh would
+  have ridden through. `2H` is still satisfied a fortiori (90 s is 18 beats) and is now asserted
+  as an explicit floor rather than left as an accident of the definition.
 
 ### 8.2 Flock-contention outcome (Change A)
 
@@ -306,7 +324,7 @@ state) — user-observable postconditions, not synthetic-input asserts.
 |---|---|---|---|
 | 1 | Orchestrator killed mid-build | knob on; dispatched verify building; heartbeat flowing | Within `T` s: no `rustc`/`cargo` under the laptop build subtree; pgid group gone |
 | 2 | SSH connection dropped mid-build | as #1 | Within `T` s: subtree gone (EOF-on-stdin path) |
-| 3 | Heartbeat starved (simulated hard partition) | as #1; dispatcher stops heartbeat but channel not cleanly closed | Within ~2H: subtree gone (heartbeat-timeout path) |
+| 3 | Heartbeat starved (simulated hard partition) | as #1; dispatcher stops heartbeat but channel not cleanly closed | Within ~~~2H~~ `T`: subtree gone (heartbeat-timeout path). **Superseded 2026-09-17 (task 4195):** see §8.1 Timing |
 | 4 | `cancel-verify` under the watchdog | dispatched verify building | `cancel-verify --request-id X` tree-kills the full descendant tree; no orphan remains |
 | 5 | Flock contention | knob on; one verify holds `.merge_verify.lock` mid-build; a second `verify-merge` launched on the same host | Second waits ≤ bounded wait, then: **no** tree mutation of #1's `_merge-verify`, **no** `_merge-<uuid>` created, emits the contention discriminant; workstation files a born-at-L2 naming host + (holder, waiter) pgids; merge blocked |
 | 6 | Normal warm path (no contention) | knob on; single dispatched verify | Reuses `_merge-verify` with a retained non-empty `target/`; **no** escalation; **no** watchdog fire; `VerifyResult` returned unchanged |
@@ -333,8 +351,13 @@ state) — user-observable postconditions, not synthetic-input asserts.
 1. **Bounded-wait value + knob-ness.** Default ~10 s (justified in A3). Decide at impl whether
    to hard-code a constant or add a (reload-tunable) config leaf. **Suggested:** small constant
    first; promote to config only if it ever needs field-tuning.
-2. **Heartbeat interval `H`.** Default `H = 5 s` → `T ≈ 15 s`. Decide at impl (task γ) whether
+2. **Heartbeat interval `H`.** Default `H = 5 s` → ~~`T ≈ 15 s`~~. Decide at impl (task γ) whether
    `H` is a constant or a config leaf. Balance liveness-detection latency vs channel chatter.
+   **Superseded 2026-09-17 (task 4195):** `T` no longer follows from `H` at all — it is derived
+   from the ssh transport's own dead-peer verdict (§8.1 Timing), which decouples the two. `H`
+   remains a module constant, deliberately NOT promoted to a knob: a second independently-settable
+   half of one protocol on two different hosts would ADD drift surface, which is the failure this
+   task closed by coupling instead.
 3. **`VerifyResult` discriminant shape.** Reuse an existing failure `reason`/`category` field
    vs add a dedicated `contention` payload. Decide at impl (task α); must be losslessly
    parseable by β (§8.2).

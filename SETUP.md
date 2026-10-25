@@ -59,23 +59,24 @@ The script is idempotent (safe to re-run) and self-reports each step with
 3. **`uv sync`** across the Python subprojects (`shared`, `escalation`, `fused-memory`, `orchestrator`, `dashboard`), in dependency order.
 4. **fused-memory systemd unit** — renders `scripts/fused-memory.service.template` into `~/.config/systemd/user/fused-memory.service` (substituting your real repo path and `uv` binary path), enables it, and starts it only if `fused-memory/.env` already exists (see §4 — you'll usually run this once before secrets exist, then `systemctl --user restart fused-memory` after writing them).
 5. **Orchestrator systemd units + watchdog** — see the **Known gap** callout immediately below; this step is the one you must edit for your own project set.
-6. **jCodeMunch** and **7. skim** — optional personal productivity tooling (AST-based code retrieval and context compression) the repo's original maintainer uses. Safe to let run; skip/ignore if you don't want them — nothing else in this repo depends on them.
-8. **Dashboard systemd units** — renders and enables `dark-factory-dashboard` + its watchdog timer (installed, not started — see §7).
-9. **Claude Code skill symlinks** — wires the in-repo `skills/` into your Claude Code install. Covered in full in §8 below.
-10. **Git hooks** — runs `hooks/setup.sh`, which points `core.hooksPath` at `hooks/` (pre-commit, pre-merge-commit).
-11. **Manual steps reminder** — printed only, for migrating data from another host (`export-data.sh`/`import-data.sh`); irrelevant on a genuinely fresh install.
+6. **jCodeMunch** — optional personal productivity tooling (AST-based code retrieval) the repo's original maintainer uses. Safe to let run; skip/ignore if you don't want it, but note that orchestrator agents and reconciliation stages are always given the `jcodemunch` MCP server (launched as `jcodemunch-mcp` from your PATH). If that launcher is missing the server fails to start, and those sessions run without the `mcp__jcodemunch__*` tools rather than failing. Step 6 also installs the version-pinned `jcodemunch-mcp` launcher with `uv tool install` (the pin lives in `shared/src/shared/jcodemunch_launch.py`) and registers it in your user-level Claude config, so uv's tool bin dir (`uv tool dir --bin`) must be on your PATH.
+7. **Dashboard systemd units** — renders and enables `dark-factory-dashboard` + its watchdog timer (installed, not started — see §7).
+8. **Claude Code skill symlinks** — wires the in-repo `skills/` into your Claude Code install. Covered in full in §8 below.
+9. **Git hooks** — runs `hooks/setup.sh`, which points `core.hooksPath` at `hooks/` (pre-commit, pre-merge-commit), then `python3 scripts/merge_lane_ratchet_merge.py install`, which writes dark-factory's own merge driver for the ratchet baseline (`merge.ratchet-baseline.driver`, named by `.gitattributes`) into the repo's `.git/config`. Without the driver a merge of two branches that both moved the baseline conflicts instead of composing.
+10. **Manual steps reminder** — printed only, for migrating data from another host (`export-data.sh`/`import-data.sh`); irrelevant on a genuinely fresh install.
 12. **Health checks** — re-probes FalkorDB, Qdrant, fused-memory, and jCodeMunch, plus a parity check between your installed fused-memory unit and its template.
 
 ### Known gap: step 5 hardcodes the maintainer's other projects
 
 `scripts/setup-host.sh`'s orchestrator-units step unconditionally installs
-and enables systemd units for **six projects that are not part of this
+and enables systemd units for **seven projects that are not part of this
 repo and won't exist on your machine**: `orchestrator-reify.service`,
 `orchestrator-autopilot-video.service`,
 `orchestrator-my-solar-challenge.service`,
 `orchestrator-solar-challenge-platform.service`,
-`orchestrator-know-live.service`, and
-`orchestrator-pump-web-ui.service`. Each `ExecStart` points at
+`orchestrator-know-live.service`,
+`orchestrator-pump-web-ui.service`, and
+`orchestrator-stream-touch.service`. Each `ExecStart` points at
 a `dark-factory-orchestrator.yaml` in a sibling repo that doesn't exist for
 you, so once `default.target` restarts them (next login/boot), they'll
 crash-loop until `StartLimitBurst` is exhausted. `orchestrator-dark-factory.service`
@@ -93,7 +94,8 @@ systemctl --user disable --now \
   orchestrator-my-solar-challenge.service \
   orchestrator-solar-challenge-platform.service \
   orchestrator-know-live.service \
-  orchestrator-pump-web-ui.service
+  orchestrator-pump-web-ui.service \
+  orchestrator-stream-touch.service
 ```
 
 Keep `orchestrator-watchdog.timer` enabled — it skips disabled units, so
@@ -282,8 +284,8 @@ completes one of them fully:
 2. **`~/.claude/skills/<name>/` symlinks** — the newer, self-contained Skill
    directory mechanism (a `SKILL.md` plus `references/`/`scripts/` living
    together in one folder, matched as a directory rather than a single
-   file). `setup-host.sh` wires exactly three this way: `factory-init`,
-   `prd`, `hotspot-survey`.
+   file). `setup-host.sh` wires exactly four this way: `factory-init`,
+   `prd`, `hotspot-survey`, `review-all`.
 
 Both are idempotent `ln -sfn` symlinks back into this repo's `skills/`
 directory, so a `git pull` here is picked up immediately — no re-run needed
@@ -298,7 +300,7 @@ Confirm the wiring landed:
 
 ```bash
 ls -la ~/.claude/commands/ | grep -E 'orchestrate|review|unblock|reflect|merge-queue'
-ls -la ~/.claude/skills/ | grep -E 'factory-init|prd|hotspot-survey'
+ls -la ~/.claude/skills/ | grep -E 'factory-init|prd|hotspot-survey|review-all'
 ```
 
 ## 9. Onboard your first project — `/factory-init`
@@ -466,6 +468,425 @@ python3 scripts/orchestrator-watchdog.py --report
 since the last verified fleet deploy, and whether a merge is currently
 in-flight (which would defer the next drain-aware redeploy) — reach for it
 before manually restarting anything.
+
+## 12. Optional: a remote merge-verify host
+
+By default every merge verify runs locally, on the same host as the
+orchestrator. A project under enough load to want a second machine's CPU can
+instead register a `verify_runners` entry (workstation-side config — see
+"What stays on the workstation" below) that dispatches merge verification to
+a second host over ssh. This is an optional throughput lever, not a
+requirement for a working install — skip this section unless you need it.
+
+### What lives on the remote host
+
+- **The project checkout**, at a fixed path (e.g. `~/src/<project>`), kept in
+  sync with the dispatching workstation's `main` (see "Provisioning the
+  remote host" below for how it gets refreshed). It is an independent full
+  clone, not a linked worktree of the dispatcher. Verify itself does not run
+  directly in this clone — each `verify-merge` materialises a worktree under
+  it (`GitOps.acquire_host_verify_worktree`), a fresh `_merge-<uuid>` per
+  invocation or a reused warm one; see "Warm vs. ephemeral verify
+  worktrees" below.
+- **`receive.denyCurrentBranch = updateInstead`**, set on that checkout
+  (`git config receive.denyCurrentBranch updateInstead`). This is required
+  because the dispatcher's best-effort keep-alive push targets
+  `<main-branch>:refs/heads/<main-branch>` — the configured `git.main_branch`
+  (`str`, default `main` — it has no unset state) — which is the branch the
+  remote checkout has checked out, and git refuses to accept a push to a
+  checked-out branch by default. The `RemoteRunner(main_branch=...)`
+  argument is always populated from `git.main_branch` in production —
+  `merge_lane/drift.py::_build_remote_runners` is the sole production site that
+  constructs a `RemoteRunner`, and it always passes
+  `main_branch=config.git.main_branch` — so this push, and therefore the
+  `updateInstead` requirement, is not optional. `RemoteRunner`'s
+  `if self._main_branch:` skip exists only for direct construction with
+  `main_branch=None` (tests), which a config-driven dispatch never does.
+  `updateInstead` tells git to update the
+  working tree in place instead of rejecting the push. When that push is
+  rejected (typically a non-fast-forward — the remote's own `main` moved),
+  the dispatcher retries **once** with a **force** refspec
+  (`+<main-branch>:refs/heads/<main-branch>`) to restore mirror semantics;
+  worth knowing before treating `updateInstead` as a passive convenience,
+  since a force push can overwrite whatever is currently on that checked-out
+  branch. The **load-bearing** push — the actual commit under verification —
+  goes to a separate, namespaced ref instead, `refs/merge-verify/<request-id>`,
+  which is never checked out and so needs no such configuration.
+- **A PATH wrapper** for the orchestrator CLI (e.g.
+  `/usr/local/bin/orchestrator`), needed because a non-interactive
+  `ssh host cmd` does not source `~/.bashrc`/`~/.profile`, so a bare
+  `orchestrator` would not otherwise resolve on PATH. The wrapper only needs
+  to export the directories the verify subprocesses require (toolchain
+  bins, package-manager shims, …) and `exec` the checkout's own venv entry
+  point:
+  ```bash
+  #!/bin/bash
+  export PATH="<toolchain-bin-dirs>:$PATH"
+  exec <path-to-checkout>/.venv/bin/orchestrator "$@"
+  ```
+  **The shim contract (task 6565).** The `exec` line must be
+  `"${ORCH_GATE_BIN:-<path-to-checkout>/.venv/bin/orchestrator}" "$@"`
+  (a subshell-form call, not `exec`, if your wrapper logs an EXIT line).
+  The dispatcher prefixes every remote `orchestrator` call with
+  `env ORCH_GATE_BIN=<gate checkout>/.venv/bin/orchestrator`, which is how a
+  verify runs in the dispatcher's own immutable gate checkout rather than in
+  whatever the shared tree holds; with `ORCH_GATE_BIN` unset the wrapper runs
+  the shared tree exactly as before. A wrapper that ignores the variable is
+  caught by the handshake (below) and benches the host. Apply the edit with
+  `scripts/deploy/install_laptop_gate_shim.sh` (idempotent; `--check` is a
+  read-only contract check that exits 0 iff the installed wrapper honours
+  `ORCH_GATE_BIN`). Keep the PATH export and any wrapper-side logging in
+  place; the dispatcher's `ensure-gate` call resolves `orchestrator` through
+  this same wrapper.
+
+**The shared Dark-Factory checkout on a verify host is no longer the code a
+verify runs.** It is the *source* the per-sha gate checkouts are cloned from
+(`verify_runners[].df_checkout_path`) and the fallback the shim runs when
+`ORCH_GATE_BIN` is unset. Refreshing it (the next subsection) no longer
+upgrades the verify code of any project, and a stale shared tree no longer
+produces a stale gate. Each dispatcher pushes its own deployed commit to
+`refs/gate/<sha>` in that repository and verifies in an immutable checkout of
+that commit under `gate_checkouts_path`; DF and reify at different commits
+use different directories, at the same commit they share one.
+
+### Provisioning the remote host
+
+The gate checkouts need no manual refresh. For the project checkout (and
+the shared Dark-Factory tree, if you keep it current as the shim fallback),
+after fast-forwarding to the workstation's `main` (a plain
+`git fetch && git reset --hard origin/main` — never `git clean`; leave
+whatever untracked paths are already on that host alone), re-provision the
+environment at the new commit:
+
+```bash
+<uv path> sync --all-packages
+npm ci
+```
+
+- **Always `--all-packages`, never a bare `uv sync`.** A Dark-Factory
+  checkout is a **uv workspace** (the gate builder does this itself for each
+  gate checkout), and a bare `uv sync` exits `0` while
+  *pruning the other members' console scripts* — including the
+  `orchestrator` entry point this host exists to expose (task 4539). Losing
+  it turns every subsequent dispatch into a silent `rc=127`.
+- **`npm ci`** installs the pinned `npx pyright` (and anything else the
+  repo-root `package-lock.json` carries) — needed the same way it is on the
+  workstation (§1).
+- **Non-login-ssh PATH trap:** a plain `ssh <host> '<uv path> sync ...'` can
+  fail `rc=127` for a reason that has nothing to do with the command itself
+  — a non-interactive, non-login ssh session does not source
+  `~/.bashrc`/`~/.profile`, so a tool installed under, e.g., `~/.local/bin`
+  is simply not on `PATH` yet. Invoke it by absolute path (as above) or
+  export `PATH` first; don't mistake the resulting `127` for a broken
+  install. `node`/`npm` are commonly already on the default ssh `PATH` via
+  `/usr/bin`, so this trap tends to bite `uv` (or `cargo`, `~/.local/bin`
+  toolchains generally) more often than the Node half of this step.
+
+### Checking the host answers
+
+Two probes, run with the same ssh options the dispatcher itself uses
+(`_SSH_BASE_OPTS`, `orchestrator/src/orchestrator/verify_runner.py`):
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=4 <host> true                                 # RemoteRunner.health()
+ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=4 <host> 'env ORCH_GATE_BIN=/bin/echo orchestrator gate-identity'
+                                                                          # the shim honours ORCH_GATE_BIN
+```
+
+- The second probe is the shim check: it must print `gate-identity` (what
+  `/bin/echo` answers when the wrapper really ran `$ORCH_GATE_BIN`). The
+  real handshake needs no hand-run: the dispatcher's `ensure-gate` publishes
+  its commit, builds or reuses the gate checkout, and compares the gate's
+  `gate-identity` (`code_sha` and a fingerprint of the verify wire shapes)
+  with its own before any verify is spent. It is spelled through the bare
+  `orchestrator` wrapper on purpose, so it exercises the same PATH
+  resolution a real dispatch does.
+- Assert exit code `0` on both. Hand-running a probe without the
+  `ConnectTimeout`/`ServerAlive*` options can hang on an unreachable host
+  instead of failing fast the way the dispatcher's own probe does — the
+  options above aren't cosmetic. `RemoteRunner.health()` also swallows
+  every exception and returns `False`, so a transport error and a
+  live-but-failing host look identical from the caller's side.
+
+**A passing probe proves the host answers, not that it runs your code.**
+Code currency is no longer a property of the remote checkout: every verify
+runs in a gate checkout of the dispatcher's deployed commit, and the
+handshake above refuses a gate whose identity differs from the dispatcher's.
+That closes the old failure where the remote ran its own tree's timeouts,
+admission logic and breadth handling. A host that cannot produce a matching
+gate is benched in the `skew` class rather than silently verifying with other
+code; see `OPERATIONS.md` §"Reading a verify-host bench". (The module set was
+already authoritative from the wire spec since task 4536:
+`verify_runner.py::run_merge_verify_on_worktree` installs the dispatcher's
+set over the remote's own discovery walk.)
+
+### The per-host YAML
+
+The remote-side config conventionally lives at
+`~/.config/orchestrator/<project>-<host>.yaml`, but that path is **pure
+operator convention — nothing in the code discovers it.** It is threaded
+through explicitly: the workstation's `verify_runners[].config_path` names
+it, passes it as `orchestrator verify-merge --config <path>`, and the
+ordinary `load_config` resolution on the remote takes it from there
+(`--config` wins over `ORCH_CONFIG_PATH`, which is the fallback when
+`config_path` is left `None`). Name it however you like, or omit it and
+rely on the remote's own `ORCH_CONFIG_PATH`.
+
+**Load-bearing vs. inert.** The dispatcher's spec is applied onto this
+file by `orchestrator/src/orchestrator/verify_spec_shared.py::apply_spec_to_host_config`,
+the one apply path since task 6667. It sets only
+`merge_verify_workspace`, `merge_verify_breadth`, the three verify
+commands (when the spec carries a `global_verify_command` — see below),
+the module set (the task-4536 `_module_configs` overwrite), and
+`verify_cold_preprovision_command`: a non-empty dispatcher value replaces
+this file's, an empty one leaves this file's in force. It also merges
+`verify_env` (see below). Every other verify-behaviour key comes from
+**this file** and is genuinely load-bearing: `project_root`, the `git.*`
+block, `verify_env`, and the full timeout/concurrency/admission/cgroup
+surface — `verify_command_timeout_secs`, `verify_cold_command_timeout_secs`,
+`merge_verify_cold_command_timeout_secs`, `verify_timeout_retries`,
+`concurrent_verify`, `max_concurrent_module_verifies`, the
+`verify_admission_*` and `verify_clock_stop_*` families, `cpu_governance`,
+and `scope_cargo`. A `verify_cold_preprovision_command` here is a fallback
+only, honoured when the dispatcher ships `''` (an unconfigured or
+pre-6127 dispatcher). Scheduler, routing, budget, and escalation sections are the
+genuinely inert ones for this subcommand and can be left at whatever
+value (or omitted) without effect; don't spend effort keeping those
+sections in sync with the workstation.
+
+**Never restate `test_command`/`lint_command`/`type_check_command` in
+this file — in both branches, a wire copy overrides whatever is set
+here.**
+
+- A project with **registered module configs** has its per-module
+  commands travel inside the `MergeVerifySpec` the workstation sends with
+  every dispatch, reconstructed remotely by `run_merge_verify_on_worktree`.
+- A project with **zero** registered module configs is *not* a fallback
+  case: whenever the dispatcher has a global `test_command`/
+  `lint_command`/`type_check_command` set, `build_merge_verify_spec`
+  ships it as the spec's `global_verify_command` — the fix for the
+  fidelity hole behind incident 966f23a6 (INV-1, task 2883) — and
+  `run_merge_verify_on_worktree` applies it *over* the reconstructed
+  remote config.
+
+Either way, whatever is written here is a **second copy, free to drift**
+from what the wire actually carries — and restating it doesn't error or
+even drift loudly, it just silently does nothing: an operator who edits
+this file to change the remote gate observes no change, because the
+dispatch always wins.
+
+The one honest edge case: `global_verify_command` is sourced only when
+the dispatcher *has* a global command set. A project with neither module
+configs nor globals ships no commands in the spec at all — but such a
+project has no gate of its own on the workstation either, so commands set
+here would make the remote run a gate the workstation itself never runs.
+That's divergence from the workstation, not a legitimate fallback;
+"don't restate" holds regardless.
+
+**`verify_env` behaves differently from the three commands above: the
+spec merges into it rather than replacing it, on either branch.** Since
+task 5496, `apply_spec_to_host_config` sets `verify_env` to this file's
+effective `verify_env` with the spec's `verify_env` laid over it. The spec
+wins on a conflicting key, because these keys select tests, and a key only
+this file sets survives. `_resolve_verify_env` starts from that merged map
+(plus the authoritative `DF_VERIFY_ROLE` stamp). On a project **with**
+registered module configs, a module's own `verify_env` (threaded in by
+`_module_config_from_command`) is merged on top as well. Either way, a key
+set only here has real, non-silent effect — unlike restating a command, it
+is never overridden into a no-op.
+
+### Warm vs. ephemeral verify worktrees
+
+`git.persistent_merge_worktree` controls what a `verify-merge` invocation
+materialises its detached checkout into. **Off** (the default): every
+invocation gets its own fresh `<worktree_dir>/_merge-<uuid>`, used once and
+discarded. **On:** invocations on that host instead reuse one fixed-path
+warm worktree, `<worktree_dir>/_merge-verify`, resetting it in place each
+time — trading the cost of materialising a worktree from scratch for
+reuse of whatever build caches already live inside it.
+
+Two things to settle before turning it on for a project — one about how
+the serial-lane constraint is actually enforced, one about whether the
+reuse is worth having at all:
+
+1. **Set the knob on both sides together — but do not expect startup to
+   catch you if you don't.** The knob belongs on **both** the dispatching
+   workstation and the remote host, because each side reads its own copy
+   and they describe one shared physical constraint. What actually
+   enforces that constraint, though, is the remote's *runtime* lane lock:
+   contention there turns into an aborted verify rather than a race (see
+   the failure mode below).
+
+   It is worth being precise about what does **not** back you up here,
+   because the name suggests otherwise. There is a fail-closed config-time
+   guard, `merge_lane/liveness.py::enforce_persistent_worktree_serial_lane`,
+   which raises `PersistentWorktreeConfigError` when the per-host worst
+   case `ceil(merge_ahead_bound / num_hosts)` exceeds `1` (PRD §A
+   invariant 4) — but at its only production call site
+   (`harness.py`, `_start_merge_worker`) it is invoked as
+   `enforce_persistent_worktree_serial_lane(config, merge_ahead_bound=_k,
+   num_hosts=_k)`. Because `num_hosts` equals `merge_ahead_bound`, the
+   per-host bound is `ceil(K/K) = 1` for every `K`, and the refusal branch
+   is structurally unreachable as wired today; the harness comment says so
+   outright ("each of the K hosts gets its own serial lane so per-host lane
+   bound = ceil(K/num_hosts) = 1"). Treat that guard as protecting the
+   invariant *by construction*, not as a net that will refuse a bad
+   concurrency budget at startup — it will not fire. The runtime lock
+   below is the enforcement that actually runs.
+2. **The project's cold-preprovision cost must be high enough to make
+   reuse worth wanting.** If a project pays a full dependency
+   install/build on every cold verify (a `verify_cold_preprovision_command`
+   with no in-process memoisation across invocations — which is exactly
+   what a stateless `ssh host orchestrator verify-merge ...` dispatch is),
+   warm reuse is what makes that cost bearable. A project with a cheap cold
+   path gets little from the knob and takes on the concurrency constraint
+   for nothing.
+
+**Failure mode if you set it on the remote alone:** not a race. The
+remote's own `verify-merge` serialises the span itself, under a
+bounded-wait `fcntl.flock` on the shared `_merge-verify.lock` lane lock
+(plus a compat co-lock held across the span), whenever *its own* copy of
+the knob is on (task 2306 α, converged in task 2830). On contention it
+returns a distinguished `flock_contention` result rather than ever
+touching the tree — no second worktree gets materialised, no build runs
+concurrently. The cost is throughput and pages, not corruption: the
+dispatcher's `is_flock_contention_failure` check classifies that result,
+files a born-at-L2 escalation, and blocks the merge (task 2307 β). A
+remote-only flip trades a data race you don't get for repeated blocked
+merges and pages you do — which is why "set the knob on both sides
+together, or not at all" is still the right call, on a
+throughput-and-paging basis rather than a corruption one.
+
+**Dark Factory's answer, as a worked example (decided 2026-09-07, task
+5051):** `false`. Two verified legs:
+
+1. **Paging, the decisive leg — but read the premise carefully.** As
+   configured *today*, `dark-factory-orchestrator.yaml` registers no
+   `verify_runners` at all, so `enabled_verify_runners` is empty and
+   `K = 1 + len(enabled_verify_runners) = 1` (`harness.py`). There is no
+   remote verify host for two dark_factory verifies to contend on, and no
+   `K=2`. So the immediate reason the knob is `false` is simply that the
+   feature it tunes is not yet in use.
+
+   The forward-looking reason is what makes `false` the right setting to
+   *keep* — but not the mechanism this leg used to name. Once task D1
+   registers the laptop runner, `K` becomes `2` — yet `HostAllocator` is
+   documented and implemented as **one slot per host**
+   (`self._slots[name] = _SLOT_FREE`; `acquire_remote` requires
+   `_SLOT_FREE`), and both the merge worker and the drift detective
+   (`merge_lane/drift.py`'s `acquire_local`/`acquire_remote`) dispatch through
+   that same worker-lifetime allocator instance. So at `K=2`, ordinary
+   allocator-mediated concurrency cannot by itself put two dark_factory
+   verifies on the laptop together — a runtime "by construction"
+   guarantee, parallel to the config-time one point 1 above establishes
+   for the startup guard. `plans/merge-lane-throughput-prd.md`
+   §"RULED 2026-09-03" retracts the arithmetic this leg used to lean on
+   ("the decompose session's estimate of '1–3 blocked merges and L2 pages
+   per day' without arbitration... was arithmetic on the false premise")
+   and names `FLOCK_CONTENTION_CATEGORY` a **within-project orphan
+   detector**, never a co-tenancy one — the
+   realistic trigger is an orphaned lane lock (a stuck or crashed holder;
+   `plans/laptop-warm-verify-flock-orphan-prd.md`, tasks 2306/2307) or a
+   dispatch that bypasses the allocator (a manual `ssh host orchestrator
+   verify-merge ...`), not two allocator-granted verifies sharing a host.
+   That same ruling is why task C (5052), the proposed host-level
+   arbitration, is **cancelled** — but a `flock_contention` event's actual
+   cost, a born-at-L2 escalation and a blocked merge (below), still has no
+   landed remedy, which is why `false` stays the setting to keep, on this
+   narrower and verified basis.
+2. **With the knob off**, `cli.py` is explicit — "Knob OFF -> lane_fd/
+   compat_fd stay None -> byte-identical back-compat (no lock)" —
+   concurrent verifies simply get disjoint ephemeral worktrees, no
+   contention outcome at all.
+
+The recorded **cost** of "no", which lands *once a runner is registered*
+and not before: dark_factory sets a `verify_cold_preprovision_command`
+(`uv sync --all-packages && npm ci …`), and `verify.py`'s
+`_PREPROVISION_DONE` memo is in-process with a 5-minute TTL, so every
+stateless `ssh host orchestrator verify-merge …` dispatch pays that
+install cold. **Revisit path:**
+after measuring that cost over its own 14-day window, and only by
+flipping both sides together in the same change — never the remote
+alone.
+
+### What stays on the workstation
+
+The `verify_runners:` block lives in the **dispatching** project's own
+`dark-factory-orchestrator.yaml` — never on the remote host. The remote's
+per-host yaml (above) has no knowledge of the pool it belongs to; the
+workstation is what decides which hosts participate.
+
+Entry shape (`VerifyRunnerConfig`):
+
+```yaml
+verify_runners:
+  - name: <short-id>              # e.g. "laptop"
+    ssh_host: <ssh-alias>         # used for git push and ssh invocations
+    git_remote: <git-remote-name> # git remote pointing at the remote's PROJECT checkout
+    config_path: <remote-path>    # passed as --config; omit (null) to let the
+                                   # remote fall back to its own ORCH_CONFIG_PATH
+    df_checkout_path: <remote-path>  # REQUIRED when enabled. Remote path of the
+                                      # Dark-Factory repository the gate checkouts
+                                      # are cloned from -- distinct from git_remote's
+                                      # project checkout. The dispatcher pushes its
+                                      # deployed commit there as refs/gate/<sha>.
+    gate_checkouts_path: <remote-path>  # optional; absolute directory holding one
+                                      # immutable checkout per deployed commit.
+                                      # Default: the sibling `dark-factory-gate` of
+                                      # df_checkout_path. Restart-tier.
+    enabled: true
+verify_drift_check_every_n_lands: 20   # companion setting: periodic remote/local
+                                        # verdict cross-check cadence
+```
+
+Worked example, modelled on a live deployment (Dark Factory's own):
+
+```yaml
+verify_runners:
+  - name: laptop
+    ssh_host: leo-laptop
+    git_remote: leo-laptop
+    config_path: /home/leo/.config/orchestrator/dark-factory-laptop.yaml
+    df_checkout_path: /home/leo/src/dark-factory
+    gate_checkouts_path: /home/leo/src/dark-factory-gate
+    enabled: true
+verify_drift_check_every_n_lands: 20
+```
+
+Four operator-facing facts:
+
+- **`enabled: false` is the kill switch — no need to delete the block.**
+  Every consumer reads runners through the `enabled_verify_runners`
+  property (never `verify_runners` directly), which already filters to
+  `enabled=True`. Disabling a runner is a one-line edit, and the config
+  keeps its history of what's been tried.
+- **`verify_runners` is restart-only, not hot-reloadable.** A config
+  reload accepts the edit into the file but reports it under
+  `restart_required` — see `OPERATIONS.md`'s config-reload tiers. Don't
+  expect a live pool change from a reload alone.
+- **`df_checkout_path` is required for an enabled runner, and an absolute
+  path.** A runner that cannot be gated is a configuration error at load,
+  not a dispatch through a shared tree. A process that has an enabled runner
+  but cannot resolve its own deployed commit refuses to start, for the same
+  reason.
+- **The gate builder runs `uv sync --all-packages`; it does not run
+  `npm ci`.** A commit that bumps `package-lock.json` still needs the Node-installed tools provisioned on the host ("Provisioning
+  the remote host" above). Gate directories are built on first use of a
+  commit (about a second warm, a minute cold), are marked ready only once
+  their own binary answers the handshake for their commit, are never written
+  after that, and are reaped when idle for 7 days (leftover trash after 1 day)
+  by a detached sweep launched at most hourly per orchestrator process (never against a benched host: unreachable, skew or divergence) that touches only a root carrying the
+  `.dark-factory-gate-root` marker. The dispatcher emits `runner_stale` then
+  `runner_synced` (kind `gate_checkout`) when it had to build one.
+
+For the environment-parity checklist between a workstation and a laptop
+verify host, and day-2 operational notes for a live laptop runner, see
+`docs/verdict-parity-report.md` (§1, §6) — this section covers the
+generic wiring and precedence, not environment fingerprints or ongoing
+operational notes, which already live there. For the full config
+hot-reload tier reference, see `OPERATIONS.md`.
 
 ---
 

@@ -22,6 +22,7 @@ import sys
 import warnings
 import weakref
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -71,12 +72,15 @@ if str(REPO_ROOT) not in sys.path:
 from _fm_helpers import (  # noqa: E402
     _leaked_async_httpx_clients,
     _warn_if_drain_closed_a_foreign_client,
+    complete_paged_read,
+    install_identity_mocks,
     pydantic_spec,
     reap_leaked_async_httpx_clients,
     reap_leaked_ticket_workers,
     resolve_xdist_worker_id,
     track_async_httpx_clients,
 )
+from _graphiti_fake import FakeGraphitiClient  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
@@ -95,6 +99,7 @@ from fused_memory.config.schema import (  # noqa: E402
     QueueConfig,
     RoutingConfig,
 )
+from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV  # noqa: E402
 
 
 def pytest_configure(config):
@@ -136,20 +141,214 @@ def worker_id(request) -> str:
     return resolve_xdist_worker_id(request)
 
 
-@pytest.fixture(autouse=True)
-def preserve_config_path():
-    """Save and restore os.environ['CONFIG_PATH'] around every test.
+#: The canonical fused-memory config, by ABSOLUTE path, for the autouse
+#: ``_isolate_fm_config`` pin below.  Derived from this file's location and
+#: NEVER from ``Path.cwd()`` — a CWD-derived path would reintroduce the exact
+#: leak the pin exists to close.
+FM_CONFIG_PATH = Path(_tests_dir).parent / 'config' / 'config.yaml'
 
-    This is a safety net: if a test (or the code under test) modifies CONFIG_PATH,
-    it won't leak into subsequent tests.  The fixture is autouse so all tests in this
-    package are covered without needing to request it explicitly.
+#: The top-level fields ``FusedMemoryConfig`` exposes to the environment.
+#: DERIVED from the model, never listed by hand: a field added later is then
+#: covered with no edit here, which is the drift that let this leak class
+#: survive in one subproject after being fixed in the other.
+_FM_CONFIG_FIELDS = frozenset(FusedMemoryConfig.model_fields)
+
+#: The variables the TRACKED config interpolates into its PATH-VALUED leaves,
+#: each mapped to its layout under a test's ``tmp_path``.  The layout's home is
+#: the ``${VAR:default}`` in ``fused-memory/config/config.yaml``; it is mirrored
+#: here so config-driven stores stay out of the tmp root a test uses for its
+#: own files, and
+#: ``test_config_hermeticity.py::test_the_pin_lays_out_tmp_path_as_the_tracked_config_does``
+#: fails if the mirror drifts from that home.  A
+#: THIRD env surface, reached through the YAML's own interpolation rather than
+#: through pydantic's env layer, so the derived names above cannot see it:
+#: measured with ``CONFIG_PATH`` already pinned at the canonical file,
+#: ``PROJECT_ROOT=/pwned-by-env`` still rewrote both of its leaves, and this
+#: repo's operator scripts do export ``PROJECT_ROOT``
+#: (``scripts/memory-metadata-coverage-census.sh`` and two siblings).
+#: LISTED rather than derived, unlike the model fields: deriving the
+#: interpolation surface from the file would sweep in ``${OPENAI_API_KEY}`` and
+#: ``${FALKORDB_URI:...}``, which the config reads from the environment BY
+#: DESIGN.  Only path-valued names belong here.
+_FM_CONFIG_PATH_INTERPOLATIONS = {
+    'PROJECT_ROOT': Path('.'),
+    'QUEUE_DATA_DIR': Path('data', 'queue'),
+    'RECONCILIATION_DATA_DIR': Path('data', 'reconciliation'),
+}
+
+
+def _reads_as_a_config_override(env_name):
+    """Whether pydantic-settings would read *env_name* as a config field.
+
+    ``env_prefix=''`` makes the WHOLE name a top-level field name, and
+    ``env_nested_delimiter='__'`` makes everything before the first ``__`` the
+    top-level field of a nested override.  Both are matched case-insensitively
+    because the model sets ``case_sensitive=False``.
+
+    Nothing else matches: ``PATH`` is not ``path_scope_adjudicator``, and
+    ``FOO__TASKMASTER`` has the head ``foo``.  That narrowness is deliberate —
+    unrelated fixtures and the uv/venv machinery legitimately need the ambient
+    environment, so a blanket clear would trade one nondeterminism for a worse
+    one.  It is also asserted rather than merely asserted-in-prose:
+    ``test_config_hermeticity.py::TestTheScrubStaysNarrow`` plants those
+    near-miss names ambiently and fails if a widened match deletes one, which
+    is the failure a reader would otherwise meet as a cascade in an unrelated
+    suite.
     """
-    original = os.environ.get('CONFIG_PATH')
-    yield
-    if original is None:
-        os.environ.pop('CONFIG_PATH', None)
-    else:
-        os.environ['CONFIG_PATH'] = original
+    lowered = env_name.lower()
+    return lowered in _FM_CONFIG_FIELDS or lowered.split('__', 1)[0] in _FM_CONFIG_FIELDS
+
+
+@pytest.fixture(autouse=True)
+def _isolate_fm_config(monkeypatch, tmp_path):
+    """Pin ``CONFIG_PATH`` at the canonical config so config resolution does
+    not depend on the process CWD (task 5444), and its path leaves at this
+    test's ``tmp_path`` (task 5481).
+
+    ``FusedMemoryConfig`` is a pydantic-settings ``BaseSettings``, not a plain
+    ``BaseModel``: ``fused_memory.config.schema::FusedMemoryConfig.settings_customise_sources``
+    reads ``CONFIG_PATH`` with a default of the RELATIVE ``config/config.yaml``,
+    and ``fused_memory.config.schema::YamlSettingsSource.__call__`` returns
+    ``{}`` — silently — when that path does not exist.
+
+    WITHOUT THIS PIN the YAML layer is present only when pytest happens to run
+    from ``fused-memory/``.  Run the identical commit from the repo root and
+    every field a test does not pass explicitly drops to its code default; the
+    tracked ``taskmaster:`` section disappears and ``config.taskmaster``
+    becomes ``None``.  That is not hypothetical: it is why
+    ``test_referent_repair.py``'s taskmaster test read as green for both
+    registered verify commands (both ``cd`` into ``fused-memory/``) and red for
+    a human running it from the root — a phantom main-red that cost an
+    investigation and produced a fix for a test that was never broken.  See
+    ``plans/fused-memory-config-cwd-leak-rca-2026-09-13.md``.
+
+    Pinning the CANONICAL file rather than an absent one reproduces the
+    CWD=``fused-memory/`` semantics every currently-green test was written
+    against, so the pin changes no test's meaning — it only makes the result
+    the same from everywhere.  Tests that want pure schema defaults opt into
+    ``code_default_config`` below.
+
+    Mirrors the CONFIG-PATH half of
+    ``orchestrator/tests/conftest.py::_isolate_orch_config``, whose docstring
+    records the same reasoning for ``ORCH_CONFIG_PATH`` ("the absolute path is
+    also CWD-independent, so the config no longer depends on running from
+    ``orchestrator/``").  That hardening was applied subproject-locally and
+    never propagated; this is the propagation.
+
+    THE PATH-LEAF HALF.  The tracked file's path leaves interpolate the
+    variables in ``_FM_CONFIG_PATH_INTERPOLATIONS``; this fixture points them
+    at this test's ``tmp_path``, so a write through a bare config lands in tmp
+    — the mirror of ``ORCH_PROJECT_ROOT`` in
+    ``orchestrator/tests/conftest.py::_isolate_orch_config``.  It pins the
+    YAML's own variables, not pydantic's nested ``TASKMASTER__PROJECT_ROOT``
+    names: the env layer outranks the YAML, so those would override a test's
+    OWN config file.  A test-body ``setenv`` of one of the three still wins.
+    The measurement is in ``plans/fused-memory-config-cwd-leak-rca-2026-09-13.md``;
+    ``test_config_hermeticity.py`` states both halves executably.
+
+    ``monkeypatch.setenv`` restores the pre-existing value at teardown, so this
+    SUBSUMES the ``preserve_config_path`` fixture it replaced — one fixture
+    owning ``CONFIG_PATH`` rather than two with no defined ordering between
+    them.  A test that sets ``CONFIG_PATH`` itself still wins: a
+    function-scoped ``monkeypatch.setenv`` in the test body runs after this
+    autouse fixture.  That same ordering is why the scrub below cannot — and
+    must not — stop a test setting ``SERVER__PORT`` deliberately; it removes
+    only what pytest INHERITED.
+
+    THE ENVIRONMENT HALF.  Pinning the file closes only half the leak.  The
+    model sets ``env_prefix=''``, so a bare ambient variable named after any
+    top-level field is an unprefixed override that outranks the YAML.
+    Measured: ``TASKMASTER='{"project_root": "/pwned-by-env"}'`` rewrites
+    ``config.taskmaster.project_root`` even with ``CONFIG_PATH`` pointing at a
+    missing file, so whatever the shell, the CI runner or a parent process
+    happens to export decides what a test reads.  The names are DERIVED from
+    the model rather than listed, mirroring
+    ``orchestrator/src/orchestrator/verify.py``'s reason for scrubbing the
+    whole ``ORCH_`` prefix: so a variable added later cannot reintroduce the
+    class.  The comprehension snapshots the names before the loop deletes any,
+    since mutating ``os.environ`` while iterating it raises.  The YAML's own
+    interpolation surface, which pydantic never sees, is covered by the
+    path-leaf pin above: ``setenv`` overwrites an inherited value.
+    """
+    for inherited in [name for name in os.environ if _reads_as_a_config_override(name)]:
+        monkeypatch.delenv(inherited, raising=False)
+
+    for name, layout in _FM_CONFIG_PATH_INTERPOLATIONS.items():
+        monkeypatch.setenv(name, str(tmp_path / layout))
+
+    monkeypatch.setenv('CONFIG_PATH', str(FM_CONFIG_PATH))
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_project_registry(monkeypatch):
+    """Drop an INHERITED ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (task 3708).
+
+    A ``GraphitiBackend`` built without ``registered_graph_ids`` (through
+    ``MemoryService`` or a direct construction, rather than ``make_backend``)
+    derives its index-provisioning registry from this variable plus
+    ``taskmaster.project_root``.  The live service exports it, so an operator
+    shell would otherwise register real project ids, and writes to them would
+    attempt provisioning against mock drivers.  A test that sets it itself still
+    wins, because its ``monkeypatch.setenv`` runs after this fixture.
+
+    The project_root half is ``_isolate_fm_config``'s pin, this test's
+    ``tmp_path``, so the derived registry registers that tmp dir's basename,
+    never the launching checkout.
+    """
+    monkeypatch.delenv(KNOWN_PROJECT_ROOTS_ENV, raising=False)
+
+
+@pytest.fixture
+def code_default_config(monkeypatch, tmp_path):
+    """Resolve ``FusedMemoryConfig()`` from the SCHEMA alone, on request.
+
+    Opt-in counterpart to the autouse ``_isolate_fm_config`` above.  That
+    fixture deliberately keeps the tracked ``fused-memory/config/config.yaml``
+    loaded, because that is what every currently-green test was written
+    against — but it therefore leaves no way to ask what a field's CODE
+    default is.  Pointing ``CONFIG_PATH`` at a guaranteed-absent file makes
+    ``fused_memory.config.schema::YamlSettingsSource.__call__`` skip the YAML
+    layer (its ``.exists()`` is False), so only the schema's own defaults
+    remain.
+
+    Request it explicitly, or via ``@pytest.mark.usefixtures``; NEVER autouse.
+    It runs after the autouse pin and deliberately overrides it, so making it
+    autouse would strip the YAML from the whole suite.
+
+    THE MEASUREMENT THAT SIZES BOTH FIXTURES — taken at eb04f1d1c8, the whole
+    suite with the YAML layer removed (``FM_CONFIG_PATH`` temporarily
+    re-pointed at an absent file, less the two assertions in this branch that
+    exist to pin the file's PRESENCE and so cannot survive its removal):
+    ``1 failed, 19783 passed, 3 skipped`` in 265.69s.  The single failure is
+    ``test_referent_repair.py::TestTheStormGateProjectRoot::test_the_taskmaster_project_root_is_never_used_as_a_fallback``
+    — the trap this task exists because of.  Exactly one test in ~19.8k reads
+    a value that only the ambient file supplies, which is why a CWD-dependent
+    config could sit under this suite unnoticed.  Mirrors
+    ``orchestrator/tests/conftest.py::code_default_config``, whose absent-file
+    trick this copies.
+    """
+    monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'no-such-config.yaml'))
+
+
+@dataclass(frozen=True)
+class EscalationQueueRelocation:
+    legacy_relpath: str
+    relocated_relpath: str
+
+
+@pytest.fixture
+def escalation_queue_relocation(monkeypatch) -> EscalationQueueRelocation:
+    """Simulate an operator relocating the escalation queue in its one home."""
+    import shared.project_layout
+
+    relocation = EscalationQueueRelocation(
+        legacy_relpath=shared.project_layout.ESCALATION_QUEUE_RELPATH,
+        relocated_relpath='data/relocated-escalations',
+    )
+    monkeypatch.setattr(
+        shared.project_layout, 'ESCALATION_QUEUE_RELPATH', relocation.relocated_relpath
+    )
+    return relocation
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -341,11 +540,47 @@ def standard_mock_config() -> MagicMock:
 
 @pytest.fixture
 def make_backend():
-    """Factory fixture: returns a callable(config) -> GraphitiBackend with mock client."""
-    def _factory(config) -> GraphitiBackend:
-        backend = GraphitiBackend(config)
+    """Factory fixture: returns a callable(config) -> GraphitiBackend with mock client.
+
+    ``registered_graph_ids`` defaults to EMPTY, not to the derived registry, so
+    no ambient DASHBOARD_KNOWN_PROJECT_ROOTS or CWD-derived project id can turn
+    on index provisioning against a MagicMock driver (task 3708).
+
+    For a client that enforces graphiti_core's uuid= contract, use
+    make_backend_over_fake_graphiti.
+    """
+    def _factory(config, *, registered_graph_ids=()) -> GraphitiBackend:
+        backend = GraphitiBackend(config, registered_graph_ids=registered_graph_ids)
         backend.client = MagicMock()
         backend._driver = MagicMock()
+        return backend
+
+    return _factory
+
+
+@pytest.fixture
+def make_backend_over_fake_graphiti():
+    """Factory fixture: returns a callable(config, fake, *, registered_graph_ids=()) -> GraphitiBackend over *fake*.
+
+    The contract-faithful sibling of make_backend: use it when a test depends
+    on graphiti_core's argument semantics (FakeGraphitiClient models the
+    ``uuid=`` load-or-raise contract); use make_backend when a permissive
+    MagicMock client suffices.  Same empty registry default as make_backend.
+
+    The real backend stays in the path; only the graphiti_core client is
+    replaced.  ``_driver_for`` returns None because there is no FalkorDB
+    driver and the fake ignores ``client.search(driver=...)``.
+    ``install_identity_mocks`` keeps the post-write reconcile off the
+    nonexistent driver.
+    """
+    def _factory(
+        config, fake: FakeGraphitiClient, *, registered_graph_ids=(),
+    ) -> GraphitiBackend:
+        backend = GraphitiBackend(config, registered_graph_ids=registered_graph_ids)
+        backend.client = fake  # type: ignore[assignment]
+        backend._client_for = MagicMock(return_value=fake)  # type: ignore[method-assign]
+        backend._driver_for = MagicMock(return_value=None)  # type: ignore[method-assign]
+        install_identity_mocks(backend)  # type: ignore[arg-type]
         return backend
 
     return _factory
@@ -391,12 +626,14 @@ def make_graph_mock():
     person to paginate something rediscovers the same trap.
 
     This fixture deliberately does NOT simulate the server's
-    ``RESULTSET_SIZE`` truncation.  ONE double owns that behaviour —
-    ``test_graph_read_pagination.FakeCappedGraph``, which also carries the
-    stateful query log the truncation tests need — because two doubles that
-    both claim to stand in for the same server drift, and the drift shows up
-    as a test that passes against a fake nothing else agrees with.  A test
-    that needs the cap should use that one.
+    ``RESULTSET_SIZE`` truncation.  ONE ro_query-level double owns that
+    behaviour — ``test_graph_read_pagination.FakeCappedGraph``, which also
+    carries the stateful query log the truncation tests need — because two
+    doubles that both claim to stand in for the same server drift, and the
+    drift shows up as a test that passes against a fake nothing else agrees
+    with.  A test that needs the cap should use that one (or, for episode
+    reads through graphiti-core, its API-level counterpart
+    ``FakeCappedEpisodeStore`` in the same module).
     """
     skip_limit_re = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
     # Deliberately NARROW: only a query whose entire projection is a bare row
@@ -466,10 +703,27 @@ def make_fake_maintenance_service():
 
 @pytest.fixture
 def make_edge_backend():
-    """Factory fixture: returns a callable(backend, *, nodes, edges) -> backend."""
-    def _factory(backend, *, nodes, edges):
-        backend.list_entity_nodes = AsyncMock(return_value=nodes)
-        backend.get_all_valid_edges = AsyncMock(return_value=edges)
+    """Factory fixture: callable(backend, *, nodes, edges, nodes_read=None, edges_read=None) -> backend.
+
+    Stubs the two paginated whole-graph reads, ``enumerate_entity_nodes`` and
+    ``enumerate_all_valid_edges``, to return ``(nodes, nodes_read)`` and
+    ``(edges, edges_read)``.  A read left as None is a proven-complete
+    ``complete_paged_read`` sized to its collection.  Pass
+    ``incomplete_paged_read(kind)`` to drive the completeness policy.
+
+    The back-compat shims ``list_entity_nodes`` / ``get_all_valid_edges`` stay
+    REAL: they delegate to these stubs and apply the shared policy, so a
+    caller on either surface reads the same corpus.
+    """
+    def _factory(backend, *, nodes, edges, nodes_read=None, edges_read=None):
+        if nodes_read is None:
+            nodes_read = complete_paged_read(rows_seen=len(nodes))
+        if edges_read is None:
+            edges_read = complete_paged_read(
+                rows_seen=sum(len(v) for v in edges.values())
+            )
+        backend.enumerate_entity_nodes = AsyncMock(return_value=(nodes, nodes_read))
+        backend.enumerate_all_valid_edges = AsyncMock(return_value=(edges, edges_read))
         return backend
 
     return _factory
@@ -477,8 +731,25 @@ def make_edge_backend():
 
 @pytest.fixture
 def mock_config(tmp_path) -> FusedMemoryConfig:
-    """A FusedMemoryConfig that doesn't require real API keys or services."""
-    return FusedMemoryConfig(
+    """A FusedMemoryConfig that doesn't require real API keys or services.
+
+    NOT hermetic, despite reading that way.  ``FusedMemoryConfig`` is a
+    pydantic-settings ``BaseSettings``: only the sections passed explicitly
+    below are fixed here.  Every other field — ``taskmaster`` among them —
+    comes from the YAML that ``_isolate_fm_config`` pins and from the
+    environment (the model sets ``env_prefix=''``).  A test asserting on a
+    field this factory does not name is asserting on the tracked
+    ``fused-memory/config/config.yaml``, not on a code default.
+
+    ``write_triage.enabled`` is the one YAML-sourced field pinned here, to
+    off: the tracked YAML ships it on (task 3169), and with it on every
+    Mem0-primary ``add_memory`` in a unit test would reach the real judge
+    client.  A test of the triage path opts in on its own config.
+    ``overreach_guard.shadow_enabled`` is pinned off for the same reason: with
+    it on, every decision write in a unit test would reach the real overreach
+    judge; a test of the shadow opts in on its own config.
+    """
+    config = FusedMemoryConfig(
         llm=LLMConfig(
             provider='openai',
             model='gpt-4o-mini',
@@ -507,3 +778,57 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
             data_dir=str(tmp_path / 'queue'),
         ),
     )
+    config.write_triage.enabled = False
+    config.overreach_guard.shadow_enabled = False
+    return config
+
+
+# ---------------------------------------------------------------------------
+# The integration lane's in-use collection lease (task 4775)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _integration_collection_lease(request):
+    """Hold an in-use lease for the duration of every ``integration`` test.
+
+    ``scripts/cleanup_test_collections.py`` runs from cron every six hours
+    and deletes every collection under ``PREFIXES`` unconditionally.  A live
+    integration test seeds under one of those prefixes, so an unguarded
+    sweep landing between its seed and its assertions empties the corpus out
+    from under it — and leaves nothing behind pointing at the reaper.
+
+    MARKER-KEYED AND AUTOUSE, rather than a module-level
+    ``pytest.mark.usefixtures``.  A module-level opt-in could not reach two
+    of the three modules that need it: ``test_memory_eval_retrieval_probe.py``
+    and ``test_memory_eval_staleness_sweep.py`` deliberately mark
+    ``integration`` PER-TEST, because ``addopts = -m 'not integration'``
+    means a module-level mark would deselect the ~170 pure tests each of
+    them carries (both files say so in a comment).  More importantly, ANY
+    per-module opt-in is a thing a future integration module can forget, and
+    silently forgetting the guard is exactly the failure this exists to
+    prevent — the same argument the reaper's own docstring makes about a
+    prefix coined in one file and reaped by a constant in another.
+
+    Costs an unmarked test nothing: it yields immediately, loads no script
+    and creates no directory, so the merge lane (which runs under
+    ``-m 'not integration'``) never writes into the machine-global lease
+    directory the live cron reads.
+
+    The reaper is loaded LAZILY here rather than at conftest import time, for
+    the reason ``_fm_helpers.qdrant_skipif`` documents for deferring its own
+    probe: a session that never runs an integration test must not pay for
+    it.  Via ``load_script_module`` — do not add another local
+    ``spec_from_file_location`` loader (tasks 3738/3895).
+    """
+    if request.node.get_closest_marker('integration') is None:
+        yield
+        return
+
+    from _fm_helpers import load_script_module  # noqa: PLC0415
+
+    reaper = load_script_module(
+        Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py',
+    )
+    with reaper.hold_lease(owner=request.node.nodeid):
+        yield

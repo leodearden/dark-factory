@@ -14,6 +14,9 @@ mis-modeled recon's run_id and marker-deletion mechanics.
 from __future__ import annotations
 
 from fused_memory.middleware.premise_lint_guard import premise_lint_error
+from fused_memory.reconciliation.graphiti_degradation_probe import (
+    NEGATIVE_SET_VERDICT,
+)
 
 # ---------------------------------------------------------------------------
 # Step-1: invariant matrix tests
@@ -226,9 +229,10 @@ class TestPremiseLintErrorInvariantMatrix:
     def test_recon_stage_marker_deletion_cross_clause_false_positive_accepts(self):
         """A benign description that mentions "Stage 3" in one clause and a
         correct "GC ... deletes the marker" in a separate clause — split by
-        a semicolon — must NOT be flagged. Regression guard for the
-        tempered-dot gap (`_GAP_NO_NEGATION`) spanning a clause terminator
-        and combining an unrelated "Stage 3" mention with a later, correct
+        a semicolon — must NOT be flagged. Regression guard for a
+        subject/verb/marker match spanning a clause terminator
+        (`recon_self_model._GAP_STOP`) and combining an unrelated "Stage 3"
+        mention with a later, correct
         "GC deletes" clause into a spurious subject/verb/object match; the
         sentence never asserts that Stage 3 deletes the marker."""
         result = premise_lint_error(
@@ -260,6 +264,42 @@ class TestPremiseLintErrorInvariantMatrix:
         assert 'invariant(s): markers_deleted_only_by_gc, run_id_is_fresh_per_run' in error
         assert 'never persisted across cycles' in error
         assert 'deleted only by GC' in error
+
+    def test_recon_stage_negative_probe_absence_claim_in_details_rejects(self):
+        """Task 4644: the cd53b227 absence paragraph travelled through
+        `details`, so that is the channel the rule has to close.
+
+        A recon stage promoting a negative mixed-store probe set to "the
+        degradation did not reproduce" is rejected before the task is
+        persisted, with the error naming the invariant it contradicts.
+        """
+        result = premise_lint_error(
+            None,
+            'recon-stage-task_knowledge_sync',
+            '/tmp',
+            details=(
+                'EXPLICIT NON-CORROBORATION: the mixed-store probe ran and the '
+                'degradation did not reproduce this cycle.'
+            ),
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'negative_probe_set_does_not_clear_intermittent_fault' in result['error']
+        # The caller is told the same wording the stage prompts show.
+        assert NEGATIVE_SET_VERDICT in result['error']
+
+    def test_non_recon_caller_negative_probe_claim_passes(self):
+        """The guard's recon-only scoping is unchanged by the new rule: a
+        human or interactive caller writing the same sentence is unaffected."""
+        assert premise_lint_error(
+            None,
+            'claude-interactive',
+            '/tmp',
+            details=(
+                'EXPLICIT NON-CORROBORATION: the mixed-store probe ran and the '
+                'degradation did not reproduce this cycle.'
+            ),
+        ) is None
 
     def test_recon_stage_duplicate_violation_across_fields_deduped(self):
         """The SAME false premise stated in two different fields

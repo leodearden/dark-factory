@@ -41,5 +41,41 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Batched curator prompt for ticket worker",
+      "description": "Lift the TaskInterceptor ticket worker (introduced in task 919) from serial (one candidate per curator call) to batched (N candidates per single curator LLM call). Rationale: the add_task site is a known hot-site under orchestrator load; batching amortises LLM cost and reduces the worst-case resolve_ticket wait for back-to-back submitters.\n\nScope:\n- Extend task_curator.curate() (or add a sibling curate_batch()) to accept an ordered list of candidates and return an ordered list of decisions. Prompt must explicitly handle duplicate pairs WITHIN the batch (A is a duplicate of B and both are new).\n- Worker: when pulling from the queue, if more tickets are immediately available, drain up to a configurable batch_max (e.g. 5) and pass the batch to the curator in one call. Fall back to size-1 if only one ticket is queued.\n- Scale curator budget and turn cap proportional to batch size: config.curator.timeout_seconds and whatever turn cap the curator agent uses in _call_llm must grow with N (e.g. base_timeout + per_item_slack * N, base_turns + per_item_turns * N). Cap the max.\n- Preserve per-ticket failure isolation: a failure decoding the batch response for item i must not fail items j\u2260i. Fall back to size-1 retries for ambiguous items.\n\nOut of scope: worker / ticket design itself (task 919), caller migrations (920/921/922).\n\nDepends on: 919.\n\nmemory_hints:\n  entities: [\"task_curator\", \"curate\", \"curator_worker\", \"batch\"]\n  queries: [\"curator batch prompt design multi-candidate\", \"curator timeout turn cap scaling batch size\"]",
+      "test_strategy": "",
+      "details": "",
+      "authored": false,
+      "id": "924",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-04-24T07:13:19.461Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/src/fused_memory/middleware/task_interceptor.py",
+      "fused-memory/tests/test_ticket_worker.py"
+    ],
+    "base_sha": "5cc007fbf1cc18016757a4c89c1ac384b144b6d1",
+    "branch_sha": "b849c4d4e7f4325157f56b89d4ea088bdd07ac53",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "c0ec5611a8564be8da04dd6019daa216df01c053",
+      "merge_base_sha": "5cc007fbf1cc18016757a4c89c1ac384b144b6d1",
+      "diff_reproduces_from": "git diff 5cc007fbf1 c0ec5611a8",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

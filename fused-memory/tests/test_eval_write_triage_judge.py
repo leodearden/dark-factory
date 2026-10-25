@@ -1,11 +1,11 @@
-"""Tests for eval_write_triage_judge.py — the judge measured against leaf alpha's labels.
+"""Tests for eval_write_triage_judge.py — the runner, the committed-artifact guard and the CLI.
 
 PRD ``docs/prds/memory-write-path-convergence.md`` §9 leaf γ, decision D10.
 
-Structure mirrors ``test_calibrate_write_triage.py``: the script is loaded by
-path through importlib (``scripts/`` is not an importable package), and the
-loader is invoked LAZILY via ``_mod()`` so the label-vocabulary tests below
-stay runnable independently of the script's existence.
+Structure mirrors ``test_calibrate_write_triage.py``: each script is loaded by
+path through importlib (``scripts/`` is not an importable package), under its
+file stem, by the loaders in ``_eval_write_triage_fixtures.py``, and each
+loader is invoked LAZILY so a test loads only the scripts it exercises.
 
 Every test in this file is free of ``OPENAI_API_KEY``, network and Qdrant —
 the judge is injected as a plain callable, exactly as ``run_calibration``
@@ -20,496 +20,47 @@ and traceability — never about whether a number is large enough.
 """
 from __future__ import annotations
 
-import functools
-import importlib.util
+import hashlib
 import json
 import logging
+import subprocess
+import sys
 import types
 from pathlib import Path
 
 import pytest
+from _eval_write_triage_fixtures import ALIASES as _ALIASES
+from _eval_write_triage_fixtures import ALIASES_PATH, FIXTURE_PATH
+from _eval_write_triage_fixtures import PROVENANCE as _PROVENANCE
+from _eval_write_triage_fixtures import aliased_row as _aliased_row
+from _eval_write_triage_fixtures import cases_mod as _cases_mod
+from _eval_write_triage_fixtures import cli_mod as _mod
+from _eval_write_triage_fixtures import corpus as _corpus
+from _eval_write_triage_fixtures import crossed_retrieved_plan as _crossed_retrieved_plan
+from _eval_write_triage_fixtures import live as _live
+from _eval_write_triage_fixtures import one_cluster_corpus as _one_cluster_corpus
+from _eval_write_triage_fixtures import rec as _rec
+from _eval_write_triage_fixtures import scored as _scored
+from _eval_write_triage_fixtures import scoring_mod as _scoring
+from _eval_write_triage_fixtures import slate as _slate
+from _eval_write_triage_fixtures import wording_mod as _wording
 
+from fused_memory.models.enums import SourceStore
+from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
+    OUTCOME_JUDGE,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
-    TRIAGE_OUTCOMES,
 )
+from fused_memory.server.write_triage_judge import JudgePromptElisions, judge_prompt_elisions
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'eval_write_triage_judge.py'
-CALIBRATE_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
-FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
-
-
-def _load_module(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` file by path, registered in ``sys.modules``.
-
-    Registration is required for reflection-based decorators, which resolve
-    ``sys.modules.get(cls.__module__)``. Same loader as
-    ``test_calibrate_write_triage.py``.
-    """
-    import sys  # noqa: PLC0415
-
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-@functools.cache
-def _mod() -> types.ModuleType:
-    return _load_module(SCRIPT_PATH, 'eval_write_triage_judge')
-
-
-@functools.cache
-def _calib() -> types.ModuleType:
-    """Leaf alpha's script, loaded INDEPENDENTLY of the eval's own import.
-
-    Loaded separately on purpose: the whole point of the label-vocabulary
-    tests is that the eval does not RE-SPELL alpha's labels, and reading them
-    back through the eval's own re-export could not tell a faithful re-export
-    from a hand-typed copy that happens to agree today.
-    """
-    return _load_module(CALIBRATE_PATH, 'calibrate_write_triage')
-
-
-@pytest.fixture(scope='module')
-def records() -> list[dict]:
-    """The committed curator corpus, parsed with the stdlib.
-
-    Parsed here rather than through either script's loader, so a loader bug
-    cannot mask a data defect (and vice versa) — the discipline the sibling
-    suite's own ``records`` fixture states.
-    """
-    assert FIXTURE_PATH.exists(), f'fixture missing: {FIXTURE_PATH}'
-    return [
-        json.loads(line)
-        for line in FIXTURE_PATH.read_text().splitlines()
-        if line.strip()
-    ]
-
-
-def _rec(memory_id: str, cluster_id: str, label: str, *, category: str = 'procedural_knowledge') -> dict:
-    """A minimal fixture record — only the keys the eval's pure core reads."""
-    return {
-        'memory_id': memory_id,
-        'content': f'content of {memory_id}',
-        'category': category,
-        'cluster_id': cluster_id,
-        'label': label,
-    }
-
-
-def _corpus() -> list[dict]:
-    """Three clusters, every label represented, deliberately unsorted on input.
-
-    Unsorted so a determinism assertion cannot pass by accident on an input
-    that was already in canonical order.
-
-    ``cluster_id`` IS the canonical record's own ``memory_id`` — the fixture's
-    referential-integrity invariant, pinned against the committed corpus by
-    `test_the_synthetic_corpus_uses_the_fixtures_cluster_key` below. A
-    synthetic corpus that named clusters some other way would let the eval
-    build slates out of ids that exist nowhere, and every test here would
-    still pass.
-    """
-    return [
-        _rec('c2-dup-1', 'c2-canon', 'duplicate'),
-        _rec('c1-canon', 'c1-canon', 'canonical'),
-        _rec('c3-pseudo', 'c3-canon', 'pseudo_contradiction'),
-        _rec('c1-dup-2', 'c1-canon', 'duplicate'),
-        _rec('c2-canon', 'c2-canon', 'canonical'),
-        _rec('c1-dup-1', 'c1-canon', 'duplicate'),
-        _rec('c3-canon', 'c3-canon', 'canonical'),
-        _rec('c2-distinct', 'c2-canon', 'distinct'),
-        _rec('c3-dup-1', 'c3-canon', 'duplicate'),
-    ]
-
-
-def _by_class(cases: list[dict], expected_class: str) -> list[dict]:
-    return [c for c in cases if c['expected_class'] == expected_class]
 
 
 # ---------------------------------------------------------------------------
-# build_judge_cases
-# ---------------------------------------------------------------------------
-
-class TestBuildJudgeCases:
-    """Ground truth derived from alpha's labels — never invented here.
-
-    Each case is one judge call: a submitted entry plus the candidate slate it
-    is shown. The label the curator assigned to the submitted entry is what
-    names the acceptable answers, so every expectation in this class traces
-    back to a human adjudication rather than to a guess about what the judge
-    ought to say.
-    """
-
-    def test_every_non_canonical_record_yields_a_labelled_case(self) -> None:
-        cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        labelled = [
-            c for c in cases
-            if c['expected_class'] != _mod().CLASS_DISTRACTOR
-        ]
-        assert {c['memory_id'] for c in labelled} == {
-            'c1-dup-1', 'c1-dup-2', 'c2-dup-1', 'c2-distinct', 'c3-dup-1', 'c3-pseudo',
-        }
-
-    def test_the_synthetic_corpus_uses_the_fixtures_cluster_key(
-        self, records,
-    ) -> None:
-        """`cluster_id` is the canonical's own `memory_id`, in BOTH corpora.
-
-        Load-bearing, because `build_judge_cases` puts `cluster_id` straight
-        onto the slate as the attach target. If the synthetic corpus named
-        clusters any other way, every slate here would carry an id that
-        resolves to no record — and nothing else in this file would notice,
-        since none of it dereferences the slate.
-        """
-        by_id = {r['memory_id']: r for r in records}
-        for record in records:
-            canonical = by_id.get(record['cluster_id'])
-            assert canonical is not None, f'dangling cluster_id: {record!r}'
-            assert canonical['label'] == _mod().LABEL_CANONICAL, f'{record!r}'
-        for record in _corpus():
-            assert record['cluster_id'] in {r['memory_id'] for r in _corpus()}
-
-    def test_a_canonical_record_is_never_a_submitted_entry(self) -> None:
-        """A canonical IS the attach target; asking the judge to compare it to
-        itself would score the fixture's construction, not the judge.
-        """
-        cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        canonicals = {'c1-canon', 'c2-canon', 'c3-canon'}
-        assert not (canonicals & {c['memory_id'] for c in cases}), (
-            f'a canonical was submitted as a case: {cases!r}'
-        )
-
-    def test_a_labelled_case_always_shows_the_judge_its_cluster_canonical(self) -> None:
-        """The attach target must be on the slate or the answer is about
-        a different memory than the one an attach would touch.
-        """
-        cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        for case in cases:
-            if case['expected_class'] == _mod().CLASS_DISTRACTOR:
-                continue
-            cluster = case['memory_id'].split('-')[0]
-            assert f'{cluster}-canon' in case['candidates'], f'{case!r}'
-
-    def test_the_case_carries_the_submitted_content_and_category(self) -> None:
-        cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        case = next(c for c in cases if c['memory_id'] == 'c1-dup-1')
-        assert case['content'] == 'content of c1-dup-1'
-        assert case['category'] == 'procedural_knowledge'
-
-    # -- the label -> acceptable-outcomes table ----------------------------
-
-    def test_a_duplicate_accepts_either_attach_and_nothing_else(self) -> None:
-        """BOTH attach outcomes are correct, and that is a measurement
-        decision, not laxity.
-
-        Alpha's labels do not separate a verbatim restatement from a
-        rediscovery that carries a novel fragment — the curator recorded
-        "same claim as the canonical" and stopped there. Scoring one of
-        `restated`/`amended` as WRONG would invent a label the curator never
-        assigned and report a made-up error rate as a measured one. The split
-        between them is reported as a DISTRIBUTION instead (see
-        `TestScoreCases`), which says what the judge did without claiming to
-        know which was right.
-        """
-        cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        case = next(c for c in cases if c['memory_id'] == 'c1-dup-1')
-        assert set(case['acceptable_outcomes']) == {OUTCOME_RESTATED, OUTCOME_AMENDED}
-        assert OUTCOME_STORED not in case['acceptable_outcomes'], (
-            'a curator-confirmed rediscovery answered `stored` is the exact '
-            'miss triage exists to catch'
-        )
-        assert OUTCOME_CONTESTED not in case['acceptable_outcomes']
-
-    def test_a_distinct_record_accepts_only_stored(self) -> None:
-        """The hard negative: same cluster, same topic, curator-ruled NOT the
-        same claim. Any attach here destroys a distinction a human drew.
-        """
-        cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        case = next(c for c in cases if c['memory_id'] == 'c2-distinct')
-        assert set(case['acceptable_outcomes']) == {OUTCOME_STORED}
-
-    def test_a_pseudo_contradiction_accepts_everything_but_contested(self) -> None:
-        """These are curator-adjudicated BOTH-CORRECT pairs (esc-5557/esc-5626)
-        — "the contradiction was an omission, not a disagreement".
-
-        So the measurable property is narrow and negative: the judge must not
-        MANUFACTURE a contradiction. Whether it stores or attaches is not
-        something alpha's labels adjudicate, so neither is scored.
-        """
-        cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        case = next(c for c in cases if c['memory_id'] == 'c3-pseudo')
-        assert set(case['acceptable_outcomes']) == set(TRIAGE_OUTCOMES) - {OUTCOME_CONTESTED}
-        assert OUTCOME_CONTESTED not in case['acceptable_outcomes']
-
-    def test_the_table_is_alphas_vocabulary_imported_not_re_spelled(self) -> None:
-        """A fifth label added to alpha must fail HERE, loudly.
-
-        The failure mode this forbids: a new curator label lands in the
-        fixture, this eval has no entry for it, and it is quietly bucketed as
-        something — producing an accuracy figure computed against an
-        expectation nobody ever set.
-        """
-        calib = _calib()
-        assert set(_mod().ACCEPTABLE_OUTCOMES) == {
-            calib.LABEL_DUPLICATE,
-            calib.LABEL_DISTINCT,
-            calib.LABEL_PSEUDO_CONTRADICTION,
-        }
-        assert _mod().LABEL_CANONICAL == calib.LABEL_CANONICAL
-
-    def test_an_unknown_label_raises_rather_than_being_bucketed(self) -> None:
-        corpus = [*_corpus(), _rec('c1-mystery', 'c1', 'newly_invented_label')]
-        with pytest.raises(Exception, match='newly_invented_label'):
-            _mod().build_judge_cases(corpus, distractors=2)
-
-    def test_every_label_in_the_committed_fixture_is_covered(self, records) -> None:
-        """The live guard against the case above, run on the real corpus."""
-        known = set(_mod().ACCEPTABLE_OUTCOMES) | {_mod().LABEL_CANONICAL}
-        assert {r['label'] for r in records} <= known
-
-    # -- distractors -------------------------------------------------------
-
-    def test_a_distractor_never_comes_from_the_cases_own_cluster(self) -> None:
-        """A same-cluster record on the "unrelated" slate would make an attach
-        to it CORRECT while being scored as a distraction.
-        """
-        corpus = _corpus()
-        by_id = {r['memory_id']: r['cluster_id'] for r in corpus}
-        for case in _mod().build_judge_cases(corpus, distractors=2):
-            own = by_id.get(case['memory_id'])
-            cluster = case['memory_id'].split('-')[0]
-            extras = [
-                cid for cid in case['candidates']
-                if cid != f'{cluster}-canon'
-            ]
-            assert own is not None
-            for cid in extras:
-                assert by_id[cid] != own, f'{case!r} carries a same-cluster distractor'
-
-    def test_the_slate_is_the_canonical_plus_exactly_n_distractors(self) -> None:
-        """PRD C1's "top 3-5" is a WIDTH; a slate that silently narrows makes
-        the measurement easier than the production call it stands in for.
-        """
-        cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        for case in cases:
-            if case['expected_class'] == _mod().CLASS_DISTRACTOR:
-                continue
-            assert len(case['candidates']) == 3, f'{case!r}'
-            assert len(set(case['candidates'])) == 3, f'duplicated slot: {case!r}'
-
-    def test_selection_is_deterministic_and_seedless(self) -> None:
-        """Committed artifacts must be reproducible from the fixture alone.
-
-        `random` is not merely discouraged here: a seeded shuffle would make
-        the committed report un-reproducible by anyone who did not also know
-        the seed, and an unseeded one un-reproducible by anyone at all.
-        """
-        first = _mod().build_judge_cases(_corpus(), distractors=2)
-        second = _mod().build_judge_cases(list(reversed(_corpus())), distractors=2)
-        assert first == second, 'case construction depends on input ORDER'
-
-    def test_distractors_are_spread_rather_than_the_same_slate_every_time(
-        self, records,
-    ) -> None:
-        """A single globally-smallest slate reused 84 times would measure one
-        arbitrary pair of clusters, not the corpus.
-        """
-        cases = _mod().build_judge_cases(records, distractors=4)
-        slates = {tuple(sorted(c['candidates'])) for c in cases}
-        assert len(slates) > 1, 'every case was shown an identical slate'
-
-    # -- the distractor control class --------------------------------------
-
-    def test_a_distractor_control_case_shows_no_same_cluster_record_at_all(
-        self,
-    ) -> None:
-        """The negative control: nothing on the slate is the right answer.
-
-        Without it the eval cannot tell a judge that classifies from a judge
-        that attaches to whatever it is shown — the labelled cases all carry
-        the correct target, so "always attach" scores well on every one of
-        them.
-        """
-        corpus = _corpus()
-        by_id = {r['memory_id']: r['cluster_id'] for r in corpus}
-        controls = _by_class(_mod().build_judge_cases(corpus, distractors=2), 'distractor')
-        assert controls, 'no distractor-control cases were built'
-        for case in controls:
-            own = by_id[case['memory_id']]
-            for cid in case['candidates']:
-                assert by_id[cid] != own, f'{case!r} shows its own cluster'
-
-    def test_a_distractor_control_accepts_only_stored(self) -> None:
-        controls = _by_class(_mod().build_judge_cases(_corpus(), distractors=2), 'distractor')
-        for case in controls:
-            assert set(case['acceptable_outcomes']) == {OUTCOME_STORED}, f'{case!r}'
-
-    def test_the_control_slate_is_as_wide_as_a_labelled_one(self) -> None:
-        """Same width, so a difference in the answer is about the CONTENT of
-        the slate rather than about how much of it there was.
-        """
-        cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        controls = _by_class(cases, 'distractor')
-        for case in controls:
-            assert len(case['candidates']) == 3, f'{case!r}'
-
-    def test_the_control_class_is_capped_at_one_case_per_cluster(self) -> None:
-        """Cost control, stated rather than silent: every case is a paid LLM
-        call, and one control per cluster already answers the question the
-        control exists to ask.
-        """
-        controls = _by_class(_mod().build_judge_cases(_corpus(), distractors=2), 'distractor')
-        clusters = [c['memory_id'].split('-')[0] for c in controls]
-        assert sorted(clusters) == ['c1', 'c2', 'c3']
-
-    def test_the_class_name_is_a_module_constant_not_a_literal(self) -> None:
-        assert _mod().CLASS_DISTRACTOR == 'distractor'
-        assert tuple(_mod().EVAL_CLASSES) == (
-            _calib().LABEL_DUPLICATE,
-            _calib().LABEL_DISTINCT,
-            _calib().LABEL_PSEUDO_CONTRADICTION,
-            _mod().CLASS_DISTRACTOR,
-        )
-
-
-# ---------------------------------------------------------------------------
-# score_cases
-# ---------------------------------------------------------------------------
-
-def _cases(*specs: tuple[str, str]) -> list[dict]:
-    """Hand-built cases: ``(memory_id, expected_class)`` pairs.
-
-    Built directly rather than through ``build_judge_cases`` so a scoring bug
-    and a case-construction bug cannot cancel each other out.
-    """
-    out = []
-    for memory_id, expected_class in specs:
-        out.append({
-            'memory_id': memory_id,
-            'content': f'content of {memory_id}',
-            'category': 'procedural_knowledge',
-            'candidates': ['x-canon'],
-            'expected_class': expected_class,
-            'acceptable_outcomes': _mod().ACCEPTABLE_OUTCOMES.get(
-                expected_class, frozenset({OUTCOME_STORED}),
-            ),
-        })
-    return out
-
-
-class TestScoreCases:
-    """Counting only — every judgment call was made in the table above."""
-
-    def test_per_class_reports_n_correct_and_accuracy(self) -> None:
-        cases = _cases(('a', 'duplicate'), ('b', 'duplicate'), ('c', 'distinct'))
-        got = _mod().score_cases(cases, [OUTCOME_RESTATED, OUTCOME_STORED, OUTCOME_STORED])
-        assert got['per_class']['duplicate'] == {'n': 2, 'correct': 1, 'accuracy': 0.5}
-        assert got['per_class']['distinct'] == {'n': 1, 'correct': 1, 'accuracy': 1.0}
-
-    def test_all_four_classes_are_always_present_with_an_explicit_n(self) -> None:
-        """An omitted class reads identically to a perfect one.
-
-        `distinct` (n=3) and `pseudo_contradiction` (n=6) are small enough
-        that a construction bug could empty either without anything looking
-        wrong, so the report must state the population it measured even when
-        that population is zero.
-        """
-        got = _mod().score_cases([], [])
-        assert set(got['per_class']) == set(_mod().EVAL_CLASSES)
-        for name, entry in got['per_class'].items():
-            assert entry['n'] == 0, name
-            assert entry['correct'] == 0, name
-
-    def test_an_empty_class_scores_none_never_zero(self) -> None:
-        """`0.0` reads as "measured, and the judge failed everything"."""
-        got = _mod().score_cases([], [])
-        for name, entry in got['per_class'].items():
-            assert entry['accuracy'] is None, f'{name}: {entry!r}'
-
-    def test_the_confusion_map_is_every_class_by_every_outcome(self) -> None:
-        """Full 4xN, so a systematic failure is visible as a SHAPE.
-
-        "Every duplicate answered `stored`" is a wiring bug and "duplicates
-        split across the two attaches" is a working judge; a per-class
-        accuracy alone cannot tell them apart.
-        """
-        cases = _cases(('a', 'duplicate'), ('b', 'pseudo_contradiction'))
-        got = _mod().score_cases(cases, [OUTCOME_STORED, OUTCOME_CONTESTED])
-        assert set(got['confusion']) == set(_mod().EVAL_CLASSES)
-        for name, row in got['confusion'].items():
-            assert set(row) == set(TRIAGE_OUTCOMES), name
-        assert got['confusion']['duplicate'][OUTCOME_STORED] == 1
-        assert got['confusion']['duplicate'][OUTCOME_RESTATED] == 0
-        assert got['confusion']['pseudo_contradiction'][OUTCOME_CONTESTED] == 1
-
-    def test_the_duplicate_split_is_a_distribution_not_an_error_term(self) -> None:
-        """Reported, and deliberately not scored — see the table's rationale."""
-        cases = _cases(('a', 'duplicate'), ('b', 'duplicate'), ('c', 'duplicate'))
-        got = _mod().score_cases(
-            cases, [OUTCOME_RESTATED, OUTCOME_AMENDED, OUTCOME_AMENDED],
-        )
-        assert got['duplicate_outcome_split'] == {'restated': 1, 'amended': 2}
-        assert got['per_class']['duplicate']['correct'] == 3, (
-            'the split must not be charged as error'
-        )
-
-    def test_false_contested_counts_every_contested_verdict(self) -> None:
-        """Every one of them is a false positive, and that is a property of
-        the CORPUS, not a simplification.
-
-        Alpha carries no positively-labelled contradiction anywhere: all six
-        `pseudo_contradiction` records were adjudicated NOT contradictions.
-        So the fixture can measure the judge's contested false-positive rate
-        and nothing else — there is no contested recall to compute, and
-        reporting one would be a number with no measurement behind it.
-        """
-        cases = _cases(('a', 'duplicate'), ('b', 'pseudo_contradiction'), ('c', 'distinct'))
-        got = _mod().score_cases(
-            cases, [OUTCOME_CONTESTED, OUTCOME_CONTESTED, OUTCOME_STORED],
-        )
-        assert got['false_contested'] == 2
-
-    def test_no_contested_verdict_scores_zero_not_none(self) -> None:
-        """Unlike an empty class, this one WAS measured — 0 is the finding."""
-        cases = _cases(('a', 'duplicate'))
-        got = _mod().score_cases(cases, [OUTCOME_RESTATED])
-        assert got['false_contested'] == 0
-
-    def test_the_result_round_trips_through_json(self) -> None:
-        """It is written to disk verbatim; a set or a tuple in here is a
-        TypeError at the end of a paid run.
-        """
-        cases = _cases(('a', 'duplicate'), ('b', 'distractor'))
-        got = _mod().score_cases(cases, [OUTCOME_RESTATED, OUTCOME_STORED])
-        assert json.loads(json.dumps(got)) == got
-
-    def test_a_verdict_count_mismatch_raises(self) -> None:
-        """Silently zipping to the shorter list would drop cases from the
-        denominator and report an accuracy over a population nobody chose.
-        """
-        with pytest.raises(Exception, match='(?i)verdict'):
-            _mod().score_cases(_cases(('a', 'duplicate'), ('b', 'distinct')), [OUTCOME_STORED])
-
-    def test_the_distractor_class_is_scored_like_any_other(self) -> None:
-        cases = _cases(('a', 'distractor'), ('b', 'distractor'))
-        got = _mod().score_cases(cases, [OUTCOME_STORED, OUTCOME_RESTATED])
-        assert got['per_class']['distractor'] == {'n': 2, 'correct': 1, 'accuracy': 0.5}
-
-
-# ---------------------------------------------------------------------------
-# Report assembly / rendering / the runner
+# The runner
 # ---------------------------------------------------------------------------
 
 def _fake_judge(answer: str = OUTCOME_RESTATED):
@@ -531,161 +82,23 @@ def _fake_judge(answer: str = OUTCOME_RESTATED):
     return judge_fn
 
 
-_PROVENANCE = {
-    'fixture_path': 'tests/fixtures/write_triage_calibration.jsonl',
-    'judge_provider': 'openai',
-    'judge_model': 'gpt-4o-mini',
-}
-
-
-def _run(tmp_path: Path, *, judge=None, corpus=None, distractors: int = 2):
+def _run(
+    tmp_path: Path,
+    *,
+    judge=None,
+    corpus=None,
+    distractors: int = 2,
+    provenance=None,
+):
     return _mod().run_judge_eval(
-        records=corpus if corpus is not None else _corpus(),
+        plan=_cases_mod().seeded_plan(
+            corpus if corpus is not None else _corpus(),
+            distractors=distractors,
+        ),
         judge_fn=judge if judge is not None else _fake_judge(),
         report_path=tmp_path / 'report.json',
-        provenance=dict(_PROVENANCE),
-        distractors=distractors,
+        provenance=dict(_PROVENANCE if provenance is None else provenance),
     )
-
-
-class TestBuildReport:
-    """The report is the deliverable — D10 makes it the operator's input."""
-
-    def _report(self, **kwargs):
-        cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        verdicts = [OUTCOME_RESTATED] * len(cases)
-        return _mod().build_report(
-            scored=_mod().score_cases(cases, verdicts),
-            provenance=dict(_PROVENANCE),
-            **kwargs,
-        )
-
-    def test_carries_every_top_level_key_the_operator_reads(self) -> None:
-        assert set(self._report()) >= {
-            'per_class', 'confusion', 'duplicate_outcome_split', 'false_contested',
-            'contested_ground_truth', 'caveats', 'provenance',
-        }
-
-    def test_states_in_machine_readable_form_that_contested_is_unmeasurable(
-        self,
-    ) -> None:
-        """The single most misleading reading this report could invite.
-
-        `false_contested: 0` looks like "the contradiction detector is
-        precise". It is not: alpha's corpus carries no positively-labelled
-        contradiction, so a judge that can NEVER say `contested` scores
-        identically to a perfect one. That has to be stated in the artifact
-        rather than left to the reader, and machine-readably rather than only
-        in prose, so a future consumer cannot join on the number without
-        tripping over the caveat.
-        """
-        ground_truth = self._report()['contested_ground_truth']
-        assert ground_truth['available'] is False
-        assert ':' in ground_truth['reason'], (
-            "alpha's '<code>: <measured detail>' reason format"
-        )
-        assert ground_truth['reason'].split(':')[0].strip(), 'a bare detail is not a code'
-
-    def test_all_four_classes_are_present_with_an_explicit_n(self) -> None:
-        per_class = self._report()['per_class']
-        assert set(per_class) == set(_mod().EVAL_CLASSES)
-        for name, entry in per_class.items():
-            assert isinstance(entry['n'], int), name
-
-    def test_provenance_names_the_model_that_produced_the_numbers(self) -> None:
-        """An accuracy figure with no model attached cannot be acted on: the
-        operator at the 3169 gate is deciding about a SHIPPED judge, and the
-        judge follows `llm.model` unless pinned.
-        """
-        provenance = self._report()['provenance']
-        for key in (
-            'fixture_path', 'judge_provider', 'judge_model',
-            'record_count', 'case_count', 'candidate_count', 'distractor_count',
-        ):
-            assert key in provenance, key
-
-    def test_the_report_round_trips_through_json(self) -> None:
-        report = self._report()
-        assert json.loads(json.dumps(report)) == report
-
-    def test_caveats_is_a_list_of_prose_strings(self) -> None:
-        caveats = self._report()['caveats']
-        assert isinstance(caveats, list) and caveats
-        assert all(isinstance(c, str) and c for c in caveats)
-
-
-class TestRenderMarkdown:
-    """Positional column binding — the `_row_cells` idiom from the sibling suite."""
-
-    COLUMNS = ('class', 'n', 'correct', 'accuracy')
-
-    @staticmethod
-    def _cells(row: str) -> list[str]:
-        return [c.strip() for c in row.strip().strip('|').split('|')]
-
-    @classmethod
-    def _row_cells(cls, md: str, name: str) -> dict[str, str]:
-        row = next(ln for ln in md.splitlines() if ln.startswith(f'| {name} |'))
-        cells = cls._cells(row)
-        assert len(cells) == len(cls.COLUMNS), (
-            f'row has {len(cells)} cells, header declares {len(cls.COLUMNS)}: {row}'
-        )
-        return dict(zip(cls.COLUMNS, cells, strict=True))
-
-    def _md(self, verdict: str = OUTCOME_RESTATED) -> str:
-        cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        scored = _mod().score_cases(cases, [verdict] * len(cases))
-        return _mod().render_markdown(
-            _mod().build_report(scored=scored, provenance=dict(_PROVENANCE)),
-        )
-
-    def test_the_header_declares_the_columns_this_class_binds(self) -> None:
-        """Pins the binding itself: a reordered header fails here, once."""
-        header = next(ln for ln in self._md().splitlines() if ln.startswith('| class |'))
-        assert self._cells(header) == list(self.COLUMNS)
-
-    def test_emits_one_row_per_class_including_the_empty_ones(self) -> None:
-        md = self._md()
-        for name in _mod().EVAL_CLASSES:
-            assert self._row_cells(md, name), name
-
-    def test_the_row_carries_that_classes_own_numbers(self) -> None:
-        cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        scored = _mod().score_cases(cases, [OUTCOME_RESTATED] * len(cases))
-        md = _mod().render_markdown(
-            _mod().build_report(scored=scored, provenance=dict(_PROVENANCE)),
-        )
-        cells = self._row_cells(md, 'duplicate')
-        entry = scored['per_class']['duplicate']
-        assert cells['n'] == str(entry['n'])
-        assert cells['correct'] == str(entry['correct'])
-        assert cells['accuracy'] == str(entry['accuracy'])
-
-    def test_an_unmeasured_class_renders_its_none_rather_than_a_number(self) -> None:
-        """`0.0` in this cell would read as a measured failure."""
-        scored = _mod().score_cases([], [])
-        md = _mod().render_markdown(
-            _mod().build_report(scored=scored, provenance=dict(_PROVENANCE)),
-        )
-        assert self._row_cells(md, 'distinct')['accuracy'] == 'None'
-
-    def test_every_caveat_reaches_the_markdown_as_its_own_bullet(self) -> None:
-        """Every ``CAVEATS`` entry renders verbatim, so none is silently dropped.
-
-        Derived from the module's own constant BY IDENTITY, so it pins no
-        prose: rewording a caveat rewords the expectation with it. What it
-        does catch is the drift a keyword check could not — the renderer
-        ceasing to iterate ``report['caveats']``, or an entry going missing
-        on the way to the operator who reads the markdown, not the JSON.
-        """
-        md = self._md()
-        for caveat in _mod().CAVEATS:
-            assert f'- {caveat}' in md, caveat
-
-    def test_renders_a_provenance_bullet_list(self) -> None:
-        md = self._md()
-        assert '## Provenance' in md
-        assert '- `judge_model`: `gpt-4o-mini`' in md
 
 
 class TestRunJudgeEval:
@@ -699,14 +112,106 @@ class TestRunJudgeEval:
         _run(tmp_path)
         assert (tmp_path / 'report.md').exists()
 
+    # --- the markdown sibling's composition (gate item 4) --------------------
+    #
+    # `run_judge_eval` writes the JSON and then a markdown sibling. Deriving
+    # that sibling with `Path.with_suffix('.md')` REPLACES the last suffix, so
+    # `--report-path foo.md` composes back to `foo.md` and the markdown
+    # silently overwrites the JSON that was just written — with no error, on a
+    # script whose output is a committed artifact. `guard_committed_report`
+    # does not cover it: that guard addresses dry-run/`--limit` publishing and
+    # returns early for any non-committed path.
+
+    @staticmethod
+    def _sibling_run(tmp_path: Path, name: str):
+        return _mod().run_judge_eval(
+            plan=_cases_mod().seeded_plan(_corpus(), distractors=2),
+            judge_fn=_fake_judge(),
+            report_path=tmp_path / name,
+            provenance=dict(_PROVENANCE),
+        )
+
+    def test_a_json_report_path_gets_a_dot_md_sibling(self, tmp_path: Path) -> None:
+        """The anchor case: `.json` in, `.md` beside it, JSON still parseable."""
+        report = self._sibling_run(tmp_path, 'r.json')
+        assert json.loads((tmp_path / 'r.json').read_text()) == report
+        assert (tmp_path / 'r.md').exists()
+        assert (tmp_path / 'r.md').read_text().startswith('# ')
+
+    def test_a_multi_suffix_path_keeps_its_json_and_gains_a_sibling(
+        self, tmp_path: Path,
+    ) -> None:
+        """`foo.tar.gz` — the sibling is composed from the STEM, not a suffix swap."""
+        report = self._sibling_run(tmp_path, 'foo.tar.gz')
+        assert json.loads((tmp_path / 'foo.tar.gz').read_text()) == report
+        assert (tmp_path / 'foo.tar.md').exists()
+
+    def test_a_suffixless_path_gains_a_dot_md_sibling(self, tmp_path: Path) -> None:
+        """`--report-path /tmp/smoke` is a reasonable ad-hoc spelling."""
+        report = self._sibling_run(tmp_path, 'smoke')
+        assert json.loads((tmp_path / 'smoke').read_text()) == report
+        assert (tmp_path / 'smoke.md').exists()
+
+    def test_a_dot_md_report_path_raises_instead_of_eating_the_json(
+        self, tmp_path: Path,
+    ) -> None:
+        """The destructive case, and the reason this is gate item 4.
+
+        `with_suffix('.md')` composes `foo.md` back to `foo.md`: the report is
+        written and then overwritten by its own markdown, losing every number
+        the run paid for, silently. `markdown_sibling` raises before the run
+        does ANY work — not merely before the two writes — so the mistake
+        costs nothing at all rather than costing a whole corpus of LLM calls
+        for no artifact. That stronger claim is what
+        :meth:`test_a_dot_md_report_path_costs_nothing_because_it_raises_first`
+        pins; this one stays on the files. A warning instead of a raise, on a
+        script whose output is a committed artifact, would be read after the
+        loss.
+        """
+        target = tmp_path / 'foo.md'
+        with pytest.raises(ValueError) as excinfo:
+            self._sibling_run(tmp_path, 'foo.md')
+        message = str(excinfo.value)
+        assert str(target) in message, message
+        assert not target.exists() or json.loads(target.read_text()), (
+            f'{target} was left holding markdown where the JSON should be'
+        )
+
+    def test_a_dot_md_report_path_costs_nothing_because_it_raises_first(
+        self, tmp_path: Path,
+    ) -> None:
+        """The guard's whole claim is that the mistake is free. Pin the COST.
+
+        Raising before the two WRITES only protects the two files. The
+        precondition is a function of *report_path* alone — knowable before
+        `build_judge_cases`, before the per-case `judge_fn` loop, before
+        `score_cases`. Evaluated after them, `--report-path foo.md` on a LIVE
+        run spends every LLM call for the whole 102-case corpus and then
+        raises with no artifact written at all: the operator pays for the run
+        and gets nothing. The unit tests above cannot see that, because
+        `_sibling_run` injects a free stub judge — so this asserts on the stub
+        judge's CALL LOG instead of on the files.
+        """
+        judge = _fake_judge()
+        with pytest.raises(ValueError):
+            _mod().run_judge_eval(
+                plan=_cases_mod().seeded_plan(_corpus(), distractors=2),
+                judge_fn=judge,
+                report_path=tmp_path / 'foo.md',
+                provenance=dict(_PROVENANCE),
+            )
+        assert judge.calls == [], (
+            f'the guard raised only after {len(judge.calls)} judge call(s); on a '
+            f'live run that is the whole corpus paid for and nothing written'
+        )
+
     def test_creates_the_report_directory(self, tmp_path: Path) -> None:
         nested = tmp_path / 'calibration' / 'nested'
         _mod().run_judge_eval(
-            records=_corpus(),
+            plan=_cases_mod().seeded_plan(_corpus(), distractors=2),
             judge_fn=_fake_judge(),
             report_path=nested / 'report.json',
             provenance=dict(_PROVENANCE),
-            distractors=2,
         )
         assert (nested / 'report.json').exists()
 
@@ -714,7 +219,7 @@ class TestRunJudgeEval:
         """Every call is paid for; a re-ask would double the bill silently."""
         judge = _fake_judge()
         _run(tmp_path, judge=judge)
-        expected = _mod().build_judge_cases(_corpus(), distractors=2)
+        expected = _cases_mod().build_judge_cases(_corpus(), distractors=2)
         assert len(judge.calls) == len(expected)
 
     def test_the_judge_is_handed_resolved_candidate_records_not_bare_ids(
@@ -736,7 +241,7 @@ class TestRunJudgeEval:
         assert by_case[('c1-dup-1', 'duplicate')][0] == 'c1-canon', (
             'the attach target must lead the resolved slate'
         )
-        control = by_case[('c1-dup-1', _mod().CLASS_DISTRACTOR)]
+        control = by_case[('c1-dup-1', _scoring().CLASS_DISTRACTOR)]
         assert 'c1-canon' not in control, (
             'the control slate must carry no correct attach target at all'
         )
@@ -773,10 +278,20 @@ class TestRunJudgeEval:
         provenance = report['provenance']
         assert provenance['record_count'] == len(_corpus())
         assert provenance['case_count'] == len(
-            _mod().build_judge_cases(_corpus(), distractors=2),
+            _cases_mod().build_judge_cases(_corpus(), distractors=2),
         )
         assert provenance['distractor_count'] == 2
         assert provenance['judge_model'] == 'gpt-4o-mini'
+
+    @staticmethod
+    def _short_pool() -> list[dict]:
+        """`_corpus()`'s c1 and c2 clusters: each draws from the other's 3 records.
+
+        At ``distractors=4`` that narrows every labelled slate to 4 and every
+        control to 3 — short, but never empty. A single cluster would empty
+        the control's slate, which `EvalPlan` refuses outright.
+        """
+        return [r for r in _corpus() if r['cluster_id'] in {'c1-canon', 'c2-canon'}]
 
     def test_slate_width_provenance_is_measured_not_asserted(
         self, tmp_path: Path,
@@ -791,20 +306,21 @@ class TestRunJudgeEval:
         arriving by the other door — and the artifact is the operator's
         stated input at the task-3169 flip gate.
 
-        A single-cluster corpus is the concrete trigger: `_distractor_pool`
-        draws only from OTHER clusters, so it is empty and every labelled
-        slate collapses to the canonical alone.
+        A short distractor pool is the concrete trigger: `_distractor_pool`
+        draws only from OTHER clusters, so two clusters of three records
+        cannot fill a 5-wide slate.
         """
-        single = [r for r in _corpus() if r['cluster_id'] == _corpus()[0]['cluster_id']]
-        report = _run(tmp_path, corpus=single, distractors=4)
+        short = self._short_pool()
+        report = _run(tmp_path, corpus=short, distractors=4)
         provenance = report['provenance']
 
         widths = {
             len(c['candidates'])
-            for c in _mod().build_judge_cases(single, distractors=4)
+            for c in _cases_mod().build_judge_cases(short, distractors=4)
         }
-        assert max(widths) < 5, 'precondition: this corpus cannot fill a 5-wide slate'
+        assert widths == {4, 3}, 'precondition: labelled slates 4 wide, controls 3'
         assert provenance['candidate_count'] == max(widths)
+        assert provenance['candidate_count_min'] == min(widths)
         assert provenance['candidate_count'] != 5, (
             'the report must not claim a width it never built'
         )
@@ -815,9 +331,8 @@ class TestRunJudgeEval:
         self, tmp_path: Path, caplog,
     ) -> None:
         """Silence here reads as "covered everything" when it did not."""
-        single = [r for r in _corpus() if r['cluster_id'] == _corpus()[0]['cluster_id']]
         with caplog.at_level(logging.WARNING):
-            _run(tmp_path, corpus=single, distractors=4)
+            _run(tmp_path, corpus=self._short_pool(), distractors=4)
         assert any(
             record.levelno >= logging.WARNING for record in caplog.records
         ), 'a narrowed slate must warn, not pass silently'
@@ -827,9 +342,9 @@ class TestRunJudgeEval:
     ) -> None:
         """Measuring must not CHANGE the numbers when the pool is adequate.
 
-        The committed artifact reports candidate_count 5 / distractor_count 4;
-        measurement has to agree with that on a corpus that can supply it,
-        or this fix would silently restate the operator's own input.
+        A seeded run whose pool can supply `--distractors` publishes exactly
+        the width asked for, or measuring would silently restate the
+        operator's own input.
         """
         report = _run(tmp_path, distractors=2)
         provenance = report['provenance']
@@ -837,6 +352,289 @@ class TestRunJudgeEval:
         assert provenance['candidate_count_min'] == 3
         assert provenance['distractor_count'] == 2
         assert provenance['distractor_count_requested'] == 2
+
+    def test_the_effective_cap_is_recorded_beside_the_built_width(
+        self, tmp_path: Path,
+    ) -> None:
+        """`candidate_count` is the slate BUILT. The model sees it TRIMMED.
+
+        `judge_write` re-trims via
+        `select_judge_candidates(..., resolve_judge_candidate_count(...))`, so
+        a slate built 3 wide against a cap of 2 reaches the model 2 wide and
+        `candidate_count: 3` overstates what was measured. With the shipped
+        `judge_candidate_count: 5` and the default `--distractors 4` the two
+        agree, which is why this is latent rather than visible.
+
+        Recorded ALONGSIDE the measurement, never in place of it: the cap is
+        a config value and `candidate_count` stays the width that was built.
+        """
+        report = _run(tmp_path, distractors=2, provenance={
+            **_PROVENANCE, 'judge_candidate_count': 2,
+        })
+        provenance = report['provenance']
+        assert provenance['candidate_count'] == 3, 'precondition: built 3 wide'
+        assert provenance['judge_candidate_count'] == 2
+
+    def test_a_slate_wider_than_the_effective_cap_is_logged_loudly(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """The same silence the short-pool warning exists to break.
+
+        A run that builds wider than the model can see is measuring a
+        different slate from the one it publishes, and nothing in the
+        artifact says so.
+        """
+        with caplog.at_level(logging.WARNING):
+            _run(tmp_path, distractors=2, provenance={
+                **_PROVENANCE, 'judge_candidate_count': 2,
+            })
+        warnings = [
+            record.getMessage()
+            for record in caplog.records if record.levelno >= logging.WARNING
+        ]
+        assert any('measured' in message for message in warnings), warnings
+        assert any('3' in message and '2' in message for message in warnings), (
+            'the warning must name the width built and the cap it exceeds'
+        )
+
+    def test_a_slate_within_the_effective_cap_does_not_warn(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """A warning that always fires is a warning nobody reads."""
+        with caplog.at_level(logging.WARNING):
+            _run(tmp_path, distractors=2, provenance={
+                **_PROVENANCE, 'judge_candidate_count': 5,
+            })
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestRunResolvesTheJudgeConfigIntoProvenance:
+    """`_run` records the two config values that decide what was measured.
+
+    `run_judge_eval` measures the width it BUILT; what the model saw is that
+    width trimmed by `judge_candidate_count`. And whether the model saw
+    anything at all is `judge_enabled`: a run against a config with the kill
+    switch off returns `stored` on `judge_write`'s FIRST line, spends nothing,
+    and still writes a committed-looking report — in which `distractor` scores
+    1.0 (its only acceptable outcome IS `stored`) and `duplicate` scores 0.0.
+    Neither fact is recoverable from the artifact today.
+
+    Driven through `_run` with `run_judge_eval` captured, so this pins the
+    resolution wiring rather than the runner it hands off to.
+    """
+
+    def _handed(self, tmp_path: Path, monkeypatch, **overrides) -> dict:
+        """The kwargs `_run` hands `run_judge_eval`, with *overrides* on the args."""
+        handed: dict = {}
+
+        def fake_run_judge_eval(**kwargs):
+            handed.update(kwargs)
+            return _scoring().build_report(
+                scored=_scoring().score_cases([], []),
+                provenance=dict(kwargs['provenance']),
+            )
+
+        monkeypatch.setattr(_mod(), 'run_judge_eval', fake_run_judge_eval)
+        args = types.SimpleNamespace(**{
+            'config': None,
+            'report_path': str(tmp_path / 'report.json'),
+            'fixture': str(FIXTURE_PATH),
+            'distractors': 2,
+            'limit': None,
+            'dry_run': True,
+            'slate_mode': _scoring().SLATE_SEEDED,
+            'project_id': 'reify',
+            'field_chars': None,
+            'judge_candidate_count': None,
+            'cases_path': None,
+            'canonical_aliases': None,
+            'wording': 'shipped',
+            **overrides,
+        })
+        assert _mod()._run(args) == 0
+        return handed
+
+    def _captured(self, tmp_path: Path, monkeypatch, **overrides) -> dict:
+        return dict(self._handed(tmp_path, monkeypatch, **overrides)['provenance'])
+
+    @staticmethod
+    def _service():
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+
+        return types.SimpleNamespace(config=FusedMemoryConfig())
+
+    def test_provenance_records_the_effective_candidate_cap(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+
+        captured = self._captured(tmp_path, monkeypatch)
+        expected = write_triage_judge.resolve_judge_candidate_count(self._service())
+        assert captured['judge_candidate_count'] == expected
+        assert isinstance(captured['judge_candidate_count'], int)
+
+    def test_provenance_records_the_effective_field_width(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+
+        captured = self._captured(tmp_path, monkeypatch)
+        expected = write_triage_judge.resolve_judge_field_chars(self._service())
+        assert captured['field_chars'] == expected
+        assert isinstance(captured['field_chars'], int)
+
+    def test_a_requested_width_is_recorded(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        captured = self._captured(tmp_path, monkeypatch, field_chars=40)
+        assert captured['field_chars'] == 40
+
+    def test_provenance_records_whether_the_judge_arm_was_live(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+
+        captured = self._captured(tmp_path, monkeypatch)
+        expected = write_triage_judge.resolve_judge_enabled(self._service())
+        assert captured['judge_enabled'] is expected
+        assert isinstance(captured['judge_enabled'], bool)
+
+    def test_a_disabled_judge_is_machine_detectable_in_the_artifact(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The kill switch is the one that costs the operator a decision.
+
+        `judge_write` returns `stored` on its first line when the switch is
+        off, so every case is answered without a provider call and the report
+        still looks like a measurement.
+        """
+        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+
+        monkeypatch.setattr(
+            write_triage_judge, 'resolve_judge_enabled', lambda service: False,
+        )
+        captured = self._captured(tmp_path, monkeypatch)
+        assert captured['judge_enabled'] is False
+
+    def test_provenance_names_the_alias_sidecar_and_its_size(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        captured = self._captured(tmp_path, monkeypatch, canonical_aliases=str(ALIASES_PATH))
+        assert captured['canonical_aliases_path'] == (
+            'tests/fixtures/write_triage_calibration.canonical_aliases.json'
+        )
+        assert captured['canonical_aliases_count'] == 3
+
+    def test_no_sidecar_is_recorded_as_none_and_zero(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        captured = self._captured(tmp_path, monkeypatch)
+        assert (captured['canonical_aliases_path'], captured['canonical_aliases_count']) == (
+            None, 0,
+        )
+
+    def test_every_case_is_built_with_the_sidecars_aliases(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        aliases = json.loads(ALIASES_PATH.read_text())
+        plan = self._handed(tmp_path, monkeypatch, canonical_aliases=str(ALIASES_PATH))['plan']
+        for case in plan.cases:
+            assert case['canonical_alias_id'] == aliases.get(case['cluster_id']), (
+                case['memory_id']
+            )
+        assert {c['canonical_alias_id'] for c in plan.cases} - {None} == set(aliases.values())
+
+    def test_provenance_names_the_cases_file_package_relative(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        never_written = SCRIPT_PATH.parent.parent / 'calibration' / 'never-written.cases.jsonl'
+        captured = self._captured(tmp_path, monkeypatch, cases_path=str(never_written))
+        assert captured['cases_path'] == 'calibration/never-written.cases.jsonl'
+        assert not never_written.exists()
+
+    def test_no_dump_is_recorded_as_no_cases_path(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        assert self._captured(tmp_path, monkeypatch)['cases_path'] is None
+
+    def test_a_malformed_sidecar_is_refused_by_the_calibrators_parser(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        sidecar = tmp_path / 'aliases.json'
+        sidecar.write_text(json.dumps({'old-canonical': 123}))
+        with pytest.raises(ValueError, match='str -> str'):
+            self._captured(tmp_path, monkeypatch, canonical_aliases=str(sidecar))
+
+    def test_the_three_keys_are_provenance_vocabulary(self) -> None:
+        assert {'canonical_aliases_path', 'canonical_aliases_count', 'cases_path'} <= set(
+            _scoring().PROVENANCE_KEYS,
+        )
+
+    def test_provenance_records_the_system_prompt_it_measured(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+            JUDGE_SYSTEM_PROMPT,
+        )
+
+        recorded = self._captured(tmp_path, monkeypatch)['judge_system_prompt_sha256']
+        assert recorded == hashlib.sha256(JUDGE_SYSTEM_PROMPT.encode('utf-8')).hexdigest()
+        assert len(recorded) == 64 and set(recorded) <= set('0123456789abcdef')
+
+    def test_a_pre_psi_run_records_the_pre_psi_prompt_it_measured(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        recorded = self._captured(tmp_path, monkeypatch, wording='pre-psi')[
+            'judge_system_prompt_sha256'
+        ]
+        assert recorded == hashlib.sha256(
+            _wording().PRE_PSI_JUDGE_SYSTEM_PROMPT.encode('utf-8'),
+        ).hexdigest()
+
+
+class TestADotMdReportPathIsRejectedAtArgumentTime:
+    """`--report-path foo.md` is a bad ARGUMENT, so `_run` refuses it up front.
+
+    Nothing about the collision depends on what the run measures, so making
+    the operator wait for a paid corpus-wide run to be told is pure waste.
+    Driven with a fixture that does NOT exist: if the check were ordered
+    after the fixture load — never mind after the judge loop — the failure
+    would be a `FileNotFoundError` naming the fixture instead of the
+    `ValueError` naming the report path.
+    """
+
+    @staticmethod
+    def _args(tmp_path: Path, name: str) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            config=None,
+            report_path=str(tmp_path / name),
+            fixture=str(tmp_path / 'no-such-fixture.jsonl'),
+            distractors=2,
+            limit=None,
+            dry_run=True,
+            slate_mode=_scoring().SLATE_SEEDED,
+            project_id='reify',
+            field_chars=None,
+            judge_candidate_count=None,
+            cases_path=None,
+            canonical_aliases=None,
+            wording='shipped',
+        )
+
+    def test_run_refuses_it_before_it_even_reads_the_fixture(
+        self, tmp_path: Path,
+    ) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            _mod()._run(self._args(tmp_path, 'foo.md'))
+        assert str(tmp_path / 'foo.md') in str(excinfo.value), str(excinfo.value)
+
+    def test_a_json_report_path_is_not_refused_by_that_check(
+        self, tmp_path: Path,
+    ) -> None:
+        """The control: a well-formed path gets past it and fails LATER, on
+        the missing fixture, which is the next real precondition."""
+        with pytest.raises(FileNotFoundError):
+            _mod()._run(self._args(tmp_path, 'report.json'))
 
 
 # ---------------------------------------------------------------------------
@@ -853,21 +651,27 @@ class TestGuardCommittedReport:
     that measures nothing at all — defaulted to the committed path and
     rewrote both artifacts with fixed-answer numbers under a `dry-run`
     provider nobody was obliged to notice.
+
+    The committed report is also the RETRIEVED-slate arbiter (PRD C2'), so a
+    seeded measurement aimed at it is refused outright. A seeded run anywhere
+    else is untouched: that is how historical artifacts are reproduced.
     """
 
     def test_an_unrelated_path_is_returned_untouched(self, tmp_path: Path) -> None:
         target = str(tmp_path / 'somewhere-else.json')
         assert _mod().guard_committed_report(
-            target, dry_run=True, limit=None) == target
+            target, dry_run=True, limit=None, slate_mode=_scoring().SLATE_SEEDED) == target
 
     def test_a_dry_run_is_redirected_off_the_committed_artifact(self) -> None:
         committed = _mod()._DEFAULT_REPORT_PATH
-        got = _mod().guard_committed_report(committed, dry_run=True, limit=None)
-        assert Path(got).resolve() != Path(committed).resolve(), (
-            'a --dry-run scores a fixed-answer stub; publishing it puts '
-            'fabricated numbers in front of the flip-gate operator'
-        )
-        assert Path(got).name == _mod()._DRY_RUN_REPORT_NAME
+        for slate_mode in _scoring().SLATE_MODES:
+            got = _mod().guard_committed_report(
+                committed, dry_run=True, limit=None, slate_mode=slate_mode)
+            assert Path(got).resolve() != Path(committed).resolve(), (
+                f'a {slate_mode} --dry-run scores a fixed-answer stub; publishing '
+                f'it puts fabricated numbers in front of the flip-gate operator'
+            )
+            assert Path(got).name == _mod()._DRY_RUN_REPORT_NAME
 
     def test_a_relative_spelling_of_the_committed_path_is_also_caught(
         self, tmp_path: Path, monkeypatch,
@@ -876,14 +680,46 @@ class TestGuardCommittedReport:
         committed = Path(_mod()._DEFAULT_REPORT_PATH)
         monkeypatch.chdir(committed.parent.parent)
         relative = str(Path('calibration') / committed.name)
-        got = _mod().guard_committed_report(relative, dry_run=True, limit=None)
+        got = _mod().guard_committed_report(
+            relative, dry_run=True, limit=None, slate_mode=_scoring().SLATE_SEEDED)
         assert Path(got).resolve() != committed.resolve()
 
     def test_the_dry_run_redirect_is_logged_loudly(self, caplog) -> None:
         with caplog.at_level(logging.WARNING):
             _mod().guard_committed_report(
-                _mod()._DEFAULT_REPORT_PATH, dry_run=True, limit=None)
+                _mod()._DEFAULT_REPORT_PATH, dry_run=True, limit=None,
+                slate_mode=_scoring().SLATE_SEEDED)
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    @pytest.mark.parametrize('limit', [None, 5])
+    def test_a_seeded_measurement_cannot_overwrite_the_retrieved_arbiter(
+        self, limit: int | None,
+    ) -> None:
+        with pytest.raises(ValueError, match='--report-path'):
+            _mod().guard_committed_report(
+                _mod()._DEFAULT_REPORT_PATH, dry_run=False, limit=limit,
+                slate_mode=_scoring().SLATE_SEEDED)
+
+    def test_nor_can_it_through_a_relative_spelling(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        committed = Path(_mod()._DEFAULT_REPORT_PATH)
+        monkeypatch.chdir(committed.parent.parent)
+        with pytest.raises(ValueError, match='--report-path'):
+            _mod().guard_committed_report(
+                str(Path('calibration') / committed.name), dry_run=False, limit=None,
+                slate_mode=_scoring().SLATE_SEEDED)
+
+    def test_a_seeded_measurement_elsewhere_is_untouched(self, tmp_path: Path) -> None:
+        target = str(tmp_path / 'historical.json')
+        assert _mod().guard_committed_report(
+            target, dry_run=False, limit=None, slate_mode=_scoring().SLATE_SEEDED) == target
+
+    def test_the_slate_mode_must_be_named(self) -> None:
+        """No default: a caller that forgot it must not be waved through as retrieved."""
+        with pytest.raises(TypeError, match='slate_mode'):
+            _mod().guard_committed_report(
+                _mod()._DEFAULT_REPORT_PATH, dry_run=False, limit=None)
 
     def test_a_limit_run_still_writes_the_committed_path_but_warns(
         self, caplog,
@@ -898,206 +734,627 @@ class TestGuardCommittedReport:
         """
         committed = _mod()._DEFAULT_REPORT_PATH
         with caplog.at_level(logging.WARNING):
-            got = _mod().guard_committed_report(committed, dry_run=False, limit=5)
+            got = _mod().guard_committed_report(
+                committed, dry_run=False, limit=5, slate_mode=_scoring().SLATE_RETRIEVED)
         assert got == committed
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
-    def test_a_full_live_run_is_neither_redirected_nor_warned(
+    def test_a_full_retrieved_run_is_neither_redirected_nor_warned(
         self, caplog,
     ) -> None:
         committed = _mod()._DEFAULT_REPORT_PATH
         with caplog.at_level(logging.WARNING):
-            got = _mod().guard_committed_report(committed, dry_run=False, limit=None)
+            got = _mod().guard_committed_report(
+                committed, dry_run=False, limit=None, slate_mode=_scoring().SLATE_RETRIEVED)
         assert got == committed
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
-    def test_the_guard_is_reached_outside_the_limit_block(self) -> None:
-        """`_run` must consult the guard on EVERY path, not just `--limit`.
+    def test_a_non_shipped_wording_cannot_overwrite_the_arbiter(self) -> None:
+        with pytest.raises(ValueError, match='--report-path'):
+            _mod().guard_committed_report(
+                _mod()._DEFAULT_REPORT_PATH, dry_run=False, limit=None,
+                slate_mode=_scoring().SLATE_RETRIEVED, wording='pre-psi')
 
-        Asserted against the call SITE rather than by driving `_run` (which
-        would need a config, a fixture load and a provider resolution) —
-        narrow, but it is exactly the structural mistake being pinned: the
-        guard nested one `if` too deep.
-        """
-        import inspect  # noqa: PLC0415
+    def test_the_shipped_wording_may_write_the_arbiter(self) -> None:
+        committed = _mod()._DEFAULT_REPORT_PATH
+        assert _mod().guard_committed_report(
+            committed, dry_run=False, limit=None,
+            slate_mode=_scoring().SLATE_RETRIEVED, wording='shipped') == committed
 
-        source = inspect.getsource(_mod()._run)
-        head = source.split('if args.limit is not None:')[0]
-        assert 'guard_committed_report(' in head, (
-            'the guard must run before/outside the --limit block, or a bare '
-            '--dry-run reaches the committed artifact again'
-        )
+    def test_a_pre_psi_run_elsewhere_is_untouched(self, tmp_path: Path) -> None:
+        target = str(tmp_path / 'fixture-pre-psi.json')
+        assert _mod().guard_committed_report(
+            target, dry_run=False, limit=None,
+            slate_mode=_scoring().SLATE_RETRIEVED, wording='pre-psi') == target
 
 
-class TestCommittedJudgeAccuracyReportIsTraceable:
-    """A number gating a decision must be a number some run measured.
+class TestABareDryRunCannotReachTheCommittedArtifact:
+    """The guard must be consulted on EVERY path, driven rather than read.
 
-    Modelled on `test_calibrate_write_triage.py::TestCommittedCalibrationIsTraceable`,
-    and for the same reason: `judge_accuracy_report_path` exists so a reader
-    can get from "the judge was evaluated" back to the run that evaluated it,
-    without taking anyone's word that the figures were not typed in. Committed
-    artifacts only — no network, no script execution, no Qdrant.
+    Replaces a test that asserted `'guard_committed_report(' in
+    inspect.getsource(_run).split('if args.limit is not None:')[0]`. That
+    passes UNCONDITIONALLY the moment the split literal is reworded or moved:
+    `str.split` on an absent separator returns the WHOLE function body, so the
+    guard could sink back inside the `--limit` block — the exact structural
+    mistake being pinned — and the assertion would still find it. Per the repo
+    norm it is replaced with behaviour, not hardened into a better grep.
 
-    EXPLICITLY NO ASSERTION ON ANY ACCURACY VALUE, and that is the point of
-    this docstring. D10 makes this report the operator's input at the
-    task-3169 flip gate. A floor asserted here would silently BECOME that
-    gate — every future run would have to clear a bar this task invented,
-    pre-empting a judgment it is explicitly told to leave to a human. What is
-    asserted is only that each accuracy is WELL-FORMED: `None`, or a float in
-    [0.0, 1.0]. Never that it is large enough.
+    Driven through `main()` rather than a hand-built args namespace, so the
+    argparse DEFAULT for `--report-path` is what gets guarded — that default
+    is the whole hazard: a bare `--dry-run`, the first invocation in the
+    module docstring, aims at the committed artifact without the operator
+    naming it.
     """
 
-    CONFIG_PATH = Path(__file__).parent.parent / 'config' / 'config.yaml'
-
-    # Decorator order is load-bearing: `staticmethod` OUTERMOST, so
-    # `self._committed()` resolves through the descriptor and calls the cached
-    # function with zero arguments. Stacked the other way, `functools.cache`'s
-    # plain-function wrapper is the class attribute, binds `self` as its first
-    # argument, and raises TypeError on every access. Same note as the
-    # sibling suite's.
-    @staticmethod
-    @functools.cache
-    def _committed():
-        import yaml  # noqa: PLC0415
-
-        cls = TestCommittedJudgeAccuracyReportIsTraceable
-        block = yaml.safe_load(cls.CONFIG_PATH.read_text()).get('write_triage') or {}
-        report_path = block.get('judge_accuracy_report_path')
-        report = None
-        resolved = None
-        if report_path is not None:
-            resolved = Path(__file__).parent.parent / report_path
-            if resolved.exists():
-                report = json.loads(resolved.read_text())
-        return block, report, resolved
-
-    def test_the_report_path_is_set_and_relative(self) -> None:
-        block, _report, _resolved = self._committed()
-        assert block.get('judge_accuracy_report_path'), (
-            'a judge shipped without a measurement is an untraceable judge'
-        )
-        assert not Path(block['judge_accuracy_report_path']).is_absolute(), (
-            'the path must not bake in the checkout it was produced in — this '
-            'script runs in per-task worktrees that get reset'
-        )
-
-    def test_the_path_resolves_to_a_committed_report(self) -> None:
-        block, report, resolved = self._committed()
-        assert report is not None, (
-            f'judge_accuracy_report_path '
-            f'{block.get("judge_accuracy_report_path")!r} does not resolve to a '
-            f'committed report (looked at {resolved})'
-        )
-
-    def test_the_report_carries_every_key_the_operator_reads(self) -> None:
-        _block, report, _resolved = self._committed()
-        assert report is not None
-        assert set(report) >= {
-            'per_class', 'confusion', 'duplicate_outcome_split', 'false_contested',
-            'contested_ground_truth', 'caveats', 'provenance',
-        }
-
-    def test_all_four_classes_are_present_with_an_integer_n(self) -> None:
-        _block, report, _resolved = self._committed()
-        assert report is not None
-        per_class = report['per_class']
-        assert set(per_class) == set(_mod().EVAL_CLASSES)
-        for name, entry in per_class.items():
-            assert isinstance(entry['n'], int), f'{name}: {entry!r}'
-
-    def test_the_small_classes_match_the_fixtures_own_label_census(
-        self, records,
+    def test_a_bare_dry_run_leaves_both_committed_artifacts_byte_identical(
+        self, tmp_path: Path, monkeypatch,
     ) -> None:
-        """`distinct` and `pseudo_contradiction` are the two the task names by
-        hand — n=3 and n=6 today.
+        import sys  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
 
-        Recounted from the JSONL rather than hardcoded, so editing the fixture
-        surfaces as a mismatch demanding a re-measurement instead of leaving a
-        stale constant agreeing with a stale report.
-        """
-        _block, report, _resolved = self._committed()
-        assert report is not None
-        for label in (_mod().LABEL_DISTINCT, _mod().LABEL_PSEUDO_CONTRADICTION):
-            expected = sum(1 for r in records if r['label'] == label)
-            assert expected > 0, f'{label} vanished from the fixture'
-            assert report['per_class'][label]['n'] == expected, (
-                f'{label}: report says {report["per_class"][label]["n"]}, the '
-                f'fixture holds {expected} — re-run the eval'
+        fixture = tmp_path / 'synthetic_corpus.jsonl'
+        fixture.write_text(
+            ''.join(json.dumps(record) + '\n' for record in _corpus()),
+        )
+
+        committed = Path(_mod()._DEFAULT_REPORT_PATH)
+        sibling = committed.parent / (committed.stem + '.md')
+        assert committed.exists() and sibling.exists(), (
+            'precondition: both committed artifacts are on disk to be clobbered'
+        )
+        before = {path: path.read_bytes() for path in (committed, sibling)}
+        before_mtimes = {path: path.stat().st_mtime_ns for path in before}
+
+        # The redirect target, pointed somewhere hermetic. `guard_committed_report`
+        # imports `tempfile` inside itself, so the module attribute is the seam.
+        redirect_dir = tmp_path / 'redirected'
+        redirect_dir.mkdir()
+        monkeypatch.setattr(tempfile, 'gettempdir', lambda: str(redirect_dir))
+        monkeypatch.setattr(sys, 'argv', [
+            'eval_write_triage_judge.py', '--dry-run', '--fixture', str(fixture),
+        ])
+
+        assert _mod().main() == 0
+
+        for path, content in before.items():
+            assert path.read_bytes() == content, (
+                f'a --dry-run rewrote {path.name} with fixed-answer numbers — '
+                f'the guard is not reached on the bare --dry-run path'
+            )
+            assert path.stat().st_mtime_ns == before_mtimes[path], (
+                f'{path.name} was rewritten (identically, this time) — the '
+                f'guard must not let a dry run touch it at all'
             )
 
-    def test_every_accuracy_is_well_formed_and_none_is_asserted_to_be_good(
-        self,
+        redirected = redirect_dir / _mod()._DRY_RUN_REPORT_NAME
+        assert redirected.exists(), (
+            'the dry run must still publish its throwaway where the redirect '
+            'warning says it did, or "prove the pipeline" proves nothing'
+        )
+        assert json.loads(redirected.read_text())['provenance'][
+            'judge_provider'
+        ] == 'dry-run'
+
+    def test_a_bare_live_run_is_refused_before_it_reads_the_fixture(
+        self, tmp_path: Path, monkeypatch,
     ) -> None:
-        """The only shape assertion this class makes about a number."""
-        _block, report, _resolved = self._committed()
-        assert report is not None
-        for name, entry in report['per_class'].items():
-            accuracy = entry['accuracy']
-            if accuracy is None:
-                assert entry['n'] == 0, f'{name}: measured but unscored'
-                continue
-            assert isinstance(accuracy, float), f'{name}: {accuracy!r}'
-            assert 0.0 <= accuracy <= 1.0, f'{name}: {accuracy!r}'
+        """The old "full measured pass" command: seeded, aimed at the arbiter.
 
-    def test_the_contested_caveat_survived_into_the_artifact(self) -> None:
-        _block, report, _resolved = self._committed()
-        assert report is not None
-        ground_truth = report['contested_ground_truth']
-        assert ground_truth['available'] is False
-        assert ground_truth['reason'].split(':')[0].strip(), 'a reason code is required'
-
-    def test_a_markdown_sibling_was_committed_beside_the_json(self) -> None:
-        """The operator reads the markdown, so the artifact must exist.
-
-        Only existence is checked. Deliberately NOT a ``CAVEATS``-identity
-        check like the renderer's: ``CAVEATS`` is source, whereas this ``.md``
-        is a measured artifact regenerable only by a live LLM run, so coupling
-        the two would make a one-word caveat edit require a paid
-        re-measurement to get back to green. The caveat's substance is pinned
-        in the JSON instead, by
-        :meth:`test_the_contested_caveat_survived_into_the_artifact`.
+        Given a fixture that does not exist, so a refusal ordered after the
+        fixture load would surface as `FileNotFoundError` instead.
         """
-        _block, report, resolved = self._committed()
-        assert report is not None and resolved is not None
-        sibling = resolved.with_suffix('.md')
-        assert sibling.exists(), f'no markdown sibling at {sibling}'
+        import sys  # noqa: PLC0415
 
-    def test_the_committed_report_is_a_full_measurement(self) -> None:
-        """Not a `--dry-run` stub, and not a truncated `--limit` smoke.
+        monkeypatch.setattr(sys, 'argv', [
+            'eval_write_triage_judge.py', '--fixture', str(tmp_path / 'absent.jsonl'),
+        ])
+        with pytest.raises(ValueError, match='--report-path'):
+            _mod().main()
 
-        The guard in the script stops the first case at write time; this
-        stops BOTH at review time, so a clobbered artifact is a red test
-        rather than a silent substitution of fabricated (or partial) numbers
-        for the measurement the task-3169 flip gate reads.
 
-        `judge_provider` is checked against the shipped `_KNOWN_PROVIDERS`
-        tuple, which the `dry-run` sentinel is deliberately not a member of.
-        Still no assertion on any accuracy VALUE — this is about whether a
-        run happened, never about whether it scored well.
-        """
-        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+# ---------------------------------------------------------------------------
+# Option C: the per-case dump, the field-width override, the retrieved slate
+# ---------------------------------------------------------------------------
 
-        _block, report, _resolved = self._committed()
-        assert report is not None
-        provenance = report['provenance']
-        assert provenance['limit'] is None, (
-            f'the committed report is a --limit {provenance["limit"]!r} smoke, '
-            f'not the corpus-wide measurement — re-run the eval without --limit'
+class TestTheCasesDump:
+    """Per-case evidence, written as it is bought."""
+
+    def _dump(self, tmp_path: Path, judge=None) -> list[dict]:
+        _mod().run_judge_eval(
+            plan=_cases_mod().seeded_plan(_corpus(), distractors=2),
+            judge_fn=judge if judge is not None else _fake_judge(),
+            report_path=tmp_path / 'report.json',
+            provenance=dict(_PROVENANCE),
+            cases_path=tmp_path / 'cases.jsonl',
         )
-        assert provenance['judge_provider'] in write_triage_judge._KNOWN_PROVIDERS, (
-            f'judge_provider {provenance["judge_provider"]!r} is not a real '
-            f'provider {list(write_triage_judge._KNOWN_PROVIDERS)} — this '
-            f'artifact was written by a stub, not measured'
+        return [
+            json.loads(line)
+            for line in (tmp_path / 'cases.jsonl').read_text().splitlines()
+            if line.strip()
+        ]
+
+    def test_one_line_per_case(self, tmp_path: Path) -> None:
+        rows = self._dump(tmp_path)
+        assert len(rows) == len(_cases_mod().build_judge_cases(_corpus(), distractors=2))
+
+    def test_a_row_carries_what_the_aggregates_cannot_be_reread_from(
+        self, tmp_path: Path,
+    ) -> None:
+        row = self._dump(tmp_path)[0]
+        assert set(row) >= {
+            'memory_id', 'cluster_id', 'expected_class', 'candidates',
+            'band_winner_id', 'verdict_candidate_id', 'judged_candidate_id',
+            'attach_target_id', 'attach_target_is_canonical', 'verdict',
+            'outcome', 'band', 'similarity', 'canonical_in_slate',
+            'canonical_present', 'entry_elided', 'candidates_elided',
+        }
+
+    def test_a_bare_word_names_no_candidate_so_attaches_to_the_band_winner(
+        self, tmp_path: Path,
+    ) -> None:
+        rows = self._dump(tmp_path, judge=_fake_judge(OUTCOME_AMENDED))
+        assert {
+            (row['verdict_candidate_id'], row['judged_candidate_id']) for row in rows
+        } == {(None, None)}
+        assert all(row['attach_target_id'] == row['band_winner_id'] for row in rows)
+
+    def test_the_slate_is_recorded_in_prompt_order(self, tmp_path: Path) -> None:
+        rows = {r['memory_id']: r for r in self._dump(tmp_path)
+                if r['expected_class'] == 'duplicate'}
+        row = rows['c1-dup-1']
+        assert row['candidates'][0] == 'c1-canon'
+        assert row['attach_target_id'] == 'c1-canon'
+        assert row['attach_target_is_canonical'] is True
+        assert row['canonical_in_slate'] is True
+
+    def test_a_control_case_records_that_no_correct_target_was_shown(
+        self, tmp_path: Path,
+    ) -> None:
+        control = [
+            r for r in self._dump(tmp_path)
+            if r['expected_class'] == _scoring().CLASS_DISTRACTOR
+        ][0]
+        assert control['canonical_in_slate'] is False
+        assert control['attach_target_is_canonical'] is False
+
+    def test_each_row_lands_before_the_next_case_is_asked(
+        self, tmp_path: Path,
+    ) -> None:
+        """A 429 partway through must not cost the cases already paid for."""
+        seen: list[int] = []
+
+        def judge_fn(case, candidates):
+            path = tmp_path / 'cases.jsonl'
+            seen.append(
+                len(path.read_text().splitlines()) if path.exists() else 0,
+            )
+            return OUTCOME_RESTATED
+
+        self._dump(tmp_path, judge=judge_fn)
+        assert seen == list(range(len(seen))), (
+            f'rows were buffered rather than flushed per case: {seen}'
         )
 
-    def test_provenance_names_the_model_and_the_fixture(self) -> None:
-        _block, report, _resolved = self._committed()
-        assert report is not None
+    def test_a_provider_error_mid_run_keeps_every_row_already_answered(
+        self, tmp_path: Path,
+    ) -> None:
+        """Task 5277 A4: the error propagates, and cases 1..N-1 stay on disk."""
+        answers = [OUTCOME_RESTATED, OUTCOME_STORED, OUTCOME_AMENDED]
+        asked: list[str] = []
+
+        def judge_fn(case, candidates):
+            asked.append(case['memory_id'])
+            if len(asked) > len(answers):
+                raise RuntimeError('429 Too Many Requests')
+            return answers[len(asked) - 1]
+
+        with pytest.raises(RuntimeError, match='429'):
+            self._dump(tmp_path, judge=judge_fn)
+        *answered, failed = asked
+        rows = [
+            json.loads(line)
+            for line in (tmp_path / 'cases.jsonl').read_text().splitlines()
+        ]
+        assert [(r['memory_id'], r['outcome']) for r in rows] == list(
+            zip(answered, answers, strict=True),
+        ), f'the rows bought before case {len(asked)} ({failed}) raised were lost'
+
+    def test_no_dump_is_written_without_a_cases_path(self, tmp_path: Path) -> None:
+        _run(tmp_path)
+        assert list(tmp_path.glob('*.jsonl')) == []
+
+    def test_an_attach_to_the_alias_is_an_attach_to_the_canonical(self) -> None:
+        row = _aliased_row([_live('new-canon')], 'new-canon')
+        assert row['canonical_alias_id'] == 'new-canon'
+        assert row['attach_target_is_canonical'] is True
+        assert row['canonical_in_slate'] is True
+
+    def test_a_sighting_child_of_the_alias_puts_the_canonical_on_the_slate(self) -> None:
+        row = _aliased_row([_live('child', canonical_id='new-canon')], 'new-canon')
+        assert row['canonical_in_slate'] is True
+
+    def test_an_alias_does_not_make_an_unrelated_attach_canonical(self) -> None:
+        row = _aliased_row([_live('zz')], 'zz')
+        assert row['attach_target_is_canonical'] is False
+        assert row['canonical_in_slate'] is False
+
+    def test_a_case_with_no_alias_yields_todays_row(self) -> None:
+        records = [
+            _rec('c1-canon', 'c1-canon', 'canonical'),
+            _rec('c1-dup-1', 'c1-canon', 'duplicate'),
+        ]
+        slate = _slate('c1-dup-1', candidates=[_live('c1-canon'), _live('zz')],
+                       band_winner_id='c1-canon', band=OUTCOME_JUDGE)
+        plan = _cases_mod().plan_from_slates(records, [slate], provenance={}, aliases=_ALIASES)
+        row = _scoring().case_row(
+            3, plan.cases[0],
+            _scoring().JudgeAnswer(outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED),
+            plan.candidate_records[0], plan.fixture_by_id,
+        )
+        assert row == {
+            'index': 3,
+            'memory_id': 'c1-dup-1',
+            'cluster_id': 'c1-canon',
+            'category': 'procedural_knowledge',
+            'expected_class': 'duplicate',
+            'acceptable_outcomes': sorted([OUTCOME_AMENDED, OUTCOME_RESTATED]),
+            'candidates': ['c1-canon', 'zz'],
+            'band_winner_id': 'c1-canon',
+            'verdict_candidate_id': None,
+            'judged_candidate_id': None,
+            'attach_target_id': 'c1-canon',
+            'attach_target_cluster_id': 'c1-canon',
+            'attach_target_category': 'procedural_knowledge',
+            'attach_target_label': 'canonical',
+            'attach_target_is_canonical': True,
+            'canonical_in_slate': True,
+            'canonical_present': True,
+            'band': OUTCOME_JUDGE,
+            'similarity': 0.7,
+            'verdict': OUTCOME_AMENDED,
+            'outcome': OUTCOME_AMENDED,
+            'correct': True,
+            'entry_elided': None,
+            'candidates_elided': None,
+            'usage': None,
+            'canonical_alias_id': None,
+        }
+
+
+class TestTheAttachTargetIsDescribedFromTheFixture:
+    """A null cluster or label means the target is not a fixture record.
+
+    A retrieved row carries only what the store holds, so a target described
+    from the slate alone published both as null in the arbiter's own mode,
+    fixture record or not.
+    """
+
+    RECORDS = (
+        _rec('canon', 'canon', 'canonical', category='preferences_and_norms'),
+        _rec('dup-a', 'canon', 'duplicate'),
+        _rec('dup-b', 'canon', 'duplicate', category='observations_and_summaries'),
+    )
+
+    @classmethod
+    def _dup_a_target(cls, candidates, band_winner_id, *, records=None, **kwargs) -> dict:
+        """How dup-a's dump row describes its attach target."""
+        population = list(cls.RECORDS if records is None else records)
+        slates = [
+            _slate(r['memory_id'], candidates=candidates,
+                   band_winner_id=band_winner_id, band=OUTCOME_JUDGE)
+            for r in population if r['label'] != 'canonical'
+        ]
+        plan = _cases_mod().plan_from_slates(population, slates, provenance={}, **kwargs)
+        row = _scoring().case_row(
+            1, plan.cases[0], _scoring().JudgeAnswer(outcome=OUTCOME_AMENDED),
+            plan.candidate_records[0], plan.fixture_by_id,
+        )
+        return {key: row[f'attach_target_{key}'] for key in ('cluster_id', 'label', 'category')}
+
+    def test_a_wrong_attach_to_a_fixture_sibling_names_its_cluster_and_label(self) -> None:
+        shown = [_live('dup-b', category='observations_and_summaries')]
+        assert self._dup_a_target(shown, 'dup-b') == {
+            'cluster_id': 'canon', 'label': 'duplicate', 'category': 'observations_and_summaries',
+        }
+
+    def test_a_hoisted_parent_off_the_slate_is_described_from_the_fixture(self) -> None:
+        shown = [_live('child', canonical_id='canon')]
+        assert self._dup_a_target(shown, 'canon') == {
+            'cluster_id': 'canon', 'label': 'canonical', 'category': 'preferences_and_norms',
+        }
+
+    def test_a_target_outside_the_fixture_is_described_by_its_row_alone(self) -> None:
+        shown = [_live('zz', category='observations_and_summaries')]
+        assert self._dup_a_target(shown, 'zz') == {
+            'cluster_id': None, 'label': None, 'category': 'observations_and_summaries',
+        }
+
+    def test_a_limited_run_describes_a_target_as_the_full_run_does(self) -> None:
+        """`--limit` narrows the population, not the fixture a target is read from."""
+        limited = [r for r in self.RECORDS if r['memory_id'] != 'dup-b']
+        shown = [_live('dup-b', category='observations_and_summaries')]
+        assert self._dup_a_target(
+            shown, 'dup-b', records=limited, fixture=self.RECORDS,
+        ) == self._dup_a_target(shown, 'dup-b')
+
+
+class TestTheAttachTargetIsTheJudgedCandidate:
+    """A judged attach lands on the candidate the verdict NAMED, hoisted.
+
+    `write_triage.py::_apply_judge_verdict` files a middle-band attach against
+    `canonical_id_of(named record)`, and against the band winner only when
+    the verdict named nothing. The row's `attach_target_*` describe that
+    record, so `score_attachments` scores production's attach.
+    """
+
+    RECORDS = (
+        _rec('c1-canon', 'c1-canon', 'canonical'),
+        _rec('c1-dup-1', 'c1-canon', 'duplicate'),
+    )
+
+    @classmethod
+    def _row(cls, candidates, band_winner_id, answer) -> dict:
+        slate = _slate('c1-dup-1', candidates=candidates,
+                       band_winner_id=band_winner_id, band=OUTCOME_JUDGE)
+        plan = _cases_mod().plan_from_slates(list(cls.RECORDS), [slate], provenance={})
+        return _scoring().case_row(
+            1, plan.cases[0], answer, plan.candidate_records[0], plan.fixture_by_id,
+        )
+
+    @staticmethod
+    def _naming(candidate_id: str):
+        return _scoring().JudgeAnswer(
+            outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED, candidate_id=candidate_id,
+        )
+
+    def test_the_judge_naming_the_canonical_overrules_the_band_winner(self) -> None:
+        row = self._row([_live('zz'), _live('c1-canon')], 'zz', self._naming('c1-canon'))
+        assert {key: row[key] for key in (
+            'band_winner_id', 'verdict_candidate_id', 'judged_candidate_id',
+            'attach_target_id', 'attach_target_is_canonical', 'attach_target_label',
+        )} == {
+            'band_winner_id': 'zz',
+            'verdict_candidate_id': 'c1-canon',
+            'judged_candidate_id': 'c1-canon',
+            'attach_target_id': 'c1-canon',
+            'attach_target_is_canonical': True,
+            'attach_target_label': 'canonical',
+        }
+
+    def test_a_named_sighting_child_is_hoisted_to_its_canonical(self) -> None:
+        row = self._row(
+            [_live('zz'), _live('child', canonical_id='c1-canon')], 'zz', self._naming('child'),
+        )
+        assert (row['verdict_candidate_id'], row['judged_candidate_id']) == ('child', 'c1-canon')
+        assert row['attach_target_is_canonical'] is True
+        assert row['attach_target_cluster_id'] == 'c1-canon'
+
+    def test_the_judge_can_move_a_correct_band_attach_off_the_canonical(self) -> None:
+        row = self._row([_live('c1-canon'), _live('zz')], 'c1-canon', self._naming('zz'))
+        assert row['attach_target_id'] == 'zz'
+        assert row['attach_target_is_canonical'] is False
+
+    def test_the_alias_rule_applies_to_the_judged_candidate(self) -> None:
+        row = _aliased_row(
+            [_live('zz'), _live('new-canon')], 'zz', self._naming('new-canon'),
+        )
+        assert row['attach_target_is_canonical'] is True
+
+    @pytest.mark.parametrize('answer', [
+        {'outcome': OUTCOME_AMENDED, 'verdict': OUTCOME_AMENDED},
+        {'outcome': OUTCOME_RESTATED},
+    ], ids=['a-verdict-naming-none', 'a-band-that-decided-itself'])
+    def test_naming_nothing_attaches_to_the_band_winner(self, answer: dict) -> None:
+        row = self._row(
+            [_live('zz'), _live('c1-canon')], 'zz', _scoring().JudgeAnswer(**answer),
+        )
+        assert (row['verdict_candidate_id'], row['judged_candidate_id']) == (None, None)
+        assert row['attach_target_id'] == row['band_winner_id'] == 'zz'
+
+    def test_a_named_id_off_the_cases_own_slate_raises(self) -> None:
+        """Production fails such a write open to `stored`; it never attaches it."""
+        with pytest.raises(ValueError) as excinfo:
+            self._row([_live('zz'), _live('c1-canon')], 'zz', self._naming('ghost'))
+        message = str(excinfo.value)
+        assert 'c1-dup-1' in message and 'ghost' in message, message
+
+    def test_a_seeded_case_naming_a_distractor_attaches_off_the_canonical(self) -> None:
+        plan = _cases_mod().seeded_plan(_corpus(), distractors=2)
+        index, case = next(
+            (i, c) for i, c in enumerate(plan.cases) if c['expected_class'] == 'duplicate'
+        )
+        distractor = case['candidates'][1]
+        row = _scoring().case_row(
+            1, case, self._naming(distractor),
+            plan.candidate_records[index], plan.fixture_by_id,
+        )
+        assert row['judged_candidate_id'] == distractor
+        assert row['attach_target_is_canonical'] is False
+
+    def test_the_production_shape_scores_the_judged_attach(self, tmp_path: Path) -> None:
+        records = [
+            _rec('c1-canon', 'c1-canon', 'canonical'),
+            _rec('c1-dup-1', 'c1-canon', 'duplicate'),
+            _rec('c2-canon', 'c2-canon', 'canonical'),
+            _rec('c2-dup-1', 'c2-canon', 'duplicate'),
+        ]
+        slates = [
+            _slate('c1-dup-1', candidates=[_live('zz'), _live('c1-canon')],
+                   band_winner_id='zz', band=OUTCOME_JUDGE),
+            _slate('c2-dup-1', candidates=[_live('zz'), _live('c2-canon')],
+                   band_winner_id='zz', band=OUTCOME_JUDGE),
+        ]
+        named = {'c1-dup-1': 'c1-canon', 'c2-dup-1': 'zz'}
+        report = _mod().run_judge_eval(
+            plan=_cases_mod().plan_from_slates(records, slates, provenance={}),
+            judge_fn=lambda case, candidates: self._naming(named[case['memory_id']]),
+            report_path=tmp_path / 'report.json', provenance={},
+            cases_path=tmp_path / 'cases.jsonl',
+        )
+        shape = report['production_shape']
+        assert shape['duplicate_attach']['strict'] == 1, 'the band winner would score 0'
+        assert [
+            (case['memory_id'], case['attach_target_id'])
+            for case in shape['wrong_record_attach']['cases']
+        ] == [('c2-dup-1', 'zz')]
+        rows = [
+            json.loads(line) for line in (tmp_path / 'cases.jsonl').read_text().splitlines()
+        ]
+        assert [row['judged_candidate_id'] for row in rows] == ['c1-canon', 'zz']
+
+
+class TestRunJudgeEvalOverABuiltPlan:
+    """`run_judge_eval` over plans built by eval_write_triage_cases.py.
+
+    How a plan is built, and which plans are refused, is
+    test_eval_write_triage_cases.py's subject. These pin what the runner does
+    with one.
+    """
+
+    def test_a_retrieved_run_publishes_no_distractor_count(self, tmp_path: Path) -> None:
+        """Distractors are the seeded construction's; a retrieved slate draws none."""
+        plan, _ = _crossed_retrieved_plan()
+        report = _mod().run_judge_eval(
+            plan=plan, judge_fn=_fake_judge(),
+            report_path=tmp_path / 'report.json', provenance={},
+        )
         provenance = report['provenance']
-        for key in ('judge_provider', 'judge_model'):
-            assert isinstance(provenance[key], str) and provenance[key], key
-        fixture = Path(__file__).parent.parent / provenance['fixture_path']
-        assert fixture.resolve() == FIXTURE_PATH.resolve(), (
-            f'the report measured {provenance["fixture_path"]!r}, not the '
-            f'committed fixture'
+        assert (provenance['candidate_count'], provenance['distractor_count']) == (2, None)
+
+    def test_each_case_is_handed_its_own_rows(self, tmp_path: Path) -> None:
+        """`judge_write` re-sorts a slate by its rows' cosines, so a row pooled
+        from another case's retrieval would hand this prompt that query's order."""
+        plan, _ = _crossed_retrieved_plan()
+        handed: list[list[tuple[str, float]]] = []
+
+        def judge_fn(case, candidates):
+            handed.append(_scored(candidates))
+            return OUTCOME_AMENDED
+
+        _mod().run_judge_eval(
+            plan=plan, judge_fn=judge_fn,
+            report_path=tmp_path / 'report.json', provenance=dict(_PROVENANCE),
+        )
+        assert handed == [
+            [('canon', 0.80), ('other', 0.70)],
+            [('other', 0.85), ('canon', 0.75)],
+        ]
+
+    def test_the_judge_is_never_asked_and_nothing_is_written(self, tmp_path: Path) -> None:
+        """Task 5277 A3: a judge-band case with an empty slate is refused before any spend."""
+        judge = _fake_judge()
+        with pytest.raises(ValueError):
+            _run(tmp_path, judge=judge, corpus=_one_cluster_corpus(), distractors=4)
+        assert judge.calls == []
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestApplyFieldChars:
+    """`--field-chars` moves the run's own in-memory `write_triage.judge_field_chars`."""
+
+    @staticmethod
+    def _resolved(config) -> int:
+        from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+            resolve_judge_field_chars,
+        )
+
+        return resolve_judge_field_chars(types.SimpleNamespace(config=config))
+
+    @staticmethod
+    def _config():
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+
+        return FusedMemoryConfig()
+
+    def test_a_requested_width_is_written_to_the_leaf(self) -> None:
+        config = self._config()
+        assert _mod().apply_field_chars(config, 40) == 40
+        assert self._resolved(config) == 40
+
+    def test_zero_means_no_elision_rather_than_everything_elided(self) -> None:
+        config = self._config()
+        text = 'x' * 20_000
+        slate = [MemoryResult(id='a', content=text, source_store=SourceStore.mem0)]
+        assert _mod().apply_field_chars(config, 0) == 0
+        width = self._resolved(config)
+        assert width >= len(text)
+        assert judge_prompt_elisions(text, slate, field_chars=width) == JudgePromptElisions(
+            entry=False, candidates={'a': False},
+        )
+
+    def test_a_negative_width_is_refused_rather_than_recorded(self) -> None:
+        """The resolver would fall back to the default, so provenance would lie."""
+        config = self._config()
+        before = config.write_triage.judge_field_chars
+        with pytest.raises(ValueError, match='--field-chars'):
+            _mod().apply_field_chars(config, -5)
+        assert config.write_triage.judge_field_chars == before
+
+    def test_none_changes_nothing_and_reports_the_configs_own_width(self) -> None:
+        config = self._config()
+        before = config.write_triage.judge_field_chars
+        assert _mod().apply_field_chars(config, None) == self._resolved(config) == 4_000
+        assert config.write_triage.judge_field_chars == before
+
+
+# ---------------------------------------------------------------------------
+# The split: one contract path, and imports that point downward only
+# ---------------------------------------------------------------------------
+
+class TestScoreAttachmentsKeepsItsContractPath:
+    """PRD C2' and task 5807 call it at eval_write_triage_judge.py::score_attachments."""
+
+    def test_the_cli_binds_the_scoring_modules_function(self) -> None:
+        assert _mod().score_attachments is _scoring().score_attachments
+
+
+#: Loads ONE ``scripts/`` module by path under its stem and prints the
+#: ``scripts/`` stems then in ``sys.modules``, as one JSON list.
+_LAYERING_PROBE = """
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+scripts = Path('scripts')
+stems = {path.stem for path in scripts.glob('*.py')}
+stem = sys.argv[1]
+spec = importlib.util.spec_from_file_location(stem, scripts / f'{stem}.py')
+module = importlib.util.module_from_spec(spec)
+sys.modules[stem] = module
+spec.loader.exec_module(module)
+print(json.dumps(sorted(stems & set(sys.modules))))
+"""
+
+_SCORING_CLOSURE = frozenset({'eval_write_triage_scoring', 'calibrate_write_triage'})
+
+
+class TestTheEvalScriptsImportOnlyDownward:
+    """Each eval module loads exactly what lies beneath it: never the CLI, never a sibling.
+
+    The loads go by path, so no linter sees an upward or sideways one. Each
+    module is loaded in its OWN fresh interpreter, so a sibling cannot hide
+    behind a ``sys.modules`` entry an earlier load left, and the ``scripts/``
+    modules it brings in must equal its downward closure. The CLI is not
+    loaded: it may load everything.
+    """
+
+    @pytest.mark.parametrize(('stem', 'closure'), [
+        ('eval_write_triage_scoring', _SCORING_CLOSURE),
+        ('eval_write_triage_cases', _SCORING_CLOSURE | {'eval_write_triage_cases'}),
+        ('eval_write_triage_live_judge', _SCORING_CLOSURE | {'eval_write_triage_live_judge'}),
+    ])
+    def test_a_module_loads_exactly_its_downward_closure(
+        self, stem: str, closure: frozenset[str],
+    ) -> None:
+        result = subprocess.run(
+            [sys.executable, '-c', _LAYERING_PROBE, stem],
+            cwd=SCRIPT_PATH.parent.parent, capture_output=True, text=True, check=False,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stderr
+        loaded = set(json.loads(result.stdout))
+        assert loaded == closure, (
+            f'loading {stem} also loaded {sorted(loaded - closure)} '
+            f'and not {sorted(closure - loaded)}'
         )

@@ -13,10 +13,12 @@ machine-readable form; :mod:`check_trickle_progress` reads it. A quiet
 night is recorded AS quiet and never alarms, so decision 7's stated
 rationale is satisfied rather than circumvented.
 
-Division of labour between the two probes:
+Division of labour between the probes:
 
 - ``check_trickle_liveness.sh``  — did the UNIT RUN? (systemd unit state)
 - ``check_trickle_progress.py``  — did SIGNAL FLOW? (this state file)
+- ``check_census_progress.py``   — did a FIRED census advance census-state?
+  (this state file + census-state.json)
 
 STDLIB-ONLY IMPORTS ARE A HARD CONSTRAINT, NOT A STYLE PREFERENCE.
 ``check_trickle_progress.py`` imports this module and, when bound as a
@@ -27,7 +29,8 @@ wrapper, no project venv, bare ``#!/usr/bin/env python3``. Meanwhile
 ``nightly.py`` and ``legibility.config`` both pull in PyYAML. A stray
 third-party import HERE would break the predicate at DISPATCH time, not
 at test time — i.e. it would fail in exactly the silent way this module
-exists to prevent. Same reason ``DEFAULT_MAX_BARREN_RUNS`` is a module
+exists to prevent. ``state_docs`` and the ``shared.safe_io`` it imports
+are under the same constraint. Same reason ``DEFAULT_MAX_BARREN_RUNS`` is a module
 constant rather than a ``legibility.yaml`` field: reading that config
 would drag pydantic + PyYAML onto the predicate path.
 
@@ -39,13 +42,26 @@ that let a suppressed night read like a quiet one for 14 nights
 """
 from __future__ import annotations
 
-import contextlib
+import dataclasses
 import json
 import logging
 import os
+import pwd
 import tempfile
-from datetime import date, datetime
+from collections.abc import Iterable, Mapping
+from datetime import UTC, date, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
+from typing import NamedTuple
+
+# Import state_docs by the same spelling this module was imported by, so a
+# caller matching on Missing / Malformed / Ok sees the classes this module
+# returns: one source file loaded as two modules has two copies of each.
+if __package__:
+    from . import state_docs
+else:
+    import state_docs
 
 logger = logging.getLogger(__name__)
 
@@ -53,102 +69,225 @@ STATE_FILENAME = 'trickle-state.json'
 """Basename of the per-project run-state file."""
 
 STATE_SCHEMA_VERSION = 1
-"""Version of the recorded document's shape. :func:`load_state` treats any
-OTHER value as ``malformed`` rather than guessing at unknown fields — a
-reader that silently accepts a shape it does not understand is exactly the
-silent-degradation mode this module exists to close."""
+"""Version of the recorded document's shape. :func:`load_state` reads any
+OTHER value as malformed rather than guessing at unknown fields.
+
+Fields added after the first writer are ADDITIVE and do not bump it:
+``consecutive_failed_runs``, ``capped``, ``retry_backlog``,
+``last_scheduled_target_date``, ``census_fired``, ``census_fire_streak``
+and ``barren_escalated``. :meth:`TrickleState.from_json` reads an absent one
+as its default, and an absent ``barren_escalated`` as ``None``
+(unrecorded). Bumping for such a field would make every live state file
+read malformed on the first post-deploy probe.
+
+THE RULE FOR THE NEXT PERSON: bump only for a change that would make an
+OLD reader MIS-READ a NEW document. Adding a field an old reader ignores
+is not that; changing the meaning or type of an existing field is."""
 
 
 # ---------------------------------------------------------------------------
-# Outcome vocabulary
+# Outcome vocabulary and the classifier
 # ---------------------------------------------------------------------------
 
-OUTCOME_PRODUCTIVE = 'productive'
-"""Digests were built: ``selected > 0``."""
+class RunOutcome(StrEnum):
+    """What one recorded night was, as :func:`classify_run` derives it."""
 
-OUTCOME_QUIET = 'quiet'
-"""Nothing was digested and nothing reached the sampling/budget stage — a
-legitimately quiet or dormant night. NEVER an alarm."""
+    PRODUCTIVE = 'productive'
+    """Digests were built: ``selected_count > 0``."""
 
-OUTCOME_BARREN = 'barren'
-"""Nothing was digested even though real, distinct, non-duplicate signal
-DID reach the sampling/budget stage. This is the absence mode that looks
-identical to a quiet night from outside the pipeline."""
+    QUIET = 'quiet'
+    """Nothing reached the sampling or budget stage: a legitimately quiet or
+    dormant night. Never an alarm."""
+
+    BARREN = 'barren'
+    """Real, distinct, non-duplicate signal reached the sampling or budget
+    stage and nothing was digested: the absence that looks quiet from
+    outside the pipeline."""
+
+    FAILED = 'failed'
+    """The run did not complete (``exit_code != 0``). Its counters are still
+    recorded, so whether signal flowed in stays answerable."""
+
+    DEFERRED = 'deferred'
+    """The usage cap deferred the night's coding (``coder.is_cap_deferral``),
+    so it observed neither whether signal flows nor whether the pipeline
+    finishes."""
 
 
-# ---------------------------------------------------------------------------
-# classify_run — the three-valued absence classifier
-# ---------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class RunCounters:
+    """One night's :class:`sampling.SampleResult` counters, each a
+    non-negative int."""
+
+    total_records: int
+    zero_signal_dropped: int
+    dedupe_collapsed: int
+    below_sampling_cut: int
+    budget_skipped: int
+    selected_count: int
+
+    def __post_init__(self) -> None:
+        for field in dataclasses.fields(self):
+            state_docs.as_count(field.name, getattr(self, field.name))
+
+    @classmethod
+    def from_json(cls, raw: object) -> RunCounters:
+        doc = state_docs.json_object(raw, 'counters')
+        return cls(**{
+            field.name: state_docs.required(doc, field.name, state_docs.as_count)
+            for field in dataclasses.fields(cls)
+        })
+
+    def to_json(self) -> dict[str, int]:
+        return dataclasses.asdict(self)
+
 
 def classify_run(
-    *,
-    total_records: int,
-    zero_signal_dropped: int,
-    dedupe_collapsed: int,
-    below_sampling_cut: int,
-    budget_skipped: int,
-    selected_count: int,
-) -> str:
-    """Classify one nightly trickle run as productive / barren / quiet.
+    *, exit_code: int, counters: RunCounters, capped: bool
+) -> RunOutcome:
+    """Classify one night; the first matching branch wins.
 
-    DERIVED FROM, not tuned against, :class:`sampling.SampleResult`'s
-    conservation identity::
+    1. ``exit_code != 0``                         -> FAILED, whatever else is
+       true: selected digests prove signal arrived, not that the night
+       finished.
+    2. ``capped``                                 -> DEFERRED.
+    3. ``selected_count > 0``                     -> PRODUCTIVE, including a
+       night that also skipped records on budget (the budget working).
+    4. ``budget_skipped + below_sampling_cut > 0`` -> BARREN: only real,
+       distinct, non-duplicate signal leaves by either door.
+    5. otherwise                                  -> QUIET.
 
-        total_records == zero_signal_dropped + dedupe_collapsed
-                         + below_sampling_cut + budget_skipped
-                         + len(selected)
+    Branch 5 never hides a barren night. By SampleResult's conservation
+    identity ``total_records == zero_signal_dropped + dedupe_collapsed +
+    below_sampling_cut + budget_skipped + selected_count``, reaching it means
+    every record left by the zero-signal or dedupe door, or none was
+    enumerated: the genuinely quiet night PRD decision 7 protects.
 
-    Three branches:
+    Every parameter is a required keyword, so a caller cannot silently
+    default ``exit_code`` to 0 or ``capped`` to False."""
+    if exit_code != 0:
+        return RunOutcome.FAILED
+    if capped:
+        return RunOutcome.DEFERRED
+    if counters.selected_count > 0:
+        return RunOutcome.PRODUCTIVE
+    if (counters.budget_skipped + counters.below_sampling_cut) > 0:
+        return RunOutcome.BARREN
+    return RunOutcome.QUIET
 
-    1. ``selected_count > 0``                                -> productive.
-       Digests were built. This deliberately INCLUDES a night that also
-       skipped records on budget: a partially-truncated night is the byte
-       budget working as designed, never an absence.
-    2. ``(budget_skipped + below_sampling_cut) > 0``          -> barren.
-       Both are doors that only records with real, distinct,
-       non-duplicate signal can leave by, so reaching this branch proves
-       genuine signal existed and NOTHING was digested. The two doors are
-       kept separate in the recorded counters because they have DIFFERENT
-       remedies (``budgets.max_daily_digest_bytes`` vs
-       ``sampling.top_fraction``/``per_stratum_min`` — SampleResult's own
-       docstring is explicit that conflating them is wrong), but for the
-       PRESENCE question they are one signal: real signal in, nothing out.
-    3. otherwise                                             -> quiet.
 
-    WHY BRANCH 3 IS PROVABLY SAFE — the no-false-alarm guarantee. Reaching
-    the ``else`` means ``selected_count == 0`` and both cut counters are
-    0, so by the identity ``total_records == zero_signal_dropped +
-    dedupe_collapsed``: every enumerated record left by the zero-signal or
-    dedupe door, or nothing was enumerated at all. That is EXACTLY the
-    "genuinely quiet night" PRD decision 7 protects, so a quiet or dormant
-    project can never be classified barren. This is a proof from the
-    invariant, not a threshold someone picked — which is what lets a
-    progress probe exist without re-opening decision 7's false-alarm
-    objection.
+# ---------------------------------------------------------------------------
+# project_state_dir / trickle_state_path — where the record lives, and why
+# not in the repo
+# ---------------------------------------------------------------------------
 
-    ``total_records`` and ``zero_signal_dropped`` are accepted (and
-    RECORDED by :func:`record_run`) but deliberately NOT consulted by the
-    branch logic — they are what an operator reads to understand the shape
-    of a night, and the identity above is what makes the classification
-    auditable after the fact. Do not "simplify" them out of the signature
-    or out of the recorded state.
+STATE_ROOT_ENV = 'DARK_FACTORY_LEGIBILITY_STATE_ROOT'
+"""The ONE supported lever for relocating the legibility state root.
+
+Deliberately a dedicated name rather than a general-purpose one. See
+:func:`project_state_dir` for why that distinction is the whole fix."""
+
+
+def project_state_dir(project_id: str) -> Path:
+    """Return this host's legibility state directory for *project_id*,
+    resolved from the ACCOUNT rather than from the calling process's
+    environment.
+
+    ``<passwd home>/.local/state/dark-factory/legibility/<project_id>/``,
+    overridable only via :data:`STATE_ROOT_ENV`. It holds the trickle
+    run-state file (:func:`trickle_state_path`) and the quarantine of
+    refused legibility writes (``scripts/legibility/unlanded.py::
+    quarantine_root``). Never raises.
+
+    WHY THE PASSWD ANCHOR. The home in the passwd database is a property
+    of the account that owns the pipeline, read from NSS, and is identical
+    for the same uid in every process environment. Measured 2026-09-19 on
+    this host: under ``env -i`` and under ``HOME=/tmp/otherhome``,
+    ``pwd.getpwuid(os.getuid()).pw_dir`` is unmoved while ``Path.home()``
+    follows ``HOME``. ``pwd`` is stdlib, so the module docstring's hard
+    stdlib-only constraint for the bare-``python3`` predicate path
+    survives.
+
+    WHY THE DEDICATED OVERRIDE IS NOT THE SAME BUG. ``XDG_STATE_HOME`` and
+    ``HOME`` are AMBIENT, GENERAL-PURPOSE variables that a login shell, a
+    ``systemd --user`` manager, a container and CI each set differently
+    for reasons having nothing to do with legibility — so writer and
+    reader diverged with nobody having intended to redirect anything.
+    ``DARK_FACTORY_LEGIBILITY_STATE_ROOT`` is never set incidentally; it
+    is set only by someone who means THIS directory. The shipped systemd
+    units deliberately do not set it (pinned by
+    ``scripts/tests/test_install_trickle_health_timer.py``), so production
+    always takes the anchored branch.
+
+    WHAT THE DEGRADATION NOW MEANS. The old code fell through to
+    ``tempfile.gettempdir()`` whenever ``Path.home()`` raised — which a
+    stripped systemd environment with no ``HOME`` did reach. That wrote to
+    a path the nightly never reads, while logging to a logger the
+    bare-``python3`` predicate never configures, so the divergence was
+    invisible. That case now resolves correctly. The tempdir fallback
+    survives only for a genuinely absent passwd entry (an arbitrary-uid
+    container), preserving the never-raise property this helper needs on
+    the nightly run's unconditional path.
+
+    RE-DERIVED, NOT REUSED — AND NO LONGER THE SAME SHAPE. This used to
+    mirror ``orchestrator/src/orchestrator/mcp_lifecycle.py::
+    managed_runtime_data_dirs`` (task 2439) verbatim, and that claim is now
+    false: that function still resolves ``${XDG_STATE_HOME:-~/.local/state}``
+    from its own environment. That is CORRECT there, because a single
+    orchestrator process both creates and consumes those dirs, and WRONG
+    here, because two independently-launched processes must agree. The
+    rooting convention (``dark-factory/`` under a state root) is still
+    shared; the resolution of the root is deliberately not. That function
+    stays un-imported regardless: the ``orchestrator`` package is not
+    importable under the bare-``python3`` predicate path this module must
+    survive.
+
+    ONE DELIBERATE DIVERGENCE from that convention: an extra
+    ``legibility/`` segment between ``dark-factory/`` and ``<project_id>/``
+    (mcp_lifecycle uses ``dark-factory/<project_id>/queue|reconciliation``).
+    This keeps legibility state from colliding with the managed
+    fused-memory runtime dirs for the same project id.
     """
-    if selected_count > 0:
-        return OUTCOME_PRODUCTIVE
-    if (budget_skipped + below_sampling_cut) > 0:
-        return OUTCOME_BARREN
-    return OUTCOME_QUIET
+    override = os.environ.get(STATE_ROOT_ENV)
+    if override:
+        base = Path(override)
+    else:
+        try:
+            base = Path(pwd.getpwuid(os.getuid()).pw_dir) / '.local' / 'state'
+        except (KeyError, OSError):
+            logger.warning(
+                'project_state_dir: no passwd entry for uid %s; falling '
+                'back to the OS temp dir for project_id=%s — the recorded '
+                'legibility state will not survive a reboot. Set %s to a '
+                'durable path.',
+                os.getuid(),
+                project_id,
+                STATE_ROOT_ENV,
+            )
+            base = Path(tempfile.gettempdir())
 
+    return base / 'dark-factory' / 'legibility' / project_id
 
-# ---------------------------------------------------------------------------
-# trickle_state_path — where the record lives, and why not in the repo
-# ---------------------------------------------------------------------------
 
 def trickle_state_path(project_id: str) -> Path:
-    """Return the per-project run-state file path.
+    """Return the per-project run-state file path:
+    ``<project_state_dir(project_id)>/trickle-state.json``.
 
-    ``${XDG_STATE_HOME:-~/.local/state}/dark-factory/legibility/
-    <project_id>/trickle-state.json``.
+    WHAT THIS FILE IS. Its identity is "this host's legibility state for
+    this USER and this project" — not "this PROCESS's state dir". Two
+    processes that must agree on ONE file cannot each resolve it from
+    their own environment. The writer is
+    ``legibility-trickle@<project>.service`` under the ``systemd --user``
+    manager (user-record HOME, no shell rc). The reader is
+    ``legibility-trickle-health@<project>.service``, or an
+    orchestrator-EXEC'd ``before_done`` predicate inheriting whatever
+    shell launched the orchestrator, or a dev shell. Nothing pinned them
+    to agree, so before task 4514 they silently read and wrote different
+    files — and a probe that cannot find the file reports ``missing`` and
+    fails PERMANENTLY, which for a milestone binding is a born-at-L2
+    ``milestone_check_failed`` for a pipeline running perfectly. How the
+    directory is resolved so that they DO agree is
+    :func:`project_state_dir`'s business.
 
     NOT UNDER ``docs/legibility/``, despite ``census-state.json`` living
     there and looking like the local precedent. That file is git-TRACKED
@@ -159,221 +298,729 @@ def trickle_state_path(project_id: str) -> Path:
     warm-lane GC, the exact pollution class task 2439 fixed — or force a
     nightly commit, which would make "the repo has a commit today" a valid
     liveness signal and thereby CONTRADICT PRD decision 7 outright.
-    XDG-rooted host state is what this actually is: a record of what the
-    local timer did. It also needs no ``.gitignore`` entry, because the
-    path is outside every checkout.
-
-    RE-DERIVED, NOT REUSED. The rooting scheme and the ``Path.home()`` ->
-    ``RuntimeError`` -> ``tempfile.gettempdir()`` degradation mirror
-    ``orchestrator.mcp_lifecycle.managed_runtime_data_dirs``
-    (mcp_lifecycle.py, task 2439) verbatim in shape, but that function is
-    deliberately NOT imported: the ``orchestrator`` package is not
-    importable under the bare-``python3`` predicate path this module must
-    survive (see the module docstring). Cited here so the two stay
-    recognizably ONE convention rather than drifting into two.
-
-    ONE DELIBERATE DIVERGENCE from that scheme: an extra ``legibility/``
-    segment between ``dark-factory/`` and ``<project_id>/`` (mcp_lifecycle
-    uses ``dark-factory/<project_id>/queue|reconciliation``). This keeps
-    legibility state from colliding with the managed fused-memory runtime
-    dirs for the same project id.
+    Host-local state outside every checkout is what this actually is: a
+    record of what the local timer did. It also needs no ``.gitignore``
+    entry.
     """
-    xdg_state_home = os.environ.get('XDG_STATE_HOME')
-    if xdg_state_home:
-        base = Path(xdg_state_home)
+    return project_state_dir(project_id) / STATE_FILENAME
+
+
+# ---------------------------------------------------------------------------
+# Retry backlog — the target dates still owed a run
+# ---------------------------------------------------------------------------
+
+RETRY_MAX_AGE_DAYS = 7
+"""Age in days past which an owed target date is abandoned.
+
+At :data:`RETRIES_PER_NIGHT` retries per finished night, oldest first,
+every date of a k-night outage is retried at age k+1, so, when every
+later night finishes, an outage of up to ``RETRY_MAX_AGE_DAYS - 1``
+nights is fully recovered and a longer one loses only its oldest dates.
+On the same condition a systemd outage of up to ``RETRY_MAX_AGE_DAYS``
+missed elapses is fully recovered, since its catch-up pass covers the
+last date itself. Each later night that does not finish retries nothing,
+so it costs the oldest owed date. A module constant, not a
+``legibility.yaml`` field, for the same bare-``python3`` reason as
+:data:`DEFAULT_MAX_BARREN_RUNS`."""
+
+RETRY_MAX_ATTEMPTS = 3
+"""Unfinished passes of one date (its scheduled pass plus retries) after
+which it is abandoned, so a date that fails deterministically cannot hold
+the head of the oldest-first queue until it ages out. It counts unfinished
+passes only, so a date no pass ran gets this many retries."""
+
+RETRIES_PER_NIGHT = 1
+"""Retry passes one invocation runs after its own scheduled pass finished.
+It bounds the extra spend to one night's, and it is the rate the
+:data:`RETRY_MAX_AGE_DAYS` recovery bound is derived from."""
+
+
+class RetryFold(NamedTuple):
+    """The backlog after folding one pass, and what that fold abandoned."""
+
+    backlog: dict[date, int]
+    abandoned: dict[date, int]
+
+
+class NeverRun(NamedTuple):
+    """The target dates a scheduled pass jumped over: the ``owed`` ones
+    still inside the age window, oldest first, and how many older ones
+    ``expired`` before any pass could run them."""
+
+    owed: tuple[date, ...]
+    expired: int
+
+
+def finished(*, exit_code: int, capped: bool) -> bool:
+    """Whether a pass completed: a clean exit the usage cap did not defer."""
+    return exit_code == 0 and not capped
+
+
+def owes_retry(*, exit_code: int, capped: bool, commit_made: bool) -> bool:
+    """Whether a pass leaves its target date owed a run: it did not
+    finish, and it landed nothing."""
+    return not commit_made and not finished(exit_code=exit_code, capped=capped)
+
+
+def parse_retry_backlog(raw: object) -> dict[date, int]:
+    """Read a recorded ``retry_backlog`` ({ISO date: unfinished attempts}).
+
+    Never raises. A non-mapping gives an empty backlog, and an entry whose
+    key is not an ISO date or whose count is not a non-negative int is
+    dropped: a damaged backlog under-reports, like a lost streak."""
+    if not isinstance(raw, dict):
+        return {}
+    backlog: dict[date, int] = {}
+    for key, attempts in raw.items():
+        owed = _parse_iso_date(key)
+        if owed is not None and _is_attempt_count(attempts):
+            backlog[owed] = attempts
+    return backlog
+
+
+def _parse_iso_date(raw: object) -> date | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _is_attempt_count(raw: object) -> bool:
+    return isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0
+
+
+def _oldest_in_window(today: date) -> date:
+    return today - timedelta(days=RETRY_MAX_AGE_DAYS)
+
+
+def _within_window(owed: date, today: date) -> bool:
+    return owed >= _oldest_in_window(today)
+
+
+def never_run_dates(
+    last_scheduled: date | None, *, target_date: date, today: date
+) -> NeverRun:
+    """The target dates no scheduled pass ran: strictly after the last
+    scheduled pass's target and strictly before this one's. Only those
+    inside the age window on *today* are listed; older ones would be
+    abandoned on arrival, so they are counted, never listed."""
+    if last_scheduled is None:
+        return NeverRun(owed=(), expired=0)
+    gap_start = last_scheduled + timedelta(days=1)
+    owed_start = min(max(gap_start, _oldest_in_window(today)), target_date)
+    return NeverRun(
+        owed=tuple(
+            owed_start + timedelta(days=n)
+            for n in range((target_date - owed_start).days)
+        ),
+        expired=max(0, (owed_start - gap_start).days),
+    )
+
+
+def fold_retry_backlog(
+    backlog: Mapping[date, int],
+    *,
+    target_date: date,
+    owes_retry: bool,
+    today: date,
+    never_run: Iterable[date] = (),
+) -> RetryFold:
+    """Fold one pass of *target_date* into a copy of *backlog*.
+
+    Each *never_run* date not already owed enters with 0 attempts. An
+    unfinished pass adds its date or counts one more attempt; a finished
+    pass removes it. Every entry then outside the age window, or at
+    :data:`RETRY_MAX_ATTEMPTS`, moves to ``abandoned``."""
+    folded = dict(backlog)
+    for owed in never_run:
+        folded.setdefault(owed, 0)
+    if owes_retry:
+        folded[target_date] = folded.get(target_date, 0) + 1
     else:
-        try:
-            base = Path.home() / '.local' / 'state'
-        except RuntimeError:
-            # Stripped daemon/CI environment: no HOME and no pwd entry.
-            # This helper is on the nightly run's unconditional path and on
-            # the predicate's, so an unguarded raise would turn an
-            # observability write into a new failure mode. Degrade loudly
-            # instead (task 2439 amendment's identical choice).
-            logger.warning(
-                'trickle_state_path: could not resolve a home directory '
-                '(HOME unset?); falling back to the OS temp dir for '
-                'project_id=%s — the recorded streak will not survive a '
-                'reboot',
-                project_id,
-            )
-            base = Path(tempfile.gettempdir())
+        folded.pop(target_date, None)
+    kept = {
+        owed: attempts
+        for owed, attempts in folded.items()
+        if _within_window(owed, today) and attempts < RETRY_MAX_ATTEMPTS
+    }
+    abandoned = {
+        owed: attempts for owed, attempts in folded.items() if owed not in kept
+    }
+    return RetryFold(backlog=kept, abandoned=abandoned)
 
-    return base / 'dark-factory' / 'legibility' / project_id / STATE_FILENAME
+
+def select_due_retries(
+    backlog: Mapping[date, int],
+    *,
+    today: date,
+    limit: int = RETRIES_PER_NIGHT,
+) -> tuple[date, ...]:
+    """The owed dates to retry now: in-window only, oldest first, at most
+    *limit*."""
+    due = sorted(owed for owed in backlog if _within_window(owed, today))
+    return tuple(due[:limit])
+
+
+def _serialize_retry_backlog(backlog: Mapping[date, int]) -> dict[str, int]:
+    return {owed.isoformat(): backlog[owed] for owed in sorted(backlog)}
 
 
 # ---------------------------------------------------------------------------
-# load_state — three-valued reader (mirrors census_trigger.load_census_state)
+# The census-fire streak — did the census each FIRE launched advance
+# census-state?
 # ---------------------------------------------------------------------------
 
-def load_state(path: str | Path) -> tuple[str, dict | None]:
-    """Read a trickle run-state file. Three-valued, never raises.
+@dataclasses.dataclass(frozen=True)
+class CensusObservation:
+    """One night's census-trigger fact, as a :class:`NightRun` carries it.
 
-    - path does not exist -> ``("missing", None)``, NO warning logged. A
-      project that has never recorded a run is a normal, expected state,
-      not a degradation.
-    - unreadable / invalid JSON / non-dict top level / unknown
-      ``schema_version`` -> ``("malformed", None)`` + exactly ONE WARNING.
-      An unknown schema version is malformed rather than best-effort
-      parsed: a reader that silently accepts a shape it does not
-      understand reintroduces exactly the silent degradation this module
-      exists to close.
-    - otherwise -> ``("ok", data)``.
+    ``last_census_at`` is the census-state value the trigger was evaluated
+    against, read BEFORE any launch: the launch is synchronous, so a census
+    that lands has already rewritten census-state by the time the night is
+    recorded. ``None`` means census-state had no value (never censused)."""
 
-    Shape AND vocabulary mirror the sibling reader in this same package,
-    :func:`census_trigger.load_census_state` (census_trigger.py:239),
-    VERBATIM — same tuple shape, same literal status strings
-    (``'malformed'``, never ``'invalid'``), same fail-safe posture — so
-    the two state readers in ``scripts/legibility/`` cannot drift into two
-    vocabularies for one concept.
-    """
-    path = Path(path)
+    fired: bool
+    last_census_at: str | None
+    census_state_path: str
+
+
+@dataclasses.dataclass(frozen=True)
+class CensusFireStreak:
+    """``fires`` consecutive recorded nights on which the trigger FIRED
+    against one unchanged ``last_census_at`` at one ``census_state_path``,
+    starting on the target_date ``since``."""
+
+    fires: int
+    last_census_at: str | None
+    census_state_path: str
+    since: str
+
+
+def _parse_census_fire_streak(raw: object) -> CensusFireStreak | None:
+    """The recorded ``census_fire_streak`` object, or ``None`` when absent,
+    null or unusable: a damaged streak under-reports rather than making the
+    whole document malformed. ``fires`` must be a real int of at least 1."""
+    if not isinstance(raw, dict):
+        return None
+    fires = raw.get('fires')
+    anchor = raw.get('last_census_at')
+    path = raw.get('census_state_path')
+    since = raw.get('since')
+    if not isinstance(fires, int) or isinstance(fires, bool) or fires < 1:
+        return None
+    if anchor is not None and not isinstance(anchor, str):
+        return None
+    if not isinstance(path, str) or not isinstance(since, str):
+        return None
+    return CensusFireStreak(
+        fires=fires, last_census_at=anchor, census_state_path=path, since=since,
+    )
+
+
+def read_last_census_at(path: Path) -> tuple[str, object]:
+    """``('missing', None)``, ``('malformed', None)`` or ``('ok', raw
+    last_census_at)`` for census-state.json at *path*: the ONE read shared
+    by the nightly's pre-launch anchor and ``check_census_progress.py``'s
+    live comparison, so the two sides of its exact-equality test agree.
+
+    QUIET: ``census_trigger.load_census_state`` owns the malformed WARNING
+    for this file. Timestamps are deliberately not validated: the trigger
+    never FIREs on a malformed census-state, so no streak can be anchored
+    on one."""
     if not path.exists():
         return 'missing', None
-
     try:
-        with open(path, encoding='utf-8') as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning('trickle state at %s is malformed: %s', path, exc)
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
         return 'malformed', None
-
     if not isinstance(data, dict):
-        logger.warning(
-            'trickle state at %s is malformed: expected a JSON object, got %s',
-            path,
-            type(data).__name__,
-        )
         return 'malformed', None
+    return 'ok', data.get('last_census_at')
 
-    schema_version = data.get('schema_version')
-    if schema_version != STATE_SCHEMA_VERSION:
-        logger.warning(
-            'trickle state at %s is malformed: unknown schema_version %r '
-            '(this module writes %d)',
-            path,
-            schema_version,
-            STATE_SCHEMA_VERSION,
-        )
-        return 'malformed', None
 
-    return 'ok', data
+def _fold_census_fire_streak(
+    prev: CensusFireStreak | None,
+    census: CensusObservation | None,
+    target_date: date,
+) -> CensusFireStreak | None:
+    if census is None:
+        return prev
+    if not census.fired:
+        return None
+    if (
+        prev is not None
+        and prev.last_census_at == census.last_census_at
+        and prev.census_state_path == census.census_state_path
+    ):
+        return dataclasses.replace(prev, fires=prev.fires + 1)
+    return CensusFireStreak(
+        fires=1,
+        last_census_at=census.last_census_at,
+        census_state_path=census.census_state_path,
+        since=target_date.isoformat(),
+    )
 
 
 # ---------------------------------------------------------------------------
-# record_run — the writer
+# The recorded document
 # ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class TrickleState:
+    """One recorded night, as ``trickle-state.json`` holds it.
+
+    :meth:`from_json` and :meth:`to_json` are the document's only codec.
+    ``barren_escalated`` is ``None`` for a document written before the
+    field existed: UNRECORDED, which a reader must not take for False."""
+
+    project_id: str
+    target_date: date
+    recorded_at: datetime
+    exit_code: int
+    outcome: RunOutcome
+    applied: int
+    commit_made: bool
+    budget_suppressed: bool
+    capped: bool
+    consecutive_barren_runs: int
+    consecutive_failed_runs: int
+    last_productive_at: datetime | None
+    last_scheduled_target_date: date | None
+    census_fired: bool | None
+    census_fire_streak: CensusFireStreak | None
+    counters: RunCounters
+    retry_backlog: Mapping[date, int]
+    barren_escalated: bool | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'retry_backlog', MappingProxyType(dict(self.retry_backlog))
+        )
+
+    @classmethod
+    def from_json(cls, raw: object) -> TrickleState:
+        """Strict about every field present; an absent additive field takes
+        its default (see :data:`STATE_SCHEMA_VERSION`). The census streak
+        and the retry backlog keep their under-reporting parses."""
+        doc = state_docs.json_object(raw, 'trickle state')
+        version = state_docs.required(doc, 'schema_version', state_docs.as_int)
+        if version != STATE_SCHEMA_VERSION:
+            raise ValueError(
+                f'schema_version: unknown version {version!r} (this module '
+                f'writes {STATE_SCHEMA_VERSION})'
+            )
+        required, defaulted = state_docs.required, state_docs.defaulted
+        return cls(
+            project_id=required(doc, 'project_id', state_docs.as_str),
+            target_date=required(doc, 'target_date', state_docs.as_date),
+            recorded_at=required(doc, 'recorded_at', state_docs.as_datetime),
+            exit_code=required(doc, 'exit_code', state_docs.as_int),
+            outcome=required(doc, 'outcome', state_docs.as_member(RunOutcome)),
+            applied=required(doc, 'applied', state_docs.as_count),
+            commit_made=required(doc, 'commit_made', state_docs.as_bool),
+            budget_suppressed=required(doc, 'budget_suppressed', state_docs.as_bool),
+            capped=defaulted(doc, 'capped', state_docs.as_bool, False),
+            consecutive_barren_runs=required(
+                doc, 'consecutive_barren_runs', state_docs.as_count
+            ),
+            consecutive_failed_runs=defaulted(
+                doc, 'consecutive_failed_runs', state_docs.as_count, 0
+            ),
+            last_productive_at=defaulted(
+                doc, 'last_productive_at', state_docs.as_datetime, None
+            ),
+            last_scheduled_target_date=defaulted(
+                doc, 'last_scheduled_target_date', state_docs.as_date, None
+            ),
+            census_fired=defaulted(doc, 'census_fired', state_docs.as_bool, None),
+            census_fire_streak=_parse_census_fire_streak(
+                doc.get('census_fire_streak')
+            ),
+            counters=RunCounters.from_json(doc.get('counters')),
+            retry_backlog=parse_retry_backlog(doc.get('retry_backlog')),
+            barren_escalated=defaulted(
+                doc, 'barren_escalated', state_docs.as_bool, None
+            ),
+        )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            'schema_version': STATE_SCHEMA_VERSION,
+            'project_id': self.project_id,
+            'target_date': self.target_date.isoformat(),
+            'recorded_at': self.recorded_at.isoformat(),
+            'exit_code': self.exit_code,
+            'outcome': self.outcome.value,
+            'applied': self.applied,
+            'commit_made': self.commit_made,
+            'budget_suppressed': self.budget_suppressed,
+            'capped': self.capped,
+            'consecutive_barren_runs': self.consecutive_barren_runs,
+            'consecutive_failed_runs': self.consecutive_failed_runs,
+            'last_productive_at': isoformat_or_none(self.last_productive_at),
+            'last_scheduled_target_date': isoformat_or_none(
+                self.last_scheduled_target_date
+            ),
+            'census_fired': self.census_fired,
+            'census_fire_streak': (
+                None if self.census_fire_streak is None
+                else dataclasses.asdict(self.census_fire_streak)
+            ),
+            'counters': self.counters.to_json(),
+            'retry_backlog': _serialize_retry_backlog(self.retry_backlog),
+            'barren_escalated': self.barren_escalated,
+        }
+
+
+def isoformat_or_none(value: date | None) -> str | None:
+    """*value* as the document spells it: ISO, or ``None`` when unset."""
+    return None if value is None else value.isoformat()
+
+
+def load_state(path: str | Path) -> state_docs.StateRead[TrickleState]:
+    """Read a trickle run-state file: Missing, Malformed (with the reason,
+    one WARNING) or Ok. Never raises."""
+    return state_docs.read_state(Path(path), TrickleState.from_json)
+
+
+def recorded_age_hours(state: TrickleState, now: datetime | None = None) -> float:
+    """Hours since *state* was recorded, against *now* (the wall clock by
+    default): the one freshness reading both probes share."""
+    current = datetime.now(UTC) if now is None else now
+    return (current - state.recorded_at).total_seconds() / 3600.0
+
+
+def due_retries(state: TrickleState, *, today: date) -> tuple[date, ...]:
+    """The owed dates *state* makes due now, per :func:`select_due_retries`."""
+    return select_due_retries(state.retry_backlog, today=today)
+
+
+# ---------------------------------------------------------------------------
+# Barren policy — the threshold predicate and each door's remedy
+# ---------------------------------------------------------------------------
+
+def barren_streak_due(state: TrickleState, max_runs: int) -> bool:
+    """Whether *state*'s barren streak has reached *max_runs*: the one
+    threshold predicate the nightly's escalation and the progress probe's
+    verdict are both built from."""
+    return state.consecutive_barren_runs >= max_runs
+
+
+class BarrenDoor(StrEnum):
+    """A counter only real, distinct, non-duplicate signal leaves by; a
+    barren night has at least one open."""
+
+    BUDGET = 'budget_skipped'
+    SAMPLING_CUT = 'below_sampling_cut'
+
+
+BARREN_REMEDIES: Mapping[BarrenDoor, str] = MappingProxyType({
+    BarrenDoor.BUDGET: (
+        'raise budgets.max_daily_digest_bytes (candidates competed for '
+        'budget and were ALL discarded on it)'
+    ),
+    BarrenDoor.SAMPLING_CUT: (
+        'raise sampling.top_fraction or sampling.per_stratum_min (these '
+        'records ranked below their stratum cut and never competed for '
+        'budget, so a bigger byte budget will not recover them)'
+    ),
+})
+"""The one spelling of each door's remedy. They differ because a bigger
+byte budget recovers a budget-skipped record and never a sampling-cut one
+(``sampling.SampleResult``)."""
+
+_NO_OPEN_DOOR_REMEDY = (
+    'inspect the recorded counters: no door counter is set, which should be '
+    'impossible for a barren run'
+)
+
+
+def barren_remedy(counters: RunCounters) -> str:
+    """The remedies of the doors *counters* shows open, budget first."""
+    door_counts = {
+        BarrenDoor.BUDGET: counters.budget_skipped,
+        BarrenDoor.SAMPLING_CUT: counters.below_sampling_cut,
+    }
+    remedies = [BARREN_REMEDIES[door] for door, count in door_counts.items() if count > 0]
+    return '; '.join(remedies) or _NO_OPEN_DOOR_REMEDY
+
+
+# ---------------------------------------------------------------------------
+# The writer
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class NightRun:
+    """One pass's facts, as the nightly hands them to :func:`fold_night`.
+
+    ``census`` has no default: ``None`` means the census trigger was not
+    evaluated, and a defaulted ``None`` would silently blind
+    ``check_census_progress.py`` into a permanent OK."""
+
+    target_date: date
+    recorded_at: datetime
+    exit_code: int
+    counters: RunCounters
+    census: CensusObservation | None
+    applied: int = 0
+    commit_made: bool = False
+    budget_suppressed: bool = False
+    capped: bool = False
+    scheduled: bool = False
+
+    @property
+    def outcome(self) -> RunOutcome:
+        return classify_run(
+            exit_code=self.exit_code, counters=self.counters, capped=self.capped
+        )
+
+
+def read_prior(project_id: str) -> TrickleState | None:
+    """The recorded state for *project_id*, or ``None`` when it is missing
+    or malformed: a lost predecessor restarts the streaks at the next night,
+    which under-reports rather than crashing the nightly run."""
+    match load_state(trickle_state_path(project_id)):
+        case state_docs.Ok(value=state):
+            return state
+        case _:
+            return None
+
+
+@dataclasses.dataclass(frozen=True)
+class NightFold:
+    """*run* folded over its recorded *prior* by :func:`fold_night`: the
+    ``state`` the night writes, and the owed dates the fold abandoned for
+    :func:`write_night` to log. The one fold of a night, so whatever is
+    decided from ``state`` is what gets written."""
+
+    prior: TrickleState | None
+    run: NightRun
+    state: TrickleState
+    never_run: NeverRun
+    abandoned: Mapping[date, int]
+
+
+def fold_night(
+    prior: TrickleState | None, project_id: str, run: NightRun
+) -> NightFold:
+    """Fold *run* over *prior*. Pure: it reads and writes nothing and logs
+    nothing. ``state.barren_escalated`` is False here; :func:`write_night`
+    records the real value.
+
+    ==========  =============  =============  ======================
+    outcome     barren streak  failed streak  last_productive_at
+    ==========  =============  =============  ======================
+    productive  reset          reset          stamped with recorded_at
+    quiet       reset          reset          carried
+    barren      +1             reset          carried
+    failed      carried        +1             carried
+    deferred    carried        carried        carried
+    ==========  =============  =============  ======================
+
+    A failed night is evidence about the run, not about signal; a deferred
+    night coded nothing, so it observed neither. Moving a streak on either
+    would let a crash or cap weather erase a real streak or fake one.
+
+    A census FIRE against the streak's anchor and path increments
+    ``census_fire_streak``, any other FIRE restarts it at 1, a NO-FIRE
+    clears it and ``census=None`` carries it. A scheduled pass advances
+    ``last_scheduled_target_date`` (never backwards) and owes, with 0
+    attempts, the :func:`never_run_dates` since the previous scheduled pass;
+    a manual pass moves neither. A pass that :func:`owes_retry` enters or
+    counts its date in ``retry_backlog`` (:func:`fold_retry_backlog`)."""
+    outcome = run.outcome
+    today = run.recorded_at.date()
+    barren_streak, failed_streak = _fold_streaks(prior, outcome)
+    cursor, never_run = _schedule_cursor(
+        None if prior is None else prior.last_scheduled_target_date,
+        target_date=run.target_date,
+        today=today,
+        scheduled=run.scheduled,
+    )
+    retry = fold_retry_backlog(
+        {} if prior is None else prior.retry_backlog,
+        target_date=run.target_date,
+        owes_retry=owes_retry(
+            exit_code=run.exit_code, capped=run.capped, commit_made=run.commit_made
+        ),
+        today=today,
+        never_run=never_run.owed,
+    )
+    state = TrickleState(
+        project_id=project_id,
+        target_date=run.target_date,
+        recorded_at=run.recorded_at,
+        exit_code=run.exit_code,
+        outcome=outcome,
+        applied=run.applied,
+        commit_made=run.commit_made,
+        budget_suppressed=run.budget_suppressed,
+        capped=run.capped,
+        consecutive_barren_runs=barren_streak,
+        consecutive_failed_runs=failed_streak,
+        last_productive_at=(
+            run.recorded_at if outcome == RunOutcome.PRODUCTIVE
+            else None if prior is None
+            else prior.last_productive_at
+        ),
+        last_scheduled_target_date=cursor,
+        census_fired=None if run.census is None else run.census.fired,
+        census_fire_streak=_fold_census_fire_streak(
+            None if prior is None else prior.census_fire_streak,
+            run.census,
+            run.target_date,
+        ),
+        counters=run.counters,
+        retry_backlog=retry.backlog,
+        barren_escalated=False,
+    )
+    return NightFold(prior, run, state, never_run, MappingProxyType(retry.abandoned))
+
+
+def _fold_streaks(
+    prior: TrickleState | None, outcome: RunOutcome
+) -> tuple[int, int]:
+    """``(consecutive_barren_runs, consecutive_failed_runs)`` after a night
+    with *outcome*."""
+    barren = 0 if prior is None else prior.consecutive_barren_runs
+    failed = 0 if prior is None else prior.consecutive_failed_runs
+    match outcome:
+        case RunOutcome.BARREN:
+            return barren + 1, 0
+        case RunOutcome.FAILED:
+            return barren, failed + 1
+        case RunOutcome.DEFERRED:
+            return barren, failed
+        case _:
+            return 0, 0
+
+
+def _schedule_cursor(
+    prior_cursor: date | None,
+    *,
+    target_date: date,
+    today: date,
+    scheduled: bool,
+) -> tuple[date | None, NeverRun]:
+    """The schedule cursor to record, and the never-run dates this pass owes."""
+    nothing_owed = NeverRun(owed=(), expired=0)
+    if not scheduled:
+        return prior_cursor, nothing_owed
+    if prior_cursor is None:
+        return target_date, nothing_owed
+    return (
+        max(prior_cursor, target_date),
+        never_run_dates(prior_cursor, target_date=target_date, today=today),
+    )
+
+
+def write_night(night: NightFold, *, barren_escalated: bool) -> TrickleState:
+    """Record *night* with *barren_escalated* — whether the nightly
+    escalated its barren streak — write the document atomically and return
+    it.
+
+    *barren_escalated* has no default: it is the fact the health probe reads
+    instead of re-deriving the nightly's threshold. The WARNINGs for owed
+    dates the fold abandoned are logged here, once per write. An ``OSError``
+    from the write propagates."""
+    state = dataclasses.replace(night.state, barren_escalated=barren_escalated)
+    prior_cursor = None if night.prior is None else night.prior.last_scheduled_target_date
+    if prior_cursor is not None and night.never_run.expired:
+        _warn_expired_never_run(state.project_id, prior_cursor, night.never_run.expired)
+    _warn_abandoned_retries(
+        state.project_id, night.abandoned, today=state.recorded_at.date()
+    )
+    state_docs.write_state(trickle_state_path(state.project_id), state)
+    return state
+
 
 def record_run(
+    project_id: str, run: NightRun, *, barren_escalated: bool
+) -> TrickleState:
+    """Fold *run* over the recorded predecessor and write it: :func:`write_night`
+    of :func:`fold_night`, for a writer with nothing to decide in between."""
+    return write_night(
+        fold_night(read_prior(project_id), project_id, run),
+        barren_escalated=barren_escalated,
+    )
+
+
+def _warn_expired_never_run(
+    project_id: str, last_scheduled: date, expired: int
+) -> None:
+    first = last_scheduled + timedelta(days=1)
+    logger.warning(
+        'trickle retry backlog: abandoning %d never-run date(s) %s..%s for '
+        'project=%s, already past the %d-day window — their sightings are '
+        'permanently lost to the trickle',
+        expired,
+        first.isoformat(),
+        (first + timedelta(days=expired - 1)).isoformat(),
+        project_id,
+        RETRY_MAX_AGE_DAYS,
+    )
+
+
+def _warn_abandoned_retries(
+    project_id: str, abandoned: Mapping[date, int], *, today: date
+) -> None:
+    for owed, attempts in sorted(abandoned.items()):
+        logger.warning(
+            'trickle retry backlog: abandoning %s for project=%s after %d '
+            'unfinished attempt(s), age %d day(s) (limits: %d attempts, %d '
+            'days) — its sightings are permanently lost to the trickle',
+            owed.isoformat(),
+            project_id,
+            attempts,
+            (today - owed).days,
+            RETRY_MAX_ATTEMPTS,
+            RETRY_MAX_AGE_DAYS,
+        )
+
+
+def record_retry(
     project_id: str,
     *,
     target_date: date,
     recorded_at: datetime,
     exit_code: int,
-    total_records: int,
-    zero_signal_dropped: int,
-    dedupe_collapsed: int,
-    below_sampling_cut: int,
-    budget_skipped: int,
-    selected_count: int,
-    applied: int = 0,
-    commit_made: bool = False,
-    budget_suppressed: bool = False,
-) -> dict:
-    """Classify this run, fold it into the running streak, and write the
-    state file atomically. Returns the document it wrote.
+    capped: bool,
+    commit_made: bool,
+) -> TrickleState | None:
+    """Fold one RETRY pass of *target_date* into the recorded backlog.
+    Returns the state it wrote, or ``None`` when it wrote nothing.
 
-    ``recorded_at`` is an INJECTED parameter, not a ``datetime.now()``
-    inside this function, so the whole module stays clock-injectable and
-    streak/freshness tests need no time faking — mirroring
-    ``nightly.run_nightly``'s existing ``now=`` seam and
-    ``census_trigger.evaluate_census_step``'s clock seam.
-
-    Streak semantics: ``consecutive_barren_runs`` is the previous value
-    plus one when this run is barren, and 0 otherwise. BOTH ``productive``
-    and ``quiet`` reset it — a legitimately quiet night is not evidence of
-    breakage, which is PRD decision 7's no-false-alarm guarantee expressed
-    in the streak rather than only in the classifier.
-
-    ``last_productive_at`` is stamped with ``recorded_at`` on a productive
-    run and carried forward UNCHANGED across barren and quiet runs. It is
-    the field an operator reads to answer "when did this pipeline last
-    actually do anything".
-
-    A ``missing`` or ``malformed`` predecessor simply starts the streak at
-    this run (and drops ``last_productive_at``): losing streak history
-    degrades to UNDER-reporting, never to a crash inside the nightly run.
-
-    The write is atomic: the payload goes to a ``.tmp`` sibling in the
-    SAME directory and is then ``os.replace``d onto the final path.
-    Same-directory is required — ``os.replace`` is only atomic within one
-    filesystem — and the tmp file is removed on any failure, so a crashed
-    write can never leave a partial document that ``load_state`` would
-    report as ``malformed``.
-    """
+    A retry pass rewrites ONLY ``retry_backlog``, so the health record, and
+    the ``recorded_at`` freshness both probes read, keep describing the
+    scheduled night. With no readable predecessor there is no backlog to
+    fold into: it logs one WARNING and writes nothing."""
     path = trickle_state_path(project_id)
+    read = load_state(path)
+    if not isinstance(read, state_docs.Ok):
+        logger.warning(
+            'trickle state: cannot record retry of %s for project=%s: no '
+            'readable trickle state (%s)',
+            target_date.isoformat(),
+            project_id,
+            type(read).__name__.lower(),
+        )
+        return None
 
-    prev_status, prev = load_state(path)
-    prev_streak = 0
-    last_productive_at = None
-    if prev_status == 'ok' and prev is not None:
-        raw_streak = prev.get('consecutive_barren_runs')
-        if isinstance(raw_streak, int) and raw_streak >= 0:
-            prev_streak = raw_streak
-        raw_last = prev.get('last_productive_at')
-        if isinstance(raw_last, str):
-            last_productive_at = raw_last
-
-    outcome = classify_run(
-        total_records=total_records,
-        zero_signal_dropped=zero_signal_dropped,
-        dedupe_collapsed=dedupe_collapsed,
-        below_sampling_cut=below_sampling_cut,
-        budget_skipped=budget_skipped,
-        selected_count=selected_count,
-    )
-
-    recorded_at_iso = recorded_at.isoformat()
-    if outcome == OUTCOME_PRODUCTIVE:
-        last_productive_at = recorded_at_iso
-
-    doc = {
-        'schema_version': STATE_SCHEMA_VERSION,
-        'project_id': project_id,
-        'target_date': target_date.isoformat(),
-        'recorded_at': recorded_at_iso,
-        'exit_code': exit_code,
-        'outcome': outcome,
-        'applied': applied,
-        'commit_made': bool(commit_made),
-        'budget_suppressed': bool(budget_suppressed),
-        'consecutive_barren_runs': (
-            prev_streak + 1 if outcome == OUTCOME_BARREN else 0
+    today = recorded_at.date()
+    fold = fold_retry_backlog(
+        read.value.retry_backlog,
+        target_date=target_date,
+        owes_retry=owes_retry(
+            exit_code=exit_code, capped=capped, commit_made=commit_made
         ),
-        'last_productive_at': last_productive_at,
-        'counters': {
-            'total_records': total_records,
-            'zero_signal_dropped': zero_signal_dropped,
-            'dedupe_collapsed': dedupe_collapsed,
-            'below_sampling_cut': below_sampling_cut,
-            'budget_skipped': budget_skipped,
-            'selected_count': selected_count,
-        },
-    }
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(path.name + '.tmp')
-    try:
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(doc, f, indent=2, sort_keys=True)
-            f.write('\n')
-        os.replace(tmp_path, path)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp_path.unlink()
-        raise
-
-    return doc
+        today=today,
+    )
+    _warn_abandoned_retries(project_id, fold.abandoned, today=today)
+    state = dataclasses.replace(read.value, retry_backlog=fold.backlog)
+    state_docs.write_state(path, state)
+    return state
 
 
 DEFAULT_MAX_BARREN_RUNS = 3
@@ -394,4 +1041,39 @@ that config would drag pydantic + PyYAML onto the bare-``python3``
 predicate path this module must survive (see the module docstring). The
 progress probe also takes the threshold as an argument, so a binding that
 wants a different window passes one rather than editing config.
+"""
+
+DEFAULT_MAX_FAILED_RUNS = 2
+"""Consecutive FAILED runs before ``check_trickle_progress.py`` fails.
+
+WHY 2, AND WHY TIGHTER THAN ``DEFAULT_MAX_BARREN_RUNS = 3``. One failed
+night is already owned TWICE OVER — by ``nightly.py``'s own fail-loud
+escalation for that run, and by ``check_trickle_liveness.sh``'s ``Result
+!= success`` gate — so firing at 1 would only duplicate them. TWO
+consecutive is the PERSISTENT shape neither per-run signal can express,
+and it is what the permanently-broken-coder scenario produces on night
+two. The barren threshold is looser because one barren night can be an
+ordinary bad day, whereas a night that did not finish is already an
+anomaly on its own.
+
+A MODULE CONSTANT, NOT A ``legibility.yaml`` FIELD, for the same reason
+as its sibling above: reading that config would drag pydantic + PyYAML
+onto the bare-``python3`` predicate path this module must survive.
+"""
+
+DEFAULT_MAX_UNADVANCED_CENSUS_FIRES = 3
+"""Consecutive census-trigger FIREs against one unchanged ``last_census_at``
+before ``check_census_progress.py`` fails.
+
+WHY 3. One or two unadvanced fires can be a census deferred for usage
+headroom, which ``census.py``'s ``_defer`` already escalates at info. A
+census that DID advance blocks the trigger for the next ``floor_days``
+(stock 5) nights, so three consecutive unadvanced fires are persistent.
+The threshold bounds how many unadvanced paid censuses run BEFORE an
+operator is alerted, not how many run: nothing here stops the trigger, so
+every later FIRE still launches one until someone acts. A deferred census
+COUNTS toward the streak: nothing the pipeline records tells it apart.
+
+A MODULE CONSTANT, NOT A ``legibility.yaml`` FIELD, for the same reason
+as its siblings above.
 """

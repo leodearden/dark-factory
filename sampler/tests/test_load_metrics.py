@@ -7,12 +7,23 @@ fd9-exists predicates) so they are fully deterministic and safe to run in pytest
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
+from typing import NamedTuple
 
 import pytest
+
+from sampler.metrics import SampleKey
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
 # ---------------------------------------------------------------------------
+
+
+def host_keys(*metrics: str) -> set[SampleKey]:
+    """The keys of host-level metrics, which carry no leaf."""
+    return {SampleKey(metric) for metric in metrics}
 
 # Realistic /proc/pressure/* text with both some and full lines
 PSI_CPU_TEXT = (
@@ -31,28 +42,181 @@ PSI_IO_TEXT = (
 
 
 # ---------------------------------------------------------------------------
+# cgroup-tree fixtures (PRD plans/load-throttle-harmonisation-prd.md §6.4/§7)
+#
+# Every own-pressure test drives discovery and reading through a tmp_path tree
+# plus a matching ``0::`` kernel path, so nothing here reads the live
+# /sys/fs/cgroup — whose topology differs per host and per day.
+# ---------------------------------------------------------------------------
+
+# The segment prefix a systemd user manager puts every user unit under. The
+# ``user@<uid>.service`` element is the discovery ANCHOR (see
+# sampler.metrics.discover_pressure_cgroups).
+USER_MANAGER_PREFIX = 'user.slice/user-1000.slice/user@1000.service'
+
+# Parent slices of the two topologies PRD §6.4 names. ``df.slice`` is the
+# post-3394 shape (PRD §7 row 1); ``app.slice`` is the shape measured live on
+# this host on 2026-09-13, where 3394 has not landed and there is no df-*.slice
+# anywhere — so the orchestrator-*.service fallback is today's LIVE branch.
+DF_PARENT = 'df.slice'
+APP_PARENT = 'app.slice'
+
+# The seven leaves measured under app.slice on this host, and the 0:: path the
+# sampler's own process reports there.
+LIVE_ORCHESTRATOR_LEAVES = (
+    'orchestrator-autopilot-video.service',
+    'orchestrator-dark-factory.service',
+    'orchestrator-know-live.service',
+    'orchestrator-my-solar-challenge.service',
+    'orchestrator-pump-web-ui.service',
+    'orchestrator-reify.service',
+    'orchestrator-solar-challenge-platform.service',
+)
+LIVE_OWN_CGROUP_PATH = f'/{USER_MANAGER_PREFIX}/{APP_PARENT}/orchestrator-dark-factory.service'
+
+# A cpu.pressure body that no parser can extract an avg10 from — the "exists
+# but is garbage" case, which must degrade exactly like an absent file.
+GARBAGE_PRESSURE_TEXT = 'nothing here resembles a pressure line\n'
+
+
+def pressure_text(*, some: float, full: float | None = 0.0) -> str:
+    """Return a cpu.pressure body in the shape measured on a live cgroup.
+
+    ``full=None`` omits the ``full`` line entirely — a legitimate kernel state
+    for CPU pressure, which shared.psi.parse_pressure_file reads as a partial
+    miss (a dict, not None).
+    """
+    lines = [f'some avg10={some:.2f} avg60=0.10 avg300=0.07 total=717833958']
+    if full is not None:
+        lines.append(f'full avg10={full:.2f} avg60=0.05 avg300=0.03 total=350000000')
+    return '\n'.join(lines) + '\n'
+
+
+class CgroupTree(NamedTuple):
+    """The seams a built fixture tree exposes.
+
+    ``cgroup_root`` and ``own_cgroup_path`` are what
+    sampler.metrics.discover_pressure_cgroups takes; ``proc_cgroup_path`` is
+    the α seam (shared.psi.resolve_own_cgroup) that produces the same
+    ``own_cgroup_path`` from a ``0::`` line, so a test can prove the fixture's
+    kernel-path text and its directory layout agree.
+    """
+
+    cgroup_root: Path
+    own_cgroup_path: str
+    proc_cgroup_path: Path
+
+
+def build_cgroup_tree(
+    root: Path,
+    *,
+    groups: Mapping[str, Mapping[str, str | None]],
+    outside: Mapping[str, str] = MappingProxyType({}),
+    own_cgroup_path: str = LIVE_OWN_CGROUP_PATH,
+) -> CgroupTree:
+    """Write a sysfs-shaped cgroup tree under *root* and return its seams.
+
+    Args:
+        root: A tmp_path. The tree is written under ``root/cgroup``.
+        groups: ``{parent_slice_name: {leaf_name: cpu_pressure_text_or_None}}``,
+            planted under the ``user@1000.service`` anchor. A ``None`` text
+            creates the leaf directory with NO cpu.pressure file.
+        outside: ``{leaf_name: text}`` planted under ``root/cgroup/system.slice``
+            — i.e. OUTSIDE the anchor, so an anchored search must not find them.
+        own_cgroup_path: The ``0::`` kernel path the sampler's own process
+            reports. Also written to ``root/proc_self_cgroup``.
+    """
+    cgroup_root = root / 'cgroup'
+    anchor = cgroup_root / USER_MANAGER_PREFIX
+    for parent, leaves in groups.items():
+        for leaf, text in leaves.items():
+            leaf_dir = anchor / parent / leaf
+            leaf_dir.mkdir(parents=True, exist_ok=True)
+            if text is not None:
+                (leaf_dir / 'cpu.pressure').write_text(text)
+    for leaf, text in outside.items():
+        leaf_dir = cgroup_root / 'system.slice' / leaf
+        leaf_dir.mkdir(parents=True, exist_ok=True)
+        (leaf_dir / 'cpu.pressure').write_text(text)
+
+    proc_cgroup_path = root / 'proc_self_cgroup'
+    proc_cgroup_path.write_text(f'0::{own_cgroup_path}\n')
+    return CgroupTree(cgroup_root, own_cgroup_path, proc_cgroup_path)
+
+
+def live_topology(root: Path, **pressures: str | None) -> CgroupTree:
+    """Build topology (a): the seven app.slice leaves, no df-*.slice anywhere.
+
+    Keyword overrides are keyed by leaf name with '.' and '-' replaced by '_',
+    so a test can make one leaf's cpu.pressure absent or garbage without
+    restating the other six.
+    """
+    leaves = {
+        name: pressures.get(
+            name.replace('.', '_').replace('-', '_'),
+            pressure_text(some=round(0.5 + i, 2)),
+        )
+        for i, name in enumerate(LIVE_ORCHESTRATOR_LEAVES)
+    }
+    return build_cgroup_tree(root, groups={APP_PARENT: leaves})
+
+
+def df_topology(root: Path, *project_ids: str) -> CgroupTree:
+    """Build topology (b): one ``df-<project_id>.slice`` leaf per id, post-3394."""
+    leaves = {
+        f'df-{pid}.slice': pressure_text(some=round(1.5 + i, 2))
+        for i, pid in enumerate(project_ids)
+    }
+    return build_cgroup_tree(root, groups={DF_PARENT: leaves})
+
+
+
+# ---------------------------------------------------------------------------
 # Step-1 tests: parse_pressure_file and collect_psi
 # ---------------------------------------------------------------------------
 
 
 class TestParsePressureFile:
+    """The re-exported shared parser (see ``TestParserRehomedToShared``).
+
+    These exact-dict pins therefore move whenever ``shared.psi`` grows a key:
+    the four-key shape below is the 60 s window ruling D17 added (task 3353).
+    ``collect_psi``'s own six-key contract is unaffected — it selects the two
+    avg10 keys explicitly — which is what makes the growth additive here.
+    """
+
     def test_both_lines_extracted(self):
         from sampler.metrics import parse_pressure_file
 
         result = parse_pressure_file(PSI_CPU_TEXT)
-        assert result == {'some_avg10': 2.50, 'full_avg10': 0.30}
+        assert result == {
+            'some_avg10': 2.50,
+            'some_avg60': 1.80,
+            'full_avg10': 0.30,
+            'full_avg60': 0.20,
+        }
 
     def test_missing_full_defaults_to_zero(self):
         from sampler.metrics import parse_pressure_file
 
         result = parse_pressure_file(PSI_MEM_TEXT)
-        assert result == {'some_avg10': 1.23, 'full_avg10': 0.0}
+        assert result == {
+            'some_avg10': 1.23,
+            'some_avg60': 0.90,
+            'full_avg10': 0.0,
+            'full_avg60': 0.0,
+        }
 
     def test_io_both_lines(self):
         from sampler.metrics import parse_pressure_file
 
         result = parse_pressure_file(PSI_IO_TEXT)
-        assert result == {'some_avg10': 0.75, 'full_avg10': 0.45}
+        assert result == {
+            'some_avg10': 0.75,
+            'some_avg60': 0.60,
+            'full_avg10': 0.45,
+            'full_avg60': 0.30,
+        }
 
     def test_float_precision(self):
         from sampler.metrics import parse_pressure_file
@@ -93,11 +257,11 @@ class TestCollectPsi:
 
         mapping = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
         result = collect_psi(read=self._fake_read(mapping))
-        expected_keys = {
+        expected_keys = host_keys(
             'psi_cpu_some_avg10', 'psi_cpu_full_avg10',
             'psi_mem_some_avg10', 'psi_mem_full_avg10',
             'psi_io_some_avg10', 'psi_io_full_avg10',
-        }
+        )
         assert set(result.keys()) == expected_keys
 
     def test_values_match_parsed_text(self):
@@ -106,12 +270,12 @@ class TestCollectPsi:
         mapping = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
         result = collect_psi(read=self._fake_read(mapping))
 
-        assert result['psi_cpu_some_avg10'] == pytest.approx(2.50)
-        assert result['psi_cpu_full_avg10'] == pytest.approx(0.30)
-        assert result['psi_mem_some_avg10'] == pytest.approx(1.23)
-        assert result['psi_mem_full_avg10'] == 0.0          # missing full -> 0.0
-        assert result['psi_io_some_avg10'] == pytest.approx(0.75)
-        assert result['psi_io_full_avg10'] == pytest.approx(0.45)
+        assert result[SampleKey('psi_cpu_some_avg10')] == pytest.approx(2.50)
+        assert result[SampleKey('psi_cpu_full_avg10')] == pytest.approx(0.30)
+        assert result[SampleKey('psi_mem_some_avg10')] == pytest.approx(1.23)
+        assert result[SampleKey('psi_mem_full_avg10')] == 0.0          # missing full -> 0.0
+        assert result[SampleKey('psi_io_some_avg10')] == pytest.approx(0.75)
+        assert result[SampleKey('psi_io_full_avg10')] == pytest.approx(0.45)
 
     def test_all_values_are_floats(self):
         from sampler.metrics import collect_psi
@@ -142,13 +306,13 @@ class TestCollectPsi:
             result = collect_psi(read=self._fake_read(mapping))
 
         # cpu keys must be absent — no fabricated 0.0
-        assert 'psi_cpu_some_avg10' not in result
-        assert 'psi_cpu_full_avg10' not in result
+        assert SampleKey('psi_cpu_some_avg10') not in result
+        assert SampleKey('psi_cpu_full_avg10') not in result
         # memory and io keys must be present
-        assert set(result) == {
+        assert set(result) == host_keys(
             'psi_mem_some_avg10', 'psi_mem_full_avg10',
             'psi_io_some_avg10', 'psi_io_full_avg10',
-        }
+        )
         # At least one WARNING record must mention the skipped source name
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any('cpu' in msg for msg in warning_messages), (
@@ -157,190 +321,257 @@ class TestCollectPsi:
 
 
 # ---------------------------------------------------------------------------
-# Step-3 tests: count_occt_queue_depth, count_verify_concurrency, sum_verify_rss
+# The process collector: classify once from proc.info, read memory only for
+# verify trees
 # ---------------------------------------------------------------------------
 
 
 class FakeProc:
-    """Lightweight process stub exposing the attributes the impl reads."""
+    """A psutil.Process stand-in whose classification can come only from ``info``.
+
+    ``cmdline()`` raises, so any re-read of the command line fails loudly.
+    ``memory_info()`` and ``children()`` raise *memory_error* and
+    *children_error* when those are given.
+    """
 
     def __init__(
         self,
         pid: int,
-        name: str = 'bash',
         cmdline: list[str] | None = None,
         rss: int = 0,
         children: list[FakeProc] | None = None,
+        memory_error: BaseException | None = None,
+        children_error: BaseException | None = None,
     ):
         self.pid = pid
-        self._name = name
-        self._cmdline = cmdline if cmdline is not None else []
+        self.info = {'pid': pid, 'cmdline': cmdline}
         self._rss = rss
         self._children = children if children is not None else []
-
-    def name(self) -> str:
-        return self._name
+        self._memory_error = memory_error
+        self._children_error = children_error
 
     def cmdline(self) -> list[str]:
-        return self._cmdline
+        raise AssertionError('classification must read proc.info')
 
     def memory_info(self):
-        class _MI:
-            def __init__(self, rss):
-                self.rss = rss
-        return _MI(self._rss)
+        if self._memory_error is not None:
+            raise self._memory_error
+        return SimpleNamespace(rss=self._rss)
 
     def children(self, recursive: bool = False) -> list[FakeProc]:
-        if recursive:
-            result = []
-            for ch in self._children:
-                result.append(ch)
-                result.extend(ch.children(recursive=True))
-            return result
-        return list(self._children)
+        if self._children_error is not None:
+            raise self._children_error
+        if not recursive:
+            return list(self._children)
+        result = []
+        for child in self._children:
+            result.append(child)
+            result.extend(child.children(recursive=True))
+        return result
+
+
+def _never_read_memory(pid: int) -> FakeProc:
+    """A non-verify process: reading its memory is the bug under test."""
+    return FakeProc(
+        pid, ['python', 'app.py'], memory_error=AssertionError('memory read off a verify tree')
+    )
+
+
+class TestClassifyProcess:
+    @pytest.mark.parametrize(
+        'cmdline',
+        [
+            ['bash', 'cargo-test-occt-gated'],
+            ['/bin/bash', 'reify/scripts/cargo-test-occt-gated.sh'],
+            ['bash', './scripts/cargo-test-occt-gated.sh', 'cargo', 'test'],
+        ],
+    )
+    def test_an_occt_gated_command_line_is_occt(self, cmdline):
+        from sampler.metrics import ProcessRecord, classify_process
+
+        assert classify_process({'pid': 7, 'cmdline': cmdline}) == ProcessRecord(7, True, False)
+
+    @pytest.mark.parametrize('argv0', ['verify.sh', '/usr/local/bin/verify.sh'])
+    def test_an_argv0_basename_of_verify_sh_is_verify(self, argv0):
+        from sampler.metrics import ProcessRecord, classify_process
+
+        record = classify_process({'pid': 8, 'cmdline': [argv0, 'arg1']})
+
+        assert record == ProcessRecord(8, False, True)
+
+    def test_verify_sh_as_an_argument_is_not_verify(self):
+        from sampler.metrics import classify_process
+
+        assert not classify_process({'pid': 9, 'cmdline': ['bash', 'verify.sh']}).is_verify
+
+    @pytest.mark.parametrize('cmdline', [None, [], ['python', 'script.py']])
+    def test_an_unreadable_empty_or_unrelated_command_line_is_neither(self, cmdline):
+        """``None`` is what psutil puts in ``info`` for an AccessDenied attribute."""
+        from sampler.metrics import ProcessRecord, classify_process
+
+        assert classify_process({'pid': 10, 'cmdline': cmdline}) == ProcessRecord(10, False, False)
+
+    def test_a_record_is_frozen(self):
+        import dataclasses
+
+        from sampler.metrics import classify_process
+
+        record = classify_process({'pid': 11, 'cmdline': ['verify.sh']})
+        field = 'is_verify'
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(record, field, False)
 
 
 class TestCountOcctQueueDepth:
-    def test_counts_only_occt_processes_waiting_on_semaphore(self):
-        """Processes matching cargo-test-occt-gated bash without fd/9 are counted."""
-        from sampler.metrics import count_occt_queue_depth
+    """An occt process is *waiting* while its /proc/<pid>/fd/9 does not exist."""
 
-        procs = [
-            FakeProc(1, 'bash', ['bash', 'cargo-test-occt-gated']),   # waiting (fd9 absent)
-            FakeProc(2, 'bash', ['bash', 'cargo-test-occt-gated']),   # has fd9 → not waiting
-            FakeProc(3, 'bash', ['bash', 'cargo-test-occt-gated']),   # waiting
-            FakeProc(4, 'python', ['python', 'something']),            # not occt
+    def test_counts_only_occt_processes_waiting_on_the_semaphore(self):
+        from sampler.metrics import ProcessRecord, count_occt_queue_depth
+
+        records = [
+            ProcessRecord(1, True, False),
+            ProcessRecord(2, True, False),
+            ProcessRecord(3, True, False),
+            ProcessRecord(4, False, False),
         ]
-        fd9_has = {2}  # pid 2 has fd/9
 
-        def fd9_exists(pid: int) -> bool:
-            return pid in fd9_has
+        assert count_occt_queue_depth(records, lambda pid: pid == 2) == 2
 
-        result = count_occt_queue_depth(procs, fd9_exists)
-        assert result == 2
+    def test_non_occt_records_are_ignored(self):
+        from sampler.metrics import ProcessRecord, count_occt_queue_depth
 
-    def test_non_matching_processes_ignored(self):
-        from sampler.metrics import count_occt_queue_depth
+        records = [ProcessRecord(10, False, False), ProcessRecord(11, False, True)]
 
-        procs = [
-            FakeProc(10, 'python', ['python', 'script.py']),
-            FakeProc(11, 'bash', ['bash', 'other-script']),
-        ]
-        result = count_occt_queue_depth(procs, lambda pid: False)
-        assert result == 0
+        assert count_occt_queue_depth(records, lambda _pid: False) == 0
 
     def test_all_waiting(self):
-        from sampler.metrics import count_occt_queue_depth
+        from sampler.metrics import ProcessRecord, count_occt_queue_depth
 
-        procs = [
-            FakeProc(i, 'bash', ['bash', 'cargo-test-occt-gated']) for i in range(5)
-        ]
-        result = count_occt_queue_depth(procs, lambda pid: False)
-        assert result == 5
+        records = [ProcessRecord(i, True, False) for i in range(5)]
 
-    def test_all_have_fd9_so_none_counted(self):
-        from sampler.metrics import count_occt_queue_depth
+        assert count_occt_queue_depth(records, lambda _pid: False) == 5
 
-        procs = [
-            FakeProc(i, 'bash', ['bash', 'cargo-test-occt-gated']) for i in range(3)
-        ]
-        result = count_occt_queue_depth(procs, lambda pid: True)
-        assert result == 0
+    def test_all_holding_fd9_so_none_counted(self):
+        from sampler.metrics import ProcessRecord, count_occt_queue_depth
 
-    def test_realistic_path_with_extension_counted(self):
-        """The real script is invoked with its .sh path — must be recognised.
+        records = [ProcessRecord(i, True, False) for i in range(3)]
 
-        Realistic invocation: ['/bin/bash', 'reify/scripts/cargo-test-occt-gated.sh']
-        The bare-token form ['bash', 'cargo-test-occt-gated'] was the only fixture
-        used in prior tests, giving false confidence.  This test proves the
-        path-with-extension form is also counted.
-
-        Current _is_occt_gated uses list membership ('cargo-test-occt-gated' in cmdline),
-        which requires an element to equal the bare token exactly.
-        'reify/scripts/cargo-test-occt-gated.sh' != 'cargo-test-occt-gated', so count==0
-        and this test FAILS against the current impl (confirming the RED phase).
-        """
-        from sampler.metrics import count_occt_queue_depth
-
-        procs = [
-            # Realistic form: bash running the script by its full relative path
-            FakeProc(1, 'bash', ['/bin/bash', 'reify/scripts/cargo-test-occt-gated.sh']),
-            # Another common form: bash + path with leading ./
-            FakeProc(2, 'bash', ['bash', './scripts/cargo-test-occt-gated.sh', 'cargo', 'test']),
-            # Unrelated process — must NOT be counted
-            FakeProc(3, 'python', ['python', 'unrelated']),
-        ]
-        result = count_occt_queue_depth(procs, lambda _pid: False)
-        # pids 1 and 2 match (path contains 'cargo-test-occt-gated'), pid 3 does not
-        assert result == 2
+        assert count_occt_queue_depth(records, lambda _pid: True) == 0
 
 
 class TestCountVerifyConcurrency:
-    def test_counts_verify_sh_argv0(self):
-        from sampler.metrics import count_verify_concurrency
+    def test_counts_verify_records(self):
+        from sampler.metrics import ProcessRecord, count_verify_concurrency
 
-        procs = [
-            FakeProc(1, 'bash', ['verify.sh', 'arg1']),              # matches
-            FakeProc(2, 'bash', ['/usr/local/bin/verify.sh', 'x']),  # basename matches
-            FakeProc(3, 'bash', ['bash', 'verify.sh']),               # verify.sh NOT argv[0]
-            FakeProc(4, 'python', ['python', 'app.py']),
+        records = [
+            ProcessRecord(1, False, True),
+            ProcessRecord(2, False, True),
+            ProcessRecord(3, True, False),
+            ProcessRecord(4, False, False),
         ]
-        result = count_verify_concurrency(procs)
-        assert result == 2
 
-    def test_no_verify_processes(self):
-        from sampler.metrics import count_verify_concurrency
+        assert count_verify_concurrency(records) == 2
 
-        procs = [FakeProc(1, 'python', ['python', 'main.py'])]
-        result = count_verify_concurrency(procs)
-        assert result == 0
+    def test_no_verify_records(self):
+        from sampler.metrics import ProcessRecord, count_verify_concurrency
 
-    def test_empty_cmdline_skipped(self):
-        from sampler.metrics import count_verify_concurrency
-
-        procs = [FakeProc(1, 'bash', [])]
-        result = count_verify_concurrency(procs)
-        assert result == 0
+        assert count_verify_concurrency([ProcessRecord(1, False, False)]) == 0
 
 
 class TestSumVerifyRss:
-    def test_sums_process_and_children_rss(self):
+    """Takes only the verify roots, and is the only reader of their trees' memory."""
+
+    def test_sums_each_root_and_its_children(self):
         from sampler.metrics import sum_verify_rss
 
-        child1 = FakeProc(101, 'bash', [], rss=512)
-        child2 = FakeProc(102, 'bash', [], rss=256)
-        parent = FakeProc(100, 'bash', ['verify.sh'], rss=1024, children=[child1, child2])
-        other = FakeProc(200, 'python', ['python'], rss=9999)
+        parent = FakeProc(
+            100, ['verify.sh'], rss=1024,
+            children=[FakeProc(101, rss=512), FakeProc(102, rss=256)],
+        )
 
-        result = sum_verify_rss([parent, other])
-        # parent (1024) + child1 (512) + child2 (256) = 1792
-        assert result == 1792
+        assert sum_verify_rss([parent]) == 1024 + 512 + 256
 
-    def test_dedupes_shared_pids(self):
-        """If a child appears in multiple process trees, count its RSS only once."""
+    def test_a_pid_shared_between_trees_is_counted_once(self):
         from sampler.metrics import sum_verify_rss
 
-        shared_child = FakeProc(999, 'bash', [], rss=100)
-        parent1 = FakeProc(1, 'bash', ['verify.sh'], rss=200, children=[shared_child])
-        parent2 = FakeProc(2, 'bash', ['verify.sh'], rss=300, children=[shared_child])
+        shared_child = FakeProc(999, rss=100)
+        parent1 = FakeProc(1, ['verify.sh'], rss=200, children=[shared_child])
+        parent2 = FakeProc(2, ['verify.sh'], rss=300, children=[shared_child])
 
-        result = sum_verify_rss([parent1, parent2])
-        # parent1 (200) + parent2 (300) + shared_child counted once (100) = 600
-        assert result == 600
+        assert sum_verify_rss([parent1, parent2]) == 200 + 300 + 100
 
-    def test_no_verify_processes_returns_zero(self):
+    def test_no_roots_sum_to_zero(self):
         from sampler.metrics import sum_verify_rss
 
-        procs = [FakeProc(1, 'python', ['python'], rss=1000)]
-        result = sum_verify_rss(procs)
-        assert result == 0
+        assert sum_verify_rss([]) == 0
 
-    def test_verify_without_children(self):
+    def test_a_root_without_children(self):
         from sampler.metrics import sum_verify_rss
 
-        proc = FakeProc(1, 'bash', ['verify.sh'], rss=4096)
-        result = sum_verify_rss([proc])
-        assert result == 4096
+        assert sum_verify_rss([FakeProc(1, ['verify.sh'], rss=4096)]) == 4096
+
+    def test_a_child_that_vanished_is_skipped_and_the_rest_summed(self):
+        import psutil
+
+        from sampler.metrics import sum_verify_rss
+
+        gone = FakeProc(101, memory_error=psutil.NoSuchProcess(101))
+        parent = FakeProc(100, ['verify.sh'], rss=1024, children=[gone, FakeProc(102, rss=256)])
+
+        assert sum_verify_rss([parent]) == 1024 + 256
+
+    def test_a_root_whose_children_are_denied_counts_alone(self):
+        import psutil
+
+        from sampler.metrics import sum_verify_rss
+
+        root = FakeProc(100, ['verify.sh'], rss=1024, children_error=psutil.AccessDenied(100))
+
+        assert sum_verify_rss([root]) == 1024
+
+    def test_a_programming_error_propagates(self):
+        from sampler.metrics import sum_verify_rss
+
+        root = FakeProc(100, ['verify.sh'], memory_error=RuntimeError('not a psutil error'))
+
+        with pytest.raises(RuntimeError, match='not a psutil error'):
+            sum_verify_rss([root])
+
+
+class TestCollectProcessMetrics:
+    def test_the_scan_requests_only_pid_and_cmdline(self):
+        from sampler.metrics import collect_process_metrics
+
+        requested: list[list[str]] = []
+
+        def proc_iter(attrs):
+            requested.append(list(attrs))
+            return iter(())
+
+        collect_process_metrics(proc_iter=proc_iter, fd9_exists=lambda _pid: False)
+
+        assert requested == [['pid', 'cmdline']]
+
+    def test_a_mixed_population(self):
+        from sampler.metrics import collect_process_metrics
+
+        procs = [
+            FakeProc(1, ['bash', 'cargo-test-occt-gated'], memory_error=AssertionError('occt')),
+            FakeProc(2, ['bash', 'cargo-test-occt-gated'], memory_error=AssertionError('occt')),
+            FakeProc(3, ['verify.sh'], rss=1000, children=[FakeProc(30, rss=500)]),
+            FakeProc(4, ['/repo/verify.sh', '--fast'], rss=200),
+            _never_read_memory(5),
+        ]
+
+        result = collect_process_metrics(
+            proc_iter=lambda _attrs: iter(procs), fd9_exists=lambda pid: pid == 2
+        )
+
+        assert result == {
+            SampleKey('occt_queue_depth'): 1.0,
+            SampleKey('verify_concurrency'): 2.0,
+            SampleKey('verify_rss_total_bytes'): 1700.0,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +606,10 @@ class TestParserRehomedToShared:
         """sampler.metrics.parse_pressure_file must be the SAME object as
         shared.psi.parse_pressure_file -- a re-export, not a duplicate copy
         that could drift and re-derive the kernel-asymmetry bug (DA-D9).
+
+        This covers every caller in the module, /proc/pressure/* and each
+        discovered cgroup's cpu.pressure alike: the cgroup text goes through
+        α's parser, not a copy of it (INV-5).
         """
         import shared.psi
 
@@ -402,12 +637,730 @@ class TestParserRehomedToShared:
             return mapping[name]
 
         result = collect_psi(read=read)
-        expected_keys = {
+        expected_keys = host_keys(
             'psi_cpu_some_avg10',
             'psi_cpu_full_avg10',
             'psi_mem_some_avg10',
             'psi_mem_full_avg10',
             'psi_io_some_avg10',
             'psi_io_full_avg10',
-        }
+        )
         assert set(result.keys()) == expected_keys
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-1: discover_pressure_cgroups — the anchored per-leaf search
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverPressureCgroups:
+    """PRD §6.4: one row per df-*.slice present, ELSE per orchestrator-*.service."""
+
+    def test_df_topology_returns_every_leaf_sorted(self, tmp_path):
+        from sampler.metrics import discover_pressure_cgroups
+
+        tree = df_topology(tmp_path, 'reify', 'dark_factory')
+
+        found = discover_pressure_cgroups(
+            own_cgroup_path=tree.own_cgroup_path, cgroup_root=tree.cgroup_root
+        )
+
+        # Named by the LEAF DIRECTORY name, and sorted so the emitted metric
+        # set is stable tick to tick rather than filesystem-order dependent.
+        assert [name for name, _ in found] == [
+            'df-dark_factory.slice',
+            'df-reify.slice',
+        ]
+        for name, pressure_path in found:
+            assert pressure_path.name == 'cpu.pressure'
+            assert pressure_path.parent.name == name
+            assert pressure_path.read_text().startswith('some avg10=')
+
+    def test_live_topology_returns_all_seven_orchestrator_leaves(self, tmp_path):
+        """The ELSE branch of PRD §6.4 — and the branch that is LIVE today.
+
+        Measured on this host 2026-09-13: zero df-*.slice (task 3394 has not
+        landed) and seven orchestrator-*.service leaves.
+        """
+        from sampler.metrics import discover_pressure_cgroups
+
+        tree = live_topology(tmp_path)
+
+        found = discover_pressure_cgroups(
+            own_cgroup_path=tree.own_cgroup_path, cgroup_root=tree.cgroup_root
+        )
+
+        assert [name for name, _ in found] == sorted(LIVE_ORCHESTRATOR_LEAVES)
+        assert len(found) == 7
+
+    def test_a_near_miss_sibling_is_not_swept_in(self, tmp_path):
+        """The SUFFIX half of both globs, which nothing else here exercises.
+
+        Every other fixture plants only leaves that match, so relaxing the two
+        globs to ``*/df-*`` and ``*/orchestrator-*`` left the suite green — and
+        a cgroup manager plants more than services beside a service:
+        ``orchestrator-*.socket`` and ``.scope`` units live in the same
+        directory. Sweeping one in would emit ``own_cpu_some10`` rows whose
+        leaf is a cgroup that is not the unit the arm is about, and ε2
+        would average them in without a way to tell.
+
+        Both branches get a decoy, because the two globs are separate spellings
+        and only the branch that RUNS is under test in any one call.
+        """
+        from sampler.metrics import discover_pressure_cgroups
+
+        orchestrator_tree = build_cgroup_tree(
+            tmp_path / 'else-branch',
+            groups={APP_PARENT: {
+                'orchestrator-1.service': pressure_text(some=1.0),
+                'orchestrator-1.socket': pressure_text(some=2.0),
+                'orchestrator-1.scope': pressure_text(some=3.0),
+            }},
+        )
+        found = discover_pressure_cgroups(
+            own_cgroup_path=orchestrator_tree.own_cgroup_path,
+            cgroup_root=orchestrator_tree.cgroup_root,
+        )
+        assert [name for name, _ in found] == ['orchestrator-1.service']
+
+        df_tree = build_cgroup_tree(
+            tmp_path / 'df-branch',
+            groups={DF_PARENT: {
+                'df-dark_factory.slice': pressure_text(some=1.5),
+                'df-dark_factory': pressure_text(some=2.5),
+            }},
+        )
+        found = discover_pressure_cgroups(
+            own_cgroup_path=df_tree.own_cgroup_path,
+            cgroup_root=df_tree.cgroup_root,
+        )
+        assert [name for name, _ in found] == ['df-dark_factory.slice']
+
+    def test_df_wins_outright_when_both_topologies_exist(self, tmp_path):
+        """df-*.slice is preferred, not unioned — the PRD says ELSE, not AND."""
+        from sampler.metrics import discover_pressure_cgroups
+
+        tree = build_cgroup_tree(
+            tmp_path,
+            groups={
+                DF_PARENT: {'df-dark_factory.slice': pressure_text(some=1.5)},
+                APP_PARENT: {
+                    leaf: pressure_text(some=2.5) for leaf in LIVE_ORCHESTRATOR_LEAVES
+                },
+            },
+        )
+
+        found = discover_pressure_cgroups(
+            own_cgroup_path=tree.own_cgroup_path, cgroup_root=tree.cgroup_root
+        )
+
+        assert [name for name, _ in found] == ['df-dark_factory.slice']
+
+    def test_search_is_anchored_at_the_user_manager_segment(self, tmp_path):
+        """A df-*.slice outside the own cgroup's user@NNN subtree is invisible.
+
+        This is what makes the search cost 0.30 ms instead of the 32.7 ms a
+        recursive rglob from the cgroup root measured on this host — and it is
+        also a correctness property: another user's slices are not ours.
+        """
+        from sampler.metrics import discover_pressure_cgroups
+
+        tree = build_cgroup_tree(
+            tmp_path,
+            groups={APP_PARENT: {leaf: pressure_text(some=0.5) for leaf in LIVE_ORCHESTRATOR_LEAVES}},
+            outside={
+                'df-someone_else.slice': pressure_text(some=9.0),
+                'orchestrator-someone-else.service': pressure_text(some=9.0),
+            },
+        )
+
+        found = discover_pressure_cgroups(
+            own_cgroup_path=tree.own_cgroup_path, cgroup_root=tree.cgroup_root
+        )
+
+        names = [name for name, _ in found]
+        assert 'df-someone_else.slice' not in names
+        assert 'orchestrator-someone-else.service' not in names
+        assert names == sorted(LIVE_ORCHESTRATOR_LEAVES)
+
+    def test_outside_only_tree_finds_nothing_at_all(self, tmp_path):
+        """With every candidate planted outside the anchor, the result is empty.
+
+        Pins that discovery never falls back to walking the whole cgroup root:
+        a search that did would return both planted leaves here.
+        """
+        from sampler.metrics import discover_pressure_cgroups
+
+        tree = build_cgroup_tree(
+            tmp_path,
+            groups={},
+            outside={'df-someone_else.slice': pressure_text(some=9.0)},
+        )
+
+        assert discover_pressure_cgroups(
+            own_cgroup_path=tree.own_cgroup_path, cgroup_root=tree.cgroup_root
+        ) == []
+
+    @pytest.mark.parametrize(
+        'own_cgroup_path',
+        [
+            pytest.param('/system.slice/some-daemon.service', id='no-user-manager-segment'),
+            pytest.param('', id='alpha-resolution-failure-value'),
+        ],
+    )
+    def test_unanchorable_own_cgroup_yields_empty_without_raising(
+        self, tmp_path, own_cgroup_path
+    ):
+        """``''`` is α's OwnCgroup('', None) failure value — it must not raise."""
+        from sampler.metrics import discover_pressure_cgroups
+
+        tree = live_topology(tmp_path)
+
+        assert discover_pressure_cgroups(
+            own_cgroup_path=own_cgroup_path, cgroup_root=tree.cgroup_root
+        ) == []
+
+    def test_fixture_kernel_path_agrees_with_alphas_resolver(self, tmp_path):
+        """The fixture's 0:: text and its directory layout are the same tree.
+
+        Drives α's own seam (shared.psi.resolve_own_cgroup) over the fixture's
+        proc_cgroup_path and asserts it produces the own_cgroup_path discovery
+        is given, so the two halves of the fixture cannot drift apart.
+        """
+        from shared.psi import resolve_own_cgroup
+
+        tree = live_topology(tmp_path)
+        resolve_own_cgroup.cache_clear()
+        own = resolve_own_cgroup(
+            None, proc_cgroup_path=tree.proc_cgroup_path, cgroup_root=tree.cgroup_root
+        )
+
+        assert own.path == tree.own_cgroup_path
+        assert own.pressure_path is not None
+        assert own.pressure_path.read_text().startswith('some avg10=')
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-3: collect_load_metrics — the runqueue half (PRD detail A)
+# ---------------------------------------------------------------------------
+
+
+class TestCollectLoadMetricsRunqueue:
+    """After D1, runqueue_ratio is the only LIVE CPU arm.
+
+    So an unreadable /proc/stat must leave a counter behind rather than
+    silently making the arm inert: ``runqueue_read_ok`` is always emitted, and
+    ``runqueue_ratio`` is emitted only when the read actually succeeded.
+    """
+
+    @staticmethod
+    def _reader(reading):
+        def read_runqueue(**_kwargs):
+            return reading
+        return read_runqueue
+
+    def test_healthy_read_emits_ratio_and_ok(self, tmp_path):
+        from shared.psi import RunqueueReading
+
+        from sampler.metrics import collect_load_metrics
+
+        tree = live_topology(tmp_path)
+        result = collect_load_metrics(
+            read_runqueue=self._reader(RunqueueReading(2.75, True)),
+            own_cgroup_path=tree.own_cgroup_path,
+            cgroup_root=tree.cgroup_root,
+        )
+
+        assert result[SampleKey('runqueue_ratio')] == pytest.approx(2.75)
+        assert result[SampleKey('runqueue_read_ok')] == 1.0
+
+    def test_failed_read_emits_ok_zero_and_no_ratio(self, tmp_path):
+        """α degrades to RunqueueReading(0.0, False) — a value, not a reading.
+
+        Persisting that 0.0 under ``runqueue_ratio`` would put a fabricated
+        "completely idle host" row in the corpus ε1/ε2 calibrate against, which
+        is the defect class task 1817 fixed in this module. The read_ok row
+        alone carries the failure.
+        """
+        from shared.psi import RunqueueReading
+
+        from sampler.metrics import collect_load_metrics
+
+        tree = live_topology(tmp_path)
+        result = collect_load_metrics(
+            read_runqueue=self._reader(RunqueueReading(0.0, False)),
+            own_cgroup_path=tree.own_cgroup_path,
+            cgroup_root=tree.cgroup_root,
+        )
+
+        assert result[SampleKey('runqueue_read_ok')] == 0.0
+        assert SampleKey('runqueue_ratio') not in result
+
+    def test_a_genuine_zero_ratio_is_still_recorded(self, tmp_path):
+        """A real 0.0 reading is distinguishable from a failed one: read_ok=1."""
+        from shared.psi import RunqueueReading
+
+        from sampler.metrics import collect_load_metrics
+
+        tree = live_topology(tmp_path)
+        result = collect_load_metrics(
+            read_runqueue=self._reader(RunqueueReading(0.0, True)),
+            own_cgroup_path=tree.own_cgroup_path,
+            cgroup_root=tree.cgroup_root,
+        )
+
+        assert result[SampleKey('runqueue_ratio')] == 0.0
+        assert result[SampleKey('runqueue_read_ok')] == 1.0
+
+    @pytest.mark.parametrize('read_ok', [True, False])
+    def test_every_value_is_a_float(self, tmp_path, read_ok):
+        """The store's value column is REAL, so a bool read_ok must not leak."""
+        from shared.psi import RunqueueReading
+
+        from sampler.metrics import collect_load_metrics
+
+        tree = live_topology(tmp_path)
+        result = collect_load_metrics(
+            read_runqueue=self._reader(RunqueueReading(1.25, read_ok)),
+            own_cgroup_path=tree.own_cgroup_path,
+            cgroup_root=tree.cgroup_root,
+        )
+
+        for key, value in result.items():
+            assert type(value) is float, f'{key} is {type(value).__name__}: {value!r}'
+
+    def test_default_reader_is_alphas_read_runqueue_ratio(self):
+        """No /proc/stat reading of our own — α owns that reader (INV-5)."""
+        import inspect
+
+        import shared.psi
+
+        from sampler.metrics import collect_load_metrics
+
+        sig = inspect.signature(collect_load_metrics)
+        assert sig.parameters['read_runqueue'].default is shared.psi.read_runqueue_ratio
+
+
+# ---------------------------------------------------------------------------
+# Task 3592 step-5: collect_load_metrics — the per-cgroup own-pressure half
+# ---------------------------------------------------------------------------
+
+
+def _healthy_runqueue(**_kwargs):
+    from shared.psi import RunqueueReading
+
+    return RunqueueReading(1.0, True)
+
+
+def _collect(tree, **overrides):
+    from sampler.metrics import collect_load_metrics
+
+    return collect_load_metrics(
+        read_runqueue=_healthy_runqueue,
+        own_cgroup_path=overrides.pop('own_cgroup_path', tree.own_cgroup_path),
+        cgroup_root=overrides.pop('cgroup_root', tree.cgroup_root),
+        **overrides,
+    )
+
+
+class TestCollectLoadMetricsOwnPressure:
+    """One own_cpu_some10 + one own_read_ok row per DISCOVERED leaf, and no more.
+
+    ``own_read_ok`` is per-LEAF evidence — it answers "did THIS
+    cgroup's pressure file read". Every degradation is therefore carried by
+    value against a real leaf name (INV-11), and never fabricated against an
+    invented one.
+    """
+
+    def test_seven_leaves_yield_fourteen_keys_with_parsed_values(self, tmp_path):
+        tree = live_topology(tmp_path)
+
+        result = _collect(tree)
+
+        own = {k: v for k, v in result.items() if k.metric.startswith('own_')}
+        assert len(own) == 14
+        # live_topology gives leaf i a `some avg10` of 0.5 + i, in
+        # LIVE_ORCHESTRATOR_LEAVES order.
+        for i, leaf in enumerate(LIVE_ORCHESTRATOR_LEAVES):
+            assert own[SampleKey('own_cpu_some10', leaf)] == pytest.approx(0.5 + i)
+            assert own[SampleKey('own_read_ok', leaf)] == 1.0
+        # The leaf is the FULL leaf directory name, verbatim.
+        assert SampleKey('own_cpu_some10', 'orchestrator-dark-factory.service') in own
+
+    def test_the_live_none_branch_resolves_its_own_cgroup_hermetically(self, tmp_path):
+        """The branch production actually takes, driven without touching /proc.
+
+        __main__ calls ``collect_load_metrics()`` with no arguments, so the
+        ``own_cgroup_path is None`` path — ask α's resolver for the live 0::
+        path — is the one that runs on every real tick. Every other test in
+        this class injects ``own_cgroup_path`` explicitly and so skips it,
+        which left the live wiring (does it pass the right argument? does it
+        take ``.path``?) protected by nothing. Forwarding α's own
+        ``proc_cgroup_path`` seam is what makes it drivable against a fixture
+        instead of only against the real /proc/self/cgroup.
+        """
+        from shared.psi import RunqueueReading, resolve_own_cgroup
+
+        from sampler.metrics import collect_load_metrics
+
+        tree = live_topology(tmp_path)
+        resolve_own_cgroup.cache_clear()
+
+        result = collect_load_metrics(
+            read_runqueue=lambda **_kwargs: RunqueueReading(1.0, True),
+            proc_cgroup_path=tree.proc_cgroup_path,
+            cgroup_root=tree.cgroup_root,
+        )
+
+        own = {k: v for k, v in result.items() if k.metric.startswith('own_')}
+        assert len(own) == 14, (
+            'the live None branch discovered no leaves, so the resolved anchor '
+            f'disagrees with the injected one; got {sorted(own)}'
+        )
+        for i, leaf in enumerate(LIVE_ORCHESTRATOR_LEAVES):
+            assert own[SampleKey('own_cpu_some10', leaf)] == pytest.approx(0.5 + i)
+            assert own[SampleKey('own_read_ok', leaf)] == 1.0
+
+    def test_the_resolution_reads_the_injected_proc_file_not_the_live_one(
+        self, tmp_path, caplog
+    ):
+        """What makes the test above non-vacuous, and it needs saying why.
+
+        LIVE_OWN_CGROUP_PATH is byte-identical to this host's real
+        /proc/self/cgroup 0:: line, and the anchor is derived from the
+        ``user@<uid>.service`` segment alone — so on this host a run that
+        IGNORED the seam and read the real /proc would derive the very same
+        anchor and discover the fixture's leaves anyway. The positive test
+        therefore cannot, by itself, show the seam is plumbed.
+
+        This one can: the injected 0:: line carries no ``user@`` segment, so
+        α's resolver has nothing to anchor at and discovery must report zero
+        leaves. A run that read the live /proc instead would anchor
+        successfully and emit fourteen own_* rows, failing here.
+        """
+        from shared.psi import RunqueueReading, resolve_own_cgroup
+
+        from sampler.metrics import collect_load_metrics
+
+        tree = live_topology(tmp_path)
+        tree.proc_cgroup_path.write_text('0::/system.slice/not-a-user-manager.service\n')
+        resolve_own_cgroup.cache_clear()
+
+        # DEBUG, not WARNING: an unanchorable 0:: line is the structural case
+        # and is logged below warning level so a 5 s oneshot stays quiet.
+        with caplog.at_level(logging.DEBUG, logger='sampler.metrics'):
+            result = collect_load_metrics(
+                read_runqueue=lambda **_kwargs: RunqueueReading(1.0, True),
+                proc_cgroup_path=tree.proc_cgroup_path,
+                cgroup_root=tree.cgroup_root,
+            )
+
+        assert not [k for k in result if k.metric.startswith('own_')], (
+            'own_* rows were emitted from an unanchorable 0:: line, so the '
+            'resolution read the live /proc/self/cgroup and not the seam'
+        )
+        assert 'no pressure cgroups discovered' in caplog.text
+        # The runqueue group is independent and still reports.
+        assert result[SampleKey('runqueue_read_ok')] == 1.0
+
+    def test_absent_pressure_file_degrades_only_its_own_leaf(self, tmp_path):
+        broken = 'orchestrator-reify.service'
+        tree = live_topology(tmp_path, **{broken.replace('.', '_').replace('-', '_'): None})
+
+        result = _collect(tree)
+
+        assert result[SampleKey('own_read_ok', broken)] == 0.0
+        assert SampleKey('own_cpu_some10', broken) not in result
+        # The other six are untouched — the failure is isolated, not pooled.
+        for leaf in LIVE_ORCHESTRATOR_LEAVES:
+            if leaf == broken:
+                continue
+            assert result[SampleKey('own_read_ok', leaf)] == 1.0
+            assert SampleKey('own_cpu_some10', leaf) in result
+
+    def test_unparseable_pressure_file_behaves_exactly_like_an_absent_one(self, tmp_path):
+        broken = 'orchestrator-reify.service'
+        key = broken.replace('.', '_').replace('-', '_')
+        tree = live_topology(tmp_path, **{key: GARBAGE_PRESSURE_TEXT})
+
+        result = _collect(tree)
+
+        assert result[SampleKey('own_read_ok', broken)] == 0.0
+        assert SampleKey('own_cpu_some10', broken) not in result
+        assert len([k for k in result if k.metric.startswith('own_')]) == 13
+
+    def test_zero_discovered_leaves_emit_no_own_rows_and_warn(self, tmp_path, caplog):
+        """Decision 2: no leaf means no subject, so no row — and one WARNING.
+
+        A synthesised ``own_read_ok`` = 0.0 for an invented leaf would put a key into
+        the DB that ε2 would then average, so the assertion is on the ABSENCE
+        of any own_ key rather than on a particular invented name.
+        """
+        tree = build_cgroup_tree(tmp_path, groups={})
+
+        with caplog.at_level(logging.WARNING):
+            result = _collect(tree)
+
+        assert [k for k in result if k.metric.startswith('own_')] == []
+        # The runqueue half is unaffected — the two halves degrade separately.
+        assert result[SampleKey('runqueue_read_ok')] == 1.0
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('user@1000.service' in msg for msg in warnings), (
+            f'Expected a WARNING naming the attempted anchor; got: {warnings}'
+        )
+
+    def test_an_unanchorable_path_says_so_below_warning_level(self, tmp_path, caplog):
+        """The same "no leaves" outcome, at two severities, chosen by CAUSE.
+
+        Its sibling above resolves an anchor and finds it empty — a surprise,
+        so WARNING. Here there is no ``user@<uid>.service`` segment to anchor
+        at, which is the ordinary state of a dev box, a container, or any
+        sampler outside a systemd user manager. At the unit's 5 s cadence
+        warning on that would be 17,280 journal lines a day carrying no
+        information after the first, burying the per-tick ``logger.exception``
+        lines the three degrade handlers exist to surface.
+
+        Asserted as "no WARNING, and the DEBUG record still names the path",
+        not as "logger.debug was called": the operator-visible property is the
+        severity the journal filters on, and the diagnosis must survive the
+        downgrade rather than be silenced by it.
+        """
+        tree = build_cgroup_tree(tmp_path, groups={})
+
+        with caplog.at_level(logging.DEBUG, logger='sampler.metrics'):
+            result = _collect(tree, own_cgroup_path='/system.slice/nowhere.service')
+
+        assert [k for k in result if k.metric.startswith('own_')] == []
+        assert result[SampleKey('runqueue_read_ok')] == 1.0
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+        debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any('nowhere.service' in msg for msg in debug), (
+            f'the diagnosis was silenced rather than downgraded; got: {debug}'
+        )
+
+    def test_some_only_pressure_file_still_reads_ok(self, tmp_path):
+        """A cgroup cpu.pressure may legitimately carry no ``full`` line.
+
+        α's parser returns a dict in that case, not None, so this is a
+        successful read and must not be reported as a failure.
+        """
+        leaf = 'orchestrator-reify.service'
+        key = leaf.replace('.', '_').replace('-', '_')
+        tree = live_topology(tmp_path, **{key: pressure_text(some=3.25, full=None)})
+
+        result = _collect(tree)
+
+        assert result[SampleKey('own_read_ok', leaf)] == 1.0
+        assert result[SampleKey('own_cpu_some10', leaf)] == pytest.approx(3.25)
+
+    def test_df_topology_names_rows_by_the_slice_leaf(self, tmp_path):
+        tree = df_topology(tmp_path, 'dark_factory', 'reify')
+
+        result = _collect(tree)
+
+        assert result[SampleKey('own_read_ok', 'df-dark_factory.slice')] == 1.0
+        assert result[SampleKey('own_read_ok', 'df-reify.slice')] == 1.0
+        assert len([k for k in result if k.metric.startswith('own_')]) == 4
+
+    def test_every_value_is_a_float(self, tmp_path):
+        tree = live_topology(tmp_path, orchestrator_reify_service=None)
+
+        result = _collect(tree)
+
+        for key, value in result.items():
+            assert type(value) is float, f'{key} is {type(value).__name__}: {value!r}'
+
+    def test_per_leaf_keys_carry_the_leaf_as_data(self, tmp_path):
+        """The leaf travels in its own field, never encoded into the metric name."""
+        tree = live_topology(tmp_path)
+
+        result = _collect(tree)
+
+        assert [k for k in result if ':' in k.metric] == []
+        own = [k for k in result if k.metric.startswith('own_')]
+        assert {k.leaf for k in own} == set(LIVE_ORCHESTRATOR_LEAVES)
+        assert {k.leaf for k in result if k.metric.startswith('runqueue_')} == {None}
+
+    def test_a_sample_key_defaults_to_a_host_level_leaf(self):
+        """``label()`` is display rendering only: nothing parses it back."""
+        assert SampleKey('x').leaf is None
+        assert SampleKey('own_cpu_some10', 'a.service').label() == 'own_cpu_some10:a.service'
+        assert SampleKey('runqueue_ratio').label() == 'runqueue_ratio'
+
+
+# ---------------------------------------------------------------------------
+# Sampler-to-gate vocabulary parity: the table's arms against shared.psi's
+# ---------------------------------------------------------------------------
+
+
+def _emitted_by_group(tmp_path):
+    """What each live group's own collector emits over this module's fixtures."""
+    from sampler.metrics import GroupName, collect_process_metrics, collect_psi
+
+    pressure = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
+    return {
+        GroupName.PSI: set(collect_psi(read=lambda name: pressure[name])),
+        GroupName.PROCESS: set(collect_process_metrics(
+            proc_iter=lambda _attrs: iter(()), fd9_exists=lambda _pid: False
+        )),
+        GroupName.LOAD: set(_collect(live_topology(tmp_path))),
+    }
+
+
+def _is_emitted(spec, emitted: set[SampleKey]) -> bool:
+    if spec.per_leaf:
+        return any(key.metric == spec.name and key.leaf for key in emitted)
+    return spec.key() in emitted
+
+
+class TestArmMetricStemParity:
+    """Every gate arm is recorded by a table metric, and every such metric is emitted.
+
+    The gate decides on arms; the sampler records metrics; the calibration
+    gates (tasks 5219/5220) read one against the other. The metric side is the
+    table's projection, sampler.metrics.ARM_METRICS. The arm side is read from
+    the live artifact, shared.psi._ARMS: a private name deliberately, because
+    it IS the saturation truth table and a copy of it here would be the drift
+    this test exists to catch.
+    """
+
+    @staticmethod
+    def _arm_fields():
+        from shared.psi import _ARMS
+
+        return {arm.field for arm in _ARMS}
+
+    def test_every_arm_is_recorded_by_a_table_metric(self):
+        from sampler.metrics import ARM_METRICS
+
+        missing = self._arm_fields() - set(ARM_METRICS)
+        assert not missing, (
+            f'shared.psi._ARMS has arms no MetricSpec records: {sorted(missing)}. '
+            'Give the recording spec in sampler.metrics.METRIC_GROUPS that arm, or '
+            'the gate will hold on a signal the calibration corpus cannot see.'
+        )
+
+    def test_no_table_arm_is_orphaned(self):
+        from sampler.metrics import ARM_METRICS
+
+        orphans = set(ARM_METRICS) - self._arm_fields()
+        assert not orphans, (
+            f'sampler.metrics.METRIC_GROUPS names arms that shared.psi._ARMS does not '
+            f'have: {sorted(orphans)}.'
+        )
+
+    def test_every_arm_metric_is_emitted_by_its_own_groups_collector(self, tmp_path):
+        from sampler.metrics import ARM_METRICS, METRIC_GROUPS
+
+        emitted = _emitted_by_group(tmp_path)
+        for arm, spec in ARM_METRICS.items():
+            (group,) = [g for g in METRIC_GROUPS if spec in g.metrics]
+            assert _is_emitted(spec, emitted[group.name]), (
+                f'arm {arm!r} is recorded as {spec.name!r} in the {group.name} group, '
+                f'whose collector does not emit it; emitted: {sorted(emitted[group.name])}'
+            )
+
+    def test_every_readability_metric_is_emitted_by_the_same_collector(self, tmp_path):
+        from sampler.metrics import METRIC_GROUPS
+
+        emitted = _emitted_by_group(tmp_path)
+        readable = [
+            (group, spec) for group in METRIC_GROUPS for spec in group.metrics
+            if spec.readability is not None
+        ]
+        assert readable, 'no spec declares a readability metric'
+        for group, spec in readable:
+            assert spec.readability is not None
+            assert _is_emitted(spec.readability, emitted[group.name]), (
+                f'{spec.name!r} declares readability {spec.readability.name!r}, which the '
+                f'{group.name} collector does not emit; emitted: {sorted(emitted[group.name])}'
+            )
+
+# ---------------------------------------------------------------------------
+# Every key a live collector emits is admitted by its own group and stored
+# ---------------------------------------------------------------------------
+
+
+class TestEmittedNamesAreAdmittedByRunTick:
+    """The REAL collectors, through the REAL run_tick, over the live table.
+
+    Each group of METRIC_GROUPS keeps its admission rule and window mode, and
+    only its collector is rebound to this module's fixtures. A row landing in
+    the store is the property that matters, so that is what is asserted.
+    """
+
+    @staticmethod
+    def _bound_table(tree):
+        """METRIC_GROUPS with each group's collector bound to this module's fixtures."""
+        import dataclasses
+
+        from shared.psi import RunqueueReading
+
+        from sampler.metrics import (
+            METRIC_GROUPS,
+            GroupName,
+            collect_load_metrics,
+            collect_process_metrics,
+            collect_psi,
+        )
+
+        pressure = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
+        bound = {
+            GroupName.PSI: lambda: collect_psi(read=lambda name: pressure[name]),
+            GroupName.PROCESS: lambda: collect_process_metrics(
+                proc_iter=lambda _attrs: iter(()), fd9_exists=lambda _pid: False
+            ),
+            GroupName.LOAD: lambda: collect_load_metrics(
+                read_runqueue=lambda **_kwargs: RunqueueReading(2.5, True),
+                own_cgroup_path=tree.own_cgroup_path,
+                cgroup_root=tree.cgroup_root,
+            ),
+        }
+        return tuple(
+            dataclasses.replace(group, collect=bound[group.name]) for group in METRIC_GROUPS
+        )
+
+    def _store_one_tick(self, tmp_path, tree) -> tuple[set[SampleKey], set[SampleKey]]:
+        """Collect every bound group, run one tick, and return (emitted, stored)."""
+        import sqlite3
+
+        from sampler.sampler import run_tick
+        from sampler.store import LoadSampleStore
+
+        collected = {group: group.collect() for group in self._bound_table(tree)}
+        for group, samples in collected.items():
+            unadmitted = sorted(key.label() for key in samples if not group.admits(key))
+            assert not unadmitted, f'the {group.name} group does not admit {unadmitted}'
+
+        db_path = tmp_path / 'db.sqlite'
+        run_tick(LoadSampleStore(db_path), 1_000_000, collected)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            stored = {
+                SampleKey(*row)
+                for row in conn.execute('SELECT DISTINCT metric, leaf FROM samples')
+            }
+        finally:
+            conn.close()
+        emitted = {key for samples in collected.values() for key in samples}
+        return emitted, stored
+
+    def test_every_name_the_collectors_emit_reaches_the_store(self, tmp_path):
+        from sampler.metrics import METRIC_GROUPS
+
+        emitted, stored = self._store_one_tick(tmp_path, live_topology(tmp_path))
+
+        exact = [name for group in METRIC_GROUPS for name in group.exact]
+        per_leaf = [name for group in METRIC_GROUPS for name in group.per_leaf]
+        assert len(emitted) == len(exact) + len(per_leaf) * len(LIVE_ORCHESTRATOR_LEAVES), (
+            f'the fixture did not exercise every group; got {sorted(emitted)}'
+        )
+        assert stored == emitted
+
+    def test_the_df_topology_vocabulary_is_admitted_too(self, tmp_path):
+        """Post-3394 the leaf names change shape; admission must still take them."""
+        emitted, stored = self._store_one_tick(tmp_path, df_topology(tmp_path, 'dark-factory', 'reify'))
+
+        assert SampleKey('own_cpu_some10', 'df-dark-factory.slice') in emitted, sorted(emitted)
+        assert stored == emitted

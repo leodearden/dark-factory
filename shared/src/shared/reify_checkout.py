@@ -12,7 +12,12 @@ resolution AND the skip wording live here: a call site that hand-rolled its own
 
 Consumers import from this module directly::
 
-    from shared.reify_checkout import REIFY_ROOT_ENV, reify_skip_reason, resolve_reify_checkout
+    from shared.reify_checkout import (
+        REIFY_ROOT_ENV,
+        checkout_skip_reason,
+        reify_skip_reason,
+        resolve_reify_checkout,
+    )
 
 It is deliberately NOT re-exported from ``shared/__init__.py`` — see
 ``shared/tests/test_public_api.py``, which pins ``shared.__all__`` to the union
@@ -22,8 +27,9 @@ convention for this kind of module here (``shared.testing``,
 
 This module is pure stdlib on purpose: it must NOT import pytest, which is in
 shared's ``[dependency-groups] dev`` and not its ``[project]`` dependencies.
-Test-support callers get a skip *reason* string from `reify_skip_reason` and
-turn it into a ``pytest.skip`` / ``pytest.mark.skipif`` themselves — which is
+Test-support callers get a skip *reason* string from `reify_skip_reason` or
+`checkout_skip_reason` and turn it into a ``pytest.skip`` /
+``pytest.mark.skipif`` themselves — which is
 also the shape the two consumers need anyway, since they need DIFFERENT ones
 (a runtime skip inside a test body vs a module-level skipif marker).
 """
@@ -34,12 +40,23 @@ import os
 from pathlib import Path
 from typing import NamedTuple
 
-__all__ = ['REIFY_ROOT_ENV', 'ReifyCheckout', 'reify_skip_reason', 'resolve_reify_checkout']
+__all__ = [
+    'REIFY_ROOT_ENV',
+    'ReifyCheckout',
+    'checkout_skip_reason',
+    'reify_skip_reason',
+    'resolve_reify_checkout',
+]
 
 #: The one env var steering every reify-dependent test in dark-factory.  Named
 #: here rather than respelled at each call site, so one `export REIFY_ROOT=...`
 #: cannot be half-honored by a consumer that typo'd the name.
 REIFY_ROOT_ENV = 'REIFY_ROOT'
+
+#: The one repo label `checkout_skip_reason`'s ``None`` arm can honestly
+#: describe.  That arm's wording is `reify_skip_reason`'s, which names reify and
+#: REIFY_ROOT literally, so it is a true statement about this repo and no other.
+_REIFY_REPO_LABEL = 'reify'
 
 
 class ReifyCheckout(NamedTuple):
@@ -149,7 +166,8 @@ def reify_skip_reason(
     set between the two calls.
 
     The two non-None arms are deliberately distinct (carried over from task
-    3843's ``_skip_unless_checkout``), and conflating them is the failure this
+    3843's ``_skip_unless_checkout``, whose own two arms now live in
+    `checkout_skip_reason` below), and conflating them is the failure this
     exists to prevent:
 
       * ``root is None`` is the legitimate standalone-checkout discovery MISS —
@@ -173,4 +191,91 @@ def reify_skip_reason(
     if not (root / marker).is_file():
         named_by = f' (named by {REIFY_ROOT_ENV})' if named_by_env else ''
         return f'reify checkout at {root}{named_by} has no {marker}'
+    return None
+
+
+def checkout_skip_reason(repo: str, root: Path | None, *, marker: str | Path) -> str | None:
+    """Why a checkout-dependent sweep cannot run against *root*, or None if it can.
+
+    The CHECKOUT-reachability gate, one rung weaker than `reify_skip_reason`:
+    the corpus sweeps that use it need only a git checkout to be on disk, not
+    the guard script the Tier-2 gates need.  Returns ``None`` when *root* is a
+    real directory — the sweep must RUN — and otherwise a non-empty reason for
+    the caller to feed to ``pytest.skip``.  Same contract as its sibling: never
+    ``''``, because a falsy reason silently disables a call site that gates on
+    truthiness, turning a skip into a phantom pass.
+
+    Consolidated here by task 4259 from two identical hand-rolled copies (in
+    shared/tests/test_locking.py and fused-memory/tests/test_lock_charter_guard.py,
+    both descended from task 3843's ``_skip_unless_checkout``).  It lives beside
+    `reify_skip_reason` because this module already owns reify skip WORDING —
+    see the module docstring — and a call site that hand-rolls its own string
+    re-opens exactly the conflation that rule exists to prevent.
+
+    The caller turns the reason into a ``pytest.skip`` itself; this module is
+    pytest-free (module docstring, and mechanically ``PURE_STDLIB_LEAVES`` in
+    shared/tests/test_pure_stdlib_leaves.py).
+
+    The two non-None arms are deliberately distinct, and conflating them is the
+    failure this exists to prevent:
+
+      * ``root is None`` is the legitimate standalone-checkout discovery MISS —
+        `resolve_reify_checkout` walked every ancestor and none carried
+        ``reify/<marker>``, with REIFY_ROOT unset.  It is the SAME condition
+        `reify_skip_reason` describes, so it is delegated there rather than
+        restated: one wording for one condition, whatever gate is asking.
+        That delegation is also why this arm is reify-ONLY and raises
+        ``ValueError`` for any other *repo* — see below.
+      * a *root* that is not a directory is an operator's REIFY_ROOT naming a
+        path that is not there.  The override is honored verbatim rather than
+        silently falling back to discovery, so the reason NAMES the path and a
+        typo is self-evident in ``pytest -rs`` output instead of quietly
+        answering for a different repo than the operator asked for.  This arm
+        does NOT borrow the marker-based wording: these sweeps need only a
+        checkout, so a reason built around the stronger marker would overstate
+        what they actually require.
+
+    The test is ``is_dir()``, not ``exists()``: a path that exists but is a
+    regular file is not a checkout, and admitting it would fail deep inside git
+    rather than skip with a message naming the bad path.
+
+    *repo* is used verbatim on the set-but-absent arm, but the ``None`` arm
+    cannot honor it: the wording it delegates to names reify and REIFY_ROOT
+    literally, so answering a ``dark-factory`` caller with it would report the
+    wrong repo AND prescribe a remedy (``export REIFY_ROOT=...``) that cannot
+    fix a dark-factory problem — precisely the conflation this module exists to
+    remove, just one label over.  Rather than silently misattribute, a non-reify
+    *repo* with a ``None`` *root* raises ``ValueError``.  Nothing reachable does
+    that today: every non-reify call site resolves its root from ``__file__``
+    and so is never ``None``.  The guard is what keeps that true — a future
+    caller that broke it would get a loud error instead of reify wording for
+    another repo.
+
+    *named_by_env* is hardcoded ``False`` on the delegated arm rather than being
+    a parameter, and that is a fact about the resolver, not a simplification:
+    `resolve_reify_checkout` returns a non-None ``Path(override)`` for the
+    REIFY_ROOT arm — honored verbatim, even when absent on disk — so
+    ``root is None`` implies the discovery-MISS arm BY CONSTRUCTION.  There is
+    no reachable ``named_by_env=True`` None root to mis-attribute, and offering
+    the parameter would invite a caller to claim one.
+    """
+    if root is None:
+        if repo != _REIFY_REPO_LABEL:
+            raise ValueError(
+                f'a None root is the reify discovery-MISS arm, whose wording '
+                f'names reify and {REIFY_ROOT_ENV} literally — it cannot '
+                f'honestly describe {repo!r}, and answering with it would name '
+                f'the wrong repo and prescribe a remedy that cannot fix a '
+                f'{repo} problem; pass the resolved {repo} root instead'
+            )
+        reason = reify_skip_reason(marker, None, named_by_env=False)
+        if not reason:
+            raise RuntimeError(
+                f'a None {repo} root is the discovery-miss arm, which always '
+                f'yields a reason — a falsy one here would turn this skip into '
+                f'a phantom pass (got {reason!r})'
+            )
+        return reason
+    if not Path(root).is_dir():
+        return f'{repo} checkout not present at {root}'
     return None

@@ -1,35 +1,27 @@
-"""Wiring tests for the Task-Creation Accounting prompt contract (task 3046).
+"""Wiring tests for the Stage 2 task-accounting prompt contract (tasks 3046, 4873).
 
-Stage 2 self-reports ``tasks_created`` as a bare LLM counter with no code-side
-ground truth: ``submit_task``/``resolve_ticket`` are not journaled (see
-``fused_memory.middleware.task_interceptor.TaskInterceptor._journal_around``,
-which wraps only ``set_task_status``/``update_task``/``remove_tasks``/
-``add_dependency``/``remove_dependency``), so ``derive_stage_stats`` cannot
-recompute it and ``stats_verifier`` leaves it untouched (it is not in
-``_COMPUTED_STAT_KEYS``). Run 507bc25b filed task 3045 via the Proactive Task
-Sample / cross-project-routing surface yet Stage 2 self-reported
-``tasks_created: 0`` — the increment mandate (``## Verifying Task
-Operations``, ``prompts/stage2.py``) never declared the counter
-path-agnostic, and (unlike the flag counters) had no action-record ground
-truth analogous to ``flag_deleted_records``.
+Stage 2 self-reports ``tasks_created``, ``tasks_combined`` and
+``tasks_hints_updated``; ``derive_stage_stats`` does not recompute them.
+Run 507bc25b filed task 3045 yet self-reported ``tasks_created: 0``. The
+framework now grounds these counters in the code-side creation journal
+(``middleware.task_creation_journal``, keyed on the ``_causation_id`` in
+``submit_task`` metadata) and in the ``task_created_records`` /
+``task_hints_updated_records`` action records the prompt asks for.
 
-This module pins the WIRING of the fix's shared renderer,
-``render_task_creation_accounting_section()`` (``recon_self_model.py``) —
-exactly once per assembled Stage 2 prompt, on both
-``build_stage2_system_prompt`` branches, never colliding with the
-``'## Available Tools'`` injection sentinel or the ``mcp__recon-report__``
-run_id drift guard (``test_recon_report_guidance_drift.py``) — and the
-machine-readable contract tokens the Python side actually reads
-(``tasks_created``, ``task_created_records``, the
-``"action": "task_created"`` record shape). Per the
-``test_recon_gate_closure_guidance.py`` house rule, prose wording beyond
-those tokens is intentionally NOT pinned here.
+This module pins the WIRING of the shared renderers
+``render_task_creation_accounting_section()`` and
+``render_task_hints_update_accounting_section()`` (``recon_self_model.py``) —
+each exactly once per assembled Stage 2 prompt, on both
+``build_stage2_system_prompt`` branches — and the machine-readable contract
+tokens the Python side reads (``tasks_created``, ``tasks_combined``,
+``task_created_records``, ``task_hints_updated_records`` and the two
+``"action"`` record shapes). Per the ``test_recon_gate_closure_guidance.py``
+house rule, prose wording beyond those tokens is intentionally NOT pinned.
 
-It also pins the code-side layer: the pure ``_count_valid_task_created_records``
-helper, and the deterministic upward-only repair
-``TaskKnowledgeSync._apply_post_flight_guards`` performs when the
-self-reported ``tasks_created`` undercounts the ``task_created_records``
-ground truth — the exact shape of the run-507bc25b regression.
+It also pins the code-side layer: ``stage2_counter_grounding.coerce_count``
+and the upward-only repair ``TaskKnowledgeSync._apply_post_flight_guards``
+performs when the self-reported ``tasks_created`` undercounts its confirmed
+evidence — the exact shape of the run-507bc25b regression.
 """
 
 from __future__ import annotations
@@ -49,12 +41,10 @@ from fused_memory.reconciliation.prompts.stage2 import (
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_task_creation_accounting_section,
+    render_task_hints_update_accounting_section,
 )
-from fused_memory.reconciliation.stages.task_knowledge_sync import (
-    TaskKnowledgeSync,
-    _coerce_tasks_created_count,
-    _count_valid_task_created_records,
-)
+from fused_memory.reconciliation.stage2_counter_grounding import coerce_count
+from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
 
 class TestTaskCreationAccountingWiring:
@@ -86,7 +76,8 @@ class TestTaskCreationAccountingWiring:
             'render_task_creation_accounting_section() verbatim, exactly once.'
         )
 
-    def test_assembled_prompt_carries_machine_readable_contract_tokens(self):
+    @pytest.mark.parametrize('project_id', ['dark_factory', 'autopilot_video'])
+    def test_assembled_prompt_carries_machine_readable_contract_tokens(self, project_id: str):
         """The Python side reads tasks_created / task_created_records / the
         "action": "task_created" record shape — pin those tokens, not prose.
 
@@ -99,194 +90,46 @@ class TestTaskCreationAccountingWiring:
         which scans this exact assembled prompt for run_id=-less call
         examples. No need to re-pin either as a standalone negative-substring
         check here (task-3046 amendment)."""
-        built = build_stage2_system_prompt('dark_factory')
+        built = build_stage2_system_prompt(project_id)
 
         assert 'tasks_created' in built
         assert 'task_created_records' in built
         assert '"action": "task_created"' in built
+        assert 'tasks_combined' in built
+        assert 'task_hints_updated_records' in built
+        assert '"action": "task_hints_updated"' in built
 
 
-class TestCountValidTaskCreatedRecords:
-    """Pins _count_valid_task_created_records (task 3046): a defensive,
-    non-raising, deduped counter over stats['task_created_records'] — the
-    code-side complement to the '## Verifying Task Operations' confirmation
-    rule and the '## Task-Creation Accounting' action-record mandate.
-    """
+class TestHintsUpdateAccountingWiring:
+    """render_task_hints_update_accounting_section() is wired into Stage 2
+    exactly once (task 4018)."""
 
-    # -- degenerate input: never raises, always 0 --------------------------
+    def test_embedded_verbatim_exactly_once_in_stage2_prompt(self):
+        section = render_task_hints_update_accounting_section()
 
-    @pytest.mark.parametrize(
-        'records',
-        [None, {}, 'x', 3, []],
-        ids=['none', 'dict', 'str', 'int', 'empty-list'],
-    )
-    def test_degenerate_input_returns_zero(self, records):
-        assert _count_valid_task_created_records(records) == 0
+        assert STAGE2_SYSTEM_PROMPT.count(section) == 1, (
+            'STAGE2_SYSTEM_PROMPT must interpolate '
+            'render_task_hints_update_accounting_section() verbatim, exactly once.'
+        )
 
-    # -- confirmation-status predicate ---------------------------------------
+    @pytest.mark.parametrize('project_id', ['dark_factory', 'autopilot_video'])
+    def test_survives_build_stage2_system_prompt(self, project_id: str):
+        section = render_task_hints_update_accounting_section()
+        built = build_stage2_system_prompt(project_id)
 
-    def test_one_created_record_counts_one(self):
-        records = [
-            {
-                'action': 'task_created',
-                'task_id': '3045',
-                'status': 'created',
-                'project_id': 'dark_factory',
-            },
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    def test_combined_status_counts_as_success(self):
-        """`combined` is a success per `## Creating Tasks` — a candidate
-        merged into an existing task still returns a task_id."""
-        records = [
-            {
-                'action': 'task_created',
-                'task_id': '3045',
-                'status': 'combined',
-                'project_id': 'dark_factory',
-            },
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    def test_failed_status_never_counts_even_with_task_id(self):
-        """`failed` is never counted toward tasks_created regardless of
-        whether a task_id is present — mirrors the '## Verifying Task
-        Operations' rule this helper encodes in Python."""
-        records = [
-            {
-                'action': 'task_created',
-                'task_id': '3045',
-                'status': 'failed',
-                'project_id': 'dark_factory',
-            },
-        ]
-        assert _count_valid_task_created_records(records) == 0
-
-    @pytest.mark.parametrize(
-        'record',
-        [
-            {'status': 'created', 'project_id': 'dark_factory'},
-            {'status': 'created', 'project_id': 'dark_factory', 'task_id': None},
-            {'status': 'created', 'project_id': 'dark_factory', 'task_id': ''},
-        ],
-        ids=['missing-task_id', 'none-task_id', 'empty-task_id'],
-    )
-    def test_missing_or_empty_task_id_does_not_count(self, record):
-        assert _count_valid_task_created_records([record]) == 0
-
-    @pytest.mark.parametrize(
-        'record',
-        [
-            {'task_id': '3045', 'status': 'pending', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'project_id': 'dark_factory'},
-        ],
-        ids=['unknown-status', 'missing-status'],
-    )
-    def test_unknown_or_missing_status_does_not_count(self, record):
-        """Only created/combined count — the helper does not guess at an
-        absent or unrecognized status."""
-        assert _count_valid_task_created_records([record]) == 0
-
-    # -- malformed entries are skipped, never raise --------------------------
-
-    def test_non_dict_entries_interleaved_with_one_valid_record(self):
-        records = [
-            None,
-            'x',
-            ['a'],
-            {
-                'action': 'task_created',
-                'task_id': '3045',
-                'status': 'created',
-                'project_id': 'dark_factory',
-            },
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    # -- dedup: keyed on (project_id, str(task_id)) --------------------------
-
-    def test_dedups_same_project_and_task_id(self):
-        records = [
-            {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'status': 'combined', 'project_id': 'dark_factory'},
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    def test_same_task_id_under_different_projects_counts_twice(self):
-        """Cross-project routing files genuinely distinct tasks — Taskmaster
-        ids are per-project, so the same numeric id under two different
-        project_ids is two distinct tasks, not a duplicate."""
-        records = [
-            {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'status': 'created', 'project_id': 'autopilot_video'},
-        ]
-        assert _count_valid_task_created_records(records) == 2
-
-    def test_dedups_int_and_str_task_id_forms(self):
-        """task_id normalises to str before deduping — the repo's existing
-        str(task_id) exact-form convention."""
-        records = [
-            {'task_id': 3045, 'status': 'created', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'status': 'combined', 'project_id': 'dark_factory'},
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    # -- project_id normalisation (task-3046 amendment) -----------------------
-
-    def test_dedups_project_id_with_surrounding_whitespace(self):
-        """project_id is normalised via str(...).strip(), same as task_id —
-        ' dark_factory' and 'dark_factory' must collapse to one key, not
-        inflate the count by masquerading as a second distinct project."""
-        records = [
-            {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'status': 'combined', 'project_id': ' dark_factory '},
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    def test_missing_project_id_collapses_onto_default_project_id(self):
-        """A record with no project_id falls back to default_project_id (the
-        caller's own self.project_id) rather than keying as a distinct
-        `None` project — so an omitted field can't masquerade as a second,
-        distinct cross-project filing of the same task."""
-        records = [
-            {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'status': 'combined'},  # project_id omitted
-        ]
-        assert _count_valid_task_created_records(
-            records, default_project_id='dark_factory'
-        ) == 1
-
-    def test_missing_project_id_without_default_keys_as_none(self):
-        """With no default_project_id supplied (the pre-amendment call
-        shape), a record with no project_id still keys as None — same
-        behaviour as before this amendment when the caller opts out of the
-        default-collapse."""
-        records = [
-            {'task_id': '3045', 'status': 'created'},
-            {'task_id': '3045', 'status': 'combined'},
-        ]
-        assert _count_valid_task_created_records(records) == 1
-
-    def test_blank_project_id_after_strip_collapses_onto_default(self):
-        """A whitespace-only project_id is treated as omitted, not as a
-        literal '' project — it also falls back to default_project_id."""
-        records = [
-            {'task_id': '3045', 'status': 'created', 'project_id': 'dark_factory'},
-            {'task_id': '3045', 'status': 'combined', 'project_id': '   '},
-        ]
-        assert _count_valid_task_created_records(
-            records, default_project_id='dark_factory'
-        ) == 1
+        assert built.count(section) == 1, (
+            f'build_stage2_system_prompt({project_id!r}) must carry '
+            'render_task_hints_update_accounting_section() verbatim, exactly once.'
+        )
 
 
-class TestCoerceTasksCreatedCount:
-    """Pins _coerce_tasks_created_count (task-3046 amendment): best-effort int
-    coercion for a self-reported tasks_created value, so a non-int self-report
-    (plausible free-form LLM JSON) doesn't collapse to 0 and look like an
-    undercount relative to a smaller record-derived observed count — which
-    would silently move a legitimately larger self-report DOWN, breaking the
-    upward-only repair contract (task 2230 / W5-mu)."""
+class TestCoerceCount:
+    """Pins coerce_count: best-effort int coercion for a self-reported Stage 2
+    counter, so a non-int self-report (plausible free-form LLM JSON) doesn't
+    collapse to 0 and look like an undercount relative to smaller evidence —
+    which would silently move a legitimately larger self-report DOWN, breaking
+    the upward-only repair contract (task 2230 / W5-mu). Never raises (task
+    4140: NaN / infinity once escaped as ValueError / OverflowError)."""
 
     @pytest.mark.parametrize(
         ('value', 'expected'),
@@ -302,7 +145,7 @@ class TestCoerceTasksCreatedCount:
         ids=['int-0', 'int-3', 'str-0', 'str-3', 'str-3-whitespace', 'float-3', 'str-float-3'],
     )
     def test_coerces_legitimate_numeric_forms(self, value, expected):
-        assert _coerce_tasks_created_count(value) == expected
+        assert coerce_count(value) == expected
 
     @pytest.mark.parametrize(
         'value',
@@ -312,10 +155,44 @@ class TestCoerceTasksCreatedCount:
     def test_uncoercible_or_bool_falls_back_to_zero(self, value):
         """A bool is REJECTED even though isinstance(True, int) holds in
         Python — never trusted as a legitimate self-reported count."""
-        assert _coerce_tasks_created_count(value) == 0
+        assert coerce_count(value) == 0
+
+    @pytest.mark.parametrize(
+        'value',
+        [float('nan'), float('inf'), float('-inf'), 'inf', '-inf', '1e400', 'nan', ' Infinity '],
+        ids=['nan', 'inf', '-inf', 'str-inf', 'str--inf', 'str-1e400', 'str-nan', 'str-Infinity'],
+    )
+    def test_non_finite_values_fall_back_to_zero_without_raising(self, value):
+        assert coerce_count(value) == 0
 
 
 # ── Task-3046 step-5: TaskKnowledgeSync._apply_post_flight_guards repair ────
+
+
+class _AllPresentTaskmaster:
+    """Corroborating taskmaster double (task 3051).
+
+    Every ``get_task`` returns a task record, so the corroboration pass task
+    3051 inserted ahead of the repair confirms every structurally-valid
+    record. That keeps the pins BELOW exercising the task-3046 repair itself
+    — which records count, how they dedup, how a non-int self-report coerces
+    — rather than accidentally re-testing the corroboration gate, whose own
+    contract (what happens when a record can NOT be confirmed) is owned by
+    ``tests/test_stage2_stats_audit.py``.
+    """
+
+    async def get_task(self, task_id, project_root):
+        return {'id': str(task_id), 'title': f'task {task_id}', 'status': 'pending'}
+
+
+#: project_id -> project_root for every project the records below name.
+#: Required as of task 3051: an unresolvable project_id issues no get_task
+#: call and therefore corroborates nothing, which would withhold the repair.
+_KNOWN_PROJECTS = {
+    'dark_factory': '/repo/dark-factory',
+    'reify': '/repo/reify',
+    'test_project': '/tmp/test',
+}
 
 
 def _mock_deps() -> dict:
@@ -326,6 +203,11 @@ def _mock_deps() -> dict:
     cross-importing that module-private fixture — the same choice
     ``test_recon_gate_closure_guidance.py::_make_consolidator`` documents and
     makes for ``MemoryConsolidator``.
+
+    Supplies a corroborating taskmaster and a populated ``known_projects``
+    (task 3051): a bare ``AsyncMock()`` taskmaster confirms nothing and an
+    empty ``known_projects`` issues no lookups at all, either of which now
+    withholds the upward repair these pins exercise.
     """
     config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
     write_journal_mock = MagicMock()
@@ -336,10 +218,11 @@ def _mock_deps() -> dict:
     journal_mock.clear_run_session = AsyncMock()
     return {
         'memory_service': AsyncMock(),
-        'taskmaster': AsyncMock(),
+        'taskmaster': _AllPresentTaskmaster(),
         'journal': journal_mock,
         'config': config,
         'scope': ProjectScope(ProjectId('test_project'), ProjectRoot('/tmp/test')),
+        'known_projects': dict(_KNOWN_PROJECTS),
     }
 
 
@@ -376,7 +259,7 @@ class TestPostFlightTasksCreatedRepair:
         stage = _make_stage()
         report = _make_report({})
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+        await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 0
         assert report.stats['task_created_records_valid'] == 0
@@ -402,7 +285,7 @@ class TestPostFlightTasksCreatedRepair:
         })
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+            await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 1
         assert report.stats['tasks_created_reported'] == 0
@@ -435,7 +318,7 @@ class TestPostFlightTasksCreatedRepair:
             ],
         })
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+        await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 2
         assert report.stats['tasks_created_reported'] == 0
@@ -465,7 +348,7 @@ class TestPostFlightTasksCreatedRepair:
         })
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+            await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 2
         assert 'tasks_created_reported' not in report.stats
@@ -492,7 +375,7 @@ class TestPostFlightTasksCreatedRepair:
         })
 
         with caplog.at_level(logging.WARNING, logger=_REPAIR_LOGGER):
-            await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+            await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 3
         assert report.stats['task_created_records_valid'] == 1
@@ -507,7 +390,7 @@ class TestPostFlightTasksCreatedRepair:
             'task_created_records': 'not-a-list',
         })
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+        await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 0
         assert report.stats['task_created_records_valid'] == 0
@@ -531,7 +414,7 @@ class TestPostFlightTasksCreatedRepair:
             ],
         })
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+        await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == 0
         assert report.stats['task_created_records_valid'] == 0
@@ -578,7 +461,7 @@ class TestPostFlightTasksCreatedRepair:
             ],
         })
 
-        await stage._apply_post_flight_guards(report, [], 'test-run-3046')
+        await stage._apply_post_flight_guards(report, 'test-run-3046')
 
         assert report.stats['tasks_created'] == expected
         assert isinstance(report.stats['tasks_created'], int)

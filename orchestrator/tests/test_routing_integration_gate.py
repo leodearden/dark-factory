@@ -110,6 +110,7 @@ from _workflow_helpers import (
     _build_workflow,
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
     _init_repo,
+    fixed_prompt,
     wire_metadata_backend,
 )
 from escalation.models import Escalation
@@ -651,9 +652,9 @@ class TestByteEquivalenceThroughTheRig:
             'crates/alpha/src/lib.rs', 'crates/beta/src/lib.rs', 'crates/gamma/src/lib.rs',
         ]
 
-        await workflow._invoke(IMPLEMENTER, 'impl prompt', git_repo)
-        await workflow._invoke(DEBUGGER, 'debug prompt', git_repo)
-        await workflow._invoke(ARCHITECT, 'arch prompt', git_repo)
+        await workflow._invoke(IMPLEMENTER, fixed_prompt('impl prompt'), git_repo)
+        await workflow._invoke(DEBUGGER, fixed_prompt('debug prompt'), git_repo)
+        await workflow._invoke(ARCHITECT, fixed_prompt('arch prompt'), git_repo)
 
         assert stub.calls[0]['model'] == 'opus'  # implementer, upgraded
         assert stub.calls[1]['model'] == 'opus'  # debugger, upgraded
@@ -1057,7 +1058,11 @@ class TestCeilingFallbackDoesNotBlockDispatch:
     ):
         config.routing.per_model_daily_ceiling_usd = {'opus': self._CEILING_USD}
         assert 'opus' in config.routing.allowed_models
-        assert config.models.implementer != 'opus'  # so a config-layer fallback is observable
+        # Pin the config layer to a model other than the ceiling-pinned one so
+        # the fallback is observable whatever the live project yaml routes the
+        # implementer to (the D4 ruling moved it to opus, esc-main-sweep-105168baceb4-2).
+        config.models.implementer = 'sonnet'
+        assert config.models.implementer != 'opus'
         task_assignment.task['metadata']['model_overrides'] = {'implementer': 'opus'}
 
         cost_store = CostStore(tmp_path / 'costs.db')
@@ -1200,7 +1205,7 @@ class TestSaturationStampRoutesNextDispatchFullPath:
         # simple_saturated=True through a genuine scheduler merge write AND
         # the in-memory task dict.
         outcome_1 = await workflow._run_simple_task()
-        assert outcome_1 == WorkflowOutcome.REQUEUED
+        assert outcome_1 is None
         assert backend.blob['routing']['simple_saturated'] is True
         assert workflow.task['metadata']['routing']['simple_saturated'] is True
 
@@ -1240,7 +1245,7 @@ class TestSaturationStampRoutesNextDispatchFullPath:
         # regressed to one write -- 0 == 1 - 1 is a false positive for the
         # same regression the round-1 checks above already guard against.
         outcome_2 = await workflow._run_simple_task()
-        assert outcome_2 == WorkflowOutcome.REQUEUED
+        assert outcome_2 is None
         assert backend.blob['routing']['simple_saturated'] is True
         assert workflow.task['metadata']['routing']['simple_saturated'] is True
         new_calls_in_round_2 = backend.update_task_calls[2:]
@@ -1411,7 +1416,7 @@ class TestSimpleTaskModelReloadReachesTheSeam:
             fake_verify=False,
         )
 
-        await workflow._invoke(SIMPLE_TASK, 'simple task prompt', tmp_path)
+        await workflow._invoke(SIMPLE_TASK, fixed_prompt('simple task prompt'), tmp_path)
 
         assert recorder.route_by_role['simple_task']['model'] == (
             _PINNED_SIMPLE_TASK_RELOAD_MODEL
@@ -1519,7 +1524,7 @@ class TestUnknownRuleKeyRejectedPriorRulesStillRoute:
         workflow.plan = {'steps': [{'id': f's{i}', 'status': 'pending'} for i in range(12)]}
         workflow.modules = ['lib']
 
-        await workflow._invoke(IMPLEMENTER, 'impl prompt', git_repo)
+        await workflow._invoke(IMPLEMENTER, fixed_prompt('impl prompt'), git_repo)
 
         assert stub.calls[-1]['model'] == 'opus'
         impl_data = [
@@ -1798,7 +1803,7 @@ class TestRollupRendersRigProducedRows:
             workflow1.modules = ['lib']
             monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub1.invoke_agent)
 
-            await workflow1._invoke(IMPLEMENTER, 'impl prompt', git_repo)
+            await workflow1._invoke(IMPLEMENTER, fixed_prompt('impl prompt'), git_repo)
             # Confirms the premise (no policy rule fires for this tiny plan)
             # rather than silently asserting the wrong cell below.
             assert stub1.calls[-1]['model'] == stock_config.models.implementer
@@ -1824,7 +1829,7 @@ class TestRollupRendersRigProducedRows:
             workflow2.modules = ['lib']
             monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub2.invoke_agent)
 
-            await workflow2._invoke(IMPLEMENTER, 'impl prompt', git_repo)
+            await workflow2._invoke(IMPLEMENTER, fixed_prompt('impl prompt'), git_repo)
             assert stub2.calls[-1]['model'] == 'haiku'
 
             # A role that emitted invocation_end but was never routed through

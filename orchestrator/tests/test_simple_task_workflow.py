@@ -11,10 +11,12 @@ import pytest
 from _orch_helpers import pydantic_spec
 from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
 from shared.cli_invoke import AgentResult
+from shared.task_text_fingerprint import task_text_fingerprint
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
+from orchestrator.scheduler import BlastRadiusResult, files_to_modules
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 
@@ -100,7 +102,9 @@ def _make(
     config.budgets.simple_task = 1.50
     config.max_turns.simple_task = 30
 
-    handle_blast_radius_expansion = AsyncMock(return_value=blast_radius_grants)
+    handle_blast_radius_expansion = AsyncMock(
+        return_value=BlastRadiusResult(applied=blast_radius_grants),
+    )
     update_task = AsyncMock(return_value=True)
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock()
@@ -191,6 +195,7 @@ async def test_simple_task_success_returns_planned(tmp_path: Path):
     assert f.invocation_count == [1]
     plan = f.artifacts.read_plan()
     assert plan['_session_id'] == f.wf.session_id
+    assert plan['_task_text_fp'] == task_text_fingerprint('Add a docstring to foo.', None)
 
     skip_calls = [
         c for c in f.event_emit.call_args_list
@@ -224,7 +229,7 @@ async def test_simple_task_no_plan_falls_through(tmp_path: Path):
     )
 
     outcome = await f.wf._run_simple_task()
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
 
 
 @pytest.mark.asyncio
@@ -239,7 +244,7 @@ async def test_simple_task_no_steps_done_falls_through(tmp_path: Path):
     )
 
     outcome = await f.wf._run_simple_task()
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
 
 
 @pytest.mark.asyncio
@@ -262,7 +267,7 @@ async def test_simple_task_invoke_failure_falls_through(tmp_path: Path):
     )
 
     outcome = await f.wf._run_simple_task()
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
 
 
 def _saturation_stamp_calls(update_task: AsyncMock) -> list:
@@ -295,7 +300,7 @@ async def test_simple_task_max_turns_stamps_saturated(tmp_path: Path):
 
     outcome = await f.wf._run_simple_task()
 
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
     stamp_calls = _saturation_stamp_calls(f.update_task)
     assert stamp_calls, (
         'expected a merge-mode routing stamp with simple_saturated=True'
@@ -314,7 +319,7 @@ async def test_simple_task_max_turns_in_memory_stamp_survives_write_failure(
     tmp_path: Path,
 ):
     """The saturation stamp is best-effort: when the merge-mode scheduler write
-    raises, ``_run_simple_task`` still returns REQUEUED (the exception is
+    raises, ``_run_simple_task`` still falls through, returning None (the exception is
     swallowed inside ``_stamp_simple_saturated``, never propagated to crash the
     fall-through to the architect) AND the persistence-independent in-memory
     ``self.task['metadata']['routing']['simple_saturated']`` flip still lands —
@@ -331,7 +336,7 @@ async def test_simple_task_max_turns_in_memory_stamp_survives_write_failure(
 
     outcome = await f.wf._run_simple_task()
 
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
     assert f.wf.task['metadata']['routing']['simple_saturated'] is True
 
 
@@ -353,7 +358,7 @@ async def test_simple_task_max_turns_already_saturated_no_double_write(
 
     outcome = await f.wf._run_simple_task()
 
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
     # Idempotent early-return: no scheduler write at all on this failure path.
     f.update_task.assert_not_awaited()
     assert not _saturation_stamp_calls(f.update_task)
@@ -374,7 +379,7 @@ async def test_simple_task_generic_failure_does_not_stamp(tmp_path: Path):
 
     outcome = await f.wf._run_simple_task()
 
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
     assert not _saturation_stamp_calls(f.update_task)
 
 
@@ -388,7 +393,29 @@ async def test_simple_task_invoke_exception_falls_through(tmp_path: Path):
     f.wf._invoke = _raising  # type: ignore[assignment]
 
     outcome = await f.wf._run_simple_task()
-    assert outcome == WorkflowOutcome.REQUEUED
+    assert outcome is None
+
+
+@pytest.mark.asyncio
+async def test_simple_task_blocking_dependency_falls_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=_good_plan(),
+    )
+
+    async def _reports_blocking_dependency(*args, **kwargs):
+        f.artifacts.write_blocking_dependency(
+            depends_on_task_id='499', reason='needs 499 first',
+            main_sha_at_report='mainsha',
+        )
+        return _make_result()
+
+    monkeypatch.setattr(f.wf, '_invoke', _reports_blocking_dependency)
+
+    outcome = await f.wf._run_simple_task()
+    assert outcome is None
 
 
 @pytest.mark.asyncio
@@ -404,6 +431,55 @@ async def test_blast_radius_expansion_invoked_when_files_grow(tmp_path: Path):
     outcome = await f.wf._run_simple_task()
     assert outcome == WorkflowOutcome.PLANNED
     f.handle_blast_radius_expansion.assert_awaited_once()
+
+
+def _conflicting_plan() -> dict:
+    plan = _good_plan()
+    plan['files'] = ['mod_b/x.py']  # a module the task does not hold
+    return plan
+
+
+@pytest.mark.asyncio
+async def test_simple_task_lock_conflict_requeues(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=_conflicting_plan(), blast_radius_grants=False,
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.REQUEUED
+    f.handle_blast_radius_expansion.assert_awaited_once()
+    assert f.wf.modules == ['mod_a']
+    assert not [
+        c for c in f.update_task.call_args_list
+        if len(c.args) >= 2
+        and isinstance(c.args[1], dict)
+        and 'optimistic_path' in c.args[1]
+    ]
+    assert not [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.phase_skipped
+        and c.kwargs['data']['reason'] == 'architect_skipped_simple_task'
+    ]
+
+
+@pytest.mark.asyncio
+async def test_simple_task_lock_conflict_with_dead_repend_requeues(tmp_path: Path):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=_conflicting_plan(), blast_radius_grants=False,
+    )
+    f.handle_blast_radius_expansion.return_value = BlastRadiusResult(
+        applied=False,
+        repend_error=RuntimeError(
+            'set_task_status(500, pending) failed after 4 transient retries',
+        ),
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.REQUEUED
 
 
 @pytest.mark.asyncio
@@ -463,6 +539,35 @@ async def test_optimistic_stamp_preserves_narrowed_files(tmp_path: Path):
     # failure above is the clobber, not a missing stamp.
     assert backend.blob['optimistic_path'] == 'simple_task'
     assert f.wf.task['metadata']['optimistic_path'] == 'simple_task'
+
+
+@pytest.mark.asyncio
+async def test_unchanged_lock_set_heals_wiped_metadata_files(tmp_path: Path):
+    """Task 3113: a SIMPLE_TASK whose plan modules equal the held lock set,
+    dispatched with a wiped ``metadata.files``, leaves the plan boundary with
+    the scope restored from plan.files — and task 4031's ``plan_text_fp``
+    mirror survives that heal write."""
+    plan = _good_plan()
+    held = files_to_modules(plan['files'], 2)
+    backend = FakeMetadataBackend()
+
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        plan_to_write=plan,
+        task_metadata={'files': []},
+        modules=held,
+        metadata_backend=backend,
+    )
+    assert set(f.wf.modules) == set(files_to_modules(plan['files'], f.wf.config.lock_depth))
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    assert backend.blast_radius_calls == []
+    assert backend.blob['files'] == plan['files']
+    assert backend.blob['plan_text_fp'] == task_text_fingerprint(
+        'Add a docstring to foo.', None,
+    )
 
 
 @pytest.mark.asyncio

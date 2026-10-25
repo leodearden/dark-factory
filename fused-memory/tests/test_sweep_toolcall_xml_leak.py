@@ -48,8 +48,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 from fused_memory.models import SourceStore
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_toolcall_xml_leak.py'
 
@@ -508,24 +515,16 @@ def _record_for(report: dict, memory_id: str) -> dict:
     return next(r for r in report['records'] if r['id'] == memory_id)
 
 
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` now runs a fail-closed capability preflight before
-    it scans (task 3686). That probe touches the real filesystem, so without
-    this fixture every ``--apply`` test would pass or fail according to whether
-    the machine running pytest happens to be able to write mem0's history
-    directory — and it genuinely cannot inside an agent sandbox, which is the
-    whole reason the guard exists. This suite is deliberately MOCK-unit (an
-    AsyncMock service, no live Qdrant), so the environment must not be an
-    input to it.
-
-    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test — to refuse,
-    to record, or to pass — so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it scans (task
+    3686 -- this is the script whose half-completed sandboxed ``--apply`` run
+    is the incident the guard exists to prevent). This suite is deliberately
+    MOCK-unit (an AsyncMock service, no live Qdrant).
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.""",
+)
 
 
 class TestRunDiscovery:
@@ -1668,23 +1667,15 @@ class TestRunApplyStoreMutationPreflight:
     per-record probe would detect a fleet-wide condition one record too late.
     """
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
     ):
         """The whole point: refuse to start rather than half-complete."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
-        with pytest.raises(_mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'):
+        with pytest.raises(StoreMutationUnavailable, match=SENTINEL):
             await _mod.run(_args(apply=True), service)
 
         service.delete_memory.assert_not_awaited()
@@ -1696,13 +1687,26 @@ class TestRunApplyStoreMutationPreflight:
     ):
         """It aborts without even scanning -- one probe per run, not per record,
         and no wasted pagination over a corpus it was never going to repair."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(_args(apply=True), service)
 
         service.scan_memory_content.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_logs_its_fail_closed_diagnosis(self, monkeypatch, caplog):
+        """``main`` prints only the partial report, so this script's own logger
+        carries the one record saying what was refused and what to do."""
+        deny(_mod, monkeypatch)
+        service = _service([_match('r', _TAIL_LEAK)])
+
+        with caplog.at_level(logging.ERROR), pytest.raises(StoreMutationUnavailable):
+            await _mod.run(_args(apply=True), service)
+
+        (record,) = fail_closed_records(caplog, 'sweep_toolcall_xml_leak')
+        assert SENTINEL in record.getMessage()
 
     def test_the_refusal_is_loud_and_reaches_mains_fatal_abort_path(
         self, monkeypatch, capsys
@@ -1717,7 +1721,7 @@ class TestRunApplyStoreMutationPreflight:
         to reach main's container, and replace ``asyncio.run`` so ``_run_live``
         never constructs a real MemoryService.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
         monkeypatch.setattr(sys, 'argv', ['sweep_toolcall_xml_leak.py', '--apply'])
         progress = _mod.new_progress()
@@ -1744,7 +1748,7 @@ class TestRunApplyStoreMutationPreflight:
         mutate. Gating it would break the module's core promise -- that the
         classification report can always be obtained safely, from anywhere.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
         report = await _mod.run(_args(), service)
@@ -1756,9 +1760,8 @@ class TestRunApplyStoreMutationPreflight:
         assert _mod.resolve_exit_code(report) == 0
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
         """Happy path: a writable environment repairs exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         service = _service([_match('r', _TAIL_LEAK)])
 
         report = await _mod.run(_args(apply=True), service)

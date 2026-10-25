@@ -1,0 +1,1047 @@
+"""Preservation-specimen corroboration guard for Stage 1 — task 4223.
+
+Some tasks are left ``in-progress`` with a null claimant and a null heartbeat
+*deliberately*, because that state is the evidence something else is waiting
+on.  Stage 1's stranded-task heuristic cannot see intent: it reads the absence
+of a live-workflow signal, and ``prompts/stage1.py`` tells it that absence
+means "the genuinely stranded case that legitimately needs operator
+attention".  So it re-emits a moderate/actionable stranded finding for such a
+task on roughly every cycle, and downstream that finding becomes a request to
+destroy the very thing it is looking at.
+
+THE MEASURED DAMAGE.  Task 3105 is held ``in-progress`` as a preserved live
+validation specimen for a gate task's soak/flip checklist.  Its re-flag twice
+became an operator-gate ``submit_task`` asking for the specimen to be reset out
+of ``in-progress`` (tasks 5080 and 5104, the second born-at-L2 critical); both
+were declined and cancelled by hand.  A twin specimen was not so lucky — it
+stopped being one when its pinning escalation lost open status in an
+orphan-reaper cascade.  Task 4223's record holds the dates, ids and counts.
+
+WHY A SUPPRESSION LIST DID NOT FIX IT.  A ``stage1_flag_suppression`` record
+for task 3105 already existed, and was later WIDENED to blanket by removing its
+``flag_types`` key.  Recurrence continued anyway, for two independent reasons
+this module is shaped around:
+
+1. ``stages/memory_consolidator.py``'s remediation early-return sits ABOVE the
+   whole filter chain, so nothing wired beside ``filter_entity_standing_decisions``
+   runs on a remediation pass — and the recurrences that continued after the
+   widening were remediation runs.  This guard is therefore wired ABOVE that
+   early-return.
+2. ``flag_type`` is free-form LLM output.  This ONE false positive has already
+   worn at least three distinct namings — ``task_stranded_no_claimant``,
+   ``task_stranded_no_claimant_heartbeat``, ``stranded_merge_phase_liveness``.
+   An enumerated ``(task_id, flag_type)`` list cannot keep up, which is why the
+   scoped record had to be widened in the first place.
+
+So the verdict is DERIVED from the preservation evidence rather than looked up
+in a hand-authored list.  That also closes the gap those two gate tasks were
+filed in: a specimen is protected on the first cycle it is documented, not on
+the first cycle somebody remembers to write a suppression record for it.
+
+COMPOSITE TASK IDS, AND THE DEFECT THIS AVOIDS.  A flag's OWN ``task_id`` is
+routinely comma-joined — task 3105 has been flagged as ``'3105,5080'`` and
+``'3105,4223'``, among others — so every candidate id is DECOMPOSED before
+corroboration and the counters key on a corroborated COMPONENT, not on the
+raw string.  Decomposition is what lets the guard SEE a specimen inside a
+composite at all, and the sibling shows the gap it avoids:
+``flag_dedup.filter_suppressed._keep`` looks its flag's task_id up
+VERBATIM while only the suppression ROW side is decomposed (see
+``_decompose_suppression_task_id``'s docstring, which scopes itself to that
+side), so a suppression row for ``'3105'`` still does not match a finding
+carrying ``'3105,4223'``.  Inheriting that gap would leave this guard blind
+to the specimen inside every composite that names it.  This guard and
+``flag_dedup._flag_candidate_task_ids`` both decompose a flag's own task_id
+through the one shared splitter, ``flag_task_ids.task_id_components``.
+
+Seeing a specimen is not licence to drop the finding.  A composite is dropped
+only when EVERY component corroborates: ``'3105,4223'`` claims something about
+4223 too, and the under-suppression bias below forbids hiding that claim on
+3105's citation.  A mixed composite is instead kept on a copy annotated with
+:data:`PRESERVED_SPECIMEN_COMPONENTS_KEY`, so Stage 2 sees the specimen
+evidence beside the reset request.
+
+LEAF CONTRACT.  This module imports only from
+``standing_decision_constants`` (for the one genuinely shared fact, the
+``investigation_outcome`` mem0 kind), ``flag_task_ids`` (the shared flag
+task-id splitter), ``flag_shape`` (the leaf ``contains_any_casefolded``
+matcher), ``services.memory_service`` (for the canonical raw-payload content
+extractor), ``shared.task_statuses`` (the closed status vocabulary) and,
+optionally, ``escalation.dedupe.file_or_fold_l1``.  It reaches
+nothing in ``stages/``, ``middleware/`` or ``prompts/``; the consolidator
+calls in.  It performs detection only — it drops flags, never writes tasks or
+memories.
+
+WHAT "DISTINCTIVE" MEANS HERE, AND WHY IT IS CHECKED.  Both token families are
+matched as casefolded SUBSTRINGS, so their safety rests entirely on holding
+phrases that appear in no unrelated text — the same precondition
+``standing_decision_constants.GROUNDS_TOKEN_FAMILIES``' comment makes of its
+own stems, and for the same reason: a member that fires outside its class does
+not merely add noise, it silently DROPS that finding.  The bias is
+deliberately toward UNDER-suppression — a miss costs one more cycle of a false
+positive the rotation has been absorbing since August, while an over-broad
+member costs a hidden finding.  ``tests/reconciliation/test_preservation_specimen_guard.py``
+enforces this behaviourally, running each matcher against live-but-unrelated
+flag_types and unrelated recon prose, rather than asserting on this comment.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+from shared.task_statuses import TaskStatus
+
+from fused_memory.reconciliation.flag_shape import contains_any_casefolded
+from fused_memory.reconciliation.flag_task_ids import task_id_components
+from fused_memory.reconciliation.standing_decision_constants import (
+    MEM0_KIND_INVESTIGATION_OUTCOME,
+)
+
+# The scroll-row text reader, IMPORTED rather than re-spelled: it owns the
+# canonical raw-payload key fallback through ``_mem0_content``, and a second
+# copy would be one more place for the two to drift (INV-5).
+from fused_memory.services.memory_service import metadata_row_text
+
+# Optional escalation dependency: the reconciliation package must import
+# cleanly where the escalation package is not installed, and
+# ``maybe_escalate_preservation_suppression_storm`` no-ops when the name is None.
+try:
+    from escalation.dedupe import file_or_fold_l1  # type: ignore[import-untyped]
+except ImportError:
+    file_or_fold_l1 = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    'CATEGORY_PRESERVATION_SPECIMEN_STORM',
+    'MEM0_KIND_INVESTIGATION_OUTCOME',
+    'PRESERVATION_CORROBORATION_BUDGET_SECONDS',
+    'PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE',
+    'PRESERVATION_TOKEN_FAMILY',
+    'PRESERVED_SPECIMEN_COMPONENTS_KEY',
+    'STRANDED_ACTION_TARGET_FAMILY',
+    'STRANDED_ACTION_VERB_FAMILY',
+    'STRANDED_FLAG_TOKEN_FAMILY',
+    'UNRESOLVED_CORROBORATION_SUBJECT',
+    'GRAPHITI_TASK_ENTITY_TEMPLATE',
+    'PreservationSuppressionResult',
+    'cites_preservation',
+    'filter_preservation_specimen_flags',
+    'flag_asserts_stranded',
+    'maybe_escalate_preservation_suppression_storm',
+    'preservation_mem0_filters',
+]
+
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+#: Phrases that identify text as a PRESERVATION CITATION — a statement that a
+#: task's odd state is deliberate because the task is being kept as evidence.
+#:
+#: Curated from the live corpus, not invented.  ``'validation specimen'`` alone
+#: matched every ``investigation_outcome`` row and both Graphiti sources found
+#: for the specimen when this was written, across several different surrounding
+#: phrasings ("sole preserved live ...", "preserved dark-factory ...",
+#: "preserved SOLE live ...") — which is exactly why the family holds the
+#: invariant NOUN PHRASE rather than any one full sentence.  Recall is a
+#: property of a corpus that grows every cycle, so it is asserted by the
+#: matcher tests against fixture prose, never claimed as a count here.
+#:
+#: Every member is multi-word by rule.  The bare words this class is written in
+#: — ``preserved``, ``specimen``, ``intentional``, ``deliberate`` — all occur
+#: throughout unrelated recon prose, so a single-word member would suppress far
+#: past this class.  ``'hand-recover'`` was considered and REJECTED on the same
+#: test the ``GROUNDS_TOKEN_FAMILIES`` comment applies to ``'count'``/``'scope'``:
+#: it adds zero recall on the live corpus (both rows carrying it already match
+#: ``'validation specimen'``) while "task 3066 was hand-recovered by the
+#: operator" is ordinary operations prose that would falsely corroborate.  The
+#: four-word ``'hand-recovery evidence loss'`` is kept instead — it names the
+#: specific harm that makes a specimen worth preserving and cannot be reached
+#: by a bare mention of a recovery.
+PRESERVATION_TOKEN_FAMILY: tuple[str, ...] = (
+    'validation specimen',
+    'preservation specimen',
+    'preserved specimen',
+    'hand-recovery evidence loss',
+)
+
+#: Stems identifying a flag_type as a member of the stranded/reset class.
+#:
+#: ONE stem, not an enumerated list of namings: ``'strand'`` is a substring of
+#: ``task_stranded_no_claimant``, ``task_stranded_no_claimant_heartbeat`` and
+#: ``stranded_merge_phase_liveness`` alike.  That is the whole point — the
+#: naming drifts every few cycles and the stem does not.  Checked against the
+#: live flag_type vocabulary: no unrelated flag_type contains it.
+STRANDED_FLAG_TOKEN_FAMILY: tuple[str, ...] = ('strand',)
+
+#: Second, orthogonal channel: what the finding ASKS FOR.  A flag_type nobody
+#: has seen yet still makes the stranded claim if its suggested action is to
+#: move the task out of ``in-progress``.  Matched as a CONJUNCTION with
+#: :data:`STRANDED_ACTION_TARGET_FAMILY` — each half alone is far too common
+#: ("reset the priority override", "the task is in-progress") to gate a drop.
+STRANDED_ACTION_VERB_FAMILY: tuple[str, ...] = (
+    'reset',
+    'redispatch',
+    're-dispatch',
+    'unstick',
+    'un-stick',
+)
+
+#: The status the stranded class always wants moved away from.  Both spellings
+#: occur in the corpus ("reset it in-progress->pending", "reset it out of
+#: in progress").
+STRANDED_ACTION_TARGET_FAMILY: tuple[str, ...] = ('in-progress', 'in progress')
+
+#: Flag fields consulted for the ACTION channel.  ``suggested_action`` is the
+#: canonical field (``FINDING_ITEM_SCHEMA``); ``description`` is read too
+#: because the LLM routinely states the task's status there and leaves
+#: ``suggested_action`` terse, so the verb and the target may sit in
+#: different fields.
+_STRANDED_ACTION_FIELDS: tuple[str, ...] = ('suggested_action', 'description')
+
+#: The destinations a reset out of in-progress can name, derived from
+#: ``TaskStatus`` so the list has one home.  Longest first, so no member can
+#: shadow a longer one in an alternation.
+_STATUSES_OUT_OF_IN_PROGRESS: tuple[str, ...] = tuple(
+    sorted((s.value for s in TaskStatus if s is not TaskStatus.IN_PROGRESS), key=len, reverse=True)
+)
+
+
+def _alternation(members: tuple[str, ...]) -> str:
+    return '|'.join(map(re.escape, members))
+
+
+#: A :data:`STRANDED_ACTION_VERB_FAMILY` verb whose object is the task itself:
+#: "task" or "the task" with an optional id, then the clause ends (a comma does
+#: not end it) or names a destination status.  Anything else after it is
+#: something the task OWNS: "task 3105's priority override", "to its default".
+_RESET_AIMED_AT_THE_TASK: re.Pattern[str] = re.compile(
+    rf'\b(?:{_alternation(STRANDED_ACTION_VERB_FAMILY)})\s+(?:the\s+)?tasks?(?:\s+#?\d+)?'
+    rf'(?=\s*(?:[.;:!?)]|$)|\s+(?:back\s+)?to\s+(?:{_alternation(_STATUSES_OUT_OF_IN_PROGRESS)})\b)',
+    re.IGNORECASE,
+)
+
+#: The key a KEPT mixed-composite flag's copy carries: ``{component: citation}``
+#: for each component of its task_id that corroborated as a preserved specimen.
+#: Stage 2 is handed each flag as JSON, so the evidence travels beside the claim.
+PRESERVED_SPECIMEN_COMPONENTS_KEY: str = 'preserved_specimen_components'
+
+#: Per-cycle, per-task suppression ceiling for the INV-4 storm escape.  One
+#: preserved specimen legitimately draws one stranded finding a cycle, very
+#: occasionally two (the same claim under two namings), so MORE THAN this many
+#: drops for a single task in a single cycle is not the shape this guard was
+#: built for: the citation is over-broad, stale, or the task's situation has
+#: changed.  Strict ``>``, matching ``SUPPRESSION_STORM_THRESHOLD_PER_CYCLE``'s
+#: value and reasoning without importing it — the two gates are independent and
+#: must be free to move apart.
+#:
+#: Defined HERE, not in ``standing_decision_constants``: that module's stated
+#: purpose is the entity-standing-decision batch, and this is a different
+#: suppression class.  INV-5 asks that a fact have one home, not that every
+#: constant share one file.
+PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE: int = 5
+
+#: Wall-clock ceiling on ONE cycle's corroboration, in seconds.
+#:
+#: The guard's cost is per-CANDIDATE, not per-cycle (see
+#: :func:`_corroborate_preservation`'s cost note): each genuinely stranded task
+#: with no preservation record costs two semantic Graphiti searches, and the
+#: candidate population peaks during a fleet-wide stall — the cycle where Stage
+#: 1 finishing promptly matters most.  Without a ceiling the guard's
+#: contribution to Stage 1's critical path grows with the size of the incident
+#: it is running inside.
+#:
+#: A DEADLINE, deliberately, rather than a cap on the number of candidates.  A
+#: count cap bites a healthy cycle that merely has many stranded tasks — denying
+#: those specimens protection for no reason — and, since candidates are visited
+#: in a stable order, it would deny the SAME tasks protection every cycle.  A
+#: deadline never bites when the backends are answering: it costs a verdict only
+#: in the case it exists for, a cycle already too slow to finish.
+#:
+#: Generous on purpose.  Stage 1's own LLM calls dominate a cycle, so this is a
+#: circuit breaker and not a performance target; a value tight enough to trim a
+#: healthy cycle would trade the guard's whole purpose for latency it does not
+#: control.  Exhaustion is never silent — the un-corroborated tasks keep their
+#: flags and are disclosed through ``unresolved_task_ids`` like any other
+#: unreadable verdict.
+PRESERVATION_CORROBORATION_BUDGET_SECONDS: float = 30.0
+
+#: Escalation category for BOTH records this module files, single-sourced here
+#: rather than spelled at each use site.  ``Escalation.category`` is free-form
+#: prose validated by nothing at submit time, so a categorized detector is only
+#: correct while its filer and its readers spell the category identically — the
+#: fold gate (``DedupeConfig.infra_dedupe_categories``) and any operator query
+#: both read it back.  A shared constant makes that agreement structural.
+CATEGORY_PRESERVATION_SPECIMEN_STORM: str = 'reconciliation_preservation_specimen_storm'
+
+#: ``Escalation.task_id`` of the unresolved-corroboration report.  That record's
+#: subject is the GUARD, not any one task — "my corroboration reads are
+#: failing" is a subsystem fact, and filing it per task would mint one record
+#: per candidate the cycle a backend goes down.  A stable sentinel subject keeps
+#: it findable via ``get_by_task`` and folding into a single parent across
+#: cycles, with the affected task ids carried in the detail.
+UNRESOLVED_CORROBORATION_SUBJECT: str = 'preservation_specimen_guard'
+
+#: Finding-category components of the two records' dedupe fingerprints — the
+#: second axis of ``compute_content_fingerprint``.  Distinct values are what
+#: keep a storm record and an unresolved-corroboration report from folding into
+#: each other when both fire in one cycle.
+_STORM_FINDING_CATEGORY: str = 'preservation_specimen_suppression_storm'
+_UNRESOLVED_FINDING_CATEGORY: str = 'preservation_specimen_corroboration_unreadable'
+
+_AGENT_ROLE: str = 'reconciliation-stage1'
+_LOG_LABEL: str = 'maybe_escalate_preservation_suppression_storm'
+
+
+# ── Pure helpers ─────────────────────────────────────────────────────────────
+
+
+def cites_preservation(text: Any) -> bool:
+    """Return True iff *text* states that a task is a deliberately preserved specimen.
+
+    The single preservation matcher for BOTH corroboration channels — the Mem0
+    ``investigation_outcome`` prose and the Graphiti node summary / edge facts
+    — so the two can never drift apart on what counts as a citation (INV-5).
+
+    Matches any member of :data:`PRESERVATION_TOKEN_FAMILY` as a casefolded
+    substring.  See that constant's comment for why the family holds only
+    multi-word phrases and what was deliberately left out of it.
+
+    Pure, sync, no I/O.
+    """
+    return contains_any_casefolded(text, PRESERVATION_TOKEN_FAMILY)
+
+
+def flag_asserts_stranded(flag: Any) -> bool:
+    """Return True iff *flag* makes the "this task is stranded" claim.
+
+    Two orthogonal channels, OR'd, because neither is sufficient alone:
+
+    1. **Vocabulary** — ``flag['flag_type']`` contains a
+       :data:`STRANDED_FLAG_TOKEN_FAMILY` stem.  Catches the namings already
+       observed, and any future one built on the same word.
+    2. **Requested action** — the flag asks to move the task out of
+       ``in-progress``: ONE of ``suggested_action``/``description`` holds both
+       a :data:`STRANDED_ACTION_VERB_FAMILY` verb and a
+       :data:`STRANDED_ACTION_TARGET_FAMILY` status, or the status sits in
+       either field and a verb aimed at the task itself
+       (:data:`_RESET_AIMED_AT_THE_TASK`) in either.  The second form is how
+       real findings read: the status in ``description``, "reset task 3105" in
+       ``suggested_action``.  Catches a naming built on a different word
+       entirely, which the vocabulary channel must eventually miss because
+       ``flag_type`` is free-form LLM output.
+
+    The conjunction in channel 2 is load-bearing.  ``'reset'`` alone matches
+    ``stale_priority_override``'s perfectly reasonable "reset the priority
+    override back to its default"; ``'in-progress'`` alone matches any finding
+    that merely mentions a task's status, and a preserved specimen is
+    permanently in-progress, so its unrelated findings mention that status
+    often.  That is why a verb pairs with a status in the OTHER field only when
+    the task is its object.  Requiring both keeps the channel inside the class
+    it is named for.
+
+    This is the discriminator that BOUNDS the guard: a preserved task's genuine,
+    unrelated findings still reach Stage 2 because they answer False here.
+
+    Total over malformed input — *flag* may be any object, and a non-mapping,
+    an absent key, or a non-``str`` value all yield ``False`` rather than
+    raising.  ``items_flagged`` entries are free-form LLM-authored dicts.
+
+    Pure, sync, no I/O.
+    """
+    if not isinstance(flag, dict):
+        return False
+    if contains_any_casefolded(flag.get('flag_type'), STRANDED_FLAG_TOKEN_FAMILY):
+        return True
+    return _requests_reset_out_of_in_progress(flag)
+
+
+def _requests_reset_out_of_in_progress(flag: dict[str, Any]) -> bool:
+    """Channel 2 of :func:`flag_asserts_stranded`, whose docstring states the rule.
+
+    Each field is read on its own rather than joined, so no match can straddle
+    the boundary between two of them.  Total over non-``str`` values.  Pure,
+    sync, no I/O.
+    """
+    texts = [text for field in _STRANDED_ACTION_FIELDS if isinstance(text := flag.get(field), str)]
+    in_one_field = any(
+        contains_any_casefolded(text, STRANDED_ACTION_VERB_FAMILY)
+        and contains_any_casefolded(text, STRANDED_ACTION_TARGET_FAMILY)
+        for text in texts
+    )
+    across_fields = any(
+        contains_any_casefolded(text, STRANDED_ACTION_TARGET_FAMILY) for text in texts
+    ) and any(_RESET_AIMED_AT_THE_TASK.search(text) for text in texts)
+    return in_one_field or across_fields
+
+
+def _is_usable_task_id(component: str) -> bool:
+    """Return True iff *component* could name a real task.
+
+    Judges only what it can: a component that parses as an integer must be
+    POSITIVE, since task numbering starts at 1 and ``0``/``-5`` are junk an LLM
+    produced rather than a task to look up.  Anything NON-numeric passes
+    untouched — cross-project ids are spelled ``'project:id'`` and subtask ids
+    carry a dot, and this screen has no business ruling on shapes it does not
+    understand.
+
+    That asymmetry is the point.  The two errors are not symmetric: admitting a
+    junk component costs two backend lookups that miss, inside the cycle's
+    corroboration budget, while wrongly rejecting a real one leaves a preserved
+    specimen unprotected — the harm this whole module exists to prevent.  So the
+    screen rejects only what it can positively identify as impossible.
+
+    Pure, sync, no I/O.
+    """
+    if not component:
+        return False
+    try:
+        return int(component) > 0
+    except ValueError:
+        return True
+
+
+def _flag_task_ids(flag: dict[str, Any]) -> tuple[str, ...]:
+    """The usable component ids of *flag*'s OWN task_id, in order, deduped; ``()`` when none.
+
+    Decomposed by
+    :func:`~fused_memory.reconciliation.flag_task_ids.task_id_components` and
+    screened per component by :func:`_is_usable_task_id`.  Why decomposition is
+    required at all is the module docstring's COMPOSITE TASK IDS paragraph.
+
+    The top-level ``task_id`` only, deliberately: ``cited_tasks`` is not read,
+    because a stranded flag for one task that merely CITES a specimen must not
+    be suppressed on the specimen's evidence.
+
+    Pure, sync, no I/O.
+    """
+    return tuple(c for c in task_id_components(flag.get('task_id')) if _is_usable_task_id(c))
+
+
+
+@dataclass(frozen=True)
+class PreservationSuppressionResult:
+    """Outcome of :func:`filter_preservation_specimen_flags`.
+
+    - ``kept_flags`` — the flags that survived, input order preserved, to be
+      assigned back to ``report.items_flagged``.  A mixed composite survives
+      as an annotated COPY (the module docstring's COMPOSITE TASK IDS); every
+      other kept flag is the input object itself.
+    - ``suppressed_by_task`` — ``{task_id: count}`` of flags dropped, each
+      counted ONCE, so its ``values()`` sum is the per-cycle
+      ``preservation_specimen_suppressed`` stat.  A composite counts against
+      its least component in string order, never the first-written one, so
+      every ordering of the same ids lands on one counter.  It drives the
+      storm escape.
+    - ``citations_by_task`` — ``{task_id: citation_ref}``, the Mem0 memory id or
+      Graphiti uuid of every component citation a drop relied on.  A drop is never
+      anonymous: without this, "one flag suppressed" gives an operator no way to
+      check whether the citation is real, current, or over-broad.
+    - ``unresolved_task_ids`` — tasks this cycle reached no verdict on: a
+      channel read failed, or the cycle's corroboration budget ran out before
+      they were looked up at all.  Their flags were KEPT (see the fail-open
+      policy in :func:`filter_preservation_specimen_flags`), and this field is
+      what stops that keep from being byte-identical to a clean "no citation
+      exists" (INV-11).
+    """
+
+    kept_flags: list[dict[str, Any]]
+    suppressed_by_task: dict[str, int]
+    citations_by_task: dict[str, str]
+    unresolved_task_ids: tuple[str, ...]
+
+
+#: Canonical Graphiti entity label for a task.  ``get_entity`` TRIES this shape
+#: as an EXACT, case-sensitive match first, and on a HIT it lands on the task's
+#: own node, with edges gathered topologically from that node's uuid.
+#:
+#: On a MISS it does not return empty.  It falls back to a purely SEMANTIC
+#: gather — ``search_nodes(query='Task <id>', max_nodes=5)`` plus
+#: ``graphiti.search(query='Task <id>', num_results=edge_limit)`` — whose own
+#: docstring warns it "can surface edges whose fact merely mentions the
+#: entity's name (or is contextually related) without that edge being
+#: RELATES_TO-incident on this node at all".  ``'Task 3105'`` and ``'Task
+#: 5231'`` embed almost identically, so task 3105's preservation edge is
+#: exactly the kind of edge that fuzzy branch surfaces for ANY other task.
+#:
+#: Both branches return the SAME ``{'nodes', 'edges'}`` shape, so a caller
+#: cannot tell them apart by shape alone.  That is why
+#: :func:`_entity_is_scoped_to_task` re-derives this label and requires it
+#: before any citation is trusted.
+GRAPHITI_TASK_ENTITY_TEMPLATE: str = 'Task {task_id}'
+
+#: The Graphiti sub-collections consulted for a preservation citation, in
+#: preference order, as ``(collection key, text field)``.
+#:
+#: EDGES FIRST, deliberately.  An edge fact is the atomic, individually
+#: addressable statement (``get_edge(uuid)``) and is durable; a node summary is
+#: a derived digest that ``refresh_entity_summary`` regenerates.  Citing the
+#: edge is what lets a later reader check the evidence rather than take the
+#: suppression on trust.  The summary is still consulted, because it can carry
+#: the fact in a graph whose edges word it differently.
+_GRAPHITI_CITATION_SOURCES: tuple[tuple[str, str], ...] = (
+    ('edges', 'fact'),
+    ('nodes', 'summary'),
+)
+
+
+def preservation_mem0_filters(task_id: str) -> dict[str, Any]:
+    """The Mem0 metadata filter that finds *task_id*'s recorded not-actionable verdicts.
+
+    Qdrant ANDs equality conditions, so the ``actionable: False`` term is what
+    makes a retrieved row a RECORDED not-actionable adjudication rather than
+    any passing mention of the task.
+
+    The one source of this filter: :func:`_corroborate_preservation` queries
+    it, and Stage 1's ``## Preserved-Specimen Corroboration`` directive renders
+    it as the call the agent should run.  A fresh dict on every call.
+
+    Pure, sync, no I/O.
+    """
+    return {'kind': MEM0_KIND_INVESTIGATION_OUTCOME, 'task_id': task_id, 'actionable': False}
+
+
+def _first_citation(
+    rows: Any,
+    text_of: Callable[[dict[str, Any]], Any],
+    ref_key: str,
+) -> str | None:
+    """Return *ref_key* of the first row in *rows* whose text cites preservation.
+
+    The single definition of "a citable preservation record", shared by both
+    channels so they cannot drift on what counts (INV-5).  *text_of* extracts
+    the prose (payload fallback for Mem0, a plain field for Graphiti) and
+    *ref_key* names the field holding the citable id (``'id'`` / ``'uuid'``).
+
+    ``None`` when nothing matches, when *rows* is not a list/tuple of mappings,
+    or when the row that matches carries no usable ref.  That last case is
+    deliberate and mirrors ``curator_gate_resolution_sweep``'s refusal to flag a
+    gate it cannot cite: a suppression that cannot name its evidence is exactly
+    the anonymous drop ``citations_by_task`` exists to prevent.
+
+    Total over malformed input — every row here comes off a raw backend read.
+    Pure, sync, no I/O.
+    """
+    if not isinstance(rows, (list, tuple)):
+        return None
+    for row in rows:
+        if not isinstance(row, dict) or not cites_preservation(text_of(row)):
+            continue
+        ref = row.get(ref_key)
+        if isinstance(ref, str) and ref:
+            return ref
+    return None
+
+
+def _is_degraded_entity_result(entity: Any) -> bool:
+    """Return True iff *entity* is ``get_entity``'s degraded-fallback result.
+
+    ``services/memory_service.py::_degrade_or_reraise`` does NOT re-raise a
+    rate-limit/quota error: it returns
+    ``{'nodes': [], 'edges': [], 'degraded': True, 'failed_stores': [...]}``.
+    So that outcome arrives through the SUCCESS path, carrying collections
+    byte-identical to a genuine "this task has no preservation fact" — which is
+    why the Graphiti channel needs this screen in ADDITION to its ``except``.
+
+    Either marker alone suffices.  The two keys are written together today, so
+    demanding both would make the verdict depend on a coincidence of the
+    producer rather than on what either key means.  ``failed_stores`` counts
+    only when it is a NON-EMPTY list/tuple: the empty list is what a healthy
+    result carries, and treating it as degradation would report every clean
+    cycle as unreadable.
+
+    Sniffs dict KEYS, not attributes: ``get_entity``'s degraded dict and
+    ``search()``'s attribute-carrying ``SearchResults`` are deliberately
+    different shapes (``_graphiti_degraded_entity_result``'s own docstring).
+
+    Total over malformed input — every value here comes off a raw backend read.
+    Pure, sync, no I/O.
+    """
+    if not isinstance(entity, dict):
+        return False
+    if entity.get('degraded') is True:
+        return True
+    failed_stores = entity.get('failed_stores')
+    return isinstance(failed_stores, (list, tuple)) and bool(failed_stores)
+
+
+def _entity_is_scoped_to_task(entity: Any, task_id: str) -> bool:
+    """Return True iff *entity* carries *task_id*'s OWN node, matched by name.
+
+    THE SECOND THING A ``get_entity`` RESULT CAN BE.  Like
+    :func:`_is_degraded_entity_result`, this screens an outcome that arrives
+    through the success path wearing the shape of a good answer.  There the
+    imposter was a degraded read; here it is ``get_entity``'s SEMANTIC
+    fallback, taken whenever no node is named exactly
+    ``GRAPHITI_TASK_ENTITY_TEMPLATE.format(task_id=task_id)`` (see that
+    constant's comment).  A fuzzy result is a set of nodes and edges that are
+    merely TEXTUALLY NEAR the query string — it is evidence about the corpus,
+    never about this task.
+
+    WHAT GOES WRONG WITHOUT IT.  Task 3105's preservation edge is prose
+    containing the words a fuzzy search for any other ``'Task N'`` ranks
+    highly, so an ordinary undocumented stranded task would borrow 3105's
+    citation and have its finding SUPPRESSED — the hidden-finding harm this
+    module's docstring says it is biased against, and worse than a plain miss
+    because the drop is logged with a citation uuid belonging to a DIFFERENT
+    task, so the audit trail actively misleads the reader who checks it.
+
+    Presence of the exact-named node is the available proxy for "the exact
+    branch was taken": that branch is the only one that resolves nodes BY that
+    name, and a node genuinely carrying the name is about this task whichever
+    branch surfaced it.  Multiple nodes may share the name (the duplicate-name
+    pathology ``get_entity`` unions edges across) — one suffices.
+
+    Total over malformed input — every value here comes off a raw backend
+    read.  Pure, sync, no I/O.
+    """
+    if not isinstance(entity, dict):
+        return False
+    nodes = entity.get('nodes')
+    if not isinstance(nodes, (list, tuple)):
+        return False
+    expected = GRAPHITI_TASK_ENTITY_TEMPLATE.format(task_id=task_id)
+    return any(isinstance(node, dict) and node.get('name') == expected for node in nodes)
+
+
+def _graphiti_citation(entity: Any) -> str | None:
+    """Return the uuid of the first edge fact / node summary citing preservation.
+
+    Consults :data:`_GRAPHITI_CITATION_SOURCES` in order.  ``None`` for a
+    non-mapping result, a missing collection, or no match.  Pure, sync, no I/O.
+
+    Requires BOTH pre-screens, because this matcher reads TEXT only and so
+    cannot tell any of ``get_entity``'s three same-shaped outcomes apart:
+
+    - :func:`_is_degraded_entity_result` — else a Graphiti outage is silently
+      converted into a "no citation" verdict.
+    - :func:`_entity_is_scoped_to_task` — else a semantic-fallback result is
+      silently converted into a citation for a task it does not describe.
+
+    The two screens fail in OPPOSITE directions, which is why neither
+    substitutes for the other.
+    """
+    if not isinstance(entity, dict):
+        return None
+    for collection, text_field in _GRAPHITI_CITATION_SOURCES:
+        citation = _first_citation(
+            entity.get(collection), lambda row, f=text_field: row.get(f), 'uuid',
+        )
+        if citation is not None:
+            return citation
+    return None
+
+
+@dataclass(frozen=True)
+class _Corroboration:
+    """One task's corroboration verdict.
+
+    - ``citation`` — the citing ref, or ``None`` when no channel produced one.
+    - ``degraded`` — at least one channel could not be READ this cycle.
+
+    The two are carried separately because ``citation is None`` alone cannot
+    tell "no citation exists" from "we could not look", and collapsing them is
+    exactly the silent fail-soft INV-11 forbids.  ``degraded`` matters only when
+    ``citation is None``: a verdict reached on a surviving channel is resolved,
+    however the other channel fared.
+    """
+
+    citation: str | None
+    degraded: bool
+
+
+async def _corroborate_preservation(
+    memory_service: Any, project_id: str, task_id: str, *, log: logging.Logger,
+) -> _Corroboration:
+    """Corroborate *task_id* as a preserved specimen across both channels.
+
+    Two channels, OR'd, cheapest-first.
+
+    1. **Mem0** — a deterministic ``get_memories_by_metadata`` scroll filtered on
+       :func:`preservation_mem0_filters`.
+    2. **Graphiti** — ``get_entity('Task <id>')``, consulted ONLY when channel 1
+       produced no citation.
+
+    Neither channel is a semantic ``search``: its top-N cutoff silently drops
+    low-similarity matches, and a silent miss here re-opens the destructive path.
+
+    The fallback is not redundant.  A Graphiti edge exists as soon as the
+    preservation fact is recorded, whereas an ``investigation_outcome`` row only
+    exists after some stage has ALREADY investigated a flag — so channel 2 is
+    what protects a newly documented specimen on its first cycle, precisely the
+    window the two destructive gate tasks were filed in.  Channel 1 runs first
+    because its metadata filter is the cheaper and more authoritative signal.
+
+    THE FALLBACK IS FREE ON THE RARE PATH, NOT THE COMMON ONE.  The common
+    candidate is the OPPOSITE of a specimen — an ordinary stranded task with no
+    ``investigation_outcome`` row at all — so channel 1 misses and channel 2
+    always runs for it.  And ``get_entity`` skips its semantic work only on an
+    exact name hit: a task with no ``'Task <id>'`` node falls through to
+    ``search_nodes`` PLUS ``graphiti.search``, i.e. two embedding searches.  So
+    the steady-state cost is two semantic searches per genuinely stranded task,
+    and a fleet-wide stall — when Stage 1 most needs to finish — is exactly when
+    that population is largest.  :func:`filter_preservation_specimen_flags`
+    bounds it with a per-cycle deadline rather than paying it unbounded.
+
+    Each channel is guarded independently, so one being down never costs the
+    other its verdict.  A failed read logs WARNING naming the project, task and
+    channel, and marks the verdict ``degraded`` — it is NEVER counted as
+    evidence either way.  ``asyncio.CancelledError``/``KeyboardInterrupt``/
+    ``SystemExit`` propagate unchanged: a shutdown is not a backend blip.
+
+    ``try``/``except`` is NOT full coverage of channel 2.  ``get_entity`` has
+    THREE outcomes: it can answer, it can raise, and on a rate-limit/quota
+    error it can ABSORB the failure and return the degraded superset dict
+    (``memory_service.py::_degrade_or_reraise``).  That third outcome arrives
+    through the success path with empty ``nodes``/``edges``, so left unscreened
+    it would read as a clean "this task has no preservation fact" and the
+    specimen would go unprotected on a cycle reported as fully resolved.  The
+    success path is therefore screened by :func:`_is_degraded_entity_result`
+    as well, BEFORE the citation matcher runs — a read that failed is not
+    evidence in either direction.
+
+    NOR IS A READ THAT ANSWERED ABOUT SOMETHING ELSE.  ``get_entity`` resolves
+    the exact label only when a node carries it; otherwise it returns a
+    SEMANTIC gather over whatever merely reads like ``'Task <id>'``, in the
+    same ``{'nodes', 'edges'}`` shape.  Trusting that would let one documented
+    specimen's edge corroborate every OTHER task whose label embeds near it,
+    silently suppressing genuine stranded findings and citing a uuid that
+    belongs to a different task.  :func:`_entity_is_scoped_to_task` is
+    therefore the second pre-screen, and its failure is a resolved negative
+    rather than a degradation — see the comment at that call site.
+    """
+    degraded = False
+
+    try:
+        rows = await memory_service.get_memories_by_metadata(
+            project_id=project_id, filters=preservation_mem0_filters(task_id),
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        # Includes a propagated Qdrant read-timeout, which arrives here as an
+        # exception precisely so it cannot be mistaken for an empty scroll.
+        log.warning(
+            'preservation_specimen_guard: mem0 corroboration read failed for task '
+            '%s in project %s — verdict unresolved, flag kept',
+            task_id, project_id, exc_info=True,
+        )
+        degraded = True
+    else:
+        citation = _first_citation(rows, metadata_row_text, 'id')
+        if citation is not None:
+            return _Corroboration(citation=citation, degraded=False)
+
+    try:
+        entity = await memory_service.get_entity(
+            GRAPHITI_TASK_ENTITY_TEMPLATE.format(task_id=task_id), project_id,
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        log.warning(
+            'preservation_specimen_guard: graphiti corroboration read failed for '
+            'task %s in project %s — verdict unresolved, flag kept',
+            task_id, project_id, exc_info=True,
+        )
+        return _Corroboration(citation=None, degraded=True)
+
+    if _is_degraded_entity_result(entity):
+        log.warning(
+            'preservation_specimen_guard: graphiti corroboration read degraded for '
+            'task %s in project %s — verdict unresolved, flag kept',
+            task_id, project_id,
+        )
+        return _Corroboration(citation=None, degraded=True)
+
+    if not _entity_is_scoped_to_task(entity, task_id):
+        # A resolved NEGATIVE, not a degraded read: the lookup answered, and
+        # what it answered is that this task has no node of its own.  Marking
+        # it unresolved would file an `unresolved_corroboration` report for
+        # every ordinary task absent from the graph — i.e. for most stranded
+        # flags — drowning the signal that channel exists to carry.
+        log.debug(
+            'preservation_specimen_guard: graphiti returned no node named %r for task '
+            '%s in project %s (semantic fallback) — not evidence about this task, '
+            'flag kept',
+            GRAPHITI_TASK_ENTITY_TEMPLATE.format(task_id=task_id), task_id, project_id,
+        )
+        return _Corroboration(citation=None, degraded=degraded)
+
+    return _Corroboration(citation=_graphiti_citation(entity), degraded=degraded)
+
+
+def _component_citations(
+    task_ids: tuple[str, ...], verdicts: dict[str, _Corroboration],
+) -> dict[str, str]:
+    """``{component: citation}`` for each of *task_ids* that corroborated, in order.
+
+    A component with no verdict (the cycle's budget ran out before it was
+    looked up) or no citation is simply absent.  Pure, sync, no I/O.
+    """
+    return {
+        task_id: verdict.citation
+        for task_id in task_ids
+        if (verdict := verdicts.get(task_id)) is not None and verdict.citation is not None
+    }
+
+
+# ── Orchestrator ─────────────────────────────────────────────────────────────
+
+
+async def filter_preservation_specimen_flags(
+    memory_service: Any,
+    project_id: str,
+    flags: list[dict[str, Any]] | None,
+    *,
+    budget_seconds: float = PRESERVATION_CORROBORATION_BUDGET_SECONDS,
+    log: logging.Logger = logger,
+) -> PreservationSuppressionResult:
+    """Drop stranded-class recon flags for tasks documented as preserved specimens.
+
+    Narrow, then corroborate, then drop:
+
+    1. Candidates are the tasks named by flags that pass
+       :func:`flag_asserts_stranded`.  Nothing else is ever looked up, which is
+       what keeps a preserved task's UNRELATED findings reaching Stage 2 — the
+       guard drops the adjudicated class, not the task.
+    2. Each candidate is corroborated ONCE by
+       :func:`_corroborate_preservation`, positive and negative verdicts alike,
+       so a task appearing on N flags costs one corroboration pass.
+    3. A stranded flag is dropped, and its citations recorded, only when EVERY
+       component of its task_id corroborated; one where only some did is kept
+       on an annotated copy (the module docstring's COMPOSITE TASK IDS).
+
+    An empty candidate set short-circuits before any I/O, so a cycle with
+    nothing in this class — the overwhelming majority — costs zero backend
+    calls.  The corroboration loop is sequential rather than an
+    ``asyncio.gather`` because a serial loop keeps per-task error attribution
+    exact (the reason ``curator_gate_resolution_sweep`` gives for its own),
+    which is what lets a failure name the task it belongs to.
+
+    **Bounded by a deadline, not by an assumption.**  A candidate that is NOT a
+    specimen — the common one — costs two semantic Graphiti searches, and the
+    population is largest exactly during the fleet-wide stall where Stage 1 must
+    still finish, so the serial loop is given
+    :data:`PRESERVATION_CORROBORATION_BUDGET_SECONDS` of wall clock for the
+    whole cycle and each corroboration is capped at whatever remains.  Overrun
+    is treated as one more unreadable verdict: the remaining candidates keep
+    their flags and are named in ``unresolved_task_ids``, so a guard that could
+    not keep up says so instead of quietly protecting nothing.
+
+    **Fail OPEN on the drop, but never silently.**  A read failure NEVER
+    suppresses: it keeps the flag and names the task in ``unresolved_task_ids``.
+    The asymmetry is deliberate.  Suppressing on a backend blip would hide every
+    stranded finding fleet-wide — the hidden-finding cost the under-suppression
+    bias forbids — whereas keeping the flag costs at most one more cycle of a
+    false positive the rotation has absorbed since August.  But a BARE fail-open
+    would make "corroboration unreadable" byte-identical to "no citation
+    exists", and the destructive recommendation would then flow on unremarked;
+    disclosing the unresolved tasks in the result (surfaced as a stat and
+    reported through the storm escape) is what keeps the degradation visible at
+    the point of consumption.  A per-task failure costs that task's verdict
+    only, never the batch.
+
+    Returns a :class:`PreservationSuppressionResult`; the caller assigns
+    ``kept_flags`` back to ``items_flagged``.  Suppression is NOT resolution —
+    the caller excludes suppressed flags' signatures from marker acknowledgment
+    so recurrence history survives until the preservation citation is retired.
+    """
+    batch = list(flags or ())
+    # One pass fixes each flag's candidate task ids (``()`` = not a candidate),
+    # so neither the discriminator nor the decomposition is recomputed below.
+    candidacy: list[tuple[dict[str, Any], tuple[str, ...]]] = [
+        (
+            flag,
+            _flag_task_ids(flag)
+            if isinstance(flag, dict) and flag_asserts_stranded(flag)
+            else (),
+        )
+        for flag in batch
+    ]
+    candidates = sorted({tid for _, task_ids in candidacy for tid in task_ids})
+    if not candidates:
+        return PreservationSuppressionResult(
+            kept_flags=batch, suppressed_by_task={}, citations_by_task={},
+            unresolved_task_ids=(),
+        )
+
+    verdicts: dict[str, _Corroboration] = {}
+    unresolved: list[str] = []
+    loop_clock = asyncio.get_running_loop()
+    deadline = loop_clock.time() + budget_seconds
+    for position, task_id in enumerate(candidates):
+        remaining = deadline - loop_clock.time()
+        if remaining <= 0:
+            # Skipped, not answered.  These tasks join the unreadable set for
+            # the same INV-11 reason a failed read does: nothing was looked up,
+            # so "no citation" would be a claim the guard did not earn.
+            log.warning(
+                'preservation_specimen_guard: corroboration budget of %.1fs exhausted '
+                'after %d of %d candidate(s) in project %s — %d task(s) left '
+                'uncorroborated, flags kept',
+                budget_seconds, position, len(candidates), project_id,
+                len(candidates) - position,
+            )
+            unresolved.extend(candidates[position:])
+            break
+        try:
+            # The per-call cap is the REMAINING budget, so one hung backend read
+            # cannot outlast the cycle's ceiling on its own; _corroborate_
+            # preservation re-raises CancelledError, which is what lets wait_for
+            # convert the cancellation into the TimeoutError caught here.
+            verdict = await asyncio.wait_for(
+                _corroborate_preservation(memory_service, project_id, task_id, log=log),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            log.warning(
+                'preservation_specimen_guard: corroboration timed out after %.1fs for '
+                'task %s in project %s — verdict unresolved, flag kept',
+                remaining, task_id, project_id,
+            )
+            verdict = _Corroboration(citation=None, degraded=True)
+        verdicts[task_id] = verdict
+        if verdict.citation is None and verdict.degraded:
+            unresolved.append(task_id)
+
+    kept: list[dict[str, Any]] = []
+    suppressed_by_task: dict[str, int] = {}
+    citations_by_task: dict[str, str] = {}
+    for flag, task_ids in candidacy:
+        citations = _component_citations(task_ids, verdicts)
+        if not citations:
+            kept.append(flag)
+        elif len(citations) < len(task_ids):
+            kept.append({**flag, PRESERVED_SPECIMEN_COMPONENTS_KEY: citations})
+            log.info(
+                'preservation_specimen_guard: kept flag_type=%r (task_id=%r) in project '
+                '%s annotated with specimen citations %s — not every component '
+                'corroborated as a preserved specimen',
+                flag.get('flag_type'), flag.get('task_id'), project_id, citations,
+            )
+        else:
+            counted_against = min(task_ids)
+            suppressed_by_task[counted_against] = suppressed_by_task.get(counted_against, 0) + 1
+            citations_by_task.update(citations)
+            log.info(
+                'preservation_specimen_guard: suppressed flag_type=%r (task_id=%r) in '
+                'project %s — every component corroborated as a preserved specimen: %s',
+                flag.get('flag_type'), flag.get('task_id'), project_id, citations,
+            )
+
+    return PreservationSuppressionResult(
+        kept_flags=kept,
+        suppressed_by_task=suppressed_by_task,
+        citations_by_task=citations_by_task,
+        unresolved_task_ids=tuple(unresolved),
+    )
+
+
+# ── Storm escape (INV-4) ─────────────────────────────────────────────────────
+
+
+async def maybe_escalate_preservation_suppression_storm(
+    escalation_queue: Any,
+    project_id: str,
+    run_id: str,
+    result: PreservationSuppressionResult,
+    *,
+    threshold: int = PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+    log: logging.Logger = logger,
+) -> list[str]:
+    """File (or fold) the two L1 records that keep this guard audible (INV-4).
+
+    1. **Suppression storm** — one record per task whose per-cycle suppression
+       count exceeds *threshold* (strict ``>``), naming the count and the
+       citation the drops leaned on.  A citation hiding a flood of findings in
+       one cycle is a signal it is over-broad or stale, and the guard's whole
+       job is dropping findings, so this is the escape that stops it doing so
+       unaccountably.
+    2. **Unresolved corroboration** — one record for the cycle when
+       ``result.unresolved_task_ids`` is non-empty (a channel read failed, or
+       the cycle's corroboration budget ran out first).  The guard fails OPEN, so a
+       subsystem whose reads are all failing otherwise degrades in total
+       silence: every stranded recommendation flows on, the suppressed stat
+       reads 0, and nothing distinguishes that from a healthy quiet cycle.
+
+    Each is filed or folded through ``escalation/dedupe.py::file_or_fold_l1``,
+    NOT gated on ``has_open_l1`` (task 3522): Stage 1 re-evaluates every cycle,
+    so a condition that fires once tends to fire every cycle, and folding keeps
+    ONE pending record per subject whose ``dedupe_count`` carries the
+    recurrence.  A folded record keeps the PARENT's summary, so the count named
+    there is the FIRST breach's.
+
+    Best-effort throughout: returns ``[]`` immediately when the ``escalation``
+    package is unavailable, and any per-subject failure is logged on *log* and
+    excluded.  Returns the subjects that received a NEW record this cycle.
+    """
+    if file_or_fold_l1 is None:
+        return []
+
+    escalated: list[str] = []
+
+    for task_id, count in result.suppressed_by_task.items():
+        if count <= threshold:
+            continue
+        citation = result.citations_by_task.get(task_id, 'unknown')
+        filed = file_or_fold_l1(
+            escalation_queue,
+            project_id=project_id,
+            subject=task_id,
+            category=CATEGORY_PRESERVATION_SPECIMEN_STORM,
+            finding_category=_STORM_FINDING_CATEGORY,
+            agent_role=_AGENT_ROLE,
+            summary=(
+                f'Preservation citation for task {task_id} suppressed {count} recon '
+                f'flag(s) in a single cycle (> {threshold})'
+            ),
+            detail='\n'.join([
+                f'project_id: {project_id}',
+                f'run_id: {run_id}',
+                f'task_id: {task_id}',
+                f'citation: {citation}',
+                f'suppressed_this_cycle: {count}',
+                f'threshold: {threshold}',
+            ]),
+            log=log,
+            log_label=_LOG_LABEL,
+        )
+        if filed:
+            escalated.append(task_id)
+
+    if result.unresolved_task_ids:
+        unresolved = ', '.join(result.unresolved_task_ids)
+        filed = file_or_fold_l1(
+            escalation_queue,
+            project_id=project_id,
+            subject=UNRESOLVED_CORROBORATION_SUBJECT,
+            category=CATEGORY_PRESERVATION_SPECIMEN_STORM,
+            finding_category=_UNRESOLVED_FINDING_CATEGORY,
+            agent_role=_AGENT_ROLE,
+            summary=(
+                f'Preservation corroboration unresolved for '
+                f'{len(result.unresolved_task_ids)} task(s) this cycle — stranded '
+                f'findings are flowing through unfiltered'
+            ),
+            detail='\n'.join([
+                f'project_id: {project_id}',
+                f'run_id: {run_id}',
+                f'unresolved_task_ids: {unresolved}',
+                'The guard fails OPEN on the drop, so these tasks\' flags were '
+                'KEPT. That is correct, but it means a preserved specimen is '
+                'currently unprotected: check Qdrant/FalkorDB health and the '
+                'WARNING log lines from this module, which name either the '
+                'failing channel or an exhausted per-cycle corroboration budget.',
+            ]),
+            log=log,
+            log_label=_LOG_LABEL,
+        )
+        if filed:
+            escalated.append(UNRESOLVED_CORROBORATION_SUBJECT)
+
+    return escalated

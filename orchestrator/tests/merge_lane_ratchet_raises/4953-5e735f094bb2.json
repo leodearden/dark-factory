@@ -1,0 +1,18 @@
+{
+  "task_id": "4953",
+  "reason": "amendment (review of task 4953, heuristics 9/14): the coalesce-unwind restore policy moves out of worker.py into merge_lane/coalesce_unwind.py and reads each member's status just before its restore; worker.py falls, the cluster totals rise only by the new module's docstring and imports",
+  "measures": [
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57839,
+      "current": 57860
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 32100,
+      "current": 32110
+    }
+  ]
+}

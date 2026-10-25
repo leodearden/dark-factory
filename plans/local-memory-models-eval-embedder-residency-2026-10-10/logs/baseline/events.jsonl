@@ -1,0 +1,12 @@
+{"t": 1791652391.7710798, "event": "whisper_loaded", "secs": 15.04}
+{"t": 1791652393.6898706, "event": "warmup", "secs": 1.9184, "match": 1.0}
+{"t": 1791652393.6899955, "event": "phase_start", "phase": "no_embedder"}
+{"t": 1791652394.2950702, "event": "transcribe", "phase": "no_embedder", "clip": "jfk11s", "i": 0, "secs": 0.6049, "match": 1.0, "text": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."}
+{"t": 1791652394.9925964, "event": "transcribe", "phase": "no_embedder", "clip": "jfk11s", "i": 1, "secs": 0.6973, "match": 1.0, "text": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."}
+{"t": 1791652395.6856124, "event": "transcribe", "phase": "no_embedder", "clip": "jfk11s", "i": 2, "secs": 0.6928, "match": 1.0, "text": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."}
+{"t": 1791652396.321843, "event": "transcribe", "phase": "no_embedder", "clip": "jfk11s", "i": 3, "secs": 0.6359, "match": 1.0, "text": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."}
+{"t": 1791652396.913234, "event": "transcribe", "phase": "no_embedder", "clip": "jfk11s", "i": 4, "secs": 0.5908, "match": 1.0, "text": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."}
+{"t": 1791652398.31408, "event": "transcribe", "phase": "no_embedder", "clip": "jfk30s", "i": 0, "secs": 1.4007, "text": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country. And so, my fellow Americans, ask not what your country can do for you, ask what you can do "}
+{"t": 1791652399.790728, "event": "transcribe", "phase": "no_embedder", "clip": "jfk30s", "i": 1, "secs": 1.4765, "text": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country. And so, my fellow Americans, ask not what your country can do for you, ask what you can do "}
+{"t": 1791652401.3316662, "event": "transcribe", "phase": "no_embedder", "clip": "jfk30s", "i": 2, "secs": 1.5407, "text": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country. And so, my fellow Americans, ask not what your country can do for you, ask what you can do "}
+{"t": 1791652401.3317986, "event": "phase_end", "phase": "no_embedder"}

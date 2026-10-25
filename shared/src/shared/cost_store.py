@@ -9,12 +9,14 @@ Uses a persistent connection opened via open()/close() or the async context mana
 
 from __future__ import annotations
 
+import enum
 import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from shared.async_sqlite_base import AsyncSqliteBase
+from shared.sqlite_column_migration import add_column_if_missing
 
 __all__ = ['CostStore']
 
@@ -28,6 +30,21 @@ logger = logging.getLogger(__name__)
 # cost_store.__all__ to exactly {'CostStore'}, and this is a module-level
 # constant, not part of the shared package's re-exported surface.
 API_ERROR_EVENT_TYPE = 'api_error'
+
+
+class CapReason(enum.StrEnum):
+    """The ``invocations.capped_reason`` vocabulary: which ceiling ended a run.
+
+    Single-sourced here beside the column it describes, and outside
+    ``__all__`` for the same reason as :data:`API_ERROR_EVENT_TYPE`.
+    ``BUDGET`` and ``TURNS`` are configured per-invocation ceilings
+    (``shared.cli_invoke.classify_cap_kill``); ``ACCOUNT`` is an unattributed
+    account usage cap (``shared.cli_invoke.invoke_with_cap_retry``).
+    """
+
+    BUDGET = 'budget'
+    TURNS = 'turns'
+    ACCOUNT = 'account'
 
 # Schema without PRAGMA — pragmas are set once on the persistent connection.
 _SCHEMA = """\
@@ -47,7 +64,10 @@ CREATE TABLE IF NOT EXISTS invocations (
     duration_ms         INTEGER NOT NULL DEFAULT 0,
     capped              INTEGER NOT NULL DEFAULT 0,
     started_at          TEXT NOT NULL,
-    completed_at        TEXT NOT NULL
+    completed_at        TEXT NOT NULL,
+    -- Added columns stay LAST and nullable: see _ADDED_INVOCATION_COLUMNS.
+    model_id            TEXT,
+    capped_reason       TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_inv_project
@@ -88,6 +108,35 @@ CREATE INDEX IF NOT EXISTS idx_acct_evt_created
 # pre-existing cap_hit/switch/resume rows.  Without a bare created_at index
 # that branch degrades to a full scan of an append-only table that grows for
 # the life of the deployment.
+
+# Columns added to `invocations` after the original 16-column schema shipped,
+# in the order _migrate_invocations_columns adds them.  They must also be the
+# LAST columns of _SCHEMA, in this order, so a fresh DB matches a migrated one
+# (see orchestrator/src/orchestrator/run_store.py::_SCHEMA), and nullable so
+# ADD COLUMN never rewrites the table.
+_ADDED_INVOCATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ('model_id', 'TEXT'),
+    ('capped_reason', 'TEXT'),
+)
+
+
+def _checked_cap_reason(*, capped: bool, capped_reason: str | None) -> CapReason | None:
+    """Return *capped_reason* as a :class:`CapReason`, enforcing that it agrees
+    with *capped*.
+
+    The ``invocations`` row invariant is ``capped == (capped_reason IS NOT
+    NULL)``.  A pair that breaks it, or a reason outside the vocabulary, raises
+    ValueError instead of persisting a row that contradicts itself.  Callers
+    that predate ``capped_reason`` pass ``capped=False`` alone, which agrees.
+    """
+    reason = None if capped_reason is None else CapReason(capped_reason)
+    if capped != (reason is not None):
+        raise ValueError(
+            f'invocations row would contradict itself: capped={capped!r} but '
+            f'capped_reason={capped_reason!r}; capped must equal '
+            f'capped_reason is not None'
+        )
+    return reason
 
 
 def _inclusive_end_bound(end_iso: str) -> str:
@@ -157,6 +206,45 @@ class CostStore(AsyncSqliteBase):
     def _schema(self) -> str:
         return _SCHEMA
 
+    # -- lifecycle ------------------------------------------------------------
+
+    async def open(self) -> None:
+        """Open, then bring an existing DB up to the current column set.
+
+        :data:`_SCHEMA` is applied with ``CREATE TABLE IF NOT EXISTS``, so an
+        ``invocations`` table created before task 4826 never gains ``model_id``
+        or ``capped_reason`` from the DDL edit alone — and the widened INSERT
+        in :meth:`save_invocation` would then fail on the first invocation
+        after deploy.  Migrating here, before any caller can write, is what
+        keeps a writer from ever meeting an un-migrated table.
+
+        Closes the connection on failure so a half-open store is never left
+        behind.  Safe because ``AsyncSqliteBase.open()`` releases
+        ``_lifecycle_lock`` before returning and assigns ``_conn`` only on
+        success, so ``close()`` here neither deadlocks nor races.
+        """
+        await super().open()
+        try:
+            await self._migrate_invocations_columns()
+            await self._require_conn().commit()
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _migrate_invocations_columns(self) -> None:
+        """Add any :data:`_ADDED_INVOCATION_COLUMNS` an existing table lacks.
+
+        Additive only: one ``ALTER TABLE ... ADD COLUMN`` per missing column.
+        Idempotent, and a no-op on a fresh DB.  Pre-existing rows read NULL for
+        the new columns, meaning "not recorded".  No ``PRAGMA user_version``
+        ladder, per the rule in ``shared/src/shared/sqlite_column_migration.py``.
+        The caller commits.
+        """
+        conn = self._require_conn()
+        for column, ddl in _ADDED_INVOCATION_COLUMNS:
+            if await add_column_if_missing(conn, 'invocations', column, ddl):
+                logger.info('CostStore: added invocations.%s (%s)', column, ddl)
+
     # -- internal helpers -----------------------------------------------------
 
     async def _execute(self, sql: str, params: tuple[Any, ...]) -> None:
@@ -185,14 +273,30 @@ class CostStore(AsyncSqliteBase):
         capped: bool,
         started_at: str,
         completed_at: str,
+        model_id: str | None = None,
+        capped_reason: CapReason | None = None,
     ) -> None:
-        """Insert one row into the invocations table."""
+        """Insert one row into the invocations table.
+
+        ``model`` is the caller's routing lineage ALIAS ('opus', 'sonnet') and
+        stays that way, so existing ``GROUP BY model`` consumers are
+        unaffected.  ``model_id`` is the exact version the CLI actually served
+        ('claude-opus-5'), or None when it could not be determined — for a
+        non-Claude backend, which writes no transcript to read it from, or for
+        a run whose transcript was unavailable.
+
+        ``capped`` means "ended by a ceiling" and ``capped_reason`` names which
+        one, or is None when the run was not capped.  ``capped`` must equal
+        ``capped_reason is not None``; see :func:`_checked_cap_reason`.
+        """
+        reason = _checked_cap_reason(capped=capped, capped_reason=capped_reason)
         await self._execute(
             'INSERT INTO invocations '
             '(run_id, task_id, project_id, account_name, model, role, '
             ' cost_usd, input_tokens, output_tokens, cache_read_tokens, '
-            ' cache_create_tokens, duration_ms, capped, started_at, completed_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ' cache_create_tokens, duration_ms, capped, started_at, completed_at, '
+            ' model_id, capped_reason) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 run_id,
                 task_id,
@@ -209,6 +313,8 @@ class CostStore(AsyncSqliteBase):
                 int(capped),
                 started_at,
                 completed_at,
+                model_id,
+                reason,
             ),
         )
 

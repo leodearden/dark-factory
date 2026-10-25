@@ -45,6 +45,10 @@ exception, the ``cross_repo`` explanation, the ``execution_class`` note) are
 deliberately outside the marker and unpinned, and this guard must not be extended
 to them. Parser BEHAVIOUR is pinned by ``shared/tests/test_task_metadata.py``;
 neither implies the other.
+
+Marker plumbing lives in ``task_authoring_marker_span.marked_span`` (task 4999),
+shared with the task-4303 guard next door; read that module for why the markers
+are explicit and why every failure is loud.
 """
 from __future__ import annotations
 
@@ -52,14 +56,14 @@ import pathlib
 
 import pytest
 from shared.task_metadata import _BLESSED_METADATA_KEYS
+from task_authoring_marker_span import marked_span
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 TASK_AUTHORING_PATH = REPO_ROOT / "docs" / "task-authoring.md"
 
-# The full HTML-comment forms, not the bare slug: the begin literal is not a
-# substring of the end literal (the `/` differs), so `.count()` on each is
-# unambiguous.
+# The full HTML-comment forms, not the bare slug: `marked_span` requires the two
+# literals not to overlap as substrings, and the bare slug sits inside both.
 MIRROR_BEGIN = "<!-- tier-a-blessed-keys-mirror -->"
 MIRROR_END = "<!-- /tier-a-blessed-keys-mirror -->"
 
@@ -69,47 +73,24 @@ _FENCE = "```"
 def _documented_blessed_keys(markdown_text):
     """The comma-separated key names in the fence delimited by the mirror markers.
 
-    Anchored on an EXPLICIT marker pair rather than positionally ("the fenced
-    block after the Tier-A heading"). A positional match quietly guards nothing
-    the moment the section is renamed, reordered, or gains a second fence; an
-    explicit marker fails loudly instead, and the failure names what to restore.
-
-    Every failure is a loud ``AssertionError`` naming the marker literal and the
-    doc, never a ``[]``/``None`` return. That is the vacuity hazard and the whole
-    point of this function: an extractor that silently yields nothing turns the
-    drift assertion downstream green while pinning nothing at all — strictly
-    worse than having no guard, because the suite still reports success.
+    Everything below the ``marked_span`` call is this guard's OWN fence-content
+    extraction; it raises loudly rather than returning ``[]`` for the same
+    reason ``marked_span`` does.
 
     Returns the names in DOCUMENT ORDER (a list, not a set) so the caller can
     also detect an accidental double-entry, which set equality alone cannot see.
     """
-    begin_count = markdown_text.count(MIRROR_BEGIN)
-    assert begin_count == 1, (
-        f"expected exactly one {MIRROR_BEGIN!r} marker in docs/task-authoring.md, "
-        f"found {begin_count} (task 3780). This marker opens the fenced Tier-A "
-        f"listing that mirrors _BLESSED_METADATA_KEYS in "
-        f"shared/src/shared/task_metadata.py. If it was deleted, restore it "
-        f"immediately above that fence; if it was duplicated, one of the two "
-        f"listings is unpinned and free to drift."
+    marked = marked_span(
+        markdown_text,
+        MIRROR_BEGIN,
+        MIRROR_END,
+        doc_path="docs/task-authoring.md",
+        task="task 3780",
+        delimits=(
+            "the fenced Tier-A listing that mirrors _BLESSED_METADATA_KEYS in "
+            "shared/src/shared/task_metadata.py"
+        ),
     )
-    end_count = markdown_text.count(MIRROR_END)
-    assert end_count == 1, (
-        f"expected exactly one {MIRROR_END!r} marker to close {MIRROR_BEGIN!r} in "
-        f"docs/task-authoring.md, found {end_count} (task 3780) — restore the "
-        f"closing marker immediately below the fenced Tier-A listing, and above "
-        f"the explanatory paragraphs, which are deliberately outside the marker."
-    )
-
-    begin_at = markdown_text.index(MIRROR_BEGIN)
-    end_at = markdown_text.index(MIRROR_END)
-    assert begin_at < end_at, (
-        f"the Tier-A mirror markers are INVERTED in docs/task-authoring.md: "
-        f"{MIRROR_END!r} appears before {MIRROR_BEGIN!r} (task 3780). Swap them "
-        f"back around the fenced listing — as written they delimit an empty span "
-        f"and this guard would pin nothing."
-    )
-
-    marked = markdown_text[begin_at + len(MIRROR_BEGIN):end_at]
 
     # Strip the fence delimiter lines; everything between them is the listing.
     # Keeping this tolerant (bare names, wrapped across lines, no per-line
@@ -243,7 +224,12 @@ def test_documented_blessed_keys_fails_loudly_on_a_broken_marker(markdown_text, 
     All five are the same failure at different depths: each would otherwise
     silently reduce this guard to a tautology while the suite kept reporting
     green. The message must tell a human what to restore and where, so the
-    assertions check the marker literal and the doc path are both named.
+    assertions check the marker literal, the doc path and this guard's task are
+    all named. ``doc_path`` and ``task`` are ARGUMENTS threaded into
+    ``marked_span``, so without these a copy-paste from the task-4303 caller
+    next door would leave this file green while sending every broken-marker
+    reader to the wrong guard and the wrong document. Identifiers only, so any
+    rewording of the shared message templates stays green.
     """
     with pytest.raises(AssertionError) as excinfo:
         _documented_blessed_keys(markdown_text)
@@ -251,6 +237,7 @@ def test_documented_blessed_keys_fails_loudly_on_a_broken_marker(markdown_text, 
     message = str(excinfo.value)
     assert "tier-a-blessed-keys-mirror" in message, case
     assert "task-authoring.md" in message, case
+    assert "3780" in message, case
 
 
 def test_task_authoring_marker_pair_is_present_and_non_empty():

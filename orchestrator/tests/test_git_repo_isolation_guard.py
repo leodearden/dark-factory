@@ -394,7 +394,6 @@ _TARGET_MODULE = Path(__file__).parent / 'test_git_ops.py'
 # below asserts each entry really does contain that init/clone, so the
 # allowlist cannot quietly rot into a blanket exemption.
 _SELF_INITIALISING_HELPERS = frozenset({
-    '_setup_repo',
     '_setup_repo_with_remote',
     '_push_n_commits_to_origin',
 })

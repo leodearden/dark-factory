@@ -46,6 +46,7 @@ const {
   stepPaths,
   plottableMax,
   axisY,
+  niceCountMax,
   axisPaths,
   barFractions,
   stackedAreaPaths,
@@ -62,6 +63,14 @@ const MODULE_SPECIFIER = '../../src/dashboard/static/redux/spark_path.js';
 // sparklines to charts.jsx's LineChart/StackedAreaChart/BarChart/HistBar. They
 // live here rather than in a second module because they share this file's hole
 // predicate and its two private helpers.
+//
+// `formatCountTick` (task 4232) is the one entry that is not scale/path math: it
+// is the y-tick LABEL formatter for an integer-count axis. It lives here for the
+// same reason the rest do — it composes with `plottableMax`/`axisY`, and unlike
+// anything defined in charts.jsx it can actually be EXECUTED by a test.
+// `niceCountMax` (task 5121) is the count-axis MAXIMUM rule that pairs with
+// formatCountTick's label rule.
+// Both count-axis rules are tested in spark_path_count_axis.test.mjs.
 const EXPECTED_FUNCTION_NAMES = [
   'isPlottable',
   'sparkPaths',
@@ -69,6 +78,8 @@ const EXPECTED_FUNCTION_NAMES = [
   'stepPaths',
   'plottableMax',
   'axisY',
+  'formatCountTick',
+  'niceCountMax',
   'axisPaths',
   'barFractions',
   'stackedAreaPaths',
@@ -1503,4 +1514,51 @@ test('stackedAreaPaths: does not mutate its input stacks', () => {
   const before = JSON.stringify(stacks);
   stackedAreaPaths(stacks, STACK_GEOM_3);
   assert.equal(JSON.stringify(stacks), before, 'the caller owns the stacks; hand them back untouched');
+});
+
+// The optional third argument (task 5121): a policy mapping the folded maximum
+// to the axis maximum BEFORE any band is scaled. Stacks a=[3,4,3], b=[2,3,2]
+// fold to 7; snapped to 8, every y is 198 - (v/8)*190, an exact binary fraction.
+const SNAP_STACKS = [layer('a', [3, 4, 3]), layer('b', [2, 3, 2])];
+
+test('stackedAreaPaths: a snapMax policy rescales every band against the snapped axis', () => {
+  const { max, paths } = stackedAreaPaths(SNAP_STACKS, STACK_GEOM_3, m => niceCountMax(m, 4));
+  assert.equal(max, 8, 'the folded max 7 snaps up to 8');
+  assert.deepEqual(paths, [
+    'M38,126.75 L88,103 L138,126.75 L138,198 L88,198 L38,198 Z',
+    'M38,79.25 L88,31.75 L138,79.25 L138,126.75 L88,103 L38,126.75 Z',
+  ]);
+
+  const top = STACK_GEOM_3.y0;
+  const floor = STACK_GEOM_3.y0 + STACK_GEOM_3.height;
+  for (const y of allYs(paths)) {
+    assert.ok(y >= top && y <= floor, `y=${y} lies outside the plot box [${top}, ${floor}]`);
+  }
+  assert.ok(
+    !ys(paths[1]).includes(top),
+    'the tallest drawn top (7) must sit below the box top: the snapped headroom is real',
+  );
+});
+
+test('stackedAreaPaths: snapMax is called once, on the folded max INCLUDING the seed', () => {
+  const seen = [];
+  stackedAreaPaths(SNAP_STACKS, STACK_GEOM_3, m => {
+    seen.push(m);
+    return m;
+  });
+  assert.deepEqual(seen, [7], 'one call, on the folded stack maximum');
+
+  assert.deepEqual(
+    stackedAreaPaths([], STACK_GEOM_3, m => niceCountMax(m, 4)),
+    { max: 4, paths: [], stepX: 50 },
+    'the idle seed floor of 1 snaps to 4',
+  );
+});
+
+test('stackedAreaPaths: omitting snapMax is the identity', () => {
+  // Every other stackedAreaPaths test calls with two arguments and stays green
+  // unchanged: the no-existing-chart-moves guarantee.
+  const twoArg = stackedAreaPaths(SNAP_STACKS, STACK_GEOM_3);
+  assert.deepEqual(twoArg, stackedAreaPaths(SNAP_STACKS, STACK_GEOM_3, m => m));
+  assert.equal(twoArg.max, 7);
 });

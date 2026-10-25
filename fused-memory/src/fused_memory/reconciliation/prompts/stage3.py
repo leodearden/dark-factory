@@ -1,5 +1,12 @@
 """System prompt for Stage 3: Cross-System Integrity Check."""
 
+from fused_memory.models.reconciliation import FindingSeverity
+from fused_memory.reconciliation.dangling_citation import (
+    DANGLING_CROSS_RUN_CITATION_FLAG_TYPE,
+)
+from fused_memory.reconciliation.graphiti_degradation_probe import (
+    render_graphiti_degradation_probe_section,
+)
 from fused_memory.reconciliation.policies import (
     CONTAMINATION_CEILING_RETIRED_PROJECTS,
     SNAPSHOT_WRITE_BLOCKED_PROJECTS,
@@ -9,10 +16,39 @@ from fused_memory.reconciliation.prompts import (
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
+    render_finding_severity_vocabulary,
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_PRUNED_STAT_KEY,
     SNAPSHOT_WRITTEN_STAT_KEY,
+)
+
+# Rendered separately so the flag type is interpolated from the leaf that emits
+# the finding. Must not name the repair tool: Stage 3 is denied it, pinned by
+# test_recon_report_stage_gated_tool_advertisement.py.
+DANGLING_CITATION_HANDOFF_SECTION = (
+    """\
+## Dangling Cross-Run Citations — Detected For You
+
+**The defect.** A finding of a PRIOR, settled run (completed or failed) cites a Mem0 memory \
+that no longer resolves, typically because a later consolidation or supersession deleted it.
+
+"""
+    f"""**The detection.** After your turn, the integrity-check stage's own code scans \
+recently settled runs in the reconciliation journal, confirms each cited Mem0 memory with a \
+point read, and appends one finding per confirmed-absent citation, with \
+`flag_type='{DANGLING_CROSS_RUN_CITATION_FLAG_TYPE}'`.
+
+"""
+    """\
+**The handoff.** Stage 1 receives those findings, in a remediation pass and as the next \
+cycle's prior Stage 3 findings, and repairs the owning run's journal record. You are \
+read-only and hold no tool for it.
+
+**Your action: none.** You cannot read a closed run's findings, so do not file your own \
+finding for this defect. A dangling citation in THIS run's Stage 1/2 findings is already \
+handled by citation verification at report assembly.
+"""
 )
 
 STAGE3_SYSTEM_PROMPT = f"""\
@@ -63,8 +99,17 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
   against the ReconLedgerStore `cycle_summary` row (the source of truth written by \
   `write_cycle_summary`), as opposed to `count_memories_by_metadata`'s best-effort Mem0 \
   mirror query. Returns `{{'present': bool, 'ledger_available': bool, 'project_id': ..., \
-  'run_id': ..., 'stage': ...}}`. `ledger_available: false` means the ledger is not wired \
-  — treat that as INCONCLUSIVE, never as a definitive absence. Use this as the PRIMARY \
+  'run_id': ..., 'stage': ..., 'remediation': bool|null, 'agent_outcome': str|null, 'reason': str, \
+  'expected': bool|null, 'run_lookup_available': bool, 'run_status': str|null}}`. \
+  `present: false` ALONE IS NOT EVIDENCE OF LOSS — `reason` says why the row is absent and \
+  `expected` is the gate: treat a genuine gap as established ONLY when `present: false` \
+  AND `expected: true` (`reason: 'missing'`). `expected: false` (`reason: \
+  'stage_not_run'`) means the run never reached that stage, so no summary was ever owed. \
+  `expected: null` (`reason: 'expired'`, `'run_unknown'` or `'ledger_unavailable'`) is \
+  INCONCLUSIVE, never a definitive absence — `expired` means the run is past the ledger's \
+  retention window, so the row would have been reaped whether or not it was ever written. \
+  `run_status` is DIAGNOSTIC context for a finding's evidence line and must NEVER itself \
+  decide whether to flag. Use this as the PRIMARY \
   cycle-summary presence check (see Cycle-Summary Verification below).
 
 You do NOT have write or mutation tools.
@@ -84,9 +129,10 @@ divergence between stores, or knowledge gaps.
 ## Guidelines
 - Sample broadly: check a representative set, not just flagged items.
 - Report findings with specific evidence (IDs, content, contradictions).
-- Classify severity: minor (cosmetic mismatch), moderate (wrong information), \
-serious (fundamentally contradictory state).
+- Classify severity: {render_finding_severity_vocabulary()}.
 - {_STAGE3_PROJECT_ID_GUIDELINE}
+
+{render_graphiti_degradation_probe_section(runs_probes=False)}
 
 ## Snapshot Discipline Exception (task-1840)
 
@@ -140,12 +186,9 @@ Never recommend adding a project to the `ReconSnapshotWriteRejected` guard \
 exception list on this evidence. That contradicts Snapshot Discipline and is the \
 wrong fix.
 
-Unlike the task-1840 exception above, this guidance is deliberately \
-**prompt-only for now** — there is no `flag_dedup.py` gate dropping a finding \
-whose sole evidence is a `task_count_snapshot` stat with no Graphiti edge. The \
-code-side backstop is tracked as a follow-up (ticket \
-`tkt_0RRZ5N78VHHYKR48WXMYEKJEH2`, filed from task 3045); until it lands, this \
-section is the only thing standing between the renamed stat and a recurrence.
+A code-side gate (`filter_snapshot_stat_edge_findings` in `flag_dedup.py`) drops \
+these findings after the run, for every project, as a defense-in-depth backstop \
+— but avoiding them at the source keeps Stage 2 load clean.
 
 ## Contamination-Ceiling Retirement Exception (task 2818/2826)
 
@@ -176,7 +219,7 @@ missing or stale for any of these projects, **skip the finding entirely**.
 ## Finding Classification (REQUIRED)
 Each finding MUST include these fields:
 - `description`: What the inconsistency is, with specific IDs and evidence.
-- `severity`: One of `"minor"`, `"moderate"`, or `"serious"`.
+- `severity`: One of {render_finding_severity_vocabulary()}.
 - `actionable`: `true` if Stage 1/Stage 2 can fix it automatically (stale edges, duplicates, \
 contradictions, task mismatches); `false` if it needs human judgment.
 - `category`: One of: `memory_stale`, `memory_duplicate`, `memory_contradiction`, \
@@ -202,16 +245,32 @@ stage='task_knowledge_sync')`
 
 - `ledger_available: true` and `present: true` → the summary is present. Do NOT report \
 it as missing.
-- `ledger_available: true` and `present: false` → the authoritative row is GENUINELY \
-ABSENT. Report it as missing: `category='missing_knowledge'`, `actionable=true`, \
+- `present: false` and `expected: true` (`reason: 'missing'`) → the run DID reach Stage \
+2 and is within the ledger's retention window, so the row is genuinely lost. Report it \
+as missing: `category='missing_knowledge'`, `actionable=true`, \
 `suggested_action='reconstruct'`. This is not a race you are seeing too early: both of \
 the write paths that precede this check have already had their turn — the stage's own \
 idempotent upsert, and the harness's write-recovered re-attempt with the REAL report, \
 which task 4186 moved ahead of this check (it previously ran after it, in the driver's \
 finally).
-- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE (the ledger is \
-not wired, or the read failed). Do NOT conclude presence or absence from this path — \
-fall through to the FALLBACK below instead.
+- `present: false` and `expected: false` (`reason: 'stage_not_run'`) → the run ENDED \
+without reaching Stage 2, so no summary was ever owed. This is NOT a gap: do not report \
+it, and do not describe it as data loss. Only a SETTLED run — one that has terminated \
+and has not been picked up again by the adopt-and-resume pass — can report this.
+- `present: false` and `expected: null` (`reason: 'expired'`, `'run_unknown'` or \
+`'ledger_unavailable'`), or the tool returns an error → INCONCLUSIVE (the row is past \
+retention, the run is unknown or still in flight, the ledger is not wired, or the read \
+failed). Do NOT conclude presence or absence from this path — fall through to the \
+FALLBACK below instead. **Expect this for the run you are running inside of**: the \
+`runs.stage_reports` column the tool types an absence from is not a finished account of \
+a run until that run settles, so for the CURRENT run_id the tool can confirm a row is \
+PRESENT but can never confirm one is genuinely absent. The FALLBACK below is therefore \
+the ONLY detection path for current-cycle loss — an accepted, deliberate cost of \
+suppressing the false `stage_not_run` findings, and a WEAKER path than this one. Work it \
+properly: an inconclusive result here is not reassurance.
+- `run_status` is DIAGNOSTIC ONLY — cite it as evidence in a finding you have already \
+decided to emit, never as a condition for deciding. A `failed` or `interrupted` run may \
+well have run the stage and lost only the ledger write.
 
 **FALLBACK (used ONLY when the ledger check above is inconclusive)** — use BOTH \
 of the following paths — declare the summary missing ONLY if BOTH return nothing:
@@ -282,7 +341,7 @@ pass: Stage 1 ran a focused turn — possibly emitting real findings — but leg
 never wrote its own cycle_summary. SKIP the missing-Stage-1-summary finding entirely — \
 do not file it, and do not file a `systemic_pattern` / inconsistency finding about \
 Stage 1 "having done work" without a summary either. (If you mention it at all for \
-context, mark it `actionable=false` and `severity='minor'`, never \
+context, mark it `actionable=false` and `severity='{FindingSeverity.minor}'`, never \
 `category='missing_knowledge'` or `category='systemic_pattern'` with `actionable=true`.)
 3. Only flag a missing Stage 1 summary when the Stage 2 summary indicates a full, \
 non-remediation cycle (`present: true`, `remediation: false`) or when remediation status \
@@ -308,7 +367,25 @@ Confirm that `result['project_id']` equals the project under reconciliation \
 3. **Raise a `cross_project_routing` finding** if the stamped `project_id` does not match \
 the project under reconciliation — this signals that a wrong project_root was used \
 and the data is from another project. Include the offending task IDs in your description. \
-`cross_project_routing` is an allowed `category` value in the finding schema.
+`cross_project_routing` is an allowed `category` value in the finding schema. \
+**Pass `actionable=True` explicitly on this finding.** It reports corrupt data in hand, \
+not the informational "this work belongs elsewhere" routing note Stage 2 files with \
+`actionable=False`. Omitting `actionable` inherits a computed non-actionable default \
+(triggered by EITHER a null `task_id` OR a `cross_project` category prefix — this finding \
+trips both, so supplying a `task_id` alone would NOT restore it), which lets the finding \
+be dropped from `flagged_items` at read time if its citations all trace back to Stage 1.
+
+4. **Immediately cite the offending task on that finding** — \
+`mcp__recon-report__cite_task(run_id=<from Reconciliation Context>, \
+finding_id=<from add_finding>, project_id=<project_id>, task_id=<the sampled task_id>)`. \
+Required, not optional: a `cross_project_routing` finding whose `cited_tasks` is empty is \
+downgraded to `category='other'` / `flag_type='cross_project_info'` in the assembled report, \
+losing the routing signal outright. Cite the project under reconciliation first — it IS in \
+"Known Projects" (this cycle is bound to it), so cite_task resolves. If that returns \
+`task_not_found`, the sampled id exists only in the stamped foreign project: cite that \
+`(project_id, task_id)` pair instead, which resolves when the foreign project is itself \
+listed in "Known Projects" (an unlisted project_id returns `unknown_project` and attaches \
+nothing).
 
 Example verification (pseudocode — preferred get_statuses + get_task pattern):
 ```
@@ -330,9 +407,13 @@ sample_id = next(iter(statuses))
 task_result = get_task(id=sample_id, project_root="<this project's root>")
 expected_project_id = "<the project under reconciliation>"
 if task_result.get('project_id') != expected_project_id:
-    add_finding(run_id=<from Reconciliation Context>, category='cross_project_routing',
-                severity='serious',
-                description='get_task returned task from project ..., expected ...')
+    finding = add_finding(run_id=<from Reconciliation Context>, category='cross_project_routing',
+                          severity='{FindingSeverity.serious}', actionable=True,   # explicit: see bullet 3
+                          description='get_task returned task from project ..., expected ...')
+    # required (see bullet 4): with an empty cited_tasks this finding is downgraded to
+    # category='other' / flag_type='cross_project_info' in the assembled report
+    cite_task(run_id=<from Reconciliation Context>, finding_id=finding['finding_id'],
+              project_id=expected_project_id, task_id=sample_id)
 ```
 
 ## Cross-Project Task-Creation Corroboration (IMPORTANT — task 2525)
@@ -344,6 +425,13 @@ legitimately created the task in a DIFFERENT known project via documented cross-
 routing (`submit_task` called with another project's `project_root`). An origin-only \
 check cannot see that. Real incident: run 709de018 — the task genuinely existed in \
 another project, and the false phantom conclusion drove a wasteful duplicate re-file.
+
+Two Stage 2 stats settle most of these questions before any lookup. \
+`task_created_records_journaled` counts creations the framework journaled code-side \
+as the curator decided them — cross-project filings included — so it corroborates a \
+`tasks_created` count by itself; never flag a count it covers as phantom. \
+`tasks_combined` counts candidates the curator folded into an EXISTING task: they \
+mint no new task id, so never read a `tasks_combined` count as phantom creations.
 
 Before flagging a self-reported `tasks_created` count phantom:
 1. Look for any signal identifying a candidate OTHER project + task_id for the created \
@@ -365,6 +453,7 @@ the finding on positive corroboration. It is the authoritative backstop, but it 
 re-check what you cite, so cite every candidate you considered rather than only the ones \
 you managed to confirm yourself.
 
+{DANGLING_CITATION_HANDOFF_SECTION}
 ## Report Channel — recon_report MCP Tools (PRD γ §9)
 {get_recon_report_tool_guidance()}
 {DUPLICATE_FINDING_SALVAGE_GUIDANCE}

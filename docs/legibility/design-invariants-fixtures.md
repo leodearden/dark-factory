@@ -15,7 +15,9 @@ task/escalation state-graph invariants; INV-8 fixtures were added
 2026-08-06 with the loop-occupancy invariant; INV-9 fixtures were added
 2026-08-24 with the one-fact-one-home invariant; INV-10 fixtures were
 added 2026-08-30 with the guards-exercise-behaviour invariant (task 4666);
-INV-11 fixtures were added with the promotion of `no-silent-fail-soft`.
+INV-11 fixtures were added with the promotion of `no-silent-fail-soft`;
+INV-12 fixtures were added 2026-09-18 with the exceptions-owned-or-ratified
+invariant (task 5599; `plans/inv12-exceptions-owned-or-ratified-prd.md`).
 
 **Two fixture shapes.** Each invariant below carries exactly two seeded
 violations — both expressions of the SAME underlying violation, so the two
@@ -59,8 +61,9 @@ records the verdict each yields against the expected slug. Columns:
 Acceptance: every fixture flags with the correct slug. The base table
 holds 10 rows (INV-1..5); the 2026-08-02 addendum adds 4 (INV-6..7), the
 2026-08-06 addendum adds 2 (INV-8), the 2026-08-24 addendum adds 2
-(INV-9), the 2026-08-30 addendum adds 2 (INV-10), and the INV-11 addendum
-adds 2 — 22 rows cumulative, all `Y`.
+(INV-9), the 2026-08-30 addendum adds 2 (INV-10), the INV-11 addendum
+adds 2, the INV-12 addendum adds 2, the INV-13 addendum adds 2, and the
+INV-14 addendum adds 2 — 28 rows cumulative, all `Y`.
 
 ## INV-1 `contracts-machine-checked`
 
@@ -480,6 +483,124 @@ def census(path: Path) -> int:
 {"invariant": "no-silent-fail-soft", "file": "fused-memory/scripts/transcript_window_census.py", "line": 7, "issue": "load_records drops unparseable lines and returns a plain list, so census() returns a count its caller cannot distinguish from a complete one — the only trace of the shortfall is a debug log the caller never reads, and neither the return value nor the exit code carries it", "severity": "high"}
 ```
 
+## INV-12 `exceptions-owned-or-ratified`
+
+### PRD-leaf-shaped (`INV-12-PRD`)
+
+> The new `TaskConfigDir` construction site destroys its dir without
+> archiving the transcripts first. Add an `UNARCHIVED_GAP` entry for that
+> site to `shared/tests/config_dir_archival_allowlist.py` so the
+> archival-parity guard stops flagging it. The entry's `follow_up` reads
+> "matches the existing pattern" — no task or ticket is cited, and no
+> ratification row is added.
+
+**Expected disposition**: `flag: exceptions-owned-or-ratified`
+
+**Redesign that clears it**: Name the task or ticket that owns removing the
+exemption in `follow_up` (`Debt(TaskRef(n))` / `Debt(TicketRef(id))`), or,
+for an exemption that is a deliberate, permanent ruling rather than debt, add
+a row to the ratification table
+(`docs/legibility/exception-ratifications.yaml`) and cite its id
+(`Policy(ratified)`). An entry may never carry neither.
+
+### Code-snippet-shaped (`INV-12-CODE`)
+
+```python
+def convert(value):
+    return int(value)  # type: ignore[arg-type]
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "exceptions-owned-or-ratified", "file": "orchestrator/src/orchestrator/coerce.py", "line": 2, "issue": "the type: ignore[arg-type] suppression carries no debt or ratified disposition in its trailing comment — no owning task/ticket, no ratification-table id — so nothing notices if this exemption should already have expired", "severity": "warning"}
+```
+
+## INV-13 `readers-prove-their-producer`
+
+### PRD-leaf-shaped (`INV-13-PRD`)
+
+> Add the `orchestrator debt-report` command, which prints every open debt
+> row with its owner and age and a health line (`open=N unowned=N status`).
+> Signal: the command prints the health line; verified by a test that seeds
+> three rows with raw `sqlite3` and asserts the rendered counts. The writer
+> that opens debt rows lands in task ζ, two rows down the plan.
+
+**Expected disposition**: `flag: readers-prove-their-producer`
+
+**Redesign that clears it**: Either land the reader in the slice that
+lands its producer, with the signal "after one real suppression the command
+prints that test's row", or make the command render the absence of a
+producer as its own state — "no producer has written to this ledger
+(0 rows; N suppressions observed)" — so an operator cannot read an unwired
+ledger as `status ok`. A row the test seeded proves the renderer, never the
+ledger.
+
+### Code-snippet-shaped (`INV-13-CODE`)
+
+```python
+def render_health(open_rows: list[DebtRow]) -> str:
+    unowned = sum(1 for r in open_rows if r.owner_task_id is None)
+    if not open_rows:
+        return 'non-convergence: open=0 unowned=0 status=ok'
+    return f'non-convergence: open={len(open_rows)} unowned={unowned}'
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "readers-prove-their-producer", "file": "orchestrator/src/orchestrator/debt_report.py", "line": 3, "issue": "an empty debt table renders as status=ok, but nothing in this package writes a debt row — the counter is derived from rows that no producer creates, so a ledger with no producer is indistinguishable from a healthy one", "severity": "warning"}
+```
+
+## INV-14 `sampler-vocabulary-one-table`
+
+### PRD-leaf-shaped (`INV-14-PRD`)
+
+> Add a `gpu_busy_avg10` load-sampler metric: emit it from the process
+> collector, append the name to the sampler's process admission set, and
+> append it to the dashboard's served-metric list so `/api/load` returns
+> it. Signal: a new test asserts the dashboard list and the admission set
+> hold the same names.
+
+**Expected disposition**: `flag: sampler-vocabulary-one-table`
+
+**Redesign that clears it**: Add one `MetricSpec('gpu_busy_avg10')` to the
+process group in `sampler.metrics.METRIC_GROUPS`. The collector takes the
+name from that spec, `run_tick` admits it through the group, and the
+dashboard serves it through `exact_metric_names` because it already serves
+the process group. Nothing is left to reconcile, so the agreement test is
+not written.
+
+### Code-snippet-shaped (`INV-14-CODE`)
+
+File `sampler/src/sampler/gpu.py` (new, the violation — illustrative, not
+a real file in this repo):
+
+```python
+_GPU_METRICS = frozenset({'gpu_busy_avg10', 'gpu_read_ok'})
+
+
+def collect_gpu_metrics(read: Callable[[], float | None]) -> Samples:
+    busy = read()
+    if busy is None:
+        return {SampleKey('gpu_read_ok'): 0.0}
+    return {SampleKey('gpu_busy_avg10'): busy, SampleKey('gpu_read_ok'): 1.0}
+```
+
+File `sampler/tests/test_gpu.py` (new, the parity test offered as its
+enforcement — illustrative):
+
+```python
+def test_gpu_admission_matches_collector() -> None:
+    assert {key.metric for key in collect_gpu_metrics(lambda: 0.5)} == _GPU_METRICS
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "sampler-vocabulary-one-table", "file": "sampler/src/sampler/gpu.py", "line": 1, "issue": "the admission set _GPU_METRICS and collect_gpu_metrics each spell gpu_busy_avg10 and gpu_read_ok, and neither is computed from sampler.metrics.METRIC_GROUPS — two homes for one vocabulary, held together only by a parity test", "severity": "warning"}
+```
+
 ## Rehearsal verdict table
 
 Walked 2026-07-14 against `skills/prd/references/gates.md` §"G7 — Design
@@ -668,6 +789,122 @@ exists is being log-scraped or re-derived, so INV-2
 is emitted, does not apply either. The fixtures are deliberately seeded
 against exactly that seam, which the normative doc's own "Family boundary"
 paragraph draws.
+
+### Addendum — INV-12 walk (2026-09-18)
+
+Walked against the as-landed G7 §"Design invariants pass" text and the
+Step 5.5 audit text, both re-read from the working tree at the commit that
+adds INV-12 (task 5599) rather than from the drafting context. Both G7
+paths were walked, as in the 2026-08-06 addendum: the normative path
+(which Reads the doc at run time and auto-extended to INV-12 with no edit)
+and the no-invariants-file fallback path (the trigger-shape list, which
+does NOT auto-extend and gained an INV-12 entry in the same commit).
+
+The same snapshot caveat applies: the Verdict column transcribes phrasing
+as it read on 2026-09-18, not a live pin.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
+|---|---|---|---|---|---|
+| `INV-12-PRD` | PRD | INV-12 exceptions-owned-or-ratified | `exceptions-owned-or-ratified` | Normative path: G7's walk of the checkable question ("where does each entry's disposition live, and what notices when its owner dies?") fires — the row appends an allow-list entry citing no task, ticket, or ratification id. Fallback path: the new trigger-shape entry ("adds an entry to an allow-list or an inline suppression with no owning task and no ratification reference") fires on the same row → `flag: exceptions-owned-or-ratified` | Y |
+| `INV-12-CODE` | CODE | INV-12 exceptions-owned-or-ratified | `exceptions-owned-or-ratified` | Step 5.5 (unchanged — Reads the doc generically) applies INV-12's question to the bare `type: ignore[arg-type]` marker: the comment carries no `debt:`/`ratified:` disposition, so nothing records who owns removing it or when → `invariant_findings` entry with `invariant="exceptions-owned-or-ratified"`, `severity="warning"` | Y |
+
+**Addendum result: 2/2 match** (cumulative 24/24). No wording change to
+G7's walk instruction or to Step 5.5 was needed — both read the normative
+doc at run time, so INV-12's arrival is enough. The two gate-text edits
+this change did require (G7's trigger-shape entry and the family-inventory
+row) are not rehearsal misses: neither enumeration auto-extends, which is
+why `scripts/tests/test_design_invariants_consistency.py` fails the moment
+a heading lands without them.
+
+Isolation re-checked while walking: no other trigger shape fires on either
+INV-12 fixture. There is no rate/streak dimension (not INV-4
+`storm-escape-required`), no log-scrape of emitter-known facts (not INV-2
+`structured-facts-at-failure`), and nothing acts on a stale snapshot (not
+INV-3 `corroborate-before-acting`). The entries are tree-resident exception
+lists rather than held runtime states, which is the family-boundary
+distinction the normative doc's INV-12 section draws against INV-7
+`holds-owned-and-bounded`.
+
+### Addendum — INV-13 walk (2026-09-25)
+
+Walked against the as-landed G7 §"Design invariants pass" text and the
+Step 5.5 audit text, both re-read from the working tree at the commit that
+adds INV-13 rather than from the drafting context. Both G7 paths were
+walked, as in the 2026-09-18 addendum: the normative path (which Reads the
+doc at run time and auto-extended to INV-13 with no edit) and the
+no-invariants-file fallback path (the trigger-shape list, which does NOT
+auto-extend and gained an INV-13 entry in the same commit).
+
+The same snapshot caveat applies: the Verdict column transcribes phrasing
+as it read on 2026-09-25, not a live pin.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
+|---|---|---|---|---|---|
+| `INV-13-PRD` | PRD | INV-13 readers-prove-their-producer | `readers-prove-their-producer` | Normative path: G7's walk of the checkable question ("has that trigger fired in production, and did a row appear?", "what does the reader print until the producer lands?") fires — the row's only signal is a seeded-row test and the producer is two tasks away. Fallback path: the new trigger-shape entry ("a reader, report, gate or counter landed over a store whose producer has not yet written in production, rendering an empty store as healthy") fires on the same row → `flag: readers-prove-their-producer` | Y |
+| `INV-13-CODE` | CODE | INV-13 readers-prove-their-producer | `readers-prove-their-producer` | Step 5.5 (unchanged — Reads the doc generically) applies INV-13's question to `render_health`: `status=ok` is produced by the absence of rows, and the package holds no writer of those rows, so an unwired ledger and a healthy one render identically → `invariant_findings` entry with `invariant="readers-prove-their-producer"`, `severity="warning"` | Y |
+
+**Addendum result: 2/2 match** (cumulative 26/26). No wording change to
+G7's walk instruction or to Step 5.5 was needed. The two gate-text edits
+this change did require (G7's trigger-shape entry and the family-inventory
+row) are not rehearsal misses: neither enumeration auto-extends, which is
+why `scripts/tests/test_design_invariants_consistency.py` fails the moment
+a heading lands without them.
+
+Isolation re-checked while walking: no other trigger shape fires on either
+INV-13 fixture. Nothing fails or falls back (not INV-11
+`no-silent-fail-soft`), no emitter knows a fact the reader must scrape (not
+INV-2 `structured-facts-at-failure`), and the seeded-row test is a test of
+a reader rather than a guard asserting prose (not INV-10
+`guards-exercise-behaviour`) — the family-boundary distinctions the
+normative doc's INV-13 section draws.
+
+### Addendum — INV-14 walk (2026-10-12)
+
+Walked against the as-landed G7 §"Design invariants pass" text and the
+Step 5.5 audit text, both re-read from the working tree at the commit that
+adds INV-14 (task 6773) rather than from the drafting context. Both G7
+paths were walked, as in the 2026-09-25 addendum: the normative path
+(which Reads the doc at run time and auto-extended to INV-14 with no edit)
+and the no-invariants-file fallback path (the trigger-shape list, which
+does NOT auto-extend and gained an INV-14 entry in the same commit).
+
+Step 5.5 has itself changed since the INV-13 walk. The findings-contract
+rewrite (commit `20a3ed0ece`, 2026-10-04) has it record each violation as
+a `findings` entry whose lens, `tags[0]`, is `inv-<n>`, followed by the
+heuristic the invariant encodes when the quality doc names one; it no
+longer emits an `invariant_findings` entry. The expected entry under
+`INV-14-CODE` keeps the legend's `invariant_findings` shape so every CODE
+fixture reads alike, and the Verdict column below records what the current
+text yields.
+
+The same snapshot caveat applies: the Verdict column transcribes phrasing
+as it read on 2026-10-12, not a live pin.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
+|---|---|---|---|---|---|
+| `INV-14-PRD` | PRD | INV-14 sampler-vocabulary-one-table | `sampler-vocabulary-one-table` | Normative path: G7's walk of the checkable question ("Is it a projection of `METRIC_GROUPS`, or a new spelling that something must reconcile?") fires — the row spells the new name in two lists and its only enforcement is a test reconciling them, which the rule names as not compliance. Fallback path: the new trigger-shape entry ("a load-sampler metric name, admission set, arm mapping or dashboard-served metric spelled outside `sampler.metrics.METRIC_GROUPS`") fires on the same row → `flag: sampler-vocabulary-one-table` | Y |
+| `INV-14-CODE` | CODE | INV-14 sampler-vocabulary-one-table | `sampler-vocabulary-one-table` | Step 5.5 ("audit the Phase 2 file set against each invariant's checkable question" — Reads the doc generically) applies INV-14's question to `sampler/src/sampler/gpu.py`: `_GPU_METRICS` and `collect_gpu_metrics` each spell both names and neither is computed from `METRIC_GROUPS` → a `findings` entry with lens `inv-14` (the quality doc names no heuristic for INV-14, so none follows), which the normative heading resolves to `sampler-vocabulary-one-table`; in the legend's shape, `invariant_findings` entry with `invariant="sampler-vocabulary-one-table"`, `severity="warning"` | Y |
+
+**Addendum result: 2/2 match** (cumulative 28/28). No wording change to
+G7's walk instruction or to Step 5.5 was needed — both read the normative
+doc at run time, so INV-14's arrival is enough. The gate-text edits this
+change did require (G7's trigger-shape entry, the family-inventory row and
+the Calibration pointer) are not rehearsal misses: none of those
+enumerations auto-extends, which is why
+`scripts/tests/test_design_invariants_consistency.py` fails the moment a
+heading lands without the first two.
+
+Isolation re-checked while walking. INV-5 `no-lockstep-duplication` is
+adjacent by construction, and the fixtures are seeded on that seam. INV-5
+governs duplicated logic in general and accepts a drift test as a house
+pattern, so a walker applying INV-5 alone can read either fixture's parity
+test as its enforcement; INV-14 governs this one vocabulary and rejects
+that test, which is the distinction the normative doc's INV-14 Family
+boundary paragraph draws. No other trigger shape fires: the names are code
+vocabulary, not a world-fact written into a record or store (not INV-9
+`one-fact-one-home`); the parity test executes the collector rather than
+matching prose (not INV-10 `guards-exercise-behaviour`); and nothing fails
+or falls back (not INV-11 `no-silent-fail-soft`).
 
 ## Reconciliation — 2026-07-14 base walk
 

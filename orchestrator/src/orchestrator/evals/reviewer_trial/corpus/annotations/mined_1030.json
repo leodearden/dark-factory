@@ -24,5 +24,40 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Include reviewer_trial scorer (haiku) cost in TrialReport totals",
+      "description": "orchestrator/src/orchestrator/evals/reviewer_trial/scorer.py::match_issues() calls invoke_agent(model='haiku', max_budget_usd=0.50) and receives result.cost_usd, but the cost is discarded. ScoringResult.cost_usd (scorer.py:300) is populated only from run.total_cost_usd (the reviewer-panel cost). TrialReport.total_cost_usd (report.py:204) sums just these panel costs.\n\nImpact: 5 variants \u00d7 15 diffs = 75 scorer invocations \u00d7 up to $0.50 each = up to $37.50 silently omitted from cost metrics and f1_per_dollar rankings \u2014 the exact metric this trial is built to measure. Cost-based variant comparisons are under-reported.\n\nFix:\n- scorer.py:182 match_issues() \u2014 return (matches, unmatched, match_cost_usd).\n- scorer.py:~300 score_panel_run \u2014 accumulate match_cost into ScoringResult (new field match_cost_usd, or fold into cost_usd with a doc note).\n- report.py:204 TrialReport.total_cost_usd \u2014 sum the new field.\n- Update any tests that assert cost-field shape.\n\nLocations: orchestrator/src/orchestrator/evals/reviewer_trial/{scorer.py, report.py}.",
+      "test_strategy": "",
+      "details": "",
+      "authored": false,
+      "id": "1030",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-09T06:42:00.781Z",
+        "updated_after_merge": true,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "orchestrator/tests/test_workflow_e2e.py"
+    ],
+    "base_sha": "73ea589b43791de10fc1cdeb7f1910877f35c6d7",
+    "branch_sha": "c1a51fc7de603e171b26f1368263a5b8ef9b8949",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "e76e86710eee6c325adab2ef8782d66952927376",
+      "merge_base_sha": "73ea589b43791de10fc1cdeb7f1910877f35c6d7",
+      "diff_reproduces_from": "git diff 73ea589b43 e76e86710e",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

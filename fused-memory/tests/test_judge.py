@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _sdk_client_stubs import sdk_client_double
 from shared.phantom_verdict import (
     UNPARSEABLE_ISSUE_PREFIX,
     UNPARSEABLE_VERDICT_CODE,
@@ -244,7 +245,7 @@ async def test_judge_call_llm_anthropic_normal(mock_journal):
 
     mock_messages = MagicMock()
     mock_messages.create = AsyncMock(return_value=fake_response)
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.messages = mock_messages
 
     with patch('anthropic.AsyncAnthropic', return_value=mock_client):
@@ -273,7 +274,7 @@ async def test_judge_call_llm_anthropic_no_text_blocks(mock_journal):
 
     mock_messages = MagicMock()
     mock_messages.create = AsyncMock(return_value=fake_response)
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.messages = mock_messages
 
     with patch('anthropic.AsyncAnthropic', return_value=mock_client):
@@ -299,7 +300,7 @@ async def test_judge_call_llm_anthropic_mixed_content(mock_journal):
 
     mock_messages = MagicMock()
     mock_messages.create = AsyncMock(return_value=fake_response)
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.messages = mock_messages
 
     with patch('anthropic.AsyncAnthropic', return_value=mock_client):
@@ -334,7 +335,7 @@ async def test_judge_call_llm_openai_normal(mock_journal):
     mock_completions.create = AsyncMock(return_value=fake_response)
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
@@ -727,13 +728,60 @@ async def test_judge_call_llm_openai_none_content(mock_journal):
     mock_completions.create = AsyncMock(return_value=fake_response)
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
         result = await judge._call_llm('Evaluate this run.')
 
     assert result == ''
+
+
+class TestJudgeCallLlmReleasesClient:
+    @pytest.mark.asyncio
+    async def test_the_anthropic_client_is_released(self, mock_journal):
+        judge = Judge(config=_make_judge_config(judge_llm_provider='anthropic'), journal=mock_journal)
+        client = sdk_client_double()
+        client.messages.create = AsyncMock(
+            return_value=FakeAnthropicResponse(content=[FakeAnthropicTextBlock(text='ok')]),
+        )
+
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            await judge._call_llm('p')
+
+        client.__aexit__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_openai_client_is_released(self, mock_journal):
+        judge = Judge(
+            config=_make_judge_config(judge_llm_provider='openai', judge_llm_model='gpt-4o'),
+            journal=mock_journal,
+        )
+        client = sdk_client_double()
+        client.chat.completions.create = AsyncMock(
+            return_value=FakeJudgeOpenAIResponse(
+                choices=[FakeJudgeOpenAIChoice(message=FakeJudgeOpenAIMessage(content='ok'))],
+            ),
+        )
+
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge._call_llm('p')
+
+        client.__aexit__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_client_is_released_when_the_call_fails(self, mock_journal):
+        judge = Judge(config=_make_judge_config(judge_llm_provider='anthropic'), journal=mock_journal)
+        client = sdk_client_double()
+        client.messages.create = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with (
+            patch('anthropic.AsyncAnthropic', return_value=client),
+            pytest.raises(RuntimeError, match='boom'),
+        ):
+            await judge._call_llm('p')
+
+        client.__aexit__.assert_awaited_once()
 
 
 # --- is_phantom_verdict tests ---
@@ -1860,10 +1908,11 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
 
     Verifies the essential delegation contract: prompt, system_prompt, model,
     usage_gate, output_schema, and timeout are wired through correctly.
-    Fine-grained knobs (max_turns, permission_mode, disallowed_tools) are
-    implementation details covered by shared/tests/test_cli_invoke.py and, for
-    the schema-carrying invariants specifically, by
-    test_call_judge_cli_passes_judge_verdict_schema below.
+    Fine-grained knobs (permission_mode, disallowed_tools) are implementation
+    details covered by shared/tests/test_cli_invoke.py.  ``max_turns`` is NOT
+    one of them despite this test not asserting it — it is pinned by
+    test_call_judge_cli_passes_judge_verdict_schema below, along with the other
+    schema-carrying invariants.
     """
     from unittest.mock import AsyncMock
 
@@ -1929,13 +1978,12 @@ async def test_call_judge_cli_passes_judge_verdict_schema(mock_journal):
 
     - ``output_schema is JUDGE_VERDICT_SCHEMA`` — the contract is attached.
     - ``disallowed_tools == ['*']`` — the judge keeps passing the wildcard
-      VERBATIM.  Expanding it into the ``StructuredOutput``-preserving
-      real-builtins deny-list is cli_invoke's job (:1533-1536), not the
-      caller's, so the judge inherits future central fixes instead of pinning a
-      stale copy of the CLI's built-in list.
-    - ``max_turns >= 3`` — the schema mechanism burns a tool-use turn, so
-      ``max_turns=1`` is incompatible with ``--json-schema``
-      (task_curator.py:2366-2372); 3 is the floor both migrated siblings use.
+      VERBATIM.  Replacing it with the ``StructuredOutput``-preserving
+      ``--tools ''`` registry filter is cli_invoke's job, not the caller's, so
+      the judge inherits future central fixes.
+    - ``max_turns >= 3`` — a cap of 1 leaves no room for the prose turn the
+      model emits before calling ``StructuredOutput`` (see
+      ``_JUDGE_CLI_MAX_TURNS``); 3 is the floor both migrated siblings use.
     - ``system_prompt`` is unchanged — JUDGE_SYSTEM_PROMPT's "## Output Format"
       block stays because it is the ONLY output contract the anthropic/openai
       provider branches have (they never see ``--json-schema``).
@@ -1971,9 +2019,9 @@ async def test_call_judge_cli_passes_judge_verdict_schema(mock_journal):
     assert call_kwargs['output_schema'] is JUDGE_VERDICT_SCHEMA
     assert call_kwargs['disallowed_tools'] == ['*']
     assert call_kwargs['max_turns'] >= 3, (
-        'max_turns=1 is incompatible with --json-schema: the schema mechanism '
-        'burns a tool-use turn and the CLI returns error_max_turns even when '
-        'the payload is attached (task_curator.py:2366-2372)'
+        'max_turns=1 leaves no room for the prose turn the model emits before '
+        'calling StructuredOutput, so the CLI returns error_max_turns; see '
+        '_JUDGE_CLI_MAX_TURNS'
     )
     assert call_kwargs['system_prompt'] == JUDGE_SYSTEM_PROMPT
 
@@ -2201,8 +2249,9 @@ async def test_call_judge_cli_scopes_mcp_to_no_servers(mock_journal):
     """The judge strict-scopes its run to ZERO MCP servers.
 
     ``disallowed_tools=['*']`` alone does NOT keep MCP tools unreachable here:
-    under an ``output_schema`` cli_invoke expands the wildcard into a
-    BUILT-INS-ONLY deny-list carrying no MCP tool pattern, and ``cwd`` is
+    under an ``output_schema`` cli_invoke turns the wildcard into
+    ``--tools ''``, which removes built-in and deferred tools but does not
+    filter MCP, and ``cwd`` is
     ``explore_codebase_root`` (the project root, task 1989), which holds a live
     ``.mcp.json`` the CLI would ambient-merge — under ``bypassPermissions``,
     that is unreviewed access to tools like ``halt_scheduler`` /
@@ -2529,11 +2578,11 @@ class TestCallJudgeCliTaxonomy:
         """(f) A blocked ``StructuredOutput`` tool is a systemic config break with
         its own machine-readable code, not an anonymous UNKNOWN failure.
 
-        ``--json-schema`` rides the synthetic ``StructuredOutput`` tool, which
-        cli_invoke's wildcard expansion deliberately omits from
-        ``_REAL_BUILTIN_TOOLS_DENYLIST``.  If a future CLI change starts denying
-        it, EVERY judge run is starved of its verdict — the deny-list needs
-        fixing, and the log has to say so.  cli_invoke can only ever set
+        ``--json-schema`` rides the synthetic ``StructuredOutput`` tool, the one
+        tool cli_invoke's ``'*'`` -> ``--tools ''`` substitution keeps in the
+        registry.  If a future CLI change starts denying it, EVERY judge run is
+        starved of its verdict — that substitution needs fixing, and the log has
+        to say so.  cli_invoke can only ever set
         ``schema_tool_denied`` on a NON-success result (cli_invoke.py:1807 guards
         on ``not is_success``), so the detection has to live on this branch;
         checking it on the success branch is dead code.

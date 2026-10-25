@@ -8,7 +8,7 @@ Task 3539 closes a measured zombie loop at its two ENDS:
   the exact INVERSE of the truth (``plan_files_not_touched``) through
   ``_mark_blocked(..., escalate_to_human=True)``, whose default
   ``category='task_failure'`` mints the pin that fuels the loop.  The
-  already-landed carve-out (:func:`orchestrator.merge_gates.resolve_already_landed_branch`)
+  already-landed carve-out (:func:`orchestrator.merge_lane.gates.resolve_already_landed_branch`)
   recognises that shape and routes it to an honest terminal outcome on the
   NORMAL ladder, so no ``task_failure`` pin is minted at all.
 
@@ -44,8 +44,13 @@ from __future__ import annotations
 
 import pytest
 from shared.deploy_state import DeployPhase
+from shared.strand_conversion import StrandConverted
 from shared.task_statuses import TaskStatus
 
+from orchestrator.event_store import EventType
+from orchestrator.harness import Harness
+from orchestrator.merge_lane.gates import PlanFilesTouchedResult
+from orchestrator.recovery_emission import RecoverySweepTally
 from orchestrator.task_ground_truth import (
     BranchState,
     BranchStateKind,
@@ -55,7 +60,23 @@ from orchestrator.task_ground_truth import (
     RecoveryAction,
     TruthReport,
     classify_recovery,
+    recovery_shape_str,
 )
+
+
+async def _reconcile_stranded(
+    harness: Harness, tid: str, status: str, *, mid_run: bool = False,
+    tally: RecoverySweepTally | None = None,
+) -> str | None:
+    """Drive ONE stranded-task reconciliation.
+
+    The suite's coupling to this private driver lives here and nowhere else,
+    so a signature change costs one edit instead of one per test.
+    """
+    return await harness._reconcile_one_stranded(
+        tid, status, mid_run=mid_run, tally=tally,
+    )
+
 
 # ---------------------------------------------------------------------------
 # step-1 — the pure _RECOVERY half
@@ -334,7 +355,7 @@ def applier_harness(tmp_path, mock_orch_config):
     import shutil
     from unittest.mock import AsyncMock, MagicMock, patch
 
-    from _orch_helpers import wire_scheduler_liveness_mock
+    from _orch_helpers import wire_clear_claim_then_set_status, wire_scheduler_liveness_mock
     from escalation.queue import EscalationQueue
 
     from orchestrator.config import RecoveryEmissionConfig
@@ -348,6 +369,7 @@ def applier_harness(tmp_path, mock_orch_config):
 
     h.scheduler = MagicMock()
     wire_scheduler_liveness_mock(h.scheduler)
+    wire_clear_claim_then_set_status(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(
         return_value=({_TID: str(TaskStatus.IN_PROGRESS)}, None),
@@ -357,6 +379,7 @@ def applier_harness(tmp_path, mock_orch_config):
     )
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.mark_done = AsyncMock()
+    h.scheduler.update_task = AsyncMock(return_value=True)
 
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
     h.git_ops.cleanup_worktree = AsyncMock(
@@ -383,6 +406,11 @@ def applier_harness(tmp_path, mock_orch_config):
 
 def _bind(harness, report: TruthReport) -> None:
     harness._get_ground_truth = lambda: _StubGroundTruth(report)
+
+
+def _strand_rows(harness) -> list[dict]:
+    """Every strand_converted row this harness wrote, oldest first."""
+    return harness.event_store.fetch_events_by_type(EventType.strand_converted)
 
 
 def _recovery_rows(harness) -> list[dict]:
@@ -416,14 +444,8 @@ class TestConvertToBlockedEnforceFlag:
     """
 
     @pytest.mark.usefixtures("code_default_config")
-    def test_the_flag_ships_observe_only(self) -> None:
-        """Observe-before-enforce is the SHIPPED posture, not a test-only one.
-
-        task 4481: the hatch is what makes "SHIPPED" true.  Without it this
-        reads whatever dark-factory-orchestrator.yaml says, so an operator
-        opting the fleet into enforcement would turn a claim about the
-        shipped default into a claim about their own config.
-        """
+    def test_the_code_default_is_observe_only(self) -> None:
+        """The CODE default is log mode; a project config may opt into enforce."""
         from orchestrator.config import OrchestratorConfig
 
         assert OrchestratorConfig().convert_to_blocked_enforce is False
@@ -439,8 +461,8 @@ class TestConvertToBlockedApplierLogMode:
         """The load-bearing assertion: log mode may not move a single row."""
         _bind(applier_harness, _pinned_in_progress())
 
-        await applier_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        await _reconcile_stranded(
+            applier_harness, _TID, 'in-progress', mid_run=False,
         )
 
         assert applier_harness.scheduler.set_task_status.await_count == 0
@@ -458,8 +480,8 @@ class TestConvertToBlockedApplierLogMode:
         """
         _bind(applier_harness, _pinned_in_progress(kind))
 
-        await applier_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        await _reconcile_stranded(
+            applier_harness, _TID, 'in-progress', mid_run=False,
         )
 
         assert applier_harness.scheduler.set_task_status.await_count == 0
@@ -469,8 +491,8 @@ class TestConvertToBlockedApplierLogMode:
         driver counts this int, so a converting task must not read as busy."""
         _bind(applier_harness, _pinned_in_progress())
 
-        result = await applier_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        result = await _reconcile_stranded(
+            applier_harness, _TID, 'in-progress', mid_run=False,
         )
 
         assert result is None
@@ -491,8 +513,8 @@ class TestConvertToBlockedApplierLogMode:
         _bind(applier_harness, report)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
-            await applier_harness._reconcile_one_stranded(
-                _TID, 'in-progress', mid_run=False,
+            await _reconcile_stranded(
+            applier_harness, _TID, 'in-progress', mid_run=False,
             )
 
         lines = [
@@ -519,8 +541,8 @@ class TestConvertToBlockedApplierLogMode:
         _bind(applier_harness, _pinned_in_progress(kind))
 
         with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
-            await applier_harness._reconcile_one_stranded(
-                _TID, 'in-progress', mid_run=False,
+            await _reconcile_stranded(
+            applier_harness, _TID, 'in-progress', mid_run=False,
             )
 
         line = next(
@@ -543,8 +565,8 @@ class TestConvertToBlockedApplierLogMode:
 
         _bind(applier_harness, _pinned_in_progress())
 
-        await applier_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        await _reconcile_stranded(
+            applier_harness, _TID, 'in-progress', mid_run=False,
         )
 
         rows = _recovery_rows(applier_harness)
@@ -560,8 +582,8 @@ class TestConvertToBlockedApplierLogMode:
         operator already greps for must not move under them."""
         _bind(applier_harness, _pinned_in_progress())
 
-        await applier_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        await _reconcile_stranded(
+            applier_harness, _TID, 'in-progress', mid_run=False,
         )
 
         assert _recovery_rows(applier_harness)[0]['data']['shape'] == _SHAPE_3717
@@ -571,8 +593,8 @@ class TestConvertToBlockedApplierLogMode:
     ) -> None:
         _bind(applier_harness, _pinned_in_progress(refs=[PIN_REFS[0], PIN_REFS[2]]))
 
-        await applier_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        await _reconcile_stranded(
+            applier_harness, _TID, 'in-progress', mid_run=False,
         )
 
         buckets = _recovery_rows(applier_harness)[0]['data']['escalation_ids']
@@ -587,8 +609,8 @@ class TestConvertToBlockedApplierLogMode:
         task in the SAME pass; emitting at both would double every row."""
         _bind(applier_harness, _pinned_in_progress())
 
-        await applier_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        await _reconcile_stranded(
+            applier_harness, _TID, 'in-progress', mid_run=False,
         )
 
         assert len(_recovery_rows(applier_harness)) == 1
@@ -607,8 +629,8 @@ class TestConvertToBlockedApplierLogMode:
         _bind(applier_harness, _pinned_in_progress())
 
         for _ in range(3):
-            await applier_harness._reconcile_one_stranded(
-                _TID, 'in-progress', mid_run=False,
+            await _reconcile_stranded(
+            applier_harness, _TID, 'in-progress', mid_run=False,
             )
 
         assert applier_harness._recovery_veto_tracker.streak(
@@ -625,8 +647,8 @@ class TestConvertToBlockedApplierLogMode:
         tally = RecoverySweepTally()
         _bind(applier_harness, _pinned_in_progress(refs=[PIN_REFS[1]]))
 
-        await applier_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False, tally=tally,
+        await _reconcile_stranded(
+            applier_harness, _TID, 'in-progress', mid_run=False, tally=tally,
         )
 
         assert tally.held == 1
@@ -669,8 +691,8 @@ class TestConvertToBlockedApplierEnforce:
     ) -> None:
         _bind(enforce_harness, _pinned_in_progress(kind))
 
-        await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
         )
 
         enforce_harness.scheduler.set_task_status.assert_awaited_once_with(
@@ -690,8 +712,8 @@ class TestConvertToBlockedApplierEnforce:
         """
         _bind(enforce_harness, _pinned_in_progress(kind))
 
-        await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
         )
 
         assert enforce_harness.scheduler.mark_done.await_count == 0
@@ -709,8 +731,8 @@ class TestConvertToBlockedApplierEnforce:
         into either would make the per-sweep summary lie about what moved."""
         _bind(enforce_harness, _pinned_in_progress(kind))
 
-        result = await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        result = await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
         )
 
         assert result == _CONVERTED
@@ -730,8 +752,8 @@ class TestConvertToBlockedApplierEnforce:
         _bind(enforce_harness, report)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
-            await enforce_harness._reconcile_one_stranded(
-                _TID, 'in-progress', mid_run=False,
+            await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
             )
 
         lines = [
@@ -755,8 +777,8 @@ class TestConvertToBlockedApplierEnforce:
         _bind(enforce_harness, _pinned_in_progress())
 
         with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
-            await enforce_harness._reconcile_one_stranded(
-                _TID, 'in-progress', mid_run=False,
+            await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
             )
 
         assert [
@@ -776,8 +798,8 @@ class TestConvertToBlockedApplierEnforce:
         exactly how an operator sees the promotion take effect."""
         _bind(enforce_harness, _pinned_in_progress(kind))
 
-        await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
         )
 
         assert _recovery_rows(enforce_harness) == []
@@ -790,8 +812,8 @@ class TestConvertToBlockedApplierEnforce:
         tally = RecoverySweepTally()
         _bind(enforce_harness, _pinned_in_progress())
 
-        await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False, tally=tally,
+        await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False, tally=tally,
         )
 
         assert tally.held == 0
@@ -816,8 +838,8 @@ class TestConvertToBlockedApplierEnforce:
         _bind(enforce_harness, _pinned_in_progress())
 
         with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
-            result = await enforce_harness._reconcile_one_stranded(
-                _TID, 'in-progress', mid_run=False,
+            result = await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
             )
 
         assert result is None, 'a failed conversion is not a conversion'
@@ -833,8 +855,8 @@ class TestConvertToBlockedApplierEnforce:
         enforce_harness.scheduler.set_task_status.side_effect = RuntimeError('boom')
         _bind(enforce_harness, _pinned_in_progress())
 
-        assert await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
         ) is None
 
     # (6) no second record ---------------------------------------------------
@@ -853,8 +875,8 @@ class TestConvertToBlockedApplierEnforce:
         )
         _bind(enforce_harness, _pinned_in_progress(kind))
 
-        await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
         )
 
         assert enforce_harness._escalation_queue.submit.call_count == 0
@@ -873,8 +895,8 @@ class TestConvertToBlockedApplierEnforce:
         one-shot with no persisted counter.
         """
         _bind(enforce_harness, _pinned_in_progress(kind))
-        assert await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
         ) == _CONVERTED
 
         # The very next sweep observes the row it just wrote.
@@ -886,14 +908,109 @@ class TestConvertToBlockedApplierEnforce:
             open_escalations=[PIN_REFS[1]],
             deploy_phase=None,
         ))
-        result = await enforce_harness._reconcile_one_stranded(
-            _TID, 'blocked', mid_run=False,
+        result = await _reconcile_stranded(
+            enforce_harness, _TID, 'blocked', mid_run=False,
         )
 
         assert result is None
         assert enforce_harness.scheduler.set_task_status.await_count == 1, (
             'a second write means the sweep is oscillating on its own output'
         )
+
+
+@pytest.mark.asyncio
+class TestConvertToBlockedRecordsTheConversion:
+    """Task 6476 — an applied conversion leaves a stamp and one event naming its pins.
+
+    This is the producer task 3546's gate step 3 verifies; the stamp and the
+    event come from orchestrator/src/orchestrator/strand_conversion.py.
+    """
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_one_row_names_the_queue_handoff_pins(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        refs = [PIN_REFS[0], PIN_REFS[1]]
+        _bind(enforce_harness, _pinned_in_progress(kind, refs=refs))
+
+        result = await _reconcile_stranded(enforce_harness, _TID, 'in-progress')
+
+        assert result == _CONVERTED
+        rows = _strand_rows(enforce_harness)
+        assert len(rows) == 1
+        assert rows[0]['task_id'] == _TID
+        assert rows[0]['data']['pinning_escalation_ids'] == ['esc-3539-1']
+
+    async def test_the_metadata_stamp_agrees_with_the_row(self, enforce_harness) -> None:
+        report = _pinned_in_progress()
+        _bind(enforce_harness, report)
+
+        await _reconcile_stranded(enforce_harness, _TID, 'in-progress')
+
+        update_task = enforce_harness.scheduler.update_task
+        update_task.assert_awaited_once()
+        args, kwargs = update_task.await_args
+        assert args[0] == _TID
+        assert kwargs['metadata_mode'] == 'merge'
+        stamp = StrandConverted.model_validate(args[1]['strand_converted'])
+        row_ids = _strand_rows(enforce_harness)[0]['data']['pinning_escalation_ids']
+        assert list(stamp.pinning_escalation_ids) == row_ids
+        assert stamp.shape == recovery_shape_str(report)
+
+    async def test_nothing_is_recorded_when_the_blocked_write_fails(
+        self, enforce_harness,
+    ) -> None:
+        from orchestrator.scheduler import SetTaskStatusRejected
+
+        enforce_harness.scheduler.set_task_status.side_effect = (
+            SetTaskStatusRejected(_TID, 'rejected', 'nope')
+        )
+        _bind(enforce_harness, _pinned_in_progress())
+
+        result = await _reconcile_stranded(enforce_harness, _TID, 'in-progress')
+
+        assert result is None
+        enforce_harness.scheduler.update_task.assert_not_awaited()
+        assert _strand_rows(enforce_harness) == []
+
+    async def test_log_mode_records_nothing(self, applier_harness) -> None:
+        _bind(applier_harness, _pinned_in_progress())
+
+        await _reconcile_stranded(applier_harness, _TID, 'in-progress')
+
+        applier_harness.scheduler.update_task.assert_not_awaited()
+        assert _strand_rows(applier_harness) == []
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_a_held_merge_remediable_pin_records_nothing(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        _bind(enforce_harness, _pinned_in_progress(kind, refs=[REMEDIABLE_PIN]))
+
+        await _reconcile_stranded(enforce_harness, _TID, 'in-progress')
+
+        enforce_harness.scheduler.update_task.assert_not_awaited()
+        assert _strand_rows(enforce_harness) == []
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_the_next_sweep_records_nothing_more(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        _bind(enforce_harness, _pinned_in_progress(kind))
+        assert await _reconcile_stranded(enforce_harness, _TID, 'in-progress') == _CONVERTED
+
+        _bind(enforce_harness, TruthReport(
+            db_status=TaskStatus.BLOCKED,
+            live_claimant=None,
+            branch_state=_branch(kind),
+            worktree_present=True,
+            open_escalations=[PIN_REFS[1]],
+            deploy_phase=None,
+        ))
+        await _reconcile_stranded(enforce_harness, _TID, 'blocked')
+
+        assert len(_strand_rows(enforce_harness)) == 1
+        assert enforce_harness.scheduler.update_task.await_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -951,8 +1068,8 @@ class TestConvertIsScopedToNonMergeRemediablePins:
         """
         _bind(enforce_harness, _pinned_in_progress(kind, refs=[REMEDIABLE_PIN]))
 
-        result = await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        result = await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
         )
 
         assert result is None, 'a held row returns the LEAVE disposition'
@@ -975,8 +1092,8 @@ class TestConvertIsScopedToNonMergeRemediablePins:
 
         _bind(enforce_harness, _pinned_in_progress(kind, refs=[REMEDIABLE_PIN]))
 
-        await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
         )
 
         rows = _recovery_rows(enforce_harness)
@@ -999,8 +1116,8 @@ class TestConvertIsScopedToNonMergeRemediablePins:
             BranchStateKind.ON_MAIN, refs=[REMEDIABLE_PIN, PIN_REFS[1]],
         ))
 
-        assert await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
         ) == _CONVERTED
 
     @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
@@ -1018,8 +1135,8 @@ class TestConvertIsScopedToNonMergeRemediablePins:
         _bind(applier_harness, _pinned_in_progress(kind, refs=[REMEDIABLE_PIN]))
 
         with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
-            await applier_harness._reconcile_one_stranded(
-                _TID, 'in-progress', mid_run=False,
+            await _reconcile_stranded(
+            applier_harness, _TID, 'in-progress', mid_run=False,
             )
 
         assert not [
@@ -1198,7 +1315,7 @@ async def _resolve(plan_files, base, head, git_ops, *, task_id, branch):
     a failing new class.  Keeping it local means the RED is exactly the eight
     cases below and nothing else.
     """
-    from orchestrator.merge_gates import resolve_already_landed_branch
+    from orchestrator.merge_lane.gates import resolve_already_landed_branch
 
     return await resolve_already_landed_branch(
         plan_files, base, head, git_ops, task_id=task_id, branch=branch,
@@ -1219,12 +1336,11 @@ class TestResolveAlreadyLandedBranch:
     # --- vocabulary ---------------------------------------------------------
 
     async def test_the_reason_prefix_is_distinct_from_the_one_it_replaces(
-        self,
-    ) -> None:
+        self, ) -> None:
         """The carve-out needs its OWN prefix, or workflow-side routing that
         keys on ``PLAN_FILES_NOT_TOUCHED_REASON_PREFIX`` would still send this
         shape to a human."""
-        from orchestrator.merge_gates import (
+        from orchestrator.merge_lane.gates import (
             ALREADY_LANDED_REASON_PREFIX,
             CROSS_REPO_DELIVERABLE_REASON_PREFIX,
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
@@ -1232,11 +1348,9 @@ class TestResolveAlreadyLandedBranch:
 
         assert ALREADY_LANDED_REASON_PREFIX
         assert not ALREADY_LANDED_REASON_PREFIX.startswith(
-            PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
-        )
+            PLAN_FILES_NOT_TOUCHED_REASON_PREFIX, )
         assert not PLAN_FILES_NOT_TOUCHED_REASON_PREFIX.startswith(
-            ALREADY_LANDED_REASON_PREFIX,
-        )
+            ALREADY_LANDED_REASON_PREFIX, )
         assert ALREADY_LANDED_REASON_PREFIX != CROSS_REPO_DELIVERABLE_REASON_PREFIX
 
     # --- (1) POSITIVE — merge marker ---------------------------------------
@@ -1441,7 +1555,7 @@ class TestResolveAlreadyLandedBranch:
         await _reseed(git_repo, 'task/906', parked)
 
         spy = _RunSpy(fail_when=_is_rev_list_count)
-        monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+        monkeypatch.setattr('orchestrator.merge_lane.gates._run', spy)
 
         assert await _resolve(
             plan_files, parked, parked, git_ops,
@@ -1474,7 +1588,7 @@ class TestResolveAlreadyLandedBranch:
 
         async def boom(*a, **k):  # noqa: ARG001
             raise RuntimeError('probe exploded')
-        monkeypatch.setattr('orchestrator.merge_gates._run', boom)
+        monkeypatch.setattr('orchestrator.merge_lane.gates._run', boom)
 
         assert await _resolve(
             plan_files, parked, parked, git_ops,
@@ -1500,7 +1614,7 @@ class TestResolveAlreadyLandedBranch:
         awaiting task in a state the caller believes it left."""
         async def cancel(*a, **k):  # noqa: ARG001
             raise asyncio.CancelledError
-        monkeypatch.setattr('orchestrator.merge_gates._run', cancel)
+        monkeypatch.setattr('orchestrator.merge_lane.gates._run', cancel)
 
         with pytest.raises(asyncio.CancelledError):
             await _resolve(
@@ -1576,10 +1690,9 @@ class TestResolveAlreadyLandedBranch:
     ) -> None:
         """Signal 4 in ISOLATION, with every earlier signal fully satisfied.
 
-        The sibling test above is now caught one step earlier, by the
-        revert-subject attribution guard — which is correct, but it means that
-        test no longer proves signal 4 does anything.  Here the removal is an
-        ORDINARY commit (``impl(924): ...``), so the merge marker is still the
+        Here the removal is an ORDINARY commit (``impl(924): ...``), so this
+        test isolates signal 4 independently of how the sibling test's revert
+        shape is attributed: the merge marker is still the
         attributing commit, its subject is not revert-shaped, and
         ``M^1..M`` still names the declared file.  The ONLY thing left that
         can decline is "does the landing's effect survive at current HEAD".
@@ -1665,7 +1778,7 @@ class TestResolveAlreadyLandedBranch:
         could be tightened all the way to "match nothing" and the decoy test
         would still pass.
         """
-        from orchestrator.merge_gates import ALREADY_LANDED_CITATION_PATTERN
+        from orchestrator.merge_lane.gates import ALREADY_LANDED_CITATION_PATTERN
 
         plan_files = ['src/pkg/member.py']
         landed = await _commit_on_main(
@@ -1686,6 +1799,56 @@ class TestResolveAlreadyLandedBranch:
         from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN
 
         assert ALREADY_LANDED_CITATION_PATTERN != DEFAULT_COMMIT_CITATION_PATTERN
+
+    # --- (9b) the REVERT-SUBJECT GUARD, pinned on its own -------------------
+    #
+    # Since task 5765 neither probe answers with a revert, so each revert test
+    # above is declined by an EARLIER layer (signal 4, or the strict citation
+    # template) and stays green with `_REVERT_SUBJECT_RE` deleted.  This one
+    # widens the marker probe back to its pre-5765 answer through the injected
+    # `git_ops` port, leaving the guard as the only layer that can decline.
+
+    async def test_a_marker_probe_answering_a_revert_is_declined_by_the_guard(
+        self, git_repo: Path, git_config: GitConfig,
+    ) -> None:
+        """The probe answers ``Revert "Merge task/930 into main"``, as the
+        real one did before task 5765.
+
+        The revert's OWN effect (the deletion) is present at main HEAD and its
+        touched set is exactly the declared file, so signals 3 and 4 would both
+        admit it — asserted below, so the decline cannot come from them.
+        """
+        plan_files = ['src/pkg/reverted_again.py']
+        merge_sha = await _land_via_merge(
+            git_repo, 'task/930', {f: f'# {f}\n' for f in plan_files},
+        )
+        rc, _, err = await _run(
+            ['git', 'revert', '--no-edit', '-m', '1', merge_sha], cwd=git_repo,
+        )
+        assert rc == 0, f'revert failed: {err}'
+        revert_sha = await _head_of(git_repo)
+        await _reseed(git_repo, 'task/930', revert_sha)
+
+        class _WidenedMarkerProbe(GitOps):
+            async def find_merge_marker(
+                self, branch: str, *, gate_on_existing_ref: bool = True,
+            ) -> str | None:
+                return revert_sha
+
+        widened = _WidenedMarkerProbe(git_config, git_repo)
+
+        assert await widened.get_files_touched_in_branch(
+            f'{revert_sha}^1', revert_sha,
+        ) == plan_files
+        assert await widened.commit_effect_present_in_main(revert_sha)
+
+        assert await _resolve(
+            plan_files, revert_sha, revert_sha, widened,
+            task_id='930', branch='task/930',
+        ) is None, (
+            'a revert undoes a delivery; the revert-subject guard must decline '
+            'it even when a probe answers with it'
+        )
 
     # --- (10) TRAP 3 — the rename gap, asserted rather than assumed ---------
 
@@ -1738,7 +1901,6 @@ from unittest.mock import AsyncMock  # noqa: E402
 
 from test_workflow import _make_workflow  # noqa: E402
 
-from orchestrator.merge_gates import PlanFilesTouchedResult  # noqa: E402
 from orchestrator.workflow import WorkflowOutcome  # noqa: E402
 
 
@@ -1773,16 +1935,15 @@ class TestSubmitToMergeQueueAlreadyLanded:
         async def fake_check(*a, **k):  # noqa: ARG001
             return PlanFilesTouchedResult(not_touched=['a.py'])
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
-            fake_check,
-        )
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
+            fake_check, )
 
         emits: list = []
 
         def fake_emit(event_store, task_id, outcome, **kwargs):  # noqa: ARG001
             emits.append(outcome)
         monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_attempt', fake_emit,
+            'orchestrator.merge_lane.worker._emit_merge_attempt', fake_emit,
         )
 
         narrow = AsyncMock(return_value=False)
@@ -1799,13 +1960,12 @@ class TestSubmitToMergeQueueAlreadyLanded:
                 seen.append((list(plan_files), base_sha, branch_head, kw))
             return result
         monkeypatch.setattr(
-            'orchestrator.merge_gates.resolve_already_landed_branch',
-            fake_resolve,
-        )
+            'orchestrator.merge_lane.gates.resolve_already_landed_branch',
+            fake_resolve, )
 
     @staticmethod
     def _landed():
-        from orchestrator.merge_gates import AlreadyLandedResult
+        from orchestrator.merge_lane.gates import AlreadyLandedResult
 
         return AlreadyLandedResult(
             landed_sha='9ab336bd6e' * 4,
@@ -1825,7 +1985,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         ``category='task_failure'`` from minting the escalation that pins the
         task, vetoes its recovery, and feeds it back round the loop.
         """
-        from orchestrator.merge_gates import ALREADY_LANDED_REASON_PREFIX
+        from orchestrator.merge_lane.gates import ALREADY_LANDED_REASON_PREFIX
 
         wf = _make_workflow(tmp_path=tmp_path)
         landed = self._landed()
@@ -1867,7 +2027,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         attributed by citation; the outcome must be identical and the reason
         must SAY which probe answered.
         """
-        from orchestrator.merge_gates import AlreadyLandedResult
+        from orchestrator.merge_lane.gates import AlreadyLandedResult
 
         wf = _make_workflow(tmp_path=tmp_path)
         self._stub_predicate(monkeypatch, AlreadyLandedResult(
@@ -1922,7 +2082,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         the same outcome, the same narrowing attempt, the same reason prefix
         and the same forced human ladder.
         """
-        from orchestrator.merge_gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
+        from orchestrator.merge_lane.gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
 
         wf = _make_workflow(tmp_path=tmp_path)
         self._stub_predicate(monkeypatch, None)
@@ -1960,9 +2120,8 @@ class TestSubmitToMergeQueueAlreadyLanded:
         async def passing_check(*a, **k):  # noqa: ARG001
             return PlanFilesTouchedResult()
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
-            passing_check,
-        )
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
+            passing_check, )
 
         # A healthy branch runs off the end of the gate and into the real
         # enqueue, which this minimal harness cannot service (its queue is a
@@ -1975,7 +2134,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         async def boom(*a, **k):  # noqa: ARG001
             raise _ReachedEnqueue
         monkeypatch.setattr(
-            'orchestrator.merge_queue.register_and_enqueue_merge_request', boom,
+            'orchestrator.merge_lane.worker.register_and_enqueue_merge_request', boom,
         )
 
         with pytest.raises(_ReachedEnqueue):
@@ -2003,9 +2162,8 @@ class TestSubmitToMergeQueueAlreadyLanded:
             order.append('predicate')
             return self._landed()
         monkeypatch.setattr(
-            'orchestrator.merge_gates.resolve_already_landed_branch',
-            fake_resolve,
-        )
+            'orchestrator.merge_lane.gates.resolve_already_landed_branch',
+            fake_resolve, )
         _emits, narrow, _mark_blocked = self._wire(wf, monkeypatch)
         narrow.side_effect = lambda *a, **k: order.append('narrow') or False
 
@@ -2059,11 +2217,10 @@ class TestAlreadyLandedLadderWithRealMarkBlocked:
         async def fake_check(*a, **k):  # noqa: ARG001
             return PlanFilesTouchedResult(not_touched=['a.py'])
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
-            fake_check,
-        )
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
+            fake_check, )
         monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_attempt',
+            'orchestrator.merge_lane.worker._emit_merge_attempt',
             lambda *a, **k: None,
         )
 
@@ -2256,13 +2413,12 @@ class TestLandedButPinnedZombieLoop:
             # test_merge_gates_plan_files_rename.py already owns).
             return PlanFilesTouchedResult(not_touched=list(self._PLAN_FILES))
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
-            fake_check,
-        )
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
+            fake_check, )
 
         emits: list = []
         monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_attempt',
+            'orchestrator.merge_lane.worker._emit_merge_attempt',
             lambda es, tid, outcome, **k: emits.append(outcome),  # noqa: ARG005
         )
         narrow = AsyncMock(return_value=False)
@@ -2308,8 +2464,8 @@ class TestLandedButPinnedZombieLoop:
         """One conversion, then nothing — the churn stops for good."""
         _bind(enforce_harness, self._landed_but_pinned())
 
-        assert await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
         ) == _CONVERTED
         enforce_harness.scheduler.set_task_status.assert_awaited_once_with(
             _TID, 'blocked',
@@ -2326,8 +2482,8 @@ class TestLandedButPinnedZombieLoop:
         )
         _bind(enforce_harness, converted)
 
-        assert await enforce_harness._reconcile_one_stranded(
-            _TID, 'blocked', mid_run=False,
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'blocked', mid_run=False,
         ) is None
         assert enforce_harness.scheduler.set_task_status.await_count == 1, (
             'a second write means the sweep is oscillating on its own output'
@@ -2364,8 +2520,8 @@ class TestLandedButPinnedZombieLoop:
         assert Harness._only_merge_remediable([PIN_REFS[1]]) is False
 
         _bind(enforce_harness, self._landed_but_pinned())
-        await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
         )
 
         enforce_harness.scheduler.mark_done.assert_not_awaited()
@@ -2399,8 +2555,219 @@ class TestLandedButPinnedZombieLoop:
         assert classify_recovery(unpinned) != RecoveryAction.CONVERT_TO_BLOCKED
 
         _bind(enforce_harness, unpinned)
-        assert await enforce_harness._reconcile_one_stranded(
-            _TID, 'in-progress', mid_run=False,
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
         ) != _CONVERTED
         for call in enforce_harness.scheduler.set_task_status.await_args_list:
             assert 'blocked' not in call.args
+
+
+# ---------------------------------------------------------------------------
+# task 3541 (eta) — the CONVERT SCOPING CLAUSE consumes the same predicate.
+#
+# The clause exists to answer ONE question: "would the blocked-arm upgrade
+# clauses pick this converted row straight back up next sweep?"  Before eta it
+# asked that question with `_only_merge_remediable`, which was the blocked
+# arm's whole predicate at the time.  Now the blocked arm reads
+# `report_pins_blocked_recovery`, so the scoping clause must read it too — the
+# two are the SAME question asked at two moments, and letting them drift is how
+# review finding #3's two-sweep-auto-done hazard reopens.
+#
+# That coherence CHANGES one population, deliberately: a CONVERT row pinned
+# solely by a DEAD-filer L0 in a non-remediable category.  Under
+# `_only_merge_remediable` it converted; under the shared predicate the blocked
+# arm would now move it, so it is held at its pre-3539 LEAVE instead.  Spec S6
+# assigns that row's visibility to the ORPHAN-L0 REAPER (part 4 of this same
+# task), which promotes the aged-out L0 to L1 — after which it is a genuine
+# QUEUE_HANDOFF and converts on the very next sweep.
+# ---------------------------------------------------------------------------
+
+DEAD_L0_PIN = EscalationRef(
+    id='esc-3541-deadl0', level=0, category='task_failure', severity='blocking',
+)
+INFO_PIN = EscalationRef(
+    id='esc-3541-info', level=0, category='task_failure', severity='info',
+)
+
+
+@pytest.mark.asyncio
+class TestConvertScopingClauseTracksTheBlockedArm:
+    """The scoping clause and the blocked arm must agree, by construction."""
+
+    @pytest.mark.parametrize('kind', ALL_BRANCH_KINDS)
+    async def test_a_merge_remediable_pin_is_still_held_silently(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        """UNCHANGED — review finding #3's hazard stays closed.
+
+        The reaper's own `stranded_blocked` is relaxed by the blocked arm, so
+        converting the row would hand it straight back to that arm next sweep.
+        """
+        from orchestrator.event_store import EventType
+
+        _bind(enforce_harness, _pinned_in_progress(kind, refs=[REMEDIABLE_PIN]))
+
+        result = await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        )
+
+        assert result is None
+        assert enforce_harness.scheduler.set_task_status.await_count == 0
+        rows = _recovery_rows(enforce_harness)
+        assert len(rows) == 1, rows
+        assert rows[0]['event_type'] == EventType.recovery_vetoed.value
+        assert rows[0]['data'].get('reason') == 'escalation_pinned', (
+            'LeaveReason.escalation_pinned must still be threaded explicitly — '
+            'the report still classifies CONVERT, so leave_reason alone would '
+            'drop the row this clause is counted in'
+        )
+
+    async def test_a_human_concern_l1_still_converts(
+        self, enforce_harness,
+    ) -> None:
+        """The measured 3717 population is untouched by the rewiring."""
+        _bind(enforce_harness, _pinned_in_progress(
+            BranchStateKind.ON_MAIN, refs=[PIN_REFS[1]],
+        ))
+
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED
+
+    async def test_a_dead_l0_only_pin_is_now_held_not_converted(
+        self, enforce_harness,
+    ) -> None:
+        """THE ONE POPULATION THIS REWIRING MOVES, and why it is correct.
+
+        `report.live_claimant is None` here — the CONVERT rows all require it —
+        so `classify_pins` link 4 PROVES the filer dead and the blocked arm no
+        longer vetoes on this record.  Converting would therefore produce
+        exactly the two-sweep auto-done review finding #3 named: `blocked`,
+        then MARK_DONE on the next pass.  Holding is the coherent answer, and
+        the row stops being invisible when the orphan-L0 reaper promotes it.
+        """
+        _bind(enforce_harness, _pinned_in_progress(
+            BranchStateKind.ON_MAIN, refs=[DEAD_L0_PIN],
+        ))
+
+        result = await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        )
+
+        assert result is None, (
+            'a dead-L0-pinned row must not convert into a shape the blocked '
+            'arm would immediately auto-done'
+        )
+        assert enforce_harness.scheduler.set_task_status.await_count == 0
+
+    async def test_a_dead_l0_beside_a_live_handoff_still_converts(
+        self, enforce_harness,
+    ) -> None:
+        """One QUEUE_HANDOFF record is enough to make `blocked` genuinely at rest."""
+        _bind(enforce_harness, _pinned_in_progress(
+            BranchStateKind.ON_MAIN, refs=[DEAD_L0_PIN, PIN_REFS[2]],
+        ))
+
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED
+
+    async def test_an_info_record_cannot_reach_this_clause_at_all(
+        self, enforce_harness,
+    ) -> None:
+        """Link 1 short-circuits upstream: an info-only report never CONVERTs.
+
+        Asserted so the clause is never "fixed" to handle a case the resolver
+        already excludes — `_shape`'s element is False, so the table maps this
+        shape to a plain MARK_DONE/REVERT row (PRD boundary #8).
+        """
+        report = _pinned_in_progress(BranchStateKind.ON_MAIN, refs=[INFO_PIN])
+        assert classify_recovery(report) != RecoveryAction.CONVERT_TO_BLOCKED
+
+        _bind(enforce_harness, report)
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        ) != _CONVERTED
+
+
+#: Task 4645: the escalation whose ask an ON-MAIN landing satisfies.  Pinned to
+#: the literal on purpose — this suite asserts the category's behaviour, and the
+#: set it belongs to is pinned in `test_recovery_pins.py`.
+PREEXISTING_MAIN_BREAK_PIN = EscalationRef(
+    id='esc-4645-pmb', level=1, category='preexisting_main_break', severity='blocking',
+)
+
+
+@pytest.mark.asyncio
+class TestConvertScopingClauseFollowsTheOnMainRelaxation:
+    """The ON_MAIN clause relaxes one more category than the recovery predicate.
+
+    The scoping clause asks "would the blocked arm move this row next sweep?",
+    so it must follow BOTH clauses: an in-progress on-main row pinned only by a
+    `preexisting_main_break` record would otherwise convert and then be marked
+    done by the ON_MAIN clause one sweep later (task 4645).
+    """
+
+    @pytest.mark.parametrize(
+        'kind', [BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER],
+    )
+    async def test_an_on_main_preexisting_main_break_pin_is_held_not_converted(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        from orchestrator.event_store import EventType
+
+        _bind(enforce_harness, _pinned_in_progress(
+            kind, refs=[PREEXISTING_MAIN_BREAK_PIN],
+        ))
+
+        result = await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        )
+
+        assert result is None
+        assert enforce_harness.scheduler.set_task_status.await_count == 0
+        rows = _recovery_rows(enforce_harness)
+        assert len(rows) == 1, rows
+        assert rows[0]['event_type'] == EventType.recovery_vetoed.value
+        assert rows[0]['data'].get('reason') == 'escalation_pinned'
+
+    @pytest.mark.parametrize(
+        'kind', [BranchStateKind.EXISTS_OFF_MAIN, BranchStateKind.GONE_NO_MARKER],
+    )
+    async def test_an_off_main_preexisting_main_break_pin_still_converts(
+        self, enforce_harness, kind: BranchStateKind,
+    ) -> None:
+        """Off main the ask is unmet and the recovery predicate still pins it,
+        so `blocked` is genuinely at rest — the relaxation is ON_MAIN only."""
+        _bind(enforce_harness, _pinned_in_progress(
+            kind, refs=[PREEXISTING_MAIN_BREAK_PIN],
+        ))
+
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED
+
+    async def test_an_on_main_task_failure_pin_still_converts(
+        self, enforce_harness,
+    ) -> None:
+        """Control: a human-concern pin is in neither set, on main or off."""
+        _bind(enforce_harness, _pinned_in_progress(
+            BranchStateKind.ON_MAIN, refs=[PIN_REFS[1]],
+        ))
+
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED
+
+    async def test_a_preexisting_main_break_beside_a_human_concern_still_converts(
+        self, enforce_harness,
+    ) -> None:
+        """B8 through this clause: `all(...)` keeps the human concern pinning."""
+        _bind(enforce_harness, _pinned_in_progress(
+            BranchStateKind.ON_MAIN,
+            refs=[PREEXISTING_MAIN_BREAK_PIN, PIN_REFS[2]],
+        ))
+
+        assert await _reconcile_stranded(
+            enforce_harness, _TID, 'in-progress', mid_run=False,
+        ) == _CONVERTED

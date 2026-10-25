@@ -3,9 +3,19 @@
 Layer 2 of the headless ``--print`` background-task footgun fix: detect when an
 otherwise-successful ``claude --print`` run ended its turn while a backgrounded
 Bash command was still pending (launched via ``Bash run_in_background=true``,
-never subsequently polled with ``BashOutput`` or killed with
-``KillShell``/``KillBash``), and downgrade ``success``→failure so existing
+never subsequently reaped), and downgrade ``success``→failure so existing
 non-success handling retries/resumes instead of proceeding on a half-done tree.
+
+A session reaps either by calling a background-management tool named in
+``_BACKGROUND_REAP_TOOLS`` or — the tool-agnostic second clause (task 3639) — by
+issuing any tool_use whose input references the task's id or output-file path.
+The tool names appearing in the fixtures below are test DATA standing in for
+whatever a CLI build might emit, not a claim that each is live — only
+``TaskStop`` is (task 5332).  Exercising the accept set's full membership is
+the coverage that should stay; see the comment on ``_BACKGROUND_REAP_TOOLS``
+for why membership is kept rather than resynced, and
+orchestrator/tests/test_roles_harness_tool_inventory.py::MEASURED_ABSENT_TOOLS
+for the measurement that says which names are live.
 
 RCA: Reify 5164's amender ended its turn (681s, 19 turns, subtype=success,
 timed_out=false) "to wait for the completion notification" while a 2700s
@@ -325,7 +335,16 @@ class TestForegroundBgLogReadIsAReap:
 
     def test_read_tool_of_bg_log_is_false(self) -> None:
         """`Read` on the bg-log path — the reap the CLI's own launch message
-        recommends ("use Read on that file path") → False."""
+        recommends ("use Read on that file path") → False.
+
+        This is also the shape
+        orchestrator/src/orchestrator/agents/roles.py::WAIT_PATTERN_GUIDANCE
+        now steers every Bash-capable role into (task 5332), which is why
+        correcting those prompts needed no change to the detector. Keep it: it
+        is the executable form of that claim, and narrowing
+        ``_iter_input_strings`` to a ``command`` key fails HERE rather than
+        silently downgrading every correctly-behaved session to failure.
+        """
         records = [
             _assistant([_bash_launch(command='cargo test --all')]),
             _bg_launch_result(),
@@ -428,10 +447,16 @@ class TestForegroundBgLogReadIsAReap:
 
 
 class TestTaskToolReaps:
-    """``TaskOutput`` and ``TaskStop`` are reaps (task 3639) — the Task-tool
-    analogues of ``BashOutput``/``KillShell``: one collects a backgrounded
-    Task/subagent's result, the other terminates it.  Both are equally
-    conclusive evidence the session engaged with its pending work."""
+    """``TaskOutput`` and ``TaskStop`` are reaps (task 3639): one collects a
+    backgrounded Task/subagent's result, the other terminates it.  Both are
+    equally conclusive evidence the session engaged with its pending work.
+
+    Deliberately NOT described as the analogues of
+    ``BashOutput``/``KillShell``, as this docstring used to: that framing is
+    doubly wrong.  ``BashOutput`` was never live in this fleet, and
+    ``TaskOutput`` has since been removed from the registry too (task 5332; the
+    measurement is cited from the module docstring).  Both remain in the accept
+    set on purpose; these cases pin that membership."""
 
     def test_task_output_after_launch_is_false(self) -> None:
         """TaskOutput collects a backgrounded task's result → reap → False."""

@@ -11,12 +11,18 @@ curator instead.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
+from shared.defects import DeclareEvent, OutcomeEvent
+
+from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
+    DefectWriteResult,
     DependencyResult,
     GetTasksResult,
+    MetadataLookupResult,
     RemoveTaskResult,
     SetTaskStatusResult,
     StatusWriteNotPersistedResult,
@@ -67,6 +73,21 @@ class TaskBackendProtocol(Protocol):
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None
     ) -> dict: ...
+
+    async def find_tasks_by_metadata(
+        self,
+        project_root: str,
+        key: str,
+        value: str | int | None = None,
+        *,
+        statuses: list[str] | None = None,
+        limit: int = DEFAULT_LOOKUP_LIMIT,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: bool = False,
+    ) -> MetadataLookupResult:
+        """One page of tasks whose top-level ``metadata[key]`` matches; see plans/task-metadata-lookup-prd.md."""
+        ...
 
     async def get_statuses_raw(
         self,
@@ -129,6 +150,7 @@ class TaskBackendProtocol(Protocol):
         *,
         claimant_run_id: str | None = None,
         heartbeat_at: str | None = None,
+        pending_since_now: str | None = None,
     ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Update ``status``, optionally stamping the claimant columns.
 
@@ -137,6 +159,13 @@ class TaskBackendProtocol(Protocol):
         (a sentinel default leaves the column untouched); the protocol exposes
         them as ``None``-defaulted so callers may supply them and backends stay
         assignable to this shape.
+
+        ``pending_since_now`` supplies the clock for the ``metadata.pending_since``
+        stamp (task 3816); ``None`` means the backend reads its own clock. A
+        string is used verbatim and must be shaped like
+        ``fused_memory/backends/sqlite_task_backend.py::task_timestamp_now``,
+        never a ``datetime.isoformat()`` string. It supplies only the clock:
+        whether a stamp is owed is still the backend's transition table.
 
         Returns :class:`StatusWriteNotPersistedResult` instead of a fabricated
         success (task 2649) when a post-write read-back shows the status
@@ -206,7 +235,12 @@ class TaskBackendProtocol(Protocol):
         * ``metadata_mode='additive'`` — recursive list union+dedup,
           scalar/type-collision OLD-wins.  Required by list-append callers.
         * ``metadata_mode='replace'`` — whole-blob overwrite.  Bypasses the
-          corrupt-blob guard; the sanctioned repair path.
+          corrupt-blob guard; the sanctioned repair path.  It is the ONLY mode
+          that can retire a key ('merge'/'additive' have no deletion
+          sentinel).  It is usable on done/merged tasks provided the payload
+          carries the stored ``metadata.done_provenance`` verbatim: adding,
+          changing or dropping it is rejected with
+          ``DoneProvenanceWriteAuthorityError`` (see the MUST below).
         * ``append=True`` (legacy shim) → 'additive'.  A bare ``append=False``
           (no ``metadata_mode``) on a metadata write is **rejected** — it used
           to silently 'replace' and wiped a live in-progress task (the task-2180
@@ -227,16 +261,71 @@ class TaskBackendProtocol(Protocol):
           True)`` and ``('additive', False)`` are unaffected, and as with the
           task-2180 guard a details-only write (NO metadata) is not rejected.
 
+        **Implementations MUST reject ``append=True`` combined with a non-None
+        ``title``, ``description`` or ``priority`` by raising**, naming the
+        offending field(s) in the message (e.g.
+        ``AppendUnsupportedFieldError``, which keeps the
+        ``TASKMASTER_TOOL_ERROR`` code).  Those three columns are
+        REPLACE-ONLY: ``append`` governs ONLY the ``details``/``prompt``
+        concatenation and the metadata mode above, and has never applied to
+        them.  Accepting the pair silently OVERWROTE the column — a caller
+        who believed they were extending a description destroyed the whole
+        original instead, with no error and no warning, in four recorded live
+        repros (the worst wiping ~17KB of authored prose that existed nowhere
+        else; the task-4039 defect).  Loud over silent, exactly like the two
+        metadata guards above: reject unconditionally on the flag combination,
+        without consulting the stored row, so the outcome cannot depend on
+        invisible state and the rejection can precede the row lookup.  The way
+        to EXTEND one of these fields is a read-modify-write — read the
+        current value, concatenate locally, then write the COMPLETE new value
+        with ``append`` omitted.  ``dependencies`` is also replace-only but is
+        deliberately NOT covered.
+
         **Implementations MUST reject a non-None ``status`` by raising** (e.g.
         ``TaskmasterError('TASKMASTER_TOOL_ERROR', …)``).  ``set_task_status``
         is the only sanctioned status writer — it enforces the terminal-exit,
         phantom-done, and done-provenance gates.  Accepting ``status`` here
         would silently bypass all three.
 
+        **Implementations MUST NOT let update_task add, change or remove
+        ``metadata.done_provenance``** — ``set_task_status`` is its only
+        sanctioned writer, for the same reason.  In every mode except
+        ``'replace'``, reject a payload carrying the key unconditionally, before
+        the row lookup (``DoneProvenanceWriteAuthorityError``).  Under
+        ``'replace'``, compare against the STORED value read in the same
+        transaction as the write: admit the payload only when the key's presence
+        and JSON value match the stored row exactly, and refuse a payload
+        carrying the key when the stored blob does not parse.
+
+        **Implementations MUST reject a metadata payload that is not a JSON
+        object** (unparseable text, or JSON that decodes to an array, null,
+        string, number or boolean) in every ``metadata_mode``, by raising (e.g.
+        ``MetadataNotAnObjectError``), before the row lookup.  Such a payload
+        has no keys to merge; treating it as a last-write-wins replacement
+        wiped the whole stored blob, ``done_provenance`` included (task 6130).
+
         The ``status`` param is kept in the signature as a **reject-trap**: it
         preserves the ``status=None`` passthrough that ``server/tools.py`` and
         ``task_interceptor.py`` forward via ``**kwargs``, and it makes the
         reject-only contract explicit for future backend authors.
+        """
+        ...
+
+    async def apply_defect_events(
+        self,
+        task_id: str,
+        project_root: str,
+        events: Sequence[DeclareEvent | OutcomeEvent],
+        *,
+        tag: str | None = None,
+    ) -> DefectWriteResult:
+        """Fold *events* into the task's ``defects`` / ``defect_test_retirements``, all or nothing.
+
+        The one post-creation writer of both defect keys: the rules are
+        ``fused_memory/backends/defect_records.py``'s, and the read-fold-write
+        runs in one write transaction. It takes none of the interceptor's
+        locks and journals nothing; its caller supplies both, as
+        ``TaskInterceptor.apply_defect_events`` does for the MCP tools.
         """
         ...
 
@@ -262,6 +351,16 @@ class TaskBackendProtocol(Protocol):
         project_root: str,
         tag: str | None = None,
     ) -> DependencyResult: ...
+
+    async def get_dependency_edges(
+        self, project_root: str, tag: str | None = None
+    ) -> dict[int, list[int]]:
+        """Return ``{task_id: [depends_on, ...]}`` — the dependency edge set alone.
+
+        Lists are sorted ascending, and a task with no dependencies is ABSENT
+        from the map rather than present with an empty list.
+        """
+        ...
 
     async def validate_dependencies(
         self, project_root: str, tag: str | None = None

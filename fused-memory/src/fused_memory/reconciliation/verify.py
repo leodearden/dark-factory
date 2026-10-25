@@ -9,6 +9,7 @@ from shared.agent_result import extract_agent_verdict
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
 from fused_memory.reconciliation.agent_loop import AgentLoop, ToolDefinition
+from fused_memory.utils.clip_disclosure import elide_text, truncation_fields
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,15 @@ _MAX_FAILURE_TOKEN_LEN = 64
 # never let it become agent-controlled — every other token on this path goes
 # through _as_failure_token precisely because the agent can influence those.
 CODEBASE_ROOT_UNRESOLVED = 'codebase_root_unresolved'
+
+# The claude_cli provider's read-only equivalents of the in-process tools in
+# verify().  Git history stays in-process only: a git-scoped CLI Bash rule is
+# not read-only (fused-memory/scripts/probe_schema_max_turns.py's docstring
+# records the measured `git log --output` write).
+_EXPLORE_CLI_TOOLS = ('Read', 'Grep', 'Glob')
+
+# Clears every ordinary commit's `git show --stat` measured at 2026-09/10.
+_GIT_SHOW_CHARS = 16_000
 
 
 # Sub-reasons for a refused root.  They discriminate the populations hiding
@@ -109,15 +119,34 @@ codebase. You are strictly read-only and have no access to memory systems or tas
 - Be neutral: report what the code says, don't speculate.
 - Every claim must cite specific evidence: file paths, line ranges, code snippets.
 - If you can't find evidence either way, say "inconclusive" — don't guess.
-- Check git history when the claim involves changes over time.
 - Focus your search on the scope hints provided, but expand if needed.
+- Your `summary` becomes a PERMANENT project-memory record. It will be retrieved \
+months from now by semantic search, by people and agents who never see this \
+conversation, this claim, or your reasoning. Write it so it stands alone.
+- Cite concrete repository evidence IN THE SUMMARY ITSELF — file paths, symbol names, \
+line ranges, commit SHAs. "auth.py:112 defines verify_token(), called from \
+middleware.py:44" is a useful record; "the feature appears to be implemented" is not.
+- NEVER narrate your own process or tooling. No "I searched for…", "I ran grep…", \
+"I looked at several files…", "I could not find the file…", and no naming the tools \
+you used. Describe what the code does or does not contain, and the path that shows it. \
+"No handler for `task.done` exists under `orchestrator/`" is a finding; "I searched \
+and found nothing" is not.
+
+## Why the summary matters
+Both verdict-bearing outcomes are consumed by someone who was not here:
+- A `confirmed` summary becomes the project's durable record that this work is real.
+- A `contradicted` summary becomes an alert a human triages, deciding whether to \
+reopen the task.
+Neither is readable without the evidence that justifies it, so put that evidence in \
+the summary regardless of which verdict you reach.
 
 ## Output
-When done, call `verification_complete` with your findings:
+Report your findings with these fields:
 - verdict: "confirmed" | "contradicted" | "inconclusive"
 - confidence: 0.0-1.0
 - evidence: list of {file_path, line_range, snippet, relevance}
-- summary: brief explanation
+- summary: a self-contained, evidence-citing statement of what the code shows \
+(see the guidelines above — this is the field that outlives the run)
 - git_context: {latest_relevant_commit, author, date} if applicable
 """
 
@@ -322,7 +351,10 @@ class CodebaseVerifier:
 
         tools['git_log'] = ToolDefinition(
             name='git_log',
-            description='View git commit history, optionally filtered to a file path.',
+            description=(
+                'View git commit history, optionally filtered to a file path. '
+                'Use it when the claim involves changes over time.'
+            ),
             parameters={
                 'type': 'object',
                 'properties': {
@@ -345,8 +377,8 @@ class CodebaseVerifier:
                     stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-                output = stdout.decode()[:3000]
-                return {'commit': commit, 'output': output}
+                clip = elide_text(stdout.decode(), _GIT_SHOW_CHARS, field='output')
+                return {'commit': commit, 'output': clip.text, **truncation_fields(clip.fact)}
             except Exception as e:
                 return {'error': str(e)}
 
@@ -367,7 +399,10 @@ class CodebaseVerifier:
         # Terminal tool
         tools['verification_complete'] = ToolDefinition(
             name='verification_complete',
-            description='Signal verification is complete with your findings.',
+            description=(
+                'Deliver your findings. Call this exactly once, when you are done; '
+                'it ends the verification.'
+            ),
             parameters={
                 'type': 'object',
                 'properties': {
@@ -413,7 +448,7 @@ class CodebaseVerifier:
 ### Codebase Root
 {codebase_root}
 
-Investigate this claim against the codebase and call `verification_complete` with your findings.
+Investigate this claim against the codebase and report your findings.
 """
 
         agent = AgentLoop(
@@ -421,8 +456,9 @@ Investigate this claim against the codebase and call `verification_complete` wit
             system_prompt=EXPLORE_AGENT_SYSTEM_PROMPT,
             tools=tools,
             terminal_tool='verification_complete',
-            # The agent explores the TARGET project (task 4722): its cwd, and
-            # so the CLAUDE.md the CLI auto-loads, must be that project's.
+            cli_tools=_EXPLORE_CLI_TOOLS,
+            # The agent explores the TARGET project (task 4722): its cwd, the
+            # root the CLI confines its read tools to, must be that project's.
             cwd=codebase_root,
         )
 
@@ -455,10 +491,10 @@ Investigate this claim against the codebase and call `verification_complete` wit
         # construction boundary, and a non-str under either key would raise
         # ValidationError below — surfacing as a generic 'error' audit row,
         # i.e. losing exactly the diagnosis this code exists to preserve.
-        # AgentLoop.run() already gates `warning_origin` on its closed
-        # CLI_WARNING_ORIGINS vocabulary; this is the independent guard at the
-        # consuming end, so a future producer cannot widen the column by
-        # accident.
+        # agent_loop.py::_cli_failure_payload already gates `warning_origin` on
+        # the closed CLI_WARNING_ORIGINS vocabulary; this is the independent
+        # guard at the consuming end, so a future producer cannot widen the
+        # column by accident.
         token = ''
         if verdict.failed:
             token = (

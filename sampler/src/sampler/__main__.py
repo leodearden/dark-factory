@@ -6,9 +6,14 @@ SQLite DB at data/load-samples.db (relative to the repo root WorkingDirectory).
 
 This module is intentionally thin — all business logic lives in sampler.sampler
 and sampler.store so it can be unit-tested.  The live integration signal
-(``systemctl --user is-active dark-factory-load-sampler.timer`` plus
-``sqlite3 data/load-samples.db 'SELECT COUNT(DISTINCT metric) FROM samples
-WHERE ts > strftime(...)' `` returning >= 7) validates this shell.
+(``systemctl --user is-active dark-factory-load-sampler.timer`` plus a
+``SELECT COUNT(DISTINCT metric) FROM samples WHERE ts > ...`` query against
+data/load-samples.db) validates this shell; ``scripts/install-load-sampler.sh``
+runs exactly that check after arming the timer.
+
+That count depends on how many cgroup leaves a host has (the per-tick row
+formula is stated on ``sampler.metrics.METRIC_GROUPS``), so the floor worth
+asserting is that rows arrived at all, not that a particular count did.
 """
 
 from __future__ import annotations
@@ -17,9 +22,10 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
-from sampler.metrics import collect_process_metrics, collect_psi
+from sampler.metrics import METRIC_GROUPS, MetricGroup, Samples
 from sampler.sampler import run_tick
 from sampler.store import LoadSampleStore
 
@@ -30,13 +36,16 @@ logging.basicConfig(
 logger = logging.getLogger('sampler')
 
 
-def main() -> None:
-    """Collect one tick of metrics and write them to data/load-samples.db.
+def main(groups: Sequence[MetricGroup] = METRIC_GROUPS) -> None:
+    """Collect one tick of *groups* and write it to data/load-samples.db.
 
     The DB path is ``<root>/data/load-samples.db`` where ``<root>`` defaults to
     the process's CWD (set by the systemd ``WorkingDirectory=`` to the repo
     root) or is overridden by the ``DARK_FACTORY_ROOT`` environment variable.
     This allows relocating the checkout without editing the unit file.
+
+    A group whose collector fails writes no rows this tick and the others are
+    still written; only a store that cannot be opened exits non-zero.
     """
     root = os.environ.get('DARK_FACTORY_ROOT', '.')
     db_path = Path(root) / 'data/load-samples.db'
@@ -48,38 +57,30 @@ def main() -> None:
         sys.exit(1)
 
     now = int(time.time())
-
-    # Degrade-and-continue: a failure in one collection group (e.g. kernel
-    # lacking PSI support) should not discard the other group's metrics.
-    # Each tick is independent, so partial writes are better than no write.
-    # Only store-construction failure justifies a non-zero exit.
-    try:
-        psi = collect_psi()
-    except Exception:
-        logger.exception('Failed to collect PSI metrics; writing process metrics only')
-        psi = {}
-
-    try:
-        process_metrics = collect_process_metrics()
-    except Exception:
-        # collect_process_metrics propagates a total proc_iter failure (no bare
-        # except inside metrics.py).  This handler is the SINGLE loud degrade
-        # point: log at exception level and fall back to an EMPTY dict so
-        # run_tick writes ZERO process rows — distinguishable from a fabricated
-        # healthy 0.0.  Per-process NoSuchProcess/AccessDenied are still
-        # silently skipped inside the counters (benign mid-scan deaths).
-        logger.exception('Failed to collect process metrics; writing PSI metrics only')
-        process_metrics = {}
-
-    run_tick(store, now, psi=psi, process_metrics=process_metrics)
+    collected = {group: _collect(group) for group in groups}
+    written = run_tick(store, now, collected)
     store.maybe_vacuum(now)
 
     logger.info(
-        'tick ts=%d psi=%s process=%s',
+        'tick ts=%d %s',
         now,
-        {k: f'{v:.2f}' for k, v in psi.items()},
-        {k: f'{v:.0f}' for k, v in process_metrics.items()},
+        ' '.join(f'{group.name}={_render(written.get(group))}' for group in groups),
     )
+
+
+def _collect(group: MetricGroup) -> Samples:
+    """The one degrade handler: a failed collection is ``{}``, never a fabricated 0.0."""
+    try:
+        return group.collect()
+    except Exception:
+        logger.exception('Failed to collect %s metrics; writing the other groups only', group.name)
+        return {}
+
+
+def _render(samples: Samples | None) -> str:
+    if samples is None:
+        return 'dropped'
+    return str({key.label(): f'{value:.2f}' for key, value in samples.items()})
 
 
 if __name__ == '__main__':

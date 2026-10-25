@@ -120,6 +120,8 @@ CALL_RETRY_ATTEMPTS = 3
 #: Seconds, multiplied by the attempt number for a linear backoff. Module-level
 #: rather than a literal so a test can set it to 0 instead of sleeping.
 CALL_RETRY_BACKOFF_S = 1.0
+#: Seconds every request gets unless :meth:`FusedMemoryClient.call_tool` is given its own.
+DEFAULT_CALL_TIMEOUT_S = 30.0
 
 
 def _flatten_tasks(tasks_payload: Any) -> list[dict]:
@@ -148,13 +150,17 @@ class FusedMemoryClient:
     #: Override it in a subclass — do NOT restate `_initialize` to change it.
     _client_name: str = 'migrate-metadata'
 
-    def __init__(self, server_url: str):
+    def __init__(self, server_url: str, *, transport: httpx.AsyncBaseTransport | None = None):
+        """*transport* is the httpx transport the client sends through, so a test can pass ``httpx.MockTransport``."""
         self._url = server_url.rstrip('/')
+        self._transport = transport
         self._client: httpx.AsyncClient | None = None
         self._session_id: str | None = None
 
     async def __aenter__(self) -> FusedMemoryClient:
-        self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        self._client = httpx.AsyncClient(
+            timeout=DEFAULT_CALL_TIMEOUT_S, follow_redirects=True, transport=self._transport
+        )
         self._session_id = uuid.uuid4().hex
         await self._initialize()
         return self
@@ -163,14 +169,20 @@ class FusedMemoryClient:
         if self._client is not None:
             await self._client.aclose()
 
-    async def _post(self, payload: dict) -> dict:
+    async def _post(self, payload: dict, *, timeout: float | None = None) -> dict:
         assert self._client is not None
         headers = {
             'Content-Type': 'application/json',
             'Accept': 'application/json, text/event-stream',
             'mcp-session-id': self._session_id or '',
         }
-        resp = await self._client.post(f'{self._url}/mcp/', json=payload, headers=headers)
+        from shared.mcp_post import mcp_endpoint_url  # local: E402-safe
+        resp = await self._client.post(
+            mcp_endpoint_url(self._url),
+            json=payload,
+            headers=headers,
+            timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
+        )
         resp.raise_for_status()
         # 202 Accepted (notifications) returns no body.
         if resp.status_code == 202 or not resp.content:
@@ -200,13 +212,18 @@ class FusedMemoryClient:
             'params': {},
         })
 
-    async def call_tool(self, name: str, arguments: dict) -> dict:
+    async def call_tool(self, name: str, arguments: dict, *, timeout: float | None = None) -> dict:
+        """Call tool *name* with *arguments*.
+
+        *timeout* is seconds for this call only. None means the client's
+        :data:`DEFAULT_CALL_TIMEOUT_S`, not httpx's "no timeout".
+        """
         result = await self._post({
             'jsonrpc': '2.0',
             'id': uuid.uuid4().hex,
             'method': 'tools/call',
             'params': {'name': name, 'arguments': arguments},
-        })
+        }, timeout=timeout)
         if 'error' in result:
             raise RuntimeError(f'{name} failed: {result["error"]}')
         # MCP tools/call returns content list; structuredContent is the parsed dict
@@ -261,9 +278,11 @@ def _clip(value: Any, limit: int = 200) -> str:
 
 
 async def call_tool_with_retry(
-    client: FusedMemoryClient, name: str, arguments: dict,
+    client: FusedMemoryClient, name: str, arguments: dict, *, timeout: float | None = None,
 ) -> dict:
     """Call *name*, retrying only TRANSPORT-level failures. See :data:`CALL_RETRY_ATTEMPTS`.
+
+    *timeout* is passed to every attempt's :meth:`FusedMemoryClient.call_tool`.
 
     A rejection is not an exception here — the server answers, and
     :func:`write_failure_reason` classifies the answer — so the only thing this
@@ -278,7 +297,7 @@ async def call_tool_with_retry(
     """
     for attempt in range(1, CALL_RETRY_ATTEMPTS + 1):
         try:
-            return await client.call_tool(name, arguments)
+            return await client.call_tool(name, arguments, timeout=timeout)
         except httpx.TransportError as exc:
             if attempt >= CALL_RETRY_ATTEMPTS:
                 raise
@@ -303,17 +322,23 @@ def write_failure_reason(reply: Any) -> str | None:
     migration exists to stop colliding with — arrives here as a perfectly
     ordinary return value, and without this predicate is printed as a success.
 
-    DELIBERATELY MIRRORS, RATHER THAN IMPORTS, two existing implementations of
-    the same contract:
+    DELIBERATELY MIRRORS, RATHER THAN IMPORTS, the one canonical
+    implementation of this contract —
+    ``fused_memory.middleware.task_interceptor::interceptor_write_succeeded``,
+    which is not importable here: ``fused_memory`` fails to import from this
+    script's runtime context (measured: ``ModuleNotFoundError:
+    graphiti_core``).
 
-    * ``fused_memory.middleware.task_interceptor.interceptor_write_succeeded``,
-      the canonical one. Not importable here — ``fused_memory`` fails to import
-      from this script's runtime context (measured:
-      ``ModuleNotFoundError: graphiti_core``).
-    * ``scripts/repair_wiped_metadata_files.py:classify_reply``. Not imported
-      because that module imports :class:`FusedMemoryClient` FROM this one
-      (:1066); importing it back would make this base module depend on its
-      subclass's module.
+    THIS IS THE SINGLE IMPLEMENTATION FOR BOTH SCRIPTS.
+    ``scripts/repair_wiped_metadata_files.py::classify_reply`` was a
+    transcribed twin until task 4608 and now DELEGATES here, wrapping the
+    ``str | None`` returned below in its own ``ReplyVerdict``. It runs in that
+    direction and not the reverse because that module imports
+    :class:`FusedMemoryClient` FROM this one — importing ``classify_reply``
+    back would make this base module depend on its subclass's module. Its
+    import of this function is FUNCTION-SCOPED, so this module's module-scope
+    ``httpx`` stays off that script's dry-run path; do not "tidy" it by asking
+    it to hoist the import.
 
     THE CHECK ORDER IS LOAD-BEARING: not-a-dict first (nothing else can call
     ``.get`` on it), then emptiness — a ``{}`` has neither an ``error`` nor a

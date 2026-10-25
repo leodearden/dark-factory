@@ -608,7 +608,7 @@ class TestResolveZeroProgressRequeueAlert:
             agent_role='someone-else',
             severity='blocking',
             level=1,
-            category='merge_conflict',
+            category='merge_error',
             summary='not ours',
             detail='not ours',
         )

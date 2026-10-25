@@ -48,7 +48,7 @@ Row    Name                                        Seam(s) driven
                                                      routing, no branch charge, one probe across two merges)
 6      infra non-consumption, both consumers        task-verify: ``TaskWorkflow._verify_debugfix_loop``;
                                                      merge-verify: ``_run_post_merge_verify`` accounting
-7      train amortization                           ``MergeWorker._do_merge`` (exactly one broad,
+7      train amortization                           ``MergeLane`` train merge (exactly one broad,
                                                      per-module merge-role verify of the train tip)
 8      rollback path (breadth='scoped')              producer: ``run_scoped_verification`` (byte-identical
                                                      legacy merge-role plan)
@@ -66,7 +66,7 @@ inspects the executed ``ModuleConfig``(s) / ``VerifyResult.plan`` /
 ``VerifyResult.summary``. The CONSUMER/merge-gate side drives the REAL
 ``_run_post_merge_verify`` chokepoint (merge_queue.py), opting OUT of the
 autouse ``_mock_merge_queue_verification`` stub via
-``@pytest.mark.exercise_merge_verify`` so ``orchestrator.merge_queue.
+``@pytest.mark.exercise_merge_verify`` so ``orchestrator.merge_lane.worker.
 run_scoped_verification`` stays bound to the REAL function — which, in turn,
 calls the SAME patched ``orchestrator.verify.run_verification`` fake. One
 patched seam, two chokepoints, both real end-to-end.
@@ -104,7 +104,7 @@ from typing import Literal, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _serial_merge_worker import MergeWorker
+from _merge_lane_fakes import merge_through_lane
 from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
 from test_train_integration import _SpyEventStore, build_group_merge_request, make_stacked_member
 from test_verify import _real_worktree_reader
@@ -123,7 +123,8 @@ from test_workflow_verify_infra_resume import _make as _make_workflow
 from orchestrator import verify, verify_plan
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
     MergeOutcome,
@@ -737,7 +738,7 @@ class TestRow5WhollyPreexistingMainHealthRedAndCacheHit:
         shared_git_ops = _make_git_ops(tmp_path)
         probe_spy = AsyncMock(wraps=verify_failure_is_preexisting_on_main)
         with patch(
-            'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+            'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
             new=probe_spy,
         ):
             outcome1 = await _drive_merge_gate(
@@ -937,11 +938,11 @@ class TestRow6InfraTransientConsumesNoAttemptBothConsumers:
 # Row 7: "train amortization" (λ/σ, T1). A 3-member line-stacked Python
 # train lands via exactly ONE broad, per-module merge-role verify of the
 # TIP — the amortization win — driven through the REAL
-# ``MergeWorker._do_merge`` -> ``_do_train_merge`` -> ``_run_post_merge_verify``
+# ``MergeLane`` -> ``_do_train_merge`` -> ``_run_post_merge_verify``
 # chokepoint chain. Adapts test_train_integration.py's real-git train harness
-# (``make_stacked_member`` / ``build_group_merge_request`` / ``_SpyEventStore``
-# / the test-local ``MergeWorker`` reference) to non-cargo Python modules
-# with an instrumented fake ``run_verification`` — no cargo, no ssh.
+# (``make_stacked_member`` / ``build_group_merge_request`` / ``_SpyEventStore``)
+# driven through ``MergeLane``, to non-cargo Python modules with an
+# instrumented fake ``run_verification`` — no cargo, no ssh.
 # ---------------------------------------------------------------------------
 
 
@@ -990,7 +991,7 @@ def _three_module_train_registry(
     scoped``). A ``None`` ``type_check_command`` keeps
     ``_run_unscoped_typechecks``'s ``active`` list empty, so neither call
     ever spawns a real, unpatched ``pyright`` subprocess — that function is
-    reached via ``orchestrator.merge_queue``'s OWN imported
+    reached via ``orchestrator.merge_lane.worker``'s OWN imported
     ``run_verification`` reference, a DIFFERENT binding from the
     ``orchestrator.verify.run_verification`` seam this module patches
     everywhere else, so it would not be faked away like the scoped phase is.
@@ -1072,13 +1073,13 @@ class TestRow7TrainAmortizationOneFullBreadthVerify:
         })
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue, event_store=spy_events)
+        lane = MergeLane(git_ops, queue, event_store=spy_events)
 
         with (
-            patch('orchestrator.merge_queue.run_scoped_verification', side_effect=_spy_verify),
+            patch('orchestrator.merge_lane.worker.run_scoped_verification', side_effect=_spy_verify),
             patch.object(verify, 'run_verification', new=run_verification_fake),
         ):
-            outcome = await worker._do_merge(req)
+            outcome = await merge_through_lane(lane, queue, req)
 
         assert outcome is not None
         assert outcome.status == 'done', f'expected the train to land; got {outcome!r}'
@@ -1306,8 +1307,9 @@ class TestRow9FallbackNarrowingNeverWholeRepoChain:
 # ALSO touched a production file would fork by role, which is not the shape
 # this row exercises.) modB's touched file is a plain SOURCE file with no
 # collectable test alongside it, which DOES fork by role: FULL_SUITE at
-# role='task' (the R3 owning-module pytest floor) vs SKIPPED at role='merge'
-# (R4 — the legacy shape).
+# role='task' (modB carries no whole-tree guard family, so the task-3294
+# floor takes its full-suite fallback leg — gate 5702, task 7253) vs SKIPPED
+# at role='merge' (R4 — the legacy shape).
 ROW10_MODA_TEST_PATH: str = 'moda/tests/test_thing.py'
 ROW10_MODA_TEST_CONTENT: str = 'def test_thing():\n    pass\n'
 ROW10_MODB_SOURCE_PATH: str = 'modb/helpers.py'
@@ -1375,7 +1377,8 @@ class TestRow10PlanAuthorityBothRoles:
     ``plan.runs`` — A1 — at BOTH role='task' and role='merge'. A mixed diff
     (a touched TEST file under modA, role-independent; a touched SOURCE-only
     file under modB, which forks by role — FULL_SUITE pytest at role='task'
-    (R3), SKIPPED at role='merge' (R4, breadth='scoped')) exercises both a
+    (R3's floor, via its no-guard-family fallback leg), SKIPPED at
+    role='merge' (R4, breadth='scoped')) exercises both a
     role-independent and a role-forking module in one plan.
     """
 

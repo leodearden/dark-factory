@@ -29,6 +29,7 @@ import json
 import logging
 
 import pytest
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import entity_mint_storm_escalator as emse_mod
 from fused_memory.middleware.entity_mint_storm_escalator import (
@@ -88,6 +89,15 @@ class TestTheFiledEscalation:
 
         assert len(_filed(root_a)) == 1
         assert len(_filed(root_b)) == 1
+
+    def test_files_into_the_layout_escalation_queue_when_relocated(
+        self, tmp_path, escalation_queue_relocation,
+    ):
+        esc_id = _emit(tmp_path)
+
+        filed = sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))
+        assert [json.loads(p.read_text())['id'] for p in filed] == [esc_id]
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
     def test_carries_the_category_severity_role_and_anchor(self, tmp_path):
         _emit(tmp_path)

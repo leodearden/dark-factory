@@ -91,7 +91,7 @@ uses that flag rather than re-rendering the unit from the template.
 (That last clause is a HISTORICAL record of task 3868's reasoning, kept as
 written. It was true when it was written: re-rendering then meant a truncating
 `sed` redirect. Since task 4796 setup-host.sh renders this unit through
-scripts/render_dashboard_unit.py, which preserves DASHBOARD_KNOWN_PROJECT_ROOTS
+scripts/render_systemd_unit.py, which preserves DASHBOARD_KNOWN_PROJECT_ROOTS
 across the render, so the destructive premise no longer holds for the
 sanctioned install path — `--fix` remains the recommendation because it is
 narrower, not because a re-render would now destroy anything.) Also
@@ -221,7 +221,7 @@ _NO_CAP_SENTINEL = "infinity"
 # no re-provision of the host.
 #
 # It is no longer named because the alternatives are destructive. Task 4796
-# made setup-host.sh install this unit through scripts/render_dashboard_unit.py,
+# made setup-host.sh install this unit through scripts/render_systemd_unit.py,
 # which reads this host's DASHBOARD_KNOWN_PROJECT_ROOTS off the installed unit
 # and puts it back, so a setup-host.sh re-run now PRESERVES those entries (task
 # 4793 did the same for the dashboard unit). A hand-rolled `sed` re-render is
