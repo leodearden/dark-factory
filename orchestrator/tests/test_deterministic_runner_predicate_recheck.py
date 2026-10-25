@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -417,3 +418,116 @@ class TestRearmWriteFailures:
         assert len(scheduler.updates()) == 1
         assert 'gate_escalated_at' not in scheduler.updates()[0]
         assert event_store.fetch_events_by_type(EventType.predicate_rearmed) == []
+
+
+STALL_SUMMARY = 'Milestone predicate still not satisfied after {cap} consecutive checks'
+
+
+@pytest.mark.asyncio
+class TestStallCap:
+    async def test_reaching_the_cap_files_one_stall_escalation(self, queue, event_store):
+        scheduler = _scheduler(_declared_task(), event_store)
+        script = _ScriptRunner(75, NOT_YET)
+        clock = _Clock()
+        first = await _run(scheduler, queue, script, **_rearm_kwargs(clock, cap=2))
+        assert first == WorkflowOutcome.REQUEUED
+        milestone_after_rearm = dict(scheduler.task['metadata']['milestone'])
+        clock.now = FIXED_NOW + timedelta(days=1)
+        writes_before = len(scheduler.writes)
+
+        outcome = await _run(scheduler, queue, script, **_rearm_kwargs(clock, cap=2))
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        [escalation] = _pending(queue)
+        assert escalation.category == 'milestone_check_stalled'
+        assert escalation.level == 2
+        assert escalation.severity == 'critical'
+        assert escalation.agent_role == DETERMINISTIC_AGENT_ROLE
+        assert escalation.category in L2_AUTO_CLOSE_DENY_CATEGORIES
+        assert escalation.summary == STALL_SUMMARY.format(cap=2)
+        for fragment in (
+            'streak 2/2',
+            FIXED_NOW.isoformat(),
+            str(timedelta(days=1)),
+            '86400',
+            json.dumps(NOT_YET_VERDICT, separators=(',', ':')),
+            'kept across',
+            'resume',
+            'abandon',
+        ):
+            assert fragment in escalation.detail, fragment
+        stall_writes = scheduler.writes[writes_before:]
+        assert [kind for kind, _ in stall_writes] == ['update_task', 'set_task_status']
+        [payload] = [w['metadata'] for kind, w in stall_writes if kind == 'update_task']
+        assert set(payload) == {'gate_escalated_at', 'predicate_recheck', 'predicate_verdict'}
+        assert payload['predicate_recheck'] == {
+            'consecutive': 0,
+            'first_rearmed_at': FIXED_NOW.isoformat(),
+            'last_checked_at': clock.now.isoformat(),
+            'next_check_at': None,
+        }
+        assert payload['predicate_verdict'] == NOT_YET_VERDICT
+        assert scheduler.task['metadata']['milestone'] == milestone_after_rearm
+        assert stall_writes[-1][1]['status'] == 'blocked'
+        [event] = event_store.fetch_events_by_type(EventType.predicate_recheck_stalled)
+        assert event['task_id'] == TASK_ID
+        assert (
+            event['data']['rc'],
+            event['data']['consecutive'],
+            event['data']['stall_cap'],
+            event['data']['next_check_at'],
+        ) == (75, 2, 2, None)
+        assert len(event_store.fetch_events_by_type(EventType.predicate_rearmed)) == 1
+
+    async def test_a_pending_stall_is_quiescent(self, queue, event_store):
+        scheduler = _scheduler(_declared_task(), event_store)
+        script = _ScriptRunner(75, NOT_YET)
+        clock = _Clock()
+        await _run(scheduler, queue, script, **_rearm_kwargs(clock, cap=2))
+        await _run(scheduler, queue, script, **_rearm_kwargs(clock, cap=2))
+
+        outcome = await _run(scheduler, queue, script, **_rearm_kwargs(clock, cap=2))
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert script.calls == 2
+        assert len(_own_records(queue)) == 1
+
+    async def test_resume_after_a_stall_restarts_the_streak(self, queue, event_store):
+        scheduler = _scheduler(_declared_task(), event_store)
+        script = _ScriptRunner(75, NOT_YET)
+        clock = _Clock()
+        await _run(scheduler, queue, script, **_rearm_kwargs(clock, cap=2))
+        clock.now = FIXED_NOW + timedelta(days=1)
+        await _run(scheduler, queue, script, **_rearm_kwargs(clock, cap=2))
+        [stall] = _pending(queue)
+        queue.resolve(stall.id, 'resume')
+        clock.now = FIXED_NOW + timedelta(days=2)
+
+        outcome = await _run(scheduler, queue, script, **_rearm_kwargs(clock, cap=2))
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        assert script.calls == 3
+        record = scheduler.task['metadata']['predicate_recheck']
+        assert record['consecutive'] == 1
+        assert record['first_rearmed_at'] == FIXED_NOW.isoformat()
+        assert len(_own_records(queue)) == 1
+        assert _pending(queue) == []
+
+    async def test_a_cap_of_one_stalls_on_the_first_not_yet(self, queue, event_store):
+        scheduler = _scheduler(_declared_task(), event_store)
+
+        outcome = await _run(
+            scheduler, queue, _ScriptRunner(75, NOT_YET), **_rearm_kwargs(_Clock(), cap=1),
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        [escalation] = _pending(queue)
+        assert escalation.category == 'milestone_check_stalled'
+        assert escalation.summary == STALL_SUMMARY.format(cap=1)
+        record = scheduler.task['metadata']['predicate_recheck']
+        assert record['consecutive'] == 0
+        assert record['first_rearmed_at'] is None
+        assert scheduler.task['metadata']['milestone'] == DECLARED_MILESTONE
+        assert event_store.fetch_events_by_type(EventType.predicate_rearmed) == []
+        [event] = event_store.fetch_events_by_type(EventType.predicate_recheck_stalled)
+        assert (event['data']['consecutive'], event['data']['stall_cap']) == (1, 1)
