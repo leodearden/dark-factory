@@ -34,6 +34,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import shared.safe_io as _safe_io
 from _lane_episode_fakes import Clock, FakeLedgerClient
+from _merge_lane_fakes import lane_scene_config
 from _orch_helpers import make_placeholder_future, pydantic_spec
 from escalation.models import Escalation
 
@@ -342,10 +343,10 @@ class TestStewardGuardsAreTaskScoped:
 # ---------------------------------------------------------------------------
 
 def _merge_config(project_root: Path):
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    return OrchestratorConfig(
-        project_root=project_root,
-        git=GitConfig(
+    from orchestrator.config import GitConfig
+    return lane_scene_config(
+        project_root,
+        GitConfig(
             main_branch='main',
             branch_prefix='task/',
             remote='origin',
