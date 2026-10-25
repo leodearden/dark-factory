@@ -789,6 +789,30 @@ async def test_assembled_task_context_carries_the_elision_markers(mock_memory, m
     assert_elided(_memory_body(result.context_items[hinted.id].formatted), hinted.content)
 
 
+@pytest.mark.asyncio
+async def test_assembled_context_renders_typical_long_records_whole(mock_memory, mock_taskmaster):
+    """A description just above the measured p90 and a memory body at the dark_factory p90
+    reach the payload whole (plans/recon-evidence-caps-measurement-2026-10.md, M1/M2)."""
+    desc = 'd' * 3_800
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        **_task_with_description(desc),
+        'id': '42',
+        'metadata': {'memory_hints': {'queries': ['q']}},
+    })
+    hinted = _make_memory_result(content='m' * 1_950)
+    mock_memory.search = AsyncMock(return_value=[hinted])
+    assembler = _make_assembler(memory_service=mock_memory, taskmaster=mock_taskmaster)
+    events = [_make_event(
+        event_type=EventType.task_status_changed,
+        payload={'task_id': '42', 'old_status': 'in-progress', 'new_status': 'done'},
+    )]
+
+    result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+    assert _desc_line(result.context_items['task:42'].formatted) == f'  desc: {desc}'
+    assert _memory_body(result.context_items[hinted.id].formatted) == hinted.content
+
+
 # ── _ctx_task_event subtask qualification ────────────────────────────
 
 
