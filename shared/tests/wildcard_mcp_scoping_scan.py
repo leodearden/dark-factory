@@ -74,6 +74,16 @@ Design
   the call: an unresolvable argument must never be a blessing, and a name the
   scanner cannot see through may hold ``{}`` at runtime — the very footgun
   being guarded.
+* **A call through a bound name is the same call.**  A callee counts when its
+  bare name is a target, or when the module binds that name to a target: a
+  parameter defaulting to one (``invoke=invoke_with_cap_retry``), the attribute
+  assigned from such a parameter (``self._invoke = invoke``), or a class-body
+  field defaulting to one (the dataclass form).  A constructor-injected invoker
+  is therefore still a site, matched by its binding rather than its spelling.
+  The alias set is module-wide; that is acceptable because a site still needs
+  the literal wildcard or registry kwargs, and it keeps
+  :func:`records_worth_scanning` sound because every binding spells a target
+  name.
 """
 
 from __future__ import annotations
@@ -132,7 +142,7 @@ class WildcardMcpScopingSite(NamedTuple):
 
     filename: str        # repo-relative posix path, the caller's spelling
     qualname: str        # enclosing def, e.g. 'TaskCurator._call_llm'
-    callee: str          # the target name as written
+    callee: str          # the callee as written: a target or a name bound to one
     lineno: int          # display only -- drifts on any edit above the site
     exemption: str       # how it is protected, or NOT_EXEMPT when it is not
     message: str         # one-line human explanation
@@ -228,6 +238,83 @@ def _is_true_literal(node: ast.expr | None) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Injected-invoker bindings
+# --------------------------------------------------------------------------- #
+
+
+def _bare_name(node: ast.expr | None) -> str | None:
+    """``Name.id`` or ``Attribute.attr`` of a reference, else None."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _is_target_reference(node: ast.expr | None) -> bool:
+    return _bare_name(node) in TARGET_CALLEES
+
+
+def _target_defaulted_params(args: ast.arguments) -> set[str]:
+    """Parameters whose default is a target callee."""
+    positional = [*args.posonlyargs, *args.args]
+    first_defaulted = len(positional) - len(args.defaults)
+    defaulted = list(zip(positional[first_defaulted:], args.defaults, strict=True))
+    defaulted += [
+        (arg, default)
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True)
+        if default is not None
+    ]
+    return {arg.arg for arg, default in defaulted if _is_target_reference(default)}
+
+
+def _attributes_assigned_from(
+    func: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda, params: set[str],
+) -> set[str]:
+    """Attributes *func* assigns one of *params* to, e.g. ``self._invoke = invoke``."""
+    attrs: set[str] = set()
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not (isinstance(value, ast.Name) and value.id in params):
+            continue
+        attrs.update(target.attr for target in targets if isinstance(target, ast.Attribute))
+    return attrs
+
+
+def _target_class_fields(cls: ast.ClassDef) -> set[str]:
+    """Class-body fields whose default is a target callee (the dataclass form)."""
+    fields: set[str] = set()
+    for stmt in cls.body:
+        if isinstance(stmt, ast.AnnAssign):
+            targets, value = [stmt.target], stmt.value
+        elif isinstance(stmt, ast.Assign):
+            targets, value = stmt.targets, stmt.value
+        else:
+            continue
+        if _is_target_reference(value):
+            fields.update(target.id for target in targets if isinstance(target, ast.Name))
+    return fields
+
+
+def _injected_invoker_names(tree: ast.Module) -> frozenset[str]:
+    """The names *tree* binds to a target callee, so a call through one is a call to it."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            params = _target_defaulted_params(node.args)
+            if params:
+                names |= params | _attributes_assigned_from(node, params)
+        elif isinstance(node, ast.ClassDef):
+            names |= _target_class_fields(node)
+    return frozenset(names)
+
+
+# --------------------------------------------------------------------------- #
 # Scanner
 # --------------------------------------------------------------------------- #
 
@@ -259,8 +346,9 @@ def find_wildcard_mcp_scoping_sites(
     """Report every call in *tree* that reaches the CLI through a registry
     filter that does not filter MCP.
 
-    A call is a site when its callee's bare name is in :data:`TARGET_CALLEES`
-    AND either trigger holds:
+    A call is a site when its callee's bare name is in :data:`TARGET_CALLEES`,
+    or is a name the module binds to one (a defaulted parameter, the attribute
+    assigned from it, or a class-field default), AND either trigger holds:
 
     * WILDCARD — ``disallowed_tools`` is a list/tuple display containing
       ``'*'`` AND ``output_schema`` is passed and is not a falsy literal; or
@@ -290,18 +378,34 @@ def find_wildcard_mcp_scoping_sites(
             _parent_map = _build_parent_map(tree)
         return _parent_map
 
+    _aliases: frozenset[str] | None = None
+
+    def calls_a_target(callee: str) -> bool:
+        """The injected-invoker bindings are read LAZILY, at most once, and only
+        for a file holding a triggering call to a non-target name, for the same
+        reason as :func:`parent_map`.
+        """
+        nonlocal _aliases
+        if callee in TARGET_CALLEES:
+            return True
+        if _aliases is None:
+            _aliases = _injected_invoker_names(tree)
+        return callee in _aliases
+
     sites: list[WildcardMcpScopingSite] = []
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         callee = _callee_name(node)
-        if callee not in TARGET_CALLEES:
+        if callee is None:
             continue
         wildcard = _denies_everything(
             _keyword(node, 'disallowed_tools')
         ) and not _is_falsy_literal(_keyword(node, 'output_schema'))
         if not (wildcard or _sets_registry_filter(_keyword(node, 'available_tools'))):
+            continue
+        if not calls_a_target(callee):
             continue
 
         pmap = parent_map()
