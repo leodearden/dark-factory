@@ -58,9 +58,122 @@ class Classified:
     follow_ups: tuple[str, ...] = ()
 
 
-MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({})
+_PROFILE_RIDES_SPEC = (
+    'Task 2822 fix a: the merge-gate profile rides MergeVerifySpec, and '
+    "run_merge_verify_on_worktree applies it through apply_spec_to_host_config's field_overrides."
+)
+_GLOBAL_COMMANDS_FROM_HOST = (
+    'Carried as spec.global_verify_command only when the spec has no verify_commands and the '
+    'dispatcher has a global command. The force_workspace route with a non-empty module set ends '
+    "in run_verification(module_config=None), which runs the host's own globals."
+)
+_FAN_OUT_CAP = 'A fan-out cap: it bounds how many module verifies run at once, never which ones run.'
+_ADMISSION = (
+    'Verify admission scheduling: it decides when a run starts and at what priority, never what it selects.'
+)
+_CGROUP_SHAPING = 'cgroup CPU shaping: it weights the run against other work and leaves its commands alone.'
+_FAILS_CLOSED_TIMEOUT = (
+    'A timeout only ends a run timed_out, which the merge path fails closed: the scoped verify does '
+    'not pass, and the unscoped gate runs with block_on_timeout=True.'
+)
 
-UNREAD_CANDIDATES: Mapping[str, str] = MappingProxyType({})
+MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({
+    # SPEC_CARRIED
+    'merge_verify_workspace': Classified(
+        Fidelity.SPEC_CARRIED,
+        f'{_PROFILE_RIDES_SPEC} LocalRunner.run_merge_verify reads it as force_workspace.',
+    ),
+    'merge_verify_breadth': Classified(Fidelity.SPEC_CARRIED, _PROFILE_RIDES_SPEC),
+    'module_configs_or_empty': Classified(
+        Fidelity.SPEC_CARRIED,
+        'Task 4536: apply_spec_to_host_config installs the module registry from spec.verify_commands, '
+        "so the host's own discovery walk never decides.",
+    ),
+    'verify_env': Classified(
+        Fidelity.SPEC_CARRIED,
+        'Task 5496: {**host effective_verify_env, **spec.verify_env}. The spec wins on every key it '
+        'ships; host-only keys survive by design.',
+    ),
+    'verify_cold_preprovision_command': Classified(
+        Fidelity.SPEC_CARRIED,
+        "Task 6127: a non-empty spec value replaces the host's, and '' keeps the host's own by design "
+        '(plans/remote-task-leg-verify-prd.md §4.1).',
+    ),
+    # HOST_DECIDING
+    'scope_cargo': Classified(
+        Fidelity.HOST_DECIDING,
+        "Gates verify.py::_apply_cargo_scope's --workspace to -p rewrite, including the zero-module "
+        'cargo-scoped route. MergeVerifySpec does not carry it.',
+        follow_ups=('agent-followup-5295-scope-cargo',),
+    ),
+    'git': Classified(
+        Fidelity.HOST_DECIDING,
+        'git.merge_config_only_full_gate_globs forces the full gate for a config-only diff and is never '
+        "carried. git.main_branch drives the remote's _derive_task_files_from_git whenever "
+        'spec.task_files is None: merge_lane/drift.py ships None, and so does the serial route when '
+        "the dispatcher's own derivation comes back empty.",
+        follow_ups=(
+            'agent-followup-5295-config-only-globs',
+            'agent-followup-5295-remote-task-files-derivation',
+        ),
+    ),
+    'test_command': Classified(
+        Fidelity.HOST_DECIDING, _GLOBAL_COMMANDS_FROM_HOST, follow_ups=('agent-followup-5295-global-commands',)
+    ),
+    'lint_command': Classified(
+        Fidelity.HOST_DECIDING, _GLOBAL_COMMANDS_FROM_HOST, follow_ups=('agent-followup-5295-global-commands',)
+    ),
+    'type_check_command': Classified(
+        Fidelity.HOST_DECIDING, _GLOBAL_COMMANDS_FROM_HOST, follow_ups=('agent-followup-5295-global-commands',)
+    ),
+    # MERGE_NEUTRAL
+    'concurrent_verify': Classified(Fidelity.MERGE_NEUTRAL, 'Leg order only: every leg still runs.'),
+    'sequential_lint_first': Classified(
+        Fidelity.MERGE_NEUTRAL, 'Lint-first skips test and type check only after lint is already red.'
+    ),
+    'cpu_governance': Classified(Fidelity.MERGE_NEUTRAL, 'An exec wrapper around the same commands.'),
+    'max_concurrent_module_verifies': Classified(Fidelity.MERGE_NEUTRAL, _FAN_OUT_CAP),
+    'merge_verify_max_concurrent_modules': Classified(Fidelity.MERGE_NEUTRAL, _FAN_OUT_CAP),
+    'project_root': Classified(
+        Fidelity.MERGE_NEUTRAL, "The host's own checkout, read only to tag the cgroup scope."
+    ),
+    'verify_admission_background_promote_secs': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
+    'verify_admission_enabled': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
+    'verify_admission_nice_background': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
+    'verify_admission_nice_merge': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
+    'verify_admission_nice_task': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
+    'verify_admission_order': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
+    'verify_admission_pytest_n': Classified(
+        Fidelity.MERGE_NEUTRAL, f'{_ADMISSION} It changes xdist parallelism, never test selection.'
+    ),
+    'verify_admission_slots_dir': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
+    'verify_admission_task_slots': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
+    'verify_cgroup_cpu_weight_background': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_SHAPING),
+    'verify_cgroup_cpu_weight_merge': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_SHAPING),
+    'verify_cgroup_cpu_weight_task': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_SHAPING),
+    'verify_use_cgroup_scope': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_SHAPING),
+    'verify_clock_stop_enabled': Classified(Fidelity.MERGE_NEUTRAL, _FAILS_CLOSED_TIMEOUT),
+    'verify_clock_stop_heartbeat_idle_max': Classified(Fidelity.MERGE_NEUTRAL, _FAILS_CLOSED_TIMEOUT),
+    'verify_clock_stop_marker_heartbeat': Classified(Fidelity.MERGE_NEUTRAL, _FAILS_CLOSED_TIMEOUT),
+    'verify_clock_stop_marker_start': Classified(Fidelity.MERGE_NEUTRAL, _FAILS_CLOSED_TIMEOUT),
+    'verify_clock_stop_marker_stop': Classified(Fidelity.MERGE_NEUTRAL, _FAILS_CLOSED_TIMEOUT),
+    'verify_clock_stop_max_total_secs': Classified(Fidelity.MERGE_NEUTRAL, _FAILS_CLOSED_TIMEOUT),
+    'verify_command_timeout_secs': Classified(Fidelity.MERGE_NEUTRAL, _FAILS_CLOSED_TIMEOUT),
+    'verify_cold_command_timeout_secs': Classified(Fidelity.MERGE_NEUTRAL, _FAILS_CLOSED_TIMEOUT),
+    'merge_verify_cold_command_timeout_secs': Classified(Fidelity.MERGE_NEUTRAL, _FAILS_CLOSED_TIMEOUT),
+    'verify_timeout_retries': Classified(
+        Fidelity.MERGE_NEUTRAL,
+        'Every run_verification call reachable from LocalRunner.run_merge_verify passes max_retries=0.',
+    ),
+})
+
+UNREAD_CANDIDATES: Mapping[str, str] = MappingProxyType({
+    'lock_depth': 'Module prefixes on the merge path come from spec.verify_commands.',
+    'for_module': (
+        'No host-side prefix resolution happens on the merge path; '
+        'config._discover_module_configs is unreachable from the entry points.'
+    ),
+})
 
 
 # ---------------------------------------------------------------------------
