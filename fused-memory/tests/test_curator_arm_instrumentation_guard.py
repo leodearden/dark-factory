@@ -42,9 +42,10 @@ TASK_INTERCEPTOR = SRC_ROOT / 'middleware' / 'task_interceptor.py'
 CURATOR_CLASS = 'TaskCurator'
 CURATE_METHOD = 'curate'
 
-# ``calls_named`` matches an attribute's name exactly, so the sibling batch
-# path ``self._call_llm_batch(...)`` cannot select the wrong ``try``.
-LLM_CALL = '_call_llm'
+# The batch path calls the same invoker, but from
+# ``_call_llm_batch_with_fallback`` rather than ``curate()``, so the one
+# ``try`` in ``curate()`` that calls it is still the single-candidate call.
+LLM_CALL = '_invoke_curator'
 REPORT_CALL = 'report_failure'
 DEFER_FUNNEL = 'deferred'
 

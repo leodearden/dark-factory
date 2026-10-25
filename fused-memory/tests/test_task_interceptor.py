@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import submit_as_one_batch, zot_agent_result
+from _curator_helpers import agent_result, submit_as_one_batch, zot_agent_result
 from _fm_helpers import _init_git_repo, make_8df8_scenario, poll_until
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
 from shared.async_sqlite_base import CheckpointResult
@@ -2176,10 +2176,7 @@ async def test_concurrent_add_task_produces_single_task(
     record_task was fire-and-forget and the second triage's embedding
     lookup missed the first task's vector.
     """
-    from fused_memory.middleware.curator_types import (
-        CuratorDecision,
-        PoolWithheld,
-    )
+    from fused_memory.middleware.curator_types import PoolWithheld
     from fused_memory.middleware.task_curator import TaskCurator
 
     # Use a real curator so the exact-match cache is exercised; stub
@@ -2187,18 +2184,13 @@ async def test_concurrent_add_task_produces_single_task(
     async def empty_corpus(*a, **k):
         return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
-    real_curator = TaskCurator(config=curator_enabled_config, taskmaster=taskmaster)
+    invoke = AsyncMock(return_value=agent_result({'action': 'create', 'justification': 'novel'}))
+    real_curator = TaskCurator(
+        config=curator_enabled_config, taskmaster=taskmaster, invoke=invoke,
+    )
     real_curator.record_task = AsyncMock()
 
-    llm_calls = 0
-
-    async def fake_call_llm(*a, **k):
-        nonlocal llm_calls
-        llm_calls += 1
-        return CuratorDecision(action='create', justification='novel')
-
     real_curator._build_corpus = empty_corpus  # type: ignore[method-assign]
-    real_curator._call_llm = fake_call_llm  # type: ignore[method-assign]
 
     from fused_memory.middleware.ticket_store import TicketStore
 
@@ -2244,9 +2236,9 @@ async def test_concurrent_add_task_produces_single_task(
     # Exactly one created; the second is a pre-LLM drop pointing at the first.
     ids = {r['id'] for r in results}
     assert ids == {'100'}
-    # Exactly one LLM call — the second never reached _call_llm because
+    # Exactly one LLM call — the second never reached the LLM because
     # the pre-LLM exact-match cache caught it.
-    assert llm_calls == 1
+    assert invoke.await_count == 1
     # Only one survivor in taskmaster.
     assert add_task_counter['n'] == 100
 
@@ -16477,7 +16469,10 @@ class TestZotDuplicateSweepWiring:
 
     @staticmethod
     async def _real_curator(cfg, stub_escalator, corpus, monkeypatch, project_id):
-        curator = TaskCurator(config=cfg, taskmaster=None, escalator=stub_escalator)
+        curator = TaskCurator(
+            config=cfg, taskmaster=None, escalator=stub_escalator,
+            invoke=AsyncMock(return_value=zot_agent_result()),
+        )
         monkeypatch.setattr(curator, 'search_corpus', corpus.search_corpus)
         monkeypatch.setattr(curator, 'record_task', corpus.record_task)
         await corpus.record_task(
@@ -16492,11 +16487,9 @@ class TestZotDuplicateSweepWiring:
             pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
             prompt_tokens=0,
         )
-        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
-                   new=AsyncMock(return_value=zot_agent_result())):
-            return await curator.curate(
-                candidate, project_id, _ZOT_PROJECT_ROOT, prepared=prepared,
-            )
+        return await curator.curate(
+            candidate, project_id, _ZOT_PROJECT_ROOT, prepared=prepared,
+        )
 
     async def _dispatch(self, interceptor, curator, candidate, decision, project_id):
         return await interceptor._dispatch_ticket_decision(
