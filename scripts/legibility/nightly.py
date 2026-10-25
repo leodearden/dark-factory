@@ -28,12 +28,12 @@ import os
 import subprocess
 import sys
 import traceback
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 # Self-bootstrap for standalone `python scripts/legibility/nightly.py` runs
 # (and the systemd ExecStart, which invokes this file directly) -- must run
@@ -200,6 +200,7 @@ def select_digest_sessions(
     cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
     *, rendered: dict[tuple, str] | None = None,
     skip_sessions: frozenset[str] = frozenset(),
+    build=None,
 ) -> sampling.SampleResult:
     """The budget-bounded, stratified sample of *target_date*'s sessions to
     digest -- :func:`select_scored_records` narrowed by
@@ -252,7 +253,9 @@ def select_digest_sessions(
     strict halt.
 
     *skip_sessions* is forwarded to :func:`select_scored_records`, so a
-    skipped session never enters the returned accounting.
+    skipped session never enters the returned accounting. *build* is the
+    costing renderer (default :func:`legibility.digest.build_digest`), the
+    cost-side twin of :func:`build_digests`'s own *build*.
     """
     scored = select_scored_records(
         cfg, projects_root, target_date, skip_sessions=skip_sessions,
@@ -260,7 +263,7 @@ def select_digest_sessions(
     return sampling.stratified_sample(
         scored, cfg,
         cost_fn=sampling.digest_byte_cost_fn(
-            max_bytes=DEFAULT_MAX_DIGEST_BYTES, rendered=rendered,
+            max_bytes=DEFAULT_MAX_DIGEST_BYTES, build=build, rendered=rendered,
         ),
     )
 
@@ -734,6 +737,57 @@ class PassKind(Enum):
     MANUAL = 'manual'
 
 
+Selector = Callable[..., sampling.SampleResult]
+"""``selector(cfg, projects_root, target_date, *, rendered, skip_sessions)``,
+shaped like :func:`select_digest_sessions`."""
+
+DigestBuilder = Callable[..., tuple[list[str], list[tuple[str, str]]]]
+"""``digest_builder(selected, *, rendered) -> (digests, extractor_failures)``,
+shaped like :func:`build_digests`."""
+
+CensusLauncher = Callable[..., None]
+"""``census_launcher(project_root, *, config_path, caps)``, shaped like
+:func:`_default_census_launcher`."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class _NightSeams:
+    """:func:`run_nightly`'s injected stages with every ``None`` resolved to
+    the real one, except *invoke* and *status_fetcher*: the stage that owns
+    each builds its real one only when it runs."""
+
+    invoke: Callable[[str, str], str] | None
+    status_fetcher: Callable[[], Any] | None
+    poster: Callable[[str, dict], None]
+    committer: Callable[..., unlanded.CommitResult]
+    recorder: Callable[..., trickle_state.TrickleState]
+    retry_recorder: Callable[..., trickle_state.TrickleState | None]
+    selector: Selector
+    digest_builder: DigestBuilder
+    census_launcher: CensusLauncher
+
+    @classmethod
+    def resolve(
+        cls, *, invoke, status_fetcher, poster, committer, recorder, retry_recorder,
+        selector, digest_builder, census_launcher,
+    ) -> _NightSeams:
+        return cls(
+            invoke=invoke,
+            status_fetcher=status_fetcher,
+            poster=poster if poster is not None else _default_poster,
+            committer=committer if committer is not None else unlanded.commit_only,
+            recorder=recorder if recorder is not None else trickle_state.write_night,
+            retry_recorder=(
+                retry_recorder if retry_recorder is not None else trickle_state.record_retry
+            ),
+            selector=selector if selector is not None else select_digest_sessions,
+            digest_builder=digest_builder if digest_builder is not None else build_digests,
+            census_launcher=(
+                census_launcher if census_launcher is not None else _default_census_launcher
+            ),
+        )
+
+
 @dataclass
 class NightlyResult:
     """Outcome of one :func:`run_nightly` run.
@@ -1065,8 +1119,7 @@ def _record_trickle_progress(
                 max_barren_runs=max_barren_runs, poster=poster,
             )
         )
-        record = recorder if recorder is not None else trickle_state.write_night
-        recorded = record(night, barren_escalated=result.barren_escalated)
+        recorded = recorder(night, barren_escalated=result.barren_escalated)
         if trickle_state.finished(exit_code=result.exit_code, capped=result.capped):
             result.retry_due = trickle_state.due_retries(recorded, today=recorded_at.date())
 
@@ -1092,8 +1145,7 @@ def _record_unloaded_night(
             _nothing_sampled(), target_date, result,
             census=None, recorded_at=recorded_at, pass_kind=pass_kind,
         )
-        record = recorder if recorder is not None else trickle_state.write_night
-        record(
+        recorder(
             trickle_state.fold_night(trickle_state.read_prior(project_id), project_id, run),
             barren_escalated=False,
         )
@@ -1121,10 +1173,7 @@ def _record_retry(
     retry_recorder,
     recorded_at: datetime,
 ) -> None:
-    record_retry = (
-        retry_recorder if retry_recorder is not None else trickle_state.record_retry
-    )
-    record_retry(
+    retry_recorder(
         project_id,
         target_date=target_date,
         recorded_at=recorded_at,
@@ -1235,6 +1284,9 @@ def run_nightly(
     committer=None,
     recorder=None,
     retry_recorder=None,
+    selector: Selector | None = None,
+    digest_builder: DigestBuilder | None = None,
+    census_launcher: CensusLauncher | None = None,
     pass_kind: PassKind,
     max_barren_runs: int = trickle_state.DEFAULT_MAX_BARREN_RUNS,
 ) -> NightlyResult:
@@ -1296,6 +1348,11 @@ def run_nightly(
     ``exit_code=0``; the decision-8 fail-loud triggers are added by later
     steps.
     """
+    seams = _NightSeams.resolve(
+        invoke=invoke, status_fetcher=status_fetcher, poster=poster, committer=committer,
+        recorder=recorder, retry_recorder=retry_recorder, selector=selector,
+        digest_builder=digest_builder, census_launcher=census_launcher,
+    )
     if target_date is None:
         target_date = (datetime.now(UTC) - timedelta(days=1)).date()
     if config_path is not None:
@@ -1303,30 +1360,25 @@ def run_nightly(
         cfg = load_config(resolved_config_path)
     elif project_id is not None:
         resolved_config_path, cfg = _load_config_for_project(
-            project_id, target_date,
-            recorder=recorder, retry_recorder=retry_recorder, now=now,
-            pass_kind=pass_kind,
+            project_id, target_date, seams=seams, now=now, pass_kind=pass_kind,
         )
     else:
         raise ValueError('run_nightly requires either config_path or project_id')
     try:
         return _run_configured_nightly(
-            cfg, resolved_config_path,
+            cfg, resolved_config_path, seams,
             projects_root=projects_root, target_date=target_date, now=now,
-            invoke=invoke, status_fetcher=status_fetcher, poster=poster,
-            committer=committer, recorder=recorder, retry_recorder=retry_recorder,
             pass_kind=pass_kind, max_barren_runs=max_barren_runs,
         )
     except Exception as exc:
-        return _crashed_night(cfg, exc, poster=poster)
+        return _crashed_night(cfg, exc, poster=seams.poster)
 
 
 def _load_config_for_project(
     project_id: str,
     target_date: date,
     *,
-    recorder,
-    retry_recorder,
+    seams: _NightSeams,
     now: datetime | None,
     pass_kind: PassKind,
 ) -> tuple[Path, LegibilityConfig]:
@@ -1337,7 +1389,7 @@ def _load_config_for_project(
     except Exception:
         _record_unloaded_night(
             project_id, target_date,
-            recorder=recorder, retry_recorder=retry_recorder,
+            recorder=seams.recorder, retry_recorder=seams.retry_recorder,
             now=now, pass_kind=pass_kind,
         )
         raise
@@ -1374,16 +1426,11 @@ def _census_anchor(state_path: Path) -> str | None:
 def _run_configured_nightly(
     cfg: LegibilityConfig,
     resolved_config_path: Path,
+    seams: _NightSeams,
     *,
     projects_root: Path | str | None,
     target_date: date,
     now: datetime | None,
-    invoke,
-    status_fetcher,
-    poster,
-    committer,
-    recorder,
-    retry_recorder,
     pass_kind: PassKind,
     max_barren_runs: int,
 ) -> NightlyResult:
@@ -1412,10 +1459,11 @@ def _run_configured_nightly(
     )
     census_observation: trickle_state.CensusObservation | None = None
     runner = None
+    poster = seams.poster
+    invoke = seams.invoke
     try:
         if projects_root is None:
             projects_root = DEFAULT_PROJECTS_ROOT
-        commit_fn = committer if committer is not None else unlanded.commit_only
         # Task 4148. The systemd path is `nightly.py run --project-id %i` ->
         # main() -> run_nightly, and main() never built a fetcher -- so
         # `status_fetcher=None` reached `compute_tasks_landed` on every real run
@@ -1449,7 +1497,7 @@ def _run_configured_nightly(
         # AND stub `_default_census_launcher`; see the task-4148 block in
         # scripts/tests/test_legibility_nightly.py for the worked pattern.
         status_fetcher = (
-            status_fetcher if status_fetcher is not None
+            seams.status_fetcher if seams.status_fetcher is not None
             else census_trigger.default_status_fetcher(cfg.project_root)
         )
 
@@ -1461,7 +1509,7 @@ def _run_configured_nightly(
         skip_sessions = (
             _ledgered_sessions(cfg) if pass_kind is PassKind.RETRY else frozenset()
         )
-        sample = select_digest_sessions(
+        sample = seams.selector(
             cfg, projects_root, target_date, rendered=rendered, skip_sessions=skip_sessions,
         )
 
@@ -1492,7 +1540,7 @@ def _run_configured_nightly(
             )
             invoke = runner.invoker(coder.TRICKLE_CODER_STAGE)
 
-        digests, extractor_failures = build_digests(sample.selected, rendered=rendered)
+        digests, extractor_failures = seams.digest_builder(sample.selected, rendered=rendered)
 
         if extractor_failures:
             # A digest builder raise is exceptional (build_digests already
@@ -1648,7 +1696,9 @@ def _run_configured_nightly(
             codebook.dump(cb, codebook_path)
             if _git_status_changed(cfg.project_root, _CODEBOOK_RELPATH):
                 message = f'legibility: nightly trickle sightings for {target_date.isoformat()}'
-                commit_result = commit_fn(cfg.project_root, [_CODEBOOK_RELPATH], message)
+                commit_result = seams.committer(
+                    cfg.project_root, [_CODEBOOK_RELPATH], message,
+                )
                 if not commit_result.ok:
                     # Fail loud (decision 8), and never leave the refused dump
                     # in the checkout -- why, and the remedy applied, are in
@@ -1765,7 +1815,7 @@ def _run_configured_nightly(
             try:
                 _record_trickle_progress(
                     cfg, sample, target_date, result, census=census_observation,
-                    recorder=recorder, retry_recorder=retry_recorder,
+                    recorder=seams.recorder, retry_recorder=seams.retry_recorder,
                     poster=poster, now=now, pass_kind=pass_kind,
                     max_barren_runs=max_barren_runs,
                 )
@@ -1809,6 +1859,9 @@ def run_scheduled_night(
     committer=None,
     recorder=None,
     retry_recorder=None,
+    selector: Selector | None = None,
+    digest_builder: DigestBuilder | None = None,
+    census_launcher: CensusLauncher | None = None,
     max_barren_runs: int = trickle_state.DEFAULT_MAX_BARREN_RUNS,
 ) -> tuple[NightlyResult, ...]:
     """The ``PassKind.SCHEDULED`` :func:`run_nightly` pass over *target_date*,
@@ -1822,8 +1875,9 @@ def run_scheduled_night(
             config_path=config_path, project_id=project_id, projects_root=projects_root,
             target_date=pass_date, now=now, invoke=invoke, status_fetcher=status_fetcher,
             poster=poster, committer=committer, recorder=recorder,
-            retry_recorder=retry_recorder, pass_kind=pass_kind,
-            max_barren_runs=max_barren_runs,
+            retry_recorder=retry_recorder, selector=selector,
+            digest_builder=digest_builder, census_launcher=census_launcher,
+            pass_kind=pass_kind, max_barren_runs=max_barren_runs,
         )
 
     scheduled = run_pass(target_date, PassKind.SCHEDULED)
