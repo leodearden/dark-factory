@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -14,7 +15,7 @@ from shared.cli_invoke import no_mcp_servers_config
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.review_payload import normalize_review
+from orchestrator.review_payload import ReviewPayload, ReviewPayloadError, normalize_review
 
 from .elo import PAIRWISE_RESULT
 from .judge import _strip_metadata, parse_confidence, parse_winner
@@ -161,30 +162,27 @@ def pick_best_result(results: list[EvalResult]) -> EvalResult | None:
 # Review artifact reading
 # ---------------------------------------------------------------------------
 
-def _read_reviewer_verdict_envelopes(artifacts: TaskArtifacts) -> dict[str, Any]:
+def _read_reviewer_verdict_envelopes(artifacts: TaskArtifacts) -> dict[str, ReviewPayload]:
     """Read reviewer verdict envelopes from ``<root>/verdicts/reviewer*.json``.
 
     Post-migration (task 2484), the reviewer's verdict/issues payload for a
     run is written by the verdict-tools MCP server as a schema-versioned
-    envelope (``{role, schema_version, session_id, emitted_at, verdict:
-    {reviewer, verdict, issues, summary}}``) rather than a flat
-    ``.task/reviews/<name>.json`` file. This unwraps ``envelope['verdict']``
-    so callers see the same flat ``{reviewer, verdict, issues, summary}``
-    shape as the legacy reviews/ directory.
+    envelope rather than a flat ``.task/reviews/<name>.json`` file. Each
+    envelope is normalised by ``orchestrator/review_payload.py::normalize_review``.
 
     Only ``reviewer*.json`` files are considered — the verdicts/ directory
     also holds judge/triage/merger envelopes, which are not review
-    artifacts. Missing/corrupt envelopes are skipped (``read_verdict`` is
-    corrupt-tolerant), never raised.
+    artifacts. Missing, corrupt or off-contract envelopes are skipped
+    (``read_verdict`` is corrupt-tolerant), never raised.
 
-    Returns ``{reviewer_name: {verdict, issues, summary, ...}}``. Returns
-    empty dict if the verdicts dir doesn't exist or has no reviewer files.
+    Returns ``{reviewer_name: ReviewPayload}``. Returns an empty dict if the
+    verdicts dir doesn't exist or has no reviewer files.
     """
     verdicts_dir = artifacts.root / 'verdicts'
     if not verdicts_dir.is_dir():
         return {}
 
-    reviews: dict[str, Any] = {}
+    reviews: dict[str, ReviewPayload] = {}
     for path in sorted(verdicts_dir.glob('reviewer*.json')):
         role = path.stem
         try:
@@ -200,43 +198,44 @@ def _read_reviewer_verdict_envelopes(artifacts: TaskArtifacts) -> dict[str, Any]
             continue
         if not envelope:
             continue
-        payload = envelope.get('verdict')
-        if not isinstance(payload, dict):
-            logger.warning('Verdict envelope %s missing/invalid "verdict" payload', path)
+        try:
+            payload = normalize_review(envelope)
+        except ReviewPayloadError as exc:
+            logger.warning('Skipping off-contract verdict envelope %s: %s', path, exc)
             continue
-        name = payload.get('reviewer', role)
-        reviews[name] = payload
+        reviews[payload.reviewer or role] = payload
     return reviews
 
 
-def _read_legacy_reviews(artifacts: TaskArtifacts) -> dict[str, Any]:
+def _read_legacy_reviews(artifacts: TaskArtifacts) -> dict[str, ReviewPayload]:
     """Read ``<root>/reviews/*.json`` directly, tolerating corrupt files.
 
     ``TaskArtifacts.read_reviews()`` has no per-file exception handling, so
     one corrupt/unreadable file would abort the whole read. This mirrors
-    the pre-envelope ``_read_review_artifacts`` behavior: a corrupt file is
-    skipped with a warning rather than raised, so the other reviewers in a
-    pre-migration run are still graded.
+    the pre-envelope ``_read_review_artifacts`` behavior: a corrupt or
+    off-contract file is skipped with a warning rather than raised, so the
+    other reviewers in a pre-migration run are still graded. Each file is
+    normalised by ``orchestrator/review_payload.py::normalize_review``.
 
-    Returns ``{reviewer_name: {verdict, issues, summary}}``. Returns empty
-    dict if the reviews dir doesn't exist.
+    Returns ``{reviewer_name: ReviewPayload}``. Returns an empty dict if the
+    reviews dir doesn't exist.
     """
     reviews_dir = artifacts.root / 'reviews'
     if not reviews_dir.is_dir():
         return {}
 
-    reviews: dict[str, Any] = {}
+    reviews: dict[str, ReviewPayload] = {}
     for path in sorted(reviews_dir.glob('*.json')):
         try:
-            data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
+            payload = normalize_review(json.loads(path.read_text()))
+        except (json.JSONDecodeError, OSError, ReviewPayloadError) as exc:
             logger.warning('Failed to read review %s: %s', path, exc)
             continue
-        reviews[data.get('reviewer', path.stem)] = data
+        reviews[payload.reviewer or path.stem] = payload
     return reviews
 
 
-def _read_review_artifacts(worktree_path: str) -> dict[str, Any]:
+def _read_review_artifacts(worktree_path: str) -> dict[str, ReviewPayload]:
     """Read review data for a worktree, preferring the MCP verdict envelope.
 
     Post-migration (task 2484) runs write the reviewer's verdict/issues
@@ -247,7 +246,7 @@ def _read_review_artifacts(worktree_path: str) -> dict[str, Any]:
     directory otherwise — a run is reviewed by one reviewer roster at one
     point in time, so the two sources are never meaningfully mixed.
 
-    Returns ``{reviewer_name: {verdict, issues, summary}}``.
+    Returns ``{reviewer_name: ReviewPayload}``.
     Returns empty dict if the worktree has neither artifact source.
     """
     artifacts = TaskArtifacts(Path(worktree_path))
@@ -267,8 +266,8 @@ def score_result_from_artifacts(
     """Contract-agnostic P4/B8 quality for one result, off its PERSISTED reviews.
 
     The μ driver's per-result quality: reads the result's worktree reviews via
-    :func:`_read_review_artifacts` (envelope-preferring, legacy fallback), each
-    normalised by ``orchestrator/review_payload.py::normalize_review``, and
+    :func:`_read_review_artifacts` (envelope-preferring, legacy fallback, each
+    normalised by ``orchestrator/review_payload.py::normalize_review``) and
     scores them together via :func:`scoring.quality_from_reviews`. The SAME
     review content yields the SAME float regardless of which reviewer/judge
     output contract is live — and it NEVER opens a transcript / session / log
@@ -280,29 +279,21 @@ def score_result_from_artifacts(
     reviews = _read_review_artifacts(result.worktree_path)
     steps = plan_steps if plan_steps is not None else int(result.metrics.get('plan_steps', 0) or 0)
     debug_cycles = int(result.metrics.get('debug_cycles', 0) or 0)
-    return quality_from_reviews(
-        (normalize_review(review) for review in reviews.values()),
-        plan_steps=steps,
-        debug_cycles=debug_cycles,
-    )
+    return quality_from_reviews(reviews.values(), plan_steps=steps, debug_cycles=debug_cycles)
 
 
-def _format_review_artifacts(reviews: dict[str, Any]) -> str:
+def _format_review_artifacts(reviews: Mapping[str, ReviewPayload]) -> str:
     """Format review artifacts as text for the assessor prompt."""
     if not reviews:
         return '(no review data available)'
 
     parts: list[str] = []
-    for reviewer_name, data in reviews.items():
-        verdict = data.get('verdict', 'unknown')
-        summary = data.get('summary', '')
-        issues = data.get('issues', [])
+    for reviewer_name, payload in reviews.items():
+        lines = [f'### {reviewer_name} — {payload.verdict}']
+        if payload.summary:
+            lines.append(payload.summary)
 
-        lines = [f'### {reviewer_name} — {verdict}']
-        if summary:
-            lines.append(summary)
-
-        for issue in issues:
+        for issue in payload.issues:
             sev = issue.get('severity', '?')
             cat = issue.get('category', '')
             loc = issue.get('location', '')
@@ -348,8 +339,8 @@ def _build_assessor_prompt(
     result_b: EvalResult,
     diff_a: str,
     diff_b: str,
-    reviews_a: dict[str, Any],
-    reviews_b: dict[str, Any],
+    reviews_a: Mapping[str, ReviewPayload],
+    reviews_b: Mapping[str, ReviewPayload],
     group_a_name: str,
     group_b_name: str,
 ) -> str:
