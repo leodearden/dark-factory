@@ -51,6 +51,7 @@ from legibility import (  # noqa: E402
     digest,
     invariants,
     inventory,
+    plan_deviation_census,
     sampling,
     session_ledger,
     session_runner,
@@ -1761,6 +1762,9 @@ def _run_configured_nightly(
             if runner is not None:
                 runner.close()
         finally:
+            # plans/plan-deviation-recording-prd.md D8; run() never raises.
+            if pass_kind is not PassKind.RETRY:
+                plan_deviation_census.run(cfg, now=now)
             _record_trickle_progress(
                 cfg, sample, target_date, result, census=census_observation,
                 recorder=recorder, retry_recorder=retry_recorder,
