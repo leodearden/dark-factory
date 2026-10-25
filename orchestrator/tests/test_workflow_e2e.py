@@ -8201,34 +8201,27 @@ class TestBuildAgentEnvCpuPriority:
     def _make_workflow(self, config, git_ops, task_assignment):
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
-        # task 4481: pin the enabled-path config explicitly instead of relying
-        # on it being ambient.  The assertions below spell the nice value as
-        # the literal '10', so both fields must be pinned, not just `enabled` —
-        # an operator setting either one in dark-factory-orchestrator.yaml
-        # would otherwise break tests that are about _build_agent_env, not
-        # about cpu_priority's defaults.  Mirrors this class's own
-        # CpuPriorityConfig(enabled=False) / (enabled=True, nice=15) idiom;
-        # the tests that need a different value still override after this.
+        # pin: these tests are about _build_agent_env, not cpu_priority's default
         workflow.config.cpu_priority = CpuPriorityConfig(enabled=True, nice=10)
         return workflow
 
     async def test_architect_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
-        """ARCHITECT gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        """ARCHITECT gets DF_AGENT_CPU_NICE='10' with cpu_priority enabled (nice=10)."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
-        # cpu_priority is enabled by default (nice=10)
+        # _make_workflow pins cpu_priority enabled (nice=10)
         env = workflow._build_agent_env(ARCHITECT)
         assert env is not None
         assert env.get('DF_AGENT_CPU_NICE') == '10'
 
     async def test_implementer_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
-        """IMPLEMENTER gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        """IMPLEMENTER gets DF_AGENT_CPU_NICE='10' with cpu_priority enabled (nice=10)."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
         env = workflow._build_agent_env(IMPLEMENTER)
         assert env is not None
         assert env.get('DF_AGENT_CPU_NICE') == '10'
 
     async def test_debugger_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
-        """DEBUGGER gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        """DEBUGGER gets DF_AGENT_CPU_NICE='10' with cpu_priority enabled (nice=10)."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
         env = workflow._build_agent_env(DEBUGGER)
         assert env is not None
@@ -8296,10 +8289,7 @@ class TestBuildAgentEnvCpuGovern:
     def _make_workflow(self, config, git_ops, task_assignment):
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
-        # task 4481: as in TestBuildAgentEnvCpuPriority — the coexistence test
-        # below asserts DF_AGENT_CPU_NICE == '10' alongside the govern vars, so
-        # cpu_priority is pinned rather than inherited.  cpu_governance itself
-        # is always set explicitly by each test that needs it.
+        # pin: the coexistence test asserts DF_AGENT_CPU_NICE == '10'
         workflow.config.cpu_priority = CpuPriorityConfig(enabled=True, nice=10)
         return workflow
 
@@ -8454,7 +8444,7 @@ class TestBuildAgentEnvCpuGovern:
             shim_dir='scripts/agent-bin',
         )
         workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
-        # cpu_priority is enabled by default (nice=10)
+        # _make_workflow pins cpu_priority enabled (nice=10)
 
         env = workflow._build_agent_env(IMPLEMENTER)
         assert env is not None
