@@ -191,7 +191,8 @@ class FakeMergeQueue:
         if self.landing == "merge":
             git(self.repo, "merge", "--no-ff", "-q", "-m", message, self.branch)
         elif self.landing == "cherry_pick":
-            git(self.repo, "cherry-pick", self.branch)
+            # -x makes the copy a distinct commit even within the same second.
+            git(self.repo, "cherry-pick", "-x", self.branch)
         elif self.landing == "ref_only":
             tip = git(self.repo, "rev-parse", self.branch).strip()
             merged = git(

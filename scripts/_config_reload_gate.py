@@ -83,6 +83,20 @@ def load_transport():
     return census_trigger, httpx
 
 
+def transport_not_importable_remedy(exc: ImportError) -> str:
+    """The operator's next step when this interpreter cannot import the MCP
+    transport: what failed, where it looked, and how to get a venv that has
+    it."""
+    scripts_dir = Path(__file__).parent
+    checkout = scripts_dir.parent
+    return (
+        f"the MCP reload transport is not importable under {sys.executable}: {exc}\n"
+        f"  looked for legibility/ under: {scripts_dir}\n"
+        f"  remedy: run `uv sync --all-packages` in {checkout} so {checkout / '.venv'}\n"
+        f"  provides httpx and pydantic, or re-run this script under `uv run --project shared`"
+    )
+
+
 def fetch_reload_report(
     port: str, *, committed_as: str, config_path: str | None,
     timeout: float = RELOAD_REPLY_TIMEOUT_SECS,
@@ -123,17 +137,11 @@ def _call_reload_config(port: str, *, committed_as: str, timeout: float) -> dict
     decoding, raising on a JSON-RPC `error` and on `result.isError`, and the
     session-terminating DELETE.
     """
-    scripts_dir = Path(__file__).parent
-    checkout = scripts_dir.parent
     try:
         census_trigger, httpx = load_transport()
     except ImportError as exc:
         raise ReloadNotConfirmed(
-            ReloadFailure.TRANSPORT_NOT_IMPORTABLE,
-            f"the MCP reload transport is not importable under {sys.executable}: {exc}\n"
-            f"  looked for legibility/ under: {scripts_dir}\n"
-            f"  remedy: run `uv sync --all-packages` in {checkout} so {checkout / '.venv'}\n"
-            f"  provides httpx and pydantic, or re-run this script under `uv run --project shared`",
+            ReloadFailure.TRANSPORT_NOT_IMPORTABLE, transport_not_importable_remedy(exc),
         ) from exc
 
     url = f"http://127.0.0.1:{port}/mcp"

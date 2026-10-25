@@ -91,6 +91,7 @@ class FakeEscalationMcp:
         self.faults_armed = faults_armed
         self._release = threading.Event()
         self.received = []
+        self._dispatched = []
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -143,6 +144,7 @@ class FakeEscalationMcp:
         if method == "notifications/initialized":
             return (202, {}, "")
         params = payload.get("params") or {}
+        self._dispatched.append((params.get("name"), params.get("arguments") or {}))
         handler = self.tool_handlers.get(params.get("name"))
         if handler is not None:
             return self._structured(payload, handler(params.get("arguments") or {}))
@@ -166,16 +168,17 @@ class FakeEscalationMcp:
 
     def called_tools(self):
         """The tool names every `tools/call` the server saw asked for."""
-        return [name for name, _ in self.tool_calls()]
-
-    def tool_calls(self):
-        """(tool name, arguments) for every `tools/call` the server saw, in order."""
         return [
-            ((payload.get("params") or {}).get("name"),
-             (payload.get("params") or {}).get("arguments") or {})
+            (payload.get("params") or {}).get("name")
             for _, _, payload in self.received
             if payload.get("method") == "tools/call"
         ]
+
+    def tool_calls(self):
+        """(tool name, arguments) for every `tools/call` that reached a tool, in
+        order: the session-less first attempt the transport makes before its
+        handshake is rejected with a 400 and is not among them."""
+        return list(self._dispatched)
 
     def delete_count(self):
         """How many session-terminating DELETEs the server saw.
