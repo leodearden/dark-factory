@@ -7,7 +7,9 @@ edges.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import sqlite3
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -22,7 +24,10 @@ from fused_memory.config.schema import (
 )
 from fused_memory.models.reconciliation import (
     AssembledPayload,
+    ReconciliationRun,
     RunStatus,
+    RunType,
+    StageId,
     StageReport,
     Watermark,
 )
@@ -382,6 +387,68 @@ class TestHarnessWiring:
         assert [_keys(page) for page in stage_1_pages] == [
             [('ep-a', 'a1'), ('ep-b', 'b1'), ('ep-b', 'b2')],
         ] * 2
+
+    @pytest.mark.parametrize('error', [
+        pytest.param(sqlite3.OperationalError('disk I/O error'), id='raises'),
+        pytest.param(asyncio.CancelledError(), id='cancelled'),
+    ])
+    @pytest.mark.asyncio
+    async def test_a_cycle_whose_complete_run_fails_leaves_its_flags_for_the_next(
+        self, cycle_harness, shadow, stage_1_pages, error,
+    ) -> None:
+        cycle_harness.memory.overreach_shadow = shadow
+        real_complete_run = cycle_harness.journal.complete_run
+        completions_failed: list[str] = []
+
+        async def complete_run_failing_once(run_id: str, status: str) -> None:
+            if status == 'completed' and not completions_failed:
+                completions_failed.append(run_id)
+                raise error
+            await real_complete_run(run_id, status)
+
+        with (
+            patch.object(cycle_harness.journal, 'complete_run', complete_run_failing_once),
+            pytest.raises(type(error)),
+        ):
+            await cycle_harness.run_full_cycle(PROJECT, 'test-trigger')
+        await cycle_harness.run_full_cycle(PROJECT, 'test-trigger')
+        assert [_keys(page) for page in stage_1_pages] == [
+            [('ep-a', 'a1'), ('ep-b', 'b1'), ('ep-b', 'b2')],
+        ] * 2
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_run_that_skips_stage_1_acknowledges_nothing(
+        self, cycle_harness, shadow, stage_1_pages,
+    ) -> None:
+        cycle_harness.memory.overreach_shadow = shadow
+        interrupted_at = datetime.now(UTC) - timedelta(minutes=10)
+        interrupted = ReconciliationRun(
+            id='run-to-resume',
+            project_id=PROJECT,
+            run_type=RunType.full,
+            trigger_reason='test-trigger',
+            started_at=interrupted_at,
+            status=RunStatus.interrupted,
+            stage_reports={StageId.memory_consolidator.value: StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=interrupted_at,
+                completed_at=interrupted_at,
+            )},
+            session_id='S',
+            stage_cursor=StageId.task_knowledge_sync.value,
+            instance_id=cycle_harness.buffer.instance_id,
+        )
+        await cycle_harness.journal.start_run(interrupted)
+
+        resumed = await cycle_harness.run_full_cycle(
+            PROJECT, 'resume_after_restart', resume_run=interrupted, events=[],
+        )
+        fresh = await cycle_harness.run_full_cycle(PROJECT, 'test-trigger')
+
+        assert (resumed.status, fresh.status) == (RunStatus.completed, RunStatus.completed)
+        assert [_keys(page) for page in stage_1_pages] == [
+            [('ep-a', 'a1'), ('ep-b', 'b1'), ('ep-b', 'b2')],
+        ]
 
     @pytest.mark.asyncio
     async def test_no_shadow_runs_the_cycle_without_flags(self, cycle_harness, stage_1_pages) -> None:
