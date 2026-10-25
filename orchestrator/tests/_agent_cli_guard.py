@@ -9,7 +9,7 @@ bypass.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -61,6 +61,8 @@ class AgentCliSpawnGuard:
 
     def guarded(self, real_init: Callable[..., None]) -> Callable[..., None]:
         def init(popen_self: Any, args: Any, *a: Any, **kw: Any) -> None:
+            if isinstance(args, Iterator):
+                args = list(args)
             if agent_cli_in(args) is None:
                 return real_init(popen_self, args, *a, **kw)
             argv = _argv(args)

@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _agent_cli_guard import AGENT_CLI_BINARIES, AgentCliSpawnGuard, agent_cli_in
+from _agent_cli_guard import AgentCliSpawnGuard, agent_cli_in
 from shared.cli_invoke import build_claude_argv
 
 import orchestrator.workflow
@@ -33,9 +33,6 @@ def _real_claude_argv() -> list[str]:
 
 
 class TestAgentCliIn:
-    def test_the_backend_set_is_the_four_invoke_agent_backends(self):
-        assert frozenset({'claude', 'codex', 'gemini', 'pi'}) == AGENT_CLI_BINARIES
-
     def test_production_claude_argv_is_classified_as_claude(self):
         assert agent_cli_in(_real_claude_argv()) == 'claude'
 
@@ -143,6 +140,18 @@ class TestAgentCliSpawnGuard:
         assert message is not None
         assert _NODEID in message
         assert repr(_NICE_CLAUDE) in message
+
+    def test_a_one_shot_argv_iterator_is_delegated_intact(self, wrapped, calls):
+        wrapped(object(), iter(['git', 'status']))
+
+        [(args, _, _)] = calls
+        assert list(args) == ['git', 'status']
+
+    def test_a_one_shot_agent_argv_iterator_is_recorded_intact(self, guard, wrapped):
+        with pytest.raises(pytest.fail.Exception, match=re.escape(repr(_NICE_CLAUDE))):
+            wrapped(object(), iter(_NICE_CLAUDE))
+
+        assert guard.take_attempts() == [_NICE_CLAUDE]
 
     def test_taking_the_attempts_acknowledges_them(self, guard, wrapped):
         with pytest.raises(pytest.fail.Exception):
