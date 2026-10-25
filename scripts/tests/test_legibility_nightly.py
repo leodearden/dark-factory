@@ -4607,6 +4607,55 @@ class TestNightlyResultIsOneTypedOutcome:
     def test_an_alarm_kind_carries_its_journal_level(self, kind, level):
         assert kind.level == level
 
+    @pytest.mark.parametrize(
+        ('invariant', 'outcome', 'field', 'value'),
+        [
+            pytest.param(
+                'rollback-implies-failed', _Outcome.PRODUCTIVE, 'rollback',
+                unlanded.Rollback(quarantine_dir=None, paths=('codebook.yaml',)),
+                id='rollback',
+            ),
+            pytest.param(
+                'commit-implies-productive', _Outcome.QUIET, 'commit_made', True, id='commit',
+            ),
+            pytest.param(
+                'retry-due-implies-finished', _Outcome.FAILED, 'retry_due',
+                (date(2026, 7, 12),), id='retry-after-failed',
+            ),
+            pytest.param(
+                'retry-due-implies-finished', _Outcome.DEFERRED, 'retry_due',
+                (date(2026, 7, 12),), id='retry-after-deferred',
+            ),
+            pytest.param(
+                'budget-suppressed-implies-barren-or-failed', _Outcome.PRODUCTIVE,
+                'budget_suppressed', True, id='budget-suppressed',
+            ),
+        ],
+    )
+    def test_an_impossible_combination_is_refused_by_name(
+        self, invariant, outcome, field, value,
+    ):
+        with pytest.raises(ValueError) as refused:
+            _result(outcome, **{field: value})
+
+        message = str(refused.value)
+        assert f'NightlyResult invariant {invariant} violated' in message
+        assert f'outcome={outcome}' in message
+        assert f'{field}={value!r}' in message
+
+    @pytest.mark.parametrize(
+        ('outcome', 'fields'),
+        [
+            (_Outcome.FAILED, dict(rollback=unlanded.Rollback(quarantine_dir=None, paths=()))),
+            (_Outcome.PRODUCTIVE, dict(commit_made=True, retry_due=(date(2026, 7, 12),))),
+            (_Outcome.BARREN, dict(budget_suppressed=True, retry_due=(date(2026, 7, 12),))),
+            (_Outcome.FAILED, dict(budget_suppressed=True)),
+        ],
+        ids=['rollback-failed', 'commit-productive', 'suppressed-barren', 'suppressed-failed'],
+    )
+    def test_a_possible_combination_constructs(self, outcome, fields):
+        assert _result(outcome, **fields).outcome is outcome
+
 
 _BRANCH_MATRIX = [
     pytest.param(dict(transcript=False), _Outcome.QUIET, [], id='quiet'),
