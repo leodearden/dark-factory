@@ -296,13 +296,7 @@ class TestPytestNWiring:
 
         slots_dir = tmp_path / 'slots'
         config = OrchestratorConfig(
-            # task 4481: the admission path is what performs the -n rewrite,
-            # so pin it ON rather than inheriting it.  This test is about the
-            # rewrite's WIRING, not about verify_admission_enabled's default —
-            # an operator disabling admission in dark-factory-orchestrator.yaml
-            # would otherwise silently delete this coverage.  Mirrors this
-            # class's own test_admission_disabled_injects_nothing, which pins
-            # the same flag off.
+            # pin: this test is about the -n rewrite's wiring, not the default
             verify_admission_enabled=True,
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,
@@ -367,13 +361,7 @@ class TestPytestNWiring:
 
         slots_dir = tmp_path / 'slots'
         config = OrchestratorConfig(
-            # task 4481: the admission path is what performs the -n rewrite,
-            # so pin it ON rather than inheriting it.  This test is about the
-            # rewrite's WIRING, not about verify_admission_enabled's default —
-            # an operator disabling admission in dark-factory-orchestrator.yaml
-            # would otherwise silently delete this coverage.  Mirrors this
-            # class's own test_admission_disabled_injects_nothing, which pins
-            # the same flag off.
+            # pin: this test is about the -n rewrite's wiring, not the default
             verify_admission_enabled=True,
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,
@@ -460,13 +448,7 @@ class TestPytestNWiring:
 
         slots_dir = tmp_path / 'slots'
         config = OrchestratorConfig(
-            # task 4481: the admission path is what performs the -n rewrite,
-            # so pin it ON rather than inheriting it.  This test is about the
-            # rewrite's WIRING, not about verify_admission_enabled's default —
-            # an operator disabling admission in dark-factory-orchestrator.yaml
-            # would otherwise silently delete this coverage.  Mirrors this
-            # class's own test_admission_disabled_injects_nothing, which pins
-            # the same flag off.
+            # pin: this test is about the -n rewrite's wiring, not the default
             verify_admission_enabled=True,
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,
@@ -508,13 +490,7 @@ class TestPytestNWiring:
 
         slots_dir = tmp_path / 'slots'
         config = OrchestratorConfig(
-            # task 4481: the admission path is what performs the -n rewrite,
-            # so pin it ON rather than inheriting it.  This test is about the
-            # rewrite's WIRING, not about verify_admission_enabled's default —
-            # an operator disabling admission in dark-factory-orchestrator.yaml
-            # would otherwise silently delete this coverage.  Mirrors this
-            # class's own test_admission_disabled_injects_nothing, which pins
-            # the same flag off.
+            # pin: this test is about the -n rewrite's wiring, not the default
             verify_admission_enabled=True,
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,

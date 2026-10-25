@@ -45,6 +45,19 @@ from orchestrator.scheduler import (
     _delivered_checks_descriptor_digest,
 )
 
+
+def _gate_on_config(max_per_module: int) -> OrchestratorConfig:
+    """A config with the delivered-checks gate pinned ON.
+
+    For tests about gate BEHAVIOUR.  The flag's default is
+    ``TestDeliveredChecksConfig::test_default_enabled_is_true``'s claim; every
+    other key still reads the operational config.
+    """
+    config = OrchestratorConfig(max_per_module=max_per_module)
+    config.delivered_checks.enabled = True
+    return config
+
+
 # ---------------------------------------------------------------------------
 # TestRunnerGrepKind (task 2580 — step-1 RED / step-2 GREEN)
 # ---------------------------------------------------------------------------
@@ -719,16 +732,7 @@ class TestPhaseBackfillTerminalDepRecords:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
-        # task 4481: pin the gate ON explicitly rather than inheriting it.
-        # These tests are about gate BEHAVIOUR, not about the default —
-        # TestDeliveredChecksConfig::test_default_enabled_is_true owns that
-        # claim (under code_default_config).  Without the pin, an operator
-        # declaring delivered_checks.enabled=false in
-        # dark-factory-orchestrator.yaml silently disarms the gate and
-        # deletes this coverage.  Only this one flag is pinned, so every
-        # other key still reads the operational config.
-        config.delivered_checks.enabled = True
+        config = _gate_on_config(max_per_module=1)
         scheduler = Scheduler(config)
         scheduler.finish_startup()
         return scheduler
@@ -1120,16 +1124,7 @@ class TestDeliveredCheckGateEnabledSwitch:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
-        # task 4481: pin the gate ON explicitly rather than inheriting it.
-        # These tests are about gate BEHAVIOUR, not about the default —
-        # TestDeliveredChecksConfig::test_default_enabled_is_true owns that
-        # claim (under code_default_config).  Without the pin, an operator
-        # declaring delivered_checks.enabled=false in
-        # dark-factory-orchestrator.yaml silently disarms the gate and
-        # deletes this coverage.  Only this one flag is pinned, so every
-        # other key still reads the operational config.
-        config.delivered_checks.enabled = True
+        config = _gate_on_config(max_per_module=1)
         scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
         scheduler.finish_startup()
         return scheduler
@@ -2302,16 +2297,7 @@ class TestDeliveredCheckGraceEscalation:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
-        # task 4481: pin the gate ON explicitly rather than inheriting it.
-        # These tests are about gate BEHAVIOUR, not about the default —
-        # TestDeliveredChecksConfig::test_default_enabled_is_true owns that
-        # claim (under code_default_config).  Without the pin, an operator
-        # declaring delivered_checks.enabled=false in
-        # dark-factory-orchestrator.yaml silently disarms the gate and
-        # deletes this coverage.  Only this one flag is pinned, so every
-        # other key still reads the operational config.
-        config.delivered_checks.enabled = True
+        config = _gate_on_config(max_per_module=1)
         config.delivered_checks.grace_cycles = 3
         scheduler = Scheduler(
             config,
@@ -2626,16 +2612,7 @@ class TestAcquireNextDeliveredGate:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=2)
-        # task 4481: pin the gate ON explicitly rather than inheriting it.
-        # These tests are about gate BEHAVIOUR, not about the default —
-        # TestDeliveredChecksConfig::test_default_enabled_is_true owns that
-        # claim (under code_default_config).  Without the pin, an operator
-        # declaring delivered_checks.enabled=false in
-        # dark-factory-orchestrator.yaml silently disarms the gate and
-        # deletes this coverage.  Only this one flag is pinned, so every
-        # other key still reads the operational config.
-        config.delivered_checks.enabled = True
+        config = _gate_on_config(max_per_module=2)
         scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
         scheduler.finish_startup()
         return scheduler
@@ -2826,16 +2803,7 @@ class TestAcquireNextDeliveredGateRealFilteredFetch:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=2)
-        # task 4481: pin the gate ON explicitly rather than inheriting it.
-        # These tests are about gate BEHAVIOUR, not about the default —
-        # TestDeliveredChecksConfig::test_default_enabled_is_true owns that
-        # claim (under code_default_config).  Without the pin, an operator
-        # declaring delivered_checks.enabled=false in
-        # dark-factory-orchestrator.yaml silently disarms the gate and
-        # deletes this coverage.  Only this one flag is pinned, so every
-        # other key still reads the operational config.
-        config.delivered_checks.enabled = True
+        config = _gate_on_config(max_per_module=2)
         scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
         scheduler.finish_startup()
         return scheduler
