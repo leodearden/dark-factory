@@ -6560,16 +6560,21 @@ def _render_done_provenance_kinds() -> str:
 
 
 _DONE_PROVENANCE_KINDS_TEXT = _render_done_provenance_kinds()
+_CALLER_SELECTABLE_KINDS_GUIDANCE = (
+    '{"kind": "merged", "commit": "<merge-sha>"} after the merge_request '
+    'landed the commit on main; '
+    '{"kind": "found_on_main", "commit": "<sha>", "note": "<text>"} when the '
+    'implementation is already on main from a sibling task (the commit is '
+    'ancestor-checked); or '
+    '{"kind": "operational-verified", "escalation_id": "<esc-id>", '
+    '"note": "<text>"} for a no-code operational ask closed via a resolved '
+    'escalation. The deterministic-* kinds are stamped by DeterministicRunner '
+    'and never supplied by hand. The per-kind table in docs/task-authoring.md '
+    'is canonical.'
+)
 _KIND_REQUIRED_REASON = (
     f'done_provenance.kind is required (must be {_DONE_PROVENANCE_KINDS_TEXT}). '
-    'Use kind="merged" with commit=<merge-sha> after a successful '
-    'merge_request; kind="found_on_main" with commit=<sha> and '
-    'note=<explanation> when the implementation is already on main '
-    'from a sibling task; or kind="operational-verified" with '
-    'escalation_id=<id> and note=<text> for a no-code operational ask '
-    'closed via a resolved escalation. The deterministic-* kinds are '
-    'stamped by DeterministicRunner, not supplied by hand — see the '
-    'per-kind table in docs/task-authoring.md.'
+    f'Pass done_provenance= one of: {_CALLER_SELECTABLE_KINDS_GUIDANCE}'
 )
 
 
@@ -6774,10 +6779,9 @@ async def _validate_done_provenance(
         logger.warning(
             'set_task_status(%s, done) called without done_provenance; '
             'Stage-2 reconciliation will treat this task as provenance-unknown. '
-            'Pass done_provenance={"kind": "merged", "commit": "..."} or '
-            '{"kind": "found_on_main", "commit": "...", "note": "..."} to '
-            'record verified evidence.',
+            'To record verified evidence, pass done_provenance= one of: %s',
             task_id,
+            _CALLER_SELECTABLE_KINDS_GUIDANCE,
         )
         return None, None
 
@@ -7402,11 +7406,7 @@ def _done_provenance_missing_error(task_id: str) -> dict:
         'hint': (
             'Cannot mark task done: done_provenance is required when '
             'reconciliation.require_done_provenance is enabled. Pass '
-            'done_provenance={"kind": "merged", "commit": "<merge-sha>"} when '
-            'the merge_request landed a commit on main, or '
-            'done_provenance={"kind": "found_on_main", "commit": "<sha>", '
-            '"note": "<text>"} when the implementation is already on main '
-            'from a sibling task (commit is ancestor-checked).'
+            f'done_provenance= one of: {_CALLER_SELECTABLE_KINDS_GUIDANCE}'
         ),
     }
 
