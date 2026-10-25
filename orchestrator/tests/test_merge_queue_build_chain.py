@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _merge_lane_fakes import lane_scene_config
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -163,9 +164,7 @@ def _registry_states(worker: SpeculativeMergeWorker) -> dict[str, ItemLifecycleS
     return worker._lifecycle.non_terminal_items()
 
 def _make_config(repo: Path, git_config: GitConfig | None = None) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        project_root=repo, git=git_config or _make_spec_git_config(),
-    )
+    return lane_scene_config(repo, git_config or _make_spec_git_config())
 
 
 # ── MergeRequest helpers (mirrors test_merge_queue_conflict_graph.py:74-96) ───

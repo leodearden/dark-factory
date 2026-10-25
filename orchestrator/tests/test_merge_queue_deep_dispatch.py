@@ -42,6 +42,7 @@ from typing import Literal
 
 import pytest
 from _merge_lane_census import queued_in_lane, queued_request_ids
+from _merge_lane_fakes import lane_scene_config
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
@@ -152,9 +153,9 @@ def _make_config(
     ``chain_cap`` defaults to 0 — α's shipped kill switch — so a test that wants
     the deep path must opt in explicitly, exactly as an operator would.
     """
-    return OrchestratorConfig(
-        project_root=repo,
-        git=git_config or _make_spec_git_config(),
+    return lane_scene_config(
+        repo,
+        git_config or _make_spec_git_config(),
         merge_deep=MergeDeepConfig(chain_cap=chain_cap),
     )
 

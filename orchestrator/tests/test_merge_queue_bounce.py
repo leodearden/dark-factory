@@ -53,7 +53,7 @@ from typing import Literal
 from unittest.mock import AsyncMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, hangs_until, lane_state
+from _merge_lane_fakes import FakeVerifier, hangs_until, lane_scene_config, lane_state
 from _orch_helpers import wait_responsive
 from shared.task_metadata import RetryLedger
 
@@ -119,7 +119,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Helpers: a running lane over a real repo ─────────────────────────────────
