@@ -36,6 +36,16 @@ class SubmitOutcome:
 class SubmitBatchResult:
     outcomes: tuple[SubmitOutcome, ...]
 
+    @classmethod
+    def failed(
+        cls, arguments_list: Sequence[Mapping[str, Any]], reason: str,
+    ) -> SubmitBatchResult:
+        """Every submission in *arguments_list* failed for the one *reason*."""
+        return cls(outcomes=tuple(
+            SubmitOutcome(title=_title_of(arguments), failure=reason)
+            for arguments in arguments_list
+        ))
+
     @property
     def tickets(self) -> tuple[str, ...]:
         return tuple(o.ticket for o in self.outcomes if o.ticket is not None)
@@ -64,10 +74,9 @@ async def submit_task_batch(
                     await _submit_one(client, base_url, arguments, context=context),
                 )
     except Exception as exc:
-        reason = f'{type(exc).__name__}: {exc}'
+        unsent = arguments_list[len(outcomes):]
         outcomes.extend(
-            SubmitOutcome(title=_title_of(arguments), failure=reason)
-            for arguments in arguments_list[len(outcomes):]
+            SubmitBatchResult.failed(unsent, f'{type(exc).__name__}: {exc}').outcomes,
         )
     for outcome in outcomes:
         if outcome.failure is not None:
