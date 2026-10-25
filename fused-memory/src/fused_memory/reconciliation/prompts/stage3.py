@@ -30,8 +30,8 @@ DANGLING_CITATION_HANDOFF_SECTION = (
     """\
 ## Dangling Cross-Run Citations — Detected For You
 
-**The defect.** A finding of a PRIOR, already-completed run cites a Mem0 memory that no \
-longer resolves, typically because a later consolidation or supersession deleted it.
+**The defect.** A finding of a PRIOR, settled run (completed or failed) cites a Mem0 memory \
+that no longer resolves, typically because a later consolidation or supersession deleted it.
 
 """
     f"""**The detection.** After your turn, the integrity-check stage's own code scans \

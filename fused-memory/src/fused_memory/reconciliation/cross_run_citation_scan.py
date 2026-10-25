@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -36,12 +36,12 @@ logger = logging.getLogger(__name__)
 
 CROSS_RUN_CITATION_SCAN_LOOKBACK_RUNS = 50
 MAX_CROSS_RUN_CITATION_IDS_PER_SCAN = 100
+MAX_CONSECUTIVE_CITATION_READ_ERRORS = 3
 MAX_DANGLING_CITATION_FINDINGS_PER_SCAN = 20
 
 _FOUND = 'found'
 _MISSING = 'missing'
 _ERROR = 'error'
-_UNCHECKED = 'unchecked'
 
 
 @dataclass(frozen=True)
@@ -94,14 +94,19 @@ async def scan_cross_run_citations(
     project_id: str,
     lookback: int = CROSS_RUN_CITATION_SCAN_LOOKBACK_RUNS,
     max_ids: int = MAX_CROSS_RUN_CITATION_IDS_PER_SCAN,
+    max_consecutive_errors: int = MAX_CONSECUTIVE_CITATION_READ_ERRORS,
     max_findings: int = MAX_DANGLING_CITATION_FINDINGS_PER_SCAN,
 ) -> CrossRunCitationScan:
     runs = await _settled_runs(journal, project_id, lookback)
     if runs is None:
         return _FAILED_SCAN
     citations = [citation for run in runs for citation in _mem0_citations(run)]
-    resolve = make_memory_resolver(memory_service, project_id)
-    outcomes = await _resolve_within_budget(citations, resolve, max_ids)
+    outcomes = await _outcome_per_citation(
+        citations,
+        make_memory_resolver(memory_service, project_id),
+        max_ids=max_ids,
+        max_consecutive_errors=max_consecutive_errors,
+    )
     dangling = tuple(
         record
         for c, outcome in zip(citations, outcomes, strict=True)
@@ -114,7 +119,7 @@ async def scan_cross_run_citations(
         citations_verified=counts[_FOUND],
         dangling_total=len(dangling),
         verification_errors=counts[_ERROR],
-        unchecked=counts[_UNCHECKED],
+        unchecked=counts[None],
         scan_failed=False,
     )
 
@@ -175,19 +180,52 @@ def _addressable_record(citation: _Citation) -> DanglingCitation | None:
         return None
 
 
-async def _resolve_within_budget(
+async def _outcome_per_citation(
     citations: list[_Citation],
     resolve: Callable[[Any], Awaitable[tuple[str, str | None]]],
+    *,
     max_ids: int,
-) -> list[str]:
-    budgeted: set[str] = set()
-    outcomes: list[str] = []
+    max_consecutive_errors: int,
+) -> list[str | None]:
+    spelling_by_key: dict[str, str] = {}
     for citation in citations:
-        key = citation.memory_id.lower()
-        if key not in budgeted and len(budgeted) >= max_ids:
-            outcomes.append(_UNCHECKED)
+        spelling_by_key.setdefault(citation.memory_id.lower(), citation.memory_id)
+    resolved = await _resolve_distinct_ids(
+        spelling_by_key.values(),
+        resolve,
+        max_ids=max_ids,
+        max_consecutive_errors=max_consecutive_errors,
+    )
+    outcome_by_key = dict(zip(spelling_by_key, resolved, strict=True))
+    return [outcome_by_key[c.memory_id.lower()] for c in citations]
+
+
+async def _resolve_distinct_ids(
+    memory_ids: Iterable[str],
+    resolve: Callable[[Any], Awaitable[tuple[str, str | None]]],
+    *,
+    max_ids: int,
+    max_consecutive_errors: int,
+) -> list[str | None]:
+    """Resolve each id in order, answering ``None`` for every id left unchecked.
+
+    Resolution stops after *max_ids* ids, or once *max_consecutive_errors*
+    reads in a row raised: each read on a degraded store waits out its own
+    backend timeout on Stage 3's critical path.
+    """
+    outcomes: list[str | None] = []
+    consecutive_errors = 0
+    for memory_id in memory_ids:
+        if len(outcomes) >= max_ids or consecutive_errors >= max_consecutive_errors:
+            outcomes.append(None)
             continue
-        budgeted.add(key)
-        outcome, _detail = await resolve(citation.memory_id)
+        outcome, _detail = await resolve(memory_id)
+        consecutive_errors = consecutive_errors + 1 if outcome == _ERROR else 0
+        if consecutive_errors == max_consecutive_errors:
+            logger.warning(
+                'cross-run citation scan: %d consecutive mem0 reads failed; '
+                'leaving the remaining ids unchecked',
+                consecutive_errors,
+            )
         outcomes.append(outcome)
     return outcomes

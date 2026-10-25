@@ -76,7 +76,7 @@ class TestConstructionInvariant:
             DanglingCitation(**_record_fields(**{field: value}))
         message = str(excinfo.value)
         assert field in message
-        assert repr(value) in message or str(value) in message
+        assert repr(value) in message
 
     def test_valid_record_is_frozen(self) -> None:
         record: Any = _record()

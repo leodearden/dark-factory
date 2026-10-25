@@ -361,6 +361,60 @@ class TestBounds:
         assert ABSENT_3 not in {r.memory_id for r in scan.dangling}
 
     @pytest.mark.asyncio
+    async def test_consecutive_read_errors_leave_the_rest_unchecked(
+        self, tmp_path: Any,
+    ) -> None:
+        failing = [RAISING, ABSENT_1, ABSENT_2, ABSENT_3]
+        journal = await build_journal_with_closed_run(
+            tmp_path, run_id=RUN_A, project_id=P,
+            findings=[
+                _finding(FINDING_1, *(_citation(m) for m in failing)),
+                _finding(FINDING_2, _citation(ABSENT_1)),
+            ],
+        )
+        try:
+            memory = FakeMemoryLookup({m: TimeoutError('qdrant timed out') for m in failing})
+            scan = await scan_cross_run_citations(
+                journal, memory, project_id=P, max_consecutive_errors=2,
+            )
+        finally:
+            await journal.close()
+
+        assert _looked_up(memory) == [RAISING, ABSENT_1]
+        assert scan.verification_errors == 3
+        assert scan.unchecked == 2
+        assert scan.dangling == ()
+
+    @pytest.mark.asyncio
+    async def test_a_resolved_read_resets_the_error_run(self, tmp_path: Any) -> None:
+        journal = await build_journal_with_closed_run(
+            tmp_path, run_id=RUN_A, project_id=P,
+            findings=[
+                _finding(
+                    FINDING_1,
+                    _citation(RAISING), _citation(LIVE),
+                    _citation(ABSENT_1), _citation(ABSENT_2),
+                ),
+            ],
+        )
+        try:
+            memory = FakeMemoryLookup({
+                RAISING: TimeoutError('qdrant timed out'),
+                LIVE: LIVE_RECORD,
+                ABSENT_1: TimeoutError('qdrant timed out'),
+            })
+            scan = await scan_cross_run_citations(
+                journal, memory, project_id=P, max_consecutive_errors=2,
+            )
+        finally:
+            await journal.close()
+
+        assert _looked_up(memory) == [RAISING, LIVE, ABSENT_1, ABSENT_2]
+        assert scan.verification_errors == 2
+        assert scan.unchecked == 0
+        assert scan.dangling == (DanglingCitation(RUN_A, FINDING_1, ABSENT_2, 'mem0'),)
+
+    @pytest.mark.asyncio
     async def test_max_findings_truncates_but_counts_all(self, tmp_path: Any) -> None:
         journal = await build_journal_with_closed_run(
             tmp_path, run_id=RUN_A, project_id=P,
