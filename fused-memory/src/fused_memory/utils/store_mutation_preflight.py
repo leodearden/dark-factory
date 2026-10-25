@@ -205,6 +205,12 @@ Two placement rules, which are the non-obvious part:
     on other grounds (an empty scan, a truncated scan, a safety cap). Those are
     handled outcomes an operator can reasonably read past. A half-completed
     store mutation is not, so this refusal must not be mistakable for one.
+    The guard also emits the refusal's operator-facing record itself: a call
+    site passes its own ``logger=`` and an ``extra_detail=`` naming its
+    mechanism (see :func:`assert_store_mutation_allowed`), and must not wrap
+    the guard in an ``except StoreMutationUnavailable`` arm that logs --
+    ``tests/test_store_mutation_conformance.py`` fails any guarded script
+    that does.
 
 On this section's own history, which is why it is shaped this way: an earlier
 draft stated the rule as a universal, and a one-line grep disproved it -- the
@@ -236,6 +242,7 @@ network, no ``MemoryService``.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -315,7 +322,36 @@ def _create_probe_file(path: Path) -> None:
     os.close(fd)
 
 
-def assert_store_mutation_allowed(*, operation: str) -> None:
+def _refusal_record_message(
+    *, operation: str, history_dir: Path, extra_detail: str | None, cause: OSError
+) -> str:
+    """Compose the operator-facing ERROR record for a refused *operation*.
+
+    Every guarded script used to hand-copy this prose into its own
+    ``except StoreMutationUnavailable`` arm, and the copies drifted. Only the
+    marker, the diagnosis, the remedy and the ``--apply`` tail are shared; the
+    one script-specific part is *extra_detail*, spliced in after "so" and
+    ended here with exactly one full stop, whatever the caller wrote.
+    """
+    ending = f', so {extra_detail.rstrip().rstrip(".")}.' if extra_detail else '.'
+    diagnosis = (
+        f'{operation}: NOT started (fail-closed) -- this process cannot write '
+        f"mem0's history directory {str(history_dir)!r}{ending}"
+    )
+    return (
+        f'{diagnosis} Route this operation through the fused-memory MCP server '
+        f'(the unsandboxed owner of the store), or re-run from an unsandboxed '
+        f"operator shell. To obtain this run's report safely from anywhere, "
+        f're-run without --apply. ({cause!r})'
+    )
+
+
+def assert_store_mutation_allowed(
+    *,
+    operation: str,
+    logger: logging.Logger | None = None,
+    extra_detail: str | None = None,
+) -> None:
     """Refuse *operation* unless this process can actually write mem0's history dir.
 
     Probes real capability by creating a uniquely-named file in the resolved
@@ -333,16 +369,52 @@ def assert_store_mutation_allowed(*, operation: str) -> None:
         operation: Human-readable name of the mutation being gated (e.g.
             ``'sweep_toolcall_xml_leak --apply'``). Echoed into the refusal
             message so an operator can tell WHICH operation was refused.
+        logger: The CALLER's own logger. When given, a refusal emits exactly
+            one ERROR record through it -- naming the operation, the probed
+            directory and the probe's error -- before raising. It is the
+            caller's rather than this module's because, in most guarded
+            scripts, that record is the only diagnosis an operator sees.
+            Omitted, nothing is logged. CALLER CONTRACT: the record tells the
+            operator to re-run without ``--apply``, so pass a logger only when
+            *operation* is the ``--apply`` mode of a dry-run-by-default script.
+        extra_detail: This script's own part of that record: the mechanism by
+            which its mutation would split in half, plus its "nothing was X'd"
+            clause, read as a continuation after "so". Its final full stop is
+            optional; the record supplies exactly one. CALLER CONTRACT: never
+            restate the shared remedy or the ``--apply`` tail, which the
+            record already carries. Only the record reads it, so it requires
+            *logger*.
 
     Raises:
         StoreMutationUnavailable: When the probe cannot be created. The caller
-            MUST NOT begin the mutation.
+            MUST NOT begin the mutation. Raised the same whether or not a
+            *logger* was given.
+        ValueError: When *extra_detail* is given without *logger*. Checked
+            before the probe, so a miswired call site fails on every run rather
+            than only on the rare refused one.
     """
+    if extra_detail is not None and logger is None:
+        raise ValueError(
+            f'assert_store_mutation_allowed(operation={operation!r}) was given '
+            f'extra_detail without a logger; only the record emitted through '
+            f"the caller's logger reads extra_detail, so it would be silently "
+            f"discarded. Pass the calling module's logger, or drop extra_detail."
+        )
+
     history_dir = resolve_history_dir()
     probe = history_dir / f'.store-mutation-probe-{uuid.uuid4().hex}'
     try:
         _create_probe_file(probe)
     except OSError as exc:
+        if logger is not None:
+            logger.error(
+                _refusal_record_message(
+                    operation=operation,
+                    history_dir=history_dir,
+                    extra_detail=extra_detail,
+                    cause=exc,
+                )
+            )
         raise StoreMutationUnavailable(
             f'Refusing to begin {operation!r}: this process cannot create files in '
             f"mem0's history directory {str(history_dir)!r} ({exc!r}). "

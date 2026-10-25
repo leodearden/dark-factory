@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import enum
 import logging
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from shared.async_sqlite_base import AsyncSqliteBase
+from shared.sqlite_column_migration import add_column_if_missing
 
 __all__ = ['CostStore']
 
@@ -234,33 +234,16 @@ class CostStore(AsyncSqliteBase):
     async def _migrate_invocations_columns(self) -> None:
         """Add any :data:`_ADDED_INVOCATION_COLUMNS` an existing table lacks.
 
-        Additive only: probes ``PRAGMA table_info`` and issues one
-        ``ALTER TABLE ... ADD COLUMN`` per missing column.  Idempotent, and a
-        no-op on a fresh DB.  Pre-existing rows read NULL for the new columns,
-        meaning "not recorded".  No ``PRAGMA user_version`` ladder, per the
-        runs.db convention at ``orchestrator/src/orchestrator/flake_ledger.py``.
-
-        ``duplicate column name`` is swallowed: a concurrent ``CostStore`` open
-        added the column between our probe and this ``ALTER``, so the goal is
-        already met.  Any other error surfaces, because a silently
-        half-migrated schema would be worse.  The caller commits.
+        Additive only: one ``ALTER TABLE ... ADD COLUMN`` per missing column.
+        Idempotent, and a no-op on a fresh DB.  Pre-existing rows read NULL for
+        the new columns, meaning "not recorded".  No ``PRAGMA user_version``
+        ladder, per the rule in ``shared/src/shared/sqlite_column_migration.py``.
+        The caller commits.
         """
         conn = self._require_conn()
-        cursor = await conn.execute('PRAGMA table_info(invocations)')
-        existing = {row[1] for row in await cursor.fetchall()}
-        await cursor.close()
         for column, ddl in _ADDED_INVOCATION_COLUMNS:
-            if column in existing:
-                continue
-            try:
-                # Column name and DDL are hard-coded literals, never caller input.
-                await conn.execute(f'ALTER TABLE invocations ADD COLUMN {column} {ddl}')
-            except sqlite3.OperationalError as exc:
-                if 'duplicate column name' not in str(exc).lower():
-                    raise
-                logger.debug('CostStore: invocations.%s already added concurrently', column)
-                continue
-            logger.info('CostStore: added invocations.%s (%s)', column, ddl)
+            if await add_column_if_missing(conn, 'invocations', column, ddl):
+                logger.info('CostStore: added invocations.%s (%s)', column, ddl)
 
     # -- internal helpers -----------------------------------------------------
 

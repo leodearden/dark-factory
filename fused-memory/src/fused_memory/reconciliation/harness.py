@@ -53,6 +53,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     recon_archive_root,
     run_config_dir_path,
 )
+from fused_memory.reconciliation.dangling_citation import dangling_citation_identity
 from fused_memory.reconciliation.drained_event_restore import (
     restore_unless_completed_best_effort,
 )
@@ -71,6 +72,10 @@ from fused_memory.reconciliation.index_health import summarize_index_health
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
+from fused_memory.reconciliation.overreach_flags import (
+    acknowledge_overreach_flags,
+    fetch_overreach_flags,
+)
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
 from fused_memory.reconciliation.scope_freshness import (
@@ -123,6 +128,7 @@ from fused_memory.services.orchestrator_detector import (
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+    from fused_memory.services.overreach_shadow import OverreachFlagPage
 
 try:
     from escalation.dedupe import (  # type: ignore[import-untyped]
@@ -377,9 +383,13 @@ def _derive_affected_ids(finding: dict) -> list[str]:
     recurrence counting still works against pre-cutover journal rows that carry
     the old shape.
 
+    A Stage-3 dangling-citation finding cites nothing, so its
+    ``dangling_citation`` handoff record supplies its identity
+    (``dangling_citation.py::dangling_citation_identity``, task 5749).
+
     The top-level ``add_finding`` ``task_id`` is deliberately NOT an identity
-    source: only the legacy ``affected_ids`` and the typed ``cited_*`` lists
-    are.  Guarded by
+    source: only the legacy ``affected_ids``, the typed ``cited_*`` lists and
+    the ``dangling_citation`` record are.  Guarded by
     ``tests/reconciliation/test_derive_affected_ids.py::TestDeriveAffectedIds``
     (task-4772 section).
     """
@@ -404,6 +414,7 @@ def _derive_affected_ids(finding: dict) -> list[str]:
         mid = c.get('memory_id') if isinstance(c, dict) else None
         if mid:
             ids.append(str(mid))
+    ids.extend(dangling_citation_identity(finding))
     return ids
 
 
@@ -1307,6 +1318,7 @@ class ReconciliationHarness:
         graphiti_queue_health: dict | None = None,
         index_health: dict | None = None,
         status_correction_reconciliation: dict | None = None,
+        overreach_flags: OverreachFlagPage | None = None,
     ) -> None:
         """Apply tier limits and mode-specific attributes to MemoryConsolidator.
 
@@ -1326,6 +1338,8 @@ class ReconciliationHarness:
         status_correction_reconciliation: _reconcile_status_correction record
             (task 1938; available only in full-cycle passes; None in
             remediation passes).
+        overreach_flags: fetch_overreach_flags page (task 6137; available only
+            in full-cycle passes; None in remediation passes).
         """
         stage.episode_limit = tier.episode_limit
         stage.memory_limit = tier.memory_limit
@@ -1338,6 +1352,7 @@ class ReconciliationHarness:
         stage.graphiti_queue_health = graphiti_queue_health
         stage.index_health = index_health
         stage.status_correction_reconciliation = status_correction_reconciliation
+        stage.overreach_flags = overreach_flags
 
     @staticmethod
     def _configure_task_sync(
@@ -3775,6 +3790,8 @@ class ReconciliationHarness:
         # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
         graphiti_queue_health = await self._check_graphiti_queue_health(scope.project_id)
 
+        overreach_flags = await fetch_overreach_flags(self.memory.overreach_shadow, scope.project_id)
+
         # Check FalkorDB index provisioning and escalate on drift (task 3709 / PRD δ).
         # This is the recon-cadence half of Q3; the startup sweep calls the SAME
         # detector.  Kept here, outside the _active_runs.track block below, so a
@@ -3892,6 +3909,7 @@ class ReconciliationHarness:
                             graphiti_queue_health=graphiti_queue_health,
                             index_health=index_health,
                             status_correction_reconciliation=status_correction_reconciliation,
+                            overreach_flags=overreach_flags,
                         )
 
                     # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)
@@ -3943,6 +3961,7 @@ class ReconciliationHarness:
                     'last_task_change_timestamp': completed_at,
                 })
                 await self.journal.update_watermark(watermark)
+                await acknowledge_overreach_flags(self.memory.overreach_shadow, overreach_flags)
 
                 run.completed_at = datetime.now(UTC)
                 run.status = RunStatus.completed

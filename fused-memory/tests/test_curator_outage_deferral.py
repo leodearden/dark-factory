@@ -24,13 +24,13 @@ from _curator_helpers import (
 from shared.cli_invoke import AgentResult
 
 from fused_memory.middleware.curation_deferral import DeferReason
-from fused_memory.middleware.task_curator import (
+from fused_memory.middleware.curator_types import (
     CuratorDecision,
     PoolWithheld,
     PreparedCandidate,
-    TaskCurator,
     empty_pool_sizes,
 )
+from fused_memory.middleware.task_curator import TaskCurator
 
 INVOKE = 'fused_memory.middleware.task_curator.invoke_with_cap_retry'
 DEADLINE_SECS = 30.0

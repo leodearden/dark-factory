@@ -33,17 +33,17 @@ from shared.project_layout import escalation_queue_dir
 from shared.usage_gate import UsageGate
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, TicketJanitorConfig
+from fused_memory.middleware.candidate_key import normalize_title
 from fused_memory.middleware.curation_deferral import DEDUPE_SKIPPED_KEY, DeferReason
-from fused_memory.middleware.task_curator import (
+from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
     CuratorFailureError,
     PoolWithheld,
     PreparedCandidate,
     RewrittenTask,
-    TaskCurator,
-    normalize_title,
 )
+from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_janitor import TicketJanitor, curation_backlog_anchor
 from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore

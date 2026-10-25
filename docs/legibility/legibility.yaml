@@ -57,6 +57,25 @@ census:
   trickle_caps:
     max_batches: 50
     max_verify_clusters: 150
+  # Run in this checkout after a census writes its outputs and before it
+  # commits them. These are the tests that read the live codebook; a red gate
+  # rolls the census back unlanded (task 7448). See the LandingGate model in
+  # scripts/legibility/config.py.
+  landing_gate:
+    argv:
+      - uv
+      - run
+      - --no-sync
+      - --project
+      - shared
+      - pytest
+      - -q
+      - -p
+      - "no:cacheprovider"
+      - --timeout=300
+      - scripts/tests/test_codebook.py
+      - scripts/tests/test_legibility_coder.py
+    timeout_secs: 900
 models:
   trickle: haiku
   census_miner: sonnet

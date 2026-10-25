@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -381,6 +382,15 @@ def render_memory_results(results: Sequence[Any]) -> str:
     return '\n'.join(bullets)
 
 
+ENTITY_BLOCK_MAX_EDGES = 10
+"""The most edge facts one task-entity block renders.
+
+The exact-name ``get_entity`` path returns every connected edge, uncapped.
+"""
+
+ENTITY_EDGES_OMITTED_NOTICE = '_{count} more knowledge-graph fact(s) about **{name}** not shown._'
+
+
 def render_entity_block(payload: Mapping[str, Any], expected_name: str) -> str:
     """Render a ``get_entity`` reply, but ONLY for a node named exactly *expected_name*.
 
@@ -389,6 +399,11 @@ def render_entity_block(payload: Mapping[str, Any], expected_name: str) -> str:
     own. Exact-name admission is what makes the channel safe to render. An
     edge's date is best-effort and never required. Returns '' for a missing,
     empty or wrong-named node.
+
+    A fact the summary already says, or one an earlier edge carried, renders
+    once. At most :data:`ENTITY_BLOCK_MAX_EDGES` edge facts render, newest
+    first, and the rest are counted in-block by
+    :data:`ENTITY_EDGES_OMITTED_NOTICE`.
     """
     nodes = payload.get('nodes')
     nodes = nodes if isinstance(nodes, list) else []
@@ -407,13 +422,31 @@ def render_entity_block(payload: Mapping[str, Any], expected_name: str) -> str:
         )
         return ''
 
-    summary = node.get('summary')
-    heading = f'**{expected_name}**'
-    if isinstance(summary, str) and summary.strip():
-        heading += f' — {summary.strip()}'
+    raw_summary = node.get('summary')
+    summary = raw_summary.strip() if isinstance(raw_summary, str) else ''
+    heading = f'**{expected_name}** — {summary}' if summary else f'**{expected_name}**'
+    distinct = _newest_distinct_facts(_edge_facts(payload.get('edges')), summary)
+    lines = [heading, *(edge.bullet() for edge in distinct[:ENTITY_BLOCK_MAX_EDGES])]
+    if (omitted := len(distinct) - ENTITY_BLOCK_MAX_EDGES) > 0:
+        lines.append(ENTITY_EDGES_OMITTED_NOTICE.format(count=omitted, name=expected_name))
+    return '\n'.join(lines)
 
-    lines = [heading]
-    edges = payload.get('edges')
+
+@dataclass(frozen=True)
+class _EdgeFact:
+    """One ``get_entity`` edge with a non-blank fact; ``valid_at`` is set only when usably dated."""
+
+    fact: str
+    valid_at: str | None
+
+    def bullet(self) -> str:
+        dated = f' ({self.valid_at[:10]})' if self.valid_at else ''
+        return f'- {self.fact}{dated}'
+
+
+def _edge_facts(edges: Any) -> list[_EdgeFact]:
+    """The reply's renderable edges, in reply order; a non-list *edges* has none."""
+    parsed: list[_EdgeFact] = []
     for edge in edges if isinstance(edges, list) else []:
         if not isinstance(edge, dict):
             continue
@@ -422,9 +455,27 @@ def render_entity_block(payload: Mapping[str, Any], expected_name: str) -> str:
             continue
         temporal = edge.get('temporal')
         valid_at = temporal.get('valid_at') if isinstance(temporal, dict) else None
-        dated = f' ({valid_at[:10]})' if isinstance(valid_at, str) and len(valid_at) >= 10 else ''
-        lines.append(f'- {fact.strip()}{dated}')
-    return '\n'.join(lines)
+        dated = isinstance(valid_at, str) and len(valid_at) >= 10
+        parsed.append(_EdgeFact(fact.strip(), valid_at if dated else None))
+    return parsed
+
+
+def _newest_distinct_facts(facts: Sequence[_EdgeFact], summary: str) -> list[_EdgeFact]:
+    """*facts*, newest ``valid_at`` first, minus each one *summary* already
+    states or an earlier edge already carried; undated edges follow in reply order."""
+    seen: set[str] = set()
+    distinct: list[_EdgeFact] = []
+    for edge in sorted(facts, key=lambda edge: edge.valid_at or '', reverse=True):
+        if _states(summary, edge.fact) or edge.fact in seen:
+            continue
+        seen.add(edge.fact)
+        distinct.append(edge)
+    return distinct
+
+
+def _states(summary: str, fact: str) -> bool:
+    """Whether *fact* appears in *summary* bounded by whitespace or its ends, not inside longer text."""
+    return re.search(rf'(?<!\S){re.escape(fact)}(?!\S)', summary) is not None
 
 
 class MemoryFailure(Enum):

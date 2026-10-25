@@ -36,37 +36,38 @@ from fused_memory.mcp_tools.scheduler_state import (
     clear_lock_depth_cache,
     effective_lock_depth,
 )
-from fused_memory.middleware.candidate_key import compute_candidate_key
+from fused_memory.middleware.candidate_key import compute_candidate_key, normalize_title
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.curator_escalator import CuratorEscalator
+from fused_memory.middleware.curator_types import (
+    CandidateTask,
+    CuratorDecision,
+    CuratorFailureError,
+    PoolEntry,
+    PoolWithheld,
+    PreparedCandidate,
+    clip_for_prompt,
+    embedding_text,
+    empty_pool_sizes,
+    exception_summary,
+    is_combine_eligible_status,
+)
 from fused_memory.middleware.task_curator import (
     _CURATOR_PROMPT_HARNESS_VERSION,
     CURATOR_BATCH_OUTPUT_SCHEMA,
     CURATOR_BATCH_SPEC,
     CURATOR_OUTPUT_SCHEMA,
     CURATOR_SINGLE_SPEC,
-    CandidateTask,
-    CuratorDecision,
-    CuratorFailureError,
-    PoolWithheld,
-    PreparedCandidate,
     TaskCurator,
     _DegradedStreak,
     _parse_batch_decisions,
     _parse_decision,
     _parse_decision_dict,
-    _PoolEntry,
     _scale_budget,
     _task_files,
     _to_pool_entry,
     _trim_pool,
-    clip_for_prompt,
-    embedding_text,
-    empty_pool_sizes,
-    exception_summary,
     flatten_task_tree,
-    is_combine_eligible_status,
-    normalize_title,
 )
 
 # ----------------------------------------------------------------------
@@ -223,7 +224,7 @@ class TestFlattenTaskTree:
 class TestClipForPrompt:
     """`clip_for_prompt` is the single owner of truncate-and-mark (INV-5).
 
-    Both the pool side (`_PoolEntry.render`) and the candidate side
+    Both the pool side (`PoolEntry.render`) and the candidate side
     (`_build_user_prompt` / `_build_batch_section`) route through it, so the
     marker cannot drift between them.
     """
@@ -279,8 +280,8 @@ class TestEmbeddingText:
 
 
 class TestTrimPool:
-    def _entry(self, task_id: str, source: str) -> _PoolEntry:
-        return _PoolEntry(
+    def _entry(self, task_id: str, source: str) -> PoolEntry:
+        return PoolEntry(
             task_id=task_id,
             title='',
             description='',
@@ -512,16 +513,15 @@ class TestCandidateTaskExecutionClass:
 
 
 class TestHashShapeContract16:
-    """Shape-contract regression guard for the two task_curator.py sha256 mirror sites
-    that lack an existing 16-char length assertion.
+    """Shape-contract regression guard for the fused-memory sha256 mirror sites:
+    ``curator_types.py::CandidateTask.payload_hash``, and
+    ``TaskCurator._normalize_key``, which delegates to
+    ``candidate_key.py::compute_candidate_key``.
 
     The canonical 16-char sha256-hex shape is owned by
     ``orchestrator.agents.triage.sha256_16`` — see the docstring there for the full
-    enumeration of mirror sites.  The third curator mirror site,
-    ``TaskCurator._intra_batch_key``, is already guarded by
-    ``TestIntraBatchKey.test_returns_16_hex_chars`` (line ~1868); do not add duplicate
-    coverage here.  Anyone adding a fourth mirror site should add a corresponding
-    assertion to that test or this class.
+    enumeration of mirror sites.  Anyone adding a new mirror site should add a
+    corresponding assertion to this class.
 
     These tests do NOT introspect docstrings — they verify actual hash output length,
     mirroring the ``TestSha256_16.test_length_is_16`` pattern in
@@ -2224,7 +2224,7 @@ class TestZeroOutputBreakerBatchReset:
         """(3) Same reset, proven through the real production entry point
         (curate_batch_prepared → _call_llm_batch_with_fallback → _call_llm_batch)
         rather than the private method directly."""
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         config = _make_config()
         config.curator.zero_output_breaker_threshold = 2
@@ -2460,7 +2460,7 @@ class TestDegradedStreakBatchReset:
         """(3) Same reset, proven through the real production entry point
         (curate_batch_prepared → _call_llm_batch_with_fallback → _call_llm_batch)
         rather than the private method directly."""
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         curator, _escalator = self._curator_with_escalator()
         _seed_streak(curator, count=3, alarm_fired=True)
@@ -2645,7 +2645,7 @@ class TestPayloadFailureDegradedness:
         curator, escalator = self._curator_with_escalator()
 
         async def one_entry_corpus(*a, **k):
-            return [_PoolEntry(
+            return [PoolEntry(
                 task_id='1', title='Existing', description='d', details='',
                 files_to_modify=[], module_keys=[], status='pending',
                 priority='medium', source='anchor', combine_eligible=True,
@@ -2730,7 +2730,7 @@ class TestPayloadFailureDegradedness:
         curator, escalator = self._curator_with_escalator()
 
         async def one_entry_corpus(*a, **k):
-            return [_PoolEntry(
+            return [PoolEntry(
                 task_id='7', title='Existing', description='d', details='',
                 files_to_modify=[], module_keys=[], status='done',
                 priority='medium', source='anchor', combine_eligible=False,
@@ -2773,9 +2773,9 @@ class TestParserDegradednessTable:
     """
 
     @staticmethod
-    def _pool() -> list[_PoolEntry]:
+    def _pool() -> list[PoolEntry]:
         def entry(task_id, status, combine_eligible):
-            return _PoolEntry(
+            return PoolEntry(
                 task_id=task_id, title=f'T{task_id}', description='d', details='',
                 files_to_modify=[], module_keys=[], status=status,
                 priority='medium', source='anchor', combine_eligible=combine_eligible,
@@ -3856,7 +3856,7 @@ class TestParseDecisionDict:
         guard must still block the combine — authoritative independent of
         combine_eligible.
         """
-        entry = _PoolEntry(
+        entry = PoolEntry(
             task_id='11',
             title='Mystery task',
             description='',
@@ -3968,8 +3968,8 @@ class TestParseBatchDecisions:
     def test_returns_ordered_decisions_by_candidate_index(self):
         from fused_memory.middleware.task_curator import _parse_batch_decisions
         pool0 = _pool_with_ids(('10', 'pending'))
-        pool1: list[_PoolEntry] = []
-        pool2: list[_PoolEntry] = []
+        pool1: list[PoolEntry] = []
+        pool2: list[PoolEntry] = []
         result = _parse_batch_decisions(
             self._make_result([
                 {'candidate_index': 2, 'action': 'create', 'justification': 'c'},
@@ -4250,8 +4250,8 @@ class TestPromptClipSymmetry:
         desc_cap, details_cap = self._caps(config)
         return ('D' * (desc_cap + 777), 'X' * (details_cap + 313))
 
-    def _entry_with(self, description: str, details: str) -> _PoolEntry:
-        return _PoolEntry(
+    def _entry_with(self, description: str, details: str) -> PoolEntry:
+        return PoolEntry(
             task_id='pool-1',
             title='pool entry',
             description=description,
@@ -4421,7 +4421,7 @@ class TestCallLlmBatchFailure:
     @pytest.mark.asyncio
     async def test_raises_curator_failure_error_when_agent_result_not_success(self):
         """Non-success AgentResult raises CuratorFailureError with batch diagnostics."""
-        from fused_memory.middleware.task_curator import CuratorFailureError
+        from fused_memory.middleware.curator_types import CuratorFailureError
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         failed_result = AgentResult(
@@ -4948,10 +4948,8 @@ class TestPrepareCandidate:
 
     @pytest.mark.asyncio
     async def test_returns_prepared_candidate_with_token_estimate(self):
-        from fused_memory.middleware.task_curator import (
-            PreparedCandidate,
-            estimate_tokens,
-        )
+        from fused_memory.middleware.curator_types import PreparedCandidate
+        from fused_memory.middleware.task_curator import estimate_tokens
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         candidate = CandidateTask(
@@ -5183,7 +5181,7 @@ class TestWithheldReachesTheLlmPrompt:
         assert prepared.withheld is None or prepared.withheld.total == 0
 
     def _prepared(self, title: str, withheld: PoolWithheld | None) -> Any:
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
         return PreparedCandidate(
             candidate=CandidateTask(title=title, description=f'body of {title}'),
             pool=_pool_with_ids((f'pool-{title}', 'pending')),
@@ -5543,8 +5541,9 @@ class TestCurateBatchBatchTargetIndexRemap:
     a within-batch ``batch_target_index`` emitted by the LLM is in
     *unique-space* (positions 0..K-1).  The merge site must remap it to
     *original-space* (positions in the full ``candidates`` list) before
-    returning, because ``_process_add_tickets_batch`` keys
-    ``resolved_task_ids`` by original-space index.
+    returning, because the consumer,
+    ``TaskInterceptor._process_add_tickets_batch_prepared``, reads
+    ``batch_target_index`` positionally over the curatable slice it passed in.
     """
 
     @pytest.mark.asyncio
@@ -5720,70 +5719,6 @@ class TestCurateBatchCacheCheck:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# TaskCurator._intra_batch_key (step-1: tests written before impl)
-# ─────────────────────────────────────────────────────────────────────
-
-
-class TestIntraBatchKey:
-    """Unit tests for the intra-batch dedup key helper.
-
-    These tests are written before the implementation exists (TDD step-1);
-    they must FAIL until _intra_batch_key is added in step-2.
-    """
-
-    def test_identical_inputs_produce_same_key(self):
-        """(a) identical inputs → identical keys."""
-        k1 = TaskCurator._intra_batch_key('Fix the parser', 'The parser is broken')
-        k2 = TaskCurator._intra_batch_key('Fix the parser', 'The parser is broken')
-        assert k1 == k2
-
-    def test_title_case_normalised(self):
-        """(b) case difference on title is normalised away."""
-        k1 = TaskCurator._intra_batch_key('Fix Bug', 'same description')
-        k2 = TaskCurator._intra_batch_key('fix bug', 'same description')
-        assert k1 == k2
-
-    def test_whitespace_drift_normalised(self):
-        """(c) leading/trailing and internal whitespace collapse to same key."""
-        k1 = TaskCurator._intra_batch_key('  Fix   bug ', 'desc')
-        k2 = TaskCurator._intra_batch_key('fix bug', 'desc')
-        assert k1 == k2
-
-    def test_description_whitespace_normalised(self):
-        """(c) description whitespace drift also normalised."""
-        k1 = TaskCurator._intra_batch_key('title', '  do   something ')
-        k2 = TaskCurator._intra_batch_key('title', 'do something')
-        assert k1 == k2
-
-    def test_different_description_yields_different_key(self):
-        """(d) same title but different description → different keys."""
-        k1 = TaskCurator._intra_batch_key('Fix parser', 'in module A')
-        k2 = TaskCurator._intra_batch_key('Fix parser', 'in module B')
-        assert k1 != k2
-
-    def test_empty_description_does_not_raise(self):
-        """(e) empty description is handled without raising."""
-        k = TaskCurator._intra_batch_key('Some title', '')
-        assert isinstance(k, str)
-
-    def test_none_description_does_not_raise(self):
-        """(e) None description is handled without raising."""
-        k = TaskCurator._intra_batch_key('Some title', None)  # type: ignore[arg-type]
-        assert isinstance(k, str)
-
-    def test_returns_16_hex_chars(self):
-        """(f) returns a stable 16-character hex string."""
-        k = TaskCurator._intra_batch_key('hello', 'world')
-        assert len(k) == 16
-        assert all(c in '0123456789abcdef' for c in k)
-
-    def test_empty_title_and_description(self):
-        """(e) both empty — no raise, returns 16-char string."""
-        k = TaskCurator._intra_batch_key('', '')
-        assert len(k) == 16
-
-
-# ─────────────────────────────────────────────────────────────────────
 # normalize_title module-level helper
 # ─────────────────────────────────────────────────────────────────────
 
@@ -5811,6 +5746,13 @@ class TestNormalizeTitle:
     def test_empty_input_returns_empty_string(self):
         """(e) empty string → empty string."""
         assert normalize_title('') == ''
+
+    def test_candidate_key_and_normalize_title_agree_on_sameness(self):
+        """(f) the store's dedup key treats a title exactly as normalize_title does."""
+        title, files = '  Fix   The\tParser  ', ['b.py', 'a.py']
+        assert compute_candidate_key(title, files) == compute_candidate_key(
+            normalize_title(title), files,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -6419,7 +6361,7 @@ class TestCuratorBatchBlocklistShortCircuit:
 
     async def test_batch_blocklist_match_excluded_from_llm(self, tmp_path):
         """candidates[0] matches blocklist → excluded from LLM; decisions[0].action=='drop'."""
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         blocklist = _make_blocklist_yaml(
             tmp_path,
@@ -6702,7 +6644,7 @@ class TestBlocklistLazyLoadRunsOffEventLoop:
             raise RuntimeError("boom")
 
         with patch(
-            "fused_memory.middleware.cancelled_premise_blocklist.load_blocklist",
+            "fused_memory.middleware.task_curator.load_blocklist",
             side_effect=counting_raise,
         ), caplog.at_level(logging.WARNING):
             decision1 = await curator._maybe_blocklist_drop(
@@ -7091,7 +7033,7 @@ class TestZeroOutputBreakerBatchPath:
     async def test_breaker_open_gates_batch_llm_calls(self):
         """With breaker OPEN, curate_batch_prepared defers all LLM-bound
         candidates without invoking invoke_with_cap_retry."""
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         config = _make_config()
         config.curator.zero_output_breaker_threshold = 1  # opens after 1 ZOT
@@ -7150,7 +7092,7 @@ class TestZeroOutputBreakerBatchPath:
         A follow-on batch with the breaker open produces no LLM calls and no
         new escalation submissions.
         """
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         config = _make_config()
         config.curator.zero_output_breaker_threshold = 1  # open after 1 ZOT
@@ -7218,10 +7160,10 @@ class TestZeroOutputBreakerBatchPath:
 # ----------------------------------------------------------------------
 
 
-def _make_pool(n: int) -> list[_PoolEntry]:
-    """Build N minimal _PoolEntry objects for budget-scaling tests."""
+def _make_pool(n: int) -> list[PoolEntry]:
+    """Build N minimal PoolEntry objects for budget-scaling tests."""
     return [
-        _PoolEntry(
+        PoolEntry(
             task_id=str(i),
             title=f'Task {i}',
             description='',
@@ -7653,7 +7595,7 @@ class TestPremiseGuardRunsOffEventLoop:
             return True
 
         with patch(
-            "fused_memory.middleware.recon_code_fix_premise_guard.verify_premise_refuted",
+            "fused_memory.middleware.task_curator.verify_premise_refuted",
             side_effect=recording_verify,
         ):
             decision = await curator._maybe_premise_refuted_drop(
@@ -7706,7 +7648,7 @@ class TestPremiseGuardRunsOffEventLoop:
         )
 
         with patch(
-            "fused_memory.middleware.recon_code_fix_premise_guard.verify_premise_refuted",
+            "fused_memory.middleware.task_curator.verify_premise_refuted",
             side_effect=RuntimeError("boom"),
         ), caplog.at_level(logging.WARNING):
             decision = await curator._maybe_premise_refuted_drop(
@@ -7788,7 +7730,7 @@ class TestPremiseGuardRunsOffEventLoop:
             return real_load_premise_registry(path)
 
         with patch(
-            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            "fused_memory.middleware.task_curator.load_premise_registry",
             side_effect=recording_load,
         ):
             decision1 = await curator._maybe_premise_refuted_drop(
@@ -7863,7 +7805,7 @@ class TestPremiseGuardRunsOffEventLoop:
             return real_load_premise_registry(path)
 
         with patch(
-            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            "fused_memory.middleware.task_curator.load_premise_registry",
             side_effect=slow_load,
         ):
             d1, d2 = await asyncio.gather(
@@ -7939,7 +7881,7 @@ class TestPremiseGuardRunsOffEventLoop:
             raise RuntimeError("registry load exploded")
 
         with patch(
-            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            "fused_memory.middleware.task_curator.load_premise_registry",
             side_effect=raising_load,
         ), caplog.at_level(logging.WARNING):
             decision1 = await curator._maybe_premise_refuted_drop(
@@ -8017,7 +7959,7 @@ class TestPremiseGuardRunsOffEventLoop:
             return real_load_premise_registry(path)
 
         with patch(
-            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            "fused_memory.middleware.task_curator.load_premise_registry",
             side_effect=first_call_cancelled,
         ):
             with pytest.raises(asyncio.CancelledError):
@@ -8048,7 +7990,7 @@ class TestCuratorBatchPremiseRefutedDrop:
 
     async def test_batch_premise_refuted_match_excluded_from_llm(self, tmp_path):
         """candidates[0] is premise-refuted → excluded from LLM; decisions[0].action=='drop'."""
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         source_root = tmp_path / "source_root"
         source_root.mkdir()
@@ -8118,7 +8060,7 @@ class TestCuratorBatchPremiseRefutedDrop:
 
     async def test_batch_ordinary_candidate_flows_through_normally(self, tmp_path):
         """A batch with no premise-refuted candidates is unaffected by the guard."""
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         source_root = tmp_path / "source_root"
         source_root.mkdir()
@@ -8178,7 +8120,7 @@ class TestCuratorBatchPremiseRefutedDrop:
         refute the premise, the identical candidate must reach the (mocked) LLM
         on the second call instead of being suppressed by a stale cached drop.
         """
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         source_root = tmp_path / "source_root"
         source_root.mkdir()
@@ -8278,7 +8220,7 @@ class TestBatchDuplicateInheritsRefusal:
     """
 
     async def test_identical_blocklisted_duplicates_both_refused(self, tmp_path):
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         blocklist = _make_blocklist_yaml(
             tmp_path,
@@ -8327,7 +8269,7 @@ class TestBatchDuplicateInheritsRefusal:
             assert dec.target_id is None, (i, dec)
 
     async def test_identical_premise_refuted_duplicates_both_refused(self, tmp_path):
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         source_root = tmp_path / "source_root"
         source_root.mkdir()
@@ -8385,7 +8327,7 @@ class TestBatchDuplicateInheritsRefusal:
         """The propagation must be narrow: a duplicate of a NON-refused candidate
         keeps its synthetic pre-batch-dedup drop, so the worker's topo-sort can
         still substitute the first candidate's task_id."""
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         blocklist = _make_blocklist_yaml(
             tmp_path,
@@ -8726,7 +8668,7 @@ class TestOperationalRegistryLazyLoadRunsOffEventLoop:
             raise RuntimeError("boom")
 
         with patch(
-            "fused_memory.middleware.operational_ask_registry.load_operational_registry",
+            "fused_memory.middleware.task_curator.load_operational_registry",
             side_effect=counting_raise,
         ), caplog.at_level(logging.WARNING):
             decision1 = await curator._maybe_route_deterministic(
@@ -8940,7 +8882,7 @@ class TestCuratorBatchRouteDeterministic:
         """(a) candidates[0] matches the operational registry -> excluded from
         the batch LLM and resolves to action=='route_deterministic';
         candidates[1] is a registry-miss and goes through the (mocked) LLM."""
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         registry = _make_operational_registry_yaml(
             tmp_path,
@@ -9003,7 +8945,7 @@ class TestCuratorBatchRouteDeterministic:
     async def test_batch_blocklist_precedence_over_route(self, tmp_path):
         """(b) Within a batch, a candidate matching BOTH the blocklist and the
         operational registry resolves to the blocklist refusal, not route."""
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         blocklist = _make_blocklist_yaml(
             tmp_path,
@@ -9062,7 +9004,7 @@ class TestCuratorBatchRouteDeterministic:
         pre-batch payload-hash dedup means only the FIRST is evaluated (and
         routed); the second gets a batch_target_index sibling-substitution
         drop — no second gate is spawned."""
-        from fused_memory.middleware.task_curator import PreparedCandidate
+        from fused_memory.middleware.curator_types import PreparedCandidate
 
         registry = _make_operational_registry_yaml(
             tmp_path,

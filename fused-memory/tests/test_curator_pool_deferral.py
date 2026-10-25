@@ -30,11 +30,11 @@ from shared.invocation_outcome import AuthFailed, CapHit, InvocationOutcome
 from shared.usage_gate import PoolFrozen, UsageGate
 
 from fused_memory.middleware.curation_deferral import DeferReason
-from fused_memory.middleware.task_curator import (
+from fused_memory.middleware.curator_types import (
     CuratorDecision,
     PreparedCandidate,
-    TaskCurator,
 )
+from fused_memory.middleware.task_curator import TaskCurator
 
 INVOKE = 'fused_memory.middleware.task_curator.invoke_with_cap_retry'
 DEADLINE_SECS = 30.0

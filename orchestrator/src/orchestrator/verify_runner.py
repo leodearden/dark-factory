@@ -1378,6 +1378,8 @@ class RemoteRunner:
         # The request cancel_verify() last signalled: its verify then dies by
         # this dispatcher's hand, which says nothing about the host.
         self._cancelled_request_id: str | None = None
+        # The request whose verify ssh has started: the only one with a remote process to kill.
+        self._verify_started_request_id: str | None = None
 
     async def health(self) -> bool:
         """Best-effort health probe: ``ssh <host> true``.
@@ -1764,7 +1766,9 @@ class RemoteRunner:
         exclusive-use invariant and raises ConcurrentDispatchError, leaving
         the live claim untouched.  :meth:`ensure_gate` runs on every call, so
         every verify runs the deployed sha's gate.  After a successful push the
-        ref is deleted best-effort on every exit.
+        ref is deleted best-effort on every exit.  A :meth:`cancel_verify`
+        before the verify ssh starts makes it raise RunnerUnavailable
+        ('transport') instead of starting the verify.
 
         Raises RunnerUnavailable, whose ``kind`` says why, whenever the host
         produced no usable verdict — a parseable no-verdict result included.
@@ -1790,6 +1794,7 @@ class RemoteRunner:
                     )
         finally:
             self._inflight_request_id = None
+            self._verify_started_request_id = None
 
     async def _run_gate_verify(
         self, sha: str, subcommand: RemoteVerifySubcommand, spec_json: str, request_id: str,
@@ -1799,6 +1804,13 @@ class RemoteRunner:
             subcommand, '--sha', sha, '--spec', spec_json, *self._config_args(),
             '--request-id', request_id,
         ])
+        if request_id == self._cancelled_request_id:
+            raise RunnerUnavailable(
+                f'request {request_id!r} was cancelled before its verify ssh to '
+                f'{self._ssh_host!r} started',
+                kind='transport',
+            )
+        self._verify_started_request_id = request_id
         ssh_t0 = time.monotonic()
         try:
             ssh_rc, ssh_stdout, ssh_stderr = await self._ssh_run(
@@ -2042,19 +2054,33 @@ class RemoteRunner:
         including during run_merge_verify's main-mirror push, which precedes
         the claim — matching α's contract: cancel an unknown/finished id exits 0.
 
-        Otherwise issues, through the gate binary (design D3):
+        Before the request's verify ssh starts (ensure_gate's sha publish and
+        ensure-gate.sh, which may be building the gate binary, then the
+        verify-ref push) it is a local no-op returning 0 that makes
+        ``_run_gate_verify`` refuse to start the verify, so this 0 guarantees
+        the verify never starts.
+
+        Once the verify ssh has started it issues, through the gate binary
+        (design D3):
             ssh <_SSH_BASE_OPTS> <host>
                 env ORCH_GATE_BIN=<gate bin> orchestrator cancel-verify
                     --request-id <id> [--config <path>]
 
-        Returns the ssh return code.  An OSError (host unreachable) returns a
+        and returns the remote cancel-verify's rc.  That 0 is weaker: the remote
+        (``orchestrator/src/orchestrator/cli.py::cancel_verify``) also exits 0
+        when the verify has not yet written its pgid file, so a
+        verify still starting up can outlive it, and the caller must still
+        cancel its local dispatch.  An OSError (host unreachable) returns a
         non-zero sentinel so the caller treats it as a cancel failure.
         """
-        if self._inflight_request_id is None:
+        request_id = self._inflight_request_id
+        if request_id is None:
             return 0
-        self._cancelled_request_id = self._inflight_request_id
+        self._cancelled_request_id = request_id
+        if request_id != self._verify_started_request_id:
+            return 0
         remote_cmd = self._gate_command([
-            'cancel-verify', '--request-id', self._inflight_request_id, *self._config_args(),
+            'cancel-verify', '--request-id', request_id, *self._config_args(),
         ])
         try:
             rc, _, _ = await self._run(

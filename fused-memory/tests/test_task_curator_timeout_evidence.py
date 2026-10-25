@@ -29,12 +29,12 @@ from shared.usage_gate import UsageGate
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.curation_deferral import DeferReason
-from fused_memory.middleware.task_curator import (
+from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
     PoolWithheld,
-    TaskCurator,
 )
+from fused_memory.middleware.task_curator import TaskCurator
 
 _CURATOR_MODULE = 'fused_memory.middleware.task_curator'
 _INVOKE = f'{_CURATOR_MODULE}.invoke_with_cap_retry'

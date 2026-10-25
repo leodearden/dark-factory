@@ -682,12 +682,16 @@ class TaskStatusConfig(BaseModel):
 # --- Reconciliation ---
 
 class ProceduralTopicCluster(BaseModel):
-    """One known-contradictory procedural_knowledge topic for the write-time topic guard.
+    """One known-contradictory topic for the write-time topic guard.
 
-    A cluster is matched deterministically: an incoming ``procedural_knowledge``
-    add_memory write is soft-blocked when its (lowercased) content contains
-    EITHER at least ``min_phrase_hits`` DISTINCT ``phrases``, OR any single
-    phrase listed in ``sufficient_phrases``. A blocked write routes the writer
+    A cluster is matched deterministically: an incoming add_memory write whose
+    explicit ``category`` is in ``_TOPIC_GUARD_GATED_CATEGORIES``
+    (``server/tools.py::create_mcp_server``) is soft-blocked when its (lowercased)
+    content contains EITHER at least ``min_phrase_hits`` DISTINCT ``phrases``,
+    OR any single phrase listed in ``sufficient_phrases``. The cosine
+    near-duplicate guard that this topic guard complements (see
+    ``procedural_knowledge_near_dup_guard_enabled`` on ``ReconciliationConfig``)
+    remains ``procedural_knowledge``-only. A blocked write routes the writer
     to consolidate/update the existing entries or add context to the human gate
     task named in ``hint`` -- instead of accumulating another paraphrased,
     below-cosine-threshold restatement the semantic near-dup guard cannot catch
@@ -2022,8 +2026,11 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
-    # Write-time TOPIC-keyed cluster guard for procedural_knowledge add_memory writes
-    # (task 2845). Complements the cosine near-dup guard above: paraphrased same-topic
+    # Write-time TOPIC-keyed cluster guard for add_memory writes (task 2845), gated
+    # since task 3430 on category in _TOPIC_GUARD_GATED_CATEGORIES
+    # (server/tools.py::create_mcp_server) rather than procedural_knowledge alone.
+    # Complements the cosine near-dup guard above, which remains
+    # procedural_knowledge-only: paraphrased same-topic
     # entries score BELOW any cosine threshold that is also safe for unrelated writes,
     # so a recurring known-contradictory topic (e.g. "pytest-xdist -n0 serial override")
     # kept accumulating contradictory entries the cosine guard
@@ -2038,21 +2045,33 @@ class ReconciliationConfig(BaseModel):
     # Machine-derived clusters from server/topic_cluster_store.py merge AFTER this
     # list at read time and, unlike it, ARE project-scoped
     # (server/near_duplicate_guard.py::resolve_topic_guard_clusters).
+    # NOTE: the field keeps its historical `procedural_knowledge_` prefix although the
+    # gate covers more categories. Do not rename it: ReconciliationConfig leaves
+    # pydantic's extra='ignore' in force, so a rename would silently drop any operator
+    # override still written under the old key unless a rejecting validator like
+    # _reject_legacy_bulk_reset_threshold were added. Keep the ProceduralTopicCluster
+    # class name and the ProceduralKnowledgeKnownTopicClusterWriteRejected error_type
+    # too; writers and skills match on that error_type string.
     procedural_knowledge_topic_guard_clusters: list[ProceduralTopicCluster] = Field(
         default_factory=_default_topic_guard_clusters,
         description=(
-            'Known-contradictory procedural_knowledge topic clusters. An add_memory '
-            "write whose content contains >= a cluster's min_phrase_hits distinct "
-            "phrases -- OR any single one of that cluster's sufficient_phrases, for "
-            'phrases distinctive enough to qualify alone -- is soft-blocked '
+            'Known-contradictory topic clusters for the write-time topic guard. An '
+            'add_memory write whose explicit category is gated (procedural_knowledge or '
+            'preferences_and_norms; source of truth: _TOPIC_GUARD_GATED_CATEGORIES in '
+            "server/tools.py) and whose content contains >= a cluster's min_phrase_hits "
+            "distinct phrases -- OR any single one of that cluster's sufficient_phrases, "
+            'for phrases distinctive enough to qualify alone -- is soft-blocked '
             '(error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) BEFORE '
-            'the cosine near-dup search. Seeded with five clusters (pytest-xdist, '
+            'the cosine near-dup search. The cosine near-dup guard remains '
+            'procedural_knowledge-only. Seeded with five clusters (pytest-xdist, '
             'the two architect families, ruff-format, and npx-pyright-EACCES); '
             'the two eval-worktree '
             'clusters that were seeded originally are RETIRED -- both their human '
             'gates (2841/2844) are done -- and must not be reinstated without '
             'reading the retirement notes on _default_topic_guard_clusters. An '
             'empty list disables the topic guard. '
+            'The procedural_knowledge_ name prefix is historical: the guard covers '
+            'more than procedural_knowledge. '
             'A sufficient_phrases entry absent from that cluster\'s phrases is '
             'rejected at load/reload rather than silently matching nothing. Green-tier '
             'hot-reloadable via the reload_config MCP tool (read live per add_memory '
@@ -2297,7 +2316,7 @@ class CuratorConfig(BaseModel):
     #
     # These four are deliberately NOT re-tuned by task 5364. Nothing measured
     # how often they bind; the ``pool_truncated`` census that task installs
-    # (``task_curator.py::PoolWithheld``) IS that instrument, and tuning waits
+    # (``curator_types.py::PoolWithheld``) IS that instrument, and tuning waits
     # on what it reports rather than repeating the 2026-04 guess.
     pool_module_cap: int = Field(default=15)
     pool_embedding_cap: int = Field(default=10)
@@ -2328,7 +2347,7 @@ class CuratorConfig(BaseModel):
     idempotency_ttl_seconds: float = Field(default=600.0)
 
     # Entry payload limits, applied per pool entry AND to the candidate block
-    # (both sides route through ``task_curator.py::clip_for_prompt``, which
+    # (both sides route through ``curator_types.py::clip_for_prompt``, which
     # marks what it elided).
     #
     # Derived from the live task corpus, measured 2026-09-18 (n=5574 rows;
@@ -3548,6 +3567,27 @@ class LinkHealConfig(BaseModel):
     )
 
 
+class OverreachGuardConfig(BaseModel):
+    """The ruling-overreach guard's Stage S shadow (design.md §6.1, task 6137)."""
+
+    shadow_enabled: bool = Field(
+        default=True,
+        description=(
+            'Kill switch for the record-only overreach shadow judge. Read live per '
+            'job by services/overreach_shadow.py, so a hot reload takes effect on '
+            'the next decisions_and_rationale write.'
+        ),
+    )
+    judge_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description=(
+            'Bound on one shadow judge call; a slower call is recorded as failed. '
+            'Read live per job by services/overreach_shadow.py.'
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseSettings):
     """Fused Memory configuration with YAML and environment support."""
 
@@ -3593,6 +3633,9 @@ class FusedMemoryConfig(BaseSettings):
     )
     # Bare submodel for the same per-leaf-reload reason as write_triage above.
     mem0_update: Mem0UpdateConfig = Field(default_factory=Mem0UpdateConfig)
+    # Bare submodel for the same per-leaf-reload reason as write_triage above;
+    # shadow_enabled is a kill switch, and a restart-only kill switch is none.
+    overreach_guard: OverreachGuardConfig = Field(default_factory=OverreachGuardConfig)
     # Bare submodel for the same per-leaf-reload reason as write_triage above.
     # Here nullability would additionally cost the KILL SWITCH its green tier,
     # and a restart-only kill switch is no kill switch.

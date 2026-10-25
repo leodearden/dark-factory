@@ -263,6 +263,9 @@ DISALLOW_ESCALATION_READS = [
     'mcp__escalation__get_escalation',
     'mcp__escalation__get_task_escalations',
     'mcp__escalation__get_task_escalation_history',
+    # A by-id record read, denied for the same reason as get_escalation
+    # (task 5751).
+    'mcp__escalation__resolve_escalation_shas',
 ]
 
 # Escalation FILING tools (disallowed in Stage 1 and Stage 3 — task 3250).

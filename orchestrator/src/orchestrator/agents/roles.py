@@ -145,6 +145,17 @@ _ESCALATION_TOOLS = [
     'mcp__escalation__escalate_blocker',
 ]
 
+# Spliced into ESCALATION_LADDER_CORE so every escalating role, steward included, reads it.
+RESERVED_BOUND_ROUTING_RULE = """
+**A bound reserved to a human makes the ruling blocking, even when the finding is not.**
+If your remedy must cross a bound whose own text reserves the change to a human
+decision (a docstring, comment or PRD row saying the move must be a decision, must not
+be tidied away, or needs an operator ruling), file `escalate_blocker` BEFORE crossing
+it — at PLAN time if you are planning. An `escalate_info` record gates nothing unless
+something later promotes it, and promotion is not retroactive: it can land after your
+branch has already merged.
+"""
+
 # Split (task 4169): the original single `_ESCALATION_INSTRUCTIONS` literal
 # ended with a paragraph telling every escalating role that `level=1` is "the
 # STEWARD's route, not yours" -- correct for the six non-steward escalating
@@ -202,7 +213,7 @@ If you encounter a problem you cannot solve at your scope, you can escalate:
     `critical`/`urgent` filing bypasses dedupe entirely — so on every other path each
     repeat mints a NEW record, and on that one a NEW page to the human. One retry
     buys a second chance at durability; a retry every iteration is a storm.
-
+""" + RESERVED_BOUND_ROUTING_RULE + """
 Categories: scope_violation, design_concern, cleanup_needed, dependency_discovered,
 risk_identified, infra_issue.
 
@@ -480,6 +491,8 @@ alone, and escalate. Full rule and cross-links: `docs/task-authoring.md`,
 section "In-place memory amendments are not task-agent work".
 """
 
+# fused-memory/tests/test_referent_declaration_examples.py executes the `entities=`
+# example below against the live gate.
 _MEMORY_INSTRUCTIONS = """
 ## Memory
 
@@ -503,6 +516,8 @@ Parameters:
 - `category`: One of `observations_and_summaries`, `procedural_knowledge`, or `preferences_and_norms`
 - `project_id`: Use the project_id from your Agent Identity section
 - `agent_id`: Use the agent_id from your Agent Identity section
+- `entities`: The tasks the memory is about, or `[]` if you considered it and none apply. Name each declared task as `task NNN` in the content too, for example:
+  `add_memory(content="Task 3127's retry loop swallows the timeout", category="procedural_knowledge", project_id=..., agent_id=..., entities=[{'kind': 'task', 'id': 3127}])`
 
 Write immediately when you discover something — don't batch until the end.
 """ + MEMORY_AMEND_ROUTING_RULE + """
@@ -2600,7 +2615,8 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
     caller_indent='   ',
 ) + """
 2. For notable conventions among accepted items: write via `add_memory`
-   with category `preferences_and_norms`.
+   with category `preferences_and_norms` and `entities` set to `[]`, since a
+   convention is about a pattern; declare a task only if it concerns that one task.
 3. Call `resolve_issue` summarizing: N candidates submitted, K skipped (submit errors),
    M conventions written. Curator outcomes (created / combined / dropped) land in
    `tasks.json` asynchronously; any failed tickets will re-surface via the janitor as
@@ -2624,7 +2640,8 @@ classification has already been done by a triage agent. Do NOT re-classify. Inst
     caller_indent='  ',
 ) + """
 - **convention** — Pattern-level insight for future agents. Write via `add_memory`
-  with category `preferences_and_norms`.
+  with category `preferences_and_norms` and `entities` set to `[]`, unless it
+  concerns one specific task.
 - **dismiss** — Not actionable, already covered, or noise.
 
 **Deduplication:** Before creating any task, call `get_tasks` to check for existing

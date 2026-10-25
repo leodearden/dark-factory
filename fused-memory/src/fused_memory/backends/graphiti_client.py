@@ -429,6 +429,20 @@ class EdgeDict(TypedDict):
     name: str
 
 
+class EdgeWithEndpoints(TypedDict):
+    """A RELATES_TO edge with its endpoint names, as get_edges_by_uuids returns it.
+
+    ``active`` is ``_ACTIVE_EDGE_PREDICATE`` evaluated on the edge.
+    """
+
+    uuid: str
+    fact: str
+    source_name: str
+    target_name: str
+    episodes: list[str]
+    active: bool
+
+
 @dataclass(frozen=True, kw_only=True)
 class StaleSummaryResult:
     """Structured return type for detect_stale_with_edges.
@@ -5271,6 +5285,34 @@ class GraphitiBackend:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
         row = result.result_set[0]
         return (row[0] or '', row[1] or '')
+
+    @_canonicalize_group_args
+    async def get_edges_by_uuids(
+        self, uuids: Sequence[str], *, group_id: str,
+    ) -> list[EdgeWithEndpoints]:
+        """The surviving RELATES_TO edges among *uuids*, in input order, one per uuid.
+
+        The survivor read for services/overreach_shadow.py: by the time the
+        identity lock is released, _dedup_episode_edges may have deleted a
+        duplicate edge and the node passes may have renamed an endpoint, so
+        the write's own result is stale. Retired edges are returned too,
+        marked by ``active``.
+        """
+        if not uuids:
+            return []
+        result = await self._graph_for(group_id).ro_query(
+            'MATCH (a)-[e:RELATES_TO]->(b) WHERE e.uuid IN $uuids '
+            f'RETURN e.uuid, e.fact, a.name, b.name, e.episodes, {_ACTIVE_EDGE_PREDICATE}',
+            {'uuids': list(uuids)},
+        )
+        by_uuid: dict[str, EdgeWithEndpoints] = {}
+        for edge_uuid, fact, source_name, target_name, episodes, active in result.result_set:
+            by_uuid.setdefault(edge_uuid, EdgeWithEndpoints(
+                uuid=edge_uuid, fact=fact or '', source_name=source_name or '',
+                target_name=target_name or '', episodes=list(episodes or []),
+                active=bool(active),
+            ))
+        return [by_uuid[wanted] for wanted in dict.fromkeys(uuids) if wanted in by_uuid]
 
     @_canonicalize_group_args
     async def get_edge_invalid_at(self, uuid: str, *, group_id: str) -> Any:

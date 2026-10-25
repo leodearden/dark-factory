@@ -107,6 +107,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
 )
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
+from fused_memory.services import overreach_guard
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
@@ -117,6 +118,11 @@ from fused_memory.services.memory_metadata_census import (
     UnknownKeyStormDetector,
     emit_schema_warnings,
     file_unknown_key_storm_escalation,
+)
+from fused_memory.services.overreach_shadow import (
+    OverreachShadow,
+    open_overreach_shadow,
+    shadow_job_from_write,
 )
 from fused_memory.services.read_telemetry import (
     fallback_search_summary,
@@ -185,6 +191,9 @@ _SUBCLOSE_TIMEOUT = 3.0
 # SDK connection-pool releases (classifier, router) only close local idle sockets: httpx opens its TLS streams with standard_compatible=False, so no close waits on the peer.
 # They run after every durable-flush close and lose nothing if cut short.
 _POOL_RELEASE_TIMEOUT = 0.5
+
+# The overreach shadow's close cancels its judge jobs rather than draining them, so it needs no SQLite-flush budget.
+_SHADOW_CLOSE_TIMEOUT = 0.5
 
 # The durable-queue group_id prefix that distinguishes a project's Mem0 writes
 # from its Graphiti ones, whose group_id is the bare project_id
@@ -2330,6 +2339,8 @@ class MemoryService:
         self._write_journal: WriteJournal | None = None
         self.taskmaster: TaskBackendProtocol | None = None
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
+        # Public: recon's O4 handoff reads flags through it (task 6137).
+        self.overreach_shadow: OverreachShadow | None = None
         self.recon_ledger: ReconLedgerStore | None = None
         self.recon_journal: ReconciliationJournal | None = None
         # {project_id: project_root}, seeded below from DASHBOARD_KNOWN_PROJECT_ROOTS
@@ -2601,6 +2612,13 @@ class MemoryService:
             self.planned_episode_registry = PlannedEpisodeRegistry(data_dir=qcfg.data_dir)
             await self.planned_episode_registry.initialize()
 
+        try:
+            self.overreach_shadow = await open_overreach_shadow(
+                self.config, read_edges=self.graphiti.get_edges_by_uuids,
+            )
+        except Exception:
+            logger.warning('overreach shadow failed to open; running without it', exc_info=True)
+
         self.durable_queue = DurableWriteQueue(
             data_dir=qcfg.data_dir,
             execute_write=self._execute_durable_write,
@@ -2698,6 +2716,7 @@ class MemoryService:
         """Each sub-close close() runs, in order, with its time budget."""
         return (
             ('durable_queue', self.durable_queue, _SUBCLOSE_TIMEOUT),
+            ('overreach_shadow', self.overreach_shadow, _SHADOW_CLOSE_TIMEOUT),
             ('graphiti', self.graphiti, _SUBCLOSE_TIMEOUT),
             ('mem0', self.mem0, _SUBCLOSE_TIMEOUT),
             ('write_journal', self._write_journal, _SUBCLOSE_TIMEOUT),
@@ -5980,6 +5999,22 @@ class MemoryService:
         counts['streaks'] = dict(self._referent_repair_streaks)
         return counts
 
+    def _submit_overreach_shadow(
+        self, result: Any, payload: dict[str, Any], category: MemoryCategory | None,
+    ) -> None:
+        """Hand a landed class write to the overreach shadow; a failure never fails the write."""
+        if self.overreach_shadow is None or not overreach_guard.is_guarded_category(category):
+            return
+        try:
+            job = shadow_job_from_write(
+                result, group_id=payload['group_id'], content=payload['content'], category=category,
+            )
+            if job is not None:
+                self.overreach_shadow.submit(job)
+        except Exception:
+            logger.warning('overreach shadow: submit failed for group_id=%r',
+                           payload.get('group_id'), exc_info=True)
+
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
     ) -> Any:
@@ -6034,6 +6069,8 @@ class MemoryService:
         # the tag reaches the persisted episodic node (and, via
         # _dual_write_callback, every fact derived from it).
         unverified_claim = bool(payload.pop('unverified_claim', False))
+        # task 6137: the overreach shadow's class key, on the same channel.
+        memory_category = overreach_guard.category_of(payload.pop('memory_category', None))
         # task 3561: rows enqueued BEFORE the fix still carry the fatal 'uuid'
         # key, and the durable queue outlives the deploy that removed it — so
         # the defect would survive its own fix for as long as the backlog does
@@ -6166,6 +6203,11 @@ class MemoryService:
                 'Reconciled episode identity for group_id=%r: %r',
                 payload['group_id'], reconcile_stats,
             )
+
+        # After the lock: the judge needs no identity lock, and an LLM round trip
+        # inside it would serialize every decision write for the group
+        # (design.md §6 'Lock placement').
+        self._submit_overreach_shadow(result, payload, memory_category)
 
         # Register planning episodes so they can be filtered from search results.
         #
@@ -6905,6 +6947,8 @@ class MemoryService:
                         'source': 'text',
                         'group_id': scope.graphiti_group_id,
                         'source_description': f'add_memory:{resolved_category.value}',
+                        # Popped by _execute_graphiti_write for the overreach shadow.
+                        'memory_category': resolved_category.value,
                         '_causation_id': causation_id,
                         '_write_op_id': write_op_id,
                         # Popped and decoded by _execute_graphiti_write.

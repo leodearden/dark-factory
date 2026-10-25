@@ -37,11 +37,14 @@ from fused_memory.reconciliation.blocked_gate_audit_section import (
     render_blocked_gate_audit_section,
 )
 from fused_memory.reconciliation.capped_task_list import render_capped_task_list
+from fused_memory.reconciliation.citation_verifier import STAGE_STAT_PREFIX
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
 )
+from fused_memory.reconciliation.cross_run_citation_scan import scan_cross_run_citations
+from fused_memory.reconciliation.dangling_citation import build_dangling_citation_finding
 from fused_memory.reconciliation.flag_dedup import (
     _content_fingerprint,
     _normalize_content_description,
@@ -3339,8 +3342,9 @@ class TaskKnowledgeSync(BaseStage):
     # ── Inference-bearing payload sections (task 5113) ──────────────────────
     # INCLUSION CRITERION — a section belongs here iff prompts/stage2.py tells
     # the model to draw an inference from that section's ABSENCE ("If
-    # `### Live-Workflow Signals` is absent from the payload, no task is live
-    # this cycle …"). Every payload builder renders these via
+    # `### Live-Workflow Signals` is absent from the payload, no task the
+    # `### Active Task Tree` lists is live this cycle …"). Every payload builder
+    # renders these via
     # _render_required_sections(). Enforced by
     # tests/reconciliation/test_stage2_payload_section_parity.py, whose module
     # docstring holds the section census: why each other conditional section
@@ -4609,7 +4613,10 @@ class IntegrityCheck(BaseStage):
            read a Mem0-only task-count snapshot stat as evidence of a missing
            Graphiti temporal_facts edge, for every project (task 3487).  Records
            report.stats['snapshot_stat_edge_findings_dropped'] = before - after.
-        5. Calls record_task_dump_spot_check() to record a non-destructive
+        5. Calls scan_cross_run_citations() and appends one finding per
+           confirmed-absent mem0 citation on a settled run's finding, recording
+           the scan's stage3_cross_run_* stats (task 5749).
+        6. Calls record_task_dump_spot_check() to record a non-destructive
            observability stat when the cached task tree contains contamination
            signals.
 
@@ -4675,6 +4682,12 @@ class IntegrityCheck(BaseStage):
         report.stats['snapshot_stat_edge_findings_dropped'] = (
             _before - len(report.items_flagged)
         )
+
+        scan = await scan_cross_run_citations(
+            self.journal, self.memory, project_id=self.project_id
+        )
+        report.items_flagged.extend(build_dangling_citation_finding(r) for r in scan.dangling)
+        report.stats.update(scan.as_stats(STAGE_STAT_PREFIX[self.stage_id]))
 
         self.record_task_dump_spot_check(report)
         return report

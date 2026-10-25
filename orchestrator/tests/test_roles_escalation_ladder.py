@@ -37,7 +37,8 @@ in its module docstring), every assertion here is a containment /
 non-containment / identity check against a NAMED constant — never a string
 literal pinned to a constant's prose. A prose pin "passes on prose reworded to
 say the opposite and fails on a legitimate tightening" and only taxes future
-prompt edits; it has no correctness content in either direction.
+prompt edits; it has no correctness content in either direction. The
+``RESERVED_BOUND_ROUTING_RULE`` checks (task 5721) are this ordinary shape.
 
 Task 5368 adds containment checks for `escalation.models`' filer-facing action
 tokens, and they are NOT that banned shape even though what they search is
@@ -59,6 +60,7 @@ from orchestrator.agents.roles import (
     _ESCALATION_TOOLS,
     ESCALATION_LADDER_CORE,
     NON_STEWARD_LEVEL_GATE,
+    RESERVED_BOUND_ROUTING_RULE,
     ROLES,
 )
 
@@ -308,4 +310,26 @@ def test_every_escalating_role_reads_both_filer_action_tokens() -> None:
         f'filer action tokens: {offenders}. Every role that can file a blocker '
         'receives the `action` key in its response and must be told how to read '
         'both of its values.'
+    )
+
+
+def test_reserved_bound_rule_lives_in_the_ladder_core() -> None:
+    """The rule has one home: the mechanics half, which the steward reads too."""
+    assert RESERVED_BOUND_ROUTING_RULE.strip(), 'RESERVED_BOUND_ROUTING_RULE is empty'
+    assert RESERVED_BOUND_ROUTING_RULE in ESCALATION_LADDER_CORE, (
+        'RESERVED_BOUND_ROUTING_RULE is not spliced into ESCALATION_LADDER_CORE. '
+        'Splice it into the core -- not NON_STEWARD_LEVEL_GATE, which the steward '
+        'never reads, and not per role.'
+    )
+
+
+def test_every_escalating_role_reads_the_reserved_bound_rule() -> None:
+    """Derived coverage over the composed prompts each escalating role receives."""
+    offenders = sorted(
+        name for name in _L1_FILER_ROLES + _NON_STEWARD_ESCALATING_ROLES
+        if RESERVED_BOUND_ROUTING_RULE not in ROLES[name].system_prompt
+    )
+    assert offenders == [], (
+        f'Escalating role(s) whose composed system_prompt is missing '
+        f'RESERVED_BOUND_ROUTING_RULE: {offenders}.'
     )

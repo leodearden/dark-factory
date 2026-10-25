@@ -59,6 +59,7 @@ from collections.abc import (
     Collection,
     Iterable,
     Mapping,
+    Sequence,
 )
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -97,6 +98,7 @@ from orchestrator.lane_lifecycle import (
     LaneState,
 )
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
+from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
 from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
@@ -153,6 +155,18 @@ PushResult = Literal['pushed', 'noop', 'rejected', 'error']
 # Return type for recover_red_main — distinguishes a successful CAS move
 # from an atomic abort (another writer beat us to the ref).
 RecoverResult = Literal['rewound', 'cas_failed', 'error']
+
+
+# How GitOps._find_replay matched a replayed commit: the exact patch-id tier,
+# or the unique exact-subject fallback.
+ReplayMatch = Literal['patch-id', 'subject']
+
+
+class RebasedCitation(TypedDict):
+    """GitOps.resolve_rebased_citation's answer: the commit on main a cited SHA landed as."""
+    landed: str
+    subject: str
+    method: ReplayMatch
 
 
 # Return type for remove_merge_worktree_guarded — the C1 lease-enforced
@@ -3234,11 +3248,12 @@ class GitOps:
         NON-retryable add failure (ENOSPC) is not retried at all — see (c) under
         ``Raises`` below.
 
-        On exit — normal return OR an exception raised in the ``async
-        with`` body — cleanup ALWAYS runs: scoped ``git worktree remove
-        --force <path>`` + an unconditional ``remove_tree(path,
-        ignore_errors=True)`` belt-and-suspenders in case ``remove`` left an
-        empty skeleton.  This method NEVER issues ``git worktree prune``
+        On exit — normal return, a body exception, OR a cancellation (even
+        one delivered during the warm seed or cleanup) — cleanup ALWAYS runs
+        to completion via teardown.py::complete_despite_cancellation, which
+        re-raises the cancellation afterwards: scoped ``git worktree remove
+        --force <path>`` (a failure is a WARNING), then ``remove_tree(path,
+        ignore_errors=True)``.  This method NEVER issues ``git worktree prune``
         (DD5 — the comment-only invariant that failed in the 2026-07-04
         warm-lane broad-prune registration-wipe incident, df 2097-2100): a
         broad prune would deregister ANY concurrently-active sibling
@@ -3266,10 +3281,7 @@ class GitOps:
                 seed-then-retain-cold-on-fault contract). The whole gate
                 (base-health check + seed call) is also wrapped in a
                 broad ``except Exception`` so this holds even if an
-                unexpected exception escapes those helpers — the gate
-                runs before the ``git worktree remove --force`` cleanup
-                below, so an unsuppressed raise here would leak the
-                registered worktree instead of degrading to cold. A
+                unexpected exception escapes those helpers. A
                 non-resolvable base (ABSENT/INDETERMINATE) skips the seed
                 subprocess, logged at INFO for a ``MAIN_SWEEP`` (its warm/cold
                 mode is a verdict input) and DEBUG for a hot-path
@@ -3292,11 +3304,11 @@ class GitOps:
                 cases the caller's ``async with`` body never runs.
                 For (b) and (c), because the add never succeeded, no cleanup ``git
                 worktree remove`` is issued (there is nothing registered to
-                remove) — but a belt-and-suspenders ``remove_tree`` of
-                *tmp_path* still runs before the exception propagates, in
-                case a failed add left a partial/empty directory behind
-                (this prefix is :data:`PROTECTED_PREFIXES`-registered, so
-                the reaper would never reclaim a leaked directory itself).
+                remove) — but a ``remove_tree`` of *tmp_path* runs before
+                the exception propagates, in case a failed add left a
+                partial directory behind (this prefix is
+                :data:`PROTECTED_PREFIXES`-registered, so the reaper would
+                never reclaim a leaked directory itself).
 
         Note:
             Acquires an exclusive, non-blocking ``fcntl.flock`` on a
@@ -3308,8 +3320,12 @@ class GitOps:
             contender, so a live probe/sweep here is correctly seen as a
             "live consumer" by gc.sh and preserved rather than force-
             removed mid-verify. The lock file is unlinked on exit ONLY
-            when this call was the one that acquired it (never a foreign
-            holder's lock) — see the ``EphemeralWorktreeError`` case above.
+            when this call acquired it (never a foreign holder's lock — see
+            the ``EphemeralWorktreeError`` case above) AND *tmp_path* is
+            confirmed absent (teardown.py::path_confirmed_absent): residue
+            keeps an unheld ``<name>.lock``, visible to gc.sh's ``flock -n``
+            and the #5584 reclaim.  A cancelled ``git worktree add`` is not
+            torn down in-process.
         """
         base = self.worktree_base
         base.mkdir(parents=True, exist_ok=True)
@@ -3321,8 +3337,6 @@ class GitOps:
         # worktree instead of force-removing it out from under a still-
         # running probe/sweep (task 2507).
         lock_path = lane_lock_path(tmp_path)
-
-        worktree_added = False
 
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
         acquired = False
@@ -3350,115 +3364,91 @@ class GitOps:
                     f'consumer holds it (could also be a lock-fault); skipping'
                 ) from e
 
-            try:
-                rc, out, err, attempts = await self._worktree_add_with_retry(
-                    tmp_path, sha, label=f'ephemeral_worktree({kind.name})',
+            rc, out, err, attempts = await self._worktree_add_with_retry(
+                tmp_path, sha, label=f'ephemeral_worktree({kind.name})',
+            )
+            if rc != 0:
+                # A failed add can leave a directory no reaper reclaims (PROTECTED_PREFIXES).
+                await remove_tree(tmp_path, ignore_errors=True)
+                raise EphemeralWorktreeError(
+                    f'ephemeral_worktree({kind.name}): git worktree add failed '
+                    f'after {attempts} attempt(s) (rc={rc}); '
+                    f'stderr={err!r}; stdout={out!r}'
                 )
-                worktree_added = rc == 0
-                if not worktree_added:
-                    raise EphemeralWorktreeError(
-                        f'ephemeral_worktree({kind.name}): git worktree add failed '
-                        f'after {attempts} attempt(s) (rc={rc}); '
-                        f'stderr={err!r}; stdout={out!r}'
-                    )
-            except EphemeralWorktreeError:
-                # Belt-and-suspenders: a failed `git worktree add` may still have
-                # left a partial/empty directory at tmp_path (git creates the
-                # target dir early during add) — and since this prefix is
-                # PROTECTED_PREFIXES-registered, the reaper will NEVER reclaim it.
-                # Clean up here or it leaks under worktree_base permanently.
-                # Restores the pre-extraction probes' unconditional
-                # "rmtree in case ... the worktree add never ran" guarantee.
-                with contextlib.suppress(Exception):
-                    await remove_tree(tmp_path, ignore_errors=True)
-                raise
-
-            # task 2567: optionally CoW-seed the freshly-added worktree's
-            # target/ from the shared warm-lane base before the body runs,
-            # so a probe/sweep opted into warm_seed starts from a pre-built
-            # main instead of a cold from-scratch recompile. Fail-soft: any
-            # non-zero seed rc just logs and proceeds COLD — never raises,
-            # never removes the worktree. HELD_BY_CALLER because this CM
-            # holds <lane_dir>.lock (above) for its entire lifetime.
-            #
-            # task 2567 amendment: the whole gate is wrapped in a broad
-            # except so the never-raise contract is structural rather than
-            # relying on _warm_lane_base_resolvable() (catches only
-            # OSError) and _seed_warm_lane() (catches Exception) each
-            # behaving today. This runs BEFORE the `try: yield ... finally:
-            # git worktree remove --force` block below, so an unsuppressed
-            # raise here would skip that scoped cleanup entirely — leaking
-            # a registered git worktree that DD5 forbids reclaiming via a
-            # broad `git worktree prune`.
-            if worktree_added and warm_seed:
-                try:
-                    if self._warm_lane_base_resolvable() is WarmBaseHealth.OK:
-                        seed_rc = await self._seed_warm_lane(
-                            tmp_path, '--fresh-checkout',
-                            lane_lock=SeedLaneLock.HELD_BY_CALLER,
-                        )
-                        if seed_rc != 0:
-                            logger.info(
-                                'ephemeral_worktree(%s): warm seed failed (rc=%d) '
-                                'for %s — proceeding COLD (fail-soft)',
-                                kind.name, seed_rc, tmp_path,
-                            )
-                    else:
-                        logger.log(
-                            {WorktreeKind.MAIN_SWEEP: logging.INFO}.get(kind, logging.DEBUG),
-                            'ephemeral_worktree(%s): warm base not resolvable — '
-                            'skipping seed, proceeding COLD for %s', kind.name, tmp_path,
-                        )
-                except Exception:
-                    logger.warning(
-                        'ephemeral_worktree(%s): warm-seed gate raised '
-                        'unexpectedly for %s — proceeding COLD (fail-soft)',
-                        kind.name, tmp_path, exc_info=True,
-                    )
 
             try:
+                if warm_seed:
+                    await self._warm_seed_ephemeral_worktree(tmp_path, kind)
                 yield tmp_path
             finally:
-                # Scoped cleanup: remove ONLY this specific ephemeral worktree.
-                # INTENTIONALLY NO 'git worktree prune' here (DD5 guarantee) —
-                # see the docstring above / the 2097-2100 incident.
-                if worktree_added:
-                    try:
-                        await _run(
-                            ['git', 'worktree', 'remove', '--force', str(tmp_path)],
-                            cwd=self.project_root,
-                        )
-                    except Exception:
-                        logger.debug(
-                            'ephemeral_worktree(%s): worktree remove failed',
-                            kind.name, exc_info=True,
-                        )
-                with contextlib.suppress(Exception):
-                    # Belt-and-suspenders: rmtree in case git worktree remove
-                    # left an empty skeleton.
-                    await remove_tree(tmp_path, ignore_errors=True)
+                await complete_despite_cancellation(
+                    self._remove_ephemeral_worktree(tmp_path, kind),
+                )
         finally:
-            # Release the advisory lock and — ONLY when this call was the
-            # one that acquired it — best-effort unlink the lock file,
-            # mirroring gc.sh's own `rm -f "$orphan_lock"` (gc.sh:606) on
-            # removal. Never unlink a lock we did not acquire: that would
-            # delete a foreign holder's lock file out from under it.
-            #
-            # Unlink BEFORE closing the fd — i.e. while we still hold the
-            # flock — rather than after. This mirrors gc.sh, which performs
-            # its own analogous `rm -f` while still holding ITS flock, and
-            # it closes a window that a close-then-unlink ordering would
-            # leave open: between releasing the flock and removing the
-            # directory entry, a new contender could open+flock the same
-            # (about-to-be-deleted) path, only to have our unlink yank the
-            # file out from under it. Unlinking first means any contender
-            # that opens the path afterward necessarily creates a fresh
-            # inode, so it can never observe a lock we are about to drop.
-            if acquired:
+            # Never touch a lock this call did not acquire; unlink while still holding the
+            # flock, so a later contender always creates a fresh inode.
+            if acquired and path_confirmed_absent(tmp_path):
                 with contextlib.suppress(Exception):
                     os.unlink(lock_path)
+            elif acquired:
+                logger.warning(
+                    'ephemeral_worktree(%s): %s survived cleanup; keeping %s so the residue '
+                    'stays lock-bearing for the flock-based reclaim',
+                    kind.name, tmp_path, lock_path,
+                )
             with contextlib.suppress(Exception):
                 os.close(lock_fd)
+
+    async def _warm_seed_ephemeral_worktree(self, path: Path, kind: WorktreeKind) -> None:
+        """CoW-seed *path*'s ``target/`` from the warm-lane base, proceeding COLD on any fault.
+
+        ``HELD_BY_CALLER``: :meth:`ephemeral_worktree` holds ``<name>.lock`` for its lifetime.
+        """
+        try:
+            if self._warm_lane_base_resolvable() is WarmBaseHealth.OK:
+                seed_rc = await self._seed_warm_lane(
+                    path, '--fresh-checkout',
+                    lane_lock=SeedLaneLock.HELD_BY_CALLER,
+                )
+                if seed_rc != 0:
+                    logger.info(
+                        'ephemeral_worktree(%s): warm seed failed (rc=%d) '
+                        'for %s — proceeding COLD (fail-soft)',
+                        kind.name, seed_rc, path,
+                    )
+            else:
+                logger.log(
+                    {WorktreeKind.MAIN_SWEEP: logging.INFO}.get(kind, logging.DEBUG),
+                    'ephemeral_worktree(%s): warm base not resolvable — '
+                    'skipping seed, proceeding COLD for %s', kind.name, path,
+                )
+        except Exception:
+            logger.warning(
+                'ephemeral_worktree(%s): warm-seed gate raised '
+                'unexpectedly for %s — proceeding COLD (fail-soft)',
+                kind.name, path, exc_info=True,
+            )
+
+    async def _remove_ephemeral_worktree(self, path: Path, kind: WorktreeKind) -> None:
+        """Scoped ``git worktree remove --force``, never a prune (DD5), then ``remove_tree``; failures are WARNINGs."""
+        try:
+            rc, _out, err = await _run(
+                ['git', 'worktree', 'remove', '--force', str(path)],
+                cwd=self.project_root,
+            )
+        except Exception:
+            logger.warning(
+                'ephemeral_worktree(%s): git worktree remove could not run for %s',
+                kind.name, path, exc_info=True,
+            )
+        else:
+            if rc != 0:
+                logger.warning(
+                    'ephemeral_worktree(%s): git worktree remove --force %s failed (rc=%d): %s',
+                    kind.name, path, rc, err.strip(),
+                )
+        finally:
+            await remove_tree(path, ignore_errors=True)
 
     def pool_in_use(self) -> bool:
         """True iff a warm or spec lane pool is configured on this host (task 2099).
@@ -11898,35 +11888,8 @@ class GitOps:
         replayed commit so :meth:`TaskWorkflow._reconcile_done_step_commits`
         can re-point the plan step to it instead of escalating.
 
-        Two tiers, tried in order:
-
-        1. **patch-id** (exact): compute *target_sha*'s patch-id
-           (``git log -p -1 --no-color`` piped to ``git patch-id --stable``)
-           and look it up in a ``{patch-id: sha}`` map built the same way over
-           ``base_sha..HEAD``. ``git patch-id --stable`` hashes the normalized
-           diff hunks, so a clean replay reproduces byte-identical hunks and an
-           identical patch-id — the canonical, whitespace/line-number-robust
-           equivalence the ``git cherry`` dedup in
-           :meth:`rebase_preserving_task_commits` also relies on. Using the
-           identical diff-emitting command (``git log -p``) for both the single
-           target and the range guarantees both sides are normalized by the
-           same code path. The ``<patch-id> <sha>`` line the range form emits
-           maps the shared patch-id to the REPLAYED (HEAD-side) sha, which is
-           exactly the remap target. If TWO commits in ``base_sha..HEAD`` share
-           a patch-id (a diff reverted then re-applied, or genuinely identical
-           hunks), that patch-id is ambiguous — we cannot tell which sha the
-           orphan replayed onto — so it is skipped rather than resolved to an
-           arbitrary one of them, the same 'never guess' posture tier 2 applies
-           to an ambiguous subject.
-        2. **unique exact-subject** (fallback): when the patch-id lookup
-           misses — e.g. a rebase that resolved a conflict altered the diff
-           but preserved the commit message — recover the replayed sha only if
-           EXACTLY ONE commit in ``base_sha..HEAD`` shares *target_sha*'s
-           subject (the ``%H\\x1f%s`` idiom from :meth:`get_commit_subjects`,
-           ``\\x1f``-split because subjects may contain colons/punctuation). An
-           ambiguous subject (two or more matches) or no match returns
-           ``None`` — the method fails toward the caller's escalation, never
-           toward a wrong re-point.
+        The search over ``base_sha..HEAD`` is :meth:`_find_replay`'s two
+        tiers (patch-id, then unique exact subject), unnarrowed.
 
         Fully fail-safe: any git error, an unresolvable/GC'd *target_sha*, or
         empty patch-id output yields ``None``, letting the caller fall through
@@ -11937,75 +11900,8 @@ class GitOps:
         posture as :meth:`get_commit_subjects` / :meth:`get_commit_changed_files`.
         """
         try:
-            # Tier 1: patch-id equivalence. Compute the orphaned target's
-            # patch-id from its own diff.
-            rc, target_diff, _ = await _run(
-                ['git', 'log', '-p', '-1', '--no-color', target_sha], cwd=worktree,
-            )
-            if rc != 0 or not target_diff.strip():
-                return None
-            _, target_pid_out, _ = await _run(
-                ['git', 'patch-id', '--stable'], cwd=worktree, input_text=target_diff,
-            )
-            target_pid = target_pid_out.split()[0] if target_pid_out.strip() else None
-
-            # Build the {patch-id: sha} map over base..HEAD (the live branch).
-            rc, range_diff, _ = await _run(
-                ['git', 'log', '-p', '--no-color', f'{base_sha}..HEAD'], cwd=worktree,
-            )
-            if rc == 0 and range_diff.strip():
-                _, range_pid_out, _ = await _run(
-                    ['git', 'patch-id', '--stable'], cwd=worktree, input_text=range_diff,
-                )
-                pid_to_sha: dict[str, str] = {}
-                ambiguous_pids: set[str] = set()
-                for line in range_pid_out.splitlines():
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        pid = parts[0]
-                        if pid in pid_to_sha:
-                            # Two commits in base..HEAD share a patch-id (a
-                            # diff reverted then re-applied, or genuinely
-                            # identical hunks). We cannot know which one the
-                            # orphaned step replayed onto, so mark the patch-id
-                            # ambiguous and fall through — the same 'never
-                            # guess' posture tier 2 applies to an ambiguous
-                            # subject, rather than silently keeping whichever
-                            # colliding sha the dict happens to retain.
-                            ambiguous_pids.add(pid)
-                        pid_to_sha[pid] = parts[1]
-                if (
-                    target_pid
-                    and target_pid in pid_to_sha
-                    and target_pid not in ambiguous_pids
-                ):
-                    return pid_to_sha[target_pid]
-
-            # Tier 2: unique exact-subject fallback. Only fires when the
-            # patch-id lookup missed; recovers the replayed sha only when
-            # exactly ONE commit in base..HEAD shares the target's subject, so
-            # we never mis-point a step whose subject two replayed commits
-            # happen to share (e.g. a generic "feat: GREEN — implementation").
-            rc, target_subject, _ = await _run(
-                ['git', 'log', '-1', '--format=%s', target_sha], cwd=worktree,
-            )
-            if rc != 0 or not target_subject.strip():
-                return None
-            rc, subj_out, _ = await _run(
-                ['git', 'log', '--format=%H\x1f%s', f'{base_sha}..HEAD'], cwd=worktree,
-            )
-            if rc != 0 or not subj_out.strip():
-                return None
-            subject_matches: list[str] = []
-            for line in subj_out.splitlines():
-                if not line.strip():
-                    continue
-                sha, _, subject = line.partition('\x1f')
-                if subject == target_subject:
-                    subject_matches.append(sha)
-            if len(subject_matches) == 1:
-                return subject_matches[0]
-            return None
+            match = await self._find_replay(worktree, target_sha, f'{base_sha}..HEAD')
+            return match[0] if match is not None else None
         except Exception:
             # Fully fail-safe: any git error / unresolvable target yields None so
             # the caller falls through to its existing escalation path. Log at
@@ -12014,6 +11910,190 @@ class GitOps:
                 'find_equivalent_commit failed for target_sha=%s base_sha=%s '
                 'in %s; returning None (caller will fall through to escalation)',
                 target_sha, base_sha, worktree, exc_info=True,
+            )
+            return None
+
+    async def _find_replay(
+        self,
+        cwd: Path,
+        target_sha: str,
+        rev_range: str,
+        *,
+        paths: Sequence[str] | None = None,
+    ) -> tuple[str, ReplayMatch] | None:
+        """The commit in *rev_range* that *target_sha* was replayed onto, and how it matched.
+
+        Two tiers, tried in order:
+
+        1. **patch-id** (exact): compute *target_sha*'s patch-id
+           (``git log -p -1 --no-color`` piped to ``git patch-id --stable``)
+           and look it up in a ``{patch-id: sha}`` map built the same way over
+           *rev_range*. ``git patch-id --stable`` hashes the normalized
+           diff hunks, so a clean replay reproduces byte-identical hunks and an
+           identical patch-id — the canonical, whitespace/line-number-robust
+           equivalence the ``git cherry`` dedup in
+           :meth:`rebase_preserving_task_commits` also relies on. Using the
+           identical diff-emitting command (``git log -p``) for both the single
+           target and the range guarantees both sides are normalized by the
+           same code path. The ``<patch-id> <sha>`` line the range form emits
+           maps the shared patch-id to the REPLAYED (range-side) sha, which is
+           exactly the remap target. If TWO commits in *rev_range* share
+           a patch-id (a diff reverted then re-applied, or genuinely identical
+           hunks), that patch-id is ambiguous — we cannot tell which sha the
+           orphan replayed onto — so it is skipped rather than resolved to an
+           arbitrary one of them, the same 'never guess' posture tier 2 applies
+           to an ambiguous subject.
+        2. **unique exact-subject** (fallback): when the patch-id lookup
+           misses — e.g. a rebase that resolved a conflict altered the diff
+           but preserved the commit message — recover the replayed sha only if
+           EXACTLY ONE commit in *rev_range* shares *target_sha*'s
+           subject (the ``%H\\x1f%s`` idiom from :meth:`get_commit_subjects`,
+           ``\\x1f``-split because subjects may contain colons/punctuation). An
+           ambiguous subject (two or more matches) or no match returns
+           ``None`` — the method fails toward the caller, never toward a wrong
+           match.
+
+        *paths*, when given, narrows tier 1's candidates to commits touching
+        those paths (``--full-diff`` keeps each candidate's whole patch so its
+        patch-id stays comparable; ``--full-history`` stops history
+        simplification pruning a merged side's commit; ``--no-merges`` drops
+        merges, which emit no diff anyway). The narrowing is exact: a patch-id
+        twin, or any commit colliding with it, touches exactly the target's
+        paths. An EMPTY *paths* means no tier-1 candidates, never an
+        unrestricted scan. Tier 2 always scans the whole range.
+
+        No exception handling: each caller owns its fail-safe posture.
+        """
+        # Tier 1: patch-id equivalence. Compute the target's patch-id from its
+        # own diff.
+        rc, target_diff, _ = await _run(
+            ['git', 'log', '-p', '-1', '--no-color', target_sha], cwd=cwd,
+        )
+        if rc != 0 or not target_diff.strip():
+            return None
+        _, target_pid_out, _ = await _run(
+            ['git', 'patch-id', '--stable'], cwd=cwd, input_text=target_diff,
+        )
+        target_pid = target_pid_out.split()[0] if target_pid_out.strip() else None
+
+        twins = await self._unambiguous_patch_ids(cwd, rev_range, paths)
+        if target_pid and target_pid in twins:
+            return twins[target_pid], 'patch-id'
+
+        # Tier 2: unique exact-subject fallback. Only fires when the patch-id
+        # lookup missed; recovers the replayed sha only when exactly ONE commit
+        # in rev_range shares the target's subject, so we never mis-point at a
+        # commit whose subject two replayed commits happen to share (e.g. a
+        # generic "feat: GREEN — implementation").
+        rc, target_subject, _ = await _run(
+            ['git', 'log', '-1', '--format=%s', target_sha], cwd=cwd,
+        )
+        if rc != 0 or not target_subject.strip():
+            return None
+        rc, subj_out, _ = await _run(
+            ['git', 'log', '--format=%H\x1f%s', rev_range], cwd=cwd,
+        )
+        if rc != 0 or not subj_out.strip():
+            return None
+        subject_matches: list[str] = []
+        for line in subj_out.splitlines():
+            if not line.strip():
+                continue
+            sha, _, subject = line.partition('\x1f')
+            if subject == target_subject:
+                subject_matches.append(sha)
+        if len(subject_matches) == 1:
+            return subject_matches[0], 'subject'
+        return None
+
+    async def _unambiguous_patch_ids(
+        self, cwd: Path, rev_range: str, paths: Sequence[str] | None,
+    ) -> dict[str, str]:
+        """``{patch-id: sha}`` over *rev_range* (narrowed to *paths* when given),
+        omitting every patch-id two commits share."""
+        if paths is None:
+            range_log = ['git', 'log', '-p', '--no-color', rev_range]
+        elif paths:
+            range_log = [
+                'git', 'log', '-p', '--no-color', '--full-diff', '--full-history',
+                '--no-merges', rev_range, '--', *paths,
+            ]
+        else:
+            return {}
+        rc, range_diff, _ = await _run(range_log, cwd=cwd)
+        if rc != 0 or not range_diff.strip():
+            return {}
+        _, range_pid_out, _ = await _run(
+            ['git', 'patch-id', '--stable'], cwd=cwd, input_text=range_diff,
+        )
+        pid_to_sha: dict[str, str] = {}
+        ambiguous_pids: set[str] = set()
+        for line in range_pid_out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                pid = parts[0]
+                if pid in pid_to_sha:
+                    # Two commits in rev_range share a patch-id (a diff
+                    # reverted then re-applied, or genuinely identical hunks).
+                    # We cannot know which one the target replayed onto, so the
+                    # patch-id is ambiguous and dropped — the same 'never
+                    # guess' posture tier 2 applies to an ambiguous subject.
+                    ambiguous_pids.add(pid)
+                pid_to_sha[pid] = parts[1]
+        return {pid: sha for pid, sha in pid_to_sha.items() if pid not in ambiguous_pids}
+
+    async def resolve_rebased_citation(self, sha: str) -> RebasedCitation | None:
+        """The commit on main that a cited, since-rebased *sha* landed as, or None.
+
+        For a SHA quoted by an archived record (an escalation's detail, an
+        evidence line) after its branch was rebased and landed: the fork point
+        is ``merge-base(main, sha)`` and the search is :meth:`_find_replay`'s
+        two tiers over ``<fork point>..main``, patch-id first, then a unique
+        exact subject, never a guess on an ambiguous one. Tier 1 is narrowed
+        to commits touching *sha*'s own paths, which is exact because a
+        patch-id twin touches exactly those paths, and keeps the scan to
+        seconds over a month of main.
+
+        *sha* may be abbreviated. None when it is not a commit, is already an
+        ancestor of main (it needs no resolution, and searching ``sha..main``
+        could pair it with a LATER same-subject commit), or has no twin.
+
+        Read-only: runs git queries at ``project_root`` and never rewrites a
+        ref, a record or anything else. Fail-safe like
+        :meth:`find_equivalent_commit`: any error is logged at WARNING and
+        yields None.
+        """
+        main = self.config.main_branch
+        try:
+            rc, out, _ = await _run(
+                ['git', 'rev-parse', '--verify', '--quiet', f'{sha}^{{commit}}'],
+                cwd=self.project_root,
+            )
+            cited = out.strip()
+            if rc != 0 or not cited:
+                return None
+            if await self.is_ancestor_checked(cited, main) is not False:
+                return None
+            base = await self.merge_base_with_main(cited)
+            if base is None:
+                return None
+            paths = await self.get_commit_changed_files(cited)
+            match = await self._find_replay(
+                self.project_root, cited, f'{base}..{main}', paths=paths,
+            )
+            if match is None:
+                return None
+            landed, method = match
+            rc, subject, _ = await _run(
+                ['git', 'log', '-1', '--format=%s', landed], cwd=self.project_root,
+            )
+            if rc != 0:
+                return None
+            return RebasedCitation(landed=landed, subject=subject.strip(), method=method)
+        except Exception:
+            logger.warning(
+                'resolve_rebased_citation failed for sha=%s; returning None',
+                sha, exc_info=True,
             )
             return None
 

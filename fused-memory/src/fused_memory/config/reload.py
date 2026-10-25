@@ -181,6 +181,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # flow on a running server WITHOUT granting content-amend authority.
     'mem0_update.content_amend_allowed_agent_prefixes',
     'mem0_update.metadata_patch_allowed_agent_prefixes',
+    # Read live per shadow job by services/overreach_shadow.py::OverreachShadow,
+    # whose settings() re-reads memory_service.config.overreach_guard on every
+    # submit and judge call. shadow_enabled is the shadow's kill switch.
+    'overreach_guard.shadow_enabled',
+    'overreach_guard.judge_timeout_seconds',
     # Storm-alarm knobs, read live off the shared config by
     # MemoryService.update_memory and passed INTO StormCounter.record() on every
     # call. That per-call argument is the non-obvious part: the shared

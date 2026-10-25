@@ -7397,7 +7397,7 @@ class TestRemoteRunnerRequestId:
 class TestRemoteRunnerCancelVerify:
     """cancel_verify() issues ssh cancel-verify; probe_clean() issues ssh pgrep."""
 
-    def _make_runner_and_calls(self, *, config_path=None, cancel_rc=0, probe_rc=1):
+    def _make_runner_and_calls(self, *, probe_rc=1):
         """Return (runner, calls_list) where calls_list records each run() argv."""
         calls = []
 
@@ -7406,8 +7406,37 @@ class TestRemoteRunnerCancelVerify:
             if argv[0] == 'ssh':
                 if 'pgrep' in argv[-1]:
                     return (probe_rc, '', '')
-                return (cancel_rc, '', '')
+                return (0, '', '')
             return (0, '', '')
+
+        runner = gated_remote_runner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'req-42',
+        )
+        return runner, calls
+
+    async def _cancel_mid_verify(self, *, config_path=None, cancel_rc=0):
+        """Cancel a real dispatch while its verify ssh is held; return (cancel rc, recorded argvs)."""
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        calls: list[list[str]] = []
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            if argv[0] == 'git':
+                return (0, '', '')
+            if 'cancel-verify' in argv[-1]:
+                return (cancel_rc, '', '')
+            if 'pgrep' in argv[-1]:
+                return (1, '', '')
+            entered.set()
+            await release.wait()
+            return (137, '', 'Killed')
 
         runner = gated_remote_runner(
             name='laptop',
@@ -7418,10 +7447,20 @@ class TestRemoteRunnerCancelVerify:
             run=fake_run,
             id_factory=lambda: 'req-42',
         )
-        return runner, calls
+        dispatch = asyncio.create_task(runner.run_merge_verify('abc123', _make_spec()))
+        await entered.wait()
+        rc = await runner.cancel_verify()
+        release.set()
+        with pytest.raises(RunnerUnavailable):
+            await dispatch
+        return rc, calls
+
+    @staticmethod
+    def _cancel_ssh_calls(calls):
+        return [c for c in calls if c[0] == 'ssh' and 'cancel-verify' in c[-1]]
 
     async def test_cancel_verify_no_inflight_returns_zero_no_ssh(self):
-        """cancel_verify() with _inflight_request_id=None returns 0 without issuing ssh."""
+        """cancel_verify() with no dispatch in flight returns 0 without issuing ssh."""
         runner, calls = self._make_runner_and_calls()
         rc = await runner.cancel_verify()
         assert rc == 0
@@ -7431,11 +7470,9 @@ class TestRemoteRunnerCancelVerify:
     async def test_cancel_verify_issues_correct_argv(self):
         """cancel_verify() issues ssh BatchMode/ConnectTimeout cancel-verify --request-id."""
 
-        runner, calls = self._make_runner_and_calls(cancel_rc=0)
-        runner._inflight_request_id = 'req-42'
-        await runner.cancel_verify()
+        _, calls = await self._cancel_mid_verify(cancel_rc=0)
 
-        ssh_calls = [c for c in calls if c[0] == 'ssh']
+        ssh_calls = self._cancel_ssh_calls(calls)
         assert len(ssh_calls) == 1
         argv = ssh_calls[0]
 
@@ -7451,11 +7488,9 @@ class TestRemoteRunnerCancelVerify:
     async def test_cancel_verify_appends_config_when_set(self):
         """cancel_verify() appends --config <path> when config_path is set."""
 
-        runner, calls = self._make_runner_and_calls(config_path='/etc/orch.yaml', cancel_rc=0)
-        runner._inflight_request_id = 'req-42'
-        await runner.cancel_verify()
+        _, calls = await self._cancel_mid_verify(config_path='/etc/orch.yaml', cancel_rc=0)
 
-        ssh_calls = [c for c in calls if c[0] == 'ssh']
+        ssh_calls = self._cancel_ssh_calls(calls)
         remote_cmd = ssh_calls[0][-1]
         parsed = gate_argv(remote_cmd)
         cfg_idx = parsed.index('--config')
@@ -7463,9 +7498,7 @@ class TestRemoteRunnerCancelVerify:
 
     async def test_cancel_verify_returns_ssh_rc(self):
         """cancel_verify() returns the ssh return code."""
-        runner, calls = self._make_runner_and_calls(cancel_rc=1)
-        runner._inflight_request_id = 'req-42'
-        rc = await runner.cancel_verify()
+        rc, _ = await self._cancel_mid_verify(cancel_rc=1)
         assert rc == 1
 
     async def test_probe_clean_true_when_pgrep_rc_is_1(self):
@@ -7622,7 +7655,7 @@ class TestRemoteRunnerSshKeepalive:
     probe_clean) must carry the ServerAlive keepalive options, and must stay
     identical across sites (shared const, task 2362 / incident 5111)."""
 
-    def _make_runner(self, expected_result):
+    def _make_runner(self, expected_result, *, verify_entered, verify_release):
         calls = []
 
         async def fake_run(argv, *, cwd=None):
@@ -7634,7 +7667,11 @@ class TestRemoteRunnerSshKeepalive:
                     return (1, '', '')
                 if 'cancel-verify' in argv[-1]:
                     return (0, '', '')
-                # ssh dispatch / health probe
+                if 'verify-merge' in argv[-1]:
+                    verify_entered.set()
+                    await verify_release.wait()
+                    return (137, '', 'Killed')
+                # health probe
                 return (0, result_to_json(expected_result), '')
             return (0, '', '')
 
@@ -7664,18 +7701,25 @@ class TestRemoteRunnerSshKeepalive:
             _SSH_BASE_OPTS,
             SSH_SERVER_ALIVE_COUNT_MAX,
             SSH_SERVER_ALIVE_INTERVAL,
+            RunnerUnavailable,
         )
 
         expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
-        runner, calls = self._make_runner(expected)
+        verify_entered, verify_release = asyncio.Event(), asyncio.Event()
+        runner, calls = self._make_runner(
+            expected, verify_entered=verify_entered, verify_release=verify_release,
+        )
 
         # Site 1: health()
         await runner.health()
-        # Site 2: run_merge_verify() dispatch
-        await runner.run_merge_verify('abc123', _make_spec())
-        # Site 3: cancel_verify()
-        runner._inflight_request_id = 'req-42'
+        # Site 2: run_merge_verify() dispatch, its verify ssh held
+        dispatch = asyncio.create_task(runner.run_merge_verify('abc123', _make_spec()))
+        await verify_entered.wait()
+        # Site 3: cancel_verify() of that in-flight verify
         await runner.cancel_verify()
+        verify_release.set()
+        with pytest.raises(RunnerUnavailable):
+            await dispatch
         # Site 4: probe_clean()
         await runner.probe_clean()
 

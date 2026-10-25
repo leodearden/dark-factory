@@ -24,8 +24,8 @@ threshold/window. :func:`maybe_file_chronic_flake_tasks` unions both.
 This module never talks to the fused-memory MCP directly —
 :class:`ChronicFlakeTaskClient` is the pluggable seam, and
 :class:`SchedulerChronicFlakeTaskClient` is the concrete adapter over a
-duck-typed scheduler exposing ``dispatch_tool`` and ``submit_task``
-(self-contained here to avoid a workflow<->harness import cycle).
+:class:`SchedulerTaskStore` (self-contained here to avoid a
+workflow<->harness import cycle).
 
 Non-blocking guarantee: :func:`maybe_file_chronic_flake_tasks` is internally
 catch-all-defensive, so a ledger/MCP/search error can never fail the
@@ -42,7 +42,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypeGuard
+from typing import TYPE_CHECKING, Protocol, TypeGuard
 
 from shared.mcp_envelope import parse_tool_result
 from shared.safe_io import load_json_or_warn
@@ -352,7 +352,7 @@ class ChronicFlakeTaskClient(Protocol):
     """Pluggable task-filing seam so this module never talks to the
     fused-memory MCP directly.
     :class:`SchedulerChronicFlakeTaskClient` (step-15/step-16) is the
-    concrete adapter over a duck-typed scheduler.
+    concrete adapter over a :class:`SchedulerTaskStore`.
 
     That adapter now serves a SECOND consumer:
     ``orchestrator/src/orchestrator/flake_ledger.py::FlakeLedgerTaskClient``,
@@ -792,17 +792,28 @@ _SUBMIT_TASK_TIMEOUT_SECS = 30
 _METADATA_LOOKUP_PAGE = 100
 
 
+class SchedulerTaskStore(Protocol):
+    """The scheduler surface :class:`SchedulerChronicFlakeTaskClient` reads and files through."""
+
+    async def dispatch_tool(
+        self, name: str, arguments: dict, *, timeout: float = ...,
+    ) -> dict: ...
+
+    async def submit_task(
+        self, arguments: dict, *, timeout: float = ...,
+    ) -> SubmitOutcome: ...
+
+
 class SchedulerChronicFlakeTaskClient:
-    """Concrete :class:`ChronicFlakeTaskClient` adapter over a duck-typed
-    scheduler exposing ``dispatch_tool`` (the ``SchedulerFacade`` surface) and
-    ``orchestrator/src/orchestrator/scheduler.py::Scheduler.submit_task``.
+    """Concrete :class:`ChronicFlakeTaskClient` adapter over a
+    :class:`SchedulerTaskStore`.
 
     Self-contained here (not in ``harness.py``) so this module never talks
     to the fused-memory MCP directly and avoids a workflow<->harness import
     cycle.
     """
 
-    def __init__(self, scheduler: Any, project_root: str | Path) -> None:
+    def __init__(self, scheduler: SchedulerTaskStore, project_root: str | Path) -> None:
         self._scheduler = scheduler
         self._project_root = str(project_root)
 

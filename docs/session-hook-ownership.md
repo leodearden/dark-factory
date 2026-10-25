@@ -88,6 +88,15 @@ when both of these hold:
 
 When both hold, SessionStart re-binds the record to the new id.
 
+The re-bind moves `claude_session_id` only. `claude_launch_session_id` keeps
+the id the first binding stamped and is never re-bound, so the launch
+transcript `<id>.jsonl` stays findable after a `/clear` or compaction
+(task 6069). Records bound before that field existed carry none and are not
+backfilled.
+
+Code: `orchestrator/src/orchestrator/session_hooks.py::_bind_claude_session_id`,
+`scripts/legibility/check_transcript_persistence.py::find_matching_transcript`.
+
 `resume` is excluded. `--resume` and `--continue` make a brand-new process
 report it, so a nested `claude -c -p` would present it. Honouring it would
 let an inheritor re-bind its spawner's record to itself. A spawned session

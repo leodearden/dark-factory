@@ -434,9 +434,15 @@ AGENT_FILABLE_LEVELS: frozenset[int] = frozenset({0, 1})
 # 'moot-terminal-subject' they are deliberately neither 'benign' nor
 # 'actionable'.  The decision vocabulary lives in
 # escalation/src/escalation/disposition.py.
+#
+# NOTE_TO_FILE_CLASS is stamped only by escalate_info(note_to_file=True), filed
+# resolved at filing; like 'moot-terminal-subject' it is neither benign nor
+# actionable.  Rationale: plans/plan-deviation-recording-prd.md D2.
+NOTE_TO_FILE_CLASS: str = 'note-to-file'
 RESOLUTION_CLASSES: frozenset[str] = frozenset({
     'benign', 'actionable', 'moot-terminal-subject', 'stale-strand',
     'addressed', 'observation-consumed', 'converted', 'status-info',
+    NOTE_TO_FILE_CLASS,
 })
 
 
@@ -707,6 +713,13 @@ class Escalation:
     # every field above.  Deliberately NOT added to
     # `_COMPACT_ESCALATION_FIELDS` (server.py) — its readers load full records.
     project_id: str | None = None
+    # NOTE TO FILE (plans/plan-deviation-recording-prd.md D2) — a filer-declared
+    # record that requests nothing: never pending (EscalationQueue.submit), and
+    # filed by EscalationQueue.submit_resolved.  Every resolution-class stamp
+    # site refuses this flag without NOTE_TO_FILE_CLASS, and that class without
+    # this flag, via note_to_file_class_conflict.  Zero migration via the
+    # from_dict filter.
+    note_to_file: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -721,3 +734,14 @@ class Escalation:
     @classmethod
     def from_json(cls, text: str) -> Escalation:
         return cls.from_dict(json.loads(text))
+
+
+def note_to_file_class_conflict(escalation: Escalation, resolution_class: str | None) -> str | None:
+    """Why *escalation* cannot carry *resolution_class* under the note-to-file pairing, else None."""
+    if escalation.note_to_file == (resolution_class == NOTE_TO_FILE_CLASS):
+        return None
+    return (
+        f'escalation {escalation.id}: note_to_file={escalation.note_to_file} with '
+        f'resolution_class={resolution_class!r}; {NOTE_TO_FILE_CLASS!r} is stamped on a '
+        'note_to_file record and on nothing else'
+    )

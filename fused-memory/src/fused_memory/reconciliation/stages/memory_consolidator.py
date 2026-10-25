@@ -27,6 +27,7 @@ from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     extract_open_gate_task_ids,
     sweep_resolved_curator_gates,
 )
+from fused_memory.reconciliation.dangling_citation import render_dangling_citation_line
 from fused_memory.reconciliation.degenerate_task_node_sweep import (
     extract_terminal_task_ids,
     sweep_degenerate_task_nodes,
@@ -60,6 +61,7 @@ from fused_memory.reconciliation.live_workflow_section import (
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     sweep_orphaned_recon_escalations,
 )
+from fused_memory.reconciliation.overreach_flags import render_overreach_flags_section
 from fused_memory.reconciliation.preservation_specimen_guard import (
     filter_preservation_specimen_flags,
     maybe_escalate_preservation_suppression_storm,
@@ -113,6 +115,7 @@ from fused_memory.utils.clip_disclosure import clip_note, elide_text, fetch_cap_
 
 if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
+    from fused_memory.services.overreach_shadow import OverreachFlagPage
 
 logger = logging.getLogger(__name__)
 
@@ -172,9 +175,10 @@ class MemoryConsolidator(BaseStage):
     # INCLUSION CRITERION — a section belongs here iff the shipped Stage-1 prompt
     # tells the model to draw an inference from that section's ABSENCE. Today
     # prompts/stage1.py says: "If `### Live-Workflow Signals` is absent from the
-    # payload, no task is live this cycle — neither through a per-task signal nor
-    # through the project-wide lock — and none has landing evidence; no
-    # live-workflow suppression applies …". That makes absence load-bearing: a
+    # payload, no task the `### Active Task Tree` lists is live this cycle —
+    # neither through a per-task signal nor through the project-wide lock — and
+    # none of them has landing evidence; no live-workflow suppression applies to
+    # them …". That makes absence load-bearing: a
     # payload builder that omits the section does not merely produce a terser
     # payload, it makes the model conclude something FALSE. Every builder therefore renders these
     # via _render_required_sections() — adding a section is ONE edit here, not
@@ -195,6 +199,9 @@ class MemoryConsolidator(BaseStage):
     #     an unconditional directive with NO absence-inference in any prompt, so
     #     it falls outside this tuple's inclusion criterion. It keeps its own
     #     dedicated tests instead (task 2552).
+    #   * render_overreach_flags_section — 2 of 3 by design (task 6137): the
+    #     shadow's flags are a full-cycle handoff, and no prompt draws an
+    #     inference from the section's absence.
     REQUIRED_SECTIONS: tuple[RequiredSection, ...] = (
         RequiredSection('### Live-Workflow Signals', '_build_live_workflow_section'),
     )
@@ -228,6 +235,10 @@ class MemoryConsolidator(BaseStage):
     # FalkorDB index-provisioning health record — set by harness (task 3709).
     # None when the graph was unreadable, absent, or in remediation passes.
     index_health: dict | None = None
+
+    # The overreach shadow's next page of flags not yet handed over — set by harness
+    # (design.md §6.1 O4, task 6137). None when unavailable or in remediation passes.
+    overreach_flags: OverreachFlagPage | None = None
 
     # Cached project_status_correction memory vs. live get_statuses census
     # diff/supersede record — set by harness (task 1938).
@@ -1674,6 +1685,9 @@ class MemoryConsolidator(BaseStage):
         # 7b. Task Count Census (task 1785)
         task_count_census_section = self._build_task_count_census_section()
 
+        # 7c. Overreach shadow flags (design.md §6.1 O4, task 6137)
+        overreach_flags_section = render_overreach_flags_section(self.overreach_flags)
+
         # 8. Format
         episodes_str, ep_n = _format_episodes(new_episodes)
         memories_str, mem_n = _format_memories(new_memories)
@@ -1707,7 +1721,7 @@ class MemoryConsolidator(BaseStage):
 
 ### Previous Reconciliation
 {_format_watermark(watermark, include_freshness_cutoffs=True)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{await self._render_required_sections()}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{overreach_flags_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -1791,6 +1805,9 @@ Review the above data and perform memory consolidation:
         # Task Count Census (task 1785)
         task_count_census_section = self._build_task_count_census_section()
 
+        # Overreach shadow flags (design.md §6.1 O4, task 6137)
+        overreach_flags_section = render_overreach_flags_section(self.overreach_flags)
+
         ctx_str, ctx_n = _format_context_items(ap.context_items)
         self._entity_summary_snapshot_lines_stripped = ctx_n
 
@@ -1808,7 +1825,7 @@ Review the above data and perform memory consolidation:
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{await self._render_required_sections()}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{overreach_flags_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -2099,7 +2116,9 @@ def _format_findings(findings: list[dict]) -> str:
 
     Each finding is formatted with its header fields (description, severity,
     category, suggested_action) followed by the four typed citation lists
-    (cited_entities, cited_edges, cited_tasks, cited_memories) from PRD §9.3.
+    (cited_entities, cited_edges, cited_tasks, cited_memories) from PRD §9.3,
+    then the dangling-citation line naming the repair ids when the finding
+    carries that handoff record (task 5749).
     Empty citation lists are omitted from output.
 
     Rendering limits (reviewer finding incomplete_rendering):
@@ -2190,6 +2209,10 @@ def _format_findings(findings: list[dict]) -> str:
                 memory_strs += f', ... +{extra} more'
                 logger.debug('_format_findings: finding %d cited_memories truncated (%d dropped)', i, extra)
             parts.append(f'   Cited memories: {memory_strs}')
+
+        line = render_dangling_citation_line(f)
+        if line is not None:
+            parts.append(f'   {line}')
 
         lines.append('\n'.join(parts))
     return '\n'.join(lines)

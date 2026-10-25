@@ -4,9 +4,12 @@ Task 1327: Every N escalation events the harness writes an append-only markdown
 digest summarising recent activity, and tracks an EWA of escalations/done that
 pauses the scheduler when it trips.
 
-All I/O in this module is fail-open: helpers return sentinels / zeros / None
-and log warnings rather than raising.  The digest is observability, not a
-correctness gate.
+The path-taking readers and writers in this module are fail-open: they return
+sentinels / zeros / None and log warnings rather than raising.  The digest is
+observability, not a correctness gate.  The connection-taking `query_*` forms
+beneath count_done_in_window and model_role_rollup raise sqlite3.Error instead,
+for a caller that must tell a failed read from a quiet window
+(scripts/sitting/fleet_state.py).
 
 Design decisions (see plan.json):
 - Pure, Harness-free helpers here; harness.py owns the trigger and state.
@@ -322,6 +325,26 @@ def _query_events_ro(
 # ---------------------------------------------------------------------------
 
 
+def query_count_done_in_window(
+    conn: sqlite3.Connection,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> int:
+    """Count done task_completed events in the window on *conn*.
+
+    sqlite3.Error propagates, and *conn* is neither opened nor closed here;
+    count_done_in_window is the fail-open form.
+    """
+    (count,) = conn.execute(
+        "SELECT COUNT(*) FROM events "
+        "WHERE event_type = 'task_completed' "
+        "  AND timestamp BETWEEN ? AND ? "
+        "  AND json_extract(data, '$.outcome') = ?",
+        (window_start_iso, window_end_iso, _DONE_OUTCOME),
+    ).fetchone()
+    return int(count)
+
+
 def count_done_in_window(
     events_db: Path,
     window_start_iso: str,
@@ -332,17 +355,10 @@ def count_done_in_window(
     Uses sqlite3 directly (read-only).  Fail-open: any exception returns 0.
     Missing DB returns 0 (DEBUG); other failures return 0 (WARNING).
     """
-    def _query(conn: sqlite3.Connection) -> int:
-        (count,) = conn.execute(
-            "SELECT COUNT(*) FROM events "
-            "WHERE event_type = 'task_completed' "
-            "  AND timestamp BETWEEN ? AND ? "
-            "  AND json_extract(data, '$.outcome') = ?",
-            (window_start_iso, window_end_iso, _DONE_OUTCOME),
-        ).fetchone()
-        return int(count)
-
-    return _query_events_ro(events_db, 'count_done_in_window', 0, _query)
+    return _query_events_ro(
+        events_db, 'count_done_in_window', 0,
+        lambda conn: query_count_done_in_window(conn, window_start_iso, window_end_iso),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -597,15 +613,14 @@ def _compute_turn_cap_saturation(
     return saturation
 
 
-def model_role_rollup(
-    runs_db: Path,
+def query_model_role_rollup(
+    conn: sqlite3.Connection,
     window_start_iso: str,
     window_end_iso: str,
 ) -> ModelRoleRollup:
-    """Aggregate per-(model, role) invocation outcomes for a digest window.
+    """Aggregate per-(model, role) invocation outcomes for a window on *conn*.
 
-    Uses sqlite3 directly (read-only) via the shared `_query_events_ro`
-    scaffold on `runs_db` (the same file backing EventStore/CostStore/
+    *conn* is a runs.db connection (the file backing EventStore/CostStore/
     RunStore). One query LEFT JOINs `invocations` to `task_results` on
     (run_id, task_id) so module_tagger rows (task_id IS NULL, never matched)
     still contribute invocation_count/cost/cap-hit but count as neither done
@@ -614,68 +629,81 @@ def model_role_rollup(
     Rates are derived in Python with divide-by-zero guards; cost_per_done is
     None (not 0/inf) when a cell has zero distinct done tasks.
 
-    Fail-open: a missing/unreadable DB returns an empty ModelRoleRollup.
+    sqlite3.Error propagates, and *conn* is neither opened nor closed here;
+    model_role_rollup is the fail-open form.
     """
-    def _query(conn: sqlite3.Connection) -> ModelRoleRollup:
-        raw_rows = conn.execute(
-            'SELECT i.model, i.role, '
-            '       COUNT(*) AS invocation_count, '
-            '       SUM(i.capped) AS capped_count, '
-            '       SUM(i.cost_usd) AS total_cost_usd, '
-            '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS done_count, '
-            '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS blocked_count, '
-            '       COUNT(DISTINCT CASE WHEN tr.outcome = ? THEN i.task_id END) '
-            '           AS distinct_done_tasks '
-            'FROM invocations i '
-            'LEFT JOIN task_results tr '
-            '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
-            'WHERE i.completed_at BETWEEN ? AND ? '
-            'GROUP BY i.model, i.role',
-            (
-                _DONE_OUTCOME, _BLOCKED_OUTCOME, _DONE_OUTCOME,
-                window_start_iso, window_end_iso,
-            ),
-        ).fetchall()
+    raw_rows = conn.execute(
+        'SELECT i.model, i.role, '
+        '       COUNT(*) AS invocation_count, '
+        '       SUM(i.capped) AS capped_count, '
+        '       SUM(i.cost_usd) AS total_cost_usd, '
+        '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS done_count, '
+        '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS blocked_count, '
+        '       COUNT(DISTINCT CASE WHEN tr.outcome = ? THEN i.task_id END) '
+        '           AS distinct_done_tasks '
+        'FROM invocations i '
+        'LEFT JOIN task_results tr '
+        '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
+        'WHERE i.completed_at BETWEEN ? AND ? '
+        'GROUP BY i.model, i.role',
+        (
+            _DONE_OUTCOME, _BLOCKED_OUTCOME, _DONE_OUTCOME,
+            window_start_iso, window_end_iso,
+        ),
+    ).fetchall()
 
-        rows: list[ModelRoleRow] = []
-        for (
-            model, role, invocation_count, capped_count, total_cost_usd,
-            done_count, blocked_count, distinct_done_tasks,
-        ) in raw_rows:
-            invocation_count = int(invocation_count or 0)
-            capped_count = int(capped_count or 0)
-            total_cost_usd = float(total_cost_usd or 0.0)
-            done_count = int(done_count or 0)
-            blocked_count = int(blocked_count or 0)
-            distinct_done_tasks = int(distinct_done_tasks or 0)
+    rows: list[ModelRoleRow] = []
+    for (
+        model, role, invocation_count, capped_count, total_cost_usd,
+        done_count, blocked_count, distinct_done_tasks,
+    ) in raw_rows:
+        invocation_count = int(invocation_count or 0)
+        capped_count = int(capped_count or 0)
+        total_cost_usd = float(total_cost_usd or 0.0)
+        done_count = int(done_count or 0)
+        blocked_count = int(blocked_count or 0)
+        distinct_done_tasks = int(distinct_done_tasks or 0)
 
-            done_rate = (done_count / invocation_count) if invocation_count else 0.0
-            blocked_rate = (blocked_count / invocation_count) if invocation_count else 0.0
-            cap_hit_rate = (capped_count / invocation_count) if invocation_count else 0.0
-            cost_per_done = (
-                (total_cost_usd / distinct_done_tasks) if distinct_done_tasks > 0 else None
-            )
-
-            rows.append(ModelRoleRow(
-                model=model,
-                role=role,
-                invocation_count=invocation_count,
-                done_count=done_count,
-                blocked_count=blocked_count,
-                done_rate=done_rate,
-                blocked_rate=blocked_rate,
-                capped_count=capped_count,
-                cap_hit_rate=cap_hit_rate,
-                total_cost_usd=total_cost_usd,
-                cost_per_done=cost_per_done,
-            ))
-
-        turn_cap_saturation = _compute_turn_cap_saturation(
-            conn, window_start_iso, window_end_iso,
+        done_rate = (done_count / invocation_count) if invocation_count else 0.0
+        blocked_rate = (blocked_count / invocation_count) if invocation_count else 0.0
+        cap_hit_rate = (capped_count / invocation_count) if invocation_count else 0.0
+        cost_per_done = (
+            (total_cost_usd / distinct_done_tasks) if distinct_done_tasks > 0 else None
         )
-        return ModelRoleRollup(rows=rows, turn_cap_saturation=turn_cap_saturation)
 
-    return _query_events_ro(runs_db, 'model_role_rollup', ModelRoleRollup(), _query)
+        rows.append(ModelRoleRow(
+            model=model,
+            role=role,
+            invocation_count=invocation_count,
+            done_count=done_count,
+            blocked_count=blocked_count,
+            done_rate=done_rate,
+            blocked_rate=blocked_rate,
+            capped_count=capped_count,
+            cap_hit_rate=cap_hit_rate,
+            total_cost_usd=total_cost_usd,
+            cost_per_done=cost_per_done,
+        ))
+
+    turn_cap_saturation = _compute_turn_cap_saturation(
+        conn, window_start_iso, window_end_iso,
+    )
+    return ModelRoleRollup(rows=rows, turn_cap_saturation=turn_cap_saturation)
+
+
+def model_role_rollup(
+    runs_db: Path,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> ModelRoleRollup:
+    """Fail-open form of query_model_role_rollup over a read-only `runs_db`.
+
+    A missing/unreadable DB returns an empty ModelRoleRollup.
+    """
+    return _query_events_ro(
+        runs_db, 'model_role_rollup', ModelRoleRollup(),
+        lambda conn: query_model_role_rollup(conn, window_start_iso, window_end_iso),
+    )
 
 
 # ---------------------------------------------------------------------------

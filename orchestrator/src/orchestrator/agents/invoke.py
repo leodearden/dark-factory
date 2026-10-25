@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -61,11 +62,19 @@ def _rate(entry: Any, key: str) -> float:
     return getattr(entry, key) if hasattr(entry, key) else entry[key]
 
 
+def _optional_rate(entry: Any, key: str) -> float | None:
+    """Read an optional *key* off a price *entry* as _rate does, answering
+    None when it is absent or unset rather than raising."""
+    return getattr(entry, key) if hasattr(entry, key) else entry.get(key)
+
+
 def _estimate_cost(
     model: str,
     input_tokens: int,
     output_tokens: int,
     prices: dict[str, Any] | None = None,
+    *,
+    cached_input_tokens: int = 0,
 ) -> float:
     """Estimate USD cost for *model* from token counts (backends without
     native cost reporting: codex, gemini).
@@ -75,6 +84,9 @@ def _estimate_cost(
     packaged ``default_price_table()`` (lazy import — this low-level module
     does not depend on orchestrator.config at module-load time). A model
     absent from the resolved table falls back to _FALLBACK_PRICE.
+
+    *input_tokens* INCLUDES *cached_input_tokens*; that cached share is priced
+    at cached_input_per_1m, or at input_per_1m when the entry has none.
     """
     if prices is None:
         from orchestrator.config import default_price_table
@@ -87,8 +99,13 @@ def _estimate_cost(
             model, _FALLBACK_PRICE['input_per_1m'], _FALLBACK_PRICE['output_per_1m'],
         )
         entry = _FALLBACK_PRICE
+    input_rate = _rate(entry, 'input_per_1m')
+    cached_rate = _optional_rate(entry, 'cached_input_per_1m')
+    if cached_rate is None:
+        cached_rate = input_rate
     return (
-        input_tokens * _rate(entry, 'input_per_1m')
+        (input_tokens - cached_input_tokens) * input_rate
+        + cached_input_tokens * cached_rate
         + output_tokens * _rate(entry, 'output_per_1m')
     ) / 1_000_000
 
@@ -147,6 +164,8 @@ async def invoke_agent(
     *prices*, when set (codex/gemini backends only — claude reports native
     cost), is forwarded to the parser's cost estimator in place of the
     packaged default price table; see ``_estimate_cost``.
+    The codex backend maps *allowed_tools* / *disallowed_tools* onto its
+    sandbox (see ``codex_exec_argv``).
     """
     if backend == 'claude':
         return await _invoke_claude_with_sandbox(
@@ -176,6 +195,7 @@ async def invoke_agent(
             effort=effort,
             timeout_seconds=timeout_seconds, prices=prices,
             max_turns=max_turns,
+            allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
         )
     elif backend == 'gemini':
         return await _invoke_gemini(
@@ -376,6 +396,106 @@ async def _invoke_claude_with_sandbox(
 # Codex backend
 # ---------------------------------------------------------------------------
 
+_CODEX_WRITE_TOOLS = frozenset({'Edit', 'Write'})
+
+
+def _codex_sandbox_mode(
+    allowed_tools: list[str] | None,
+    disallowed_tools: list[str] | None,
+) -> str | None:
+    """`codex exec` offers no per-tool lever, only its sandbox axis, so a role's tool lists collapse onto it.
+
+    A role that cannot write runs 'read-only'; every other caller keeps the existing bypass (None).
+    """
+    allowed = set(allowed_tools or ())
+    disallowed = set(disallowed_tools or ())
+    cannot_write = (
+        '*' in disallowed
+        or bool(_CODEX_WRITE_TOOLS & disallowed)
+        or (bool(allowed) and not _CODEX_WRITE_TOOLS & allowed)
+    )
+    return 'read-only' if cannot_write else None
+
+
+_CODEX_HONOURED_TOOLS = _CODEX_WRITE_TOOLS | {'Read', 'Glob', 'Grep'}
+
+
+def _codex_inexpressible_tool_specs(
+    allowed_tools: list[str] | None,
+    disallowed_tools: list[str] | None,
+) -> list[str]:
+    """The specs codex's sandbox axis cannot honour: all but Edit/Write (which pick the mode) and Read/Glob/Grep (which read-only permits)."""
+    return [
+        spec for spec in [*(allowed_tools or ()), *(disallowed_tools or ())]
+        if spec not in _CODEX_HONOURED_TOOLS
+    ]
+
+
+_TOML_BARE_KEY = re.compile(r'[A-Za-z0-9_-]+')
+
+
+def _codex_mcp_override_args(mcp_config: dict | None) -> list[str]:
+    """MCP servers as per-invocation ``-c mcp_servers.<name>.<key>=<toml>`` argv overrides.
+
+    codex's ``-c`` splitter keeps a quoted segment's quotes in the server name,
+    so each name must be a bare TOML key; any other name raises ValueError.
+    codex reads each server's ``command`` (the executable alone), an ``args``
+    list and an optional ``env`` inline table, all JSON-encoded, which is valid
+    TOML for strings, string arrays and quoted inline-table keys. Each server's
+    tools are pre-approved: ``-s read-only`` runs with approval policy
+    ``never``, which fails every unapproved MCP call, and the bypass flag
+    ignores the setting.
+    """
+    overrides: list[str] = []
+    for name, cfg in (mcp_config or {}).get('mcpServers', {}).items():
+        if not _TOML_BARE_KEY.fullmatch(name):
+            raise ValueError(f'codex MCP server name {name!r} is not a bare TOML key')
+        table = f'mcp_servers.{name}'
+        overrides.append(f'{table}.command={json.dumps(cfg.get("command", ""))}')
+        overrides.append(f'{table}.args={json.dumps([str(a) for a in cfg.get("args", [])])}')
+        env_vars = cfg.get('env', {})
+        if env_vars:
+            inline = ', '.join(f'{json.dumps(str(k))} = {json.dumps(str(v))}' for k, v in env_vars.items())
+            overrides.append(f'{table}.env={{{inline}}}')
+        overrides.append(f'{table}.default_tools_approval_mode="approve"')
+    return [arg for override in overrides for arg in ('-c', override)]
+
+
+def codex_exec_argv(
+    model: str,
+    *,
+    effort: str | None = None,
+    mcp_config: dict | None = None,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
+) -> list[str]:
+    """The ``codex exec`` argv for one invocation, before any sandbox wrap; it ends in ``-``, so the prompt goes on stdin.
+
+    The tool lists only pick the confinement (see ``_codex_sandbox_mode``), and
+    every spec that axis cannot honour is logged as dropped. MCP servers ride
+    as ``-c`` overrides (see ``_codex_mcp_override_args``), which raises
+    ValueError for a server name codex cannot carry.
+    """
+    dropped_specs = _codex_inexpressible_tool_specs(allowed_tools, disallowed_tools)
+    if dropped_specs:
+        logger.warning(
+            'codex backend: dropped tool spec(s) not expressible on codex\'s '
+            'sandbox axis (no per-tool allowlist): %s',
+            ', '.join(dropped_specs),
+        )
+    sandbox_mode = _codex_sandbox_mode(allowed_tools, disallowed_tools)
+    confinement = (
+        ['-s', sandbox_mode] if sandbox_mode
+        else ['--dangerously-bypass-approvals-and-sandbox']
+    )
+    argv = ['codex', 'exec', '-m', model, '--json', *confinement]
+    if effort:
+        argv.extend(['-c', f'model_reasoning_effort={effort}'])
+    argv.extend(_codex_mcp_override_args(mcp_config))
+    argv.append('-')
+    return argv
+
+
 async def _invoke_codex(
     prompt: str,
     system_prompt: str,
@@ -389,8 +509,13 @@ async def _invoke_codex(
     timeout_seconds: float | None = None,
     prices: dict[str, Any] | None = None,
     max_turns: int | None = None,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
 ) -> AgentResult:
     """Invoke OpenAI Codex CLI.
+
+    The sandbox-bypass flag survives only for roles that legitimately write;
+    a role that cannot runs ``-s read-only`` (see ``codex_exec_argv``).
 
     No instruction file (AGENTS.md) is ever written into the worktree —
     system_prompt and prompt are folded together and delivered entirely via
@@ -400,7 +525,10 @@ async def _invoke_codex(
     strictly stronger than relocating/excluding the file: with no file on
     disk at all, no staging command run against this worktree — including
     the single-implementer-commit path's `git add -A -- . :!.claude`
-    (git_ops.py:5320) — can ever pick it up.
+    (git_ops.py:5320) — can ever pick it up. MCP servers likewise arrive as
+    ``-c`` overrides (see ``codex_exec_argv``), so nothing at all is
+    written into *cwd*. CODEX_HOME is deliberately left alone: a temp home
+    silently drops the ChatGPT login for OPENAI_API_KEY.
 
     *max_turns* and *max_budget_usd* are accepted for dispatcher-signature
     uniformity/observability only: codex-cli (verified 0.143.0, full `codex
@@ -421,37 +549,23 @@ async def _invoke_codex(
         'the wall-clock watchdog (timeout_seconds=%r) is enforced',
         max_turns, max_budget_usd, timeout_seconds,
     )
-    temp_files: list[Path] = []
-    try:
-        # Write MCP config
-        if mcp_config:
-            codex_dir = cwd / '.codex'
-            codex_dir.mkdir(exist_ok=True)
-            config_toml = codex_dir / 'config.toml'
-            _write_codex_mcp_config(config_toml, mcp_config)
-            temp_files.append(config_toml)
+    cmd = codex_exec_argv(
+        model, effort=effort, mcp_config=mcp_config,
+        allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+    )
+    codex_input = f'{system_prompt}\n\n{prompt}'.encode()
 
-        cmd = ['codex', 'exec', '-m', model, '--json',
-               '--dangerously-bypass-approvals-and-sandbox']
+    cmd, env = _sandbox_spawn(cmd, os.environ, cwd, sandbox_modules, sandbox_extras)
 
-        if effort:
-            cmd.extend(['-c', f'model_reasoning_effort={effort}'])
+    result = await _run_subprocess_local(
+        cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds,
+        stdin_data=codex_input,
+    )
+    return _parse_codex_output(result, model, prices)
 
-        # '-' tells codex exec to read the prompt from stdin instead of argv.
-        cmd.append('-')
-        codex_input = f'{system_prompt}\n\n{prompt}'.encode()
 
-        cmd, env = _sandbox_spawn(cmd, os.environ, cwd, sandbox_modules, sandbox_extras)
-
-        result = await _run_subprocess_local(
-            cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds,
-            stdin_data=codex_input,
-        )
-        return _parse_codex_output(result, model, prices)
-
-    finally:
-        for f in temp_files:
-            f.unlink(missing_ok=True)
+def _codex_exit_line(result: _SubprocessResult) -> str:
+    return f'codex exited rc={result.returncode}' + (' (timed out)' if result.timed_out else '')
 
 
 def _parse_codex_output(
@@ -466,7 +580,14 @@ def _parse_codex_output(
 
     timed_out is propagated directly from result.timed_out on every return path.
     *prices*, when provided, is forwarded to _estimate_cost (see there for the
-    resolution order when None).
+    resolution order when None). codex exits 0 on ``turn.failed``, so
+    returncode alone is not a failure signal. A failed run's output is only
+    codex-authored text — its error events, or a synthetic exit line when it
+    died without one (timeout, crash) — so a reply that discusses caps is
+    never read as one by classify_invocation.
+
+    codex's input_tokens INCLUDES its cached_input_tokens; the result's
+    input_tokens excludes them, the AgentResult convention every backend shares.
     """
     if not result.stdout.strip():
         return AgentResult(
@@ -495,21 +616,25 @@ def _parse_codex_output(
         except json.JSONDecodeError:
             return AgentResult(
                 success=result.returncode == 0,
-                output=result.stdout,
+                output=result.stdout if result.returncode == 0 else _codex_exit_line(result),
                 subtype='text_output',
                 stderr=result.stderr,
                 timed_out=result.timed_out,
             )
 
-    # Find completion events and collect text
-    # Codex JSONL format:
+    # Codex JSONL events handled below (others, e.g. turn.started, are ignored):
     #   {"type":"thread.started","thread_id":"..."}
-    #   {"type":"turn.started"}
     #   {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
-    #   {"type":"item.completed","item":{"type":"command_execution","command":"...","exit_code":0}}
-    #   {"type":"turn.completed","usage":{"input_tokens":N,"output_tokens":N}}
-    output_parts = []
+    #   {"type":"item.completed","item":{"type":"error","message":"..."}}  non-fatal warning
+    #   {"type":"turn.completed","usage":{"input_tokens":N,"cached_input_tokens":N,
+    #       "cache_write_input_tokens":N,"output_tokens":N}}  cached is INSIDE input
+    #   {"type":"error","message":"..."}                  fatal; paired with turn.failed
+    #   {"type":"turn.failed","error":{"message":"..."}}  fatal
+    agent_parts: list[str] = []
+    error_parts: list[str] = []
     total_input_tokens = 0
+    total_cached_input_tokens = 0
+    total_cache_write_tokens = 0
     total_output_tokens = 0
     session_id = ''
     is_error = False
@@ -517,6 +642,7 @@ def _parse_codex_output(
 
     for event in events:
         event_type = event.get('type', '')
+        error_text: str | None = None
 
         if event_type == 'thread.started':
             session_id = event.get('thread_id', session_id)
@@ -526,25 +652,58 @@ def _parse_codex_output(
             if item.get('type') == 'agent_message':
                 text = item.get('text', '')
                 if text:
-                    output_parts.append(text)
+                    agent_parts.append(text)
             elif item.get('type') == 'command_execution':
                 # Track command executions for debugging
                 pass
+            elif item.get('type') == 'error':
+                error_text = item.get('message', 'Unknown error')
 
         elif event_type == 'turn.completed':
             num_turns += 1
             usage = event.get('usage') or {}
             total_input_tokens += usage.get('input_tokens') or 0
+            total_cached_input_tokens += usage.get('cached_input_tokens') or 0
+            total_cache_write_tokens += usage.get('cache_write_input_tokens') or 0
             total_output_tokens += usage.get('output_tokens') or 0
 
         elif event_type == 'error':
             is_error = True
-            output_parts.append(event.get('message', 'Unknown error'))
+            error_text = event.get('message', 'Unknown error')
 
-    output_text = '\n'.join(output_parts) if output_parts else result.stdout[:2000]
+        elif event_type == 'turn.failed':
+            is_error = True
+            error_text = (event.get('error') or {}).get('message', 'Unknown error')
 
-    # Estimate cost from token counts
-    cost = _estimate_cost(model, total_input_tokens, total_output_tokens, prices)
+        # The measured cap arrives as an `error` AND a `turn.failed` with one text.
+        if error_text is not None and error_text not in error_parts:
+            error_parts.append(error_text)
+
+    if is_error:
+        output_text = '\n'.join(error_parts)
+    elif result.returncode != 0 or result.timed_out:
+        if agent_parts:
+            logger.info(
+                'codex %s; its partial reply is withheld from output: %.500s',
+                _codex_exit_line(result), '\n'.join(agent_parts),
+            )
+        output_text = '\n'.join([_codex_exit_line(result), *error_parts])
+    else:
+        output_parts = agent_parts + error_parts
+        output_text = '\n'.join(output_parts) if output_parts else result.stdout[:2000]
+
+    uncached_input_tokens = total_input_tokens - total_cached_input_tokens
+    if uncached_input_tokens < 0:
+        logger.warning(
+            'codex reported cached_input_tokens=%d above input_tokens=%d, which should '
+            'include them; counting the non-cached input as 0',
+            total_cached_input_tokens, total_input_tokens,
+        )
+        uncached_input_tokens = 0
+    cost = _estimate_cost(
+        model, uncached_input_tokens + total_cached_input_tokens, total_output_tokens, prices,
+        cached_input_tokens=total_cached_input_tokens,
+    )
 
     return AgentResult(
         success=result.returncode == 0 and not is_error,
@@ -556,30 +715,11 @@ def _parse_codex_output(
         subtype='success' if result.returncode == 0 and not is_error else 'error',
         stderr=result.stderr,
         timed_out=result.timed_out,
+        input_tokens=uncached_input_tokens,
+        output_tokens=total_output_tokens,
+        cache_read_tokens=total_cached_input_tokens,
+        cache_create_tokens=total_cache_write_tokens,
     )
-
-
-def _write_codex_mcp_config(config_path: Path, mcp_config: dict) -> None:
-    """Write MCP server config as .codex/config.toml.
-
-    codex reads one ``[mcp_servers.<name>]`` table per server with ``command``
-    (the executable alone) and an ``args`` list, plus an optional
-    ``[mcp_servers.<name>.env]`` subtable. Keys and values are JSON-encoded,
-    which is valid TOML for strings and string arrays, so a server name with a
-    hyphen or a path with a quote cannot break the file.
-    """
-    lines = []
-    for name, cfg in mcp_config.get('mcpServers', {}).items():
-        table = f'mcp_servers.{json.dumps(name)}'
-        lines.append(f'[{table}]')
-        lines.append(f'command = {json.dumps(cfg.get("command", ""))}')
-        lines.append(f'args = {json.dumps([str(a) for a in cfg.get("args", [])])}')
-        env_vars = cfg.get('env', {})
-        if env_vars:
-            lines.append(f'[{table}.env]')
-            lines.extend(f'{json.dumps(str(k))} = {json.dumps(str(v))}' for k, v in env_vars.items())
-        lines.append('')
-    config_path.write_text('\n'.join(lines))
 
 
 # ---------------------------------------------------------------------------
