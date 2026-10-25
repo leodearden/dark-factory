@@ -207,11 +207,14 @@ class _KillpgCall(NamedTuple):
 
 
 def _record_killpg(monkeypatch: pytest.MonkeyPatch) -> list[_KillpgCall]:
-    """Record every ``os.killpg`` as ``shared.proc_group`` sees it, then forward it to the real one.
+    """Record every ``os.killpg`` call in this process, then forward it to the real one.
 
-    Each call is stamped with ``time.monotonic()`` before it is forwarded.
-    The returned list is live: it keeps growing until *monkeypatch* undoes
-    the patch, so snapshot it before any later call that probes with killpg.
+    The patch target resolves to the ``os`` module itself, so it replaces
+    ``os.killpg`` process-wide: calls from the test's own helpers are
+    recorded alongside ``shared.proc_group``'s. Each call is stamped with
+    ``time.monotonic()`` before it is forwarded. The returned list is live:
+    it keeps growing until *monkeypatch* undoes the patch, so snapshot it
+    before any later call that probes with killpg.
     """
     real = os.killpg
     calls: list[_KillpgCall] = []
