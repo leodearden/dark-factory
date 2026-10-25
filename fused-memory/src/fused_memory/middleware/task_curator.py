@@ -70,6 +70,7 @@ from shared.config_dir import (
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
+from shared.streak import KeyedStreaks
 
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
@@ -703,19 +704,6 @@ def _render_batch_prompt(
     return '\n'.join([*sections, instruction])
 
 
-@dataclass
-class _DegradedStreak:
-    """One project's run of consecutive degraded curations.
-
-    ``alarm_fired`` latches so a streak escalates once, not once per curation
-    past the threshold; the whole record is discarded on that project's next
-    usable decision.
-    """
-
-    count: int = 0
-    alarm_fired: bool = False
-
-
 class _LazyRegistry:
     """One-shot, off-loop lazy load of a YAML registry file.
 
@@ -897,7 +885,9 @@ class TaskCurator:
         # order to make a sustained outage visible. Keyed by project because
         # one curator serves every project, so a shared count would let one
         # project's healthy curations mask another's outage.
-        self._degraded_streaks: dict[str, _DegradedStreak] = {}
+        self._degraded_streaks: KeyedStreaks[str] = KeyedStreaks(
+            threshold=config.curator.degraded_streak_threshold,
+        )
 
     # ------------------------------------------------------------------
     # Lazy init (mirrors task_dedup.py pattern)
@@ -1538,10 +1528,6 @@ class TaskCurator:
     # Class-agnostic degraded-streak alarm (task 4448)
     # ------------------------------------------------------------------
 
-    def _reset_degraded_streak(self, project_id: str) -> None:
-        """Clear *project_id*'s streak and re-arm its alarm, on a usable decision."""
-        self._degraded_streaks.pop(project_id, None)
-
     async def _degraded_create(
         self,
         *,
@@ -1595,24 +1581,22 @@ class TaskCurator:
         nonetheless failed to decide).  The alarm is class-agnostic by construction: it
         takes only the fact that a curation degraded, never the reason.
         """
-        streak = self._degraded_streaks.setdefault(project_id, _DegradedStreak())
-        streak.count += 1
-        threshold = self._config.curator.degraded_streak_threshold
-        if streak.count < threshold or streak.alarm_fired:
+        step = self._degraded_streaks.failure(project_id)
+        if not step.fired:
             return
 
-        streak.alarm_fired = True
+        threshold = self._config.curator.degraded_streak_threshold
         logger.error(
             'task_curator: %d consecutive degraded curations for project %s '
             '(threshold %d) — every candidate in that run was filed without '
             'dedupe. Last: %s',
-            streak.count, project_id, threshold, justification,
+            step.count, project_id, threshold, justification,
         )
         if self._escalator is not None:
             await self._escalator.report_consecutive_degraded(
                 project_root=project_root,
                 project_id=project_id,
-                streak=streak.count,
+                streak=step.count,
                 threshold=threshold,
                 last_justification=justification,
                 candidate_title=candidate_title,
@@ -1762,7 +1746,7 @@ class TaskCurator:
                     candidate_title=candidate.title,
                 )
             else:
-                self._reset_degraded_streak(project_id)
+                self._degraded_streaks.success(project_id)
         except POOL_UNAVAILABLE_ERRORS as exc:
             decision = CuratorDecision.deferred(
                 pool_defer_reason(exc),
@@ -3143,7 +3127,7 @@ class TaskCurator:
         # action='create' without raising. One usable decision suffices — the
         # other items' degradation is then the designed per-item fail-open.
         if any(not d.degraded for d in decisions):
-            self._reset_degraded_streak(project_id)
+            self._degraded_streaks.success(project_id)
         else:
             for candidate, decision in zip(candidates, decisions, strict=True):
                 await self._count_degraded(
