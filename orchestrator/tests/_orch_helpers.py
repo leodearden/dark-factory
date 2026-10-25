@@ -193,8 +193,10 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 # test_merge_lane_ratchet.py, both named with their reasons in
 # test_whole_tree_scan_timeout_guard.py.  For a consumer, the per-item cost
 # this ceiling must clear is no longer a sweep of its own but the SHARED PASS:
-# one streaming read+parse of the union of every requested analysis's file
-# set, billed to whichever consumer item requests `tree_pass` first on its
+# one streaming read of the union of every requested analysis's file set,
+# each file parsed at most once and walked only by the analyses whose
+# `_tree_scan.py::ParsedModule.may_name` prefilter cannot rule it out,
+# billed to whichever consumer item requests `tree_pass` first on its
 # worker, while every later consumer item projects facts already held.  Any
 # consumer may be the item billed, which is why each one carries this mark
 # however cheap its own tests are.
