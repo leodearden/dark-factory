@@ -6650,6 +6650,45 @@ async def test_reopen_freshness_exempts_operational_verified(
         await backend.close()
 
 
+@pytest.mark.asyncio
+async def test_deterministic_gate_escalation_id_persists_against_real_backend(
+    tmp_path, event_buffer,
+):
+    """Task 5274's VERIFY scenario at the persistence floor: a
+    deterministic-gate close keeps its escalation_id through a real
+    SqliteTaskBackend, read back by a fresh instance. The AsyncMock-taskmaster
+    tests above cannot see a backend-floor drop."""
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer, config=FusedMemoryConfig())
+
+        result = await interceptor.set_task_status(
+            '1', 'done', project_root,
+            done_provenance=_gate_provenance(escalation_id='esc-5274-1'),
+            agent_id='orchestrator',
+        )
+
+        assert 'error' not in result, result
+
+        fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await fresh.start()
+        try:
+            task = await fresh.get_task('1', project_root=project_root)
+        finally:
+            await fresh.close()
+        assert task['status'] == 'done', task
+        assert task['metadata']['done_provenance']['kind'] == 'deterministic-gate'
+        assert task['metadata']['done_provenance']['escalation_id'] == 'esc-5274-1'
+    finally:
+        await backend.close()
+
+
 # ── Tests for same-status done_provenance repair (fix c, task 2401) ───────
 #
 # Legacy `done` tasks may carry `metadata.done_provenance` written before
