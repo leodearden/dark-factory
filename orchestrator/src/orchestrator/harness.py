@@ -10976,6 +10976,7 @@ class Harness:
         runner = DeterministicRunner(
             scheduler=self.scheduler,
             escalation_queue=self._escalation_queue,
+            predicate_recheck_stall_cap=self.config.deterministic.predicate_recheck_stall_cap,
         )
         outcome = await runner.run(assignment)
         return TaskReport(
