@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
+from shared.async_sqlite_base import CheckpointResult
 
 from fused_memory.config.schema import FusedMemoryConfig, OverreachGuardConfig
 from fused_memory.models.enums import MemoryCategory
@@ -283,6 +284,42 @@ class TestStoreLifecycle:
             assert await second.judged_episode('g', 'ep1') == _episode()
         finally:
             await second.close()
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_truncates_the_wal(self, tmp_path: Path) -> None:
+        opened = await OverreachShadowStore.open(tmp_path / 'ckpt')
+        try:
+            await opened.record(episode=_episode(), judgements=[_judged('e1', 'overreach')])
+            assert _wal_bytes(tmp_path / 'ckpt') > 0
+            result = await opened.checkpoint()
+            assert result.busy == 0
+            assert _wal_bytes(tmp_path / 'ckpt') == 0
+        finally:
+            await opened.close()
+
+    @pytest.mark.asyncio
+    async def test_a_closed_store_checkpoints_as_unavailable(self, tmp_path: Path) -> None:
+        opened = await OverreachShadowStore.open(tmp_path / 'closed')
+        await opened.close()
+        assert await opened.checkpoint() == CheckpointResult.unavailable()
+
+    @pytest.mark.asyncio
+    async def test_the_shadow_checkpoints_its_store(self, store, tmp_path: Path) -> None:
+        await store.record(episode=_episode(), judgements=[_judged('e1', 'overreach')])
+        runner = _runner(store)
+        result = await runner.checkpoint()
+        assert result.busy == 0
+        assert _wal_bytes(tmp_path / 'sidecar') == 0
+
+    @pytest.mark.asyncio
+    async def test_a_closed_shadow_checkpoints_as_unavailable(self, store) -> None:
+        runner = _runner(store)
+        await runner.close()
+        assert await runner.checkpoint() == CheckpointResult.unavailable()
+
+
+def _wal_bytes(data_dir: Path) -> int:
+    return (data_dir / f'{SIDECAR_FILENAME}-wal').stat().st_size
 
 
 # --------------------------------------------------------------------------- #
