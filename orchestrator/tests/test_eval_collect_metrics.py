@@ -1,4 +1,4 @@
-"""runner.collect_metrics, the executor's metric collection, and its git diff-stat probe."""
+"""runner.collect_metrics, the executor's metric collection, measured against a real git worktree."""
 
 from __future__ import annotations
 
@@ -7,10 +7,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _eval_diff_repo import repo_with_commit
 
-from orchestrator.evals.metrics import RoleUnderTest
+from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
 from orchestrator.evals.runner import collect_metrics
 from orchestrator.verify import VerifyResult
+
+_RUNNER_LOGGER = 'orchestrator.evals.runner'
 
 
 def _workflow() -> MagicMock:
@@ -31,140 +34,89 @@ def _workflow() -> MagicMock:
     return wf
 
 
-@pytest.mark.asyncio
-async def test_collect_metrics_sets_role_and_replay_frame_on_the_dataclass():
+async def _collect(
+    worktree: Path,
+    base_commit: str,
+    *,
+    role: RoleUnderTest = RoleUnderTest.IMPLEMENTER,
+    replay_frame: str | None = None,
+) -> EvalMetrics:
     verification = VerifyResult(
         passed=True, test_output='', lint_output='', type_output='', summary='',
     )
-    with (
-        patch('orchestrator.verify.run_verification', AsyncMock(return_value=verification)),
-        patch('orchestrator.evals.runner._git_diff_stats', AsyncMock(return_value=(3, 1))),
-    ):
-        m = await collect_metrics(
-            _workflow(), Path('/fake/wt'), {'id': 't', 'pre_task_commit': 'base'},
-            role=RoleUnderTest.JUDGE, replay_frame='f',
+    with patch('orchestrator.verify.run_verification', AsyncMock(return_value=verification)):
+        return await collect_metrics(
+            _workflow(), worktree, {'id': 't', 'pre_task_commit': base_commit},
+            role=role, replay_frame=replay_frame,
         )
+
+
+def _runner_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == _RUNNER_LOGGER and r.levelno >= logging.WARNING
+    ]
+
+
+@pytest.mark.asyncio
+async def test_collect_metrics_sets_role_and_replay_frame_on_the_dataclass(tmp_path: Path):
+    repo, base = repo_with_commit(tmp_path / 'repo', {})
+
+    m = await _collect(repo, base, role=RoleUnderTest.JUDGE, replay_frame='f')
 
     assert m.role_under_test is RoleUnderTest.JUDGE
     assert m.replay_frame == 'f'
 
 
-# ---------------------------------------------------------------------------
-# Task 1809 step-15: _git_diff_stats returncode check + (-1,-1) sentinel
-# ---------------------------------------------------------------------------
-
-def _make_fake_proc(returncode: int, stdout: bytes, stderr: bytes) -> MagicMock:
-    """Build a minimal fake asyncio Process mock."""
-    proc = MagicMock()
-    proc.returncode = returncode
-    proc.communicate = AsyncMock(return_value=(stdout, stderr))
-    return proc
-
-
 @pytest.mark.asyncio
-class TestGitDiffStatsReturncode:
-    """Step-15 (RED): _git_diff_stats must return (-1,-1) and emit a WARNING
-    when git exits non-zero, rather than returning (0,0) silently.
+class TestDiffStats:
+    """lines_changed / files_changed measure the base..HEAD diff.
 
-    Before step-16 impl: rc!=0 path is silent and returns (0,0) → RED.
-    After step-16 impl: returns (-1,-1) + WARNING at 'orchestrator.evals.runner'.
+    A measurement that failed reads (-1, -1) with a WARNING, never a silent
+    (0, 0) that would pass for a genuine no-change run (task 1809).
     """
 
-    async def test_nonzero_returncode_returns_sentinel_and_warns(
-        self, caplog,
+    async def test_committed_change_counts_lines_and_files(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
-        from orchestrator.evals.runner import _git_diff_stats
-
-        fake_proc = _make_fake_proc(
-            returncode=128,
-            stdout=b'',
-            stderr=b'fatal: bad object deadbeef',
+        repo, base = repo_with_commit(
+            tmp_path / 'repo',
+            {'README.md': '# Changed\n', 'src/b.py': 'x = 1\ny = 2\n'},
         )
 
-        with (
-            patch('asyncio.create_subprocess_exec', return_value=fake_proc),
-            caplog.at_level(logging.WARNING, logger='orchestrator.evals.runner'),
-        ):
-            result = await _git_diff_stats(Path('/fake/worktree'), 'deadbeef')
+        with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
+            m = await _collect(repo, base)
 
-        assert result == (-1, -1), (
-            f'Expected (-1,-1) sentinel on rc=128; got {result!r}'
-        )
-        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-        assert warning_texts, (
-            'Expected a WARNING at orchestrator.evals.runner on rc!=0; '
-            'got no warnings'
-        )
+        assert (m.lines_changed, m.files_changed) == (4, 2)
+        assert not _runner_warnings(caplog)
 
-    async def test_create_subprocess_raises_returns_sentinel_and_warns(
-        self, caplog,
+    async def test_nothing_committed_since_base_is_zero_zero(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
-        from orchestrator.evals.runner import _git_diff_stats
+        repo, base = repo_with_commit(tmp_path / 'repo', {})
 
-        with (
-            patch(
-                'asyncio.create_subprocess_exec',
-                side_effect=OSError('no such file'),
-            ),
-            caplog.at_level(logging.WARNING, logger='orchestrator.evals.runner'),
-        ):
-            result = await _git_diff_stats(Path('/fake/worktree'), 'deadbeef')
+        with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
+            m = await _collect(repo, base)
 
-        assert result == (-1, -1), (
-            f'Expected (-1,-1) sentinel on OSError; got {result!r}'
-        )
-        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-        assert warning_texts, (
-            'Expected a WARNING at orchestrator.evals.runner on OSError; '
-            'got no warnings'
-        )
+        assert (m.lines_changed, m.files_changed) == (0, 0)
+        assert not _runner_warnings(caplog)
 
-    async def test_zero_returncode_valid_stat_output_parsed(
-        self, caplog,
+    async def test_unknown_base_commit_is_the_sentinel_and_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
-        from orchestrator.evals.runner import _git_diff_stats
+        repo, _base = repo_with_commit(tmp_path / 'repo', {})
 
-        stat_output = (
-            b' src/foo.py | 10 +++++-----\n'
-            b' src/bar.py |  5 ++---\n'
-            b' 2 files changed, 15 insertions(+), 0 deletions(-)\n'
-        )
-        fake_proc = _make_fake_proc(returncode=0, stdout=stat_output, stderr=b'')
+        with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
+            m = await _collect(repo, 'deadbeef')
 
-        with (
-            patch('asyncio.create_subprocess_exec', return_value=fake_proc),
-            caplog.at_level(logging.WARNING, logger='orchestrator.evals.runner'),
-        ):
-            lines, files = await _git_diff_stats(Path('/fake/worktree'), 'abc123')
+        assert (m.lines_changed, m.files_changed) == (-1, -1)
+        assert _runner_warnings(caplog)
 
-        assert files == 2, f'Expected files=2; got {files!r}'
-        assert lines == 15, f'Expected lines=15; got {lines!r}'
-        parse_warnings = [
-            r.message for r in caplog.records if r.levelno >= logging.WARNING
-        ]
-        assert not parse_warnings, (
-            f'No WARNING expected for successful parse; got: {parse_warnings}'
-        )
-
-    async def test_zero_returncode_empty_stdout_returns_zero_zero(
-        self, caplog,
+    async def test_absent_worktree_is_the_sentinel_and_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
-        from orchestrator.evals.runner import _git_diff_stats
+        with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
+            m = await _collect(tmp_path / 'absent', 'deadbeef')
 
-        fake_proc = _make_fake_proc(returncode=0, stdout=b'', stderr=b'')
-
-        with (
-            patch('asyncio.create_subprocess_exec', return_value=fake_proc),
-            caplog.at_level(logging.WARNING, logger='orchestrator.evals.runner'),
-        ):
-            result = await _git_diff_stats(Path('/fake/worktree'), 'abc123')
-
-        assert result == (0, 0), (
-            f'Expected (0,0) for legitimate empty diff; got {result!r}'
-        )
-        parse_warnings = [
-            r.message for r in caplog.records if r.levelno >= logging.WARNING
-        ]
-        assert not parse_warnings, (
-            f'No WARNING expected for empty-diff (no-change); got: {parse_warnings}'
-        )
+        assert (m.lines_changed, m.files_changed) == (-1, -1)
+        assert _runner_warnings(caplog)

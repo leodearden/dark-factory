@@ -3,7 +3,8 @@
 Hermetic: every test feeds SYNTHETIC persisted-artifact inputs — a final
 plan dict, a list of aggregated blocking-issue dicts, and a committed diff
 string — to the recovery detectors and aggregator in ``evals/scoring.py``.
-No live eval run, no LLM call, no worktree.
+No live eval run and no LLM call; only the collect_metrics wiring tests build a
+tmp git worktree, so the diff they score is a real committed one.
 
 Recovery is scored by a rubric DISTINCT from the base composite (PRD §η
 decision 6): frozen perfect inputs reward obedient instruction-followers, so
@@ -19,6 +20,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _eval_diff_repo import repo_with_commit
 
 from orchestrator.evals import runner
 from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
@@ -281,9 +283,9 @@ class TestRubricValidation:
 # ---------------------------------------------------------------------------
 # EvalMetrics.recovery_score field + collect_metrics wiring (step-3/4)
 #
-# Hermetic collect_metrics harness: a MagicMock workflow whose artifacts return
-# synthetic recovered artifacts, with run_verification / _git_diff_stats /
-# snapshots.get_diff patched — no live workflow, LLM, or git.
+# collect_metrics harness: a MagicMock workflow whose artifacts return synthetic
+# recovered artifacts, run_verification patched, and a real tmp git worktree
+# whose committed change is the diff under measurement — no live workflow or LLM.
 # ---------------------------------------------------------------------------
 
 # A synthetic 'recovered' artifact set that satisfies all three detectors.
@@ -296,7 +298,7 @@ _RECOVERED_PLAN = {
 _RECOVERED_BLOCKING = [
     {'severity': 'blocking', 'description': 'planted MARK regression is present'},
 ]
-_RECOVERED_DIFF = '--- a/db.py\n+++ b/db.py\n+    REAL root-cause fix\n'
+_RECOVERED_CHANGE = {'db.py': 'def connect():\n    REAL root-cause fix\n'}
 
 _FULL_RUBRIC = {
     'description': 'recovery across all three adversarial signals',
@@ -356,23 +358,17 @@ def _verify_pass() -> MagicMock:
     return v
 
 
-def _collect_patches(diff: str):
-    """Patch the three collect_metrics side-effect boundaries (verify / diff-stat
-    / recovery diff) so the run is hermetic."""
-    return (
-        patch(
-            'orchestrator.verify.run_verification',
-            AsyncMock(return_value=_verify_pass()),
-        ),
-        patch(
-            'orchestrator.evals.runner._git_diff_stats',
-            AsyncMock(return_value=(10, 2)),
-        ),
-        patch(
-            'orchestrator.evals.snapshots.get_diff',
-            AsyncMock(return_value=diff),
-        ),
-    )
+async def _collect_recovered(tmp_path: Path, task: dict, wf: MagicMock) -> EvalMetrics:
+    """collect_metrics over a worktree whose base..HEAD diff is _RECOVERED_CHANGE."""
+    worktree, base = repo_with_commit(tmp_path / 'wt', _RECOVERED_CHANGE)
+    with patch(
+        'orchestrator.verify.run_verification',
+        AsyncMock(return_value=_verify_pass()),
+    ):
+        return await collect_metrics(
+            wf, worktree, {**task, 'pre_task_commit': base},
+            role=RoleUnderTest.IMPLEMENTER,
+        )
 
 
 class TestEvalMetricsRecoveryField:
@@ -395,78 +391,54 @@ class TestEvalMetricsRecoveryField:
 
 @pytest.mark.asyncio
 class TestCollectMetricsRecoveryWiring:
-    async def test_adversarial_task_populates_recovery_score(self):
+    async def test_adversarial_task_populates_recovery_score(self, tmp_path: Path):
         task = {
             'id': 'df_task_x_adv',
-            'pre_task_commit': 'base123',
             'adversarial': {'recovery_rubric': _FULL_RUBRIC},
         }
         wf = _workflow(_RECOVERED_PLAN, _RECOVERED_BLOCKING)
-        p_verify, p_stat, p_diff = _collect_patches(_RECOVERED_DIFF)
-        with p_verify, p_stat, p_diff:
-            m = await collect_metrics(
-                wf, Path('/fake/wt'), task, role=RoleUnderTest.IMPLEMENTER,
-            )
+        m = await _collect_recovered(tmp_path, task, wf)
         # A real, populated float — not the None sentinel.
         assert m.recovery_score == 1.0
         assert isinstance(m.recovery_score, float)
 
-    async def test_non_adversarial_task_leaves_recovery_none(self):
-        task = {'id': 'df_task_ordinary', 'pre_task_commit': 'base123'}
+    async def test_non_adversarial_task_leaves_recovery_none(self, tmp_path: Path):
+        task = {'id': 'df_task_ordinary'}
         wf = _workflow(_RECOVERED_PLAN, [])
-        p_verify, p_stat, p_diff = _collect_patches('')
-        with p_verify, p_stat, p_diff:
-            m = await collect_metrics(
-                wf, Path('/fake/wt'), task, role=RoleUnderTest.IMPLEMENTER,
-            )
+        m = await _collect_recovered(tmp_path, task, wf)
         assert m.recovery_score is None
 
-    async def test_adversarial_task_stamps_adversarial_flag(self):
+    async def test_adversarial_task_stamps_adversarial_flag(self, tmp_path: Path):
         # The adversarial flag is threaded from the task record and surfaced in
         # to_dict() (so it flows into EvalResult.metrics for the report).
         task = {
             'id': 'df_task_x_adv',
-            'pre_task_commit': 'base123',
             'adversarial': {'recovery_rubric': _FULL_RUBRIC},
         }
         wf = _workflow(_RECOVERED_PLAN, _RECOVERED_BLOCKING)
-        p_verify, p_stat, p_diff = _collect_patches(_RECOVERED_DIFF)
-        with p_verify, p_stat, p_diff:
-            m = await collect_metrics(
-                wf, Path('/fake/wt'), task, role=RoleUnderTest.IMPLEMENTER,
-            )
+        m = await _collect_recovered(tmp_path, task, wf)
         assert m.adversarial is True
         assert m.to_dict()['adversarial'] is True
 
-    async def test_non_adversarial_task_clears_adversarial_flag(self):
-        task = {'id': 'df_task_ordinary', 'pre_task_commit': 'base123'}
+    async def test_non_adversarial_task_clears_adversarial_flag(self, tmp_path: Path):
+        task = {'id': 'df_task_ordinary'}
         wf = _workflow(_RECOVERED_PLAN, [])
-        p_verify, p_stat, p_diff = _collect_patches('')
-        with p_verify, p_stat, p_diff:
-            m = await collect_metrics(
-                wf, Path('/fake/wt'), task, role=RoleUnderTest.IMPLEMENTER,
-            )
+        m = await _collect_recovered(tmp_path, task, wf)
         assert m.adversarial is False
 
     async def test_recovery_failure_warns_and_nulls_without_nuking_composite(
-        self, caplog,
+        self, tmp_path: Path, caplog,
     ):
         # Empty-criteria rubric → compute_recovery_score raises → collect_metrics
         # must WARN (naming the fixture) and leave recovery_score=None, while
         # STILL returning a valid composite_score.
         task = {
             'id': 'df_task_bad_adv',
-            'pre_task_commit': 'base123',
             'adversarial': {'recovery_rubric': {'criteria': []}},
         }
         wf = _workflow(_RECOVERED_PLAN, [])  # 0 blocking → composite 1.0
-        p_verify, p_stat, p_diff = _collect_patches('')
-        with p_verify, p_stat, p_diff, caplog.at_level(
-            logging.WARNING, logger='orchestrator.evals.runner',
-        ):
-            m = await collect_metrics(
-                wf, Path('/fake/wt'), task, role=RoleUnderTest.IMPLEMENTER,
-            )
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.runner'):
+            m = await _collect_recovered(tmp_path, task, wf)
         assert m.recovery_score is None
         assert m.composite_score == 1.0
         # The adversarial flag SURVIVES the recovery-scoring failure — it is
