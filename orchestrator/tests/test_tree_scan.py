@@ -91,6 +91,16 @@ class TestStreaming:
 
 
 class TestLazyParse:
+    def test_a_file_no_analysis_touches_as_a_tree_is_never_parsed(self, tmp_path: Path) -> None:
+        bad = _write(tmp_path, 'bad.py', 'def broken(:\n')
+        source_only = _analysis(
+            'source_only', lambda: python_files(tmp_path), lambda m: len(m.source),
+        )
+
+        facts = TreePass.run([source_only]).facts(source_only)
+
+        assert dict(facts) == {bad: len('def broken(:\n')}
+
     def test_only_an_analysis_that_touches_the_tree_pays_for_a_syntax_error(
         self, tmp_path: Path,
     ) -> None:
@@ -248,8 +258,9 @@ class TestFactInvariant:
 
         with pytest.raises(AssertionError) as raised:
             pass_.facts(analysis)
-        assert 'leaky' in str(raised.value)
-        assert offending_type in str(raised.value)
+        message = str(raised.value)
+        assert 'leaky' in message
+        assert f'holding a {offending_type};' in message
 
     @pytest.mark.parametrize(
         'extract',
