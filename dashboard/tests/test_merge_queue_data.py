@@ -354,9 +354,33 @@ class TestQueueDepthTimeseries:
 
     @pytest.mark.asyncio
     async def test_none_db(self):
-        """None DB returns empty ChartData."""
+        """None DB returns an empty series that still names the window's width."""
         result = await queue_depth_timeseries(None, hours=24)
-        assert result == {'labels': [], 'values': []}
+        assert result == {'labels': [], 'values': [], 'bucket_minutes': 15}
+
+    @pytest.mark.asyncio
+    async def test_unreadable_db_names_the_windows_width(self, tableless_runs_conn):
+        """A runs.db whose read fails serves an empty series at the window's width."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        result = await queue_depth_timeseries(tableless_runs_conn, hours=168, now=now)
+        assert result == {'labels': [], 'values': [], 'bucket_minutes': 60}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'hours, minutes', [(24, 15), (168, 60), (720, 360), (87600, 1440)],
+    )
+    async def test_reports_the_width_its_labels_are_spaced_at(
+        self, empty_merge_events_conn, hours, minutes,
+    ):
+        """The series names its bucket width, and its labels are spaced exactly that far."""
+        now = datetime(2026, 4, 11, 12, 7, 30, tzinfo=UTC)
+        result = await queue_depth_timeseries(empty_merge_events_conn, hours=hours, now=now)
+
+        assert result['bucket_minutes'] == minutes
+        width = timedelta(minutes=result['bucket_minutes'])
+        starts = [datetime.fromisoformat(label) for label in result['labels']]
+        gaps = {later - earlier for earlier, later in zip(starts, starts[1:], strict=False)}
+        assert gaps == {width}
 
     @pytest.mark.asyncio
     async def test_empty_db(self, empty_merge_events_conn):
@@ -1425,7 +1449,7 @@ class TestBuildPerProjectMergeQueue:
         assert '/tmp/nofile' in result
         data = result['/tmp/nofile']
         assert set(data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
-        assert data['depth_timeseries'] == {'labels': [], 'values': []}
+        assert data['depth_timeseries'] == {'labels': [], 'values': [], 'bucket_minutes': 15}
         assert data['outcomes'] == {'labels': [], 'values': []}
         assert data['latency'] == ZERO_LATENCY
         assert data['recent'] == []
@@ -1477,6 +1501,22 @@ class TestBuildPerProjectMergeQueue:
         for data in result.values():
             for field in ('speculative', 'recent_total'):
                 validate_datum(data[field], now)
+
+    async def test_depth_names_the_windows_width_read_or_unread(self, tmp_path):
+        """A real empty project and a (pid, None) project both serve the window's width."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'real.db', [])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue(
+                [('/tmp/real', conn), ('/tmp/none', None)], hours=168, now=now,
+            )
+
+        assert result['/tmp/real']['depth_timeseries']['bucket_minutes'] == 60
+        assert result['/tmp/none']['depth_timeseries']['bucket_minutes'] == 60
 
     async def test_the_outcome_total_is_the_latency_attempt_total(self, tmp_path):
         """Sketch #9, second half: one row set behind the donut and the latency."""
