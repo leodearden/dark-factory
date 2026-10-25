@@ -127,6 +127,25 @@ class TestScoreResultFromArtifacts:
             == compare.score_result_from_artifacts(_result(legacy_error_wt))
         )
 
+    def test_an_error_reviewer_contributes_nothing_beside_a_counted_one(self, tmp_path: Path):
+        from orchestrator.evals import compare
+
+        wt = tmp_path / 'wt_two'
+        art = TaskArtifacts(wt)
+        art.init('df_task', 'T', 'd')
+        error_payload = {
+            'reviewer': 'reviewer_errored',
+            'verdict': 'ERROR',
+            'issues': [{'severity': 'blocking', 'description': 'stale', 'location': 'm/y.py:1'}],
+            'summary': 'reviewer crashed',
+        }
+        art.write_review('reviewer_errored', error_payload)
+        art.write_review(_REVIEWER, _payload())
+
+        assert compare.score_result_from_artifacts(_result(wt)) == scoring.quality_from_reviews(
+            [normalize_review(_payload())], plan_steps=5,
+        )
+
     def test_plan_steps_falls_back_to_result_metrics_and_kwarg_overrides(self, tmp_path: Path):
         # plan_steps is sourced from result.metrics when the kwarg is omitted; an
         # explicit kwarg overrides it.
