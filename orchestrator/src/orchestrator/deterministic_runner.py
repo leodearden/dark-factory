@@ -367,7 +367,7 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, assert_never
@@ -397,11 +397,13 @@ from orchestrator.deploy_state import (
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import FM_RESTART_RETRY_WINDOW_SECS, fm_retry_backoffs
 from orchestrator.predicate_recheck import (
-    PREDICATE_VERDICT_KEY,
     PredicateRecheck,
+    RearmedRecheck,
     rearmed,
     recheck_declaration,
+    render_verdict,
     reset,
+    stall_detail,
     verdict_stamps,
 )
 from orchestrator.proc_supervision import (
@@ -1191,46 +1193,6 @@ def _predicate_verdict(out: object) -> dict | None:
     return payload.json_value
 
 
-def _render_verdict(verdict: dict | None) -> str:
-    """A ``predicate_verdict`` as one compact line, for logs and escalation details."""
-    if verdict is None:
-        return 'no structured verdict'
-    return json.dumps(verdict, separators=(',', ':'))
-
-
-def _stall_detail(
-    description: str,
-    *,
-    streak: int,
-    stall_cap: int,
-    first_rearmed_at: datetime | None,
-    now: datetime,
-    recheck_secs: int,
-    verdict: dict | None,
-) -> str:
-    """The ``milestone_check_stalled`` detail: what a human weighs to resume or abandon."""
-    if first_rearmed_at is None:
-        first_line = 'first_rearmed_at: none — the gate stalled before it ever re-armed'
-    else:
-        elapsed = timedelta(seconds=int((now - first_rearmed_at).total_seconds()))
-        first_line = f'first_rearmed_at: {first_rearmed_at.isoformat()} ({elapsed} ago)'
-    return '\n'.join([
-        description,
-        f'Predicate still not satisfied: streak {streak}/{stall_cap} consecutive '
-        'exit-75 checks (deterministic.predicate_recheck_stall_cap).',
-        first_line,
-        f'recheck_secs: {recheck_secs}',
-        f'Last verdict: {_render_verdict(verdict)}',
-        'The streak is reset; first_rearmed_at is kept across this reset (it records '
-        'when the gate first re-armed, not when this streak began).',
-        'Resolutions:',
-        '- resume: re-run the check now; a further not-yet re-arms with the streak restarted.',
-        '- abandon: cancel this gate, which releases any dependent because a cancelled '
-        'dependency satisfies. To end a trigger chain, abandon its human gate first, '
-        'then this gate.',
-    ])
-
-
 def _is_operational_llm_gate(metadata: dict) -> bool:
     """Return True iff *metadata* carries β's operational-llm-gate marker.
 
@@ -1493,8 +1455,9 @@ class DeterministicRunner:
             ``Harness._run_deterministic_slot`` passes the live
             ``deterministic.predicate_recheck_stall_cap``; the default is
             ``orchestrator.config.PREDICATE_RECHECK_STALL_CAP``.
-        clock: Optional callable ``() -> datetime`` (aware, UTC) timing the
-            re-arm and its streak record.  Defaults to ``datetime.now(UTC)``.
+        clock: Optional callable ``() -> datetime`` (aware, UTC) timing a
+            predicate check: the re-arm, its streak record and the verdict
+            filer's ``gate_escalated_at``.  Defaults to ``datetime.now(UTC)``.
             Injected in tests for exact ``milestone.at`` assertions.
     """
 
@@ -2918,6 +2881,7 @@ class DeterministicRunner:
         summary: str,
         detail: str,
         stamps: dict,
+        now: datetime,
     ) -> WorkflowOutcome:
         """File a born-at-L2 predicate VERDICT escalation and block (γ-predicate).
 
@@ -2934,7 +2898,9 @@ class DeterministicRunner:
         *stamps* (``predicate_verdict`` / ``predicate_recheck``, PRD
         plans/completion-driven-triggers-prd.md C1) ride in the SAME single
         ``update_task`` as ``gate_escalated_at``, so a verdict exit is still
-        exactly one metadata write.
+        exactly one metadata write.  ``gate_escalated_at`` is *now*, the
+        instant the check ran, so it agrees with the streak record's
+        ``last_checked_at``.
 
         Includes a dedup guard — if a pending escalation already exists (e.g.
         prior crash-safe re-dispatch), filing is skipped to avoid duplicate L2
@@ -2975,10 +2941,9 @@ class DeterministicRunner:
         # ordering, same as _file_milestone_gate_and_block) so a stamp failure re-files
         # on the next dispatch rather than silently skipping it.  A predicate NEVER
         # stamps before_done_ran_at — there is no I1 side effect to guard here.
-        now_iso = datetime.now(UTC).isoformat()
         await self.scheduler.update_task(
             task_id,
-            {'gate_escalated_at': now_iso, **stamps},
+            {'gate_escalated_at': now.isoformat(), **stamps},
             metadata_mode='merge',
         )
 
@@ -3275,6 +3240,7 @@ class DeterministicRunner:
                 summary=f'Milestone predicate check failed (rc={rc})',
                 detail=fail_detail,
                 stamps=settled_stamps,
+                now=now,
             )
 
         # Log the RAW output before summarizing it.  `_summarize_predicate_output`
@@ -3357,7 +3323,7 @@ class DeterministicRunner:
         *,
         metadata: dict,
         verdict: dict | None,
-        record: PredicateRecheck,
+        record: RearmedRecheck,
         recheck_secs: int,
         no_verdict_category: str,
     ) -> WorkflowOutcome:
@@ -3369,12 +3335,10 @@ class DeterministicRunner:
         write is escalated instead: with ``at`` not advanced, re-pending would
         re-dispatch at once into the same 75, a loop with no escape.
         """
-        assert record.next_check_at is not None
         next_check_at = record.next_check_at.isoformat()
         stamps = {
             'milestone': {**metadata['milestone'], 'at': next_check_at},
-            PREDICATE_VERDICT_KEY: verdict,
-            **verdict_stamps(metadata, verdict, record),
+            **verdict_stamps(metadata, verdict, record, always_stamp_verdict=True),
         }
         if not await self.scheduler.update_task(task_id, stamps, metadata_mode='merge'):
             return await self._file_infra_issue_and_block(
@@ -3399,7 +3363,7 @@ class DeterministicRunner:
             'DeterministicRunner: task %s predicate re-armed (rc=75, consecutive=%d/%d, '
             'next_check_at=%s): %s',
             task_id, record.consecutive, self._predicate_recheck_stall_cap, next_check_at,
-            _render_verdict(verdict),
+            render_verdict(verdict),
         )
         try:
             await self.scheduler.set_task_status(task_id, 'pending')
@@ -3437,7 +3401,7 @@ class DeterministicRunner:
             task_id,
             category=MILESTONE_CHECK_STALLED_CATEGORY,
             summary=f'Milestone predicate still not satisfied after {cap} consecutive checks',
-            detail=_stall_detail(
+            detail=stall_detail(
                 description,
                 streak=streak,
                 stall_cap=cap,
@@ -3446,10 +3410,8 @@ class DeterministicRunner:
                 recheck_secs=recheck_secs,
                 verdict=verdict,
             ),
-            stamps={
-                PREDICATE_VERDICT_KEY: verdict,
-                **verdict_stamps(metadata, verdict, stored),
-            },
+            stamps=verdict_stamps(metadata, verdict, stored, always_stamp_verdict=True),
+            now=now,
         )
         self._emit_predicate_event(
             EventType.predicate_recheck_stalled, task_id,
@@ -3459,7 +3421,7 @@ class DeterministicRunner:
         logger.warning(
             'DeterministicRunner: task %s predicate stalled (rc=75, consecutive=%d/%d) — '
             'filed %s instead of re-arming: %s',
-            task_id, streak, cap, MILESTONE_CHECK_STALLED_CATEGORY, _render_verdict(verdict),
+            task_id, streak, cap, MILESTONE_CHECK_STALLED_CATEGORY, render_verdict(verdict),
         )
         return outcome
 

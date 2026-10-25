@@ -17,7 +17,9 @@ from orchestrator.predicate_recheck import (
     RecheckDeclaration,
     rearmed,
     recheck_declaration,
+    render_verdict,
     reset,
+    stall_detail,
     verdict_stamps,
 )
 
@@ -44,11 +46,6 @@ def _record(consecutive: int = 3, first_rearmed_at: datetime | None = EARLIER) -
 
 
 class TestStoredRecord:
-    def test_keys_are_the_runner_spellings(self):
-        assert (PREDICATE_RECHECK_KEY, PREDICATE_VERDICT_KEY) == (
-            'predicate_recheck', 'predicate_verdict',
-        )
-
     def test_absent_record_reads_as_none(self):
         assert PredicateRecheck.from_metadata({}) is None
 
@@ -149,8 +146,9 @@ class TestRecheckDeclaration:
 
         assert declaration.recheck_secs is None
         assert declaration.gap is not None
-        assert 'recheck_secs' in declaration.gap
+        assert 'before_done.recheck_secs: ' in declaration.gap
         assert 'greater than or equal to 300' in declaration.gap
+        assert '\n' not in declaration.gap
 
     @pytest.mark.parametrize(
         ('recheck_secs', 'gap'), [(86400, 'a gap'), (None, None)], ids=['both', 'neither'],
@@ -178,3 +176,37 @@ class TestVerdictStamps:
         record = reset(_record(), NOW)
 
         assert verdict_stamps({}, None, record) == {PREDICATE_RECHECK_KEY: record.to_metadata()}
+
+    def test_a_not_yet_exit_always_stamps_its_verdict(self):
+        assert verdict_stamps({}, None, None, always_stamp_verdict=True) == {
+            PREDICATE_VERDICT_KEY: None,
+        }
+
+
+class TestStallDetail:
+    def _detail(self, first_rearmed_at: datetime | None, verdict: dict | None) -> list[str]:
+        return stall_detail(
+            'the gate',
+            streak=30,
+            stall_cap=30,
+            first_rearmed_at=first_rearmed_at,
+            now=NOW,
+            recheck_secs=86400,
+            verdict=verdict,
+        ).splitlines()
+
+    def test_names_the_streak_the_elapsed_time_and_the_last_verdict(self):
+        lines = self._detail(EARLIER, {'verdict': 'not_yet'})
+
+        assert lines[0] == 'the gate'
+        assert 'streak 30/30' in lines[1]
+        assert lines[2] == f'first_rearmed_at: {EARLIER.isoformat()} (3 days, 0:00:00 ago)'
+        assert lines[3] == 'recheck_secs: 86400'
+        assert lines[4] == 'Last verdict: {"verdict":"not_yet"}'
+
+    def test_a_gate_that_never_re_armed_says_so(self):
+        lines = self._detail(None, None)
+
+        assert lines[2].startswith('first_rearmed_at: none')
+        assert lines[4] == f'Last verdict: {render_verdict(None)}'
+        assert render_verdict(None) == 'no structured verdict'

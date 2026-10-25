@@ -336,8 +336,12 @@ class TestUndeclaredNotYetIsAFailure:
                 {'recheck_secs': 86400, 'milestone': {'mode': 'delayed', 'after_secs': 60}},
                 "mode='dated'",
             ),
+            (
+                {'recheck_secs': 10, 'milestone': DATED},
+                'before_done.recheck_secs: Input should be greater than or equal to 300',
+            ),
         ],
-        ids=['no-recheck-secs', 'delayed-milestone'],
+        ids=['no-recheck-secs', 'delayed-milestone', 'invalid-before-done'],
     )
     async def test_files_milestone_check_failed_naming_the_gap(
         self, queue, event_store, task_fields, gap_fragment,
@@ -460,6 +464,7 @@ class TestStallCap:
         assert [kind for kind, _ in stall_writes] == ['update_task', 'set_task_status']
         [payload] = [w['metadata'] for kind, w in stall_writes if kind == 'update_task']
         assert set(payload) == {'gate_escalated_at', 'predicate_recheck', 'predicate_verdict'}
+        assert payload['gate_escalated_at'] == clock.now.isoformat()
         assert payload['predicate_recheck'] == {
             'consecutive': 0,
             'first_rearmed_at': FIXED_NOW.isoformat(),

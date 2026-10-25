@@ -4,12 +4,13 @@ plans/completion-driven-triggers-prd.md C1: a predicate that exits 75 ("not
 yet") on a gate declaring ``before_done.recheck_secs`` re-arms by advancing
 its dated ``milestone.at``. This module holds the streak record the runner
 stamps as ``metadata.predicate_recheck``, its transitions, the "is this 75
-declared?" check and the ``predicate_verdict`` stamp rule.
-``DeterministicRunner`` does the I/O.
+declared?" check, the ``predicate_verdict`` stamp rule and the text of the
+``milestone_check_stalled`` escalation. ``DeterministicRunner`` does the I/O.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -22,10 +23,13 @@ __all__ = [
     'PREDICATE_RECHECK_KEY',
     'PREDICATE_VERDICT_KEY',
     'PredicateRecheck',
+    'RearmedRecheck',
     'RecheckDeclaration',
     'rearmed',
     'recheck_declaration',
+    'render_verdict',
     'reset',
+    'stall_detail',
     'verdict_stamps',
 ]
 
@@ -73,6 +77,13 @@ class PredicateRecheck:
         }
 
 
+@dataclass(frozen=True)
+class RearmedRecheck(PredicateRecheck):
+    """The record a re-arm writes: its next check is always scheduled."""
+
+    next_check_at: datetime
+
+
 def _parse_record(raw: object) -> PredicateRecheck | None:
     if not isinstance(raw, Mapping):
         return None
@@ -105,9 +116,9 @@ def _iso(value: datetime | None) -> str | None:
     return None if value is None else value.isoformat()
 
 
-def rearmed(prev: PredicateRecheck | None, now: datetime, recheck_secs: int) -> PredicateRecheck:
+def rearmed(prev: PredicateRecheck | None, now: datetime, recheck_secs: int) -> RearmedRecheck:
     """The record after one more exit-75 re-arm checked at *now*."""
-    return PredicateRecheck(
+    return RearmedRecheck(
         consecutive=(prev.consecutive if prev else 0) + 1,
         first_rearmed_at=(prev.first_rearmed_at if prev else None) or now,
         last_checked_at=now,
@@ -145,7 +156,9 @@ def recheck_declaration(before_done: object, milestone: object) -> RecheckDeclar
     try:
         action = BeforeDone.model_validate(before_done)
     except ValidationError as exc:
-        return RecheckDeclaration(recheck_secs=None, gap=f'before_done does not validate: {exc}')
+        return RecheckDeclaration(
+            recheck_secs=None, gap=f'before_done does not validate: {_one_line(exc)}',
+        )
     if action.recheck_secs is None:
         return RecheckDeclaration(
             recheck_secs=None,
@@ -160,20 +173,72 @@ def recheck_declaration(before_done: object, milestone: object) -> RecheckDeclar
     return RecheckDeclaration(recheck_secs=action.recheck_secs, gap=None)
 
 
+def _one_line(exc: ValidationError) -> str:
+    """*exc*'s errors as one line: each failing ``before_done`` field and its message."""
+    return '; '.join(
+        f"{'.'.join(('before_done', *map(str, error['loc'])))}: {' '.join(error['msg'].split())}"
+        for error in exc.errors()
+    )
+
+
 def verdict_stamps(
     metadata: Mapping[str, object],
     verdict: Mapping[str, object] | None,
     recheck: PredicateRecheck | None,
+    *,
+    always_stamp_verdict: bool = False,
 ) -> dict[str, object]:
     """The metadata keys a verdict-bearing exit writes.
 
     ``predicate_verdict`` is written when the check produced one, and cleared
     when it did not but an older stamp exists: a stamp never outlives the
-    check that produced it. Nothing is written otherwise.
+    check that produced it. Nothing is written otherwise, unless
+    *always_stamp_verdict*: a declared exit 75 (re-arm or stall) always
+    records the verdict it answered, ``None`` included.
     """
     stamps: dict[str, object] = {}
-    if verdict is not None or PREDICATE_VERDICT_KEY in metadata:
+    if always_stamp_verdict or verdict is not None or PREDICATE_VERDICT_KEY in metadata:
         stamps[PREDICATE_VERDICT_KEY] = verdict
     if recheck is not None:
         stamps[PREDICATE_RECHECK_KEY] = recheck.to_metadata()
     return stamps
+
+
+def render_verdict(verdict: Mapping[str, object] | None) -> str:
+    """A ``predicate_verdict`` as one compact line, for logs and escalation details."""
+    if verdict is None:
+        return 'no structured verdict'
+    return json.dumps(verdict, separators=(',', ':'))
+
+
+def stall_detail(
+    description: str,
+    *,
+    streak: int,
+    stall_cap: int,
+    first_rearmed_at: datetime | None,
+    now: datetime,
+    recheck_secs: int,
+    verdict: Mapping[str, object] | None,
+) -> str:
+    """The ``milestone_check_stalled`` detail: what a human weighs to resume or abandon."""
+    if first_rearmed_at is None:
+        first_line = 'first_rearmed_at: none — the gate stalled before it ever re-armed'
+    else:
+        elapsed = timedelta(seconds=int((now - first_rearmed_at).total_seconds()))
+        first_line = f'first_rearmed_at: {first_rearmed_at.isoformat()} ({elapsed} ago)'
+    return '\n'.join([
+        description,
+        f'Predicate still not satisfied: streak {streak}/{stall_cap} consecutive '
+        'exit-75 checks (deterministic.predicate_recheck_stall_cap).',
+        first_line,
+        f'recheck_secs: {recheck_secs}',
+        f'Last verdict: {render_verdict(verdict)}',
+        'The streak is reset; first_rearmed_at is kept across this reset (it records '
+        'when the gate first re-armed, not when this streak began).',
+        'Resolutions:',
+        '- resume: re-run the check now; a further not-yet re-arms with the streak restarted.',
+        '- abandon: cancel this gate, which releases any dependent because a cancelled '
+        'dependency satisfies. To end a trigger chain, abandon its human gate first, '
+        'then this gate.',
+    ])
