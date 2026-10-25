@@ -90,16 +90,35 @@ class TestDisjointSkipBlockers:
             note_queue_verified_main_tip,
         )
         sha = 'f' * 40
-        note_queue_verified_main_tip(sha)
+        note_queue_verified_main_tip(tmp_path, sha)
         cfg = OrchestratorConfig(merge_verify_breadth='scoped')
-        assert _disjoint_skip_blockers(self._req(cfg), rebased_onto=sha) == []
+        assert _disjoint_skip_blockers(
+            self._req(cfg), project_root=tmp_path, rebased_onto=sha,
+        ) == []
+
+    def test_a_tip_landed_for_another_repository_blocks(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        from orchestrator.merge_lane.gates import (
+            _disjoint_skip_blockers,
+            note_queue_verified_main_tip,
+        )
+        sha = 'a' * 40
+        note_queue_verified_main_tip(tmp_path / 'landed', sha)
+        cfg = OrchestratorConfig(merge_verify_breadth='scoped')
+        blockers = _disjoint_skip_blockers(
+            self._req(cfg), project_root=tmp_path / 'fresh', rebased_onto=sha,
+        )
+        assert len(blockers) == 1 and 'unverified drift' in blockers[0]
 
     def test_unverified_drift_blocks(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         from orchestrator.merge_lane.gates import _disjoint_skip_blockers
         cfg = OrchestratorConfig(merge_verify_breadth='scoped')
-        blockers = _disjoint_skip_blockers(self._req(cfg), rebased_onto='0' * 40)
+        blockers = _disjoint_skip_blockers(
+            self._req(cfg), project_root=tmp_path, rebased_onto='0' * 40,
+        )
         assert len(blockers) == 1 and 'unverified drift' in blockers[0]
 
     def test_kill_switch_restores_legacy_trust(self, monkeypatch, tmp_path):
@@ -110,7 +129,9 @@ class TestDisjointSkipBlockers:
             merge_verify_breadth='scoped',
             merge_disjoint_skip_requires_verified_drift=False,
         )
-        assert _disjoint_skip_blockers(self._req(cfg), rebased_onto='0' * 40) == []
+        assert _disjoint_skip_blockers(
+            self._req(cfg), project_root=tmp_path, rebased_onto='0' * 40,
+        ) == []
 
     def test_whole_tree_breadth_blocks_even_with_kill_switch_off(
         self, monkeypatch, tmp_path,
@@ -125,19 +146,23 @@ class TestDisjointSkipBlockers:
             note_queue_verified_main_tip,
         )
         sha = 'e' * 40
-        note_queue_verified_main_tip(sha)
+        note_queue_verified_main_tip(tmp_path, sha)
         cfg = OrchestratorConfig(
             merge_verify_breadth='full',
             merge_disjoint_skip_requires_verified_drift=False,
         )
-        blockers = _disjoint_skip_blockers(self._req(cfg), rebased_onto=sha)
+        blockers = _disjoint_skip_blockers(
+            self._req(cfg), project_root=tmp_path, rebased_onto=sha,
+        )
         assert len(blockers) == 1 and 'whole-tree' in blockers[0]
 
-    def test_missing_config_fails_safe(self):
+    def test_missing_config_fails_safe(self, tmp_path):
         """Unknown premises answer 'distrust', matching the overlap probe's
         own fail-CLOSED policy."""
         from types import SimpleNamespace
 
         from orchestrator.merge_lane.gates import _disjoint_skip_blockers
         req = cast('MergeRequest', SimpleNamespace(task_id='t'))
-        assert _disjoint_skip_blockers(req, rebased_onto='0' * 40) != []
+        assert _disjoint_skip_blockers(
+            req, project_root=tmp_path, rebased_onto='0' * 40,
+        ) != []

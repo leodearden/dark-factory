@@ -262,7 +262,7 @@ def _drift_adding_a_source_file(repo: Path) -> str:
 def _queue_landed(drift: Drift) -> Drift:
     def landed(repo: Path) -> str:
         sha = drift(repo)
-        note_queue_verified_main_tip(sha)
+        note_queue_verified_main_tip(repo, sha)
         return sha
     return landed
 
@@ -473,6 +473,34 @@ class TestReverifyGateRecordsItsDecision:
         [blocker] = row['blockers']
         assert 'unverified drift' in blocker
         assert len(scene.verify_rows(rebased.rebased_sha)) == 1
+
+    async def test_a_tip_another_repositorys_queue_landed_does_not_vouch_for_this_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        for clock in ('GIT_AUTHOR_DATE', 'GIT_COMMITTER_DATE'):
+            monkeypatch.setenv(clock, '1700000000 +0000')
+        landed = _scene(tmp_path / 'landed')
+        async with _rebased_merge(
+            landed, landed.config(merge_verify_breadth='scoped'), _queue_landed(_drift_elsewhere),
+        ) as landed_rebased:
+            assert await _gate(landed, landed_rebased, FakeVerifier()) is GateClearance.disjoint
+
+        fresh = _scene(tmp_path / 'fresh')
+        async with _rebased_merge(
+            fresh, fresh.config(merge_verify_breadth='scoped'), _drift_elsewhere,
+        ) as fresh_rebased:
+            assert fresh_rebased.rebased_onto == landed_rebased.rebased_onto, (
+                'vacuous without the collision: both repositories must hold one '
+                'byte-identical drift commit'
+            )
+            clearance = await _gate(fresh, fresh_rebased, FakeVerifier())
+
+        assert clearance is GateClearance.reverified, clearance
+        [row] = fresh.gate_rows()
+        assert row['reason'] == 'disjoint_untrusted'
+        [blocker] = row['blockers']
+        assert 'unverified drift' in blocker
+        assert len(fresh.verify_rows(fresh_rebased.rebased_sha)) == 1
 
     async def test_a_failed_overlap_probe_fires_with_no_paths_recorded(
         self, tmp_path: Path,
