@@ -509,6 +509,19 @@ def _shape_outcomes(raw: Mapping[str, Any] | None) -> dict[str, Any]:
     return outcomes
 
 
+def _shape_depth(raw: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Serve a depth series as ``{labels, values, bucket_minutes}``.
+
+    ``bucket_minutes`` is None when the series names no width.
+    """
+    depth = raw or {}
+    return {
+        'labels': list(depth.get('labels') or []),
+        'values': list(depth.get('values') or []),
+        'bucket_minutes': depth.get('bucket_minutes'),
+    }
+
+
 def shape_merge_queue(
     per_project: Mapping[str, Mapping[str, Any]],
     *,
@@ -523,7 +536,8 @@ def shape_merge_queue(
     from absolute project_root paths to each root's project label
     (``dashboard/project_labels.py::ProjectLabels``) so the React side can
     match against ``PROJECTS[].name``.  Per project: ``depth`` (renamed from
-    ``depth_timeseries``), ``outcomes``, ``latency`` (whose ``with_duration``
+    ``depth_timeseries``, carrying ``bucket_minutes``: the width each of its
+    buckets spans, None when the series names none), ``outcomes``, ``latency`` (whose ``with_duration``
     and ``without_duration`` sum to the outcomes total), ``recent``,
     ``recent_total`` (how many merges the window holds; ``recent`` is capped),
     ``speculative``, ``active`` (the live probe's entries), ``in_queue``,
@@ -564,7 +578,7 @@ def shape_merge_queue(
         spark = sparks.get(pid) or _EMPTY_SERIES
         label = labels.of(pid)
         out[label] = {
-            'depth': dict(data.get('depth_timeseries') or {'labels': [], 'values': []}),
+            'depth': _shape_depth(data.get('depth_timeseries')),
             'outcomes': _shape_outcomes(data.get('outcomes')),
             'latency': dict(data.get('latency') or {}),
             'recent': _titled(data.get('recent'), f'{label}.recent'),
