@@ -152,15 +152,10 @@ OUTSIDE_THE_SHARED_PASS_DECLARATION = governed_exceptions(
 # Family members still sweeping privately; shrinks to empty as each migrates.
 _NOT_YET_MIGRATED = frozenset({
     'test_archive_sole_locator_gate.py',
-    'test_event_loop_antipattern_guard.py',
     'test_killpg_frozen_pgid_guard.py',
-    'test_local_repo_seeder_guard.py',
-    'test_marker_registration_drift.py',
     'test_mcp_url_sweep_guard.py',
     'test_merge_lane_facade_names.py',
     'test_merge_worker_retired.py',
-    'test_steward_scaffolding_guards.py',
-    'test_timeout_marker_inversion_guard.py',
     'test_whole_tree_scan_timeout_guard.py',
 })
 
