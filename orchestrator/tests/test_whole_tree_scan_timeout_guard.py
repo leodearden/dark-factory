@@ -1419,11 +1419,17 @@ def _module_census(module: ParsedModule) -> _ModuleCensus:
     prevent.  An unreadable module is not counted as examined (it was not), and
     the family test surfaces the count, so a sweep that silently stops reading
     cannot hide.
+
+    A module naming none of the identifiers the two detectors match on is
+    neither a sweeper nor a consumer, so its tree is never walked.
     """
     try:
         source = module.source
     except (UnicodeDecodeError, OSError):
         return _ModuleCensus(readable=False)
+    is_family_member = is_whole_tree_guard_module(source)
+    if not module.may_name(*_GLOB_METHODS, _TREE_ANALYSES_NAME, TREE_PASS_FIXTURE):
+        return _ModuleCensus(readable=True, is_family_member=is_family_member)
     try:
         tree: ast.Module | None = module.tree
     except (SyntaxError, ValueError):
@@ -1436,7 +1442,7 @@ def _module_census(module: ParsedModule) -> _ModuleCensus:
         readable=True,
         sweeps_privately=sweeps,
         consumes=consumes,
-        is_family_member=is_whole_tree_guard_module(source),
+        is_family_member=is_family_member,
         offence=_scanner_offence(name, source) if judged else None,
         xdist_group=_module_xdist_group(source) if consumes else None,
         low_timeout_marks=_timeout_marks_below_ceiling(source) if consumes else (),

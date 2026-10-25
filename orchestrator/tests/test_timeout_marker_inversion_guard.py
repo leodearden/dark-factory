@@ -2047,7 +2047,10 @@ class _ModuleMarkers:
 
 
 def _module_markers(module: ParsedModule) -> _ModuleMarkers:
+    """A module naming neither the ``timeout`` marker nor a sanctioned constant has neither, unwalked."""
     try:
+        if not module.may_name('timeout', *_SANCTIONED_TIMEOUT_NAMES):
+            return _ModuleMarkers(readable=True)
         tree = module.tree
     except (UnicodeDecodeError, OSError):
         return _ModuleMarkers(readable=False)

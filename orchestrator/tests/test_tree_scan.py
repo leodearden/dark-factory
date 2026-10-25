@@ -5,6 +5,7 @@ the real repository, so this module is not a consumer of the shared pass.
 """
 from __future__ import annotations
 
+import ast
 import gc
 import re
 import weakref
@@ -111,6 +112,42 @@ class TestLazyParse:
         assert str(bad) in str(raised.value)
         assert 'SyntaxError' in str(raised.value)
         assert str(good) not in str(raised.value)
+
+
+class TestMayName:
+    """``ParsedModule.may_name``: the sound substring prefilter an extractor runs before its walk."""
+
+    def _module(self, tmp_path: Path, text: str) -> ParsedModule:
+        return ParsedModule(_write(tmp_path, 'm.py', text))
+
+    def test_a_fragment_of_an_identifier_is_found(self, tmp_path: Path) -> None:
+        module = self._module(tmp_path, "files = root.rglob('*.py')\n")
+
+        assert module.may_name('glob')
+        assert module.may_name('absent', 'glob')
+        assert not module.may_name('absent', 'missing')
+
+    def test_a_compatibility_spelling_counts_because_the_parser_normalizes_it(
+        self, tmp_path: Path,
+    ) -> None:
+        module = self._module(tmp_path, 'files = root.ｒglob()\n')
+
+        assert 'rglob' in {node.attr for node in ast.walk(module.tree) if isinstance(node, ast.Attribute)}
+        assert module.may_name('rglob')
+
+    def test_ignore_case_matches_a_name_in_any_case(self, tmp_path: Path) -> None:
+        module = self._module(tmp_path, "_Review_PROJECT_ROOT = '/tmp/x'\n")
+
+        assert not module.may_name('project_root')
+        assert module.may_name('project_root', ignore_case=True)
+
+    def test_it_reads_the_source_and_never_parses(self, tmp_path: Path) -> None:
+        module = self._module(tmp_path, 'def broken(:\n    glob\n')
+
+        assert module.may_name('glob')
+        assert not module.may_name('absent')
+        with pytest.raises(SyntaxError):
+            _ = module.tree
 
 
 class TestFailureIsolation:

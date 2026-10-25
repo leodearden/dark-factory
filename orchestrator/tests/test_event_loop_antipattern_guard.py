@@ -48,6 +48,7 @@ pytestmark = [
 ]
 
 _THIS_FILE = Path(__file__).name
+_BANNED_METHOD = 'get_event_loop'
 
 
 def _find_get_event_loop_calls(source: str) -> list[int]:
@@ -71,13 +72,15 @@ def _find_get_event_loop_calls_in(tree: ast.Module) -> list[int]:
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr == 'get_event_loop'
+            and node.func.attr == _BANNED_METHOD
         )
     ]
 
 
 def _get_event_loop_sites(module: ParsedModule) -> tuple[tuple[int, str], ...]:
     """``(lineno, line_text)`` per get_event_loop() call; none if unparseable."""
+    if not module.may_name(_BANNED_METHOD):
+        return ()
     try:
         tree = module.tree
     except SyntaxError:

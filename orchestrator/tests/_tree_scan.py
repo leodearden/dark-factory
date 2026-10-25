@@ -16,6 +16,7 @@ import ast
 import dataclasses
 import functools
 import subprocess
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePath
@@ -127,6 +128,27 @@ class ParsedModule:
     @functools.cached_property
     def tree(self) -> ast.Module:
         return ast.parse(self.source, filename=str(self.path))
+
+    def may_name(self, *fragments: str, ignore_case: bool = False) -> bool:
+        """Whether some identifier in this module could contain one of *fragments*.
+
+        False proves none can, so an extractor whose every finding names one
+        may return its empty fact without walking the tree.  The source is
+        read as the parser compares identifiers, under NFKC, so ``ｇｌｏｂ``
+        counts as ``glob``; *ignore_case* lowercases both sides, for a detector
+        that lowercases names itself.  Comments and strings only add matches.
+        """
+        text = self._lowered_names_text if ignore_case else self._names_text
+        return any((fragment.lower() if ignore_case else fragment) in text for fragment in fragments)
+
+    @functools.cached_property
+    def _names_text(self) -> str:
+        source = self.source
+        return source if source.isascii() else unicodedata.normalize('NFKC', source)
+
+    @functools.cached_property
+    def _lowered_names_text(self) -> str:
+        return self._names_text.lower()
 
 
 @dataclass(frozen=True, eq=False)

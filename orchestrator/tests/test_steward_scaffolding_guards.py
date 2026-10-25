@@ -48,6 +48,7 @@ module.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import functools
 from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass
@@ -302,6 +303,9 @@ def _asserts_isinstance_path(func: ast.AST) -> bool:
     return False
 
 
+_CONTAINMENT_METHOD = 'is_relative_to'
+
+
 def _asserts_is_relative_to_tmp_path(func: ast.AST) -> bool:
     """Signal (iii): a NON-NEGATED ``assert ....is_relative_to(<...tmp_path...>)``.
 
@@ -322,7 +326,7 @@ def _asserts_is_relative_to_tmp_path(func: ast.AST) -> bool:
             if (
                 isinstance(call, ast.Call)
                 and isinstance(call.func, ast.Attribute)
-                and call.func.attr == 'is_relative_to'
+                and call.func.attr == _CONTAINMENT_METHOD
                 and _mentions(call, 'tmp_path')
             ):
                 return True
@@ -405,18 +409,24 @@ _CensusFact = tuple[str, ...] | _Unparseable
 
 
 def _census_analysis(
-    detector: _Detector, files: Callable[[], Iterable[Path]],
+    detector: _Detector,
+    files: Callable[[], Iterable[Path]],
+    may_find: Callable[[ParsedModule], bool],
 ) -> TreeAnalysis[_CensusFact]:
     """*detector* as a tree-pass analysis over *files*.
 
     A ``SyntaxError`` becomes an :class:`_Unparseable` fact; a decode error
     propagates, which fails the pass loudly rather than shrinking the swept set.
+    A module *may_find* rules out has no findings and is not walked; it is
+    still parsed first, so an unparseable one is named all the same.
     """
     def extract(module: ParsedModule) -> _CensusFact:
         try:
             tree = module.tree
         except SyntaxError as exc:
             return _Unparseable(str(exc))
+        if not may_find(module):
+            return ()
         return tuple(detector(tree))
 
     return TreeAnalysis(name=f'{Path(__file__).stem}:{detector.__name__}', files=files, extract=extract)
@@ -445,7 +455,9 @@ def _census_from(facts: Mapping[Path, _CensusFact], root: Path) -> _Census:
 
 def _census_tree(root: Path, detector: _Detector) -> _Census:
     """*detector*'s census of every ``*.py`` under *root*, through its own one-analysis pass."""
-    analysis = _census_analysis(detector, functools.partial(python_files, root))
+    analysis = dataclasses.replace(
+        _CENSUS_ANALYSES[detector], files=functools.partial(python_files, root),
+    )
     return _census_from(TreePass.run((analysis,)).facts(analysis), root)
 
 
@@ -714,6 +726,9 @@ _SANCTIONED_STEWARD_CONSTRUCTION: dict[str, _Sanctioned] = {
 }
 
 
+_STEWARD_SUFFIX = 'Steward'
+
+
 def _steward_construction_sites(tree: ast.Module) -> list[str]:
     """Steward constructions in *tree*: ``<lineno> (<what>)`` for each.
 
@@ -759,7 +774,7 @@ def _steward_construction_sites(tree: ast.Module) -> list[str]:
                 else node.func.attr if isinstance(node.func, ast.Attribute)
                 else None
             )
-            if called is not None and called.endswith('Steward'):
+            if called is not None and called.endswith(_STEWARD_SUFFIX):
                 sites.append(f'{node.lineno} (constructs {called})')
         if isinstance(node, ast.ClassDef):
             for base in node.bases:
@@ -768,7 +783,7 @@ def _steward_construction_sites(tree: ast.Module) -> list[str]:
                     else base.attr if isinstance(base, ast.Attribute)
                     else None
                 )
-                if name is not None and name.endswith('Steward'):
+                if name is not None and name.endswith(_STEWARD_SUFFIX):
                     sites.append(f'{node.lineno} (class {node.name} subclasses {name})')
     return sites
 
@@ -1214,6 +1229,9 @@ def _tmp_literal(value: ast.expr) -> str | None:
     return None
 
 
+_PROJECT_ROOT = 'project_root'
+
+
 def _names_project_root(name: str) -> bool:
     """True if the bare identifier *name* denotes a ``project_root``.
 
@@ -1223,7 +1241,7 @@ def _names_project_root(name: str) -> bool:
     a second spelling here is how the parameter-default or keyword shape would
     drift out from under the assignment shape.
     """
-    return name.lower().strip('_').endswith('project_root')
+    return name.lower().strip('_').endswith(_PROJECT_ROOT)
 
 
 def _is_project_root_target(target: ast.expr) -> bool:
@@ -1243,7 +1261,7 @@ def _is_project_root_target(target: ast.expr) -> bool:
     guard meant to pin it.
     """
     if isinstance(target, ast.Attribute):
-        return target.attr == 'project_root'
+        return target.attr == _PROJECT_ROOT
     if isinstance(target, ast.Name):
         return _names_project_root(target.id)
     return False
@@ -1765,11 +1783,14 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
 
 
 _CENSUS_ANALYSES: Mapping[_Detector, TreeAnalysis[_CensusFact]] = MappingProxyType({
-    detector: _census_analysis(detector, ORCHESTRATOR_TESTS)
-    for detector in (
-        _inline_sandbox_asserts,
-        _steward_construction_sites,
-        _absolute_tmp_project_root_literals,
+    detector: _census_analysis(detector, ORCHESTRATOR_TESTS, may_find)
+    for detector, may_find in (
+        (_inline_sandbox_asserts, lambda module: module.may_name(_CONTAINMENT_METHOD)),
+        (_steward_construction_sites, lambda module: module.may_name(_STEWARD_SUFFIX)),
+        (
+            _absolute_tmp_project_root_literals,
+            lambda module: module.may_name(_PROJECT_ROOT, ignore_case=True),
+        ),
     )
 })
 TREE_ANALYSES = tuple(_CENSUS_ANALYSES.values())

@@ -239,6 +239,8 @@ def _session_id_globs_in(tree: ast.Module, relpath: str) -> list[_Site]:
 
 def _archive_sites(module: ParsedModule) -> tuple[_Site, ...]:
     """Session-id-keyed globs in *module*: loud if it cannot be read, none if it cannot be parsed."""
+    if not module.may_name(*_GLOB_METHODS):
+        return ()
     try:
         tree = module.tree
     except UnicodeDecodeError:

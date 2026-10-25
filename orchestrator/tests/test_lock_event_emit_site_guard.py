@@ -37,6 +37,7 @@ pytestmark = [
 
 _CHOKEPOINT = '_emit_lock_event'
 _GUARDED_EVENTS = ('lock_acquired', 'lock_released')
+_EVENT_ENUM = 'EventType'
 
 
 def _enclosing_function_ranges(tree: ast.Module) -> list[tuple[str, int, int]]:
@@ -63,7 +64,7 @@ def _emit_sites_in(tree: ast.Module) -> tuple[tuple[str, int, str], ...]:
             if (
                 isinstance(arg, ast.Attribute)
                 and isinstance(arg.value, ast.Name)
-                and arg.value.id == 'EventType'
+                and arg.value.id == _EVENT_ENUM
             ):
                 enclosing = [
                     name for name, lo, hi in ranges if lo <= node.lineno <= hi
@@ -73,7 +74,11 @@ def _emit_sites_in(tree: ast.Module) -> tuple[tuple[str, int, str], ...]:
 
 
 def _emit_sites(module: ParsedModule) -> tuple[tuple[str, int, str], ...]:
-    return _emit_sites_in(module.tree)
+    """:func:`_emit_sites_in`, loud on a parse error; a module never naming the enum has no site."""
+    tree = module.tree
+    if not module.may_name(_EVENT_ENUM):
+        return ()
+    return _emit_sites_in(tree)
 
 
 ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=ORCHESTRATOR_SRC, extract=_emit_sites)

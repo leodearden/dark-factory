@@ -217,6 +217,8 @@ def _find_lock_table_releases_in(tree: ast.Module) -> list[tuple[int, bool]]:
 
 def _release_sites(module: ParsedModule) -> tuple[tuple[int, bool, str], ...]:
     """``(lineno, inside_chokepoint, line_text)`` per ``lock_table.release(...)`` call; none if unparseable."""
+    if not module.may_name(_GUARDED_RECEIVER):
+        return ()
     try:
         tree = module.tree
     except SyntaxError:
