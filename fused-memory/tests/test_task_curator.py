@@ -16,10 +16,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _curator_helpers import agent_result as _agent_result
-from _curator_helpers import empty_corpus, escalator_double, zot_agent_result
+from _curator_helpers import (
+    batch_create_result,
+    empty_corpus,
+    escalator_double,
+    invoke_by_role,
+    zot_agent_result,
+)
 from _curator_helpers import make_config as _make_config
 from _curator_helpers import pool_with_ids as _pool_with_ids
-from shared.cli_invoke import AgentResult
+from _curator_helpers import prepared as _bundle
+from shared.cli_invoke import AgentResult, no_mcp_servers_config
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import (
     ArtifactProvenance,
@@ -1391,6 +1398,260 @@ class TestStartupSelfCheck:
         monkeypatch.setenv('CLAUDE_BINARY', str(tmp_path / 'no-such-claude'))
         curator = TaskCurator(config=_make_config(), taskmaster=None)
         assert await curator.startup_self_check(project_id='p', project_root='/x') is False
+
+
+_GOLDEN_CANDIDATE = CandidateTask(
+    title='Fix the parser',
+    description='The parser drops trailing commas.',
+    details='See parser.py::parse_list.',
+    files_to_modify=['src/parser.py', 'tests/test_parser.py'],
+    priority='high',
+    spawned_from='4242',
+    spawn_context='review',
+)
+_GOLDEN_CENSUS = PoolWithheld(
+    by_source={'module': 5},
+    caps={'module': 15, 'embedding': 10, 'dependency': 3, 'total_cap': 30},
+)
+
+# Captured from the builders as they stood before task 6706 collapsed them;
+# literal on purpose, so a whitespace drift in the one renderer fails here.
+_GOLDEN_SINGLE_PROMPT = (
+    '# Candidate task (not yet created)\n'
+    '  title: Fix the parser\n'
+    '  priority: high\n'
+    '  spawn_context: review\n'
+    '  spawned_from: 4242\n'
+    '  description: The parser drops trailing commas.\n'
+    '  details: See parser.py::parse_list.\n'
+    '  files_to_modify: src/parser.py, tests/test_parser.py\n'
+    '\n'
+    '# Pool (2 tasks)\n'
+    '[Task 10] status=pending priority=medium source=module '
+    'combine_eligible=True\n'
+    '  title: t\n'
+    '  description: \n'
+    '  details: \n'
+    '  files_to_modify: (none)\n'
+    '\n'
+    '[Task 11] status=done priority=medium source=module '
+    'combine_eligible=False\n'
+    '  title: t\n'
+    '  description: \n'
+    '  details: \n'
+    '  files_to_modify: (none)\n'
+    '\n'
+    'pool_truncated: {"caps": {"dependency": 3, "embedding": 10, "module": '
+    '15, "total_cap": 30}, "withheld": {"module": 5}}\n'
+    '  The pool above is INCOMPLETE — the counts above are tasks that '
+    'matched this candidate but did not fit. Absence of a duplicate in a '
+    'truncated pool is not proof that no duplicate exists, so prefer '
+    '"create" over a speculative "combine" or "drop" when the pool offers no '
+    'clearly-overlapping task.\n'
+    '\n'
+    'Decide drop / combine / create per the system-prompt rules. Return only '
+    'the JSON object required by the schema.'
+)
+
+_GOLDEN_BATCH_PROMPT = (
+    '# Candidate batch_index=0\n'
+    '  title: Fix the parser\n'
+    '  priority: high\n'
+    '  spawn_context: review\n'
+    '  spawned_from: 4242\n'
+    '  description: The parser drops trailing commas.\n'
+    '  details: See parser.py::parse_list.\n'
+    '  files_to_modify: src/parser.py, tests/test_parser.py\n'
+    '\n'
+    '# Pool for batch_index=0 (2 tasks)\n'
+    '[Task 10] status=pending priority=medium source=module '
+    'combine_eligible=True\n'
+    '  title: t\n'
+    '  description: \n'
+    '  details: \n'
+    '  files_to_modify: (none)\n'
+    '\n'
+    '[Task 11] status=done priority=medium source=module '
+    'combine_eligible=False\n'
+    '  title: t\n'
+    '  description: \n'
+    '  details: \n'
+    '  files_to_modify: (none)\n'
+    '\n'
+    'pool_truncated: {"caps": {"dependency": 3, "embedding": 10, "module": '
+    '15, "total_cap": 30}, "withheld": {"module": 5}}\n'
+    '  The pool above is INCOMPLETE — the counts above are tasks that '
+    'matched this candidate but did not fit. Absence of a duplicate in a '
+    'truncated pool is not proof that no duplicate exists, so prefer '
+    '"create" over a speculative "combine" or "drop" when the pool offers no '
+    'clearly-overlapping task.\n'
+    '\n'
+    '\n'
+    '# Candidate batch_index=1\n'
+    '  title: Add a lint rule\n'
+    '  priority: medium\n'
+    '  spawn_context: manual\n'
+    '\n'
+    '# Pool for batch_index=1 (0 tasks)\n'
+    '  (empty — no candidates; answer "create")\n'
+    '\n'
+    'Return one decision per candidate as {"decisions": [...]} with a '
+    'candidate_index field on each item, per the schema.'
+)
+
+
+class TestInjectedInvoker:
+    """The curator reaches the LLM only through the ``invoke`` its constructor takes.
+
+    What each call size sends is pinned here through that seam: the scoping
+    kwargs, the per-size limits and ledger role, and the exact prompt bytes.
+    """
+
+    @staticmethod
+    def _curator(
+        tmp_path: Path, invoke: AsyncMock, config: FusedMemoryConfig | None = None,
+    ) -> TaskCurator:
+        return TaskCurator(
+            config=config or _make_config(), taskmaster=None,
+            prompt_store=PromptArtifactStore(tmp_path), invoke=invoke,
+        )
+
+    @staticmethod
+    def _scoping_kwargs() -> dict[str, Any]:
+        return {
+            'project_id': 'p',
+            'run_id': '',
+            'cost_store': None,
+            'usage_gate': None,
+            'disallowed_tools': ['*'],
+            'mcp_config': no_mcp_servers_config(),
+            'strict_mcp_config': True,
+            'permission_mode': 'bypassPermissions',
+            'cap_wait_sanity_secs': 120.0,
+            'park_on_frozen_pool': False,
+            'cwd': neutral_cli_cwd(),
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_single_candidate_call_carries_the_single_contract(self, tmp_path):
+        invoke = AsyncMock(return_value=_agent_result({'action': 'create', 'justification': 'x'}))
+        config = _make_config()
+        cfg = config.curator
+        curator = self._curator(tmp_path, invoke, config)
+        pool = _pool_with_ids(('10', 'pending'), ('11', 'done'))
+
+        [decision] = await curator.curate_batch_prepared(
+            [_bundle('Fix the parser', pool)], 'p', '/p',
+        )
+
+        invoke.assert_awaited_once()
+        assert invoke.await_args is not None
+        kwargs = dict(invoke.await_args.kwargs)
+        kwargs.pop('prompt')
+        assert kwargs['output_schema'] is CURATOR_OUTPUT_SCHEMA
+        assert kwargs == {
+            **self._scoping_kwargs(),
+            'label': 'task-curator[p]',
+            'role': 'task_curator',
+            'output_schema': CURATOR_OUTPUT_SCHEMA,
+            'system_prompt': CURATOR_SINGLE_SPEC.in_code_constant,
+            'model': cfg.model,
+            'timeout_seconds': cfg.timeout_seconds,
+            'max_turns': cfg.max_turns,
+            'max_budget_usd': _scale_budget(
+                cfg.max_budget_usd, cfg.per_pool_entry_budget_usd, len(pool),
+                cfg.single_call_budget_cap_usd,
+            ),
+        }
+        assert (decision.action, decision.justification) == ('create', 'x')
+
+    @pytest.mark.asyncio
+    async def test_a_batch_call_carries_the_batch_contract(self, tmp_path):
+        invoke = AsyncMock(return_value=batch_create_result(3))
+        config = _make_config()
+        cfg = config.curator
+        curator = self._curator(tmp_path, invoke, config)
+
+        decisions = await curator.curate_batch_prepared(
+            [_bundle('Alpha'), _bundle('Beta'), _bundle('Gamma')], 'p', '/p',
+        )
+
+        invoke.assert_awaited_once()
+        assert invoke.await_args is not None
+        kwargs = dict(invoke.await_args.kwargs)
+        kwargs.pop('prompt')
+        assert kwargs['output_schema'] is CURATOR_BATCH_OUTPUT_SCHEMA
+        assert kwargs == {
+            **self._scoping_kwargs(),
+            'label': 'task-curator-batch[p]',
+            'role': 'task_curator_batch',
+            'output_schema': CURATOR_BATCH_OUTPUT_SCHEMA,
+            'system_prompt': CURATOR_BATCH_SPEC.in_code_constant,
+            'model': cfg.model,
+            'timeout_seconds': min(
+                cfg.timeout_seconds + 2 * cfg.per_item_slack_seconds,
+                cfg.batch_timeout_cap_seconds,
+            ),
+            'max_turns': min(cfg.max_turns + 2 * cfg.per_item_turns, cfg.batch_turns_cap),
+            'max_budget_usd': _scale_budget(
+                cfg.max_budget_usd, cfg.per_item_budget_usd, 2, cfg.batch_budget_cap_usd,
+            ),
+        }
+        assert [d.action for d in decisions] == ['create', 'create', 'create']
+
+    @pytest.mark.asyncio
+    async def test_a_failed_batch_bottoms_out_in_one_single_call_per_candidate(self, tmp_path):
+        """PRD B8: a failed size-2 batch is followed by exactly two single-spec calls."""
+        invoke = invoke_by_role(
+            batch=AgentResult(success=False, output='x', subtype='error_max_turns'),
+            single=_agent_result({'action': 'create', 'justification': 'single'}),
+        )
+        curator = self._curator(tmp_path, invoke)
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
+            decisions = await curator.curate_batch_prepared(
+                [_bundle('Alpha'), _bundle('Beta')], 'p', '/p',
+            )
+
+        roles = [call.kwargs['role'] for call in invoke.await_args_list]
+        assert roles == ['task_curator_batch', 'task_curator', 'task_curator']
+        single_prompts = [call.kwargs['prompt'] for call in invoke.await_args_list[1:]]
+        assert sorted(
+            title for title in ('Alpha', 'Beta')
+            for prompt in single_prompts if f'  title: {title}\n' in prompt
+        ) == ['Alpha', 'Beta']
+        assert [d.justification for d in decisions] == ['single', 'single']
+
+    @pytest.mark.asyncio
+    async def test_the_single_prompt_is_byte_identical(self, tmp_path):
+        invoke = AsyncMock(return_value=_agent_result({'action': 'create', 'justification': 'x'}))
+        curator = self._curator(tmp_path, invoke)
+        bundle = _bundle(
+            _GOLDEN_CANDIDATE.title, _pool_with_ids(('10', 'pending'), ('11', 'done')),
+            candidate=_GOLDEN_CANDIDATE, withheld=_GOLDEN_CENSUS,
+        )
+
+        await curator.curate_batch_prepared([bundle], 'p', '/p')
+
+        assert invoke.await_args is not None
+        assert invoke.await_args.kwargs['prompt'] == _GOLDEN_SINGLE_PROMPT
+
+    @pytest.mark.asyncio
+    async def test_the_batch_prompt_is_byte_identical(self, tmp_path):
+        invoke = AsyncMock(return_value=batch_create_result(2))
+        curator = self._curator(tmp_path, invoke)
+        bundles = [
+            _bundle(
+                _GOLDEN_CANDIDATE.title, _pool_with_ids(('10', 'pending'), ('11', 'done')),
+                candidate=_GOLDEN_CANDIDATE, withheld=_GOLDEN_CENSUS,
+            ),
+            _bundle('Add a lint rule'),
+        ]
+
+        await curator.curate_batch_prepared(bundles, 'p', '/p')
+
+        assert invoke.await_args is not None
+        assert invoke.await_args.kwargs['prompt'] == _GOLDEN_BATCH_PROMPT
 
 
 class TestCallLlmNeutralCwd:
