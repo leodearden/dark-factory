@@ -4794,6 +4794,73 @@ def test_a_crash_keeps_every_alarm_posted_before_it(tmp_path):
     assert 'the committer exploded' in (result.reason or '')
 
 
+class TestEveryPassEndsWithOneJournalLine:
+    """The pass's last nightly journal line is its NightlyResult, rendered
+    by the value itself."""
+
+    @staticmethod
+    def _journal_lines(caplog) -> list[str]:
+        return [
+            record.getMessage() for record in caplog.records
+            if record.name == 'legibility.nightly' and ' outcome=' in record.getMessage()
+        ]
+
+    def test_the_value_renders_its_own_line(self):
+        result = _result(
+            applied=1, commit_made=True, alarms=(_alarm(_Kind.DELETION_DIRECTIVE),),
+        )
+
+        assert result.journal_line() == (
+            'legibility trickle: 2026-07-13 outcome=productive alarms=1 landed=1 '
+            'project=testproj pass=manual exit_code=0 applied=1 commit_made=True '
+            'census_fire=False retry_due=0'
+        )
+
+    @pytest.mark.parametrize('branch', [None, 'storm', 'capped'])
+    def test_it_is_the_last_line_a_pass_journals(self, tmp_path, caplog, branch):
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            result, _repo = _run_e2e_nightly(tmp_path, branch=branch)
+
+        nightly_messages = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'legibility.nightly'
+        ]
+        assert nightly_messages[-1] == result.journal_line()
+        assert nightly_messages.count(result.journal_line()) == 1
+
+    def test_a_scheduled_night_and_its_retry_each_journal_their_own(self, tmp_path, caplog):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            results = runner.scheduled_night(14, 'productive')
+
+        assert [result.pass_kind for result in results] == [
+            nightly.PassKind.SCHEDULED, nightly.PassKind.RETRY,
+        ]
+        lines = self._journal_lines(caplog)
+        assert lines == [result.journal_line() for result in results]
+        assert ['pass=scheduled' in lines[0], 'pass=retry' in lines[1]] == [True, True]
+
+    def test_the_systemd_entry_journals_it(self, tmp_path, monkeypatch, caplog, install_fake_httpx):
+        install_fake_httpx(_no_outbound_post)
+        _spy_census_subprocess_and_stub_pool(monkeypatch)
+        config_path = _write_config(tmp_path, project_id='proj_a')
+        projects_root = tmp_path / 'projects'
+        projects_root.mkdir()
+
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            exit_code = nightly.main([
+                'run', '--config', str(config_path),
+                '--projects-root', str(projects_root), '--date', '2026-07-13',
+            ])
+
+        assert exit_code == 0
+        [line] = self._journal_lines(caplog)
+        assert line.startswith('legibility trickle: 2026-07-13 outcome=quiet ')
+        assert ' project=proj_a pass=manual ' in line
+
+
 # ---------------------------------------------------------------------------
 # task 3340 step-11/12: edge-triggered barren-streak escalation
 # ---------------------------------------------------------------------------
