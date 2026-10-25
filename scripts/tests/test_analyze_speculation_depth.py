@@ -315,18 +315,16 @@ class TestMainCLI:
         with pytest.raises(sqlite3.OperationalError, match='readonly'):
             mod.main([str(db_path)])
 
-    def test_main_reports_chain_items_and_counts_legacy_rows(self, tmp_path, capsys):
-        db_path = str(tmp_path / 'runs.db')
-        _seed_events_db(
-            db_path,
+    def test_main_reports_chain_items_and_counts_legacy_rows(self, make_runs_db, capsys):
+        db_path = make_runs_db(_recent_events(
             merge_verify_events=[
                 _mv('legacy', True, depth=3),
                 _mv('live', True, depth=3, chain_items=4),
             ],
             merge_attempt_events=[],
-        )
+        ))
 
-        assert mod.main([db_path, '--since', '30']) == 0
+        assert mod.main([str(db_path), '--since', '30']) == 0
 
         out = capsys.readouterr().out
         assert '  chain_items=4: 1/1 = 1.000' in out, out
