@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from graphiti_core.nodes import EpisodeType
 from shared.storm_counter import KeyedStormCounters
+from shared.streak import KeyedStreaks
 
 from fused_memory.backends.graphiti_client import (
     ActiveEdgesError,
@@ -2427,8 +2428,9 @@ class MemoryService:
         # the degraded configuration where a repair storm is least likely to be
         # noticed any other way.
         #
-        # `_referent_repair_streaks` maps group_id -> CONSECUTIVE episodes whose
-        # repair pass moved at least one endpoint. Per group_id because the
+        # `_referent_repair_streaks` holds, per group_id, the live run of
+        # CONSECUTIVE episodes whose repair pass moved at least one endpoint.
+        # Per group_id because the
         # escalation queue is per-project: a regression in one project's graph
         # must not be masked by another project's clean writes, which is exactly
         # what a single global streak would do (any interleaved clean project
@@ -2437,7 +2439,9 @@ class MemoryService:
         # Bounded by the LIVE PROJECT SET — `group_id == project_id`, of which
         # there are a handful — so unlike the per-agent mem0 storm counters
         # above it needs no pruning; there is no unbounded key space to leak.
-        self._referent_repair_streaks: dict[str, int] = {}
+        self._referent_repair_streaks: KeyedStreaks[str] = KeyedStreaks(
+            threshold=_REFERENT_REPAIR_STREAK_THRESHOLD,
+        )
         # Process-lifetime totals, monotonic and never reset, keyed by a closed
         # five-member vocabulary so a reader never distinguishes "zero" from
         # "absent". Deliberately SEPARATE from the streaks: the streak is a live
@@ -4801,9 +4805,9 @@ class MemoryService:
           evidence either way: resetting on it would let a FalkorDB blip
           mid-storm disarm the alarm, and incrementing on it would let an
           outage page as a scanner regression.
-        * zero repairs but ``endpoints_checked > 0`` -> ``0``. THE POSITIVE
-          HEALTH SIGNAL: we looked at this episode's edge endpoints and none
-          needed moving.
+        * zero repairs but ``endpoints_checked > 0`` -> ends the run. THE
+          POSITIVE HEALTH SIGNAL: we looked at this episode's edge endpoints and
+          none needed moving.
         * zero repairs and ``endpoints_checked == 0`` -> UNCHANGED, and the key
           is not even created.
 
@@ -4831,7 +4835,7 @@ class MemoryService:
             The group's streak AFTER the increment, when this pass incremented
             it — i.e. the reading the storm gate thresholds. ``None`` on the
             other three arms. Returning the value rather than having the caller
-            re-read the dict is what keeps the gate from firing on a pass that
+            re-read the streak is what keeps the gate from firing on a pass that
             merely LEFT a breached streak in place: an episode that checked
             nothing performs no repair, so it must not re-page an alarm it
             produced no evidence for.
@@ -4845,13 +4849,11 @@ class MemoryService:
         self._referent_repair_counts['nodes_deleted'] += repair_stats.nodes_deleted
 
         if repair_stats.repaired:
-            streak = self._referent_repair_streaks.get(group_id, 0) + 1
-            self._referent_repair_streaks[group_id] = streak
-            return streak
+            return self._referent_repair_streaks.failure(group_id).count
         if repair_stats.failed:
             return None
         if stats.endpoints_checked:
-            self._referent_repair_streaks[group_id] = 0
+            self._referent_repair_streaks.success(group_id)
         return None
 
     async def _escalate_referent_repair_storm(
@@ -5497,7 +5499,7 @@ class MemoryService:
             # above would record `outcome='failed'` with `moved` never set —
             # a committed repair booked as an infrastructure failure that did
             # nothing. That would un-count it in `ReferentRepairStats.repaired`,
-            # suppress its `_referent_repair_streaks` increment, and drop the
+            # suppress its streak increment, and drop the
             # emptied node from `_cleanup_emptied_nodes` candidacy: the exact
             # "report zero repairs for an episode that performed one" shape
             # that `_backstop_endpoint_summaries` and the cleanup's own
@@ -5987,16 +5989,16 @@ class MemoryService:
         whose repairs the backend thwarted clears nothing). It is the
         value the storm gate thresholds, exposed so an operator can see how
         close a project is to the alarm rather than only learning at the breach.
-        A group appears only once a pass has produced evidence about it, so an
-        absent key means "no repair pass has drawn a conclusion here yet" —
-        distinct from a present ``0``, which means "checked, clean".
+        A group appears only while it is in a live run; absent means no live
+        run.
 
         Returns a COPY at BOTH levels — the nested streaks dict included — so a
         caller cannot mutate the escape hatch's own state. A read-only escape
         hatch a consumer can write through is not an escape hatch.
         """
         counts: dict[str, Any] = dict(self._referent_repair_counts)
-        counts['streaks'] = dict(self._referent_repair_streaks)
+        streaks = self._referent_repair_streaks
+        counts['streaks'] = {g: streaks.count(g) for g in streaks.tracked_keys}
         return counts
 
     def _submit_overreach_shadow(
