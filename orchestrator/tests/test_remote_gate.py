@@ -85,7 +85,7 @@ def test_wire_fingerprint_is_pinned_for_todays_wire_classes():
     a field change must update it too (folding the two is a follow-up).
     """
     assert wire_fingerprint(wire_classes()) == (
-        'a1d128e7f274c216c5c8f2570853fa4a0f25fe791a58f74d80f88e9cd1dac637'
+        '20880076d8c6c72c7df684edebf6ed3f3e0a3112dd67b09f5bc1c7e0277947b9'
     )
 
 
