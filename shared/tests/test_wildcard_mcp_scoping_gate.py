@@ -743,7 +743,7 @@ class TestWholeTreeGate:
         fixes land, this one scans for load-bearing production callers, none of
         which may silently vanish. In the other direction, a NEW matching
         caller is surfaced for review even when it is scoped correctly, so
-        nobody adds a seventh one without reading this gate.
+        nobody adds a sixth one without reading this gate.
         """
         found = {(site.filename, site.qualname) for site in tree_sites}
         assert found == _KNOWN_SITES, (
