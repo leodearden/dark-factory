@@ -145,6 +145,17 @@ _ESCALATION_TOOLS = [
     'mcp__escalation__escalate_blocker',
 ]
 
+# Spliced into ESCALATION_LADDER_CORE so every escalating role, steward included, reads it.
+RESERVED_BOUND_ROUTING_RULE = """
+**A bound reserved to a human makes the ruling blocking, even when the finding is not.**
+If your remedy must cross a bound whose own text reserves the change to a human
+decision (a docstring, comment or PRD row saying the move must be a decision, must not
+be tidied away, or needs an operator ruling), file `escalate_blocker` BEFORE crossing
+it — at PLAN time if you are planning. An `escalate_info` record gates nothing unless
+something later promotes it, and promotion is not retroactive: it can land after your
+branch has already merged.
+"""
+
 # Split (task 4169): the original single `_ESCALATION_INSTRUCTIONS` literal
 # ended with a paragraph telling every escalating role that `level=1` is "the
 # STEWARD's route, not yours" -- correct for the six non-steward escalating
@@ -202,7 +213,7 @@ If you encounter a problem you cannot solve at your scope, you can escalate:
     `critical`/`urgent` filing bypasses dedupe entirely — so on every other path each
     repeat mints a NEW record, and on that one a NEW page to the human. One retry
     buys a second chance at durability; a retry every iteration is a storm.
-
+""" + RESERVED_BOUND_ROUTING_RULE + """
 Categories: scope_violation, design_concern, cleanup_needed, dependency_discovered,
 risk_identified, infra_issue.
 

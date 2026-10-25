@@ -21235,6 +21235,12 @@ entries:
 
 
       Hypothesis: the coder matched the session here because its briefing embeds the cluster under verification, a vector owned by pending task 6847.'
+  - date: '2026-10-24'
+    project: dark_factory
+    session: task-7448-5687-outcome-is-a-correction
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'RECORDS WHAT TASK 5687 DID FOR THIS ENTRY. Task 5687''s whole outcome for this entry was its correction, docs/legibility/coding-records/task-5687-corrections.jsonl: a re-titling and a first cause, with no status change. It did not fix the defect, which stays open. The 2026-10-24 census (0f443e6c0e) read 5687''s done plus a GONE re-verify as a fix and set this entry fixed; 6279723661 restored it to open. This record names 5687 in outcome_of_task, so the merger lists it in this entry''s corrected_by and scripts/legibility/disposition.py never reads its done as a fix again (task 7448).'
   cause: 'A `python3` heredoc edit script pasted a docstring into its `old = """..."""` literal together with the docstring''s OWN closing `"""`, ending that literal early and leaving the script tail as bare top-level code.
 
 
@@ -21270,6 +21276,9 @@ entries:
     task_id: 5687
     resolution: created
     step: curator
+  corrected_by:
+  - project_root: /home/leo/src/dark-factory
+    task_id: 5687
 - id: entry-cand-20260919-3
   title: fused-memory MCP calls fail within a second with the harness's `Unable to connect` while fused-memory.service restarts with port 8002 unbound -- not a backing-store timeout and not worktree-specific
   severity: medium
