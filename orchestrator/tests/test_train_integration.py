@@ -209,6 +209,7 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
     """
     return OrchestratorConfig(
         project_root=repo,
+        escalate_preexisting_main_break=True,
         test_command="cargo test --workspace --quiet",
         lint_command="true",
         type_check_command="true",

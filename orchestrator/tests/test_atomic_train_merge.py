@@ -220,6 +220,7 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
     """
     return OrchestratorConfig(
         project_root=repo,
+        escalate_preexisting_main_break=True,
         test_command="cargo test --workspace --quiet",
         # Use no-op shell builtins so lint/type_check don't interfere with
         # the Rust workspace.  'true' always exits 0.
@@ -502,6 +503,7 @@ class TestScenario3IntraTrainDispatch:
 
         config = OrchestratorConfig(
             project_root=tmp_path,
+            escalate_preexisting_main_break=True,
             git=GitConfig(
                 main_branch="main",
                 branch_prefix="task/",
@@ -556,6 +558,7 @@ class TestScenario4ExtraTrainDispatchBlocked:
 
         config = OrchestratorConfig(
             project_root=tmp_path,
+            escalate_preexisting_main_break=True,
             git=GitConfig(
                 main_branch="main",
                 branch_prefix="task/",
@@ -604,6 +607,7 @@ class TestScenario4ExtraTrainDispatchBlocked:
 
         config = OrchestratorConfig(
             project_root=tmp_path,
+            escalate_preexisting_main_break=True,
             git=GitConfig(
                 main_branch="main",
                 branch_prefix="task/",
@@ -1004,6 +1008,7 @@ class TestScenario6ParkPrefixDerail:
 
         config6 = OrchestratorConfig(
             project_root=repo6,
+            escalate_preexisting_main_break=True,
             max_verify_attempts=5,
             max_failure_signature_repeat=3,
             git=GitConfig(
@@ -1072,6 +1077,7 @@ class TestScenario6ParkPrefixDerail:
 
         config6b = OrchestratorConfig(
             project_root=repo6b,
+            escalate_preexisting_main_break=True,
             git=GitConfig(
                 main_branch="main",
                 branch_prefix="task/",
@@ -1215,6 +1221,7 @@ class TestScenario7TrainResume:
 
         config7 = OrchestratorConfig(
             project_root=repo,
+            escalate_preexisting_main_break=True,
             test_command="true",   # no real cargo — verify is mocked
             lint_command="true",
             type_check_command="true",
@@ -1492,6 +1499,7 @@ class TestScenario8MainAdvances:
 
         config8r = OrchestratorConfig(
             project_root=repo,
+            escalate_preexisting_main_break=True,
             test_command="true",
             lint_command="true",
             type_check_command="true",
@@ -1625,6 +1633,7 @@ class TestScenario9LoopGuardNonTrain:
 
         config9 = OrchestratorConfig(
             project_root=repo9,
+            escalate_preexisting_main_break=True,
             max_verify_attempts=5,
             max_failure_signature_repeat=3,
             git=GitConfig(
@@ -1701,6 +1710,7 @@ class TestScenario10DoneProvGateUnweakened:
         # mcp_session=None → uses mcp_call HTTP path (monkeypatched below).
         config10 = OrchestratorConfig(
             project_root=tmp_path,
+            escalate_preexisting_main_break=True,
             git=GitConfig(
                 main_branch="main",
                 branch_prefix="task/",
@@ -2046,7 +2056,11 @@ async def _setup_gate_train(
         worktree_dir=".worktrees",
         push_after_advance=False,
     )
-    config = OrchestratorConfig(project_root=repo, git=git_cfg)
+    config = OrchestratorConfig(
+        project_root=repo,
+        escalate_preexisting_main_break=True,
+        git=git_cfg,
+    )
     git_ops = GitOps(git_cfg, repo)
 
     a_name, b_name, c_name = member_names
