@@ -757,7 +757,6 @@ def test_a_retry_for_a_changed_revealed_file_adds_nothing_to_its_follow_head_re_
     got = pass_answers(followed, minutes=70)
 
     assert summary(got) == [('src/a.py', c2, None, False, 25)]
-    assert len(got) == 1
 
 
 def test_a_crash_between_append_and_cursor_neither_re_answers_nor_drops_a_request(

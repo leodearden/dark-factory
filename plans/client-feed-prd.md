@@ -612,7 +612,10 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     and it has already re-emitted at head every revealed file whose blob changed
     (`client-feed/src/client_feed/reveals.py::_follow_events`). The feed therefore already holds
     head's content for every revealed path. The request is still judged first, so a refusal is
-    emitted exactly as before (`client-feed/src/client_feed/reveals.py::_answer`).
+    emitted exactly as before (`client-feed/src/client_feed/reveals.py::_answer`). A consumer that
+    tracks pending requests therefore settles one when its path is in `state.revealed` or a
+    `reveal_refused` answers it, and never waits for a `file_revealed` per request. An explicit
+    `already_revealed` acknowledgement would need a contract revision.
   - (c) git output that does not parse is a `GitError` of the command that wrote it, and it
     degrades `git` like any other git failure
     (`client-feed/src/client_feed/sources/git.py::_parsing`). Every `git cat-file --batch` read is
