@@ -875,6 +875,15 @@ class NightlyResult:
     retry_due: tuple[date, ...] = ()
     """The backlog dates this invocation retries next, oldest first."""
 
+    def __post_init__(self) -> None:
+        for invariant in _RESULT_INVARIANTS:
+            if not invariant.holds(self):
+                raise ValueError(
+                    f'NightlyResult invariant {invariant.name} violated: '
+                    f'outcome={self.outcome} '
+                    f'{invariant.field}={getattr(self, invariant.field)!r}'
+                )
+
     @property
     def exit_code(self) -> int:
         return _exit_code_of(self.outcome)
@@ -901,6 +910,38 @@ class _LedgerWrite(NamedTuple):
     written: int
     failed: int
     error: str | None
+
+
+class _ResultInvariant(NamedTuple):
+    name: str
+    field: str
+    holds: Callable[[NightlyResult], bool]
+
+
+_RESULT_INVARIANTS = (
+    _ResultInvariant(
+        'rollback-implies-failed', 'rollback',
+        lambda result: result.rollback is None
+        or result.outcome is trickle_state.RunOutcome.FAILED,
+    ),
+    _ResultInvariant(
+        'commit-implies-productive', 'commit_made',
+        lambda result: not result.commit_made
+        or result.outcome is trickle_state.RunOutcome.PRODUCTIVE,
+    ),
+    _ResultInvariant(
+        'retry-due-implies-finished', 'retry_due',
+        lambda result: not result.retry_due
+        or trickle_state.finished(exit_code=result.exit_code, capped=result.capped),
+    ),
+    _ResultInvariant(
+        'budget-suppressed-implies-barren-or-failed', 'budget_suppressed',
+        lambda result: not result.budget_suppressed
+        or result.outcome in (trickle_state.RunOutcome.BARREN, trickle_state.RunOutcome.FAILED),
+    ),
+)
+"""The field combinations a :class:`NightlyResult` may hold, each checked at
+construction and named in the ``ValueError`` that refuses a violation."""
 
 
 @dataclass(frozen=True, kw_only=True)
