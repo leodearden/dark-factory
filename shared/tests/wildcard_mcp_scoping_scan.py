@@ -141,7 +141,7 @@ class WildcardMcpScopingSite(NamedTuple):
     """
 
     filename: str        # repo-relative posix path, the caller's spelling
-    qualname: str        # enclosing def, e.g. 'TaskCurator._call_llm'
+    qualname: str        # enclosing def, e.g. 'TaskCurator._invoke_curator'
     callee: str          # the callee as written: a target or a name bound to one
     lineno: int          # display only -- drifts on any edit above the site
     exemption: str       # how it is protected, or NOT_EXEMPT when it is not

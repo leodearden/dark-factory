@@ -125,7 +125,7 @@ if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
-    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
     from fused_memory.middleware.curator_escalator import CuratorEscalator
 
 logger = logging.getLogger(__name__)
@@ -478,6 +478,99 @@ def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float
     constant is tuned.
     """
     return min(base + per_entry * size, cap)
+
+
+@dataclass(frozen=True)
+class _CuratorCall:
+    """Everything one curator LLM call varies by its size, decided in one place."""
+
+    spec: PromptSpec
+    output_schema: dict[str, Any]
+    timeout_seconds: float
+    max_turns: int
+    budget_usd: float
+    label: str
+    ledger_role: str
+    project_id: str
+    failure_context: str
+
+    @classmethod
+    def single(cls, cfg: CuratorConfig, project_id: str, pool_size: int) -> _CuratorCall:
+        """One candidate judged against a pool of *pool_size* entries.
+
+        The budget scales by pool size, but its base and cap are both a flat
+        $2.00 (task 1980 / esc-task-curator-194), so every pool size clamps to
+        that.
+
+        ``max_turns`` is never 1: see
+        fused-memory/src/fused_memory/reconciliation/agent_loop.py::_AGENT_CLI_MAX_TURNS
+        for the prose turn the model emits before calling ``StructuredOutput``.
+        """
+        return cls(
+            spec=CURATOR_SINGLE_SPEC,
+            output_schema=CURATOR_OUTPUT_SCHEMA,
+            timeout_seconds=cfg.timeout_seconds,
+            max_turns=cfg.max_turns,
+            budget_usd=_scale_budget(
+                cfg.max_budget_usd, cfg.per_pool_entry_budget_usd, pool_size,
+                cfg.single_call_budget_cap_usd,
+            ),
+            label=f'task-curator[{project_id}]',
+            ledger_role='task_curator',
+            project_id=project_id,
+            failure_context='curator LLM call failed:',
+        )
+
+    @classmethod
+    def batch(cls, cfg: CuratorConfig, project_id: str, n: int) -> _CuratorCall:
+        """*n* candidates (n >= 2) judged in one call.
+
+        Limits scale by ``n - 1``: the single-call limits already cover the
+        first item, and each further item adds its slack, up to the batch caps.
+        The budget's base and cap are both a flat $2.00 (task 1980), so its
+        per-item term is inert.
+        """
+        return cls(
+            spec=CURATOR_BATCH_SPEC,
+            output_schema=CURATOR_BATCH_OUTPUT_SCHEMA,
+            timeout_seconds=min(
+                cfg.timeout_seconds + cfg.per_item_slack_seconds * (n - 1),
+                cfg.batch_timeout_cap_seconds,
+            ),
+            max_turns=min(cfg.max_turns + cfg.per_item_turns * (n - 1), cfg.batch_turns_cap),
+            budget_usd=_scale_budget(
+                cfg.max_budget_usd, cfg.per_item_budget_usd, n - 1, cfg.batch_budget_cap_usd,
+            ),
+            label=f'task-curator-batch[{project_id}]',
+            ledger_role='task_curator_batch',
+            project_id=project_id,
+            failure_context=f'curator batch LLM call failed: batch_size={n}',
+        )
+
+
+def _failure_error(
+    agent_result: AgentResult, evidence: TranscriptEvidence | None, call: _CuratorCall,
+) -> CuratorFailureError:
+    """The :exc:`CuratorFailureError` for a failed *call*, with what the failure carried."""
+    return CuratorFailureError(
+        f'{call.failure_context} output={agent_result.output[:200]!r} '
+        f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
+        f'transcript_turns={agent_result.transcript_turns} '
+        f'timed_out={agent_result.timed_out} '
+        f'duration_ms={agent_result.duration_ms} '
+        f'schema_tool_denied={agent_result.schema_tool_denied} '
+        f'configured_timeout_secs={call.timeout_seconds}',
+        timed_out=agent_result.timed_out,
+        duration_ms=agent_result.duration_ms,
+        subtype=agent_result.subtype or None,
+        schema_tool_denied=agent_result.schema_tool_denied,
+        zero_output_timeout=is_zero_output_timeout(agent_result),
+        proc_tree=agent_result.proc_tree,
+        account_name=agent_result.account_name,
+        cost_usd=agent_result.cost_usd,
+        transcript_turns=agent_result.transcript_turns,
+        tools_used=evidence.other_tool_uses if evidence else None,
+    )
 
 
 @dataclass
@@ -1402,8 +1495,8 @@ class TaskCurator:
         """Advance *project_id*'s streak by one degraded curation, alarming once.
 
         Shared by :meth:`_degraded_create` (single-candidate paths) and by
-        :meth:`_call_llm_batch` (items a successful round-trip nonetheless
-        failed to decide).  The alarm is class-agnostic by construction: it
+        :meth:`_decisions_from_batch_result` (items a successful round-trip
+        nonetheless failed to decide).  The alarm is class-agnostic by construction: it
         takes only the fact that a curation degraded, never the reason.
         """
         streak = self._degraded_streaks.setdefault(project_id, _DegradedStreak())
@@ -1552,9 +1645,13 @@ class TaskCurator:
         # (no orchestrator → interactive path) let it propagate so the MCP
         # caller sees the outage loudly instead of silently falling back.
         try:
-            decision = await self._call_llm(
-                candidate, pool, pool_sizes, start, project_id, project_root,
-                withheld=withheld,
+            agent_result = await self._invoke_curator(
+                self._build_user_prompt(candidate, pool, withheld=withheld),
+                _CuratorCall.single(self._config.curator, project_id, len(pool)),
+            )
+            decision = _parse_decision(
+                agent_result, pool_sizes=pool_sizes,
+                latency_ms=int((time.monotonic() - start) * 1000), pool=pool,
             )
             # Success: reset the consecutive-ZOT counter so a single hung call
             # that was followed by a healthy one doesn't accumulate toward open.
@@ -1960,8 +2057,8 @@ class TaskCurator:
         # intentional — opening sooner is harmless and simpler than trying to
         # normalise concurrent increments.  curate_batch_prepared need not
         # record separately; it relies on the per-size-1 accumulation.
-        # Conversely, a successful _call_llm_batch call resets the counter
-        # itself (see the success branch near its `return`, task 4143), so
+        # Conversely, a successful batch call resets the counter itself
+        # (see _decisions_from_batch_result, task 4143), so
         # "consecutive" is measured across every real LLM success — batch
         # and size-1 alike — not just the size-1 successes handled by
         # curate().
@@ -2861,226 +2958,75 @@ class TaskCurator:
         )
         return salvaged, evidence
 
-    async def _call_llm(
-        self,
-        candidate: CandidateTask,
-        pool: list[PoolEntry],
-        pool_sizes: dict[str, int],
-        start: float,
-        project_id: str,
-        project_root: str,
-        *,
-        withheld: PoolWithheld | None = None,
-    ) -> CuratorDecision:
-        # Task 1989: neutral CLI cwd decouples per-call cost from the filing
-        # project's CLAUDE.md/MEMORY.md; self._cwd stays project-root for
-        # Python-side premise/blocklist resolution (L774/863/870).
-        cwd = neutral_cli_cwd()
-        user_prompt = self._build_user_prompt(candidate, pool, withheld=withheld)
+    async def _invoke_curator(self, prompt: str, call: _CuratorCall) -> AgentResult:
+        """One LLM round-trip for *call*, returning a successful result.
 
-        # max_budget_usd is now a durable flat $2.00 (task 1980 /
-        # esc-task-curator-194): max_budget_usd and single_call_budget_cap_usd
-        # were both raised to $2.00, comfortably above the ~$0.30574 cost of a
-        # full 30-entry corpus prompt (esc-task-curator-191). _scale_budget
-        # still runs — mirroring the R1 batch formula but scaling by
-        # len(pool) rather than (n-1):
-        #   budget = min(max_budget_usd + per_pool_entry_budget_usd*len(pool),
-        #                single_call_budget_cap_usd)
-        # — but with base == cap == $2.00 the scaling term is inert: every
-        # pool size clamps to the same flat $2.00.
-        budget = _scale_budget(
-            self._config.curator.max_budget_usd,
-            self._config.curator.per_pool_entry_budget_usd,
-            len(pool),
-            self._config.curator.single_call_budget_cap_usd,
-        )
-        system_prompt = self._resolve_curator_prompt(CURATOR_SINGLE_SPEC)
-        transcript_scope = self._transcript_scope(self._config.curator.timeout_seconds)
+        A failed call raises :exc:`CuratorFailureError` (see
+        :func:`_failure_error`), unless its transcript holds a verdict the CLI
+        accepted, which :meth:`_resolve_failed_result` salvages into a success.
+        """
+        system_prompt = self._resolve_curator_prompt(call.spec)
+        transcript_scope = self._transcript_scope(call.timeout_seconds)
 
         agent_result: AgentResult = await self._invoke(
             usage_gate=self._usage_gate,
-            label=f'task-curator[{project_id}]',
-            project_id=project_id,
-            prompt=user_prompt,
+            label=call.label,
+            project_id=call.project_id,
+            prompt=prompt,
             system_prompt=system_prompt,
-            cwd=cwd,
+            # Task 1989: neutral CLI cwd decouples per-call cost from the filing
+            # project's CLAUDE.md/MEMORY.md; self._cwd stays project-root for
+            # Python-side premise/blocklist resolution.
+            cwd=neutral_cli_cwd(),
             model=self._config.curator.model,
-            # Never 1: a cap of 1 leaves no room for the prose turn the model
-            # emits before calling ``StructuredOutput`` (see
-            # fused-memory/src/fused_memory/reconciliation/agent_loop.py::_AGENT_CLI_MAX_TURNS).
-            # Schema salvage in cli_invoke is not a backstop for that: on the
-            # measured recon-verify shape the ``error_max_turns`` result carried
-            # no payload, so salvage had nothing to recover.  The curator's own
-            # shape has not been measured, so the ``ge=3`` floor and the default
-            # of 8 are established values, not revalidated ones; 8 leaves
-            # headroom for harder combine-vs-create decisions.
-            max_turns=self._config.curator.max_turns,
-            max_budget_usd=budget,
+            max_turns=call.max_turns,
+            max_budget_usd=call.budget_usd,
             # Pure classifier: build_claude_argv turns '*' into --tools '', which
             # removes built-in and deferred tools; the two MCP kwargs remove MCP.
             disallowed_tools=['*'],
             mcp_config=no_mcp_servers_config(),
             strict_mcp_config=True,
-            output_schema=CURATOR_OUTPUT_SCHEMA,
+            output_schema=call.output_schema,
             permission_mode='bypassPermissions',
-            timeout_seconds=self._config.curator.timeout_seconds,
+            timeout_seconds=call.timeout_seconds,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
             park_on_frozen_pool=False,
-            **self._ledger_kwargs('task_curator'),
+            **self._ledger_kwargs(call.ledger_role),
             **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
 
         agent_result, evidence = await self._resolve_failed_result(agent_result, transcript_scope)
-        latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
-            raise CuratorFailureError(
-                f'curator LLM call failed: output={agent_result.output[:200]!r} '
-                f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
-                f'transcript_turns={agent_result.transcript_turns} '
-                f'timed_out={agent_result.timed_out} '
-                f'duration_ms={agent_result.duration_ms} '
-                f'schema_tool_denied={agent_result.schema_tool_denied} '
-                f'configured_timeout_secs={self._config.curator.timeout_seconds}',
-                timed_out=agent_result.timed_out,
-                duration_ms=agent_result.duration_ms,
-                subtype=agent_result.subtype or None,
-                schema_tool_denied=agent_result.schema_tool_denied,
-                zero_output_timeout=is_zero_output_timeout(agent_result),
-                proc_tree=agent_result.proc_tree,
-                account_name=agent_result.account_name,
-                cost_usd=agent_result.cost_usd,
-                transcript_turns=agent_result.transcript_turns,
-                tools_used=evidence.other_tool_uses if evidence else None,
-            )
+            raise _failure_error(agent_result, evidence, call)
+        return agent_result
 
-        return _parse_decision(
-            agent_result, pool_sizes=pool_sizes,
-            latency_ms=latency_ms, pool=pool,
-        )
-
-    async def _call_llm_batch(
+    async def _decisions_from_batch_result(
         self,
+        agent_result: AgentResult,
         candidates: list[CandidateTask],
         pools: list[list[PoolEntry]],
         pool_sizes_list: list[dict[str, int]],
         start: float,
         project_id: str,
         project_root: str,
-        *,
-        withheld_list: list[PoolWithheld | None] | None = None,
     ) -> list[CuratorDecision]:
-        """Invoke one batched LLM call for N candidates and parse the result.
-
-        Timeout and turn-cap scale linearly with the batch size, capped by the
-        configured hard limits in :class:`~fused_memory.config.schema.CuratorConfig`.
-        On failure, raises :exc:`CuratorFailureError`; the caller in
-        :meth:`curate_batch` is responsible for the per-item fallback.
-        """
-        # Task 1989: neutral CLI cwd decouples per-call cost from the filing
-        # project's CLAUDE.md/MEMORY.md; self._cwd stays project-root for
-        # Python-side premise/blocklist resolution (L774/863/870).
-        cwd = neutral_cli_cwd()
-        n = len(candidates)
-        user_prompt = self._build_batch_user_prompt(
-            candidates, pools, withheld_list=withheld_list,
-        )
-
-        # Scale by (n-1): the single-call budget (timeout_seconds /
-        # max_turns / max_budget_usd) already covers the first item's
-        # baseline; each additional item beyond the first adds its slack.
-        # This avoids over-provisioning a size-2 batch at 2× the single-call
-        # budget.  Note: _call_llm_batch is never called for n<2.
-        timeout = min(
-            self._config.curator.timeout_seconds
-            + self._config.curator.per_item_slack_seconds * (n - 1),
-            self._config.curator.batch_timeout_cap_seconds,
-        )
-        max_turns = min(
-            self._config.curator.max_turns
-            + self._config.curator.per_item_turns * (n - 1),
-            self._config.curator.batch_turns_cap,
-        )
-        # R1: max_budget_usd is now a durable flat $2.00 (task 1980 /
-        # esc-task-curator-194) — base (max_budget_usd) and
-        # batch_budget_cap_usd are both $2.00, so this clamps to a flat
-        # $2.00 regardless of batch size. _scale_budget still runs but its
-        # per-item scaling term is now inert (min(2.00 + scale, 2.00) == 2.00).
-        budget = _scale_budget(
-            self._config.curator.max_budget_usd,
-            self._config.curator.per_item_budget_usd,
-            n - 1,
-            self._config.curator.batch_budget_cap_usd,
-        )
-        system_prompt = self._resolve_curator_prompt(CURATOR_BATCH_SPEC)
-        transcript_scope = self._transcript_scope(timeout)
-
-        agent_result: AgentResult = await self._invoke(
-            usage_gate=self._usage_gate,
-            label=f'task-curator-batch[{project_id}]',
-            project_id=project_id,
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-            cwd=cwd,
-            model=self._config.curator.model,
-            max_turns=max_turns,
-            max_budget_usd=budget,
-            # Pure classifier: build_claude_argv turns '*' into --tools '', which
-            # removes built-in and deferred tools; the two MCP kwargs remove MCP.
-            disallowed_tools=['*'],
-            mcp_config=no_mcp_servers_config(),
-            strict_mcp_config=True,
-            output_schema=CURATOR_BATCH_OUTPUT_SCHEMA,
-            permission_mode='bypassPermissions',
-            timeout_seconds=timeout,
-            cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
-            park_on_frozen_pool=False,
-            **self._ledger_kwargs('task_curator_batch'),
-            **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
-        )
-
-        agent_result, evidence = await self._resolve_failed_result(agent_result, transcript_scope)
-        latency_ms = int((time.monotonic() - start) * 1000)
-        if not agent_result.success:
-            raise CuratorFailureError(
-                f'curator batch LLM call failed: batch_size={n} '
-                f'output={agent_result.output[:200]!r} '
-                f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
-                f'transcript_turns={agent_result.transcript_turns} '
-                f'timed_out={agent_result.timed_out} '
-                f'duration_ms={agent_result.duration_ms} '
-                f'schema_tool_denied={agent_result.schema_tool_denied} '
-                f'configured_timeout_secs={timeout}',
-                timed_out=agent_result.timed_out,
-                duration_ms=agent_result.duration_ms,
-                subtype=agent_result.subtype or None,
-                schema_tool_denied=agent_result.schema_tool_denied,
-                zero_output_timeout=is_zero_output_timeout(agent_result),
-                proc_tree=agent_result.proc_tree,
-                account_name=agent_result.account_name,
-                cost_usd=agent_result.cost_usd,
-                transcript_turns=agent_result.transcript_turns,
-                tools_used=evidence.other_tool_uses if evidence else None,
-            )
-
-        # Success: a real LLM round-trip completed, so the service is not
-        # wedged — reset the consecutive-ZOT counter exactly as the
-        # single-item path does in task_curator.py::TaskCurator.curate.
-        # Without this, size-1 bisect ZOTs accumulate across arbitrarily
-        # many healthy BATCH calls in a batch-dominant deployment until
-        # threshold (default 2) trips the breaker and disables dedupe for
+        """Parse a successful batch call into one decision per candidate, and account for it."""
+        # A real LLM round-trip completed, so the service is not wedged — reset
+        # the consecutive-ZOT counter exactly as TaskCurator.curate does for a
+        # single call. Without this, size-1 bisect ZOTs accumulate across
+        # arbitrarily many healthy BATCH calls in a batch-dominant deployment
+        # until threshold (default 2) trips the breaker and disables dedupe for
         # the cooldown (default 600s) on a healthy service (task 4143).
-        # Keyed on agent_result.success, not on decision quality: what this
-        # breaker asserts is a wedged BACKEND, and a completed round-trip
-        # disproves that however unusable its payload turns out to be.
+        # Keyed on the round-trip, not on decision quality: what this breaker
+        # asserts is a wedged BACKEND, and a completed round-trip disproves that
+        # however unusable its payload turns out to be.
         #
         # This also closes an ALREADY-OPEN breaker/cooldown, not just the
-        # counter: _call_llm_batch_with_fallback's two bisect halves run
+        # counter: the two bisect halves of _call_llm_batch_with_fallback run
         # concurrently under asyncio.gather, so a sibling half's size-1
         # curate() ZOTs can open the breaker while this call is still in
-        # flight. A completed round-trip is still proof the backend isn't
-        # wedged, so letting it close an already-open cooldown early is a
-        # deliberate choice, not an oversight (see this task's plan design
-        # decision 3; pinned by
+        # flight. Closing that cooldown early is deliberate (task 4143's plan
+        # design decision 3; pinned by
         # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker).
         self._reset_zero_output_breaker()
 
@@ -3088,7 +3034,7 @@ class TaskCurator:
             agent_result,
             pools=pools,
             pool_sizes_list=pool_sizes_list,
-            latency_ms=latency_ms,
+            latency_ms=int((time.monotonic() - start) * 1000),
         )
 
         # The streak, unlike the breaker, needs a usable DECISION rather than a
@@ -3155,9 +3101,9 @@ class TaskCurator:
 
         censuses: list[PoolWithheld | None] = list(withheld_list or [None] * n)
         try:
-            return await self._call_llm_batch(
-                candidates, pools, pool_sizes_list, start,
-                project_id, project_root, withheld_list=censuses,
+            agent_result = await self._invoke_curator(
+                self._build_batch_user_prompt(candidates, pools, withheld_list=censuses),
+                _CuratorCall.batch(self._config.curator, project_id, n),
             )
         except POOL_UNAVAILABLE_ERRORS as exc:
             logger.warning(
@@ -3203,6 +3149,9 @@ class TaskCurator:
                 _shift_batch_target_index(d, mid) for d in right
             ]
             return left + shifted_right
+        return await self._decisions_from_batch_result(
+            agent_result, candidates, pools, pool_sizes_list, start, project_id, project_root,
+        )
 
     def _build_user_prompt(
         self,
