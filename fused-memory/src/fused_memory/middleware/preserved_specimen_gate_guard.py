@@ -25,12 +25,18 @@ read as ``description``.  No ``flag_type`` is passed: a title is not a flag
 type, and reading it as one fires on gates that ask for no reset.
 
 ESCALATING GATES ONLY.  The scope is whatever ``inject_operational_routing``
-stamps ``always_escalates=True``.  Named residual: a recon filing that does not
-become an escalating gate is not covered here.
+stamps ``always_escalates=True``, at admission.  Two named residuals are not
+covered here: a recon filing that does not become an escalating gate, and an
+``update_task`` amendment of an already-open carrier, the route the
+recurring-gate dedupe steers a recon stage to, which can reword a reset carrier
+minted before this guard with no preserved-specimen check.
 
 FAILS OPEN.  A degraded read, a timeout or any other failure logs a WARNING and
 lets the submission through.  Refusing on a backend blip would block every
-recon reset gate, including the genuine ones a human needs to see.
+recon reset gate, including the genuine ones a human needs to see.  Unlike
+Stage 1's layer, which escalates an unresolved cycle, this one is handed no
+escalation channel, so a persistent outage is audible here only as those
+WARNINGs; the gate it admits still lands in front of a human.
 
 IMPORT CONTRACT.  This module imports ``recurring_gate_guard``'s public subject
 readers, ``operational_routing_guard.inject_operational_routing``,

@@ -17,6 +17,11 @@ were declined and cancelled by hand.  A twin specimen was not so lucky — it
 stopped being one when its pinning escalation lost open status in an
 orphan-reaper cascade.  Task 4223's record holds the dates, ids and counts.
 
+TWO LAYERS, TWO MODULES.  This module filters Stage 1's flags.  The
+``submit_task`` layer, ``middleware/preserved_specimen_gate_guard.py`` (task
+5456), refuses the reset gate itself and reuses :func:`corroborate_preservation`
+for its verdict.
+
 WHY A SUPPRESSION LIST DID NOT FIX IT.  A ``stage1_flag_suppression`` record
 for task 3105 already existed, and was later WIDENED to blanket by removing its
 ``flag_types`` key.  Recurrence continued anyway, for two independent reasons
@@ -67,8 +72,8 @@ task-id splitter), ``flag_shape`` (the leaf ``contains_any_casefolded``
 matcher), ``services.memory_service`` (for the canonical raw-payload content
 extractor), ``shared.task_statuses`` (the closed status vocabulary) and,
 optionally, ``escalation.dedupe.file_or_fold_l1``.  It reaches
-nothing in ``stages/``, ``middleware/`` or ``prompts/``; the consolidator
-calls in.  It performs detection only — it drops flags, never writes tasks or
+nothing in ``stages/``, ``middleware/`` or ``prompts/``; the consolidator and
+the ``submit_task`` layer call in.  It performs detection only — it drops flags, never writes tasks or
 memories.
 
 WHAT "DISTINCTIVE" MEANS HERE, AND WHY IT IS CHECKED.  Both token families are
