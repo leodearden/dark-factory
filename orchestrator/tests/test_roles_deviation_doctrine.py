@@ -19,9 +19,12 @@ from shared.plan_deviation import DEVIATION_KINDS
 
 from orchestrator.agents.deviation_doctrine import render_deviation_doctrine
 from orchestrator.agents.roles import (
+    _ESCALATION_TOOLS,
     _PLAN_DEVIATION_TOOLS,
+    ESCALATE_INFO_CONTRACT,
     IMPLEMENTER_DEVIATION_DOCTRINE,
     ROLES,
+    AgentRole,
 )
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools
@@ -49,6 +52,25 @@ def _code_span(token: str) -> str:
     # check would pass vacuously; the code span is the render's delimiter.
     return '`' + token + '`'
 
+
+def _holds_an_escalation_tool(role: AgentRole) -> bool:
+    return any(tool in _ESCALATION_TOOLS for tool in role.allowed_tools)
+
+
+# Derived from tool grants, not hand-listed: test_roles_escalation_ladder.py
+# already owns the hand classification and its tool-grant tripwire.
+_ESCALATING_ROLES = frozenset(
+    name for name, role in ROLES.items() if _holds_an_escalation_tool(role)
+)
+
+_ESCALATE_INFO_CONTRACT = SpliceContract(
+    constant_name='ESCALATE_INFO_CONTRACT',
+    constant=ESCALATE_INFO_CONTRACT,
+    roles=_ESCALATING_ROLES,
+    role_set_name='_ESCALATING_ROLES (derived from _ESCALATION_TOOLS grants)',
+    capability=_holds_an_escalation_tool,
+    capability_description='an escalate_info/escalate_blocker grant',
+)
 
 _DOCTRINE_CONTRACT = SpliceContract(
     constant_name='IMPLEMENTER_DEVIATION_DOCTRINE',
@@ -213,4 +235,54 @@ class TestImplementerDeviationDoctrine:
         assert _RETIRED_INSTRUCTION not in ROLES['implementer'].system_prompt, (
             'IMPLEMENTER\'s prompt carries the retired "note it and stop" '
             'instruction again, which contradicts the deviation doctrine. Delete it.'
+        )
+
+
+class TestEscalateInfoContract:
+    """PRD D3: one escalate_info contract, rendered once into every escalating role."""
+
+    def test_contract_is_nonempty(self):
+        assert_nonempty(
+            'ESCALATE_INFO_CONTRACT',
+            ESCALATE_INFO_CONTRACT,
+            remedy='Restore the D3 contract text in roles.py.',
+        )
+
+    def test_the_escalating_role_set_is_not_vacuous(self):
+        assert 'implementer' in _ESCALATING_ROLES, (
+            f'_ESCALATING_ROLES derived from _ESCALATION_TOOLS grants is '
+            f'{sorted(_ESCALATING_ROLES)}, without implementer, so the derivation '
+            'has stopped matching the grants it reads.'
+        )
+
+    # assert_role_set_matches_capability is not called: _ESCALATING_ROLES IS
+    # the derivation, so the check would compare it with itself.
+
+    def test_every_escalating_role_carries_the_contract(self):
+        _ESCALATE_INFO_CONTRACT.assert_every_role_carries(
+            remedy=(
+                'Render ESCALATE_INFO_CONTRACT into ESCALATION_LADDER_CORE, which '
+                'every escalating role carries.'
+            ),
+        )
+
+    def test_the_contract_is_spliced_exactly_once(self):
+        # absent_ok=True leaves a missing splice to fail only the containment
+        # test above: one root cause, one failing test.
+        _ESCALATE_INFO_CONTRACT.assert_spliced_exactly_once(
+            absent_ok=True,
+            remedy=(
+                'A second copy most likely came from _FOLLOWUP_FILING_INSTRUCTIONS, '
+                'which is appended to ARCHITECT and IMPLEMENTER after construction, '
+                'or from DEEP_REVIEWER\'s own prompt. Make that site a pointer to '
+                '"## Escalation" instead.'
+            ),
+        )
+
+    def test_no_other_role_carries_the_contract(self):
+        _ESCALATE_INFO_CONTRACT.assert_no_other_role_carries(
+            remedy=(
+                'Remove the splice, or grant the role an escalation tool if it '
+                'really should escalate.'
+            ),
         )

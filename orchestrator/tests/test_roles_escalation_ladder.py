@@ -58,6 +58,7 @@ from escalation.models import ACTION_KEEP_DRIVING, ACTION_TERMINATE_CLEANLY
 from orchestrator.agents.roles import (
     _ESCALATION_INSTRUCTIONS,
     _ESCALATION_TOOLS,
+    ESCALATE_INFO_CONTRACT,
     ESCALATION_LADDER_CORE,
     NON_STEWARD_LEVEL_GATE,
     RESERVED_BOUND_ROUTING_RULE,
@@ -96,6 +97,30 @@ def test_both_halves_are_nonempty() -> None:
     """
     assert ESCALATION_LADDER_CORE.strip(), 'ESCALATION_LADDER_CORE is empty'
     assert NON_STEWARD_LEVEL_GATE.strip(), 'NON_STEWARD_LEVEL_GATE is empty'
+    assert ESCALATE_INFO_CONTRACT.strip(), 'ESCALATE_INFO_CONTRACT is empty'
+
+
+def test_ladder_core_carries_the_escalate_info_contract() -> None:
+    """The one escalate_info contract is rendered into the mechanics half (PRD D3)."""
+    assert ESCALATE_INFO_CONTRACT in ESCALATION_LADDER_CORE, (
+        'ESCALATION_LADDER_CORE no longer contains ESCALATE_INFO_CONTRACT. Every '
+        'escalating role, steward included, learns the escalate_info contract '
+        'from the core; render it there exactly once.'
+    )
+
+
+def test_non_steward_gate_omits_the_escalate_info_contract() -> None:
+    """The contract belongs to the core, which the steward reads.
+
+    The same placement argument as
+    `test_non_steward_gate_names_neither_filer_action_token`: the steward is
+    composed from ESCALATION_LADDER_CORE alone, so a contract placed in the gate
+    half would be invisible to it.
+    """
+    assert ESCALATE_INFO_CONTRACT not in NON_STEWARD_LEVEL_GATE, (
+        'NON_STEWARD_LEVEL_GATE contains ESCALATE_INFO_CONTRACT. The steward is '
+        'composed from ESCALATION_LADDER_CORE alone; move the contract into the core.'
+    )
 
 
 def test_composite_is_core_plus_gate() -> None:
