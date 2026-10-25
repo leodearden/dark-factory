@@ -333,6 +333,35 @@ def test_b14_a_free_file_is_granted_without_spending(hostile: Project) -> None:
     assert newest_tree(hostile).budget.spent_lines == 0
 
 
+def test_b14_a_free_file_is_granted_after_follow_head_overspends_the_budget(tmp_path: Path) -> None:
+    project = make_project(
+        tmp_path,
+        {
+            'src/a.py': numbered('a', 200),
+            'src/b.py': numbered('b', 800),
+            'tests/test_a.py': 'def test_a():\n    assert True\n',
+        },
+        reveal_proportion=0.25,
+        reveal_floor_lines=50,
+    )
+    write_engagement(project.in_dir, project_id=PROJECT)
+    request(project, 'src/a.py')
+    project.run(minutes=60)
+    project.repo.write('src/a.py', numbered('a', 1000))
+    project.repo.commit('grow a', when=at(61))
+    request(project, 'tests/test_a.py', minutes=62)
+
+    got = pass_answers(project, minutes=63)
+
+    assert [(event.type, event.path) for event in got] == [
+        ('file_revealed', 'src/a.py'),
+        ('file_revealed', 'tests/test_a.py'),
+    ]
+    budget = newest_tree(project).budget
+    assert (budget.spent_lines, budget.budget_lines) == (1000, 450)
+    assert 'tests/test_a.py' in revealed_paths(project)
+
+
 HOSTILE_REQUESTS = [
     ('../x', RefusalReason.NOT_IN_TREE),
     ('/etc/passwd', RefusalReason.NOT_IN_TREE),
