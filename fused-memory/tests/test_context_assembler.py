@@ -1,6 +1,7 @@
 """Tests for the token-budget context assembler."""
 
 import asyncio
+import itertools
 import json
 import uuid
 from datetime import UTC, datetime
@@ -811,6 +812,73 @@ async def test_assembled_context_renders_typical_long_records_whole(mock_memory,
 
     assert _desc_line(result.context_items['task:42'].formatted) == f'  desc: {desc}'
     assert _memory_body(result.context_items[hinted.id].formatted) == hinted.content
+
+
+# ── token_budget against a measured backlog chunk ───────────────────
+# Inputs measured in plans/recon-evidence-caps-measurement-2026-10.md (M1, M2, M3, M7).
+
+_MEASURED_CHUNK_EVENTS = 268
+_MEAN_RENDERED_DESCRIPTION_CHARS = 2_052
+_MEAN_RENDERED_MEMORY_CHARS = 763
+_CONTENT_PREVIEW_CHARS = 200
+_TASKS_PER_BLOCK = 3
+
+
+def _measured_block(block: int) -> list[ReconciliationEvent]:
+    task_ids = [str(_TASKS_PER_BLOCK * block + n) for n in range(_TASKS_PER_BLOCK)]
+    return [
+        *(_make_event(EventType.task_modified, payload={'task_id': task_ids[n % _TASKS_PER_BLOCK]})
+          for n in range(11)),
+        *(_make_event(EventType.memory_added, payload={'content_preview': 'p' * _CONTENT_PREVIEW_CHARS})
+          for _ in range(7)),
+        *(_make_event(EventType.memory_deleted, payload={'memory_id': str(uuid.uuid4())})
+          for _ in range(2)),
+    ]
+
+
+def _measured_backlog_chunk() -> list[ReconciliationEvent]:
+    blocks = itertools.chain.from_iterable(_measured_block(b) for b in itertools.count())
+    return list(itertools.islice(blocks, _MEASURED_CHUNK_EVENTS))
+
+
+async def _measured_search(*, query: str, **_) -> list[MemoryResult]:
+    hits = 1 if query.startswith('memory ') else 4
+    return [_make_memory_result(content='b' * _MEAN_RENDERED_MEMORY_CHARS) for _ in range(hits)]
+
+
+async def _measured_task(*, task_id: str, project_root: str) -> dict:
+    return {**_task_with_description('d' * _MEAN_RENDERED_DESCRIPTION_CHARS), 'id': task_id}
+
+
+_BUDGET_HOMES = {
+    'shipped_config_yaml': lambda shipped: shipped.reconciliation,
+    'schema_default': lambda _shipped: ReconciliationConfig(),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('budget_home', list(_BUDGET_HOMES.values()), ids=list(_BUDGET_HOMES))
+async def test_shipped_budget_holds_a_measured_backlog_chunk(
+    budget_home, mock_config, mock_memory, mock_taskmaster,
+):
+    """token_budget holds the median budget-bound chunk at the per-item caps.
+
+    Raising a per-item cap without the budget, or cutting the budget, narrows
+    every backlog chunk and fails here.
+    """
+    mock_memory.search = AsyncMock(side_effect=_measured_search)
+    mock_taskmaster.get_task = AsyncMock(side_effect=_measured_task)
+    assembler = _make_assembler(
+        memory_service=mock_memory, taskmaster=mock_taskmaster, config=budget_home(mock_config),
+    )
+
+    result = await assembler.assemble(_measured_backlog_chunk(), _make_watermark(), 'test-project')
+
+    assert len(result.events) == _MEASURED_CHUNK_EVENTS, (
+        f'only {len(result.events)} of {_MEASURED_CHUNK_EVENTS} measured events fit '
+        f'token_budget={result.token_budget}'
+    )
+    assert result.events_remaining == 0
 
 
 # ── _ctx_task_event subtask qualification ────────────────────────────
