@@ -1464,43 +1464,6 @@ def _run_configured_nightly(
     try:
         if projects_root is None:
             projects_root = DEFAULT_PROJECTS_ROOT
-        # Task 4148. The systemd path is `nightly.py run --project-id %i` ->
-        # main() -> run_nightly, and main() never built a fetcher -- so
-        # `status_fetcher=None` reached `compute_tasks_landed` on every real run
-        # and hit its `status_fetcher is None` arm (census_trigger.py:735-739;
-        # journal 2026-08-10/11/12), leaving condition (b) tasks-landed unable to
-        # fire at all. Every OTHER seam here already resolves None to its real
-        # implementation (committer -> unlanded.commit_only above, recorder ->
-        # trickle_state.write_night, poster -> _default_poster); status_fetcher
-        # alone resolved to nothing, and that asymmetry is how three prior repairs
-        # of this same code (2953's 406 fix, 3291's baseline fix, 4085's fail-safe
-        # arms) each left the wiring loop open.
-        #
-        # Defaulted HERE rather than in main() because `cfg.project_root` is the
-        # first point in the chain where the ABSOLUTE root is known (config.py's
-        # validator guarantees absolute -- exactly what the MCP wire requires
-        # post-3291) while main() holds only --config/--project-id; and it is the
-        # identical value `evaluate_census_step` hands to `decide`, so the fetcher
-        # and the decision can never disagree about which project they are for.
-        # Deliberately NOT wrapped in try/except: the construction does no I/O
-        # (a resolve, an environ read, a returned closure), and every call-time
-        # failure is already fail-safe inside compute_tasks_landed.
-        #
-        # HAZARD, for whoever writes the next run_nightly test (amendment): this
-        # default is LIVE, so a test that seeds census-state.json with a valid
-        # non-negative `last_census_done_count` and injects no `status_fetcher`
-        # issues a REAL POST to $FUSED_MEMORY_MCP_URL (default localhost:8002) --
-        # and on a dev box where fused-memory is actually up, a stale fixture
-        # baseline against the real done-count can produce a genuine FIRE that
-        # subprocess-launches scripts/legibility/census.py (real LLM spend, real
-        # git writes). Such a test MUST fake httpx (conftest's install_fake_httpx)
-        # AND stub `_default_census_launcher`; see the task-4148 block in
-        # scripts/tests/test_legibility_nightly.py for the worked pattern.
-        status_fetcher = (
-            seams.status_fetcher if seams.status_fetcher is not None
-            else census_trigger.default_status_fetcher(cfg.project_root)
-        )
-
         # One render cache for the whole run: select_digest_sessions renders each
         # candidate to CHARGE it against the byte budget, and build_digests reuses
         # that render instead of paying for it twice. Rendering is super-linear in
@@ -1748,19 +1711,6 @@ def _run_configured_nightly(
         census_state = census_trigger.census_state_path(cfg.project_root)
         census_anchor = _census_anchor(census_state)
 
-        # Task 4148. The decision was computed and returned on NightlyResult
-        # below, but never LOGGED -- so only the census's failure modes
-        # (census_trigger's own WARNINGs, FIRE-WITHOUT-LAUNCH, 4085's
-        # evaluation-failed line) ever reached the journal. With condition (b)
-        # now wired, a healthy evaluation would otherwise be indistinguishable
-        # from the still-dead one in
-        # `journalctl --user -u legibility-trickle@dark_factory` -- the same
-        # channel that diagnosed this task. Deliberately NOT logged here at
-        # the call site (amendment): `evaluate_census_step` LAUNCHES the
-        # census synchronously before returning, so a log line here would only
-        # reach the journal after the whole census subprocess finished -- see
-        # the log site inside that function for the full reasoning. Do not
-        # re-add one here; that would double the line, not advance it.
         # Task 3269: the census is pinned to the config THIS run loaded -- never
         # a fresh resolution, never the process cwd. A retry pass skips it: the
         # scheduled pass already evaluated it this invocation, and a census that
@@ -1775,7 +1725,12 @@ def _run_configured_nightly(
             census_line, census_fire = None, False
         else:
             census_line, census_fire = evaluate_census_step(
-                cfg, now=now, status_fetcher=status_fetcher,
+                cfg, now=now,
+                status_fetcher=(
+                    seams.status_fetcher if seams.status_fetcher is not None
+                    else census_trigger.default_status_fetcher(cfg.project_root)
+                ),
+                launcher=seams.census_launcher,
                 config_path=resolved_config_path,
             )
             census_observation = trickle_state.CensusObservation(
