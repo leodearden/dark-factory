@@ -410,7 +410,7 @@ class TestCampaignUnmeasured:
         panel_results = [
             PanelRunResult(
                 variant_name=_ARM, diff_id=diff_id, total_cost_usd=cost, wall_clock_ms=100,
-                reviews={'r1': {'verdict': 'NEEDS_CHANGES', 'issues': [_ISSUE]}},
+                reviews={'r1': {'verdict': 'ISSUES_FOUND', 'issues': [_ISSUE]}},
             )
             for diff_id, cost in (('d_ok', 1.0), ('d_refused', 2.0))
         ]
