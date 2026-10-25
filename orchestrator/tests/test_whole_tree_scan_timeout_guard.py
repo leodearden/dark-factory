@@ -75,7 +75,14 @@ from _orch_helpers import (
     VERIFY_CLI_PER_TEST_TIMEOUT,
     WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
-from _tree_scan import TREE_PASS_FIXTURE, TREE_PASS_XDIST_GROUP
+from _tree_scan import (
+    ORCHESTRATOR_TESTS,
+    TREE_PASS_FIXTURE,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+)
 from shared.governed_exceptions import Debt, TaskRef, TicketRef, governed_exceptions
 from shared.pytest_mark_grammar import marker_name, pytestmark_elements, scope_binding
 from shared.testing_timeout_markers import SiteKind, timeout_marker_sites
@@ -87,13 +94,16 @@ from orchestrator.pytest_markers import (
     module_level_timeout_arguments,
 )
 
-# This module is ITSELF a member of the family it polices -- the invariant
-# below rglob()s every *.py under this directory and ast.parse()s each one --
-# so it carries the very mark it demands instead of exempting itself.  The
-# deliberate omission of the sibling guards' `_THIS_FILE`/`continue` skip-self
-# idiom is spelled out in that test's docstring; skipping itself would exempt
-# the one file most certain to need the mark.
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+# This module is ITSELF a member of the family it polices -- its census is a
+# consumer of the shared tree pass, so any of its items may be the one billed
+# the pass -- and it carries the very mark and group it demands instead of
+# exempting itself.  The deliberate omission of the sibling guards'
+# `_THIS_FILE`/`continue` skip-self idiom is spelled out in that test's
+# docstring; skipping itself would exempt the one file most certain to need it.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 # This directory, resolved from THIS FILE and never from the process CWD:
 # merge-verify runs pytest from the orchestrator/ cwd while a plain
@@ -355,10 +365,10 @@ def _scans_whole_tree_py(source: str) -> bool:
       of modules, not a lookup.
 
     * **``.py`` suffix required.** ``glob('*/src/*')`` (a real pattern, in
-      test_killpg_frozen_pgid_guard.py::_root_glob_python) walks directories,
+      _tree_scan.py::_package_root_python_files) walks directories,
       not Python sources. Restricting to ``.py`` is what keeps that same
-      function's genuine ``rglob('*.py')`` caught without its directory walks
-      being misread as three more scans.
+      function's genuine ``glob('*.py')`` caught without its directory walks
+      being misread as more scans.
 
     KNOWN LIMITATION, stated rather than papered over: an f-string, a
     variable, or a pattern built at runtime is NOT matched, and neither is a
@@ -655,9 +665,9 @@ def test_detector_ignores_non_py_directory_sweep() -> None:
     """``glob('*/src/*')`` is NOT a Python-source sweep.
 
     This is the real pattern in
-    test_killpg_frozen_pgid_guard.py::_root_glob_python, and it is what stops
+    _tree_scan.py::_package_root_python_files, and it is what stops
     the detector reading that function's directory walks as the thing being
-    guarded -- while its genuine ``rglob('*.py')`` is still caught by the case
+    guarded -- while its genuine ``glob('*.py')`` is still caught by the case
     above.
     """
     source = (
@@ -1375,14 +1385,19 @@ def test_sub_ceiling_marks_ignore_everything_else_without_raising(source: str) -
 
 @dataclass(frozen=True)
 class _ModuleCensus:
-    """What the family invariant needs to know about one module under this directory."""
+    """What the family invariant needs to know about one module under this directory.
 
-    sweeps_privately: bool
-    consumes: bool
-    is_family_member: bool
-    offence: str | None
-    xdist_group: str | None
-    low_timeout_marks: tuple[tuple[str, float], ...]
+    An unreadable module is ``readable=False`` with every other field at its
+    default: it was not examined.
+    """
+
+    readable: bool
+    sweeps_privately: bool = False
+    consumes: bool = False
+    is_family_member: bool = False
+    offence: str | None = None
+    xdist_group: str | None = None
+    low_timeout_marks: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1393,13 +1408,32 @@ class _TreeCensus:
     unreadable: tuple[str, ...]
 
 
-def _module_census(name: str, source: str) -> _ModuleCensus:
-    """Census one module, parsing it once; ``_tree_scan.py`` is a helper, not a test module, so it cannot offend."""
-    tree = _parsed(source)
+def _module_census(module: ParsedModule) -> _ModuleCensus:
+    """Census one module from the shared pass; ``_tree_scan.py`` is a helper, not a test module, so it cannot offend.
+
+    Fail-soft on the READ for the same reason _scans_whole_tree_py fails soft
+    on the PARSE: a non-UTF-8 source, a deliberately-malformed encoding fixture
+    or a broken symlink under this directory would otherwise fail a
+    TIMEOUT-COVERAGE check for a reason that has nothing to do with timeout
+    coverage -- the very class of misattributed failure this module exists to
+    prevent.  An unreadable module is not counted as examined (it was not), and
+    the family test surfaces the count, so a sweep that silently stops reading
+    cannot hide.
+    """
+    try:
+        source = module.source
+    except (UnicodeDecodeError, OSError):
+        return _ModuleCensus(readable=False)
+    try:
+        tree: ast.Module | None = module.tree
+    except (SyntaxError, ValueError):
+        tree = None
+    name = module.path.name
     sweeps = tree is not None and _sweeps_whole_tree_in(tree)
     consumes = tree is not None and _consumes_tree_pass_in(tree)
     judged = (sweeps or consumes) and name.startswith('test_')
     return _ModuleCensus(
+        readable=True,
         sweeps_privately=sweeps,
         consumes=consumes,
         is_family_member=is_whole_tree_guard_module(source),
@@ -1409,26 +1443,17 @@ def _module_census(name: str, source: str) -> _ModuleCensus:
     )
 
 
-def _tests_tree_census() -> _TreeCensus:
-    modules: dict[str, _ModuleCensus] = {}
-    unreadable: list[str] = []
-    for py_file in sorted(_TESTS_DIR.rglob('*.py')):
-        # Fail-soft on the READ for the same reason _scans_whole_tree_py fails
-        # soft on the PARSE: a non-UTF-8 source, a deliberately-malformed
-        # encoding fixture or a broken symlink under this directory would
-        # otherwise raise UnicodeDecodeError/OSError straight out of a
-        # TIMEOUT-COVERAGE check, turning it red for a reason that has nothing
-        # to do with timeout coverage -- the very class of misattributed
-        # failure this module exists to prevent. Skipped files are NOT counted
-        # as examined (they were not), and the count is surfaced by the family
-        # test so a sweep that silently stops reading anything cannot hide.
-        try:
-            source = py_file.read_text(encoding='utf-8')
-        except (UnicodeDecodeError, OSError):
-            unreadable.append(py_file.name)
-            continue
-        modules[py_file.name] = _module_census(py_file.name, source)
-    return _TreeCensus(MappingProxyType(modules), tuple(unreadable))
+ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=ORCHESTRATOR_TESTS, extract=_module_census)
+TREE_ANALYSES = (ANALYSIS,)
+
+
+def _tests_tree_census(tree_pass: TreePass) -> _TreeCensus:
+    """This directory's census by file name, projected from the shared tree pass."""
+    facts = tree_pass.facts(ANALYSIS)
+    return _TreeCensus(
+        MappingProxyType({path.name: fact for path, fact in facts.items() if fact.readable}),
+        tuple(path.name for path, fact in facts.items() if not fact.readable),
+    )
 
 
 def _sweepers(modules: Mapping[str, _ModuleCensus]) -> frozenset[str]:
@@ -1569,7 +1594,7 @@ def _failure_report(checks: Iterable[tuple[str, list[str]]]) -> str:
     )
 
 
-def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
+def test_whole_tree_scanners_carry_module_level_timeout_mark(tree_pass: TreePass) -> None:
     """Every whole-tree guard here -- a private ``*.py`` sweeper or a consumer of
     the shared tree pass -- needs a MODULE-LEVEL timeout mark AT the family
     ceiling, spelled via ``WHOLE_TREE_SCAN_TEST_TIMEOUT``, and every family
@@ -1618,19 +1643,19 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
     acts purely as a FLOOR and narrows nothing.
 
     NO SKIP-SELF, deliberately, and stated here because it inverts a convention
-    a reviewer will expect. Five sibling guards
-    (test_prune_chokepoint_guard.py::test_exactly_one_prune_argv_literal_inside_chokepoint,
-    test_event_loop_antipattern_guard.py::test_no_get_event_loop_in_orchestrator_tests,
-    and the serial-merge-worker, reachback and lock-release guards) carry a
-    ``_THIS_FILE``/``continue``
+    a reviewer will expect. Sibling guards such as
+    test_prune_chokepoint_guard.py::test_exactly_one_prune_argv_literal_inside_chokepoint,
+    test_event_loop_antipattern_guard.py::test_no_get_event_loop_in_orchestrator_tests
+    and the lock-release guard carry a ``_THIS_FILE``/``continue``
     skip-self because their forbidden pattern necessarily appears in their own
     detector code, making self-inclusion a guaranteed false positive. The
-    opposite holds here: this module genuinely IS a whole-tree AST scanner and
-    genuinely IS exposed to the same worker-death cliff, so skipping itself
+    opposite holds here: this module genuinely IS a whole-tree guard -- a
+    consumer of the shared pass, so any of its items may be billed the pass --
+    and genuinely IS exposed to the same worker-death cliff, so skipping itself
     would exempt the one file most certain to need the mark. Its own
     ``pytestmark`` is at the top of this file.
     """
-    census = _tests_tree_census()
+    census = _tests_tree_census(tree_pass)
     modules = census.modules
     guards = _sweepers(modules) | _consumers(modules)
 
@@ -1678,8 +1703,10 @@ _FORMERLY_MIXED_MODULES = (
 
 
 @pytest.mark.parametrize('module_name', _FORMERLY_MIXED_MODULES)
-def test_formerly_mixed_module_is_not_a_family_member(module_name: str) -> None:
-    source = (_TESTS_DIR / module_name).read_text(encoding='utf-8')
+def test_formerly_mixed_module_is_not_a_family_member(
+    module_name: str, tree_pass: TreePass,
+) -> None:
+    census = _tests_tree_census(tree_pass).modules[module_name]
     reason = (
         'Move the incidental whole-tree scan into a dedicated *_guard.py module. '
         'A module-level family mark widens the hang ceiling of every unrelated '
@@ -1687,10 +1714,10 @@ def test_formerly_mixed_module_is_not_a_family_member(module_name: str) -> None:
         f'({WHOLE_TREE_SCAN_TEST_TIMEOUT}s), and drags those tests into every '
         'task-role verify (docs/task-role-pytest-floor.md).'
     )
-    assert is_whole_tree_guard_module(source) is False, (
+    assert census.is_family_member is False, (
         f'{module_name} carries the whole-tree guard family mark. {reason}'
     )
-    assert _scans_whole_tree_py(source) is False, (
+    assert census.sweeps_privately is False, (
         f'{module_name} sweeps a directory tree for *.py files. {reason}'
     )
 
@@ -1720,11 +1747,12 @@ _ORIGINAL_FAMILY_HOMES = MappingProxyType({
 })
 
 
-def test_every_original_family_scan_is_served_by_the_shared_pass() -> None:
+def test_every_original_family_scan_is_served_by_the_shared_pass(tree_pass: TreePass) -> None:
+    modules = _tests_tree_census(tree_pass).modules
     outside = [
         f'{original}: its scan lives in {home}, which does not consume the shared pass'
         for original, home in sorted(_ORIGINAL_FAMILY_HOMES.items())
-        if not _consumes_tree_pass((_TESTS_DIR / home).read_text(encoding='utf-8'))
+        if not (home in modules and modules[home].consumes)
     ]
     assert outside == [], (
         'Each scan of the original whole-tree guard family must resolve to the one '
