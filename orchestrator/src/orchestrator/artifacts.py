@@ -28,6 +28,22 @@ PLAN_TASK_TEXT_FP_KEY = '_task_text_fp'
 # Must exceed the longest legitimate critical section: plan_tools._mark_step_done's two timeout=10 git probes.
 PLAN_MUTEX_TIMEOUT_SECS = 60.0
 
+ORCHESTRATOR_ITERATION_SOURCES: frozenset[str] = frozenset({'orchestrator', 'amendment'})
+"""The only ``source`` values :meth:`TaskArtifacts.append_iteration_log` writes."""
+
+
+def iteration_entry_written_by_orchestrator(entry: object) -> bool:
+    """Whether an iterations.jsonl entry went through ``TaskArtifacts.append_iteration_log``.
+
+    Agents also append to iterations.jsonl by hand from their own shell
+    (task 5726); only entries passing this check are orchestrator-written.
+    Total over arbitrary JSON: any non-dict entry or non-str source is False.
+    """
+    if not isinstance(entry, dict):
+        return False
+    source = entry.get('source')
+    return isinstance(source, str) and source in ORCHESTRATOR_ITERATION_SOURCES
+
 
 class ArtifactWriteError(OSError):
     """An atomic artifact write was REFUSED; the target was left UNTOUCHED.
@@ -1009,7 +1025,17 @@ class TaskArtifacts:
         return completed
 
     def append_iteration_log(self, entry: dict) -> None:
-        """Append to .task/iterations.jsonl — one JSON object per line."""
+        """Append to iterations.jsonl — one JSON object per line.
+
+        A missing ``source`` is stamped ``'orchestrator'``; any source outside
+        :data:`ORCHESTRATOR_ITERATION_SOURCES` is refused before writing.
+        """
+        entry.setdefault('source', 'orchestrator')
+        if not iteration_entry_written_by_orchestrator(entry):
+            raise ValueError(
+                f'iteration-log source must be one of '
+                f'{sorted(ORCHESTRATOR_ITERATION_SOURCES)}, got {entry["source"]!r}'
+            )
         entry['timestamp'] = datetime.now(UTC).isoformat()
         log_path = self.root / 'iterations.jsonl'
         with open(log_path, 'a') as f:
