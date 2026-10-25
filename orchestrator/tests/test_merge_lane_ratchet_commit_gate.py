@@ -1034,7 +1034,7 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         assert refused.returncode == 1, refused.stdout + refused.stderr
         assert 'rose 128 -> 129' in refused.stderr
 
-        repo.write_entry(_a_py_cognitive_raise(128, 129, '5830'))
+        repo.write_entry(_a_py_cognitive_raise(128, 129, '5792'))
         repo.stage(metrics.LEDGER_DIR_RELPATH)
 
         authorized = repo.gate()
@@ -1066,7 +1066,7 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         written = metrics.write_baseline(
             repo.root / metrics.BASELINE_RELPATH,
             _with_a_py('cognitive', 129),
-            authorization=metrics.RaiseAuthorization(task_id='5830', reason='beyond both sides'),
+            authorization=metrics.RaiseAuthorization(task_id='5792', reason='beyond both sides'),
             ledger=repo.root / metrics.LEDGER_DIR_RELPATH,
         )
         assert written.record is not None
