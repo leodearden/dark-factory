@@ -99,6 +99,11 @@ _TESTS_DIR = Path(__file__).resolve().parent
 _MIN_EXPECTED_TEST_FILES = 400
 _MIN_EXPECTED_SCANNERS = 10
 
+# The shared tree pass's home sweeps by design but is a helper, not a test
+# module: a pytestmark there binds no item, and its cost is billed to the
+# consumer item that first requests the tree_pass fixture.
+_SHARED_PASS_MODULE = '_tree_scan.py'
+
 # Worst wall clock MEASURED for a member of this family under REAL load: a
 # per-test TOTAL (setup + call + teardown, what a timeout mark bounds; almost all
 # of it module-fixture setup) of 148.65s for test_merge_lane_ratchet.py::
@@ -1070,6 +1075,8 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
         if not _scans_whole_tree_py(source):
             continue
         scanners.append(py_file)
+        if py_file.name == _SHARED_PASS_MODULE:
+            continue
         offence = _scanner_offence(py_file.name, source)
         if offence is not None:
             offenders.append(offence)
