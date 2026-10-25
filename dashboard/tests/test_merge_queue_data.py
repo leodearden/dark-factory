@@ -6,7 +6,7 @@ import asyncio
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import httpx
@@ -1726,6 +1726,28 @@ class TestBuildPerProjectMergeQueue:
             assert project[field].state is DatumState.UNKNOWN, field
             assert 'RuntimeError: boom' in (project[field].reason or ''), field
             validate_datum(project[field], now)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('failing, failure', [
+        ('queue_depth_timeseries', AsyncMock(side_effect=RuntimeError('boom'))),
+        ('safe_gather_result', MagicMock(side_effect=RuntimeError('boom'))),
+    ], ids=['depth-leg-raises', 'whole-project-fails'])
+    async def test_an_unread_depth_still_names_the_windows_width(self, tmp_path, failing, failure):
+        """Both fallbacks serve the window's bucket width beside their empty series."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        hours = 168
+        db_path = _make_db(tmp_path, 'unread_depth.db', [])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with patch(f'dashboard.data.merge_queue.{failing}', new=failure):
+                result = await build_per_project_merge_queue([('/tmp/P', conn)], hours=hours, now=now)
+
+        assert result['/tmp/P']['depth_timeseries'] == {
+            'labels': [], 'values': [], 'bucket_minutes': _bucket_minutes_for_window(hours),
+        }
 
     @pytest.mark.asyncio
     async def test_cancelled_error_from_sub_query_propagates(self, tmp_path):
