@@ -228,6 +228,10 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      quiescence/resolve-to-done fork), and block.  A non-zero rc reaching this
      branch is always a verdict — the default runner's own timeout no longer
      arrives as one (next bullet).
+   - ``rc == 75`` on a gate declaring ``before_done.recheck_secs`` with a dated
+     milestone is "not yet": the gate re-arms instead of failing
+     (``DeterministicRunner._run_predicate`` carries the table, PRD
+     ``plans/completion-driven-triggers-prd.md`` C1).
    - ``ScriptTimeout`` — the DEFAULT runner's INNER per-script timeout (task
      4065) — is an infra fault, NOT a verdict: ``infra_issue`` + blocked with
      NO ``gate_escalated_at`` stamp.  See the ``ScriptTimeout`` class
@@ -382,6 +386,7 @@ from shared.task_metadata import (
 )
 
 from orchestrator import systemd_inspect
+from orchestrator.config import PREDICATE_RECHECK_STALL_CAP
 from orchestrator.deploy_state import (
     DeployPhase,
     DeployState,
@@ -390,7 +395,15 @@ from orchestrator.deploy_state import (
     enforce_transition,
 )
 from orchestrator.fm_retry import FM_RESTART_RETRY_WINDOW_SECS, fm_retry_backoffs
-from orchestrator.predicate_recheck import PredicateRecheck, reset, verdict_stamps
+from orchestrator.event_store import EventType
+from orchestrator.predicate_recheck import (
+    PREDICATE_VERDICT_KEY,
+    PredicateRecheck,
+    rearmed,
+    recheck_declaration,
+    reset,
+    verdict_stamps,
+)
 from orchestrator.proc_supervision import (
     EscalationSpec,
     FreshPidVerify,
@@ -1175,6 +1188,13 @@ def _predicate_verdict(out: object) -> dict | None:
     return payload.json_value
 
 
+def _render_verdict(verdict: dict | None) -> str:
+    """A ``predicate_verdict`` as one compact line, for logs and escalation details."""
+    if verdict is None:
+        return 'no structured verdict'
+    return json.dumps(verdict, separators=(',', ':'))
+
+
 def _is_operational_llm_gate(metadata: dict) -> bool:
     """Return True iff *metadata* carries β's operational-llm-gate marker.
 
@@ -1431,6 +1451,15 @@ class DeterministicRunner:
             script resolves under.  Defaults to
             ``shared.repo_paths.resolve_dark_factory_root``; consulted only for
             such scripts.  ``None`` raises ``FactoryRootUnresolved``.
+        predicate_recheck_stall_cap: How many consecutive exit-75 "not yet"
+            verdicts a re-arming predicate may return before the runner files
+            ``milestone_check_stalled`` (PRD completion-driven-triggers C1).
+            ``Harness._run_deterministic_slot`` passes the live
+            ``deterministic.predicate_recheck_stall_cap``; the default is
+            ``orchestrator.config.PREDICATE_RECHECK_STALL_CAP``.
+        clock: Optional callable ``() -> datetime`` (aware, UTC) timing the
+            re-arm and its streak record.  Defaults to ``datetime.now(UTC)``.
+            Injected in tests for exact ``milestone.at`` assertions.
     """
 
     def __init__(
@@ -1447,6 +1476,8 @@ class DeterministicRunner:
         run_timeout_grace_secs=_RUN_TIMEOUT_GRACE_SECS,
         inspect_timeout_secs=_INSPECT_TIMEOUT_SECS,
         factory_root_resolver: Callable[[], Path | None] | None = None,
+        predicate_recheck_stall_cap: int = PREDICATE_RECHECK_STALL_CAP,
+        clock: Callable[[], datetime] | None = None,
     ):
         self.scheduler = scheduler
         self.escalation_queue = escalation_queue
@@ -1463,6 +1494,8 @@ class DeterministicRunner:
         self._run_timeout_grace_secs = run_timeout_grace_secs
         self._inspect_timeout_secs = inspect_timeout_secs
         self._factory_root_resolver = factory_root_resolver or resolve_dark_factory_root
+        self._predicate_recheck_stall_cap = predicate_recheck_stall_cap
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     # ------------------------------------------------------------------
     # Default injectable seam implementations
@@ -2959,12 +2992,23 @@ class DeterministicRunner:
           a Mem0 completion-summary write, so raw subprocess output landing
           there is ingested into memory.  The full raw output is logged at
           INFO immediately before summarizing, so nothing is silently lost.
+        - ``rc == 75`` (``os.EX_TEMPFAIL``) on a gate declaring
+          ``before_done.recheck_secs`` with a dated milestone -> "not yet"
+          (PRD ``plans/completion-driven-triggers-prd.md`` C1): ONE merge
+          write advances ``milestone.at`` by ``recheck_secs`` and stamps the
+          streak record and verdict, then a best-effort ``pending`` ->
+          ``WorkflowOutcome.REQUEUED``.  A refused write files the
+          no-verdict category and blocks instead.
         - ``rc != 0`` -> a milestone VERDICT failure ("the invariant does not
           hold"): born-at-L2 ``milestone_check_failed`` escalation +
           ``gate_escalated_at`` stamp + blocked (routes through section-1's
           resume/quiescence machinery on the next dispatch).  Any non-zero rc
           returned by the seam is a verdict — including one from an injected
-          ``script_runner``, whatever its tail text says.
+          ``script_runner``, whatever its tail text says.  An UNDECLARED 75
+          lands here, its detail naming what the declaration lacks.
+        - Every verdict exit (0, 75, other) stamps ``predicate_verdict`` by
+          ``orchestrator.predicate_recheck.verdict_stamps``, and every exit
+          but a re-arm resets a ``predicate_recheck`` streak.
         - ``ScriptTimeout`` (task 4065) -> an INFRA fault, not a verdict: the
           DEFAULT runner's own inner per-script timeout fired, so no exit code
           exists.  born-at-L2 escalation + blocked, with NO
@@ -2999,7 +3043,8 @@ class DeterministicRunner:
           for the category instead of asserting the opposite of it.
 
         Returns:
-            WorkflowOutcome.DONE or WorkflowOutcome.BLOCKED.
+            WorkflowOutcome.DONE, WorkflowOutcome.BLOCKED, or
+            WorkflowOutcome.REQUEUED after a re-arm.
         """
         run_fn = self._script_runner or self._default_run_script
         outer_timeout = before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
@@ -3142,7 +3187,21 @@ class DeterministicRunner:
 
         verdict = _predicate_verdict(out)
         prev_recheck = PredicateRecheck.from_metadata(metadata)
-        now = datetime.now(UTC)
+        now = self._clock()
+        declaration_gap: str | None = None
+        if rc == os.EX_TEMPFAIL:
+            declaration = recheck_declaration(before_done, metadata.get('milestone'))
+            if declaration.recheck_secs is not None:
+                return await self._rearm_or_stall(
+                    task_id,
+                    metadata=metadata,
+                    out=out,
+                    verdict=verdict,
+                    record=rearmed(prev_recheck, now, declaration.recheck_secs),
+                    recheck_secs=declaration.recheck_secs,
+                    no_verdict_category=no_verdict_category,
+                )
+            declaration_gap = declaration.gap
         settled_stamps = verdict_stamps(
             metadata, verdict, reset(prev_recheck, now) if prev_recheck else None,
         )
@@ -3166,6 +3225,7 @@ class DeterministicRunner:
             fail_detail = '\n'.join([
                 description,
                 f'Predicate check exit code: rc={rc}',
+                *([declaration_gap] if declaration_gap else []),
                 f'Output:\n{out}',
             ])
             return await self._file_predicate_escalation_and_block(
@@ -3209,6 +3269,121 @@ class DeterministicRunner:
             ),
         )
         return WorkflowOutcome.DONE
+
+    async def _rearm_or_stall(
+        self,
+        task_id: str,
+        *,
+        metadata: dict,
+        out: object,
+        verdict: dict | None,
+        record: PredicateRecheck,
+        recheck_secs: int,
+        no_verdict_category: str,
+    ) -> WorkflowOutcome:
+        """Answer a declared exit-75 "not yet": re-arm the gate (PRD C1)."""
+        return await self._rearm_predicate(
+            task_id,
+            metadata=metadata,
+            out=out,
+            verdict=verdict,
+            record=record,
+            recheck_secs=recheck_secs,
+            no_verdict_category=no_verdict_category,
+        )
+
+    async def _rearm_predicate(
+        self,
+        task_id: str,
+        *,
+        metadata: dict,
+        out: object,
+        verdict: dict | None,
+        record: PredicateRecheck,
+        recheck_secs: int,
+        no_verdict_category: str,
+    ) -> WorkflowOutcome:
+        """Advance the dated ``milestone.at`` to *record*'s next check and re-pend.
+
+        ONE merge write carries the advanced milestone, the streak record and
+        the verdict.  It comes first, so a lost trailing status write leaves a
+        task whose advanced ``at`` already withholds re-dispatch.  A REFUSED
+        write is escalated instead: with ``at`` not advanced, re-pending would
+        re-dispatch at once into the same 75, a loop with no escape.
+        """
+        logger.info(
+            'DeterministicRunner: task %s predicate raw output (%d chars, '
+            'summarized into predicate_verdict): %s',
+            task_id, len(out) if isinstance(out, str) else 0, out,
+        )
+        assert record.next_check_at is not None
+        next_check_at = record.next_check_at.isoformat()
+        stamps = {
+            'milestone': {**metadata['milestone'], 'at': next_check_at},
+            PREDICATE_VERDICT_KEY: verdict,
+            **verdict_stamps(metadata, verdict, record),
+        }
+        if not await self.scheduler.update_task(task_id, stamps, metadata_mode='merge'):
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Predicate re-arm write failed (rc=75)',
+                detail='\n'.join([
+                    f'The predicate answered "not yet" (exit 75) and should have re-armed '
+                    f'to next_check_at={next_check_at}, but the metadata write advancing '
+                    'milestone.at was refused, so the gate was not re-armed.',
+                    'Blocked rather than re-pended: with milestone.at unchanged, a '
+                    're-dispatch would re-run the check at once into the same verdict.',
+                    'Resume to re-run the check.',
+                ]),
+                category=no_verdict_category,
+            )
+        self._emit_predicate_event(
+            EventType.predicate_rearmed, task_id, record=record, recheck_secs=recheck_secs,
+            verdict=verdict,
+        )
+        logger.info(
+            'DeterministicRunner: task %s predicate re-armed (rc=75, consecutive=%d/%d, '
+            'next_check_at=%s): %s',
+            task_id, record.consecutive, self._predicate_recheck_stall_cap, next_check_at,
+            _render_verdict(verdict),
+        )
+        try:
+            await self.scheduler.set_task_status(task_id, 'pending')
+        except Exception as exc:
+            logger.warning(
+                'DeterministicRunner: task %s pending-status writeback failed after the '
+                're-arm (%s: %s) — milestone.at is already advanced, so the gate stays '
+                'withheld until next_check_at regardless',
+                task_id, type(exc).__name__, exc,
+            )
+        return WorkflowOutcome.REQUEUED
+
+    def _emit_predicate_event(
+        self,
+        event_type: EventType,
+        task_id: str,
+        *,
+        record: PredicateRecheck,
+        recheck_secs: int,
+        verdict: dict | None,
+    ) -> None:
+        event_store = getattr(self.scheduler, 'event_store', None)
+        if event_store is None:
+            return
+        event_store.emit(
+            event_type,
+            task_id=task_id,
+            data={
+                'rc': os.EX_TEMPFAIL,
+                'consecutive': record.consecutive,
+                'stall_cap': self._predicate_recheck_stall_cap,
+                'recheck_secs': recheck_secs,
+                'next_check_at': (
+                    record.next_check_at.isoformat() if record.next_check_at else None
+                ),
+                'verdict': verdict,
+            },
+        )
 
     # ------------------------------------------------------------------
     # before_done deploy script execution — shared by run()'s named-target
