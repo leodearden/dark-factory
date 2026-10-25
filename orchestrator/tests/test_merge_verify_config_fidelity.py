@@ -492,8 +492,8 @@ async def test_spec_carried_read_takes_the_dispatchers_value(tmp_path: Path, row
     probe = _CARRIED_PROBES[row]
     received = await _config_the_remote_bundle_receives(
         tmp_path,
-        OrchestratorConfig(**probe.dispatcher),
-        OrchestratorConfig(**probe.host),
+        OrchestratorConfig.model_validate(dict(probe.dispatcher)),
+        OrchestratorConfig.model_validate(dict(probe.host)),
         _ROUTES[route],
     )
     assert probe.observe(received) == probe.expected, (
