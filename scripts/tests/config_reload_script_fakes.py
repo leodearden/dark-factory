@@ -58,9 +58,15 @@ class FakeEscalationMcp:
     `initialize_reply` / `tool_call_reply` each override one step of that
     exchange with a literal (status, headers, body) triple, which is how the
     transport-fault cases below are built without restating the handshake.
-    `tool_call_delay` holds the authenticated `tools/call` reply back that many
-    seconds (released early at exit), modelling a tool that outlives the
-    client's read timeout.
+    `faults_armed` gates both overrides: they bite only while it answers True,
+    so a fault can wait for a landing to happen first. `tool_call_delay`
+    holds the authenticated `tools/call` reply back that many seconds
+    (released early at exit), modelling a tool that outlives the client's
+    read timeout.
+
+    `tool_handlers` maps a tool name to a function of its arguments whose
+    return value is that tool's structuredContent. A tool without a handler
+    answers *report*, as reload_config does.
     """
 
     SESSION_ID = "sess-5379-fake"
@@ -76,11 +82,13 @@ class FakeEscalationMcp:
     )
 
     def __init__(self, report=None, *, initialize_reply=None, tool_call_reply=None,
-                 tool_call_delay=0.0):
+                 tool_call_delay=0.0, tool_handlers=None, faults_armed=lambda: True):
         self.report = report
         self.initialize_reply = initialize_reply
         self.tool_call_reply = tool_call_reply
         self.tool_call_delay = tool_call_delay
+        self.tool_handlers = dict(tool_handlers or {})
+        self.faults_armed = faults_armed
         self._release = threading.Event()
         self.received = []
         outer = self
@@ -123,8 +131,9 @@ class FakeEscalationMcp:
         method = payload.get("method")
         if method != "initialize" and not headers.get("mcp-session-id"):
             return self.MISSING_SESSION_REPLY
+        armed = self.faults_armed()
         if method == "initialize":
-            return self.initialize_reply or (
+            return (armed and self.initialize_reply) or (
                 200,
                 {"Content-Type": "application/json",
                  "mcp-session-id": self.SESSION_ID},
@@ -133,13 +142,22 @@ class FakeEscalationMcp:
             )
         if method == "notifications/initialized":
             return (202, {}, "")
+        params = payload.get("params") or {}
+        handler = self.tool_handlers.get(params.get("name"))
+        if handler is not None:
+            return self._structured(payload, handler(params.get("arguments") or {}))
         if self.tool_call_delay > 0:
             self._release.wait(self.tool_call_delay)
-        return self.tool_call_reply or (
+        return (armed and self.tool_call_reply) or self._structured(payload, self.report)
+
+    @staticmethod
+    def _structured(payload, content):
+        """A 200 SSE `tools/call` reply carrying *content* as structuredContent."""
+        return (
             200,
             {"Content-Type": "text/event-stream"},
             sse_frame({"jsonrpc": "2.0", "id": payload.get("id"),
-                       "result": {"structuredContent": self.report}}),
+                       "result": {"structuredContent": content}}),
         )
 
     def rpc_methods(self):
@@ -148,8 +166,13 @@ class FakeEscalationMcp:
 
     def called_tools(self):
         """The tool names every `tools/call` the server saw asked for."""
+        return [name for name, _ in self.tool_calls()]
+
+    def tool_calls(self):
+        """(tool name, arguments) for every `tools/call` the server saw, in order."""
         return [
-            (payload.get("params") or {}).get("name")
+            ((payload.get("params") or {}).get("name"),
+             (payload.get("params") or {}).get("arguments") or {})
             for _, _, payload in self.received
             if payload.get("method") == "tools/call"
         ]
