@@ -30,7 +30,6 @@ This module holds three things:
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -39,7 +38,7 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.config import OrchestratorConfig
 
-# The ratchet below rglob()s every test_*.py under tests/ and ast.parse()s each
+# The ratchet below glob()s every test_*.py directly in tests/ and ast.parse()s each
 # one, which makes this module the newest member of the whole-tree-scanner
 # family.  Exceeding the 60s pyproject default does NOT merely fail the test:
 # pytest-timeout's thread method os._exit()s the whole xdist worker and
@@ -464,20 +463,18 @@ class TestHatchIsNotAutouse:
     Making it autouse is the inversion task 3886 rejected on the record: it
     would strip the operational config from the thousands of tests that
     legitimately read it, turning this sweep's premise into its opposite.
-    Asserted off the fixture's own marker, not off any prose.
+    Asserted off what pytest actually resolves for a test that does NOT ask
+    for the hatch, not off prose or pytest internals.
     """
 
-    def test_fixture_marker_is_not_autouse(self):
-        conftest = sys.modules['conftest']
-        conftest_file = conftest.__file__
-        assert conftest_file is not None and (
-            Path(conftest_file).parent == Path(__file__).parent
-        ), (
-            f'resolved the wrong conftest: {conftest_file}'
-        )
-        marker = conftest.code_default_config._fixture_function_marker
-        assert marker.autouse is False, (
+    def test_a_test_that_does_not_ask_for_the_hatch_does_not_get_it(self, request):
+        assert 'code_default_config' not in request.fixturenames, (
             'code_default_config must never be autouse — it would re-point '
             'ORCH_CONFIG_PATH at an absent file for the whole suite, stripping '
             'the operational config from every test that legitimately reads it'
+        )
+        in_effect = Path(os.environ['ORCH_CONFIG_PATH'])
+        assert in_effect.name == 'dark-factory-orchestrator.yaml' and in_effect.is_file(), (
+            f'an un-hatched test must read the operational config; '
+            f'ORCH_CONFIG_PATH is {in_effect}'
         )
