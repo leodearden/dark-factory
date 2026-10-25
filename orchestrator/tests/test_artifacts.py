@@ -24,6 +24,7 @@ from orchestrator.artifacts import (
     _normalize_plan,
     iteration_entry_written_by_orchestrator,
 )
+from orchestrator.review_payload import ReviewPayloadError
 
 
 @pytest.fixture
@@ -1301,6 +1302,17 @@ class TestReviews:
         assert 'reviewer1' in agg.reviews
         assert 'reviewer2' not in agg.reviews
         assert not agg.all_reviewers_errored
+
+    def test_aggregate_reviews_rejects_an_off_contract_verdict(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer1', {
+            'reviewer': 'reviewer1',
+            'verdict': 'NEEDS_CHANGES',
+            'issues': [],
+            'summary': 'not a contract verdict',
+        })
+
+        with pytest.raises(ReviewPayloadError, match='NEEDS_CHANGES'):
+            artifacts.aggregate_reviews()
 
 
 class TestBlockingDependency:

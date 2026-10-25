@@ -7,9 +7,15 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from pathlib import Path
 
 import pytest
 
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.evals import compare
+from orchestrator.evals.metrics import EvalMetrics, compute_composite
+from orchestrator.evals.results import EvalResult
+from orchestrator.evals.scoring import quality_from_review_artifact
 from orchestrator.mcp import verdict_tools as _verdict_tools
 from orchestrator.review_payload import (
     ReviewPayload,
@@ -154,3 +160,48 @@ class TestReviewPayload:
         payload = normalize_review(_payload())
 
         pytest.raises(dataclasses.FrozenInstanceError, setattr, payload, 'verdict', Verdict.PASS)
+
+
+def _task_artifacts(root: Path) -> TaskArtifacts:
+    artifacts = TaskArtifacts(root)
+    artifacts.init('df_task', 'T', 'd')
+    return artifacts
+
+
+def _eval_score(worktree: Path) -> float:
+    result = EvalResult('df_task', 'cfg', 'done', {'plan_steps': 5}, str(worktree))
+    return compare.score_result_from_artifacts(result)
+
+
+@pytest.mark.parametrize('verdict', list(Verdict))
+def test_b4_envelope_and_legacy_payload_agree_in_production_and_evals(
+    tmp_path: Path, verdict: Verdict,
+):
+    payload = _payload(verdict.value)
+    envelope = _verdict_tools._envelope(_REVIEWER, 'sid-b4', payload)
+    expected = (0, 0, [_REVIEWER]) if verdict is Verdict.ERROR else (1, 2, [])
+
+    for shape, artifact in (('legacy', payload), ('envelope', envelope)):
+        production = _task_artifacts(tmp_path / shape)
+        production.write_review(_REVIEWER, artifact)
+        aggregation = production.aggregate_reviews()
+        assert (
+            len(aggregation.blocking_issues),
+            len(aggregation.suggestions),
+            aggregation.reviewer_errors,
+        ) == expected, shape
+
+    blocking, suggestions, _ = expected
+    score = compute_composite(EvalMetrics(
+        tests_pass=True,
+        plan_steps=5,
+        review_blocking_issues=blocking,
+        review_suggestions=suggestions,
+    ))
+    assert quality_from_review_artifact(payload, plan_steps=5) == score
+    assert quality_from_review_artifact(envelope, plan_steps=5) == score
+
+    _task_artifacts(tmp_path / 'wt_legacy').write_review(_REVIEWER, payload)
+    _task_artifacts(tmp_path / 'wt_envelope').write_verdict(_REVIEWER, envelope)
+    assert _eval_score(tmp_path / 'wt_legacy') == score
+    assert _eval_score(tmp_path / 'wt_envelope') == score
