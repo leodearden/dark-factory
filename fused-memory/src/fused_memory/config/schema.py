@@ -685,9 +685,8 @@ class ProceduralTopicCluster(BaseModel):
     """One known-contradictory topic for the write-time topic guard.
 
     A cluster is matched deterministically: an incoming add_memory write whose
-    explicit ``category`` is one of ``_TOPIC_GUARD_GATED_CATEGORIES``
-    (``procedural_knowledge`` and ``preferences_and_norms`` as of task 3430;
-    see ``fused_memory.server.tools``) is soft-blocked when its (lowercased)
+    explicit ``category`` is in ``_TOPIC_GUARD_GATED_CATEGORIES``
+    (``server/tools.py::create_mcp_server``) is soft-blocked when its (lowercased)
     content contains EITHER at least ``min_phrase_hits`` DISTINCT ``phrases``,
     OR any single phrase listed in ``sufficient_phrases``. The cosine
     near-duplicate guard that this topic guard complements (see
@@ -2027,11 +2026,11 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
-    # Write-time TOPIC-keyed cluster guard for add_memory writes (task 2845),
-    # extended by task 3430 to gate on category in _TOPIC_GUARD_GATED_CATEGORIES
-    # (server/tools.py) -- currently procedural_knowledge and preferences_and_norms
-    # -- rather than procedural_knowledge alone. Complements the cosine near-dup
-    # guard above, which remains procedural_knowledge-only: paraphrased same-topic
+    # Write-time TOPIC-keyed cluster guard for add_memory writes (task 2845), gated
+    # since task 3430 on category in _TOPIC_GUARD_GATED_CATEGORIES
+    # (server/tools.py::create_mcp_server) rather than procedural_knowledge alone.
+    # Complements the cosine near-dup guard above, which remains
+    # procedural_knowledge-only: paraphrased same-topic
     # entries score BELOW any cosine threshold that is also safe for unrelated writes,
     # so a recurring known-contradictory topic (e.g. "pytest-xdist -n0 serial override")
     # kept accumulating contradictory entries the cosine guard
@@ -2046,17 +2045,20 @@ class ReconciliationConfig(BaseModel):
     # Machine-derived clusters from server/topic_cluster_store.py merge AFTER this
     # list at read time and, unlike it, ARE project-scoped
     # (server/near_duplicate_guard.py::resolve_topic_guard_clusters).
-    # NOTE: the field keeps its historical `procedural_knowledge_` prefix for config
-    # back-compat even though the gate now spans both categories -- do not rename it
-    # (ReconciliationConfig's model_validator hard-raises on the legacy renamed key)
-    # or the ProceduralTopicCluster class / error_type strings.
+    # NOTE: the field keeps its historical `procedural_knowledge_` prefix although the
+    # gate covers more categories. Do not rename it: ReconciliationConfig leaves
+    # pydantic's extra='ignore' in force, so a rename would silently drop any operator
+    # override still written under the old key unless a rejecting validator like
+    # _reject_legacy_bulk_reset_threshold were added. Keep the ProceduralTopicCluster
+    # class name and the ProceduralKnowledgeKnownTopicClusterWriteRejected error_type
+    # too; writers and skills match on that error_type string.
     procedural_knowledge_topic_guard_clusters: list[ProceduralTopicCluster] = Field(
         default_factory=_default_topic_guard_clusters,
         description=(
             'Known-contradictory topic clusters for the write-time topic guard. An '
-            'add_memory write whose explicit category is in _TOPIC_GUARD_GATED_CATEGORIES '
-            '(server/tools.py -- procedural_knowledge and preferences_and_norms as of '
-            "task 3430) and whose content contains >= a cluster's min_phrase_hits "
+            'add_memory write whose explicit category is gated (procedural_knowledge or '
+            'preferences_and_norms; source of truth: _TOPIC_GUARD_GATED_CATEGORIES in '
+            "server/tools.py) and whose content contains >= a cluster's min_phrase_hits "
             "distinct phrases -- OR any single one of that cluster's sufficient_phrases, "
             'for phrases distinctive enough to qualify alone -- is soft-blocked '
             '(error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) BEFORE '
@@ -2068,11 +2070,8 @@ class ReconciliationConfig(BaseModel):
             'gates (2841/2844) are done -- and must not be reinstated without '
             'reading the retirement notes on _default_topic_guard_clusters. An '
             'empty list disables the topic guard. '
-            'This field keeps its historical procedural_knowledge_ name prefix for '
-            'config back-compat even though the gate now spans both categories; '
-            'do not rename it (a ReconciliationConfig model_validator hard-raises on '
-            'the legacy renamed key) or the ProceduralTopicCluster class / '
-            'error_type strings. '
+            'The procedural_knowledge_ name prefix is historical: the guard covers '
+            'more than procedural_knowledge. '
             'A sufficient_phrases entry absent from that cluster\'s phrases is '
             'rejected at load/reload rather than silently matching nothing. Green-tier '
             'hot-reloadable via the reload_config MCP tool (read live per add_memory '
