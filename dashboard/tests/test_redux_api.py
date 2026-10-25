@@ -697,7 +697,7 @@ def _task_ids(rows):
 def test_shape_merge_queue_relabels_and_renames_depth():
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [0, 1], 'values': [3, 4]},
+            'depth_timeseries': {'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60},
             'outcomes': {'labels': ['done'], 'values': [12]},
             'latency': {'p50': 6000},
             'recent': [_mq_titled('17')],
@@ -708,10 +708,28 @@ def test_shape_merge_queue_relabels_and_renames_depth():
     body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     assert 'dark-factory' in body['MERGE_QUEUE']
     section = body['MERGE_QUEUE']['dark-factory']
-    assert section['depth'] == {'labels': [0, 1], 'values': [3, 4]}
+    assert section['depth'] == {'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60}
     assert _task_ids(section['recent']) == ['17']
     # Default: no halt_status passed → offline fallback per project.
     assert section['halt'] == {'offline': True}
+
+
+def test_shape_merge_queue_serves_no_width_for_a_depth_that_names_none():
+    """A depth series without bucket_minutes serves None for it, never a guessed width."""
+    raw = {
+        '/home/leo/src/dark-factory': {
+            'depth_timeseries': {'labels': [], 'values': []},
+            'outcomes': {'labels': [], 'values': []},
+            'latency': {},
+            'recent': [],
+            'active': [],
+            **_MQ_MEASURED_QUEUE,
+        },
+    }
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
+    assert body['MERGE_QUEUE']['dark-factory']['depth'] == {
+        'labels': [], 'values': [], 'bucket_minutes': None,
+    }
 
 
 def test_shape_merge_queue_carries_the_recent_window_total():
