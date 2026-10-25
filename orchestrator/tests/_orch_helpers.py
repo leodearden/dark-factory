@@ -183,9 +183,21 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 # task 4215: per-test ceiling for the family of guard tests that sweep the
 # WHOLE tree -- `rglob('*.py')` over ~500 files, `ast.parse` on each -- and so
 # cannot be sized by the ordinary 60s default.  This comment is the SINGLE
-# home of that rationale: the ~13 modules that carry the mark point HERE
+# home of that rationale: the ~20 modules that carry the mark point HERE
 # instead of repeating it, so switching `timeout_method`, retuning the
-# ceiling, or revising the measurements is one edit rather than fourteen.
+# ceiling, or revising the measurements is one edit rather than twenty.
+#
+# WHAT THE FAMILY IS (task 4600): the consumers of the one shared tree pass
+# (`_tree_scan.py::TreePass`, served by conftest.py's session `tree_pass`
+# fixture), plus the one permanent private sweeper and
+# test_merge_lane_ratchet.py, both named with their reasons in
+# test_whole_tree_scan_timeout_guard.py.  For a consumer, the per-item cost
+# this ceiling must clear is no longer a sweep of its own but the SHARED PASS:
+# one streaming read+parse of the union of every requested analysis's file
+# set, billed to whichever consumer item requests `tree_pass` first on its
+# worker, while every later consumer item projects facts already held.  Any
+# consumer may be the item billed, which is why each one carries this mark
+# however cheap its own tests are.
 #
 # It is the pyproject's own sanctioned escape hatch -- "Slow tests opt out
 # with `@pytest.mark.timeout(N)`", the comment on
@@ -194,9 +206,9 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 # collected item (a per-test decorator leaves any test added later at the
 # default).  A tighter decorator still WINS where one is present, so the
 # module mark narrows nothing.  Coverage of the family is ENFORCED, not
-# sprinkled: test_whole_tree_scan_timeout_guard.py recomputes the census from
-# source on every run and fails a scanner that lacks the mark OR pins it below
-# this ceiling.
+# sprinkled: test_whole_tree_scan_timeout_guard.py recomputes the census
+# (private sweepers and shared-pass consumers) from source on every run and
+# fails a member that lacks the mark OR pins it below this ceiling.
 #
 # MECHANISM -- why a breach here is far more expensive than a red test:
 #   * `[tool.pytest.ini_options].timeout_method = "thread"` means pytest-timeout
