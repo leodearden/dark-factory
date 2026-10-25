@@ -495,6 +495,7 @@ def _scaffold_git(cwd: Path, *args: str) -> str:
 
 @pytest.mark.skipif(_skip_landlock(), reason=_LANDLOCK_SKIP_REASON)
 @pytest.mark.skipif(_skip_var_tmp(), reason=_VAR_TMP_SKIP_REASON)
+@pytest.mark.spawns_agent_cli
 class TestLandlockSandboxedConflictedMerge:
     """A sandboxed agent resolves a NEW merge conflict and commits it cleanly.
 
