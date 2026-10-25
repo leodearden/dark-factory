@@ -1,7 +1,7 @@
 """Tests for scripts/legibility/landing_gate.py: a project's landing-gate
 command, run in its checkout, says whether a census output may land there
-(task 7448). Real subprocesses through ``sys.executable -c``, a one-commit git
-repo under ``tmp_path`` as the checkout."""
+(task 7448). Real subprocesses (mostly ``sys.executable -c``), a one-commit
+git repo under ``tmp_path`` as the checkout."""
 from __future__ import annotations
 
 import contextlib
