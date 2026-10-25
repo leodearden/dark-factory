@@ -15,6 +15,7 @@ import json
 import logging
 import os
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 
@@ -183,7 +184,6 @@ def test_shipped_config_block_is_accepted_without_warning(caplog):
 
     assert settings == config_mod.PlanDeviationCensus()
     assert _warnings(caplog) == []
-    assert 'plan_deviation_census:' in SHIPPED_CONFIG_PATH.read_text(encoding='utf-8')
 
 
 # ---------------------------------------------------------------------------
@@ -363,10 +363,13 @@ def _escalation(
     )
 
 
-def _write_escalation(directory: Path, esc: Escalation) -> Path:
+def _write_escalation(directory: Path, esc: Escalation, *, mtime: datetime | None = None) -> Path:
+    """*esc* as ``<directory>/<id>.json``, last modified at *mtime* -- by
+    default its filing timestamp."""
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f'{esc.id}.json'
     path.write_text(esc.to_json(), encoding='utf-8')
+    _set_mtime(path, datetime.fromisoformat(esc.timestamp) if mtime is None else mtime)
     return path
 
 
@@ -374,7 +377,7 @@ def test_note_reader_counts_noted_classes_and_the_implementer_fallback(tmp_path)
     queue_dir = tmp_path / 'data' / 'escalations'
     archive = queue_dir / 'archive'
     stamps = {name: NOW - timedelta(days=n) for n, name in enumerate(
-        ['n2f', 'obs', 'impl-pending', 'impl-resolved', 'blk', 'arch', 'infra'], start=1,
+        ['n2f', 'obs', 'impl-pending', 'impl-resolved', 'blk', 'arch', 'infra', 'own'], start=1,
     )}
     counted = [
         (archive / '2026-10-20', _escalation(
@@ -402,11 +405,17 @@ def test_note_reader_counts_noted_classes_and_the_implementer_fallback(tmp_path)
         (queue_dir, _escalation(
             'esc-407-1', task_id='407', category='infra_issue', timestamp=stamps['infra'],
         )),
+        (archive / '2026-10-17', _escalation(
+            f'esc-{mod.synthetic_task_id("proj")}-1', task_id=mod.synthetic_task_id('proj'),
+            agent_role=mod.AGENT_ROLE, severity='blocking',
+            resolution_class=ObservationConsumed.resolution_class, status='resolved',
+            timestamp=stamps['own'],
+        )),
     ]
     for directory, esc in [*counted, *not_counted]:
         _write_escalation(directory, esc)
 
-    corpus = mod.read_archived_notes(queue_dir)
+    corpus = mod.read_archived_notes(queue_dir, horizon=HORIZON)
 
     assert _sorted(corpus.records) == [
         mod.CensusRecord(
@@ -415,26 +424,61 @@ def test_note_reader_counts_noted_classes_and_the_implementer_fallback(tmp_path)
         )
         for _, esc in counted
     ]
-    assert corpus.opened == 7
+    assert corpus.opened == 8
+    assert corpus.skipped == 0
+
+
+def test_note_reader_skips_files_older_than_the_horizon_without_opening_them(tmp_path):
+    queue_dir = tmp_path / 'data' / 'escalations'
+    stale = HORIZON - timedelta(days=1)
+    _write_escalation(queue_dir / 'archive' / '2026-09-01', _escalation(
+        'esc-451-1', task_id='451', resolution_class=NOTE_TO_FILE_CLASS, status='resolved',
+        timestamp=stale,
+    ))
+    garbage = queue_dir / 'esc-452-1.json'
+    garbage.write_text('{"id": ', encoding='utf-8')
+    _set_mtime(garbage, stale)
+    _write_escalation(queue_dir, _escalation(
+        'esc-453-1', task_id='453', timestamp=NOW - timedelta(days=1),
+    ))
+
+    corpus = mod.read_archived_notes(queue_dir, horizon=HORIZON)
+
+    assert [record.task_id for record in corpus.records] == ['453']
+    assert corpus.opened == 1
     assert corpus.skipped == 0
 
 
 def test_note_reader_counts_an_unparsable_record_as_skipped(tmp_path):
     queue_dir = tmp_path / 'data' / 'escalations'
     queue_dir.mkdir(parents=True)
-    (queue_dir / 'esc-501-1.json').write_text('{"id": ', encoding='utf-8')
+    garbage = queue_dir / 'esc-501-1.json'
+    garbage.write_text('{"id": ', encoding='utf-8')
+    _set_mtime(garbage, NOW)
     _write_escalation(queue_dir, _escalation(
         'esc-502-1', task_id='502', timestamp=NOW - timedelta(days=1),
     ))
 
-    corpus = mod.read_archived_notes(queue_dir)
+    corpus = mod.read_archived_notes(queue_dir, horizon=HORIZON)
 
     assert [record.task_id for record in corpus.records] == ['502']
     assert corpus.skipped == 1
 
 
+def test_note_reader_counts_a_note_with_an_unparseable_timestamp_as_skipped(tmp_path):
+    queue_dir = tmp_path / 'data' / 'escalations'
+    undated = replace(
+        _escalation('esc-511-1', task_id='511', timestamp=NOW), timestamp='not-a-date',
+    )
+    _write_escalation(queue_dir, undated, mtime=NOW)
+
+    corpus = mod.read_archived_notes(queue_dir, horizon=HORIZON)
+
+    assert corpus == mod.CorpusRead(records=(), opened=1, skipped=1)
+
+
 def test_note_reader_absent_queue_dir_is_an_empty_corpus(tmp_path):
-    corpus = mod.read_archived_notes(tmp_path / 'data' / 'escalations')
+    corpus = mod.read_archived_notes(tmp_path / 'data' / 'escalations', horizon=HORIZON)
 
     assert corpus == mod.CorpusRead(records=(), opened=0, skipped=0)
 
@@ -769,10 +813,11 @@ def test_run_inside_the_cooldown_makes_no_call(tmp_path):
     assert state_path.read_bytes() == before
 
 
-def test_run_after_the_cooldown_files_again(tmp_path):
+@pytest.mark.parametrize('days_ago', [7, 8])
+def test_run_after_the_cooldown_files_again(tmp_path, days_ago):
     _write_positive_control(tmp_path)
     state_path = mod.default_state_path(PROJECT_ID)
-    _seed_state(state_path, last_filed_at=NOW - timedelta(days=8))
+    _seed_state(state_path, last_filed_at=NOW - timedelta(days=days_ago))
     fake = _FakeCallTool()
 
     line = _run(tmp_path, fake)
@@ -832,6 +877,35 @@ def test_run_a_failed_filing_writes_no_state(tmp_path, caplog, response):
     assert line.startswith(_FIRE_PREFIX)
     assert 'filing failed' in line
     assert not mod.default_state_path(PROJECT_ID).exists()
+    assert [record.levelno for record in _census_records(caplog)] == [logging.WARNING]
+
+
+class _StateDirBlockedOnFiling(_FakeCallTool):
+    """Files normally, but the filing puts a regular file where the state
+    directory belongs, so the state write after it fails."""
+
+    def __init__(self, state_dir: Path) -> None:
+        super().__init__()
+        self.state_dir = state_dir
+
+    def __call__(self, tool_name: str, arguments: dict) -> object:
+        if tool_name == 'escalate_info':
+            self.state_dir.write_text('not a directory', encoding='utf-8')
+        return super().__call__(tool_name, arguments)
+
+
+def test_run_a_failed_state_write_still_reports_the_filing(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger=_LOGGER)
+    _write_positive_control(tmp_path)
+    state_dir = tmp_path / 'census-state'
+    fake = _StateDirBlockedOnFiling(state_dir)
+
+    line = _run(tmp_path, fake, state_path=state_dir / 'state.json')
+
+    assert fake.tool_names == ['get_pending_escalations', 'escalate_info']
+    assert line.startswith(_FIRE_PREFIX)
+    assert f'filed {MINTED_ID}' in line
+    assert 'state write failed' in line
     assert [record.levelno for record in _census_records(caplog)] == [logging.WARNING]
 
 

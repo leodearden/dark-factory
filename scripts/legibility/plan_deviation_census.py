@@ -45,10 +45,9 @@ _LINE_PREFIX = 'plan-deviation census'
 _DESIGN_POINTER = 'plans/plan-deviation-recording-prd.md D9-D10'
 _MCP_TIMEOUT_SECS = 10.0
 _MAX_FAILURE_CHARS = 200
+_MAX_REPR_CHARS = 80
 
 CallTool = Callable[[str, dict], object]
-
-_MAX_REPR_CHARS = 80
 
 
 def _bounded(text: str, limit: int = _MAX_REPR_CHARS) -> str:
@@ -230,15 +229,25 @@ def _read_meta_root(root: Path, cutoff: float) -> CorpusRead:
     return _combine(_read_plan(lane / 'plan.json', cutoff) for lane in lanes)
 
 
-def _read_plan(path: Path, cutoff: float) -> CorpusRead:
+def _unopened(path: Path, cutoff: float) -> CorpusRead | None:
+    """What *path* contributes without being opened -- nothing when it is
+    absent or last modified before *cutoff*, one skip when it cannot be
+    stat'ed -- or ``None`` when it is to be read."""
     try:
-        if path.stat().st_mtime < cutoff:
-            return _NOTHING
+        if path.stat().st_mtime >= cutoff:
+            return None
     except (FileNotFoundError, NotADirectoryError):
         return _NOTHING
     except OSError as exc:
         logger.debug('cannot stat %s: %s', path, exc)
         return _ONE_SKIPPED
+    return _NOTHING
+
+
+def _read_plan(path: Path, cutoff: float) -> CorpusRead:
+    unopened = _unopened(path, cutoff)
+    if unopened is not None:
+        return unopened
     try:
         doc = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -279,14 +288,25 @@ def _plan_entry(task_id: str, entry: object) -> CensusRecord | None:
     )
 
 
-def read_archived_notes(escalations_dir: Path) -> CorpusRead:
+def read_archived_notes(escalations_dir: Path, *, horizon: datetime) -> CorpusRead:
     """Every escalation, pending or archived, that records a plan-deviation
     note: a note-to-file or observation-consumed resolution, or an info
-    ``design_concern`` filed by an implementer before those classes existed."""
-    return _combine(_read_note(path) for path in iter_all_escalation_paths(escalations_dir))
+    ``design_concern`` filed by an implementer before those classes existed.
+    The census's own escalations are never counted.
+
+    A record's file is written at filing and rewritten at resolution, so one
+    last modified before *horizon* was filed before it too and is skipped
+    without being opened."""
+    cutoff = horizon.timestamp()
+    return _combine(
+        _read_note(path, cutoff) for path in iter_all_escalation_paths(escalations_dir)
+    )
 
 
-def _read_note(path: Path) -> CorpusRead:
+def _read_note(path: Path, cutoff: float) -> CorpusRead:
+    unopened = _unopened(path, cutoff)
+    if unopened is not None:
+        return unopened
     esc, outcome = read_escalation_for_scan(path, context=_NOTE_SCAN_CONTEXT)
     if esc is None:
         return _NOTHING if outcome == 'vanished' else _ONE_SKIPPED
@@ -303,6 +323,8 @@ def _read_note(path: Path) -> CorpusRead:
 
 
 def _is_counted_note(esc: Escalation) -> bool:
+    if esc.agent_role == AGENT_ROLE:
+        return False
     if _is_str_in(esc.resolution_class, _NOTED_RESOLUTION_CLASSES):
         return True
     return (
@@ -566,11 +588,11 @@ def _census_line(
     if not settings.enabled:
         return f'{_LINE_PREFIX}: NO-FIRE -- disabled by plan_deviation_census.enabled', False
     now = _as_utc(now)
+    horizon = now - timedelta(days=settings.horizon_days)
     plans = read_plan_deviations(
-        [Path(cfg.project_root) / root for root in settings.meta_roots],
-        horizon=now - timedelta(days=settings.horizon_days),
+        [Path(cfg.project_root) / root for root in settings.meta_roots], horizon=horizon,
     )
-    notes = read_archived_notes(escalation_queue_dir(cfg.project_root))
+    notes = read_archived_notes(escalation_queue_dir(cfg.project_root), horizon=horizon)
     verdict = evaluate([*plans.records, *notes.records], now=now, config=settings)
     summary = (
         f'{"; ".join(verdict.reasons)}; corpus: {len(plans.records)} plan-step + '
