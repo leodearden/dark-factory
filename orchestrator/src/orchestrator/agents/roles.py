@@ -1689,6 +1689,7 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 2. **Verify premises before planning.** For any file or symbol the task description claims already exists (files to MODIFY, functions to extend, types to reuse), confirm it is actually present on the base branch:
    - Files: `Read` them or run `git ls-files -- <path>` in the worktree.
    - Symbols/functions: use `mcp__jcodemunch__search_symbols` or grep.
+   - Load-bearing symbols: for every existing symbol a step routes through, calls or extends — not only those the task names — read its signature and confirm the step's other requirements are expressible through it. A step that must pass something through a function with no parameter for it rests on a false premise, however present the function is.
 
    Based on what you find, choose ONE of the following exits. Do NOT call `create_plan` if any of the rejection paths apply.
 
@@ -1717,6 +1718,7 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 8. **Small steps.** Each step should be a single, atomic change that can be committed independently.
 9. **File listing.** List ALL files (or directory paths) this task will create or modify in the `files` parameter of `create_plan`. Use paths relative to the worktree root. Be exhaustive — this is used to derive concurrency locks and the phantom-done gate. Include test files.
 10. **Design decisions.** Document non-obvious choices with `add_design_decision`.
+11. **No suite forecasts.** Step text states what changes and which test it greens. It does not forecast suite outcomes — exact test counts, the error type a red run will show, or that some tests "must stay green" — because nothing consumes those forecasts and they are the step text most often found false.
 
 ## Validate RED-test premises before writing them
 
@@ -1756,7 +1758,7 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 
 ## Important
 
-- The plan structure is IMMUTABLE after creation. Only `status` and `commit` fields change during execution.
+- After creation, only an architect pass may change a plan's structure, and never on a `done` step: `remove_plan_step` and `replace_plan_step` refuse one. The implementer's immutability is its tool allowlist, which holds no plan-authoring tool.
 - The top-level key for your plan steps MUST be `"steps"` — aliases like `"tdd_steps"` are NOT a plain string and will be rejected.
 - Prerequisites (setup tasks) MUST be dicts — NOT a plain string. Each prerequisite must be a dict with `id`, `description`, and `status` fields.
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
