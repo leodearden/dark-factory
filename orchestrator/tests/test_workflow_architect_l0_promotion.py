@@ -11,10 +11,10 @@ An architect that filed only ``escalate_info`` has not escalated in lieu of
 a plan: the no-plan handler (with its cycle counters) runs instead, as it
 does when the architect filed nothing new.
 
-Each promotion stands alone. An L0 whose L1 cannot be written stays pending,
-named in a WARNING, and does not stop the others. The task blocks behind
-whichever blocking L0s did promote, and falls through to the no-plan handler
-when none did.
+An L0 whose L1 cannot be written is named in a WARNING and stays pending.
+Its finding (id, summary, detail) is carried verbatim in the detail of one
+fallback level-1 record, which blocks the task beside whichever L0s did
+promote. A refused promotion never reaches the no-plan handler.
 
 These tests drive ``_plan()`` against a real ``EscalationQueue`` and the
 real ``_mark_blocked`` / ``_handle_no_plan_failure``. The architect
@@ -33,6 +33,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _orch_helpers import pydantic_spec
 from escalation.models import Escalation
+from escalation.pins import is_queue_handoff
 from escalation.queue import EscalationQueue
 from shared.cli_invoke import AgentResult
 
@@ -213,6 +214,24 @@ def _assert_blocked_through_no_plan_handler(
     assert _no_plan_handler_filed(f.queue), [e.summary for e in handoffs]
 
 
+def _assert_carried_by_fallback(
+    queue: EscalationQueue, refused: Escalation, detail: str,
+) -> Escalation:
+    current = queue.get(refused.id)
+    assert current is not None and current.status == 'pending', current
+    carriers = [
+        e for e in _open_handoffs(queue)
+        if e.summary != refused.summary
+        and refused.id in e.detail
+        and refused.summary in e.detail
+        and detail in e.detail
+    ]
+    assert len(carriers) == 1, [(e.id, e.summary) for e in _open_handoffs(queue)]
+    fallback = carriers[0]
+    assert is_queue_handoff(fallback), fallback
+    return fallback
+
+
 def _warned_about(caplog: pytest.LogCaptureFixture, esc_id: str) -> bool:
     return any(
         r.levelno == logging.WARNING and esc_id in r.getMessage()
@@ -320,15 +339,18 @@ async def test_an_l0_that_fails_to_promote_does_not_stop_the_others(
     outcome = await f.wf._plan()
 
     assert outcome == WorkflowOutcome.BLOCKED
+    fallback = _assert_carried_by_fallback(queue, refused, BLOCKING_DETAIL)
     handoffs = _open_handoffs(queue)
-    assert [e.summary for e in handoffs] == [SECOND_BLOCKING_SUMMARY]
+    second = _l1_carrying(handoffs, SECOND_BLOCKING_SUMMARY)
+    assert sorted(e.id for e in handoffs) == sorted([fallback.id, second.id])
     assert not _no_plan_handler_filed(queue)
     assert _warned_about(caplog, refused.id)
+    assert f.scheduler.set_task_status.await_args_list[-1].args == (TASK_ID, 'blocked')
     assert _sweep_would_leave_it_blocked(queue)
 
 
 @pytest.mark.asyncio
-async def test_no_blocking_l0_promoted_falls_through_to_the_no_plan_handler(
+async def test_a_refused_lone_blocking_l0_is_carried_by_a_fallback_l1(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ):
     queue = _QueueRefusingL1(tmp_path / 'escalations', BLOCKING_SUMMARY)
@@ -339,6 +361,8 @@ async def test_no_blocking_l0_promoted_falls_through_to_the_no_plan_handler(
     outcome = await f.wf._plan()
 
     assert outcome == WorkflowOutcome.BLOCKED
-    _assert_blocked_through_no_plan_handler(f, not_promoted=BLOCKING_SUMMARY)
+    _assert_carried_by_fallback(queue, refused, BLOCKING_DETAIL)
+    assert _l1_carrying(_open_handoffs(queue), INFO_SUMMARY).severity == 'info'
+    assert not _no_plan_handler_filed(queue)
     assert _warned_about(caplog, refused.id)
     assert _sweep_would_leave_it_blocked(queue)
