@@ -3559,7 +3559,7 @@ def test_main_run_with_config_invokes_run_nightly_and_returns_exit_code(monkeypa
 
     def _fake_run_nightly(**kwargs):
         calls.append(kwargs)
-        return nightly.NightlyResult(exit_code=0)
+        return _result()
 
     monkeypatch.setattr(nightly, 'run_nightly', _fake_run_nightly)
 
@@ -3583,7 +3583,7 @@ def test_main_run_with_project_id_resolves_then_runs(monkeypatch):
 
     def _fake_run_nightly(**kwargs):
         calls.append(kwargs)
-        return nightly.NightlyResult(exit_code=0)
+        return _result()
 
     monkeypatch.setattr(nightly, 'run_nightly', _fake_run_nightly)
 
@@ -3598,7 +3598,7 @@ def test_main_run_with_project_id_resolves_then_runs(monkeypatch):
 
 def test_main_run_propagates_fail_loud_exit_code(monkeypatch):
     def _fake_run_nightly(**kwargs):
-        return nightly.NightlyResult(exit_code=1, escalated=True, reason='boom')
+        return _result(_Outcome.FAILED, reason='boom')
 
     monkeypatch.setattr(nightly, 'run_nightly', _fake_run_nightly)
 
@@ -3655,7 +3655,7 @@ def _main_run_with_stubbed_run_nightly(monkeypatch, tmp_path):
     ``(exit_code, effective_root_level, root_handler_count)`` sampled while
     still inside the isolated-root block."""
     def _fake_run_nightly(**kwargs):
-        return nightly.NightlyResult(exit_code=0)
+        return _result()
 
     monkeypatch.setattr(nightly, 'run_nightly', _fake_run_nightly)
 
@@ -3839,18 +3839,27 @@ def _one_recorded(calls):
     return calls[0][1]
 
 
-# Spelled once: two of the four branch drivers patch a module global, so they
-# need the caller's own `monkeypatch` fixture handed in (the previous inline
-# form got it from each test's signature). Asserted per-arm rather than once up
-# front so the failure is loud AND the type checker can see the narrowing.
-_BRANCH_NEEDS_MONKEYPATCH = (
-    'the {!r} branch is driven by monkeypatching a module global; pass '
-    'monkeypatch= to _run_e2e_nightly'
-)
+def _mid_run_explosion(selected, **kwargs):
+    raise RuntimeError('synthetic mid-run explosion')
 
 
-def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
-                     branch=None, recorder=None, budget_bytes=None,
+def _seed_a_structurally_invalid_entry(repo: Path) -> None:
+    """Add an entry with an unknown severity to *repo*'s codebook. Loading
+    does not validate, so the night reaches the merge and fails there."""
+    codebook_path = repo / _CODEBOOK_RELPATH
+    cb = codebook.load(codebook_path)
+    cb['entries'].append({
+        'id': 'mis-severed', 'title': 'Mis Severed', 'severity': 'apocalyptic',
+        'status': 'open', 'origin_phase': 'implement',
+        'manifested_phase': 'implement', 'sightings': [],
+    })
+    codebook.dump(cb, codebook_path)
+
+
+_INVALID_SEVERITY_ERROR = "'apocalyptic' is not one of"
+
+
+def _run_e2e_nightly(tmp_path, *, branch=None, recorder=None, budget_bytes=None,
                      invoke=_fake_invoke_known_cause, committer=None, poster=None,
                      digest_builder=None, census_launcher=_no_census_launch,
                      census_state: dict | None = None, transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
@@ -3865,19 +3874,20 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
     repo/transcript setup and the ``run_nightly`` kwargs exist exactly once
     and cannot drift when that signature changes.
 
-    *branch*, when given, drives the run down ONE named decision-8 fail-loud
-    branch, and THIS IS THE ONLY PLACE that knowledge lives — a fifth branch
-    added to ``run_nightly`` gets wired here once, not in each suite:
+    *branch*, when given, drives the run down ONE named branch, and THIS IS
+    THE ONLY PLACE that knowledge lives — a new branch added to
+    ``run_nightly`` gets wired here once, not in each suite:
 
     * ``'extractor'``  — the injected digest builder reports a crashed session
     * ``'storm'``      — every digest's coding output is unparseable
-    * ``'capped'``     — every digest hits a usage cap (task 4736).  Not a
-      fail-loud branch: it returns ``exit_code=0``.  Wired here anyway so
-      the recorder and journaling parametrizations can reach it, since this
-      is the one place branch knowledge lives.
-    * ``'validation'`` — the merged codebook fails ``codebook.validate``
-      (needs *monkeypatch*)
+    * ``'capped'``     — every digest hits a usage cap (task 4736); exit 0
+    * ``'validation'`` — the seeded codebook carries a structurally invalid
+      entry, so the merged codebook fails ``codebook.validate``
     * ``'commit'``     — the committer fails
+    * ``'crash'``      — the injected digest builder raises outright
+    * ``'deletion'``   — the coder emits a deletion directive; exit 0
+    * ``'census'``     — census-state is :data:`_OLD_CENSUS`, so the census
+      trigger FIREs through *census_launcher*
 
     The other knobs shape a run that does NOT fail: *budget_bytes* rewrites
     the config with a digest byte budget small enough to suppress the whole
@@ -3946,14 +3956,17 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
     elif branch == 'capped':
         kwargs['invoke'] = _fake_invoke_capped
     elif branch == 'validation':
-        assert monkeypatch is not None, _BRANCH_NEEDS_MONKEYPATCH.format(branch)
-        monkeypatch.setattr(
-            codebook, 'validate', lambda cb: ['synthetic validation error'],
-        )
+        _seed_a_structurally_invalid_entry(repo)
     elif branch == 'commit':
         kwargs['committer'] = _failing_committer
+    elif branch == 'crash':
+        kwargs['digest_builder'] = _mid_run_explosion
+    elif branch == 'deletion':
+        kwargs['invoke'] = _fake_invoke_deletion_directive
+    elif branch == 'census':
+        _write_census_state(repo, _OLD_CENSUS)
     elif branch is not None:  # pragma: no cover - guards a typo'd branch id
-        raise AssertionError(f'unknown decision-8 branch {branch!r}')
+        raise AssertionError(f'unknown branch {branch!r}')
 
     try:
         if unreadable_transcripts:
@@ -4041,11 +4054,9 @@ class TestRunNightlyRecordsTrickleState:
         assert doc['exit_code'] == 1
         assert doc['counters']['selected_count'] == 1
 
-    def test_codebook_validation_failure_still_records(self, tmp_path, monkeypatch):
+    def test_codebook_validation_failure_still_records(self, tmp_path):
         recorder, calls = _recorder_spy()
-        result, _repo = _run_e2e_nightly(
-            tmp_path, monkeypatch=monkeypatch, branch='validation', recorder=recorder,
-        )
+        result, _repo = _run_e2e_nightly(tmp_path, branch='validation', recorder=recorder)
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
@@ -4070,14 +4081,11 @@ class TestRunNightlyRecordsTrickleState:
         probe read a stale streak as healthy. The boundary converts the
         exception into a failed, escalated result — recording is not
         swallowing."""
-        def _boom(selected, **kwargs):
-            raise RuntimeError('synthetic mid-run explosion')
-
         recorder, calls = _recorder_spy()
         poster, posted = _capture_poster()
 
         result, _repo = _run_e2e_nightly(
-            tmp_path, recorder=recorder, poster=poster, digest_builder=_boom,
+            tmp_path, branch='crash', recorder=recorder, poster=poster,
         )
 
         assert result.exit_code == 1
@@ -4101,9 +4109,6 @@ class TestRunNightlyRecordsTrickleState:
         """The sampler found a suppressed night and escalated it before the
         crash; neither fact may be lost, even when the crash's own POST
         fails."""
-        def _boom(selected, **kwargs):
-            raise RuntimeError('synthetic mid-run explosion')
-
         recorder, calls = _recorder_spy()
         posted = []
 
@@ -4113,8 +4118,8 @@ class TestRunNightlyRecordsTrickleState:
             posted.append(envelope)
 
         result, _repo = _run_e2e_nightly(
-            tmp_path, recorder=recorder, budget_bytes=10,
-            poster=_server_gone_after_the_first_post, digest_builder=_boom,
+            tmp_path, branch='crash', recorder=recorder, budget_bytes=10,
+            poster=_server_gone_after_the_first_post,
         )
 
         assert result.exit_code == 1
@@ -4519,6 +4524,225 @@ class TestRunNightlyRecordsTheCensusObservation:
         assert probe.returncode == 0, (
             f'stdout={probe.stdout!r} stderr={probe.stderr!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 6745: a night's outcome is one typed value, and its posted alarms are
+# one list (boundary row 8)
+# ---------------------------------------------------------------------------
+
+_Outcome = trickle_state.RunOutcome
+_Kind = nightly.AlarmKind
+
+
+def _result(outcome=_Outcome.PRODUCTIVE, **fields):
+    """A hand-built :class:`nightly.NightlyResult` for project testproj."""
+    return nightly.NightlyResult(
+        project_id='testproj', target_date=date(2026, 7, 13),
+        pass_kind=nightly.PassKind.MANUAL, outcome=outcome, **fields,
+    )
+
+
+def _alarm(kind, *, landed=True):
+    return nightly.Alarm(kind=kind, summary=f'legibility trickle {kind}', landed=landed)
+
+
+def _refusing_poster(url, envelope):
+    raise ConnectionError('escalation server is down')
+
+
+class TestNightlyResultIsOneTypedOutcome:
+
+    @pytest.mark.parametrize('outcome', list(_Outcome))
+    def test_exit_code_is_one_iff_the_night_failed(self, outcome):
+        assert _result(outcome).exit_code == (1 if outcome is _Outcome.FAILED else 0)
+
+    @pytest.mark.parametrize('outcome', list(_Outcome))
+    def test_capped_iff_the_night_was_deferred(self, outcome):
+        assert _result(outcome).capped is (outcome is _Outcome.DEFERRED)
+
+    @pytest.mark.parametrize(
+        'landed', [(), (False,), (True,), (False, True)], ids=['none', 'refused', 'landed', 'mixed'],
+    )
+    def test_escalated_iff_an_alarm_landed(self, landed):
+        alarms = tuple(_alarm(_Kind.CODER_STORM, landed=flag) for flag in landed)
+
+        result = _result(_Outcome.FAILED, alarms=alarms)
+
+        assert result.escalated is any(landed)
+
+    @pytest.mark.parametrize(
+        ('alarms', 'expected'),
+        [
+            ((_alarm(_Kind.BARREN_STREAK),), True),
+            ((_alarm(_Kind.BARREN_STREAK, landed=False),), False),
+            ((_alarm(_Kind.BUDGET_SUPPRESSED),), False),
+            ((), False),
+        ],
+        ids=['streak-landed', 'streak-refused', 'other-kind-landed', 'none'],
+    )
+    def test_barren_escalated_iff_a_barren_streak_alarm_landed(self, alarms, expected):
+        assert _result(_Outcome.BARREN, alarms=alarms).barren_escalated is expected
+
+    def test_the_result_is_frozen(self):
+        result = _result()
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            result.outcome = _Outcome.FAILED  # type: ignore[misc]
+
+    @pytest.mark.parametrize(
+        ('kind', 'level'),
+        [
+            (_Kind.EXTRACTOR_CRASH, logging.ERROR),
+            (_Kind.CODER_STORM, logging.ERROR),
+            (_Kind.VALIDATION_FAILED, logging.ERROR),
+            (_Kind.COMMIT_FAILED, logging.ERROR),
+            (_Kind.CRASHED, logging.ERROR),
+            (_Kind.BUDGET_SUPPRESSED, logging.WARNING),
+            (_Kind.CODER_DEFERRED, logging.WARNING),
+            (_Kind.DELETION_DIRECTIVE, logging.WARNING),
+            (_Kind.BARREN_STREAK, logging.WARNING),
+        ],
+    )
+    def test_an_alarm_kind_carries_its_journal_level(self, kind, level):
+        assert kind.level == level
+
+
+_BRANCH_MATRIX = [
+    pytest.param(dict(transcript=False), _Outcome.QUIET, [], id='quiet'),
+    pytest.param({}, _Outcome.PRODUCTIVE, [], id='productive'),
+    pytest.param(
+        dict(budget_bytes=10), _Outcome.BARREN, [_Kind.BUDGET_SUPPRESSED], id='budget',
+    ),
+    pytest.param(
+        dict(branch='capped'), _Outcome.DEFERRED, [_Kind.CODER_DEFERRED], id='capped',
+    ),
+    pytest.param(dict(branch='storm'), _Outcome.FAILED, [_Kind.CODER_STORM], id='storm'),
+    pytest.param(
+        dict(branch='extractor'), _Outcome.FAILED, [_Kind.EXTRACTOR_CRASH], id='extractor',
+    ),
+    pytest.param(
+        dict(branch='deletion'), _Outcome.PRODUCTIVE, [_Kind.DELETION_DIRECTIVE],
+        id='deletion',
+    ),
+    pytest.param(
+        dict(branch='validation'), _Outcome.FAILED, [_Kind.VALIDATION_FAILED],
+        id='validation',
+    ),
+    pytest.param(dict(branch='commit'), _Outcome.FAILED, [_Kind.COMMIT_FAILED], id='commit'),
+    pytest.param(dict(branch='crash'), _Outcome.FAILED, [_Kind.CRASHED], id='crash'),
+    pytest.param(dict(branch='census'), _Outcome.PRODUCTIVE, [], id='census'),
+]
+
+
+class TestEveryBranchIsOneOutcomeAndOneAlarmList:
+    """BOUNDARY ROW 8, over injected stages only: every branch ends in one
+    typed outcome, the one the night records, and its posted alarms in one
+    list, whether or not the escalation server takes them."""
+
+    @pytest.mark.parametrize('lands', [True, False], ids=['landing', 'refusing'])
+    @pytest.mark.parametrize(('knobs', 'outcome', 'kinds'), _BRANCH_MATRIX)
+    def test_a_branch(self, tmp_path, knobs, outcome, kinds, lands):
+        poster, posted = _capture_poster()
+        recorder, calls = _recorder_spy()
+        launcher, launches = _recording_census_launcher()
+
+        result, _repo = _run_e2e_nightly(
+            tmp_path, recorder=recorder, census_launcher=launcher,
+            poster=poster if lands else _refusing_poster, **knobs,
+        )
+
+        assert result.outcome is outcome
+        assert result.exit_code == (1 if outcome is _Outcome.FAILED else 0)
+        assert [alarm.kind for alarm in result.alarms] == kinds
+        if lands:
+            assert result.escalated is bool(posted)
+            assert len(posted) == sum(alarm.landed for alarm in result.alarms)
+        else:
+            assert [alarm.landed for alarm in result.alarms] == [False] * len(kinds)
+            assert result.escalated is False
+        assert _one_recorded(calls)['outcome'] == result.outcome
+        assert result.census_fire is (knobs.get('branch') == 'census')
+        assert len(launches) == int(result.census_fire)
+
+    @pytest.mark.parametrize('lands', [True, False], ids=['landing', 'refusing'])
+    def test_the_barren_streak(self, tmp_path, lands):
+        recorder, calls = _recorder_spy()
+        runner = _NightRunner(
+            tmp_path, recorder=recorder,
+            on_post=None if lands else (lambda envelope: _refusing_poster('', envelope)),
+        )
+        for day in (13, 14):
+            runner.night(day, 'barren')
+        posted_before = len(runner.escalations)
+
+        third = runner.night(15, 'barren')
+
+        assert third.outcome is _Outcome.BARREN
+        assert third.exit_code == 0
+        assert [alarm.kind for alarm in third.alarms] == [
+            _Kind.BUDGET_SUPPRESSED, _Kind.BARREN_STREAK,
+        ]
+        assert [alarm.landed for alarm in third.alarms] == [lands, lands]
+        assert third.barren_escalated is lands
+        assert third.escalated is lands
+        assert len(runner.escalations) - posted_before == 2
+        assert calls[-1][1]['outcome'] == third.outcome
+
+
+def test_a_crash_keeps_every_alarm_posted_before_it(tmp_path):
+    """A deletion-directive night whose commit raises: the deletion alarm was
+    posted before the crash, so it survives in the one list, and it landed
+    even though the crash's own post did not."""
+    work_cwd = str(tmp_path / 'work')
+    _repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'
+    session_dir = projects_root / _encode_cwd(work_cwd)
+    _write_transcript(
+        session_dir / 'session-1.jsonl', cwd=work_cwd,
+        timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+    _write_transcript(
+        session_dir / 'session-2.jsonl', cwd=work_cwd,
+        timestamp='2026-07-13T11:00:00Z', session_id='session-2',
+        user_text='an entirely different request that also went sideways',
+    )
+    invocations = []
+
+    def _deletion_then_match(prompt, model):
+        invocations.append(prompt)
+        if len(invocations) == 1:
+            return _fake_invoke_deletion_directive(prompt, model)
+        return _fake_invoke_known_cause(prompt, model)
+
+    def _raising_committer(repo, paths, message):
+        raise RuntimeError('the committer exploded')
+
+    posted = []
+
+    def _server_gone_after_the_first_post(url, envelope):
+        if posted:
+            raise ConnectionError('escalation server went away')
+        posted.append(envelope)
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+        invoke=_deletion_then_match,
+        poster=_server_gone_after_the_first_post,
+        committer=_raising_committer,
+        census_launcher=_no_census_launch,
+        pass_kind=nightly.PassKind.MANUAL,
+    )
+
+    assert result.outcome is _Outcome.FAILED
+    assert [(alarm.kind, alarm.landed) for alarm in result.alarms] == [
+        (_Kind.DELETION_DIRECTIVE, True), (_Kind.CRASHED, False),
+    ]
+    assert result.escalated is True
+    assert 'the committer exploded' in (result.reason or '')
 
 
 # ---------------------------------------------------------------------------
@@ -5397,8 +5621,8 @@ class TestRunScheduledNight:
 
     def test_every_argument_reaches_both_passes(self, monkeypatch):
         fake, calls = _scripted_run_nightly(
-            nightly.NightlyResult(exit_code=0, retry_due=(date(2026, 7, 13),)),
-            nightly.NightlyResult(exit_code=0),
+            _result(retry_due=(date(2026, 7, 13),)),
+            _result(),
         )
         monkeypatch.setattr(nightly, 'run_nightly', fake)
         now = datetime(2026, 7, 15, 3, 0, tzinfo=UTC)
@@ -5431,8 +5655,8 @@ class TestRunScheduledNight:
 
     def test_main_retries_the_owed_date_after_an_undated_run(self, monkeypatch):
         fake, calls = _scripted_run_nightly(
-            nightly.NightlyResult(exit_code=0, retry_due=(date(2026, 7, 13),)),
-            nightly.NightlyResult(exit_code=0),
+            _result(retry_due=(date(2026, 7, 13),)),
+            _result(),
         )
         monkeypatch.setattr(nightly, 'run_nightly', fake)
 
@@ -5449,8 +5673,8 @@ class TestRunScheduledNight:
 
     def test_main_threads_max_barren_runs_to_every_pass(self, monkeypatch):
         fake, calls = _scripted_run_nightly(
-            nightly.NightlyResult(exit_code=0, retry_due=(date(2026, 7, 13),)),
-            nightly.NightlyResult(exit_code=0),
+            _result(retry_due=(date(2026, 7, 13),)),
+            _result(),
         )
         monkeypatch.setattr(nightly, 'run_nightly', fake)
 
@@ -5459,7 +5683,7 @@ class TestRunScheduledNight:
         assert [call['max_barren_runs'] for call in calls] == [5, 5]
 
     def test_a_dated_main_run_threads_max_barren_runs(self, monkeypatch):
-        fake, calls = _scripted_run_nightly(nightly.NightlyResult(exit_code=0))
+        fake, calls = _scripted_run_nightly(_result())
         monkeypatch.setattr(nightly, 'run_nightly', fake)
 
         nightly.main([
@@ -5470,7 +5694,7 @@ class TestRunScheduledNight:
         assert [call['max_barren_runs'] for call in calls] == [5]
 
     def test_main_defaults_max_barren_runs_to_the_module_constant(self, monkeypatch):
-        fake, calls = _scripted_run_nightly(nightly.NightlyResult(exit_code=0))
+        fake, calls = _scripted_run_nightly(_result())
         monkeypatch.setattr(nightly, 'run_nightly', fake)
         monkeypatch.setattr(trickle_state, 'DEFAULT_MAX_BARREN_RUNS', 7)
 
@@ -5480,8 +5704,8 @@ class TestRunScheduledNight:
 
     def test_main_fails_when_the_retry_fails(self, monkeypatch):
         fake, calls = _scripted_run_nightly(
-            nightly.NightlyResult(exit_code=0, retry_due=(date(2026, 7, 13),)),
-            nightly.NightlyResult(exit_code=1),
+            _result(retry_due=(date(2026, 7, 13),)),
+            _result(_Outcome.FAILED),
         )
         monkeypatch.setattr(nightly, 'run_nightly', fake)
 
@@ -5492,7 +5716,7 @@ class TestRunScheduledNight:
 
     def test_a_dated_run_is_a_single_pass(self, monkeypatch):
         fake, calls = _scripted_run_nightly(
-            nightly.NightlyResult(exit_code=0, retry_due=(date(2026, 7, 10),)),
+            _result(retry_due=(date(2026, 7, 10),)),
         )
         monkeypatch.setattr(nightly, 'run_nightly', fake)
 
@@ -5593,10 +5817,10 @@ class TestNeverRunDates:
 def _sample(*, selected=(), zero_signal_dropped=0, dedupe_collapsed=0,
             below_sampling_cut=0, budget_skipped=0):
     """Hand-build a SampleResult satisfying the conservation identity. The
-    sampling-cut-only barren night is NOT reachable end-to-end (a stratum's
-    cut is max(ceil(top_fraction*n), per_stratum_min) >= 1, so something is
-    always selected unless the BUDGET also cuts), so this mode is exercised
-    at the _report_sample_outcome boundary directly."""
+    sampling-cut-only barren night is NOT reachable from real transcripts (a
+    stratum's cut is max(ceil(top_fraction*n), per_stratum_min) >= 1, so
+    something is always selected unless the BUDGET also cuts), so this mode
+    reaches run_nightly through an injected selector."""
     selected = list(selected)
     return nightly.sampling.SampleResult(
         selected=selected,
@@ -5613,8 +5837,25 @@ def _sample(*, selected=(), zero_signal_dropped=0, dedupe_collapsed=0,
     )
 
 
-def _cfg_for(tmp_path):
-    return load_config(_write_config(tmp_path, project_id='testproj'))
+def _run_sampled_night(tmp_path, sample, **seams):
+    """Run one MANUAL night whose injected selector returns *sample*; its
+    digest builder renders nothing. Returns ``(result, posted envelopes)``."""
+    poster, posted = _capture_poster()
+    result = nightly.run_nightly(
+        config_path=_write_config(tmp_path, project_id='testproj'),
+        projects_root=tmp_path / 'projects',
+        target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+        invoke=lambda prompt, model: pytest.fail('no digest may reach the coder'),
+        status_fetcher=lambda: {'statuses': {}},
+        poster=poster,
+        selector=lambda *args, **kwargs: sample,
+        digest_builder=lambda selected, **kwargs: ([], []),
+        census_launcher=_no_census_launch,
+        pass_kind=nightly.PassKind.MANUAL,
+        **seams,
+    )
+    return result, posted
 
 
 def test_report_sample_outcome_warns_on_a_sampling_cut_only_night(tmp_path, caplog):
@@ -5622,16 +5863,10 @@ def test_report_sample_outcome_warns_on_a_sampling_cut_only_night(tmp_path, capl
     distinct signal held back by the sampling cut, nothing digested. It
     gets journal visibility now, and escalation only via the streak, so
     per-night alarm volume does not rise."""
-    cfg = _cfg_for(tmp_path)
-    posted = []
-
     with caplog.at_level('INFO', logger='legibility.nightly'):
-        escalated = nightly._report_sample_outcome(
-            cfg, _sample(below_sampling_cut=3), date(2026, 7, 13),
-            poster=lambda url, env: posted.append((url, env)),
-        )
+        result, posted = _run_sampled_night(tmp_path, _sample(below_sampling_cut=3))
 
-    assert escalated is False
+    assert result.alarms == ()
     assert posted == [], (
         'the streak owns escalation for this mode; a per-night escalation '
         'here would raise alarm volume for a signal that already repeats'
@@ -5665,32 +5900,22 @@ def test_report_sample_outcome_warns_on_a_sampling_cut_only_night(tmp_path, capl
 def test_report_sample_outcome_budget_door_is_unchanged(tmp_path, caplog):
     """The budget door keeps its per-night escalation exactly as 3270 left
     it — this change adds a sibling branch, it does not alter this one."""
-    cfg = _cfg_for(tmp_path)
-    posted = []
-
     with caplog.at_level('INFO', logger='legibility.nightly'):
-        escalated = nightly._report_sample_outcome(
-            cfg, _sample(budget_skipped=4), date(2026, 7, 13),
-            poster=lambda url, env: posted.append((url, env)),
-        )
+        result, posted = _run_sampled_night(tmp_path, _sample(budget_skipped=4))
 
-    assert escalated is True
-    assert len(posted) == 1
-    assert 'suppress' in posted[0][1]['params']['arguments']['summary'].lower()
+    assert [(alarm.kind, alarm.landed) for alarm in result.alarms] == [
+        (nightly.AlarmKind.BUDGET_SUPPRESSED, True),
+    ]
+    assert 'suppress' in _one_escalation(posted)['summary'].lower()
 
 
 def test_report_sample_outcome_stays_quiet_on_a_quiet_night(tmp_path, caplog):
-    cfg = _cfg_for(tmp_path)
-    posted = []
-
     with caplog.at_level('INFO', logger='legibility.nightly'):
-        escalated = nightly._report_sample_outcome(
-            cfg, _sample(zero_signal_dropped=9, dedupe_collapsed=2),
-            date(2026, 7, 13),
-            poster=lambda url, env: posted.append((url, env)),
+        result, posted = _run_sampled_night(
+            tmp_path, _sample(zero_signal_dropped=9, dedupe_collapsed=2),
         )
 
-    assert escalated is False
+    assert result.alarms == ()
     assert posted == []
     assert _nightly_warnings(caplog) == []
 
@@ -5698,17 +5923,12 @@ def test_report_sample_outcome_stays_quiet_on_a_quiet_night(tmp_path, caplog):
 def test_report_sample_outcome_partial_truncation_stays_at_info(tmp_path, caplog):
     """Selected something AND skipped some on budget: the budget working as
     designed, never an absence."""
-    cfg = _cfg_for(tmp_path)
-    posted = []
-
     with caplog.at_level('INFO', logger='legibility.nightly'):
-        escalated = nightly._report_sample_outcome(
-            cfg, _sample(selected=['digest'], budget_skipped=2),
-            date(2026, 7, 13),
-            poster=lambda url, env: posted.append((url, env)),
+        result, posted = _run_sampled_night(
+            tmp_path, _sample(selected=['digest'], budget_skipped=2),
         )
 
-    assert escalated is False
+    assert result.alarms == ()
     assert posted == []
     assert _nightly_warnings(caplog) == []
 
@@ -6159,21 +6379,18 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
     [
         ('extractor', 'extractor crashed', 'boom: corrupt transcript'),
         ('storm', 'coder storm', 'could not parse a JSON object'),
-        ('validation', 'failed validation', 'synthetic validation error'),
+        ('validation', 'failed validation', _INVALID_SEVERITY_ERROR),
         ('commit', 'commit failed', 'cannot lock ref (simulated)'),
     ],
 )
 def test_every_fail_loud_branch_journals_its_reason_with_the_server_down(
-    tmp_path, monkeypatch, caplog, branch, summary_marker, detail_marker,
+    tmp_path, caplog, branch, summary_marker, detail_marker,
 ):
     def _raising_poster(url, envelope):
         raise RuntimeError('escalation server unreachable')
 
     with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
-        result, _repo = _run_e2e_nightly(
-            tmp_path, monkeypatch=monkeypatch, branch=branch,
-            poster=_raising_poster,
-        )
+        result, _repo = _run_e2e_nightly(tmp_path, branch=branch, poster=_raising_poster)
 
     assert result.exit_code == 1
     assert result.escalated is False, (
@@ -6217,16 +6434,10 @@ def test_budget_suppression_door_journals_once_at_warning(tmp_path, caplog):
     """The budget-suppression door escalates AND exits 0, so its journal
     line stays a WARNING -- and there is exactly one of it, not a call-site
     WARNING plus a post_escalation ERROR."""
-    cfg = _cfg_for(tmp_path)
-    posted = []
-
     with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
-        escalated = nightly._report_sample_outcome(
-            cfg, _sample(budget_skipped=4), date(2026, 7, 13),
-            poster=lambda url, env: posted.append((url, env)),
-        )
+        result, posted = _run_sampled_night(tmp_path, _sample(budget_skipped=4))
 
-    assert escalated is True
+    assert [alarm.kind for alarm in result.alarms] == [nightly.AlarmKind.BUDGET_SUPPRESSED]
     assert len(posted) == 1
 
     loud = _nightly_warnings(caplog)
@@ -6246,49 +6457,25 @@ def test_budget_suppression_door_journals_once_at_warning(tmp_path, caplog):
     )
 
 
-def _barren_night(day: int) -> trickle_state.NightRun:
-    return trickle_state.NightRun(
-        target_date=date(2026, 7, day),
-        recorded_at=datetime(2026, 7, day + 1, 3, 0, tzinfo=UTC),
-        exit_code=0,
-        counters=trickle_state.RunCounters(
-            total_records=2, zero_signal_dropped=0, dedupe_collapsed=0,
-            below_sampling_cut=0, budget_skipped=2, selected_count=0,
-        ),
-        census=None,
-    )
-
-
 def test_barren_streak_journals_once_at_warning(tmp_path, caplog):
     """Same rule for the sibling streak escalation: it explicitly refuses to
     touch `result.exit_code`, so it stays out of `journalctl -p err`."""
-    cfg = _cfg_for(tmp_path)
-    posted = []
-    state = trickle_state.fold_night(
-        dataclasses.replace(
-            trickle_state.fold_night(None, 'testproj', _barren_night(14)).state,
-            consecutive_barren_runs=trickle_state.DEFAULT_MAX_BARREN_RUNS - 1,
-        ),
-        'testproj',
-        _barren_night(15),
-    ).state
+    runner = _NightRunner(tmp_path)
+    for day in (13, 14):
+        runner.night(day, 'barren')
 
     with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
-        escalated = nightly._escalate_barren_streak(
-            cfg, state, date(2026, 7, 15),
-            max_barren_runs=trickle_state.DEFAULT_MAX_BARREN_RUNS,
-            poster=lambda url, env: posted.append((url, env)),
-        )
+        third = runner.night(15, 'barren')
 
-    assert escalated is True
-    assert len(posted) == 1
-
+    assert third.barren_escalated is True
     loud = _nightly_warnings(caplog)
-    assert [r.levelname for r in loud] == ['WARNING'], (
+    streak = [r for r in loud if 'consecutive runs' in r.getMessage()]
+    assert [r.levelname for r in streak] == ['WARNING'], (
         f'expected exactly one WARNING; got '
-        f'{[(r.levelname, r.getMessage()) for r in loud]}'
+        f'{[(r.levelname, r.getMessage()) for r in streak]}'
     )
-    message = loud[0].getMessage()
+    assert [r for r in loud if r.levelno >= logging.ERROR] == []
+    message = streak[0].getMessage()
     assert (
         f'produced nothing for {trickle_state.DEFAULT_MAX_BARREN_RUNS} '
         f'consecutive runs'
@@ -6398,10 +6585,8 @@ class TestRunNightlyLedgersCodedSessions:
     @pytest.mark.parametrize(
         'branch', ['extractor', 'storm', 'capped', 'validation', 'commit'],
     )
-    def test_a_night_that_did_not_land_its_coding_ledgers_nothing(
-        self, tmp_path, monkeypatch, branch,
-    ):
-        result, _repo = _run_e2e_nightly(tmp_path, monkeypatch=monkeypatch, branch=branch)
+    def test_a_night_that_did_not_land_its_coding_ledgers_nothing(self, tmp_path, branch):
+        result, _repo = _run_e2e_nightly(tmp_path, branch=branch)
 
         assert result.commit_made is False
         assert _ledger().sessions == frozenset()
