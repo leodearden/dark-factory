@@ -7629,12 +7629,13 @@ class TestRemoteRunnerEnvProbeRun:
         assert len(remote_cmds) == 4
 
     async def test_master_establishment_does_not_eat_the_first_probes_budget(self, monkeypatch):
-        """Open and first probe are bounded separately: 0.3s + 0.3s under a 0.5s bound
-        each passes, where one shared budget would have timed the probe out."""
+        """Open and first probe are bounded separately: 0.6s + 0.6s under a 1.0s bound
+        each passes, where one shared budget would have timed the probe out.  A sleep
+        never ends early, so only the 0.4s per-call headroom is load-sensitive."""
         from orchestrator import verify_runner as vr
-        monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 0.5)
+        monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 1.0)
 
-        runner, _ = self._make_runner(responses=[(0, 'uv 0.11.6\n', '')], delay=0.3)
+        runner, _ = self._make_runner(responses=[(0, 'uv 0.11.6\n', '')], delay=0.6)
         adapter = await runner.env_probe_run()
 
         assert await adapter(['uv', '--version']) == (0, 'uv 0.11.6\n', '')
