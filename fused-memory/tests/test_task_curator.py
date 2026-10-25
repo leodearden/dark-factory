@@ -233,9 +233,9 @@ class TestFlattenTaskTree:
 class TestClipForPrompt:
     """`clip_for_prompt` is the single owner of truncate-and-mark (INV-5).
 
-    Both the pool side (`PoolEntry.render`) and the candidate side
-    (`_build_user_prompt` / `_build_batch_section`) route through it, so the
-    marker cannot drift between them.
+    Both the pool side (`PoolEntry.render`) and the candidate side (the
+    candidate section of the single and batch prompts) route through it, so
+    the marker cannot drift between them.
     """
 
     def test_under_cap_returned_unchanged(self):
@@ -4066,23 +4066,67 @@ class TestParseBatchDecisions:
 
 
 # ----------------------------------------------------------------------
-# TaskCurator._build_batch_user_prompt
+# The prompts the curator sends, captured from the injected invoker
 # ----------------------------------------------------------------------
 
 
-class TestBuildBatchUserPrompt:
-    def test_renders_per_candidate_sections_with_pools(self):
+def _bundle_for(
+    candidate: CandidateTask,
+    pool: list[PoolEntry] | None = None,
+    withheld: PoolWithheld | None = None,
+) -> PreparedCandidate:
+    return _bundle(candidate.title, pool or [], candidate=candidate, withheld=withheld)
+
+
+async def _prompt_sent_for(bundles: list[PreparedCandidate]) -> str:
+    """The prompt the LLM receives for *bundles*: the single prompt for one, else the batch."""
+    verdict = (
+        _agent_result({'action': 'create', 'justification': 'x'})
+        if len(bundles) == 1 else batch_create_result(len(bundles))
+    )
+    invoke = AsyncMock(return_value=verdict)
+    curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=invoke)
+    await curator.curate_batch_prepared(bundles, 'p', '/x')
+    invoke.assert_awaited_once()
+    assert invoke.await_args is not None
+    return invoke.await_args.kwargs['prompt']
+
+
+async def _single_prompt(
+    candidate: CandidateTask,
+    pool: list[PoolEntry] | None = None,
+    withheld: PoolWithheld | None = None,
+) -> str:
+    return await _prompt_sent_for([_bundle_for(candidate, pool, withheld)])
+
+
+def _first_section(batch_prompt: str) -> str:
+    """batch_index=0's section, without the newline that joins it to the next section."""
+    return batch_prompt[:batch_prompt.index('# Candidate batch_index=1') - 1]
+
+
+async def _first_batch_section(
+    candidate: CandidateTask,
+    pool: list[PoolEntry] | None = None,
+    withheld: PoolWithheld | None = None,
+) -> str:
+    """The section a batch prompt gives *candidate* when it sits at batch_index=0."""
+    return _first_section(await _prompt_sent_for([
+        _bundle_for(candidate, pool, withheld), _bundle_for(CandidateTask(title='Other')),
+    ]))
+
+
+class TestBatchUserPrompt:
+    @pytest.mark.asyncio
+    async def test_renders_per_candidate_sections_with_pools(self):
         """Prompt contains a labelled block per candidate with its own pool."""
-        config = _make_config()
-        curator = TaskCurator(config=config, taskmaster=None)
-        candidates = [
-            CandidateTask(title='Alpha task', description='do alpha'),
-            CandidateTask(title='Beta task', description='do beta'),
-        ]
         pool0 = _pool_with_ids(('task-11', 'pending'), ('task-12', 'done'))
         pool1 = _pool_with_ids(('task-99', 'in-progress'))
 
-        result = curator._build_batch_user_prompt(candidates, [pool0, pool1])
+        result = await _prompt_sent_for([
+            _bundle_for(CandidateTask(title='Alpha task', description='do alpha'), pool0),
+            _bundle_for(CandidateTask(title='Beta task', description='do beta'), pool1),
+        ])
 
         # Section headers
         assert '# Candidate batch_index=0' in result
@@ -4112,88 +4156,67 @@ class TestPromptCarriesPoolTruncation:
             caps={'module': 15, 'embedding': 10, 'dependency': 3, 'total_cap': 30},
         )
 
-    def test_single_prompt_carries_the_fact_and_the_guidance(self):
-        curator = TaskCurator(config=_make_config(), taskmaster=None)
-        pool = _pool_with_ids(('10', 'pending'))
-        rendered = curator._build_user_prompt(
-            CandidateTask(title='T'), pool, withheld=self._census(),
+    @pytest.mark.asyncio
+    async def test_single_prompt_carries_the_fact_and_the_guidance(self):
+        rendered = await _single_prompt(
+            CandidateTask(title='T'), _pool_with_ids(('10', 'pending')), self._census(),
         )
         assert 'pool_truncated:' in rendered
         assert _carries_guidance(rendered)
 
-    def test_batch_section_carries_the_fact_and_the_guidance(self):
-        curator = TaskCurator(config=_make_config(), taskmaster=None)
-        pool = _pool_with_ids(('10', 'pending'))
-        rendered = curator._build_batch_section(
-            CandidateTask(title='T'), pool, 0, withheld=self._census(),
+    @pytest.mark.asyncio
+    async def test_batch_section_carries_the_fact_and_the_guidance(self):
+        rendered = await _first_batch_section(
+            CandidateTask(title='T'), _pool_with_ids(('10', 'pending')), self._census(),
         )
         assert 'pool_truncated:' in rendered
         assert _carries_guidance(rendered)
 
-    def test_fact_follows_the_pool_block(self):
-        curator = TaskCurator(config=_make_config(), taskmaster=None)
-        pool = _pool_with_ids(('10', 'pending'))
-        rendered = curator._build_user_prompt(
-            CandidateTask(title='T'), pool, withheld=self._census(),
+    @pytest.mark.asyncio
+    async def test_fact_follows_the_pool_block(self):
+        rendered = await _single_prompt(
+            CandidateTask(title='T'), _pool_with_ids(('10', 'pending')), self._census(),
         )
         assert rendered.index('# Pool (') < rendered.index('pool_truncated:')
 
-    def test_omitted_when_the_census_is_empty(self):
-        curator = TaskCurator(config=_make_config(), taskmaster=None)
+    @pytest.mark.asyncio
+    async def test_omitted_when_the_census_is_empty(self):
         pool = _pool_with_ids(('10', 'pending'))
         for rendered in (
-            curator._build_user_prompt(
-                CandidateTask(title='T'), pool, withheld=PoolWithheld(),
-            ),
-            curator._build_batch_section(
-                CandidateTask(title='T'), pool, 0, withheld=PoolWithheld(),
-            ),
+            await _single_prompt(CandidateTask(title='T'), pool, PoolWithheld()),
+            await _first_batch_section(CandidateTask(title='T'), pool, PoolWithheld()),
         ):
             assert 'pool_truncated' not in rendered
 
-    def test_omitted_when_the_census_is_not_passed_at_all(self):
-        """The parameter is keyword-only with a default — positional callers
-        are unaffected and quiet calls stay quiet."""
-        curator = TaskCurator(config=_make_config(), taskmaster=None)
+    @pytest.mark.asyncio
+    async def test_omitted_when_the_bundles_carry_no_census(self):
+        """Bundles whose withheld is None render no census, and quiet calls stay quiet."""
         pool = _pool_with_ids(('10', 'pending'))
         for rendered in (
-            curator._build_user_prompt(CandidateTask(title='T'), pool),
-            curator._build_batch_section(CandidateTask(title='T'), pool, 0),
+            await _single_prompt(CandidateTask(title='T'), pool),
+            await _prompt_sent_for([
+                _bundle_for(CandidateTask(title='Alpha'), pool),
+                _bundle_for(CandidateTask(title='Beta'), _pool_with_ids(('20', 'pending'))),
+            ]),
         ):
             assert 'pool_truncated' not in rendered
 
-    def test_batch_prompt_places_each_fact_in_its_own_section(self):
-        curator = TaskCurator(config=_make_config(), taskmaster=None)
-        candidates = [CandidateTask(title='Alpha'), CandidateTask(title='Beta')]
-        pools = [_pool_with_ids(('10', 'pending')), _pool_with_ids(('20', 'pending'))]
+    @pytest.mark.asyncio
+    async def test_batch_prompt_places_each_fact_in_its_own_section(self):
         only_second = PoolWithheld(
             by_source={'module': 7}, caps={'module': 15},
         )
-        rendered = curator._build_batch_user_prompt(
-            candidates, pools, withheld_list=[PoolWithheld(), only_second],
-        )
+        rendered = await _prompt_sent_for([
+            _bundle_for(CandidateTask(title='Alpha'), _pool_with_ids(('10', 'pending')),
+                        PoolWithheld()),
+            _bundle_for(CandidateTask(title='Beta'), _pool_with_ids(('20', 'pending')),
+                        only_second),
+        ])
 
         # Exactly one fact, and it sits inside candidate 1's section — not
         # emitted once for the whole batch.
         assert rendered.count('pool_truncated:') == 1
         assert rendered.index('# Candidate batch_index=1') < rendered.index('pool_truncated:')
-
-    def test_batch_prompt_tolerates_an_absent_withheld_list(self):
-        curator = TaskCurator(config=_make_config(), taskmaster=None)
-        candidates = [CandidateTask(title='Alpha'), CandidateTask(title='Beta')]
-        pools = [_pool_with_ids(('10', 'pending')), _pool_with_ids(('20', 'pending'))]
-        assert 'pool_truncated' not in curator._build_batch_user_prompt(candidates, pools)
-
-    def test_batch_prompt_tolerates_a_short_withheld_list(self):
-        curator = TaskCurator(config=_make_config(), taskmaster=None)
-        candidates = [CandidateTask(title='Alpha'), CandidateTask(title='Beta')]
-        pools = [_pool_with_ids(('10', 'pending')), _pool_with_ids(('20', 'pending'))]
-        rendered = curator._build_batch_user_prompt(
-            candidates, pools, withheld_list=[self._census()],
-        )
-        assert rendered.count('pool_truncated:') == 1
-        assert rendered.index('# Candidate batch_index=0') < rendered.index('pool_truncated:')
-        assert rendered.index('pool_truncated:') < rendered.index('# Candidate batch_index=1')
 
 
 # ----------------------------------------------------------------------
@@ -4234,36 +4257,42 @@ class TestPromptClipSymmetry:
             combine_eligible=True,
         )
 
-    def test_same_text_renders_identically_on_both_sides(self):
+    @staticmethod
+    async def _both_prompts(
+        candidate: CandidateTask, pool: list[PoolEntry] | None = None,
+    ) -> tuple[str, str]:
+        """The single prompt and the batch_index=0 section for *candidate* over *pool*."""
+        return (
+            await _single_prompt(candidate, pool),
+            await _first_batch_section(candidate, pool),
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_text_renders_identically_on_both_sides(self):
         config = _make_config()
         desc_cap, details_cap = self._caps(config)
         desc, details = self._over_cap_texts(config)
-        curator = TaskCurator(config=config, taskmaster=None)
         candidate = CandidateTask(title='C', description=desc, details=details)
 
         expected_desc = clip_for_prompt(desc, desc_cap)
         expected_details = clip_for_prompt(details, details_cap)
 
         pool_rendered = self._entry_with(desc, details).render(desc_cap, details_cap)
-        single = curator._build_user_prompt(candidate, [])
-        section = curator._build_batch_section(candidate, [], 0)
+        single, section = await self._both_prompts(candidate)
 
         for rendered in (pool_rendered, single, section):
             assert expected_desc in rendered
             assert expected_details in rendered
 
-    def test_candidate_block_is_no_longer_silent(self):
+    @pytest.mark.asyncio
+    async def test_candidate_block_is_no_longer_silent(self):
         """Direct regression: the candidate side emitted a bare `[:cap]` slice."""
         config = _make_config()
         desc_cap, details_cap = self._caps(config)
         desc, details = self._over_cap_texts(config)
-        curator = TaskCurator(config=config, taskmaster=None)
         candidate = CandidateTask(title='C', description=desc, details=details)
 
-        for rendered in (
-            curator._build_user_prompt(candidate, []),
-            curator._build_batch_section(candidate, [], 0),
-        ):
+        for rendered in await self._both_prompts(candidate):
             # The clipped text is present but is NOT the whole story, and the
             # prompt says so — with the exact number of characters withheld.
             assert f'  description: {desc[:desc_cap]}\n' not in rendered
@@ -4271,34 +4300,31 @@ class TestPromptClipSymmetry:
             assert str(len(desc) - desc_cap) in rendered
             assert str(len(details) - details_cap) in rendered
 
-    def test_elided_counts_agree_across_all_three_renderings(self):
+    @pytest.mark.asyncio
+    async def test_elided_counts_agree_across_all_three_renderings(self):
         config = _make_config()
         desc_cap, details_cap = self._caps(config)
         desc, details = self._over_cap_texts(config)
-        curator = TaskCurator(config=config, taskmaster=None)
         candidate = CandidateTask(title='C', description=desc, details=details)
         pool = [self._entry_with(desc, details)]
 
         marker_desc = clip_for_prompt(desc, desc_cap)[desc_cap:]
         marker_details = clip_for_prompt(details, details_cap)[details_cap:]
 
-        single = curator._build_user_prompt(candidate, pool)
-        section = curator._build_batch_section(candidate, pool, 0)
-        for rendered in (single, section):
+        for rendered in await self._both_prompts(candidate, pool):
             # Once for the candidate block, once for the single pool entry.
             assert rendered.count(marker_desc) == 2
             assert rendered.count(marker_details) == 2
 
-    def test_under_cap_text_is_never_marked(self):
+    @pytest.mark.asyncio
+    async def test_under_cap_text_is_never_marked(self):
         config = _make_config()
         desc_cap, details_cap = self._caps(config)
-        curator = TaskCurator(config=config, taskmaster=None)
         candidate = CandidateTask(title='C', description='short', details='also short')
         pool = [self._entry_with('short', 'also short')]
 
         for rendered in (
-            curator._build_user_prompt(candidate, pool),
-            curator._build_batch_section(candidate, pool, 0),
+            *await self._both_prompts(candidate, pool),
             pool[0].render(desc_cap, details_cap),
         ):
             assert 'elided' not in rendered
@@ -4706,8 +4732,8 @@ class TestPrepareCandidate:
         assert prepared.pool_sizes['anchor'] == 0
 
         # Token estimate matches estimate_tokens() of the section the curator
-        # would emit for this candidate at batch_index=0.
-        section = curator._build_batch_section(candidate, [], 0)
+        # emits for this candidate at batch_index=0.
+        section = await _first_batch_section(candidate, [], PoolWithheld())
         assert prepared.prompt_tokens == estimate_tokens(section)
         assert prepared.prompt_tokens > 0  # candidate has real text
 
@@ -4897,7 +4923,8 @@ class TestWithheldReachesTheLlmPrompt:
 
         with patch.object(curator, '_build_corpus', side_effect=corpus):
             prepared = await curator.prepare_candidate(candidate, 'p', '/x')
-        section = curator._build_batch_section(candidate, [], 0, withheld=census)
+        section = await _first_batch_section(candidate, [], census)
+        assert 'pool_truncated:' in section
         assert prepared.prompt_tokens == estimate_tokens(section)
 
     @pytest.mark.asyncio
