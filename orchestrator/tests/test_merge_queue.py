@@ -16176,7 +16176,7 @@ class TestReverifyRebasedTree:
         # Premise P2: the drift is a tip THIS queue landed after a green gate
         # run.  Without this the gate now fails safe and re-verifies — see
         # test_disjoint_unverified_drift_reverifies below.
-        note_queue_verified_main_tip(rebased_onto)
+        note_queue_verified_main_tip(git_ops.project_root, rebased_onto)
 
         verify_mock = _mock_verify_pass()
         try:
@@ -16291,7 +16291,7 @@ class TestReverifyRebasedTree:
         await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
         await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
         rebased_onto = await git_ops.get_main_sha()
-        note_queue_verified_main_tip(rebased_onto)
+        note_queue_verified_main_tip(git_ops.project_root, rebased_onto)
 
         wide = config.model_copy(update={
             'merge_verify_breadth': 'full',
@@ -16763,7 +16763,7 @@ class TestSpeculativeMergeWorkerGate:
         # The drift stands in for another QUEUE landing: a tip this queue
         # already landed green.  Without this the gate fails safe and
         # re-verifies (see test_disjoint_unverified_drift_extra_verify).
-        note_queue_verified_main_tip(await git_ops.get_main_sha())
+        note_queue_verified_main_tip(git_ops.project_root, await git_ops.get_main_sha())
 
         verify_calls: list[int] = []
 
