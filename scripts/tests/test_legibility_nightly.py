@@ -1476,42 +1476,66 @@ def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
     absolute, so an operator's relative ``--config`` is never re-resolved
     against the census subprocess's cwd."""
     monkeypatch.chdir(tmp_path)
-    _write_config(tmp_path / 'proj_a', project_id='proj_a')
-    calls = []
+    project_root = tmp_path / 'proj_a'
+    _write_config(project_root, project_id='proj_a')
+    _write_census_state(project_root, _OLD_CENSUS)
+    launcher, launches = _recording_census_launcher()
 
-    def _spy_evaluate(cfg, **kwargs):
-        calls.append((cfg, kwargs))
-        return 'census trigger: NO-FIRE -- stub', False
-
-    monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
-
-    nightly.run_nightly(
+    result = nightly.run_nightly(
         config_path='proj_a/docs/legibility/legibility.yaml',
         projects_root=tmp_path / 'projects',
         target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
         invoke=lambda prompt, model: '{"proposals": []}',
         status_fetcher=lambda: {'statuses': {}},
         poster=lambda url, envelope: None,
+        census_launcher=launcher,
         pass_kind=nightly.PassKind.MANUAL,
     )
 
-    assert len(calls) == 1
-    cfg, kwargs = calls[0]
-    expected = (tmp_path / 'proj_a' / 'docs' / 'legibility' / 'legibility.yaml').resolve()
+    assert result.census_fire is True
+    [(args, kwargs)] = launches
+    expected = (project_root / 'docs' / 'legibility' / 'legibility.yaml').resolve()
     assert kwargs['config_path'] == expected
     assert Path(kwargs['config_path']).is_absolute()
-    # The cfg and the config path name the SAME project.
-    assert cfg.project_root == str(tmp_path / 'proj_a')
+    # The launch and the config path name the SAME project.
+    assert args == (str(project_root),)
+
+
+@pytest.mark.parametrize('fire', [True, False], ids=['fire', 'no-fire'])
+def test_run_nightly_launches_the_census_once_through_the_injected_launcher(
+    tmp_path, fire,
+):
+    launcher, launches = _recording_census_launcher()
+
+    result, repo = _run_e2e_nightly(
+        tmp_path, census_state=_OLD_CENSUS if fire else None, census_launcher=launcher,
+    )
+
+    cfg = load_config(repo / 'docs' / 'legibility' / 'legibility.yaml')
+    if not fire:
+        assert result.census_fire is False
+        assert launches == []
+        return
+    assert result.census_fire is True
+    assert launches == [(
+        (cfg.project_root,),
+        {
+            'config_path': (repo / 'docs' / 'legibility' / 'legibility.yaml').resolve(),
+            'caps': cfg.census.trickle_caps,
+        },
+    )]
 
 
 def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
     tmp_path, monkeypatch, install_fake_httpx,
 ):
     """End to end: a max-interval FIRE through run_nightly and the REAL default
-    launcher carries the project's census.trickle_caps into census.py's argv.
+    launcher carries the project's census.trickle_caps into census.py's argv,
+    and no env: census.py opens its own pooled runner (task 6042), so a pinned
+    env would hand it one account for every stage.
 
-    The injected invoke means no pool is built, so run_nightly hands
-    evaluate_census_step no launcher and the default one runs. Only
+    No census_launcher is injected, so the default one runs. Only
     subprocess.run is spied -- recording every call, since nightly.subprocess
     is the global module -- so no census really starts. Non-default caps
     (7/9) make a silent fall-back to the schema default fail.
@@ -1540,7 +1564,7 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
     runs = []
 
     def _record_run(args, **kwargs):
-        runs.append(list(args))
+        runs.append((list(args), kwargs))
         return subprocess.CompletedProcess(args, 0)
 
     monkeypatch.setattr(nightly.subprocess, 'run', _record_run)
@@ -1558,10 +1582,12 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
 
     assert result.census_fire is True
     census_launches = [
-        argv for argv in runs if len(argv) > 1 and str(argv[1]).endswith('census.py')
+        (argv, kwargs) for argv, kwargs in runs
+        if len(argv) > 1 and str(argv[1]).endswith('census.py')
     ]
     assert len(census_launches) == 1
-    argv = census_launches[0]
+    argv, kwargs = census_launches[0]
+    assert kwargs.get('env') is None
     assert _adjacent_pair(argv, '--max-batches') == ['--max-batches', '7']
     assert _adjacent_pair(argv, '--max-verify-clusters') == ['--max-verify-clusters', '9']
     assert _adjacent_pair(argv, '--project-root') == ['--project-root', str(root)]
@@ -1588,74 +1614,72 @@ class TestRunNightlyDefaultsTheCensusStatusFetcher:
     """Pin run_nightly's status_fetcher seam: None means "build the real
     MCP-backed fetcher for cfg.project_root", an explicit value is honoured.
 
-    The spy replaces ``evaluate_census_step`` ITSELF rather than the inner
-    ``decide`` seam. That is load-bearing: task 4085 wrapped the inner
-    ``decide`` call in a never-raises try/except (nightly.py:590-606) that
-    converts any failure into a synthetic ``NO-FIRE`` line, so a spy placed
-    inside it could turn a genuine wiring fault into a quiet pass.
+    Observed through the REAL trigger decision: an 8-day-old census with a
+    done-count baseline reaches compute_tasks_landed's fetch, so the fetcher
+    that decision called is the one run_nightly resolved.
     """
 
-    @staticmethod
-    def _install_spies(monkeypatch):
-        """Record the factory's argument and what evaluate_census_step got.
+    _NOW = datetime(2026, 7, 14, 3, 0, tzinfo=UTC)
 
-        Returns ``(sentinel, factory_calls, seen)`` where *sentinel* is the
-        object the stubbed factory hands back -- asserted by IDENTITY, so
-        "some fetcher got built" cannot pass for "the real factory's fetcher
-        got through".
-        """
-        sentinel = object()
+    @staticmethod
+    def _recording_fetcher(calls):
+        def _fetch():
+            calls.append(True)
+            return {'statuses': {f't{i}': 'done' for i in range(1000)}}
+
+        return _fetch
+
+    def _install_factory(self, monkeypatch):
+        """Make ``census_trigger.default_status_fetcher`` hand back a
+        recording fetcher. Returns ``(factory_calls, fetches)``."""
         factory_calls = []
-        seen = {}
+        fetches = []
 
         def _recording_factory(project_root):
             factory_calls.append(project_root)
-            return sentinel
-
-        def _spy_evaluate(
-            cfg, *, now=None, status_fetcher=None, launcher=None, config_path=None,
-        ):
-            seen['status_fetcher'] = status_fetcher
-            return 'census trigger: NO-FIRE -- stub', False
+            return self._recording_fetcher(fetches)
 
         monkeypatch.setattr(
             nightly.census_trigger, 'default_status_fetcher', _recording_factory,
         )
-        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
-        return sentinel, factory_calls, seen
+        return factory_calls, fetches
 
-    @staticmethod
-    def _run_quiet_night(tmp_path, **kwargs):
+    def _run_quiet_night(self, tmp_path, **kwargs):
         """Drive run_nightly over the light quiet-night path (empty
-        projects_root -> empty sample -> no LLM, no commit) and return the
-        loaded config, so a caller can assert against ``cfg.project_root``."""
+        projects_root -> empty sample -> no LLM, no commit) against a census
+        baseline the fetch is reached for, and return the loaded config."""
         config_path = _write_config(tmp_path, project_id='proj_a')
+        _write_census_state(tmp_path, {
+            'last_census_at': (self._NOW - timedelta(days=8)).isoformat(),
+            'last_census_done_count': 1000,
+        })
         nightly.run_nightly(
             config_path=config_path,
             projects_root=tmp_path / 'projects',
             target_date=date(2026, 7, 13),
+            now=self._NOW,
             invoke=lambda prompt, model: '{"proposals": []}',
             poster=lambda url, envelope: None,
+            census_launcher=_no_census_launch,
             pass_kind=nightly.PassKind.MANUAL,
             **kwargs,
         )
         return load_config(config_path)
 
     def test_defaults_to_the_real_mcp_backed_fetcher(self, tmp_path, monkeypatch):
-        sentinel, _factory_calls, seen = self._install_spies(monkeypatch)
+        _factory_calls, fetches = self._install_factory(monkeypatch)
 
         # No status_fetcher argument at all -- exactly what main() passes.
         self._run_quiet_night(tmp_path)
 
-        assert seen['status_fetcher'] is sentinel, (
-            'run_nightly handed evaluate_census_step '
-            f'{seen["status_fetcher"]!r} instead of the fetcher built by '
+        assert fetches == [True], (
+            'the census decision never called the fetcher built by '
             'census_trigger.default_status_fetcher -- with None, '
             'compute_tasks_landed fails safe and condition (b) can never fire'
         )
 
     def test_the_fetcher_is_built_for_the_configs_project_root(self, tmp_path, monkeypatch):
-        _sentinel, factory_calls, _seen = self._install_spies(monkeypatch)
+        factory_calls, _fetches = self._install_factory(monkeypatch)
 
         cfg = self._run_quiet_night(tmp_path)
 
@@ -1663,9 +1687,8 @@ class TestRunNightlyDefaultsTheCensusStatusFetcher:
             'default_status_fetcher must be called exactly once per run, '
             f'got {len(factory_calls)} call(s)'
         )
-        # The SAME project_root evaluate_census_step hands to decide()
-        # (nightly.py:591), so the fetcher and the decision can never disagree
-        # about which project they are for.
+        # The SAME project_root the trigger decides for, so the fetcher and
+        # the decision can never disagree about which project they are for.
         assert factory_calls[0] == cfg.project_root
         # Absolute is the wire contract task 3291 fixed: fused-memory's
         # _normalize_project_root hard-rejects any relative path.
@@ -1674,14 +1697,15 @@ class TestRunNightlyDefaultsTheCensusStatusFetcher:
     def test_an_injected_fetcher_is_not_overridden(self, tmp_path, monkeypatch):
         """DI-seam regression guard: the default must not clobber an explicit
         fetcher (every run_nightly test that injects one depends on this)."""
-        _sentinel, factory_calls, seen = self._install_spies(monkeypatch)
+        factory_calls, default_fetches = self._install_factory(monkeypatch)
+        injected_fetches = []
 
-        def my_fake():
-            return {'statuses': {}}
+        self._run_quiet_night(
+            tmp_path, status_fetcher=self._recording_fetcher(injected_fetches),
+        )
 
-        self._run_quiet_night(tmp_path, status_fetcher=my_fake)
-
-        assert seen['status_fetcher'] is my_fake
+        assert injected_fetches == [True]
+        assert default_fetches == []
         assert factory_calls == [], (
             'an injected status_fetcher must short-circuit the default factory'
         )
@@ -1724,7 +1748,6 @@ gate's reset sweep cannot reopen the account mid-test."""
 
 
 _REAL_OPEN_POOLED_RUNNER = session_runner.open_pooled_runner
-_REAL_DEFAULT_CENSUS_LAUNCHER = nightly._default_census_launcher
 
 
 def _pool_the_night_on(monkeypatch, accounts_file, env_file):
@@ -1772,6 +1795,30 @@ def _one_escalation(envelopes):
     return envelopes[0]['params']['arguments']
 
 
+def _no_census_launch(project_root, **kwargs):
+    """The ``census_launcher=`` every e2e helper injects unless a test passes
+    its own: a FIRE must never spawn the real census.py from a test."""
+
+
+def _recording_census_launcher(on_launch=None):
+    """A ``census_launcher=`` seam recording each launch as ``(args, kwargs)``;
+    *on_launch(project_root)* runs inside each. Returns (launcher, launches)."""
+    launches = []
+
+    def _launch(*args, **kwargs):
+        launches.append((args, kwargs))
+        if on_launch is not None:
+            on_launch(Path(args[0]))
+
+    return _launch, launches
+
+
+_OLD_CENSUS = {'last_census_at': '2026-06-01'}
+"""A census-state that FIREs on max-interval: no session_watermark, so the
+floor anchors on last_census_at, and no ``last_census_done_count``, so the
+trigger never reaches a status fetcher."""
+
+
 def _run_one_digest_night(tmp_path, **kwargs):
     """Drive a night carrying ONE real digest, so the coder is genuinely
     reached (an empty sample returns before it). Returns
@@ -1785,6 +1832,7 @@ def _run_one_digest_night(tmp_path, **kwargs):
     )
     poster, escalations = _capture_poster()
     kwargs.setdefault('status_fetcher', lambda: {'statuses': {}})
+    kwargs.setdefault('census_launcher', _no_census_launch)
     kwargs.setdefault('poster', poster)
     kwargs.setdefault('pass_kind', nightly.PassKind.MANUAL)
     result = nightly.run_nightly(
@@ -1804,11 +1852,9 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         self, tmp_path, monkeypatch, install_fake_httpx, fake_claude_cli,
         pool_roster, sentinel_login,
     ):
-        """A two-account pool behind the fake CLI, the census launch stubbed
-        out (a FIRE would spawn census.py: real spend, real git), and the
-        operator's login a sentinel no call may read."""
+        """A two-account pool behind the fake CLI and the operator's login a
+        sentinel no call may read."""
         install_fake_httpx(_no_outbound_post)
-        monkeypatch.setattr(nightly, '_default_census_launcher', lambda *a, **k: None)
         accounts_file, env_file = pool_roster(_P, _Q)
         opened = _pool_the_night_on(monkeypatch, accounts_file, env_file)
         return fake_claude_cli, pool_roster, sentinel_login, opened
@@ -1950,35 +1996,6 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         assert _one_recorded(recorded) is not None
         assert fake.calls() == []
 
-    def test_the_census_builds_its_own_pool_so_its_launch_carries_no_env(
-        self, tmp_path, night, monkeypatch,
-    ):
-        fake, _roster, _home, _opened = night
-        fake.plan(default={'result': _EMPTY_VERDICT})
-        seen = {}
-
-        def _spy_evaluate(cfg, *, now=None, status_fetcher=None, launcher=None, config_path=None):
-            seen['launcher'] = launcher
-            return 'census trigger: NO-FIRE -- stub', False
-
-        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
-        monkeypatch.setattr(nightly, '_default_census_launcher', _REAL_DEFAULT_CENSUS_LAUNCHER)
-        _run_one_digest_night(tmp_path)
-
-        assert seen['launcher'] is None, (
-            'the trickle leaves the census launch to _default_census_launcher; '
-            'any launcher it injected would bypass the assertion below'
-        )
-        launched = _spy_subprocess_run(monkeypatch)
-        nightly._default_census_launcher(
-            '/some/project', caps=TrickleCensusCaps(max_batches=7),
-        )
-        assert launched.get('env') is None, (
-            'the census opens its own pooled runner; a pinned env would hand it '
-            'one account for every stage'
-        )
-        assert _adjacent_pair(launched['args'], '--max-batches') == ['--max-batches', '7']
-
     @pytest.mark.parametrize('outcome', ['ok', 'capped', 'storm', 'raised'])
     def test_the_runner_is_closed_on_every_exit_path(
         self, tmp_path, night, monkeypatch, outcome,
@@ -2036,7 +2053,6 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         depends on the default never clobbering it -- nor opening a pool,
         which would read the operator's own .env."""
         install_fake_httpx(_no_outbound_post)
-        monkeypatch.setattr(nightly, '_default_census_launcher', lambda *a, **k: None)
         monkeypatch.setattr(
             session_runner, 'open_pooled_runner',
             lambda *a, **k: pytest.fail('no runner may be opened on the injected path'),
@@ -3836,7 +3852,8 @@ _BRANCH_NEEDS_MONKEYPATCH = (
 def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
                      branch=None, recorder=None, budget_bytes=None,
                      invoke=_fake_invoke_known_cause, committer=None, poster=None,
-                     digest_builder=None, transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+                     digest_builder=None, census_launcher=_no_census_launch,
+                     census_state: dict | None = None, transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
                      invariants_doc: str | None = None,
                      unreadable_transcripts: bool = False,
                      pass_kind=nightly.PassKind.MANUAL):
@@ -3866,8 +3883,10 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
     the config with a digest byte budget small enough to suppress the whole
     night, *transcript=False* makes it a genuinely quiet one, *invariants_doc*
     is committed as the project's design-invariants doc, and
-    *recorder* / *committer* / *poster* / *invoke* / *digest_builder* are the
-    injected seams
+    *recorder* / *committer* / *poster* / *invoke* / *digest_builder* /
+    *census_launcher* are the injected seams (*census_launcher* defaults to a
+    no-op, so no night here can spawn census.py), *census_state* is written as
+    the repo's census-state.json
     (*poster* defaults to a no-op, so a test that does not care about
     escalations never has to build one), and *pass_kind* (default
     ``MANUAL``) is passed through. *unreadable_transcripts* is the
@@ -3876,6 +3895,8 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
     """
     work_cwd = str(tmp_path / 'work')
     repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    if census_state is not None:
+        _write_census_state(repo, census_state)
     if invariants_doc is not None:
         doc_path = repo / invariants.DOC_RELPATH
         doc_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3908,6 +3929,7 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
         invoke=invoke,
         status_fetcher=None,
         poster=poster if poster is not None else (lambda url, envelope: None),
+        census_launcher=census_launcher,
         pass_kind=pass_kind,
     )
     if recorder is not None:
@@ -4320,20 +4342,6 @@ def _write_census_state(repo: Path, state: dict) -> None:
     _census_state(repo).write_text(json.dumps(state), encoding='utf-8')
 
 
-def _stub_census_launcher(monkeypatch, on_launch=None):
-    """Replace the real launcher, which would subprocess census.py. Returns
-    the call list; *on_launch(project_root)* runs inside each launch."""
-    launches = []
-
-    def _launch(project_root, **kwargs):
-        launches.append(project_root)
-        if on_launch is not None:
-            on_launch(Path(project_root))
-
-    monkeypatch.setattr(nightly, '_default_census_launcher', _launch)
-    return launches
-
-
 def _run_census_progress_probe(project_id: str, threshold: int):
     """The REAL predicate by subprocess. It inherits this process's
     environment, so it reads the conftest-isolated state root."""
@@ -4348,27 +4356,20 @@ class TestRunNightlyRecordsTheCensusObservation:
     check_census_progress.py can tell a FIRE whose census never advanced
     census-state from one whose census landed.
 
-    HAZARD. A test reaching a FIRE seeds
-    ``<repo>/docs/legibility/census-state.json`` = ``{"last_census_at":
-    "2026-06-01"}``: no session_watermark, so the floor anchors on
-    last_census_at (43 days) and max-interval (stock 10d) FIREs; and no
-    ``last_census_done_count``, so compute_tasks_landed never reaches the
-    REAL status fetcher these fixtures build from ``status_fetcher=None``.
-    Every test here ALWAYS stubs ``nightly._default_census_launcher``:
-    evaluate_census_step resolves that global at call time, and the real
-    one subprocess-runs census.py.
+    A night reaching a FIRE seeds :data:`_OLD_CENSUS`, and every night here
+    launches through an injected recording launcher.
     """
 
-    _OLD_CENSUS = {'last_census_at': '2026-06-01'}
-
-    def test_a_no_fire_night_records_census_fired_false(self, tmp_path, monkeypatch):
+    def test_a_no_fire_night_records_census_fired_false(self, tmp_path):
         """Never censused: the floor anchors on the codebook's earliest
         date, the night's own 2026-07-13 sighting, one day before now and
         inside floor_days=5."""
-        launches = _stub_census_launcher(monkeypatch)
+        launcher, launches = _recording_census_launcher()
         recorder, calls = _recorder_spy()
 
-        result, _repo = _run_e2e_nightly(tmp_path, recorder=recorder)
+        result, _repo = _run_e2e_nightly(
+            tmp_path, recorder=recorder, census_launcher=launcher,
+        )
 
         assert result.census_fire is False
         assert launches == []
@@ -4376,10 +4377,10 @@ class TestRunNightlyRecordsTheCensusObservation:
         assert doc['census_fired'] is False
         assert doc['census_fire_streak'] is None
 
-    def test_a_fire_night_records_the_streak(self, tmp_path, monkeypatch):
-        launches = _stub_census_launcher(monkeypatch)
-        runner = _NightRunner(tmp_path)
-        _write_census_state(runner.repo, self._OLD_CENSUS)
+    def test_a_fire_night_records_the_streak(self, tmp_path):
+        launcher, launches = _recording_census_launcher()
+        runner = _NightRunner(tmp_path, census_launcher=launcher)
+        _write_census_state(runner.repo, _OLD_CENSUS)
 
         result = runner.night(13, 'quiet')
 
@@ -4394,20 +4395,17 @@ class TestRunNightlyRecordsTheCensusObservation:
             'since': '2026-07-13',
         }
 
-    def test_the_anchor_is_read_before_the_synchronous_launch(
-        self, tmp_path, monkeypatch,
-    ):
+    def test_the_anchor_is_read_before_the_synchronous_launch(self, tmp_path):
         """A census that lands rewrites census-state INSIDE the launch; an
         anchor read afterwards would equal the new value and a census that
         advanced would read as unadvanced."""
-        _stub_census_launcher(
-            monkeypatch,
+        launcher, _launches = _recording_census_launcher(
             on_launch=lambda root: _write_census_state(
                 root, {'last_census_at': '2026-07-14'},
             ),
         )
-        runner = _NightRunner(tmp_path)
-        _write_census_state(runner.repo, self._OLD_CENSUS)
+        runner = _NightRunner(tmp_path, census_launcher=launcher)
+        _write_census_state(runner.repo, _OLD_CENSUS)
 
         runner.night(13, 'quiet')
 
@@ -4416,13 +4414,11 @@ class TestRunNightlyRecordsTheCensusObservation:
         assert runner.recorded()['census_fire_streak'][
             'last_census_at'] == '2026-06-01'
 
-    def test_a_malformed_census_state_warns_once_per_night(
-        self, tmp_path, monkeypatch, caplog,
-    ):
+    def test_a_malformed_census_state_warns_once_per_night(self, tmp_path, caplog):
         """The trigger's own read owns the malformed WARNING; the anchor
         read must not repeat it in the journal."""
-        launches = _stub_census_launcher(monkeypatch)
-        runner = _NightRunner(tmp_path)
+        launcher, launches = _recording_census_launcher()
+        runner = _NightRunner(tmp_path, census_launcher=launcher)
         _census_state(runner.repo).write_text('{not json', encoding='utf-8')
 
         with caplog.at_level('WARNING'):
@@ -4438,12 +4434,15 @@ class TestRunNightlyRecordsTheCensusObservation:
 
     @pytest.mark.parametrize('branch', ['storm', 'capped'])
     def test_a_night_that_returns_before_the_census_step_records_none(
-        self, tmp_path, monkeypatch, branch,
+        self, tmp_path, branch,
     ):
-        launches = _stub_census_launcher(monkeypatch)
+        launcher, launches = _recording_census_launcher()
         recorder, calls = _recorder_spy()
 
-        _run_e2e_nightly(tmp_path, branch=branch, recorder=recorder)
+        _run_e2e_nightly(
+            tmp_path, branch=branch, recorder=recorder, census_state=_OLD_CENSUS,
+            census_launcher=launcher,
+        )
 
         assert launches == []
         doc = _one_recorded(calls)
@@ -4453,7 +4452,6 @@ class TestRunNightlyRecordsTheCensusObservation:
     def test_a_project_whose_config_does_not_load_records_none(
         self, tmp_path, monkeypatch,
     ):
-        _stub_census_launcher(monkeypatch)
         _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
         monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
         recorder, calls = _recorder_spy()
@@ -4469,12 +4467,10 @@ class TestRunNightlyRecordsTheCensusObservation:
         assert doc['census_fired'] is None
         assert doc['census_fire_streak'] is None
 
-    def test_a_night_without_a_census_step_carries_the_streak(
-        self, tmp_path, monkeypatch,
-    ):
-        _stub_census_launcher(monkeypatch)
-        runner = _NightRunner(tmp_path)
-        _write_census_state(runner.repo, self._OLD_CENSUS)
+    def test_a_night_without_a_census_step_carries_the_streak(self, tmp_path):
+        launcher, _launches = _recording_census_launcher()
+        runner = _NightRunner(tmp_path, census_launcher=launcher)
+        _write_census_state(runner.repo, _OLD_CENSUS)
 
         runner.night(13, 'quiet')
         fired = runner.recorded()['census_fire_streak']
@@ -4486,14 +4482,11 @@ class TestRunNightlyRecordsTheCensusObservation:
         assert doc['census_fire_streak'] == fired
         assert fired['fires'] == 1
 
-    def test_unadvanced_fires_through_the_real_pipeline_are_flagged(
-        self, tmp_path, monkeypatch,
-    ):
-        """ACCEPTANCE. Every night is quiet, so the walk is census-safe
-        beyond the launcher stub."""
-        launches = _stub_census_launcher(monkeypatch)
-        runner = _NightRunner(tmp_path)
-        _write_census_state(runner.repo, self._OLD_CENSUS)
+    def test_unadvanced_fires_through_the_real_pipeline_are_flagged(self, tmp_path):
+        """ACCEPTANCE: three quiet FIRE nights whose census never advanced."""
+        launcher, launches = _recording_census_launcher()
+        runner = _NightRunner(tmp_path, census_launcher=launcher)
+        _write_census_state(runner.repo, _OLD_CENSUS)
 
         for day in (13, 14, 15):
             runner.night(day, 'quiet')
@@ -4506,20 +4499,17 @@ class TestRunNightlyRecordsTheCensusObservation:
         )
         assert '2026-06-01' in probe.stderr
 
-    def test_a_census_that_advanced_through_the_real_pipeline_passes(
-        self, tmp_path, monkeypatch,
-    ):
+    def test_a_census_that_advanced_through_the_real_pipeline_passes(self, tmp_path):
         """The inverse: night 13's census lands, so nights 14 and 15 are
         NO-FIRE inside the stock floor_days=5."""
-        _stub_census_launcher(
-            monkeypatch,
+        launcher, _launches = _recording_census_launcher(
             on_launch=lambda root: _write_census_state(root, {
                 'last_census_at': '2026-07-14',
                 'session_watermark': '2026-07-14T00:00:00+00:00',
             }),
         )
-        runner = _NightRunner(tmp_path)
-        _write_census_state(runner.repo, self._OLD_CENSUS)
+        runner = _NightRunner(tmp_path, census_launcher=launcher)
+        _write_census_state(runner.repo, _OLD_CENSUS)
 
         fires = [runner.night(day, 'quiet').census_fire for day in (13, 14, 15)]
 
@@ -4584,12 +4574,13 @@ class _NightRunner:
     Every scheduled or manual night records through *recorder* (default the
     real one) and escalates at *max_barren_runs*. Every post is collected in
     ``escalations`` and then handed to *on_post*, which may raise to play a
-    failed post."""
+    failed post. Every pass launches a census through *census_launcher*
+    (default a no-op)."""
 
     def __init__(
         self, tmp_path, *, recorder=None,
         max_barren_runs: int = trickle_state.DEFAULT_MAX_BARREN_RUNS,
-        on_post=None,
+        on_post=None, census_launcher=_no_census_launch,
     ):
         self.tmp_path = tmp_path
         self.work_cwd = str(tmp_path / 'work')
@@ -4602,6 +4593,7 @@ class _NightRunner:
         self.recorder = recorder
         self.max_barren_runs = max_barren_runs
         self.on_post = on_post
+        self.census_launcher = census_launcher
 
     def _post(self, url, envelope):
         self.escalations.append((url, envelope))
@@ -4672,6 +4664,7 @@ class _NightRunner:
             invoke=invoke,
             status_fetcher=None,
             poster=self._post,
+            census_launcher=self.census_launcher,
             max_barren_runs=self.max_barren_runs,
         )
 
@@ -5166,10 +5159,16 @@ def _seed_state(*, day: int, exit_code: int) -> None:
     )
 
 
-def _owed_after_storm_then_productive(tmp_path) -> tuple[_NightRunner, dict]:
+def _owed_after_storm_then_productive(
+    tmp_path, *, census_state: dict | None = None, **runner_kwargs,
+) -> tuple[_NightRunner, dict]:
     """Night 13 storms and night 14 is productive, so date 13 is owed with
-    one attempt. Returns the runner and the state document night 14 wrote."""
-    runner = _NightRunner(tmp_path)
+    one attempt. Returns the runner and the state document night 14 wrote.
+    *census_state* is seeded before night 13; *runner_kwargs* reach the
+    :class:`_NightRunner`."""
+    runner = _NightRunner(tmp_path, **runner_kwargs)
+    if census_state is not None:
+        _write_census_state(runner.repo, census_state)
     runner.night(13, 'storm')
     runner.night(14, 'productive')
     before = runner.recorded()
@@ -5278,20 +5277,16 @@ class TestRetryPass:
         assert _one_recorded(retried)['retry_backlog'] == {'2026-07-13': 2}
         assert retried[0][0]['exit_code'] == 1
 
-    def test_a_retry_never_evaluates_the_census_step(self, tmp_path, monkeypatch):
-        census_calls = []
-
-        def _spy(cfg, **kwargs):
-            census_calls.append(cfg.project_id)
-            return 'census: spy', False
-
-        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy)
-        runner, _before = _owed_after_storm_then_productive(tmp_path)
-        assert census_calls == ['testproj'], 'the scheduled night 14 evaluates it once'
+    def test_a_retry_never_evaluates_the_census_step(self, tmp_path):
+        launcher, launches = _recording_census_launcher()
+        runner, _before = _owed_after_storm_then_productive(
+            tmp_path, census_state=_OLD_CENSUS, census_launcher=launcher,
+        )
+        assert len(launches) == 1, 'night 14 evaluates the census once and FIREs'
 
         result = runner.retry(13, on_night=14)
 
-        assert census_calls == ['testproj']
+        assert len(launches) == 1
         assert result.census_line is None
         assert result.census_fire is False
 
@@ -5894,15 +5889,9 @@ def test_post_escalation_reports_false_on_a_tool_error_envelope(
 # fail-safe line on 2026-08-10, 2026-08-11 and 2026-08-12:
 # "tasks-landed: no status_fetcher configured -- condition (b) fails safe".
 #
-# HAZARD, now that the fetcher default is live (amendment): ANY run_nightly or
-# main() test that writes a valid non-negative `last_census_done_count` into
-# census-state.json and injects no `status_fetcher` will issue a REAL POST to
-# $FUSED_MEMORY_MCP_URL (default localhost:8002) -- and on a dev box where
-# fused-memory is actually up, a stale fixture baseline against the real
-# done-count can produce a genuine FIRE that subprocess-launches
-# scripts/legibility/census.py, i.e. real LLM spend and real git writes.
-# Such a test MUST both fake httpx (conftest's `install_fake_httpx`) AND stub
-# `nightly._default_census_launcher`. The two tests below are the pattern.
+# main() injects nothing, so these two reach the REAL status fetcher and the
+# REAL census launcher: they fake httpx (conftest's `install_fake_httpx`) and
+# spy the census.py subprocess (`_spy_census_subprocess_and_stub_pool`).
 # ---------------------------------------------------------------------------
 
 class _UnusedRunner:
@@ -5918,28 +5907,30 @@ class _UnusedRunner:
         pass
 
 
-def _stub_census_launcher_and_pool(monkeypatch):
-    """Stub both of a ``main()``-driven run's reaches into the real world, and
-    return the launcher's call list, one ``(args, kwargs)`` pair per call.
+def _spy_census_subprocess_and_stub_pool(monkeypatch):
+    """Keep a ``main()``-driven run off both of its reaches into the real
+    world, and return the argv of every census.py launch.
 
-    MANDATORY, not cosmetic, on both counts. On FIRE the real launcher
-    subprocess-runs scripts/legibility/census.py (real LLM spend + real git
-    writes) and ``_default_entrypoint_exists`` is true in a real checkout --
-    and reaching FIRE is the entire point of the tests that call this. And
-    main() -- which injects no ``invoke`` -- makes run_nightly open a REAL
-    pooled session runner over the operator's own roster and
-    CLAUDE_OAUTH_TOKEN_* vars. A test about the census trigger has no
-    business touching either.
+    The real launcher's census.py subprocess is recorded and answered rc 0,
+    never run (real LLM spend + real git writes); every other subprocess.run
+    is delegated to the real one. And main() -- which injects no ``invoke`` --
+    would open a REAL pooled session runner over the operator's own roster,
+    so the runner factory hands back an :class:`_UnusedRunner`.
     """
-    launcher_calls = []
-    monkeypatch.setattr(
-        nightly, '_default_census_launcher',
-        lambda *args, **kwargs: launcher_calls.append((args, kwargs)),
-    )
+    census_argvs = []
+    real_run = subprocess.run
+
+    def _run(args, *rest, **kwargs):
+        if len(args) > 1 and str(args[1]).endswith('census.py'):
+            census_argvs.append(list(args))
+            return subprocess.CompletedProcess(args, 0)
+        return real_run(args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'run', _run)
     monkeypatch.setattr(
         session_runner, 'open_pooled_runner', lambda *_args, **_kwargs: _UnusedRunner(),
     )
-    return launcher_calls
+    return census_argvs
 
 
 def test_main_run_fires_the_tasks_landed_condition_end_to_end(
@@ -5998,7 +5989,7 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
 
     install_fake_httpx(_fake_post)
 
-    launcher_calls = _stub_census_launcher_and_pool(monkeypatch)
+    census_argvs = _spy_census_subprocess_and_stub_pool(monkeypatch)
 
     # Empty -> empty sample -> no digests -> `invoke` is never called and
     # nothing is committed, so no LLM and no git.
@@ -6022,8 +6013,8 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
 
     # (i) condition (b) fired all the way through the production entrypoint.
     assert exit_code == 0
-    assert len(launcher_calls) == 1, (
-        'the census launcher never fired end-to-end. Read the captured log '
+    assert len(census_argvs) == 1, (
+        'the census never launched end-to-end. Read the captured log '
         'BEFORE suspecting the wiring: task 4085 turns any exception out of '
         '`decide` into a quiet synthetic NO-FIRE line rather than a '
         f'traceback. messages={messages}'
@@ -6052,9 +6043,11 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
 
     # (iv) task 3269: the census launched from the systemd entry point is aimed
     # at THIS project and THIS legibility.yaml, never at the process cwd.
-    launch_args, launch_kwargs = launcher_calls[0]
-    assert launch_args == (str(tmp_path),)
-    assert launch_kwargs['config_path'] == Path(config_path).resolve()
+    [argv] = census_argvs
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', str(tmp_path)]
+    assert _adjacent_pair(argv, '--config') == [
+        '--config', str(Path(config_path).resolve()),
+    ]
 
 
 def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memory(
@@ -6105,7 +6098,7 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
 
     install_fake_httpx(_refusing_post)
 
-    launcher_calls = _stub_census_launcher_and_pool(monkeypatch)
+    census_argvs = _spy_census_subprocess_and_stub_pool(monkeypatch)
 
     projects_root = tmp_path / 'projects'
     projects_root.mkdir()
@@ -6121,7 +6114,7 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
 
     # The nightly run is unaffected by a dead fused-memory...
     assert exit_code == 0
-    assert launcher_calls == [], messages
+    assert census_argvs == [], messages
 
     # ...but the fetch really was attempted through the DEFAULTED seam, so
     # this test cannot go green on a fetcher that was never built.
@@ -6389,18 +6382,18 @@ class TestRunNightlyLedgersCodedSessions:
         assert result.ledger_rows_written == 1
         assert result.ledger_rows_failed == 0
 
-    def test_the_row_is_ledgered_before_the_census_step_runs(self, tmp_path, monkeypatch):
-        seen_by_census_step = []
+    def test_the_row_is_ledgered_before_the_census_step_runs(self, tmp_path):
+        seen_by_census = []
+        launcher, _launches = _recording_census_launcher(
+            on_launch=lambda root: seen_by_census.append(_ledger().sessions),
+        )
 
-        def _spy(cfg, **kwargs):
-            seen_by_census_step.append(_ledger().sessions)
-            return 'census: spy', False
+        result, _repo = _run_e2e_nightly(
+            tmp_path, census_state=_OLD_CENSUS, census_launcher=launcher,
+        )
 
-        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy)
-        result, _repo = _run_e2e_nightly(tmp_path)
-
-        assert result.census_line == 'census: spy'
-        assert seen_by_census_step == [frozenset({'session-1'})]
+        assert result.census_fire is True
+        assert seen_by_census == [frozenset({'session-1'})]
 
     @pytest.mark.parametrize(
         'branch', ['extractor', 'storm', 'capped', 'validation', 'commit'],
