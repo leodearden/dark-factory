@@ -26,6 +26,11 @@ MAX_CLAUDE_ANCESTOR_HOPS = 6
 """How many ancestors above the hook's parent the walk inspects for the firing ``claude``."""
 
 
+def _read_proc_text(path: Path) -> str:
+    """*path* decoded with U+FFFD for undecodable bytes, since a process sets its own name; raises only OSError."""
+    return path.read_bytes().decode('utf-8', 'replace')
+
+
 def _parent_pid_of(pid: int) -> int | None:
     """The parent pid of *pid* per ``/proc/<pid>/status``, or None.
 
@@ -49,10 +54,12 @@ def _process_comm(pid: int) -> str | None:
 
     Returns None -- never raises -- on a platform with no ``/proc``, on a
     race where *pid* exits mid-read, and on any unreadable body, so callers
-    can treat the answer as a best-effort hint.
+    can treat the answer as a best-effort hint. An undecodable name reads
+    back with U+FFFD in place of the bad bytes, so the answer is always a
+    str or None.
     """
     try:
-        return Path(f'/proc/{pid}/comm').read_text().strip()
+        return _read_proc_text(Path(f'/proc/{pid}/comm')).strip()
     except OSError:
         return None
 
