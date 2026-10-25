@@ -7743,6 +7743,50 @@ class TestRemoteRunnerSshKeepalive:
             assert argv[:len(expected_prefix)] == expected_prefix, argv
             assert argv[len(expected_prefix)] == 'laptop.local'
 
+    async def test_non_probe_ssh_sites_carry_the_unmultiplexed_option_block(self):
+        """Only env probes multiplex: the dispatch sites and git's push transport
+        keep the plain option block byte for byte.
+
+        The verify-merge dispatch's ssh child owns the heartbeat connection-death
+        protocol (``_default_ssh_heartbeat_run``); a shared ControlMaster would put
+        that child's liveness behind another process's socket.  The block is spelled
+        literally, because comparing against ``_SSH_BASE_OPTS`` would be tautological.
+        """
+        from orchestrator.verify_runner import (
+            GIT_PUSH_SSH_CONFIG,
+            SSH_SERVER_ALIVE_COUNT_MAX,
+            SSH_SERVER_ALIVE_INTERVAL,
+            RunnerUnavailable,
+        )
+
+        block = [
+            '-o', 'BatchMode=yes',
+            '-o', 'ConnectTimeout=10',
+            '-o', f'ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}',
+            '-o', f'ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}',
+        ]
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        verify_entered, verify_release = asyncio.Event(), asyncio.Event()
+        runner, calls = self._make_runner(
+            expected, verify_entered=verify_entered, verify_release=verify_release,
+        )
+
+        await runner.health()
+        dispatch = asyncio.create_task(runner.run_merge_verify('abc123', _make_spec()))
+        await verify_entered.wait()
+        await runner.cancel_verify()
+        verify_release.set()
+        with pytest.raises(RunnerUnavailable):
+            await dispatch
+        await runner.probe_clean()
+
+        ssh_calls = [c for c in calls if c[0] == 'ssh']
+        assert len(ssh_calls) == 4
+        for argv in ssh_calls:
+            assert argv == ['ssh', *block, 'laptop.local', argv[-1]], argv
+            assert not any('Control' in element for element in argv), argv
+        assert ('-c', 'core.sshCommand=ssh ' + ' '.join(block)) == GIT_PUSH_SSH_CONFIG
+
 
 # ---------------------------------------------------------------------------
 # β step-15: RemoteRunner _last_pushed_main_sha dedup
