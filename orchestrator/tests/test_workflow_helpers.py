@@ -36,6 +36,21 @@ async def test_fake_scheduler_smoke() -> None:
     assert sched.statuses == {'x': ['pending', 'done']}
 
 
+@pytest.mark.asyncio
+async def test_fake_scheduler_submit_task_through_the_chronic_flake_adapter_files_nothing() -> None:
+    """The chronic-flake adapter submits through FakeScheduler, which records the call and files nothing."""
+    from _workflow_helpers import FakeScheduler
+    from shared.task_submit import SubmitFailed
+
+    from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+
+    sched = FakeScheduler()
+    outcome = await SchedulerChronicFlakeTaskClient(sched, '/proj').submit_task({'title': 't'})
+
+    assert outcome == SubmitFailed('FakeScheduler files nothing')
+    assert sched.submit_task_calls == [({'title': 't', 'project_root': '/proj'}, 30)]
+
+
 def test_fake_mcp_smoke() -> None:
     """FakeMcp returns the expected URL and empty MCP config."""
     from _workflow_helpers import FakeMcp  # noqa: PLC0415

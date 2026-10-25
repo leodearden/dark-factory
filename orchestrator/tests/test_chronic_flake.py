@@ -24,6 +24,7 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from importlib import resources as pkg_resources
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -781,10 +782,10 @@ _FILED = SubmittedTask('fix-7', 'deferred')
 
 
 class _StubScheduler:
-    """Stub scheduler exposing ``dispatch_tool`` and ``submit_task`` — the surface
-    ``SchedulerChronicFlakeTaskClient`` depends on (duck-typed; no import of
-    the real ``Scheduler``, mirroring the module's cross-project scope
-    boundary).  ``submit_task`` answers with a canned outcome: parsing the response
+    """Stub scheduler exposing ``dispatch_tool`` and ``submit_task`` — the
+    ``SchedulerTaskStore`` surface ``SchedulerChronicFlakeTaskClient`` depends on
+    (no import of the real ``Scheduler``, mirroring the module's cross-project
+    scope boundary).  ``submit_task`` answers with a canned outcome: parsing the response
     is ``Scheduler.submit_task``'s job, driven for real in
     :class:`TestSubmitTaskThroughTheRealScheduler`."""
 
@@ -801,7 +802,7 @@ class _StubScheduler:
         self.calls: list[tuple[str, dict, float | None]] = []
         self.submit_calls: list[tuple[dict, float]] = []
 
-    async def dispatch_tool(self, name, arguments, *, timeout=15):
+    async def dispatch_tool(self, name: str, arguments: dict, *, timeout: float = 15) -> Any:
         self.calls.append((name, arguments, timeout))
         if self.raises is not None:
             raise self.raises
@@ -1509,7 +1510,7 @@ class _PagingScheduler(_StubScheduler):
         super().__init__()
         self.pages = list(pages)
 
-    async def dispatch_tool(self, name, arguments, *, timeout=15):
+    async def dispatch_tool(self, name: str, arguments: dict, *, timeout: float = 15) -> Any:
         self.calls.append((name, arguments, timeout))
         return self.pages.pop(0)
 
