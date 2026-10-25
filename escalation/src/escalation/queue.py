@@ -48,6 +48,7 @@ from escalation.models import (
     Escalation,
     LateResolution,
     max_severity,
+    note_to_file_class_conflict,
 )
 
 logger = logging.getLogger(__name__)
@@ -387,6 +388,24 @@ def _elide(text: str, limit: int, what: str = 'amendment field') -> tuple[str, i
         f'{text[:limit]}\n[... {dropped} char(s) elided at the '
         f'{limit}-char {what} cap ...]'
     ), dropped
+
+
+def _stamped_resolution_class(
+    escalation: Escalation, resolution_class: str | None, resolved_by: str | None,
+) -> str | None:
+    """The class a terminal write stamps: *resolution_class*, else the resolver default.
+
+    ``ValueError`` with ``models.note_to_file_class_conflict``'s message when
+    *escalation* cannot carry that class.
+    """
+    stamped = (
+        resolution_class if resolution_class is not None
+        else default_resolution_class_for_resolver(resolved_by)
+    )
+    conflict = note_to_file_class_conflict(escalation, stamped)
+    if conflict is not None:
+        raise ValueError(conflict)
+    return stamped
 
 
 def _is_late_resolution_worth_capturing(
@@ -1010,9 +1029,16 @@ class EscalationQueue:
 
         An unregistered ``escalation.category`` raises
         ``UnregisteredEscalationCategory`` before anything is written (see
-        ``escalation.categories``).
+        ``escalation.categories``).  A ``note_to_file`` record raises
+        ``ValueError`` before anything is written: it is never pending.
         """
         require_registered_category(escalation.category)
+        if escalation.note_to_file:
+            raise ValueError(
+                f'note-to-file record {escalation.id} (task {escalation.task_id}) '
+                'is filed resolved via submit_resolved and is never pending; '
+                'submit() refused it'
+            )
         with escalation_id_lock(self.queue_dir, escalation.id):
             self._atomic_write(escalation.id, escalation.to_json(), durable=True)
         logger.info(f'Escalation submitted: {escalation.id} [{escalation.severity}]')
@@ -1526,7 +1552,9 @@ class EscalationQueue:
         an invalid value raises ``ValueError`` naming the legal values and
         nothing is persisted (INV-1). When ``None``, the stamp defaults per
         the caller's ``resolved_by`` (see ``escalation.classify.
-        default_resolution_class_for_resolver``).
+        default_resolution_class_for_resolver``). A class the record cannot
+        carry (``models.note_to_file_class_conflict``) raises ``ValueError``
+        inside the critical section before anything is written.
 
         ``outcome`` (task 4495): an optional :class:`ResolveOutcome` dict filled
         in place with what this call DID — whether the resolution was actually
@@ -1649,6 +1677,7 @@ class EscalationQueue:
                         outcome['resolution_class_corrected'] = corrected
                 return esc
 
+            stamped_class = _stamped_resolution_class(esc, resolution_class, resolved_by)
             if outcome is not None:
                 outcome['applied'] = True
                 outcome['prior_status'] = esc.status
@@ -1660,10 +1689,7 @@ class EscalationQueue:
                 esc.resolved_by = resolved_by
             if resolution_turns is not None:
                 esc.resolution_turns = resolution_turns
-            esc.resolution_class = (
-                resolution_class if resolution_class is not None
-                else default_resolution_class_for_resolver(resolved_by)
-            )
+            esc.resolution_class = stamped_class
             if granted_files is not None:
                 esc.granted_files = granted_files
 
@@ -1760,8 +1786,9 @@ class EscalationQueue:
         corrected: str | None = None
         if esc.resolution_class == 'benign':
             # `resolution_class` was validated against RESOLUTION_CLASSES at
-            # the top of `resolve`, so the incoming value is known-legal here.
-            candidate = resolution_class or 'actionable'
+            # the top of `resolve` and paired through _stamped_resolution_class,
+            # so the incoming value is known-legal here.
+            candidate = _stamped_resolution_class(esc, resolution_class or 'actionable', resolved_by)
             corrected = candidate if candidate != esc.resolution_class else None
 
         entry, chars_elided = _build_late_resolution(
@@ -1979,12 +2006,14 @@ class EscalationQueue:
         validated against ``RESOLUTION_CLASSES`` before *escalation* is
         mutated at all — an invalid value raises ``ValueError`` naming the
         legal values and leaves the passed-in object untouched (INV-1).  When
-        ``None``, the stamp defaults per *resolved_by* via the same
-        ``default_resolution_class_for_resolver`` helper ``resolve()`` uses
-        (INV-5 — one classification site for both terminal-write paths).
+        ``None``, the stamp defaults per *resolved_by* via
+        ``_stamped_resolution_class``, the stamp site ``resolve()``,
+        ``submit_resolved`` and ``_capture_late_resolution`` share (INV-5).
         An unregistered ``escalation.category`` likewise raises
         ``UnregisteredEscalationCategory`` before any mutation (see
-        ``escalation.categories``).
+        ``escalation.categories``), and so does a ``note_to_file`` flag whose
+        stamped class is not ``NOTE_TO_FILE_CLASS``, or that class without the
+        flag, as ``ValueError`` naming both values.
 
         Contract:
         - Mutates *escalation* in-place (status/resolution/resolved_at/resolved_by)
@@ -2005,6 +2034,7 @@ class EscalationQueue:
                 f'invalid resolution_class {resolution_class!r}; '
                 f'expected one of {sorted(RESOLUTION_CLASSES)} or None'
             )
+        stamped_class = _stamped_resolution_class(escalation, resolution_class, resolved_by)
 
         # Step 1: mutate in memory
         escalation.status = 'resolved'
@@ -2012,10 +2042,7 @@ class EscalationQueue:
         escalation.resolved_at = datetime.now(UTC).isoformat()
         if resolved_by is not None:
             escalation.resolved_by = resolved_by
-        escalation.resolution_class = (
-            resolution_class if resolution_class is not None
-            else default_resolution_class_for_resolver(resolved_by)
-        )
+        escalation.resolution_class = stamped_class
 
         # Step 2: atomic write + best-effort archive under the per-id lock.
         # The lock prevents a concurrent same-id RMW from clobbering this write.

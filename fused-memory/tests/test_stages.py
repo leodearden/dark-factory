@@ -472,14 +472,19 @@ class TestDisallowedToolLists:
         ``..._the_three_read_tools`` when the fourth member landed, and a name
         that promises a count forces a rename on every accession (and reads as a
         lie in between — see the RETIRED ASSERTION note above).
+
+        ``resolve_escalation_shas`` joined it in task 5751: a by-id record read,
+        denied for the same reason as ``get_escalation`` (against the
+        reconciliation queue it can only answer not-found).
         """
         assert set(DISALLOW_ESCALATION_READS) == {
             'mcp__escalation__get_pending_escalations',
             'mcp__escalation__get_escalation',
             'mcp__escalation__get_task_escalations',
             'mcp__escalation__get_task_escalation_history',
+            'mcp__escalation__resolve_escalation_shas',
         }
-        assert len(DISALLOW_ESCALATION_READS) == 4, 'no duplicate entries'
+        assert len(DISALLOW_ESCALATION_READS) == 5, 'no duplicate entries'
 
     def test_every_escalation_server_tool_is_classified(self):
         """Every tool the SHARED escalation server registers is denied or reviewed.
