@@ -6001,9 +6001,9 @@ class TestCuratorBlocklistShortCircuit:
 
         assert decision.action == "refuse"
         assert decision.justification.startswith("cancelled-premise-blocklist:")
-        mock_corpus.assert_not_called()
+        mock_corpus.assert_not_awaited()
         invoke.assert_not_awaited()
-        mock_exact.assert_not_called()
+        mock_exact.assert_not_awaited()
 
     async def test_blocklist_decision_stored_in_cache(self, tmp_path):
         """(e) The decision is stored in _decision_cache under payload_hash."""
@@ -7014,9 +7014,9 @@ class TestCuratorPremiseRefutedDrop:
         assert decision.action == "refuse"
         assert decision.justification.startswith("recon-premise-refuted:")
         assert "test_premise_entry" in decision.justification
-        mock_corpus.assert_not_called()
+        mock_corpus.assert_not_awaited()
         invoke.assert_not_awaited()
-        mock_exact.assert_not_called()
+        mock_exact.assert_not_awaited()
 
     async def test_premise_refuted_drop_not_stored_in_cache(self, tmp_path):
         """The recon-premise-refuted refusal is deliberately NOT stored in
@@ -8418,7 +8418,7 @@ class TestCuratorCurateRouteDeterministicIntegration:
 
         assert decision.action == "route_deterministic"
         assert decision.justification.startswith("operational-ask-registry:")
-        mock_corpus.assert_not_called()
+        mock_corpus.assert_not_awaited()
         invoke.assert_not_awaited()
 
     async def test_registry_miss_flows_through_llm_unaffected(self, tmp_path):
