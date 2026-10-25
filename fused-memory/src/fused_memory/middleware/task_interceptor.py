@@ -17,6 +17,7 @@ import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with t
 from pydantic import ValidationError
 from shared import process_identity
 from shared.defects import DeclareEvent, OutcomeEvent
+from shared.git_async import run_git
 from shared.mcp_envelope import write_failure_reason
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
@@ -6582,6 +6583,8 @@ _KIND_REQUIRED_REASON = (
 # travel with the value instead of living in a call-site variable name.
 # The authoritative branch-by-branch contract is each probe's docstring.
 
+_GIT_PROBE_TIMEOUT_SECS = 5.0
+
 
 class _CommitResolutionFailure(NamedTuple):
     """`git rev-parse --verify` did not yield a SHA. See _resolve_commit_sha."""
@@ -6891,50 +6894,41 @@ async def _verify_commit_on_main(project_root: str, sha: str) -> _AncestorCheckF
       case that actually means "not on main", and the only one whose
       remedy is to re-derive the landing SHA.
     - ``confirmed_off_main=False`` for every other failure (a non-1 git
-      error such as an unresolvable ``main`` ref, a timeout, a missing git
-      binary, or any unexpected exception) — the check never completed, so
-      the caller must treat it as NOT-YET-CONFIRMED rather than a
-      not-on-main verdict. The remedy there is the opposite one: fetch /
-      fix the checkout / retry. Task 3455: conflating the two under a
-      single "is not on main" wording is the same defect class as task
-      3119's premature outcome assertions. Any failure branch added later
-      inherits ``False``, i.e. the weaker (honest) claim, by default.
+      error such as an unresolvable ``main`` ref, a timed-out ``run_git``
+      result, a missing git binary, or any unexpected exception) — the
+      check never completed, so the caller must treat it as
+      NOT-YET-CONFIRMED rather than a not-on-main verdict. The remedy
+      there is the opposite one: fetch / fix the checkout / retry. Task
+      3455: conflating the two under a single "is not on main" wording is
+      the same defect class as task 3119's premature outcome assertions.
+      Any failure branch added later inherits ``False``, i.e. the weaker
+      (honest) claim, by default.
 
     Used as a backstop for kind="merged" provenance so that a SHA from a
     feature branch cannot pass as a merge commit.
     """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            'git',
-            '-C',
-            project_root,
-            'merge-base',
-            '--is-ancestor',
-            sha,
-            'main',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = await run_git(
+            ['git', '-C', project_root, 'merge-base', '--is-ancestor', sha, 'main'],
+            timeout=_GIT_PROBE_TIMEOUT_SECS,
         )
-        try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except TimeoutError:
-            proc.kill()
-            return _AncestorCheckFailure(False, 'git merge-base timed out')
     except FileNotFoundError:
         return _AncestorCheckFailure(False, 'git binary not found')
     except Exception as e:
         return _AncestorCheckFailure(False, f'{type(e).__name__}: {e}')
 
+    # A timed-out result's returncode is a kill signal, never a verdict.
+    if result.timed_out:
+        return _AncestorCheckFailure(False, 'git merge-base timed out')
     # Exit codes from `git merge-base --is-ancestor`:
     #   0 — sha is reachable from main
     #   1 — sha is NOT reachable from main
     #   other — git error (e.g. unknown ref `main`)
-    if proc.returncode == 0:
+    if result.returncode == 0:
         return None
-    if proc.returncode == 1:
+    if result.returncode == 1:
         return _AncestorCheckFailure(True, 'commit is not an ancestor of main')
-    msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'merge-base failed'
-    return _AncestorCheckFailure(False, msg)
+    return _AncestorCheckFailure(False, result.stderr or 'merge-base failed')
 
 
 async def _resolve_commit_sha(project_root: str, commit: str) -> str | _CommitResolutionFailure:
@@ -6947,41 +6941,32 @@ async def _resolve_commit_sha(project_root: str, commit: str) -> str | _CommitRe
     - ``confirmed_absent=True`` for a non-zero rev-parse exit — git ran,
       evaluated the ref against this checkout, and rejected it. Only then
       may the caller say the commit was "not found in <project_root>".
-    - ``confirmed_absent=False`` for a timeout, a missing git binary, an
-      unexpected exception, or empty output on rc=0 — rev-parse never
-      rendered a verdict on the ref, so the honest report is "could not be
-      resolved", with the same fetch / fix-the-checkout / retry remedy as
-      an unconfirmed ancestor check. Any failure branch added later
-      inherits ``False``, i.e. the weaker claim, by default.
+    - ``confirmed_absent=False`` for a timed-out ``run_git`` result, a
+      missing git binary, an unexpected exception, or empty output on
+      rc=0 — rev-parse never rendered a verdict on the ref, so the honest
+      report is "could not be resolved", with the same fetch /
+      fix-the-checkout / retry remedy as an unconfirmed ancestor check.
+      Any failure branch added later inherits ``False``, i.e. the weaker
+      claim, by default.
 
     Uses a commit-peeling suffix (``^{commit}``) so a tag that points at a
     commit resolves to the commit SHA directly.
     """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            'git',
-            '-C',
-            project_root,
-            'rev-parse',
-            '--verify',
-            f'{commit}^{{commit}}',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = await run_git(
+            ['git', '-C', project_root, 'rev-parse', '--verify', f'{commit}^{{commit}}'],
+            timeout=_GIT_PROBE_TIMEOUT_SECS,
         )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except TimeoutError:
-            proc.kill()
-            return _CommitResolutionFailure(False, 'git rev-parse timed out')
     except FileNotFoundError:
         return _CommitResolutionFailure(False, 'git binary not found')
     except Exception as e:
         return _CommitResolutionFailure(False, f'{type(e).__name__}: {e}')
 
-    if proc.returncode != 0:
-        msg = (stderr.decode('utf-8', errors='replace') or '').strip() or 'no such ref'
-        return _CommitResolutionFailure(True, msg)
-    sha = stdout.decode('utf-8', errors='replace').strip()
+    if result.timed_out:
+        return _CommitResolutionFailure(False, 'git rev-parse timed out')
+    if result.returncode != 0:
+        return _CommitResolutionFailure(True, result.stderr or 'no such ref')
+    sha = result.stdout
     if not sha or len(sha) < 7:
         return _CommitResolutionFailure(False, 'empty rev-parse output')
     return sha
@@ -7000,30 +6985,16 @@ async def _resolve_commit_committed_at(project_root: str, sha: str) -> str | Non
     """Resolve a commit's committer date via ``git show -s --format=%cI``.
 
     Returns the stripped ``%cI`` (strict ISO-8601, offset-aware) string on
-    success, or None on any failure (git binary missing, non-zero exit,
-    timeout, empty output). Modeled directly on :func:`_resolve_commit_sha`'s
-    subprocess/timeout/error-handling shape for consistent semantics.
+    success, or None on any failure (git binary missing, non-zero exit, a
+    timed-out ``run_git`` result, empty output). All three git probes spawn
+    through ``shared/src/shared/git_async.py::run_git``, which kills and
+    reaps a timed-out child.
     """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            'git',
-            '-C',
-            project_root,
-            'show',
-            '-s',
-            '--format=%cI',
-            sha,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = await run_git(
+            ['git', '-C', project_root, 'show', '-s', '--format=%cI', sha],
+            timeout=_GIT_PROBE_TIMEOUT_SECS,
         )
-        try:
-            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except TimeoutError:
-            proc.kill()
-            # Reap the killed child promptly rather than leaving it as a
-            # transient zombie until GC finalizes the Process object.
-            await proc.wait()
-            return None
     except FileNotFoundError:
         return None
     except Exception:
@@ -7040,10 +7011,9 @@ async def _resolve_commit_committed_at(project_root: str, sha: str) -> str | Non
         )
         return None
 
-    if proc.returncode != 0:
+    if result.timed_out or result.returncode != 0:
         return None
-    committed_at = stdout.decode('utf-8', errors='replace').strip()
-    return committed_at or None
+    return result.stdout or None
 
 
 def _extract_reopen_at(before: Any) -> str | None:
