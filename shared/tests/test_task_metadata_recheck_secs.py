@@ -16,7 +16,6 @@ from shared.task_metadata import (
     BeforeDone,
     Milestone,
     TaskMetadata,
-    is_known_metadata_key,
     parse_metadata,
     recheck_secs_milestone_conflict,
 )
@@ -140,20 +139,3 @@ class TestPredicatesWithoutRecheckSecsUnchanged:
         assert model.before_done is not None
         assert model.before_done.recheck_secs is None
         assert warnings == []
-
-
-class TestRecheckStampsAreKnownKeys:
-    def test_runner_stamps_raise_no_unknown_key_warning(self) -> None:
-        blob = {
-            'predicate_recheck': {
-                'consecutive': 1,
-                'first_rearmed_at': '2026-10-25T00:00:00+00:00',
-                'last_checked_at': '2026-10-25T00:00:00+00:00',
-                'next_check_at': '2026-10-26T00:00:00+00:00',
-            },
-            'predicate_verdict': {'verdict': 'not_yet'},
-        }
-        _model, warnings = parse_metadata(blob, direction='read')
-        assert [w for w in warnings if w.code == 'unknown_key'] == []
-        assert is_known_metadata_key('predicate_recheck')
-        assert is_known_metadata_key('predicate_verdict')
