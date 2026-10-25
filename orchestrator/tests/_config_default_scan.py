@@ -5,14 +5,16 @@ it out of pytest collection while remaining importable (``conftest.py`` puts the
 tests dir on ``sys.path``), matching ``_orch_helpers.py`` and
 ``_verify_config_corpus.py``.
 
-WHAT IT LOOKS FOR.  A test is flagged when it (1) binds a name to a *bare*
-``OrchestratorConfig()`` — no args, no keywords — (2) is not isolated from the
-ambient operational config, and (3) asserts that name's attribute path equals a
-literal that is exactly the package default for that path.  Such an assertion
-passes only because the repo happens NOT to declare that key in
-``dark-factory-orchestrator.yaml``; the autouse ``_isolate_orch_config`` fixture
-pins that file for every test.  An operator declaring the key turns the test red
-without touching any code the test is about (task 3886's incident).
+WHAT IT LOOKS FOR.  A test is flagged when it (1) builds a *bare*
+``OrchestratorConfig()`` — no args, no keywords — either binding a name to it
+or asserting directly off the call (``OrchestratorConfig().x.y == literal``),
+(2) is not isolated from the ambient operational config, and (3) asserts an
+attribute path off that name or call equals a literal that is exactly the
+package default for that path.  Such an assertion passes only because the
+repo happens NOT to declare that key in ``dark-factory-orchestrator.yaml``; the
+autouse ``_isolate_orch_config`` fixture pins that file for every test.  An
+operator declaring the key turns the test red without touching any code the
+test is about (task 3886's incident).
 
 WHAT COUNTS AS ISOLATED.  Three idioms, all honoured:
 
@@ -91,15 +93,15 @@ def _resolve_default(dotted: str) -> Any:
     return current
 
 
-def _attr_chain(node: ast.AST) -> tuple[str, str] | None:
-    """Unwind ``a.b.c`` into ``('a', 'b.c')``; ``None`` if not a pure chain."""
+def _attr_chain(node: ast.expr) -> tuple[ast.expr, str] | None:
+    """Unwind ``a.b.c`` into ``(<node a>, 'b.c')``; ``None`` if no attribute."""
     parts: list[str] = []
     while isinstance(node, ast.Attribute):
         parts.append(node.attr)
         node = node.value
-    if not isinstance(node, ast.Name) or not parts:
+    if not parts:
         return None
-    return node.id, '.'.join(reversed(parts))
+    return node, '.'.join(reversed(parts))
 
 
 def _is_bare_config_call(node: ast.AST | None) -> bool:
@@ -116,6 +118,13 @@ def _is_bare_config_call(node: ast.AST | None) -> bool:
         and not node.args
         and not node.keywords
     )
+
+
+def _is_config_root(root: ast.expr, names: set[str]) -> bool:
+    """True if *root* is a name bound to a bare config, or a bare call itself."""
+    if isinstance(root, ast.Name):
+        return root.id in names
+    return _is_bare_config_call(root)
 
 
 def _decorated_with_hatch(node: ast.AST) -> bool:
@@ -180,9 +189,11 @@ def _default_assertions(func: ast.FunctionDef | ast.AsyncFunctionDef,
             if not isinstance(cmp_node.ops[0], (ast.Eq, ast.Is)):
                 continue
             chain = _attr_chain(cmp_node.left)
-            if chain is None or chain[0] not in names:
+            if chain is None:
                 continue
-            _root, attr_path = chain
+            root, attr_path = chain
+            if not _is_config_root(root, names):
+                continue
             try:
                 literal = ast.literal_eval(cmp_node.comparators[0])
             except (ValueError, TypeError, SyntaxError, MemoryError,
@@ -214,8 +225,6 @@ def iter_default_asserting_tests(
         if _is_isolated(func, enclosing_class):
             return
         names = _bare_config_names(func)
-        if not names:
-            return
         class_name = enclosing_class.name if enclosing_class is not None else None
         for lineno, attr_path, literal in _default_assertions(func, names):
             yield class_name, func.name, lineno, attr_path, literal
