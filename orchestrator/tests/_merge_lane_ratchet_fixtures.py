@@ -1,5 +1,6 @@
 """What the merge-lane ratchet suites share: the instrument, the one seed report,
-and the throwaway repo the git-driving suites build history in.
+the throwaway repo the git-driving suites build history in, and what a gate
+copied into that repo needs beside it.
 
 The ``scripts/`` modules are imported HERE, once, so no suite carries its own
 ``sys.path`` bootstrap; orchestrator/pyproject.toml's [tool.pyright] extraPaths
@@ -15,6 +16,7 @@ bootstrap. A helper lives here only when more than one ratchet suite uses it;
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +24,8 @@ from typing import Self
 
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
-_SCRIPTS = Path(__file__).parents[2] / 'scripts'
+_CHECKOUT = Path(__file__).parents[2]
+_SCRIPTS = _CHECKOUT / 'scripts'
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
@@ -30,6 +33,7 @@ import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: 
 import source_measures  # type: ignore[import-not-found]  # noqa: E402
 
 __all__ = [
+    'GATE_IMPORT_CLOSURE',
     'RatchetRepo',
     'a_py_cognitive_raise',
     'blank_file_entry',
@@ -38,6 +42,19 @@ __all__ = [
     'source_measures',
     'synthetic_report',
 ]
+
+
+#: What either gate script needs beside it to run in a copied checkout: the
+#: gates' git plumbing, the instrument, and the checkout binding with the
+#: pyproject.toml it reads. A suite installing a gate adds only that gate and the
+#: hooks that run it, so a new import is named here once.
+GATE_IMPORT_CLOSURE = (
+    'scripts/ratchet_revisions.py',
+    'scripts/merge_lane_metrics.py',
+    'scripts/source_measures.py',
+    'scripts/_checkout.py',
+    'pyproject.toml',
+)
 
 
 def synthetic_report() -> dict:
@@ -156,8 +173,9 @@ class RatchetRepo:
         """An initialized repo with NO commit yet -- HEAD names nothing."""
         return cls(cls._init_main(tmp_path))
 
-    def git(self, *args: str, check: bool = True) -> str:
-        proc = subprocess.run(
+    def attempt(self, *args: str) -> subprocess.CompletedProcess[str]:
+        """A real git command, hooks and all, whose outcome is the caller's assertion."""
+        return subprocess.run(
             ['git', *args],
             cwd=str(self.root),
             capture_output=True,
@@ -165,6 +183,9 @@ class RatchetRepo:
             env=self.env,
             check=False,
         )
+
+    def git(self, *args: str, check: bool = True) -> str:
+        proc = self.attempt(*args)
         if check:
             assert proc.returncode == 0, (
                 f'git {" ".join(args)} failed (rc={proc.returncode}): '
@@ -197,6 +218,18 @@ class RatchetRepo:
 
     def stage(self, *relpaths: str) -> None:
         self.git('add', '--', *relpaths)
+
+    def install_from_checkout(self, *relpaths: str) -> None:
+        """Copy THIS checkout's *relpaths* in verbatim and executable, at the same paths.
+
+        Copied rather than restated, so a renamed gate or a dropped hook section
+        stops the copy working and the case that relies on it goes red.
+        """
+        for relpath in relpaths:
+            target = self.root / relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(_CHECKOUT / relpath, target)
+            target.chmod(0o755)
 
 
 def record(raises: list[metrics.Violation], task_id: str = '5722') -> dict:

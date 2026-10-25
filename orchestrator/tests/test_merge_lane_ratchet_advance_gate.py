@@ -23,13 +23,13 @@ hook drives it. EVERY CASE PINS THE EXIT CODE: 0 clean, 1 a policy refusal,
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 from _merge_lane_ratchet_fixtures import (
+    GATE_IMPORT_CLOSURE,
     RatchetRepo,
     a_py_cognitive_raise,
     metrics,
@@ -389,6 +389,34 @@ class TestTheAdvanceAuditor:
             assert _how_to_lines(result.stderr, base), result.stderr
         assert base in result.stdout + result.stderr
 
+    def test_a_sideways_move_drops_what_only_old_holds_unrefused(
+        self, tmp_path: Path
+    ) -> None:
+        # ACCEPTED RESIDUAL, pinned so no change widens it unseen: a sideways
+        # move is a rewind to the merge base plus an advance from it. The entry
+        # and the lowering only OLD holds are dropped, as a rewind drops them,
+        # and NEW's a.py 125 over OLD's 115 is covered only by its 5 over BASE.
+        repo = RatchetRepo.seeded(tmp_path)
+        _fork(repo)
+        new = _commit(
+            repo,
+            'raise a.py, recorded',
+            baseline=_a_py_cognitive(125),
+            entries=(a_py_cognitive_raise(120, 125, '5722'),),
+        )
+        repo.git('switch', '--quiet', 'main')
+        old = _commit(
+            repo,
+            'main records an entry and lowers a.py',
+            baseline=_a_py_cognitive(115),
+            entries=(record([], '5000'),),
+        )
+
+        result = _advance(repo, old, new)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'does not fast-forward' in result.stdout
+
     def test_a_later_commits_entry_covers_an_earlier_commits_raise(
         self, tmp_path: Path
     ) -> None:
@@ -514,16 +542,8 @@ class TestTheAdvanceHonoursTheRestoreCarveOut:
 
 _HOOK = 'hooks/reference-transaction'
 
-#: What the copied hook needs to run the auditor: the auditor, its plumbing, the
-#: instrument, and the checkout binding the instrument imports through.
-_AUDITOR_FILES = (
-    'scripts/check_ratchet_advance.py',
-    'scripts/ratchet_revisions.py',
-    'scripts/merge_lane_metrics.py',
-    'scripts/source_measures.py',
-    'scripts/_checkout.py',
-    'pyproject.toml',
-)
+#: What the copied hook needs to run the auditor.
+_AUDITOR_FILES = (metrics.ADVANCE_GATE_RELPATH, *GATE_IMPORT_CLOSURE)
 
 
 def _install_advance_hook(repo: RatchetRepo, *, with_auditor: bool = True) -> None:
@@ -533,24 +553,8 @@ def _install_advance_hook(repo: RatchetRepo, *, with_auditor: bool = True) -> No
     Without the auditor, a hook that spawned it would refuse the move, which is
     how a case proves the bash filter spawned nothing.
     """
-    for relpath in (_HOOK, *(_AUDITOR_FILES if with_auditor else ())):
-        target = repo.root / relpath
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(_REPO_ROOT / relpath, target)
-        target.chmod(0o755)
+    repo.install_from_checkout(_HOOK, *(_AUDITOR_FILES if with_auditor else ()))
     repo.git('config', 'core.hooksPath', 'hooks')
-
-
-def _attempt(repo: RatchetRepo, *args: str) -> subprocess.CompletedProcess[str]:
-    """A real git command, hooks and all, whose outcome is the assertion."""
-    return subprocess.run(
-        ['git', *args],
-        cwd=str(repo.root),
-        capture_output=True,
-        text=True,
-        env=repo.env,
-        check=False,
-    )
 
 
 def _raising_landing(repo: RatchetRepo, *, entries: tuple[dict, ...] = ()) -> tuple[str, str]:
@@ -583,7 +587,7 @@ class TestTheHookGatesEveryMoveOfMain:
         old, landing = _land(repo, _TASK_BRANCH)
         _install_advance_hook(repo)
 
-        result = _attempt(repo, 'update-ref', 'refs/heads/main', landing, old)
+        result = repo.attempt('update-ref', 'refs/heads/main', landing, old)
 
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
@@ -597,7 +601,7 @@ class TestTheHookGatesEveryMoveOfMain:
         old, landing = _raising_landing(repo)
         _install_advance_hook(repo)
 
-        result = _attempt(repo, 'update-ref', 'refs/heads/main', landing)
+        result = repo.attempt('update-ref', 'refs/heads/main', landing)
 
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
@@ -612,7 +616,7 @@ class TestTheHookGatesEveryMoveOfMain:
         old = repo.git('rev-parse', 'HEAD')
         _install_advance_hook(repo)
 
-        result = _attempt(repo, 'merge', '--no-ff', '--no-verify', '-m', 'merge', _TASK_BRANCH)
+        result = repo.attempt('merge', '--no-ff', '--no-verify', '-m', 'merge', _TASK_BRANCH)
 
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
@@ -626,12 +630,14 @@ class TestTheHookGatesEveryMoveOfMain:
         repo.write_baseline(_a_py_cognitive(125))
         repo.stage(metrics.BASELINE_RELPATH)
 
-        result = _attempt(repo, 'commit', '--no-verify', '-m', 'raise a.py on main')
+        result = repo.attempt('commit', '--no-verify', '-m', 'raise a.py on main')
 
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
         assert repo.git('rev-parse', 'HEAD') == old
         assert 'cognitive rose 120 -> 125 for a.py' in output
+        # The HEAD line riding along with main's is not audited a second time.
+        assert output.count('merge-lane ratchet audit REFUSED') == 1, output
 
     def test_a_covered_raise_moves_main(self, tmp_path: Path) -> None:
         repo = RatchetRepo.seeded(tmp_path)
@@ -640,7 +646,7 @@ class TestTheHookGatesEveryMoveOfMain:
         )
         _install_advance_hook(repo)
 
-        result = _attempt(repo, 'update-ref', 'refs/heads/main', landing, old)
+        result = repo.attempt('update-ref', 'refs/heads/main', landing, old)
 
         assert result.returncode == 0, result.stdout + result.stderr
         assert repo.git('rev-parse', 'main') == landing
@@ -652,7 +658,7 @@ class TestTheHookGatesEveryMoveOfMain:
         old, landing = _land(repo, _TASK_BRANCH)
         _install_advance_hook(repo, with_auditor=False)
 
-        result = _attempt(repo, 'update-ref', 'refs/heads/main', landing, old)
+        result = repo.attempt('update-ref', 'refs/heads/main', landing, old)
 
         assert result.returncode == 0, result.stdout + result.stderr
         assert repo.git('rev-parse', 'main') == landing
@@ -662,7 +668,7 @@ class TestTheHookGatesEveryMoveOfMain:
         _old, landing = _raising_landing(repo)
         _install_advance_hook(repo, with_auditor=False)
 
-        result = _attempt(repo, 'update-ref', 'refs/heads/parking', landing)
+        result = repo.attempt('update-ref', 'refs/heads/parking', landing)
 
         assert result.returncode == 0, result.stdout + result.stderr
         assert repo.git('rev-parse', 'parking') == landing
@@ -677,7 +683,7 @@ class TestTheHookGatesEveryMoveOfMain:
         repo.git('switch', '--quiet', '-c', 'elsewhere')
         _install_advance_hook(repo)
 
-        result = _attempt(repo, 'update-ref', 'refs/heads/main', earlier, old)
+        result = repo.attempt('update-ref', 'refs/heads/main', earlier, old)
 
         assert result.returncode == 0, result.stdout + result.stderr
         assert repo.git('rev-parse', 'main') == earlier
@@ -692,12 +698,12 @@ class TestTheHookGatesEveryMoveOfMain:
         _commit(repo, 'raise a.py on main with no entry', baseline=_a_py_cognitive(125))
         _install_advance_hook(repo, with_auditor=False)
 
-        packed = _attempt(repo, 'pack-refs', '--all')
+        packed = repo.attempt('pack-refs', '--all')
 
         assert packed.returncode == 0, packed.stdout + packed.stderr
         packed_refs = (repo.root / '.git' / 'packed-refs').read_text(encoding='utf-8')
         assert 'refs/heads/main' in packed_refs
-        collected = _attempt(repo, 'gc', '--quiet')
+        collected = repo.attempt('gc', '--quiet')
         assert collected.returncode == 0, collected.stdout + collected.stderr
 
     def test_an_auditor_that_cannot_run_refuses_the_move(self, tmp_path: Path) -> None:
@@ -708,11 +714,32 @@ class TestTheHookGatesEveryMoveOfMain:
         old, landing = _land(repo, _TASK_BRANCH)
         _install_advance_hook(repo)
 
-        result = _attempt(repo, 'update-ref', 'refs/heads/main', landing, old)
+        result = repo.attempt('update-ref', 'refs/heads/main', landing, old)
 
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
         assert 'could NOT RUN' in output
+        assert repo.git('rev-parse', 'main') == old
+
+    def test_a_move_whose_artifacts_cannot_be_compared_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # A covered raise the auditor would pass, so only the bash filter's own
+        # fail-closed arm can refuse it: OLD's root tree is gone, and diff-tree
+        # exits 128 rather than answering "same" or "differs".
+        repo = RatchetRepo.seeded(tmp_path)
+        old, landing = _raising_landing(
+            repo, entries=(a_py_cognitive_raise(120, 125, '5722'),)
+        )
+        tree = repo.git('rev-parse', f'{old}^{{tree}}')
+        (repo.root / '.git' / 'objects' / tree[:2] / tree[2:]).unlink()
+        _install_advance_hook(repo, with_auditor=False)
+
+        result = repo.attempt('update-ref', 'refs/heads/main', landing, old)
+
+        output = result.stdout + result.stderr
+        assert result.returncode != 0, output
+        assert 'could not compare the ratchet artifacts' in output
         assert repo.git('rev-parse', 'main') == old
 
     def test_the_hook_names_every_artifact_and_the_auditor(self) -> None:

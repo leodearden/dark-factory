@@ -36,7 +36,6 @@ from __future__ import annotations
 import copy
 import enum
 import json
-import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -44,6 +43,7 @@ from pathlib import Path
 
 import pytest
 from _merge_lane_ratchet_fixtures import (
+    GATE_IMPORT_CLOSURE,
     RatchetRepo,
     a_py_cognitive_raise,
     metrics,
@@ -181,14 +181,7 @@ class _Repo(RatchetRepo):
 
     def attempt_commit(self, message: str) -> subprocess.CompletedProcess[str]:
         """A real `git commit`, hooks and all, whose outcome is the assertion."""
-        return subprocess.run(
-            ['git', 'commit', '-m', message],
-            cwd=str(self.root),
-            capture_output=True,
-            text=True,
-            env=self.env,
-            check=False,
-        )
+        return self.attempt('commit', '-m', message)
 
     def gate(self) -> subprocess.CompletedProcess[str]:
         """Drive the auditor through its real entry point, as the hook does."""
@@ -1026,12 +1019,8 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
 _WIRED_FILES = (
     'hooks/pre-commit',
     'hooks/project-checks',
-    'scripts/merge_lane_metrics.py',
-    'scripts/source_measures.py',
-    'scripts/check_staged_ratchet_raise.py',
-    'scripts/ratchet_revisions.py',
-    'scripts/_checkout.py',
-    'pyproject.toml',
+    metrics.COMMIT_GATE_RELPATH,
+    *GATE_IMPORT_CLOSURE,
 )
 
 
@@ -1060,11 +1049,7 @@ def _install_real_hooks(repo: _Repo) -> None:
     The commit that installs them already runs them, harmlessly: it stages no
     ratchet artifact, and it must be made off main.
     """
-    for relpath in _WIRED_FILES:
-        target = repo.root / relpath
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(_REPO_ROOT / relpath, target)
-        target.chmod(0o755)
+    repo.install_from_checkout(*_WIRED_FILES)
     repo.git('config', 'core.hooksPath', 'hooks')
     repo.commit_all('install the real hooks and the instrument')
 
