@@ -302,8 +302,8 @@ class TestSeparateLabelBoundsWithinRange:
 # ---------------------------------------------------------------------------
 
 
-class _WidthedChart(ChartData):
-    bucket_minutes: int
+class _ChartWithExtraKey(ChartData):
+    extra: str
 
 
 class TestTrimLeadingZeroBuckets:
@@ -374,10 +374,10 @@ class TestTrimLeadingZeroBuckets:
     ])
     def test_keeps_every_key_beside_the_series(self, labels, values, trimmed_labels, trimmed_values):
         """A key the chart carries beside labels and values survives the trim."""
-        data: _WidthedChart = {'labels': labels, 'values': values, 'bucket_minutes': 60}
+        data: _ChartWithExtraKey = {'labels': labels, 'values': values, 'extra': 'kept'}
         before = copy.deepcopy(data)
 
         result = trim_leading_zero_buckets(data)
 
-        assert result == {'labels': trimmed_labels, 'values': trimmed_values, 'bucket_minutes': 60}
+        assert result == {'labels': trimmed_labels, 'values': trimmed_values, 'extra': 'kept'}
         assert data == before
