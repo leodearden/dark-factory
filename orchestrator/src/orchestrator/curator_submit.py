@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -14,6 +15,10 @@ logger = logging.getLogger(__name__)
 
 _NO_REPLY = 'no tool reply; see the shared.mcp_post / shared.mcp_envelope warning'
 _CLIP_CHARS = 200
+
+#: Ceiling on a whole batch: a hung but connectable server would otherwise cost
+#: ``call_mcp_tool``'s 10s per submission, one after another.
+BATCH_DEADLINE_SECS = 30.0
 
 
 @dataclass(frozen=True)
@@ -64,20 +69,28 @@ async def submit_task_batch(
     arguments_list: Sequence[Mapping[str, Any]],
     *,
     context: str,
+    deadline_secs: float = BATCH_DEADLINE_SECS,
 ) -> SubmitBatchResult:
-    """Send every ``submit_task`` over one client; never raises, warns once per failure."""
+    """Send every ``submit_task`` over one client within *deadline_secs*.
+
+    Never raises and warns once per failure.  A submission with no reply when
+    the deadline passes fails, whether it was in flight or never sent.
+    """
     outcomes: list[SubmitOutcome] = []
+    deadline = asyncio.timeout(deadline_secs)
     try:
-        async with open_mcp_client() as client:
+        async with deadline, open_mcp_client() as client:
             for arguments in arguments_list:
                 outcomes.append(
                     await _submit_one(client, base_url, arguments, context=context),
                 )
     except Exception as exc:
-        unsent = arguments_list[len(outcomes):]
-        outcomes.extend(
-            SubmitBatchResult.failed(unsent, f'{type(exc).__name__}: {exc}').outcomes,
+        reason = (
+            f'no reply within the {deadline_secs:g}s batch deadline'
+            if deadline.expired() else f'{type(exc).__name__}: {exc}'
         )
+        unsent = arguments_list[len(outcomes):]
+        outcomes.extend(SubmitBatchResult.failed(unsent, reason).outcomes)
     for outcome in outcomes:
         if outcome.failure is not None:
             logger.warning(
