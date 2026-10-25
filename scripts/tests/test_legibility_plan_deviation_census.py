@@ -17,6 +17,7 @@ import os
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -24,6 +25,7 @@ from escalation.disposition import ObservationConsumed
 from escalation.models import NOTE_TO_FILE_CLASS, Escalation
 from legibility import config as config_mod
 from legibility import plan_deviation_census as mod
+from legibility import state_docs, trickle_state
 from shared.plan_deviation import DEVIATION_KINDS, DeviationRecord
 
 _LOGGER = 'legibility.plan_deviation_census'
@@ -603,3 +605,267 @@ def test_evaluate_top_task_ids_are_the_five_busiest_recent_tasks():
         {'task_id': 't3', 'count': 3},
         {'task_id': 't4', 'count': 3},
     ]
+
+
+# ---------------------------------------------------------------------------
+# run — readers -> evaluate -> cooldown -> pending check -> filing -> state,
+# one journal line, never raises
+# ---------------------------------------------------------------------------
+
+PROJECT_ID = 'testproj'
+SYNTHETIC_TASK_ID = f'plan-deviation-census-{PROJECT_ID}'
+MINTED_ID = f'esc-{SYNTHETIC_TASK_ID}-1'
+_FIRE_PREFIX = 'plan-deviation census: FIRE -- '
+_NO_FIRE_PREFIX = 'plan-deviation census: NO-FIRE -- '
+
+
+class _FakeCallTool:
+    """Records every MCP call; answers each tool from a canned response, or
+    raises it when the canned response is an exception."""
+
+    def __init__(self, **responses: object) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self.responses: dict[str, object] = {
+            'get_pending_escalations': {'result': []},
+            'escalate_info': {'id': MINTED_ID, 'status': 'queued', 'level': 0},
+            **responses,
+        }
+
+    def __call__(self, tool_name: str, arguments: dict) -> object:
+        self.calls.append((tool_name, arguments))
+        response = self.responses[tool_name]
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    @property
+    def tool_names(self) -> list[str]:
+        return [name for name, _ in self.calls]
+
+
+def _load_cfg(tmp_path: Path, *, block: object = None) -> config_mod.LegibilityConfig:
+    return config_mod.load_config(_write_config(tmp_path, block=block))
+
+
+def _meta_root(tmp_path: Path) -> Path:
+    return tmp_path / '.worktrees' / '.task-meta'
+
+
+def _write_daily_plans(tmp_path: Path, *, baseline_per_day: int, recent_per_day: int) -> None:
+    """Step deviations at the given daily rates, spread one lane per slot of
+    the day so several plans contribute and kinds run round-robin."""
+    lanes: dict[int, list[dict]] = {}
+    for d in range(28):
+        per_day = recent_per_day if d < 7 else baseline_per_day
+        for k in range(per_day):
+            lanes.setdefault(k, []).append(_deviation(
+                recorded_at=NOW - timedelta(days=d, hours=1 + k), kind=_KINDS[k % len(_KINDS)],
+            ))
+    for k, entries in lanes.items():
+        _write_plan(_meta_root(tmp_path), str(6000 + k), steps=[entries])
+
+
+def _write_positive_control(tmp_path: Path) -> None:
+    _write_daily_plans(tmp_path, baseline_per_day=3, recent_per_day=8)
+
+
+def _census_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        record for record in caplog.records
+        if record.name == _LOGGER and record.getMessage().startswith('plan-deviation census: ')
+    ]
+
+
+def _run(
+    tmp_path: Path,
+    call_tool: _FakeCallTool,
+    *,
+    block: object = None,
+    state_path: Path | None = None,
+) -> str:
+    return mod.run(
+        _load_cfg(tmp_path, block=block), now=NOW, call_tool=call_tool, state_path=state_path,
+    )
+
+
+def _seed_state(path: Path, *, last_filed_at: datetime, escalation_id: str = 'esc-old-1') -> None:
+    state_docs.write_state(
+        path, mod.CensusState(last_filed_at=last_filed_at, escalation_id=escalation_id),
+    )
+
+
+def test_run_positive_control_files_one_blocking_escalation(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger=_LOGGER)
+    _write_positive_control(tmp_path)
+    fake = _FakeCallTool()
+
+    line = _run(tmp_path, fake)
+
+    assert fake.tool_names == ['get_pending_escalations', 'escalate_info']
+    pending_args = fake.calls[0][1]
+    assert pending_args['task_id'] == SYNTHETIC_TASK_ID
+    filed = fake.calls[1][1]
+    json.dumps(filed)
+    assert filed['task_id'] == SYNTHETIC_TASK_ID
+    assert filed['agent_role'] == 'plan-deviation-census'
+    assert filed['category'] == 'design_concern'
+    assert filed['severity'] == 'blocking'
+    assert isinstance(filed['evidence'], list)
+    (window,) = [entry for entry in filed['evidence'] if entry['ref'] == 'window']
+    assert window['recent_mean'] == 8.0
+    assert window['baseline_mean'] == 3.0
+    assert line.startswith(_FIRE_PREFIX)
+    assert MINTED_ID in line
+
+    state_path = mod.default_state_path(PROJECT_ID)
+    assert state_path.parent == trickle_state.project_state_dir(PROJECT_ID)
+    state = json.loads(state_path.read_text(encoding='utf-8'))
+    assert datetime.fromisoformat(state['last_filed_at']) == NOW
+    assert state['escalation_id'] == MINTED_ID
+
+    records = _census_records(caplog)
+    assert [record.getMessage() for record in records] == [line]
+    assert records[0].levelno == logging.INFO
+
+
+def test_run_negative_control_files_nothing(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger=_LOGGER)
+    _write_daily_plans(tmp_path, baseline_per_day=3, recent_per_day=3)
+    fake = _FakeCallTool()
+
+    line = _run(tmp_path, fake)
+
+    assert fake.calls == []
+    assert line.startswith(_NO_FIRE_PREFIX)
+    assert not mod.default_state_path(PROJECT_ID).exists()
+    assert [record.getMessage() for record in _census_records(caplog)] == [line]
+
+
+def test_run_reads_both_corpora_into_one_count(tmp_path):
+    _write_plan(_meta_root(tmp_path), '7001', steps=[[_deviation(recorded_at=NOW - timedelta(days=1))]])
+    _write_escalation(tmp_path / 'data' / 'escalations' / 'archive' / '2026-10-24', _escalation(
+        'esc-7001-1', task_id='7001', resolution_class=NOTE_TO_FILE_CLASS, status='resolved',
+        timestamp=NOW - timedelta(days=1),
+    ))
+
+    line = _run(tmp_path, _FakeCallTool())
+
+    assert line.startswith(_NO_FIRE_PREFIX)
+    assert 'corpus: 1 plan-step + 1 escalation record(s), 0 skipped' in line
+
+
+def test_run_inside_the_cooldown_makes_no_call(tmp_path):
+    _write_positive_control(tmp_path)
+    state_path = mod.default_state_path(PROJECT_ID)
+    _seed_state(state_path, last_filed_at=NOW - timedelta(days=2))
+    before = state_path.read_bytes()
+    fake = _FakeCallTool()
+
+    line = _run(tmp_path, fake)
+
+    assert fake.calls == []
+    assert line.startswith(_FIRE_PREFIX)
+    assert 'cooldown' in line
+    assert 'esc-old-1' in line
+    assert state_path.read_bytes() == before
+
+
+def test_run_after_the_cooldown_files_again(tmp_path):
+    _write_positive_control(tmp_path)
+    state_path = mod.default_state_path(PROJECT_ID)
+    _seed_state(state_path, last_filed_at=NOW - timedelta(days=8))
+    fake = _FakeCallTool()
+
+    line = _run(tmp_path, fake)
+
+    assert fake.tool_names == ['get_pending_escalations', 'escalate_info']
+    assert MINTED_ID in line
+    assert json.loads(state_path.read_text(encoding='utf-8'))['escalation_id'] == MINTED_ID
+
+
+def test_run_a_pending_census_escalation_blocks_a_refile(tmp_path):
+    _write_positive_control(tmp_path)
+    fake = _FakeCallTool(get_pending_escalations={
+        'result': [{'id': 'esc-x', 'task_id': SYNTHETIC_TASK_ID, 'status': 'pending'}],
+    })
+
+    line = _run(tmp_path, fake)
+
+    assert fake.tool_names == ['get_pending_escalations']
+    assert line.startswith(_FIRE_PREFIX)
+    assert 'esc-x' in line
+    assert not mod.default_state_path(PROJECT_ID).exists()
+
+
+@pytest.mark.parametrize('response', [
+    ConnectionError('connection refused'),
+    {'unexpected': 'shape'},
+    [{'id': 'esc-x'}],
+    {'result': 'not a list'},
+])
+def test_run_a_failed_pending_check_files_nothing(tmp_path, caplog, response):
+    caplog.set_level(logging.DEBUG, logger=_LOGGER)
+    _write_positive_control(tmp_path)
+    fake = _FakeCallTool(get_pending_escalations=response)
+
+    line = _run(tmp_path, fake)
+
+    assert fake.tool_names == ['get_pending_escalations']
+    assert line.startswith(_FIRE_PREFIX)
+    assert 'pending check failed' in line
+    assert [record.levelno for record in _census_records(caplog)] == [logging.WARNING]
+
+
+@pytest.mark.parametrize('response', [
+    RuntimeError('server down'),
+    {'error': 'refused', 'error_type': 'Boom'},
+    {'id': MINTED_ID, 'status': 'accepted_unpersisted', 'level': 0},
+    ['not', 'a', 'dict'],
+])
+def test_run_a_failed_filing_writes_no_state(tmp_path, caplog, response):
+    caplog.set_level(logging.DEBUG, logger=_LOGGER)
+    _write_positive_control(tmp_path)
+    fake = _FakeCallTool(escalate_info=response)
+
+    line = _run(tmp_path, fake)
+
+    assert fake.tool_names == ['get_pending_escalations', 'escalate_info']
+    assert line.startswith(_FIRE_PREFIX)
+    assert 'filing failed' in line
+    assert not mod.default_state_path(PROJECT_ID).exists()
+    assert [record.levelno for record in _census_records(caplog)] == [logging.WARNING]
+
+
+def test_run_a_malformed_state_file_files_nothing(tmp_path):
+    _write_positive_control(tmp_path)
+    state_path = tmp_path / 'census-state.json'
+    state_path.write_text('{not json', encoding='utf-8')
+    fake = _FakeCallTool()
+
+    line = _run(tmp_path, fake, state_path=state_path)
+
+    assert fake.calls == []
+    assert line.startswith(_FIRE_PREFIX)
+    assert str(state_path) in line
+    assert state_path.read_text(encoding='utf-8') == '{not json'
+
+
+def test_run_disabled_reads_and_calls_nothing(tmp_path):
+    _write_positive_control(tmp_path)
+    fake = _FakeCallTool()
+
+    line = _run(tmp_path, fake, block={'enabled': False})
+
+    assert line == 'plan-deviation census: NO-FIRE -- disabled by plan_deviation_census.enabled'
+    assert fake.calls == []
+
+
+def test_run_an_evaluation_failure_is_a_no_fire_line_not_a_raise(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger=_LOGGER)
+    fake = _FakeCallTool()
+
+    line = mod.run(_load_cfg(tmp_path), now=cast(Any, object()), call_tool=fake)
+
+    assert line.startswith('plan-deviation census: NO-FIRE -- evaluation failed (')
+    assert fake.calls == []
+    assert [record.levelno for record in _census_records(caplog)] == [logging.WARNING]
