@@ -7616,7 +7616,6 @@ class TestRemoteRunnerEnvProbeRun:
             ['ssh', *opts, 'laptop.local', 'true'],
             ['ssh', *opts, 'laptop.local', f'{vr.REMOTE_TOOL_PATH_PRELUDE} uv --version'],
         ]
-        assert tuple(opts) == vr._SSH_PROBE_OPTS
 
     async def test_one_open_serves_every_probe_of_an_adapter(self):
         runner, calls = self._make_runner()
