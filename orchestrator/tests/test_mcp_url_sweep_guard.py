@@ -9,15 +9,24 @@ The detector itself is ``_mcp_url_scan``.
 
 from __future__ import annotations
 
-import functools
 from pathlib import Path
 
 import pytest
-from _mcp_url_scan import SweepFindings, sweep_source
+from _mcp_url_scan import SweepFindings, sweep_parsed
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _tree_scan import (
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    python_files,
+)
 
-# Ceiling rationale: _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+# The family mark and shared group: _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 #: Directories holding raw-POST source.  Scoped, not repo-wide, on purpose:
 #: ``*/tests`` are excluded wholesale because FastMCP's
@@ -42,48 +51,47 @@ SWEEP_DIRS = (
 #: makes the sweep check THIS worktree, the copy the task's verify run gates on.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: Co-location tag for the two tests that call ``_sweep_findings``.
-#:
-#: MEASURED.  The walk reads and ``ast.parse``s 553 files: ~13s of pure work,
-#: 20.5s wall on a machine already running the fleet.  Its timeout budget is
-#: the module-level ``pytestmark`` above; this tag is the other half.
-#:
-#: ``xdist_group`` is what makes the ``lru_cache`` actually pay: ``--dist
-#: loadgroup`` spreads UNGROUPED tests across workers, so without the tag the
-#: two callers land in different processes and each pays a full walk — a
-#: per-process cache cannot help.  Tagged, they share one worker and the second
-#: call is free (measured 0.000004s).
-SWEEP_GROUP = 'mcp_url_sweep'
+#: Anti-vacuity floor on the files swept, ~25% below the 1106 measured on
+#: 2026-10-25 (task 4600): a sweep that silently reads nothing must fail rather
+#: than report a clean tree.  Raise it as the tree grows; never lower it to
+#: silence a failure.
+_MIN_SWEPT_FILES = 830
 
 
-@functools.lru_cache(maxsize=1)
-def _sweep_findings() -> dict[str, SweepFindings]:
+def _swept_files() -> tuple[Path, ...]:
+    return python_files(*(REPO_ROOT / rel_dir for rel_dir in SWEEP_DIRS))
+
+
+def _sweep(module: ParsedModule) -> SweepFindings:
+    return sweep_parsed(module.tree, module.source)
+
+
+ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=_swept_files, extract=_sweep)
+TREE_ANALYSES = (ANALYSIS,)
+
+
+def _sweep_findings(tree_pass: TreePass) -> dict[str, SweepFindings]:
     """Return ``{relpath: findings}`` for every swept file with anything to report.
 
     Shared by the guard and the allow-marker check below so both read the
-    same walk — the markers and the sweep they exempt from must never be able
-    to disagree about what the tree contains.
-
-    CACHED, and returning frozen findings so the cached value cannot be
-    mutated by either caller.  The walk parses 553 files (measured); it ran
-    twice for a byte-identical result, and each run is the dominant cost of
-    this whole file — against a per-test timeout that only gets tighter under
-    ``-n auto`` contention.  Nothing in the tree
-    changes between the two calls within a session, so the second is pure
-    waste: measured at 0.000004s from cache.
+    same pass — the markers and the sweep they exempt from must never be able
+    to disagree about what the tree contains.  Refuses a vacuous sweep first.
+    An unparseable file fails the pass loudly, naming it.
     """
-    found: dict[str, SweepFindings] = {}
-    for rel_dir in SWEEP_DIRS:
-        for path in sorted((REPO_ROOT / rel_dir).rglob('*.py')):
-            rel = path.relative_to(REPO_ROOT).as_posix()
-            findings = sweep_source(path.read_text(encoding='utf-8'), filename=rel)
-            if findings != SweepFindings():
-                found[rel] = findings
-    return found
+    swept = tree_pass.facts(ANALYSIS)
+    assert len(swept) >= _MIN_SWEPT_FILES, (
+        f'the MCP URL sweep read only {len(swept)} files under {SWEEP_DIRS}, '
+        f'expected at least {_MIN_SWEPT_FILES}: a sweep that reads nothing '
+        'reports a clean tree.'
+    )
+    return {
+        path.relative_to(REPO_ROOT).as_posix(): findings
+        for path, findings in swept.items()
+        if findings != SweepFindings()
+    }
 
 
-@pytest.mark.xdist_group(SWEEP_GROUP)
-def test_no_raw_post_builds_a_trailing_slash_mcp_url():
+def test_no_raw_post_builds_a_trailing_slash_mcp_url(tree_pass: TreePass):
     """No source file may build an MCP URL with a trailing slash.
 
     Implements the "grep the slash, not the flag" rule: the slash is the
@@ -128,7 +136,7 @@ def test_no_raw_post_builds_a_trailing_slash_mcp_url():
     """
     offenders = [
         f'{rel}:{lineno}: {text}'
-        for rel, findings in sorted(_sweep_findings().items())
+        for rel, findings in sorted(_sweep_findings(tree_pass).items())
         for lineno, text in findings.offenders
     ]
 
@@ -144,8 +152,7 @@ def test_no_raw_post_builds_a_trailing_slash_mcp_url():
     )
 
 
-@pytest.mark.xdist_group(SWEEP_GROUP)
-def test_every_sweep_allow_marker_earns_its_place():
+def test_every_sweep_allow_marker_earns_its_place(tree_pass: TreePass):
     """An allow marker that outlives its offending line must fail, not lurk.
 
     Each ``# mcp-url-sweep: allow <reason>`` marker is a hole in the guard
@@ -158,14 +165,15 @@ def test_every_sweep_allow_marker_earns_its_place():
     A malformed marker is reported here too: it exempts nothing, so the guard
     above already fails on its line, and this names the marker as the reason.
     """
+    findings_by_file = sorted(_sweep_findings(tree_pass).items())
     stale = [
         f'{rel}:{lineno}: {comment}'
-        for rel, findings in sorted(_sweep_findings().items())
+        for rel, findings in findings_by_file
         for lineno, comment in findings.stale_markers
     ]
     malformed = [
         f'{rel}:{lineno}: {comment}'
-        for rel, findings in sorted(_sweep_findings().items())
+        for rel, findings in findings_by_file
         for lineno, comment in findings.malformed_markers
     ]
 

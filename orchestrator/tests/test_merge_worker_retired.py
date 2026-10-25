@@ -17,17 +17,28 @@ from pathlib import Path
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _tree_scan import (
+    ORCHESTRATOR_SRC_DIR,
+    TESTS_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    python_files,
+)
 
 import orchestrator.merge_lane as merge_lane
 import orchestrator.merge_lane.worker as mq
 
-# test_no_copy_of_the_serial_worker_anywhere reads every *.py under the tests
-# and the production package; see _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+# The family mark and shared group: _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 _RETIRED_CLASS = 'MergeWorker'
-_TESTS_DIR = Path(__file__).resolve().parent
-_SRC_DIR = Path(mq.__file__).resolve().parents[1]
+_TESTS_DIR = TESTS_DIR
+_SRC_DIR = ORCHESTRATOR_SRC_DIR
 
 #: Anti-vacuity floors, one per swept tree (630 test files and 155 source
 #: files today): a sweep that silently reads nothing must fail rather than
@@ -41,12 +52,30 @@ def _defines_retired_class(source: str) -> bool:
     A mention in a comment or docstring is not a definition. The substring test
     only spares parsing the hundreds of files that cannot contain one.
     """
-    if f'class {_RETIRED_CLASS}' not in source:
-        return False
+    return _may_define_retired_class(source) and _defines_retired_class_in(ast.parse(source))
+
+
+def _may_define_retired_class(source: str) -> bool:
+    return f'class {_RETIRED_CLASS}' in source
+
+
+def _defines_retired_class_in(tree: ast.Module) -> bool:
     return any(
         isinstance(node, ast.ClassDef) and node.name == _RETIRED_CLASS
-        for node in ast.walk(ast.parse(source))
+        for node in ast.walk(tree)
     )
+
+
+def _retired_class_defined(module: ParsedModule) -> bool:
+    return _may_define_retired_class(module.source) and _defines_retired_class_in(module.tree)
+
+
+ANALYSIS = TreeAnalysis(
+    name=Path(__file__).stem,
+    files=lambda: python_files(_TESTS_DIR, _SRC_DIR),
+    extract=_retired_class_defined,
+)
+TREE_ANALYSES = (ANALYSIS,)
 
 
 def test_the_lane_facade_exports_the_production_worker() -> None:
@@ -62,17 +91,12 @@ def test_detector_sees_a_definition_and_not_a_mention() -> None:
     )
 
 
-def test_no_copy_of_the_serial_worker_anywhere() -> None:
-    sources: list[Path] = []
+def test_no_copy_of_the_serial_worker_anywhere(tree_pass: TreePass) -> None:
+    defines_retired_class = tree_pass.facts(ANALYSIS)
     for root, floor in _MIN_EXPECTED_FILES.items():
-        swept = sorted(root.rglob('*.py'))
+        swept = [path for path in defines_retired_class if path.is_relative_to(root)]
         assert len(swept) >= floor, f'swept only {len(swept)} files under {root}'
-        sources += swept
-    copies = [
-        path.as_posix()
-        for path in sources
-        if _defines_retired_class(path.read_text(encoding='utf-8'))
-    ]
+    copies = [path.as_posix() for path, defines in defines_retired_class.items() if defines]
     assert copies == [], (
         f'a serial MergeWorker is defined again in {copies}. Drive the '
         'production lane instead: make_lane / merge_through_lane in '

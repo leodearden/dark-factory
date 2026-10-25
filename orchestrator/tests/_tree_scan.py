@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import functools
+import subprocess
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePath
@@ -51,6 +52,66 @@ def python_files(*roots: Path, exclude_parts: frozenset[str] = frozenset()) -> t
 
 ORCHESTRATOR_TESTS = functools.partial(python_files, TESTS_DIR)
 ORCHESTRATOR_SRC = functools.partial(python_files, ORCHESTRATOR_SRC_DIR)
+
+CHECKOUT_SKIP_PARTS = frozenset({'.worktrees', '.venv', 'node_modules', '__pycache__'})
+
+
+def git_tracked_python_files(repo_root: Path) -> tuple[Path, ...]:
+    """Every ``*.py`` git tracks in *repo_root*, resolved, or ``()`` if git cannot answer.
+
+    NUL-delimited (``-z``) so a path holding a space or newline cannot truncate
+    the listing, which would make any completeness check built on it pass
+    vacuously.
+    """
+    root = Path(repo_root).resolve()
+    try:
+        listing = subprocess.run(
+            ['git', '-C', str(root), 'ls-files', '-z', '--', '*.py'],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    return tuple((root / relpath).resolve() for relpath in listing.split('\0') if relpath)
+
+
+def _package_root_python_files(root: Path) -> tuple[Path, ...]:
+    package_roots = [
+        *sorted(root.glob('*/src/*')),
+        *sorted(root.glob('*/tests')),
+        root / 'scripts',
+        root / 'hooks',
+    ]
+    walkable = [
+        package_root for package_root in package_roots
+        if package_root.is_dir()
+        and CHECKOUT_SKIP_PARTS.isdisjoint(package_root.relative_to(root).parts)
+    ]
+    return (
+        *root.glob('*.py'),
+        *python_files(*walkable, exclude_parts=CHECKOUT_SKIP_PARTS),
+    )
+
+
+def checkout_python_files(repo_root: Path) -> tuple[Path, ...]:
+    """Every ``*.py`` in the checkout at *repo_root*: git-tracked UNION the on-disk
+    package roots, resolved, deduplicated and sorted.
+
+    Neither source alone is enough.  ``git ls-files`` is complete by
+    construction for committed work but cannot see a file written and not yet
+    added; the package roots (``*/src/*``, ``*/tests``, ``scripts``, ``hooks``
+    and top-level ``*.py``) cover that in-progress work but, as a hand-kept
+    list, miss whole tracked trees such as ``skills/**/scripts``.  Only files
+    that exist are returned, since the index can list a deleted file.
+
+    :data:`CHECKOUT_SKIP_PARTS` is judged on each path RELATIVE to *repo_root*:
+    every task worktree lives under ``.worktrees/``, so an absolute-path filter
+    would skip everything.  Never widen this into a whole-repo walk: the main
+    checkout holds sibling copies of this repo at other revisions, which git
+    never lists and these roots never reach.
+    """
+    root = Path(repo_root).resolve()
+    candidates = (*git_tracked_python_files(root), *_package_root_python_files(root))
+    return tuple(sorted({path.resolve() for path in candidates if path.is_file()}))
 
 
 class ParsedModule:
@@ -89,6 +150,23 @@ class ExtractionFailure:
     error_type: str
     message: str
 
+    def __str__(self) -> str:
+        return f'{self.path}: {self.error_type}: {self.message}'
+
+
+@dataclass(frozen=True)
+class ListingFailure:
+    """Why an analysis could not list its files, so it examined none."""
+
+    error_type: str
+    message: str
+
+    def __str__(self) -> str:
+        return f'listing its files: {self.error_type}: {self.message}'
+
+
+AnalysisFailure = ExtractionFailure | ListingFailure
+
 
 _PLAIN_SCALARS = (str, bytes, int, float, bool, type(None), PurePath)
 
@@ -121,7 +199,7 @@ def _dispatch_one_file(
     module: ParsedModule,
     interested: Iterable[TreeAnalysis[Any]],
     facts: dict[TreeAnalysis[Any], dict[Path, Any]],
-    failures: dict[TreeAnalysis[Any], list[ExtractionFailure]],
+    failures: dict[TreeAnalysis[Any], list[AnalysisFailure]],
 ) -> None:
     for analysis in interested:
         try:
@@ -144,7 +222,9 @@ def _require_unique_names(analyses: tuple[TreeAnalysis[Any], ...]) -> None:
 
 def _resolved_file_sets(
     analyses: tuple[TreeAnalysis[Any], ...],
+    failures: dict[TreeAnalysis[Any], list[AnalysisFailure]],
 ) -> dict[TreeAnalysis[Any], frozenset[Path]]:
+    """Each analysis's resolved file set; one that cannot list its files gets none and a failure."""
     resolved: dict[Path, Path] = {}
 
     def resolve(path: Path) -> Path:
@@ -152,10 +232,14 @@ def _resolved_file_sets(
             resolved[path] = Path(path).resolve()
         return resolved[path]
 
-    return {
-        analysis: frozenset(resolve(path) for path in analysis.files())
-        for analysis in analyses
-    }
+    file_sets: dict[TreeAnalysis[Any], frozenset[Path]] = {}
+    for analysis in analyses:
+        try:
+            file_sets[analysis] = frozenset(resolve(path) for path in analysis.files())
+        except Exception as error:
+            failures[analysis].append(ListingFailure(type(error).__name__, str(error)))
+            file_sets[analysis] = frozenset()
+    return file_sets
 
 
 class TreePass:
@@ -164,7 +248,7 @@ class TreePass:
     def __init__(
         self,
         facts: Mapping[TreeAnalysis[Any], Mapping[Path, Any]],
-        failures: Mapping[TreeAnalysis[Any], tuple[ExtractionFailure, ...]],
+        failures: Mapping[TreeAnalysis[Any], tuple[AnalysisFailure, ...]],
     ) -> None:
         self._facts = MappingProxyType(dict(facts))
         self._failures = MappingProxyType(dict(failures))
@@ -173,9 +257,9 @@ class TreePass:
     def run(cls, analyses: Iterable[TreeAnalysis[Any]]) -> TreePass:
         declared = tuple(analyses)
         _require_unique_names(declared)
-        file_sets = _resolved_file_sets(declared)
         facts: dict[TreeAnalysis[Any], dict[Path, Any]] = {a: {} for a in declared}
-        failures: dict[TreeAnalysis[Any], list[ExtractionFailure]] = {a: [] for a in declared}
+        failures: dict[TreeAnalysis[Any], list[AnalysisFailure]] = {a: [] for a in declared}
+        file_sets = _resolved_file_sets(declared, failures)
         for path in sorted(frozenset().union(*file_sets.values())):
             interested = [a for a in declared if path in file_sets[a]]
             _dispatch_one_file(ParsedModule(path), interested, facts, failures)
@@ -187,8 +271,9 @@ class TreePass:
     def facts(self, analysis: TreeAnalysis[T]) -> Mapping[Path, T]:
         """*analysis*'s facts keyed by resolved path, in sorted order.
 
-        Raises if *analysis* was not part of this pass, or if any of its files
-        failed, so a consumer never asserts over a partial census.
+        Raises if *analysis* was not part of this pass, or if it could not list
+        its files or any of them failed, so a consumer never asserts over a
+        partial census.
         """
         if analysis not in self._facts:
             raise LookupError(
@@ -198,10 +283,8 @@ class TreePass:
             )
         failed = self._failures[analysis]
         if failed:
-            listing = '\n  '.join(f'{f.path}: {f.error_type}: {f.message}' for f in failed)
-            raise AssertionError(
-                f'tree analysis {analysis.name!r} failed on {len(failed)} file(s):\n  {listing}'
-            )
+            listing = '\n  '.join(map(str, failed))
+            raise AssertionError(f'tree analysis {analysis.name!r} failed:\n  {listing}')
         return self._facts[analysis]
 
 

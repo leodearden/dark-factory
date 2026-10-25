@@ -23,6 +23,7 @@ from _tree_scan import (
     TreePass,
     analyses_requested_by,
     checkout_python_files,
+    git_tracked_python_files,
     python_files,
 )
 
@@ -133,6 +134,26 @@ class TestFailureIsolation:
         for expected in ('raising', str(target), 'ValueError', 'boom on purpose'):
             assert expected in message
         assert len(pass_.facts(bystander)) == 2
+
+    def test_an_analysis_that_cannot_list_its_files_fails_only_itself(
+        self, tmp_path: Path,
+    ) -> None:
+        _write(tmp_path, 'present.py')
+
+        def unlistable() -> tuple[Path, ...]:
+            raise NotADirectoryError('no such root on purpose')
+
+        broken = _analysis('broken', unlistable, _path_name)
+        bystander = _analysis('bystander', lambda: python_files(tmp_path), _path_name)
+
+        pass_ = TreePass.run([broken, bystander])
+
+        with pytest.raises(AssertionError) as raised:
+            pass_.facts(broken)
+        message = str(raised.value)
+        for expected in ('broken', 'NotADirectoryError', 'no such root on purpose'):
+            assert expected in message
+        assert list(pass_.facts(bystander).values()) == ['present.py']
 
     def test_a_non_utf8_source_fails_only_the_analysis_that_reads_it(
         self, tmp_path: Path,
@@ -424,3 +445,27 @@ class TestCheckoutPythonFiles:
         )
 
         assert checkout_python_files(plain) == (on_disk,)
+
+
+class TestGitTrackedPythonFiles:
+    def test_lists_only_the_tracked_python_files_resolved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = _seed_checkout(tmp_path / 'repo', monkeypatch)
+        _write(repo, 'pkg/src/pkg/untracked.py')
+
+        assert sorted(git_tracked_python_files(repo)) == [
+            repo / 'pkg/src/pkg/tracked.py',
+            repo / 'skills/tool/scripts/deep.py',
+        ]
+
+    def test_is_empty_outside_a_repository(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        plain = (tmp_path / 'plain').resolve()
+        _write(plain, 'pkg/src/pkg/on_disk.py')
+        monkeypatch.setenv(
+            'GIT_CEILING_DIRECTORIES', git_env_with_ceiling(plain)['GIT_CEILING_DIRECTORIES'],
+        )
+
+        assert git_tracked_python_files(plain) == ()
