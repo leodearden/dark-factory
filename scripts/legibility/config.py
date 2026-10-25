@@ -20,7 +20,6 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -228,7 +227,7 @@ class LegibilityConfig(BaseModel):
     census: Census = Field(default_factory=Census)
     models: Models = Field(default_factory=Models)
     timeouts: Timeouts = Field(default_factory=Timeouts)
-    plan_deviation_census: Any = None
+    plan_deviation_census: object = None
 
     @field_validator('project_root')
     @classmethod
