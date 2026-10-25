@@ -22,6 +22,7 @@ from _review_fixtures import review_aggregation, review_issue
 from _workflow_helpers import _make
 from escalation.queue import EscalationQueue
 
+from orchestrator.curator_submit import SubmitBatchResult, SubmitOutcome
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -151,7 +152,7 @@ async def test_esc_4223_1_shape_one_blocking_eight_suggestions(tmp_path: Path):
     wf = _make_cap_workflow(tmp_path, escalation_queue=queue)
     suggestions = [review_issue(f's{i}') for i in range(1, 9)]
     wf._review = AsyncMock(return_value=_blocking(suggestions))  # type: ignore[method-assign]
-    server = RecordingMcpServer()
+    server = RecordingMcpServer(tool_replies={'submit_task': {'ticket': 'tkt_X'}})
 
     with patch('httpx.AsyncClient', RecordingClientFactory(server)):
         outcome = await wf._execute_verify_review_loop()
@@ -175,6 +176,29 @@ async def test_esc_4223_1_shape_one_blocking_eight_suggestions(tmp_path: Path):
     assert len({m['suggestion_hash'] for m in metadata}) == 8
 
 
+async def test_refused_submissions_escalate_as_undelivered(tmp_path: Path):
+    """A submit_task the server refused holds no ticket, so the escalation must not say curator."""
+    queue = EscalationQueue(tmp_path / 'esc')
+    wf = _make_cap_workflow(tmp_path, escalation_queue=queue)
+    suggestions = [review_issue('s1'), review_issue('s2')]
+    server = RecordingMcpServer(
+        tool_replies={'submit_task': {'error': 'backlog full', 'error_type': 'BacklogFull'}},
+    )
+
+    with (
+        patch.object(wf, '_review', AsyncMock(return_value=_blocking(suggestions))),
+        patch('httpx.AsyncClient', RecordingClientFactory(server)),
+    ):
+        outcome = await wf._execute_verify_review_loop()
+
+    assert outcome == WorkflowOutcome.ESCALATED
+    assert len(server.tool_calls('submit_task')) == 2
+    [esc] = [e for e in queue.get_by_task(TASK_ID) if e.category == 'review_issues']
+    assert '[suggestions → undelivered]' in esc.summary
+    for suggestion in suggestions:
+        assert suggestion['description'] in esc.detail
+
+
 async def test_same_instance_identical_reentry_is_deduped(tmp_path: Path):
     wf = _make_cap_workflow(tmp_path)
     wf._review = AsyncMock(  # type: ignore[method-assign]
@@ -182,7 +206,9 @@ async def test_same_instance_identical_reentry_is_deduped(tmp_path: Path):
     )
     dispositions = _spy_on_router(wf)
 
-    with patch.object(wf, '_post_submit_tasks', AsyncMock()) as post:
+    delivered = SubmitBatchResult(outcomes=(SubmitOutcome(title='s1', ticket='tkt_X'),))
+
+    with patch.object(wf, '_post_submit_tasks', AsyncMock(return_value=delivered)) as post:
         first = await wf._execute_verify_review_loop()
         await asyncio.gather(*wf._background_tasks, return_exceptions=True)
         second = await wf._execute_verify_review_loop()
