@@ -7,15 +7,13 @@ plans/confusion-reduction-prd.md §5.5 (pipeline), §7.4 (per-project config),
 decisions 7/8 (fail-loud contract, liveness probes git history never),
 boundary test §8.8.
 
-Every stage is reached behind a dependency-injection seam (``invoke`` for
-the LLM, ``status_fetcher`` for the census -- defaulting to the real
-MCP-backed ``get_statuses`` fetcher for ``cfg.project_root``, ``poster``
-for escalation, ``committer`` for git) plus module-level functions a caller
-can monkeypatch -- mirrors the established seam convention (coder.py's
-``invoke`` override, census_trigger.py's injected ``status_fetcher``).
-Each seam resolves ``None`` to its real implementation, so a production
-entrypoint that injects nothing still gets the real thing rather than
-nothing at all (task 4148). This is what the
+Every stage is injected through :func:`run_nightly` (``selector``,
+``digest_builder``, ``invoke`` for the LLM, ``committer`` for git,
+``census_launcher`` and ``status_fetcher`` for the census, ``poster`` for
+escalation, ``recorder``/``retry_recorder`` for run state). Each seam
+resolves ``None`` to its real implementation, so a production entrypoint
+that injects nothing still gets the real thing rather than nothing at all
+(task 4148). This is what the
 systemd ``legibility-trickle@.service`` template runs nightly, and what
 ``install-trickle-timer.sh``/``check_trickle_liveness.sh`` install and probe.
 """
@@ -713,9 +711,7 @@ def evaluate_census_step(
 
 # ---------------------------------------------------------------------------
 # run_nightly — full pipeline assembly: inventory -> sample -> digest ->
-# code -> merge -> docs-only commit -> census (PRD §5.5). This step wires
-# the happy path only; the three decision-8 fail-loud triggers (extractor
-# crash, coder storm, commit failure) are layered on by later steps.
+# code -> merge -> docs-only commit -> census (PRD §5.5).
 # ---------------------------------------------------------------------------
 
 _CODEBOOK_RELPATH = Path('docs') / 'legibility' / 'confusion-codebook.yaml'
@@ -1115,74 +1111,20 @@ def _report_sample_outcome(
     *,
     raise_alarm: _RaiseAlarm,
 ) -> None:
-    """Report *sample*'s accounting, loudly if the night was totally
-    suppressed.
+    """Journal *sample*'s accounting at INFO (the operator's grep anchor,
+    visible once ``main()`` calls ``config.configure_logging()``), and report
+    the two barren doors.
 
-    Always emits the operator's grep anchor at INFO -- what was enumerated,
-    what was dropped and why, what the budget bought -- prefixed with the
-    project id and target date, since one journal interleaves every project's
-    timer. Its visibility depends on ``config.configure_logging()`` being
-    called from ``main()``; the two halves are one contract.
+    A budget-suppressed night (:func:`_budget_suppressed`) raises one
+    BUDGET_SUPPRESSED alarm; a night whose signal was all held back by the
+    SAMPLING cut gets a WARNING naming its own remedy and no per-night alarm,
+    since the barren streak owns escalation for both doors. Neither touches
+    the exit code or stops the run.
 
-    On ``not sample.selected and sample.budget_skipped > 0`` -- which the
-    :class:`~legibility.sampling.SampleResult` conservation invariant makes
-    exactly "candidates existed and were ALL discarded on the byte budget" --
-    it additionally posts ONE best-effort :func:`post_escalation`,
-    reusing the decision-8 ``escalate_info``/``infra_issue``/severity=info
-    envelope unchanged. THAT CALL IS ALSO WHAT JOURNALS THE PAIR (task
-    4511): ``post_escalation`` logs ``summary -- detail`` itself, here at
-    ``logging.WARNING``, so this function no longer logs it separately and
-    there is exactly one such line per night, not two.
-
-    IT NOW REPORTS BOTH BARREN DOORS AT WARNING, BUT ESCALATES ONLY THE
-    BUDGET ONE PER-NIGHT (task 3340). The sibling door -- ``not
-    sample.selected and sample.budget_skipped <= 0 and
-    sample.below_sampling_cut > 0``, i.e. real signal held back by the
-    SAMPLING cut, which never even reached the budget phase -- was
-    entirely unobserved before and now gets a WARNING naming its OWN
-    remedy (``sampling.top_fraction`` / ``sampling.per_stratum_min``,
-    never ``budgets.max_daily_digest_bytes``; ``SampleResult``'s docstring
-    is explicit that conflating the two is wrong). It posts no per-night
-    escalation: escalation for BOTH doors is owned by the edge-triggered
-    barren-STREAK signal in :func:`_record_trickle_progress`, so per-night
-    alarm volume does not rise.
-
-    Two deliberate non-behaviors. It does NOT touch the exit code: a non-zero
-    exit flips ``legibility-trickle@<project>.service`` to ``Result=failed``,
-    so ``check_trickle_liveness.sh`` would fail every night for a timer that
-    is running perfectly -- trading a silent-failure mode for a permanent
-    false alarm, and burning the one signal that currently works. And it does
-    not stop the run: a suppressed night has no reason to skip the census
-    trigger. Partial truncation (``budget_skipped > 0`` with a non-empty
-    selection) stays at INFO too -- that is the budget working as designed,
-    and it is fully visible in the always-on line.
-
-    IT REPEATS EVERY NIGHT, BY DESIGN -- know this before you tune it.
-    Unlike the other decision-8 triggers (extractor crash, coder storm,
-    commit failure), which fire on exceptional events, total suppression is
-    caused by PERSISTENT CONFIG STATE: ``budgets.max_daily_digest_bytes``
-    too small for this project's session sizes. An undersized budget nobody
-    fixes therefore posts one info escalation per project per night, for as
-    long as it stays unfixed, under the same synthetic
-    ``task_id=legibility-trickle-<project_id>``
-    (:func:`_build_escalation_arguments`).
-
-    Repetition was chosen over de-duplicating repeats behind a state file
-    for two reasons. It is self-limiting by construction -- the escalation
-    stops the very first night the budget is raised, and the operator action
-    that stops it is exactly the action that fixes the underlying data loss,
-    so a nightly reminder is proportionate to a project silently digesting
-    NOTHING. And a "only escalate when the previous run was not suppressed"
-    latch has the worse failure mode for this specific incident: whoever
-    misses the single first-night escalation gets silence thereafter, which
-    is the precise pathology (14 indistinguishable nights, 2026-07-16..29)
-    this whole task exists to end. The recurring-alarm-fatigue risk is real
-    and accepted with eyes open; the WARNING line -- now emitted by
-    :func:`post_escalation` on this function's behalf, at the
-    ``logging.WARNING`` passed below -- is the per-night signal either way,
-    and the severity stays ``info`` so this never gates anything. If the
-    repeats do become noise before the budget is fixed, latch them here
-    rather than downgrading the WARNING.
+    The budget alarm repeats every night until the budget is fixed, by
+    design: a latch would leave whoever missed the first one in silence. If
+    the repeats become noise, latch them here rather than downgrading the
+    WARNING.
     """
     summary_line = sampling.format_sample_summary_line(
         sample, max_bytes=cfg.budgets.max_daily_digest_bytes,
@@ -1394,12 +1336,8 @@ def _escalate_barren_streak(
     max_barren_runs: int,
     raise_alarm: _RaiseAlarm,
 ) -> Alarm:
-    """Post the barren-streak escalation for *night*; return whether it
-    landed.
-
-    Journalled at WARNING with the exit code left 0, as
-    :func:`_report_sample_outcome` does: a non-zero exit would flip
-    ``legibility-trickle@<project>.service`` to ``Result=failed`` and turn
+    """Raise the BARREN_STREAK alarm for *night*. Like every WARNING-level
+    alarm it leaves the exit code 0: a non-zero exit would turn
     ``check_trickle_liveness.sh`` into a nightly false alarm for a timer
     that is running."""
     counters = night.counters
@@ -1469,16 +1407,20 @@ def run_nightly(
     fail-safe path injects a raising/empty fake instead.
 
     *invoke* reads the same way (task 5488): ``None`` means "open ONE
-    pooled session runner for the night and code every digest through it"
-    (:func:`session_runner.open_pooled_runner`, the orchestrator's own runner
-    and account pool, task 6042), not "no invoker". The runner is opened
-    inside the recorded ``try`` and closed on every exit path.
+    pooled session runner for the code stage and code every digest through
+    it" (:func:`session_runner.open_pooled_runner`, the orchestrator's own
+    runner and account pool, task 6042), not "no invoker".
+
+    *selector* (default :func:`select_digest_sessions`) draws the sample,
+    *digest_builder* (default :func:`build_digests`) renders it, and
+    *census_launcher* (default :func:`_default_census_launcher`) starts a
+    census the trigger FIREd.
 
     *recorder* (default :func:`trickle_state.write_night`) is the run-state
     seam: ``recorder(night_fold, *, barren_escalated)`` writes the
     :class:`trickle_state.NightFold` the barren escalation was decided on and
     returns the :class:`trickle_state.TrickleState` it wrote. It is called exactly
-    once per pass but a retry, from a ``finally`` spanning every exit path,
+    once per pass but a retry, whatever the stages did,
     so the progress probe (``check_trickle_progress.py``) can tell every
     outcome apart, a barren night from a quiet one included — the
     distinction ``check_trickle_liveness.sh`` cannot make.
@@ -1493,13 +1435,7 @@ def run_nightly(
     the session ledger already holds, never evaluates the census trigger,
     and records through *retry_recorder*.
 
-    Happy-path wiring only in this step: inventory+sample -> digest ->
-    code -> merge -> docs-only commit (only when the merge actually
-    applied something AND the dump changed the working tree -- a
-    dedup-only or empty-coding night therefore commits nothing) -> census
-    trigger evaluation. This step's happy path always returns
-    ``exit_code=0``; the decision-8 fail-loud triggers are added by later
-    steps.
+    The pass ends with one INFO line, :meth:`NightlyResult.journal_line`.
     """
     seams = _NightSeams.resolve(
         invoke=invoke, status_fetcher=status_fetcher, poster=poster, committer=committer,

@@ -2,11 +2,11 @@
 assembly (PRD task epsilon: plans/confusion-reduction-prd.md §5.5, decisions
 7/8, boundary test §8.8).
 
-Every stage is exercised behind a dependency-injection seam (invoke for the
-LLM, status_fetcher for the census, poster for escalation, committer for
-git) plus pytest-monkeypatched module functions — no test here ever touches
-a real LLM, the machine-operated main git checkout, a live escalation
-server, or real systemd. The one true end-to-end test
+Every stage is exercised through run_nightly's injected seams (selector,
+digest_builder, invoke, committer, census_launcher, status_fetcher, poster,
+recorder) — no test here ever touches a real LLM, the machine-operated main
+git checkout, a live escalation server, a real census, or real systemd. The
+main()-entry tests, which can inject nothing, spy the census.py subprocess. The one true end-to-end test
 (test_run_nightly_happy_path_end_to_end) uses a real temp `git init` repo so
 the commit path is genuinely exercised without risking main.
 """
@@ -5696,6 +5696,15 @@ def _scripted_run_nightly(*outcomes):
     return _fake, calls
 
 
+def _sentinel_seam():
+    """A distinct callable for a typed seam that must be forwarded, never
+    called."""
+    def _seam(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError('a forwarded sentinel seam was called')
+
+    return _seam
+
+
 class TestRunScheduledNight:
     """An undated run is the scheduled night plus, once that night finished,
     the retry the backlog owes; a dated run stays a single pass."""
@@ -5744,7 +5753,9 @@ class TestRunScheduledNight:
         now = datetime(2026, 7, 15, 3, 0, tzinfo=UTC)
         invoke, status_fetcher, poster = object(), object(), object()
         committer, recorder, retry_recorder = object(), object(), object()
-        selector, digest_builder, census_launcher = object(), object(), object()
+        selector, digest_builder, census_launcher = (
+            _sentinel_seam(), _sentinel_seam(), _sentinel_seam(),
+        )
 
         nightly.run_scheduled_night(
             config_path='legibility.yaml', project_id='proj_a', projects_root='projects',
