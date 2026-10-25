@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -563,14 +563,16 @@ _RECOVERED_SHA = 'deadbeef' + 'a' * 32
 
 
 def _on_main_effect_absent(harness: Harness, tid: str, *, metadata: dict | None = None) -> None:
-    harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
-    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+    scheduler = cast(MagicMock, harness.scheduler)
+    git_ops = cast(MagicMock, harness.git_ops)
+    scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)
+    scheduler.get_task = AsyncMock(
         return_value={'status': 'in-progress', 'metadata': metadata or {}},
     )
-    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
-    harness.git_ops.resolve_branch_sha = AsyncMock(return_value=_RECOVERED_SHA)  # type: ignore[attr-defined]
-    harness.git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)  # type: ignore[attr-defined]
-    harness.git_ops.describe_commit_effect_in_main = AsyncMock(  # type: ignore[attr-defined]
+    git_ops.is_ancestor = AsyncMock(return_value=True)
+    git_ops.resolve_branch_sha = AsyncMock(return_value=_RECOVERED_SHA)
+    git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)
+    git_ops.describe_commit_effect_in_main = AsyncMock(
         return_value=CommitEffectProbe(
             present=False, diverged_paths=('src/y.py',), anchor_sha=_RECOVERED_SHA,
             failure='effect_not_survived', aggregate_survival=0.3, added_lines_total=40,
@@ -579,14 +581,16 @@ def _on_main_effect_absent(harness: Harness, tid: str, *, metadata: dict | None 
 
 
 def _blocked_marker_effect_absent(harness: Harness, tid: str, marker_sha: str) -> None:
-    harness.scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)  # type: ignore[attr-defined]
-    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+    scheduler = cast(MagicMock, harness.scheduler)
+    git_ops = cast(MagicMock, harness.git_ops)
+    scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)
+    scheduler.get_task = AsyncMock(
         return_value={'status': 'blocked', 'metadata': {}},
     )
-    harness.git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # type: ignore[attr-defined]
-    harness.git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)  # type: ignore[attr-defined]
-    harness.git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)  # type: ignore[attr-defined]
-    harness.git_ops.describe_commit_effect_in_main = AsyncMock(  # type: ignore[attr-defined]
+    git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+    git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
+    git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)
+    git_ops.describe_commit_effect_in_main = AsyncMock(
         return_value=CommitEffectProbe(
             present=False, diverged_paths=('src/z.py',), anchor_sha=marker_sha,
             failure='effect_not_survived', aggregate_survival=0.2, added_lines_total=30,
@@ -605,7 +609,7 @@ class TestReconcileOneStrandedLandingRejectEmission:
 
         await harness._reconcile_stranded_in_progress()
 
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+        cast(AsyncMock, harness.scheduler.set_task_status).assert_awaited_once_with(
             tid, 'pending',
         )
         [row] = landing_reject_rows(store)
@@ -631,7 +635,7 @@ class TestReconcileOneStrandedLandingRejectEmission:
         async def _revert(*_args, **_kwargs):
             rows_at_revert.append(len(landing_reject_rows(store)))
 
-        harness._revert_in_progress_if_no_live_claimant = AsyncMock(  # type: ignore[method-assign]
+        cast(Any, harness)._revert_in_progress_if_no_live_claimant = AsyncMock(
             side_effect=_revert,
         )
 
@@ -649,7 +653,7 @@ class TestReconcileOneStrandedLandingRejectEmission:
 
         await harness._reconcile_stranded_in_progress()
 
-        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        cast(AsyncMock, harness.scheduler.set_task_status).assert_not_called()
         [row] = landing_reject_rows(store)
         assert row['data']['task_status'] == 'blocked'
         assert row['data']['citation'] == marker_sha
@@ -694,8 +698,10 @@ class TestReconcileOneStrandedLandingRejectEmission:
                    AsyncMock(return_value=None)):
             await harness._reconcile_stranded_in_progress()
 
-        harness.scheduler.set_task_status.assert_awaited_once()  # type: ignore[attr-defined]
-        call = harness.scheduler.set_task_status.await_args  # type: ignore[attr-defined]
+        set_task_status = cast(AsyncMock, harness.scheduler.set_task_status)
+        set_task_status.assert_awaited_once()
+        call = set_task_status.await_args
+        assert call is not None
         assert call.args == (tid, 'done')
         provenance = call.kwargs['done_provenance']
         assert provenance['kind'] == 'found_on_main'
