@@ -104,7 +104,7 @@ from typing import Literal, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _merge_lane_fakes import merge_through_lane
+from _merge_lane_fakes import lane_scene_config, merge_through_lane
 from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
 from test_train_integration import _SpyEventStore, build_group_merge_request, make_stacked_member
 from test_verify import _real_worktree_reader
@@ -999,13 +999,13 @@ def _three_module_train_registry(
     mod_a = ModuleConfig(prefix='moda', test_command='uv run --directory moda pytest tests/')
     mod_b = ModuleConfig(prefix='modb', test_command='uv run --directory modb pytest tests/')
     mod_c = ModuleConfig(prefix='modc', test_command='uv run --directory modc pytest tests/')
-    config = OrchestratorConfig(
-        project_root=repo,
-        merge_verify_breadth='full',
-        git=GitConfig(
+    config = lane_scene_config(
+        repo,
+        GitConfig(
             main_branch='main', branch_prefix='task/', remote='origin',
             worktree_dir='.worktrees', push_after_advance=False,
         ),
+        merge_verify_breadth='full',
     )
     config._module_configs = {'moda': mod_a, 'modb': mod_b, 'modc': mod_c}
     return mod_a, mod_b, mod_c, config
