@@ -86,7 +86,7 @@ def test_merge_gates_logger_name_is_merge_lane() -> None:
 class TestFinalizeRecordsQueueVerifiedTip:
     """Which landings ``_finalize_advanced_merge`` records as queue-verified."""
 
-    async def test_finalize_advanced_merge_records_queue_verified_tip(self) -> None:
+    async def test_finalize_advanced_merge_records_queue_verified_tip(self, tmp_path) -> None:
         """A clean landing records the advanced SHA as a queue-verified main tip.
 
         This is the PRODUCER for premise P2 of ``_disjoint_skip_blockers``: a
@@ -101,6 +101,7 @@ class TestFinalizeRecordsQueueVerifiedTip:
         )
 
         git_ops = MagicMock()
+        git_ops.project_root = tmp_path
         git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
         req = MagicMock()
@@ -111,7 +112,7 @@ class TestFinalizeRecordsQueueVerifiedTip:
         req.module_configs = []
 
         landed = 'deadbeefcafe0001'
-        assert not main_tip_is_queue_verified(landed), (
+        assert not main_tip_is_queue_verified(tmp_path, landed), (
             'precondition: the tip must not already be registered'
         )
 
@@ -139,12 +140,15 @@ class TestFinalizeRecordsQueueVerifiedTip:
             )
 
         assert outcome.status == 'done', f'expected done, got {outcome!r}'
-        assert main_tip_is_queue_verified(landed), (
+        assert main_tip_is_queue_verified(tmp_path, landed), (
             'a clean landing must record its advanced SHA as queue-verified, '
             'otherwise every subsequent rebase-under-drift re-verifies forever'
         )
+        assert not main_tip_is_queue_verified(tmp_path / 'elsewhere', landed), (
+            'the landing vouches only for the repository its GitOps lands into'
+        )
 
-    async def test_finalize_advanced_merge_blocked_does_not_record_tip(self) -> None:
+    async def test_finalize_advanced_merge_blocked_does_not_record_tip(self, tmp_path) -> None:
         """A landing BLOCKED by a post-advance gate records nothing.
 
         Main has already advanced at that point, but the gate chain says the
@@ -157,6 +161,7 @@ class TestFinalizeRecordsQueueVerifiedTip:
         )
 
         git_ops = MagicMock()
+        git_ops.project_root = tmp_path
         git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
         req = MagicMock()
@@ -193,7 +198,7 @@ class TestFinalizeRecordsQueueVerifiedTip:
             )
 
         assert outcome.status != 'done', f'expected a blocked outcome, got {outcome!r}'
-        assert not main_tip_is_queue_verified(landed), (
+        assert not main_tip_is_queue_verified(tmp_path, landed), (
             'a tip whose post-advance gates failed must NOT be recorded as '
             'queue-verified'
         )
