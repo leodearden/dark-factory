@@ -7746,6 +7746,32 @@ class TestRemoteRunnerEnvProbeRun:
         assert all(argv[:len(prefix)] == prefix for argv in ssh_run.issued), ssh_run.issued
 
 
+_REAL_SSHD_HOST = os.environ.get('DF_ENV_PROBE_SSH_HOST', '')
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not _REAL_SSHD_HOST,
+    reason='opt-in: set DF_ENV_PROBE_SSH_HOST to a host this user reaches by BatchMode ssh',
+)
+async def test_env_probe_master_against_a_real_sshd():
+    """Run before arming Lever C, from the account the orchestrator runs as.
+
+    The open must come back inside _SSH_PROBE_TIMEOUT_SECS even though ControlPersist keeps
+    the backgrounded master for longer, the ControlPath under ~ must bind, and the probes
+    must ride that master with the remote shell's own exit codes."""
+    from orchestrator import verify_runner as vr
+
+    runner = gated_remote_runner('real-sshd', _REAL_SSHD_HOST, 'origin', '/')
+    probe = await runner.env_probe_run()
+
+    control_path = next(opt for opt in vr._SSH_PROBE_OPTS if opt.startswith('ControlPath='))
+    check = await vr._default_subprocess_run(['ssh', '-o', control_path, '-O', 'check', _REAL_SSHD_HOST])
+    assert check[0] == 0, check
+    assert (await probe(['uname', '-s']))[0] == 0
+    assert (await probe(['df-env-probe-absent-tool', '--version']))[0] == 127
+
+
 # ---------------------------------------------------------------------------
 # task-2362: ssh ServerAliveInterval/ServerAliveCountMax keepalive hardening
 # ---------------------------------------------------------------------------
