@@ -229,3 +229,18 @@ class TestAddMemoryMarksTheSupersededRecord:
         [unmarked] = body['unmarked']
         assert unmarked['id'] == OLD
         assert unmarked['reason'] == 'patch_failed'
+
+
+class TestOnlyTheServerWritesTheSupersessionMark:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('triage_enabled', [True, False], ids=['triage-on', 'triage-off'])
+    async def test_a_caller_supplied_mark_is_not_persisted(self, triage_enabled: bool) -> None:
+        """A restatement copying a read record's metadata must not read as superseded."""
+        mock_service = _service(_BELOW_REJECT_GUARD, enabled=triage_enabled)
+
+        await _call(mock_service, {SUPERSEDED_BY_METADATA_KEY: OLD, 'source': 'notes'})
+
+        persisted = _persisted_metadata(mock_service)
+        assert SUPERSEDED_BY_METADATA_KEY not in persisted, f'{persisted!r}'
+        assert persisted['source'] == 'notes', f'{persisted!r}'
+        mock_service.update_memory.assert_not_awaited()

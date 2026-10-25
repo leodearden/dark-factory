@@ -128,9 +128,6 @@ EXPERIMENTAL_KEY_PREFIX = 'x_'
 #: ``plans/write-triage-link-healing-prd.md`` H1 row 2.
 TRIAGE_CONTESTED_METADATA_KEY = f'{EXPERIMENTAL_KEY_PREFIX}contested_by_triage'
 
-# ``SUPERSEDED_BY_METADATA_KEY`` (imported above from ``shared.memory_supersession``)
-# is the server-stamped supersession mark.
-
 
 def normalize_supersedes(value: Any) -> list[Any]:
     """Normalize a ``supersedes`` metadata value to a list (PRD D2).
