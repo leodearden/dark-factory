@@ -58,6 +58,7 @@ Amendment pass (post-review) additionally covers:
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -1857,16 +1858,15 @@ async def _recon_passes(
 ) -> None:
     """Run *count* deterministic passes *interval* apart, as the loop would.
 
-    *count* defaults to the harness's OWN ``veto_streak_threshold``, read live
-    off the config under test.  Every caller below wants "exactly enough passes
-    to charge the streak to its alarm point", which used to be spelled as the
-    literal 3 — correct only for as long as nobody declares
-    ``recovery_emission.veto_streak_threshold`` in
-    dark-factory-orchestrator.yaml (task 4481, measured: declaring it 10 turns
-    5 tests here red for a reason none of them is about).
+    *count* defaults to the fewest passes that clear BOTH halves of the alarm
+    predicate on the config under test: a streak of at least
+    ``veto_streak_threshold``, and a span — ``(count - 1) * interval`` — of at
+    least ``veto_streak_min_span_secs``.
     """
     if count is None:
-        count = h.config.recovery_emission.veto_streak_threshold
+        cfg = h.config.recovery_emission
+        passes_to_span = math.ceil(cfg.veto_streak_min_span_secs / interval) + 1
+        count = max(cfg.veto_streak_threshold, passes_to_span)
     for i in range(count):
         if i:
             clock.advance(interval)
