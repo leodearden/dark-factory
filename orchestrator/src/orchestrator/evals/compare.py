@@ -14,6 +14,7 @@ from shared.cli_invoke import no_mcp_servers_config
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.review_payload import normalize_review
 
 from .elo import PAIRWISE_RESULT
 from .judge import _strip_metadata, parse_confidence, parse_winner
@@ -26,7 +27,7 @@ from .measurement import (
 )
 from .report import format_invocation_errors
 from .results import EvalResult
-from .scoring import quality_from_review_artifact
+from .scoring import quality_from_reviews
 from .snapshots import get_diff
 
 if TYPE_CHECKING:
@@ -266,36 +267,23 @@ def score_result_from_artifacts(
     """Contract-agnostic P4/B8 quality for one result, off its PERSISTED reviews.
 
     The μ driver's per-result quality: reads the result's worktree reviews via
-    :func:`_read_review_artifacts` (envelope-preferring, legacy fallback — so
-    the two persisted contract shapes reduce to ONE payload), merges every
-    reviewer's issues into a single artifact, and scores it via
-    :func:`scoring.quality_from_review_artifact`. Because both shapes reduce to
-    the same payload, the SAME review content yields the SAME float regardless
-    of which reviewer/judge output contract is live — and it NEVER opens a
-    transcript / session / log (P4 / B8).
+    :func:`_read_review_artifacts` (envelope-preferring, legacy fallback), each
+    normalised by ``orchestrator/review_payload.py::normalize_review``, and
+    scores them together via :func:`scoring.quality_from_reviews`. The SAME
+    review content yields the SAME float regardless of which reviewer/judge
+    output contract is live — and it NEVER opens a transcript / session / log
+    (P4 / B8).
 
-    The per-reviewer ERROR filter mirrors ``artifacts.aggregate_reviews``: a
-    reviewer whose top-level ``verdict`` is ``ERROR`` (incomplete coverage)
-    contributes no issues, while every non-ERROR reviewer contributes all of
-    its issues. ``plan_steps`` is taken from the *plan_steps* arg when given,
-    else ``result.metrics['plan_steps']``; ``debug_cycles`` from
-    ``result.metrics``. The quality formula stays single-sourced in
-    ``metrics.compute_composite`` — this composes, it does not re-derive.
+    ``plan_steps`` is taken from the *plan_steps* arg when given, else
+    ``result.metrics['plan_steps']``; ``debug_cycles`` from ``result.metrics``.
     """
     reviews = _read_review_artifacts(result.worktree_path)
-
-    merged_issues: list[Any] = []
-    for payload in reviews.values():
-        # Mirror aggregate_reviews' per-reviewer ERROR skip — an ERROR reviewer's
-        # issues are never counted by severity (incomplete coverage).
-        if payload.get('verdict') == 'ERROR':
-            continue
-        merged_issues.extend(payload.get('issues') or [])
-
     steps = plan_steps if plan_steps is not None else int(result.metrics.get('plan_steps', 0) or 0)
     debug_cycles = int(result.metrics.get('debug_cycles', 0) or 0)
-    return quality_from_review_artifact(
-        {'issues': merged_issues}, plan_steps=steps, debug_cycles=debug_cycles,
+    return quality_from_reviews(
+        (normalize_review(review) for review in reviews.values()),
+        plan_steps=steps,
+        debug_cycles=debug_cycles,
     )
 
 

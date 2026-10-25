@@ -108,7 +108,7 @@ class TestPlanStepDeviated:
 class TestRegressionFlagged:
     """True when >= min_matches blocking-issue dicts each name a planted-
     regression marker; False otherwise. Reads only the aggregated blocking-
-    issue dicts (contract-agnostic via _unwrap_verdict_envelope)."""
+    issue dicts, matching each one's JSON text."""
 
     def _issue(self, text: str) -> dict:
         return {
