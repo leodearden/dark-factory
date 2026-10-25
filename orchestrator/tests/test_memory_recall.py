@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,8 @@ from _briefing_helpers import (
 )
 
 from orchestrator.agents.memory_recall import (
+    ENTITY_BLOCK_MAX_EDGES,
+    ENTITY_EDGES_OMITTED_NOTICE,
     FOREIGN_PROJECT_TAG_KEYS,
     MEMORY_CONTEXT_CAVEAT,
     MEMORY_EMPTY_NOTICE,
@@ -827,6 +830,15 @@ class TestContestingChildRender:
         assert ' · graphiti] ' in lines[contests_at], lines
 
 
+def _numbered_facts(count: int) -> list[str]:
+    """Distinct facts, zero-padded so that none is a substring of another."""
+    return [f'Task 3609 fact {i:02d}.' for i in range(count)]
+
+
+def _bullet_lines(lines: list[str]) -> list[str]:
+    return [line for line in lines if line.startswith('- ')]
+
+
 class TestRenderEntityBlock:
     """Only an exactly-named node is admitted: the server's fuzzy fallback
     answers a miss with a neighbouring task, whose facts would read as ours."""
@@ -845,6 +857,116 @@ class TestRenderEntityBlock:
             '**Task 3609** — Project-scopes the briefing context block.',
             '- Task 3609 landed as commit abc123. (2026-09-14)',
             '- Task 3609 is related to task 3212.',
+        ]
+
+    def test_a_summary_equal_to_the_joined_facts_renders_each_fact_once(self):
+        facts = [
+            'Task 3609 project-scopes the briefing context block.',
+            'Task 3609 landed as commit abc123.',
+            'Task 3609 is related to task 3212.',
+        ]
+        summary = '\n'.join(facts)
+        payload = {
+            'nodes': [_node('Task 3609', summary)],
+            'edges': [_edge(fact) for fact in facts] + [_edge(facts[1])],
+        }
+
+        rendered = render_entity_block(payload, 'Task 3609')
+
+        assert [rendered.count(fact) for fact in facts] == [1, 1, 1], rendered
+        assert not _bullet_lines(rendered.splitlines())
+        assert rendered == '**Task 3609** — ' + summary
+
+    def test_a_fact_the_summary_states_mid_line_is_not_repeated(self):
+        fact = 'Task 3609 is related to task 3212.'
+        payload = {
+            'nodes': [_node('Task 3609', f'Task 3609 landed as commit abc123. {fact}')],
+            'edges': [_edge(fact)],
+        }
+
+        assert not _bullet_lines(render_entity_block(payload, 'Task 3609').splitlines())
+
+    def test_a_fact_that_only_prefixes_a_longer_summary_sentence_still_renders(self):
+        payload = {
+            'nodes': [_node('Task 1', 'Task 1 blocks task 20.')],
+            'edges': [_edge('Task 1 blocks task 2')],
+        }
+
+        assert _bullet_lines(render_entity_block(payload, 'Task 1').splitlines()) == [
+            '- Task 1 blocks task 2',
+        ]
+
+    def test_an_edge_the_summary_does_not_contain_still_renders(self):
+        held = 'Task 3609 landed as commit abc123.'
+        payload = {
+            'nodes': [_node('Task 3609', held)],
+            'edges': [_edge(held), _edge('Task 3609 is related to task 3212.')],
+        }
+
+        assert render_entity_block(payload, 'Task 3609').splitlines() == [
+            f'**Task 3609** — {held}',
+            '- Task 3609 is related to task 3212.',
+        ]
+
+    def test_a_fact_carried_by_two_edges_renders_once(self):
+        fact = 'Task 3609 is related to task 3212.'
+        payload = {
+            'nodes': [_node('Task 3609')],
+            'edges': [_edge(fact), _edge(fact, valid_at='2026-09-14T07:58:01+00:00')],
+        }
+
+        lines = render_entity_block(payload, 'Task 3609').splitlines()
+
+        assert _bullet_lines(lines) == [f'- {fact} (2026-09-14)']
+
+    def test_an_n_edge_node_renders_the_cap_and_names_the_rest(self):
+        facts = _numbered_facts(ENTITY_BLOCK_MAX_EDGES + 3)
+        payload = {'nodes': [_node('Task 3609')], 'edges': [_edge(fact) for fact in facts]}
+
+        lines = render_entity_block(payload, 'Task 3609').splitlines()
+
+        assert _bullet_lines(lines) == [f'- {fact}' for fact in facts[:ENTITY_BLOCK_MAX_EDGES]]
+        assert lines[-1] == ENTITY_EDGES_OMITTED_NOTICE.format(count=3, name='Task 3609')
+
+    def test_a_node_at_the_cap_has_no_omission_line(self):
+        facts = _numbered_facts(ENTITY_BLOCK_MAX_EDGES)
+        payload = {'nodes': [_node('Task 3609')], 'edges': [_edge(fact) for fact in facts]}
+
+        lines = render_entity_block(payload, 'Task 3609').splitlines()
+
+        assert len(_bullet_lines(lines)) == ENTITY_BLOCK_MAX_EDGES
+        assert lines[-1].startswith('- '), lines
+
+    def test_the_newest_dated_edges_win_the_cap(self):
+        facts = _numbered_facts(ENTITY_BLOCK_MAX_EDGES + 2)
+        dated = [
+            (fact, f'{date(2026, 9, 1) + timedelta(days=i)}T00:00:00+00:00')
+            for i, fact in enumerate(facts[:ENTITY_BLOCK_MAX_EDGES])
+        ]
+        undated = facts[ENTITY_BLOCK_MAX_EDGES:]
+        payload = {
+            'nodes': [_node('Task 3609')],
+            'edges': [_edge(fact, valid_at=at) for fact, at in dated]
+            + [_edge(fact) for fact in undated],
+        }
+
+        lines = render_entity_block(payload, 'Task 3609').splitlines()
+
+        assert _bullet_lines(lines) == [f'- {fact} ({at[:10]})' for fact, at in reversed(dated)]
+        assert not [line for line in lines if any(fact in line for fact in undated)]
+        assert lines[-1] == ENTITY_EDGES_OMITTED_NOTICE.format(count=2, name='Task 3609')
+
+    def test_a_fact_the_summary_holds_does_not_spend_a_cap_slot(self):
+        held = 'Task 3609 held fact.'
+        others = _numbered_facts(ENTITY_BLOCK_MAX_EDGES)
+        payload = {
+            'nodes': [_node('Task 3609', held)],
+            'edges': [_edge(held)] + [_edge(fact) for fact in others],
+        }
+
+        assert render_entity_block(payload, 'Task 3609').splitlines() == [
+            f'**Task 3609** — {held}',
+            *(f'- {fact}' for fact in others),
         ]
 
     def test_a_fuzzy_neighbour_renders_nothing(self):
