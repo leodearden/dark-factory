@@ -362,6 +362,7 @@ import logging
 import os
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -389,6 +390,7 @@ from orchestrator.deploy_state import (
     enforce_transition,
 )
 from orchestrator.fm_retry import FM_RESTART_RETRY_WINDOW_SECS, fm_retry_backoffs
+from orchestrator.predicate_recheck import PredicateRecheck, reset, verdict_stamps
 from orchestrator.proc_supervision import (
     EscalationSpec,
     FreshPidVerify,
@@ -1086,9 +1088,10 @@ def _summarize_predicate_output(out: object, *, rc: int) -> str:
     ``predicate check passed (rc=2)``; the text cannot contradict the value.
     """
     verdict = f'predicate check {"passed" if rc == 0 else "failed"} (rc={rc})'
-    payload = _extract_predicate_payload(out)
-    if payload is None:
+    parsed = _parse_predicate_payload(out)
+    if parsed is None:
         return verdict
+    payload = parsed.text
     if len(payload) > _PREDICATE_NOTE_MAX_PAYLOAD_CHARS:
         payload = (
             f'<verdict payload elided: {len(payload)} chars exceeds '
@@ -1098,12 +1101,38 @@ def _summarize_predicate_output(out: object, *, rc: int) -> str:
     return f'{verdict}: {payload}'
 
 
-def _extract_predicate_payload(out: object) -> str | None:
+@dataclass(frozen=True)
+class _PredicatePayload:
+    """The recognized payload of a predicate's output: a trailing JSON block or a clean line.
+
+    Exactly one of ``json_value`` (tier 1) and ``line`` (tier 2) is set.
+    """
+
+    json_value: dict | list | None = None
+    line: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.json_value is None) == (self.line is None):
+            raise ValueError(
+                '_PredicatePayload needs exactly one of json_value and line '
+                f'(got json_value={self.json_value!r}, line={self.line!r})'
+            )
+
+    @property
+    def text(self) -> str:
+        """The single-line rendering the provenance note carries."""
+        if self.line is not None:
+            return self.line
+        return json.dumps(self.json_value, separators=(',', ':'))
+
+
+def _parse_predicate_payload(out: object) -> _PredicatePayload | None:
     """Return the recognized structured payload in *out*, or None.
 
     Tier 1 — a trailing JSON block: walk backwards to the last line whose
     strip opens a ``{``/``[``, and try to parse from there to end of output.
-    Re-dumped with compact separators so the note stays a single line.
+    Its rendering re-dumps it with compact separators so the note stays a
+    single line.
 
     Tier 2 — the last non-blank line, iff it carries no log shape
     (``_LOG_LINE_RE``).  This is what preserves the real in-repo predicate
@@ -1120,14 +1149,30 @@ def _extract_predicate_payload(out: object) -> str | None:
             parsed = json.loads('\n'.join(lines[index:]))
         except ValueError:
             continue
-        return json.dumps(parsed, separators=(',', ':'))
+        return _PredicatePayload(json_value=parsed)
 
     for line in reversed(lines):
         candidate = line.strip()
         if not candidate:
             continue
-        return None if _LOG_LINE_RE.search(candidate) else candidate
+        return None if _LOG_LINE_RE.search(candidate) else _PredicatePayload(line=candidate)
     return None
+
+
+def _predicate_verdict(out: object) -> dict | None:
+    """The structured verdict a predicate's output carries: its trailing JSON OBJECT.
+
+    Stamped as ``metadata.predicate_verdict`` (plans/completion-driven-triggers-prd.md
+    C1).  A clean line or a JSON array is never a verdict.  An object whose
+    compact rendering exceeds the note's cap is recorded by size alone.
+    """
+    payload = _parse_predicate_payload(out)
+    if payload is None or not isinstance(payload.json_value, dict):
+        return None
+    rendered = payload.text
+    if len(rendered) > _PREDICATE_NOTE_MAX_PAYLOAD_CHARS:
+        return {'elided': True, 'chars': len(rendered)}
+    return payload.json_value
 
 
 def _is_operational_llm_gate(metadata: dict) -> bool:
@@ -1895,9 +1940,9 @@ class DeterministicRunner:
         the three log lines below interpolate the category so a carrier's logs
         read ``milestone_check_failed`` rather than a lie.
 
-        THIS method — not ``_file_milestone_check_failed_and_block`` — is the
+        THIS method — not ``_file_predicate_escalation_and_block`` — is the
         right home for that override precisely BECAUSE it does not stamp
-        ``gate_escalated_at``.  The milestone helper does, and task 4065
+        ``gate_escalated_at``.  The verdict helper does, and task 4065
         established that a no-verdict leg must NOT (the check is re-attempted
         on the next dispatch instead of being latched into section-1's
         resolve-to-done path).  r3 is a CATEGORY change only, so routing the
@@ -2796,22 +2841,31 @@ class DeterministicRunner:
 
         return WorkflowOutcome.BLOCKED
 
-    async def _file_milestone_check_failed_and_block(
+    async def _file_predicate_escalation_and_block(
         self,
         task_id: str,
+        *,
+        category: str,
         summary: str,
         detail: str,
+        stamps: dict,
     ) -> WorkflowOutcome:
-        """File a born-at-L2 ``milestone_check_failed`` escalation and block (γ-predicate).
+        """File a born-at-L2 predicate VERDICT escalation and block (γ-predicate).
 
-        A non-zero predicate exit code is a milestone VERDICT ("the invariant
-        does not hold") — semantically distinct from an infra fault, so this
-        mirrors ``_file_infra_issue_and_block``'s dedup/file/block shape but
-        with a dedicated category AND additionally stamps ``gate_escalated_at``
-        (mirroring ``_file_milestone_gate_and_block``) so the next dispatch
-        routes through section-1's existing quiescence/resolve-to-done fork —
-        a human resolving the escalation drives the task to done with no
-        extra wiring.
+        Serves every verdict a human must weigh: ``milestone_check_failed``
+        ("the invariant does not hold") and ``milestone_check_stalled`` (a
+        re-arming predicate still "not yet" at its stall cap).  A verdict is
+        semantically distinct from an infra fault, so this mirrors
+        ``_file_infra_issue_and_block``'s dedup/file/block shape but
+        additionally stamps ``gate_escalated_at`` (mirroring
+        ``_file_milestone_gate_and_block``) so the next dispatch routes through
+        section-1's existing quiescence/resolve-to-done fork — a human
+        resolving the escalation re-runs the check with no extra wiring.
+
+        *stamps* (``predicate_verdict`` / ``predicate_recheck``, PRD
+        plans/completion-driven-triggers-prd.md C1) ride in the SAME single
+        ``update_task`` as ``gate_escalated_at``, so a verdict exit is still
+        exactly one metadata write.
 
         Includes a dedup guard — if a pending escalation already exists (e.g.
         prior crash-safe re-dispatch), filing is skipped to avoid duplicate L2
@@ -2828,8 +2882,8 @@ class DeterministicRunner:
         if existing_pending:
             logger.info(
                 'DeterministicRunner: task %s already has %d pending escalation(s) — '
-                'skipping re-file (milestone_check_failed dedup guard)',
-                task_id, len(existing_pending),
+                'skipping re-file (%s dedup guard)',
+                task_id, len(existing_pending), category,
             )
         else:
             esc = Escalation(
@@ -2837,15 +2891,15 @@ class DeterministicRunner:
                 task_id=task_id,
                 agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
-                category=MILESTONE_CHECK_FAILED_CATEGORY,
+                category=category,
                 summary=summary[:200],
                 detail=detail,
                 level=2,
             )
             self.escalation_queue.submit(esc)
             logger.info(
-                'DeterministicRunner: filed L2 milestone_check_failed escalation %s for task %s',
-                esc.id, task_id,
+                'DeterministicRunner: filed L2 %s escalation %s for task %s',
+                category, esc.id, task_id,
             )
 
         # Stamp gate_escalated_at AFTER successful escalation submit (file-before-stamp
@@ -2855,7 +2909,7 @@ class DeterministicRunner:
         now_iso = datetime.now(UTC).isoformat()
         await self.scheduler.update_task(
             task_id,
-            {'gate_escalated_at': now_iso},
+            {'gate_escalated_at': now_iso, **stamps},
             metadata_mode='merge',
         )
 
@@ -2865,16 +2919,13 @@ class DeterministicRunner:
         # mask them behind a raw exception.
         try:
             await self.scheduler.set_task_status(task_id, 'blocked')
-            logger.info(
-                'DeterministicRunner: task %s blocked — milestone_check_failed', task_id,
-            )
+            logger.info('DeterministicRunner: task %s blocked — %s', task_id, category)
         except Exception as exc:
             logger.warning(
                 'DeterministicRunner: task %s blocked-status writeback failed '
-                '(connection may still be severed): %s: %s — the '
-                'milestone_check_failed escalation is already durable on local '
-                'disk, so returning BLOCKED regardless',
-                task_id, type(exc).__name__, exc,
+                '(connection may still be severed): %s: %s — the %s escalation '
+                'is already durable on local disk, so returning BLOCKED regardless',
+                task_id, type(exc).__name__, exc, category,
             )
 
         return WorkflowOutcome.BLOCKED
@@ -3089,6 +3140,13 @@ class DeterministicRunner:
                 category=no_verdict_category,
             )
 
+        verdict = _predicate_verdict(out)
+        prev_recheck = PredicateRecheck.from_metadata(metadata)
+        now = datetime.now(UTC)
+        settled_stamps = verdict_stamps(
+            metadata, verdict, reset(prev_recheck, now) if prev_recheck else None,
+        )
+
         if rc != 0:
             # A non-zero exit is a milestone VERDICT ("invariant does not
             # hold"), not an infra fault — file milestone_check_failed (NOT
@@ -3110,10 +3168,12 @@ class DeterministicRunner:
                 f'Predicate check exit code: rc={rc}',
                 f'Output:\n{out}',
             ])
-            return await self._file_milestone_check_failed_and_block(
+            return await self._file_predicate_escalation_and_block(
                 task_id,
+                category=MILESTONE_CHECK_FAILED_CATEGORY,
                 summary=f'Milestone predicate check failed (rc={rc})',
                 detail=fail_detail,
+                stamps=settled_stamps,
             )
 
         # Log the RAW output before summarizing it.  `_summarize_predicate_output`
@@ -3130,6 +3190,16 @@ class DeterministicRunner:
             'DeterministicRunner: task %s predicate check passed (rc=0) — setting done',
             task_id,
         )
+        # Written before done, so no metadata write lands on a terminal row.  An
+        # observability record, never a gate: a refused write still drives to done.
+        if settled_stamps and not await self.scheduler.update_task(
+            task_id, settled_stamps, metadata_mode='merge',
+        ):
+            logger.warning(
+                'DeterministicRunner: task %s predicate verdict stamp write refused '
+                '(keys %s) — driving to done regardless',
+                task_id, sorted(settled_stamps),
+            )
         await self.scheduler.set_task_status(
             task_id,
             'done',

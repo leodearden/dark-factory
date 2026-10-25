@@ -717,7 +717,7 @@ def _deterministic_gate_stranded(metadata: dict | None) -> bool:
     was supposed to be filed) but whose escalation record never landed or was
     lost across a restart.  ``gate_escalated_at`` is written ONLY by the
     gate-filing paths (``DeterministicRunner._file_milestone_gate_and_block`` /
-    ``_file_milestone_check_failed_and_block`` / the predicate leg), so it is
+    ``_file_predicate_escalation_and_block`` / the predicate leg), so it is
     the sole reliable "a gate was supposed to be filed" signal.
 
     Metadata-only predicate — the archive-inclusive empty-escalation-queue
