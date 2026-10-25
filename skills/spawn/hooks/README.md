@@ -22,9 +22,13 @@ two things, fail-soft and fast:
   same trick `tests/scripts/test_spawn_claude.py` uses), and writes the
   emitted OSC retitle sequence to `/dev/tty`.
 - `install-hooks.sh` — merges the trio into the real `~/.claude/settings.json`.
-- `session_hooks.py` (in `orchestrator/src/orchestrator/`, not here) holds all
-  the testable logic: identity/slug resolution, the registry read/refresh
-  calls, the OSC/title helpers, and the settings-merge function. The bash
+- `session_hooks.py` (in `orchestrator/src/orchestrator/`, not here) holds the
+  hook logic: identity/slug resolution, the registry read/refresh calls, the
+  OSC/title helpers, and the settings-merge function. Its process-tree
+  ownership probes live in
+  `orchestrator/src/orchestrator/session_ownership_probes.py` (tested in
+  `orchestrator/tests/test_session_ownership_probes.py`). The ownership model
+  both implement is explained in `docs/session-hook-ownership.md`. The bash
   files here stay thin by design (PRD §4 decision 9) — assert behavior
   against the Python module in `orchestrator/tests/test_session_hooks.py`,
   not against these scripts directly (except for the one bash-level
@@ -32,8 +36,8 @@ two things, fail-soft and fast:
 
 ## Absolute paths, not `~/.claude/hooks/`
 
-Unlike the pre-existing `~/.claude/hooks/*.sh` scripts (`skim-rewrite.sh`,
-`worktree-hookspath-*.sh`), these hooks live **in this repo**, version
+Unlike the pre-existing `~/.claude/hooks/*.sh` scripts
+(`worktree-hookspath-*.sh`), these hooks live **in this repo**, version
 controlled, and are referenced from `~/.claude/settings.json` by **absolute
 path** into this checkout (e.g. `/home/leo/src/dark-factory/skills/spawn/hooks/session-start.sh`).
 That is a deliberate PRD decision (§4 decision 5): registry/hook logic is
@@ -43,7 +47,7 @@ not an ad-hoc file dropped in `~/.claude/`.
 ## MERGE, never clobber
 
 `~/.claude/settings.json` already carries a populated `hooks` object
-(`PreToolUse`: Bash → skim-rewrite.sh, EnterWorktree → worktree-hookspath-capture.sh;
+(`PreToolUse`: EnterWorktree → worktree-hookspath-capture.sh;
 `PostToolUse`: ExitWorktree → worktree-hookspath-restore.sh) plus other
 top-level keys (`env`, `permissions`, `statusLine`, `enabledPlugins`, …).
 Installing this trio must **add** the three new event keys

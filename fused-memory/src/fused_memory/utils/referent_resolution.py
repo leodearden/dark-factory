@@ -37,12 +37,17 @@ assumes completeness (PRD resolved decision 8): a node named with bare digits
 or codename aliases ('Task θ2=2184') are all invisible to the DERIVED path by
 design. Precision over recall — consumers perform destructive edge surgery, so
 a false positive misattributes a fact. The load-bearing consequence is in
-:func:`resolve_referents`: an empty scan is UNINFORMATIVE, never contradictory,
-so it can never produce a conflict and can never reject an honest write. The
-same reasoning scopes a FOREIGN declaration's conflict test to the project it
-names: the scan reaches a foreign task ONLY through an explicit qualifier, so
-its silence about that project is silence rather than disagreement
-(:func:`_conflicting_referents`, choice 2).
+:func:`_conflicting_referents`: the scan's silence about a declared referent is
+UNINFORMATIVE PER REFERENT, never contradictory, whatever else the scan saw. A
+declared referent the scan did not name conflicts only on positive evidence
+(choices 4 and 5), so a blind spot can never reject an honest write. The same
+reasoning scopes a FOREIGN declaration's conflict test to the project it names:
+the scan reaches a foreign task ONLY through an explicit qualifier, so its
+silence about that project is silence rather than disagreement (choice 2).
+
+This module also owns the caller-facing teaching of the shape it enforces
+(:func:`render_referent_declaration_guidance`), so that the rule and the way it
+is taught stay in one place.
 
 This module is a dependency-free leaf — stdlib plus utils/canonical_labels and
 utils/validation, both themselves leaves — so leaf δ (``server/tools.py``) and
@@ -53,6 +58,7 @@ canonical_labels whose shape it copies.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Literal, get_args
 
@@ -82,6 +88,31 @@ _DECLARED_REFERENT_HINT = (
     "'id' must be the task number's digits (an int, or a string of ASCII "
     'digits), never a label like "Task 3127" and never a bool.'
 )
+
+
+def render_referent_declaration_guidance() -> str:
+    """Teach a writing agent to declare referents, in the shape this module enforces.
+
+    Composes :data:`_DECLARED_REFERENT_HINT` verbatim, so the shape sentence an
+    agent is taught is the one its rejection would quote. Plain text built from
+    adjacent literals: consumers interpolate it into their own f-strings, so its
+    braces need no escaping there. ``fused-memory/tests/test_referent_declaration_examples.py``
+    runs its worked example through the live gate.
+    """
+    return (
+        '## Declaring What a Write Is About\n'
+        '`add_memory` and `add_episode` take an optional `entities` argument naming '
+        'the referents the write is about. It has three states: omitting it means you '
+        'never considered them, and they are inferred from metadata or the content; '
+        '`[]` records that you considered them and none apply; a list declares them. '
+        f'{_DECLARED_REFERENT_HINT}\n'
+        'The gate rejects only a declaration your own content contradicts: a '
+        'near-miss typo of a declared task number, or that number under another '
+        'project. If the id is wrong, fix it; if it is right, write `task NNN` in '
+        'the content so the scan can corroborate it. For example:\n'
+        '`add_memory(content="Task 3127\'s retry loop swallows the timeout", '
+        "category=..., project_id=..., agent_id=..., entities=[{'kind': 'task', 'id': 3127}])`"
+    )
 
 #: The complete set of keys a declared entry may carry. Closed deliberately:
 #: an unrecognized key ('projectId') would otherwise be silently ignored and
@@ -154,7 +185,10 @@ class ReferentResolution:
     #: regardless of ``.source``.
     referents: ReferentSet = ()
     #: DECLARED referents the scanned content contradicts — a declared referent
-    #: of kind K whose kind the scan did see, but which the scan did not name.
+    #: the scan did not name, judged PER REFERENT: it conflicts only when a
+    #: scanned referent of its kind carries its number under another project,
+    #: or is a one-edit near-miss of a number the content writes nowhere
+    #: (``_conflicting_referents``, choices 4 and 5).
     #:
     #: Populated on the ``'declared'`` path ONLY. Ambient ``metadata.task_id``
     #: is not a claim about the prose (an agent working on task 3668
@@ -255,15 +289,67 @@ def local_referent(referent: Referent, *, group_id: str) -> Referent:
     return referent
 
 
-def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSet:
+_ASCII_DIGITS = frozenset('0123456789')
+
+
+def _writes_number(content: str, number: str) -> bool:
+    """Whether *content* writes *number* as a maximal run of ASCII digits, scannable or not."""
+    start = content.find(number)
+    while start != -1:
+        end = start + len(number)
+        if (
+            content[start - 1:start] not in _ASCII_DIGITS
+            and content[end:end + 1] not in _ASCII_DIGITS
+        ):
+            return True
+        start = content.find(number, start + 1)
+    return False
+
+
+def _one_typo_apart(declared: str, scanned: str) -> bool:
+    """Whether two digit strings are exactly one Damerau edit apart.
+
+    One substitution or one adjacent transposition between equal lengths, or
+    one insertion/deletion between lengths that differ by one. Equal strings
+    are zero edits apart.
+    """
+    if len(declared) == len(scanned):
+        diffs = [i for i, (a, b) in enumerate(zip(declared, scanned, strict=True)) if a != b]
+        if len(diffs) == 2:
+            i, j = diffs
+            return j == i + 1 and (declared[i], declared[j]) == (scanned[j], scanned[i])
+        return len(diffs) == 1
+    shorter, longer = sorted((declared, scanned), key=len)
+    return len(longer) - len(shorter) == 1 and any(
+        longer[:i] + longer[i + 1:] == shorter for i in range(len(longer))
+    )
+
+
+def _contradicts(declared: Referent, scanned: Referent, *, content: str) -> bool:
+    """Whether *scanned* is positive evidence against an unnamed *declared*.
+
+    PROJECT axis: the same number, which within one kind bucket means another
+    project's task. TYPO axis: a one-edit near-miss, unless *content* itself
+    writes the declared number somewhere.
+    """
+    if scanned.number == declared.number:
+        return True
+    return _one_typo_apart(declared.number, scanned.number) and not _writes_number(
+        content, declared.number
+    )
+
+
+def _conflicting_referents(
+    declared: ReferentSet, scan: LabelScan, *, content: str
+) -> ReferentSet:
     """The declared referents the scanned content CONTRADICTS.
 
-    A declared referent ``d`` conflicts iff the scan found at least one
+    A declared referent ``d`` conflicts iff the scan did not name it and a
     referent that COULD have corroborated it — same kind, and for a FOREIGN
-    declaration the same project — and ``d`` is not among them. Declared order
-    is preserved; the result is de-duplicated.
+    declaration the same project — is positive evidence against it (choice
+    5). Declared order is preserved; the result is de-duplicated.
 
-    Four load-bearing choices, each invisible from the code alone:
+    Five load-bearing choices, each invisible from the code alone:
 
     1. KIND-SCOPED, not global. ``_KIND_LABELS`` holds one entry today, so the
        scoping is a no-op and NO test can construct a second kind — the guard
@@ -296,17 +382,32 @@ def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSe
        names an AMBIGUOUS referent counts as RESOLVING the ambiguity rather
        than contradicting it — the single most useful thing a declaration can
        do.
-    4. An EMPTY per-kind scan never conflicts. This is the load-bearing
-       consequence of resolved decision 8: the scanner cannot see bare-digit
-       node names, title-only references or Greek-letter aliases, so its
-       SILENCE is uninformative and must not reject an honest write.
+    4. Silence is uninformative PER REFERENT, never per kind: a declared
+       referent the scan did not name conflicts only on positive evidence.
+       This is the load-bearing consequence of resolved decision 8: the
+       scanner cannot see bare-digit node names, title-only references,
+       Greek-letter aliases, list continuations or non-task vocabulary, and it
+       is exactly as blind to a referent beside a scannable task as it is
+       alone.
+    5. Two evidence axes (:func:`_contradicts`). PROJECT: a scanned referent
+       carries the declared number under another project. TYPO: a scanned
+       number is one Damerau edit from the declared one AND the declared
+       number is written nowhere in the content as a digit run. The
+       literal-presence clause exists because list continuations ('Tasks
+       5949/5849') and consecutively filed siblings (4754/4755) make a scanned
+       near-miss routine for honest writes, and a declaration that copies a
+       number the prose itself wrote is not a typo of the declaration. A real
+       typo — 3129 declared beside 'Task 3127' — is written nowhere.
 
     The rejected alternative — a set-level "declared and scanned are disjoint"
     verdict — is more permissive but stops catching ``[3127, 3129]`` where 3129
     is an adjacent-number typo and 3127 corroborates, which is precisely the
     misattribution this PRD exists to prevent. A per-ref list is also strictly
     more informative: δ can derive the disjoint verdict from it, not the
-    reverse.
+    reverse. The same example bounds choice 5: an honest sibling declared by
+    number, written nowhere, beside a scanned one-edit sibling is
+    indistinguishable from that typo and still conflicts; writing it as
+    'task NNN' resolves it.
 
     The result is de-duplicated HERE as a function-LOCAL guarantee, not a
     caller-dependency. Through :func:`resolve_referents` the branch cannot fire
@@ -332,7 +433,9 @@ def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSe
             # THAT project are evidence about it. An own-project declaration
             # (project_id == '') deliberately keeps the whole-kind bucket.
             scanned = {ref for ref in scanned if ref.project_id == referent.project_id}
-        if not scanned or referent in scanned:
+        if referent in scanned or not any(
+            _contradicts(referent, ref, content=content) for ref in scanned
+        ):
             continue
         if referent in seen:
             continue
@@ -636,6 +739,7 @@ def resolve_referents(
     metadata: dict | None,
     content: str | None,
     group_id: str,
+    known_project_ids: Collection[str] | None = None,
 ) -> ReferentResolution:
     """Resolve which referents one write is about, and from which source.
 
@@ -666,18 +770,35 @@ def resolve_referents(
         group_id: The group the content belongs to (= the local project_id).
             Must be a str; there is no "no group" for a write. A non-str
             RAISES.
+        known_project_ids: Optional registry of known project ids, forwarded
+            verbatim to the single ``scan_content`` call below (any
+            collection; a ``{project_id: project_root}`` mapping works, since
+            iterating it yields its keys). Absent, empty, or wholly unusable,
+            the scan stays PERMISSIVE — that fallback belongs to
+            ``_canonical_allowlist`` and is not re-checked here. Populated, it
+            drops FOREIGN referents naming a project outside it, so a junk
+            qualifier ('localhost:6379', 'INFO:1234') stops minting one.
+            Narrowing is STRICTLY SUBTRACTIVE by the guarantee ``scan_content``
+            states: a dropped candidate keeps the ambiguity contest it created,
+            so this can only ever remove a referent, never add one.
 
     Raises:
         InputValidationError: On a malformed ``declared`` entry (see
             :func:`_declared_referents`), or on a non-str ``group_id`` /
             ``content``.
 
-    These are the PRD's exact four parameters and no more. In particular there
-    is deliberately no ``known_project_ids``: ``scan_content`` is called in its
-    documented PERMISSIVE mode, and threading a live project registry is a
-    wiring concern belonging to the leaf that owns the wiring (δ/ε). Adding an
-    unspecified fifth parameter here would fork, mid-batch, the signature those
-    siblings are being written against.
+    ``known_project_ids`` was deliberately ABSENT for the PRD's δ/ε batch,
+    which deferred it to "the leaf that owns the wiring". No leaf's decomposed
+    scope ever contained it, so the deferral orphaned the wiring; task 5262
+    closes it. The parameter is OPTIONAL and permissive-by-default precisely so
+    the four-parameter callers those siblings were written against still read
+    identically.
+
+    NOT every caller acquires a registry. ``server/entities_gate.py``'s call
+    stays at the permissive default on purpose: it holds no registry, and the
+    gate rejects on CONFLICT, never on absence — so narrowing it would only
+    drop junk-qualified conflicts it currently catches, with nothing gained.
+    That is a deliberate non-change, not wiring left half-finished.
     """
     # group_id and content are STRUCTURAL inputs the caller resolves for itself
     # (models.scope.resolve_project_id for the group, the write body for the
@@ -727,7 +848,7 @@ def resolve_referents(
     # `content or ''` only narrows the tolerated None to the empty body
     # scan_content is typed for; that call already short-circuits falsy content
     # to an empty scan, so this changes no behaviour for '' either.
-    scan = scan_content(content or '', group_id=group_id)
+    scan = scan_content(content or '', group_id=group_id, known_project_ids=known_project_ids)
 
     # `.ambiguous` is the scan's verbatim answer on every path. Ambiguous
     # referents are recorded, never guessed, and never promoted into
@@ -756,7 +877,7 @@ def resolve_referents(
             # untouched by a conflict. γ is mechanism and δ is policy — a
             # resolver that degraded to the scan here would produce a write the
             # caller never asked for.
-            conflicts=_conflicting_referents(declared_referents, scan),
+            conflicts=_conflicting_referents(declared_referents, scan, content=content or ''),
             ambiguous=ambiguous,
         )
 

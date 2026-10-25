@@ -1,0 +1,345 @@
+"""The suite's config resolution must not depend on where pytest was launched.
+
+Task 5444.  `FusedMemoryConfig` is a pydantic-settings `BaseSettings`, not a
+plain `BaseModel`: `fused_memory.config.schema::FusedMemoryConfig.settings_customise_sources`
+resolves `CONFIG_PATH`, defaulting to the RELATIVE `config/config.yaml`, and
+`fused_memory.config.schema::YamlSettingsSource.__call__` silently returns `{}`
+when that path does not exist.  So every field a caller does not pass
+explicitly is filled from a file found relative to the process CWD — and from
+the ambient environment, since the model sets `env_prefix=''`.
+
+That made a test's outcome a function of the pytest CWD.  Measured on main tip
+bd4574c8d1, on the same commit, with the same test:
+
+    uv run --directory fused-memory pytest tests/test_referent_repair.py \
+        -k taskmaster_project_root_is_never_used          -> 1 passed
+    uv run --project   fused-memory pytest fused-memory/tests/test_referent_repair.py \
+        -k taskmaster_project_root_is_never_used          -> 1 failed
+
+Green for the gate (which runs pytest from `fused-memory/`), red for anyone
+running it from the repo root.  The tests here pin that invariant directly so
+the leak cannot silently return; `conftest.py::_isolate_fm_config` is what
+holds it.
+"""
+
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from fused_memory.config.schema import FusedMemoryConfig
+
+#: A value nothing in the tracked config or the schema could ever produce, so
+#: seeing it back out of ``FusedMemoryConfig()`` can only mean the environment
+#: reached in.
+PWNED = '/pwned-by-env'
+
+#: Marks a variable these tests planted themselves, for the near-miss class below.
+SURVIVES = 'kept-by-the-narrow-scrub'
+
+#: Names the scrub must LEAVE ALONE.  The first group are near-misses on its
+#: two rules — ``PATH`` is not ``path_scope_adjudicator``; ``MEM0_DIR`` and
+#: ``MEM0_TELEMETRY`` are not ``mem0``; ``TASKMASTER_PROJECT_ROOT`` spells the
+#: nesting with ONE underscore, not the ``__`` delimiter; ``FOO__TASKMASTER``
+#: has the head ``foo``.  The rest are ambient variables the other ~19.8k
+#: tests, the uv/venv machinery and the real-I/O cohort need alive.
+NEAR_MISS_ENV_NAMES = (
+    'PATH',
+    'HOME',
+    'VIRTUAL_ENV',
+    'OPENAI_API_KEY',
+    'MEM0_API_KEY',
+    'MEM0_DIR',
+    'MEM0_TELEMETRY',
+    'TASKMASTER_PROJECT_ROOT',
+    'FOO__TASKMASTER',
+)
+
+#: Every path leaf the tracked config interpolates, each as a reader paired
+#: with an id.  The reader is a callable rather than a dotted string the test
+#: would have to split, so it cannot drift from the config it names.
+INTERPOLATED_PATH_LEAVES = (
+    pytest.param(lambda config: config.taskmaster.project_root, id='taskmaster.project_root'),
+    pytest.param(
+        lambda config: config.reconciliation.explore_codebase_root,
+        id='reconciliation.explore_codebase_root',
+    ),
+    pytest.param(lambda config: config.queue.data_dir, id='queue.data_dir'),
+    pytest.param(lambda config: config.reconciliation.data_dir, id='reconciliation.data_dir'),
+    pytest.param(
+        lambda config: config.reconciliation.escalation_queue_dir,
+        id='reconciliation.escalation_queue_dir',
+    ),
+)
+
+#: Each YAML interpolation variable paired with one leaf it drives, as ONE
+#: ``(name, reader)`` value per case: a fixture's ``params`` binds a single
+#: name, so a two-value ``pytest.param`` would not fit both consumers.
+INTERPOLATION_VAR_LEAVES = (
+    pytest.param(('PROJECT_ROOT', lambda config: config.taskmaster.project_root), id='project-root'),
+    pytest.param(('QUEUE_DATA_DIR', lambda config: config.queue.data_dir), id='queue-data-dir'),
+    pytest.param(
+        ('RECONCILIATION_DATA_DIR', lambda config: config.reconciliation.data_dir),
+        id='reconciliation-data-dir',
+    ),
+)
+
+
+def test_config_resolution_is_independent_of_the_process_cwd(monkeypatch, tmp_path):
+    """The same commit must resolve the same config LAYERS from any CWD.
+
+    `.taskmaster` is the sharpest single probe: its code default is `None`
+    while the tracked `fused-memory/config/config.yaml` carries a real
+    `taskmaster:` section, so it flips precisely when the YAML layer is lost.
+    The full `model_dump()` comparison then catches every other field that
+    would silently drop to a code default alongside it.
+
+    The equal dumps are semantic equality too, not just string equality: the
+    path leaves are absolute paths under this test's `tmp_path`, so no leaf is
+    a relative string denoting whichever CWD resolves it.  The next test
+    states that per leaf.
+    """
+    before_chdir = FusedMemoryConfig()
+
+    monkeypatch.chdir(tmp_path)
+    after_chdir = FusedMemoryConfig()
+
+    assert before_chdir.taskmaster is not None
+    assert after_chdir.taskmaster is not None
+    assert after_chdir.model_dump() == before_chdir.model_dump()
+
+
+@pytest.mark.parametrize('read_leaf', INTERPOLATED_PATH_LEAVES)
+def test_the_pin_anchors_every_path_leaf_in_the_tests_tmp_path(
+    read_leaf, monkeypatch, tmp_path, tmp_path_factory
+):
+    """Every interpolated path leaf is one absolute directory inside this test's tmp.
+
+    Task 5444 asserted the residual (same string, different directory); task
+    5481 pinned the interpolation variables and inverted it.
+
+    `.resolve()` on the before-value is taken BEFORE the chdir on purpose — a
+    relative path resolves against the CWD *at the moment it is resolved*, so
+    resolving both afterwards compares the new CWD with itself and the test
+    passes vacuously whatever the fixture does.  The chdir target is a SIBLING
+    of `tmp_path`, not `tmp_path` itself, so a regressed `'.'` resolved after
+    it can never land on the pinned root by coincidence.
+    """
+    before_chdir = FusedMemoryConfig()
+    assert before_chdir.taskmaster is not None
+    assert Path(read_leaf(before_chdir)).is_absolute()
+    before_resolved = Path(read_leaf(before_chdir)).resolve()
+
+    monkeypatch.chdir(tmp_path_factory.mktemp('elsewhere'))
+    after_chdir = FusedMemoryConfig()
+    assert after_chdir.taskmaster is not None
+
+    assert Path(read_leaf(after_chdir)).resolve() == before_resolved
+    assert before_resolved.is_relative_to(tmp_path.resolve())
+
+
+@pytest.mark.parametrize('interpolation', INTERPOLATION_VAR_LEAVES)
+def test_the_pin_lays_out_tmp_path_as_the_tracked_config_does(interpolation, monkeypatch, tmp_path):
+    """Each pinned variable sits where the YAML's own ``${VAR:default}`` puts it.
+
+    ``fused-memory/config/config.yaml`` is the home of that layout and
+    ``conftest.py::_isolate_fm_config`` mirrors it under ``tmp_path``.  Read
+    with the pin removed, the leaf is the YAML default, relative to the CWD;
+    read with it, the same relative path under ``tmp_path``.  A default edited
+    in one place and not the other fails here instead of drifting silently.
+    """
+    name, read_leaf = interpolation
+    pinned = Path(read_leaf(FusedMemoryConfig())).relative_to(tmp_path)
+
+    monkeypatch.delenv(name)
+    unpinned = FusedMemoryConfig()
+
+    assert unpinned.taskmaster is not None
+    assert Path(read_leaf(unpinned)) == pinned
+
+
+@pytest.mark.parametrize('interpolation', INTERPOLATION_VAR_LEAVES)
+def test_a_test_local_interpolation_override_still_reaches_the_config(
+    interpolation, monkeypatch, tmp_path
+):
+    """A test-body setenv of an interpolation variable still beats the pin.
+
+    This is the escape hatch that rules out pinning pydantic's nested names
+    (``TASKMASTER__PROJECT_ROOT`` and friends) instead: the env layer outranks
+    the YAML, so such a pin would override this test's own value.
+    """
+    name, read_leaf = interpolation
+    mine = str(tmp_path / 'mine')
+    monkeypatch.setenv(name, mine)
+
+    config = FusedMemoryConfig()
+
+    assert config.taskmaster is not None
+    assert read_leaf(config) == mine
+
+
+class TestAmbientInterpolationCannotRedirectTheConfig:
+    """The inherited redirect: an ambient interpolation variable cannot reach a leaf.
+
+    ``${PROJECT_ROOT:.}``, ``${QUEUE_DATA_DIR:...}`` and
+    ``${RECONCILIATION_DATA_DIR:...}`` are interpolated by the YAML loader, not
+    by pydantic-settings, so they are a THIRD env surface: the scrub derived
+    from ``model_fields`` cannot see them and the file pin does not outrank
+    them.  Measured before ``_isolate_fm_config`` listed them — with
+    ``CONFIG_PATH`` already pinned at the canonical file,
+    ``PROJECT_ROOT=/pwned-by-env`` resolved both ``taskmaster.project_root``
+    and ``reconciliation.explore_codebase_root`` to ``/pwned-by-env``.
+    Inheriting one is a real launch condition, not a contrived one: this
+    repo's own operator scripts export ``PROJECT_ROOT``.
+
+    Planting AMBIENTLY is the whole point, exactly as in
+    ``TestAmbientEnvCannotRewriteTheConfig``.  A value set in a test BODY still
+    reaches the config, because the interpolation reads ``os.environ`` when
+    ``FusedMemoryConfig()`` is constructed — the fixture OVERWRITES what pytest
+    INHERITED with this test's tmp layout and deliberately leaves a test's own
+    override working, which
+    ``test_a_test_local_interpolation_override_still_reaches_the_config``
+    pins.
+    """
+
+    @pytest.fixture(scope='class', autouse=True, params=INTERPOLATION_VAR_LEAVES)
+    def redirected_leaf(self, request):
+        """Plant one interpolation variable ambiently; hand back its leaf reader."""
+        name, read_leaf = request.param
+        ambient = pytest.MonkeyPatch()
+        ambient.setenv(name, PWNED)
+        yield read_leaf
+        ambient.undo()
+
+    def test_an_inherited_interpolation_var_cannot_redirect_the_config(
+        self, redirected_leaf, tmp_path
+    ):
+        """The planted directory must not reach the leaf; this test's tmp does.
+
+        The second assertion is the stronger one: it also fails if the leaf
+        falls back to the YAML's relative default, which ``!= PWNED`` would
+        pass.
+        """
+        config = FusedMemoryConfig()
+
+        assert config.taskmaster is not None
+        assert redirected_leaf(config) != PWNED
+        assert Path(redirected_leaf(config)).is_relative_to(tmp_path)
+
+
+def test_code_default_config_yields_pure_code_defaults(code_default_config):
+    """The escape hatch the pin makes necessary: schema defaults, on request.
+
+    With `CONFIG_PATH` now always naming a real file, a test that wants to
+    assert what the SCHEMA declares — rather than what the tracked
+    `fused-memory/config/config.yaml` overrides it to — has no other way to
+    get there.  `.taskmaster` is the sharpest probe for the same reason as
+    above: its code default is `None` and the YAML supplies a real section, so
+    it reads `None` exactly when the YAML layer is genuinely absent.
+    """
+    assert FusedMemoryConfig().taskmaster is None
+
+
+class TestAmbientEnvCannotRewriteTheConfig:
+    """The other half of the same leak, and the one the file pin does NOT close.
+
+    ``FusedMemoryConfig`` sets ``env_prefix=''`` with
+    ``env_nested_delimiter='__'`` and ``case_sensitive=False``, so a BARE
+    environment variable named after any of the model's top-level fields is an
+    unprefixed override — and env settings outrank the YAML.
+    Whatever shell, CI runner or parent process happens to export
+    ``TASKMASTER`` can therefore rewrite a value a test reads.  Measured: this
+    reproduces with ``CONFIG_PATH`` pointing at a missing file, which is what
+    makes it independent of the CWD half.
+    """
+
+    @pytest.fixture(
+        scope='class',
+        autouse=True,
+        params=[
+            ('TASKMASTER', json.dumps({'project_root': PWNED})),
+            ('TASKMASTER__PROJECT_ROOT', PWNED),
+        ],
+        ids=['bare-field-name', 'nested-delimiter'],
+    )
+    def _ambient_taskmaster(self, request):
+        """Plant the hostile variable AMBIENTLY — before per-test isolation runs.
+
+        Class scope is load-bearing, not tidiness: pytest instantiates
+        higher-scoped fixtures first, so this runs before the function-scoped
+        autouse ``conftest.py::_isolate_fm_config`` and the variable is
+        already there when isolation happens.  That is precisely the shape of
+        the real defect — a variable inherited from whoever launched pytest.
+        Setting it in the test BODY instead would model nothing: it would land
+        after isolation, and a deliberate test-local override is a documented
+        escape hatch rather than a leak.
+        """
+        name, value = request.param
+        ambient = pytest.MonkeyPatch()
+        ambient.setenv(name, value)
+        yield name
+        ambient.undo()
+
+    def test_an_ambient_bare_env_var_cannot_rewrite_the_suite_config(self):
+        """The planted variable must not reach the value a test would read.
+
+        `.taskmaster` is `TaskmasterConfig | None`, and the scrub leaves the
+        tracked YAML's section in place, so pinning it non-None first reports
+        a lost YAML layer as itself rather than as an attribute error on the
+        assertion that matters.
+        """
+        taskmaster = FusedMemoryConfig().taskmaster
+
+        assert taskmaster is not None
+        assert taskmaster.project_root != PWNED
+
+
+class TestTheScrubStaysNarrow:
+    """The scrub's NARROWNESS is as load-bearing as its coverage.
+
+    ``conftest.py::_isolate_fm_config`` deletes inherited variables from the
+    whole suite's environment, so a widened match — someone reaching for a
+    prefix or a substring test — would delete ``PATH`` and ``OPENAI_API_KEY``
+    for all ~19.8k tests.  That regression surfaces as a diffuse cascade of
+    unrelated failures in whichever suite shells out or talks to a backend
+    first, nowhere near the conftest that caused it.  Until this class existed
+    the narrowness was asserted only in prose, in the very docstring a
+    widening edit would be rewriting.
+
+    The other direction is already covered: ``TestAmbientEnvCannotRewriteTheConfig``
+    above fails if the scrub is removed.
+    """
+
+    @pytest.fixture(scope='class', autouse=True)
+    def ambient_near_misses(self):
+        """Plant the near-miss names AMBIENTLY and hand back what each holds.
+
+        Class scope for the same reason as ``_ambient_taskmaster`` above:
+        higher-scoped fixtures are set up first, so these names are already in
+        the environment when the function-scoped autouse isolation runs — the
+        shape of a variable inherited from whoever launched pytest.
+
+        An EXISTING value is kept rather than overwritten.  ``PATH`` and
+        ``HOME`` are on this list precisely because things break without them,
+        and a sentinel ``PATH`` held for the length of a class would be a
+        worse hazard than the regression being guarded against; a name that is
+        absent gets a sentinel so the assertion still observes a plant rather
+        than an absence.
+        """
+        ambient = pytest.MonkeyPatch()
+        for name in NEAR_MISS_ENV_NAMES:
+            if name not in os.environ:
+                ambient.setenv(name, f'{SURVIVES}-{name}')
+        planted = {name: os.environ[name] for name in NEAR_MISS_ENV_NAMES}
+        yield planted
+        ambient.undo()
+
+    @pytest.mark.parametrize('name', NEAR_MISS_ENV_NAMES)
+    def test_a_near_miss_name_survives_the_scrub(self, name, ambient_near_misses):
+        """Each name is still readable, with its value intact, inside a test.
+
+        Parametrised one name per case so a widening reports WHICH rule was
+        loosened — a single test asserting all nine would name only the first.
+        """
+        assert os.environ.get(name) == ambient_near_misses[name]

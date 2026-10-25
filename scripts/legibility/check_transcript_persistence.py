@@ -48,7 +48,7 @@ if __name__ == '__main__':
     sys.path.insert(0, str(_HERE.parent.parent))  # scripts/
     sys.path.insert(0, str(_HERE.parents[2] / 'orchestrator' / 'src'))  # <repo>/orchestrator/src
 
-from legibility import census_trigger, config, inventory, sampling  # noqa: E402
+from legibility import census_trigger, config, detectors, inventory  # noqa: E402  # debt: task 6760
 
 from orchestrator import session_registry  # noqa: E402
 
@@ -188,26 +188,16 @@ def _usable_prompt_prefix(prompt: str | None) -> str | None:
 def _first_user_turn(path: Path) -> dict[str, Any] | None:
     """Return *path*'s first non-sidechain/non-meta user-turn record, or None.
 
-    A LIGHT alternative to ``sampling._score_and_find_first_turn`` for the
-    STRONG match: that helper must read the WHOLE file to also compute the
-    5-class confusion score (tool_error/not_found/self_correct/df_guard/
-    interrupt) — all of which the strong match discards. This loop instead
-    early-returns on the first matching user record, so matching a record
-    against a busy encoded-cwd dir full of large sibling transcripts costs
-    O(bytes-until-first-user-turn) per candidate rather than O(filesize)
-    (reviewer_comprehensive/efficiency, task 2893 amendment). The
-    first-turn selection predicate is identical to the scorer's, so
-    ``sampling._first_user_turn_text`` flattens the result the same way.
-    Degrades to ``None`` on an unreadable file, mirroring the scorer's
-    ``except OSError`` contract.
+    It early-returns on the first such record, so matching against a busy
+    encoded-cwd dir full of large sibling transcripts costs
+    O(bytes-until-first-user-turn) per candidate rather than a whole-file
+    scan (task 2893 amendment). The predicate is
+    :func:`detectors.is_primary_user_turn`, the one the sampler's first turn
+    uses. Degrades to ``None`` on an unreadable file.
     """
     try:
         for record in inventory.iter_json_lines(path):
-            if (
-                record.get('type') == 'user'
-                and not record.get('isSidechain')
-                and not record.get('isMeta')
-            ):
+            if detectors.is_primary_user_turn(record):
                 return record
     except OSError:
         return None
@@ -222,12 +212,39 @@ def _normalize_ws(text: str) -> str:
     lines, normalize newlines) WITHOUT altering its words, which would break a
     raw substring check and FALSE-POSITIVE a present transcript as MISSING.
     Normalizing both the needle and the candidate text means whitespace-only
-    differences never mask a real match. This does NOT normalize a prompt that
-    was semantically expanded/rewritten before storage (e.g. a slash-command
-    template) — that residual false-positive class is named in the escalation
-    detail so a human reading the alarm can rule it out.
+    differences never mask a real match. A slash-command expansion is not a
+    whitespace difference; :func:`_typed_slash_command` handles it.
     """
     return ' '.join(text.split())
+
+
+_SLASH_COMMAND_TURN_RE = re.compile(
+    r"""
+    \s*(?:<command-message>[^<]*</command-message>\s*)?
+    <command-name>(?P<name>[^<]*)</command-name>\s*
+    (?:<command-message>[^<]*</command-message>\s*)?
+    <command-args>(?P<args>.*?)</command-args>
+    """,
+    re.DOTALL | re.VERBOSE,
+)
+"""Claude Code's expanded slash-command turn, matched from the turn's START:
+the ``<command-name>``/``<command-args>`` pair, adjacent and in that order,
+with ``<command-message>`` written either before or between them (both orders
+occur on disk). The anchor rejects a turn that merely QUOTES an expansion."""
+
+
+def _typed_slash_command(text: str) -> str | None:
+    """Rebuild the typed ``/name args`` from Claude Code's expanded slash-command turn.
+
+    ``record.prompt`` holds the literal argv (``/unblock 4743 ...``) while the
+    transcript stores the tagged expansion (:data:`_SLASH_COMMAND_TURN_RE`);
+    this is the inverse that lets the unchanged prompt-prefix needle match.
+    Returns None when *text* is not itself such an expansion.
+    """
+    expansion = _SLASH_COMMAND_TURN_RE.match(text)
+    if expansion is None:
+        return None
+    return '/' + expansion['name'].strip().lstrip('/') + ' ' + expansion['args']
 
 
 def find_matching_transcript(
@@ -258,43 +275,107 @@ def find_matching_transcript(
     dark-factory's own ``.eval-worktrees/df_task_<N>/`` sessions).
 
     Matching is PER-SESSION to defeat the same-cwd confound (sibling
-    headless-agent transcripts share the encoded-cwd dir):
-      - STRONG (usable prompt): the record's prompt prefix is contained
-        (whitespace-normalized) in a candidate transcript's first-user-turn
-        text — read via the light :func:`_first_user_turn` helper, not the
-        full confusion-scorer. This is the dominant path — spawn records carry
-        a substantive prompt — so a usable-prompt session with only sibling
-        transcripts is correctly flagged MISSING (returns ``None``).
-      - WEAK (prompt too short/empty to match reliably): the first candidate
-        whose file mtime lies within ``[start_ts - skew, now + skew]``. Only
-        reached when the prompt is NOT usable, so a usable-prompt session
-        never falls through to this confound-tolerant path. An unparseable
-        ``start_ts`` cannot bound the window, so the fallback yields ``None``.
-
-    Candidates are scanned in sorted order; the first match's ``Path`` is
-    returned.
+    headless-agent transcripts share the encoded-cwd dir), in one of three
+    tiers:
+      - EXACT (bound ids, per :func:`_bound_session_ids`): the first
+        ``<expected_dir>/<id>.jsonl`` that exists for the current or the launch
+        id is the transcript, or there is none. Authoritative, with NO
+        fallback — a same-prompt re-spawn, an in-window sibling, or a later
+        session that quotes the prompt would otherwise mask a genuine loss. A
+        ``/clear`` or compaction re-mint moves ``claude_session_id``, but
+        ``claude_launch_session_id`` still names the launch file; a record
+        bound before that field existed is matched on its current id alone.
+      - STRONG (unbound, usable prompt): :func:`_match_prompt_prefix`.
+      - WEAK (unbound, prompt too short/empty): :func:`_match_mtime_window`,
+        never reached for a usable prompt.
     """
     session_dir = Path(projects_root) / inventory.encode_cwd(record.cwd)
+    bound_ids = _bound_session_ids(record)
+    if bound_ids:
+        return _bound_transcript(session_dir, bound_ids)
     if not session_dir.is_dir():
         return None
     candidates = sorted(session_dir.glob('*.jsonl'))
-
     prefix = _usable_prompt_prefix(record.prompt)
     if prefix is not None:
-        # spawn-claude.sh persists record.prompt as the caller's ORIGINAL
-        # prompt, BEFORE appending its result-handback trailer, so the prompt
-        # prefix is genuinely a PREFIX of what claude received (the trailer is
-        # a suffix) — containment, not equality, is the right test. Both sides
-        # are whitespace-normalized so a reflowed transcript still matches.
-        needle = _normalize_ws(prefix)
-        for path in candidates:
-            text = _normalize_ws(sampling._first_user_turn_text(_first_user_turn(path)))
-            if needle in text:
-                return path
-        return None
+        return _match_prompt_prefix(prefix, candidates)
+    return _match_mtime_window(record.start_ts, candidates, now=now, skew=skew)
 
-    # WEAK fallback — prompt too short/empty for a reliable content match.
-    start = _parse_start_ts(record.start_ts)
+
+def _bound_session_ids(record: session_registry.SessionRecord) -> tuple[str, ...]:
+    """Return *record*'s usable bound Claude Code session ids, current then launch; empty means unbound.
+
+    Each id becomes a filename inside the expected dir, so one that is not a
+    single path component (a hand-edited ``../x`` or an absolute path) could
+    resolve to an unrelated file elsewhere and hide a real loss. Such an id
+    is rejected loudly and ignored; the record's other id still counts.
+    """
+    usable: list[str] = []
+    for field_name, session_id in (
+        ('claude_session_id', record.claude_session_id),
+        ('claude_launch_session_id', record.claude_launch_session_id),
+    ):
+        if not session_id:
+            continue
+        if Path(session_id).name != session_id:
+            logger.warning(
+                '%s: %s %r is not a single path component; ignoring it',
+                record.session_slug, field_name, session_id,
+            )
+            continue
+        usable.append(session_id)
+    return tuple(dict.fromkeys(usable))
+
+
+def _bound_transcript(session_dir: Path, session_ids: Sequence[str]) -> Path | None:
+    """Return the first ``session_dir/<id>.jsonl`` among *session_ids* that is a file, else None."""
+    for session_id in session_ids:
+        path = session_dir / f'{session_id}.jsonl'
+        if path.is_file():
+            return path
+    return None
+
+
+def _match_prompt_prefix(prefix: str, candidates: Sequence[Path]) -> Path | None:
+    """Return the first candidate whose first user turn contains *prefix*, or None.
+
+    Reads each candidate's first user turn via the light
+    :func:`_first_user_turn`, not the full confusion-scorer, so a usable-prompt
+    session with only sibling transcripts is correctly flagged MISSING. A
+    slash-command turn also matches on its de-expanded typed form
+    (:func:`_typed_slash_command`), which keeps the command name in the match.
+    """
+    # spawn-claude.sh persists record.prompt as the caller's ORIGINAL
+    # prompt, BEFORE appending its result-handback trailer, so the prompt
+    # prefix is genuinely a PREFIX of what claude received (the trailer is
+    # a suffix) — containment, not equality, is the right test. Both sides
+    # are whitespace-normalized so a reflowed transcript still matches.
+    needle = _normalize_ws(prefix)
+    for path in candidates:
+        turn = _first_user_turn(path)
+        text = (detectors.user_turn_text(turn) if turn is not None else None) or ''
+        typed = _typed_slash_command(text)
+        matched = needle in _normalize_ws(text) or (
+            typed is not None and needle in _normalize_ws(typed)
+        )
+        if matched:
+            return path
+    return None
+
+
+def _match_mtime_window(
+    start_ts: str,
+    candidates: Sequence[Path],
+    *,
+    now: datetime,
+    skew: timedelta,
+) -> Path | None:
+    """Return the first candidate whose mtime lies in ``[start_ts - skew, now + skew]``.
+
+    An unparseable *start_ts* cannot bound the window, so this yields None; an
+    unstat-able candidate is skipped.
+    """
+    start = _parse_start_ts(start_ts)
     if start is None:
         return None
     window_start = start - skew
@@ -320,7 +401,9 @@ class MissingTranscript:
     Carries the identifying facts the escalation detail names so a human (or
     a follow-up probe) can locate the lost session: its registry slug, real
     ``cwd``, prompt prefix, ``start_ts``, exit code, and the encoded
-    ``~/.claude/projects/<enc>`` dir the transcript should have lived in.
+    ``~/.claude/projects/<enc>`` dir the transcript should have lived in. The
+    bound Claude Code session ids (current and launch), when present, name the
+    exact files that were expected: ``<expected_dir>/<id>.jsonl``.
     """
 
     session_slug: str
@@ -329,6 +412,8 @@ class MissingTranscript:
     start_ts: str
     exit_code: int | None
     expected_dir: Path
+    claude_session_id: str | None = None
+    claude_launch_session_id: str | None = None
 
 
 def find_missing_transcripts(
@@ -367,6 +452,8 @@ def find_missing_transcripts(
                 start_ts=record.start_ts,
                 exit_code=record.exit_code,
                 expected_dir=projects_root / inventory.encode_cwd(record.cwd),
+                claude_session_id=record.claude_session_id,
+                claude_launch_session_id=record.claude_launch_session_id,
             )
         )
     return findings
@@ -450,10 +537,12 @@ def _build_escalation_arguments(
     labels the detector as the source since it is a timer-driven probe, not a
     Taskmaster task. The ``summary`` names the count of lost sessions; the
     ``detail`` names each finding's slug and real ``cwd`` (plus expected dir,
-    ``start_ts``, exit code, and prompt prefix) so a human can locate every
-    lost session. When *force_persistence_ok* is not ``None`` (the preventer
-    guard was evaluated), its verdict is appended — a MISSING preventer
-    strengthens the diagnosis (the known regression cause is present).
+    ``start_ts``, exit code, ``claude_session_id``,
+    ``claude_launch_session_id``, and prompt prefix) so a
+    human can locate every lost session. When *force_persistence_ok* is not
+    ``None`` (the preventer guard was evaluated), its verdict is appended — a
+    MISSING preventer strengthens the diagnosis (the known regression cause is
+    present).
     """
     count = len(findings)
     summary = (
@@ -464,20 +553,26 @@ def _build_escalation_arguments(
         f'{count} completed spawn-launched interactive session(s) in project '
         f'{cfg.project_id!r} produced no plausibly-matching transcript under '
         f'~/.claude/projects — the "session ran, no transcript" regression. '
-        f'Per-session (slug / cwd / start_ts / exit_code / expected_dir / prompt):',
+        f'Per-session (slug / cwd / start_ts / exit_code / expected_dir / '
+        f'claude_session_id / claude_launch_session_id / prompt):',
     ]
     for finding in findings:
         detail_lines.append(
             f'  - {finding.session_slug}  cwd={finding.cwd}  '
             f'start_ts={finding.start_ts}  exit_code={finding.exit_code}  '
-            f'expected_dir={finding.expected_dir}  prompt={finding.prompt_prefix!r}'
+            f'expected_dir={finding.expected_dir}  '
+            f'claude_session_id={finding.claude_session_id}  '
+            f'claude_launch_session_id={finding.claude_launch_session_id}  '
+            f'prompt={finding.prompt_prefix!r}'
         )
     detail_lines.append(
-        'NOTE: matching is prompt-prefix containment (whitespace-normalized) in '
-        'a transcript first user turn under expected_dir. A session whose prompt '
-        'was expanded/rewritten before storage (e.g. a slash-command template, '
-        'where record.prompt holds the literal argv rather than the stored text) '
-        'is a known false-positive class — inspect expected_dir before acting.'
+        'NOTE: a record with a bound claude_session_id and/or '
+        'claude_launch_session_id is matched exactly — <expected_dir>/<id>.jsonl '
+        'must exist for at least one of them. An unbound record falls back to '
+        'prompt-prefix containment (whitespace-normalized) in a transcript first '
+        'user turn under expected_dir, with a slash-command expansion '
+        'de-expanded to its typed form, or to a file-mtime window when the '
+        'prompt is too short to match. Inspect expected_dir before acting.'
     )
     if force_persistence_ok is not None:
         verdict = 'present' if force_persistence_ok else 'MISSING'

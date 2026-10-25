@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 from fused_memory.config.schema import _default_topic_guard_clusters
 from fused_memory.memory_metadata import (
@@ -334,21 +335,15 @@ class TestKeyLayers:
         `tests/test_tag_cgl_eta_rehome_scope.py:309` needs no edit, while
         identity proves the extraction left one object rather than two.
         """
-        import importlib.util
-        import sys
-
         from fused_memory.backends import mem0_client
 
         script_path = Path(__file__).parent.parent / 'scripts' / 'tag_cgl_eta_rehome_scope.py'
-        spec = importlib.util.spec_from_file_location('tag_cgl_eta_rehome_scope', script_path)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules['tag_cgl_eta_rehome_scope'] = module
-        try:
-            spec.loader.exec_module(module)
-            assert module._MEM0_MANAGED_METADATA_KEYS is mem0_client.MEM0_MANAGED_METADATA_KEYS
-        finally:
-            sys.modules.pop('tag_cgl_eta_rehome_scope', None)
+        # Left installed rather than popped in `finally`: the key is shared
+        # with test_tag_cgl_eta_rehome_scope.py, whose module-level `_mod`
+        # holds a live reference to it, so evicting it here is what forced a
+        # later load to exec a second copy (task 3895).
+        module = load_script_module(script_path, mod_name='tag_cgl_eta_rehome_scope')
+        assert module._MEM0_MANAGED_METADATA_KEYS is mem0_client.MEM0_MANAGED_METADATA_KEYS
 
     def test_server_stamped_keys(self):
         from fused_memory.memory_metadata import SERVER_STAMPED_KEYS
@@ -364,7 +359,18 @@ class TestKeyLayers:
                            # :2962). Included so a round-tripped search result
                            # re-written as metadata does not census-warn on the
                            # server's own field.
+            'unverified_claim',  # stamped by MemoryService.add_memory when the
+                                 # completion-claim gate flags a write (task 4715).
         }) == SERVER_STAMPED_KEYS
+
+    def test_unverified_claim_tag_is_a_server_stamped_key(self):
+        from fused_memory.memory_metadata import SERVER_STAMPED_KEYS, classify_unknown_keys
+        from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
+
+        assert UNVERIFIED_CLAIM_TAG in SERVER_STAMPED_KEYS
+        assert classify_unknown_keys(
+            {UNVERIFIED_CLAIM_TAG: True, 'category': 'procedural_knowledge'},
+        ) == []
 
     def test_reserved_vocabulary_keys(self):
         from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS
@@ -1169,3 +1175,111 @@ class TestValidateMemoryMetadata:
         violations = [v for v in self._validate(meta, **kwargs) if v.code == code]
         assert violations, f'expected a {code} violation'
         assert all(v.fatal is False for v in violations)
+
+
+class TestCanonicalRoutingRule:
+    """`canonical: True` on a write that cannot reach Mem0 (task 3508).
+
+    Signature: ``check_canonical_routing(meta, *, reaches_mem0)`` ->
+    ``list[MetadataViolation]``.
+
+    A SEPARATE pure function rather than a branch inside
+    ``validate_memory_metadata``, deliberately: ``reaches_mem0`` is a
+    service-layer ROUTING fact, not a dict fact, and that validator's
+    "takes only a dict" boundary is structural (leaf ε established it so a
+    later leaf could not grow store-dependent checks inside it).  The rule
+    text nonetheless lives in ``memory_metadata`` so every violation code
+    stays single-homed with its siblings (INV-5).
+
+    WHY THE RULE EXISTS, in one line: a canonical marker on a non-Mem0
+    write is DISCARDED, not merely uncounted, so it can never be read or
+    counted by anything.  The graphiti_core 0.28.2 measurement behind that
+    claim is single-homed in ``check_canonical_routing``'s own docstring —
+    pointer, not copy, so there is one place to update when the upstream
+    write path changes.
+    """
+
+    def _check(self, meta, *, reaches_mem0):
+        from fused_memory.memory_metadata import check_canonical_routing
+
+        return check_canonical_routing(meta, reaches_mem0=reaches_mem0)
+
+    # -- the violation ---------------------------------------------------
+
+    def test_canonical_on_a_non_mem0_write_is_one_fatal_violation(self):
+        """The whole point: an assertion that cannot be stored is refused."""
+        violations = self._check(
+            {'topic': 'a-good-slug', 'canonical': True}, reaches_mem0=False
+        )
+        assert len(violations) == 1
+        assert violations[0].code == 'canonical_on_non_mem0_write'
+        assert violations[0].key == 'canonical'
+        assert violations[0].fatal is True
+
+    def test_the_message_names_the_remedy(self):
+        """A rejection an agent cannot act on is a worse rejection.
+
+        V1 requires the hint to name the violated rule; naming the two ways
+        OUT (a Mem0-primary category, or dual_write) is what makes it
+        actionable rather than merely correct.
+        """
+        message = self._check(
+            {'topic': 'a-good-slug', 'canonical': True}, reaches_mem0=False
+        )[0].message
+        assert 'dual_write' in message
+
+    # -- the Mem0-reaching case is untouched ------------------------------
+
+    def test_canonical_on_a_mem0_reaching_write_is_clean(self):
+        """Where the marker IS stored, this rule has nothing to say.
+
+        The live uniqueness probe owns that case; double-reporting would
+        turn one write into two apparent defects.
+        """
+        assert self._check(
+            {'topic': 'a-good-slug', 'canonical': True}, reaches_mem0=True
+        ) == []
+
+    # -- absence and False are never defects -------------------------------
+
+    @pytest.mark.parametrize('reaches_mem0', [True, False])
+    def test_absent_canonical_is_never_a_violation(self, reaches_mem0):
+        """Matching the validator's rule 2: none of V1's keys is required."""
+        assert self._check({'topic': 'a-good-slug'}, reaches_mem0=reaches_mem0) == []
+        assert self._check({}, reaches_mem0=reaches_mem0) == []
+
+    @pytest.mark.parametrize('reaches_mem0', [True, False])
+    def test_canonical_false_is_never_a_violation(self, reaches_mem0):
+        """`is True`, not truthiness — a False marker asserts nothing."""
+        assert self._check({'canonical': False}, reaches_mem0=reaches_mem0) == []
+
+    def test_the_int_form_is_left_to_invalid_canonical_type(self):
+        """`1` is a TYPE defect the pure validator already owns.
+
+        `is True` (not truthiness) is the same discipline
+        ``validate_memory_metadata`` documents for exactly this reason: a
+        truthiness check here would report one defect twice, under two
+        different codes, implying two separate mistakes.
+        """
+        assert self._check({'canonical': 1}, reaches_mem0=False) == []
+
+    # -- purity -----------------------------------------------------------
+
+    def test_the_rule_does_not_mutate_meta(self):
+        """Unlike ``validate_memory_metadata`` this normalizes NOTHING.
+
+        The seam calls it on the same dict, so an in-place surprise here
+        would land in the persisted metadata.
+        """
+        meta = {'topic': 'a-good-slug', 'canonical': True}
+        before = dict(meta)
+        self._check(meta, reaches_mem0=False)
+        assert meta == before
+
+    # No test pins that the rule is SYNCHRONOUS: every case in this class
+    # already fails loudly if it becomes a coroutine (`self._check(...) == []`
+    # compares a coroutine object to a list; `len(violations) == 1` raises
+    # TypeError), and the seam's warn-mode test would stop seeing the census
+    # code.  A dedicated test would pin call shape rather than behaviour and
+    # add nothing the siblings do not already catch.  The reason it is sync
+    # while `_check_canonical_uniqueness` is async is in its docstring.

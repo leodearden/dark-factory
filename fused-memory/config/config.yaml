@@ -165,6 +165,150 @@ taskmaster:
   project_root: "${PROJECT_ROOT:.}"
   tool_mode: "all"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# write_journal — RED-TIER / restart-only. The prune runs at startup and every
+# prune_interval_seconds (services/write_ops_retention.py); nothing re-reads
+# these values after startup, so a changed leaf is correctly reported
+# restart_required by mcp__escalation__reload_config.
+#
+# These are the DEPLOYED values, and they are meant to be edited. The fallback
+# for an omitted leaf is config/schema.py::WriteJournalConfig, which is the one
+# place the numbers are defined — prune_write_ops itself takes all six as
+# required arguments precisely so there is no third copy to drift.
+#
+# MEASURED STARTING STATE (2026-09-11, before this section existed): write_ops
+# held 35,428,715 rows / 16 GB spanning 157 days, never pruned. The mix is
+# lopsided, which is why the horizons are:
+#
+#   reads   35,170,444 (99.27%) — get_task 20.9M, get_tasks 7.5M,
+#                                 get_statuses 5.1M, get_external_statuses 1.2M
+#                                 = 34,669,782 task reads (97.9% of the whole
+#                                 table) with NO consumer
+#   search     481,447 (1.36%, ~3,066/day) — leaf eta's (task 3213) sole data
+#                                 source and leaf theta's (3214) retro corpus
+#   writes     258,271 (0.73%)  — the causation-joined durable audit trail
+#
+# So search rows outlive task-read rows: the long horizon is nearly free
+# (365 d of search is ~1.1M rows) while the volume problem is entirely the four
+# task-read operations. An inverted pair is REJECTED at config load.
+#
+# RECORDED COST of task 3212 item (1): journalling per-result ids/scores/sizes
+# grows a search row from a measured ~90 B of JSON to roughly ~1.3 KB, i.e.
+# ~1.4 GB across the 365-day search horizon. Stated here so the cost is a
+# decision rather than a later discovery.
+#
+# THIS BOUNDS GROWTH; IT DOES NOT SHRINK THE FILE. `PRAGMA auto_vacuum` is NONE
+# on this database, so deleted pages go to SQLite's freelist for reuse — `ls -lh`
+# still reports the same size after a fully successful prune (17.3 GB on
+# 2026-10-11), and those freed pages are what absorbs the per-result detail
+# above. Reclaiming disk needs an offline VACUUM (a full-file rewrite needing
+# as much scratch again), never run at startup.
+#
+# SIZING BASIS (measured 2026-10-11, task 6655, read-only against the live
+# journal and fused-memory's user journal):
+#   inserts   trailing-7d mean 985,237 rows/day; highest 24 h window 1,128,719;
+#             a ~2x step around 2026-09-30 (09-25..09-30 ran 394k-639k/day)
+#   backlog   14,134,288 reads beyond the 30-day horizon, the oldest from
+#             2026-08-12
+#   restarts  6.55 startups/day over 16.8 days (8.29/day over the last 7)
+#   startup   every startup pass halted on the 30 s deadline, never the row
+#   passes    budget, at a median 90k rows and 2,941 rows/s (p25 2,556, min 908)
+#   net       pruned 576k-702k rows/day against 985k/day inserted: a
+#             startup-only prune lost ground, with its capacity set by how
+#             often the fleet happened to redeploy
+#
+# So the pass also runs every prune_interval_seconds: 1800 s x a 30 s deadline
+# = 48 passes/day, about 3.7M rows/day at the p25 rate with no credit taken for
+# restarts. That covers peak accrual (1.13M/day) plus a ~7-day drain of the
+# backlog (2.02M/day). The row budget and deadline are unchanged: no pass ever
+# reached the budget, and a longer deadline would lengthen every startup, which
+# prunes before READY. Once drained, each pass would have removed ~20k rows
+# (985k / 48) in ~7-8 s; task 5405, below, has since removed that accrual.
+#
+# SERVING COST, which sets prune_batch_size. The periodic pass runs while
+# serving, and every journalled tool call (~11.4/s at 985k rows/day) queues on
+# the journal's connection lock behind the batch in flight, so one batch is the
+# longest any of them waits: prune_batch_size / rows/s. At 5,000 rows that was
+# 1.7 s at the median rate, 2.0 s at p25 and 5.5 s at the minimum; at 500 it is
+# 0.17 s, 0.20 s and 0.55 s. The price is one more synchronous=FULL commit
+# (~1-5 ms) per 500 rows, 1-3% of a pass. Every rate above was measured while
+# each batch re-walked all kept search rows, which
+# WriteJournal.prune_write_ops no longer repeats, so these figures are
+# conservative.
+#
+# Each partial pass logs a WARNING naming the horizons still behind AND the
+# rows/sec it achieved. If periodic WARNINGs persist about a week after deploy,
+# re-measure from their rows/sec and lower prune_interval_seconds.
+#
+# SINCE TASK 5405 (re-checked against this block 2026-10-19) successful
+# non-search reads are COUNTED into read_op_counts, never stored, so
+# read_retention_days governs only failed reads and history not yet moved by
+# fused-memory/scripts/roll_up_journal_reads.py. Per-row inserts fall from
+# ~985k/day to the per-row figure in the write_journal_growth_alarm block's
+# MEASURED BASIS below, and nearly all of those are writes and searches
+# on the 730/365-day horizons, so the read horizon accrues almost nothing and
+# the capacity above is spent only on pre-5405 history. No value here changes:
+# - prune_batch_size: a counted read still takes the journal's connection lock
+#   for its read_op_counts upsert, so tool calls still queue at ~11.4/s behind
+#   the batch in flight and the serving-cost basis above stands.
+# - prune_interval_seconds: a pass with nothing expired seeks each horizon from
+#   its resume point, milliseconds, so frequent passes cost nothing once drained.
+# ─────────────────────────────────────────────────────────────────────────────
+write_journal:
+  read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}
+  search_retention_days: ${WRITE_JOURNAL_SEARCH_RETENTION_DAYS:365}
+  write_retention_days: ${WRITE_JOURNAL_WRITE_RETENTION_DAYS:730}
+  prune_batch_size: ${WRITE_JOURNAL_PRUNE_BATCH_SIZE:500}
+  prune_max_rows_per_run: ${WRITE_JOURNAL_PRUNE_MAX_ROWS:500000}
+  prune_max_seconds: ${WRITE_JOURNAL_PRUNE_MAX_SECONDS:30}
+  prune_interval_seconds: ${WRITE_JOURNAL_PRUNE_INTERVAL_SECONDS:1800}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# write_journal_growth_alarm — RED-TIER / restart-only (task 3311). Every
+# check_interval_seconds the checkpoint loop samples write_journal.db; a crossed
+# ceiling logs a WARNING naming the measured size and files an escalation. The
+# alarm DELETES NOTHING: rows are bounded by the write_journal prune above, and
+# the reclaim is fused-memory/scripts/roll_up_journal_reads.py's (runbook:
+# fused-memory/scripts/README_roll_up_journal_reads.md). Task 7027 re-measures
+# both ceilings one week after that reclaim.
+#
+# MEASURED BASIS (2026-10-16, post-task-5405 projection; live journal read-only,
+# keep-set rebuilt on a scratch copy; figures in the README's 'Measured'):
+#   per-row   since 5405 only writes, search and failed reads insert write_ops
+#             rows: 5.4k-38.8k/day over 2026-10-08..15, RISING; highest day
+#             38,759 (2026-10-15), trailing-7d mean 19,001
+#   size      post-reclaim 2,325,856,256 B (2.17 GiB); normal growth
+#             (write_ops + backend_ops) ~35 MB/day on the 7d mean, ~66 MB/day
+#             on the peak day
+#   regress   per-read journalling would add ~1.01M rows/day, ~477 MB/day
+#
+# max_file_bytes = 6 GiB is ~4.1 GB above the post-reclaim size: normal growth
+# crosses it in ~2-4 months, a per-read-journalling regression in ~8 days.
+# `auto_vacuum` is NONE, so the file never shrinks without an offline VACUUM.
+# This ceiling is BREACHED from the 5405 deploy until the operator reclaim runs
+# (task 7026). That one folded escalation is expected, and the README's reclaim
+# clears it.
+#
+# max_rows_inserted_per_day = 75,000 is ~1.9x the highest post-change day and
+# ~3.9x the 7-day mean. A regression to per-read journalling crosses it within
+# ~2 h of trailing window. It clears by itself when the rate falls.
+#
+# SECOND EXPECTED TRANSIENT: the insert-rate ceiling ALSO fires once, for up to
+# ~24 h after fused-memory first runs the 5405 build. The sample is a ROWID
+# difference over the trailing 24 h (WriteJournal._rows_inserted_since), so the
+# ~0.8-1.1M per-read rows the OLD build inserted inside that window count even
+# after the migration deletes them; migration does not shorten it. Do NOT
+# re-anchor the 75,000 ceiling on this transient: it ends on its own once the
+# trailing window holds only 5405-build inserts, and the alarm's suggested
+# GROUP BY over write_ops shows nothing anomalous by then. A crossing that
+# persists past ~24 h after the 5405 restart is a real regression.
+# ─────────────────────────────────────────────────────────────────────────────
+write_journal_growth_alarm:
+  max_file_bytes: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_FILE_BYTES:6442450944}
+  max_rows_inserted_per_day: ${WRITE_JOURNAL_GROWTH_ALARM_MAX_ROWS_PER_DAY:75000}
+  check_interval_seconds: ${WRITE_JOURNAL_GROWTH_ALARM_CHECK_INTERVAL_SECONDS:3600}
+
+
 # task_metadata.enforce — RED-TIER / restart-only (task 2162, W3-β). warn-mode
 # (false) logs a task_metadata.schema_warning line per SchemaWarning and lets
 # the write proceed; true rejects a schema-violating add_task/update_task with
@@ -184,11 +328,26 @@ task_status:
 
 reconciliation:
   enabled: true
+  # Leo 2026-09-27 (esc-3135-8, A′): ζ's autoseed stays on; the three derived
+  # clusters with the most off-topic matches in the 2026-09-26 replay are retired
+  # (docs/prds/memory-write-path-convergence.md §10: 39 + 33 + 27 of 267).
+  procedural_knowledge_topic_cluster_autoseed_retired:
+    dark_factory:
+      - worktree-stale-base-premise-verification
+      - orchestrator-full-suite-runtime-budget
+      - wip-requeue-plan-step-attribution
   # Phase 2 enforcement of done_provenance: require commit|note payload on done transitions
   require_done_provenance: true
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
   buffer_size_threshold: 250
   max_staleness_seconds: 14400
+  # 1800 -> 3600 (Leo, 2026-09-16) was ruled on a premise that later proved
+  # false: that remediation runs routinely overran the cutoff. In fact every
+  # age-reaped remediation run was the orphan of a fused-memory service stop.
+  # Live runs are protected by the lock-identity guard at any cutoff, so this
+  # value only sets how long an orphan row lingers. Whether to revert is
+  # pending; task 5545 terminalises the orphaned child on cancellation.
+  stale_run_recovery_seconds: 3600
   # Task 3049 lever 2 (was 0.2). The quiescent trigger fires at
   # buffer_size_threshold * conditional_trigger_ratio, so 250 * 0.6 = 150 =
   # throughput.STEADY_STATE_AMORTISATION_MIN_BATCH.
@@ -233,6 +392,9 @@ reconciliation:
   # instead of resuming silently. Restart-tier (read each cycle; not hot-reloadable).
   auto_unhalt_after_cooldown: true
   explore_codebase_root: "${PROJECT_ROOT:.}"
+  # Recon CLI transcripts are archived into the orchestrator's archive root (relative to explore_codebase_root), which the legibility miner already walks.
+  transcript_archive_enabled: true
+  transcript_archive_root: "data/orchestrator/agent-transcripts"
   # Escalation
   escalation_port: ${RECON_ESCALATION_PORT:8103}
   escalation_host: "127.0.0.1"
@@ -244,6 +406,7 @@ reconciliation:
   # benign hovering without masking a real runaway (which would blow well past 1500).
   backlog_hard_limit_overrides:
     reify: 1500
+    # solar_challenge deliberately has no override: task 7076, plans/recon-throughput-capacity.md
   # Aggregate storm alarm — dead_owner_shielded suppression burst (task 1755 / PRD β).
   # When >=threshold suppressions occur in a rolling window, one loud
   # recon_watchdog_kill_storm escalation fires. Per-event suppression (task 1731) is kept.
@@ -283,6 +446,18 @@ reconciliation:
   token_budget: 65000
   context_search_limit: 5
   context_fetch_batch_size: 10
+  # Caller bar for `deterministic-*` done provenance (task 5237, PRD C5).
+  # Green-tier hot-reloadable — registered in
+  # `config/reload.py::RELOADABLE_FIELDS`, which is the authoritative list.
+  # DENY-ON-MISSING: a caller whose resolved identity matches no prefix here is
+  # refused, and an EMPTY list denies EVERY caller — that empty value is the
+  # incident knob, and it is green-tier so it lands on the next call rather than
+  # after a restart. Only 'orchestrator' by default: the orchestrator sends no
+  # agent_id, so the identity resolver falls back to the clientInfo.name its MCP
+  # session advertises, which is that literal. NOTE the identity this bar reads
+  # is SELF-REPORTED, so it deters a cooperating caller rather than enforcing a
+  # boundary. Shown at its shipped default; uncomment to change.
+  # deterministic_provenance_allowed_agent_prefixes: ['orchestrator']
   usage_cap:
     enabled: true
     wait_for_reset: true
@@ -348,35 +523,71 @@ summary_rebuild:
 
 # In-place Mem0 amendment (task 3088) — the update_memory MCP tool, which
 # rewrites a record's content and/or metadata while PRESERVING its Qdrant point
-# id. All five leaves are green-tier hot-reloadable (see OPERATIONS.md §6);
-# every value below is the shipped default, shown so the knobs are discoverable
-# without reading the schema. Uncomment to change one.
-# mem0_update:
-#   # Kill switch. false denies every caller on the very next call, allowlisted
-#   # or not — this is the knob to flip during a runaway-rewrite incident.
-#   enabled: true
-#   # Two independent agent_id-prefix allowlists, one per arm. Widening the
-#   # metadata bar ALONE is the supported way to admit an interactive tagging
-#   # flow without granting content-amend authority: a mistagged record is cheap
-#   # to notice and cheap to correct, a silent content rewrite is neither.
-#   # agent_id is self-reported, so this deters misuse by cooperating callers
-#   # rather than enforcing a security boundary.
-#   #
-#   # curator- is part of the SCHEMA DEFAULT (ruling 2026-08-12, promoting the
-#   # 2026-08-11 esc-3524-1 ruling (b) from a per-machine override here to an
-#   # all-deployments default): it admits the interactive memory-consolidation
-#   # sitting defined by skills/curate-fused-memories, which cannot work
-#   # without the grant. Both arms deliberately — gate 3200's retain-and-tag
-#   # stamps retained peers via metadata-only patches, so content_amend alone
-#   # would be the destructive half without the preserving half. Full
-#   # rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
-#   content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
-#   metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-']
-#   # Content-amend burst alarm: escalates, never blocks (a hard block would
-#   # risk a legitimate large consolidation cycle failing mid-run over its own
-#   # success count). Metadata-only calls do not count toward it.
-#   storm_threshold: 20
-#   storm_window_seconds: 3600.0
+# id. All five leaves are green-tier hot-reloadable (see OPERATIONS.md §6).
+# Only metadata_patch_allowed_agent_prefixes is active; every commented value
+# below is the shipped default, shown so the knobs are discoverable without
+# reading the schema. Uncomment to change one.
+mem0_update:
+  # Kill switch. false denies every caller on the very next call, allowlisted
+  # or not — this is the knob to flip during a runaway-rewrite incident.
+  # enabled: true
+  # Two independent agent_id-prefix allowlists, one per arm. Widening the
+  # metadata bar ALONE is the supported way to admit an interactive tagging
+  # flow without granting content-amend authority: a mistagged record is cheap
+  # to notice and cheap to correct, a silent content rewrite is neither.
+  # agent_id is self-reported, so this deters misuse by cooperating callers
+  # rather than enforcing a security boundary.
+  #
+  # curator- is part of the SCHEMA DEFAULT (ruling 2026-08-12, promoting the
+  # 2026-08-11 esc-3524-1 ruling (b) from a per-machine override here to an
+  # all-deployments default): it admits the interactive memory-consolidation
+  # sitting defined by skills/curate-fused-memories, which cannot work
+  # without the grant. Both arms deliberately — gate 3200's retain-and-tag
+  # stamps retained peers via metadata-only patches, so content_amend alone
+  # would be the destructive half without the preserving half. Full
+  # rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
+  # content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
+  #
+  # link-heal- is owned by plans/write-triage-link-healing-prd.md H1 and task α
+  # (6181): the link-heal executor (fused-memory/scripts/link_heal.py) writes
+  # metadata-only heals as agent_id link-heal-<run8>, so it holds this arm and
+  # never the content-amend arm. This ACTIVE list overrides the schema default
+  # for this arm, so a future change to Mem0UpdateConfig's default
+  # metadata_patch_allowed_agent_prefixes must be mirrored here by hand.
+  metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-', 'link-heal-']
+  # Content-amend burst alarm: escalates, never blocks (a hard block would
+  # risk a legitimate large consolidation cycle failing mid-run over its own
+  # success count). Metadata-only calls do not count toward it.
+  # storm_threshold: 20
+  # storm_window_seconds: 3600.0
+
+# Link-heal executor caps and link adjudicator knobs (tasks 6181, 6184;
+# plans/write-triage-link-healing-prd.md H1, H2). Read by
+# fused-memory/scripts/link_heal.py and scripts/eval_link_adjudicator.py at each
+# run start, so an edit takes effect on the next run with no restart. Every
+# value below is the shipped default, shown so the knobs are discoverable.
+# Uncomment to change one.
+# link_heal:
+#   # Write attempts per unattended run, oldest-planned first; the rest stay
+#   # pending as skipped_cap. 0 applies nothing unattended.
+#   max_actions_per_run: 25
+#   # Escalate once (link-heal-backlog) when pending > max_actions_per_run x this.
+#   backlog_multiplier: 5
+#   # Consecutive failed actions that stop a run (link-heal-write-failure).
+#   write_failure_streak: 3
+#   # Claude CLI model alias the link adjudicator asks.
+#   adjudicator_model: opus
+#   # Pairs per adjudicator CLI call.
+#   shard_size: 40
+#   # Cap per text, with the rater brief's truncation marker.
+#   field_chars: 4000
+#   # Apply writes nothing past this adjudicated misfile share (link-heal-misfile-share).
+#   misfile_share_ceiling: 0.25
+#   # Apply writes nothing past this adjudicated CORRECTS share (link-heal-corrects-share).
+#   corrects_share_ceiling: 0.60
+#   # Consecutive failed adjudicator shards that stop adjudicating; a plan run records
+#   # link-heal-adjudicator as would_escape, a writing run files it.
+#   shard_failure_streak: 3
 
 # Entity-node minting (task 4932) — the ensure_entity_node MCP tool, which
 # CREATES a Graphiti Entity node so a dangling referent has something to point
@@ -421,10 +632,93 @@ summary_rebuild:
 #   storm_threshold: 10
 #   storm_window_seconds: 3600.0
 
+# Deterministic auto-consolidation of Mem0 near-duplicate clusters (task 5237,
+# plans/memory-auto-consolidation-prd.md). Recon Stage 1 proposes a cluster, a
+# pure predicate rules on it, and a passing cluster is consolidated WITH NO
+# HUMAN IN THE LOOP. All fourteen leaves are green-tier hot-reloadable: they
+# are registered in `config/reload.py::RELOADABLE_FIELDS`, which is the
+# authoritative list, and `mcp__escalation__reload_config` applies a change to
+# any of them to a RUNNING server with no restart.
+#
+# DURING AN INCIDENT the knob you want is `consolidation_auto.enabled: false`
+# immediately below: it stops every auto-execution on the next cycle. Ships
+# false already, unlike the mem0_update and entity_mint kill switches — those
+# gate a TOOL behind a self-reported-agent allowlist that is the real bar,
+# whereas this machinery writes on its own initiative, so the switch IS the bar.
+#
+# ROLLOUT (PRD §11): stage one project with `enabled_projects: ['dark_factory']`
+# while `enabled` stays false — the pipeline proposes, rules and records without
+# writing, and a human reads that supervised dry-run cycle — then set
+# `enabled: true` for the same project.
+#
+# `enabled_projects` and `category_weights` reload ATOMICALLY: each is replaced
+# wholesale, never merged into the previous value, so a half-applied ranking map
+# can never gate a cycle.
+#
+# Every value below is the shipped default, shown so the knobs are discoverable
+# without reading the schema. Uncomment to change one.
+# consolidation_auto:
+#   # Kill switch. false stops every auto-execution regardless of
+#   # enabled_projects. Read together with enabled_projects: BOTH must admit a
+#   # project before anything is written.
+#   enabled: false
+#   # Per-project staging lever. Empty means no project is staged in. Replaced
+#   # wholesale on reload, never merged — removing a project here removes it.
+#   enabled_projects: []
+#   # Opaque label stamped onto every verdict and onto auto-execution
+#   # provenance. Bump it when the predicate rungs change meaning, so a verdict
+#   # tagged with the old version is visibly not a claim about the current rules.
+#   predicate_version: '1'
+#   # Proposal-shape bounds. Below two members there is no duplication to
+#   # consolidate; above twenty a cluster is more likely a topic drifting than a
+#   # duplicate set, and a human sitting reads it better than an automatic write.
+#   member_min: 2
+#   member_max: 20
+#   # Cap on the LLM-supplied claim, which becomes the canonical's FIRST
+#   # PARAGRAPH verbatim. Inclusive — a claim of exactly this length is accepted.
+#   claim_max_chars: 200
+#   # Blast-radius caps, per reconciliation cycle. 0 is legal on both and is the
+#   # narrow off switch: it stops execution (or gate filing) while leaving the
+#   # rest of the pipeline proposing and recording.
+#   max_auto_per_cycle: 3
+#   max_gate_filings_per_cycle: 3
+#   # Proposals above (max_auto_per_cycle + max_gate_filings_per_cycle) x this
+#   # trip the backlog regime: the cycle executes and files nothing and emits
+#   # ONE aggregate escalation.
+#   backlog_multiplier: 5
+#   # Ranking multiplier for a cluster whose topic has no canonical yet. Orders
+#   # the slice only; it never raises how much a cycle executes. At least 1.0.
+#   canonical_absent_bonus: 2.0
+#   # Consecutive refusals of the SAME topic before it stops being re-proposed
+#   # and goes to a human. A refusal no LLM re-emission can fix would otherwise
+#   # repeat every cycle forever, which is cost with no information.
+#   refusal_streak_threshold: 5
+#   # Token-Jaccard at or ABOVE which a proposed topic slug is treated as
+#   # colliding with an existing canonical slug, refusing rather than minting a
+#   # near-twin topic that splits one referent across two canonicals. A slug
+#   # equal to the proposed topic is skipped, not scored — a re-emission always
+#   # sees its own slug already present. Calibrate during the supervised cycle.
+#   slug_collision_jaccard: 0.6
+#   # How long a ledger proposal stays executable before it must be re-derived.
+#   # The corpus moves under an aged proposal, so executing a week-old row on its
+#   # original facts would write against a world that no longer exists.
+#   proposal_ttl_hours: 168
+#   # Ranking weights over the three Mem0-primary categories.
+#   # observations_and_summaries is down-weighted because that corpus is
+#   # session-recap noise far more often than it is a reusable norm. An ABSENT
+#   # category is not a candidate at all — a different fact from a zero weight,
+#   # which is why the Graphiti-primary categories are absent rather than zeroed.
+#   # Replaced wholesale on reload, never merged.
+#   category_weights:
+#     procedural_knowledge: 1.0
+#     preferences_and_norms: 1.0
+#     observations_and_summaries: 0.7
+
 write_triage:
-  # OPERATOR KNOBS — hand-set, NOT calibration outputs. These two are the only
-  # keys in this block a human is meant to edit; everything below the fence is
-  # derived. Both are green-tier hot-reloadable, and
+  # OPERATOR KNOBS — hand-set, NOT calibration outputs. The keys above the
+  # CALIBRATION OUTPUT fence are the ones a human is meant to edit — these two
+  # and the judge knobs below them; everything below the fence is
+  # derived. All of them are green-tier hot-reloadable, and
   # scripts/calibrate_write_triage.py --write-config preserves them when it
   # rewrites the calibrated keys below.
   #
@@ -434,17 +728,35 @@ write_triage:
   # Flipped by task 3169, after the judge (leaf gamma) lands — until then the
   # middle band is answered by a deliberate stub. Also the lever that stops an
   # in-flight triage incident.
-  enabled: false
+  enabled: true
   # candidate_k: retrieval WIDTH, not a threshold — it caps what any band can
   # achieve, since an unretrieved candidate cannot be scored at all. 20 is the
   # measured 69.4% same-category recall point (26.1% @5, 43.9% @10, 69.4% @20,
   # 88.5% @50); the retired guard's limit=5 is the number this deliberately is
   # not. Counted as a TOTAL across the three Mem0-primary categories.
   candidate_k: 20
+  # ATTACH-GUARD KNOBS (task 7158) — hand-set operator knobs, green-tier; null
+  # switches a rule off. Evidence: the 2026-10-11..19 soak,
+  # data/write-triage-soak-2026-10-19/correctness-analysis-2026-10-19.md §1
+  # F2/F5 and team/A/fix_replay_out.md (gitignored, main checkout only). Both
+  # are in-sample and in the text-embedding-3-small cosine scale — re-derive
+  # them at the embedder cutover (task 6807, η).
+  #
+  # min_parent_cosine: never attach, in any band, to a target (the parent,
+  # after a hoist) whose cosine to the write is below this; store standalone.
+  # On replay the 0.60 floor removed 28 contested misfiles for 2 correct
+  # contests.
+  min_parent_cosine: 0.60
+  # hoist_max_cosine_gap: in the judge band, refuse to hoist from the matched
+  # child to its parent when the parent's cosine is more than this below the
+  # child's; store standalone. On replay the 0.05 gap removed 32 contested
+  # misfiles for 1 correct contest; with F1 (task 6956) contested misfile fell
+  # 0.32 -> 0.24.
+  hoist_max_cosine_gap: 0.05
   # JUDGE KNOBS (leaf gamma, task 3128) — also hand-set operator knobs, and
   # deliberately ABOVE the calibration fence below so --write-config preserves
-  # them. All six are green-tier hot-reloadable and read live per middle-band
-  # write.
+  # them. Every judge knob is green-tier hot-reloadable and read live per
+  # middle-band write.
   #
   # judge_enabled: the kill switch for the LLM arm alone. Defaults TRUE,
   # unlike `enabled` above, because the judge is inert while triage is off —
@@ -457,18 +769,36 @@ write_triage:
   # the judge follows the model this deployment already trusts for add_memory
   # auto-classification. "haiku-class" in the PRD is a cost/size class, not a
   # vendor pin.
-  judge_provider: null
-  judge_model: null
+  # Set at the task 3169 flip from calibration/write_triage_best_config.json
+  # `selection` (gate Γ3, task 5808). Leaving judge_model null would inherit
+  # llm.model, which scored worse than the status quo on the comparative.
+  judge_provider: openai
+  judge_model: gpt-6.1-sol
+  # judge_api_url: the judge's OWN endpoint (null inherits llm.providers.<provider>.api_url); see plans/write-triage-flip-readiness-prd.md task σ.
+  judge_api_url: null
   # judge_timeout_seconds: NOT optional. No LLM call elsewhere in fused-memory
   # sets a timeout and the openai SDK default is 600s; on the synchronous
   # add_memory write path that is a wedge, not a degradation. A timeout
   # propagates into triage_write's fail-open arm — stored, plus a counted
-  # fail-open (INV-4).
-  judge_timeout_seconds: 10.0
+  # fail-open (INV-4). Why this value: the field's description in
+  # fused-memory/src/fused_memory/config/schema.py::WriteTriageConfig.
+  judge_timeout_seconds: 15.0
+  # judge_reasoning_effort: null OMITS the reasoning parameter and sends
+  # temperature 0.0 (what a non-reasoning model such as gpt-4o-mini needs; a
+  # reasoning model rejects a temperature); none|low|medium|high is sent as
+  # reasoning.effort. Only a Responses-API endpoint (llm.client_class
+  # 'openai') can send it — elsewhere a set value is a counted fail-open. Set
+  # together with judge_model at the 3169 flip; see
+  # plans/write-triage-flip-readiness-prd.md §11.3 C1''.
+  judge_reasoning_effort: low
   # judge_candidate_count: how many of the `candidate_k` retrieved records
   # reach the prompt — PRD C1's "top 3-5". The band's own winner is always
   # included regardless of this cap.
   judge_candidate_count: 5
+  # judge_field_chars: the per-field character cap on the entry and on every
+  # candidate the judge reads, cut fields marked `…[elided]`. Why 4000 and
+  # not the old 1200: calibration/write_triage_judge_field_chars_report.md.
+  judge_field_chars: 4000
   # judge_accuracy_report_path: traceability from the judge shipped here back
   # to the run that MEASURED it against leaf alpha's curator-labelled fixture,
   # exactly as calibration_report_path points at the run that produced
@@ -516,3 +846,19 @@ write_triage:
   # withheld from `--apply` deletion (`ann_cutoff_not_evidenced_for_category`):
   # still reported, never irreversibly acted on with a cutoff measured
   # elsewhere.
+  # - Per-project cutoffs for these two categories (task 5547, measured on
+  #   the dark_factory corpus) live in write_triage_project_calibrations
+  #   below; a run whose --project-id matches reads them before this map.
+  #   The reify statements above are unchanged.
+
+write_triage_project_calibrations:
+  # CALIBRATION OUTPUT — machine-owned; do not hand-edit.
+  # Per-project per-category cutoffs, each measured on that project's own
+  # fixture by scripts/calibrate_write_triage.py --write-project-config.
+  # Read only by scripts/audit_duplicate_memories.py for a run whose
+  # --project-id equals the key; never pooled with write_triage's bands.
+  # Hand edits inside this section are not preserved.
+  dark_factory:
+    calibration_report_path: calibration/write_triage_calibration_report_dark_factory.json
+    t_high_by_category:
+      observations_and_summaries: 0.8578402160989046

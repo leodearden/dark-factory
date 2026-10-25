@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import TYPE_CHECKING
 
 # Real (non-TYPE_CHECKING) imports: BOTH predicates are CALLED by tiers below,
@@ -230,31 +230,40 @@ _MONTH_ABBR = {
     'dec': 12,
 }
 
-# NOTE — fork, not drift-guarded: _parse_resets_at and _extract_cap_message
-# below are ported from usage_gate.py (their regex/parsing logic originated
-# there), but unlike CAP_HIT_PREFIXES/CAP_CONFIRM_KEYWORDS/NEAR_CAP_PREFIXES/
-# CODEX_CAP_PATTERNS/GEMINI_CAP_PATTERNS/NON_CAP_CLI_ERROR_MARKERS (single-
-# sourced here with no mirrored copies elsewhere, guarded by
-# TestSingleSourceOwnership in test_invocation_outcome.py), these two
-# functions have NO automated guard keeping them in sync with their
-# usage_gate.py originals — and have already intentionally diverged: this
-# copy of _parse_resets_at returns None on parse failure and accepts an
-# injectable ``now`` (PRD 7.1.a — an unknown reset time must be reported as
-# explicitly unknown, never fabricated, and tests need determinism), whereas
-# usage_gate.py's ``_parse_resets_at(text) -> datetime`` fabricates
-# ``now + 1h`` on parse failure and always reads the real wall clock. Both
-# copies are pure and forked deliberately (this task is additive-only; see
-# the module docstring), so a future edit to one is not expected to be
-# mirrored in the other — but it also won't be caught if it should have
-# been. The beta consumer-rewire collapsed the string tables but
-# deliberately left these two functions forked. Task 4042 then moved
-# usage_gate.py's ONE live _parse_resets_at call site (_handle_auth_failure)
-# onto THIS copy, imported there as _parse_resets_at_strict — so the
-# usage_gate.py fork of _parse_resets_at now has no production callers and
-# survives only as the re-export consumed by
-# orchestrator/src/orchestrator/usage_gate.py and its tests (see the note at
-# its definition). usage_gate.py's _extract_cap_message fork remains a live
-# copy with the divergent semantics described above.
+# The strptime ladder every absolute reset clock time is read through.
+_CLOCK_TIME_FORMATS = ('%I:%M %p', '%I%p', '%I:%M%p', '%I %p')
+
+# ASSUMPTION about how codex renders its usage-window reset ("... try again
+# at 1:07 PM."): in the ChatGPT login's local time, naming no zone. On the
+# factory host that is the host's local zone, which astimezone(None) resolves.
+_CODEX_RESET_ZONE: tzinfo | None = None
+
+# codex rounds that reset to the minute, so it can be parsed just after it
+# passed; within this grace it means "now", not the same time tomorrow.
+_CODEX_RESET_ROLLOVER_GRACE = timedelta(minutes=10)
+
+# ORIGIN — _parse_resets_at and _extract_cap_message below started life in
+# usage_gate.py (their regex/parsing logic originated there) and were for a
+# time forked between the two modules with no drift guard. Task 4357 retired
+# both usage_gate.py copies, so these are now the only ones: there is nothing
+# left to drift out of sync.
+#
+# _parse_resets_at returns None on parse failure and accepts an injectable
+# ``now`` (PRD 7.1.a — an unknown reset time must be reported as explicitly
+# unknown, never fabricated, and tests need determinism). The retired fork
+# fabricated ``now + 1h`` instead, which is why it was deleted rather than
+# repaired: dashboard/src/dashboard/data/costs.py::_extract_resets_at surfaces
+# a persisted reset time verbatim, so an invented one reads as a real recovery
+# ETA.
+#
+# Single ownership is now mechanically enforced, by
+# shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership — a
+# re-fork here or a re-export elsewhere fails it. So this pair is no longer
+# the un-guarded exception to the string tables' TestSingleSourceOwnership
+# coverage (CAP_HIT_PREFIXES / CAP_CONFIRM_KEYWORDS / NEAR_CAP_PREFIXES /
+# CODEX_CAP_PATTERNS / GEMINI_CAP_PATTERNS / NON_CAP_CLI_ERROR_MARKERS,
+# collapsed to this module by the beta consumer-rewire); the two guards
+# together now cover everything this module single-sources.
 
 
 def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | None:
@@ -264,6 +273,7 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
     - "resets in 3h" / "resets in 45m" / "resets in 2d"
     - "resets [on] Mar 30, 6pm (Europe/London)" (date + time + tz)
     - "resets 9pm (Europe/London)" / "resets 3:00 AM (US/Pacific)"
+    - codex's "try again at 1:07 PM" (no zone: host local, rollover grace)
 
     Returns ``None`` when no pattern matches — PRD 7.1.a: an unknown reset
     time must be reported as explicitly unknown, never fabricated as
@@ -317,7 +327,7 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
             month = _MONTH_ABBR.get(month_str)
             if month is None:
                 raise ValueError(f'Unknown month: {month_str}')
-            for fmt in ('%I:%M %p', '%I%p', '%I:%M%p', '%I %p'):
+            for fmt in _CLOCK_TIME_FORMATS:
                 try:
                     parsed_time = datetime.strptime(time_str, fmt).time()
                     break
@@ -356,7 +366,7 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
             time_str = m.group(1).strip()
             tz_str = m.group(2).strip()
             tz = zoneinfo.ZoneInfo(tz_str)
-            for fmt in ('%I:%M %p', '%I%p', '%I:%M%p', '%I %p'):
+            for fmt in _CLOCK_TIME_FORMATS:
                 try:
                     parsed_time = datetime.strptime(time_str, fmt).time()
                     break
@@ -377,6 +387,34 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
             return target.astimezone(UTC)
         except Exception:
             pass
+
+    # codex: "... or try again at 1:07 PM." with no parenthesised zone.
+    m = re.search(
+        r'try\s+again\s+at\s+(\d{1,2}(?::\d{2})?\s*[ap]m)(?!\s*\()',
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        time_str = m.group(1).strip()
+        for fmt in _CLOCK_TIME_FORMATS:
+            try:
+                parsed_time = datetime.strptime(time_str, fmt).time()
+                break
+            except ValueError:
+                continue
+        else:
+            return None
+
+        now_local = now.astimezone(_CODEX_RESET_ZONE)
+        target = now_local.replace(
+            hour=parsed_time.hour,
+            minute=parsed_time.minute,
+            second=0,
+            microsecond=0,
+        )
+        if target < now_local - _CODEX_RESET_ROLLOVER_GRACE:
+            target += timedelta(days=1)
+        return target.astimezone(UTC)
 
     # No pattern matched: unknown reset time (PRD 7.1.a) — explicit None,
     # never a fabricated now+1h.
@@ -479,32 +517,37 @@ NEAR_CAP_PREFIXES = [
     "You're close to",
 ]
 
-# Codex (OpenAI) cap-hit patterns. Copied from usage_gate.py:86 (CODEX_CAP_PATTERNS).
+# Codex (OpenAI) patterns that name a cap by themselves.
 CODEX_CAP_PATTERNS = [
     'usage limit reached',
-    'rate limit',
-    'quota exceeded',
     'insufficient_quota',
     'rate_limit_exceeded',
+    'hit your usage limit',  # ChatGPT usage window, measured on codex-cli 0.154.0 (task 5403)
 ]
 
-# Gemini (Google) cap-hit patterns. Copied from usage_gate.py:90 (GEMINI_CAP_PATTERNS).
+# Gemini (Google) patterns that name a cap by themselves.
 GEMINI_CAP_PATTERNS = [
-    'quota exceeded',
-    'rate limit',
     'resource exhausted',
     'RESOURCE_EXHAUSTED',
     'quota_exceeded',
 ]
 
+# A reply can use these phrases about any code, so for codex/gemini they name a cap only beside a
+# confirm keyword (the CAP_CONFIRM_KEYWORDS policy). Keywords measured from codex-cli 0.154.0's own
+# errors ("try again at/in", "Check your plan and billing details"); gemini shares them unmeasured.
+GENERIC_CAP_PHRASES = ['rate limit', 'quota exceeded']
+GENERIC_CAP_CONFIRM_KEYWORDS = ['try again', 'billing']
+
 
 def _extract_cap_message(text: str, prefix: str) -> str:
     """Extract the full sentence containing the cap-hit prefix.
 
-    Forked from usage_gate.py, same as ``_parse_resets_at`` above — see the
-    fork/no-drift-guard note by that function's definition. Not covered by
+    Originated in usage_gate.py, same as ``_parse_resets_at`` above — see the
+    ORIGIN note by that function's definition. Not covered by
     TestSingleSourceOwnership, which only asserts the plain string-table
-    constants are single-sourced here with no mirrored copies elsewhere.
+    constants are single-sourced here with no mirrored copies elsewhere;
+    single ownership of this function is covered by
+    ``shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership``.
     """
     lower = text.lower()
     idx = lower.find(prefix.lower())
@@ -515,6 +558,26 @@ def _extract_cap_message(text: str, prefix: str) -> str:
     if end == -1:
         end = min(idx + 200, len(text))
     return text[idx:end].strip()
+
+
+def _backend_cap_match(
+    combined_lower: str, standalone_patterns: list[str], strict_confirm: bool,
+) -> str | None:
+    """The codex/gemini cap pattern *combined_lower* matches, or None.
+
+    A standalone pattern wins outright; a GENERIC_CAP_PHRASES hit counts
+    only under the same regime rule as the claude guard in
+    ``classify_invocation``.
+    """
+    for pattern in standalone_patterns:
+        if pattern.lower() in combined_lower:
+            return pattern
+    confirmed = not strict_confirm or any(
+        kw in combined_lower for kw in GENERIC_CAP_CONFIRM_KEYWORDS
+    )
+    if not confirmed:
+        return None
+    return next((p for p in GENERIC_CAP_PHRASES if p in combined_lower), None)
 
 
 def classify_invocation(
@@ -606,16 +669,17 @@ def classify_invocation(
             return CliLocalError(marker=marker)
 
     # Backend-specific cap patterns checked first, ahead of the claude prefix
-    # logic below (mirrors usage_gate.py:386-397). Codex/Gemini error bodies
-    # don't carry a parseable reset time, so resets_at is always None here.
+    # logic below (mirrors usage_gate.py:386-397). codex's ChatGPT usage
+    # window names its reset ("try again at 1:07 PM"), read by _parse_resets_at.
     if backend == 'codex':
-        for pattern in CODEX_CAP_PATTERNS:
-            if pattern.lower() in combined_lower:
-                return CapHit(resets_at=None, reason=f'Codex cap hit: {pattern}')
+        pattern = _backend_cap_match(combined_lower, CODEX_CAP_PATTERNS, strict_confirm)
+        if pattern is not None:
+            return CapHit(resets_at=_parse_resets_at(combined), reason=f'Codex cap hit: {pattern}')
     elif backend == 'gemini':
-        for pattern in GEMINI_CAP_PATTERNS:
-            if pattern.lower() in combined_lower:
-                return CapHit(resets_at=None, reason=f'Gemini cap hit: {pattern}')
+        # No measured gemini cap text names a reset time, so none is parsed.
+        pattern = _backend_cap_match(combined_lower, GEMINI_CAP_PATTERNS, strict_confirm)
+        if pattern is not None:
+            return CapHit(resets_at=None, reason=f'Gemini cap hit: {pattern}')
 
     # Claude cap/near-cap detection: require both a prefix match AND a
     # secondary confirmation keyword (defence against false positives on

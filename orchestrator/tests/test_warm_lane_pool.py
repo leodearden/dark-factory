@@ -15,6 +15,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
@@ -490,20 +491,9 @@ class TestWarmLanePoolCensusClassification:
 # ===========================================================================
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def wl_git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     # Task 2061: pre-create the DEFAULT derived warm-lane base
     # (<repo>/.worktrees/_merge-verify/target, non-empty) so the
     # acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK
@@ -792,6 +782,94 @@ class TestSeedRcToUnavailable:
         """127 is the command-not-found / unexpected-exception sentinel — generic FAULT."""
         from orchestrator.git_ops import _seed_rc_to_unavailable
         assert _seed_rc_to_unavailable(127) is WarmLaneUnavailable.FAULT
+
+    def test_124_is_lane_lock_timeout(self):
+        """Task 4930: rc=124 is flock's --conflict-exit-code for the bounded
+        ``<lane_dir>.lock`` wait — a TRANSIENT contention signal (a concurrent
+        GC reseed / thin / another seed still holds the lock), not a per-task
+        fault.  Before 4930 it fell through to FAULT, which is the one
+        warm-lane discriminant that is not a WarmLaneRequeue, so a lost lock
+        race hard-BLOCKed the task with agent_invocations=0.
+
+        Pinned via the module constant, not a bare 124 literal, so a retune of
+        the sentinel moves the test with it.
+        """
+        from orchestrator.git_ops import (
+            _SEED_WARM_LANE_LOCK_TIMEOUT_RC,
+            _seed_rc_to_unavailable,
+        )
+        assert _SEED_WARM_LANE_LOCK_TIMEOUT_RC == 124, (
+            'the flock --conflict-exit-code sentinel is expected to stay at '
+            "timeout(1)'s well-known 124 convention"
+        )
+        assert (
+            _seed_rc_to_unavailable(_SEED_WARM_LANE_LOCK_TIMEOUT_RC)
+            is WarmLaneUnavailable.LANE_LOCK_TIMEOUT
+        )
+
+    def test_existing_rc_mappings_unchanged(self):
+        """The new 124 branch must not swallow a neighbouring rc.
+
+        Re-asserts every other documented row in one place so a future edit to
+        the discriminant cannot quietly widen the lock-timeout branch (e.g. a
+        ``rc >= 124`` comparison) past its single cell.
+        """
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert _seed_rc_to_unavailable(75) is WarmLaneUnavailable.DISK_PRESSURE
+        assert _seed_rc_to_unavailable(76) is WarmLaneUnavailable.BASE_ABSENT
+        assert (
+            _seed_rc_to_unavailable(77)
+            is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+        )
+        assert _seed_rc_to_unavailable(1) is WarmLaneUnavailable.FAULT
+        assert _seed_rc_to_unavailable(127) is WarmLaneUnavailable.FAULT
+    # ── task 4211: rc 77 → LANE_LOCK_CONTENDED ────────────────────────────
+    #
+    # reify's seed-warm-lane.sh emits 75 at exactly two sites, BOTH lane-lock
+    # refusal arms (flock -n immediate refusal; flock -w queue timeout) — seed
+    # has no disk-pressure exit-75 path at all.  So every lane-lock refusal was
+    # unconditionally rendered as "disk pressure", which is the operator-facing
+    # string that ran throughout reify esc-5556-1.  reify task 5568 added the
+    # OPT-IN ``--distinct-lock-refusal-rc`` flag under which those two arms exit
+    # 77 instead; these tests pin DF's half of that seam.
+
+    def test_77_is_lane_lock_contended(self):
+        """77 is reify's opt-in distinct lane-lock refusal code (reify 5568)."""
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert (
+            _seed_rc_to_unavailable(77)
+            is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+        )
+
+    def test_lane_lock_contended_enum_member_value(self):
+        """The enum member exists and carries the documented wire value."""
+        assert WarmLaneUnavailable.LANE_LOCK_CONTENDED.value == 'lane_lock_contended'
+
+    def test_77_arm_is_additive_and_does_not_narrow_75(self):
+        """Regression fence — the rc 77 arm is purely ADDITIVE.
+
+        75 must KEEP meaning DISK_PRESSURE *alongside* 77 meaning
+        LANE_LOCK_CONTENDED: a lane whose checked-out seed script predates
+        reify 5568 still emits 75 for a lock refusal (the capability probe
+        fails CLOSED for such lanes, so the flag is omitted and the old code
+        is what arrives), and DF has its own genuine exit-75 producer that is
+        NOT seed — the ε pre-acquire disk-guard path, where 75 really does
+        mean disk pressure.  Narrowing 75 would break both.  Disambiguation
+        comes ONLY from the opt-in 77.
+
+        Deliberately asserts ONLY the 75/77 coexistence, not the whole
+        taxonomy: 76 -> BASE_ABSENT and 1/127 -> FAULT are already pinned by
+        test_76_is_base_absent / test_1_is_fault / test_127_is_fault directly
+        above, and re-asserting them here would make one future taxonomy
+        change fail in two places for a single reason (amendment,
+        reviewer_comprehensive test-coverage).
+        """
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert _seed_rc_to_unavailable(75) is WarmLaneUnavailable.DISK_PRESSURE
+        assert (
+            _seed_rc_to_unavailable(77)
+            is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+        )
 
 
 class TestWarmLaneBaseResolvable:
@@ -2849,26 +2927,27 @@ class TestAcquireWarmLaneReuse:
 
 
 # ===========================================================================
-# Step-23: RED — on-disk backstop: same-task plan.json survives restart
+# Step-23: on-disk backstop — same-task artifacts survive a restart
 #
-# Acquire 'A' fresh, write .task/plan.json with task_id 'A' + tracked WIP.
-# Construct a BRAND-NEW GitOps (simulating a process restart — empty
-# _assignments).  acquire_warm_lane('A', sha_main) should detect that
-# _lane-0's plan.json has task_id == 'A' and route to _reuse_warm_lane
-# (preserving .task/plan.json + rebasing).
+# Acquire 'A' fresh, seed the lane's meta root + tracked WIP.  Construct a
+# BRAND-NEW GitOps (simulating a process restart — empty _assignments).
+# acquire_warm_lane('A', sha_main) should detect that _lane-0's meta-root
+# metadata.json has task_id == 'A' and route to _reuse_warm_lane (preserving
+# the meta root's plan.json payload + rebasing).
 #
 # Contrast (fresh, different task): a new GitOps with the SAME registered
-# _lane-0 whose plan.json has task_id 'A' but we acquire for 'Z' → treated
-# FRESH → .task/plan.json is gone (git clean removed it) and target/ retained.
+# _lane-0 whose metadata.json has task_id 'A' but we acquire for 'Z' →
+# treated FRESH → plan.json is gone and target/ retained.
 #
-# Today the fresh-but-registered branch always calls _reset_warm_lane →
-# git clean -xfd -e target deletes .task/ even for the same task → RED.
+# The routing key is metadata.json (task 3154), NOT plan.json: plan.json is
+# kept here only as the PAYLOAD whose survival across the reuse route is
+# asserted.
 # ===========================================================================
 
 
 @pytest.mark.asyncio
 class TestAcquireWarmLaneOnDiskBackstop:
-    """On-disk backstop: plan.json task_id match restores REUSE across restart."""
+    """On-disk backstop: metadata.json task_id match restores REUSE across restart."""
 
     async def test_same_task_plan_preserved_after_restart(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
@@ -2882,12 +2961,14 @@ class TestAcquireWarmLaneOnDiskBackstop:
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
         assert isinstance(info1, WorktreeInfo)
 
-        # Simulate agent writing plan.json + tracked WIP
-        plan_file = (
-            TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
-            / 'plan.json'
+        # Simulate dispatch (metadata.json — the routing key) + an agent
+        # writing plan.json (the payload) + tracked WIP.
+        meta_root = TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(
+            '{"task_id": "task-A", "title": "task A work"}'
         )
-        plan_file.parent.mkdir(parents=True, exist_ok=True)
+        plan_file = meta_root / 'plan.json'
         plan_file.write_text('{"task_id": "task-A", "title": "task A work"}')
         (info1.path / 'task_work.txt').write_text('WIP after restart\n')
 
@@ -2900,12 +2981,12 @@ class TestAcquireWarmLaneOnDiskBackstop:
         # Reacquire same task on fresh GitOps — disk backstop should detect REUSE
         info2 = await git_ops2.acquire_warm_lane('task-A', sha_main)
 
-        # TODAY: fresh-but-registered → _reset_warm_lane → git clean → .task/ gone
-        # After step-24: reads plan.json, detects task_id match → _reuse_warm_lane
+        # Disk backstop reads metadata.json, detects the task_id match →
+        # _reuse_warm_lane, which preserves the meta root's plan.json payload.
         assert isinstance(info2, WorktreeInfo)
         assert info2.path == info1.path  # same _lane-0
 
-        assert plan_file.exists(), '.task/plan.json must be preserved by disk backstop'
+        assert plan_file.exists(), 'plan.json must be preserved by disk backstop'
         data = json.loads(plan_file.read_text())
         assert data['task_id'] == 'task-A', (
             f'plan.json was overwritten; got {data}'
@@ -2920,12 +3001,10 @@ class TestAcquireWarmLaneOnDiskBackstop:
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
         assert isinstance(info1, WorktreeInfo)
-        plan_file = (
-            TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
-            / 'plan.json'
-        )
-        plan_file.parent.mkdir(parents=True, exist_ok=True)
-        plan_file.write_text('{"task_id": "task-A"}')
+        meta_root = TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "task-A"}')
+        (meta_root / 'plan.json').write_text('{"task_id": "task-A"}')
         (info1.path / 'task_work.txt').write_text('WIP work\n')
 
         # Restart
@@ -4014,6 +4093,72 @@ class TestCreateWorktreeWarmLaneRouting:
         with pytest.raises(WarmLaneDiskPressure):
             await git_ops.create_worktree('task-dp')
 
+    # ── task 4211: LANE_LOCK_CONTENDED → WarmLaneLockContention ───────────
+
+    async def test_warm_lane_lock_contention_is_a_warm_lane_requeue(self):
+        """It inherits the requeue routing, not the blocked+L1 RuntimeError one.
+
+        A lane-lock refusal means another live consumer holds
+        ``<lane_dir>.lock`` — a transient shared-resource condition and no
+        fault of this task, so it must requeue via the shared
+        :class:`WarmLaneRequeue` handler in workflow.run().
+        """
+        from orchestrator.git_ops import WarmLaneLockContention, WarmLaneRequeue
+
+        assert issubclass(WarmLaneLockContention, WarmLaneRequeue)
+
+    async def test_create_worktree_lane_lock_contended_raises_lock_contention(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, monkeypatch,
+    ):
+        """The discriminant LANE_LOCK_CONTENDED routes to its own raise arm.
+
+        Isolates the create_worktree routing from the seed subprocess by
+        pinning acquire_warm_lane's return value directly: before task 4211
+        this discriminant had no arm and fell through to the generic
+        FAULT/DISABLED ``RuntimeError`` (blocked + L1), which is the wrong
+        routing for transient contention.
+        """
+        from orchestrator.git_ops import WarmLaneLockContention
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=0)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        async def _contended(*_args, **_kwargs):
+            return WarmLaneUnavailable.LANE_LOCK_CONTENDED
+
+        monkeypatch.setattr(git_ops, 'acquire_warm_lane', _contended)
+
+        with pytest.raises(WarmLaneLockContention) as excinfo:
+            await git_ops.create_worktree('task-contended')
+
+        message = str(excinfo.value)
+        assert 'lock contention' in message.lower(), message
+        assert 'task-contended' in message, message
+        # The whole point of task 4211: the operator-facing string must no
+        # longer say "disk pressure" for what is a lane-lock refusal.
+        assert 'disk pressure' not in message.lower(), message
+
+    async def test_create_worktree_seed_exit_77_raises_lock_contention(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """End-to-end sibling of the seed-exit-75 DISK_PRESSURE test above.
+
+        Drives the REAL seam — seed subprocess rc 77 → _seed_rc_to_unavailable
+        → discriminant → create_worktree raise arm — rather than pinning the
+        discriminant, so the two halves cannot drift apart.
+        """
+        from orchestrator.git_ops import WarmLaneDiskPressure, WarmLaneLockContention
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=77)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        with pytest.raises(WarmLaneLockContention) as excinfo:
+            await git_ops.create_worktree('task-lock')
+
+        assert not isinstance(excinfo.value, WarmLaneDiskPressure), (
+            'rc 77 must NOT be rendered as disk pressure (task 4211)'
+        )
+
     async def test_create_worktree_success_returns_worktree_info_on_lane(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
@@ -4212,7 +4357,7 @@ class TestReleaseLaneForTerminalTask:
         assert freed is True
         assert pool.state(lane) == LaneState.FREE
 
-    async def test_release_resolves_via_plan_json_backstop(
+    async def test_release_resolves_via_metadata_backstop(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
         """ASSIGNED lane with empty _assignments → disk backstop finds and frees it.
@@ -4228,10 +4373,12 @@ class TestReleaseLaneForTerminalTask:
         lane = await pool.try_acquire()
         assert lane is not None
 
-        # Create the lane directory and write plan.json backstop
-        task_dir = lane / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+        # Create the lane dir (the scan only considers dirs that exist under
+        # worktree_base) and seed its meta root with the backstop key.
+        lane.mkdir(parents=True, exist_ok=True)
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "3459"}')
 
         freed = await git_ops.release_lane_for_terminal_task('3459', allow_disk_backstop=True)
 
@@ -4241,7 +4388,7 @@ class TestReleaseLaneForTerminalTask:
     async def test_release_returns_false_when_no_lane(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """Unknown task id with no assignment and no plan.json → False, no raise."""
+        """Unknown task id with no assignment and no lane metadata.json → False, no raise."""
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         freed = await git_ops.release_lane_for_terminal_task('99999')
@@ -4263,7 +4410,7 @@ class TestReleaseLaneForTerminalTask:
         assert first is True
         assert pool.state(lane) == LaneState.FREE
 
-        # Second call: no in-memory assignment, no plan.json on disk
+        # Second call: no in-memory assignment, no lane metadata.json on disk
         second = await git_ops.release_lane_for_terminal_task('3459')
         assert second is False, '2nd call (neither in-memory nor disk) must return False'
         assert pool.state(lane) == LaneState.FREE, 'lane must remain FREE after double-fire'
@@ -4301,7 +4448,7 @@ class TestReleaseLaneForTerminalTask:
 
         Simulates the common done-exit path where _maybe_cleanup_done_worktree
         already released the lane and dropped the in-memory assignment. A stale
-        plan.json remains on disk, but the default (allow_disk_backstop=False)
+        metadata.json remains on disk, but the default (allow_disk_backstop=False)
         call must be a true no-op — no disk scan, no redundant cleanup_worktree /
         git branch -D retry.
 
@@ -4323,8 +4470,13 @@ class TestReleaseLaneForTerminalTask:
         assert lane is not None
         assert pool.state(lane) == LaneState.ASSIGNED
 
-        # Write stale plan.json (as if task '3459' had previously used this lane;
-        # plan.json survives release_warm_lane since that only detaches + deletes branch)
+        # Stale metadata.json, as if task '3459' had previously used this lane
+        # (the meta root survives release_warm_lane). The leftover
+        # <lane>/.task/plan.json is inert state: it is no routing key.
+        lane.mkdir(parents=True, exist_ok=True)
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "3459"}')
         task_dir = lane / '.task'
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
@@ -4373,7 +4525,8 @@ class TestReleaseLaneForTerminalTask:
         """allow_disk_backstop=True: disk backstop resolves lane and frees it.
 
         Lost-map / post-restart path: the in-memory assignment was dropped but
-        the plan.json still carries the task id.  Explicit opt-in is required.
+        the lane's metadata.json still carries the task id.  Explicit opt-in is
+        required.
 
         RED: release_lane_for_terminal_task has no allow_disk_backstop param
         (TypeError on the call).
@@ -4386,9 +4539,10 @@ class TestReleaseLaneForTerminalTask:
         lane = await pool.try_acquire()
         assert lane is not None
 
-        task_dir = lane / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+        lane.mkdir(parents=True, exist_ok=True)
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "3459"}')
 
         freed = await git_ops.release_lane_for_terminal_task('3459', allow_disk_backstop=True)
 
@@ -4405,7 +4559,7 @@ class TestReleaseLaneForTerminalTask:
         """Theft guard: disk backstop resolves lane but it's held by a DIFFERENT live task.
 
         Race window: task '3459' completes → its lane freed → a concurrent
-        dispatch assigns _lane-0 to '9000' → before the stale plan.json is
+        dispatch assigns _lane-0 to '9000' → before the stale metadata.json is
         rewritten, a reconciler fires release_lane_for_terminal_task('3459',
         allow_disk_backstop=True).  The theft guard must detect that _lane-0 is
         now assigned to '9000' (holder != '3459') and refuse the release.
@@ -4419,11 +4573,13 @@ class TestReleaseLaneForTerminalTask:
         pool = git_ops.warm_lane_pool
         assert pool is not None
 
-        # Write stale plan.json for '3459' on _lane-0 (task 3459's old lane)
+        # Stale metadata.json for '3459' on _lane-0 (task 3459's old lane) —
+        # the scan's lane→task key, so the theft guard is genuinely reached.
         lane_0 = git_ops.worktree_base / '_lane-0'
-        task_dir = lane_0 / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+        lane_0.mkdir(parents=True, exist_ok=True)
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane_0.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "3459"}')
 
         # A DIFFERENT live task acquires _lane-0 (the first FREE lane)
         result = await pool.acquire_for('9000')
@@ -5136,7 +5292,7 @@ class TestAcquireSpecLaneReseedTrashHardening:
          → git reset --hard + git clean -xfd [-e ...] runs here
 
     A no-op scripts/seed-warm-lane.sh must be committed to wl_git_repo before
-    the first acquire so _seed_warm_lane(lane, '--reset-in-place') returns 0.
+    the first acquire so _seed_warm_lane(lane, '--fresh-checkout') returns 0.
     """
 
     async def test_acquire_spec_lane_excludes_reseed_trash(self, wl_git_repo: Path):

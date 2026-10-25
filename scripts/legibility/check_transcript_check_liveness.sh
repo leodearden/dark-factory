@@ -5,6 +5,15 @@
 #
 # Usage: check_transcript_check_liveness.sh <project_id> <hours>
 #
+# BOUND BY tasks 5857 (dark_factory) and 5858 (reify). Each is a
+# before_done.kind='predicate' delayed milestone (after_secs=604800,
+# args=[<project_id>, "72"]) that depends on its project's timer deploy
+# (5855 / 5856), the same way tasks 2587/2615 bind check_trickle_liveness.sh.
+# The binding is one-shot: a done predicate never re-runs. Its recurring
+# successor is the r6 transcript-check chain (task 4681), which retires this
+# probe together with the timer. Operator view: OPERATIONS.md §12 "Nightly
+# legibility transcript check (04:00)".
+#
 # Mirrors check_trickle_liveness.sh (systemd UNIT STATE via `systemctl --user
 # show`, NEVER git history) with ONE principled divergence (task 2901 DD4):
 #

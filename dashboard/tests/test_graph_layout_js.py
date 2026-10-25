@@ -1,14 +1,22 @@
-"""pytest wrapper for the graph_layout.js `node --test` suite.
+"""pytest wrapper for the dashboard's `node --test` suite under dashboard/tests/js/.
 
-graph_layout.js (dashboard/src/dashboard/static/redux/graph_layout.js) is a
-plain-JS module (no JSX/Babel) with its own node:test-based suite under
-dashboard/tests/js/. This wrapper subprocess-runs `node --test` over that
-directory so the JS suite is surfaced as part of the normal pytest run (and
-therefore CI), instead of requiring a separate invocation.
+The suite began as graph_layout.js's
+(dashboard/src/dashboard/static/redux/graph_layout.js). It now covers every
+plain-JS redux module, and the same glob runs the jsdom render suite
+(dom_harness.test.mjs, jsx_render.test.mjs), which renders the real .jsx tabs.
+This wrapper subprocess-runs `node --test` over that directory, so the JS
+suite is surfaced as part of the normal pytest run (and therefore CI) instead
+of requiring a separate invocation.
 
 Hard-fails (does not skip) when node is missing: node v22.22.3 is a verified
 part of the host/CI toolchain, so an absent node indicates an environment
-regression rather than an optional dependency.
+regression rather than an optional dependency. The same stance covers the
+render suite's devDependencies: without the repo-root node_modules that
+`npm ci` installs, it fails naming that remedy rather than skipping.
+
+The ``boundary_*.test.mjs`` files are not run here: they apply the bodies the
+real routes serve, which only ``test_boundary_js.py`` builds, so that file is
+their one owner.
 """
 
 from __future__ import annotations
@@ -29,9 +37,17 @@ _JS_TESTS_DIR = Path(__file__).parent / 'js'
 # directory path as a CLI argument — it tries to `require()` the directory
 # itself and fails with MODULE_NOT_FOUND regardless of what's inside (verified
 # empirically: only an argument-less cwd walk or an explicit glob pattern
-# triggers node's test-file discovery). Passing an explicit "**/*.test.mjs"
-# glob makes node's own glob engine find and run the suite's files.
-_JS_TESTS_GLOB = str(_JS_TESTS_DIR / '**' / '*.test.mjs')
+# triggers node's test-file discovery). So the suite's files are globbed here
+# and passed to node as an explicit list.
+_JS_TESTS_GLOB = '**/*.test.mjs'
+
+
+def _suite_files() -> list[str]:
+    return [
+        str(path)
+        for path in sorted(_JS_TESTS_DIR.glob(_JS_TESTS_GLOB))
+        if not path.name.startswith('boundary_')
+    ]
 
 
 def test_graph_layout_js_suite_passes() -> None:
@@ -48,8 +64,13 @@ def test_graph_layout_js_suite_passes() -> None:
         'toolchain, so its absence is a regression that must not be hidden.'
     )
 
+    # Given no files, node falls back to walking its cwd, which would run the
+    # boundary files this wrapper excludes.
+    files = _suite_files()
+    assert files, f'no {_JS_TESTS_GLOB} under {_JS_TESTS_DIR}'
+
     result = subprocess.run(
-        [node, '--test', _JS_TESTS_GLOB],
+        [node, '--test', *files],
         capture_output=True,
         text=True,
         cwd=str(_JS_TESTS_DIR.parent),

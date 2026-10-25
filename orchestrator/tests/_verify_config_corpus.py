@@ -47,6 +47,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 FM_CONFIG_PATH = REPO_ROOT / 'fused-memory' / 'orchestrator.yaml'
 SCRIPTS_CONFIG_PATH = REPO_ROOT / 'scripts' / 'orchestrator.yaml'
+DASHBOARD_CONFIG_PATH = REPO_ROOT / 'dashboard' / 'orchestrator.yaml'
 
 
 def load_config_scalar(path: Path, key: str) -> str:
@@ -164,7 +165,17 @@ FM_LINT_COMMAND = (
     ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
 )
 
-# cockpit/dashboard/escalation/orchestrator/sampler/shared
+# dashboard/orchestrator.yaml::lint_command — the SECOND 3-segment chain (two
+# sibling checkers rather than one), alongside FM_LINT_COMMAND above. Task 4485
+# added the module-local-TestClient checker as dashboard's second leg, which is
+# why dashboard no longer fits the 2-segment comprehension below.
+DASHBOARD_LINT_COMMAND = (
+    'uv run --directory dashboard ruff check src/ tests/'
+    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests'
+    ' && python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests'
+)
+
+# cockpit/escalation/orchestrator/sampler/shared
 # orchestrator.yaml::lint_command — each the same 2-segment shape, differing
 # only in the module name.
 #
@@ -180,7 +191,7 @@ MODULE_LINT_COMMANDS = {
         f'uv run --directory {module} ruff check src/ tests/'
         f' && python3 fused-memory/scripts/check_bare_magicmock_config.py {module}/tests'
     )
-    for module in ('cockpit', 'dashboard', 'escalation', 'orchestrator', 'sampler', 'shared')
+    for module in ('client-feed', 'cockpit', 'escalation', 'orchestrator', 'sampler', 'shared')
 }
 
 # scripts/orchestrator.yaml::lint_command — the lone CHAINLESS lint command: a
@@ -194,10 +205,10 @@ SCRIPTS_LINT_COMMAND = 'uv run --project shared ruff check scripts/'
 # dark-factory-orchestrator.yaml::lint_command
 ROOT_LINT_COMMAND = (
     'uv run ruff check shared escalation fused-memory orchestrator dashboard sampler'
-    ' cockpit conftest.py df_pytest_isolation.py skills'
+    ' cockpit client-feed conftest.py df_pytest_isolation.py skills'
     ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
     ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-    ' sampler/tests cockpit/tests'
+    ' sampler/tests cockpit/tests client-feed/tests'
 )
 
 # dark-factory-orchestrator.yaml::type_check_command
@@ -205,7 +216,7 @@ ROOT_TYPE_CHECK_COMMAND = (
     'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
     ' && cd ../dashboard && npx pyright && cd ../shared && npx pyright'
     ' && cd ../escalation && npx pyright && cd ../sampler && npx pyright'
-    ' && cd ../cockpit && npx pyright'
+    ' && cd ../cockpit && npx pyright && cd ../client-feed && npx pyright'
 )
 
 # dark-factory-orchestrator.yaml::test_command
@@ -216,6 +227,7 @@ ROOT_TEST_COMMAND = (
     ' && cd ../fused-memory && uv run pytest tests/ --timeout=300'
     ' && cd ../dashboard && uv run pytest tests/ --timeout=300'
     ' && cd ../sampler && uv run pytest tests/ --timeout=300'
+    ' && cd ../client-feed && uv run pytest tests/ --timeout=300'
     ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
     ' && uv run --project shared pytest tests/scripts/ scripts/tests/ --timeout=300'
 )

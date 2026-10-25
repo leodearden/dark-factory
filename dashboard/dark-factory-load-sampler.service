@@ -6,10 +6,37 @@ After=network.target
 Type=oneshot
 # %h expands to the user home directory (systemd user-unit specifier), making
 # the username non-hardcoded.  Adjust "src/dark-factory" if your checkout path
-# differs.  Alternatively set DARK_FACTORY_ROOT=<repo-root> in an
-# EnvironmentFile= to override the DB path without editing this unit.
+# differs: this is the ONE knob for where the corpus lives.  The sampler
+# resolves <DARK_FACTORY_ROOT or CWD>/data/load-samples.db and this unit sets
+# no Environment=, so the CWD below IS the root, and
+# scripts/install-load-sampler.sh asks systemd for this very directory to
+# decide which DB to verify.  An EnvironmentFile= carrying DARK_FACTORY_ROOT
+# would still work but splits that into two knobs the installer cannot see
+# agree -- edit this line instead.
 WorkingDirectory=%h/src/dark-factory
-ExecStart=%h/.local/bin/uv run --project sampler python -m sampler
+# --no-sync is load-bearing, not cosmetic.  There is ONE shared root .venv per
+# checkout with every workspace member installed editable into it, and a plain
+# `uv run --project <member>` was measured UNINSTALLING a sibling from it.  At
+# this unit's 5s cadence that is 17,280 env re-syncs a day against the main
+# checkout's venv -- i.e. it would intermittently break running orchestrators
+# and verify runs.
+#
+# --no-sync is also the ONLY flag here, and that is a measured conclusion, not
+# an omission.  A lockfile flag looks tempting beside it; neither does anything
+# once --no-sync is present, because --no-sync skips the lock step along with
+# the sync.  Measured on uv 0.11.6 against a probe project with deliberate
+# lockfile drift:
+#
+#     uv run --locked            -> rc=2, "the lockfile needs to be updated"
+#     uv run --locked --no-sync  -> rc=0, silent
+#     uv run --frozen --no-sync  -> rc=0, lockfile untouched (== --no-sync alone)
+#
+# So --frozen was a no-op, and --locked would be one too: do not "fix" this by
+# reaching for it.  Making drift loud here would mean dropping --no-sync, which
+# is the hazard above.  A 5 s monitoring collector is the wrong place to fail
+# closed on unrelated lockfile drift anyway -- it would take the calibration
+# corpus dark 17,280 times a day.
+ExecStart=%h/.local/bin/uv run --no-sync --project sampler python -m sampler
 
 # Logging goes to journalctl --user -u dark-factory-load-sampler
 StandardOutput=journal

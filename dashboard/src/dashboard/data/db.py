@@ -16,41 +16,16 @@ from pathlib import Path
 from typing import TypeVar
 
 import aiosqlite
+from shared.asyncio_tasks import track_task
 
 logger = logging.getLogger(__name__)
 
 _T = TypeVar('_T')
 
-def track_task(task: asyncio.Task, *registries: set[asyncio.Task]) -> None:
-    """Keep a fire-and-forget *task* alive in every *registries* set until it ends.
-
-    The event loop holds only a WEAK reference to a Task, so one that nothing
-    else references can be garbage-collected mid-flight; membership in a
-    registry is what supplies the strong reference.  The single done-callback
-    installed here removes the task from ALL the registries and consumes its
-    exception ONCE, so asyncio does not log "exception was never retrieved".
-
-    Shared (rather than re-spelled per call site) because this repo now has
-    three of these registries — ``_PENDING_CLOSES``, ``DbPool._pending_closes``
-    and ``_ABANDONED_PROBES`` in dashboard/app.py — and two of them track the
-    SAME task, which previously meant two callbacks running the identical three
-    lines and retrieving the same exception twice.
-    """
-    for registry in registries:
-        registry.add(task)
-
-    def _release(finished: asyncio.Task) -> None:
-        for registry in registries:
-            registry.discard(finished)
-        if not finished.cancelled():
-            finished.exception()  # consume so "never retrieved" isn't logged
-
-    task.add_done_callback(_release)
-
 
 # Fire-and-forget close() tasks for connections that landed with no owner (see
 # DbPool._adopt_or_close).  Registry semantics and why the strong reference is
-# needed: see track_task above.  Mirrors _ABANDONED_PROBES in dashboard/app.py.
+# needed: shared/src/shared/asyncio_tasks.py::track_task.
 _PENDING_CLOSES: set[asyncio.Task] = set()
 
 
@@ -76,14 +51,15 @@ class DbPool:
     Both sets are fixed once at startup (``DashboardConfig.from_env`` reads
     ``DASHBOARD_KNOWN_PROJECT_ROOTS``; ``__post_init__`` resolves them; they
     are never mutated at runtime).  The ``rel-path`` values are fixed literals
-    (``data/orchestrator/runs.db``, ``data/burndown/burndown.db``) plus the
-    six fixed ``@property`` paths on ``DashboardConfig``.  The ``@property``
+    (``data/orchestrator/runs.db``, ``data/burndown/burndown.db``,
+    ``.taskmaster/tasks/tasks.db`` — ``project_dbs.py::TASKS_DB_REL_PATH``)
+    plus the six fixed ``@property`` paths on ``DashboardConfig``.  The ``@property``
     paths (``reconciliation_db``, ``tickets_db``, ``metrics_db``,
     ``write_journal_db``, etc.) are called only with ``config.project_root``,
     never with each root in ``known_project_roots``, so they contribute a
     flat ``+6`` rather than a per-root multiplier.  Therefore::
 
-        |_open_locks| ≤ (1 + len(known_project_roots)) × 2 + 6
+        |_open_locks| ≤ (1 + len(known_project_roots)) × 3 + 6
 
     Per-path lock entries are retained for the process lifetime (cleared only
     in :meth:`close_all`) — this is *intentional*: evicting an entry while
@@ -142,7 +118,8 @@ class DbPool:
         self._closing: dict[aiosqlite.Connection, asyncio.Future[None]] = {}
         # Per-path open locks — prevents duplicate opens for the same path while
         # allowing disjoint paths to open concurrently (no serialisation between
-        # unrelated paths).  Mirrors SqliteTaskBackend._get_connection convention.
+        # unrelated paths).  Mirrors the per-project connect-lock convention of
+        # fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend._get_write_access.
         # Growth is bounded; see class docstring for the structural argument.
         self._open_locks: dict[Path, asyncio.Lock] = {}
         self._open_locks_lock: asyncio.Lock = asyncio.Lock()
@@ -182,7 +159,7 @@ class DbPool:
             #     resumed get() would install a fresh connection into an already-
             #     drained pool, leaking the aiosqlite worker thread indefinitely.
             #     DbPool closes that window here; note the mirrored
-            #     SqliteTaskBackend._get_connection convention has the same window
+            #     SqliteTaskBackend._get_write_access convention has the same window
             #     (not closed there — callers must not race close and get).
             if self._closed:
                 return None
@@ -395,8 +372,8 @@ class DbPool:
         loop = asyncio.get_running_loop()
         close_task = loop.create_task(self._close_once(conn, path))
         # Registered in BOTH sets by one call — see the __init__ comment for why
-        # neither is redundant, and track_task for why one shared done-callback
-        # replaced the two identical ones this used to install.
+        # neither is redundant, and shared/src/shared/asyncio_tasks.py::track_task
+        # for why one done-callback serves both.
         track_task(close_task, _PENDING_CLOSES, self._pending_closes)
 
     @property

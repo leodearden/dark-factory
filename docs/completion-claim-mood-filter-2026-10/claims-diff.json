@@ -1,0 +1,510 @@
+{
+  "population": {
+    "graphs": [
+      "dark_factory",
+      "reify"
+    ],
+    "categories": [
+      "decisions_and_rationale",
+      "temporal_facts"
+    ],
+    "in_scope_records": 10563
+  },
+  "claims_before": 1553,
+  "claims_after": 1525,
+  "records_with_claims_before": 1420,
+  "records_with_claims_after": 1399,
+  "dropped_count": 28,
+  "added_count": 0,
+  "adjudication_counts": {
+    "correct-suppression": 26,
+    "debatable": 1,
+    "recall-loss": 1
+  },
+  "dropped_by_filter_rule": {
+    "attributive": 8,
+    "modal": 1,
+    "non_veridical": 2,
+    "quotation": 8,
+    "temporal": 9
+  },
+  "dropped": [
+    {
+      "record_uuid": "00c4525c-eb1c-467b-a127-2529927e6bd1",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "disposition",
+        "subject": "task",
+        "ref": "1374",
+        "project_id": "dark_factory"
+      },
+      "clause": "Task 1371 can be safely unblocked to pending once Task 1374 is cancelled",
+      "filter_rule": [
+        "temporal"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "'once Task 1374 is cancelled' is the precondition for unblocking 1371, not a report that 1374 was cancelled."
+    },
+    {
+      "record_uuid": "1679751b-e840-46fb-9b0f-e41a6c68e252",
+      "graph_name": "reify",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "5471",
+        "project_id": "reify"
+      },
+      "clause": "(3) PRD2 ε #5471 owns the shipped Bool-balance and stock-size examples, so a new Bool exemplar here would duplicate it",
+      "filter_rule": [
+        "attributive"
+      ],
+      "baseline_verdict": "mismatch (pending)",
+      "adjudication": "correct-suppression",
+      "note": "esc-unverified-claim-5471-1: 'the shipped' modifies the examples; 5471 was pending."
+    },
+    {
+      "record_uuid": "1a0603b3-2095-4e0a-9979-8461b63c840e",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "2062",
+        "project_id": "dark_factory"
+      },
+      "clause": "step 3 (fleet restart) must WAIT until the restart-recovery fix (df 2062) is merged, else the restart itself re-triggers the stale-checkout collision it fixes",
+      "filter_rule": [
+        "temporal"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "'must WAIT until ... (df 2062) is merged' is a future precondition."
+    },
+    {
+      "record_uuid": "1eefbd1e-0439-480a-a3cf-95cb6db7a830",
+      "graph_name": "reify",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "5317",
+        "project_id": "reify"
+      },
+      "clause": "Decision (Leo, 2026-07-21, esc-5317-3): task 5317 (narrow Manifold batch_difference pattern-boolean fast path) was EXPANDED to also own wiring the Manifold route into the shipped `reify build` CLI — chosen over (B) a separate sibling task and (C) folding it into general-route bookmark 5220",
+      "filter_rule": [
+        "attributive"
+      ],
+      "baseline_verdict": "mismatch (pending)",
+      "adjudication": "correct-suppression",
+      "note": "'the shipped `reify build` CLI' describes the CLI, not 5317's work. Task-4853 investigation Class B residual 5317."
+    },
+    {
+      "record_uuid": "29e6daff-93c1-4fd3-b118-1f0648355869",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "791",
+        "project_id": "dark_factory"
+      },
+      "clause": "The five Graphiti edges documenting the Stage 1 blind spot (3a58d184, becaf218, c44c933c, 04923ca2, 9426b0bd) are still valid and should NOT be marked superseded until task 791 is merged",
+      "filter_rule": [
+        "temporal"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "'until task 791 is merged' is a future precondition."
+    },
+    {
+      "record_uuid": "2a928fe7-323e-434c-8176-bc7cd2ca28e4",
+      "graph_name": "reify",
+      "key": {
+        "kind": "filing_dispatch",
+        "subject": "ticket",
+        "ref": "tkt_0RRRC5AASJ9Z630VP4PCN9H376",
+        "project_id": null
+      },
+      "clause": "Together these two probes refute the earlier Graphiti episode 02090224-7bc9-4485-9291-6748e1042ac9 (2026-07-27T08:31:08), which had asserted reify task 5638 \"was re-filed into dark_factory's task tree as ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376\", and corroborate the later episode c36b2b66-d988-4fc2-81ad-d88c3cfe6612 (2026-07-27T08:55:05), which had asserted no dark_factory ticket was ever filed for 5638's content",
+      "filter_rule": [
+        "quotation"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "The writer quotes an earlier episode's assertion in order to refute it."
+    },
+    {
+      "record_uuid": "448d8400-2c46-44f6-9af2-f1007dc455cf",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "3846",
+        "project_id": "dark_factory"
+      },
+      "clause": "Decision (Leo, 2026-08-07): dark_factory task 3846 was filed to give recon's stranded-in-progress finding a landed-on-main check, with three deliberate scope choices worth preserving",
+      "filter_rule": [
+        "attributive"
+      ],
+      "baseline_verdict": "mismatch (deferred)",
+      "adjudication": "correct-suppression",
+      "note": "'a landed-on-main check' names the check being added. Task-4853 investigation residual 3846; the filing_dispatch claim on 3846 is kept."
+    },
+    {
+      "record_uuid": "55bca57e-3147-4327-b7a0-da32aeb5f569",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "2440",
+        "project_id": "dark_factory"
+      },
+      "clause": "Remediation run b3787009 (2026-07-11, memory_consolidator Stage 1) invalidated five Graphiti edges on entities \"Task 2440\" and \"_ensure_stage1_cycle_summary\" that asserted the Stage-1 cycle_summary harness-level structural backstop had already shipped/was wired in, plus a stale theory tying Task 2440's resolution to Task 2448: 55c40343 (\"Task 2440 shipped a harness-level structural backstop for Stage 1\"), 6d905700 (\"Task 2440 shipped a harness-level structural backstop for the memory_consolidator cycle_summary write\"), ea160f72 (\"harness.py's run_full_cycle finally block calls the _ensure_stage1_cycle_summary method\"), 75a2a88f (\"Task 2440 could be re-scoped or closed pending task 2448\"), 8490862f (\"Task 2440's resolution depends on task 2448's outcome\")",
+      "filter_rule": [
+        "quotation"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "Quotes of edges the writer reports as invalidated."
+    },
+    {
+      "record_uuid": "5f0e4367-5cb9-47a8-afdb-249aee37e981",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "3560",
+        "project_id": "dark_factory"
+      },
+      "clause": "KEY GOTCHA: `git branch -d` REFUSES such a branch — \"the branch 'task/3560-skip-attempt' is not fully merged\" — and this refusal is EXPECTED, not a warning worth heeding",
+      "filter_rule": [
+        "quotation"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "A quoted git error message ('... is not fully merged'), which denies the merge anyway."
+    },
+    {
+      "record_uuid": "60882ba8-d3cc-4871-a983-b44ece147364",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "disposition",
+        "subject": "task",
+        "ref": "1638",
+        "project_id": "dark_factory"
+      },
+      "clause": "Rationale: cancelling would block β8 (task 1638 depends on 1637 via the cancelled-dep policy)",
+      "filter_rule": [
+        "attributive"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "'the cancelled-dep policy' names a policy; 1638 is not said to be cancelled."
+    },
+    {
+      "record_uuid": "672d203f-955e-492d-8ad6-9dc14bd0850b",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "filing_dispatch",
+        "subject": "task",
+        "ref": "2519",
+        "project_id": "dark_factory"
+      },
+      "clause": "At decompose (2026-08-05) this was resolved as a deliberate 4-repair + 1-record split rather than an extent-short defect: the fifth live conflation is a UNARY fact (\"Umbrella task 2519 was filed and then cancelled to avoid orphaning its vector\") attached to the `Task 2520` node, which is exactly the PRD's boundary-test row \"Unary fact, no correct target\"",
+      "filter_rule": [
+        "quotation"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "debatable",
+      "note": "The quoted unary fact ('Umbrella task 2519 was filed and then cancelled ...') is cited for being attached to the wrong node; the writer neither asserts nor disputes it."
+    },
+    {
+      "record_uuid": "6e96ec09-4f64-44f3-8b55-b3d73934d695",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "filing_dispatch",
+        "subject": "task",
+        "ref": "5578",
+        "project_id": "dark_factory"
+      },
+      "clause": "Reason: task 5578 is merge-deferred with a queued carrier branch that deletes the list",
+      "filter_rule": [
+        "attributive"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "'a queued carrier branch': the branch is queued, not task 5578."
+    },
+    {
+      "record_uuid": "70afe7d6-f8c6-44a3-bfa7-bbcc745b6649",
+      "graph_name": "reify",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "834",
+        "project_id": "reify"
+      },
+      "clause": "Stage 2 must: (1) reset task 1675 status to pending, (2) add dispatch_blocked=true to task metadata so orchestrator cannot re-dispatch until dark-factory task 834 (git rev-parse guard) is merged",
+      "filter_rule": [
+        "temporal"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "'until dark-factory task 834 ... is merged' is a future precondition."
+    },
+    {
+      "record_uuid": "71a366e9-8091-4dc3-a66b-c4e62e74fd38",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "5455",
+        "project_id": "dark_factory"
+      },
+      "clause": "Rationale: Task 5455 (sweep lifecycle runs.db events) is still pending, and the task text says to add an event only 'if #5455 has landed'",
+      "filter_rule": [
+        "non_veridical"
+      ],
+      "baseline_verdict": "mismatch (pending)",
+      "adjudication": "correct-suppression",
+      "note": "esc-unverified-claim-5455-1: a conditional ('if #5455 has landed') quoted from a task text; the same sentence says 5455 is still pending."
+    },
+    {
+      "record_uuid": "7839ab5d-ca4f-4ed8-8027-e49eac352562",
+      "graph_name": "reify",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "4153",
+        "project_id": "reify"
+      },
+      "clause": "Extraction pipelines must not generate a \"task 4153 complete\" edge until the branch is merged to main",
+      "filter_rule": [
+        "temporal"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "'until the branch is merged to main' is a future precondition; the quoted 'task 4153 complete' is the edge to avoid."
+    },
+    {
+      "record_uuid": "79716ccc-2d47-48c1-97ae-ffb15f20cb33",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "7407",
+        "project_id": "dark_factory"
+      },
+      "clause": "With the tense gate all 5 are kept, and 7407 is still dropped because its scope ('BEFORE #7407 stamps the PRD SHIPPED is the correct order') is present tense",
+      "filter_rule": [
+        "temporal"
+      ],
+      "baseline_verdict": "unverifiable (live status for task 7407 could not be resolved (project='dark_factory'))",
+      "adjudication": "correct-suppression",
+      "note": "This task's own architect memory, quoting the esc-unverified-claim-7407-3 sentence."
+    },
+    {
+      "record_uuid": "7c5484fb-d328-4cc2-a5e9-367ddd7a47f2",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "disposition",
+        "subject": "task",
+        "ref": "3839",
+        "project_id": "dark_factory"
+      },
+      "clause": "RELATED DECISION, same session: the know_live scoped suppression memory 53236105 was deliberately LEFT IN PLACE rather than retired, even though task 4381's details said it \"can be retired once this lands\" — its own stated re-surface condition is \"dark_factory:3839 closed without landing the fix (or cancelled)\", and 3839 is merely pending, so the suppression is still valid on its own terms",
+      "filter_rule": [
+        "quotation"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "A quoted re-surface condition; the same sentence says 3839 is merely pending."
+    },
+    {
+      "record_uuid": "811e4a18-4d52-4d48-bcc9-b1c4501d1eae",
+      "graph_name": "reify",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "5422",
+        "project_id": "reify"
+      },
+      "clause": "esc-5603-1: two episodes carried a fabricated \"task 5422's de-flake fix was applied\" narrative from which 5 false edges had already been extracted",
+      "filter_rule": [
+        "quotation"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "esc-5603-1: the writer quotes a narrative it calls fabricated."
+    },
+    {
+      "record_uuid": "99a28dac-3f2b-45de-8785-032fc76984b7",
+      "graph_name": "reify",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "929",
+        "project_id": "reify"
+      },
+      "clause": "Task 1005 was created as a review-suggestions follow-up to Task 929, to be addressed once Task 929 is confirmed merged",
+      "filter_rule": [
+        "temporal"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "'once Task 929 is confirmed merged' is future."
+    },
+    {
+      "record_uuid": "9dc32172-8a88-41ce-b2c3-61f42dbb88c9",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "3866",
+        "project_id": "dark_factory"
+      },
+      "clause": "[SUPERSEDED 2026-08-09 (Stage 1 remediation, run bcdbf2ca-b61a-415b-8d5f-aa37819f794b): this episode's claim that task 3866 settled on \"orchestrator/tests/_workflow_helpers.py same_module_siblings\" as a landed constructor is INCORRECT",
+      "filter_rule": [
+        "attributive"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "'a landed constructor' sits inside a claim the writer marks INCORRECT."
+    },
+    {
+      "record_uuid": "a2c5ee50-5139-4cc8-9950-69d0656cbf89",
+      "graph_name": "reify",
+      "key": {
+        "kind": "filing_dispatch",
+        "subject": "task",
+        "ref": "4065",
+        "project_id": "reify"
+      },
+      "clause": "Human decision required to relax the acceptance bound before task 4065 can be dispatched",
+      "filter_rule": [
+        "modal"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "'before task 4065 can be dispatched': not dispatched yet."
+    },
+    {
+      "record_uuid": "b94a4690-ceac-46a6-ba50-1d0ddc54ac6a",
+      "graph_name": "reify",
+      "key": {
+        "kind": "disposition",
+        "subject": "task",
+        "ref": "5023",
+        "project_id": "reify"
+      },
+      "clause": "But PTODO excludes .md entirely (§6.8), so a #5023 cite in the schema note would rot silently the day #5023 is cancelled",
+      "filter_rule": [
+        "temporal"
+      ],
+      "baseline_verdict": "mismatch (pending)",
+      "adjudication": "correct-suppression",
+      "note": "esc-unverified-claim-5023-2: 'the day #5023 is cancelled' is hypothetical."
+    },
+    {
+      "record_uuid": "c37b0c2b-bebb-4077-903f-e0f1fe77576b",
+      "graph_name": "reify",
+      "key": {
+        "kind": "filing_dispatch",
+        "subject": "task",
+        "ref": "3540",
+        "project_id": "reify"
+      },
+      "clause": "Its dependency on SIR-α = task #3540 (Value::StructureInstance hook) remains valid if re-filed",
+      "filter_rule": [
+        "non_veridical"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "'remains valid if re-filed' is conditional."
+    },
+    {
+      "record_uuid": "c49ec523-9593-4895-a94d-152fcf8a7e4c",
+      "graph_name": "reify",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "4785",
+        "project_id": "reify"
+      },
+      "clause": "Rationale: a per-occurrence (occurrence-tree) model is more spec-faithful and wires the dropped sub-body objectives, BUT per-occurrence objective resolution overlaps M-WHOLE's (whole-model-objective-coupling.md, task #4785) already-owned \"merged cross-scope ResolutionProblem builder\" (its task β) — adopting it in F-inherit would recreate the G4 reciprocal-ownership failure",
+      "filter_rule": [
+        "quotation"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "A quoted noun phrase ('merged cross-scope ResolutionProblem builder') naming a component."
+    },
+    {
+      "record_uuid": "cbaa9754-61d0-476a-ba00-c49b03817357",
+      "graph_name": "reify",
+      "key": {
+        "kind": "filing_dispatch",
+        "subject": "task",
+        "ref": "4345",
+        "project_id": "reify"
+      },
+      "clause": "Task 4345 extended this so the dispatched agent's .mcp.json is wired to the per-worktree endpoint automatically",
+      "filter_rule": [
+        "attributive"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "'the dispatched agent's .mcp.json': the agent is dispatched, not task 4345 filed."
+    },
+    {
+      "record_uuid": "cf752dbf-8197-49be-b086-40cda00a22ed",
+      "graph_name": "reify",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "7407",
+        "project_id": "reify"
+      },
+      "clause": "Doing it BEFORE #7407 stamps the PRD SHIPPED is the correct order",
+      "filter_rule": [
+        "temporal"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "esc-unverified-claim-7407-3: 'BEFORE #7407 stamps the PRD SHIPPED' is a future ordering."
+    },
+    {
+      "record_uuid": "ecf2aebc-b435-406b-8bb9-b5c6d8318a7f",
+      "graph_name": "reify",
+      "key": {
+        "kind": "filing_dispatch",
+        "subject": "task",
+        "ref": "5200",
+        "project_id": "reify"
+      },
+      "clause": "(2) prior memory 0f46febf-75f7-4478-8bed-91512558a48f (task 5200 completion record) listed \"downstream implementation tasks queued from this design\" as 5232/5233/5234/5235/5236 only",
+      "filter_rule": [
+        "quotation"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "correct-suppression",
+      "note": "A quoted phrase about OTHER tasks being queued."
+    },
+    {
+      "record_uuid": "eedb43e9-fbf0-48b9-a58b-a758e0544cf6",
+      "graph_name": "dark_factory",
+      "key": {
+        "kind": "applied_work",
+        "subject": "task",
+        "ref": "2633",
+        "project_id": "dark_factory"
+      },
+      "clause": "Decision that was validated: When my innocent spawn-skill merge was blocked by a red main root-caused to task 2633 (a landed clamp breaking two stale golden tests), I deliberately did NOT heal main myself by editing task 2633's tests — because df#2633 was under an owner-ratification hold (its merge-completion/auto-merge autonomy expansion needed owner sign-off), so reconciling its test contract was the owner's call, not mine",
+      "filter_rule": [
+        "attributive"
+      ],
+      "baseline_verdict": "verified",
+      "adjudication": "recall-loss",
+      "note": "'task 2633 (a landed clamp ...)' is an appositive that does assert 2633's clamp landed."
+    }
+  ],
+  "added": []
+}

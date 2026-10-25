@@ -18,8 +18,13 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.services.memory_service import MemoryService
 
-from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
-from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
+
+from fused_memory.backends.task_backend_errors import (
+    DuplicateCandidateKeyError,
+    LeakedEnvelopeMarkupError,
+)
+from fused_memory.middleware.task_creation_journal import read_run_creation_outcomes
 from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -28,6 +33,10 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.models.scope import ProjectRoot, ProjectScope, resolve_main_checkout
+from fused_memory.reconciliation.blocked_gate_audit_section import (
+    render_blocked_gate_audit_section,
+)
+from fused_memory.reconciliation.capped_task_list import render_capped_task_list
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
@@ -41,6 +50,11 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_blocked_snapshot_findings,
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
+    filter_snapshot_stat_edge_findings,
+)
+from fused_memory.reconciliation.flag_record_contract import STAGE1_FLAG_MARKER_KIND
+from fused_memory.reconciliation.live_workflow_section import (
+    render_live_workflow_section,
 )
 from fused_memory.reconciliation.mem0_tombstone import (
     is_protected_audit_record,
@@ -51,12 +65,16 @@ from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
     _STAGE3_PROJECT_ID_GUIDELINE,
+    FLAG_FOR_STAGE2_MARKER_KIND,
 )
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.reconciliation.recon_pool_map import (
     STAGE2_CYCLE_SUMMARY_RECON_POOL as _STAGE2_CYCLE_SUMMARY_RECON_POOL,
 )
-from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stage2_counter_grounding import (
+    ground_stage2_counters,
+)
+from fused_memory.reconciliation.stages.base import BaseStage, RequiredSection
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_GROWTH,
     STATE_ACTIVE,
@@ -65,6 +83,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
     expire_entity_standing_decision,
 )
 from fused_memory.reconciliation.summary_pool import (
+    trailing_incomplete_agent_run_ids,
     write_cycle_summary,
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
@@ -85,17 +104,10 @@ from fused_memory.reconciliation.task_filter import (
     format_task_list,
     id_key,
     render_active_section,
+    render_retained_done_tasks,
     select_done_since_boundary,
 )
-from fused_memory.services.live_workflow_detector import (
-    corroboration_for_task,
-    detect_live_workflow,
-    is_pure_gate_metadata,
-)
-from fused_memory.services.orchestrator_detector import (
-    is_orchestrator_live_for,
-    orchestrator_started_at,
-)
+from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.utils.async_utils import gather_collect
 
 try:
@@ -286,127 +298,6 @@ async def _acknowledge_resolved_stage1_markers(
         return 0
 
 
-#: resolve_ticket statuses that constitute a confirmed task creation (task 3046).
-_TASK_CREATED_SUCCESS_STATUSES: frozenset[str] = frozenset({'created', 'combined'})
-
-
-def _count_valid_task_created_records(
-    records: object,
-    default_project_id: str | None = None,
-) -> int:
-    """Return the deduped count of confirmed task creations in *records* (task 3046).
-
-    *records* is ``report.stats['task_created_records']`` — the action-shaped
-    ground truth the '## Task-Creation Accounting' prompt section mandates
-    Stage 2 append to at the moment each ``resolve_ticket`` call confirms a
-    creation, modeled directly on ``flag_deleted_records``. A record counts
-    only when its ``status`` (case/whitespace-insensitive) is ``created`` or
-    ``combined`` AND it carries a non-empty ``task_id``; ``failed`` is NEVER
-    counted regardless of whether a ``task_id`` is present.
-
-    This is the ``resolve_ticket``-confirmed SUBSET of the '## Verifying Task
-    Operations' confirmation rule, not the whole of it: that section also lets
-    an agent count a creation via a ``get_task`` fallback when
-    ``resolve_ticket``'s ``status`` is neither ``created``/``combined``/
-    ``failed`` but a ``task_id`` is present and a follow-up ``get_task`` call
-    verifies it. That fallback path has no dedicated ``task_created_records``
-    status value and is intentionally NOT counted here — it still
-    contributes to the agent's own self-reported ``tasks_created``, and this
-    helper's result is only ever used to raise that self-report, never lower
-    it, so a ``get_task``-verified creation is never double-counted and never
-    suppressed by this helper (task-3046 amendment: '## Verifying Task
-    Operations' intentionally covers a strictly larger set of countable
-    creations than this Python subset does — the two are not claimed to be
-    equivalent).
-
-    Deduplication is keyed on ``(project_id, str(task_id))``, NOT on
-    ``task_id`` alone: Cross-Project Routing means the same numeric id can
-    legitimately be filed under two different projects in the same cycle
-    (Taskmaster ids are per-project), and that is two distinct tasks, not a
-    duplicate report of one. ``project_id`` is normalised the same way as
-    ``task_id`` — ``str(...).strip()`` — so ``' dark_factory'`` and
-    ``'dark_factory'`` collapse to one key instead of inflating the count
-    (task-3046 amendment). A record with no ``project_id`` (or one that is
-    blank after stripping) falls back to *default_project_id* — typically
-    the caller's own ``self.project_id`` — so an omitted field cannot
-    masquerade as a second, distinct cross-project filing of the same task.
-
-    Best-effort and non-raising throughout, mirroring
-    ``_acknowledge_resolved_stage1_markers`` above: *records* must be a
-    non-empty ``list`` or this returns ``0``; non-``dict`` entries and
-    entries that raise while being inspected are silently skipped rather
-    than aborting the count — a malformed record degrades to "not counted",
-    never to an exception that would corrupt an otherwise-good stage report.
-    """
-    if not isinstance(records, list) or not records:
-        return 0
-
-    seen: set[tuple[str | None, str]] = set()
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        try:
-            status = record.get('status')
-            if (
-                not isinstance(status, str)
-                or status.strip().lower() not in _TASK_CREATED_SUCCESS_STATUSES
-            ):
-                continue
-            task_id = record.get('task_id')
-            if task_id is None:
-                continue
-            task_id_str = str(task_id).strip()
-            if not task_id_str:
-                continue
-            project_id = record.get('project_id')
-            if project_id is None:
-                project_id_str = default_project_id
-            else:
-                project_id_str = str(project_id).strip() or default_project_id
-        except Exception:
-            continue
-        seen.add((project_id_str, task_id_str))
-
-    return len(seen)
-
-
-def _coerce_tasks_created_count(value: object) -> int:
-    """Best-effort int coercion for a self-reported ``tasks_created`` value (task 3046).
-
-    Stage 2 self-reports ``tasks_created`` as free-form LLM JSON, so it can
-    plausibly arrive as a clean ``int``, a numeric ``str`` (``"3"``), or a
-    ``float`` (``3.0``) instead. This coerces all three to ``int``. A
-    ``bool`` is explicitly rejected — never trusted as a count, even though
-    ``isinstance(True, int)`` holds in Python — and anything that fails
-    coercion (``None``, a non-numeric string, a list, ...) falls back to
-    ``0``, exactly like an absent value.
-
-    Without this, a non-``int`` self-report would collapse to ``0`` under a
-    bare ``isinstance(x, int)`` check, and a smaller record-derived
-    ``observed`` count could then look like an UNDERCOUNT and overwrite a
-    legitimately larger self-report — a silent downward move the
-    upward-only repair is explicitly designed never to make (task 2230 /
-    W5-mu).
-    """
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        stripped = value.strip()
-        try:
-            return int(stripped)
-        except ValueError:
-            pass
-        try:
-            return int(float(stripped))
-        except ValueError:
-            return 0
-    return 0
-
-
 def _marker_is_within_run_window(created_at: object, run_window_start: object) -> bool:
     """Return True iff *created_at* falls within the current run window.
 
@@ -481,9 +372,10 @@ class Stage2FlagPartition(NamedTuple):
         stale_mismatched_run_id_ids: ``id`` strings for records whose
             ``metadata.run_id`` is present and truthy but does not match the
             current ``run_id`` AND whose ``created_at`` is out of the run
-            window.  These are normal prior-cycle residue, excluded from what
-            is rendered to the Stage 2 LLM and reaped the same way (see
-            ``stale_missing_run_id_ids`` above).
+            window, excluding ``carried_forward_ids``.  These are normal
+            prior-cycle residue, excluded from what is rendered to the Stage 2
+            LLM and reaped the same way (see ``stale_missing_run_id_ids``
+            above).
         rescued_ids: ``id`` strings for markers rescued by the run-window guard
             (a subset of ``current``).  Non-empty indicates Stage 1 producer
             drift within the CURRENT cycle — the LLM omitted or mis-stamped
@@ -492,12 +384,18 @@ class Stage2FlagPartition(NamedTuple):
             exclusively by the two rescue branches inside
             :func:`_query_stage2_flags`; this is the single source of truth for
             the rescued count (task-1381).
+        carried_forward_ids: ``id`` strings for prior-run markers routed to
+            ``current`` because their run's Stage 2 agent did not complete and
+            none has completed since (a subset of ``current``).  The single
+            source for the ``stage2_markers_carried_forward`` stat (task 5984;
+            see plans/recon-stage-startup-wedge-rca-2026-09-27.md).
     """
 
     current: list[dict]
     stale_missing_run_id_ids: list[str]
     stale_mismatched_run_id_ids: list[str]
     rescued_ids: list[str]
+    carried_forward_ids: list[str]
 
     @property
     def stale_all_ids(self) -> list[str]:
@@ -510,6 +408,8 @@ async def _query_stage2_flags(
     project_id: str,
     current_run_id: str,
     run_window_start: datetime | None = None,
+    *,
+    carry_forward_run_ids: Collection[str] = frozenset(),
 ) -> Stage2FlagPartition:
     """Query Mem0 for active Stage-2-destined flags and partition by run_id.
 
@@ -518,7 +418,7 @@ async def _query_stage2_flags(
     alias and is not checked here; see task-1139 reviewer note on dead code).
     Any other memories are discarded.
 
-    Results are partitioned into four groups:
+    Results are partitioned into five groups:
 
     * **current** — full dict records whose ``metadata.run_id`` is present,
       non-empty, and matches ``current_run_id`` after ``str()`` coercion.
@@ -540,6 +440,10 @@ async def _query_stage2_flags(
       the run-window guard; see :attr:`Stage2FlagPartition.rescued_ids` for
       full semantics.  This is the single source of truth for the rescued
       count (task-1381).
+    * **carried_forward_ids** — subset of **current** containing out-of-window
+      markers whose string ``run_id`` is in *carry_forward_run_ids* (runs whose
+      Stage 2 agent did not complete; task 5984).  The run-window rescue takes
+      precedence, so each marker counts as rescued, carried or stale, never two.
 
     Both stale buckets are excluded from what is rendered to the Stage 2 LLM;
     residue is reaped by the in-cycle Mem0 age-GC sweep
@@ -577,7 +481,7 @@ async def _query_stage2_flags(
         carries the top-N risk — see follow-up task for a proper
         ``scroll_by_metadata`` API on Mem0Backend.
 
-    Returns ``([], [], [], [])`` on search failure (best-effort; logs WARNING).
+    Returns ``([], [], [], [], [])`` on search failure (best-effort; logs WARNING).
     """
     try:
         results = await memory_service.search(
@@ -600,7 +504,7 @@ async def _query_stage2_flags(
             'skipping active-query path this cycle',
             extra={'project_id': project_id},
         )
-        return Stage2FlagPartition([], [], [], [])
+        return Stage2FlagPartition([], [], [], [], [])
 
     if len(results) == 100:
         logger.warning(
@@ -615,6 +519,7 @@ async def _query_stage2_flags(
     stale_missing_run_id_ids: list[str] = []
     stale_mismatched_run_id_ids: list[str] = []
     rescued_ids: list[str] = []
+    carried_forward_ids: list[str] = []
 
     def _rescue(flag: dict, rid: str) -> None:
         """Route a rescued marker to current and record its id.
@@ -695,6 +600,9 @@ async def _query_stage2_flags(
                     extra={'project_id': project_id, 'current_run_id': run_id_str, 'marker_id': r.id},
                 )
                 _rescue(flag_dict, r.id)
+            elif isinstance(_rid_val, str) and _rid_val in carry_forward_run_ids:
+                current_flags.append(flag_dict)
+                carried_forward_ids.append(r.id)
             else:
                 if run_window_start is not None and (
                     not _created_at_val or not isinstance(_created_at_val, str)
@@ -719,7 +627,13 @@ async def _query_stage2_flags(
                 'current_run_id': run_id_str,
             },
         )
-    return Stage2FlagPartition(current_flags, stale_missing_run_id_ids, stale_mismatched_run_id_ids, rescued_ids)
+    return Stage2FlagPartition(
+        current_flags,
+        stale_missing_run_id_ids,
+        stale_mismatched_run_id_ids,
+        rescued_ids,
+        carried_forward_ids,
+    )
 
 
 def _query_recon_report_findings(
@@ -736,6 +650,21 @@ def _query_recon_report_findings(
     do NOT pass through ``filter_suppressed`` — a ``stage1_flag_suppression``
     record can never hide a ``systemic_pattern`` finding from Stage 2 through
     this path.
+
+    Findings carrying ``superseded_by`` ARE dropped here (task-4653).  A
+    supersession is not an external suppression but an explicit in-run
+    retirement asserted by a LATER finding of the same run, so re-injecting
+    one would raise a claim the run itself has already refuted as a live
+    instruction.  The filter lives at this poll site, not in
+    ``get_findings_for_run`` — same precedent that method's own docstring
+    records for the task-2453 guard — so the channel stays genuinely raw.
+
+    Dropping rather than merely deprioritising is load-bearing:
+    ``assemble_payload``'s poll loop dedups FIRST-WINS on signature/content
+    fingerprint, so a superseded finding appearing earlier in this run-scoped
+    list would SHADOW its own replacement; and ``_format_flagged`` truncates
+    the TAIL at a fixed char budget, so a retained-but-dead row can also push
+    the live one off the end.
 
     Reached via duck-typed method call (no import of ``ReconReportState`` —
     mirrors ``base.py``'s ``_active_rrs.get_assembled_report`` usage, avoiding
@@ -757,7 +686,11 @@ def _query_recon_report_findings(
             extra={'run_id': run_id},
         )
         return []
-    return [f for f in findings if f.get('category') in categories]
+    return [
+        f
+        for f in findings
+        if f.get('category') in categories and not f.get('superseded_by')
+    ]
 
 
 def _compute_stale_flags(
@@ -892,16 +825,17 @@ _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE = 'stage2_persistence_marker_gc_sweep
 # under {'source': 'stage1_flag_marker'} vs 1 under
 # {'kind': 'stage1_flag_marker'} — marker a5732b3b, agent_id
 # 'recon-stage-task_knowledge_sync', 37 days old at measurement time).
-# That write is now REJECTED outright by the task-2596 add_memory gate
-# (server/tools.py:2978-2993, error flag_marker_write_blocked) for any
-# 'recon-stage-*' agent_id — the leaked marker predates that gate rather
-# than evidencing a live bypass; the only residual write hole is a
-# non-'recon-stage-*' agent_id, which the gate's prefix check does not
-# reach. See _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS below. 14 days
+# That write is now REJECTED outright for any 'recon-stage-*' agent_id
+# (flag_record_contract.py::recon_stage_flag_kind_refusal, error
+# flag_marker_write_blocked), and any other new marker write is normalized
+# to carry both keys at the MemoryService seam
+# (flag_record_contract.py::normalize_flag_record_metadata, task 4863) — the
+# leaked marker predates both rather than evidencing a live bypass. See
+# _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS below. 14 days
 # reuses the STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS / task-1944 convention
 # as a conservative, consistent aging cutoff rather than deleting
 # immediately.
-_STAGE1_FLAG_MARKER_MEM0_SOURCE = 'stage1_flag_marker'
+_STAGE1_FLAG_MARKER_MEM0_SOURCE = STAGE1_FLAG_MARKER_KIND
 STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS: int = 14
 _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
 
@@ -913,12 +847,13 @@ _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
 # agent via the add_memory MCP tool, which set 'kind' but omitted 'source'
 # entirely — the same un-normalized-LLM-metadata failure class task 2966
 # already documented for flag_for_stage2 (see the type-drift note below).
-# That specific write shape now predates the task-2596 add_memory gate
-# (server/tools.py:2978-2993), which rejects it outright for any
-# 'recon-stage-*' agent_id; the residual write hole is a
-# non-'recon-stage-*' agent_id, which nothing at the add_memory boundary
-# normalizes. A {'source': ...}-only filter therefore silently misses that
-# cohort forever: measured live counts are know_live: 0 under
+# That write shape is now refused for any 'recon-stage-*' agent_id, and
+# every other new write is normalized to carry both keys at the
+# MemoryService seam (flag_record_contract.py::normalize_flag_record_metadata,
+# task 4863). Records written before that normalization still carry only one
+# key, so this dual-spelling union remains the safety net for them: a
+# {'source': ...}-only filter would silently miss that legacy cohort
+# forever: measured live counts are know_live: 0 under
 # {'source': 'stage1_flag_marker'} vs 1 under {'kind': 'stage1_flag_marker'}.
 # Qdrant payload filters are AND-only within one dict, so a
 # source=X OR kind=X predicate cannot be expressed in a single call — each
@@ -995,14 +930,16 @@ _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS: tuple[dict, ...] = (
 # deliberately sequenced AFTER task 4375 (dependency 4374 -> 4375, ratified
 # 2026-08-25): landing it first would have roughly DOUBLED the rate of the
 # measured, irreversible audit-record loss (288 records destroyed, 40 of them
-# kind='cadence_check'). With 4375 on main the age cutoff is only gate 1 of
-# the four-part composite eligibility rule in _sweep_stale_mem0_pool — the
-# task-3041 protected-mirror invariant (gate 2), PROTECTED_AUDIT_KINDS
-# (gate 3) and the terminal-task closure gate (gate 4, the primary defence)
-# all still apply unchanged at 7 days, so a record this TTL newly exposes is
-# reaped only if it is ALSO unprotected and cites a task confirmed terminal.
+# kind='cadence_check'). With 4375 on main the age cutoff is only the first
+# gate of a composite eligibility rule, so a record this TTL newly exposes is
+# reaped only if it ALSO clears the remaining gates, the terminal-task closure
+# gate being the primary defence.
 # See _sweep_stale_mem0_flag_for_stage2_markers' docstring for the full rule.
 _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS: int = 7
+# A flag_for_stage2 marker citing no task may be retired once older than this.
+# It sits well past the TTL above because no task closure can vouch that such
+# a member is a relay marker (task 4995).
+_FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS: int = 30
 _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE = 'flag_for_stage2_gc_sweep'
 _FLAG_FOR_STAGE2_ENUM_FILTERS: dict = {'flag_for_stage2': True}
 
@@ -1250,6 +1187,58 @@ async def _gc_recon_markers(
         return 0
 
 
+class _TasklessRetirement(NamedTuple):
+    """When a pool member citing no task may pass the terminal-closure gate (task 4995)."""
+
+    max_age_days: int
+    marker_kind: str
+
+    def permits(self, metadata, created_at: datetime, now: datetime) -> bool:
+        # The kind arm mirrors
+        # fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason (task 5286);
+        # == rather than set membership, so an unhashable kind cannot raise.
+        if not isinstance(metadata, dict):
+            return False
+        kind = metadata.get('kind')
+        if kind is not None and kind != self.marker_kind:
+            return False
+        return created_at < now - timedelta(days=self.max_age_days)
+
+
+_FLAG_FOR_STAGE2_TASKLESS_RETIREMENT = _TasklessRetirement(
+    max_age_days=_FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS,
+    marker_kind=FLAG_FOR_STAGE2_MARKER_KIND,
+)
+
+
+def _cited_task_key(metadata) -> str:
+    """The stripped ``metadata['task_id']``, or ``''`` when the member cites no task."""
+    task_id = metadata.get('task_id') if isinstance(metadata, dict) else None
+    return '' if task_id is None else str(task_id).strip()
+
+
+def _closure_permits_retirement(
+    metadata,
+    created_at: datetime,
+    *,
+    terminal_ids: frozenset[str],
+    taskless_retirement: _TasklessRetirement | None,
+    now: datetime,
+) -> bool:
+    """The terminal-closure gate's verdict on one age-stale member (tasks 4375, 4995).
+
+    A member citing a task passes only on an exact-string match against
+    *terminal_ids*, so a comma-joined or non-Taskmaster id never does. A
+    member citing no task passes only under *taskless_retirement*.
+    """
+    key = _cited_task_key(metadata)
+    if key:
+        return key in terminal_ids
+    return taskless_retirement is not None and taskless_retirement.permits(
+        metadata, created_at, now,
+    )
+
+
 async def _sweep_stale_mem0_pool(
     memory_service,
     project_id: str,
@@ -1264,6 +1253,7 @@ async def _sweep_stale_mem0_pool(
     count_short_circuit: bool = False,
     enum_filters: dict | Sequence[dict] | None = None,
     terminal_task_ids: Collection[str] | None = None,
+    taskless_retirement: _TasklessRetirement | None = None,
 ) -> int:
     """Shared age-GC skeleton for a single-source Mem0 marker pool.
 
@@ -1345,34 +1335,32 @@ async def _sweep_stale_mem0_pool(
       (:func:`_sweep_stale_persistence_markers`,
       :func:`_sweep_stale_mem0_flag_markers`), which are age-only by design.
     - An EMPTY collection means "gate active, nothing is terminal" and
-      therefore retires nothing this cycle. :func:`_resolve_terminal_task_ids`
-      is explicitly fail-safe to ``[]`` on a falsy taskmaster, a raising
-      ``get_statuses``, or an unexpected result shape — so a Taskmaster outage
-      degrades to a FULL KEEP, not to unconditional age-deletion during
-      exactly the window in which nothing can be verified. Collapsing the two
-      sentinels would invert that.
+      therefore retires no task-citing member this cycle.
+      :func:`_resolve_terminal_task_ids` is explicitly fail-safe to ``[]`` on
+      a falsy taskmaster, a raising ``get_statuses``, or an unexpected result
+      shape — so a Taskmaster outage degrades to a FULL KEEP of task-citing
+      members, not to unconditional age-deletion during exactly the window in
+      which nothing can be verified. Collapsing the two sentinels would invert
+      that.
 
     Matching is exact-string against ``str(task_id).strip()``, deliberately
     reusing ``_gc_recon_markers``' documented precedent and its consequence: a
     marker whose stored ``task_id`` is a comma-joined multi-task list never
     matches even when every cited task is terminal, and is KEPT. So is a
-    marker with no ``task_id`` at all, an empty one, or a non-Taskmaster
-    pseudo-id. That is a KEEP-direction leak and it is deliberate — this
-    module's documented posture is "uncertain => keep, never delete on
-    partial/failed information", and bounded recoverable growth outranks
-    permanent loss.
+    non-Taskmaster pseudo-id. That is a KEEP-direction leak and it is
+    deliberate — this module's documented posture is "uncertain => keep, never
+    delete on partial/failed information", and bounded recoverable growth
+    outranks permanent loss.
 
-    **The leak is SIZED, not merely asserted bounded** (amendment pass;
-    reviewer finding robustness/unbounded-growth, which correctly noted the
-    original census measured ``kind`` and ``source`` coverage but never
-    ``task_id``). Direct Qdrant scroll of every live ``flag_for_stage2`` pool,
-    2026-09-02: **56 live records across 5 projects, 41 (73%) carry a
-    non-empty ``task_id`` and 15 (27%) do not** — dark_factory 3/11, reify
-    12/24, autopilot_video 0/12, know_live 0/9, solar_challenge_platform 0
-    (pool empty). So the permanently-un-retireable cohort is a minority of the
-    pool, and the sweep still retires the ~73% majority once their cited task
-    closes; it does not degrade to retiring nothing. The 27% is real growth
-    and is why the aggregate WARNING below exists.
+    A member citing NO task (a missing, ``None`` or empty ``task_id``) has no
+    closure to wait for. It is KEPT unless the caller passes
+    *taskless_retirement*, under which it is retired once past that policy's
+    age ceiling, provided it declares no ``kind`` or the policy's
+    ``marker_kind``. Comma-joined, pseudo-id and open-task citations are still
+    KEPT at any age.
+
+    The task-less cohort, 15 of 56 live ``flag_for_stage2`` records in the
+    2026-09-02 census, now has that bounded path (task 4995).
 
     The matching HISTORICAL census — ``task_id`` coverage on the 289 records
     this sweep already destroyed — is **unmeasurable, permanently**:
@@ -1386,10 +1374,9 @@ async def _sweep_stale_mem0_pool(
 
     The leak is surfaced, not hidden: when the gate withholds at
     least one AGE-STALE member, ONE aggregate WARNING per sweep names the
-    retained count, so a persistently growing number becomes visible as the
-    signal that this pool needs a real closure path for task_id-less markers.
+    retained count, so a persistently growing number becomes visible.
     The gate is evaluated only for members that already cleared the age
-    cutoff, so that count means "old enough to retire but cannot be" and never
+    cutoff, so that count means "old enough to retire but withheld" and never
     "not yet old enough" — a still-young marker citing an open task is the
     healthy steady state of a live pool and must not inflate the signal.
 
@@ -1476,6 +1463,11 @@ async def _sweep_stale_mem0_pool(
             See the "Terminal-task-closure gate" note above for the
             ``None``-vs-``[]`` distinction and the deliberate KEEP-direction
             consequences.
+        taskless_retirement: Opt-in policy under which an age-stale member
+            citing no task may pass the closure gate (task 4995). ``None``
+            (default) keeps every such member. Has no effect when
+            *terminal_task_ids* is ``None``, because then every age-stale
+            member is already eligible.
 
     Returns:
         Number of memories successfully deleted (0 if nothing is stale, on
@@ -1640,7 +1632,8 @@ async def _sweep_stale_mem0_pool(
                 extra={'project_id': project_id, 'run_id': run_id},
             )
 
-    cutoff = _assume_utc(now or datetime.now(UTC)) - timedelta(days=max_age_days)
+    reference_now = _assume_utc(now or datetime.now(UTC))
+    cutoff = reference_now - timedelta(days=max_age_days)
 
     # Full member dicts, not bare ids: the tombstone write below needs the
     # victim's metadata/created_at at classification time (task 3041). Kept
@@ -1748,22 +1741,15 @@ async def _sweep_stale_mem0_pool(
             #   The gate is a `continue` either way, so the SET OF DELETED
             #   RECORDS is identical under either ordering — only the
             #   diagnostic's meaning changes.
-            #
-            # Exact-string match on the stripped task_id, reusing
-            # _gc_recon_markers' precedent verbatim — so a comma-joined
-            # multi-task task_id, a non-Taskmaster pseudo-id, an empty string
-            # and a missing key all fail the test and are KEPT. Never raises
-            # on a weird payload.
-            if terminal_ids is not None:
-                raw_task_id = (
-                    member_metadata.get('task_id')
-                    if isinstance(member_metadata, dict)
-                    else None
-                )
-                key = str(raw_task_id).strip() if raw_task_id is not None else ''
-                if not key or key not in terminal_ids:
-                    retained_unclosed += 1
-                    continue
+            if terminal_ids is not None and not _closure_permits_retirement(
+                member_metadata,
+                created_at,
+                terminal_ids=terminal_ids,
+                taskless_retirement=taskless_retirement,
+                now=reference_now,
+            ):
+                retained_unclosed += 1
+                continue
 
             stale_members.append(member)
 
@@ -1803,9 +1789,10 @@ async def _sweep_stale_mem0_pool(
     if retained_unclosed > 0:
         # Retained-unclosed diagnostic (task 4375). The gate's KEEP direction
         # is deliberate and correct — permanent loss outranks bounded,
-        # recoverable growth — but a marker with no task_id, a pseudo-id, or a
-        # comma-joined task_id can now NEVER be retired, so the cohort only
-        # grows. Surfaced rather than hidden, per the project's
+        # recoverable growth — but a marker citing a pseudo-id or a
+        # comma-joined task_id can NEVER be retired, and one citing no task
+        # waits out a longer ceiling or, declaring a foreign kind, is kept
+        # forever (task 4995). Surfaced rather than hidden, per the project's
         # loud-over-silent-degradation invariant.
         #
         # Modelled on the task-3915 under-tagged-drift block above: purely
@@ -1816,11 +1803,11 @@ async def _sweep_stale_mem0_pool(
         try:
             logger.warning(
                 'reconciliation.%s: RETAINED %d age-stale %s record(s) — their '
-                'referencing task is not terminal, or they cite no resolvable '
-                'task id (missing/empty/comma-joined/non-Taskmaster). This is '
-                'the deliberate fail-safe KEEP direction, not a failure; a '
-                'persistently growing count means this pool needs a closure '
-                'path for task_id-less markers (task 4375).',
+                'cited task is not terminal, their task id is unresolvable '
+                '(comma-joined/non-Taskmaster), or they cite no task and are '
+                'younger than the task-less ceiling or declare a foreign kind. '
+                'This is the deliberate fail-safe KEEP direction, not a '
+                'failure (tasks 4375, 4995).',
                 log_name, retained_unclosed, source,
                 extra={
                     'project_id': project_id,
@@ -2182,7 +2169,9 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
     3. Its ``kind`` is not in ``mem0_tombstone.PROTECTED_AUDIT_KINDS`` (task
        4375, Part B).
     4. Its ``task_id`` is confirmed TERMINAL via *terminal_task_ids* (task
-       4375, Part A).
+       4375, Part A) or, when it cites NO task, it is older than
+       ``_FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS`` and declares no ``kind`` or
+       ``FLAG_FOR_STAGE2_MARKER_KIND`` (task 4995).
 
     Gate 4 is the PRIMARY defence and gate 3 is defence in depth for the
     residual intersection, not the other way round: every one of the 40
@@ -2241,24 +2230,121 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
         Number of memories successfully deleted (0 if nothing is stale, on
         enumeration failure, or on a confirmed-empty count short-circuit).
     """
-    swept = await _sweep_stale_mem0_pool(
+    swept = await _retire_flag_for_stage2_members(
+        memory_service,
+        project_id,
+        run_id,
+        enum_filters=_FLAG_FOR_STAGE2_ENUM_FILTERS,
+        terminal_task_ids=terminal_task_ids,
+        log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+        max_age_days=max_age_days,
+        now=now,
+        scroll_limit=scroll_limit,
+    )
+    # Diagnostic-only; never affects the returned sweep count (task 2966
+    # amendment, reviewer finding — see _warn_on_flag_for_stage2_type_drift).
+    await _warn_on_flag_for_stage2_type_drift(memory_service, project_id, run_id)
+    return swept
+
+
+async def _retire_flag_for_stage2_members(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    enum_filters: dict,
+    terminal_task_ids: Collection[str],
+    log_name: str,
+    max_age_days: int = _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
+    now: datetime | None = None,
+    scroll_limit: int = 1000,
+) -> int:
+    """The ``flag_for_stage2`` retirement core shared by the per-cycle sweep and the done hook.
+
+    Fixes what makes a delete a ``flag_for_stage2`` retirement — the pool label,
+    the deleter tag, the count short-circuit, the task-less retirement policy —
+    and leaves eligibility entirely to :func:`_sweep_stale_mem0_pool`'s
+    composite rule. Callers choose only which members to enumerate and which
+    tasks count as terminal.
+    """
+    return await _sweep_stale_mem0_pool(
         memory_service,
         project_id,
         run_id,
         source='flag_for_stage2',
         gc_sweep_source=_FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
         max_age_days=max_age_days,
-        log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+        log_name=log_name,
         now=now,
         scroll_limit=scroll_limit,
         count_short_circuit=True,
-        enum_filters=_FLAG_FOR_STAGE2_ENUM_FILTERS,
+        enum_filters=enum_filters,
         terminal_task_ids=terminal_task_ids,
+        taskless_retirement=_FLAG_FOR_STAGE2_TASKLESS_RETIREMENT,
     )
-    # Diagnostic-only; never affects the returned sweep count (task 2966
-    # amendment, reviewer finding — see _warn_on_flag_for_stage2_type_drift).
-    await _warn_on_flag_for_stage2_type_drift(memory_service, project_id, run_id)
-    return swept
+
+
+async def retire_flag_markers_for_terminal_task(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    task_id: str,
+    now: datetime | None = None,
+) -> int:
+    """Retire the ``flag_for_stage2`` markers of ONE task that just went terminal.
+
+    Task 4376. A best-effort LATENCY layer over the per-cycle sweep in
+    :meth:`TaskKnowledgeSync.run`, which stays the correctness and audit
+    mechanism: a marker already past the age cutoff is retired the moment its
+    task closes rather than at the next cycle. Whatever this path misses — a
+    failure, an unwired targeted reconciler, a legacy marker whose stored
+    ``task_id`` the exact-match filter below cannot reach — is left for the
+    sweep, which is why this path may lose work.
+
+    Shares the sweep's retirement core instead of re-implementing it: the same
+    pool, deleter tag and composite eligibility rule
+    (:func:`_sweep_stale_mem0_pool`), narrowed to this task twice over — the
+    enumeration is filtered on its ``task_id``, and ``terminal_task_ids`` is
+    just this task. So it never retires a marker the sweep would keep, and it
+    inherits every gate the sweep gains later; the closure gate, not the
+    filter, stays the authoritative check. Scoping the enumeration keeps each
+    firing to one exact count when the task has no markers, and keeps the
+    skeleton's aggregate diagnostics about this task alone. The pool-wide
+    type-drift probe stays with the sweep.
+
+    Terminality comes from the done-transition itself, not ``get_statuses``:
+    the caller only gets here on a terminal transition that has just been
+    persisted, and a taskmaster round-trip would spend the latency this path
+    exists to save.
+
+    Idempotent per TASK in end state, never per event: done can fire more than
+    once for a task, and the action is a pure function of live Mem0 state keyed
+    on the task. It keeps no counter and writes or restores no memory, so a
+    repeat firing finds the victims gone and nothing can be resurrected. An
+    event-counted or accumulating side effect added here would break that. The
+    per-firing COUNTS are not idempotent under concurrency: firings are not
+    serialized against each other or against the sweep, and ``delete_memory``
+    reports an already-missing id as deleted, so two runs that enumerate the
+    same victim before either deletes it both count it and both tombstone it.
+
+    No reversal path, by design: a task leaving done fires no hook
+    (``TaskInterceptor.STATUS_TRIGGERS`` excludes pending and in-progress), and
+    a reopened task simply stops matching the sweep's terminal gate.
+
+    Returns:
+        Number of markers retired.
+    """
+    key = str(task_id).strip()
+    return await _retire_flag_for_stage2_members(
+        memory_service,
+        project_id,
+        run_id,
+        enum_filters={**_FLAG_FOR_STAGE2_ENUM_FILTERS, 'task_id': key},
+        terminal_task_ids=(key,),
+        log_name='retire_flag_markers_for_terminal_task',
+        now=now,
+    )
 
 
 async def _sweep_entity_standing_decision_growth(
@@ -3077,7 +3163,9 @@ async def _track_flag_persistence(
     TTL/terminal-task schedule, not by an immediate per-cycle delete.  The
     counter therefore no longer observes Stage 2 delete failures from
     previous cycles; it only counts Stage 1 re-flags that survive within the
-    current cycle's ``run_id``.
+    current cycle's ``run_id``, plus markers carried forward from a run whose
+    Stage 2 agent did not complete (task 5984), which gain one count per
+    Stage 2 run they are rendered to.
     """
     if not flag_ids:
         return {}
@@ -3245,207 +3333,30 @@ async def _write_escalation_markers(
             )
 
 
-def _render_live_workflow_section(
-    tasks: list[dict],
-    project_root: ProjectRoot,
-    *,
-    now: datetime | None = None,
-) -> str:
-    """Render the '### Live-Workflow Signals' payload section for *tasks*.
-
-    For each task in *tasks*, calls :func:`detect_live_workflow` and collects
-    tasks whose :attr:`WorkflowLiveness.is_live` is True.  Returns an empty
-    string when no task is live (keeps the payload tight).
-
-    Each live task is listed with the firing signal names so the Stage 2 LLM
-    can see which evidence contributed to the live designation:
-
-    ```
-    ### Live-Workflow Signals
-    - task/4321: worktree, recent-commit
-    ```
-
-    Detector errors per task are swallowed and logged at WARNING level (the task
-    is treated as not-live for that call — fail-safe, matching the harness gate).
-
-    Each task's ``status`` is forwarded to the detector, so never-dispatched
-    statuses (deferred/done/cancelled — see
-    :data:`~fused_memory.services.live_workflow_detector.ORCH_LIVE_INELIGIBLE_STATUSES`)
-    drop the project-wide orchestrator_live signal for that task while leaving
-    its per-task worktree/commit signals unaffected.
-
-    Each task's ``metadata.task_kind`` is also forwarded.  A BLOCKED
-    deterministic task (``task_kind == 'deterministic'``) never acquires a
-    worktree/branch of its own — it is routed to ``DeterministicRunner``
-    instead — so the project-wide orchestrator_live signal is dropped for it
-    too, the same way it is for never-dispatched statuses.  A normal blocked
-    task (``task_kind`` absent or not ``'deterministic'``) keeps the signal
-    ONLY when it carries genuine per-task evidence (a registered worktree or a
-    recent commit), since it may legitimately auto-unblock mid-pipeline; a
-    blocked normal task whose ONLY evidence is the bare project-wide
-    orchestrator lock also has the signal dropped (task 2409 — closes the
-    repeated re-deferral loop this caused for tasks 2335/2196).
-
-    A PENDING deterministic PURE GATE — ``always_escalates`` truthy with no
-    ``before_done``, classified by :func:`is_pure_gate_metadata` and forwarded
-    as ``pure_gate`` — likewise has the project-wide signal dropped (task
-    3751).  Its entire ``DeterministicRunner`` run is "file one born-at-L2
-    escalation, stamp ``gate_escalated_at``, set status blocked": no script, no
-    systemd, no ``git_ops``, and (like every deterministic task) no
-    worktree/branch, so the bare lock can never be task-specific evidence for
-    it.  A pending deterministic task carrying a ``before_done`` KEEPS the
-    signal: that path runs a blocking deploy/predicate script while the status
-    is still ``'pending'`` (``Harness._run_deterministic_slot`` never flips it
-    to ``'in-progress'``) with no git evidence to reveal it.  Confirmed
-    incident: task 3845 was listed here with ONLY the bare ``orchestrator``
-    signal for 3+ consecutive reconciliation cycles, blocking its disposition.
-
-    **In-progress corroboration gate (task 2963).** For an ``in-progress`` task
-    whose only live signals are a lingering registered worktree and/or the
-    project-wide orchestrator lock (no ``recent_commit``), a fleet redeploy that
-    KILLED the workflow leaves both those signals falsely asserting liveness.
-    This renderer therefore computes an explicit per-task corroboration verdict
-    (:func:`corroboration_for_task`) for every in-progress task and passes it to
-    the detector as ``corroborated``.  Corroboration requires at least one FRESH
-    per-task signal, ANY sufficient: (1) a live claimant/heartbeat, (2) the
-    task_id present in the scheduler's ``current_holders``/``parks`` snapshot, or
-    (3) a ``routing.latest.decided_at`` newer than the orchestrator's start time
-    (parsed from the lock).  When none corroborates, the detector downgrades the
-    task to ``indeterminate`` (``is_live=False``) and the
-    ``if not liveness.is_live: continue`` below drops it from the section — so a
-    stranded post-redeploy task is no longer reported live, unblocking recon's
-    stranded-remediation path.  The scheduler-state snapshot and the
-    orchestrator start-time are hoisted once per render (like the orchestrator
-    hoist); both are fail-safe → ``None``.  Non-in-progress tasks pass
-    ``corroborated=None`` so the gate stays inert (behavior unchanged).
-
-    Args:
-        tasks: Task dicts from the active/proactive-sample pool.  Only tasks
-            with a parseable ``id`` are inspected (non-int ids are skipped).
-        project_root: Absolute path to the project root, forwarded to the
-            detector and used to read the orchestrator lock + scheduler-state
-            snapshot for the in-progress corroboration gate.
-        now: Injectable reference time for deterministic tests.  Also the
-            reference used for the claimant-heartbeat freshness check in the
-            in-progress corroboration gate.
-
-    Returns:
-        A Markdown section string (e.g. ``'### Live-Workflow Signals\\n...\\n'``),
-        or ``''`` when no tasks are live.
-    """
-    if not tasks:
-        return ''
-
-    # Hoist the project-level orchestrator check: it is constant for this
-    # project_root (one lock file regardless of how many tasks are inspected).
-    # Swallow any detector errors here — the per-task detect_live_workflow calls
-    # will gracefully degrade on subsequent orchestrator checks.
-    try:
-        project_orch_live: bool | None = is_orchestrator_live_for(project_root)
-    except Exception:
-        project_orch_live = None  # let detect_live_workflow derive it per-task
-
-    kwargs: dict = {} if now is None else {'now': now}
-    if project_orch_live is not None:
-        kwargs['_orchestrator_live'] = project_orch_live
-
-    # Hoist the per-render corroboration inputs (task 2963), mirroring the
-    # orchestrator hoist above: both the scheduler-state snapshot and the
-    # orchestrator restart-boundary timestamp are constant for this
-    # project_root, so read each once. Both are wrapped fail-safe → None on any
-    # error (corroboration_for_task tolerates None inputs; a None simply means
-    # that corroboration signal cannot fire — never a raise). now_eff is the
-    # reference time threaded into the claimant-freshness check.
-    now_eff = now or datetime.now(UTC)
-    try:
-        scheduler_state: dict | None = read_scheduler_state(Path(project_root))
-    except Exception:
-        scheduler_state = None
-    try:
-        orch_started: datetime | None = orchestrator_started_at(project_root)
-    except Exception:
-        orch_started = None
-
-    live_lines: list[str] = []
-
-    for task in tasks:
-        raw_id = task.get('id')
-        if raw_id is None:
-            continue
-        task_id = str(raw_id)
-        raw_metadata = task.get('metadata')
-        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
-        task_kind = metadata.get('task_kind')
-        # `metadata` is already the isinstance-guarded dict above, so a task
-        # with absent/non-dict metadata yields pure_gate=False — fail-safe
-        # toward live. See the docstring's pending-pure-gate paragraph.
-        pure_gate = is_pure_gate_metadata(metadata)
-
-        # Per-task corroboration gate (task 2963). For an IN-PROGRESS task,
-        # compute an explicit corroboration verdict so the detector can downgrade
-        # a killed-but-lingering task — whose only live signals are a stale
-        # registered worktree and/or the project-wide orchestrator lock (no
-        # recent_commit) — to indeterminate (is_live=False), which the
-        # `if not liveness.is_live: continue` below then drops from the section.
-        # A fresh per-task signal (live claimant/heartbeat, scheduler
-        # holder/park, or a post-restart routing decision) keeps corroborated
-        # True and the task listed. Non-in-progress tasks pass corroborated=None
-        # so the gate stays inert (behavior unchanged). Fail-safe TOWARD live:
-        # any assembler error leaves corroborated=None.
-        corroborated: bool | None = None
-        if task.get('status') == 'in-progress':
-            try:
-                corroborated = corroboration_for_task(
-                    task, task_id, now=now_eff,
-                    scheduler_state=scheduler_state,
-                    orchestrator_started_at=orch_started,
-                )
-            except Exception:
-                corroborated = None
-
-        try:
-            liveness = detect_live_workflow(
-                task_id, project_root,
-                status=task.get('status'), task_kind=task_kind,
-                pure_gate=pure_gate,
-                corroborated=corroborated, **kwargs
-            )
-        except Exception:
-            logger.warning(
-                'reconciliation._render_live_workflow_section: '
-                'detector error for task_id=%s; treating as not-live',
-                task_id,
-            )
-            continue
-
-        if not liveness.is_live:
-            continue
-
-        # Collect which signals fired for human-readable display.
-        signals: list[str] = []
-        if liveness.worktree_registered:
-            signals.append('worktree')
-        if liveness.recent_commit:
-            signals.append('recent-commit')
-        if liveness.orchestrator_live:
-            signals.append('orchestrator')
-        signal_str = ', '.join(signals) if signals else 'live'
-        live_lines.append(f'- {liveness.branch}: {signal_str}')
-
-    if not live_lines:
-        return ''
-
-    return '### Live-Workflow Signals\n' + '\n'.join(live_lines) + '\n'
-
-
 class TaskKnowledgeSync(BaseStage):
     """Stage 2: Reconcile tasks against memory, attach hints, fix inconsistencies."""
+
+    # ── Inference-bearing payload sections (task 5113) ──────────────────────
+    # INCLUSION CRITERION — a section belongs here iff prompts/stage2.py tells
+    # the model to draw an inference from that section's ABSENCE ("If
+    # `### Live-Workflow Signals` is absent from the payload, no task the
+    # `### Active Task Tree` lists is live this cycle …"). Every payload builder
+    # renders these via
+    # _render_required_sections(). Enforced by
+    # tests/reconciliation/test_stage2_payload_section_parity.py, whose module
+    # docstring holds the section census: why each other conditional section
+    # stays out.
+    REQUIRED_SECTIONS: tuple[RequiredSection, ...] = (
+        RequiredSection('### Live-Workflow Signals', '_build_live_workflow_section'),
+    )
 
     # Remediation support — set by harness for second pass
     remediation_mode: bool = False
 
     # Active task tree — set by harness before run() (task 455)
     filtered_task_tree: FilteredTaskTree | None = None
+    # Set with filtered_task_tree: the instant that tree, and every heartbeat_at in it, was read.
+    filtered_task_tree_fetched_at: datetime | None = None
 
     # Minimum number of tasks to proactively spot-check each run
     MIN_TASK_SAMPLE: int = 5
@@ -3494,6 +3405,10 @@ class TaskKnowledgeSync(BaseStage):
     # returns (same per-run counter reset-then-inject pattern used throughout this
     # class).
     _rescued_in_window_markers: int = 0
+
+    # Count of prior-run markers carried forward because their run's Stage 2
+    # agent did not complete (task 5984); same reset-then-inject pattern.
+    _markers_carried_forward: int = 0
 
     # Count of systemic_pattern findings polled from the recon_report channel
     # (task-1966) that were newly APPENDED to combined_flags in the current
@@ -3551,6 +3466,7 @@ class TaskKnowledgeSync(BaseStage):
         # (mirrors _current_run_id overwrite pattern).
         self._stale_missing_run_id_markers = 0
         self._rescued_in_window_markers = 0
+        self._markers_carried_forward = 0
         self._recon_report_systemic_polled = 0
         # Reset BEFORE super().run() (task-2047 Gap 2) so a run whose
         # assemble_payload call is skipped or short-circuited can never forward
@@ -3578,6 +3494,7 @@ class TaskKnowledgeSync(BaseStage):
         # swept), but the count is observable here for operator diagnostics.
         # Explicit zero so downstream consumers never need .get(..., 0) fallbacks.
         report.stats['rescued_in_window_markers'] = self._rescued_in_window_markers
+        report.stats['stage2_markers_carried_forward'] = self._markers_carried_forward
         # --- recon_report systemic_pattern channel poll stat (task-1966) ---
         # Explicit zero so downstream consumers never need .get(..., 0) fallbacks.
         report.stats['stage2_recon_report_systemic_polled'] = self._recon_report_systemic_polled
@@ -3610,7 +3527,7 @@ class TaskKnowledgeSync(BaseStage):
                 report.stats['stage2_stage1_dups_suppressed'] = len(suppressed)
 
         # --- post-flight guards (task 1137) ---
-        await self._apply_post_flight_guards(report, prior_reports, run_id)
+        await self._apply_post_flight_guards(report, run_id)
 
         # --- deterministic per-cycle summary write (task 2229 W5-λ) ---
         # Python writes the authoritative cycle_summary ledger row directly
@@ -3782,6 +3699,18 @@ class TaskKnowledgeSync(BaseStage):
         terminal_task_ids = await _resolve_terminal_task_ids(
             self.taskmaster, self.scope, run_id,
         )
+
+        # WARNING — this stat counts SQLite recon_ledger ROWS ONLY. It never
+        # reaches Mem0, and a healthy value here says NOTHING about whether
+        # the Mem0 stage1_flag_marker pool is draining. The Mem0-pool
+        # counterpart is 'stale_mem0_flag_markers_gc_swept' (emitted ~35
+        # lines below); the two address disjoint populations. Reading a
+        # healthy recon_markers_gc_swept as evidence that the Mem0 markers
+        # are being collected is precisely the inference that produced the
+        # task-2228 W5-κ regression, which deleted the two Mem0 sweeps and
+        # left that pool with no collector at all while this stat kept
+        # reporting green. See RCA §4.3,
+        # plans/reify-flag-marker-backlog-rca-2026-07-22.md.
         report.stats['recon_markers_gc_swept'] = await _gc_recon_markers(
             self.memory, self.taskmaster, self.scope, run_id,
             terminal_task_ids=terminal_task_ids,
@@ -3832,15 +3761,9 @@ class TaskKnowledgeSync(BaseStage):
         # cycle, per-project, alongside the three sibling GC passes; explicit
         # value so downstream consumers never need a .get(..., 0) fallback.
         #
-        # Retirement here is COMPOSITE, not age-only (task 4375): a marker is
-        # deleted only when it is past the 14-day cutoff AND is not a
-        # protected cycle_summary mirror AND its kind is not in
-        # PROTECTED_AUDIT_KINDS AND its task_id is confirmed terminal in the
-        # list hoisted above. The terminal gate is the primary arm — it was
-        # added because 40 kind='cadence_check' audit records in
-        # autopilot_video were destroyed by the age-only sweep, all citing a
-        # task that is merely 'deferred'. The two sibling Mem0 sweeps above
-        # are deliberately age-only and are NOT gated.
+        # Unlike the two age-only sibling sweeps above, retirement here is
+        # composite and gated on the terminal ids hoisted above (tasks 4375,
+        # 4995); _sweep_stale_mem0_flag_for_stage2_markers' docstring owns the rule.
         report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] = (
             await _sweep_stale_mem0_flag_for_stage2_markers(
                 self.memory, self.project_id, run_id,
@@ -3894,65 +3817,25 @@ class TaskKnowledgeSync(BaseStage):
                 result['failed'],
             )
 
-    async def _apply_post_flight_guards(
-        self,
-        report: StageReport,
-        prior_reports: list[StageReport],
-        run_id: str,
-    ) -> None:
-        """Acknowledge resolved Stage 1 flag markers and normalize Stage 2 counters.
+    async def _apply_post_flight_guards(self, report: StageReport, run_id: str) -> None:
+        """Acknowledge resolved Stage 1 flag markers and ground Stage 2's counters.
 
-        ``report.stats['stage1_analytical_findings_processed']`` and
-        ``report.stats['stage1_mem0_flags_processed']`` are Stage 2's
-        self-reported flag-processing counters. The clamps that used to
-        check them against ground truth here were removed by task 2230
-        (W5-mu) and not replaced: neither counter is in
-        ``_COMPUTED_STAT_KEYS`` (stage_stats.py), so ``derive_stage_stats``
-        cannot recompute either from the write journal and
-        ``stats_verifier`` leaves both untouched. They remain purely
-        self-reported with no computed ground truth; this method only
-        normalizes their presence via ``setdefault(..., 0)`` below so
-        Stage 3's audit always sees a deterministic pair.
+        The flag-processing counters ``stage1_analytical_findings_processed``
+        and ``stage1_mem0_flags_processed`` stay purely self-reported (their
+        clamps were removed by task 2230 / W5-mu); they are only normalized to
+        a present value so Stage 3's audit sees a deterministic pair.
 
-        Terminal-state, stall-guard-freshness, post-action-mismatch, and
-        live-workflow writes are also no longer reclassified here: that write
-        class is now rejected pre-write, server-side, by ``ReconWritePolicy``
-        (task 2224), so post-hoc detection is redundant.
-
-        ``report.stats['tasks_created']`` (task 3046) is also normalized here,
-        plus repaired — UPWARD ONLY — against ``report.stats['task_created_records']``,
-        the action-shaped ground truth the '## Task-Creation Accounting' prompt
-        section mandates Stage 2 append to at the moment each ``resolve_ticket``
-        call confirms a creation. ``submit_task``/``resolve_ticket`` are not
-        journaled, so unlike the flag counters above, ``tasks_created`` has no
-        write-journal-derived ground truth to fall back on; a self-reported
-        undercount (e.g. a task filed mid-cycle via the Proactive Task Sample or
-        Cross-Project Routing, as in run 507bc25b) would otherwise stand
-        uncorrected. The self-reported value is coerced to ``int`` via
-        :func:`_coerce_tasks_created_count` (a numeric-``str``/``float`` self-report
-        normalizes in place; a ``bool`` or anything else uncoercible normalizes to
-        ``0``) *before* comparison, so a legitimately larger non-``int`` self-report
-        (e.g. ``"3"``) can never look like an undercount and get overwritten
-        downward — the coerced value is always what ends up in
-        ``report.stats['tasks_created']``, so normalization is real even when no
-        repair fires. The deduped valid-record count (project-scoped via
-        :func:`_count_valid_task_created_records`'s ``default_project_id``, so a
-        record with an omitted ``project_id`` collapses onto this stage's own
-        ``self.project_id`` rather than masquerading as a second cross-project
-        filing) is always published as ``report.stats['task_created_records_valid']``;
-        when it exceeds the coerced self-reported ``tasks_created``, the pre-repair
-        raw value is stashed under ``report.stats['tasks_created_reported']``,
-        ``tasks_created`` is overwritten, and a WARNING is logged. Never clamped
-        downward — task 2230 (W5-mu) deliberately removed symmetric clamping of
-        Stage 2's self-reported counters from this method.
+        The task counters are grounded in code-side evidence by
+        :mod:`fused_memory.reconciliation.stage2_counter_grounding`, which owns
+        the rules. ``tasks_created`` has ground truth in the creation journal
+        TaskInterceptor writes for every submission that carried this run's
+        ``_causation_id``; the agent's record list remains a second channel,
+        each claim confirmed with ``get_task`` in its own project. Repairs move
+        a counter UPWARD only.
 
         Args:
             report: The ``StageReport`` returned by ``super().run()``.
                 Mutated in place.
-            prior_reports: Stage reports for all earlier stages in this cycle.
-                Unused now that the analytical flag-counter clamp has been
-                removed; kept for signature compatibility with the sole call
-                site.
             run_id: Current reconciliation run identifier.
         """
         # ── Stage-1 flag-marker acknowledgment (task-2029 scenario b) ──────────
@@ -3971,47 +3854,20 @@ class TaskKnowledgeSync(BaseStage):
             getattr(self, '_stage2_combined_flags', []) or [],
         )
 
-        # Normalize: ensure both Stage 2 counters are always present in stats so
-        # Stage 3's audit sees a deterministic, present pair via recon_report's
-        # free-form stats passthrough.  setdefault preserves any agent-reported
-        # value.
         report.stats.setdefault('stage1_analytical_findings_processed', 0)
         report.stats.setdefault('stage1_mem0_flags_processed', 0)
 
-        # ── tasks_created accounting repair (task 3046) ─────────────────────
-        # tasks_created is a purely SELF-REPORTED counter: submit_task/resolve_ticket
-        # are not journaled (TaskInterceptor._journal_around covers only
-        # set_task_status/update_task/remove_tasks/add_dependency/remove_dependency),
-        # so derive_stage_stats cannot recompute it and stats_verifier leaves it
-        # untouched (not in _COMPUTED_STAT_KEYS).  task_created_records is the
-        # action-shaped ground truth the prompt now mandates — mirroring
-        # flag_deleted_records — so an increment missed on a mid-cycle
-        # proactive/cross-project filing is recovered here instead of lost
-        # (run 507bc25b reported tasks_created=0 while filing task 3045).
-        report.stats.setdefault('tasks_created', 0)
-        observed = _count_valid_task_created_records(
-            report.stats.get('task_created_records'),
-            default_project_id=self.project_id,
+        journal = await read_run_creation_outcomes(
+            self.journal.write_journal, run_id, default_project_id=self.project_id,
         )
-        report.stats['task_created_records_valid'] = observed
-        reported = report.stats.get('tasks_created')
-        # Coerce before comparing (task-3046 amendment): a non-int self-report
-        # (e.g. "3" or 3.0) must not collapse to 0 and look like an undercount
-        # relative to `observed` — that would silently move a legitimately
-        # larger self-report DOWN, which the upward-only contract forbids.
-        # The coerced value is written back unconditionally so the "normalize"
-        # half of this block is real even when no repair fires.
-        reported_int = _coerce_tasks_created_count(reported)
-        report.stats['tasks_created'] = reported_int
-        if observed > reported_int:
-            report.stats['tasks_created_reported'] = reported
-            report.stats['tasks_created'] = observed
-            logger.warning(
-                'reconciliation.stage2_tasks_created_undercount: run_id=%s project_id=%s '
-                'self-reported tasks_created=%r but %d confirmed task_created_records were '
-                'emitted — repairing upward to %d.',
-                run_id, self.project_id, reported, observed, observed,
-            )
+        report.stats.update(await ground_stage2_counters(
+            report.stats,
+            taskmaster=self.taskmaster,
+            known_projects=self.known_projects,
+            project_id=self.project_id,
+            run_id=run_id,
+            journal=journal,
+        ))
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
@@ -4040,7 +3896,7 @@ class TaskKnowledgeSync(BaseStage):
                         self.filtered_task_tree.cancelled_tasks,
                     )
                 )
-            summary = await _queue_briefing_refresh_tasks(
+            summary = await queue_briefing_refresh_tasks(
                 self.taskmaster,
                 self.scope.project_root,
                 mismatches,
@@ -4076,6 +3932,29 @@ class TaskKnowledgeSync(BaseStage):
             },
         )
 
+    async def _resolve_task_tree(self) -> tuple[FilteredTaskTree, datetime]:
+        """The task tree this payload renders, paired with the instant it was read.
+
+        Uses the harness-injected tree when there is one (task 455); otherwise
+        self-fetches from taskmaster and stamps the instant after the fetch.
+        """
+        if self.filtered_task_tree is not None:
+            read_at = resolve_tree_read_instant(
+                self.filtered_task_tree_fetched_at,
+                event='reconciliation.task_tree_read_instant_missing',
+                extra={'project_id': self.project_id, 'run_id': self._current_run_id},
+            )
+            return self.filtered_task_tree, read_at
+
+        # filter_task_tree accepts `object`; either GetTasksResult or {} is fine.
+        tasks_data: object = {}
+        if self.taskmaster:
+            try:
+                tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
+            except Exception:
+                tasks_data = {}
+        return filter_task_tree(tasks_data), datetime.now(UTC)
+
     async def assemble_payload(
         self,
         events: list[ReconciliationEvent],
@@ -4102,34 +3981,12 @@ class TaskKnowledgeSync(BaseStage):
 
         stage1_report = prior_reports[0] if prior_reports else None
 
-        # Dual-path: use harness-injected tree or self-fetch (task 455)
-        if self.filtered_task_tree is not None:
-            # Harness path: tree already fetched and filtered before run()
-            filtered = self.filtered_task_tree
-        else:
-            # Fallback path: self-fetch via taskmaster
-            # filter_task_tree accepts `object`; either GetTasksResult or {} is fine.
-            tasks_data: object = {}
-            if self.taskmaster:
-                try:
-                    tasks_data = await self.taskmaster.get_tasks(project_root=self.project_root)
-                except Exception:
-                    tasks_data = {}
-            filtered = filter_task_tree(tasks_data)
+        filtered, tree_read_at = await self._resolve_task_tree()
 
         # Defensive invariant check (task-782): see _check_filtered_tree_invariant.
         self._check_filtered_tree_invariant(filtered)
 
-        # Render "Recently Completed Tasks" section.
-        # Invariant: filter_task_tree() always appends to done_tasks when it increments
-        # done_count (capped at MAX_DONE_TASKS_RETAINED=30), so done_tasks is guaranteed
-        # non-empty whenever done_count > 0.  No fallback summary branch is needed.
-        # _check_filtered_tree_invariant() warns for externally-constructed trees that
-        # violate this.
-        if filtered.done_tasks:
-            recently_completed_text = format_task_list(filtered.done_tasks)
-        else:
-            recently_completed_text = format_task_list([])  # 'No tasks.'
+        recently_completed_text = render_retained_done_tasks(filtered)
 
         # Done-task provenance section — feeds verified evidence to the agent
         # so 'shipped via X' edges come from commit diffs instead of being
@@ -4181,50 +4038,40 @@ class TaskKnowledgeSync(BaseStage):
                 if boundary is not None
                 else 'no prior full-run boundary (first cycle — all done tasks in scope)'
             )
-            # Defensive render cap: never a silent truncation.  select_done_since_boundary
-            # sorts most-recent-first (and parse-failures to the front), so a clip
-            # drops only the oldest tasks, and the note + WARNING log make the
-            # clipped coverage explicit (no-silent-caps principle).
-            rendered_audit = audit_tasks
-            overflow_note = ''
-            if total_audit > self.MAX_DONE_AUDIT_RENDERED:
-                rendered_audit = audit_tasks[: self.MAX_DONE_AUDIT_RENDERED]
-                omitted = total_audit - self.MAX_DONE_AUDIT_RENDERED
-                overflow_note = (
-                    f'\n_NOTE: {omitted} additional done task(s) since the boundary were '
-                    f'omitted from this render by the MAX_DONE_AUDIT_RENDERED='
-                    f'{self.MAX_DONE_AUDIT_RENDERED} cap. Coverage was clipped — NOT complete '
-                    f'this cycle; the oldest since-boundary tasks were dropped first._'
-                )
-                logger.warning(
-                    'reconciliation.done_task_audit_render_capped',
-                    extra={
-                        'project_id': self.project_id,
-                        'run_id': self._current_run_id,
-                        'total_since_boundary': total_audit,
-                        'rendered': self.MAX_DONE_AUDIT_RENDERED,
-                        'omitted': omitted,
-                        'boundary': boundary_label,
-                    },
-                )
+            # select_done_since_boundary sorts most-recent-first (and parse-failures
+            # to the front), so a clip drops only the oldest tasks.
+            audit_body = render_capped_task_list(
+                audit_tasks,
+                cap=self.MAX_DONE_AUDIT_RENDERED,
+                cap_name='MAX_DONE_AUDIT_RENDERED',
+                omitted_noun='done task(s) since the boundary',
+                dropped_first='the oldest since-boundary tasks',
+                log_event='reconciliation.done_task_audit_render_capped',
+                log_extra={
+                    'project_id': self.project_id,
+                    'run_id': self._current_run_id,
+                    'total_since_boundary': total_audit,
+                    'boundary': boundary_label,
+                },
+            )
             done_audit_section = (
                 f'\n### Done-Task Completion-Memory Audit '
                 f'({total_audit} since last cycle)\n'
                 f'Boundary (last full-run completed): {boundary_label}\n'
-                f'{format_task_list(rendered_audit)}\n'
-                f'{overflow_note}'
+                f'{audit_body}'
             )
 
-        # Live-Workflow Signals section: check active tasks for live workflows so the
-        # Stage 2 LLM can skip set_task_status / stranded-work escalation for those tasks.
-        # Only active tasks are inspected (done/cancelled tasks cannot have live workflows).
-        # Empty string when no active tasks are live (keeps the payload tight).
-        live_workflow_section = ''
-        if filtered.active_tasks:
-            live_workflow_section = _render_live_workflow_section(
-                filtered.active_tasks,
-                self.scope.project_root,
+        # Every blocked gate, not the MIN_TASK_SAMPLE survivors: in-progress tasks
+        # sort ahead of blocked ones and evict them from the sample. Remediation-gated
+        # like its siblings; selection and cap live in blocked_gate_audit_section.
+        gate_audit_section = ''
+        if not self.remediation_mode:
+            gate_audit_section = render_blocked_gate_audit_section(
+                filtered.active_tasks, project_id=self.project_id, run_id=self._current_run_id
             )
+
+        # Inference-bearing sections (see REQUIRED_SECTIONS), bound here so their probes run first.
+        required_sections = await self._render_required_sections(filtered)
 
         # Call render_active_section once to get both the visible-task list (for
         # hint-attention slice-then-filter below) and the fully assembled Active
@@ -4235,7 +4082,8 @@ class TaskKnowledgeSync(BaseStage):
         visible_active, active_tree_text = render_active_section(filtered)
 
         # Compute the hint-attention section: active tasks whose memory_hints
-        # need conversion from legacy list format (or are missing entirely).
+        # need conversion from legacy list format (or are missing entirely), less
+        # any task live-claimed when the tree was read (task 5093).
         # Gated on `if not self.remediation_mode:` — mirrors proactive_sample_section
         # (above) because hint conversion is a general-sync activity, not a Stage 1
         # remediation task. Rendered conditionally within that gate — omitted on the
@@ -4244,9 +4092,9 @@ class TaskKnowledgeSync(BaseStage):
         # always used for the prompt template slot regardless of remediation_mode.
         hint_conversion_section = ''
         if not self.remediation_mode:
-            tasks_needing_hint_attention = [
-                t for t in visible_active if _needs_hint_conversion(t)
-            ]
+            tasks_needing_hint_attention = select_tasks_needing_hint_attention(
+                visible_active, claims_read_at=tree_read_at
+            )
             if tasks_needing_hint_attention:
                 hint_conversion_section = (
                     '\n### Tasks Needing Memory Hint Attention\n'
@@ -4255,8 +4103,8 @@ class TaskKnowledgeSync(BaseStage):
                 )
 
         # FIX A — merge Mem0 active-query flags into the flagged section.
-        # _query_stage2_flags is best-effort: search failures yield ([], [], [], []) internally.
-        # Returns a Stage2FlagPartition with four fields:
+        # _query_stage2_flags is best-effort: search failures yield ([], [], [], [], []) internally.
+        # Returns a Stage2FlagPartition with five fields:
         #   .current          — markers whose run_id matches the current run, OR whose
         #                       Mem0 created_at is within the run window (task-1369 guard)
         #   .stale_missing_run_id_ids  — prior-cycle markers with absent/empty run_id
@@ -4264,6 +4112,8 @@ class TaskKnowledgeSync(BaseStage):
         #   .rescued_ids      — ids of markers rescued by the run-window guard (subset of
         #                       .current); single source of truth for the rescued count
         #                       (task-1381, replaces the re-derivation over active_flags)
+        #   .carried_forward_ids — prior-run markers kept in .current because their run's
+        #                       Stage 2 agent did not complete (task 5984)
         # Both stale buckets contain only genuine prior-cycle residue (in-window same-
         # cycle markers are rescued to .current by the run-window guard) and are simply
         # excluded from `current` below, so they are never rendered to the LLM. They are
@@ -4304,9 +4154,15 @@ class TaskKnowledgeSync(BaseStage):
         # returned a non-datetime started_at, which disables the run-window guard
         # and falls those helpers back to their window-agnostic behaviour.
         self._run_window_start = run_window_start
+        carry_forward_run_ids = await trailing_incomplete_agent_run_ids(
+            getattr(self.memory, 'recon_ledger', None),
+            self.project_id,
+            self.stage_id.value,
+        )
         partition = await _query_stage2_flags(
             self.memory, self.project_id, run_id_for_markers,
             run_window_start=run_window_start,
+            carry_forward_run_ids=carry_forward_run_ids,
         )
         active_flags = partition.current
         self._stale_missing_run_id_markers = len(partition.stale_missing_run_id_ids)
@@ -4316,6 +4172,17 @@ class TaskKnowledgeSync(BaseStage):
         # the partition predicate here, so any future change to the guard logic
         # automatically flows through to this counter without drift.
         self._rescued_in_window_markers = len(partition.rescued_ids)
+        self._markers_carried_forward = len(partition.carried_forward_ids)
+        if self._markers_carried_forward:
+            logger.info(
+                'reconciliation.stage2_markers_carried_forward',
+                extra={
+                    'project_id': self.project_id,
+                    'run_id': run_id_for_markers,
+                    'count': self._markers_carried_forward,
+                    'owed_run_ids': sorted(carry_forward_run_ids),
+                },
+            )
 
         surviving = active_flags  # active-query path is pass-through (no scope filter)
 
@@ -4329,7 +4196,7 @@ class TaskKnowledgeSync(BaseStage):
         # single GC pass (:func:`_gc_recon_markers`, called from run()) on its
         # TTL/terminal-task schedule rather than an immediate same-cycle
         # delete.  FIX D therefore only fires on Stage 1 re-flags surviving
-        # within the current run_id.
+        # within the current run_id, and on carried-forward markers (task 5984).
         surviving_ids = [f['id'] for f in surviving]
 
         persistence_counts = await _track_flag_persistence(
@@ -4509,17 +4376,31 @@ class TaskKnowledgeSync(BaseStage):
 
         known_projects_section = self._format_known_projects_section()
 
-        # Step 5 in the Your Task block below ("read-modify-write +
-        # metadata_mode='replace' for hint conversion") is grounded in Mem0
-        # memory 0b0eeb8d (old-wins semantics for list-format hints under
-        # the additive merge).  A bare append=False RMW is no longer sanctioned
-        # — the task-2180 metadata-wipe guard in _resolve_metadata_mode now
-        # rejects it — so the reshape writes the COMPLETE blob back under the
-        # explicit metadata_mode='replace' co-signal instead.  That
-        # 'replace'-alongside-append=True combination stays sanctioned; what is
-        # NOT is metadata_mode='merge' alongside append=True, which
-        # _resolve_metadata_mode also now rejects (task 3581) because honouring
-        # 'merge' shallow-overwrote a task's whole memory_hints key.  The memory
+        # Step 5 in the Your Task block below prescribes a PLAIN ADDITIVE
+        # attach (append=True, metadata_mode OMITTED) for every task in the
+        # hint-attention section, legacy-list rows included.  That is
+        # sufficient because the additive branch of _merge_metadata
+        # (sqlite_task_backend.py) runs apply_migrations over memory_hints on
+        # BOTH sides before merging, normalising a legacy
+        # [{entity, query}, ...] row to the canonical {entities, queries}
+        # shape and unioning it with the incoming hints.
+        #
+        # metadata_mode='replace' is deliberately NOT prescribed here (task
+        # 4216).  Item 5 used to instruct a reshape read-modify-write under
+        # 'replace', on the premise that the additive merge dropped
+        # list-format hints — a premise the migration above falsifies.
+        # 'replace' also writes the incoming blob verbatim and BYPASSES the
+        # corrupt-blob guard that 'merge'/'additive' enforce, so it is the one
+        # mode that can destroy a corrupt-but-recoverable metadata row.
+        # Canonical norm: Mem0 memory
+        # 197893d5-90ad-4c9d-8da9-9706d85d5921, which supersedes the earlier
+        # record that grounded the obsolete instruction.
+        #
+        # Two guards remain, and item 5 / item 4 still carry them: a bare
+        # append=False is rejected by the task-2180 metadata-wipe guard in
+        # _resolve_metadata_mode, and metadata_mode='merge' alongside
+        # append=True is rejected too (task 3581) because honouring 'merge'
+        # shallow-overwrote a task's whole memory_hints key.  The memory
         # id is kept here rather than in the prompt string so the LLM is not
         # burdened with an opaque reference it cannot look up, and the
         # traceability survives prompt rewording.
@@ -4536,7 +4417,7 @@ class TaskKnowledgeSync(BaseStage):
 
 ### Recently Completed Tasks
 {recently_completed_text}
-{provenance_section}{proactive_sample_section}{done_audit_section}{hint_conversion_section}{live_workflow_section}
+{provenance_section}{proactive_sample_section}{done_audit_section}{gate_audit_section}{hint_conversion_section}{required_sections}
 
 ## Your Task
 Reconcile task state against memory:
@@ -4549,13 +4430,14 @@ delete tasks. Update dependent tasks.
 Use entity references + semantic queries, NOT inline content. Request the ADDITIVE merge by \
 passing `append=True` ALONE or the equivalent `metadata_mode='additive'` — never `append=True` \
 together with `metadata_mode='merge'`, which is a contradiction the backend now rejects.
-5. For tasks listed in **Tasks Needing Memory Hint Attention**: reshape legacy list-format \
-memory_hints via read-modify-write — call `get_task` to read the FULL current metadata, convert \
-the hints to the canonical `{{entities, queries}}` dict shape and merge them into that metadata \
-locally, then write the COMPLETE metadata blob back with `metadata_mode='replace'`. Do NOT use a \
-bare `append=False` (the task-2180 metadata-wipe guard now rejects it), and do NOT rely on \
-Stage 2's additive attach merge from step 4 — it silently discards legacy list-format hints \
-under old-wins semantics.
+5. For tasks listed in **Tasks Needing Memory Hint Attention**: attach hints with the plain \
+additive call from step 4 — \
+`update_task(metadata={{'memory_hints': {{'entities': [...], 'queries': [...]}}}}, append=True)` \
+with `metadata_mode` OMITTED. That one call serves every task in the section, whether it has no \
+hints yet or stores them in the LEGACY list format: the backend unions your entries with any \
+hints already on the row, preserves all sibling metadata keys, and auto-converts a legacy \
+list-format row to the canonical `{{entities, queries}}` dict shape. Do NOT use a bare \
+`append=False` (the task-2180 metadata-wipe guard rejects it).
 6. Proactively review the **Proactive Task Sample** regardless of Stage 1 findings: check \
 in-progress tasks for completion knowledge to capture, blocked tasks for unblock conditions \
 that may now be met, and done tasks for missing knowledge capture. **For each done task, \
@@ -4593,6 +4475,35 @@ For cross-project routing see "Known Projects" above.
             marker = '  (current)' if pid == self.project_id else ''
             lines.append(f'- {pid:<{width}}  → {root}{marker}')
         return '\n### Known Projects (for cross-project routing)\n' + '\n'.join(lines) + '\n'
+
+    async def _build_live_workflow_section(self, filtered: FilteredTaskTree) -> str:
+        """Return the Live-Workflow Signals section for *filtered*, or ``''``.
+
+        Takes the payload's RESOLVED tree — harness-injected or self-fetched by
+        :meth:`assemble_payload` — which is why it is not a zero-arg reader of
+        ``self.filtered_task_tree`` like Stage 1's same-named renderer. An empty
+        active list renders ``''`` with no I/O.
+        """
+        return await render_live_workflow_section(filtered.active_tasks, self.scope.project_root)
+
+    async def _render_required_sections(self, filtered: FilteredTaskTree) -> str:
+        """Render every inference-bearing payload section for *filtered*, in registry order.
+
+        Every Stage-2 payload builder MUST interpolate this — enforced
+        structurally by
+        ``tests/reconciliation/test_stage2_payload_section_parity.py``. See
+        :attr:`REQUIRED_SECTIONS` for which sections qualify.
+
+        Renderers receive the payload's resolved *filtered* tree, because
+        :meth:`assemble_payload` may self-fetch it rather than use the
+        harness-injected attribute. Each renderer keeps its own
+        conditional-empty contract, so ``''`` is a normal result and no
+        separator is added. The sections render on remediation passes too: the
+        harness sets the tree there as well.
+        """
+        return ''.join(
+            [await getattr(self, section.renderer)(filtered) for section in self.REQUIRED_SECTIONS]
+        )
 
     @staticmethod
     def _warn_if_count_tasks_mismatch(
@@ -4695,7 +4606,11 @@ class IntegrityCheck(BaseStage):
            missing or stale, for projects whose ceiling is retired-by-design
            (e.g. autopilot_video; task 2818/2826).  Records
            report.stats['contamination_ceiling_findings_dropped'] = before - after.
-        4. Calls record_task_dump_spot_check() to record a non-destructive
+        4. Applies filter_snapshot_stat_edge_findings() to drop findings that
+           read a Mem0-only task-count snapshot stat as evidence of a missing
+           Graphiti temporal_facts edge, for every project (task 3487).  Records
+           report.stats['snapshot_stat_edge_findings_dropped'] = before - after.
+        5. Calls record_task_dump_spot_check() to record a non-destructive
            observability stat when the cached task tree contains contamination
            signals.
 
@@ -4752,6 +4667,15 @@ class IntegrityCheck(BaseStage):
             )
         else:
             report.stats['contamination_ceiling_findings_dropped'] = 0
+
+        # Layer 3 (finding-side) gate for snapshot-stat/missing-edge false
+        # positives (task 3487): project-agnostic, since no project ever
+        # persists a task-count snapshot as a Graphiti edge.
+        _before = len(report.items_flagged)
+        report.items_flagged = filter_snapshot_stat_edge_findings(report.items_flagged)
+        report.stats['snapshot_stat_edge_findings_dropped'] = (
+            _before - len(report.items_flagged)
+        )
 
         self.record_task_dump_spot_check(report)
         return report
@@ -4854,6 +4778,7 @@ def _format_report(report: StageReport | None) -> str:
         f'Stage: {report.stage.value}\n'
         f'Duration: {duration:.1f}s | LLM calls: {report.llm_calls} | '
         f'Tokens: {report.tokens_used}\n'
+        f'Agent outcome: {report.agent_outcome or "unrecorded"}\n'
         f'Stats: {json.dumps(report.stats, default=str)}\n'
         f'Items flagged: {len(report.items_flagged)}'
     )
@@ -5224,32 +5149,64 @@ def _select_proactive_sample(tasks: Iterable[dict], n: int) -> list[dict]:
     return heapq.nsmallest(n, tasks, key=sort_key)
 
 
-def _needs_hint_conversion(task: dict) -> bool:
-    """Classify whether *task*'s ``metadata.memory_hints`` needs conversion to the
-    canonical ``{entities: [...], queries: [...]}`` dict shape (task 1275).
+def _needs_hint_attention(task: dict) -> bool:
+    """Classify whether *task*'s ``metadata.memory_hints`` needs ATTENTION — i.e.
+    whether Stage 2 should attach hints in the canonical
+    ``{entities: [...], queries: [...]}`` dict shape (task 1275).
 
     Three branches matching the pseudo-code in the task spec:
 
     1. ``isinstance(task_hints, list)`` → True (legacy list-of-dict format
-       ``[{entity: ..., query: ...}, ...]`` — treat as conversion target).
+       ``[{entity: ..., query: ...}, ...]``).
     2. ``not task_hints`` (missing key or empty dict) → True (existing falsy path).
     3. otherwise (any truthy non-list value, including malformed scalars like strings
        or ints) → False (skip). Any truthy non-list value is treated as
        already-converted — narrowing to dict is a separable robustness change.
 
-    Per Mem0 memory ``0b0eeb8d``: Stage 2's ADDITIVE attach merge (``append=True``
-    alone, or ``metadata_mode='additive'``) silently discards list-format hints under
-    old-wins semantics, so list-format must be re-classified as a conversion target so
-    the LLM uses read-modify-write, writing the complete metadata blob back with
-    ``metadata_mode='replace'`` (a bare ``append=False`` is now rejected by the
-    task-2180 metadata-wipe guard, and ``metadata_mode='merge'`` alongside
-    ``append=True`` by the task-3581 nested-clobber guard).
+    ONE action serves BOTH True branches: a plain additive attach —
+    ``update_task(metadata={'memory_hints': ...}, append=True)`` with
+    ``metadata_mode`` OMITTED. No reshape read-modify-write is required, because
+    the additive branch runs ``apply_migrations`` over ``memory_hints`` on BOTH
+    sides before merging (``sqlite_task_backend.py::_merge_metadata``), so a legacy
+    list-format row is normalised to the canonical dict shape and unioned with the
+    incoming hints automatically, siblings intact. ``metadata_mode='replace'`` is
+    deliberately NOT prescribed here: it returns the incoming blob verbatim and
+    bypasses the corrupt-blob guard that 'merge'/'additive' enforce. (A bare
+    ``append=False`` is rejected by the task-2180 metadata-wipe guard, and
+    ``metadata_mode='merge'`` alongside ``append=True`` by the task-3581
+    nested-clobber guard.) Canonical norm: Mem0 memory
+    ``197893d5-90ad-4c9d-8da9-9706d85d5921``, which supersedes the earlier record
+    whose discard premise this docstring used to carry and which the migration
+    above falsifies.
+
+    Named for "attention" rather than "conversion" (task 4216) because the
+    population is overwhelmingly branch 2 — tasks with no hints at all, i.e.
+    plain ATTACH candidates — matching the rendered section header
+    ``### Tasks Needing Memory Hint Attention``.
     """
     metadata = task.get('metadata')
     task_hints = metadata.get('memory_hints') if isinstance(metadata, dict) else None
     if isinstance(task_hints, list):
         return True
     return not task_hints
+
+
+def select_tasks_needing_hint_attention(
+    tasks: Iterable[dict], *, claims_read_at: datetime
+) -> list[dict]:
+    """The tasks rendered as ``### Tasks Needing Memory Hint Attention``.
+
+    A task claimed by a live orchestrator run is left out, because a Stage 2
+    hint write would race that run's own metadata writers (task 5093). Claim
+    freshness is judged at *claims_read_at*, the instant the task snapshot was
+    read, not at wall clock.
+    """
+    return [
+        t
+        for t in tasks
+        if _needs_hint_attention(t)
+        and not has_live_claimant(t, claims_read_at, DEFAULT_CLAIMANT_HEARTBEAT_TTL)
+    ]
 
 
 async def _run_briefing_known_gaps_script(project_root: ProjectRoot) -> list[dict] | None:
@@ -5329,7 +5286,7 @@ async def _run_briefing_known_gaps_script(project_root: ProjectRoot) -> list[dic
         return None
 
 
-async def _queue_briefing_refresh_tasks(
+async def queue_briefing_refresh_tasks(
     taskmaster: TaskBackendProtocol,
     project_root: ProjectRoot,
     mismatches: list[dict],
@@ -5337,6 +5294,10 @@ async def _queue_briefing_refresh_tasks(
     run_id: str = '',
 ) -> dict:
     """Create 'Refresh briefing: remove task N from known_gaps' tasks for each mismatch.
+
+    Each mismatch is a dict carrying the ``task_id`` still listed in a
+    briefing's known_gaps, its ``subproject``, its ``title``, and the gap
+    text ``what``; one refresh task is filed per mismatch.
 
     Skips creation when a task with status 'pending' and the same canonical title
     already exists (exact-title de-dup, case-sensitive string equality).
@@ -5415,6 +5376,18 @@ async def _queue_briefing_refresh_tasks(
                 },
             )
             skipped.append(task_id)
+        except LeakedEnvelopeMarkupError as exc:
+            logger.warning(
+                'briefing_refresh_add_task_refused_leaked_markup',
+                extra={
+                    'project_root': project_root,
+                    'task_id': task_id,
+                    'column': exc.column,
+                    'fragment': exc.fragment,
+                    'recovered': exc.recovered,
+                },
+            )
+            failed.append(task_id)
         except Exception:
             logger.warning(
                 'briefing_refresh_add_task_failed',

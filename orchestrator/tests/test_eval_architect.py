@@ -18,15 +18,34 @@ follows precisely.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
-import types
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# Shared campaign-gate scaffolding (task 4427), single-sourced across the three
+# files that pin this contract. _NO_INJECTED_GATE distinguishes "this case
+# passed no usage_gate at all" (the OWNED path, where run_architect_eval builds
+# and tears down its own) from "this case passed usage_gate=None" (deliberately
+# ungated by a campaign owner) — the same trap the production
+# eval_gate.GATE_UNSET sentinel exists to avoid.
+from _campaign_gate_helpers import NO_INJECTED_GATE as _NO_INJECTED_GATE
+from _campaign_gate_helpers import eval_base_config
+from shared.cli_invoke import AllAccountsCappedException
+
+from orchestrator.evals.judge import PlanQualityVerdict
+from orchestrator.evals.measurement import (
+    MeasurementStage,
+    Scored,
+    Unmeasured,
+    UnmeasuredCause,
+)
 from orchestrator.evals.metrics import EvalMetrics
+from orchestrator.evals.results import ResultStore
 
 # ---------------------------------------------------------------------------
 # Synthetic produced-plan builders (shared across the θ tests)
@@ -100,8 +119,7 @@ def _stub_with_steps(steps) -> dict:
 
 # Every artifact shape that carries NO model content to derive a score from —
 # absent, empty, not-a-dict, or the header-only stub in either empty spelling.
-# Shared by the is_scorable_plan tests and the anti-drift parity assertion, so
-# the two can never be extended out of step with each other.
+# The predicate's own tests live in test_eval_plan_predicates.py.
 _UNSCORABLE_PLAN_SHAPES = [
     {},
     None,
@@ -142,27 +160,26 @@ class TestEvalMetricsPlanQualityField:
 
 
 # ---------------------------------------------------------------------------
-# EvalMetrics.invocation_error / cap_tainted fields (task 3118 step-1/2)
+# EvalMetrics.invocation_errors / cap_tainted fields (task 3118, task 6734)
 #
 # The infra-failure markers that let a reader tell "the model wrote a terrible
-# plan" from "we never got to ask the model": ``invocation_error`` records WHAT
-# happened at the transport layer (stage-prefixed), ``cap_tainted`` is the
-# machine-checkable exclusion predicate every aggregate keys on. Both are
-# default-safe so a result JSON persisted before these fields existed reads
-# back unchanged.
+# plan" from "we never got to ask the model": ``invocation_errors`` records
+# WHAT happened, one typed record per unmeasured stage; ``cap_tainted`` is the
+# machine-checkable exclusion predicate every aggregate keys on.
 # ---------------------------------------------------------------------------
 
 class TestEvalMetricsInvocationErrorField:
-    def test_invocation_error_default_is_none(self):
-        assert EvalMetrics().invocation_error is None
+    def test_invocation_errors_default_is_none(self):
+        assert EvalMetrics().invocation_errors is None
 
     def test_cap_tainted_default_is_false(self):
         assert EvalMetrics().cap_tainted is False
 
-    def test_to_dict_carries_invocation_error_key_defaulting_none(self):
+    def test_to_dict_carries_invocation_errors_key_defaulting_none(self):
         d = EvalMetrics().to_dict()
-        assert 'invocation_error' in d
-        assert d['invocation_error'] is None
+        assert 'invocation_errors' in d
+        assert d['invocation_errors'] is None
+        assert 'invocation_error' not in d
 
     def test_to_dict_carries_cap_tainted_key_defaulting_false(self):
         d = EvalMetrics().to_dict()
@@ -204,18 +221,8 @@ class TestEvalMetricsInvocationErrorField:
 
 
 # ---------------------------------------------------------------------------
-# detect_invocation_error — the pure transport-refusal classifier (3118 step-3/4)
-#
-# Delegates to the existing shared.invocation_outcome.classify_invocation seam
-# (do NOT re-implement 429/cap string matching in the eval layer) plus a
-# structured api_error_status==429 fallback, since 429 is deliberately excluded
-# from the AuthFailed variant and routes to the cap-TEXT tier — a body-less 429
-# would otherwise classify as Failure(unclassified).
-#
-# The load-bearing property is asymmetric: an INFRA refusal must be marked, but
-# an ORDINARY content failure (an architect that ran fine and produced a bad or
-# absent plan) must NOT be — that is a real reliability signal and must keep
-# scoring 0.0 rather than being laundered into an exclusion.
+# Real AgentResult refusal shapes the runner tests feed the architect. The
+# classifier's own unit tests live in test_eval_measurement.py.
 # ---------------------------------------------------------------------------
 
 # The exact payload the Claude CLI emitted during the 2026-07-27 architect-effort
@@ -317,257 +324,6 @@ def _server_error_result(status: int = 529):
     )
 
 
-class TestDetectInvocationError:
-    def test_none_result_is_not_an_invocation_error(self):
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        assert detect_invocation_error(None) is None
-
-    def test_successful_run_quoting_cap_text_is_not_tainted(self):
-        # The no-false-taint property, inherited free from classify_invocation's
-        # OK short-circuit: a HEALTHY run whose output merely QUOTES a cap string
-        # (e.g. an agent discussing a usage-limit message) is not an infra
-        # refusal and must never be excluded from the aggregate.
-        from shared.cli_invoke import AgentResult
-
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        ok = AgentResult(
-            success=True, output=f'the CLI printed: {_CAP_TEXT}',
-            cost_usd=1.5, duration_ms=9000, turns=12,
-        )
-        assert detect_invocation_error(ok) is None
-
-    def test_campaign_429_payload_yields_marker_naming_the_cap(self):
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        marker = detect_invocation_error(_cap_agent_result())
-        assert isinstance(marker, str) and marker
-        assert 'cap' in marker.lower()
-        # The marker quotes the REASON, so a human reading the result JSON sees
-        # the forensic evidence, not just a boolean.
-        assert 'session limit' in marker
-        # A bodied 429 is a cap hit, never the new 5xx bucket — regression pin
-        # for the server_error tier, folded in here rather than as a parallel
-        # test (reviewer: duplication).
-        assert marker.partition(':')[0] == 'cap_hit'
-        assert 'server_error' not in marker
-
-    def test_body_less_429_yields_marker_via_structured_fallback(self):
-        # 429 is deliberately EXCLUDED from AuthFailed (it routes to the cap-text
-        # tier), so a 429 with no cap body classifies as a wedge/unclassified
-        # failure — the structured api_error_status fallback must still catch it.
-        from shared.cli_invoke import AgentResult
-
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        bare = AgentResult(
-            success=False, output='', stderr='', cost_usd=0.0,
-            duration_ms=800, turns=0, api_error_status=429,
-        )
-        marker = detect_invocation_error(bare)
-        assert isinstance(marker, str) and marker
-        assert '429' in marker
-        # 429 sits below the 5xx band, so a body-less 429 must keep reaching
-        # this raw-status fallback rather than drifting into the server_error
-        # bucket a bodied 5xx gets — folded in here rather than as a parallel
-        # test (reviewer: duplication).
-        assert marker.partition(':')[0] == 'api_error'
-        assert 'server_error' not in marker
-
-    def test_auth_failure_yields_auth_marker(self):
-        from shared.cli_invoke import AgentResult
-
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        unauthorized = AgentResult(
-            success=False, output='', cost_usd=0.0, duration_ms=200,
-            turns=0, api_error_status=401,
-        )
-        marker = detect_invocation_error(unauthorized)
-        assert isinstance(marker, str) and marker
-        assert 'auth' in marker.lower()
-        assert '401' in marker
-
-    def test_ordinary_content_failure_is_not_tainted(self):
-        # THE load-bearing negative: an architect that really ran (non-zero cost,
-        # real turns) and simply failed to produce a good plan is a CONTENT
-        # signal — it must keep scoring 0.0, never be excluded as infra.
-        from shared.cli_invoke import AgentResult
-
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        content_failure = AgentResult(
-            success=False, output='I could not complete the plan',
-            cost_usd=1.2, duration_ms=45000, turns=8, api_error_status=None,
-        )
-        assert detect_invocation_error(content_failure) is None
-
-    def test_zero_output_wedge_yields_wedge_marker(self):
-        # A full-timeout invocation with zero transcript turns produced NO model
-        # answer at all — unmeasurable for exactly the reason a 429 is, so it
-        # must be marked rather than scored 0.0 (reviewer: robustness).
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        marker = detect_invocation_error(_wedged_agent_result())
-        assert isinstance(marker, str) and marker
-        assert 'wedge' in marker.lower()
-
-    def test_body_less_429_outranks_the_wedge_tier(self):
-        # A 429 that ALSO timed out with zero turns must report the 429 it is,
-        # not a generic wedge — the structured status is the more specific fact.
-        from shared.cli_invoke import AgentResult
-
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        wedged_429 = AgentResult(
-            success=False, output='', cost_usd=0.0, duration_ms=600_000,
-            turns=0, timed_out=True, transcript_turns=0, api_error_status=429,
-        )
-        marker = detect_invocation_error(wedged_429)
-        assert marker is not None and '429' in marker
-        assert 'wedge' not in marker.lower()
-
-    def test_near_cap_warning_is_not_an_invocation_error(self):
-        # NearCap is a WARNING that a cap is imminent — this invocation was NOT
-        # refused, so whatever it produced is a real measurement. Pinned so the
-        # deliberate None can't silently become a marker (and an exclusion).
-        from shared.cli_invoke import AgentResult
-
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        near = AgentResult(
-            success=False,
-            output="You're close to your usage limit for this session",
-            cost_usd=0.9, duration_ms=30_000, turns=6,
-        )
-        assert detect_invocation_error(near) is None
-
-    def test_cli_local_error_is_not_an_invocation_error(self):
-        # CliLocalError is explicitly NOT a cap (the reify-3604 precedence fix).
-        # It is a local harness/CLI fault whose classification the eval layer
-        # deliberately does not launder into a cap-shaped exclusion.
-        from shared.invocation_outcome import (
-            NON_CAP_CLI_ERROR_MARKERS,
-            CliLocalError,
-            classify_invocation,
-        )
-
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        local = _cli_local_error_result(next(iter(NON_CAP_CLI_ERROR_MARKERS)))
-        # Guard the fixture: it really does reach the CliLocalError tier, so
-        # this stays a pin on the VARIANT rather than on an unclassified blob.
-        assert isinstance(
-            classify_invocation(local, strict_confirm=True), CliLocalError
-        )
-        assert detect_invocation_error(local) is None
-
-    # -- backend threading -------------------------------------------------
-    #
-    # classify_invocation's codex/gemini cap tables fire ONLY for their own
-    # backend, so the `backend=` argument is load-bearing: dropping or
-    # hard-coding it would silently un-mark every codex/gemini cap hit while
-    # every claude test still passed.
-
-    def test_codex_cap_pattern_fires_only_under_the_codex_backend(self):
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        codex_capped = _codex_cap_agent_result()
-
-        marker = detect_invocation_error(codex_capped, backend='codex')
-        assert isinstance(marker, str) and marker
-        assert 'cap' in marker.lower()
-
-        # Same payload, DEFAULT (claude) backend: the codex table is not
-        # consulted and no claude cap prefix matches, so it is not an infra
-        # refusal at all.
-        assert detect_invocation_error(codex_capped) is None
-
-    # -- 5xx (ServerError) attribution --------------------------------------
-
-    def test_server_error_5xx_yields_server_error_marker(self):
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        marker = detect_invocation_error(_server_error_result(529))
-        assert isinstance(marker, str)
-        # report._taint_cause (report.py:1194-1216) reduces the stage-prefixed
-        # marker to this first colon-delimited token as the report's by-cause
-        # exclusion key (accumulated at report.py:1313) — the prefix is a
-        # behavioural contract, not cosmetics, hence the exact-token assert
-        # rather than a loose `in`.
-        assert marker.partition(':')[0] == 'server_error'
-        assert '529' in marker
-
-    @pytest.mark.parametrize('status', [500, 502, 503, 529, 599])
-    def test_every_5xx_status_in_the_band_is_attributed(self, status: int):
-        # Mirrors the band shared/tests/test_server_error.py::TestIsServerErrorStatus
-        # pins, so the eval layer cannot drift into a 529-only special case.
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        marker = detect_invocation_error(_server_error_result(status))
-        assert isinstance(marker, str)
-        assert marker.partition(':')[0] == 'server_error'
-        assert str(status) in marker
-
-    # -- timed-out-but-actually-5xx: the shape 3314 regressed to None -------
-
-    def test_timed_out_flushed_5xx_is_attributed_as_a_server_error_not_dropped(self):
-        # The headline regression case: a watchdog-SIGTERM-flushed result
-        # carrying BOTH timed_out=True and a 5xx api_error_status. Before
-        # 3314's ServerError tier existed this classified ZeroOutputWedge and
-        # was marked; afterwards it fell through to None until this task.
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        marker = detect_invocation_error(_flushed_server_error_result(529))
-        assert marker is not None
-        assert marker.partition(':')[0] == 'server_error'
-        assert '529' in marker
-
-    def test_timed_out_flushed_5xx_outranks_the_wedge_tier(self):
-        # A SIGTERM-flushed 5xx is a PROVIDER outage, not a local wedge; the
-        # upstream ServerError tier exists precisely because ranking the
-        # wedge first discarded the 5xx evidence, so the eval marker must not
-        # re-flatten it. Mirrors test_body_less_429_outranks_the_wedge_tier.
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        marker = detect_invocation_error(_flushed_server_error_result(529))
-        assert marker is not None
-        assert 'wedge' not in marker.lower()
-
-    def test_plain_wedge_without_api_error_status_is_still_a_wedge(self):
-        # The converse guard: stops the new arm from swallowing the genuine
-        # local-wedge signal when there is no api_error_status at all.
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        marker = detect_invocation_error(_wedged_agent_result())
-        assert marker is not None
-        assert marker.partition(':')[0] == 'wedge'
-        assert 'server_error' not in marker
-
-    def test_near_cap_warning_outranks_the_server_error_tier(self):
-        # classify_invocation ranks NearCap ABOVE ServerError (invocation_
-        # outcome.py:502-505 vs :523): a real 5xx whose body ALSO carries a
-        # near-cap warning classifies NearCap, not ServerError, so this must
-        # still return None — deliberately, not a gap. This is the genuinely
-        # interesting boundary the 5xx arm introduced (reviewer:
-        # test-coverage): a provider-refused invocation (api_error_status=529)
-        # whose body happens to warn of an imminent cap is scored on content,
-        # not excluded as infra, because the near-cap text is the more
-        # specific, actionable signal.
-        from shared.cli_invoke import AgentResult
-
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        near_with_5xx = AgentResult(
-            success=False,
-            output="You're close to your usage limit for this session",
-            cost_usd=0.9, duration_ms=30_000, turns=6,
-            api_error_status=529,
-        )
-        assert detect_invocation_error(near_with_5xx) is None
-
-
 # ---------------------------------------------------------------------------
 # Deterministic structural plan-quality rubric (step-3/4)
 #
@@ -660,7 +416,7 @@ class TestScorePlanStructure:
 # instruments (task 3410)
 #
 # score_plan_structure and judge_plan_quality reduce onto the SAME axis
-# (EvalMetrics.plan_quality), so — exactly as is_scorable_plan (below) is the
+# (EvalMetrics.plan_quality), so — exactly as plan_predicates.is_scorable_plan is the
 # ONE scorability predicate both instruments call — clamp_unit_score is the
 # ONE range/rounding contract both instruments call. Pinning it directly here
 # is the anti-drift anchor: a future edit to either instrument cannot drift
@@ -693,61 +449,14 @@ class TestClampUnitScore:
 
 
 # ---------------------------------------------------------------------------
-# is_scorable_plan — THE single "does this artifact carry model content?" test
-# (3118 step-19/20)
-#
-# Extracted because the taint decision and the structural floor's 0.0
-# short-circuit were two INDEPENDENT tests that DISAGREED: run_architect_eval
-# used raw dict truthiness (`not plan`) while score_plan_structure used
-# `not plan.get('steps')`. `_create_plan` persists a TRUTHY header-only dict
-# with zero steps, so a cap landing right after the architect's first
-# plan-tools call fell straight into the gap — untainted, then floored to a
-# fabricated 0.0, the exact defect this task exists to remove.
-#
-# Both call sites now share this one function, so the parity below is
-# structural, not a convention someone has to remember.
-# ---------------------------------------------------------------------------
-
-class TestIsScorablePlan:
-    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
-    def test_shapes_without_steps_are_not_scorable(self, plan):
-        from orchestrator.evals.judge import is_scorable_plan
-
-        assert is_scorable_plan(plan) is False
-
-    def test_a_plan_with_steps_is_scorable(self):
-        from orchestrator.evals.judge import is_scorable_plan
-
-        assert is_scorable_plan(_well_formed_plan()) is True
-        # Even a poor plan is SCORABLE — the predicate asks "is there content to
-        # measure?", never "is the content good?". A bad plan must keep earning
-        # its low score rather than being laundered into an exclusion.
-        assert is_scorable_plan(_degenerate_plan()) is True
-
-    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
-    def test_rejected_shapes_are_exactly_the_structural_floor_zero(self, plan):
-        """ANTI-DRIFT: the predicate and the floor's short-circuit must agree.
-
-        The blocking defect was two "is this a real plan?" tests disagreeing.
-        Every shape the predicate rejects must be a shape the floor scores 0.0
-        by short-circuit — so a cell can never be left untainted while the floor
-        simultaneously refuses to derive a content score for it.
-        """
-        from orchestrator.evals.judge import is_scorable_plan, score_plan_structure
-
-        assert is_scorable_plan(plan) is False
-        assert score_plan_structure(plan) == 0.0
-
-
-# ---------------------------------------------------------------------------
 # LLM plan judge judge_plan_quality (step-5/6)
 #
-# Mirrors run_judge's parse-and-fallback contract: invoke_agent is mocked with
-# an AsyncMock whose structured_output is a fixed {plan_quality, per_criterion,
-# reasoning}. The judge scores the produced plan against the REAL landed diff,
-# guided by PLAN_QUALITY_RUBRIC. An unparseable/empty judge output degrades to a
-# defined fallback verdict (plan_quality=None) — the run_architect_eval path
-# then falls back to the deterministic score_plan_structure floor.
+# invoke_agent is mocked with an AsyncMock whose structured_output is a fixed
+# {plan_quality, per_criterion, reasoning}. The judge scores the produced plan
+# against the REAL landed diff, guided by PLAN_QUALITY_RUBRIC, and returns
+# Scored[PlanQualityVerdict] | Unmeasured: an unparseable, null or non-finite
+# answer is Unmeasured(judge, unparseable), and run_architect_eval then falls
+# back to the deterministic score_plan_structure floor.
 # ---------------------------------------------------------------------------
 
 def _judge_task() -> dict:
@@ -785,6 +494,27 @@ def _judge_result_scoring(raw, *, via: str) -> MagicMock:
     return fake
 
 
+def _scored_verdict(outcome) -> PlanQualityVerdict:
+    """The verdict inside a ``Scored`` plan-judge outcome, asserting it is one."""
+    assert isinstance(outcome, Scored), outcome
+    return outcome.value
+
+
+def _assert_judge_unparseable(outcome) -> Unmeasured:
+    assert isinstance(outcome, Unmeasured), outcome
+    assert outcome.stage is MeasurementStage.JUDGE
+    assert outcome.cause is UnmeasuredCause.UNPARSEABLE
+    return outcome
+
+
+def _measurement_warnings(caplog) -> list[str]:
+    """Every WARNING-or-worse message measured_call emitted, in order."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == 'orchestrator.evals.measurement' and r.levelno >= logging.WARNING
+    ]
+
+
 @pytest.mark.asyncio
 class TestJudgePlanQuality:
     async def test_returns_parsed_verdict_and_embeds_plan_diff_rubric(self):
@@ -809,8 +539,9 @@ class TestJudgePlanQuality:
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=fake),
         ) as mock_invoke:
-            verdict = await judge_plan_quality(plan, reference_diff, _judge_task())
+            outcome = await judge_plan_quality(plan, reference_diff, _judge_task())
 
+        verdict = _scored_verdict(outcome)
         assert isinstance(verdict.plan_quality, float)
         assert verdict.plan_quality == 0.83
         assert verdict.per_criterion == {'has_steps': 1.0, 'tdd_alternation': 1.0}
@@ -836,14 +567,15 @@ class TestJudgePlanQuality:
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=fake),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
-        assert verdict.plan_quality == 0.5
+        assert _scored_verdict(outcome).plan_quality == 0.5
 
-    async def test_unparseable_output_degrades_to_fallback_verdict(self):
-        from orchestrator.evals.judge import PlanQualityVerdict, judge_plan_quality
+    async def test_unparseable_output_is_unmeasured_and_names_the_cell(self, caplog):
+        from orchestrator.evals.judge import judge_plan_quality
 
+        caplog.set_level(logging.WARNING)
         fake = MagicMock()
         fake.structured_output = None
         fake.output = 'not json at all {{{'
@@ -851,39 +583,34 @@ class TestJudgePlanQuality:
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=fake),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
-        # A defined fallback verdict — no crash; plan_quality is the None
-        # sentinel so run_architect_eval degrades to score_plan_structure.
-        assert isinstance(verdict, PlanQualityVerdict)
-        assert verdict.plan_quality is None
-        assert isinstance(verdict.reasoning, str)
+        # No crash, and no fabricated score: run_architect_eval degrades to
+        # score_plan_structure on this outcome.
+        _assert_judge_unparseable(outcome)
+        assert any('df_task_2605' in w for w in _measurement_warnings(caplog))
 
-    async def test_cap_refused_judge_invoke_records_invocation_error(self):
+    async def test_cap_refused_judge_invoke_is_a_cap_hit(self):
         # The judge's OWN invoke can 429 — historically indistinguishable from
-        # an unparseable answer, because both produced the same bare
-        # plan_quality=None verdict. The marker makes the infra cause legible.
+        # an unparseable answer. The typed cause makes the infra cause legible.
         from orchestrator.evals.judge import judge_plan_quality
 
         with patch(
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=_cap_agent_result()),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
-        assert verdict.plan_quality is None
-        assert isinstance(verdict.invocation_error, str)
-        assert verdict.invocation_error
-        assert 'cap' in verdict.invocation_error.lower()
+        assert isinstance(outcome, Unmeasured)
+        assert outcome.stage is MeasurementStage.JUDGE
+        assert outcome.cause is UnmeasuredCause.CAP_HIT
 
-    async def test_unparseable_but_successful_judge_output_carries_no_marker(self):
-        # The CONTRAST that makes the marker meaningful: a judge that really
-        # answered and simply produced garbage is a CONTENT failure, so its
-        # None plan_quality stays unmarked and run_architect_eval keeps
-        # degrading to the deterministic structural floor.
+    async def test_unparseable_but_successful_judge_output_is_not_a_refusal(self):
+        # The CONTRAST: a judge that really answered and simply produced
+        # garbage is unparseable, never a transport refusal.
         from shared.cli_invoke import AgentResult
 
         from orchestrator.evals.judge import judge_plan_quality
@@ -896,17 +623,16 @@ class TestJudgePlanQuality:
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=answered),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
-        assert verdict.plan_quality is None
-        assert verdict.invocation_error is None
+        _assert_judge_unparseable(outcome)
 
-    async def test_missing_plan_quality_key_degrades_to_fallback(self):
+    async def test_missing_plan_quality_key_is_unparseable(self):
         from orchestrator.evals.judge import judge_plan_quality
 
-        # Valid JSON but no plan_quality field → fallback, not a KeyError crash.
+        # Valid JSON but no plan_quality field → unparseable, not a KeyError crash.
         payload = {'per_criterion': {}, 'reasoning': 'forgot the score'}
         fake = MagicMock()
         fake.structured_output = payload
@@ -915,10 +641,31 @@ class TestJudgePlanQuality:
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=fake),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
-        assert verdict.plan_quality is None
+        _assert_judge_unparseable(outcome)
+
+    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
+    async def test_explicit_null_plan_quality_is_unparseable_and_loud(
+        self, via, caplog,
+    ):
+        """A null answer is not a judgement, and it no longer degrades silently."""
+        from orchestrator.evals.judge import judge_plan_quality
+
+        caplog.set_level(logging.WARNING)
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_judge_result_scoring(None, via=via)),
+        ):
+            outcome = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        _assert_judge_unparseable(outcome)
+        warnings = _measurement_warnings(caplog)
+        assert len(warnings) == 1
+        assert 'df_task_2605' in warnings[0]
 
     # -- Output-range contract (task 3410) --------------------------------
     # score_plan_structure has always clamped+rounded to [0, 1]/4dp
@@ -943,10 +690,11 @@ class TestJudgePlanQuality:
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=_judge_result_scoring(raw, via=via)),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
+        verdict = _scored_verdict(outcome)
         assert isinstance(verdict.plan_quality, float)
         assert 0.0 <= verdict.plan_quality <= 1.0
         assert verdict.plan_quality == expected
@@ -971,7 +719,7 @@ class TestJudgePlanQuality:
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=_judge_result_scoring(raw, via=via)),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
@@ -988,8 +736,8 @@ class TestJudgePlanQuality:
 
         # The verdict is otherwise intact: a corrected CONTENT answer, never
         # an infra refusal (3118 exclusion shape) or a parse failure.
+        verdict = _scored_verdict(outcome)
         assert verdict.plan_quality == expected
-        assert verdict.invocation_error is None
         assert verdict.per_criterion == {}
         assert verdict.reasoning == 'r'
 
@@ -1006,11 +754,11 @@ class TestJudgePlanQuality:
                 return_value=_judge_result_scoring(0.83, via='structured_output'),
             ),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
-        assert verdict.plan_quality == 0.83
+        assert _scored_verdict(outcome).plan_quality == 0.83
         assert _judge_warnings(caplog) == []
 
     # -- The hole a bare clamp leaves open: non-finite answers (task 3410, --
@@ -1021,7 +769,7 @@ class TestJudgePlanQuality:
     # clamp DOES keep +/-Infinity in [0, 1] — but only by fabricating the
     # best/worst possible score (1.0/0.0) on a surface
     # report._mean_plan_quality -> select_survivors actually ranks on. Both
-    # are equally NOT a judgement, so both degrade to the None sentinel.
+    # are equally NOT a judgement, so both are Unmeasured(judge, unparseable).
     # Both are reachable through the SAME schema-bypassing
     # json.loads(result.output) fallback — CPython's json.loads accepts the
     # bare literals NaN and Infinity, and overflows 1e999 to inf — not
@@ -1038,52 +786,40 @@ class TestJudgePlanQuality:
         pytest.param(float('inf'), id='positive-infinity'),
         pytest.param(float('-inf'), id='negative-infinity'),
     ])
-    async def test_non_finite_answer_degrades_to_the_none_sentinel(
-        self, raw, via, caplog,
-    ):
+    async def test_non_finite_answer_is_unparseable(self, raw, via, caplog):
         from orchestrator.evals.judge import judge_plan_quality
 
-        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        caplog.set_level(logging.WARNING)
         with patch(
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=_judge_result_scoring(raw, via=via)),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
-        # The existing sentinel run_architect_eval already degrades to the
-        # deterministic structural floor on — never a fabricated pool-best
-        # 1.0 laundered into a number a downstream mean could be poisoned by.
-        assert verdict.plan_quality is None
-        # A nonsense answer is a CONTENT failure, never the 3118 infra-refusal
-        # exclusion shape.
-        assert verdict.invocation_error is None
-        # Same degraded shape the parse-failure fallback uses — pinned here
-        # too, not just plan_quality, so a future edit can't quietly leave
-        # per_criterion/reasoning out of step with that documented shape.
-        assert verdict.per_criterion == {}
-        assert repr(raw) in verdict.reasoning
+        # run_architect_eval degrades to the deterministic structural floor on
+        # this — never a fabricated pool-best 1.0 laundered into a number a
+        # downstream mean could be poisoned by. A nonsense answer is a CONTENT
+        # failure, never the 3118 infra-refusal exclusion shape.
+        unmeasured = _assert_judge_unparseable(outcome)
+        assert repr(raw) in unmeasured.reason
 
-        warnings = _judge_warnings(caplog)
+        warnings = _measurement_warnings(caplog)
         assert len(warnings) == 1
         assert 'df_task_2605' in warnings[0]  # WHICH cell to go look at
         assert repr(raw) in warnings[0]       # WHAT was wrong
 
 
 # ---------------------------------------------------------------------------
-# PlanQualityVerdict.cost_usd (step-1/2, eval-revival υ) — the judge's OWN
-# invocation spend
+# The plan judge's OWN invocation spend (eval-revival υ, task 6734)
 #
 # run_architect_eval never sees the judge's AgentResult, only the returned
-# PlanQualityVerdict — so the judge invocation's cost has to ride the return
-# value. A trailing, defaulted field (mirroring invocation_error,
-# judge.py:458-463) keeps every existing 3-arg construction site — including
-# every judge test above predating this task — reading back cost_usd=0.0
-# rather than crashing.
+# Scored | Unmeasured outcome — so the judge invocation's cost rides the
+# outcome's cost_usd, on every path, whatever the verdict turned out to be.
 # ---------------------------------------------------------------------------
 
-class TestPlanQualityVerdictCarriesJudgeSpend:
+class TestPlanJudgeOutcomeCarriesItsSpend:
     @pytest.mark.asyncio
     async def test_success_path_carries_the_invocations_own_spend(self):
         from orchestrator.evals.judge import judge_plan_quality
@@ -1097,16 +833,14 @@ class TestPlanQualityVerdictCarriesJudgeSpend:
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=fake),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
-        assert verdict.cost_usd == pytest.approx(0.42)
+        assert isinstance(outcome, Scored)
+        assert outcome.cost_usd == pytest.approx(0.42)
 
-    # -- Amendment (reviewer design-coherence): the PRODUCER coerces too ----
-    # PlanQualityVerdict.cost_usd is declared ``float``; these pin that the
-    # declared type is actually true at construction, not just enforced by
-    # the runner's defensive read (_verdict_cost_usd / coerce_cost_usd).
+    # -- The PRODUCER coerces: cost_usd is a real float at construction ----
 
     @pytest.mark.asyncio
     async def test_success_path_with_unset_mock_cost_degrades_to_zero(self):
@@ -1114,10 +848,9 @@ class TestPlanQualityVerdictCarriesJudgeSpend:
         read back a real ``0.0`` float, not a Mock instance and not a
         fabricated ``1.0`` (MagicMock's default ``__float__``).
 
-        This is what makes the producer-side coercion safe for the ~20
-        pre-existing judge tests that construct exactly this kind of bare
-        mock and never touch ``cost_usd``: none of them assert on the field,
-        and this pins the value they'd now get if they did.
+        This is what makes the producer-side coercion safe for the judge
+        tests that construct exactly this kind of bare mock and never touch
+        ``cost_usd``.
         """
         from orchestrator.evals.judge import judge_plan_quality
 
@@ -1131,12 +864,12 @@ class TestPlanQualityVerdictCarriesJudgeSpend:
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=fake),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
-        assert verdict.cost_usd == 0.0
-        assert isinstance(verdict.cost_usd, float)
+        assert outcome.cost_usd == 0.0
+        assert isinstance(outcome.cost_usd, float)
 
     @pytest.mark.asyncio
     async def test_success_path_with_non_finite_cost_degrades_to_zero(self):
@@ -1154,22 +887,11 @@ class TestPlanQualityVerdictCarriesJudgeSpend:
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=fake),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
-        assert verdict.cost_usd == 0.0
-
-    def test_legacy_three_arg_construction_reads_back_zero_spend(self):
-        """Every pre-existing construction site (and any older persisted /
-        monkeypatched verdict) must keep working and read back "no spend
-        recorded" rather than crashing."""
-        from orchestrator.evals.judge import PlanQualityVerdict
-
-        verdict = PlanQualityVerdict(
-            plan_quality=0.5, per_criterion={}, reasoning='ok',
-        )
-        assert verdict.cost_usd == 0.0
+        assert outcome.cost_usd == 0.0
 
     # -- Degraded POST-invoke paths still carry real spend (step-3/4) ------
     # A refused/unparseable/non-finite judge answer still consumed whatever
@@ -1196,12 +918,13 @@ class TestPlanQualityVerdictCarriesJudgeSpend:
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=refused),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
-        assert isinstance(verdict.invocation_error, str) and verdict.invocation_error
-        assert verdict.cost_usd == pytest.approx(0.07)
+        assert isinstance(outcome, Unmeasured)
+        assert outcome.cause is UnmeasuredCause.CAP_HIT
+        assert outcome.cost_usd == pytest.approx(0.07)
 
     @pytest.mark.asyncio
     async def test_parse_failure_path_carries_the_invocations_own_spend(self):
@@ -1215,12 +938,12 @@ class TestPlanQualityVerdictCarriesJudgeSpend:
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=fake),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
-        assert verdict.plan_quality is None
-        assert verdict.cost_usd == pytest.approx(0.31)
+        _assert_judge_unparseable(outcome)
+        assert outcome.cost_usd == pytest.approx(0.31)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('raw', [
@@ -1237,12 +960,12 @@ class TestPlanQualityVerdictCarriesJudgeSpend:
             'orchestrator.evals.judge.invoke_agent',
             AsyncMock(return_value=fake),
         ):
-            verdict = await judge_plan_quality(
+            outcome = await judge_plan_quality(
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
-        assert verdict.plan_quality is None
-        assert verdict.cost_usd == pytest.approx(0.29)
+        _assert_judge_unparseable(outcome)
+        assert outcome.cost_usd == pytest.approx(0.29)
 
     # -- The PRE-invoke refusal fabricates no spend (step-3/4) --------------
     # Nothing to judge, so invoke_agent is never awaited — recording spend
@@ -1255,10 +978,11 @@ class TestPlanQualityVerdictCarriesJudgeSpend:
 
         mock_invoke = AsyncMock()
         with patch('orchestrator.evals.judge.invoke_agent', mock_invoke):
-            verdict = await judge_plan_quality(plan, 'diff', _judge_task())
+            outcome = await judge_plan_quality(plan, 'diff', _judge_task())
 
         mock_invoke.assert_not_awaited()
-        assert verdict.cost_usd == 0.0
+        assert isinstance(outcome, Scored)
+        assert outcome.cost_usd == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1280,10 +1004,7 @@ class TestPlanQualityVerdictCarriesJudgeSpend:
 # caller — a backfill/re-scoring script, a new eval path, prompt_opt, a resume
 # wave — cannot silently re-open the same defect.
 #
-# Parametrized over the SHARED _UNSCORABLE_PLAN_SHAPES corpus (line 103), the
-# same list TestIsScorablePlan uses: any shape added to the predicate's corpus
-# automatically extends the judge path's coverage, so the two instruments can
-# never be tested out of step with each other.
+# Parametrized over the _UNSCORABLE_PLAN_SHAPES corpus at the top of this file.
 #
 # ONE call per shape pins every property of the refusal, because they are four
 # independent facts about a single return value from a single code path — and
@@ -1319,7 +1040,7 @@ async def _judge_with_a_confident_llm(plan, task=None):
     The fixture lives HERE, once: every test below differs only in the plan (or
     task) it passes, so a future change to the judge's call signature is a
     one-place edit rather than one per test. Returns the ``invoke_agent`` mock
-    alongside the verdict, since "was the LLM consulted at all?" is half of
+    alongside the outcome, since "was the LLM consulted at all?" is half of
     what these tests pin.
     """
     from orchestrator.evals.judge import judge_plan_quality
@@ -1328,10 +1049,10 @@ async def _judge_with_a_confident_llm(plan, task=None):
         'orchestrator.evals.judge.invoke_agent',
         AsyncMock(return_value=_confident_judge_result()),
     ) as mock_invoke:
-        verdict = await judge_plan_quality(
+        outcome = await judge_plan_quality(
             plan, 'diff', _judge_task() if task is None else task,
         )
-    return verdict, mock_invoke
+    return outcome, mock_invoke
 
 
 def _judge_warnings(caplog) -> list[str]:
@@ -1356,19 +1077,20 @@ class TestJudgePlanQualityRefusesAnUnjudgeableArtifact:
         from orchestrator.evals.judge import score_plan_structure
 
         caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
-        verdict, mock_invoke = await _judge_with_a_confident_llm(plan)
+        outcome, mock_invoke = await _judge_with_a_confident_llm(plan)
         floor = score_plan_structure(plan)
 
+        # A definite CONTENT verdict, Scored: never Unmeasured (parse failure /
+        # transport refusal) and never the cap-tainted exclusion shape — the
+        # content-failure vs infra-failure distinction tasks 3118 and 3302 both
+        # turn on. A stepless plan from a healthy judge call is a REAL 0.0.
+        verdict = _scored_verdict(outcome)
         # The floor's own value, DERIVED — never the judge's confident 0.95.
         assert verdict.plan_quality == floor == 0.0
         # Nothing to judge, so no spend: the refusal happens BEFORE the prompt
         # is built and before invoke_agent is awaited.
         mock_invoke.assert_not_awaited()
-        # A definite CONTENT verdict: never the None sentinel (parse failure /
-        # transport refusal) and never the cap-tainted exclusion shape — the
-        # content-failure vs infra-failure distinction tasks 3118 and 3302 both
-        # turn on. A stepless plan from a healthy judge call is a REAL 0.0.
-        assert verdict.invocation_error is None
+        assert outcome.cost_usd == 0.0
         assert verdict.per_criterion == {}
         # ``reasoning`` is the only part of this verdict a human reads off a
         # persisted cell, so it must EXPLAIN the 0.0 rather than leave the cell
@@ -1411,11 +1133,13 @@ class TestJudgePlanQualityRefusesAnUnjudgeableArtifact:
         is what pins the floor as a refusal value rather than a universal
         substitute.
         """
-        from orchestrator.evals.judge import is_scorable_plan, score_plan_structure
+        from orchestrator.evals.judge import score_plan_structure
+        from orchestrator.evals.plan_predicates import is_scorable_plan
 
         caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
         assert is_scorable_plan(plan)
-        verdict, mock_invoke = await _judge_with_a_confident_llm(plan)
+        outcome, mock_invoke = await _judge_with_a_confident_llm(plan)
+        verdict = _scored_verdict(outcome)
 
         mock_invoke.assert_awaited_once()
         assert verdict.plan_quality == 0.95
@@ -1591,6 +1315,13 @@ def _arch_task_no_reference() -> dict:
     return task
 
 
+def _architect_prompt_sent() -> str:
+    """What the hermetic architect receives: the stubbed production briefing plus the replay frame."""
+    from orchestrator.evals.replay_frame import build_replay_frame_block
+
+    return 'ARCH PROMPT' + build_replay_frame_block(_arch_task()['pre_task_commit'])
+
+
 async def _run_architect_eval_hermetic(
     cfg,
     *,
@@ -1611,8 +1342,19 @@ async def _run_architect_eval_hermetic(
     decline_reader_errors: dict[str, BaseException] | None = None,
     cleanup_side_effect=None,
     expose_mocks: dict | None = None,
+    injected_gate=_NO_INJECTED_GATE,
+    gate_factory=None,
+    cap_retry=None,
+    store: ResultStore | None = None,
 ):
-    """Drive run_architect_eval with every git/worktree/LLM boundary patched.
+    """Drive run_architect_eval with every git/worktree/LLM boundary injected.
+
+    The boundaries travel as one ``ArchitectEvalDeps`` passed as ``deps=``:
+    worktree create/cleanup, the artifacts, the architect invoke, the plan
+    judge and the reference-diff read are all doubles, and nothing is patched
+    by dotted path except the public collaborators that are not deps
+    (``runner.load_task``, ``runner.build_eval_orch_config``, the production
+    briefing, ``run_verification`` and the cap-retry sleep).
 
     Returns ``(result, mocks)`` where ``mocks`` exposes the invoke/verify/save/
     judge mocks for assertions. ``invoke_side_effect`` lets a test make the live
@@ -1637,7 +1379,7 @@ async def _run_architect_eval_hermetic(
     land verbatim in the persisted cell. Both make the harness model reality so
     a RED here is caused by production behaviour, never by the double.
 
-    The FIVE DECLINE READERS on the patched ``TaskArtifacts``
+    The FIVE DECLINE READERS on the injected artifacts double
     (``read_already_done`` / ``read_blocking_dependency`` / ``read_false_premise``
     / ``read_unactionable_task`` / ``read_ready_to_merge``) are pinned to
     ``None`` for exactly that reason (task 4760). Unpinned they are bare Mock
@@ -1655,8 +1397,8 @@ async def _run_architect_eval_hermetic(
     reader RAISE instead — the corrupt-artifact path, which must degrade that
     one kind rather than the cell.
 
-    ``cleanup_side_effect`` hangs a side_effect on the patched
-    ``cleanup_eval_worktree``. It has to be a CONSTRUCTOR argument rather than
+    ``cleanup_side_effect`` hangs a side_effect on the injected
+    ``cleanup_worktree``. It has to be a CONSTRUCTOR argument rather than
     something a caller sets on ``mocks['cleanup']`` afterwards, because the
     thing worth asserting is ORDERING *during* the run: cleanup rmtree's the
     relocated meta root, so a callback that samples state at the moment cleanup
@@ -1672,8 +1414,8 @@ async def _run_architect_eval_hermetic(
     an outer patch would be shadowed.
 
     ``task_override`` replaces the task dict ``load_task`` returns (e.g.
-    ``_arch_task_no_reference()``), and ``reference_diff`` is what the patched
-    ``get_diff_between_commits`` returns — both defaulting to today's hardcoded
+    ``_arch_task_no_reference()``), and ``reference_diff`` is what the injected
+    ``read_reference_diff`` returns — both defaulting to today's hardcoded
     values so every existing caller keeps byte-identical behavior. Together
     they drive the ``judged_without_reference`` cases (task 3628).
     Usage-gate control (eval-revival φ, task 3630). ``build_eval_orch_config``
@@ -1692,24 +1434,44 @@ async def _run_architect_eval_hermetic(
     of MagicMock truthiness:
 
     - ``usage_gate=<gate>``: flips ``usage_cap.enabled`` on and patches
-      ``runner.UsageGate`` to a factory returning THIS gate. Exposed as
+      ``eval_gate.UsageGate`` to a factory returning THIS gate. Exposed as
       ``mocks['UsageGate']`` (the factory) and ``mocks['gate']`` (the gate).
     - ``usage_gate_error=<exc>``: flips ``usage_cap.enabled`` on and patches
-      ``runner.UsageGate`` to RAISE it — the construction-failure /
+      ``eval_gate.UsageGate`` to RAISE it — the construction-failure /
       warn-and-degrade path.
+
+    ``injected_gate=`` is a DIFFERENT knob from ``usage_gate=`` and the two must
+    not be conflated (task 4427). ``usage_gate=`` patches the CONSTRUCTOR, so
+    the cell still builds and OWNS its gate — that is the owned path every
+    pre-4427 case exercises. ``injected_gate=`` instead forwards the value to
+    ``run_architect_eval``'s own ``usage_gate=`` PARAMETER, i.e. a gate a
+    campaign owner already built, which the cell must use without tearing down.
+    Omitted, no ``usage_gate`` argument is passed at all, so the owned path is
+    byte-identical to before; ``injected_gate=None`` passes an explicit ``None``
+    (deliberately ungated), which is NOT the same as omitting it.
+
+    ``gate_factory=`` replaces the deps' gate factory outright (the owned path
+    then builds through it), and ``cap_retry=`` replaces the deps' cap-retry
+    wrapper (omitted, the cell rides the production ``invoke_with_cap_retry``).
 
     ``shared.cli_invoke.asyncio.sleep`` is patched unconditionally (the
     ``_SLEEP_PATCH`` idiom from shared/tests/test_cap_retry.py:224) so cap-retry
     cooldowns never really sleep; exposed as ``mocks['sleep']``.
+
+    ``store`` replaces the default ``MagicMock(spec=ResultStore)`` with a real
+    store, so a cell the real producer wrote can be loaded back from disk;
+    ``mocks['save']`` is then that store's bound ``save``.
     """
     from shared.config_models import UsageCapConfig
 
-    from orchestrator.evals import runner
-    from orchestrator.evals.judge import PlanQualityVerdict
+    from orchestrator.agents.briefing import BriefingAssembler
+    from orchestrator.evals import eval_gate, runner
+    from orchestrator.evals.architect_eval import ArchitectEvalDeps
 
     if judge_return is None and judge_side_effect is None:
-        judge_return = PlanQualityVerdict(
-            plan_quality=0.77, per_criterion={}, reasoning='good',
+        judge_return = Scored(
+            PlanQualityVerdict(plan_quality=0.77, per_criterion={}, reasoning='good'),
+            cost_usd=0.0,
         )
 
     invoke_return = arch_result if arch_result is not None else MagicMock(
@@ -1727,23 +1489,24 @@ async def _run_architect_eval_hermetic(
     # mapping is taken from PRODUCTION rather than re-derived as
     # ``f'read_{kind}'``, which is wrong for ``unactionable``
     # (``read_unactionable_task``) and would silently stop pinning that kind.
-    from orchestrator.evals.metrics import _DECLINE_READERS
+    from orchestrator.evals.metrics import DECLINE_READERS
 
-    for _reader in _DECLINE_READERS.values():
+    for _reader in DECLINE_READERS.values():
         getattr(artifacts_instance, _reader).return_value = None
     for _kind, _artifact in (declines or {}).items():
-        assert _kind in _DECLINE_READERS, f'unknown decline kind {_kind!r}'
-        getattr(artifacts_instance, _DECLINE_READERS[_kind]).return_value = _artifact
+        assert _kind in DECLINE_READERS, f'unknown decline kind {_kind!r}'
+        getattr(artifacts_instance, DECLINE_READERS[_kind]).return_value = _artifact
     for _kind, _exc in (decline_reader_errors or {}).items():
-        assert _kind in _DECLINE_READERS, f'unknown decline kind {_kind!r}'
-        getattr(artifacts_instance, _DECLINE_READERS[_kind]).side_effect = _exc
+        assert _kind in DECLINE_READERS, f'unknown decline kind {_kind!r}'
+        getattr(artifacts_instance, DECLINE_READERS[_kind]).side_effect = _exc
 
-    briefing_instance = MagicMock()
-    briefing_instance.build_architect_prompt = AsyncMock(return_value='ARCH PROMPT')
+    # Stubs the PRODUCTION briefing only; the replay-frame subclass the runner
+    # builds still appends its block for real (task 4844).
+    production_architect_prompt = AsyncMock(return_value='ARCH PROMPT')
 
     mock_judge = AsyncMock(return_value=judge_return, side_effect=judge_side_effect)
     mock_verify = AsyncMock()
-    mock_save = MagicMock()
+    result_store = MagicMock(spec=ResultStore) if store is None else store
     mock_sleep = AsyncMock()
 
     # NOT named *_config/*_cfg on purpose: this is the anonymous stand-in for
@@ -1768,10 +1531,10 @@ async def _run_architect_eval_hermetic(
     if task_timeout_minutes is not None:
         _task_def['timeout_minutes'] = task_timeout_minutes
 
-    gate_factory = None
+    gate_constructor = None
     if usage_gate is not None or usage_gate_error is not None:
         orch_stub.usage_cap = UsageCapConfig(enabled=True)
-        gate_factory = (
+        gate_constructor = (
             MagicMock(side_effect=usage_gate_error) if usage_gate_error is not None
             else MagicMock(return_value=usage_gate)
         )
@@ -1780,40 +1543,57 @@ async def _run_architect_eval_hermetic(
         expose_mocks.update(artifacts=artifacts_instance, cleanup=mock_cleanup,
                             invoke=mock_invoke, judge=mock_judge)
 
+    deps = ArchitectEvalDeps(
+        store=result_store,
+        create_worktree=AsyncMock(return_value=(Path('/fake/wt'), 'run-abc')),
+        cleanup_worktree=mock_cleanup,
+        open_artifacts=MagicMock(return_value=artifacts_instance),
+        invoke=mock_invoke,
+        judge=mock_judge,
+        read_reference_diff=AsyncMock(return_value=reference_diff),
+        gate_factory=(
+            eval_gate.build_eval_usage_gate if gate_factory is None else gate_factory
+        ),
+        **({} if cap_retry is None else {'cap_retry': cap_retry}),
+    )
+
     with contextlib.ExitStack() as es:
         p = es.enter_context
-        if gate_factory is not None:
-            p(patch('orchestrator.evals.runner.UsageGate', gate_factory))
+        if gate_constructor is not None:
+            p(patch('orchestrator.evals.eval_gate.UsageGate', gate_constructor))
         p(patch('shared.cli_invoke.asyncio.sleep', mock_sleep))
-        p(patch('orchestrator.evals.snapshots.create_eval_worktree',
-                AsyncMock(return_value=(Path('/fake/wt'), 'run-abc'))))
-        p(patch('orchestrator.evals.snapshots.cleanup_eval_worktree', mock_cleanup))
-        p(patch('orchestrator.evals.snapshots.get_diff_between_commits',
-                AsyncMock(return_value=reference_diff)))
-        p(patch('orchestrator.agents.invoke.invoke_agent', mock_invoke))
-        p(patch('orchestrator.artifacts.TaskArtifacts',
-                MagicMock(return_value=artifacts_instance)))
-        p(patch('orchestrator.agents.briefing.BriefingAssembler',
-                MagicMock(return_value=briefing_instance)))
+        p(patch.object(BriefingAssembler, 'build_architect_prompt',
+                       production_architect_prompt))
         p(patch('orchestrator.evals.runner.build_eval_orch_config',
                 MagicMock(
                     return_value=orch_stub,
                     side_effect=orch_config_side_effect,
                 )))
-        p(patch('orchestrator.evals.judge.judge_plan_quality', mock_judge))
-        p(patch('orchestrator.evals.runner.save_result', mock_save))
         p(patch('orchestrator.evals.runner.load_task',
                 MagicMock(return_value=_task_def)))
         p(patch('orchestrator.verify.run_verification', mock_verify))
+        extra: dict[str, Any] = (
+            {} if injected_gate is _NO_INJECTED_GATE
+            else {'usage_gate': injected_gate}
+        )
         result = await runner.run_architect_eval(
             Path('/fake/task.json'), cfg, base_config=MagicMock(),
+            deps=deps, **extra,
         )
     return result, {
         'invoke': mock_invoke, 'verify': mock_verify,
-        'save': mock_save, 'judge': mock_judge,
-        'sleep': mock_sleep, 'UsageGate': gate_factory, 'gate': usage_gate,
+        'save': result_store.save, 'judge': mock_judge,
+        'sleep': mock_sleep, 'UsageGate': gate_constructor, 'gate': usage_gate,
         'cleanup': mock_cleanup, 'artifacts': artifacts_instance,
+        'gate_factory': gate_factory,
     }
+
+
+def _only_record(metrics: dict) -> dict:
+    """The one unmeasured record a cell persisted."""
+    records = metrics['invocation_errors']
+    assert isinstance(records, list) and len(records) == 1, records
+    return records[0]
 
 
 @pytest.mark.asyncio
@@ -1848,25 +1628,34 @@ class TestRunArchitectEval:
         assert mocks['invoke'].call_count == 1
         mocks['verify'].assert_not_called()
 
-        # Persisted via save_result.
+        # Persisted through the store.
         mocks['save'].assert_called_once()
 
-    async def test_judge_failure_degrades_to_deterministic_floor(self):
-        from orchestrator.evals.judge import PlanQualityVerdict, score_plan_structure
+    async def test_unparseable_judge_degrades_to_floor_and_records_it(self):
+        from orchestrator.evals.judge import score_plan_structure
 
         plan = _well_formed_plan()
-        # Judge returns the None sentinel (parse failure) → run_architect_eval
-        # must degrade to the deterministic structural floor, never a null.
+        # An unparseable judge answer → run_architect_eval degrades to the
+        # deterministic structural floor, never a null — and, unlike before
+        # task 6734, the cell now says the judge's answer was unusable.
         result, _ = await _run_architect_eval_hermetic(
             self._cfg(),
             produced_plan=plan,
-            judge_return=PlanQualityVerdict(
-                plan_quality=None, per_criterion={}, reasoning='parse failure',
+            judge_return=Unmeasured(
+                MeasurementStage.JUDGE, UnmeasuredCause.UNPARSEABLE,
+                'JSONDecodeError: Expecting value', cost_usd=0.6,
             ),
         )
-        assert result.metrics['plan_quality'] is not None
         assert result.metrics['plan_quality'] == score_plan_structure(plan)
         assert result.metrics['role_under_test'] == 'architect'
+        assert result.metrics['invocation_errors'] == [{
+            'stage': 'judge', 'cause': 'unparseable',
+            'reason': 'JSONDecodeError: Expecting value',
+        }]
+        assert result.metrics['cap_tainted'] is False
+        assert result.metrics['judge_invocations'] == 1
+        assert result.metrics['judge_cost_usd'] == pytest.approx(0.6)
+        assert result.metrics['judged_without_reference'] is False
 
     async def test_judge_raising_still_yields_non_sentinel_score(self):
         from orchestrator.evals.judge import score_plan_structure
@@ -1893,7 +1682,10 @@ class TestRunArchitectEval:
         # ...but the raise must not look identical to a judge that was
         # SKIPPED either: it is recorded so the cell reads "spend unknown",
         # not silently judge-free.
-        assert 'judge:raised' in (result.metrics['invocation_error'] or '')
+        assert result.metrics['invocation_errors'] == [{
+            'stage': 'judge', 'cause': 'raised',
+            'reason': 'RuntimeError: judge exploded',
+        }]
 
     async def test_architect_timeout_maps_to_timeout_outcome(self):
         # A hung architect invoke surfaces as TimeoutError — what asyncio.wait_for
@@ -1921,7 +1713,7 @@ class TestRunArchitectEval:
         the operator's budget. Excluding it would let a pathologically slow
         candidate dodge the penalty its competitors paid, so the cell keeps
         scoring on content and carries the reliability signal in BOTH
-        ``outcome='timeout'`` and ``invocation_error``.
+        ``outcome='timeout'`` and ``invocation_errors``.
         """
         result, _ = await _run_architect_eval_hermetic(
             self._cfg(),
@@ -1929,9 +1721,10 @@ class TestRunArchitectEval:
             invoke_side_effect=TimeoutError(),
         )
         assert result.outcome == 'timeout'
-        marker = result.metrics['invocation_error']
-        assert isinstance(marker, str) and marker.startswith('architect:')
-        assert 'timeout' in marker.lower()
+        assert result.metrics['invocation_errors'] == [{
+            'stage': 'architect', 'cause': 'timeout',
+            'reason': 'no answer within 60m',
+        }]
         assert result.metrics['cap_tainted'] is False
         assert result.metrics['plan_quality'] is not None
 
@@ -1994,9 +1787,9 @@ class TestRunArchitectEval:
 
         # The refusal is still RECORDED, so a reader knows the LLM judge never
         # ran on this cell...
-        marker = result.metrics['invocation_error']
-        assert isinstance(marker, str) and marker.startswith('architect:')
-        assert 'cap' in marker.lower()
+        assert _only_record(result.metrics) == {
+            'stage': 'architect', 'cause': 'cap_hit', 'reason': _CAP_TEXT,
+        }
         # ...and the judge is still skipped: in the same cap window it would 429
         # too, and the floor is the exact degradation a judge failure takes.
         mocks['judge'].assert_not_called()
@@ -2035,9 +1828,8 @@ class TestRunArchitectEval:
         assert result.metrics['plan_quality'] != 0.0
         assert result.metrics['plan_steps'] == 0
 
-        marker = result.metrics['invocation_error']
-        assert isinstance(marker, str) and marker.startswith('architect:')
-        assert 'cap' in marker.lower()
+        record = _only_record(result.metrics)
+        assert (record['stage'], record['cause']) == ('architect', 'cap_hit')
 
         # Nothing to judge, and inside the cap window the judge would 429 too.
         mocks['judge'].assert_not_called()
@@ -2053,9 +1845,8 @@ class TestRunArchitectEval:
         )
         assert result.metrics['cap_tainted'] is True
         assert result.metrics['plan_quality'] is None
-        marker = result.metrics['invocation_error']
-        assert isinstance(marker, str) and marker.startswith('architect:')
-        assert 'wedge' in marker.lower()
+        record = _only_record(result.metrics)
+        assert (record['stage'], record['cause']) == ('architect', 'wedge')
         mocks['judge'].assert_not_called()
 
     async def test_harness_exception_is_marked_and_excluded(self):
@@ -2069,10 +1860,9 @@ class TestRunArchitectEval:
         assert result.outcome == 'blocked'
         assert result.metrics['cap_tainted'] is True
         assert result.metrics['plan_quality'] is None
-        marker = result.metrics['invocation_error']
-        assert isinstance(marker, str) and marker.startswith('architect:')
-        assert 'harness_error' in marker
-        assert 'RuntimeError' in marker
+        record = _only_record(result.metrics)
+        assert (record['stage'], record['cause']) == ('architect', 'harness_error')
+        assert record['reason'].startswith('RuntimeError')
         mocks['judge'].assert_not_called()
 
     async def test_config_backend_reaches_the_invocation_classifier(self):
@@ -2093,16 +1883,15 @@ class TestRunArchitectEval:
         result, _ = await _run_architect_eval_hermetic(
             codex_cfg, produced_plan={}, arch_result=_codex_cap_agent_result(),
         )
-        marker = result.metrics['invocation_error']
-        assert isinstance(marker, str) and marker.startswith('architect:')
-        assert 'cap' in marker.lower()
+        record = _only_record(result.metrics)
+        assert (record['stage'], record['cause']) == ('architect', 'cap_hit')
         assert result.metrics['cap_tainted'] is True
 
         # Same payload, claude candidate: the codex table is never consulted.
         claude_result, _ = await _run_architect_eval_hermetic(
             self._cfg(), produced_plan={}, arch_result=_codex_cap_agent_result(),
         )
-        assert claude_result.metrics['invocation_error'] is None
+        assert claude_result.metrics['invocation_errors'] is None
         assert claude_result.metrics['cap_tainted'] is False
 
     async def test_cap_refused_architect_invoke_is_marked_not_scored_zero(self):
@@ -2124,12 +1913,12 @@ class TestRunArchitectEval:
             arch_result=_cap_agent_result(),
         )
 
-        # The cell is marked as NOT a content measurement...
+        # The cell is marked as NOT a content measurement, naming the refused
+        # STAGE, the typed cause and the CLI's own words.
         assert result.metrics['cap_tainted'] is True
-        marker = result.metrics['invocation_error']
-        assert isinstance(marker, str) and marker
-        assert marker.startswith('architect:')   # names the refused STAGE
-        assert 'cap' in marker.lower()           # ...and the refusal itself
+        assert result.metrics['invocation_errors'] == [
+            {'stage': 'architect', 'cause': 'cap_hit', 'reason': _CAP_TEXT},
+        ]
 
         # ...so the score is the explicit null, NOT a fabricated zero.
         assert result.metrics['plan_quality'] is None
@@ -2154,37 +1943,36 @@ class TestRunArchitectEval:
         content exists at all. The marker is still stamped so a reader knows the
         LLM judge never ran on this cell.
         """
-        from orchestrator.evals.judge import PlanQualityVerdict, score_plan_structure
+        from orchestrator.evals.judge import score_plan_structure
 
         plan = _well_formed_plan()
         result, _ = await _run_architect_eval_hermetic(
             self._cfg(),
             produced_plan=plan,
-            judge_return=PlanQualityVerdict(
-                plan_quality=None,
-                per_criterion={},
-                reasoning='plan judge invocation refused: cap_hit: ...',
-                invocation_error=f'cap_hit: {_CAP_TEXT}',
+            judge_return=Unmeasured(
+                MeasurementStage.JUDGE, UnmeasuredCause.CAP_HIT, _CAP_TEXT,
+                cost_usd=0.4,
             ),
         )
 
         # The content-derived floor is KEPT — not nulled, not excluded.
-        assert result.metrics['plan_quality'] is not None
         assert result.metrics['plan_quality'] == score_plan_structure(plan)
         assert result.metrics['cap_tainted'] is False
 
-        # ...but the judge's refusal is recorded, named by STAGE.
-        marker = result.metrics['invocation_error']
-        assert isinstance(marker, str) and marker
-        assert marker.startswith('judge:')
-        assert 'cap' in marker.lower()
+        # ...but the judge's refusal is recorded, named by STAGE, and the
+        # refused call's spend is still charged.
+        assert result.metrics['invocation_errors'] == [
+            {'stage': 'judge', 'cause': 'cap_hit', 'reason': _CAP_TEXT},
+        ]
+        assert result.metrics['judge_invocations'] == 1
+        assert result.metrics['judge_cost_usd'] == pytest.approx(0.4)
 
     async def test_healthy_run_carries_no_marker_and_is_not_tainted(self):
-        # The untouched baseline: nothing refused anywhere → no marker at all.
+        # The untouched baseline: nothing refused anywhere → no record at all.
         result, _ = await _run_architect_eval_hermetic(
             self._cfg(), produced_plan=_well_formed_plan(),
         )
-        assert result.metrics['invocation_error'] is None
+        assert result.metrics['invocation_errors'] is None
         assert result.metrics['cap_tainted'] is False
         assert result.metrics['plan_quality'] == 0.77
 
@@ -2206,10 +1994,6 @@ class TestRunArchitectEval:
             self._cfg(), produced_plan=_well_formed_plan(),
         )
 
-        # Computed OUTSIDE the harness ExitStack (above) so the TaskArtifacts
-        # patch is inactive and the REAL relocated path is produced. This uses
-        # workflow's own unpatched TaskArtifacts binding — the harness patches
-        # only orchestrator.artifacts.TaskArtifacts.
         expected_meta_root = _meta_root_for_worktree(Path('/fake/wt'))
         assert str(expected_meta_root) == '/fake/.task-meta/wt'
 
@@ -2222,6 +2006,54 @@ class TestRunArchitectEval:
             '--worktree', str(Path('/fake/wt')),
             '--meta-root', str(expected_meta_root),
         ]
+
+
+@pytest.mark.asyncio
+class TestArchitectCellCarriesReplayFrame:
+    """The architect is briefed in the replay frame and the cell says so (4844)."""
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_architect_prompt_is_production_briefing_plus_replay_frame(self):
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+
+        assert mocks['invoke'].call_args.kwargs['prompt'] == _architect_prompt_sent()
+
+    async def test_cell_is_stamped_with_the_replay_frame(self):
+        from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
+
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+
+        assert result.metrics['replay_frame'] == REPLAY_FRAME_ID
+
+    @pytest.mark.parametrize('unmeasurable_cell', [
+        pytest.param(
+            lambda: {'produced_plan': _well_formed_plan(),
+                     'invoke_side_effect': RuntimeError('boom')},
+            id='harness-error',
+        ),
+        pytest.param(
+            lambda: {'produced_plan': {}, 'arch_result': _cap_agent_result()},
+            id='cap-tainted',
+        ),
+    ])
+    async def test_stamp_survives_unmeasurable_cells(self, unmeasurable_cell):
+        from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
+
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), **unmeasurable_cell(),
+        )
+
+        assert result.metrics['replay_frame'] == REPLAY_FRAME_ID
 
 
 # ---------------------------------------------------------------------------
@@ -2246,13 +2078,11 @@ class TestArchitectCellRecordsJudgeSpend:
         )
 
     async def test_judge_spend_recorded_and_folded_into_cell_cost(self):
-        from orchestrator.evals.judge import PlanQualityVerdict
-
         result, mocks = await _run_architect_eval_hermetic(
             self._cfg(),
             produced_plan=_well_formed_plan(),
-            judge_return=PlanQualityVerdict(
-                plan_quality=0.77, per_criterion={}, reasoning='good',
+            judge_return=Scored(
+                PlanQualityVerdict(plan_quality=0.77, per_criterion={}, reasoning='good'),
                 cost_usd=0.42,
             ),
         )
@@ -2264,7 +2094,7 @@ class TestArchitectCellRecordsJudgeSpend:
         # PLUS the judge spend, never the architect spend alone.
         assert result.metrics['cost_usd'] == pytest.approx(1.23 + 0.42)
 
-        # ...and what was actually PERSISTED via save_result, not just what
+        # ...and what was actually PERSISTED through the store, not just what
         # the function happens to return.
         persisted = mocks['save'].call_args.args[0].metrics
         assert persisted['judge_cost_usd'] == pytest.approx(0.42)
@@ -2540,7 +2370,7 @@ class TestArchitectCellResolvesCostProvenance:
         persisted = mocks['save'].call_args.args[0].metrics
         # The cell LANDED — marked and excluded, not lost.
         assert persisted['cap_tainted'] is True
-        assert 'harness_error' in (persisted['invocation_error'] or '')
+        assert [r['cause'] for r in persisted['invocation_errors']] == ['harness_error']
         assert persisted['cost_usd'] == pytest.approx(0.0)
         # A concrete label, not merely "some member of the vocabulary": nothing
         # was spent, so the resolution is skipped and the documented 'cli'
@@ -2609,10 +2439,9 @@ class TestArchitectCellCostSourceIsComposed:
         )
 
     def _spending_judge(self):
-        from orchestrator.evals.judge import PlanQualityVerdict
-
-        return PlanQualityVerdict(
-            plan_quality=0.77, per_criterion={}, reasoning='good', cost_usd=0.42,
+        return Scored(
+            PlanQualityVerdict(plan_quality=0.77, per_criterion={}, reasoning='good'),
+            cost_usd=0.42,
         )
 
     async def test_price_table_architect_plus_cli_judge_reads_mixed(self):
@@ -2671,13 +2500,8 @@ class TestArchitectCellCostSourceIsComposed:
 
 
 @pytest.mark.asyncio
-class TestArchitectRunnerJudgeCostReadIsDefensive:
-    """Step-7: the runner's read of ``verdict.cost_usd`` must not fabricate
-    spend on a judge-skipped branch, and an unreadable verdict field must
-    degrade gracefully rather than crash the cell or mis-attribute the
-    failure to "the judge raised" (the judge DID run and DID answer; only
-    its cost figure is unreadable).
-    """
+class TestJudgeSkippedBranchesRecordNoJudgeSpend:
+    """A judge that never ran leaves no judge spend behind on any branch."""
 
     def _cfg(self):
         from orchestrator.evals.configs import EvalConfig
@@ -2733,88 +2557,6 @@ class TestArchitectRunnerJudgeCostReadIsDefensive:
         # mock reports cost_usd=1.23, and that must be the WHOLE cell cost.
         assert result.metrics['cost_usd'] == pytest.approx(1.23)
 
-    # -- (b) an unreadable or nonsensical verdict.cost_usd must not damage
-    #    the cell ------------------------------------------------------------
-
-    @pytest.mark.parametrize('bad_verdict', [
-        pytest.param(
-            types.SimpleNamespace(
-                plan_quality=0.77, per_criterion={}, reasoning='r',
-                invocation_error=None,
-            ),
-            id='missing-cost_usd-field',
-        ),
-        pytest.param(
-            types.SimpleNamespace(
-                plan_quality=0.77, per_criterion={}, reasoning='r',
-                invocation_error=None, cost_usd=None,
-            ),
-            id='cost_usd-is-None',
-        ),
-        # Amendment (reviewer robustness): a READABLE but NON-FINITE or
-        # negative cost_usd is just as dangerous as a missing one —
-        # `arch_cost_usd + judge_cost_usd` would otherwise poison the cell's
-        # cost_usd with NaN/Infinity (which json.dump emits as bare,
-        # non-standard tokens) or a nonsense negative total, and NaN
-        # propagates through every downstream report.py mean for the whole
-        # config row.
-        pytest.param(
-            types.SimpleNamespace(
-                plan_quality=0.77, per_criterion={}, reasoning='r',
-                invocation_error=None, cost_usd=float('nan'),
-            ),
-            id='cost_usd-is-nan',
-        ),
-        pytest.param(
-            types.SimpleNamespace(
-                plan_quality=0.77, per_criterion={}, reasoning='r',
-                invocation_error=None, cost_usd=float('inf'),
-            ),
-            id='cost_usd-is-infinite',
-        ),
-        pytest.param(
-            types.SimpleNamespace(
-                plan_quality=0.77, per_criterion={}, reasoning='r',
-                invocation_error=None, cost_usd=-3.5,
-            ),
-            id='cost_usd-is-negative',
-        ),
-    ])
-    async def test_unreadable_verdict_cost_degrades_the_field_not_the_cell(
-        self, bad_verdict, caplog,
-    ):
-        """A legacy/monkeypatched verdict lacking a readable, or carrying a
-        nonsensical, ``cost_usd``.
-
-        Must not crash the cell (``arch_cost_usd + verdict.cost_usd`` when the
-        field is ``None`` raises ``TypeError`` today, outside any try/except),
-        must not lose the fact that the judge WAS called, and must not log
-        "plan judge raised" — that warning means the judge invocation itself
-        failed, which is false here: the judge ran and answered fine, only
-        this ONE field on its verdict is unreadable or nonsensical (NaN,
-        Infinity, negative).
-        """
-        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
-
-        result, mocks = await _run_architect_eval_hermetic(
-            self._cfg(),
-            produced_plan=_well_formed_plan(),
-            judge_return=bad_verdict,
-        )
-
-        mocks['judge'].assert_awaited_once()
-        # The judge's real answer survives...
-        assert result.metrics['plan_quality'] == 0.77
-        # ...the unreadable cost degrades to 0.0, never a fabricated number...
-        assert result.metrics['judge_cost_usd'] == 0.0
-        # ...but the invocation itself is NOT lost: the judge DID run.
-        assert result.metrics['judge_invocations'] == 1
-        assert result.metrics['cost_usd'] == pytest.approx(1.23)
-
-        assert not any(
-            'plan judge raised' in r.getMessage() for r in caplog.records
-        )
-
 
 # ---------------------------------------------------------------------------
 # Task 3302: gate the LLM plan judge at the SOURCE.
@@ -2865,11 +2607,10 @@ class TestSteplessPlanIsNeverJudged:
 
     @staticmethod
     def _confident_judge():
-        from orchestrator.evals.judge import PlanQualityVerdict
-
         # What the ungated judge really does with an unjudgeable artifact.
-        return PlanQualityVerdict(
-            plan_quality=0.9, per_criterion={}, reasoning='looks fine',
+        return Scored(
+            PlanQualityVerdict(plan_quality=0.9, per_criterion={}, reasoning='looks fine'),
+            cost_usd=0.0,
         )
 
     @pytest.mark.parametrize('plan', _STEPLESS_PLANS)
@@ -2901,7 +2642,7 @@ class TestSteplessPlanIsNeverJudged:
         persisted = mocks['save'].call_args.args[0].metrics
 
         assert persisted['cap_tainted'] is False
-        assert persisted['invocation_error'] is None
+        assert persisted['invocation_errors'] is None
         assert result.metrics['cap_tainted'] is False
 
     @pytest.mark.parametrize('plan', _STEPLESS_PLANS)
@@ -2943,8 +2684,10 @@ class TestSteplessPlanIsNeverJudged:
         produced_a_plan against a copy of run_architect_eval's derivation living
         in this file, and would stay green while the two surfaces diverged.
         """
-        from orchestrator.evals.judge import is_scorable_plan
-        from orchestrator.evals.metrics import produced_a_plan
+        from orchestrator.evals.plan_predicates import (
+            is_scorable_plan,
+            produced_a_plan,
+        )
 
         _, mocks = await _run_architect_eval_hermetic(
             self._cfg(),
@@ -2992,7 +2735,7 @@ class TestJudgedWithoutReference:
             task_override=_arch_task_no_reference(),
             reference_diff='',
         )
-        # Assert on the dict handed to save_result — that dict is what both the
+        # Assert on the cell handed to the store — that cell is what both the
         # report layer and the downstream campaign driver actually read.
         persisted = mocks['save'].call_args.args[0].metrics
 
@@ -3199,7 +2942,7 @@ def _architect_result(
     measured. The default is an explicit ``False``: a healthy modern cell, not
     a legacy one.
     """
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     metrics = {
         'role_under_test': 'architect',
@@ -3223,7 +2966,7 @@ def _implementer_result(
     task_id: str = 'df_task_1993',
     config_name: str = 'opus-high',
 ):
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     # No plan_quality / role_under_test keys at all → the null sentinel path.
     return EvalResult(
@@ -3238,16 +2981,20 @@ def _implementer_result(
 def _cap_tainted_result(
     task_id: str = 'df_task_3118',
     config_name: str = 'architect-sonnet-high',
-    invocation_error: str | None = None,
+    cause: UnmeasuredCause = UnmeasuredCause.CAP_HIT,
+    reason: str = _CAP_TEXT,
 ):
     """An architect cell whose invocation was refused — NOT a measurement.
 
-    ``invocation_error`` defaults to the campaign cap payload; pass a different
-    stage-prefixed marker (e.g. ``'architect:model_not_found: ...'``) to build a
-    cell excluded for a PERMANENT rather than a transient cause.
+    Defaults to the campaign cap payload; pass a different *cause* (e.g.
+    ``UnmeasuredCause.MODEL_NOT_FOUND``) to build a cell excluded for a
+    PERMANENT rather than a transient cause.
     """
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
+    record = Unmeasured(
+        MeasurementStage.ARCHITECT, cause, reason, cost_usd=0.0,
+    ).to_record()
     return EvalResult(
         task_id=task_id,
         config_name=config_name,
@@ -3256,9 +3003,7 @@ def _cap_tainted_result(
             'role_under_test': 'architect',
             'plan_quality': None,
             'cap_tainted': True,
-            'invocation_error': (
-                invocation_error or f'architect:cap_hit: {_CAP_TEXT}'
-            ),
+            'invocation_errors': [record],
             'composite_score': 0.0,
         },
         worktree_path='/tmp/wt-arch-capped',
@@ -3341,7 +3086,7 @@ class TestPlanQualityReport:
     # fabricated zero, which would penalise whichever candidate happened to be
     # scheduled inside a cap window.
 
-    def test_rows_carry_cap_tainted_and_invocation_error(self):
+    def test_rows_carry_cap_tainted_and_invocation_errors(self):
         from orchestrator.evals.report import build_plan_quality_report
 
         report = build_plan_quality_report(
@@ -3351,12 +3096,15 @@ class TestPlanQualityReport:
 
         capped = by_task['df_task_3118']
         assert capped['cap_tainted'] is True
-        assert capped['invocation_error'].startswith('architect:')
+        assert capped['invocation_errors'] == [
+            {'stage': 'architect', 'cause': 'cap_hit', 'reason': _CAP_TEXT},
+        ]
+        assert 'invocation_error' not in capped
         assert capped['plan_quality'] is None
 
         # Legacy results, whose metrics predate both keys, read back default-safe.
         assert by_task['df_task_2605']['cap_tainted'] is False
-        assert by_task['df_task_2605']['invocation_error'] is None
+        assert by_task['df_task_2605']['invocation_errors'] is None
         assert by_task['df_task_1993']['cap_tainted'] is False
 
     def test_per_config_mean_excludes_cap_tainted_cells(self):
@@ -3596,16 +3344,14 @@ class TestPlanQualityReport:
             _cap_tainted_result(task_id='t2', config_name='a'),
             _cap_tainted_result(
                 task_id='t3', config_name='b',
-                invocation_error='architect:model_not_found: no such model',
+                cause=UnmeasuredCause.MODEL_NOT_FOUND, reason='no such model',
             ),
             # An end-to-end pin (reviewer: test-coverage) that a server_error
-            # marker survives the FULL report pipeline — not just
-            # detect_invocation_error's unit-level token — and lands in its
-            # own cap_excluded_by_cause bucket rather than being folded into
-            # 'unknown' by a marker-shape change.
+            # record survives the FULL report pipeline and lands in its own
+            # cap_excluded_by_cause bucket.
             _cap_tainted_result(
                 task_id='t4', config_name='b',
-                invocation_error='architect:server_error: HTTP 529',
+                cause=UnmeasuredCause.SERVER_ERROR, reason='HTTP 529',
             ),
         ])
         assert report['cap_excluded'] == 4
@@ -3615,17 +3361,51 @@ class TestPlanQualityReport:
         # Key-sorted, so the dict renders byte-deterministically.
         causes = list(report['cap_excluded_by_cause'])
         assert causes == sorted(causes)
+        # Every bucket is a typed cause — no free-text or 'unknown' key.
+        assert set(report['cap_excluded_by_cause']) <= {
+            c.value for c in UnmeasuredCause
+        }
 
-    def test_unparseable_marker_buckets_as_unknown_not_a_real_cause(self):
-        # A mis-shaped marker must show up as its own bucket rather than being
-        # silently folded into a real cause.
+    def test_tainted_row_without_a_record_raises_naming_the_cell(self):
+        # A tainted cell always carries a record: the producer writes one and
+        # the loader supplies one for legacy cells. A row without one bypassed
+        # ResultStore.load_all, and bucketing it would invent a cause.
         from orchestrator.evals.report import build_plan_quality_report
 
-        report = build_plan_quality_report([
-            _cap_tainted_result(task_id='t1', config_name='a',
-                                invocation_error='architect:'),
-        ])
-        assert report['cap_excluded_by_cause'] == {'unknown': 1}
+        capped = _cap_tainted_result(task_id='t1', config_name='a')
+        capped.metrics['invocation_errors'] = None
+
+        with pytest.raises(ValueError) as excinfo:
+            build_plan_quality_report([capped])
+        message = str(excinfo.value)
+        assert 't1 x a' in message
+        assert 'invocation_errors' in message
+
+    def test_tainted_row_with_an_unknown_cause_raises_naming_the_cell(self):
+        # A hand-edited or newer-producer record must not abort the report
+        # with a bare enum ValueError that leaves the bad file unnamed.
+        from orchestrator.evals.report import build_plan_quality_report
+
+        capped = _cap_tainted_result(task_id='t1', config_name='a')
+        capped.metrics['invocation_errors'] = [
+            {'stage': 'architect', 'cause': 'not_a_cause', 'reason': 'r'},
+        ]
+
+        with pytest.raises(ValueError) as excinfo:
+            build_plan_quality_report([capped])
+        message = str(excinfo.value)
+        assert 't1 x a' in message
+        assert 'not_a_cause' in message
+
+    def test_format_invocation_errors_renders_records(self):
+        from orchestrator.evals.report import format_invocation_errors
+
+        assert format_invocation_errors(None) is None
+        assert format_invocation_errors([]) is None
+        assert format_invocation_errors([
+            {'stage': 'architect', 'cause': 'timeout', 'reason': 'r1'},
+            {'stage': 'judge', 'cause': 'raised', 'reason': 'r2'},
+        ]) == 'architect:timeout: r1; judge:raised: r2'
 
     def test_all_cells_tainted_yields_null_mean_never_zero(self):
         from orchestrator.evals.report import build_plan_quality_report
@@ -3694,7 +3474,12 @@ class TestPlanQualityReport:
         # Explicit exclusion marker, WITH its reason — never a score...
         assert 'excluded' in capped_line
         assert '0.0000' not in capped_line
-        assert 'cap_hit' in capped_line
+        assert f'architect:cap_hit: {_CAP_TEXT}' in capped_line
+        # ...while a healthy architect row's invocation_error column is '-'.
+        healthy_line = next(
+            ln for ln in table.splitlines() if 'df_task_2605' in ln
+        )
+        assert healthy_line.split()[-1] == '-'
         # ...and visibly distinct from the '-' null sentinel a non-architect row
         # uses, so "not an architect run" cannot be confused with "architect run
         # we could not measure".
@@ -3720,7 +3505,7 @@ class TestPlanQualityReport:
         )
         assert '1' in summary and '3' in summary
         # ...with the CAUSE named, not a bare count.
-        assert 'cap_hit' in summary
+        assert 'cap_hit: 1' in summary
 
         mean_line = _mean_section_line(table, cfg)
         assert '0.8000' in mean_line   # the EXCLUDING mean, not 0.5333
@@ -3737,7 +3522,7 @@ class TestPlanQualityReport:
         table = format_plan_quality_table(build_plan_quality_report([
             _cap_tainted_result(
                 task_id='t1', config_name='dead-cfg',
-                invocation_error='architect:model_not_found: no such model',
+                cause=UnmeasuredCause.MODEL_NOT_FOUND, reason='no such model',
             ),
         ]))
         summary = next(
@@ -3779,6 +3564,66 @@ class TestPlanQualityReport:
         assert a == b
 
 
+class TestLegacyAndProducedUnmeasuredCellsReportAlike:
+    """B3 (PRD §6): one reader for a pre-6734 cell and a freshly produced one.
+
+    A cell persisted with the legacy ``invocation_error`` string and a cell the
+    real producer writes today both load through ``ResultStore.load_all`` and
+    land in the same typed cause bucket, rendered by the same formatter.
+    """
+
+    @pytest.mark.asyncio
+    async def test_both_cells_bucket_and_render_as_cap_exhausted(self, tmp_path):
+        from shared.cli_invoke import AllAccountsCappedException
+
+        from orchestrator.evals.configs import EvalConfig
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        store = ResultStore(tmp_path)
+        legacy = {
+            'task_id': 'legacy_task',
+            'config_name': 'architect-sonnet-high',
+            'outcome': 'blocked',
+            'metrics': {
+                'role_under_test': 'architect',
+                'plan_quality': None,
+                'cap_tainted': True,
+                'invocation_error': (
+                    'architect:cap_exhausted: all accounts capped after 3 retries'
+                ),
+            },
+            'worktree_path': '/tmp/wt-legacy',
+            'wall_clock_ms': 0,
+            'run_id': 'legacy01',
+            'trial': 1,
+        }
+        (tmp_path / 'legacy_task__architect-sonnet-high__legacy01.json').write_text(
+            json.dumps(legacy)
+        )
+        cfg = EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+        await _run_architect_eval_hermetic(
+            cfg,
+            produced_plan={},
+            invoke_side_effect=AllAccountsCappedException(3, 10.0, 'x'),
+            store=store,
+        )
+
+        cells = store.load_all()
+        assert len(cells) == 2
+        report = build_plan_quality_report(cells)
+        assert report['cap_excluded_by_cause'] == {'cap_exhausted': 2}
+        table = format_plan_quality_table(report)
+        rendered = [
+            ln for ln in table.splitlines() if 'architect:cap_exhausted: ' in ln
+        ]
+        assert len(rendered) == 2
+
+
 # ---------------------------------------------------------------------------
 # CLI dispatch — _run_single_eval routes architect candidates (step-13/14)
 #
@@ -3790,7 +3635,7 @@ class TestPlanQualityReport:
 # ---------------------------------------------------------------------------
 
 def _fake_eval_result(**over):
-    from orchestrator.evals.runner import EvalResult
+    from orchestrator.evals.results import EvalResult
 
     defaults: dict = dict(
         task_id='df_task_2605',
@@ -3810,8 +3655,17 @@ def _dispatch_single_eval(cfg, capsys, arch_metrics=None):
     ``get_config_by_name`` is patched to return ``cfg`` so the dispatch is
     exercised purely on ``cfg.role``. ``arch_metrics`` overrides the fake
     architect result's metrics dict. Returns ``(out, run_eval, run_architect)``.
+
+    The campaign gate's builder is bound to degrade to ``None`` (task 4427).
+    ``base_config`` here is a bare ``MagicMock``, so ``.usage_cap.enabled`` is a
+    TRUTHY Mock attribute — once ``_run_single_eval`` owns a campaign gate, the
+    production builder would construct a REAL ``UsageGate`` out of a mock config
+    on every one of these routing cases (touching the filesystem for probe dirs
+    and installing a SIGHUP handler). ``None`` is the ungated campaign, which is
+    what every routing/echo case here already meant.
     """
     from orchestrator import cli
+    from orchestrator.evals import eval_gate
 
     arch_result = _fake_eval_result(
         config_name=cfg.name,
@@ -3830,11 +3684,74 @@ def _dispatch_single_eval(cfg, capsys, arch_metrics=None):
         p(patch('orchestrator.evals.runner.run_architect_eval', mock_run_arch))
         p(patch('orchestrator.evals.configs.get_config_by_name',
                 MagicMock(return_value=cfg)))
+        p(patch('orchestrator.evals.eval_gate.campaign_usage_gate',
+                functools.partial(eval_gate.campaign_usage_gate,
+                                  factory=AsyncMock(return_value=None))))
         cli._run_single_eval(
             Path('/fake/task.json'), cfg.name, base_config=MagicMock(),
         )
     out = capsys.readouterr().out
     return out, mock_run_eval, mock_run_arch
+
+
+def _dispatch_mixed_eval(cfgs, capsys, *, gate=None, raise_on: str | None = None):
+    """Drive ``cli._run_single_eval`` over a MIXED config list, gate seam patched.
+
+    The sibling of :func:`_dispatch_single_eval` for the CAMPAIGN question
+    (task 4427): ``_run_single_eval``'s ``for cfg in configs`` loop is a second,
+    independent campaign loop the stage functions never pass through, and the
+    property worth pinning — one gate shared by BOTH the architect and the
+    implementer dispatch branch — only exists when several configs run in ONE
+    call. ``config_name='all'`` plus a patched ``EVAL_CONFIGS`` is what makes
+    the loop iterate the supplied list.
+
+    Each fake executor asserts AT CALL TIME that the gate is not yet shut down:
+    an after-the-fact ``assert_awaited_once`` cannot tell "torn down once after
+    the loop" from "torn down between configs". ``raise_on=<config name>`` makes
+    that config's executor raise, which propagates out of ``asyncio.run``.
+    """
+    from orchestrator import cli
+    from orchestrator.evals import eval_gate
+
+    def _make(metrics):
+        async def fake(_task_path, cfg, *_a, usage_gate=_NO_INJECTED_GATE, **_k):
+            calls.append((cfg.name, usage_gate))
+            if gate is not None:
+                assert gate.shutdown.await_count == 0, (
+                    'the campaign gate was torn down mid-loop — the configs '
+                    'after it would run without failover'
+                )
+            if raise_on is not None and cfg.name == raise_on:
+                raise RuntimeError('executor exploded')
+            return _fake_eval_result(config_name=cfg.name, metrics=dict(metrics))
+        return fake
+
+    calls: list[tuple[str, object]] = []
+    mock_run_eval = AsyncMock(side_effect=_make({'composite_score': 1.0}))
+    mock_run_arch = AsyncMock(
+        side_effect=_make({'role_under_test': 'architect', 'plan_quality': 0.75}),
+    )
+    mock_build_gate = AsyncMock(return_value=gate)
+
+    with contextlib.ExitStack() as es:
+        p = es.enter_context
+        p(patch('orchestrator.evals.runner.run_eval', mock_run_eval))
+        p(patch('orchestrator.evals.runner.run_architect_eval', mock_run_arch))
+        p(patch('orchestrator.evals.configs.EVAL_CONFIGS', list(cfgs)))
+        p(patch('orchestrator.evals.eval_gate.campaign_usage_gate',
+                functools.partial(eval_gate.campaign_usage_gate,
+                                  factory=mock_build_gate)))
+        error: BaseException | None = None
+        try:
+            cli._run_single_eval(
+                Path('/fake/task.json'), 'all', base_config=MagicMock(),
+            )
+        except Exception as exc:  # noqa: BLE001 — surfaced to the caller below
+            error = exc
+    return capsys.readouterr().out, {
+        'run_eval': mock_run_eval, 'run_arch': mock_run_arch,
+        'build_gate': mock_build_gate, 'calls': calls, 'error': error,
+    }
 
 
 class TestCliArchitectDispatch:
@@ -3864,14 +3781,15 @@ class TestCliArchitectDispatch:
     def test_cap_tainted_cell_echo_names_the_taint(self, capsys):
         # An operator watching the run must see the infra refusal LIVE, not a
         # bare `plan_quality=None` that reads like a scoring quirk.
-        marker = f'architect:cap_hit: {_CAP_TEXT}'
         out, _, _ = _dispatch_single_eval(
             self._arch_cfg(), capsys,
             arch_metrics={
                 'role_under_test': 'architect',
                 'plan_quality': None,
                 'cap_tainted': True,
-                'invocation_error': marker,
+                'invocation_errors': [
+                    {'stage': 'architect', 'cause': 'cap_hit', 'reason': _CAP_TEXT},
+                ],
             },
         )
         # Scoped to the PER-CELL echo line ('plan_quality=' with the '='), not
@@ -3881,35 +3799,124 @@ class TestCliArchitectDispatch:
         echo_line = next(
             ln for ln in out.splitlines() if 'plan_quality=' in ln
         )
-        # Cause-neutral label + the marker naming the ACTUAL cause: a permanent
+        # Cause-neutral label + the record naming the ACTUAL cause: a permanent
         # config error must not read as a transient cap window.
         assert 'unmeasurable' in echo_line
-        assert marker in echo_line
+        assert f'architect:cap_hit: {_CAP_TEXT}' in echo_line
 
     def test_model_not_found_echo_does_not_read_as_a_cap_window(self, capsys):
         # The same taint flag covers a PERMANENT candidate-configuration error.
         # An operator must not be told to "rerun after the cap resets" for a
         # model that does not exist (reviewer: design-coherence).
-        marker = 'architect:model_not_found: no such model gpt-9'
         out, _, _ = _dispatch_single_eval(
             self._arch_cfg(), capsys,
             arch_metrics={
                 'role_under_test': 'architect',
                 'plan_quality': None,
                 'cap_tainted': True,
-                'invocation_error': marker,
+                'invocation_errors': [{
+                    'stage': 'architect', 'cause': 'model_not_found',
+                    'reason': 'no such model gpt-9',
+                }],
             },
         )
         echo_line = next(
             ln for ln in out.splitlines() if 'plan_quality=' in ln
         )
-        assert 'model_not_found' in echo_line
+        assert 'unmeasurable' in echo_line
+        assert 'architect:model_not_found: no such model gpt-9' in echo_line
         assert 'cap' not in echo_line.lower()
 
     def test_implementer_config_still_routes_to_run_eval(self, capsys):
         _, run_eval, run_arch = _dispatch_single_eval(self._impl_cfg(), capsys)
         run_eval.assert_called_once()
         run_arch.assert_not_called()
+
+
+class TestCliDispatchCampaignGate:
+    """``_run_single_eval``'s config loop owns ONE gate (task 4427).
+
+    A second, independent campaign loop the μ stage functions never pass
+    through: ``orchestrator eval --config all`` walks every candidate in one
+    process. Both dispatch branches must ride the SAME gate, or the architect
+    configs and the implementer configs each keep their own cap-state view and
+    the second half of the run re-discovers what the first half already paid to
+    learn.
+    """
+
+    def _arch_cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    def _impl_cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig('opus-high', 'claude', 'opus', 'high')
+
+    def _mixed(self):
+        return [self._arch_cfg(), self._impl_cfg()]
+
+    def test_one_gate_is_built_for_the_whole_loop(self, capsys):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        _out, mocks = _dispatch_mixed_eval(self._mixed(), capsys, gate=gate)
+
+        # ONE build for the loop, not one per config.
+        mocks['build_gate'].assert_awaited_once()
+        assert mocks['error'] is None
+
+    def test_both_dispatch_branches_share_the_same_gate(self, capsys):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        _out, mocks = _dispatch_mixed_eval(self._mixed(), capsys, gate=gate)
+
+        # Both branches ran…
+        assert {name for name, _g in mocks['calls']} == {
+            'architect-sonnet-high', 'opus-high',
+        }
+        # …and each received the SAME object (identity, not equality).
+        assert [g for _n, g in mocks['calls']] == [gate, gate]
+
+    def test_gate_is_shut_down_once_after_the_loop(self, capsys):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        _out, mocks = _dispatch_mixed_eval(self._mixed(), capsys, gate=gate)
+
+        # The in-call assertion in the helper already proved it was still live
+        # for every config; this pins that it comes down exactly once.
+        assert len(mocks['calls']) == 2
+        gate.shutdown.assert_awaited_once()
+
+    def test_gate_is_shut_down_when_a_config_raises(self, capsys):
+        """The teardown is in campaign_usage_gate's finally, so a blown cell
+        cannot leak the probe loop into the rest of the process."""
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        _out, mocks = _dispatch_mixed_eval(
+            self._mixed(), capsys, gate=gate, raise_on='architect-sonnet-high',
+        )
+
+        assert isinstance(mocks['error'], RuntimeError)
+        gate.shutdown.assert_awaited_once()
+
+    def test_a_degraded_campaign_threads_an_explicit_none(self, capsys):
+        """Ungated is a DECISION every config must be told about explicitly.
+
+        A config handed no argument would build its own gate — restoring the
+        per-cell construction, and re-paying a probe-dir alloc plus a SIGHUP
+        steal per config on the zero-account path.
+        """
+        _out, mocks = _dispatch_mixed_eval(self._mixed(), capsys, gate=None)
+
+        mocks['build_gate'].assert_awaited_once()
+        assert [g for _n, g in mocks['calls']] == [None, None]
 
 
 # ---------------------------------------------------------------------------
@@ -3975,7 +3982,7 @@ class TestArchitectEvalUsageGate:
         dirs and account state it never asked for.
         """
         gate_factory = MagicMock()
-        with patch('orchestrator.evals.runner.UsageGate', gate_factory):
+        with patch('orchestrator.evals.eval_gate.UsageGate', gate_factory):
             result, mocks = await _run_architect_eval_hermetic(
                 self._cfg(), produced_plan=_well_formed_plan(),
             )
@@ -3995,7 +4002,7 @@ class TestArchitectEvalUsageGate:
         campaign — and would do it for a REASON that has nothing to do with the
         candidate under test.
         """
-        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.eval_gate')
         result, mocks = await _run_architect_eval_hermetic(
             self._cfg(),
             produced_plan=_well_formed_plan(),
@@ -4018,7 +4025,7 @@ def _healthy_agent_result():
 
     A real AgentResult, not a MagicMock: it has to survive
     ``classify_invocation`` inside ``invoke_with_cap_retry`` (which must see a
-    success, not another cap) AND ``detect_invocation_error`` in the runner
+    success, not another cap) AND ``classify_unmeasured`` in the runner
     (which must leave the cell unmarked). A MagicMock cannot express either,
     since every attribute access on it returns a truthy Mock.
     """
@@ -4058,7 +4065,7 @@ def _two_account_gate():
 #
 # The user-observable signal of the whole task: a cap on the first account must
 # cost the campaign a retry, not a cell. Before φ the 429 was classified by
-# detect_invocation_error and the cell was persisted cap_tainted with
+# the runner's classifier and the cell was persisted cap_tainted with
 # plan_quality=None — a measurement the campaign then had to EXCLUDE.
 # ---------------------------------------------------------------------------
 
@@ -4091,7 +4098,7 @@ class TestArchitectEvalCapFailover:
         # (c) The cell is HEALTHY — measured, judged, and INCLUDED in the mean.
         # This is the whole point: pre-φ this cell was an exclusion.
         assert result.metrics['cap_tainted'] is False
-        assert result.metrics['invocation_error'] is None
+        assert result.metrics['invocation_errors'] is None
         assert result.outcome == 'done'
         assert result.metrics['plan_quality'] == 0.77
         assert result.metrics['plan_steps'] == 4
@@ -4105,7 +4112,7 @@ class TestArchitectEvalCapFailover:
         assert kw['model'] == 'sonnet'
         assert kw['backend'] == 'claude'
         assert kw['effort'] == 'high'
-        assert kw['prompt'] == 'ARCH PROMPT'
+        assert kw['prompt'] == _architect_prompt_sent()
         assert kw['cwd'] == Path('/fake/wt')
         assert kw['max_turns'] == 50
         assert kw['system_prompt']
@@ -4132,13 +4139,25 @@ def _one_account_gate():
     )
 
 
+def _real_cap_retry_with_no_cap_patience():
+    """The REAL ``invoke_with_cap_retry``, its public cap-wait bound set to zero.
+
+    The first cap hit exhausts the pool, so the gate, the retry loop and the
+    exhaustion path all run for real, in milliseconds rather than the
+    inherited bound.
+    """
+    from shared.cli_invoke import invoke_with_cap_retry
+
+    return functools.partial(invoke_with_cap_retry, cap_wait_sanity_secs=0.0)
+
+
 # ---------------------------------------------------------------------------
-# BOUNDED patience and a LOUD, correctly-labelled exhaustion (eval-revival φ)
+# Shared patience and a LOUD, correctly-labelled exhaustion (eval-revival φ)
 #
 # Failover is only half the contract. The other half is what happens when it
-# runs out: the campaign must never hang on the shared 14-day default, and the
-# resulting failure must land in the EXISTING cap_tainted backstop stamped as a
-# transport refusal — not as a harness crash of our own.
+# runs out: the cell inherits the shared default cap-wait patience, and when
+# that patience is exhausted the failure must land in the EXISTING cap_tainted
+# backstop stamped as a transport refusal — not as a harness crash of our own.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -4150,58 +4169,36 @@ class TestArchitectEvalCapPatience:
             'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
         )
 
-    async def test_cap_patience_is_eval_bounded_not_the_fourteen_day_default(self):
-        from shared.cli_invoke import _DEFAULT_CAP_WAIT_SANITY_SECS
+    async def test_architect_call_sets_no_cap_bound_of_its_own(self):
+        """One cap patience for every eval stage (esc-4002-1, task 7320).
 
-        from orchestrator.evals import runner
-
-        # An eval campaign takes its OWN bound, not the 14-day patient-AFK
-        # default a per-task implementer legitimately inherits.
-        #
-        # The floor was 1800 s until 2026-08-25 (esc-3634-1), when it was raised
-        # to 48 h. A short bound never bought what it claimed: a fully-capped
-        # pool parks in the gate's own unbounded `_open.wait()` whatever this
-        # value is, so the bound only chose how many in-flight cells were
-        # tainted first — and tainting throws away mid-cell spend that
-        # `--resume` would otherwise carry across the account switch. The floor
-        # asserted here is the 5-hour account cap the bound must be able to
-        # skate, with margin; the ceiling is still the 14-day default.
-        assert runner._EVAL_CAP_WAIT_SANITY_SECS >= 6 * 3600
-        assert runner._EVAL_CAP_WAIT_SANITY_SECS < _DEFAULT_CAP_WAIT_SANITY_SECS
-
-        # …and it actually REACHES the wrapper. A constant that is defined but
-        # never passed would leave the campaign on the 14-day default while
-        # both assertions above stayed happily green.
+        Waiting is ~free because ``--resume`` carries banked spend across the
+        account switch; omitting the kwargs is what inherits the shared default.
+        """
         wrapper = AsyncMock(return_value=_healthy_agent_result())
-        with patch('orchestrator.evals.runner.invoke_with_cap_retry', wrapper):
-            await _run_architect_eval_hermetic(
-                self._cfg(),
-                produced_plan=_well_formed_plan(),
-                usage_gate=_one_account_gate(),
-            )
-
-        assert wrapper.await_count == 1
-        assert (
-            wrapper.call_args.kwargs['cap_wait_sanity_secs']
-            == runner._EVAL_CAP_WAIT_SANITY_SECS
+        await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            usage_gate=_one_account_gate(),
+            cap_retry=wrapper,
         )
 
+        assert wrapper.await_count == 1
+        assert 'cap_wait_sanity_secs' not in wrapper.call_args.kwargs
+        assert 'max_cap_retries' not in wrapper.call_args.kwargs
+
     async def test_fully_capped_pool_fails_loud_into_cap_tainted(self):
-        from orchestrator.evals import runner
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan={},
+            usage_gate=_one_account_gate(),
+            arch_result=_cap_agent_result(),
+            cap_retry=_real_cap_retry_with_no_cap_patience(),
+        )
 
-        # `arch_result` (not a side_effect LIST) means EVERY attempt caps, and
-        # the patched bound trips on the first hit — so the pool is genuinely
-        # exhausted and the test still runs in milliseconds.
-        with patch.object(runner, '_EVAL_CAP_WAIT_SANITY_SECS', 0.0):
-            result, _mocks = await _run_architect_eval_hermetic(
-                self._cfg(),
-                produced_plan={},
-                usage_gate=_one_account_gate(),
-                arch_result=_cap_agent_result(),
-            )
-
-        # It RETURNED. That is the requirement being pinned: a fully-capped
-        # pool must FAIL, not hang a campaign waiting for a reset 14 days out.
+        # It RETURNED. That is the requirement being pinned: when the real
+        # wrapper gives up, the cell lands in the cap_tainted backstop rather
+        # than propagating the exhaustion out of the campaign.
         assert result.outcome == 'blocked'
 
         # …into the pre-existing backstop, unchanged: no scorable plan landed,
@@ -4213,22 +4210,19 @@ class TestArchitectEvalCapPatience:
         # …and labelled as what it IS. Stamping a provider cap `harness_error:`
         # would charge OUR crash for a transport refusal and collapse two rows
         # of the docstring's taint table that exist precisely to stay distinct.
-        marker = result.metrics['invocation_error']
-        assert marker.startswith('architect:')
-        assert 'cap' in marker
-        assert 'harness_error' not in marker
+        record = _only_record(result.metrics)
+        assert (record['stage'], record['cause']) == ('architect', 'cap_exhausted')
 
     async def test_cap_exhaustion_that_left_a_scorable_plan_is_not_tainted(self):
-        from orchestrator.evals import runner
         from orchestrator.evals.judge import score_plan_structure
 
-        with patch.object(runner, '_EVAL_CAP_WAIT_SANITY_SECS', 0.0):
-            result, mocks = await _run_architect_eval_hermetic(
-                self._cfg(),
-                produced_plan=_well_formed_plan(),
-                usage_gate=_one_account_gate(),
-                arch_result=_cap_agent_result(),
-            )
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            usage_gate=_one_account_gate(),
+            arch_result=_cap_agent_result(),
+            cap_retry=_real_cap_retry_with_no_cap_patience(),
+        )
 
         # The architect wrote a real plan through plan-tools BEFORE the pool ran
         # dry — the common shape of a cap landing mid-campaign. Discarding it
@@ -4241,9 +4235,8 @@ class TestArchitectEvalCapPatience:
         )
 
         # Still MARKED, so a reader knows why the LLM judge was skipped…
-        marker = result.metrics['invocation_error']
-        assert marker.startswith('architect:')
-        assert 'cap' in marker
+        record = _only_record(result.metrics)
+        assert (record['stage'], record['cause']) == ('architect', 'cap_exhausted')
 
         # …and it really WAS skipped, carrying 3629's honest zeros rather than
         # spend for a call that never happened.
@@ -4298,15 +4291,14 @@ class TestPinnedTaintSemanticsSurviveTheCapRetrySeam:
         assert result.outcome == 'timeout'
         assert result.metrics['cap_tainted'] is False
         assert result.metrics['plan_quality'] is not None
-        marker = result.metrics['invocation_error']
-        assert isinstance(marker, str) and marker.startswith('architect:')
-        assert 'timeout' in marker.lower()
+        record = _only_record(result.metrics)
+        assert (record['stage'], record['cause']) == ('architect', 'timeout')
 
     async def test_gate_absent_path_is_byte_identical(self):
         """usage_cap disabled is a real deployment, and it must be untouched.
 
         With no gate the wrapper degrades to num_accounts=1 and a single
-        invoke, so a 429 is classified by detect_invocation_error exactly as it
+        invoke, so a 429 is classified by classify_unmeasured exactly as it
         was pre-φ — one invocation, marked, tainted. No retry, no failover, no
         second call the operator did not opt into.
         """
@@ -4319,8 +4311,8 @@ class TestPinnedTaintSemanticsSurviveTheCapRetrySeam:
         assert mocks['invoke'].await_count == 1
         assert result.metrics['cap_tainted'] is True
         assert result.metrics['plan_quality'] is None
-        marker = result.metrics['invocation_error']
-        assert isinstance(marker, str) and marker.startswith('architect:')
+        record = _only_record(result.metrics)
+        assert (record['stage'], record['cause']) == ('architect', 'cap_hit')
 
     async def test_healthy_architect_with_a_stepless_plan_still_scores_a_kept_zero(self):
         """A genuine 0.0 must stay a 0.0 — the anti-fabrication floor is intact.
@@ -4339,7 +4331,7 @@ class TestPinnedTaintSemanticsSurviveTheCapRetrySeam:
         )
 
         assert result.metrics['cap_tainted'] is False
-        assert result.metrics['invocation_error'] is None
+        assert result.metrics['invocation_errors'] is None
         assert result.metrics['plan_quality'] == 0.0
         assert mocks['judge'].await_count == 0
 
@@ -4348,50 +4340,48 @@ class TestPinnedTaintSemanticsSurviveTheCapRetrySeam:
 
         The tempting wrong implementation keeps the pre-φ shape —
         ``asyncio.wait_for(invoke_with_cap_retry(...), timeout=...)`` — instead
-        of moving the bound inside the per-attempt ``_timed_invoke`` closure.
-        It is wrong because the retry loop's wall clock is dominated by cap
-        COOLDOWNS, which the candidate under test is not responsible for: once
-        a cap wait outlasts --timeout, the cell surfaces as
+        of bounding each attempt. It is wrong because the retry loop's wall
+        clock is dominated by cap WAITS, which the candidate under test is not
+        responsible for: once a wait outlasts --timeout, the cell surfaces as
         ``outcome='timeout'`` → NOT tainted → a cap-starved cell scored a
-        fabricated 0.0 and INCLUDED in the mean. That is precisely the
-        differential-exclusion bias φ exists to remove, re-created one layer up.
+        fabricated 0.0 and INCLUDED in the mean.
 
-        Every other test in this file passes under that mutation (verified),
-        because they mock ``shared.cli_invoke.asyncio.sleep`` — so no wall
-        clock ever advances during a cap wait and the outer deadline never
-        fires. This test closes that hole with the one thing the mutation
-        cannot survive: a wrapper call that genuinely outlasts --timeout. The
-        patched wrapper never invokes ``invoke_fn``, so under the CORRECT
-        implementation no deadline applies to it at all.
+        Every other test in this file passes under that mutation, because they
+        mock ``shared.cli_invoke.asyncio.sleep`` — so no wall clock ever
+        advances during a cap wait. This one makes the injected gate's slot
+        acquisition (``before_invoke``, inside the real wrapper but outside any
+        attempt) genuinely outlast --timeout, so only a per-attempt bound
+        leaves the cell healthy.
         """
         import asyncio
 
-        # The REAL sleep, captured before the helper runs. ``_run_architect_
-        # eval_hermetic`` patches ``shared.cli_invoke.asyncio.sleep`` — and
-        # since ``shared.cli_invoke.asyncio`` IS the asyncio module, that patch
-        # is GLOBAL for its duration. A plain ``await asyncio.sleep(0.2)`` in
-        # here would resolve to that AsyncMock and return instantly, making
-        # this test vacuous (verified: it passed under the mutation).
+        from shared.testing import make_gate_mock
+
+        # The REAL sleep, captured before the helper runs: the harness patches
+        # ``shared.cli_invoke.asyncio.sleep``, and since that IS the asyncio
+        # module the patch is global for its duration, so a plain
+        # ``asyncio.sleep`` in here would return instantly.
         real_sleep = asyncio.sleep
 
-        async def _slow_wrapper(*_args, **_kwargs):
+        async def _slow_slot(**_kwargs) -> str:
             # ~6x the 30 ms budget below — far outside scheduler jitter.
             await real_sleep(0.2)
-            return _healthy_agent_result()
+            return 'tok'
 
-        with patch('orchestrator.evals.runner.invoke_with_cap_retry', _slow_wrapper):
-            result, _mocks = await _run_architect_eval_hermetic(
-                self._cfg(),
-                produced_plan=_well_formed_plan(),
-                usage_gate=_two_account_gate(),
-                task_timeout_minutes=0.0005,  # 30 ms
-            )
+        gate = make_gate_mock(before_invoke=AsyncMock(side_effect=_slow_slot))
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            injected_gate=gate,
+            arch_result=_healthy_agent_result(),
+            task_timeout_minutes=0.0005,  # 30 ms
+        )
 
-        # The wrapper outlived --timeout by 6x and the cell is STILL healthy:
+        # The slot wait outlived --timeout by 6x and the cell is STILL healthy:
         # the operator's budget bounds one attempt, never the retry loop.
         assert result.outcome == 'done'
         assert result.metrics['cap_tainted'] is False
-        assert result.metrics['invocation_error'] is None
+        assert result.metrics['invocation_errors'] is None
 
 
 # ---------------------------------------------------------------------------
@@ -4469,7 +4459,7 @@ class TestArchitectEvalZeroAccountGate:
             await gate.before_invoke()
 
     async def test_zero_account_gate_degrades_to_the_ungated_path(self, caplog):
-        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.eval_gate')
         gate = _zero_account_gate()
 
         result, mocks = await _run_architect_eval_hermetic(
@@ -4487,7 +4477,7 @@ class TestArchitectEvalZeroAccountGate:
         assert mocks['invoke'].await_count == 1
         assert result.outcome == 'done'
         assert result.metrics['cap_tainted'] is False
-        assert result.metrics['invocation_error'] is None
+        assert result.metrics['invocation_errors'] is None
         assert result.metrics['plan_quality'] == 0.77
 
     async def test_the_empty_gate_is_never_dispatched_through(self):
@@ -4578,7 +4568,7 @@ class TestArchitectEvalGateLifecycle:
         """Teardown is best-effort: the cell is already scored by then."""
         from shared.testing import make_gate_mock
 
-        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.eval_gate')
         gate = make_gate_mock()
         gate.shutdown = AsyncMock(side_effect=RuntimeError('teardown boom'))
 
@@ -4598,6 +4588,171 @@ class TestArchitectEvalGateLifecycle:
         )
         assert result.outcome == 'done'
         assert mocks['gate'] is None
+
+
+@pytest.mark.asyncio
+class TestArchitectEvalInjectedGate:
+    """A gate the CALLER built is used as-is and never torn down (task 4427).
+
+    The per-cell build above stays the default, but a campaign owner that
+    already holds a gate must be able to hand it down — and the cell must NOT
+    shut it down, because that would destroy the shared cap state mid-campaign,
+    which is the entire point of hoisting it.
+    """
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_injected_gate_is_the_one_invoked_with(self):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        _result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(), injected_gate=gate,
+        )
+
+        # The gate the campaign owns is the gate the invoke actually rides:
+        # its slot was taken, and the invoke carried that slot's token.
+        gate.before_invoke.assert_awaited()
+        assert mocks['invoke'].await_args.kwargs['oauth_token'] == 'tok'
+
+    async def test_an_injected_gate_suppresses_the_per_cell_build(self):
+        """The hoist is pointless if the cell builds one anyway."""
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        build = AsyncMock(return_value=make_gate_mock())
+        _result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+            injected_gate=gate, gate_factory=build,
+        )
+
+        build.assert_not_awaited()
+
+    async def test_an_injected_gate_is_never_shut_down(self):
+        """Tearing down a borrowed gate would destroy the campaign's cap state.
+
+        Cell N shutting the shared gate down would take failover away from every
+        cell after it — strictly worse than the per-cell gate it replaced.
+        """
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(), injected_gate=gate,
+        )
+
+        assert result.outcome == 'done'
+        gate.shutdown.assert_not_awaited()
+
+    async def test_an_injected_gate_survives_a_failing_cell(self):
+        """The failure path is exactly where the shared gate matters most.
+
+        A cell that blew up is the one most likely to have hit a cap, i.e. the
+        one carrying the cap knowledge its siblings need.
+        """
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan={},
+            injected_gate=gate,
+            invoke_side_effect=RuntimeError('architect exploded'),
+        )
+
+        assert result.outcome == 'blocked'
+        gate.shutdown.assert_not_awaited()
+
+    async def test_explicit_none_means_ungated_not_unset(self):
+        """``usage_gate=None`` is a DECISION, not a missing argument.
+
+        ``build_eval_usage_gate`` returns None three legitimate ways, so a
+        campaign can be deliberately ungated. If the cell read that None as
+        "nothing was supplied" it would build its own gate — silently restoring
+        the per-cell construction the hoist removes, and re-paying a probe-dir
+        alloc plus a SIGHUP-handler steal on the zero-account path.
+        """
+        build = AsyncMock()
+        _result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+            injected_gate=None, gate_factory=build,
+        )
+
+        build.assert_not_awaited()
+        # One plain invoke: no slot was taken, so no account token rode it.
+        mocks['invoke'].assert_awaited_once()
+        assert 'oauth_token' not in mocks['invoke'].await_args.kwargs
+
+    async def test_omitting_the_parameter_keeps_the_owned_path(self):
+        """Back-compat: no argument still means build-your-own AND tear it down.
+
+        The four TestArchitectEvalGateLifecycle pins cover the teardown; this
+        adds the other half — that the cell still BUILDS when nothing is passed,
+        which is what makes the sentinel (rather than a None default) load-bearing.
+        """
+        from shared.testing import make_gate_mock
+
+        own_gate = make_gate_mock()
+        build = AsyncMock(return_value=own_gate)
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(), gate_factory=build,
+        )
+
+        build.assert_awaited_once()
+        own_gate.before_invoke.assert_awaited()
+        assert result.outcome == 'done'
+        # Owned → the cell is still responsible for the teardown.
+        own_gate.shutdown.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Campaign-level gate ownership (task 4427)
+#
+# The per-cell gate above is correct but STATELESS across cells: cell N+1
+# re-leases the account cell N proved capped, paying a wasted invocation plus a
+# cooldown every time. ``campaign_usage_gate`` hoists construction+teardown to
+# whoever loops the cells (the μ stage functions and ``cli._run_single_eval``),
+# so ONE cap-state view serves the whole campaign.
+#
+# The hoist rests on one load-bearing premise: the ``usage_cap`` a cell would
+# have built its own gate from is the SAME ``usage_cap`` the campaign owner
+# reads off ``base_config``. That is an emergent property of two files
+# (``build_eval_orch_config`` + ``EVAL_PROFILE``), so it is pinned here as a
+# tripwire rather than trusted as a comment.
+# ---------------------------------------------------------------------------
+
+class TestCampaignGatePremise:
+    """A campaign gate built from ``base_config`` is what every cell expects.
+
+    ``build_eval_usage_gate`` reads exactly one leaf — ``orch_config.usage_cap``
+    — and each cell's orch config is
+    ``apply_eval_profile(base_config).model_copy(update=...)``. Neither
+    ``EVAL_PROFILE`` nor that update dict mentions ``usage_cap``, so the leaf is
+    inherited verbatim and the campaign gate is byte-identical to the gate each
+    cell builds today. If someone later adds ``usage_cap`` to ``EVAL_PROFILE``,
+    the campaign gate would silently stop matching what cells expect — this
+    fails loudly instead.
+    """
+
+
+    @pytest.mark.parametrize('role', ['architect', 'implementer'])
+    def test_cell_orch_config_inherits_base_usage_cap_verbatim(
+        self, tmp_path: Path, role: str,
+    ):
+        from orchestrator.evals.configs import EvalConfig
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = eval_base_config(tmp_path)
+        cfg = EvalConfig(f'{role}-sonnet-high', 'claude', 'sonnet', 'high', role=role)
+        task = {'id': 'df_task_4427', 'project_root': str(tmp_path)}
+
+        cell_config = build_eval_orch_config(cfg, task, base)
+
+        assert cell_config.usage_cap == base.usage_cap
 
 
 @pytest.mark.asyncio
@@ -4679,16 +4834,15 @@ class TestArchitectEvalSpendSurvivesFailover:
         makes an EXCLUDED cell's spend honest too, which matters because
         exclusions are still charged to the campaign's budget.
         """
-        from orchestrator.evals import runner
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan={},
+            usage_gate=_one_account_gate(),
+            arch_result=_mid_run_cap_agent_result(cost_usd=0.9),
+            cap_retry=_real_cap_retry_with_no_cap_patience(),
+        )
 
-        with patch.object(runner, '_EVAL_CAP_WAIT_SANITY_SECS', 0.0):
-            result, _mocks = await _run_architect_eval_hermetic(
-                self._cfg(),
-                produced_plan={},
-                usage_gate=_one_account_gate(),
-                arch_result=_mid_run_cap_agent_result(cost_usd=0.9),
-            )
-
+        assert mocks['invoke'].await_count == 1
         assert result.outcome == 'blocked'
         assert result.metrics['cap_tainted'] is True
         assert result.metrics['cost_usd'] == pytest.approx(0.9)
@@ -4747,7 +4901,7 @@ class TestArchitectEvalCapResume:
         first, second = mocks['invoke'].call_args_list
 
         # (a) Attempt 1 is a normal fresh dispatch carrying the real prompt.
-        assert first.kwargs['prompt'] == 'ARCH PROMPT'
+        assert first.kwargs['prompt'] == _architect_prompt_sent()
         assert first.kwargs.get('resume_session_id') is None
 
         # (b) Attempt 2 RESUMES that session on the OTHER account, rather than
@@ -4774,7 +4928,7 @@ class TestArchitectEvalCapResume:
         #     spend charged to it.
         assert result.outcome == 'done'
         assert result.metrics['cap_tainted'] is False
-        assert result.metrics['invocation_error'] is None
+        assert result.metrics['invocation_errors'] is None
         assert result.metrics['plan_quality'] == 0.77
         assert result.metrics['cost_usd'] == pytest.approx(0.9 + 1.23)
 
@@ -4795,7 +4949,7 @@ class TestArchitectEvalCapResume:
 
         _first, second = mocks['invoke'].call_args_list
         assert second.kwargs.get('resume_session_id') is None
-        assert second.kwargs['prompt'] == 'ARCH PROMPT'
+        assert second.kwargs['prompt'] == _architect_prompt_sent()
 
 
 def _decline_artifact(reported_at: str = '2026-07-19T12:00:00+00:00') -> dict:
@@ -4948,3 +5102,295 @@ class TestArchitectCellPersistsTerminalKind:
         assert result.outcome == 'done'
         assert isinstance(result.metrics['plan_quality'], float)
         assert result.metrics['terminal_kind'] == 'planned'
+
+
+# ---------------------------------------------------------------------------
+# Characterization of the persisted scoring fields, one row per exit (task 6737)
+#
+# Recorded against run_architect_eval BEFORE it was split into invoke →
+# classify → assemble. Only each row's harness call may change; the expected
+# literals are the evidence that the split moved no persisted field.
+# ---------------------------------------------------------------------------
+
+_SCORING_FIELDS = (
+    'plan_quality', 'cap_tainted', 'invocation_errors', 'plan_steps',
+    'judge_invocations', 'judge_cost_usd', 'judged_without_reference',
+    'cost_usd', 'cost_source', 'terminal_kind', 'tests_pass',
+    'role_under_test', 'replay_frame', 'input_tokens', 'output_tokens',
+    'cache_read_tokens', 'cache_create_tokens', 'turns_used',
+    'tokens_per_second', 'workflow_duration_ms', 'is_local_model',
+)
+
+
+def _characterized_cfg(**over):
+    from orchestrator.evals.configs import EvalConfig
+
+    return EvalConfig(
+        over.pop('name', 'architect-sonnet-high'), 'claude',
+        over.pop('model', 'sonnet'), 'high', role='architect', **over,
+    )
+
+
+# The default hermetic invoke's usage (see _run_architect_eval_hermetic) and
+# the all-zero usage of an attempt that never returned.
+_DEFAULT_INVOKE_USAGE = {
+    'input_tokens': 12000, 'output_tokens': 3000,
+    'cache_read_tokens': 48000, 'cache_create_tokens': 6000,
+    'turns_used': 9, 'tokens_per_second': 656.89,
+    'workflow_duration_ms': 4567, 'is_local_model': False,
+}
+_NO_USAGE = {
+    'input_tokens': 0, 'output_tokens': 0,
+    'cache_read_tokens': 0, 'cache_create_tokens': 0,
+    'turns_used': 0, 'tokens_per_second': 0.0,
+    'workflow_duration_ms': 0, 'is_local_model': False,
+}
+_ARCHITECT_CELL_STAMPS = {
+    'tests_pass': None, 'role_under_test': 'architect',
+    'replay_frame': 'honest-frame-v1',
+}
+_JUDGED_077 = {
+    'plan_quality': 0.77, 'cap_tainted': False, 'invocation_errors': None,
+    'plan_steps': 4, 'judge_invocations': 1, 'judge_cost_usd': 0.0,
+    'terminal_kind': 'planned',
+}
+_FLOORED_STEPLESS = {
+    'outcome': 'done', 'plan_quality': 0.0, 'cap_tainted': False,
+    'invocation_errors': None, 'plan_steps': 0, 'judge_invocations': 0,
+    'judge_cost_usd': 0.0, 'judged_without_reference': False,
+    'cost_usd': 1.23, 'cost_source': 'cli',
+}
+_CAP_HIT_RECORD = {
+    'stage': 'architect', 'cause': 'cap_hit',
+    'reason': "You've hit your session limit · resets 8pm",
+}
+_CAP_EXHAUSTED_RECORD = {
+    'stage': 'architect', 'cause': 'cap_exhausted',
+    'reason': 'x: all accounts capped after 3 retries (10.0s elapsed)',
+}
+_UNSPENT_UNJUDGED = {
+    'judge_invocations': 0, 'judge_cost_usd': 0.0,
+    'judged_without_reference': False, 'cost_usd': 0.0, 'cost_source': 'cli',
+}
+
+
+_PERSISTED_FIELD_ROWS = [
+    pytest.param(
+        lambda: {'produced_plan': _well_formed_plan()},
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE, **_JUDGED_077,
+            'outcome': 'done', 'judged_without_reference': False,
+            'cost_usd': 1.23, 'cost_source': 'cli',
+        },
+        id='healthy-scorable-plan',
+    ),
+    pytest.param(
+        lambda: {'produced_plan': {}},
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE, **_FLOORED_STEPLESS,
+            'terminal_kind': 'none',
+        },
+        id='healthy-stepless-plan',
+    ),
+    pytest.param(
+        lambda: {'produced_plan': _create_plan_stub()},
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE, **_FLOORED_STEPLESS,
+            'terminal_kind': 'none',
+        },
+        id='healthy-create-plan-stub',
+    ),
+    pytest.param(
+        lambda: {'produced_plan': {}, 'arch_result': _cap_agent_result()},
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'blocked', 'plan_quality': None, 'cap_tainted': True,
+            'invocation_errors': [_CAP_HIT_RECORD], 'plan_steps': 0,
+            'terminal_kind': 'none', 'workflow_duration_ms': 1200,
+        },
+        id='cap-refusal-no-plan',
+    ),
+    pytest.param(
+        lambda: {'produced_plan': _well_formed_plan(), 'arch_result': _cap_agent_result()},
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'blocked', 'plan_quality': 1.0, 'cap_tainted': False,
+            'invocation_errors': [_CAP_HIT_RECORD], 'plan_steps': 4,
+            'terminal_kind': 'planned', 'workflow_duration_ms': 1200,
+        },
+        id='cap-refusal-scorable-plan',
+    ),
+    pytest.param(
+        lambda: {'produced_plan': _well_formed_plan(), 'invoke_side_effect': TimeoutError()},
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'timeout', 'plan_quality': 0.0, 'cap_tainted': False,
+            'invocation_errors': [{
+                'stage': 'architect', 'cause': 'timeout',
+                'reason': 'no answer within 60m',
+            }],
+            'plan_steps': 0, 'terminal_kind': 'none',
+        },
+        id='timeout',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': _well_formed_plan(),
+            'invoke_side_effect': RuntimeError('boom'),
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'blocked', 'plan_quality': None, 'cap_tainted': True,
+            'invocation_errors': [{
+                'stage': 'architect', 'cause': 'harness_error',
+                'reason': 'RuntimeError: boom',
+            }],
+            'plan_steps': 0, 'terminal_kind': 'none',
+        },
+        id='harness-error-at-invoke',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': _well_formed_plan(),
+            'orch_config_side_effect': RuntimeError('x'),
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'blocked', 'plan_quality': None, 'cap_tainted': True,
+            'invocation_errors': [{
+                'stage': 'architect', 'cause': 'harness_error',
+                'reason': 'RuntimeError: x',
+            }],
+            'plan_steps': 0, 'terminal_kind': 'none',
+        },
+        id='harness-error-at-orch-config',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': _well_formed_plan(),
+            'invoke_side_effect': AllAccountsCappedException(3, 10.0, 'x'),
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'blocked', 'plan_quality': 1.0, 'cap_tainted': False,
+            'invocation_errors': [_CAP_EXHAUSTED_RECORD], 'plan_steps': 4,
+            'terminal_kind': 'planned',
+        },
+        id='cap-exhausted-scorable-plan',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': {},
+            'invoke_side_effect': AllAccountsCappedException(3, 10.0, 'x'),
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_NO_USAGE, **_UNSPENT_UNJUDGED,
+            'outcome': 'blocked', 'plan_quality': None, 'cap_tainted': True,
+            'invocation_errors': [_CAP_EXHAUSTED_RECORD], 'plan_steps': 0,
+            'terminal_kind': 'none',
+        },
+        id='cap-exhausted-no-plan',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': _well_formed_plan(),
+            'judge_return': Unmeasured(
+                MeasurementStage.JUDGE, UnmeasuredCause.UNPARSEABLE,
+                'JSONDecodeError: Expecting value', cost_usd=0.6,
+            ),
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE,
+            'outcome': 'done', 'plan_quality': 1.0, 'cap_tainted': False,
+            'invocation_errors': [{
+                'stage': 'judge', 'cause': 'unparseable',
+                'reason': 'JSONDecodeError: Expecting value',
+            }],
+            'plan_steps': 4, 'judge_invocations': 1, 'judge_cost_usd': 0.6,
+            'judged_without_reference': False, 'cost_usd': 1.83,
+            'cost_source': 'cli', 'terminal_kind': 'planned',
+        },
+        id='judge-unparseable',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': _well_formed_plan(),
+            'judge_side_effect': RuntimeError('judge exploded'),
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE,
+            'outcome': 'done', 'plan_quality': 1.0, 'cap_tainted': False,
+            'invocation_errors': [{
+                'stage': 'judge', 'cause': 'raised',
+                'reason': 'RuntimeError: judge exploded',
+            }],
+            'plan_steps': 4, 'judge_invocations': 0, 'judge_cost_usd': 0.0,
+            'judged_without_reference': False, 'cost_usd': 1.23,
+            'cost_source': 'cli', 'terminal_kind': 'planned',
+        },
+        id='judge-raised',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': _well_formed_plan(),
+            'task_override': _arch_task_no_reference(), 'reference_diff': '',
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE, **_JUDGED_077,
+            'outcome': 'done', 'judged_without_reference': True,
+            'cost_usd': 1.23, 'cost_source': 'cli',
+        },
+        id='judge-blind-no-reference',
+    ),
+    pytest.param(
+        lambda: {
+            'cfg': _characterized_cfg(
+                name='architect-candidate', model='qwen3-coder',
+                env_overrides=dict(_PROXY_ENV),
+            ),
+            'produced_plan': _well_formed_plan(),
+            'arch_result': _token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+            'orch_prices': {
+                'qwen3-coder': {'input_per_1m': 0.30, 'output_per_1m': 1.20},
+            },
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_JUDGED_077,
+            'outcome': 'done', 'judged_without_reference': False,
+            'cost_usd': 0.9, 'cost_source': 'price_table',
+            'input_tokens': 1000000, 'output_tokens': 500000,
+            'cache_read_tokens': 0, 'cache_create_tokens': 0, 'turns_used': 3,
+            'tokens_per_second': 109481.06, 'workflow_duration_ms': 4567,
+            'is_local_model': True,
+        },
+        id='proxied-candidate-priced',
+    ),
+    pytest.param(
+        lambda: {
+            'produced_plan': {},
+            'declines': {'false_premise': _decline_artifact()},
+        },
+        {
+            **_ARCHITECT_CELL_STAMPS, **_DEFAULT_INVOKE_USAGE, **_FLOORED_STEPLESS,
+            'terminal_kind': 'false_premise',
+        },
+        id='false-premise-decline',
+    ),
+]
+
+
+@pytest.mark.asyncio
+class TestPersistedScoringFieldsAreStable:
+    @pytest.mark.parametrize(('scenario', 'expected'), _PERSISTED_FIELD_ROWS)
+    async def test_persisted_scoring_fields(self, scenario, expected, tmp_path):
+        harness_kwargs = scenario()
+        cfg = harness_kwargs.pop('cfg', None) or _characterized_cfg()
+        store = ResultStore(tmp_path)
+
+        await _run_architect_eval_hermetic(cfg, store=store, **harness_kwargs)
+
+        (cell,) = store.load_all()
+        observed = {'outcome': cell.outcome} | {
+            field: cell.metrics[field] for field in _SCORING_FIELDS
+        }
+        assert observed == pytest.approx(expected)

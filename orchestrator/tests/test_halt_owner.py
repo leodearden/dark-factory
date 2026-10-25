@@ -22,7 +22,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
-from orchestrator.merge_queue import SpeculativeMergeWorker
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
 
 @pytest.fixture
@@ -160,7 +160,7 @@ class TestHaltOwnerUnhaltPredicate:
 
         worker.halt_for_wip('simulated gap window')
         assert worker.is_wip_halted
-        assert worker._owner is None
+        assert worker.halt_owner_esc_id is None
 
         esc = _make_wip_esc(queue, '42')
         # NO set_halt_owner — simulate the gap between halt_for_wip and

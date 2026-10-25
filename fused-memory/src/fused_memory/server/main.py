@@ -11,7 +11,8 @@ import signal
 import socket
 import sys
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,8 +23,18 @@ load_dotenv()
 from functools import partial  # noqa: E402
 
 from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
+from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 
-from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
+from fused_memory.config.schema import (  # noqa: E402
+    DedupOutageDetectorConfig,
+    FusedMemoryConfig,
+)
+from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
+    memory_service_archive,
+)
+from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
+    closure_exists_probe,
+)
 from fused_memory.server.markup_guard import install_markup_guard  # noqa: E402
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
@@ -38,13 +49,17 @@ if TYPE_CHECKING:
     from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
+    from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.middleware.ticket_janitor import TicketJanitor
     from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
+    from fused_memory.server.topic_cluster_store import TopicClusterStore
+    from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -71,11 +86,12 @@ _HARNESS_CANCEL_TIMEOUT = 25.0
 _CLEANUP_STEP_TIMEOUT = 5.0
 
 # Per-step budget for the memory_service.close step specifically (task 2701).
-# MemoryService.close() runs six sub-closes sequentially, each individually
-# time-boxed at memory_service._SUBCLOSE_TIMEOUT (3.0s), so this outer step
-# budget must dominate 6 * _SUBCLOSE_TIMEOUT (=18s) with margin. 20s does and
-# fits inside _FORCE_EXIT_BUDGET's existing headroom (the worst-case step sum
-# below rises to 70s <= 75s) while leaving graceful+force<systemd untouched —
+# MemoryService.close() runs its sub-closes sequentially, each individually
+# time-boxed, so this outer step budget must dominate their sum,
+# services/memory_service.py::MemoryService.close_budget_secs, with margin.
+# 20s does and fits inside _FORCE_EXIT_BUDGET's existing headroom (the
+# worst-case step sum below rises to 70s <= 75s) while leaving
+# graceful+force<systemd untouched —
 # so the schema.py _MIRROR_* mirror and the systemd-template parity test stay
 # valid. Guarded by TestShutdownBudgetArithmetic in tests/test_server_shutdown.py.
 _MEMORY_CLOSE_STEP_TIMEOUT = 20.0
@@ -119,6 +135,21 @@ _CHECKPOINT_INTERVAL = 300.0
 # ``_CHECKPOINT_STATUS``) so both this module (writer — periodic loop)
 # and ``tools.py`` (reader — the ``get_wal_status`` MCP tool) share
 # state without a circular import.
+
+# Event-loop lag heartbeat sampling interval (task 3778). Deliberately much
+# shorter than _thread_monitor's 60s: the signal is how late a timer actually
+# ran, so a stall is only measured when it OVERLAPS a deadline. At 5s, a 15-43s
+# wedge overlaps several deadlines and is reported at close to full magnitude;
+# at 60s it would be caught roughly half the time and under-reported.
+_LOOP_LAG_INTERVAL = 5.0
+
+# How many consecutive BELOW-threshold samples pass before one routine INFO
+# heartbeat is emitted (12 x 5s ≈ 60s, matching _thread_monitor's cadence).
+# Frequent sampling is what makes a stall observable; logging every one of
+# those samples would be ~17k INFO lines a day. Threshold CROSSINGS bypass
+# this entirely and are always reported on the sample they occur (INV-4
+# loud-over-silent) — the throttle only bounds routine chatter.
+_LOOP_LAG_INFO_EVERY = 12
 
 
 def _sd_notify(state: str) -> None:
@@ -535,6 +566,7 @@ async def run_server():
     logger.info(f'  Graphiti: {config.graphiti.provider} ({config.graphiti.falkordb.uri})')
     logger.info(f'  Mem0/Qdrant: {config.mem0.qdrant_url}')
     logger.info(f'  Transport: {config.server.transport}')
+    systemd_listeners = take_systemd_listeners()
 
     # Initialize memory service
     memory_service = MemoryService(config)
@@ -542,6 +574,10 @@ async def run_server():
 
     # Initialize write journal
     from fused_memory.services.write_journal import WriteJournal
+    from fused_memory.services.write_ops_retention import (
+        prune_write_ops_pass,
+        run_periodic_write_ops_prune,
+    )
 
     wj_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
     write_journal = WriteJournal(wj_data_dir)
@@ -572,6 +608,23 @@ async def run_server():
     if _idempotent_pruned:
         logger.info(
             f'idempotent_ops retention prune at startup: {_idempotent_pruned} rows'
+        )
+
+    # Bounded retention: age out old write_ops so the journal does not grow
+    # without bound. UNLIKE its two siblings above this prune is BATCHED,
+    # ROW-BUDGETED and DEADLINE-BOUNDED: write_ops was measured at 35.4M rows /
+    # 16 GB, and an unbounded DELETE here would hold the write lock past the
+    # watchdog's 120 s startup grace (STARTUP_GRACE_SECS in
+    # scripts/orchestrator-watchdog.py) while silently dropping journal rows —
+    # log_write_op swallows its own errors and busy_timeout is only 5000 ms — so
+    # it would corrupt the very telemetry it is pruning. The periodic loop
+    # started below now carries the drain, not successive restarts; this pass
+    # catches up after downtime, and every partial pass discloses its backlog at
+    # WARNING. Fire-and-forget.
+    _write_ops_pruned = await prune_write_ops_pass(write_journal, config.write_journal)
+    if _write_ops_pruned:
+        logger.info(
+            f'write_ops retention prune at startup: {_write_ops_pruned} rows'
         )
 
     # Initialize task backend (SqliteTaskBackend).
@@ -637,16 +690,14 @@ async def run_server():
     # be noticed any other way. Pure data, no lifetime coupling, same injection
     # pattern ReconciliationHarness and TicketJanitor already use.
     #
-    # KNOWINGLY UNCOVERED, and the asymmetry is the reason. Those two components
-    # need no wiring test because each DEFENDS ITSELF — omit the kwarg and it
-    # calls build_known_projects_map. This escalator has no such fallback (a
-    # safe fallback source is an open question: the module docstring forbids
-    # config.taskmaster.project_root, which defaults to '.'), so it depends on
-    # this one call. Deleting or reordering the line degrades the storm alarm to
-    # a WARN with no test failure. Do NOT "cover" it with a grep- or ast-based
-    # meta-test: that shape was deleted from this repo in fb3c47dccf on a
-    # CONFIRMED review finding. The real fix is tracked as a follow-up to task
-    # 3088 (escalation agent-followup-3088).
+    # MemoryService already seeds this registry from DASHBOARD_KNOWN_PROJECT_ROOTS,
+    # so this call adds the primary root rather than enabling the alarm. Tests pin
+    # the seed and set_known_projects' replace-on-set behaviour, but NO test
+    # exercises this call site: deleting or reordering it leaves every test
+    # green while a primary root the env var does not list loses its storm,
+    # dead-letter and entity-mint alarms. Do NOT "cover" it with a grep- or
+    # ast-based meta-test: that shape was deleted from this repo in fb3c47dccf
+    # on a CONFIRMED review finding.
     memory_service.set_known_projects(_known_projects_map)
     if len(_known_projects_map) > 1:
         prefix_registry: ProjectPrefixRegistry | None = (
@@ -707,6 +758,7 @@ async def run_server():
     event_queue = None
     sqlite_watchdog = None
     backlog_policy = None
+    topic_cluster_store: TopicClusterStore | None = None
     # PRD γ (task 1546): pre-initialize so the reconciliation-enabled branch can
     # populate recon_report_state before the harness is constructed, threading the
     # SAME ReconReportState object into both ReconciliationHarness and the uvicorn
@@ -722,20 +774,6 @@ async def run_server():
     # PRD γ §11: fail loudly before harness construction if reconciliation is
     # enabled but the transport cannot host the recon-report MCP server.
     _require_http_transport_for_reconciliation(config)
-
-    # Task 3112: project_id-adapting wrappers over the deterministic metadata
-    # scroll, for the consolidation-gate closure check. The service methods take
-    # project_id first positionally; the interceptor passes it by keyword because
-    # it resolves scope per task. Defined ABOVE the reconciliation branch because
-    # BOTH TaskInterceptor construction sites wire them — defining them inside the
-    # enabled arm left the disabled arm raising NameError at startup.
-    async def _closure_scroll(filters, *, limit, project_id):
-        return await memory_service.get_memories_by_metadata(
-            project_id, filters, limit=limit
-        )
-
-    async def _closure_count(filters, *, project_id):
-        return await memory_service.count_memories_by_metadata(project_id, filters)
 
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -754,6 +792,12 @@ async def run_server():
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await recon_journal.initialize()
         recon_journal.set_write_journal(write_journal)
+        # Read-only runs-table source for get_cycle_summary_presence (task
+        # 3731). Deliberately wired ABOVE the recon_ledger_enabled gate below:
+        # the journal exists whenever reconciliation does, while the ledger is
+        # feature-gated, so the presence payload reports the two availability
+        # signals separately rather than inferring one from the other.
+        memory_service.set_recon_journal(recon_journal)
 
         if config.reconciliation.recon_ledger_enabled:
             recon_ledger = await _build_recon_ledger_store(Path(config.reconciliation.data_dir))
@@ -874,6 +918,7 @@ async def run_server():
             event_queue=event_queue,
             backlog_policy=backlog_policy,
             usage_gate=curator_usage_gate,
+            cost_store=curator_cost_store,
             ticket_store=ticket_store,
             bulk_reset_guard=bulk_reset_guard,
             prefix_registry=prefix_registry,
@@ -887,12 +932,8 @@ async def run_server():
             targeted.task_interceptor = task_interceptor
         # Wire the write journal so task writes leave durable audit rows.
         task_interceptor.set_write_journal(write_journal)
-        # Task 3112: the consolidation-gate closure scroll. Dormant until
-        # wired, so this is the ONLY thing that arms the close-time refusal.
-        # memory_service is already in scope at both construction sites.
-        task_interceptor.set_consolidation_scroll(
-            _closure_scroll, count=_closure_count
-        )
+        _wire_closure_collaborators(task_interceptor, memory_service)
+        _wire_audit_trail_archive(task_interceptor, memory_service)
 
         # PRD γ (task 1546): Pre-build recon_report components here — before
         # ReconciliationHarness is constructed — so the SAME ReconReportState
@@ -944,6 +985,9 @@ async def run_server():
             known_projects=_known_projects_map,
             recon_report_state=recon_report_state,
             server_ready_event=recon_server_ready,
+            escalation_listener=_claim_listener(
+                systemd_listeners, config.reconciliation.escalation_port,
+            ),
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
@@ -963,6 +1007,7 @@ async def run_server():
             taskmaster, None, event_buffer,
             config=config, escalator=curator_escalator,
             usage_gate=curator_usage_gate,
+            cost_store=curator_cost_store,
             ticket_store=ticket_store,
             prefix_registry=prefix_registry,
             scope_violation_escalator=scope_violation_escalator,
@@ -970,12 +1015,14 @@ async def run_server():
         )
         await task_interceptor.start()
         task_interceptor.set_write_journal(write_journal)
-        # Task 3112: the consolidation-gate closure scroll. Dormant until
-        # wired, so this is the ONLY thing that arms the close-time refusal.
-        # memory_service is already in scope at both construction sites.
-        task_interceptor.set_consolidation_scroll(
-            _closure_scroll, count=_closure_count
-        )
+        _wire_closure_collaborators(task_interceptor, memory_service)
+        _wire_audit_trail_archive(task_interceptor, memory_service)
+
+    # Machine-derived topic clusters (task 3135). Built in both branches above
+    # and never gated on reconciliation.enabled or the autoseed leaf: both of
+    # its consumers (consolidate_memories and the add_memory guard) run either
+    # way, and the leaf is read live at each of them.
+    topic_cluster_store = build_topic_cluster_store(wj_data_dir)
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
@@ -985,6 +1032,7 @@ async def run_server():
         event_queue=event_queue,
         curator_usage_gate=curator_usage_gate,
         known_projects=_known_projects_map,
+        topic_cluster_store=topic_cluster_store,
     )
 
     # Both ToolManager.call_tool wrappers, in the ONE order that works. The
@@ -1009,44 +1057,38 @@ async def run_server():
 
     asyncio.create_task(_thread_monitor())
 
-    # Ticket janitor — periodic sweep that surfaces failed tickets to the
-    # orchestrator as info-severity ticket_failure escalations. Replaces the
-    # per-call resolve_ticket wait the steward / deep_reviewer used to chain.
-    janitor_task: asyncio.Task[None] | None = None
-    janitor_cfg = getattr(config.curator, 'janitor', None)
-    if janitor_cfg is not None and janitor_cfg.enabled and ticket_store is not None:
-        from fused_memory.middleware.ticket_janitor import TicketJanitor
+    # Event-loop lag heartbeat (task 3778) — the ON-loop complement to the
+    # off-loop _watchdog_thread_loop. That thread keeps pinging systemd even
+    # when the loop is wedged, which is exactly why a 15-43s stall could run
+    # for days looking healthy. This probe measures whether the loop is still
+    # being scheduled and WARNs when it is not. Handle retained (unlike
+    # _thread_monitor above) so teardown can cancel it — see
+    # _start_loop_lag_monitor.
+    loop_lag_task: asyncio.Task[None] = _start_loop_lag_monitor(config)
 
-        _janitor_primary_root = (
-            config.taskmaster.project_root if config.taskmaster else ''
-        ) or ''
-        if _janitor_primary_root:
-            _janitor_primary_root = str(
-                Path(_janitor_primary_root).expanduser().resolve(),
-            )
-        ticket_janitor = TicketJanitor(
-            ticket_store,
-            cooldown_secs=janitor_cfg.cooldown_seconds,
-            batch_limit=janitor_cfg.batch_limit,
-            primary_project_root=_janitor_primary_root,
-            liveness_probe=(
-                task_interceptor.is_worker_alive
-                if task_interceptor is not None else None
-            ),
-            signal_ticket_resolved=(
-                task_interceptor._signal_ticket_event
-                if task_interceptor is not None else None
-            ),
-            known_projects=_known_projects_map,
-        )
+    # Ticket janitor — periodic sweep that surfaces failed tickets to the
+    # orchestrator as info-severity ticket_failure escalations, and the curator
+    # dedup-outage signature as a blocking infra_issue. Replaces the per-call
+    # resolve_ticket wait the steward / deep_reviewer used to chain. It is also
+    # the only retrier of tickets parked awaiting_curation.
+    janitor_task: asyncio.Task[None] | None = None
+    ticket_janitor = (
+        _build_ticket_janitor(config, ticket_store, task_interceptor, _known_projects_map)
+        if ticket_store is not None else None
+    )
+    if ticket_janitor is not None:
+        janitor_cfg = config.curator.janitor
+        dedup_outage_cfg = _dedup_outage_detector_config(config)
         janitor_task = asyncio.create_task(
             ticket_janitor.run_loop(janitor_cfg.interval_seconds),
         )
         logger.info(
-            '  Ticket janitor: enabled (interval=%.0fs cooldown=%.0fs batch=%d)',
+            '  Ticket janitor: enabled (interval=%.0fs cooldown=%.0fs batch=%d '
+            'dedup_outage=%s)',
             janitor_cfg.interval_seconds,
             janitor_cfg.cooldown_seconds,
             janitor_cfg.batch_limit,
+            dedup_outage_cfg is not None and dedup_outage_cfg.enabled,
         )
     else:
         logger.info('  Ticket janitor: disabled')
@@ -1070,13 +1112,29 @@ async def run_server():
         recon_ledger=recon_ledger,
     )
     if _checkpoint_targets:
+        from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
+
+        growth_alarm = JournalGrowthAlarm(
+            write_journal,
+            config.write_journal_growth_alarm,
+            project_root=_primary_root or None,
+        )
         checkpoint_task = asyncio.create_task(
-            _periodic_checkpoint_loop(_checkpoint_targets),
+            _periodic_checkpoint_loop(_checkpoint_targets, growth_alarm=growth_alarm),
         )
         logger.info(
             '  Checkpoint loop: enabled (interval=%.0fs, targets=%s)',
             _CHECKPOINT_INTERVAL,
             [name for name, _ in _checkpoint_targets],
+        )
+        logger.info(
+            '  Write-journal growth alarm: max_file_bytes=%d '
+            'max_rows_inserted_per_day=%d interval=%.0fs, '
+            'rounded up to whole %.0fs checkpoint ticks',
+            config.write_journal_growth_alarm.max_file_bytes,
+            config.write_journal_growth_alarm.max_rows_inserted_per_day,
+            config.write_journal_growth_alarm.check_interval_seconds,
+            _CHECKPOINT_INTERVAL,
         )
     else:
         logger.info('  Checkpoint loop: no SQLite targets — skipped')
@@ -1099,6 +1157,22 @@ async def run_server():
     else:
         logger.info('  Summary rebuild loop: disabled')
 
+    write_ops_prune_task = asyncio.create_task(
+        run_periodic_write_ops_prune(write_journal, config.write_journal),
+    )
+    logger.info(
+        '  Write-ops prune loop: every %.0fs, each pass bounded by %.0fs / %d rows',
+        config.write_journal.prune_interval_seconds,
+        config.write_journal.prune_max_seconds,
+        config.write_journal.prune_max_rows_per_run,
+    )
+
+    remint_sweep_task: asyncio.Task[None] | None = _start_remint_sweep(
+        taskmaster,
+        task_interceptor.remint_broken_recurrence_chains,
+        _known_projects_map.values(),
+    )
+
     # Run transport
     transport = config.server.transport
     logger.info(f'Starting MCP server with transport: {transport}')
@@ -1115,7 +1189,7 @@ async def run_server():
             import uvicorn
 
             display_host = 'localhost' if config.server.host == '0.0.0.0' else config.server.host
-            logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')
+            logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')  # mcp-url-sweep: allow display string in a startup log line, never fetched
             configure_uvicorn_logging()
             starlette_app = mcp.streamable_http_app()
 
@@ -1136,6 +1210,12 @@ async def run_server():
                 keepalive_timeout=config.server.keepalive_timeout,
             )
             server = uvicorn.Server(uv_config)
+            primary_socket = _claim_listener(systemd_listeners, config.server.port)
+            if systemd_listeners:
+                logger.warning(
+                    'systemd passed listening sockets for ports %s that nothing here serves',
+                    sorted(systemd_listeners),
+                )
 
             # Second uvicorn: recon_report MCP namespace on port recon_report_port.
             # Constructed BEFORE _install_operator_stop_handler so that the stop
@@ -1185,7 +1265,7 @@ async def run_server():
             recon_report_state.start_persistence()
             await recon_report_state.start_reaper()
             logger.info(
-                '  Recon Report Endpoint: http://%s:%d/mcp/',
+                '  Recon Report Endpoint: http://%s:%d/mcp/',  # mcp-url-sweep: allow display string in a startup log line, never fetched
                 display_host,
                 config.server.recon_report_port,
             )
@@ -1198,7 +1278,10 @@ async def run_server():
             # but does NOT cancel the sibling on first failure — the surviving
             # Task would continue serving while the finally block runs, emitting
             # "Task was destroyed but it is pending!" on loop teardown.
-            _primary_task = asyncio.create_task(server.serve(), name='fused_memory_primary')
+            _primary_task = asyncio.create_task(
+                server.serve(sockets=[primary_socket] if primary_socket else None),
+                name='fused_memory_primary',
+            )
             _recon_task = asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')
 
             # Signal the harness once the recon-report server is accepting connections.
@@ -1236,6 +1319,9 @@ async def run_server():
             # so a close hiccup can't mask the original shutdown cause.
             with contextlib.suppress(BaseException):
                 recon_report_state.stop_persistence()
+        if topic_cluster_store is not None:
+            with contextlib.suppress(BaseException):
+                topic_cluster_store.close()
         # Symmetrically tear down both servers so that a failure in either
         # (e.g. recon_server port-already-bound) doesn't leave the primary
         # server serving while the rest of the app shuts down.
@@ -1260,6 +1346,16 @@ async def run_server():
             rebuild_summaries_task.cancel()
             with contextlib.suppress(BaseException):
                 await rebuild_summaries_task
+        write_ops_prune_task.cancel()
+        with contextlib.suppress(BaseException):
+            await write_ops_prune_task
+        if remint_sweep_task is not None:
+            remint_sweep_task.cancel()
+            with contextlib.suppress(BaseException):
+                await remint_sweep_task
+        loop_lag_task.cancel()
+        with contextlib.suppress(BaseException):
+            await loop_lag_task
         await _shutdown_with_watchdog(
             memory_service=memory_service,
             task_interceptor=task_interceptor,
@@ -1415,6 +1511,151 @@ def _thread_monitor_iteration(prev: int, threshold: int) -> int:
     return count
 
 
+def _loop_lag_iteration(overshoot_ms: float, threshold_ms: float) -> None:
+    """Log one event-loop-lag sample: INFO below *threshold_ms*, WARNING at/above.
+
+    *overshoot_ms* is how much LATER than requested a timer callback actually
+    ran — i.e. how long the loop thread was occupied by something that did not
+    yield. It is the on-loop counterpart to :func:`_watchdog_thread_loop`,
+    which pings systemd from a dedicated OS thread precisely so a wedged loop
+    cannot suppress the heartbeat. That off-loop design is what let task 3778's
+    defect run for days: the watchdog kept pinging, the process stayed alive,
+    and the only visible symptom was ``/health`` timing out for 15-43s while
+    the reconciliation renderer fanned ~500 synchronous ``git`` probes out on
+    the loop thread. This function is the missing half — it reports that the
+    loop itself stopped being scheduled.
+
+    The measured lag is rendered INTO the message rather than only exposed as a
+    queryable field: the failure mode was that nobody was told, so the signal
+    has to be loud at the moment it occurs (INV-4 loud-over-silent).
+
+    At/above (not merely above) the threshold warns, so a lag sitting exactly
+    on an operator's configured bar is not silently rounded into the quiet
+    branch.
+
+    Extracted from the :func:`_loop_lag_monitor` coroutine for the same reason
+    :func:`_thread_monitor_iteration` was extracted from ``_thread_monitor`` —
+    so unit tests can exercise the logging logic without mocking
+    ``asyncio.sleep``.
+    """
+    if overshoot_ms >= threshold_ms:
+        logger.warning(
+            'loop_lag: lag=%.1fms threshold=%.0fms — event loop was blocked '
+            '(on-loop heartbeat; see _watchdog_thread_loop for the off-loop one)',
+            overshoot_ms, threshold_ms,
+        )
+    else:
+        logger.info(
+            'loop_lag: lag=%.1fms threshold=%.0fms', overshoot_ms, threshold_ms,
+        )
+
+
+async def _loop_lag_monitor(threshold_ms: float, interval: float | None = None) -> None:
+    """Sample event-loop scheduling delay forever, reporting via _loop_lag_iteration.
+
+    Each pass records ``loop.time()``, sleeps *interval*, and measures how far
+    past the deadline the callback actually ran. A healthy loop overshoots by
+    microseconds-to-milliseconds; a loop occupied by blocking work overshoots
+    by however long that work took.
+
+    *interval* defaults to the module-level :data:`_LOOP_LAG_INTERVAL` at CALL
+    time (not as a bound default argument) so a test can move the constant.
+
+    Reporting policy: every at/above-threshold sample is reported immediately —
+    a crossing is never deferred or aggregated away — while below-threshold
+    samples are throttled to one INFO per :data:`_LOOP_LAG_INFO_EVERY` samples
+    so the routine heartbeat matches ``_thread_monitor``'s ~60s cadence instead
+    of logging every sample.
+
+    A raising :func:`_loop_lag_iteration` is caught and logged rather than
+    allowed to end the loop, for the same reason :func:`_watchdog_thread_loop`
+    guards its ping (task 1731): a dead heartbeat is indistinguishable from a
+    healthy one, which is exactly the failure class this probe exists to close.
+    """
+    loop = asyncio.get_running_loop()
+    quiet_samples = 0
+    while True:
+        sample_interval = _LOOP_LAG_INTERVAL if interval is None else interval
+        started = loop.time()
+        await asyncio.sleep(sample_interval)
+        overshoot_ms = max(0.0, (loop.time() - started - sample_interval) * 1000)
+        crossed = overshoot_ms >= threshold_ms
+        quiet_samples += 1
+        if crossed or quiet_samples >= _LOOP_LAG_INFO_EVERY:
+            quiet_samples = 0
+            try:
+                _loop_lag_iteration(overshoot_ms, threshold_ms)
+            except Exception:
+                logger.exception(
+                    'loop_lag: heartbeat report failed (lag=%.1fms); continuing',
+                    overshoot_ms,
+                )
+
+
+def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
+    """Spawn the loop-lag heartbeat and RETURN its handle for teardown.
+
+    Returning the task is the load-bearing difference from the adjacent
+    ``_thread_monitor``, which is spawned with a bare unreferenced
+    ``asyncio.create_task``: an un-referenced task can be garbage-collected
+    mid-flight and emits a "Task was destroyed but it is pending" line on
+    shutdown. ``checkpoint_task`` is the correct in-file precedent — retain the
+    handle, then ``cancel()`` + ``await`` it in ``run_server``'s teardown.
+
+    The threshold is read from :class:`ServerConfig` (``loop_lag_warn_ms``)
+    rather than hardcoded, so an operator can tune it per box — across a
+    RESTART, exactly like the adjacent ``thread_warn_threshold``, which is
+    captured into a local the same way ``threshold_ms`` is below.
+
+    It is deliberately NOT hot-reloadable, and saying so here is the point:
+    ``server.loop_lag_warn_ms`` is absent from
+    :data:`fused_memory.config.reload.RELOADABLE_FIELDS`, so ``reload_config``
+    reports the leaf ``restart_required`` and leaves the running monitor
+    alone. It could not simply be allowlisted either — the value is captured BY
+    VALUE here and closed over by a task that runs for the process lifetime,
+    which is the "captured at construction" shape ``reload.py``'s docstring
+    names as the disqualifying condition. Promoting it to the green tier means
+    BOTH halves: pass the config object down and re-read the leaf per sample,
+    then add the allowlist entry with the live-consumer test its neighbours
+    carry.
+    """
+    threshold_ms = float(config.server.loop_lag_warn_ms)
+    return asyncio.create_task(
+        _loop_lag_monitor(threshold_ms=threshold_ms),
+        name='loop_lag_monitor',
+    )
+
+
+def _start_remint_sweep(
+    task_backend: TaskBackendProtocol | None,
+    remint: Callable[[str], Awaitable[object]],
+    project_roots: Iterable[str],
+) -> asyncio.Task[None] | None:
+    """Spawn the recurrence re-mint sweep (task 6572) and RETURN its handle for teardown.
+
+    The sweep repairs chains left done with no successor by a failed mint or a
+    crash between the done write and the mint. Without a task backend there
+    is no chain to repair, so nothing is spawned.
+    """
+    from fused_memory.middleware.recurrence_mint import (
+        REMINT_SWEEP_INTERVAL_SECS,
+        run_remint_sweep_loop,
+    )
+
+    if task_backend is None:
+        logger.info('  Recurrence re-mint sweep: disabled (no task backend)')
+        return None
+    roots = tuple(project_roots)
+    logger.info(
+        '  Recurrence re-mint sweep: enabled (at startup, then every %.0fs, %d project root(s))',
+        REMINT_SWEEP_INTERVAL_SECS,
+        len(roots),
+    )
+    return asyncio.create_task(
+        run_remint_sweep_loop(remint, roots), name='recurrence_remint_sweep',
+    )
+
+
 async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
     """One pass of WAL TRUNCATE checkpoints over every target.
 
@@ -1422,8 +1663,6 @@ async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
     from :func:`_periodic_checkpoint_loop` so unit tests can exercise the
     bookkeeping without waiting for ``_CHECKPOINT_INTERVAL``.
     """
-    from datetime import UTC, datetime
-
     now_iso = datetime.now(UTC).isoformat()
     for name, fn in targets:
         try:
@@ -1478,20 +1717,32 @@ async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
                 )
 
 
-async def _periodic_checkpoint_loop(targets: list[tuple[str, object]]) -> None:
-    """Run ``_run_checkpoint_cycle`` every :data:`_CHECKPOINT_INTERVAL` s.
+async def _periodic_checkpoint_loop(
+    targets: list[tuple[str, object]],
+    *,
+    growth_alarm: JournalGrowthAlarm | None = None,
+    interval: float = _CHECKPOINT_INTERVAL,
+) -> None:
+    """Run ``_run_checkpoint_cycle`` every *interval* s (:data:`_CHECKPOINT_INTERVAL`).
 
     Bounds the un-flushed WAL window so a stalled PASSIVE auto-checkpoint
     (the 2026-05-13 failure mode) can't accumulate indefinitely. The
     cycle is independent of the per-project write lock — SQLite serialises
-    the checkpoint against writers internally.
+    the checkpoint against writers internally. After each cycle the
+    write-journal *growth_alarm* gets its tick; its failure is logged and
+    never stops checkpointing.
     """
     while True:
         try:
-            await asyncio.sleep(_CHECKPOINT_INTERVAL)
+            await asyncio.sleep(interval)
         except asyncio.CancelledError:
             return
         await _run_checkpoint_cycle(targets)
+        if growth_alarm is not None:
+            try:
+                await growth_alarm.maybe_check()
+            except Exception:
+                logger.exception('write_journal growth alarm failed; checkpointing continues')
 
 
 async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
@@ -1587,6 +1838,23 @@ async def _build_ticket_store(data_dir: Path) -> TicketStore:
     return store
 
 
+def build_topic_cluster_store(data_dir: Path) -> TopicClusterStore:
+    """Construct and open a :class:`TopicClusterStore` at ``data_dir/'topic_clusters.db'``.
+
+    Sibling to ``tickets.db`` and ``reconciliation.db``. Sync, because the
+    store is. A :class:`~fused_memory.server.topic_cluster_store.TopicClusterStoreError`
+    from a corrupt row propagates on purpose, failing startup the way an
+    invalid config cluster does.
+
+    Mirrors :func:`_build_ticket_store`.
+    """
+    from fused_memory.server.topic_cluster_store import TopicClusterStore
+
+    store = TopicClusterStore(data_dir / 'topic_clusters.db')
+    store.open()
+    return store
+
+
 async def _build_recon_ledger_store(data_dir: Path) -> ReconLedgerStore:
     """Construct and initialise a :class:`ReconLedgerStore` for the given data directory.
 
@@ -1636,13 +1904,71 @@ def _resolve_curator_escalator_state_path(config: FusedMemoryConfig) -> Path:
     return Path('./data/curator_escalator_state.json')
 
 
+def _build_ticket_janitor(
+    config: FusedMemoryConfig,
+    ticket_store: TicketStore,
+    task_interceptor: TaskInterceptor | None,
+    known_projects: dict[str, str],
+) -> TicketJanitor | None:
+    """The ticket janitor, wired to drain parked tickets through *task_interceptor*; None when disabled."""
+    from fused_memory.middleware.ticket_janitor import TicketJanitor
+
+    janitor_cfg = getattr(config.curator, 'janitor', None)
+    if janitor_cfg is None or not janitor_cfg.enabled:
+        return None
+    primary_root = (config.taskmaster.project_root if config.taskmaster else '') or ''
+    if primary_root:
+        primary_root = str(Path(primary_root).expanduser().resolve())
+    return TicketJanitor(
+        ticket_store,
+        cooldown_secs=janitor_cfg.cooldown_seconds,
+        batch_limit=janitor_cfg.batch_limit,
+        primary_project_root=primary_root,
+        liveness_probe=task_interceptor.is_worker_alive if task_interceptor is not None else None,
+        signal_ticket_resolved=(
+            task_interceptor._signal_ticket_event if task_interceptor is not None else None
+        ),
+        requeue_ticket=(
+            task_interceptor.requeue_awaiting_curation_ticket
+            if task_interceptor is not None else None
+        ),
+        known_projects=known_projects,
+        dedup_outage=_dedup_outage_detector_config(config),
+        curation_backlog_min_attempts=janitor_cfg.curation_backlog_escalation_min_attempts,
+    )
+
+
+def _dedup_outage_detector_config(
+    config: FusedMemoryConfig,
+) -> DedupOutageDetectorConfig | None:
+    """The janitor's dedup-outage detector config, or None with the curator disabled.
+
+    A deliberately disabled curator resolves every ticket as a fast create
+    with no combine, which is the outage signature; there is no dedup to lose.
+    ``curator.enabled`` is restart-only, so deciding once at wiring is exact.
+    """
+    if not config.curator.enabled:
+        return None
+    return config.curator.janitor.dedup_outage
+
+
+def _mint_curator_run_id() -> str:
+    """A readable per-process curator run id: a fused-memory restart is a run boundary."""
+    return f'fused-memory-{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{os.getpid()}'
+
+
 async def _setup_curator_usage_gate(
     config: FusedMemoryConfig,
+    *,
+    run_id: str | None = None,
 ) -> tuple[CostStore | None, UsageGate | None]:
     """Open a CostStore and construct a UsageGate for the curator, with leak protection.
 
     If ``config.usage_cap`` is None or disabled, returns ``(None, None)``
     without allocating any resources.
+
+    The gate is stamped with *run_id* (minted per process when omitted), the
+    run key the gate's account events and the curator's invocations share.
 
     Otherwise the CostStore is opened first (persistent aiosqlite connection).
     If ``UsageGate.__init__`` or the success-path log subsequently raises for
@@ -1652,8 +1978,7 @@ async def _setup_curator_usage_gate(
 
     **Cancellation hardening:** each cleanup await is wrapped in
     ``asyncio.shield(...)`` and guarded by ``except BaseException:`` +
-    log-and-swallow.  This mirrors the pattern at
-    ``SqliteTaskBackend._txn`` (``sqlite_task_backend.py:414-417``):
+    log-and-swallow:
     shielding prevents an external cancel from tearing the close mid-flush;
     catching ``BaseException`` ensures a synchronous ``CancelledError``
     originating inside the awaited coroutine cannot mask the original
@@ -1676,6 +2001,7 @@ async def _setup_curator_usage_gate(
     curator_usage_gate: UsageGate | None = None
     try:
         curator_usage_gate = UsageGate(config.usage_cap, cost_store=curator_cost_store)
+        curator_usage_gate.run_id = run_id or _mint_curator_run_id()
         logger.info(
             f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
             f'from {config.usage_cap.accounts_file or "inline"}',
@@ -1828,6 +2154,19 @@ def _build_uvicorn_config(
     return uvicorn.Config(app, **kwargs)
 
 
+def _claim_listener(listeners: dict[int, socket.socket], port: int) -> socket.socket | None:
+    """Remove and return the systemd-held listening socket for *port*, if any.
+
+    Under ``fused-memory.socket`` the port stays bound across restarts, so
+    clients queue instead of being refused. None means the caller binds the
+    port itself (not socket-activated, or systemd holds no socket for it).
+    """
+    sock = listeners.pop(port, None)
+    if sock is not None:
+        logger.info('  Port %d: serving on the systemd-held socket (survives restarts)', port)
+    return sock
+
+
 def _build_recon_report_components(
     config: FusedMemoryConfig,
     memory_service: Any = None,
@@ -1844,6 +2183,10 @@ def _build_recon_report_components(
     Optional service args (task β): when provided they are injected into the
     returned ReconReportState so cite_* tools can validate citations at call time.
 
+    Production enforces the known-stage vocabulary here (task 4865), not as a
+    ``ReconReportState`` default, because many test modules construct the state
+    directly with ad-hoc stage names.
+
     Args:
         recon_journal: the open ReconciliationJournal (task 3065), used solely by
             ``repair_memory_citation`` to reach the durable ``runs.stage_reports``
@@ -1855,7 +2198,11 @@ def _build_recon_report_components(
     Returns:
         (ReconReportState, FastMCP, uvicorn.Config)
     """
-    from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+    from fused_memory.server.recon_report import (
+        KNOWN_RECON_STAGES,
+        ReconReportState,
+        create_recon_report_server,
+    )
     from fused_memory.server.recon_report_store import ReconReportStore
 
     ttl = config.reconciliation.recon_report_state_ttl_seconds
@@ -1877,6 +2224,7 @@ def _build_recon_report_components(
         task_interceptor=task_interceptor,
         store=recon_report_store,
         journal=recon_journal,
+        known_stages=KNOWN_RECON_STAGES,
     )
     if known_projects is not None:
         state.known_projects = known_projects
@@ -2157,6 +2505,77 @@ def _acquire_singleton_lock() -> None:
             'Kill it first or use systemctl --user restart fused-memory'
         )
         raise SystemExit(1) from None
+
+
+def _wire_closure_collaborators(task_interceptor: Any, memory_service: Any) -> None:
+    """Hand the interceptor all three consolidation-gate closure collaborators.
+
+    Task 3112 wired the deterministic metadata *scroll* (and its *count*):
+    the gate is DORMANT until wired, so this call is the ONLY thing that arms
+    the close-time refusal at all. Task 4808 added *exists* as the THIRD
+    collaborator — it is what makes the ``unstamped_cluster_member`` refusal
+    reachable in production, because without a probe an observed member that
+    is live but never stamped into the topic stays invisible (and an id
+    missing from the scroll cannot be told apart from one that was absorbed
+    and deleted).
+
+    All three are ``project_id``-adapting wrappers: the ``MemoryService``
+    methods take that scope FIRST positionally, while the interceptor passes
+    it by keyword because it resolves scope per task. *exists* is NOT built
+    here — it comes from the shared
+    ``consolidation_gate.py::closure_exists_probe``, the same factory
+    ``scripts/check_consolidation_closure.py`` binds, so the CLI and the seam
+    cannot disagree about that argument adaptation (INV-5). Its docstring
+    carries the fail-closed ``TimeoutError`` contract.
+
+    ONE wiring block, called from both ``TaskInterceptor`` construction sites
+    in ``server/main.py::run_server`` (reconciliation enabled and disabled).
+    "Both construction sites wire all three collaborators" therefore holds BY
+    CONSTRUCTION rather than by assertion — which is why the source-text test
+    that used to guard it (``'exists=' in`` an ``inspect.getsource`` fragment)
+    is gone rather than replaced in kind: it could not distinguish an armed
+    probe from ``exists=None``. What guards this now is
+    ``tests/test_consolidation_closure_seam.py::TestClosureCollaboratorWiring``,
+    which awaits each captured collaborator against a recording stub.
+
+    The extraction also RETIRES the ``NameError`` hazard the previous comment
+    recorded: the collaborator definitions used to sit in ``run_server``'s own
+    scope, above the reconciliation branch, because defining them inside the
+    enabled arm left the disabled arm raising ``NameError`` at startup. They
+    now live in this helper's scope, so neither arm can reference an
+    undefined name.
+
+    RESIDUAL RISK, stated rather than papered over: a future construction arm
+    could still forget to CALL this helper. That failure is strictly smaller
+    and louder than the one the deleted test allowed — one missing call
+    leaves the whole gate visibly dormant for that config, versus a silently
+    half-armed gate that passed a green ``'exists=' in call`` check. It is
+    not worth a second meta-test.
+    """
+
+    async def _closure_scroll(filters, *, limit, project_id):
+        return await memory_service.get_memories_by_metadata(
+            project_id, filters, limit=limit
+        )
+
+    async def _closure_count(filters, *, project_id):
+        return await memory_service.count_memories_by_metadata(project_id, filters)
+
+    task_interceptor.set_consolidation_scroll(
+        _closure_scroll,
+        count=_closure_count,
+        exists=closure_exists_probe(memory_service),
+    )
+
+
+def _wire_audit_trail_archive(task_interceptor: Any, memory_service: Any) -> None:
+    """Arm the audit-trail rotation (task 5771); it is dormant until this runs.
+
+    Called from both ``TaskInterceptor`` construction arms, beside
+    ``_wire_closure_collaborators``. The rule lives in
+    ``reconciliation/audit_trail_rotation.py``.
+    """
+    task_interceptor.set_audit_trail_archive(memory_service_archive(memory_service))
 
 
 def main():

@@ -15,3 +15,13 @@ Machine-readable twin: `memory-metadata-vocabulary.capability-manifest.yaml` (sa
 | ι writer instructions | (stamped) | `_MEMORY_INSTRUCTIONS` names the vocabulary (incl. `supersedes`); registry↔prompt pinning drift test | PASS |
 
 No FAIL bindings. Seams honored: 3055/3088 (reserved-key bottom layer + `update_memory` — D12 defensive extraction), 3111/3112/3129/3133/3136 (amended + gated per PRD §8), 3127/3135 (amendment notes), 3108 (citation repointing untouched), 3084 (gate-closure enforcement seam respected by construction), write-path PRD §1/D4/§8 (companion commit).
+
+## Structural lint adjudication (task 6036)
+
+`scripts/audit_delivered_checks.py` lists task **3199** (zeta)
+`decision-table-report-committed`, grep `^## Decision table` in
+`plans/e2-storage-shape-bakeoff-report.md`, under STRUCTURAL as
+`vacuous_present_comment_only`. It does so only because the lint's comment
+markers (`shared/src/shared/delivered_check_polarity.py::_COMMENT_MARKERS`) read
+a leading markdown `#` as a comment. The heading IS the capability, so the
+descriptor is correct and was deliberately left unchanged.

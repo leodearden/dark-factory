@@ -10,6 +10,7 @@ Unifies the twice-fixed scope decision between ``scope_module_config`` and
 from __future__ import annotations
 
 import logging
+import posixpath
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -17,7 +18,12 @@ from enum import Enum, StrEnum
 from typing import Literal
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.pytest_markers import deselecting_expression_for_targets
+from orchestrator.pytest_markers import (
+    addopts_tokens,
+    deselecting_expression_for_targets,
+    is_whole_tree_guard_module,
+    locate_pytest_config,
+)
 from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
@@ -196,7 +202,7 @@ class PlannedRun:
     ScopeKind.FILE_SCOPED``** — FULL_SUITE is deliberately unscoped and
     SKIPPED/TRIVIAL never ran, so empty is the correct and MEANINGFUL value
     there, not an absence of information. (Pinned by tests, deliberately not
-    by a ``__post_init__`` assert: ``verify._safe_derive_verify_plan_dict``
+    by a ``__post_init__`` assert: ``verify._safe_derive_executed_fallback_plan``
     swallows exceptions and returns ``None``, so an assert here would
     degrade an invariant violation into losing the ENTIRE plan record —
     silently destroying the very observability this field exists to supply.)
@@ -204,7 +210,7 @@ class PlannedRun:
     FIDELITY: it records the scoping INTENT the decision layer computed, NOT
     a guarantee about what the command actually ran on — the executed command
     may be BROADER, never narrower. Two reachable divergences: (i) when
-    :func:`_scope_prefix_to_keyword` cannot narrow (the keyword is absent, or
+    :func:`scope_prefix_to_keyword` cannot narrow (the keyword is absent, or
     the prefix parses OPAQUE) it returns the command UNSCOPED while the slot
     is still labelled FILE_SCOPED, so a ``type_check_command='mypy src/'``
     slot records the touched files but type-checks the whole tree; (ii) after
@@ -218,7 +224,7 @@ class PlannedRun:
     It exists (task 3219) because ``cmd.targets`` CANNOT answer "which files
     was this scoped to?" whenever ``cmd`` is raw-retained, and two paths
     routinely produce exactly that: the tail-preserving chained-lint accept
-    path in :func:`_scope_prefix_to_keyword` (which every subproject's
+    path in :func:`scope_prefix_to_keyword` (which every subproject's
     ``lint_command`` hits, since each chains a sibling checker), and every
     run rebuilt by ``verify._executed_fallback_plan``. In both cases the
     rendered string still carries the narrowed file list, but the
@@ -277,29 +283,18 @@ class VerifyPlan:
         }
 
 
-def log_dropped_chain_clauses(
-    log: logging.Logger, raw: str, keyword: str, retained: str,
-) -> None:
-    """Report onto *log* the trailing chain clauses a gate REJECT discarded from *raw*.
+def _log_dropped_chain_clauses(raw: str, keyword: str, retained: str) -> None:
+    """Report the trailing chain clauses a gate REJECT discarded from *raw*.
 
-    Shared by BOTH scopers — ``_scope_prefix_to_keyword`` below and
-    ``verify._scope_to_keyword``, which passes its own module logger — so the
-    two records read alike structurally rather than by hand-mirroring. Same
-    argument that put the tail-preservation policy in one shared
-    ``split_chain_tail`` gate: lockstep the pair cannot drift out of. It lives
-    here rather than in ``verify_cmd`` because ``verify`` already imports this
-    module (not the reverse), and because keeping ``verify_cmd`` logging-free
-    is what lets ``has_unpreserved_chain_clauses`` stay a pure predicate.
+    Call it only once ``has_unpreserved_chain_clauses(raw, tail)`` holds, and
+    only on the path that actually rewrites the command: the scoper's
+    bail-outs return the whole original, chain and all, so a record emitted
+    before them would name clauses that in fact still run.
 
-    Callers MUST gate this on ``has_unpreserved_chain_clauses(raw, tail)`` and
-    MUST call it only on the path that actually rewrites the command: both
-    scopers' bail-outs return the whole original, chain and all, so a record
-    emitted before them would name clauses that in fact still run.
-
-    *retained* is the caller's truncation point (``head[: idx + len(keyword)]``
-    — each caller already computes it, as the argument to
-    ``parse_config_command``) and must be a prefix of *raw*. The clause COUNT
-    is the top-level `&&` SEGMENT DELTA across it, NOT
+    *retained* is the scoper's truncation point — the
+    ``keyword_truncation_end``-bounded prefix it already computes as the
+    argument to ``parse_config_command`` — and must be a prefix of *raw*.
+    The clause COUNT is the top-level `&&` SEGMENT DELTA across it, NOT
     ``len(split_top_level_and(raw)) - 1``: that earlier form counted every
     clause in the whole original, which is right only when the keyword sits in
     segment 0, and every ``cd X && <tool>`` config in this repo puts it in
@@ -330,7 +325,7 @@ def log_dropped_chain_clauses(
     keyword rule buried at DEBUG under fan-out prose.
     """
     dropped, fan_out = describe_dropped_clauses(raw, retained, keyword)
-    log.log(
+    logger.log(
         logging.DEBUG if fan_out else logging.INFO,
         'scope-to-keyword %r dropped %d trailing chain clause(s) from %r '
         '(gate rejected tail preservation) — %s',
@@ -344,23 +339,15 @@ def log_dropped_chain_clauses(
         # dropped clauses rather than from the keyword.
         else 'a sibling check chained onto this command will NOT run for this '
         'verify',
-        # Attribute the record to the CALLING scoper, not to this shared
-        # helper — otherwise every record, from either scoper, points at the
-        # same line here and the file/line is useless for telling them apart.
-        stacklevel=2,
     )
 
 
-def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> VerifyCmd:
+def scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> VerifyCmd:
     """Scope *raw* to *files*, first-clause-scoping a raw-retained chain.
 
-    The ``VerifyCmd``-layer counterpart of ``verify._scope_to_keyword`` (which
-    operates on — and returns — a shell string): this returns a ``VerifyCmd``
-    instead, since ``PlannedRun.cmd`` stores structured commands, not strings.
-    Lockstep between the two is now STRUCTURAL rather than a convention kept
-    by hand — both route through the single shared
-    ``verify_cmd.split_chain_tail`` gate, so neither can drift from the
-    other's tail-preservation rule.
+    Returns a ``VerifyCmd`` because ``PlannedRun.cmd`` stores structured
+    commands; ``verify._scope_to_keyword`` is this function rendered to a
+    string.
 
     Within the matched segment, *raw* is ALWAYS truncated to everything up to
     and including the first occurrence of *keyword* before being (re-)parsed,
@@ -390,13 +377,11 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     ``_extract_failing_test_ids_from_junit``, flake confirmation and the
     per-test timeout floor. The dropped clauses are not silent: a
     multi-clause command whose tail the gate rejects is reported by
-    :func:`log_dropped_chain_clauses` below, naming the keyword and the
+    :func:`_log_dropped_chain_clauses`, naming the keyword and the
     dropped-clause count — at DEBUG when a dropped clause re-invokes the tool
     (an intended same-tool fan-out truncation), at INFO when none does (a
     sibling check that will now never run), independent of which slot is
-    running. ``verify._scope_to_keyword`` emits that same record through that
-    same shared helper, since STRUCTURAL lockstep is this pair's documented
-    property. It is emitted only on the rewriting path: both bail-outs below
+    running. It is emitted only on the rewriting path: both bail-outs below
     return *raw* with its chain intact, so nothing is dropped there and
     nothing is reported.
 
@@ -428,11 +413,9 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     idx = head.find(keyword)
     if idx == -1:
         return unscoped
-    # Task 3931 / esc-3805-1: token-aware, in LOCKSTEP with
-    # verify._scope_to_keyword's identical line — the shared
-    # `keyword_truncation_end` helper is what makes that lockstep structural
-    # rather than a convention. The old byte-offset slice cut mid-token at the
-    # `@` of a pinned npx package spec, destroying the pin before the re-parse.
+    # Task 3931 / esc-3805-1: token-aware. The old byte-offset slice cut
+    # mid-token at the `@` of a pinned npx package spec, destroying the pin
+    # before the re-parse.
     retained = head[: keyword_truncation_end(head, idx + len(keyword))]
     prefix_parsed = parse_config_command(retained)
     if prefix_parsed.tool is ToolKind.OPAQUE or prefix_parsed.raw is not None:
@@ -440,17 +423,121 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     # Sited AFTER both bail-outs on purpose — each returns *unscoped*, i.e.
     # *raw* in full with its chain intact, so nothing is dropped there and a
     # record would name clauses that in fact still run. Only the rewriting
-    # path below actually discards them. Same record and same level policy as
-    # verify._scope_to_keyword's, because it is literally the same call.
+    # path below actually discards them.
     #
     # `retained` is what makes the reported count right: it is the truncation
     # point, so the clauses past it are exactly the ones this call discards.
     if has_unpreserved_chain_clauses(raw, tail):
-        log_dropped_chain_clauses(logger, raw, keyword, retained)
+        _log_dropped_chain_clauses(raw, keyword, retained)
     scoped = strip_cwd(promote_cwd_to_project(scope_to(prefix_parsed, files)))
     if not tail:
         return scoped
     return VerifyCmd(tool=scoped.tool, raw=f'{render(scoped)} {tail}')
+
+
+def _names_a_config_file(flag: str) -> bool:
+    """True for an explicit ``-c``/``--config-file`` in any spelling, which overrides pytest's walk."""
+    if flag == '--config-file' or flag.startswith('--config-file='):
+        return True
+    return flag.startswith('-c') and not flag.startswith('--')
+
+
+def _escapes_reader_root(path: str) -> bool:
+    return posixpath.isabs(path) or path == '..' or path.startswith('../')
+
+
+def pytest_config_path_for_command(
+    cmd: VerifyCmd,
+    worktree_reader: Callable[[str], str | None],
+) -> str | None:
+    """The worktree-relative config file pytest reads for *cmd*, else None.
+
+    THE one answer to "where is the ini file", shared by the marker-deselection
+    probe (:func:`deselecting_expression_for_command`) and the serial-recovery
+    addopts derivation (:func:`governing_addopts`): were two consumers to
+    answer differently, one would describe a config the command never applies.
+
+    WHERE: pytest's own walk (``_pytest/config/findpaths.py::determine_setup``),
+    started at the common ancestor of the command's positional targets — each
+    stripped of its ``::`` node id and resolved against the command's effective
+    cwd (a leading ``cd X &&``, or ``uv run --directory X``) — or at that cwd
+    when it names no target. A target *worktree_reader* can read is a file and
+    stands for its parent directory, as in pytest's ``get_dirs_from_args``; any
+    other is walked as a directory. That is exact for a directory, a dotted
+    one (``tests/v1.2/``) included, and harmless for a missing target: it holds
+    no config, and pytest refuses a run that names one. NOT any module prefix,
+    and NOT the cwd alone. The ``scripts`` and ``tests/scripts``
+    modules run ``uv run --project shared pytest tests/scripts/ scripts/tests/``
+    from the REPO ROOT (``--project`` does not shift cwd), and those targets'
+    common ancestor is the root, so the root config applies. A scoped,
+    cwd-stripped ``uv run --project orchestrator pytest
+    orchestrator/tests/test_x.py::T::t`` starts at ``orchestrator/tests`` and
+    finds ``orchestrator/pyproject.toml``, where the cwd alone would have named
+    the root's.
+
+    BOUNDED at the reader's root: the walk never looks above it, so any config
+    it finds is the same one pytest finds first, and finding none refuses —
+    correct-or-None (``pytest_markers.py::locate_pytest_config``).
+
+    REFUSES rather than guesses, each fail-safe for every consumer:
+
+    1. a *cmd* that is not PYTEST at all (``npm test``, a shell script): a
+       pyproject's ``addopts`` describe a suite this command never invokes;
+    2. a raw-retained command (``cmd.raw is not None`` — OPAQUE, or an ``&&``
+       chain): neither the effective cwd nor which invocation is meant is
+       recoverable from it. ``scope_prefix_to_keyword`` truncates a chained
+       ``test_command`` to its FIRST ``pytest`` clause, and each ``cd X &&``
+       clause reads its own config;
+    3. an explicit ``-c``/``--config-file``, which replaces the walk;
+    4. a target or cwd that is absolute or escapes the reader's root.
+    """
+    if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None:
+        return None
+    if any(_names_a_config_file(flag) for flag in cmd.base_flags):
+        return None
+    cwd = posixpath.normpath(cmd.cwd_rel or '.')
+    paths = [posixpath.normpath(posixpath.join(cwd, target.split('::')[0])) for target in cmd.targets]
+    if _escapes_reader_root(cwd) or any(_escapes_reader_root(path) for path in paths):
+        return None
+    start_dirs = [
+        posixpath.dirname(path) if worktree_reader(path) is not None else path
+        for path in paths
+    ]
+    start = posixpath.commonpath(start_dirs) if start_dirs else cwd
+    return locate_pytest_config(start, worktree_reader)
+
+
+def _governing_pyproject(
+    cmd: VerifyCmd,
+    worktree_reader: Callable[[str], str | None],
+) -> str | None:
+    """The config path pytest reads for *cmd* when it is a ``pyproject.toml``.
+
+    Only a pyproject's addopts are readable here; a ``pytest.ini`` /
+    ``tox.ini`` / ``setup.cfg`` / ``pytest.toml`` governing config is a
+    deliberate refusal — an under-fire, never an over-fire.
+    """
+    path = pytest_config_path_for_command(cmd, worktree_reader)
+    if path is None or posixpath.basename(path) != 'pyproject.toml':
+        return None
+    return path
+
+
+def governing_addopts(
+    cmd: VerifyCmd,
+    worktree_reader: Callable[[str], str | None],
+) -> tuple[str, ...]:
+    """The RAW ``addopts`` tokens pytest will apply for *cmd*, else ``()``.
+
+    xdist tokens included; ``verify_cmd.py::serial_pytest`` strips them.
+    ``()`` covers no resolvable ``pyproject.toml`` (see
+    :func:`pytest_config_path_for_command`), no ``addopts`` key, and a native
+    ``[tool.pytest]`` (toml mode) table.
+    """
+    path = _governing_pyproject(cmd, worktree_reader)
+    if path is None:
+        return ()
+    return tuple(addopts_tokens(worktree_reader(path)) or ())
 
 
 def deselecting_expression_for_command(
@@ -485,45 +572,20 @@ def deselecting_expression_for_command(
     have created exactly the divergence this shared probe exists to prevent.
 
     *targets* are worktree-ROOT-relative (the frame *worktree_reader* reads in),
-    while the command's own targets may be cwd-relative — only the CONFIG path
-    below follows the command's ``cwd_rel``. A caller holding cwd-relative
-    targets must resolve them first.
+    while the command's own targets may be cwd-relative. A caller holding
+    cwd-relative targets must resolve them first.
 
-    WHERE the ini file is looked for: pytest reads ``addopts`` from its
-    ROOTDIR, which follows the command's effective cwd — NOT from any module
-    prefix. The two come apart in this very repo: the ``scripts`` and
-    ``tests/scripts`` modules both run ``uv run --project shared pytest
-    tests/scripts/ ...`` from the REPO ROOT (no ``--directory``), so a
-    ``scripts/pyproject.toml`` would never be the config pytest actually
-    applies. The effective cwd is therefore taken from the parsed command's
-    ``cwd_rel`` (a leading ``cd X &&``, or ``uv run --directory X``), falling
-    back to the repo root when the command carries neither.
-
-    Three guards REFUSE rather than guess. Each is fail-safe — no widening,
-    i.e. exactly the pre-3494 FILE_SCOPED behaviour:
-
-    1. a *test_command* that does not parse as PYTEST at all (``npm test``,
-       a shell script): a pyproject's ``addopts`` describe a suite this command
-       never invokes, so consulting them would widen on a false premise;
-    2. a raw-retained command (``cmd.raw is not None`` — OPAQUE, or an ``&&``
-       chain): neither the effective cwd nor which invocation gets scoped is
-       recoverable from it. ``_scope_prefix_to_keyword`` truncates a chained
-       ``test_command`` to its FIRST ``pytest`` clause, so a probe that read a
-       later clause's config would describe a different invocation than the
-       one that runs;
-    3. only ``pyproject.toml`` is consulted. ``pytest.ini`` / ``setup.cfg`` /
-       ``tox.ini`` addopts are invisible here, so a module configured that way
-       simply never widens. A deliberate UNDER-fire, never an over-fire.
+    WHERE the ini file is looked for, and which commands are refused outright:
+    :func:`pytest_config_path_for_command`, shared with the serial-recovery
+    addopts derivation. Only a governing ``pyproject.toml`` is consulted, so a
+    module configured through ``pytest.ini`` / ``setup.cfg`` / ``tox.ini``
+    simply never widens — a deliberate UNDER-fire, never an over-fire.
     """
     if not test_command:
         return None
-    parsed = parse_config_command(test_command)
-    if parsed.tool is not ToolKind.PYTEST or parsed.raw is not None:
+    config_path = _governing_pyproject(parse_config_command(test_command), worktree_reader)
+    if config_path is None:
         return None
-    cwd_rel = parsed.cwd_rel
-    config_path = (
-        'pyproject.toml' if not cwd_rel or cwd_rel == '.' else f'{cwd_rel}/pyproject.toml'
-    )
     return deselecting_expression_for_targets(
         targets,
         worktree_reader(config_path),
@@ -639,6 +701,8 @@ def _derive_module_runs(
     existing_files: list[str],
     worktree_reader: Callable[[str], str | None],
     role: Literal['merge', 'task'] = 'task',
+    *,
+    list_pkg_tests: Callable[[str], list[str]] | None = None,
 ) -> list[PlannedRun]:
     """Derive one ModuleConfig's PlannedRuns — one per (module, tool) slot.
 
@@ -656,11 +720,13 @@ def _derive_module_runs(
     (``'lint:'``/``'pyright:'``/``'pytest:'``) so a caller can recover tool
     identity even for a SKIPPED slot, whose ``cmd`` is ``None``.
 
-    *role* (λ, task 2589, R3; widened by task 3294) is the task-role pytest
-    floor's policy fork. At ``role == 'task'``, ANY touched SOURCE/STRUCTURAL
-    file under the prefix runs the owning module's full ``test_command`` —
-    whether or not collectable test files were touched in the same diff.
-    Only a test-tree-ONLY diff keeps FILE_SCOPED selection (R3's
+    *role* (λ, task 2589, R3; widened by task 3294; narrowed by task 7253) is
+    the task-role pytest floor's policy fork. At ``role == 'task'``, ANY
+    touched SOURCE/STRUCTURAL file under the prefix fires the floor — whether
+    or not collectable test files were touched in the same diff — and the
+    floor runs those touched tests plus the owning module's whole-tree guard
+    family (:func:`_task_role_production_pytest_run`). Only a test-tree-ONLY
+    diff keeps plain FILE_SCOPED selection (R3's
     "touched-test-only diffs keep file-scoped selection"). ``role ==
     'merge'`` is unchanged in every cell (R4): it keeps the legacy
     FILE_SCOPED/SKIPPED shape, because the broad merge gate is a separate,
@@ -758,7 +824,7 @@ def _derive_module_runs(
     # cross-file invariant to protect, unlike pyright's Protocol/TypedDict
     # concern (D2), so there is no "widen to full suite" branch here. --
     if mc.lint_command:
-        lint_cmd = _scope_prefix_to_keyword(mc.lint_command, 'ruff check', scoped)
+        lint_cmd = scope_prefix_to_keyword(mc.lint_command, 'ruff check', scoped)
         runs.append(PlannedRun(
             mc.prefix, lint_cmd, ScopeKind.FILE_SCOPED, 'lint: file-scoped to touched file(s)',
             scoped_targets=tuple(scoped),
@@ -779,7 +845,7 @@ def _derive_module_runs(
                 f'pyright: structural file {structural_trigger} requires unscoped type check',
             ))
         else:
-            type_cmd = _scope_prefix_to_keyword(mc.type_check_command, 'pyright', scoped)
+            type_cmd = scope_prefix_to_keyword(mc.type_check_command, 'pyright', scoped)
             runs.append(PlannedRun(
                 mc.prefix, type_cmd, ScopeKind.FILE_SCOPED,
                 'pyright: file-scoped to touched file(s)',
@@ -796,15 +862,16 @@ def _derive_module_runs(
     #   2. TEST_DATA touched     -> FULL_SUITE (D1: consumed by tests we can't
     #      enumerate from the path alone)
     #   3. role='task' AND a production (SOURCE ∪ STRUCTURAL) file touched
-    #      -> FULL_SUITE, the task-3294 floor. It sits HERE, above arm 4, so
-    #      that coverage is monotone in the diff: co-committing a test must
-    #      not narrow a run the production file alone would have widened.
+    #      -> FILE_SCOPED to the touched tests plus the module's whole-tree
+    #      guard family, else the FULL_SUITE floor. It sits HERE, above arm 4,
+    #      so that coverage is monotone in the diff: co-committing a test only
+    #      adds a target.
     #   4a. collectable tests, ALL provably deselected by the module's own `-m`
     #      -> FULL_SUITE, the task-3494 arm. It sits BELOW arms 1-3 so those
-    #      stay unreachable-by-construction from the new probe, and it is a
-    #      sub-branch of arm 4 rather than a peer because it fires only on the
-    #      selection arm 4 would otherwise emit. See the MARKER DESELECTION
-    #      paragraph in this function's docstring.
+    #      never reach it (arm 3 runs the same probe over its own selection),
+    #      and it is a sub-branch of arm 4 rather than a peer because it fires
+    #      only on the selection arm 4 would otherwise emit. See the MARKER
+    #      DESELECTION paragraph in this function's docstring.
     #   4b. collectable tests     -> FILE_SCOPED to them
     #   5. otherwise             -> an explicit reasoned SKIPPED (the task-1852
     #      "not silent" requirement: never a dropped command)
@@ -826,24 +893,11 @@ def _derive_module_runs(
                 f'pytest: test-data module touched ({test_data_trigger}) — full suite required',
             ))
         elif role == 'task' and production_trigger is not None:
-            test_cmd = parse_config_command(mc.test_command)
-            # The reason is the operator-facing record of WHY this widened.
-            # A mixed diff (production + co-committed tests) must not be
-            # described as "source-only" — and must say that the touched
-            # tests did NOT narrow it, or the widened run reads as a scoper
-            # bug rather than the deliberate task-3294 policy.
-            if collectable_tests:
-                reason = (
-                    f'pytest: production module touched ({production_trigger}) — '
-                    'owning-module full suite (task role); co-committed test file(s) '
-                    'do NOT narrow it; sibling modules NOT run'
-                )
-            else:
-                reason = (
-                    'pytest: source-only diff — owning-module full suite (task role); '
-                    'sibling modules NOT run'
-                )
-            runs.append(PlannedRun(mc.prefix, test_cmd, ScopeKind.FULL_SUITE, reason))
+            runs.append(_task_role_production_pytest_run(
+                mc.prefix, mc.test_command, production_trigger, collectable_tests,
+                _whole_tree_guard_family(mc.prefix, list_pkg_tests, worktree_reader),
+                worktree_reader,
+            ))
         elif collectable_tests:
             deselecting = deselecting_expression_for_command(
                 mc.test_command, collectable_tests, worktree_reader,
@@ -867,7 +921,7 @@ def _derive_module_runs(
                     f'deselected in this run too and are NOT executed by it',
                 ))
             else:
-                test_cmd = _scope_prefix_to_keyword(mc.test_command, 'pytest', collectable_tests)
+                test_cmd = scope_prefix_to_keyword(mc.test_command, 'pytest', collectable_tests)
                 runs.append(PlannedRun(
                     mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
                     'pytest: file-scoped to touched test file(s)',
@@ -884,6 +938,95 @@ def _derive_module_runs(
         ))
 
     return runs
+
+
+def _whole_tree_guard_family(
+    prefix: str,
+    list_pkg_tests: Callable[[str], list[str]] | None,
+    worktree_reader: Callable[[str], str | None],
+) -> tuple[str, ...]:
+    """*prefix*'s collectable tests that :func:`is_whole_tree_guard_module` admits, sorted.
+
+    Only a listed file whose content marks it a guard is classified, so a
+    touched test outside the family is classified once, by the diff alone.
+    ``()`` when no *list_pkg_tests* seam was supplied: nothing can be enumerated.
+    """
+    if list_pkg_tests is None:
+        return ()
+    return tuple(sorted(
+        path for path in list_pkg_tests(prefix)
+        if is_whole_tree_guard_module(worktree_reader(path)) and _is_collectable_test_file(path)
+    ))
+
+
+def _task_role_production_pytest_run(
+    prefix: str,
+    test_command: str,
+    production_trigger: str,
+    collectable_tests: list[str],
+    guard_family: tuple[str, ...],
+    worktree_reader: Callable[[str], str | None],
+) -> PlannedRun:
+    """Arm 3: the task-role floor for a diff touching production code under *prefix*.
+
+    FILE_SCOPED to *collectable_tests* plus *guard_family* (touched first,
+    deduplicated), else the task-3294 full-suite floor when there is no family
+    or the module's own ``-m`` would deselect the whole narrowed selection.
+    Why it is narrowed, and when to re-widen it: ``docs/task-role-pytest-floor.md``.
+    """
+    if not guard_family:
+        return _task_3294_floor_run(
+            prefix, test_command, production_trigger, collectable_tests,
+            why=f'no whole-tree guard family found for {prefix}',
+        )
+    targets = tuple(dict.fromkeys((*collectable_tests, *guard_family)))
+    deselecting = deselecting_expression_for_command(test_command, targets, worktree_reader)
+    if deselecting is not None:
+        return _task_3294_floor_run(
+            prefix, test_command, production_trigger, collectable_tests,
+            why=f'the narrowed selection is entirely deselected by -m {deselecting!r}',
+        )
+    return PlannedRun(
+        prefix,
+        scope_prefix_to_keyword(test_command, 'pytest', list(targets)),
+        ScopeKind.FILE_SCOPED,
+        f'pytest: production module touched ({production_trigger}) — task role runs '
+        f'{len(collectable_tests)} touched test file(s) plus the {len(guard_family)}-module '
+        'whole-tree guard family instead of the owning-module full suite (task-3294 floor '
+        'narrowed by gate 5702); the full suite runs at the merge gate',
+        scoped_targets=targets,
+    )
+
+
+def _task_3294_floor_run(
+    prefix: str,
+    test_command: str,
+    production_trigger: str,
+    collectable_tests: list[str],
+    *,
+    why: str,
+) -> PlannedRun:
+    """The task-3294 owning-module full-suite floor, with *why* it was not narrowed.
+
+    A mixed diff (production + co-committed tests) is never described as
+    "source-only", and says its touched tests did NOT narrow the run, so the
+    widened run reads as policy rather than a scoper bug.
+    """
+    if collectable_tests:
+        reason = (
+            f'pytest: production module touched ({production_trigger}) — '
+            'owning-module full suite (task role); co-committed test file(s) '
+            'do NOT narrow it; sibling modules NOT run'
+        )
+    else:
+        reason = (
+            'pytest: source-only diff — owning-module full suite (task role); '
+            'sibling modules NOT run'
+        )
+    return PlannedRun(
+        prefix, parse_config_command(test_command), ScopeKind.FULL_SUITE,
+        f'{reason} — not narrowed: {why}',
+    )
 
 
 def _merge_breadth_is_full(config: OrchestratorConfig | None) -> bool:
@@ -1251,6 +1394,8 @@ def derive_verify_plan(
     config: OrchestratorConfig | None,
     worktree_reader: Callable[[str], str | None],
     role: Literal['merge', 'task'] = 'task',
+    *,
+    list_pkg_tests: Callable[[str], list[str]] | None = None,
 ) -> VerifyPlan:
     """Derive the declarative VerifyPlan for one verify attempt (PRD task γ).
 
@@ -1275,7 +1420,12 @@ def derive_verify_plan(
     ``derive_verify_plan`` never executes that guard itself, staying pure.
 
     Module-config branch (*module_configs* non-empty): each ModuleConfig is
-    scoped independently via :func:`_derive_module_runs`.
+    scoped independently via :func:`_derive_module_runs`. *list_pkg_tests*
+    (same contract as :func:`reverse_dependent_test_targets`' seam: a module
+    prefix to the worktree-root-relative ``.py`` files under its tests tree,
+    collectable or not) is how the task-role floor enumerates a module's
+    whole-tree guard family; without it that floor stays the owning-module
+    full suite.
 
     Fallback branch (*module_configs* empty): a single synthetic
     ``'__fallback__'`` module is derived from *config*'s global commands via
@@ -1313,9 +1463,27 @@ def derive_verify_plan(
             if merge_full:
                 runs.extend(_derive_full_suite_runs(mc, role))
             else:
-                runs.extend(_derive_module_runs(mc, existing_files, worktree_reader, role=role))
+                runs.extend(_derive_module_runs(
+                    mc, existing_files, worktree_reader, role=role,
+                    list_pkg_tests=list_pkg_tests,
+                ))
         return VerifyPlan(runs=tuple(runs))
     return VerifyPlan(runs=tuple(_derive_fallback_runs(existing_files, config, worktree_reader)))
+
+
+def executed_module_prefixes(plan: VerifyPlan) -> frozenset[str]:
+    """The module prefixes *plan* executes: none for a TRIVIAL plan, and never a
+    module whose only run is the cmd-None 'no files under prefix' SKIPPED (the rule
+    ``verify.py::_executed_module_configs_from_plan`` applies)."""
+    if len(plan.runs) == 1 and plan.runs[0].scope_kind is ScopeKind.TRIVIAL:
+        return frozenset()
+    runs_by_prefix: dict[str, list[PlannedRun]] = {}
+    for run in plan.runs:
+        runs_by_prefix.setdefault(run.module_prefix, []).append(run)
+    return frozenset(
+        prefix for prefix, runs in runs_by_prefix.items()
+        if not (len(runs) == 1 and runs[0].cmd is None and runs[0].scope_kind is ScopeKind.SKIPPED)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1326,7 +1494,7 @@ def derive_verify_plan(
 # resolves module_configs from the TASK's own touched modules only, so an
 # orchestrator-only diff never considers escalation's ModuleConfig at all —
 # even though escalation/tests/test_server.py white-box-imports
-# orchestrator.merge_queue and can be broken by an orchestrator-source
+# orchestrator.merge_lane.worker and can be broken by an orchestrator-source
 # change. This recurred 3x as a RED-main fix-forward (1736->1761,
 # 2173->2038, 2435->2604) before being structurally closed here. Mirrors the
 # hooks/project-checks reverse-dependency precedent (task 2551,
@@ -1354,7 +1522,7 @@ def _imports_any(content: str | None, import_names: list[str]) -> bool:
 
     The regex is anchored per-line (``re.MULTILINE``) but tolerates leading
     whitespace, so a guarded/indented import — e.g. escalation/tests/
-    test_server.py's ``    try:\\n        from orchestrator.merge_queue
+    test_server.py's ``    try:\\n        from orchestrator.merge_lane.worker
     import ...`` — still matches. *content* of ``None`` (unreadable/missing
     file) never matches, same as ``classify_file``'s STRUCTURAL detection
     treats missing content as "simply not detected" rather than an error.
@@ -1393,9 +1561,10 @@ def reverse_dependent_test_targets(
     of how many of ITS depended-upon packages fired or how many of THEIR
     files changed.
 
-    Via the injected *list_pkg_tests* (a dependent's collectable test files)
-    and *read_content* (that file's text) callables, keeps only the test
-    files that actually import one of the triggering packages. A dependent
+    Via the injected *list_pkg_tests* (the ``.py`` files under a dependent's
+    tests tree) and *read_content* (that file's text) callables, keeps only
+    the collectable test files that actually import one of the triggering
+    packages. A dependent
     with no importing test files is omitted entirely — never an empty-list
     entry. Both the outer list (by dependent name) and each inner file list
     are sorted for deterministic output.
@@ -1419,7 +1588,7 @@ def reverse_dependent_test_targets(
         import_names = [_package_import_name(pkg) for pkg in dependent_triggers[dependent]]
         coupled = sorted(
             f for f in list_pkg_tests(dependent)
-            if _imports_any(read_content(f), import_names)
+            if _is_collectable_test_file(f) and _imports_any(read_content(f), import_names)
         )
         if coupled:
             result.append((dependent, coupled))

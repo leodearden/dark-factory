@@ -6,40 +6,21 @@ test_purge_knowlive_namespace.py.
 """
 from __future__ import annotations
 
-import importlib.util
+import errno
 import json
+import logging
 import os
 import sys
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'investigate_cross_graph_duplication.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load investigate_cross_graph_duplication.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    mod_name = 'investigate_cross_graph_duplication'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='investigate_cross_graph_duplication')
 
 
 # ===========================================================================
@@ -706,3 +687,51 @@ class TestMainCliWiring:
             assert os.environ['CONFIG_PATH'] == '/tmp/some-config.yaml'
         finally:
             os.environ.pop('CONFIG_PATH', None)
+
+
+class _UnopenableMemoryService:
+    """A store whose open fails the way ``MemoryService.initialize`` measurably
+    does when it cannot create ``config.queue.data_dir``."""
+
+    instances: list[_UnopenableMemoryService] = []
+
+    def __init__(self, config):
+        self.closed = False
+        type(self).instances.append(self)
+
+    async def initialize(self):
+        raise PermissionError(errno.EACCES, 'Permission denied', '/unwritable/queue-data')
+
+    async def close(self):
+        self.closed = True
+
+
+class TestAStoreThatCannotBeOpened:
+    """An OSError from opening the store is a run failure named at its seam.
+
+    Left to escape ``main()``, it would reach ``run_cli``'s stdout arm and be
+    reported as "cannot write to stdout".
+    """
+
+    def test_is_a_run_failure_naming_the_store_not_stdout(self, monkeypatch, capsys, caplog):
+        monkeypatch.setattr(_UnopenableMemoryService, 'instances', [])
+        monkeypatch.setattr('fused_memory.config.schema.FusedMemoryConfig', _StubConfig)
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.MemoryService', _UnopenableMemoryService,
+        )
+        monkeypatch.setattr(sys, 'argv', ['investigate_cross_graph_duplication.py'])
+
+        with caplog.at_level(logging.ERROR, logger='investigate_cross_graph_duplication'):
+            code = _mod.main()
+
+        assert code == _mod.EXIT_RUN_FAILED == 1
+        errors = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'investigate_cross_graph_duplication' and r.levelno >= logging.ERROR
+        ]
+        assert len(errors) == 1
+        assert 'store' in errors[0]
+        assert '/unwritable/queue-data' in errors[0]
+        assert 'stdout' not in errors[0]
+        assert _UnopenableMemoryService.instances[-1].closed
+        assert capsys.readouterr().out == ''

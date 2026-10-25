@@ -48,6 +48,26 @@ Nothing enforces this mechanically, by choice — see `CONTRIBUTING.md` §2
 (esc-3815-7).
 <!-- line-pin-policy:end -->
 
+## Code quality
+
+`docs/code-quality.md` is the single normative definition of code quality
+for this repo and for every project the factory operates: quality is the
+cost and risk of the next change, and here the next change is made by an
+agent; fourteen named heuristics with their agreed readings; comments as a
+clarity smell; tests reaching a module's internals as an interface smell.
+Review, refactor and PRD work cite those heuristics by name from that file.
+Do not restate them elsewhere (INV-9). The `CONTRIBUTING.md` §4 gates are
+the floor, not the bar.
+
+`docs/quality-findings-contract.md` is the single normative contract for
+the instruments that produce quality findings (`/review`,
+`/hotspot-survey`, `/census`, `/review-all`): finding key, area and
+severity vocabularies, what a report pins, the dedup protocol before
+filing, where a disposition lives (the task store, never a new ledger), and
+the task-completion trigger chain that schedules the next run. Skills point
+at it and do not restate it. `/review-all` (`skills/review-all/SKILL.md`) is
+the whole-project instrument built on it, human-attended and launched by
+the contract §11 human-gate task.
 
 ## Prerequisites
 
@@ -124,6 +144,87 @@ Any workspace member works; `shared` is used because it is the one member every
 resolves to its OWN tree, an un-synced one to the main checkout — both are
 correct, and knowing which you are in is the whole point of asking.
 
+**Never `find .`, nor `Glob` with no `path`, from the main checkout root to
+locate a first-party file.** That root holds a full copy of the tree per
+worktree under `.worktrees/`, `.worktrees-orphaned/`, `.eval-worktrees/` and
+`.claude/worktrees/`, all four in the root `.gitignore`, so a walk times out
+printing every copy. `Glob` passes `--no-ignore` and fails the same way;
+`Grep` honours `.gitignore`. Ask git's index instead:
+`git ls-files -- '*<name>'`, adding `--others --exclude-standard` for untracked
+files. Inside a task worktree both walks are fine.
+
+### Anchoring ad-hoc paths
+
+In an interactive session the Bash working directory PERSISTS across calls, and
+any earlier `cd` moved it — including one buried in a compound command several
+turns ago. An orchestrator-dispatched Claude session is launched with
+`CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`
+(`orchestrator/src/orchestrator/agents/invoke.py::apply_bash_cwd_reset_env`),
+which the CLI reads as a request to put its shell back at the dispatch root,
+silently, after every call.
+
+Measured 2026-10-18 on CLI 2.1.302 in a dispatched session (task 5987):
+`CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR` reached the shell as `1`, a `cd` was
+undone silently before the next call, and a relative `Grep` path and `Glob`
+pattern both resolved from the worktree root afterwards.
+
+The anchor below is correct whether or not that reset happens; use it
+regardless. Your own command text does not show where the command will run: in
+the transcript behind `plans/confusion-census-2026-09-20.md` §1.4, two adjacent
+Bash calls in one session carried different tracked cwds.
+
+So a bare or repo-relative path in an ad-hoc probe is a guess, and a wrong guess
+arrives as a bare `FileNotFoundError: [Errno 2] No such file or directory:
+'test_foo.py'`, which names neither the directory you assumed nor the one you
+actually got. Your cwd is **not derivable from your command text**. Ask git;
+never assume you are still where you last were.
+
+<!-- checkout-root-anchor:begin
+     EXECUTED verbatim by
+     tests/scripts/test_checkout_root_anchor_convention.py from a subdirectory
+     of a temp checkout, asserting it answers with the checkout ROOT and not
+     with cwd. Edit it into `pwd` or a hard-coded path and that guard goes
+     red — which is the point. -->
+- **Checkout root**: `git rev-parse --show-toplevel`
+<!-- checkout-root-anchor:end -->
+
+Two measured properties are why this and not `pwd`: it answers the same from
+every directory inside the checkout, and from a directory inside no checkout it
+refuses loudly — exit 128, `fatal: not a git repository`, nothing on stdout —
+rather than handing back a path that is silently wrong.
+
+It answers with the checkout you are STANDING IN, which inside a linked
+worktree is that worktree's own root — the right answer for your task's files,
+and the wrong one when you specifically need the MAIN checkout (`.taskmaster/`,
+`claim_warm_worktree`'s `project_root`). `skills/do/SKILL.md` owns that other
+derivation; take it from there rather than adapting this one.
+
+Knowing the root is not enough on its own: a root printed in some earlier turn
+does not reach inside a heredoc you write in a later one. Carry the anchor WITH
+the probe.
+
+<!-- anchored-probe-idiom:begin
+     Also EXECUTED verbatim by
+     tests/scripts/test_checkout_root_anchor_convention.py, which runs it from
+     a subdirectory holding no CLAUDE.md of its own and then runs it AGAIN with
+     the `cd` prefix stripped — the second run must fail with the
+     FileNotFoundError this subsection exists to stop. -->
+- **Anchor an ad-hoc probe**: `cd "$(git rev-parse --show-toplevel)" && python3 -c 'import pathlib; print(pathlib.Path("CLAUDE.md").read_text().splitlines()[0])'`
+<!-- anchored-probe-idiom:end -->
+
+Prefixing a probe this way puts every path inside it on repo-relative footing
+no matter which directory the call started in — including inside a
+`python3 - <<'PY'` heredoc, which is exactly where the sighting behind this
+subsection failed. It does not have to be re-derived per path, and it is
+cheaper than reasoning about where you currently are.
+
+The `Read`, `Glob` and `Grep` tools need the same care: give them an ABSOLUTE
+path. `Read` with one is unaffected by the Bash cwd, but a relative or omitted
+`path` given to `Grep` or `Glob` resolves against that same drifted cwd —
+measured 2026-09-27 (CLI 2.1.283), `Grep` answered "Path does not exist:
+orchestrator/src/orchestrator. Note: your current working directory is
+.../orchestrator/src".
+
 ## Memory Usage
 
 ### When to read memory
@@ -142,6 +243,7 @@ correct, and knowing which you are in is the whole point of asking.
 - **Decisions made** — immediately, don't wait until session end
 - **Conventions discovered** — coding patterns, naming rules, project norms
 - **Session end** — reflect and write observations, summaries of what was accomplished
+- **Tagging a write** — `add_memory` takes an optional `metadata` dict with five reserved keys: `topic`, `canonical`, `kind`, `parent_id`, `supersedes`. A small blessed set of conventional keys (`task_id`, `source`, `transition`, `stage` and a few more) is already known and does not warn — use those spellings rather than an `x_` variant; any key outside that set warns to a census line unless you prefix it `x_`. `fused-memory/src/fused_memory/memory_metadata.py` is the single normative source for their shapes and rules (contract: `docs/prds/memory-metadata-vocabulary.md` V1) — read it there rather than from a summary.
 - **Before writing a gotcha-class `procedural_knowledge` or `preferences_and_norms` entry** — `search()` first for existing coverage; if a near-duplicate already exists, consolidate into/update it instead of writing a new one. (`fused-memory/scripts/audit_duplicate_memories.py` is the automated backstop sweep for whatever slips through.) `add_memory` now ENFORCES this at write time with two guards of different scope: (1) a deterministic topic-cluster guard covering BOTH categories, which soft-blocks content matching a known-contradictory topic cluster (error_type `ProceduralKnowledgeKnownTopicClusterWriteRejected`); and (2) a cosine near-duplicate guard that remains `procedural_knowledge`-only, which soft-blocks content matching an existing entry at high similarity. Both guards fire only on an explicit `category=` argument — a `category=None` write that auto-classifies to `procedural_knowledge` is covered by neither. Override either with `metadata={'allow_near_duplicate': True}` only for genuinely distinct content. Full statement: `fused-memory/src/fused_memory/server/tools.py::add_memory` docstring.
 
 ### Write operations
@@ -150,6 +252,12 @@ correct, and knowing which you are in is the whole point of asking.
 |-----------|------|-------------|
 | `add_memory` | 0-3 LLM calls | Discrete, distilled facts — **prefer this** |
 | `add_episode` | 5-15 LLM calls | Raw content needing extraction — use sparingly |
+
+```
+add_memory(content="Task 3127 moved retries into the caller because they hid latency",
+           category="decisions_and_rationale", project_id="dark_factory",
+           agent_id="claude-interactive", entities=[{'kind': 'task', 'id': 3127}])
+```
 
 ### Category routing
 
@@ -167,6 +275,7 @@ correct, and knowing which you are in is the whole point of asking.
 Always pass these parameters on write operations:
 - **`project_id`**: `"dark_factory"`
 - **`agent_id`**: descriptive identifier, e.g. `"claude-interactive"`, `"claude-task-7"`, `"reconciliation-stage-1"`
+- **`entities`**: declare what the write is about (`[]` if nothing), e.g. `[{'kind': 'task', 'id': 3127}]`. Omitting it always succeeds; a declaration your own content contradicts is rejected.
 
 ## Task Routing
 
@@ -193,6 +302,35 @@ metadata vocabulary/census (Tier-A blessed keys, Tier-B canonical
 spellings, Tier-C `x_` namespace) — lives in **`docs/task-authoring.md`**.
 Consult it before authoring any of those fields; the shapes are
 validated at write time and a malformed spec is rejected.
+
+### Forensic reads of tasks.db
+
+Read-only sqlite against the live store is the right tool for FORENSICS —
+asking what the store says right now, mid-incident or mid-census. Operations
+still go through the MCP tools above; a direct write skips the reconciliation
+events the interceptor exists to emit.
+
+Two things about that store are not derivable from your cwd or your memory.
+WHERE it is: `.taskmaster/` is not tracked in git, so it exists only at the
+MAIN checkout and never inside your worktree — and the `.taskmaster/tasks.db`
+one directory above the real `.taskmaster/tasks/tasks.db` is a 0-byte decoy
+whose every query answers `no such table: tasks`. WHAT SHAPE it is: neither
+its columns (`no such column: created_at`) nor its value types (an INTEGER
+column hands you an `int`, so a string method on a task id raises
+`AttributeError`) survive being remembered. Ask the database; never guess.
+
+<!-- tasks-db-schema-lookup:begin
+     EXECUTED verbatim by tests/scripts/test_tasks_db_schema_convention.py.
+     Degrade it into a hand-written sqlite query and that guard goes red —
+     which is the point: the recipe stays certified to actually run. -->
+- **Task store shape**: `python scripts/tasks_db_schema.py`
+<!-- tasks-db-schema-lookup:end -->
+
+It resolves the live store from wherever you are standing (`--db` and
+`--project-root` override), prints every table with each column's declared
+type and the Python type its values arrive as, and refuses loudly rather than
+reporting an empty schema. It states no column names of its own, deliberately:
+the store is the only copy of them that cannot be stale.
 
 ## Model Routing
 
@@ -261,12 +399,28 @@ column reference, and the soak signal to watch:
 **`OPERATIONS.md` §"Fleet redeploy & watchdog"**.
 
 Two things that section used to claim, and that measurement disproved on
-2026-08-24/25: only the **staleness** tier passes `--drain` (the coordinator
-passes no arguments, so it restarts mid-merge units ungated), and the two
-tiers **can** both redeploy inside one 8h window — the clock is stamped only
+2026-08-24/25: only the **staleness** tier passes `--drain` (historical: the
+coordinator passed no arguments then; since task **5371** both tiers pass it),
+and the two tiers **can** both redeploy inside one 8h window — the clock is stamped only
 when a sweep completes, so a long sweep leaves it reading the previous deploy
-throughout. Tasks **4754** and **4755** close this. Until they land, don't
-reason as if a fleet redeploy is at most once per 8h.
+throughout. Tasks **4754** and **4755** have since closed this: a sweep now
+holds an in-flight lease that the backstop, the coordinator and (for its
+`current_unit` only) the liveness probe all honor. Two residuals remain — a
+sweep overrunning `orchestrator_restart_lease_max_age_secs` loses the lease
+and degrades to the old collision, and the fused-memory tier has no lease at
+all — so read `--report`'s `FLEET-LEASE:` line rather than assuming.
+
+`--drain` (task 5371, per unit since task 7297) is a two-stage drain: Stage A
+halts a unit's merge admission when the sweep reaches it; Stage B restarts it
+once none of its merge verifies is in flight, bounded by each verify's own
+timeout, a per-unit `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS`, and a sweep-wide
+ceiling `ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS` counted from sweep start; past
+the ceiling every unit still gets its request and is restarted at its first
+acknowledged poll. How the ceiling fits under the lease is derived at
+`scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS`.
+Pre-5371 units and refused requests keep the old 600s merge-idle gate. The
+first sweep after a deploy of that code still meets old-code units. Detail:
+`OPERATIONS.md` §"Reading a drain".
 
 ## Working in the main checkout
 
@@ -291,6 +445,20 @@ directly, not just interactive agents.
   instead of halting the queue, and no operator rescue is needed for this
   case. If the grace still expires, that one merge is blocked per-task (see
   `park_lock_contended` in `OPERATIONS.md`) — the queue keeps running.
+- A direct-to-main commit may land while a merge verify is in flight; it
+  costs that merge one full re-verify, about what the same change would pay
+  going through the merge queue (INV-1 runs the full gate on a docs-only
+  merge). However disjoint the files, the re-verify is forced:
+  `orchestrator/src/orchestrator/merge_lane/gates.py::_disjoint_skip_blockers`
+  refuses the disjoint skip here on two counts — this project's
+  `merge_verify_breadth: "full"` (a whole-tree gate), and drift the queue did
+  not itself land green (commit `fa95988c8e`). A train pays the same price:
+  it re-verifies its rebased tip, then lands (task 5070), so a moved main no
+  longer derails a train. Batch direct commits rather than landing a burst:
+  each one restarts the in-flight merge's re-verify, and more than
+  `MAX_CAS_RETRIES` (5) in one flight blocks that merge. What the lane must
+  never do is jam tasks in a hard-to-notice way; one extra verify is
+  acceptable.
 - **Never** run `git stash` in **any** dark-factory checkout — `project_root`
   or a `.worktrees/<id>` task worktree. `refs/stash` is a single ref in the
   shared `.git` dir and is *not* per-worktree, so every checkout pushes onto

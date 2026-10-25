@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import logging
+import re
 import subprocess
 from importlib import resources as pkg_resources
 from pathlib import Path
@@ -22,10 +23,17 @@ from _orch_helpers import (
     skip_role_config_layer,
     stamp_stock_routing_config,
 )
-from shared.cli_invoke import AllAccountsCappedException
+from shared.cli_invoke import (
+    AgentFailureKind,
+    AgentResult,
+    AllAccountsCappedException,
+    classify_agent_failure,
+)
 from shared.config_dir import TaskConfigDir
+from shared.testing import make_gate_mock
 
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
+from orchestrator.dry_run_unblock import _TASK_EMPTY_STATE, _TASK_UNAVAILABLE_STATE
 from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
@@ -296,6 +304,40 @@ class TestHappyPath:
         assert 'mcp__fused-memory__update_task' in disallowed
 
 
+class TestDryRunSkillDenied:
+    @pytest.mark.asyncio
+    async def test_dry_run_invocation_denies_skill_tool(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        agent_result = _make_agent_result(structured_output={
+            'proposal_text': 'x', 'risk_label': 'low', 'files_referenced': [],
+        })
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=AsyncMock(return_value=agent_result),
+        ) as mock_invoke:
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        invoke_kwargs = mock_invoke.call_args.kwargs
+        assert 'Skill' in invoke_kwargs['disallowed_tools']
+        granted = [
+            t for t in invoke_kwargs['allowed_tools']
+            if t == 'Skill' or t.startswith('Skill(')
+        ]
+        assert granted == []
+
+
 # ---------------------------------------------------------------------------
 # step-9: missing risk_label defaults to human-review-required
 # ---------------------------------------------------------------------------
@@ -427,6 +469,7 @@ class TestBudgetExhaustedFallback:
             output='',
             structured_output=None,
         )
+        assert classify_agent_failure(agent_result).kind is AgentFailureKind.BUDGET
 
         scheduler = MagicMock()
         scheduler.update_task = AsyncMock(return_value=True)
@@ -746,7 +789,7 @@ class TestBlockClassStamping:
         on an ordinary success entry.
         """
         from orchestrator.dry_run_unblock import run_dry_run_unblock
-        from orchestrator.merge_gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane.gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
 
         reason = POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX + ': type-check failed for orchestrator'
         structured = {
@@ -1875,7 +1918,7 @@ class _ForcedCapUsageGate:
     active_account_name = 'forced-cap-account'
     soonest_resets_at = None
 
-    def invoke_slot(self, scope=None):
+    def invoke_slot(self, scope=None, *, park=True, max_wait_secs=None):
         return _ForcedCapSlot()
 
 
@@ -1933,6 +1976,136 @@ class TestDryRunCapExhaustionRealLoop:
         assert 'capped' in entry['proposal_text'].lower()
 
 
+class TestFrozenPoolInvestigationIsBounded:
+    """A pool frozen BEFORE the investigation starts used to park it in the
+    gate until a reset, out of reach of ``_DRY_RUN_CAP_WAIT_SANITY_SECS``."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('freezing_outcome', 'named', 'unnamed'), [
+        pytest.param('cap', 'capped: only', 'auth-failed: only', id='capped'),
+        pytest.param('auth', 'auth-failed: only', 'all accounts capped', id='auth_failed'),
+    ])
+    async def test_a_pool_frozen_at_spawn_writes_infra_failure_within_the_bound(
+        self, tmp_path, monkeypatch, freezing_outcome, named, unnamed,
+    ):
+        from datetime import UTC, datetime, timedelta
+
+        from _orch_helpers import build_usage_gate
+        from shared.config_models import AccountConfig
+        from shared.invocation_outcome import AuthFailed, CapHit
+
+        from orchestrator import dry_run_unblock
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        outcome = {
+            'cap': CapHit(resets_at=datetime.now(UTC) + timedelta(hours=5), reason='test cap'),
+            'auth': AuthFailed(status=401),
+        }[freezing_outcome]
+        gate = build_usage_gate(
+            [AccountConfig(name='only', oauth_token_env='TEST_TOKEN_ONLY')], ['tok-only'],
+        )
+        async with gate.invoke_slot() as slot:
+            slot.report(outcome)
+        assert gate.is_paused, 'fixture must freeze the pool before the investigation starts'
+        monkeypatch.setattr(dry_run_unblock, '_DRY_RUN_CAP_WAIT_SANITY_SECS', 0.2)
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+        mock_invoke = AsyncMock(return_value=_make_agent_result())
+
+        try:
+            with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
+                await asyncio.wait_for(
+                    run_dry_run_unblock(
+                        task_id='4002',
+                        worktree=str(tmp_path),
+                        reason='verify exhausted',
+                        detail='',
+                        scheduler=scheduler,
+                        mcp=MagicMock(),
+                        config=_make_config(),
+                        usage_gate=gate,
+                    ),
+                    5.0,
+                )
+        finally:
+            await gate.shutdown()
+
+        mock_invoke.assert_not_awaited()
+        _assert_one_proposal_persist(scheduler)
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure', entry
+        assert entry['risk_label'] == 'human-review-required', entry
+        assert named in entry['proposal_text'], entry
+        assert unnamed not in entry['proposal_text'].lower(), entry
+
+
+class TestCapHitRetriesFresh:
+    """A capped investigation retries FRESH through the real cap-retry loop,
+    even when its transcript records progress the default would resume."""
+
+    @pytest.mark.asyncio
+    async def test_capped_investigation_retries_fresh_not_resumed(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        scheduler = MagicMock(
+            update_task=AsyncMock(return_value=True),
+            get_task=AsyncMock(return_value=None),
+        )
+        calls: list[dict] = []
+
+        async def _invoke(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                slug_dir = Path(kwargs['config_dir']) / 'projects' / 'p'
+                slug_dir.mkdir(parents=True, exist_ok=True)
+                records = [
+                    {'type': 'user', 'content': 'hi'},
+                    {'type': 'assistant', 'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/tmp/x.py'}},
+                    ]}},
+                ]
+                (slug_dir / f"{kwargs['session_id']}.jsonl").write_text(
+                    '\n'.join(_json.dumps(r) for r in records) + '\n',
+                )
+                return AgentResult(
+                    success=False, output='usage limit', cost_usd=0.5,
+                    session_id=kwargs['session_id'],
+                )
+            return AgentResult(
+                success=True, output='{}', cost_usd=0.5, turns=3, duration_ms=9000,
+                structured_output={
+                    'proposal_text': 'p', 'risk_label': 'low', 'files_referenced': [],
+                },
+            )
+
+        with (
+            patch('orchestrator.dry_run_unblock.invoke_agent', new=AsyncMock(side_effect=_invoke)),
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+                usage_gate=gate,
+            )
+
+        assert len(calls) == 2
+        first, retry = calls
+        assert 'resume_session_id' not in retry
+        assert retry['prompt'] == first['prompt']
+        assert retry['session_id'] != first['session_id']
+
+
 # ---------------------------------------------------------------------------
 # task 2633 step-3: merge-completion risk clamp (RED — clamp not yet implemented)
 # ---------------------------------------------------------------------------
@@ -1976,7 +2149,7 @@ class TestMergeCompletionRiskClamp:
     for a MERGE_VERIFY_RED proposal when
     ``merge_completion_eligible(event_store, task_id)`` is False (task 2633,
     the (b)+(c) generation-time enforcement point — see
-    ``orchestrator.merge_completion``).
+    ``orchestrator.merge_lane.completion``).
 
     RED today (step-3): the clamp does not exist yet in ``run_dry_run_unblock``,
     so ``test_low_risk_clamped_when_eligibility_evidence_missing`` fails — the
@@ -2532,4 +2705,642 @@ class TestDryRunTranscriptArchival:
             f'Cancellation must still reap the per-investigation config dir — it '
             f'holds .credentials.json and was unconditionally cleaned up before '
             f'the archival hook was inserted ahead of teardown; found: {leftover}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 5361 step-5: the investigation prompt carries the task's own text
+# ---------------------------------------------------------------------------
+
+_TASK_DOC = {
+    'id': '42',
+    'title': 'Rebase the verify lane',
+    'description': 'The lane drifted from main and verify now fails on import.',
+    'details': 'Repro: run verify against main tip.',
+    'metadata': {
+        'files': ['orchestrator/src/orchestrator/workflow.py'],
+        'model_overrides': {'unblock_auto': {'model': 'opus'}},
+    },
+}
+
+_CONTENTLESS_TASK_DOC = {'id': '42', 'status': 'blocked'}
+
+
+class _TaskDocScheduler:
+    """Scheduler fake whose ``get_task`` returns a FULL task document.
+
+    ``_RecordingScheduler`` returns only ``{'metadata': ...}`` — enough for
+    route resolution, which is all the fetch was ever used for.  Set
+    *get_task_error* to model a fused-memory hiccup that RAISES, or
+    *returns_none* to model the real ``scheduler.get_task``, which catches its
+    own exceptions and returns ``None`` on failure or absence.
+
+    *returns_none* is a separate flag rather than ``task_doc=None`` because the
+    ``task_doc if task_doc is not None else _TASK_DOC`` default makes ``None``
+    mean "use the default doc".
+    """
+
+    def __init__(self, task_doc=None, *, get_task_error=None, returns_none=False):
+        self._task_doc = task_doc if task_doc is not None else _TASK_DOC
+        self._get_task_error = get_task_error
+        self._returns_none = returns_none
+        self.update_task = AsyncMock(return_value=True)
+
+    async def get_task(self, task_id):
+        if self._get_task_error is not None:
+            raise self._get_task_error
+        if self._returns_none:
+            return None
+        return dict(self._task_doc)
+
+
+async def _capture_investigation_call(tmp_path, scheduler) -> dict:
+    """Run one investigation and return the kwargs handed to the agent."""
+    from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+    agent_result = _make_agent_result(structured_output={
+        'proposal_text': 'Rebase on main and rerun verify',
+        'risk_label': 'low',
+        'files_referenced': [],
+    })
+    mock_invoke = AsyncMock(return_value=agent_result)
+    with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
+        await run_dry_run_unblock(
+            task_id='42',
+            worktree=str(tmp_path),
+            reason='verify exhausted',
+            detail='All 5 attempts timed out',
+            scheduler=scheduler,
+            mcp=MagicMock(),
+            config=_make_config(),
+        )
+    return dict(mock_invoke.call_args.kwargs)
+
+
+async def _capture_investigation_prompt(tmp_path, scheduler) -> str:
+    """Run one investigation and return the prompt handed to the agent."""
+    return (await _capture_investigation_call(tmp_path, scheduler))['prompt']
+
+
+class TestPromptCarriesTaskContext:
+    """The investigator was asked to judge a block it could not read.
+
+    The prompt carried only the block reason and a clipped detail — never the
+    task's own title, description or details, and never the declared file
+    footprint that SKILL.md's `human-review-required` trigger ("outside the
+    architect's declared file scope") must be judged against.
+    """
+
+    @pytest.mark.asyncio
+    async def test_prompt_carries_task_title_description_and_details(self, tmp_path):
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler())
+
+        assert 'Rebase the verify lane' in prompt, prompt
+        assert 'The lane drifted from main and verify now fails on import.' in prompt, prompt
+        assert 'Repro: run verify against main tip.' in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_prompt_carries_declared_file_footprint(self, tmp_path):
+        """The list the `human-review-required` scope-creep trigger is judged against."""
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler())
+
+        assert 'orchestrator/src/orchestrator/workflow.py' in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_prompt_still_carries_the_four_original_fields(self, tmp_path):
+        """The fix is additive — it must not regress what the prompt already had."""
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler())
+
+        assert '42' in prompt, prompt
+        assert str(tmp_path) in prompt, prompt
+        assert 'verify exhausted' in prompt, prompt
+        assert 'All 5 attempts timed out' in prompt, prompt
+        assert 'Investigate and emit your structured proposal.' in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_oversized_task_text_is_bounded_and_marked(self, tmp_path):
+        """An oversized task record must not blow the investigation's budget.
+
+        Asserted by length against the module's declared cap, not by exact
+        prose, and the repo's truncation marker must be present so the clip is
+        visible to the reading agent rather than silent — the failure mode the
+        160/120-char block-`detail` clips already exhibit.
+        """
+        import re
+
+        from orchestrator.dry_run_unblock import _TASK_TEXT_FIELD_CHARS
+
+        oversized = 'x' * 20000
+        scheduler = _TaskDocScheduler({**_TASK_DOC, 'description': oversized})
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+
+        assert _TASK_TEXT_FIELD_CHARS < 20000, 'the cap must bound a 20000-char field'
+        assert oversized not in prompt, 'the 20000-char description was not capped'
+        assert '... [' in prompt and 'truncated] ...' in prompt, prompt
+
+        longest_run = max((len(m) for m in re.findall('x+', prompt)), default=0)
+        assert longest_run <= _TASK_TEXT_FIELD_CHARS, (
+            f'rendered description must be capped at {_TASK_TEXT_FIELD_CHARS} '
+            f'chars; found a run of {longest_run}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_task_fetch_is_marked_not_silently_omitted(self, tmp_path):
+        """Loud over silent: the investigator must be able to tell "this task
+        has no description" from "we could not fetch it".
+
+        Matched against the module's own marker constant rather than a guessed
+        substring: `tmp_path` embeds the test's own name and is interpolated
+        into the prompt as `Worktree:`, so a single bare word ('unavailable')
+        passes spuriously against the temp directory.
+        """
+        from orchestrator.dry_run_unblock import _TASK_UNAVAILABLE_MARKER
+
+        scheduler = _TaskDocScheduler(get_task_error=RuntimeError('fused-memory down'))
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+
+        assert _TASK_UNAVAILABLE_MARKER in prompt, prompt
+        # Still a well-formed prompt — degradation is additive, not destructive.
+        assert 'Investigate and emit your structured proposal.' in prompt, prompt
+        assert 'verify exhausted' in prompt, prompt
+
+
+# ---------------------------------------------------------------------------
+# task 5361 step-9: the task-fetch fallback is loud, and visible on the entry
+# ---------------------------------------------------------------------------
+
+def _persisted_entry(scheduler):
+    """The proposal entry from the ``append=True`` persist call.
+
+    Filtered rather than read off the last call: route resolution mirrors
+    ``metadata.routing`` through a SECOND ``update_task``, and the trim write
+    is a third — see ``_assert_one_proposal_persist``.
+    """
+    persists = [
+        c for c in scheduler.update_task.call_args_list
+        if c.kwargs.get('append') is True
+    ]
+    assert len(persists) == 1, (
+        f'expected exactly one persist call; got {scheduler.update_task.call_args_list}'
+    )
+    return persists[0].args[1]['dry_run_proposals'][0]
+
+
+async def _run_with_scheduler(tmp_path, scheduler) -> None:
+    from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+    agent_result = _make_agent_result(structured_output={
+        'proposal_text': 'Rebase on main and rerun verify',
+        'risk_label': 'low',
+        'files_referenced': [],
+    })
+    with patch('orchestrator.dry_run_unblock.invoke_agent',
+               new=AsyncMock(return_value=agent_result)):
+        await run_dry_run_unblock(
+            task_id='42',
+            worktree=str(tmp_path),
+            reason='verify exhausted',
+            detail='All 5 attempts timed out',
+            scheduler=scheduler,
+            mcp=MagicMock(),
+            config=_make_config(),
+        )
+
+
+class TestTaskFetchFallbackIsLoud:
+    """A failed task fetch used to be swallowed by a bare `except Exception`.
+
+    It silently dropped BOTH the task text and the task's
+    `model_overrides['unblock_auto']` routing pin, with no log at any level
+    and nothing on the persisted entry — so an operator reviewing
+    `metadata.dry_run_proposals[-1]` could not tell a degraded investigation
+    from a healthy one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_raising_fetch_warns(self, tmp_path, caplog):
+        scheduler = _TaskDocScheduler(get_task_error=RuntimeError('fused-memory down'))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _run_with_scheduler(tmp_path, scheduler)
+
+        matching = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'orchestrator.dry_run_unblock'
+            and 'task fetch failed' in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            f'Expected one WARNING naming the failed task fetch; got records: '
+            f'{[(r.name, r.getMessage()) for r in caplog.records]}'
+        )
+        message = matching[0].getMessage()
+        assert '42' in message, message
+        assert 'fused-memory down' in message, message
+
+    @pytest.mark.asyncio
+    async def test_raising_fetch_stamps_the_flag_on_the_entry(self, tmp_path):
+        scheduler = _TaskDocScheduler(get_task_error=RuntimeError('fused-memory down'))
+        await _run_with_scheduler(tmp_path, scheduler)
+
+        entry = _persisted_entry(scheduler)
+        assert entry['task_context_unavailable'] is True, entry
+
+    @pytest.mark.asyncio
+    async def test_non_awaitable_get_task_also_warns_and_stamps(self, tmp_path, caplog):
+        """The MagicMock-scheduler shape used across this suite.
+
+        Its `get_task` is not awaitable, so awaiting it raises TypeError — this
+        shape has been taking the silent fallback path all along.
+        """
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _run_with_scheduler(tmp_path, scheduler)
+
+        assert any(
+            r.levelno == logging.WARNING
+            and r.name == 'orchestrator.dry_run_unblock'
+            and 'task fetch failed' in r.getMessage()
+            for r in caplog.records
+        ), f'{[(r.name, r.getMessage()) for r in caplog.records]}'
+        assert _persisted_entry(scheduler)['task_context_unavailable'] is True
+
+    @pytest.mark.asyncio
+    async def test_healthy_path_carries_the_flag_as_false(self, tmp_path):
+        """SHAPE PARITY — always present, never absent, matching the convention
+        `_failure_diagnostics` already sets. A consumer must never have to
+        distinguish 'absent key' from 'old entry' from 'healthy'."""
+        scheduler = _TaskDocScheduler()
+        await _run_with_scheduler(tmp_path, scheduler)
+
+        entry = _persisted_entry(scheduler)
+        assert 'task_context_unavailable' in entry, entry
+        assert entry['task_context_unavailable'] is False, entry
+
+
+# ---------------------------------------------------------------------------
+# task 5361 step-12: the DOMINANT degraded path is a falsy result, not a raise
+# ---------------------------------------------------------------------------
+
+class TestFalsyFetchIsAlsoLoud:
+    """`scheduler.get_task` is documented to return ``None`` on failure OR
+    absence, and it catches its own exceptions — so an MCP timeout, a
+    malformed reply and a deleted task all arrive as ``None``, never as a
+    raise.  Keying the loudness on the exception therefore left the dominant
+    degraded path exactly as silent as before: the prompt said
+    `_TASK_UNAVAILABLE_MARKER` while the entry said ``task_context_unavailable:
+    False``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_falsy_fetch_warns(self, tmp_path, caplog):
+        scheduler = _TaskDocScheduler(returns_none=True)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _run_with_scheduler(tmp_path, scheduler)
+
+        matching = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'orchestrator.dry_run_unblock'
+            and 'task fetch failed' in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            f'Expected one WARNING naming the failed task fetch; got records: '
+            f'{[(r.name, r.getMessage()) for r in caplog.records]}'
+        )
+        assert '42' in matching[0].getMessage(), matching[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_falsy_fetch_stamps_the_flag_on_the_entry(self, tmp_path):
+        scheduler = _TaskDocScheduler(returns_none=True)
+        await _run_with_scheduler(tmp_path, scheduler)
+
+        assert _persisted_entry(scheduler)['task_context_unavailable'] is True
+
+    @pytest.mark.asyncio
+    async def test_prompt_and_entry_agree_when_degraded(self, tmp_path):
+        """THE COHERENCE INVARIANT — the durable form of this bug.
+
+        One investigation produces both surfaces, so they cannot disagree: if
+        the prompt tells the investigator the task record is unavailable, the
+        entry an operator reads must say the same thing.
+        """
+        from orchestrator.dry_run_unblock import _TASK_UNAVAILABLE_MARKER
+
+        scheduler = _TaskDocScheduler(returns_none=True)
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+        entry = _persisted_entry(scheduler)
+
+        assert _TASK_UNAVAILABLE_MARKER in prompt, prompt
+        assert entry['task_context_unavailable'] is True, entry
+
+    @pytest.mark.asyncio
+    async def test_prompt_and_entry_agree_when_healthy(self, tmp_path):
+        """The other side of the invariant, so it cannot be satisfied by
+        stamping ``True`` unconditionally."""
+        from orchestrator.dry_run_unblock import _TASK_UNAVAILABLE_MARKER
+
+        scheduler = _TaskDocScheduler()
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+        entry = _persisted_entry(scheduler)
+
+        assert _TASK_UNAVAILABLE_MARKER not in prompt, prompt
+        assert entry['task_context_unavailable'] is False, entry
+
+
+# ---------------------------------------------------------------------------
+# task 5361 amendment: the THIRD state — a record that told us nothing
+# ---------------------------------------------------------------------------
+
+class TestContentlessTaskRecordIsAlsoDegraded:
+    """Between "full record" and "fetch failed" sits a record with nothing in it.
+
+    It used to render as the empty string: the prompt carried neither task text
+    nor a marker — just a blank gap the investigator would read as "this task
+    has no description" — while the entry stamped
+    ``task_context_unavailable: False``.  That is the same ambiguity
+    `TestFalsyFetchIsAlsoLoud` exists to eliminate, one level in.
+    """
+
+    @pytest.mark.asyncio
+    async def test_prompt_and_entry_agree_when_the_record_is_empty(self, tmp_path):
+        """The coherence invariant, extended to the third state."""
+        from orchestrator.dry_run_unblock import (
+            _TASK_EMPTY_MARKER,
+            _TASK_UNAVAILABLE_MARKER,
+        )
+
+        scheduler = _TaskDocScheduler(task_doc=_CONTENTLESS_TASK_DOC)
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+        entry = _persisted_entry(scheduler)
+
+        assert _TASK_EMPTY_MARKER in prompt, prompt
+        assert entry['task_context_unavailable'] is True, entry
+        # A DISTINCT marker: the fetch succeeded, so telling the investigator
+        # it failed would be a different lie from the one being fixed.
+        assert _TASK_UNAVAILABLE_MARKER not in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_empty_record_warns_once_without_claiming_a_failed_fetch(
+        self, tmp_path, caplog,
+    ):
+        scheduler = _TaskDocScheduler(task_doc=_CONTENTLESS_TASK_DOC)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _run_with_scheduler(tmp_path, scheduler)
+
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'orchestrator.dry_run_unblock'
+        ]
+        assert len(messages) == 1, messages
+        assert '42' in messages[0], messages[0]
+        assert 'task fetch failed' not in messages[0], messages[0]
+
+    @pytest.mark.asyncio
+    async def test_non_dict_metadata_degrades_rather_than_losing_the_run(self, tmp_path):
+        """`(task.get('metadata') or {}).get('files')` raised AttributeError on a
+        non-dict, escaping to the outer handler and downgrading a WORKING
+        investigation to `investigation_failed`.  Degrading loudly is the whole
+        point of the surrounding change; crashing is the opposite of it."""
+        scheduler = _TaskDocScheduler(task_doc={**_TASK_DOC, 'metadata': 'not-a-dict'})
+        prompt = await _capture_investigation_prompt(tmp_path, scheduler)
+        entry = _persisted_entry(scheduler)
+
+        assert 'Rebase the verify lane' in prompt, prompt
+        assert entry.get('status') != 'investigation_failed', entry
+        assert entry['task_context_unavailable'] is False, entry
+
+
+class TestSkillPromptExplainsEveryTaskBlockState:
+    """The investigator reads ``skills/unblock-auto/SKILL.md`` — its system
+    prompt — to interpret the task block ``dry_run_unblock.py::_task_context``
+    renders into its user prompt, so the two must stay aligned.  This guard is
+    that alignment mechanism.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('make_scheduler', 'state_phrases'), [
+        pytest.param(
+            _TaskDocScheduler,
+            {'**Title:**', '**Description:**', '**Details:**', '**Declared files:**'},
+            id='healthy',
+        ),
+        pytest.param(
+            lambda: _TaskDocScheduler(returns_none=True),
+            {_TASK_UNAVAILABLE_STATE},
+            id='fetch_failed',
+        ),
+        pytest.param(
+            lambda: _TaskDocScheduler(task_doc=_CONTENTLESS_TASK_DOC),
+            {_TASK_EMPTY_STATE},
+            id='record_empty',
+        ),
+    ])
+    async def test_system_prompt_explains_the_task_block(
+        self, tmp_path, make_scheduler, state_phrases,
+    ):
+        kwargs = await _capture_investigation_call(tmp_path, make_scheduler())
+        user, system = kwargs['prompt'], kwargs['system_prompt']
+
+        unrendered = sorted(p for p in state_phrases if p not in user)
+        assert not unrendered, f'the renderer no longer emits {unrendered}\n{user}'
+
+        labels = set(re.findall(r'\*\*[^*\n]+?:\*\*', user))
+        unexplained = sorted(p for p in labels | state_phrases if p not in system)
+        assert not unexplained, (
+            f'the user prompt carries {unexplained} but the unblock-auto '
+            f'system prompt never explains them'
+        )
+
+
+_MUTATING_GIT_SUBCOMMANDS = frozenset({
+    'branch', 'tag', 'checkout', 'switch', 'reset', 'commit', 'merge',
+    'rebase', 'stash', 'worktree', 'push', 'pull', 'fetch', 'clean',
+    'restore', 'add', 'rm', 'mv', 'apply', 'am', 'cherry-pick', 'revert',
+    'update-ref', 'config',
+})
+
+
+_FILE_WRITING_GIT_FLAGS: dict[str, tuple[str, ...]] = {
+    'diff': ('--output',),
+    'log': ('--output',),
+    'show': ('--output',),
+}
+
+
+def _rendered_argv(kwargs: dict) -> list[str]:
+    """The CLI argv the captured investigation call becomes."""
+    from shared.cli_invoke import build_claude_argv
+
+    argv, temp_files = build_claude_argv(
+        model=kwargs['model'],
+        max_budget_usd=kwargs['max_budget_usd'],
+        system_prompt=kwargs['system_prompt'],
+        max_turns=kwargs['max_turns'],
+        permission_mode=kwargs['permission_mode'],
+        allowed_tools=kwargs['allowed_tools'],
+        disallowed_tools=kwargs['disallowed_tools'],
+        mcp_config=None,
+        output_schema=kwargs['output_schema'],
+        effort=kwargs['effort'],
+        resume_session_id=None,
+        session_id=kwargs['session_id'],
+    )
+    for path in temp_files:
+        Path(path).unlink(missing_ok=True)
+    return argv
+
+
+def _bash_rule_matches(rule: str, command: str) -> bool:
+    """Whether the ``Bash(...)`` permission *rule* matches *command*: a trailing
+    ``:*`` makes a prefix rule, and any other ``*`` is a wildcard."""
+    match = re.fullmatch(r'Bash\((.+)\)', rule)
+    if match is None:
+        return False
+    content = match.group(1)
+    if content.endswith(':*') and '*' not in content[:-2]:
+        prefix = content[:-2]
+        return command == prefix or command.startswith(f'{prefix} ')
+    pattern = '.*'.join(re.escape(part) for part in content.split('*'))
+    return re.fullmatch(pattern, command) is not None
+
+
+def _allowed_git_subcommands(allowed_tools: list[str]) -> set[str]:
+    return {
+        match.group(1)
+        for entry in allowed_tools
+        if (match := re.fullmatch(r'Bash\(git (\S+):\*\)', entry))
+    }
+
+
+def _flag_values(argv: list[str], flag: str) -> list[str]:
+    """Every token after *flag* up to the next ``--`` flag."""
+    start = argv.index(flag) + 1
+    values = []
+    for token in argv[start:]:
+        if token.startswith('--'):
+            break
+        values.append(token)
+    return values
+
+
+class TestInvestigationPermissionEnvelope:
+    """The dry run's read-only promise must be enforced by the CLI, not advised.
+
+    Under the inherited ``bypassPermissions`` the allowlist binds nothing and
+    only deny rules hold, so ``git -C <wt> commit`` slipped past
+    ``Bash(git commit:*)`` and ``NotebookEdit`` was never denied at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_investigation_runs_under_dont_ask_not_bypass(self, tmp_path):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        assert kwargs.get('permission_mode') == 'dontAsk', kwargs.get('permission_mode')
+        argv = _rendered_argv(kwargs)
+        assert argv[argv.index('--permission-mode') + 1] == 'dontAsk', argv
+
+    @pytest.mark.asyncio
+    async def test_every_builtin_file_writing_tool_is_denied(self, tmp_path):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        denied = set(_flag_values(_rendered_argv(kwargs), '--disallowed-tools'))
+        missing = sorted({'Edit', 'Write', 'NotebookEdit'} - denied)
+        assert not missing, f'file-writing tools not denied: {missing}'
+
+    @pytest.mark.asyncio
+    async def test_no_git_subcommand_the_envelope_allows_can_mutate(self, tmp_path):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        allowed_subs = _allowed_git_subcommands(kwargs['allowed_tools'])
+        assert allowed_subs, kwargs['allowed_tools']
+        mutating = sorted(allowed_subs & _MUTATING_GIT_SUBCOMMANDS)
+        assert not mutating, f'the envelope grants mutation-capable git subcommands: {mutating}'
+
+    @pytest.mark.asyncio
+    async def test_a_file_writing_flag_of_an_allowed_git_subcommand_is_denied_anywhere(
+        self, tmp_path,
+    ):
+        """A read-only subcommand still writes any reachable path through
+        ``--output``, and a prefix allow rule admits the flag in any position."""
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        writes = [
+            f'git {sub} --stat {flag}=out.txt'
+            for sub in sorted(_allowed_git_subcommands(kwargs['allowed_tools']))
+            for flag in _FILE_WRITING_GIT_FLAGS.get(sub, ())
+        ]
+        assert writes, 'the envelope grants no subcommand with a known file-writing flag'
+        undenied = [
+            command for command in writes
+            if not any(_bash_rule_matches(rule, command) for rule in kwargs['disallowed_tools'])
+        ]
+        assert not undenied, f'file-writing git forms the envelope does not deny: {undenied}'
+
+
+_FENCE = re.compile(r'^```(\w*)\n(.*?)^```', re.MULTILINE | re.DOTALL)
+_DATA_FENCE_LANGUAGES = frozenset({'json', 'yaml', 'yml', 'toml'})
+_SHELL_COMMENT = re.compile(r'(^|\s)#.*$')
+_INLINE_SPAN = re.compile(r'`([^`\n]+)`')
+_LEADING_NAME = re.compile(r'[A-Za-z][\w-]*')
+_PLACEHOLDER = re.compile(r'<[^<>\s]+>')
+_SHELL_COMPOSITION = re.compile(r'\$\(|`|&&|\|\||[;|<>]')
+
+
+def _instructed_calls(skill: str) -> list[str]:
+    """Every tool call and shell command *skill* tells the investigator to run.
+
+    Every fence is read whatever its language tag, except one tagged with a
+    data format, which shows output rather than instructing a call.
+    """
+    calls = [
+        _SHELL_COMMENT.sub('', line).strip()
+        for lang, body in _FENCE.findall(skill) if lang not in _DATA_FENCE_LANGUAGES
+        for line in body.splitlines()
+    ]
+    prose = _FENCE.sub('', skill)
+    calls += [span for span in _INLINE_SPAN.findall(prose) if span.startswith('git ')]
+    return [call for call in calls if call]
+
+
+def _admitted(call: str, kwargs: dict) -> bool:
+    """Whether the envelope admits *call*: a tool call by its tool's name, a
+    shell command by an allow rule that no deny rule overrides.
+
+    A ``Bash`` rule never admits a composed command as a whole, so
+    substitution, operators and redirection leave it unadmitted.  A
+    ``<placeholder>`` is the skill's notation for a value, not a redirection.
+    """
+    name = _LEADING_NAME.match(call)
+    if name is not None and name.group() in kwargs['allowed_tools']:
+        return True
+    command = _PLACEHOLDER.sub('VALUE', call)
+    if _SHELL_COMPOSITION.search(command):
+        return False
+    return any(
+        _bash_rule_matches(rule, command) for rule in kwargs['allowed_tools']
+    ) and not any(_bash_rule_matches(rule, command) for rule in kwargs['disallowed_tools'])
+
+
+class TestSkillCommandsFitTheEnvelope:
+    """Under dontAsk a skill command outside the allowlist is denied without a
+    prompt, which silently degrades the investigation rather than failing it."""
+
+    @pytest.mark.asyncio
+    async def test_every_call_the_skill_instructs_is_admitted_by_the_envelope(
+        self, tmp_path,
+    ):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        calls = _instructed_calls(kwargs['system_prompt'])
+        assert any(call.startswith('git ') for call in calls), (
+            f'no git command extracted from the unblock-auto skill: {calls}'
+        )
+        unadmitted = [call for call in calls if not _admitted(call, kwargs)]
+        assert not unadmitted, (
+            f'the unblock-auto skill instructs calls its envelope denies: {unadmitted}'
         )

@@ -16,14 +16,13 @@ mechanically (:class:`TestNoSecondVocabulary`), not merely by convention.
 from __future__ import annotations
 
 import ast
-import importlib.util
 import json
 import re
-import types
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _fm_helpers import load_script_module
 
 from fused_memory.backends.graphiti_client import PagedRead
 from fused_memory.utils.canonical_labels import Referent
@@ -31,30 +30,7 @@ from fused_memory.utils.canonical_labels import Referent
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_wrong_binding_edges.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load audit_wrong_binding_edges.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'audit_wrong_binding_edges'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='audit_wrong_binding_edges')
 fact_referents = _mod.fact_referents
 endpoint_referent = _mod.endpoint_referent
 bare_id_present = _mod.bare_id_present
@@ -114,22 +90,15 @@ class TestFactReferents:
             "Ruling 6164's HALF 2 was described in task 6164.", GRAPH
         ) == frozenset({_task('6164')})
 
-    def test_the_hyphen_spelling_is_a_documented_blind_spot(self) -> None:
-        """'task-1836' is NOT seen, and this script may not patch around it.
-
-        ``canonical_labels._LOCAL_MENTION_PATTERN`` requires whitespace, '#'
-        or ':' as the separator, so the hyphen spelling is invisible by
-        design. Widening it is an edit to canonical_labels at its single
-        site — which would also change the LIVE write-time guard's behaviour
-        — and is out of scope here. The detector absorbs the recall loss
-        through ``bare_id_present`` instead (see TestBareIdPresent), which
-        mints no referent and can only SUPPRESS a flag.
-        """
+    def test_the_hyphen_spelling_is_seen(self) -> None:
+        """'task-1836' is seen: the shared scanner learned the slug spelling
+        in task 6059. ``bare_id_present`` remains the backstop for the bare
+        hash '#4262' (see TestBareIdPresent)."""
         assert fact_referents(
             'Task 1841 found the real SIGHUP bug that '
             "task-1836's timeout widening had masked.",
             GRAPH,
-        ) == frozenset({_task('1841')})
+        ) == frozenset({_task('1841'), _task('1836')})
 
     def test_a_fact_naming_no_task_yields_nothing(self) -> None:
         assert (
@@ -528,9 +497,10 @@ class TestBareIdPresent:
     flag, which is the conservative direction for a report a human
     adjudicates by hand.
 
-    It exists because two of the shared scanner's documented blind spots —
-    '#4262' and 'task-1836' — would otherwise make an endpoint that IS named
-    in the fact look unnamed, which is a false positive.
+    It exists because the shared scanner's documented bare-hash blind spot,
+    '#4262', would otherwise make an endpoint that IS named in the fact look
+    unnamed, which is a false positive. Its other original target,
+    'task-1836', has been seen by the scanner since task 6059.
     """
 
     def test_the_bare_hash_spelling_is_seen(self) -> None:

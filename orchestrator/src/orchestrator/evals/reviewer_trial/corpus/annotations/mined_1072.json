@@ -8,6 +8,70 @@
       "severity": "suggestion",
       "description": "The added tests only cover the idle-drain path where drain() emits the marker synchronously. The coupled active-loops path \u2014 where drain() is called while a project loop is still running (flag stays False, no emit) and the run_loop drain block must emit 'Harness fully drained' exactly once after loops finish and stay silent thereafter \u2014 is untested, despite being the primary path the one-shot flag was introduced to guard.",
       "mutation_type": "test_gap"
+    },
+    {
+      "id": "mined_1072_pool_01",
+      "location": "fused-memory/src/fused_memory/reconciliation/harness.py:54",
+      "category": "test_only_seam",
+      "severity": "suggestion",
+      "description": "The change adds a module-level `_sleep = asyncio.sleep` alias whose stated purpose is test patching, rewrites all six sleep sites in harness.py (escalation-server startup, run_loop, _project_loop x3, _heartbeat_loop) to use it, and the new test monkeypatches the private dotted path `fused_memory.reconciliation.harness._sleep`. This is a test-only seam reached through a private module name, the rewrites of the _project_loop/_heartbeat_loop/escalation sites are outside the task's scope, and nothing enforces that future sleeps use `_sleep`. The seam is not needed: run_loop executes its body (including the drain-status block) once before its first sleep, so one iteration inside the 0.2 s wait_for already detects a re-emitted marker.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1072_pool_02",
+      "location": "fused-memory/src/fused_memory/reconciliation/harness.py:236",
+      "category": "duplicated_one_shot_gate",
+      "severity": "suggestion",
+      "description": "The one-shot 'emit drained marker once' rule is written out twice: drain() (harness.py:236-238) and run_loop's drain-status block (harness.py:610-612) each check `_drain_complete_logged`, set it, and log the literal 'Harness fully drained \u2014 safe to restart' (a string scripts/restart-fused-memory.sh greps for). The rule and the marker text have no single home, and the __init__ comment has to enumerate the two sites to keep them in step.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1072_pool_03",
+      "location": "fused-memory/src/fused_memory/reconciliation/harness.py:236",
+      "category": "dead_condition",
+      "severity": "suggestion",
+      "description": "In drain(), the added `and not self._drain_complete_logged` can never be False: the flag is only set after `_draining` becomes True, `_draining` is never reset, and drain() returns early whenever `_draining` is already True. The condition implies a reachable already-logged state that does not exist on that path.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1072_pool_04",
+      "location": "fused-memory/src/fused_memory/reconciliation/harness.py:613",
+      "category": "comment_noise",
+      "severity": "suggestion",
+      "description": "The change adds prose comments that restate or narrate the code: `# else: silent \u2014 drained marker already emitted` describes an absent branch (harness.py:613), the 3-line __init__ comment on `_drain_complete_logged` hand-lists the two emission sites (harness.py:147-149, which goes stale when a site moves), and the test comment defends the patch as a 'true module-scoped patch'.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1072_pool_05",
+      "location": "fused-memory/src/fused_memory/reconciliation/harness.py:607-613",
+      "category": "consumer_contract_change",
+      "severity": "suggestion",
+      "description": "Before the change, run_loop re-logged 'Harness fully drained' every ~5 s while drained, which scripts/restart-fused-memory.sh relies on implicitly: it polls `journalctl --since \"10 seconds ago\"` every ~5 s. With the one-shot flag the marker is logged once per process. If SIGUSR1 is sent to a process that has already drained (e.g. a previous `--drain` run was interrupted or its restart failed), drain() only logs 'Harness already draining', the marker never reappears in the 10 s window, and the script waits the full 120 s DRAIN_TIMEOUT before restarting anyway. Detection in the normal path also now depends on a poll landing within 10 s of the single log line. The change neither adjusts the script nor re-emits the marker on the already-draining path.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1072_pool_06",
+      "location": "fused-memory/tests/test_harness.py:3667",
+      "category": "vacuous_pass_risk",
+      "severity": "suggestion",
+      "description": "test_main_loop_does_not_emit_drain_progress_after_idle_drain never asserts that run_loop actually reached its loop body within the 0.2 s wait_for. If startup blocks or raises before the while-loop (e.g. in release_stale_claims or a future awaited startup dependency), zero iterations run and the 'exactly one marker' assertion passes vacuously from drain()'s emission alone.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1072_pool_07",
+      "location": "fused-memory/tests/test_harness.py:3632",
+      "category": "misleading_test_name_vacuous_assertion",
+      "severity": "suggestion",
+      "description": "The second new test is named `..._does_not_emit_drain_progress_after_idle_drain` and its first assertion checks for no 'Harness draining:' records, but that else-branch cannot fire in this fixture with or without the fix: drain() is called before run_loop and `get_active_projects` returns [], so no project loop is ever spawned. The docstring/comment credit a 'gate restructuring' of that branch that the diff does not contain. Only the final 'exactly one fully-drained record' assertion exercises the change.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1072_pool_08",
+      "location": "fused-memory/tests/test_harness.py:3660-3663",
+      "category": "test_reaches_internals",
+      "severity": "suggestion",
+      "description": "The new main-loop test replaces private methods on the harness instance (`_recover_stale_runs`, `_start_escalation_server`, `_stop_escalation_server`) to make run_loop runnable, coupling the test to run_loop's internal call sequence. The pattern already exists elsewhere in test_harness.py (e.g. around line 3127); the diff adds another instance.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {
@@ -24,5 +88,41 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Harness drain: gate 'fully drained' marker behind one-shot flag",
+      "description": "After task 1053 added a synchronous emission of `'Harness fully drained \u2014 safe to restart'` from `Harness.drain()`, the main reconciliation loop continues to emit the same marker on every iteration while `_draining=True` and there are no active project loops, producing per-iteration log spam (~once every 5s).",
+      "test_strategy": "",
+      "details": "**Observed:** Reviewer suggestion on task 1053 merge. After drain() short-circuits and logs the marker synchronously (`fused-memory/src/fused_memory/reconciliation/harness.py:228-229`), the main loop at `harness.py:599-608` will also emit the same marker on its next iteration (since `_draining=True` and tasks are empty), and continues emitting on every subsequent iteration.\n\n**Fix (cheapest):** Add a one-shot bool `self._drain_complete_logged = False` initialized in `__init__`. Set it to True after either site emits the marker; gate both emissions on `not self._drain_complete_logged`.\n\n**Files:**\n- `fused-memory/src/fused_memory/reconciliation/harness.py` \u2014 drain() ~line 228, main loop ~line 599-601, __init__ to add flag\n- `fused-memory/tests/test_harness.py` \u2014 add tests:\n  1. Calling drain() twice on idle harness emits exactly one 'Harness fully drained' record (second call should only log 'Harness already draining').\n  2. After drain() emits the marker synchronously, the main reconciliation loop does not re-emit it on subsequent iterations.\n\n**Verification:**\n- Existing test suite continues to pass.\n- New tests assert exactly one marker emission across drain() + N main-loop iterations.\n- Manual: `time scripts/restart-fused-memory.sh --drain` on an idle harness still completes in <30s with a single 'Harness fully drained' line in the journal.\n\n**Origin:** Reviewer suggestions on task 1053 (esc-1053-180) \u2014 both the robustness suggestion (suppress duplicate marker emissions) and the test_coverage suggestion (assert drain()-twice contract) are addressed by this task.",
+      "authored": false,
+      "id": "1072",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-04-25T09:58:18.728Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/src/fused_memory/reconciliation/harness.py",
+      "fused-memory/tests/test_harness.py"
+    ],
+    "base_sha": "074ad7c9a82ffab9054ec389fd0c7fc757cf6682",
+    "branch_sha": "6048244a04abdcd2ea4d49a2b81fd9fa044c7d90",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "f47d9e286b1ff195597eb481f29621fc37dba4de",
+      "merge_base_sha": "074ad7c9a82ffab9054ec389fd0c7fc757cf6682",
+      "diff_reproduces_from": "git diff 074ad7c9a8 f47d9e286b",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

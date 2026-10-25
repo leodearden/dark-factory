@@ -206,6 +206,591 @@ Recorded rather than silently guessed:
   same session. An excluded canonical never takes ownership, so its
   members fall through to the surviving one rather than being orphaned.
 
+### `write_triage_calibration.canonical_aliases.json`
+
+A **live-store** sidecar, not part of the curator-session extraction above
+and deliberately kept out of the `.jsonl` fixture's own row shape (the
+fixture's records must never change once labeled — see the schema note).
+Maps `{old_cluster_canonical_id: current_memory_id}` for a `cluster_id`
+that has since rotated out of the live `reify` store via a later
+re-consolidation the curation session predates. Two consumers read it:
+
+- `calibrate_write_triage.py --canonical-aliases` (`compute_recall_at_k`'s
+  `aliases` kwarg), so a rotated cluster's recall is measured against its
+  live successor instead of being silently excluded as a corpus gap forever;
+- `eval_write_triage_judge.py --canonical-aliases`, where an attach to the
+  successor counts as an attach to the cluster's canonical.
+
+As of 2026-09-23, three of this fixture's 20 clusters have rotated:
+
+| old `cluster_id` | current successor | evidence |
+|---|---|---|
+| `0e954870-bba1-44a7-81e9-5be94d5f6255` | `9b01e961-e086-428a-ad7e-68323b22f21a` | live `topic='docs-prd-landing'` closure record names `0e954870` explicitly as retired in favour of `9b01e961` (a same-cluster curator race, ~100min apart) |
+| `168c3a6b-55dd-4f53-88e4-3a829ea210fc` | `bbc063a7-ea8f-4262-b9dd-eef3002a99a8` | live successor's `metadata.supersedes` names `168c3a6b` directly |
+| `417d86d0-36fe-42c8-851a-9ed0a18c64bb` | `11ed0e22-b3ae-4635-909b-fa1eb4ae2f13` | live successor's `metadata.supersedes` names `417d86d0` directly; matches the pointer recorded in `plans/memory-subsystem-eval-design.md` §4 (the *Live-store probe facts* paragraph) |
+
+This file is a **point-in-time observation of the live store**, not derived
+data: as the `reify` corpus keeps consolidating, a successor id recorded
+here can itself rotate again. Re-verify each entry (`get_memory_by_id`)
+before trusting it in a future run rather than assuming it is still live.
+
+---
+
+## `write_triage_calibration_dark_factory.jsonl`
+
+A SEPARATE labeled corpus for the `dark_factory` project, extracted from the
+live `dark_factory` Mem0 store's retain-and-tag topic clusters (task 5547).
+It exists because the `reify` fixture above cannot calibrate
+`preferences_and_norms` (one cluster, so zero negative pairs) or
+`observations_and_summaries` (4 duplicate pairs), and that corpus is closed.
+
+It is calibrated **separately** —
+`calibrate_write_triage.py --project-id dark_factory --fixture
+tests/fixtures/write_triage_calibration_dark_factory.jsonl` — into its own
+report, `calibration/write_triage_calibration_report_dark_factory.json`.
+It is **never pooled** with the `reify` corpus: the script threads one
+`--project-id` through every live read, the record schema has no per-record
+project, and the `reify`-derived pooled `t_high`/`t_low` stay the calibration
+of record for the write path (Leo ruling R3, 2026-09-21). Its per-category
+cutoffs land in `config.yaml`'s `write_triage_project_calibrations.dark_factory`,
+which only `scripts/audit_duplicate_memories.py --project-id dark_factory`
+reads.
+
+### Whose labels these are (R1)
+
+These are **curator-session labels, not Leo-adjudicated per cluster.** Each
+cluster's ruling was written by an LLM sitting under the gate-3200
+retain-and-tag shape: the `curator-sitting-*` / `curator-gate-*` sessions,
+plus `recon-stage-memory_consolidator` and one `claude-interactive`
+canonical (`15019144…`, topic `ewa-circuit-breaker`). Leo ruled on
+2026-09-21 that such labels are admissible alpha labels as-is (R1). This
+extraction formed **no fresh opinion**: every label is read off text the
+sitting wrote, and every non-canonical record quotes that text verbatim in
+`provenance.ruling`.
+
+### Provenance mapping
+
+The record schema is the `reify` fixture's, with two differences:
+`provenance.transcript_line` is `null`, and `provenance` gains `topic` and
+`ruling`. A retain-and-tag sitting leaves no transcript to cite — the store
+record IS the artifact — so any integer line number would be fabricated.
+
+| store field | record field |
+|---|---|
+| the `canonical: true` record of a topic | `cluster_id` (its own id) and `label: "canonical"` |
+| `metadata.topic` | `provenance.topic` |
+| the canonical's `metadata.agent_id` (the adjudicating sitting) | `provenance.gate_id` |
+| `metadata.supersedes` | not emitted: superseded ids are deleted, so excluded and tallied |
+| no transcript | `provenance.transcript_line: null` |
+| the extraction route, `get_memories_by_metadata(filters={'topic': <slug>})` | `provenance.source: "live_store_topic_scroll"` |
+| the canonical text that decided the label | `provenance.ruling` (verbatim; fragments joined with ` [...] `) |
+| `metadata.data` (there is no top-level `content` key) | `content` |
+| the member's own `metadata.category` | `category` |
+
+### Admission
+
+A topic member is admitted only if all three hold:
+
+1. its OWN `metadata.category` is `preferences_and_norms` or
+   `observations_and_summaries`;
+2. it carries no `metadata.parent_id` — an amendment or sighting child has
+   no sitting ruling of its own;
+3. it existed when the sitting ruled: `created_at` is at or before the
+   canonical's `created_at`, OR the canonical's text names it by id prefix.
+   A peer stamped onto the topic after the sitting, following its ACCRETION
+   instruction, was never seen by the sitting, so labelling it would be a
+   fresh opinion.
+
+Every other member is excluded and tallied by its first failing rule, in
+that order (`off_category`, `child_record`, `post_sitting_accretion`).
+Each id in a canonical's `supersedes` is deleted (all six were re-verified
+via `get_memory_by_id`: `found: false`, with a `consolidate_memories`
+tombstone whose `absorbed_by` names the canonical), so it is tallied
+`superseded_deleted` and never emitted with placeholder content.
+
+An admitted member whose own category differs from its canonical's keeps
+its own `category`. The two such records (`c6ff2aff…` in
+`doc-prose-guard-policy-corrections`, `a59f060d…` in
+`dashboard-redux-cache-buster`) therefore form no in-cluster pairs.
+`partition_pairs_by_category` drops cross-category pairs; their
+`observations_and_summaries` pairs against other clusters are ordinary
+`unrelated` negatives.
+
+### Labels (R2, applied mechanically)
+
+| label | rule |
+|---|---|
+| `canonical` | the topic's `canonical: true` record |
+| `duplicate` | a peer the canonical's text characterises — by id prefix, or by an identifiable attribute such as agent_id, timestamp, or "the stamped peers" as a whole — as a restatement, rediscovery, independent re-derivation or duplicate of the cluster's claim |
+| `distinct` | every other admitted peer: a deliberately retained peer, a correction, a peer covered only by a blanket "each peer records one instance/shape/incident" statement, or a peer the text does not name at all |
+
+`pseudo_contradiction` is **never emitted**: R2 rules only
+duplicate-versus-distinct, so this corpus has no rule for that label. Labels
+are **never** assigned by topic co-membership or by content similarity.
+
+A restatement stamp wins even where the same text says the peer was ALSO
+retained for unique detail (R2's "Otherwise"). Every such case is listed
+under *Known label ambiguities* below.
+
+`provenance.ruling` for an admitted peer the canonical does not name quotes
+the sentence that covers it: the blanket peer statement where the sitting
+wrote one, else its ACCRETION/retain instruction (the sitting retained the
+peer and stamped no restatement). On a canonical, `ruling` quotes its
+ACCRETION/retain statement, and is `null` for the two canonicals that wrote
+none (`da97c3d0…`, `59c2c6e7…`).
+
+### Per-canonical accounting
+
+Admitted peers by label, and excluded members by reason. Every live topic
+member is either emitted or tallied here.
+
+| canonical | topic | `gate_id` (agent_id) | category | dup | distinct | off_category | child_record | post_sitting_accretion | superseded_deleted |
+|---|---|---|---|---|---|---|---|---|---|
+| `091af6df…` | `guard-tests-grep-code-not-prose` | `curator-sitting-2026-08-19` | preferences_and_norms | 0 | 4 | 1 | 0 | 3 | 0 |
+| `a9f88c5b…` | `prd-generic-mode-overlay-absent` | `curator-sitting-2026-08-19` | preferences_and_norms | 4 | 0 | 0 | 0 | 0 | 0 |
+| `2821a740…` | `doc-prose-guard-policy-corrections` | `curator-sitting-2026-09-03` | preferences_and_norms | 0 | 5 | 0 | 0 | 2 | 0 |
+| `c3eff062…` | `verify-absence-claims-positive-control` | `recon-stage-memory_consolidator` | preferences_and_norms | 0 | 6 | 1 | 0 | 1 | 0 |
+| `4cfade2c…` | `head-limited-grep-truncates-the-decisive-hit` | `curator-sitting-2026-09-08` | preferences_and_norms | 0 | 3 | 1 | 0 | 0 | 0 |
+| `80df4bcb…` | `dashboard-redux-cache-buster` | `curator-sitting-2026-09-08` | preferences_and_norms | 0 | 16 | 14 | 1 | 1 | 0 |
+| `1a21f587…` | `architect-plan-files-scope` | `curator-gate-5526-2026-09-17` | preferences_and_norms | 0 | 20 | 14 | 2 | 1 | 0 |
+| `da97c3d0…` | `dark-factory-task-metadata-wire-coercion-norm` | `recon-stage-memory_consolidator` | preferences_and_norms | 0 | 0 | 0 | 0 | 0 | 2 |
+| `27ca662a…` | `commit-planning-yaml-sidecar-comment-loss` | `curator-sitting-2026-08-19` | observations_and_summaries | 7 | 0 | 1 | 0 | 4 | 0 |
+| `0d921da5…` | `resolve-ticket-timeout-discriminator` | `curator-sitting-2026-08-19` | observations_and_summaries | 0 | 9 | 3 | 0 | 2 | 0 |
+| `15019144…` | `ewa-circuit-breaker` | `claude-interactive` | observations_and_summaries | 0 | 7 | 2 | 0 | 5 | 0 |
+| `31a73fcd…` | `worktree-stale-base-premise-verification` | `curator-sitting-2026-08-27` | observations_and_summaries | 0 | 2 | 11 | 0 | 1 | 0 |
+| `c7580b29…` | `gitops-quarantine-rename-worktree-bare-branch-name` | `curator-sitting-2026-08-27` | observations_and_summaries | 1 | 1 | 1 | 0 | 0 | 0 |
+| `8b35701d…` | `watchdog-clock-gate-test-isolation` | `curator-sitting-2026-08-27` | observations_and_summaries | 0 | 0 | 7 | 0 | 0 | 0 |
+| `c3cbe271…` | `mem0-tombstone-coverage` | `curator-sitting-2026-08-27` | observations_and_summaries | 0 | 1 | 1 | 0 | 0 | 0 |
+| `62d0ebfd…` | `e2-bakeoff-gate-3200-review-findings` | `curator-sitting-2026-09-10-5318` | observations_and_summaries | 4 | 0 | 0 | 0 | 0 | 0 |
+| `b410eb23…` | `write-classifier-hardcoded-openai-provider` | `recon-stage-memory_consolidator` | observations_and_summaries | 0 | 1 | 0 | 0 | 0 | 2 |
+| `59c2c6e7…` | `warm-lane-dot-task-destruction-paths` | `recon-stage-memory_consolidator` | observations_and_summaries | 0 | 0 | 0 | 0 | 0 | 2 |
+
+### Coverage
+
+<!-- DARK_FACTORY_COVERAGE:BEGIN -->
+Snapshot taken **2026-10-10** from the live `dark_factory` store:
+**18 canonicals** (`count_memories_by_metadata(filters={'canonical': True,
+'category': c})` = 8 `preferences_and_norms` + 10
+`observations_and_summaries`). The task text measured 7 + 8 on
+2026-09-21. The three added canonicals were written later by
+`recon-stage-memory_consolidator` (`da97c3d0…`, `59c2c6e7…`, `b410eb23…`),
+and each `supersedes` two now-deleted records.
+
+**Records emitted: 109** across **18 clusters**.
+
+| category | `canonical` | `duplicate` | `distinct` | total |
+|---|---|---|---|---|
+| `preferences_and_norms` | 8 | 4 | 52 | 64 |
+| `observations_and_summaries` | 10 | 12 | 23 | 45 |
+| **total** | **18** | **16** | **75** | **109** |
+
+Accounting against the 189 live topic members (canonicals included) plus the
+6 superseded ids:
+
+| disposition | n |
+|---|---|
+| emitted canonical | 18 |
+| emitted peer | 91 |
+| excluded — `off_category` | 57 |
+| excluded — `post_sitting_accretion` | 20 |
+| excluded — `child_record` | 3 |
+| excluded — `superseded_deleted` | 6 |
+| **total** | **195** |
+
+Pairs per category, as `partition_pairs_by_category` forms them:
+`preferences_and_norms` 10 true_dup / 1629 unrelated / 377 hard_negative;
+`observations_and_summaries` 39 true_dup / 871 unrelated / 80 hard_negative;
+2880 cross-category pairs dropped.
+<!-- DARK_FACTORY_COVERAGE:END -->
+
+### Known label ambiguities
+
+Recorded rather than silently resolved:
+
+- **Restatement stamp beside a unique-detail retention**, labelled
+  `duplicate` per R2's "Otherwise":
+  - `e2-bakeoff-gate-3200-review-findings` (all four peers). The stamp is
+    "Two findings, each independently recorded twice by two different agents".
+    For the 09:49 `claude-interactive` pair (`3880719a…`, `b80c2304…`) it
+    adds "independently restating them and dropping some measured detail".
+    The same canonical also says "all four peers are RETAINED and none is
+    absorbed; each holds measured detail found in no other". The 09:31
+    `claude-review-df-3200` pair (`defdd6ca…`, `2272731a…`) are the first
+    of each finding's two independent recordings. Labelling them `distinct`
+    would turn each restatement pair into a hard negative.
+  - `gitops-quarantine-rename-worktree-bare-branch-name`: `9d4ce9c8…` is
+    "THE MECHANISM, re-derived independently". The peer list's lead-in says
+    "each holding something the others do not".
+  - `prd-generic-mode-overlay-absent` (all four peers). The stamp is "the
+    record four separate sessions independently re-derived". The same text
+    also cites "the newest peer" (`4f678382…`, by `created_at`) for what an
+    overlay would buy, and an unidentified "one peer" for an embedded
+    related norm.
+- **Collective stamp.** `commit-planning-yaml-sidecar-comment-loss` names no
+  peer by id. Its stamp is "VERIFIED REPEATEDLY across independent batches
+  … Those per-batch citations live in the stamped peers". That
+  characterises the stamped peers, as a whole, as independent
+  re-verifications of the claim, so all seven admitted peers are
+  `duplicate`. These seven supply 28 of the 39
+  `observations_and_summaries` true_dup pairs, so this one reading decides
+  whether that category clears `MIN_CATEGORY_PAIRS`.
+- **"Independently" that is not a re-derivation.** `c6ff2aff…` was "written
+  27s after 78a57f3f, independently". It is still `distinct`: the
+  same text rules that the two "correct DIFFERENT things and neither
+  supersedes the other".
+- **The canonical's own count disagrees with admission.**
+  `verify-absence-claims-positive-control` says "Four incident write-ups".
+  Seven members pre-date it, and six are admitted (one is off-category).
+  Admission keys on `created_at`, because the store records no topic-stamp
+  time. A peer created earlier but stamped after the sitting is therefore
+  admitted. All six are `distinct` either way.
+- **Unnamed peers.** `architect-plan-files-scope`, `dashboard-redux-cache-buster`,
+  `resolve-ticket-timeout-discriminator`, `ewa-circuit-breaker` and
+  `guard-tests-grep-code-not-prose` carry admitted peers their canonical
+  never names. They are `distinct` under the rule above, because no
+  restatement stamp reaches them.
+
+### Re-extraction
+
+This file is a **point-in-time snapshot** of a live, still-accreting store.
+Re-extracting it is a new fixture revision, not a refresh. It changes the
+pair counts that
+`test_calibrate_write_triage_projects.py::TestCommittedLiveStoreCalibration`
+recomputes from this file, so it forces a re-run of the dark_factory
+calibration and a re-commit of its report and config entry.
+
+---
+
+## `write_triage_calibration_solar_challenge.jsonl`
+
+A SEPARATE labeled corpus for the `solar_challenge` project, extracted from the
+live `solar_challenge` Mem0 store's retain-and-tag topic clusters (task 7147)
+by the recipe of `write_triage_calibration_dark_factory.jsonl` above. It is
+calibrated **separately** —
+`calibrate_write_triage.py --project-id solar_challenge --fixture
+tests/fixtures/write_triage_calibration_solar_challenge.jsonl` — into its own
+report, `calibration/write_triage_calibration_report_solar_challenge.json`,
+and is **never pooled** with the `reify` corpus (R3). A derived cutoff would
+land in `config.yaml`'s `write_triage_project_calibrations.solar_challenge`,
+which only `scripts/audit_duplicate_memories.py` reads. The write path keeps
+the pooled `reify` bands.
+
+### Whose labels these are (R1)
+
+These are **curator-session labels, not Leo-adjudicated per cluster.** 11 of
+the 14 canonicals were written by `recon-stage-memory_consolidator`. The other
+three were written by task agents that stamped `canonical: true` themselves:
+`claude-task-877-implementer` (`f8478d71…`), `claude-task-488-implementer`
+(`c44b097f…`) and `claude-task-335-architect` (`bf29172c…`). R1 (Leo,
+2026-09-21) admits sitting-written labels as-is, and the dark_factory corpus
+already admits one non-curator author (a `claude-interactive` canonical). The
+three task-agent canonicals are admitted on that precedent and disclosed here.
+Together they contribute two peers (`cdbb67d3…`, `77f2f17e…`). As for
+dark_factory, this extraction formed **no fresh opinion**. Every
+non-canonical record quotes the deciding text verbatim in `provenance.ruling`.
+
+### Provenance mapping
+
+Identical to the dark_factory mapping above, with one addition.
+`metadata.supersedes` there was always a deleted id. Here, 11 of the 20
+superseded ids are **still live**: every id the three task-agent canonicals
+supersede, because those agents wrote `supersedes` without deleting
+anything. A live superseded id that is a topic member is admitted like any
+other member (`cdbb67d3…`, `77f2f17e…`). A live superseded id OUTSIDE the
+topic is not a member of the cluster, so it is tallied
+`superseded_live_off_topic` and not emitted.
+
+### Admission
+
+The dark_factory rules, in the same order, with one change. Rule 1 admits a
+member whose OWN `metadata.category` is any of
+`fused_memory.models.enums.MEM0_PRIMARY`: `preferences_and_norms`,
+`procedural_knowledge` or `observations_and_summaries`. dark_factory's
+two-category restriction was a dark_factory scoping choice, because the `reify`
+corpus already calibrates `procedural_knowledge`. It was never part of R1 or
+R2. Solar has no other corpus, and `procedural_knowledge` holds 4 of these 14
+canonicals and 15 of `solar_challenge_platform`'s 22, so excluding it would
+leave solar's largest category uncalibrated. No member was off-category.
+
+Every excluded member is tallied by its first failing rule: `off_category`,
+`child_record`, `post_sitting_accretion`. Each id in a canonical's
+`supersedes` is tallied `superseded_deleted` when `get_memory_by_id` answers
+`found: false`, and `superseded_live_off_topic` per *Provenance mapping*.
+
+`provenance.ruling` follows the dark_factory rule for a peer the canonical
+never names: the blanket peer statement where the sitting wrote one, else its
+ACCRETION/retain instruction. Three canonicals wrote neither: `f8478d71…`,
+`c44b097f…`, and on `solar_challenge_platform` `c05b41d4…`. For their unnamed
+peers, `ruling` quotes the canonical's opening statement of its claim, the
+claim the text never says the peer restates. A canonical's own `ruling` quotes
+its ACCRETION/retain statement, and is `null` where it wrote none.
+
+### Labels (R2)
+
+The dark_factory R2 table, applied verbatim. The result is **zero
+`duplicate` records**. No solar canonical characterises any peer as a
+restatement, rediscovery, independent re-derivation or duplicate of the
+canonical's own claim, by id prefix, by attribute or by collective stamp.
+Every admitted peer is `distinct`. Most of these canonicals are INDEX records:
+they name each peer for the one constituent claim, reading or occurrence it
+holds. So every category forms **zero `true_dup` pairs**, and its calibration
+outcome is a measured refusal (`empty_class`). That is a property of the
+corpus, not of the extraction. The judgement calls that decide it are listed
+under *Known label ambiguities*.
+
+### Per-canonical accounting
+
+Admitted peers by label, and excluded members by reason. Every live topic
+member is either emitted or tallied here.
+
+| canonical | topic | `gate_id` (agent_id) | category | dup | distinct | off_category | child_record | post_sitting_accretion | superseded_deleted | superseded_live_off_topic |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `093c7b03…` | `task-102-edge-count-recheck-cluster` | `recon-stage-memory_consolidator` | observations_and_summaries | 0 | 6 | 0 | 0 | 0 | 0 | 0 |
+| `a2d47c99…` | `task-94-96-liveness-check-cluster` | `recon-stage-memory_consolidator` | observations_and_summaries | 0 | 10 | 0 | 0 | 4 | 1 | 0 |
+| `6d9474b0…` | `task-99-stage2-addenda-cluster` | `recon-stage-memory_consolidator` | observations_and_summaries | 0 | 9 | 0 | 0 | 3 | 0 | 0 |
+| `8f26eeac…` | `task-98-namespace-count-recheck-cluster` | `recon-stage-memory_consolidator` | observations_and_summaries | 0 | 3 | 0 | 0 | 2 | 0 | 0 |
+| `7bd1ff07…` | `entity-merge-audit-20260919-flag-history` | `recon-stage-memory_consolidator` | observations_and_summaries | 0 | 2 | 0 | 1 | 0 | 0 | 0 |
+| `5e93c78b…` | `stage2-relay-llm-analysis-gap-flag-history` | `recon-stage-memory_consolidator` | observations_and_summaries | 0 | 9 | 0 | 1 | 0 | 0 | 0 |
+| `01ebe34c…` | `review-solar-challenge-20261013` | `recon-stage-memory_consolidator` | observations_and_summaries | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `0a2e32a2…` | `license-header-spdx-convention` | `recon-stage-memory_consolidator` | preferences_and_norms | 0 | 0 | 0 | 0 | 0 | 3 | 0 |
+| `2432a184…` | `test-anti-pattern-prose-and-introspection-guards` | `recon-stage-memory_consolidator` | preferences_and_norms | 0 | 0 | 0 | 0 | 0 | 3 | 0 |
+| `f8478d71…` | `dependency-floor-contracts` | `claude-task-877-implementer` | preferences_and_norms | 0 | 1 | 0 | 0 | 0 | 0 | 3 |
+| `6b6817b4…` | `web-assistant-anthropic-lazy-import-gotcha` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 0 | 0 | 2 | 0 | 2 | 0 |
+| `87340b3c…` | `followup-dispatched-before-parent-gotcha` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 2 | 0 | 9 | 2 | 0 | 0 |
+| `c44b097f…` | `cli-fleet-simulator-seam` | `claude-task-488-implementer` | procedural_knowledge | 0 | 1 | 0 | 0 | 1 | 0 | 4 |
+| `bf29172c…` | `fleet-wide-home-settings` | `claude-task-335-architect` | procedural_knowledge | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
+
+### Coverage
+
+<!-- SOLAR_CHALLENGE_COVERAGE:BEGIN -->
+Snapshot taken **2026-10-21** from the live `solar_challenge` store: **14
+canonicals** (`count_memories_by_metadata(filters={'canonical': True,
+'category': c})` = 7 `observations_and_summaries` + 4 `procedural_knowledge`
++ 3 `preferences_and_norms`). There were 13 on 2026-10-19; the 14th,
+`f8478d71…`, was written at 2026-10-19T18:21Z.
+
+**Records emitted: 57** across **14 clusters**.
+
+| category | `canonical` | `duplicate` | `distinct` | total |
+|---|---|---|---|---|
+| `observations_and_summaries` | 7 | 0 | 39 | 46 |
+| `procedural_knowledge` | 4 | 0 | 3 | 7 |
+| `preferences_and_norms` | 3 | 0 | 1 | 4 |
+| **total** | **14** | **0** | **43** | **57** |
+
+Accounting against the 82 live topic members (canonicals included) plus the
+18 superseded ids outside them. The other two superseded ids, `cdbb67d3…` and
+`77f2f17e…`, are live topic members and are counted as emitted peers.
+
+| disposition | n |
+|---|---|
+| emitted canonical | 14 |
+| emitted peer | 43 |
+| excluded — `off_category` | 0 |
+| excluded — `child_record` | 13 |
+| excluded — `post_sitting_accretion` | 12 |
+| excluded — `superseded_deleted` | 9 |
+| excluded — `superseded_live_off_topic` | 9 |
+| **total** | **100** |
+
+Pairs per category, as `partition_pairs_by_category` forms them:
+`observations_and_summaries` 0 true_dup / 860 unrelated / 175 hard_negative;
+`procedural_knowledge` 0 true_dup / 17 unrelated / 4 hard_negative;
+`preferences_and_norms` 0 true_dup / 5 unrelated / 1 hard_negative;
+534 cross-category pairs dropped.
+<!-- SOLAR_CHALLENGE_COVERAGE:END -->
+
+### Known label ambiguities
+
+Recorded rather than silently resolved:
+
+- **Re-verification series, labelled `distinct`. This is the decisive call.**
+  Four INDEX canonicals describe peers as re-verifications or rechecks:
+  - `093c7b03…`, "a recurring periodic edge-count re-verification series"
+    (`b7eadd06…`, `ba81cec0…`, `b35881f1…`, `a78981b4…`, `ca5506a3…`);
+  - `8f26eeac…`, three addenda "each re-verifying the …
+    count snapshot and finding the prior one stale";
+  - `6d9474b0…`, "three confirmatory worktree-existence-oscillation
+    rechecks" (`9d3d5b4c…`, `2f61f324…`, `d66e2445…`);
+  - `a2d47c99…`, "Later independent rechecks … (e.g. … `e0541377…`)".
+
+  The dark_factory collective-stamp precedent (`commit-planning-yaml-sidecar-comment-loss`)
+  labelled its peers `duplicate` because the stamp characterised them as
+  independent re-verifications of THE CANONICAL'S OWN claim. Here each
+  canonical's claim is the cluster's history. Each recheck re-verifies a
+  sub-claim (an edge count, a namespace count, a worktree oscillation) and
+  records its own reading. In `093c7b03…` and `8f26eeac…` those readings
+  differ (11 edges, then 7; "finding the prior one stale"). `093c7b03…`
+  also "REVERSES the conclusion this canonical and its 5 recheck peers
+  previously carried". A `duplicate` label would pair every recheck with the
+  INDEX canonical as a true duplicate, and R2 has no label for "duplicates of
+  each other but not of the canonical". Labelled `duplicate`, the four series
+  would supply 28 `observations_and_summaries` true_dup pairs (15 + 6 + 6 +
+  1), past `MIN_CATEGORY_PAIRS` = 20. **This one reading therefore decides
+  whether the category can calibrate at all.**
+- **A detail pointer is not a restatement.** `093c7b03…` sends its root cause
+  to "full detail: peer `115bbaba…`". The text characterises that peer as the
+  detail's home, not as a restatement, so it is `distinct`.
+- **Live superseded peers named only in `metadata.supersedes`.** `cdbb67d3…`
+  (under `f8478d71…`) and `77f2f17e…` (under `c44b097f…`) are never named in
+  the canonical's text. R2 reads text, so both are `distinct`. In both cases
+  the canonical's claim replaces the peer's: `f8478d71…` deletes the
+  per-table floor tests that `cdbb67d3…` prescribes, and `c44b097f…`
+  generalises `77f2f17e…`'s `SweepSimulator` into `CliFleetSimulator`. A
+  correction is `distinct` under R2 either way.
+- **Named peers absent from the topic scroll.** `7bd1ff07…` names four
+  re-verification flags as peers. `84e0f7b9…`, `36f84e02…` and `54de2da7…`
+  were deleted by `flag_for_stage2_gc_sweep` on 2026-10-20/21, AFTER the
+  2026-10-19 soak (their tombstones say so). `555d6ff9…` answers
+  `found: false` with no tombstone. `01ebe34c…` names two child records
+  (`cfa3da80…`, `5b5850ac…`), which are live but carry no topic stamp. None
+  of these six is a topic member, so none is emitted or tallied.
+- **Canonicals edited after creation.** `093c7b03…` and `6d9474b0…` name
+  peers created after their own `created_at`, because the sitting edited
+  them later. Admission keys on `created_at` OR naming, so those peers are
+  admitted.
+
+### Re-extraction
+
+This file is a **point-in-time snapshot** of a live, still-accreting store,
+and the store moved between the 2026-10-19 soak and this 2026-10-21
+snapshot (see the GC deletions above). It was read through the production
+read path: `Mem0Backend.scroll_by_metadata`, the call
+`get_memories_by_metadata(filters={'canonical': True})` and
+`(filters={'topic': <slug>})` make, and `Mem0Backend.get_point_by_id`, the
+call `get_memory_by_id` makes. A read-only scratch script ran them, so
+`content` is the stored `metadata.data` byte for byte rather than retyped from
+tool output. Each topic count was cross-checked against
+`count_memories_by_metadata`. No extractor is committed: the labels are R2
+readings of each canonical's prose, recorded verbatim in `provenance.ruling`,
+and a script cannot re-derive them. Re-extraction is a new fixture revision.
+It changes the pair counts
+`test_calibrate_write_triage_projects.py::TestCommittedLiveStoreCalibration`
+recomputes, so it forces a re-run of this project's calibration.
+
+---
+
+## `write_triage_calibration_solar_challenge_platform.jsonl`
+
+The `solar_challenge_platform` corpus (task 7147), built by exactly the recipe
+of `write_triage_calibration_solar_challenge.jsonl` above. The same Whose
+labels, Provenance mapping, Admission, Labels (R2) and Re-extraction
+statements apply, with this project's id substituted. It is calibrated
+separately into
+`calibration/write_triage_calibration_report_solar_challenge_platform.json`.
+
+### Whose labels these are (R1)
+
+16 of the 22 canonicals were written by `recon-stage-memory_consolidator` and
+one (`323d58aa…`) by `recon-stage-task_knowledge_sync`. Five came from named
+curator sittings: `curator-recon-sitting-2026-09-12`,
+`curator-scp-185-rollup-split-2026-09-27`, and three
+`curator-l2-watcher-2026-10-0*` sittings, which carry a Leo ruling in
+`metadata.ruling` ("Leo 2026-10-05 sitting item 123=A"). No canonical here is
+task-agent-authored, and no superseded id is still live.
+
+### Labels (R2)
+
+**Zero `duplicate` records**, for the reason given for `solar_challenge`.
+Every admitted peer is `distinct`, and every category forms zero `true_dup`
+pairs.
+
+### Per-canonical accounting
+
+| canonical | topic | `gate_id` (agent_id) | category | dup | distinct | off_category | child_record | post_sitting_accretion | superseded_deleted |
+|---|---|---|---|---|---|---|---|---|---|
+| `0159f20d…` | `mem0_evidentiary_anchor_deletion_pattern` | `curator-recon-sitting-2026-09-12` | observations_and_summaries | 0 | 11 | 0 | 0 | 1 | 0 |
+| `69752e58…` | `task-204-esc-204-4-unblock-churn` | `recon-stage-memory_consolidator` | observations_and_summaries | 0 | 4 | 0 | 0 | 1 | 3 |
+| `e86d80c0…` | `task-239-esc-239-3-unblock-churn` | `recon-stage-memory_consolidator` | observations_and_summaries | 0 | 3 | 0 | 2 | 0 | 1 |
+| `323d58aa…` | `task-270-esc-270-3-unblock-churn` | `recon-stage-task_knowledge_sync` | observations_and_summaries | 0 | 2 | 0 | 0 | 0 | 0 |
+| `9f4aa4a9…` | `task-252-esc-252-3-unblock-churn` | `recon-stage-memory_consolidator` | observations_and_summaries | 0 | 0 | 0 | 4 | 1 | 0 |
+| `95cabb48…` | `task-173-liveness-investigation` | `curator-scp-185-rollup-split-2026-09-27` | observations_and_summaries | 0 | 6 | 0 | 0 | 0 | 1 |
+| `f515b56b…` | `per-tick-metric-set-vs-metric-enum` | `recon-stage-memory_consolidator` | preferences_and_norms | 0 | 0 | 0 | 0 | 0 | 3 |
+| `3fb8e09c…` | `settlement-max-gap-seconds-zero-energy` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 0 | 0 | 0 | 0 | 2 |
+| `27b6fba2…` | `settlement-hh-bucket-start-vs-half-hour-end` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 0 | 0 | 0 | 0 | 2 |
+| `26651f59…` | `billing-congruence-gate-importfrom-alias-gap` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 0 | 0 | 0 | 0 | 5 |
+| `bb809ee9…` | `cross-project-actionable-disposition-convention` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 3 | 0 | 0 | 0 | 0 |
+| `7027445c…` | `bash-tool-git-commit-heredoc-mangling` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 0 | 0 | 3 | 0 | 3 |
+| `c05b41d4…` | `bash-tool-cat-silent-truncation-gotcha` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 1 | 0 | 0 | 5 | 5 |
+| `4a0ef137…` | `register-seed-static-source-no-lookback` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 2 | 0 | 0 | 0 | 1 |
+| `c91a09c3…` | `billing-statement-numeric-round-trip-carve-out` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 4 | 0 | 2 | 1 | 0 |
+| `985610ee…` | `verify-suite-duration-and-timeout` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 11 | 0 | 20 | 16 | 0 |
+| `e0aee2e3…` | `agent-followup-task-dependency-prose-only` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 1 | 0 | 0 | 1 | 4 |
+| `17e2bb4e…` | `submit-task-metadata-files-directory-rejection` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 0 | 0 | 0 | 0 | 2 |
+| `c118ef48…` | `browser-e2e-lane-playwright` | `recon-stage-memory_consolidator` | procedural_knowledge | 0 | 6 | 0 | 0 | 1 | 3 |
+| `0c42ccd7…` | `admin-samples-docsgen-render` | `curator-l2-watcher-2026-10-05` | procedural_knowledge | 0 | 0 | 0 | 0 | 0 | 2 |
+| `1e1b0eb2…` | `frontend-npm-vitest-jsdom-pins` | `curator-l2-watcher-2026-10-06` | procedural_knowledge | 0 | 0 | 0 | 0 | 1 | 2 |
+| `b270fce8…` | `frontend-component-test-harness` | `curator-l2-watcher-2026-10-06` | procedural_knowledge | 0 | 0 | 0 | 0 | 0 | 2 |
+
+### Coverage
+
+<!-- SOLAR_CHALLENGE_PLATFORM_COVERAGE:BEGIN -->
+Snapshot taken **2026-10-21** from the live `solar_challenge_platform` store:
+**22 canonicals** (`count_memories_by_metadata(filters={'canonical': True,
+'category': c})` = 6 `observations_and_summaries` + 15
+`procedural_knowledge` + 1 `preferences_and_norms`).
+
+**Records emitted: 76** across **22 clusters**.
+
+| category | `canonical` | `duplicate` | `distinct` | total |
+|---|---|---|---|---|
+| `observations_and_summaries` | 6 | 0 | 28 | 34 |
+| `procedural_knowledge` | 15 | 0 | 26 | 41 |
+| `preferences_and_norms` | 1 | 0 | 0 | 1 |
+| **total** | **22** | **0** | **54** | **76** |
+
+Accounting against the 135 live topic members (canonicals included) plus the
+41 superseded ids, every one of which answers `found: false`:
+
+| disposition | n |
+|---|---|
+| emitted canonical | 22 |
+| emitted peer | 54 |
+| excluded — `off_category` | 0 |
+| excluded — `child_record` | 31 |
+| excluded — `post_sitting_accretion` | 28 |
+| excluded — `superseded_deleted` | 41 |
+| **total** | **176** |
+
+Pairs per category, as `partition_pairs_by_category` forms them:
+`observations_and_summaries` 0 true_dup / 465 unrelated / 96 hard_negative;
+`procedural_knowledge` 0 true_dup / 722 unrelated / 98 hard_negative;
+`preferences_and_norms` forms no pair (one record); 1469 cross-category
+pairs dropped.
+<!-- SOLAR_CHALLENGE_PLATFORM_COVERAGE:END -->
+
+### Known label ambiguities
+
+- **Per-occurrence and per-reading INDEX peers.** None of these is a
+  restatement stamp, and all of them are `distinct`:
+  - `0159f20d…` rules its eight relay notes "each … the sole surviving record
+    of a DISTINCT, non-overlapping occurrence range";
+  - `69752e58…`, `e86d80c0…` and `323d58aa…` name each peer as one dated
+    "reading". `3ca18d8e…` is "one further re-block/re-arm cycle, unchanged
+    root cause";
+  - `95cabb48…` names `4ef2518b…` "passes 3–7, no drift";
+  - `985610ee…` names "the dated full-suite measurements";
+  - `e0aee2e3…`'s `58eaad1e…` is one entry in an "Observed repeatedly" list.
+- **"Independently reconfirming" is not about a peer.** In `69752e58…` and
+  `9f4aa4a9…` the phrase describes the task's `metadata.dry_run_proposals`,
+  not any stored peer.
+- **The canonical's own count disagrees with admission.** `0159f20d…` says
+  "only 8 Stage-2 relay notes survive". A ninth relay-kind member,
+  `21a8e2c0…`, pre-dates the sitting and is never named, so it is admitted.
+  It is `distinct` either way, covered by the sitting's "RETAIN ALL" ruling.
+- **Cross-category peers form no in-cluster pairs.** They keep their own
+  category: `228978c8…` (procedural_knowledge, in observations cluster
+  `0159f20d…`), and `7221e605…`, `24d15d91…` (in `c91a09c3…`) and
+  `78425f10…` (in `bb809ee9…`), which are observations_and_summaries in
+  procedural_knowledge clusters.
+- **An unnamed peer under a canonical with no peer statement.** `c05b41d4…`
+  wrote neither a blanket peer statement nor an ACCRETION instruction, so
+  `c684004a…`'s `ruling` quotes the canonical's opening claim, per the solar
+  ruling rule above.
+- **Canonicals edited after creation.** `69752e58…`, `323d58aa…`,
+  `985610ee…` and `e0aee2e3…` name peers created after their own
+  `created_at`. Those peers are admitted by naming.
+
 ---
 
 ## `memory_eval_topic_registry.json`
@@ -214,7 +799,9 @@ The probed-topic registry for the **E1 retrieval-health** eval
 (`docs/prds/memory-eval-program.md` §5 leaf β, task 3208). Read by
 `fused-memory/scripts/memory_eval_retrieval_probe.py` via
 `load_topic_registry()`; its shape is contract-tested in
-`fused-memory/tests/test_memory_eval_retrieval_probe.py`.
+`fused-memory/tests/test_memory_eval_retrieval_probe.py`, and its
+`briefing_query` topics are pinned to their source in
+`fused-memory/tests/test_memory_eval_briefing_topics.py`.
 
 ### Purpose
 
@@ -233,7 +820,7 @@ below. Per entry:
 
 | field | meaning |
 |---|---|
-| `topic` | Stable slug. **This is a persisted key** — the tripwire item key is `t-<topic>`, which the grandfather set stores. Renaming one silently re-releases a grandfathered item. |
+| `topic` | Stable slug. **This is a persisted key** — the tripwire item key is `t-<topic>`, which the grandfather set stores. Renaming one silently re-releases a grandfathered item. Slugs must be unique after the `normalize_topic` fold (lowercased, `_` read as `-`), so two entries spelling one topic with `-` and `_` are a load failure. |
 | `project_id` | `dark_factory` or `reify` — which corpus to probe. |
 | `derived_from` | Provenance tag: `curator_gate`, `census_topic`, `topic_guard_cluster`, `briefing_query`, `hand`. Lets a later run tell which entries auto-derivation has taken over from hand-authoring. |
 | `canonical.content_hash` | `content_key()` of the expected entry — sha256 of whitespace-normalised content, `hexdigest()[:16]`. The **primary** matcher. |
@@ -243,6 +830,8 @@ below. Per entry:
 | `claim_queries[]` | `{query, needles}`. A claim is recalled when **all** needles appear in some returned entry — deliberately weaker than canonical identity, so a consolidation that moved a claim into a different entry does not read as knowledge loss. |
 | `members[]` | Content hashes of entries the curator adjudicated as the same claim. |
 | `supersedes_pairs[]` | `{superseded_hash, successor_hash}`, recorded **offline**. |
+| `search_scope` | Optional `{stores, categories}` the probe forwards to `search`, for a topic whose real caller scopes its own search. Absent means unscoped (the router picks). Parsed strictly: an empty or misspelt scope is a load failure, not a silent widening. |
+| `briefing_scopes[]` | `briefing_query` topics only: the pinned `BriefingScope` inputs (`task_id`, `title`, `files`) the tuned phrasings are rendered from. Read only by `test_memory_eval_briefing_topics.py`; the probe carries it in `RegistryEntry.extra`. |
 
 Unknown keys on an entry load untouched (the loader is required-strict /
 additive-tolerant), so 3201's widened derivation is an improvement rather
@@ -268,7 +857,7 @@ relation is therefore recorded at derivation time from committed sources, and
 the runtime metric reduces to "is `index(superseded) < index(successor)` in
 this one result list" — no pointer-shape knowledge at runtime at all.
 
-### Provenance (32 topics)
+### Provenance
 
 - **20 `curator_gate`** — one per adjudicated cluster in
   `write_triage_calibration.jsonl` (17 `esc-55xx`/`56xx` gates). The
@@ -281,15 +870,23 @@ this one result list" — no pointer-shape knowledge at runtime at all.
   `fused_memory/config/schema.py:_default_topic_guard_clusters()`.
 - **4 `census_topic`** — multi-entry topics from
   `plans/memory-metadata-census-report.json`.
-- **1 `briefing_query`** — `g7-design-invariants`, carrying the four
-  briefing-assembler queries (`briefing.py:978-1013`) as its phrasings. This
-  is the highest-leverage query surface in the system: those four run against
-  every dispatched task's context window.
+- **3 `briefing_query`** — one per query spec in
+  `shared/src/shared/briefing_queries.py::QUERY_SPECS`, keyed by the spec's
+  own `slug` (PRD `docs/prds/memory-briefing-and-fusion.md` D9). This is the
+  highest-leverage query surface in the system: these queries run against
+  every dispatched task's context window. The tuned phrasings are the
+  queries `queries_for()` fires for the pinned `briefing_scopes`, and the
+  conventions topics carry the conventions channel's `search_scope`; both are
+  **pinned by `test_memory_eval_briefing_topics.py`, not hand-maintained**,
+  so a reworded template fails that test rather than silently leaving the
+  probe measuring a query nobody issues. These topics key a query the
+  briefing fires, not a `metadata.topic` value, so the metadata census does
+  not gauge them.
 - **3 `hand`** — single-entry dark_factory topics.
 
 ### What the registry does **not** cover (`_disclosures`)
 
-32 topics is a *selection*. `scripts/memory_eval_retrieval_probe.py
+The committed topics are a *selection*. `scripts/memory_eval_retrieval_probe.py
 --derive-registry` emits 74 candidates from the committed offline sources,
 and the census tail it never offered at all is larger still. Every one of
 those narrowings is recorded in the top-level `_disclosures` block and
@@ -298,12 +895,21 @@ narrowing nobody can see reads downstream as "there was nothing there".
 
 | key | meaning |
 |---|---|
-| `curator_gate_clusters` / `census_topics_emitted` / `topic_guard_clusters` | Candidates derivation produced, per source. |
+| `curator_gate_clusters` / `census_topics_emitted` / `topic_guard_clusters` | Candidates derivation KEPT, per source, after slug collisions were dropped. |
 | `census_topics_skipped_singleton` | Census topics with `count <= 1`. A one-entry topic answers "is the canonical in the top k" by that entry's mere existence — presence, not retrieval. |
 | `curator_clusters_without_canonical` | Calibration clusters carrying no `canonical`-labelled row, so no entry could be built. |
 | `census_rows_malformed_value` / `census_rows_malformed_count` | Census rows whose `value` / `count` was the wrong shape. Counted **separately** from the singleton skip: a malformed row is a broken census, a singleton is a healthy one — folding them together reports a schema break as a corpus property. |
-| `slug_collisions_dropped` | Candidates whose slug collided with one already emitted. |
+| `slug_collisions_dropped` | Candidates dropped because their slug names a topic already kept, compared with `normalize_topic` (lowercased, `_` read as `-`), so `architect_report_…` and `architect-report-…` are one topic. The richer source wins: `curator_gate` > `topic_guard_cluster` > `census_topic`. Between two census spellings, the more-used one is kept, and on a tie the lexically first, whatever order the census file lists its rows in. The three per-source counts plus this one account for every candidate derivation generated. |
 | `derived_candidates_not_carried` | Candidates derivation emitted that this fixture does **not** contain. Mostly census topics whose canonical `content_hash` is unknown offline (derivation leaves it empty) and which no operator has resolved against a live read-only scroll yet. |
+
+`--derive-registry` refuses a census whose `grand_total.topic.entries` table
+is absent or not object/list-shaped, or which is not decodable JSON: it exits
+2 naming the census path and prints nothing. A census file it cannot read
+at all, such as a wrong path, is a run failure instead (exit 1), like any
+unreadable derivation source. An EMPTY table is a healthy
+census of a corpus with no topic values, and derives zero census candidates.
+The two are told apart because both read zero in every census counter, as the
+2026-08-31 stub `{"baseline": true}` did.
 
 Regenerate the derivation half with `--derive-registry` and merge; the flag
 prints and never overwrites, because the hand-authored held-out phrasings
@@ -313,11 +919,14 @@ A `_disclosures` value that is not an integer is a **named load failure**,
 not a silently dropped key — dropping it would erase the record that a
 narrowing happened, which is exactly the state the block exists to prevent.
 
-The `topic_guard_cluster`, `census_topic`, `hand` and `briefing_query`
-canonicals were resolved by a **read-only Qdrant payload scroll** on
-2026-07-30 (no embedder, no writes), because unlike the curator clusters their
-content is not committed anywhere in this repo. Their hashes are therefore
-re-derivable only against a live store; the curator-gate 20 are not.
+The `topic_guard_cluster`, `census_topic` and `hand` canonicals were resolved
+by a **read-only Qdrant payload scroll** on 2026-07-30 (no embedder, no
+writes), because unlike the curator clusters their content is not committed
+anywhere in this repo. The `briefing_query` canonicals were hand-adjudicated
+on 2026-09-30 by read-only searches under each topic's own `search_scope`,
+chosen as the entry that SHOULD answer the query rather than whatever ranked
+first. Both sets of hashes are therefore re-derivable only against a live
+store; the curator-gate 20 are not.
 
 ### Exclusions
 
@@ -731,3 +1340,90 @@ has no writer in the live system, so an injection must not inherit
 contested-ness from the claim it re-emits. The `topic` key is written
 into record metadata only under the `stamped` mode — the `unstamped`
 mode, which models reality today, carries no `topic` key at all.
+
+---
+
+## `curator_transcripts/`
+
+Five **redacted structural copies** of real TaskCurator CLI transcripts:
+the Exhibit A for each branch of the curator's timeout classification, and
+for the rule that only a verdict the CLI ACCEPTED is ever salvaged (task
+3995). Consumed by `fused-memory/tests/test_task_curator_timeout_evidence.py`,
+which materializes each file at
+`<curator config dir>/projects/<slug>/<session_id>.jsonl` and drives
+`TaskCurator.curate` against it, and which also feeds the records straight
+to `shared.cli_invoke.transcript_evidence`.
+
+The source files live in the operator's home under random neutral-cwd slugs
+and are subject to CLI retention, so a test reading them would skip on every
+other machine. These copies make the classification reproducible in CI.
+
+### Provenance
+
+The first three sources were read on 2026-09-27. Turn counts and tool
+sequences were re-measured at extraction and match the counts cited in the
+task.
+
+| fixture | source (`~/.claude/projects/…`) | session id | assistant records | tool_use sequence | evidences |
+|---|---|---|---|---|---|
+| `esc_curator_33_salvageable.jsonl` | `-tmp-fm-neutral-classifier-cwd-wgm-f3h8/` | `d9b60a7a-a675-40cb-964d-eb5a2e20ff1e` | 2 | `StructuredOutput` | esc-curator-33: the verdict was COMPLETED in the transcript but never reached stdout |
+| `esc_curator_2_tool_wandering.jsonl` | `-tmp-fm-neutral-classifier-cwd-ds70bqzs/` | `91c4bcfd-d262-4f77-8df8-09a60321cc4c` | 6 | `ToolSearch` → `TaskGet` → `ToolSearch` | esc-curator-2: a "pure classifier" loading and running deferred tools, no verdict |
+| `esc_curator_4_pre_turn_stall.jsonl` | `-tmp-fm-neutral-classifier-cwd-3zgf473k/` | `42efe70b-26b4-426b-8adc-682b8544175e` | 0 | none | esc-curator-4: the only genuine pre-turn stall of the three |
+
+The other two are **rejected-only** transcripts: the model called
+`StructuredOutput` with a dict input, the CLI answered with an `is_error`
+tool_result, and no `structured_output` attachment (the CLI's acceptance
+record) was ever written. Each is one of the 24 rejected-only curator
+transcripts measured on 2026-09-28, when both sources were read and their
+turn counts re-measured. Salvaging either would turn a rejected attempt into
+a verdict.
+
+| fixture | source (`~/.claude/projects/…`) | session id | CLI | assistant records | tool_use sequence | rejection |
+|---|---|---|---|---|---|---|
+| `schema_tool_denied_rejected_only.jsonl` | `-tmp-fm-neutral-classifier-cwd-5daj6zhy/` | `33f5159c-b127-43a1-87cf-a71013b1471d` | 2.1.222 | 2 | `StructuredOutput` (denied) | permission denial, "The user doesn't want to proceed with this tool use...": the shape of a `--tools ''` regression that denies the schema tool |
+| `schema_rejected_only.jsonl` | `-tmp-fm-neutral-classifier-cwd-6nd89svh/` | `50df7bda-6c99-48ee-8cfa-72c524161007` | 2.1.283 | 2 | `StructuredOutput` (rejected) | schema mismatch, "Output does not match required schema: /rewritten_task: must be object,null" |
+
+### What is preserved, and what is redacted
+
+Preserved exactly, because classification depends on it:
+- every record's `type`, in the original ORDER, including the interleaved
+  `queue-operation` / `attachment` / `last-prompt` / `user` records a parser
+  must skip;
+- the `record['message']['content']` nesting, plus `message.role`,
+  `message.model` and `message.stop_reason` on assistant records;
+- every `tool_use` block's `name`, and the KEY SET of each `input`;
+- `timestamp`, which carries the latency evidence (for example, the
+  salvageable run's first assistant record arrived ~102s after its prompt);
+- the `tool_reference` lists a `ToolSearch` returned, which show which
+  deferred tools the model loaded.
+
+Redacted to the placeholder `"redacted"`: all prose (prompts, `thinking`
+text and signatures, justification strings, `ToolSearch` queries, `TaskGet`
+ids, and string tool results). `tool_use` ids are renumbered
+`toolu_fixture_NN`, consistently across a file, so each `tool_use` still
+pairs with its `tool_result`. Every other record key (`cwd`, `uuid`,
+`sessionId`, `version`, attachment bodies, …) is dropped.
+
+The two rejected-only fixtures additionally keep each tool_result's
+`is_error` flag and its text verbatim, plus the trailing
+`[Request interrupted by user for tool use]` marker: these are CLI output,
+not prose, and the error text is the evidence of why the call was rejected.
+`action` and `priority` are enum values and are kept; `schema_rejected_only`'s
+real `target_id` is replaced by the synthetic `"9001"`, and its other string
+inputs (including the malformed string `rewritten_task` the schema rejected)
+become `"redacted"`, so the value types the rejection depends on survive.
+
+**One value is deliberately changed.** The real esc-curator-33 verdict was
+`action: "create"` with a null `target_id`. The fixture's `StructuredOutput`
+input (and the matching `structured_output` attachment's `data`) is
+`action: "drop"`, `target_id: "9001"`. The curator's failure path degrades
+to `create`, so a `create` verdict could not show whether it was salvaged or
+defaulted, while a salvaged `drop` can only come from the transcript. A test
+using it must put a pool entry with id `9001` in the pool.
+
+### Regenerating
+
+These are hand-checkable plain JSONL (< 4 KB each). Edit them directly. A
+change to a record type, its order, a tool name or the `StructuredOutput`
+key set changes what the fixture is evidence of: re-measure it against the
+source, and update the table above in the same commit.

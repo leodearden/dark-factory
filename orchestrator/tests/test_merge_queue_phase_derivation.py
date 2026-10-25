@@ -20,7 +20,7 @@ phase encodings that predate it:
   step-6  GREEN — ``InflightEntry.phase`` field deleted; existing tests
                   reconciled to drive registry state instead
 
-This module imports orchestrator.merge_queue LOCALLY inside each test method
+This module imports orchestrator.merge_lane.worker LOCALLY inside each test method
 (not at module scope) so a not-yet-implemented symbol never breaks collection
 of the rest of the file during the RED steps — mirrors
 test_merge_queue_lifecycle_registry.py's / test_merge_queue_request_liveness.py's
@@ -35,9 +35,16 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from _merge_lane_fakes import FakeClock, FakeVerifier
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+
+# The worker reports every age against its own clock, so pinning that clock is
+# what makes ``snapshot()``'s ages assertable: a request enqueued ENTRY_AGE_SECS
+# before NOW reports exactly that age.
+NOW = 1_000_000.0
+ENTRY_AGE_SECS = 42.0
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -86,14 +93,17 @@ def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
 
 
 def _make_worker(git_ops: GitOps):
-    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring).
+    """Build a bare MergeLane for unit tests (no harness wiring).
 
-    Mirrors test_merge_queue_lifecycle_registry.py's / test_merge_queue_
-    invariant_integration_gate.py:212's ``_make_worker``.
+    The verify and clock ports are the fakes from ``_merge_lane_fakes``, so
+    every observation this file makes through ``snapshot()`` is deterministic
+    — in particular the ages, which the worker reads off its own clock.
     """
-    from orchestrator.merge_queue import SpeculativeMergeWorker
+    from orchestrator.merge_lane import MergeLane
 
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+    return MergeLane(
+        git_ops, asyncio.Queue(), verifier=FakeVerifier(), clock=FakeClock(time=NOW),
+    )
 
 
 def _make_request(
@@ -108,7 +118,7 @@ def _make_request(
     request_liveness.py (per-file duplication convention — see this file's
     module docstring).
     """
-    from orchestrator.merge_types import MergeRequest, QueuedBranch
+    from orchestrator.merge_lane.types import MergeRequest, QueuedBranch
 
     return MergeRequest(
         task_id=task_id,
@@ -120,6 +130,7 @@ def _make_request(
         config=config,
         result=asyncio.get_running_loop().create_future(),
         lane='normal',
+        enqueued_at=NOW - ENTRY_AGE_SECS,
     )
 
 
@@ -179,7 +190,7 @@ class TestPhaseDerivesFromRegistry:
     async def test_registry_transition_moves_reported_phase(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState, RealMergeItem
+        from orchestrator.merge_lane.worker import InflightEntry, ItemLifecycleState, RealMergeItem
 
         worker = _make_worker(git_ops)
 
@@ -197,6 +208,11 @@ class TestPhaseDerivesFromRegistry:
 
         snap = worker.snapshot()
         assert snap['entries'][0]['state'] == 'verifying'
+        assert snap['depth'] == 1
+        assert snap['entries'][0]['age_secs'] == ENTRY_AGE_SECS, (
+            'the entry is aged by the worker\'s own clock; got '
+            f"{snap['entries'][0]['age_secs']!r}."
+        )
         assert snap['verify_in_progress']['phase'] == 'verifying'
         assert rid in worker.frozen_prefix()
 
@@ -225,7 +241,7 @@ class TestPhaseDerivesFromRegistry:
     async def test_finalizing_head_excluded_when_registry_is_non_qualifying(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState, RealMergeItem
+        from orchestrator.merge_lane.worker import InflightEntry, ItemLifecycleState, RealMergeItem
 
         worker = _make_worker(git_ops)
 
@@ -267,7 +283,7 @@ class TestInflightEntryHasNoPhaseField:
     """
 
     def test_phase_field_absent_from_dataclass(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.merge_lane.worker import InflightEntry
 
         field_names = {f.name for f in dataclasses.fields(InflightEntry)}
         assert 'phase' not in field_names, (
@@ -279,7 +295,7 @@ class TestInflightEntryHasNoPhaseField:
     async def test_derivation_works_with_no_phase_field(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState, RealMergeItem
+        from orchestrator.merge_lane.worker import InflightEntry, ItemLifecycleState, RealMergeItem
 
         worker = _make_worker(git_ops)
 
@@ -296,11 +312,12 @@ class TestInflightEntryHasNoPhaseField:
         )
         worker._inflight.append(entry)
 
-        assert worker._entry_phase(entry) == 'verifying', (
-            f'expected _entry_phase to derive verifying from the registry '
-            f'for {rid!r} with no phase field present on the entry.'
-        )
-
         snap = worker.snapshot()
-        assert snap['entries'][0]['state'] == 'verifying'
+        assert snap['depth'] == 1
+        assert snap['entries'][0]['state'] == 'verifying', (
+            f'expected the reported state to derive verifying from the '
+            f'registry for {rid!r} with no phase field present on the entry; '
+            f"got {snap['entries'][0]['state']!r}."
+        )
+        assert snap['entries'][0]['age_secs'] == ENTRY_AGE_SECS
         assert snap['verify_in_progress']['phase'] == 'verifying'

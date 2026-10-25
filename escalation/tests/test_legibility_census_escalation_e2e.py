@@ -38,6 +38,7 @@ shape (`test_capability_guard_http.py`).
 from __future__ import annotations
 
 import logging
+import subprocess
 import sys
 from pathlib import Path
 
@@ -112,6 +113,41 @@ def _write_legibility_yaml(project_root, *, escalation_port):
     return config_path
 
 
+def _commit_all(repo):
+    """Make *repo* a git repo with one commit: census.main resolves as_of_sha
+    from the censused project's HEAD and exits 1 before run_census otherwise."""
+    for args in (
+        ('init', '-q', '-b', 'main'),
+        ('config', 'user.email', 'test@example.com'),
+        ('config', 'user.name', 'Test'),
+        ('add', '-A'),
+        ('commit', '-q', '-m', 'fixture'),
+    ):
+        subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True)
+
+
+# WHY THE `with census.own_endpoint():` BLOCKS BELOW (task 5279 W1).
+#
+# census refuses every real MCP POST made from inside a pytest process,
+# because a test-minted escalation is indistinguishable at triage from a
+# genuine census failure. The census tests in this file are the entitled
+# exception: `serve_escalation_mcp` brings up a REAL escalation server on an
+# EPHEMERAL port over a tmp_path queue, and the whole point of this suite
+# (task 3644) is to drive the real streamable-HTTP protocol against it and
+# read the escalation back out by id. Nothing reaches the operator's queue on
+# :8103.
+#
+# Entitlement is declared rather than sniffed because nothing distinguishes
+# the two cases automatically -- the tests that leak write
+# `escalation_port: 8103` into their own tmp_path config, so port, config
+# shape and project_id all match a legitimate run. It is declared around the
+# entitled CALL rather than for a whole test or fixture because this suite
+# owns the escalation server it started and nothing else: a wider grant would
+# also un-guard a `submit_task` POST to the fleet's :8002. Only the sibling
+# tests that post through their own `_default_poster` (nightly, transcript
+# persistence) need no declaration: they never route through census.
+
+
 @pytest.fixture
 def live_census_project(tmp_path, serve_escalation_mcp, monkeypatch):
     """A tmp project wired to a live escalation MCP server, census set to fail.
@@ -124,6 +160,7 @@ def live_census_project(tmp_path, serve_escalation_mcp, monkeypatch):
     project_root = tmp_path / 'project'
     project_root.mkdir()
     _write_legibility_yaml(project_root, escalation_port=port)
+    _commit_all(project_root)
 
     def _raising_run_census(**kwargs):
         raise RuntimeError(_RAISED_MESSAGE)
@@ -144,7 +181,7 @@ def test_census_hard_failure_lands_a_retrievable_escalation(
     """
     project_root, queue = live_census_project
 
-    with caplog.at_level(logging.WARNING, logger='legibility.census'):
+    with caplog.at_level(logging.WARNING, logger='legibility.census'), census.own_endpoint():
         exit_code = census.main(['--project-root', str(project_root), '--force'])
 
     # (1) The authoritative exit signal is never masked by the escalation POST.
@@ -203,12 +240,13 @@ def test_default_escalate_fn_returns_the_live_servers_response(
     )
     escalate_fn = census._build_default_escalate_fn(cfg)
 
-    response = escalate_fn(
-        category='infra_issue',
-        severity='info',
-        summary=f'legibility census run failed ({_PROJECT_ID}): {_RAISED_MESSAGE}',
-        detail='traceback would go here',
-    )
+    with census.own_endpoint():
+        response = escalate_fn(
+            category='infra_issue',
+            severity='info',
+            summary=f'legibility census run failed ({_PROJECT_ID}): {_RAISED_MESSAGE}',
+            detail='traceback would go here',
+        )
 
     assert response, 'escalate_fn returned a falsy response -- the POST was swallowed'
     escalation_id = response.get('id')

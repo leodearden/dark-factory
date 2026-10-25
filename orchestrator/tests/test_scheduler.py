@@ -11,7 +11,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _recording_event_store import _RecordingEventStore
 from shared.locking import directory_locks
+from shared.task_metadata_wire import coerce_task_metadata
 
+from orchestrator.already_landed_tick_view import AlreadyLandedTickView
 from orchestrator.config import (
     TIER_BASE,
     TIER_WIDTH,
@@ -24,9 +26,11 @@ from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.scheduler import (
+    BlastRadiusResult,
     ExternalResolverError,
     ModuleLockTable,
     Scheduler,
+    SchedulerCallbacks,
     TickContext,
     files_to_modules,
     normalize_lock,
@@ -584,7 +588,9 @@ class TestNormalizeTaskMetadataLoudness:
         )
         assert task['metadata'] == {'foo': 1}
 
-    @pytest.mark.parametrize('task', [{'id': '3', 'metadata': None}, {'id': '4'}])
+    @pytest.mark.parametrize(
+        'task', [{'id': '3', 'metadata': None}, {'id': '4'}, {'id': '6', 'metadata': ''}]
+    )
     def test_absent_or_none_metadata_is_silent(self, task, caplog):
         """Most tasks carry no metadata — warning here would be pure noise."""
         caplog.set_level(logging.WARNING, logger=self.LOGGER)
@@ -608,6 +614,27 @@ class TestNormalizeTaskMetadataLoudness:
         assert len(message) < 1000, (
             f'the discarded repr must be truncated; got a {len(message)}-char message'
         )
+
+    @pytest.mark.parametrize(
+        'raw',
+        [None, '', '{"a": 1}', '{not json', '[1,2]', '"x"', '   ', [1], 42, False, {'a': 1}],
+    )
+    def test_collapse_matches_shared_wire_rule(self, raw, caplog):
+        """The wire-boundary collapse is the shared rule's, with unreadable -> {} made loud."""
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '77', 'metadata': raw}
+        expected = coerce_task_metadata(raw)
+
+        Scheduler._normalize_task_metadata(task)
+
+        assert task['metadata'] == (expected if expected is not None else {})
+        warnings = self._warnings(caplog)
+        assert bool(warnings) == (expected is None), (
+            f'metadata={raw!r}: must warn exactly when the shared rule says unreadable; '
+            f'got {warnings!r}'
+        )
+        if warnings:
+            assert '77' in ' '.join(warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -2062,6 +2089,32 @@ class TestUpdateTaskStructuredRejection:
 
         ok = await scheduler.update_task('1', {'files': ['backend/src/main.py']})
         assert ok is True, 'update_task must return True on a success envelope'
+
+    @pytest.mark.asyncio
+    async def test_update_task_returns_false_and_logs_on_is_error_envelope(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """A tool that reports its own failure through isError must not read as success."""
+        wire_envelope = {
+            'result': {
+                'isError': True,
+                'content': [{'type': 'text', 'text': 'Error: backend refused'}],
+            }
+        }
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            return wire_envelope
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.scheduler'):
+            ok = await scheduler.update_task('1', {'files': ['x.py']})
+
+        assert ok is False
+        assert any(
+            r.levelno == logging.ERROR and 'backend refused' in r.getMessage()
+            for r in caplog.records
+        )
 
 
 class TestRequeueCooldown:
@@ -3724,6 +3777,76 @@ class TestSetTaskStatusForwarding:
         assert 'reopen_reason' not in arguments
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('status', 'done_provenance'),
+        [
+            ('in-progress', None),
+            ('done', {
+                'kind': 'deterministic-gate',
+                'note': 'pure gate resolved',
+                'escalation_id': 'esc-5241-wire',
+            }),
+        ],
+        ids=['non-done', 'deterministic-done'],
+    )
+    async def test_names_the_orchestrator_in_the_arguments(
+        self, scheduler: Scheduler, monkeypatch, status, done_provenance,
+    ):
+        """Task 5241: fused-memory serves stateless HTTP, where clientInfo never
+        reaches a tools/call, so the caller identity must travel in the
+        arguments or the deterministic-* caller bar refuses every runner close.
+
+        Asserts the LITERAL rather than the orchestrator's constant: the
+        spelling is the cross-package contract with fused-memory's default
+        ``reconciliation.deterministic_provenance_allowed_agent_prefixes``.
+        """
+        mcp_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+
+        await scheduler.set_task_status('1', status, done_provenance=done_provenance)
+
+        mcp_mock.assert_called_once()
+        arguments = mcp_mock.call_args[0][2]['arguments']
+        assert arguments.get('agent_id') == 'orchestrator'
+
+    @pytest.mark.asyncio
+    async def test_a_transient_retry_resends_the_identity(
+        self, scheduler: Scheduler, monkeypatch,
+    ):
+        """The identity is in ``arguments`` before the retry loop, so a retry
+        cannot drop it. Each attempt's arguments are snapshotted at send time:
+        the same dict object is passed every attempt, so reading
+        ``call_args_list`` afterwards would show only its final state."""
+        monkeypatch.setattr(
+            'orchestrator.scheduler.fm_retry_backoffs', lambda *a, **kw: [0.0],
+        )
+        transient = {
+            'result': {'structuredContent': {
+                'error': "TimeoutError('ensure_connected timed out')",
+                'error_type': 'TimeoutError',
+            }},
+        }
+        success = {
+            'result': {'structuredContent': {
+                'message': 'ok', 'tasks': [{'success': True}],
+            }},
+        }
+        responses = iter([transient, success])
+        sent: list[dict] = []
+
+        def _send(url, method, params, **kwargs):
+            sent.append(dict(params['arguments']))
+            return next(responses)
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(side_effect=_send))
+
+        await scheduler.set_task_status('5', 'in-progress')
+
+        assert [arguments.get('agent_id') for arguments in sent] == [
+            'orchestrator', 'orchestrator',
+        ]
+
+    @pytest.mark.asyncio
     async def test_persistent_mcp_exception_raises_after_retries(
         self, scheduler: Scheduler, monkeypatch, caplog
     ):
@@ -4470,13 +4593,13 @@ class TestScoreFunction:
 
     def test_tier_base_dominates(self, scheduler: Scheduler):
         """A fresh medium task with no descendants scores = TIER_BASE[medium]."""
-        score = scheduler._compute_score('medium', age=0, transitive_count=0)
+        score = scheduler._compute_score_legacy('medium', age=0, transitive_count=0)
         assert score == float(TIER_BASE['medium'])
 
     def test_age_bonus_bounded_by_tier_width(self, scheduler: Scheduler):
         """age=1e6 + medium tier must never outscore a fresh high tier."""
-        aged_medium = scheduler._compute_score('medium', age=1_000_000, transitive_count=0)
-        fresh_high = scheduler._compute_score('high', age=0, transitive_count=0)
+        aged_medium = scheduler._compute_score_legacy('medium', age=1_000_000, transitive_count=0)
+        fresh_high = scheduler._compute_score_legacy('high', age=0, transitive_count=0)
         assert aged_medium < fresh_high
         # Verify the cap: score - base never exceeds TIER_WIDTH - 1.
         bonus = aged_medium - TIER_BASE['medium']
@@ -4484,15 +4607,15 @@ class TestScoreFunction:
 
     def test_cpm_bonus_positive(self, scheduler: Scheduler):
         """A task with many descendants scores higher than one without."""
-        alone = scheduler._compute_score('medium', age=0, transitive_count=0)
-        unlock_many = scheduler._compute_score('medium', age=0, transitive_count=1000)
+        alone = scheduler._compute_score_legacy('medium', age=0, transitive_count=0)
+        unlock_many = scheduler._compute_score_legacy('medium', age=0, transitive_count=1000)
         assert unlock_many > alone
         # Still bounded below the next tier.
         assert unlock_many < TIER_BASE['high']
 
     def test_combined_bonus_bounded(self, scheduler: Scheduler):
         """Age + CPM together never cross a tier boundary."""
-        huge = scheduler._compute_score('low', age=10_000, transitive_count=10_000)
+        huge = scheduler._compute_score_legacy('low', age=10_000, transitive_count=10_000)
         assert huge < TIER_BASE['medium']
 
 
@@ -4501,21 +4624,27 @@ class TestAgeAnchor:
 
     def test_cancelled_resurrection_no_age_jump(self):
         """A previously-cancelled task re-pended scores no higher than brand-new medium."""
+        filed, reopened = '2026-10-01T00:00:00+00:00', '2026-10-05T00:00:00+00:00'
+
+        def stamped(task_id: str, status: str, pending_since: str) -> dict:
+            task = _pending_task(task_id, status=status)
+            task['metadata']['pending_since'] = pending_since
+            return task
+
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
-        # Tick 1: task 1 is cancelled, task 100 is pending.
-        tasks_tick1 = [
-            _pending_task('1', status='cancelled'),
-            _pending_task('100', status='pending'),
-        ]
-        scheduler._update_age_anchors(tasks_tick1, max_id=100)
+        # Tick 1: task 1 and task 100 are pending.
+        scheduler._update_age_anchors(
+            [stamped('1', 'pending', filed), stamped('100', 'pending', filed)], max_id=100,
+        )
         age_100_t1 = scheduler._compute_age('100', max_id=100)
-        # Tick 2: task 1 is reinstated to pending, task 100 still pending.
-        tasks_tick2 = [
-            _pending_task('1', status='pending'),
-            _pending_task('100', status='pending'),
-        ]
-        scheduler._update_age_anchors(tasks_tick2, max_id=100)
+        # Tick 2: task 1 is cancelled; its stamp is unchanged.
+        scheduler._update_age_anchors(
+            [stamped('1', 'cancelled', filed), stamped('100', 'pending', filed)], max_id=100,
+        )
+        # Tick 3: task 1 is reinstated, which D3 marks with a new stamp.
+        tasks_tick3 = [stamped('1', 'pending', reopened), stamped('100', 'pending', filed)]
+        scheduler._update_age_anchors(tasks_tick3, max_id=100)
         age_1 = scheduler._compute_age('1', max_id=100)
         age_100 = scheduler._compute_age('100', max_id=100)
         # Resurrected 1 must not leapfrog brand-new 100.
@@ -4735,7 +4864,7 @@ class TestBlastRadiusRefinement:
             current=['crates/reify-compiler/src/lib.rs'],
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
-        assert ok is True
+        assert ok == BlastRadiusResult(applied=True)
         # lib.rs is free for another task
         assert lt.try_acquire('2035', ['crates/reify-compiler/src/lib.rs'])
         # 936 now holds conformance.rs, not lib.rs
@@ -4773,7 +4902,7 @@ class TestBlastRadiusRefinement:
                 'crates/reify-compiler/tests/trait_conformance_tests.rs',
             ],
         )
-        assert ok is True
+        assert ok.applied is True
         held = lt._held['936']
         assert held == {
             'crates/reify-compiler/src/conformance.rs',
@@ -4800,7 +4929,7 @@ class TestBlastRadiusRefinement:
             current=['a/lib.rs'],
             needed=['a/lib.rs', 'a/other.rs'],
         )
-        assert ok is True
+        assert ok.applied is True
         assert lt._held['T'] == {'a/lib.rs', 'a/other.rs'}
         event_store = scheduler.event_store
         assert event_store is not None
@@ -4820,7 +4949,7 @@ class TestBlastRadiusRefinement:
             current=['a/lib.rs', 'a/other.rs'],
             needed=['a/other.rs', 'a/lib.rs'],  # order differs, set equal
         )
-        assert ok is True
+        assert ok.applied is True
         assert lt._held['T'] == {'a/lib.rs', 'a/other.rs'}
         event_store = scheduler.event_store
         assert event_store is not None
@@ -4846,7 +4975,7 @@ class TestBlastRadiusRefinement:
             current=['crates/reify-compiler/src/lib.rs'],
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
-        assert ok is False
+        assert ok.applied is False
         # Full release ran: 936 should no longer hold anything
         assert '936' not in lt._held
 
@@ -4879,7 +5008,7 @@ class TestBlastRadiusRefinement:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is False
+        assert ok.applied is False
         assert update_task.await_args is not None
         persisted = update_task.await_args.args[1]
         assert persisted == {
@@ -4915,7 +5044,7 @@ class TestBlastRadiusRefinement:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         assert update_task.await_args is not None, (
             'update_task must be called to make the narrowed set durable'
         )
@@ -4958,7 +5087,7 @@ class TestBlastRadiusRefinement:
             needed=['a/lib.rs', 'a/other.rs'],  # pure widen: additional=[other], stale=[]
         )
 
-        assert ok is True
+        assert ok.applied is True
         assert update_task.await_args is not None, (
             'a pure widen must persist metadata.files so plan.files does not '
             'become a durable strict-superset of metadata.files'
@@ -5001,7 +5130,7 @@ class TestBlastRadiusRefinement:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         event_store = scheduler.event_store
         assert event_store is not None
         set_to_plan_events = [
@@ -5041,7 +5170,7 @@ class TestBlastRadiusRefinement:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         # In-memory narrowing applied: lib.rs released, conformance.rs held
         assert lt.try_acquire('2035', ['crates/reify-compiler/src/lib.rs'])
         assert not lt.try_acquire('9999', ['crates/reify-compiler/src/conformance.rs'])
@@ -5081,7 +5210,7 @@ class TestBlastRadiusRefinement:
             needed=['a/lib.rs', 'a/other.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         event_store = scheduler.event_store
         assert event_store is not None
         set_to_plan_events = [
@@ -5142,7 +5271,7 @@ class TestBlastRadiusRefinement:
             persist_files=[deep],  # NEW parameter: supply file-level paths
         )
 
-        assert ok is True
+        assert ok.applied is True
         assert update_task.await_args is not None, (
             'update_task must be called for the narrowing persist'
         )
@@ -5236,7 +5365,7 @@ class TestBlastRadiusRequeueEmitsRelease:
         scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
 
     @staticmethod
-    async def _requeue(scheduler: Scheduler) -> bool:
+    async def _requeue(scheduler: Scheduler) -> BlastRadiusResult:
         return await scheduler.handle_blast_radius_expansion(
             '936',
             current=[TestBlastRadiusRequeueEmitsRelease.HELD],
@@ -5266,9 +5395,12 @@ class TestBlastRadiusRequeueEmitsRelease:
         depth = scheduler.config.lock_depth
         expected = [normalize_lock(self.HELD, depth)]
 
-        ok = await self._requeue(scheduler)
+        result = await self._requeue(scheduler)
 
-        assert ok is False
+        assert result == BlastRadiusResult(applied=False), (
+            'a healthy conflict requeue re-pends the row, so it carries no '
+            f're-pend error; got {result!r}'
+        )
         released = self._lock_released_events(scheduler)
         assert len(released) == 1, (
             'the blast-radius requeue must emit exactly one lock_released '
@@ -5298,7 +5430,7 @@ class TestBlastRadiusRequeueEmitsRelease:
         expected = [normalize_lock(self.HELD, depth)]
 
         ok = await self._requeue(scheduler)
-        assert ok is False
+        assert ok.applied is False
 
         # The teardown release the workflow runs when the slot exits.
         scheduler.release('936')
@@ -5332,15 +5464,21 @@ class TestBlastRadiusRequeueEmitsRelease:
         silently free locks under a running task.
         """
         self._arrange_contention(scheduler)
+        dead = RuntimeError('backend unreachable')
         scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
-            side_effect=RuntimeError('backend unreachable')
+            side_effect=dead
         )
         scheduler._dispatched.add('936')
         scheduler._dispatched_priority['936'] = 'medium'
 
-        ok = await self._requeue(scheduler)
+        result = await self._requeue(scheduler)
 
-        assert ok is False
+        assert result.applied is False
+        assert result.repend_error is dead, (
+            'the dead pending write must come back as the exact error, so the '
+            'workflow can report it to its run()-exit write-failure ledger; '
+            f'got {result!r}'
+        )
         # Non-vacuity: the branch under test is only reached if the status
         # write was actually attempted (and raised) — without this the
         # still-held / still-dispatched assertions below would also pass if
@@ -5397,7 +5535,7 @@ class TestBlastRadiusRequeueEmitsRelease:
 
         ok = await self._requeue(scheduler)
 
-        assert ok is False
+        assert ok.applied is False
         assert 'status' in order, f'set_task_status was never awaited; got {order}'
         assert 'release' in order, (
             f'no lock_released was emitted during the requeue; got {order}'
@@ -5430,7 +5568,7 @@ class TestBlastRadiusRequeueEmitsRelease:
 
         ok = await self._requeue(scheduler)
 
-        assert ok is False
+        assert ok.applied is False
         assert '936' not in scheduler._dispatched, (
             'the requeue must clear the dispatch guard, else _eligible_for_'
             'dispatch refuses the task forever'
@@ -5443,6 +5581,15 @@ class TestBlastRadiusRequeueEmitsRelease:
             're-dispatch straight back into the same contention; got '
             f'{scheduler._requeue_until.get("936")!r}'
         )
+
+
+class TestBlastRadiusResult:
+    @staticmethod
+    def test_applied_refinement_cannot_carry_a_repend_error():
+        """An applied refinement writes no pending row, so a re-pend error
+        alongside it is an impossible shape the type refuses."""
+        with pytest.raises(ValueError):
+            BlastRadiusResult(applied=True, repend_error=RuntimeError('x'))
 
 
 class TestBlastRadiusModuleCacheSeam:
@@ -5499,7 +5646,7 @@ class TestBlastRadiusModuleCacheSeam:
             needed=needed,
         )
 
-        assert ok is False
+        assert ok.applied is False
         assert calls == [('936', expected)], (
             f'Expected exactly one _write_module_cache(936, {expected}) call; '
             f'got {calls}'
@@ -5533,7 +5680,7 @@ class TestBlastRadiusModuleCacheSeam:
             persist_files=['pkg/dir', 'pkg/mod/real.py'],
         )
 
-        assert ok is False
+        assert ok.applied is False
         assert update_task.await_args is not None
         persisted = update_task.await_args.args[1]
         assert persisted == {'files': ['pkg/mod/real.py']}, (
@@ -5582,7 +5729,7 @@ class TestBlastRadiusModuleCacheSeam:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         expected = ['crates/reify-compiler/src/conformance.rs']
         assert ('936', expected) in calls, (
             f'Expected _write_module_cache(936, {expected}) call on the '
@@ -8174,32 +8321,32 @@ class TestSchedulerPause:
         """
         # Fresh scheduler — not paused.
         snap = scheduler.get_state_snapshot()
-        assert snap['is_paused'] is False, (
-            f"Expected is_paused=False on fresh scheduler; got {snap['is_paused']!r}"
+        assert snap.is_paused is False, (
+            f"Expected is_paused=False on fresh scheduler; got {snap.is_paused!r}"
         )
-        assert snap['pause_reason'] is None, (
-            f"Expected pause_reason=None on fresh scheduler; got {snap['pause_reason']!r}"
+        assert snap.pause_reason is None, (
+            f"Expected pause_reason=None on fresh scheduler; got {snap.pause_reason!r}"
         )
 
         # After pause — snapshot must reflect the paused state.
         reason = 'park-stop: 3 tasks parked in 1h'
         scheduler.pause(reason)
         snap_paused = scheduler.get_state_snapshot()
-        assert snap_paused['is_paused'] is True, (
-            f"Expected is_paused=True after pause; got {snap_paused['is_paused']!r}"
+        assert snap_paused.is_paused is True, (
+            f"Expected is_paused=True after pause; got {snap_paused.is_paused!r}"
         )
-        assert snap_paused['pause_reason'] == reason, (
-            f"Expected pause_reason={reason!r}; got {snap_paused['pause_reason']!r}"
+        assert snap_paused.pause_reason == reason, (
+            f"Expected pause_reason={reason!r}; got {snap_paused.pause_reason!r}"
         )
 
         # After resume — snapshot must return to unpaused state.
         scheduler.resume()
         snap_resumed = scheduler.get_state_snapshot()
-        assert snap_resumed['is_paused'] is False, (
-            f"Expected is_paused=False after resume; got {snap_resumed['is_paused']!r}"
+        assert snap_resumed.is_paused is False, (
+            f"Expected is_paused=False after resume; got {snap_resumed.is_paused!r}"
         )
-        assert snap_resumed['pause_reason'] is None, (
-            f"Expected pause_reason=None after resume; got {snap_resumed['pause_reason']!r}"
+        assert snap_resumed.pause_reason is None, (
+            f"Expected pause_reason=None after resume; got {snap_resumed.pause_reason!r}"
         )
 
 
@@ -8422,7 +8569,9 @@ class TestParkStopTrip:
         """Once paused, additional blocked transitions must not fire the callback again."""
         config = OrchestratorConfig(
             max_per_module=1,
+            park_stop_enabled=True,  # pinned: the yaml must not disarm the control
             park_stop_parked_threshold=3,
+            park_stop_parked_window_hours=1.0,
         )
         scheduler = Scheduler(config)
         scheduler.finish_startup()
@@ -8441,9 +8590,20 @@ class TestParkStopTrip:
         await scheduler.set_task_status('2', 'blocked')
         scheduler.pause('manual')  # already paused; trip check should be suppressed
         await scheduler.set_task_status('3', 'blocked')
+        await asyncio.sleep(0)
 
         assert callback_count[0] == 0, (
             f'Callback must not fire while already paused; fired {callback_count[0]} time(s)'
+        )
+
+        scheduler.resume()
+        for task_id in ('4', '5', '6'):
+            await scheduler.set_task_status(task_id, 'blocked')
+        await asyncio.sleep(0)
+
+        assert callback_count[0] == 1, (
+            f'control: once resumed, three fresh transitions must trip, else the '
+            f'zero above proves nothing; fired {callback_count[0]} time(s)'
         )
 
     @pytest.mark.asyncio
@@ -8451,7 +8611,9 @@ class TestParkStopTrip:
         """Below-threshold transitions must never invoke the callback."""
         config = OrchestratorConfig(
             max_per_module=1,
+            park_stop_enabled=True,  # pinned: the yaml must not disarm the control
             park_stop_parked_threshold=5,
+            park_stop_parked_window_hours=1.0,
         )
         scheduler = Scheduler(config)
         scheduler.finish_startup()
@@ -8467,9 +8629,18 @@ class TestParkStopTrip:
 
         for i in range(4):
             await scheduler.set_task_status(str(i), 'blocked')
+        await asyncio.sleep(0)
 
         assert callback_count[0] == 0, (
             f'Expected 0 callback invocations (only 4 of 5 threshold); got {callback_count[0]}'
+        )
+
+        await scheduler.set_task_status('4', 'blocked')
+        await asyncio.sleep(0)
+
+        assert callback_count[0] == 1, (
+            f'control: the 5th transition must trip, else the zero above proves '
+            f'nothing; fired {callback_count[0]} time(s)'
         )
 
 
@@ -8607,6 +8778,7 @@ class TestParkStopDisabled:
         await scheduler.set_task_status('1', 'blocked')
         await scheduler.set_task_status('2', 'blocked')
         await scheduler.set_task_status('3', 'blocked')
+        await asyncio.sleep(0)
 
         # Transitions are recorded even when disabled.
         assert len(scheduler._blocked_transitions) == 3, (
@@ -9566,83 +9738,6 @@ class TestGetExternalStatusesPartialResult:
             f'Empty deps should not trigger partial-result guard; got err={err!r}'
         )
         assert statuses == {}
-
-
-# ---------------------------------------------------------------------------
-# TestTaskExternalDeps (task 2167 — W3-δ: shared TaskMetadata seam, SEAM A)
-# ---------------------------------------------------------------------------
-
-class TestTaskExternalDeps:
-    """Unit tests for the ``_task_external_deps`` helper (SEAM A).
-
-    ``_task_external_deps`` is the single seam every scheduler
-    ``metadata.external_deps`` read routes through:
-    ``parse_metadata(task.get('metadata'), direction='read')[0].external_deps``.
-    ``direction='read'`` is best-effort (never raises) so a corrupt
-    historical metadata row cannot break a scheduler dispatch tick — matching
-    the scheduler's existing fail-safe philosophy.  The return value stays
-    the canonical "project_id:task_id" wire STRING form (PRD Open Question
-    #4) — it is never converted to ``list[ExternalDep]``.
-
-    Plain dict task fixtures only — no Scheduler construction needed.
-    """
-
-    def test_no_metadata_key_returns_empty_list(self):
-        """A task dict with no 'metadata' key at all -> []."""
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '1'}
-        assert _task_external_deps(task) == []
-
-    def test_metadata_none_returns_empty_list(self):
-        """metadata=None -> [] (benign-absent, same as a missing key)."""
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '2', 'metadata': None}
-        assert _task_external_deps(task) == []
-
-    def test_dict_metadata_returns_external_deps(self):
-        """dict metadata {'external_deps': [...]} -> the list, unchanged."""
-        from orchestrator.scheduler import _task_external_deps
-        task = {
-            'id': '3',
-            'metadata': {'external_deps': ['dark_factory:42', 'p:9']},
-        }
-        assert _task_external_deps(task) == ['dark_factory:42', 'p:9']
-
-    def test_json_string_metadata_is_parsed(self):
-        """metadata as a JSON *string* is parsed through the shared parser.
-
-        The old inline idiom ``(task.get('metadata') or {}).get(...)`` would
-        ``AttributeError`` on a str (``str`` has no ``.get``) — the shared
-        parser handles a JSON string natively.
-        """
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '4', 'metadata': '{"external_deps": ["a:1"]}'}
-        assert _task_external_deps(task) == ['a:1']
-
-    def test_corrupt_metadata_string_returns_empty_list_no_raise(self):
-        """Unparseable metadata string -> [] with no exception raised.
-
-        ``direction='read'`` is best-effort: a corrupt historical metadata
-        row must not break a scheduler dispatch tick.
-        """
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '5', 'metadata': 'not json{'}
-        assert _task_external_deps(task) == []
-
-    def test_returned_elements_stay_string_wire_form(self):
-        """Every returned element is a str — NOT converted to ExternalDep.
-
-        Resolves PRD Open Question #4 for task W3-δ: the scheduler keeps
-        consuming the canonical "project_id:task_id" STRING wire form fed to
-        ``get_external_statuses`` / the external-status cache.
-        """
-        from orchestrator.scheduler import _task_external_deps
-        task = {
-            'id': '6',
-            'metadata': {'external_deps': ['dark_factory:42', 'p:9']},
-        }
-        result = _task_external_deps(task)
-        assert all(isinstance(dep, str) for dep in result)
 
 
 # ---------------------------------------------------------------------------
@@ -11336,12 +11431,9 @@ class TestAcquireNextBookkeepingPurgesAbsentTasks:
         assert 'X' not in scheduler._pending_anchor, (
             f"Expected 'X' purged from _pending_anchor but it's still there: {scheduler._pending_anchor}"
         )
-        # _was_non_pending must record X so that if it is resurrected to pending
-        # it gets a fresh max_id anchor (resurrection semantics) instead of
-        # re-using its old stale numeric id.
-        assert 'X' in scheduler._was_non_pending, (
-            f"Expected 'X' recorded in _was_non_pending for resurrection semantics: {scheduler._was_non_pending}"
-        )
+        # Absence is not a cancellation (D3): X returns with the anchor it left with.
+        scheduler._update_age_anchors([_pending_task('X')], max_id=100)
+        assert scheduler._compute_age('X', 100) == 95
 
 
 class TestOrchestratorStatusSetsMatchShared:
@@ -11879,7 +11971,11 @@ class TestDrainParkEvictionRequests:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # T's parks gone.
         assert not scheduler.lock_table.has_parks('T')
@@ -11914,7 +12010,11 @@ class TestDrainParkEvictionRequests:
         status_map = {}
         tasks_by_id = {}
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # No eviction event.
         evicted_events = [
@@ -11966,7 +12066,11 @@ class TestDrainParkEvictionGuard:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # T's park must be INTACT.
         assert scheduler.lock_table.has_parks('T'), (
@@ -12008,7 +12112,11 @@ class TestDrainParkEvictionGuard:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # T's park must be gone — unsatisfied deps → not live-dispatchable → evict.
         assert not scheduler.lock_table.has_parks('T'), (
@@ -12154,8 +12262,8 @@ class TestDrainFiresWithNoActiveTasks:
 class TestAcquireNextFmReadFailureFailSafe:
     """acquire_next() must NOT drain park-evictions when get_tasks signals a
     read FAILURE (get_tasks(distinguish_failure=True) returns None) — draining
-    with empty status_map/tasks_by_id would make _owner_is_live_dispatchable
-    return False for every id, bypassing the D4 live-owner guard and
+    with empty status_map/tasks_by_id would make _park_hold_refusal name a
+    refusal ('missing') for every id, bypassing the D4 live-owner guard and
     force-evicting still-live owners during an fm outage/restart.
 
     A genuine empty result ([]) is NOT a failure and still drains exactly as
@@ -12436,7 +12544,11 @@ class TestDrainBuriedOwnerRestoredEvents:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # B's park on m2 is gone.
         assert not scheduler.lock_table.has_parks('B')
@@ -13189,11 +13301,10 @@ class TestStreakRegistryMigration:
 
         NOTE: the spine entry uses ``_skip_count`` rather than
         ``_pending_anchor`` — ``_update_age_anchors`` (called earlier in the
-        same tick, before the stale-id sweep) unconditionally pops
-        ``_pending_anchor`` for any tid observed with a non-'pending' status,
-        so a task reported as already-'done' in its very first observed tick
-        never survives in ``_pending_anchor`` long enough to reach the
-        stale-id sweep.  ``_skip_count`` has no such early-pop and is one of
+        same tick, before the stale-id sweep) never anchors a tid observed
+        with a terminal status, so a task reported as already-'done' in its
+        very first observed tick never enters ``_pending_anchor`` and so
+        never reaches the stale-id sweep through it.  ``_skip_count`` has no such early-pop and is one of
         the four ``_all_tracked`` spine dicts, so it reliably lands 'T' in
         ``_stale_ids`` for this single-tick repro.
         """
@@ -13406,6 +13517,83 @@ class TestConsultAlreadyLanded:
             'a raising gate hook should be logged, not silently swallowed'
         )
 
+    async def test_tick_view_is_read_once_and_threaded_with_each_candidate(self):
+        view = AlreadyLandedTickView(local_branches=frozenset())
+        reader = AsyncMock(return_value=view)
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
+        candidates = [_pending_task(tid) for tid in ('A', 'B', 'C')]
+
+        await scheduler._consult_already_landed(candidates)
+
+        reader.assert_awaited_once()
+        assert gate.await_count == len(candidates)
+        for call, candidate in zip(gate.await_args_list, candidates, strict=True):
+            assert call.args == (candidate['id'],)
+            assert call.kwargs['task'] is candidate
+            assert call.kwargs['tick_view'] is view
+
+    async def test_without_a_reader_the_gate_gets_no_tick_view(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
+        candidate = _pending_task('Z')
+
+        await scheduler._consult_already_landed([candidate])
+
+        (call,) = gate.await_args_list
+        assert call.kwargs['task'] is candidate
+        assert call.kwargs['tick_view'] is None
+
+    async def test_a_raising_reader_fails_open_to_per_candidate_reads(self, caplog):
+        caplog.set_level('WARNING')
+        reader = AsyncMock(side_effect=RuntimeError('for-each-ref hiccup'))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+        gate = AsyncMock(side_effect=lambda task_id, **_: task_id == 'Z')
+        scheduler._already_landed_gate = gate
+
+        result = await scheduler._consult_already_landed(
+            [_pending_task('Z'), _pending_task('Y')]
+        )
+
+        assert result == {'Z'}
+        assert {call.args[0] for call in gate.await_args_list} == {'Z', 'Y'}
+        assert all(call.kwargs['tick_view'] is None for call in gate.await_args_list)
+        assert any(record.levelname == 'WARNING' for record in caplog.records)
+
+    async def test_without_a_gate_the_tick_view_is_not_read(self):
+        reader = AsyncMock(return_value=AlreadyLandedTickView(local_branches=frozenset()))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+
+        assert await scheduler._consult_already_landed([_pending_task('Z')]) == set()
+        reader.assert_not_awaited()
+
+    async def test_with_no_candidates_the_tick_view_is_not_read(self):
+        reader = AsyncMock(return_value=AlreadyLandedTickView(local_branches=frozenset()))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+        scheduler._already_landed_gate = AsyncMock(return_value=False)
+
+        assert await scheduler._consult_already_landed([]) == set()
+        reader.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # acquire_next() honors the already-landed gate (task 2313).
@@ -13427,27 +13615,33 @@ class TestAcquireNextAlreadyLandedGate:
         scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
-        scheduler._already_landed_gate = AsyncMock(return_value=True)
+        gate = AsyncMock(return_value=True)
+        scheduler._already_landed_gate = gate
 
         result = await scheduler.acquire_next()
 
         assert result is None, 'a gated task must not be dispatched this tick'
         assert 'Z' not in scheduler._dispatched
-        scheduler._already_landed_gate.assert_awaited_once_with('Z')
+        (call,) = gate.await_args_list
+        assert call.args == ('Z',)
+        assert call.kwargs['task']['id'] == 'Z'
 
     async def test_gate_false_dispatches_normally(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
-        scheduler._already_landed_gate = AsyncMock(return_value=False)
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
 
         result = await scheduler.acquire_next()
 
         assert result is not None
         assert result.task_id == 'Z'
         assert 'Z' in scheduler._dispatched
-        scheduler._already_landed_gate.assert_awaited_once_with('Z')
+        (call,) = gate.await_args_list
+        assert call.args == ('Z',)
+        assert call.kwargs['task']['id'] == 'Z'
 
     async def test_gated_pinned_candidate_is_not_dispatched(self, tmp_path):
         """Pin-loop parity: a gated PINNED candidate must also be skipped."""
@@ -13460,7 +13654,7 @@ class TestAcquireNextAlreadyLandedGate:
         scheduler = Scheduler(config, override_store=store)
         scheduler.finish_startup()
         scheduler._project_root = '/proj'
-        scheduler._already_landed_gate = AsyncMock(side_effect=lambda task_id: task_id == 'Z')
+        scheduler._already_landed_gate = AsyncMock(side_effect=lambda task_id, **_: task_id == 'Z')
 
         task_z = _pending_task('Z', files=['z/src'])
         task_y = _pending_task('Y', files=['y/src'])

@@ -8,16 +8,38 @@ neither importable nor unit-testable, and these checks must be callable
 without a running server, a service or an event loop.
 
 Imports stay stdlib + :mod:`fused_memory.memory_metadata` /
-:mod:`fused_memory.topic_slug` / :mod:`fused_memory.utils.validation` for
-exactly that reason.
+:mod:`fused_memory.topic_slug` / :mod:`fused_memory.utils.validation` /
+:mod:`fused_memory.models.enums` for exactly that reason; the config model is
+imported for type checking only.
 
-WHY VALIDATION IS A SEPARATE, FIRST STEP
-----------------------------------------
+THE ONE VALIDATOR, TWO ARMS
+---------------------------
+:func:`validate_consolidate_args` serves both callers of this shape (PRD D6 —
+one fact, one home).  ``limits=None`` selects the OP arm, taken by
+``server/tools.py::consolidate_memories``.  Passing a :class:`ProposalLimits`
+selects the PROPOSAL arm, which callers reach through
+:func:`validate_proposal_args`: ``server/tools.py::propose_consolidation`` at
+the emit boundary — so the LLM that wrote a mis-shaped claim fixes it in-turn
+— and task delta's executor when it re-checks an aged ledger row whose limits
+have since moved (PRD B7).  The id, topic and arm rules are therefore checked
+once, in one place, rather than re-typed per caller.  That executor
+(``reconciliation/consolidation_auto_executor.py``) reads the refusal through
+:func:`proposal_shape_codes`, which names it as structured codes built from
+the same rule helpers rather than by parsing the error string.
+
+``reconciliation/consolidation_auto.py::evaluate_auto_predicate`` deliberately
+calls NONE of this: PRD C2 makes the benign codes the emit boundary's business,
+and the predicate re-derives none of them.
+
+WHY VALIDATION IS A SEPARATE, PRE-WRITE STEP (2)
+------------------------------------------------
 ``consolidate_memories`` is irreversible by construction: it writes a
 canonical, patches retained peers and DELETES its supersedes.  Argument
-validation is the only stage that can refuse at zero cost, so everything
-decidable from the arguments alone is decided here — before the canonical
-exists, before a single victim is touched.
+validation runs as step (2): immediately after the fail-closed
+authorization gate, which deliberately precedes it, and before anything
+reads or writes the corpus.  It is the last point where everything
+decidable from the arguments alone can be refused for free — before the
+canonical exists, before a single victim is touched.
 
 Two properties follow from that position and are not incidental:
 
@@ -40,9 +62,13 @@ Two properties follow from that position and are not incidental:
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.memory_metadata import normalize_supersedes
+from fused_memory.models.enums import MemoryCategory
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
 
 # `_safe_repr` is module-private in `utils.validation` and this is its first
@@ -53,7 +79,17 @@ from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
 # truncate differently from every other validator's.
 from fused_memory.utils.validation import _safe_repr, is_full_uuid
 
-__all__ = ['build_consolidation_result', 'validate_consolidate_args']
+if TYPE_CHECKING:
+    from fused_memory.config.schema import ConsolidationAutoConfig
+
+__all__ = [
+    'ProposalLimits',
+    'ProposalShapeCode',
+    'build_consolidation_result',
+    'proposal_shape_codes',
+    'validate_consolidate_args',
+    'validate_proposal_args',
+]
 
 #: Pointer to the ONE topic-slug namespace (PRD D4), quoted at the wire so a
 #: caller can find the rule rather than re-derive a regex that already has a
@@ -154,6 +190,309 @@ def _repeated_id_members(values: list[Any], field: str) -> list[str]:
     return problems
 
 
+@dataclass(frozen=True)
+class ProposalLimits:
+    """The three proposal-shape bounds, passed in rather than defaulted here.
+
+    NO defaults, deliberately. Every number has exactly one home —
+    ``ConsolidationAutoConfig`` — and callers build this from it, so a default
+    here would be a second home for the same fact (SPOT) and would be the copy
+    that goes stale when the config leaf is retuned. Passing this object is
+    also what SELECTS the proposal arm of :func:`validate_consolidate_args`.
+    """
+
+    claim_max_chars: int
+    member_min: int
+    member_max: int
+
+    @classmethod
+    def from_config(cls, config: ConsolidationAutoConfig) -> ProposalLimits:
+        """The ONE config-to-limits mapping, shared by the tool and the executor."""
+        return cls(
+            claim_max_chars=config.claim_max_chars,
+            member_min=config.member_min,
+            member_max=config.member_max,
+        )
+
+
+#: Stopwords stripped before asking whether a claim says anything the topic
+#: slug did not already say.
+#:
+#: Inline, and that is the DECIDED answer rather than an oversight (PRD §12
+#: Q4): :mod:`fused_memory.topic_slug` exposes only ``TOPIC_SLUG_RE``,
+#: ``TOPIC_SLUG_MAX_LEN`` and ``is_valid_topic_slug`` — it has no tokenizer, so
+#: there is nothing to reuse and importing it would not save a list.
+_CLAIM_STOPWORDS: frozenset[str] = frozenset({
+    'the', 'a', 'an', 'and', 'or', 'of', 'for', 'to', 'in', 'on', 'at',
+    'is', 'are', 'was', 'were', 'be', 'been', 'this', 'that', 'these',
+    'those', 'it', 'its', 'as', 'by', 'with', 'from', 'into', 'over',
+    'under', 'not', 'no', 'all', 'any', 'one',
+})
+
+#: A claim must not open with a LABEL. Case-sensitive and ``\b``-terminated on
+#: purpose: the rule refuses the heading ``INDEX —``, not every sentence that
+#: happens to begin ``Indexing`` or ``Canonicalisation``.
+_CLAIM_LABEL_RE = re.compile(r'^(INDEX|CANONICAL)\b')
+
+#: Fewest whitespace-separated words a claim may carry. Below this it is a
+#: fragment, and a fragment in the canonical's first paragraph is the position
+#: PRD §2 measured the retrieval property out of.
+_CLAIM_MIN_WORDS = 8
+
+_CLAIM_HINT = (
+    'A `claim` is ONE assertion on ONE line, in ordinary prose: what is true '
+    'of this cluster that the topic slug does not already say. Not a heading '
+    f'(`INDEX ...`, `CANONICAL: ...`), not a bracketed banner, at least '
+    f'{_CLAIM_MIN_WORDS} words, and short enough to lead the canonical — it '
+    'becomes the canonical\'s first paragraph verbatim.'
+)
+
+_PROPOSAL_TEXT_HINT = (
+    'A proposal carries no canonical text: the canonical is rendered from '
+    '`claim` by `reconciliation/consolidation_auto.py::build_auto_canonical`, '
+    'its one home. Put the assertion in `claim` instead.'
+)
+
+_CATEGORY_VALUES: frozenset[str] = frozenset(c.value for c in MemoryCategory)
+
+_CATEGORY_HINT = (
+    'A proposal\'s `category` is the memory category its canonical is written '
+    'under — one of: ' + ', '.join(c.value for c in MemoryCategory) + '.'
+)
+
+_PROPOSAL_RUN_ID_HINT = (
+    'Pass the reconciliation run emitting this proposal. `run_id` is part of '
+    'the proposal row\'s ledger identity — one row per (project, topic, run), '
+    'and a re-call for the same pair overwrites it.'
+)
+
+#: Caps on the two reviewer-facing proposal fields. Unlike `claim` they never
+#: reach a canonical, so they are not operator-tunable; they exist so a
+#: runaway stage cannot grow the shared recon ledger without bound.
+_RATIONALE_MAX_CHARS = 2000
+_SEEDED_FROM_MAX_CHARS = 500
+
+_REVIEWER_TEXT_HINT = (
+    '`rationale` and `seeded_from` are the reviewer\'s evidence and never reach '
+    'the canonical. `rationale` is required: why these records are one cluster, '
+    f'at most {_RATIONALE_MAX_CHARS} characters. `seeded_from` is optional: what '
+    f'surfaced the cluster, at most {_SEEDED_FROM_MAX_CHARS} characters — omit it '
+    'rather than passing a blank.'
+)
+
+
+@dataclass(frozen=True)
+class _ArmLabels:
+    """The caller-facing names an error speaks for one arm."""
+
+    tool: str
+    member_arm: str
+
+
+#: The proposal's caller passed `member_ids` to `propose_consolidation`;
+#: naming `retain` or `consolidate_memories` to it would describe an
+#: interface it never saw.
+_OP_LABELS = _ArmLabels(tool='consolidate_memories', member_arm='retain')
+_PROPOSAL_LABELS = _ArmLabels(tool='propose_consolidation', member_arm='member_ids')
+
+
+def _claim_problems(claim: str, topic: str, *, max_chars: int) -> list[str]:
+    """The ONE home of the five claim-shape rules. Collects, never short-circuits.
+
+    A claim becomes the auto-consolidated canonical's first paragraph verbatim
+    (``reconciliation/consolidation_auto.py::build_auto_canonical``), so every
+    rule here is about that position: one line, bounded length, not a banner,
+    not a heading, long enough to be an assertion, and saying something the
+    topic slug did not already say.
+    """
+    problems: list[str] = []
+
+    if '\n' in claim or '\r' in claim:
+        problems.append(
+            '`claim` must be a single line — it becomes the canonical\'s first '
+            f'paragraph verbatim, got {_safe_repr(claim)}'
+        )
+
+    if len(claim) > max_chars:
+        problems.append(
+            f'`claim` is {len(claim)} characters, over the {max_chars} limit'
+        )
+
+    if claim.strip().startswith('['):
+        problems.append(
+            '`claim` must not open with a bracketed stamp: a `[CORRECTION ...]` '
+            'banner lifted from a record body would carry that banner into the '
+            f'canonical, got {_safe_repr(claim)}'
+        )
+
+    if _CLAIM_LABEL_RE.match(claim):
+        problems.append(
+            '`claim` must be an assertion, not an INDEX/CANONICAL label, got '
+            f'{_safe_repr(claim)}'
+        )
+
+    words = claim.split()
+    if len(words) < _CLAIM_MIN_WORDS:
+        problems.append(
+            f'`claim` has {len(words)} words, under the {_CLAIM_MIN_WORDS}-word '
+            'minimum'
+        )
+
+    # The slug is already lowercase alphanumeric segments joined by single
+    # hyphens (TOPIC_SLUG_RE), so splitting it on '-' yields the comparable
+    # token set without a second regex.
+    slug_tokens = set(topic.split('-')) if isinstance(topic, str) else set()
+    claim_tokens = set(re.findall(r'[a-z0-9]+', claim.lower()))
+    if not (claim_tokens - slug_tokens - _CLAIM_STOPWORDS):
+        problems.append(
+            '`claim` says nothing the `topic` slug does not already say: every '
+            f'word is drawn from {_safe_repr(topic)} or is a stopword'
+        )
+
+    return problems
+
+
+def _member_count_problems(
+    member_ids: list[Any], limits: ProposalLimits, member_label: str
+) -> list[str]:
+    """Range-check the proposal's member arm, naming the count AND the bound."""
+    count = len(member_ids)
+    if limits.member_min <= count <= limits.member_max:
+        return []
+    return [
+        f'a proposal names {count} members in `{member_label}`, outside the '
+        f'[{limits.member_min}, {limits.member_max}] range'
+    ]
+
+
+def _op_arm_problems(
+    canonical_content: Any, proposal_only_fields: dict[str, tuple[Any, str]]
+) -> tuple[list[str], list[str]]:
+    """The op shape's own rules: ``(problems, hints)``.
+
+    *proposal_only_fields* maps each proposal-only parameter's name to its
+    ``(value, hint)``. One passed without limits is refused rather than
+    dropped: dropping it would silently skip every rule that applies to it.
+    """
+    problems: list[str] = []
+    hints: list[str] = []
+    if not isinstance(canonical_content, str) or not canonical_content.strip():
+        problems.append(
+            '`canonical_content` must be a non-empty string, got '
+            f'{_safe_repr(canonical_content)}'
+        )
+        hints.append(
+            'canonical_content is the consolidated record\'s TEXT — the single '
+            'claim the surviving canonical will state.'
+        )
+    for name, (value, hint) in proposal_only_fields.items():
+        if value is not None:
+            problems.append(
+                f'`{name}` was passed without `limits`, so no {name} rule could '
+                'be applied; pass ProposalLimits built from '
+                'ConsolidationAutoConfig to select the proposal shape'
+            )
+            hints.append(hint)
+    return problems, hints
+
+
+def _reviewer_text_problems(rationale: Any, seeded_from: Any) -> list[str]:
+    """Bound the proposal's two reviewer-facing fields; *rationale* is required."""
+    problems: list[str] = []
+    if not isinstance(rationale, str) or not rationale.strip():
+        problems.append(
+            '`rationale` must be a non-empty string in a proposal, got '
+            f'{_safe_repr(rationale)}'
+        )
+    elif len(rationale) > _RATIONALE_MAX_CHARS:
+        problems.append(
+            f'`rationale` is {len(rationale)} characters, over the '
+            f'{_RATIONALE_MAX_CHARS} limit'
+        )
+    if seeded_from is None:
+        return problems
+    if not isinstance(seeded_from, str) or not seeded_from.strip():
+        problems.append(
+            '`seeded_from` must be omitted or a non-empty string, got '
+            f'{_safe_repr(seeded_from)}'
+        )
+    elif len(seeded_from) > _SEEDED_FROM_MAX_CHARS:
+        problems.append(
+            f'`seeded_from` is {len(seeded_from)} characters, over the '
+            f'{_SEEDED_FROM_MAX_CHARS} limit'
+        )
+    return problems
+
+
+def _proposal_arm_problems(
+    *,
+    canonical_content: Any,
+    claim: Any,
+    topic: Any,
+    category: Any,
+    run_id: Any,
+    rationale: Any,
+    seeded_from: Any,
+    member_ids: list[Any],
+    limits: ProposalLimits,
+) -> tuple[list[str], list[str]]:
+    """The proposal shape's own rules: ``(problems, hints)``.
+
+    A proposal has no canonical text yet, by construction, so a
+    ``canonical_content`` is refused rather than dropped. ``run_id`` is
+    required because it is a component of the proposal row's ledger identity.
+    """
+    problems: list[str] = []
+    hints: list[str] = []
+    if canonical_content is not None:
+        problems.append(
+            '`canonical_content` was passed with `limits`, so the proposal '
+            'shape was selected and the text would be dropped; omit it, or '
+            'pass `limits=None` to select the op shape'
+        )
+        hints.append(_PROPOSAL_TEXT_HINT)
+
+    if not isinstance(claim, str) or not claim.strip():
+        claim_problems = [
+            f'`claim` must be a non-empty string in a proposal, got {_safe_repr(claim)}'
+        ]
+    else:
+        claim_problems = _claim_problems(claim, topic, max_chars=limits.claim_max_chars)
+    if claim_problems:
+        problems.extend(claim_problems)
+        hints.append(_CLAIM_HINT)
+
+    if not isinstance(category, str) or category not in _CATEGORY_VALUES:
+        problems.append(
+            '`category` must be one of the six memory categories, got '
+            f'{_safe_repr(category)}'
+        )
+        hints.append(_CATEGORY_HINT)
+
+    if not isinstance(run_id, str) or not run_id.strip():
+        problems.append(
+            f'a proposal requires `run_id`, got {_safe_repr(run_id)}'
+        )
+        hints.append(_PROPOSAL_RUN_ID_HINT)
+
+    reviewer_text_problems = _reviewer_text_problems(rationale, seeded_from)
+    if reviewer_text_problems:
+        problems.extend(reviewer_text_problems)
+        hints.append(_REVIEWER_TEXT_HINT)
+
+    member_arm = _PROPOSAL_LABELS.member_arm
+    count_problems = _member_count_problems(member_ids, limits, member_arm)
+    if count_problems:
+        problems.extend(count_problems)
+        hints.append(
+            'A proposal names the cluster it wants consolidated in '
+            f'`{member_arm}`. Below the minimum there is no duplication '
+            'to fold; above the maximum a human sitting reads the cluster better '
+            'than an automatic write does.'
+        )
+    return problems, hints
+
+
 def validate_consolidate_args(
     *,
     canonical_content: Any,
@@ -161,8 +500,37 @@ def validate_consolidate_args(
     supersedes: Any,
     retain: Any,
     run_id: Any,
+    claim: Any = None,
+    category: Any = None,
+    rationale: Any = None,
+    seeded_from: Any = None,
+    limits: ProposalLimits | None = None,
 ) -> tuple[dict[str, str] | None, list[Any], list[Any]]:
     """Check a ``consolidate_memories`` call and normalize its two id arms.
+
+    TWO ARMS, selected by *limits* — this is THE one validator for both (PRD
+    D6), so the id, topic and arm rules below have a single home rather than a
+    re-typed copy per caller:
+
+    * ``limits is None`` — the OP shape. A non-``None`` *claim*, *category*,
+      *rationale* or *seeded_from* is itself collected as a problem, so a
+      mis-wired caller that passes one without limits fails CLOSED instead of
+      having it (and therefore every rule on it) silently dropped.
+      ``server/tools.py::consolidate_memories`` takes this arm by omission.
+    * ``limits is not None`` — the PROPOSAL shape. A proposal has no canonical
+      text yet, by construction, so a non-``None`` ``canonical_content`` is
+      REFUSED rather than dropped. *claim*, a *category* naming one of the six
+      memory categories, a non-blank *run_id* (the proposal row's ledger
+      identity) and a bounded *rationale* are required, an optional
+      *seeded_from* is bounded, and the member arm — passed as *retain* — must
+      hold ``[member_min, member_max]`` ids. Errors speak the proposal's own
+      vocabulary: ``propose_consolidation`` and ``member_ids``. Proposal
+      callers reach this arm through :func:`validate_proposal_args`, which
+      speaks those names on the way in too.
+
+    ``evaluate_auto_predicate`` deliberately calls NONE of this. PRD C2 makes
+    the benign codes the emit boundary's business, and the predicate re-derives
+    none of them.
 
     Returns ``(error_or_None, normalized_supersedes, normalized_retain)``.
     The error is the flat ``{'error', 'error_type': 'ValidationError',
@@ -194,22 +562,40 @@ def validate_consolidate_args(
     supersedes_ids = normalize_supersedes(supersedes)
     retain_ids = normalize_supersedes(retain)
 
-    if not isinstance(canonical_content, str) or not canonical_content.strip():
-        problems.append(
-            '`canonical_content` must be a non-empty string, got '
-            f'{_safe_repr(canonical_content)}'
+    labels = _OP_LABELS if limits is None else _PROPOSAL_LABELS
+    member_label = labels.member_arm
+    if limits is None:
+        arm_problems, arm_hints = _op_arm_problems(
+            canonical_content,
+            {
+                'claim': (claim, _CLAIM_HINT),
+                'category': (category, _CATEGORY_HINT),
+                'rationale': (rationale, _REVIEWER_TEXT_HINT),
+                'seeded_from': (seeded_from, _REVIEWER_TEXT_HINT),
+            },
         )
-        _add_hint(
-            'canonical_content is the consolidated record\'s TEXT — the single '
-            'claim the surviving canonical will state.'
+    else:
+        arm_problems, arm_hints = _proposal_arm_problems(
+            canonical_content=canonical_content,
+            claim=claim,
+            topic=topic,
+            category=category,
+            run_id=run_id,
+            rationale=rationale,
+            seeded_from=seeded_from,
+            member_ids=retain_ids,
+            limits=limits,
         )
+    problems.extend(arm_problems)
+    for hint in arm_hints:
+        _add_hint(hint)
 
     if not is_valid_topic_slug(topic):
         problems.append(f'`topic` is not a valid topic slug: {_safe_repr(topic)}')
         _add_hint(_TOPIC_HINT)
 
     bad_ids = _bad_id_members(supersedes_ids, 'supersedes') + _bad_id_members(
-        retain_ids, 'retain'
+        retain_ids, member_label
     )
     if bad_ids:
         problems.extend(bad_ids)
@@ -218,8 +604,9 @@ def validate_consolidate_args(
     # An empty arm is an ABSENT arm — same rule as
     # `_update_memory_arm_presence_error`. Without this, a caller whose
     # supersedes list computed to `[]` gets a success envelope for a
-    # consolidation that folded nothing.
-    if not supersedes_ids and not retain_ids:
+    # consolidation that folded nothing. Op arm only: the proposal arm's
+    # member-count range already names an empty member list.
+    if limits is None and not supersedes_ids and not retain_ids:
         problems.append(
             'consolidate_memories requires at least one arm: `supersedes` (fold '
             'and delete) or `retain` (tag in place). An empty list counts as no arm'
@@ -243,7 +630,7 @@ def validate_consolidate_args(
             if i not in seen:
                 seen.append(i)
         problems.append(
-            'these ids appear in BOTH `supersedes` and `retain`: '
+            f'these ids appear in BOTH `supersedes` and `{member_label}`: '
             + ', '.join(str(i) for i in seen)
         )
         _add_hint(
@@ -287,7 +674,7 @@ def validate_consolidate_args(
     # `normalize_supersedes` never drops a member: rewriting the caller's set
     # would make the op's own report describe a request nobody made.
     repeats = _repeated_id_members(supersedes_ids, 'supersedes')
-    repeats += _repeated_id_members(retain_ids, 'retain')
+    repeats += _repeated_id_members(retain_ids, member_label)
     if repeats:
         problems.extend(repeats)
         _add_hint(
@@ -313,13 +700,107 @@ def validate_consolidate_args(
 
     return (
         {
-            'error': 'consolidate_memories: ' + '; '.join(problems),
+            'error': f'{labels.tool}: ' + '; '.join(problems),
             'error_type': 'ValidationError',
             'hint': ' '.join(hints),
         },
         supersedes_ids,
         retain_ids,
     )
+
+
+def validate_proposal_args(
+    *,
+    topic: Any,
+    member_ids: Any,
+    run_id: Any,
+    claim: Any,
+    category: Any,
+    rationale: Any,
+    seeded_from: Any = None,
+    limits: ProposalLimits,
+) -> tuple[dict[str, str] | None, list[Any]]:
+    """Check a ``propose_consolidation`` call; return ``(error_or_None, normalized_member_ids)``.
+
+    The proposal arm of :func:`validate_consolidate_args`, spoken in the
+    proposal's own names. The rules live there; this only maps the names.
+    """
+    err, _, members = validate_consolidate_args(
+        canonical_content=None,
+        topic=topic,
+        supersedes=None,
+        retain=member_ids,
+        run_id=run_id,
+        claim=claim,
+        category=category,
+        rationale=rationale,
+        seeded_from=seeded_from,
+        limits=limits,
+    )
+    return err, members
+
+
+class ProposalShapeCode(StrEnum):
+    """Why :func:`validate_proposal_args` refused a proposal, as a structured code."""
+
+    MEMBER_COUNT_OUT_OF_RANGE = 'member_count_out_of_range'
+    INVALID_SLUG = 'invalid_slug'
+    CLAIM_NOT_INDEX_SHAPED = 'claim_not_index_shaped'
+    PROPOSAL_SHAPE_INVALID = 'proposal_shape_invalid'
+
+
+def proposal_shape_codes(
+    *,
+    topic: Any,
+    member_ids: Any,
+    run_id: Any,
+    claim: Any,
+    category: Any,
+    rationale: Any,
+    seeded_from: Any = None,
+    limits: ProposalLimits,
+) -> tuple[ProposalShapeCode, ...]:
+    """The codes for every rule :func:`validate_proposal_args` refuses, in enum order.
+
+    Empty exactly when the validator accepts. Each code is named by the same
+    rule helper the validator calls; a refusal none of them names is
+    ``PROPOSAL_SHAPE_INVALID``.
+    """
+    err, normalized_ids = validate_proposal_args(
+        topic=topic,
+        member_ids=member_ids,
+        run_id=run_id,
+        claim=claim,
+        category=category,
+        rationale=rationale,
+        seeded_from=seeded_from,
+        limits=limits,
+    )
+    if err is None:
+        return ()
+    fired = {
+        ProposalShapeCode.MEMBER_COUNT_OUT_OF_RANGE: bool(
+            _member_count_problems(normalized_ids, limits, _PROPOSAL_LABELS.member_arm)
+        ),
+        ProposalShapeCode.INVALID_SLUG: not is_valid_topic_slug(topic),
+        ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED: (
+            not isinstance(claim, str)
+            or not claim.strip()
+            or bool(_claim_problems(claim, topic, max_chars=limits.claim_max_chars))
+        ),
+    }
+    codes = tuple(code for code in ProposalShapeCode if fired.get(code))
+    return codes or (ProposalShapeCode.PROPOSAL_SHAPE_INVALID,)
+
+
+def _closure_member_ref(row: Any) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {'id': None, 'canonical': False}
+    meta = row.get('metadata')
+    return {
+        'id': row.get('id'),
+        'canonical': isinstance(meta, dict) and meta.get('canonical') is True,
+    }
 
 
 def build_consolidation_result(
@@ -343,6 +824,7 @@ def build_consolidation_result(
     citation_repoint: dict[str, Any] | None = None,
     tombstones_written: int = 0,
     tombstones_expected: int = 0,
+    topic_cluster_seed: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The op's response envelope, and the ONE home of its status rule.
 
@@ -372,17 +854,18 @@ def build_consolidation_result(
     missing.
 
     WHAT THE STATUS RULE DELIBERATELY IGNORES: a tombstone shortfall
-    (``tombstones_written < tombstones_expected``).  The memory operation
-    genuinely completed — the cluster is folded and closed — and only its
-    AUDIT TRAIL did not land, e.g. on a deployment running
-    ``recon_ledger_enabled=False`` where the fail-safe writer returns 0.
-    Reporting the two counts satisfies structured-facts and
-    no-silent-fail-soft without conflating the two failures, which matters
-    because ``'partial'`` is an invitation to RETRY: a caller that re-ran a
-    COMPLETED consolidation would re-write a canonical whose supersedes are
-    already gone, which is precisely the net-+1 ratchet this op exists to
-    end.  An audit gap is fixed by looking at the logs, never by repeating
-    the delete.
+    (``tombstones_written < tombstones_expected``) and the topic-guard seed
+    outcome (``topic_cluster_seed``).  In both the memory operation genuinely
+    completed — the cluster is folded and closed — and only a side effect did
+    not land: the AUDIT TRAIL, e.g. on a deployment running
+    ``recon_ledger_enabled=False`` where the fail-safe writer returns 0, or
+    the derived topic cluster that teaches the write-time guard (task 3135).
+    Reporting them satisfies structured-facts and no-silent-fail-soft without
+    conflating either with a consolidation failure, which matters because
+    ``'partial'`` is an invitation to RETRY: a caller that re-ran a COMPLETED
+    consolidation would re-write a canonical whose supersedes are already
+    gone, which is precisely the net-+1 ratchet this op exists to end.  Such
+    a gap is fixed by looking at the logs, never by repeating the op.
 
     WHAT ``'partial'`` IS NOT: a retry signal.  The lists say which ids keep
     the cluster open, and they are there to be FINISHED BY HAND — never by
@@ -405,13 +888,23 @@ def build_consolidation_result(
 
     Every disposition key is ALWAYS present, empty lists included, so a
     caller can read ``result['survivors']`` without a membership test and a
-    later arm cannot quietly stop reporting by omitting its key.  Three keys
+    later arm cannot quietly stop reporting by omitting its key.  Four keys
     are deliberate exceptions, each present only when the thing it describes
     actually happened: ``citation_repoint`` (an empty map would read as "the
     gate ran and found nothing" on a call where the gate never ran at all),
     ``supersedes_correction`` (absent means the canonical's claim was right
-    as written, not that a correction ran and changed nothing) and ``hint``
-    (recovery guidance on a clean run would be noise).
+    as written, not that a correction ran and changed nothing),
+    ``topic_cluster_seed`` (absent means no topic-cluster store is wired, so
+    no seed was attempted) and ``hint`` (recovery guidance on a clean run
+    would be noise).
+
+    ``topic_members`` rows are projected to ``{'id', 'canonical'}``.  This
+    envelope is the ONLY record of an irreversible multi-delete, and a
+    dumping-ground topic's raw rows could push it past the MCP transport
+    limit, where it is rejected wholesale and ``deleted``, ``survivors`` and
+    ``failed_deletes`` are lost for records that are already gone.  A
+    closure proof needs only the id and the canonical flag, and the
+    projection never raises, for the same reason.
     """
     failed_deletes = list(failed_deletes)
     survivors = list(survivors)
@@ -425,7 +918,7 @@ def build_consolidation_result(
         or survivors
         or survivor_check_failed
     )
-    members = list(topic_members or [])
+    members = [_closure_member_ref(row) for row in (topic_members or [])]
     result: dict[str, Any] = {
         'status': 'partial' if open_business else 'consolidated',
         'canonical_id': canonical_id,
@@ -465,6 +958,8 @@ def build_consolidation_result(
         result['citation_repoint'] = citation_repoint
     if supersedes_correction:
         result['supersedes_correction'] = supersedes_correction
+    if topic_cluster_seed is not None:
+        result['topic_cluster_seed'] = topic_cluster_seed
     if open_business:
         # Carried IN the envelope, not just in the docstring: the caller
         # holding a partial result is the one about to re-run the op, and a

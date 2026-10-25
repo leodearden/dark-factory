@@ -178,7 +178,7 @@ tasks:
       kind: grep
       pattern: OnCalendar
       paths:
-      - scripts/
+      - scripts/fused-memory-duplicate-audit.timer
       expect: present
   - name: gate-filing-consumes-report
     binding: capability→consumer (wired) — gates cite deterministically enumerated clusters (6/19 reify gates had wrong narrative enumerations)
@@ -214,11 +214,8 @@ tasks:
     binding: rejection-mechanism (INV-1) — reexamine_when key contract-fixed; malformed rejects with hint
     verdict: PASS
     delivered_check:
-      kind: grep
-      pattern: reexamine_when
-      paths:
-      - fused-memory/src/fused_memory/
-      expect: present
+      kind: manual
+      reason: rejection-mechanism behaviour; a bare-identifier grep was refused by the polarity lint (filename_shaped); verified by 3139's own tests
 - label: xi
   task_id: 3140
   title: 'Task-terminal invalidation hook'

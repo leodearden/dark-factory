@@ -12,8 +12,21 @@ The decision is made by an LLM against a layered corpus of existing tasks (revie
 anchor + module-lock pool + embedding neighbors + dependency neighbors). See
 docs/reify-task-fragmentation-report-2026-04-11.txt for the motivating analysis.
 
-The curator is best-effort: any failure (embedder, Qdrant, LLM, taskmaster) degrades
-to ``action="create"`` so task creation is never blocked.
+When the curator cannot judge a candidate it returns ``action="defer"``
+(:meth:`CuratorDecision.deferred`, with the
+:class:`~fused_memory.middleware.curation_deferral.DeferReason` that says why) rather
+than creating anything un-deduped. The interceptor parks a deferred
+submission and retries it until it gets a verdict, so task creation is never blocked
+and never silently skips dedupe. A response that arrives but cannot be used still
+degrades to ``action="create"``, marked ``degraded``.
+
+A timed-out LLM call is classified from its own transcript when the curator is gated
+(task 3995): a pre-turn stall (0 assistant turns) is the one outage that still creates,
+marked ``degraded_by_zot``, and files a ZOT escalation that folds into one record per
+project; a run killed with progress returns
+a verdict the CLI accepted (its ``structured_output`` attachment) if the transcript
+holds one, else escalates with its real turn count and tool sequence; any non-schema
+tool use logs a loud WARNING. A schema-tool denial is always escalated, never salvaged.
 
 Batch API (task 924)
 --------------------
@@ -27,102 +40,96 @@ for the full design rationale (batch prompt, schema, topo-sort dispatch, fallbac
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
+import os
 import time
 import uuid as uuid_mod
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from shared.cli_invoke import (
     AgentResult,
-    AllAccountsCappedException,
+    TranscriptEvidence,
+    claude_binary_spec,
     invoke_with_cap_retry,
     is_zero_output_timeout,
+    no_mcp_servers_config,
+    resolve_claude_binary,
+    transcript_evidence_for_session,
+)
+from shared.config_dir import (
+    CONFIG_DIR_PREFIX,
+    TaskConfigDir,
+    sweep_stale_pid_dirs,
+    sweep_stale_pid_dirs_once,
 )
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
-from shared.task_statuses import TaskStatus
 
+from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.mcp_tools.scheduler_state import effective_lock_depth
+from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+from fused_memory.middleware.cancelled_premise_blocklist import (
+    match_candidate as match_blocklisted_premise,
+)
 from fused_memory.middleware.candidate_key import compute_candidate_key
+from fused_memory.middleware.curation_deferral import (
+    POOL_UNAVAILABLE_ERRORS,
+    DeferReason,
+    pool_defer_reason,
+)
+from fused_memory.middleware.curator_types import (
+    DEFAULT_PRIORITY,
+    POOL_SOURCES,
+    CandidateTask,
+    CuratorDecision,
+    CuratorFailureError,
+    PoolEntry,
+    PoolWithheld,
+    PreparedCandidate,
+    RewrittenTask,
+    clip_for_prompt,
+    embedding_text,
+    empty_pool_sizes,
+    is_combine_eligible_status,
+)
+from fused_memory.middleware.operational_ask_registry import load_operational_registry
+from fused_memory.middleware.operational_ask_registry import (
+    match_candidate as match_operational_ask,
+)
+from fused_memory.middleware.recon_claim_verification_guard import (
+    AttributedClaim,
+    extract_attributed_claims,
+    make_source_and_history_probe,
+    verify_attributed_claims,
+)
+from fused_memory.middleware.recon_code_fix_premise_guard import (
+    load_premise_registry,
+    verify_premise_refuted,
+)
+from fused_memory.middleware.recon_code_fix_premise_guard import (
+    match_candidate as match_refuted_premise,
+)
 from fused_memory.reconciliation.context_assembler import estimate_tokens
 from fused_memory.utils.task_dependency_ids import task_dependency_ids as _task_dependencies
 
 if TYPE_CHECKING:
     from qdrant_client.models import ExtendedPointId
+    from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.middleware.curator_escalator import CuratorEscalator
-    from fused_memory.middleware.recon_claim_verification_guard import AttributedClaim
 
 logger = logging.getLogger(__name__)
 
-
-class CuratorFailureError(RuntimeError):
-    """Raised when the curator's LLM call fails and cannot be salvaged.
-
-    The curator no longer degrades silently to ``action='create'`` on LLM
-    errors; instead the interceptor translates this into an L1 escalation or
-    a hard failure at the MCP boundary so operators notice breakage.
-
-    Attaches ``timed_out``, ``duration_ms``, ``subtype``, ``schema_tool_denied``,
-    and ``cost_usd`` from the underlying ``AgentResult`` so
-    :class:`CuratorEscalator` can surface them in the L1 escalation detail and
-    so the bisecting fallback in
-    :meth:`TaskCurator._call_llm_batch_with_fallback` can branch on the
-    failure subtype without leaking the underlying ``AgentResult`` outside
-    :meth:`TaskCurator._call_llm` / :meth:`TaskCurator._call_llm_batch`.
-    Defaults make the attributes safe to read even when the failure
-    originates outside those call sites.
-
-    ``schema_tool_denied`` is the CLI-2.1.168 regression signal: the synthetic
-    ``StructuredOutput`` schema tool was permission-denied (a systemic deny-list
-    break, not a flaky candidate).  When set, :class:`CuratorEscalator` raises a
-    distinct, un-suppressed escalation so the deny-list gets fixed promptly.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        timed_out: bool | None = None,
-        duration_ms: int | None = None,
-        subtype: str | None = None,
-        schema_tool_denied: bool = False,
-        zero_output_timeout: bool = False,
-        proc_tree: str = '',
-        account_name: str = '',
-        cost_usd: float | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.timed_out = timed_out
-        self.duration_ms = duration_ms
-        self.subtype = subtype
-        self.schema_tool_denied = schema_tool_denied
-        self.zero_output_timeout = zero_output_timeout
-        self.proc_tree = proc_tree
-        self.account_name = account_name
-        self.cost_usd = cost_usd
-
-
-# 'drop', 'combine' and 'create' are the only actions the LLM may request — see
-# CURATOR_OUTPUT_SCHEMA / CURATOR_BATCH_OUTPUT_SCHEMA below, whose enums stay
-# exactly those three. 'route_deterministic' and 'refuse' are DETERMINISTIC-ONLY
-# verdicts, reachable solely from a `_maybe_*` guard backed by an
-# operator-curated YAML registry; the model must never be able to emit either.
-# 'refuse' in particular means "this candidate's premise is dead — create
-# NOTHING", which is deliberately distinct from 'drop' ("fold into existing
-# target task N", which requires a target).
-Action = Literal['drop', 'combine', 'create', 'route_deterministic', 'refuse']
 
 _STATUS_RANK = {
     'pending': 0,
@@ -133,17 +140,80 @@ _STATUS_RANK = {
     'done': 4,
 }
 _PRIORITY_RANK = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'polish': 4}
-DEFAULT_PRIORITY = 'medium'  # canonical fallback used by both record_task and backfill_corpus
 if DEFAULT_PRIORITY not in _PRIORITY_RANK:
     raise ValueError(f'{DEFAULT_PRIORITY!r} not in _PRIORITY_RANK')
 
-# The curator is best-effort middleware: any AllAccountsCappedException triggers a
-# graceful-degradation handler (curate() → action='create', curate_batch() → re-raise
-# so the worker defers the whole batch via UsageGate.wait_for_open).  The shared
-# default of 14 days would silently convert that into a 14-day block on this
-# best-effort path — a real behavioural regression — so we override with a short
-# minutes-scale bound that preserves the fast-fail/defer contract.
-_CURATOR_CAP_WAIT_SANITY_SECS = 120.0  # 2 minutes; override for shared 14-day default
+# Expiry of this bound raises AllAccountsCappedException, which the curator turns
+# into a defer decision for every LLM-bound candidate, so the ticket is parked and
+# retried later. The shared default of 14 days would instead hold the ticket worker
+# for up to 14 days, so a minutes-scale bound keeps the defer fast.
+_CURATOR_CAP_WAIT_SANITY_SECS = 120.0
+
+# Stem of a gated curator's per-process CLAUDE_CONFIG_DIR. The dead-PID sweep
+# builds its prefix from the same constant, so the two cannot drift apart.
+_CONFIG_DIR_TASK_PREFIX = 'fm-curator-'
+
+
+def _sweep_stale_curator_config_dirs_once(base_dir: Path | None) -> None:
+    """Reclaim curator config dirs whose owning process is dead. Never raises."""
+    prefix = CONFIG_DIR_PREFIX + _CONFIG_DIR_TASK_PREFIX
+    sweep_stale_pid_dirs_once(
+        prefix,
+        sweep=sweep_stale_pid_dirs,
+        on_reclaimed=lambda reclaimed: logger.info(
+            'TaskCurator: reclaimed %d stale config dir(s) under %s (dead-PID sweep)',
+            reclaimed, prefix,
+        ),
+        on_failure=lambda _exc: logger.warning(
+            'TaskCurator: dead-PID sweep of %s failed; continuing without it',
+            prefix, exc_info=True,
+        ),
+        base_dir=base_dir,
+    )
+
+
+@dataclass(frozen=True)
+class _TranscriptScope:
+    """Where one gated curator call's transcript lands, and its first-turn grace.
+
+    config_dir and session_id together make ``transcript_turns`` stampable,
+    which is what makes ``is_zero_output_timeout`` transcript-authoritative.
+    The grace equals the call's own timeout because the curator's measured
+    first-turn latency tail exceeds the 120s default (task 3995 plan).
+    """
+
+    config_dir: TaskConfigDir
+    session_id: str
+    startup_grace_secs: float
+
+    def as_invoke_kwargs(self) -> dict[str, Any]:
+        """The ``invoke_with_cap_retry`` kwargs that thread this scope."""
+        return {
+            'config_dir': self.config_dir,
+            'session_id': self.session_id,
+            'startup_grace_secs': self.startup_grace_secs,
+        }
+
+
+def _salvageable_verdict(
+    agent_result: AgentResult, evidence: TranscriptEvidence | None,
+) -> dict | None:
+    """The verdict a failed call may be salvaged with, else None.
+
+    Only a run that was KILLED (so its stdout never arrived) after the CLI
+    accepted its verdict qualifies. Any other failure's stdout was already
+    parsed by ``_parse_claude_output``, which owns stdout salvage, and a denied
+    schema tool must reach its loud escalation.
+    """
+    if (
+        not agent_result.timed_out
+        or agent_result.schema_tool_denied
+        or agent_result.structured_output is not None
+        or evidence is None
+    ):
+        return None
+    return evidence.accepted_schema_payload
+
 
 # JSON schema for the curator's structured output — used by invoke_with_cap_retry
 # to constrain the LLM's response.  See also CURATOR_BATCH_OUTPUT_SCHEMA below.
@@ -212,89 +282,6 @@ CURATOR_BATCH_OUTPUT_SCHEMA: dict[str, Any] = {
 
 
 @dataclass
-class CandidateTask:
-    """A task about to be created, fed to the curator for a drop/combine/create decision."""
-
-    title: str
-    description: str = ''
-    details: str = ''
-    files_to_modify: list[str] = field(default_factory=list)
-    priority: str = DEFAULT_PRIORITY
-    spawned_from: str | None = None  # task id of the review-chain anchor
-    spawn_context: str = 'manual'  # review | steward-triage | planning | manual
-    # metadata.execution_class ('code_tdd' | 'operational' | 'decision' | None) —
-    # consulted by operational_ask_registry.match_candidate. Its routing axis
-    # (task 2687) is DEMOTED (task δ): a tagged operational/decision candidate is
-    # now SKIPPED (match_candidate returns None) because the submit boundary
-    # inject_operational_routing (task β) already owns tagged-ask routing;
-    # untagged asks still use the substring fallback. Also part of payload_hash
-    # (see below).
-    execution_class: str | None = None
-
-    def payload_hash(self) -> str:
-        """Stable hash over fields the curator actually reads.
-
-        Two candidates with the same hash get the same cached decision — this
-        prevents combine-on-combine drift when a creation is retried.
-        """
-        h = hashlib.sha256()
-        h.update(self.title.encode())
-        h.update(b'\x00')
-        h.update(self.description.encode())
-        h.update(b'\x00')
-        h.update(self.details.encode())
-        h.update(b'\x00')
-        h.update('\n'.join(sorted(self.files_to_modify)).encode())
-        h.update(b'\x00')
-        h.update((self.spawned_from or '').encode())
-        h.update(b'\x00')
-        # execution_class is hashed too (task 2687; rationale corrected task δ).
-        # The match_candidate routing axis is now DEMOTED — a tagged
-        # operational/decision candidate returns None from the route guard
-        # rather than routing (task δ) — but two candidates differing ONLY in
-        # execution_class can STILL resolve to different curator decisions: a
-        # tagged operational candidate returns None from _maybe_route_deterministic
-        # and proceeds to the LLM create/drop/combine path (which IS cached),
-        # while an otherwise-identical untagged candidate may substring-route or
-        # take a different LLM decision. Dropping execution_class from the hash
-        # would let one's cached decision be wrongly returned for the other, so
-        # it must remain part of the key.
-        h.update((self.execution_class or '').encode())
-        # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
-        # Any change to length or algorithm must be mirrored there and at the other
-        # task_curator.py mirror sites (_intra_batch_key, _normalize_key).
-        return h.hexdigest()[:16]
-
-    @classmethod
-    def from_rewritten_task(cls, rt: RewrittenTask) -> CandidateTask:
-        """Construct a CandidateTask from a RewrittenTask produced by the combine action.
-
-        Centralises the field mapping so callers don't hand-enumerate fields
-        and silently drop any that ``RewrittenTask`` gains in the future.
-        ``spawned_from`` and ``spawn_context`` are left at their defaults
-        because a rewritten task has no direct spawning relationship.
-        """
-        return cls(
-            title=rt.title,
-            description=rt.description,
-            details=rt.details,
-            files_to_modify=rt.files_to_modify,
-            priority=rt.priority,
-        )
-
-
-@dataclass
-class RewrittenTask:
-    """A task description produced by the combine action."""
-
-    title: str
-    description: str
-    details: str
-    files_to_modify: list[str]
-    priority: str
-
-
-@dataclass
 class BackfillResult:
     """Result of a backfill_corpus() call."""
 
@@ -314,84 +301,19 @@ class PruneResult:
     reason: str = ''
 
 
-@dataclass
-class CuratorDecision:
-    """Result of a curator call. Always returned — never raised."""
-
-    action: Action
-    target_id: str | None = None
-    target_fingerprint: str | None = None
-    rewritten_task: RewrittenTask | None = None
-    justification: str = ''
-    pool_sizes: dict[str, int] = field(default_factory=dict)
-    latency_ms: int = 0
-    cost_usd: float = 0.0
-    # Set only by curate_batch when a candidate is a duplicate of another
-    # candidate in the same batch (neither yet materialised as a task).
-    # The worker substitutes the sibling's resulting task_id at dispatch time.
-    batch_target_index: int | None = None
-
-    def to_log_fields(self) -> dict[str, Any]:
-        return {
-            'action': self.action,
-            'target_id': self.target_id,
-            'target_fingerprint': self.target_fingerprint,
-            'justification': self.justification[:200],
-            'pool_sizes': self.pool_sizes,
-            'latency_ms': self.latency_ms,
-            'cost_usd': self.cost_usd,
-        }
-
-
-@dataclass
-class PreparedCandidate:
-    """Per-candidate batch input prepared by :meth:`TaskCurator.prepare_candidate`.
-
-    Carries the candidate, its assembled corpus pool, pool sizes, and the
-    estimated user-prompt token count for this candidate's section of the
-    batched prompt.  The token estimate is what the worker uses to decide
-    whether adding this candidate to the in-flight batch would exceed the
-    soft ``batch_token_threshold``.
-    """
-
-    candidate: CandidateTask
-    pool: list[_PoolEntry]
-    pool_sizes: dict[str, int]
-    prompt_tokens: int
-
-
-@dataclass
-class _PoolEntry:
-    """One task as seen by the curator — extracted from raw taskmaster data."""
-
-    task_id: str
-    title: str
-    description: str
-    details: str
-    files_to_modify: list[str]
-    module_keys: list[str]
-    status: str
-    priority: str
-    source: str  # anchor | module | embedding | dependency
-    combine_eligible: bool
-
-    def render(self, desc_cap: int, details_cap: int) -> str:
-        """Render this entry as a human-readable block for the LLM prompt."""
-        desc = self.description[:desc_cap]
-        if len(self.description) > desc_cap:
-            desc += '…'
-        det = self.details[:details_cap]
-        if len(self.details) > details_cap:
-            det += '…'
-        files = ', '.join(self.files_to_modify) if self.files_to_modify else '(none)'
-        return (
-            f'[Task {self.task_id}] status={self.status} priority={self.priority} '
-            f'source={self.source} combine_eligible={self.combine_eligible}\n'
-            f'  title: {self.title}\n'
-            f'  description: {desc}\n'
-            f'  details: {det}\n'
-            f'  files_to_modify: {files}'
-        )
+def _corpus_failed_deferral(
+    candidate: CandidateTask, error: object, start: float, *, exc_info: bool = False,
+) -> CuratorDecision:
+    """Defer *candidate* because its corpus could not be assembled."""
+    logger.warning(
+        'task_curator: corpus assembly failed, deferring curation of %r: %s',
+        candidate.title, error, exc_info=exc_info,
+    )
+    return CuratorDecision.deferred(
+        DeferReason.CORPUS_FAILED,
+        pool_sizes=empty_pool_sizes(),
+        latency_ms=int((time.monotonic() - start) * 1000),
+    )
 
 
 # ----------------------------------------------------------------------
@@ -544,16 +466,6 @@ CURATOR_BATCH_SPEC = PromptSpec(
 )
 
 
-def normalize_title(title: str | None) -> str:
-    """Lowercase + collapse whitespace for forgiving title comparison.
-
-    Accepts ``str | None``; a ``None`` or empty input returns ``''``.
-    Used by both the combine-guard fingerprint check (task_interceptor.py)
-    and the intra-batch dedup key helper (``TaskCurator._intra_batch_key``).
-    """
-    return ' '.join((title or '').strip().lower().split())
-
-
 def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float:
     """Compute a scaled LLM budget clamped at ``cap``.
 
@@ -568,6 +480,130 @@ def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float
     return min(base + per_entry * size, cap)
 
 
+@dataclass
+class _DegradedStreak:
+    """One project's run of consecutive degraded curations.
+
+    ``alarm_fired`` latches so a streak escalates once, not once per curation
+    past the threshold; the whole record is discarded on that project's next
+    usable decision.
+    """
+
+    count: int = 0
+    alarm_fired: bool = False
+
+
+class _LazyRegistry:
+    """One-shot, off-loop lazy load of a YAML registry file.
+
+    Owns the ``(entries, attempted, lock)`` triple for exactly one registry
+    so the double-checked-lock + ``asyncio.to_thread`` + fail-open idiom
+    (see :meth:`entries`) exists once for all three curator guards
+    (:meth:`TaskCurator._maybe_blocklist_drop`,
+    :meth:`TaskCurator._maybe_route_deterministic`,
+    :meth:`TaskCurator._maybe_premise_refuted_drop`) instead of being copied
+    at each site. The idiom is subtle in exactly the way that punishes
+    copies: the attempted flag must latch AFTER the load settles and never
+    in a ``finally``, because ``asyncio.CancelledError`` is a
+    ``BaseException`` (task 4201).
+    """
+
+    def __init__(self, config_key: str, label: str) -> None:
+        # CuratorConfig field name for this registry's path — named in the
+        # relative-path-without-cwd WARNING so an operator knows which
+        # config field to make absolute.
+        self._config_key = config_key
+        # Short guard label ('blocklist' / 'operational-ask' / 'recon-premise')
+        # — named in the load-error WARNING so an operator knows which guard
+        # just went dark. Deliberately distinct from config_key: the two
+        # warnings name genuinely different things, and 'recon-premise' does
+        # not appear in 'recon_code_fix_premise_registry_path' (hyphen vs
+        # underscore), which an existing test asserts on verbatim.
+        self._label = label
+        # _attempted (not _entries) is the not-yet-loaded-vs-settled signal
+        # — see entries() below. _entries holds the loader's result once
+        # settled, or None when the load raised and the guard failed open:
+        # None therefore means "not yet attempted" OR "load raised", while
+        # [] means only "loaded but empty". Every caller treats both falsy
+        # cases identically (`if not entries: return None`). No hot-reload
+        # — a server restart is required to pick up YAML changes.
+        self._entries: list | None = None
+        self._attempted = False
+        # Guards the one-shot load. Needed because the load is offloaded via
+        # asyncio.to_thread: the await point means a concurrent caller could
+        # otherwise observe attempted=True while _entries is still None and
+        # silently fail the guard open. One TaskCurator instance is shared
+        # across projects while the interceptor's curator lock is
+        # per-project, so concurrent entry is reachable. asyncio.Lock() is
+        # loop-agnostic at construction on Python 3.13, so building it here
+        # in __init__ is safe.
+        self._lock = asyncio.Lock()
+
+    def _resolve(self, cfg_path: str, cwd: Path | None) -> Path:
+        """Resolve *cfg_path* against *cwd*, warning once when relative with no cwd."""
+        raw_path = Path(cfg_path)
+        if raw_path.is_absolute():
+            return raw_path
+        if cwd is not None:
+            return cwd / raw_path
+        logger.warning(
+            'task_curator: %s %r is relative but TaskCurator was constructed '
+            'without cwd — resolving against process CWD which may be '
+            'incorrect; use an absolute path in CuratorConfig',
+            self._config_key, cfg_path,
+        )
+        return raw_path
+
+    async def entries(
+        self, loader: Callable[[Path], list], cfg_path: str, cwd: Path | None,
+    ) -> list | None:
+        """Return this registry's parsed entries, loading at most once.
+
+        Offloaded via ``asyncio.to_thread`` so the blocking read/YAML-parse
+        work never stalls the event loop (INV-8
+        loop-thread-occupancy-bounded, docs/legibility/design-invariants.md).
+
+        Double-checked lock: the await point inside the offloaded load means
+        a concurrent second caller could otherwise observe attempted=True
+        while entries is still None and silently fail the guard open. The
+        outer unlocked check keeps the steady-state path (every call after
+        the first) lock-free; the inner re-check under the lock is what
+        makes concurrent first calls correct. The flag is set only AFTER the
+        assignment so nobody can observe the attempted-but-unassigned window.
+        """
+        if not self._attempted:
+            async with self._lock:
+                if not self._attempted:
+                    path = self._resolve(cfg_path, cwd)
+                    try:
+                        self._entries = await asyncio.to_thread(loader, path)
+                    except Exception as exc:
+                        # The loaders never raise (their file-level contract is
+                        # fused_memory/utils/safe_yaml.py::load_yaml_list_file),
+                        # but asyncio.to_thread adds a raise path of its own
+                        # (thread-pool failure or shutdown) that no loader-
+                        # internal except can cover. Fail OPEN (guard
+                        # disabled) rather than escaping into curate() /
+                        # curate_batch_prepared, which call the guard
+                        # methods unguarded — an escape would fail the whole
+                        # task submission.
+                        logger.warning(
+                            'task_curator: %s registry load errored for %s, '
+                            'failing open (guard disabled): %s',
+                            self._label, path, exc,
+                        )
+                        self._entries = None
+                    # Settled outcome (loaded, or failed open) — latch the
+                    # one-shot contract. Deliberately NOT a `finally`:
+                    # asyncio.CancelledError is a BaseException, so it
+                    # bypasses the except above, and latching in a `finally`
+                    # would permanently disable the guard because an
+                    # unrelated caller was cancelled mid-load. Leaving the
+                    # flag clear on cancellation lets the next call retry.
+                    self._attempted = True
+        return self._entries
+
+
 class TaskCurator:
     """LLM-judged drop/combine/create gate plus the Qdrant corpus backing it."""
 
@@ -579,13 +615,19 @@ class TaskCurator:
         cwd: Path | None = None,
         escalator: CuratorEscalator | None = None,
         prompt_store: PromptArtifactStore | None = None,
+        config_dir_base: Path | None = None,
+        cost_store: CostStore | None = None,
     ) -> None:
         self._config = config
         self._taskmaster = taskmaster
         self._usage_gate = usage_gate
+        self._cost_store = cost_store
         self._cwd = cwd
         self._escalator = escalator
         self._prompt_store = prompt_store
+        # Parent of the per-process config dir; None means the system tempdir.
+        self._config_dir_base = config_dir_base
+        self._config_dir: TaskConfigDir | None = None  # lazy, gated only
         self._qdrant_client = None  # AsyncQdrantClient, lazy
         self._embedder = None  # OpenAIEmbedder, lazy
         self._initialized_collections: set[str] = set()
@@ -596,32 +638,25 @@ class TaskCurator:
         # case cheaply — skips embedding + LLM entirely on the second call.
         self._recent_creates: dict[str, dict[str, tuple[str, float]]] = {}
         # Cancelled-premise blocklist — lazy-loaded on first curate() call.
-        # None means "not yet attempted"; [] means "loaded but empty or failed".
-        self._blocklist: list | None = None
-        self._blocklist_load_attempted: bool = False
+        self._blocklist = _LazyRegistry(
+            config_key='cancelled_premise_blocklist_path', label='blocklist',
+        )
         # Recon code-fix premise-verification registry — lazy-loaded on first
         # curate() call, same shape as _blocklist above. Unlike the blocklist,
         # a match here is re-verified against the live source tree on every
         # call (see recon_code_fix_premise_guard.verify_premise_refuted) —
         # only the YAML load itself is cached for the instance lifetime.
-        self._premise_registry: list | None = None
-        self._premise_registry_load_attempted: bool = False
-        # Guards the one-shot lazy load above. Needed because the load is
-        # offloaded via asyncio.to_thread: the await point means a concurrent
-        # caller could otherwise observe load_attempted=True with
-        # _premise_registry still None and silently fail the guard open. One
-        # TaskCurator instance is shared across projects while the
-        # interceptor's curator lock is per-project, so concurrent entry is
-        # reachable. asyncio.Lock() is loop-agnostic at construction on
-        # Python 3.13, so building it here in __init__ is safe.
-        self._premise_registry_load_lock = asyncio.Lock()
+        self._premise_registry = _LazyRegistry(
+            config_key='recon_code_fix_premise_registry_path', label='recon-premise',
+        )
         # Operational-ask registry (filing-policy gate) — lazy-loaded on first
         # curate() call, same shape as _blocklist above. A match routes the
         # candidate straight to a deterministic PURE-GATE instead of the LLM;
         # unlike the blocklist, the resulting decision is deliberately NOT
         # written to the idempotency cache (see _maybe_route_deterministic).
-        self._operational_registry: list | None = None
-        self._operational_registry_load_attempted: bool = False
+        self._operational_registry = _LazyRegistry(
+            config_key='operational_ask_registry_path', label='operational-ask',
+        )
         # Consecutive-ZOT circuit breaker (task 1743).
         # Counts zero-output/full-timeout curator LLM failures since the
         # last real LLM success; a non-ZOT failure neither increments nor
@@ -629,6 +664,13 @@ class TaskCurator:
         self._consecutive_zero_output_timeouts: int = 0
         # monotonic() time until which the breaker is open (None = closed).
         self._zero_output_breaker_open_until: float | None = None
+        # Degraded-curation streaks by project_id (task 4448). Distinct from
+        # the ZOT counter above: that one counts hung calls in order to stop
+        # paying for them; these count degraded decisions of every cause, in
+        # order to make a sustained outage visible. Keyed by project because
+        # one curator serves every project, so a shared count would let one
+        # project's healthy curations mask another's outage.
+        self._degraded_streaks: dict[str, _DegradedStreak] = {}
 
     # ------------------------------------------------------------------
     # Zero-output-timeout circuit breaker (task 1743)
@@ -752,18 +794,6 @@ class TaskCurator:
         self._initialized_collections.add(name)
         return name
 
-    @staticmethod
-    def _embedding_text(
-        title: str, description: str, files_to_modify: list[str],
-    ) -> str:
-        """Text used for embedding — title + description + file list."""
-        parts = [title]
-        if description:
-            parts.append(description)
-        if files_to_modify:
-            parts.append('\n'.join(files_to_modify))
-        return '\n\n'.join(parts)
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -775,32 +805,6 @@ class TaskCurator:
     _RECENT_CREATES_TTL_SECS = 600.0  # 10 min — long enough to catch
     # concurrent triages but short enough that stale entries don't pin
     # memory after a task is removed.
-
-    @staticmethod
-    def _intra_batch_key(title: str, description: str) -> str:
-        """Stable 16-char hash over normalised (title, description).
-
-        Used by the planning_mode / curator batch pipeline to identify
-        near-identical entries inside a single LLM-generated batch (the
-        canonical bulk-creation path now that expand_task / parse_prd are
-        gone).
-
-        Normalisation delegates to the shared module-level
-        :func:`normalize_title` helper — lowercase, strip, and collapse
-        internal whitespace — making the key case- and whitespace-insensitive.
-
-        Does NOT include files_to_modify because Taskmaster-generated
-        subtasks frequently omit that field, so including it would produce
-        false negatives for otherwise-identical tasks.
-        """
-        h = hashlib.sha256()
-        h.update(normalize_title(title).encode())
-        h.update(b'|')
-        h.update(normalize_title(description).encode())
-        # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
-        # Any change to length or algorithm must be mirrored there and at the other
-        # task_curator.py mirror sites (payload_hash, _normalize_key).
-        return h.hexdigest()[:16]
 
     @staticmethod
     def _normalize_key(candidate: CandidateTask) -> str | None:
@@ -867,7 +871,7 @@ class TaskCurator:
             action='drop',
             target_id=cached_id,
             justification='pre-llm-exact-match',
-            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            pool_sizes=empty_pool_sizes(),
             latency_ms=0,
         )
 
@@ -904,45 +908,28 @@ class TaskCurator:
         Lazy-loads the blocklist from ``self._config.curator.cancelled_premise_blocklist_path``
         on the first call and caches it for the lifetime of this :class:`TaskCurator`
         instance (no hot-reload; a server restart is required to pick up YAML changes).
+        The load runs off the event-loop thread via :class:`_LazyRegistry`
+        (``asyncio.to_thread``), so it cannot stall the fused-memory event loop.
 
         Returns ``None`` when:
         - The blocklist path is not configured (``None``).
         - The blocklist file is missing, unreadable, or unparseable (one WARNING logged).
         - The blocklist is empty.
         - No entry matches the candidate.
+        - The offloaded load raised (one WARNING logged; the guard then stays
+          disabled for this TaskCurator instance rather than retrying per call).
 
         Never raises.
         """
-        from fused_memory.middleware.cancelled_premise_blocklist import (
-            load_blocklist,
-            match_candidate,
-        )
-
         cfg_path = self._config.curator.cancelled_premise_blocklist_path
         if cfg_path is None:
             return None
 
-        # Lazy load — run at most once per TaskCurator instance.
-        if not self._blocklist_load_attempted:
-            self._blocklist_load_attempted = True
-            raw_path = Path(cfg_path)
-            if not raw_path.is_absolute():
-                if self._cwd is not None:
-                    raw_path = self._cwd / raw_path
-                else:
-                    logger.warning(
-                        'task_curator: cancelled_premise_blocklist_path %r is relative but '
-                        'TaskCurator was constructed without cwd — resolving against process '
-                        'CWD which may be incorrect; use an absolute path in CuratorConfig',
-                        cfg_path,
-                    )
-            self._blocklist = load_blocklist(raw_path)
-
-        entries = self._blocklist
+        entries = await self._blocklist.entries(load_blocklist, cfg_path, self._cwd)
         if not entries:
             return None
 
-        entry = match_candidate(candidate, entries)
+        entry = match_blocklisted_premise(candidate, entries)
         if entry is None:
             return None
 
@@ -952,7 +939,7 @@ class TaskCurator:
             target_fingerprint=None,
             rewritten_task=None,
             justification=f'cancelled-premise-blocklist: {entry.name}: {entry.reason}',
-            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            pool_sizes=empty_pool_sizes(),
             latency_ms=0,
         )
         self._store_cache(payload_hash, decision)
@@ -987,47 +974,43 @@ class TaskCurator:
         signature symmetry with ``_maybe_blocklist_drop`` and is unused here.
 
         Both blocking halves of this method run off the event-loop thread
-        (task 4201, 2026-08-29): the one-shot registry load and the
-        per-match live-source re-verification are each dispatched via
-        ``asyncio.to_thread``. The textual match (``match_candidate``) is
-        deliberately kept ON the loop — it is pure string work with no I/O,
-        so the common case of a non-matching candidate pays no thread-pool
-        dispatch. Measured on the shipped registry: registry load ~9.9ms
-        (8.15ms of it ``yaml.safe_load``, only 21us the ``read_text``);
-        worst per-match verification 1.2ms warm / 6.2ms cold on a 664 KB
-        cited file; thread-dispatch overhead ~67us. This resolves an
-        instance of INV-8 ``loop-thread-occupancy-bounded``
-        (docs/legibility/design-invariants.md), mirroring the offload
-        pattern already used by :meth:`_maybe_flag_unverified_claims` and
-        the claim-verification block in :meth:`curate_batch_prepared`.
+        (task 4201, 2026-08-29): the one-shot registry load (via the shared
+        :class:`_LazyRegistry`) and the per-match live-source re-verification
+        are each dispatched via ``asyncio.to_thread``. The textual match
+        (``match_refuted_premise``) is deliberately kept ON the loop — it is pure
+        string work with no I/O, so the common case of a non-matching
+        candidate pays no thread-pool dispatch. Measured on the shipped
+        registry: registry load ~9.9ms (8.15ms of it ``yaml.safe_load``,
+        only 21us the ``read_text``); worst per-match verification 1.2ms
+        warm / 6.2ms cold on a 664 KB cited file; thread-dispatch overhead
+        ~67us. This resolves an instance of INV-8
+        ``loop-thread-occupancy-bounded`` (docs/legibility/design-invariants.md),
+        mirroring the offload pattern already used by
+        :meth:`_maybe_flag_unverified_claims` and the claim-verification
+        block in :meth:`curate_batch_prepared`.
 
-        This bounds the loop stall for THIS guard only. The two sibling
-        one-shot lazy loads invoked earlier in the same :meth:`curate` /
-        :meth:`curate_batch_prepared` sequence — :meth:`_maybe_blocklist_drop`
-        loading ``cancelled_premise_blocklist_path`` (2.2 KB) and
-        :meth:`_maybe_route_deterministic` loading
-        ``operational_ask_registry_path`` (6.7 KB, ~60% the size of this
-        guard's own 11 KB registry) — still run synchronously on the loop, so
-        the first-submission loop stall under the per-project curator write
-        lock is reduced by this change, not bounded by it. Left as-is here
-        (task 4201 scope); tracked as a follow-up to either extend the
-        offload to those two sites or fold all three into one shared
-        lazy-load helper so the idiom exists once.
+        All three curator guards — this one, :meth:`_maybe_blocklist_drop`,
+        and :meth:`_maybe_route_deterministic` — now share
+        :class:`_LazyRegistry` for their one-shot lazy loads (task 5007), so
+        the event-loop stall those loads can cause is bounded for the whole
+        :meth:`curate` / :meth:`curate_batch_prepared` first-submission
+        sequence, not just this guard.
 
         Returns ``None`` (fail-open) when:
         - The registry path is not configured (``None``).
         - The registry file is missing, unreadable, or unparseable, or the
-          offloaded load raised — for example a registry file that is not
-          valid UTF-8 (one WARNING logged; the guard then stays disabled for
-          this TaskCurator instance rather than retrying per call). This is
+          offloaded load raised (one WARNING logged; the guard then stays
+          disabled for this TaskCurator instance rather than retrying per
+          call). This is
           deliberate even for a cause that is transient in principle (a
           partially-written file observed mid-deploy, a momentary worker
-          thread I/O error): the load's ``except Exception`` below does not
-          distinguish exception type, so any raise latches the same as a
-          permanently-malformed file, and a process restart is the recovery
-          path. Only ``asyncio.CancelledError`` is excluded from the latch
-          (see the comment on that except block) — every other exception is
-          treated as permanent by design, not oversight.
+          thread I/O error): :class:`_LazyRegistry.entries`'s
+          ``except Exception`` does not distinguish exception type, so any
+          raise latches the same as a permanently-malformed file, and a
+          process restart is the recovery path. Only
+          ``asyncio.CancelledError`` is excluded from the latch (see the
+          comment on that except block) — every other exception is treated
+          as permanent by design, not oversight.
         - The registry is empty.
         - No entry textually matches the candidate.
         - ``self._cwd`` is ``None`` — the source root cannot be resolved, so the
@@ -1038,12 +1021,6 @@ class TaskCurator:
 
         Never raises.
         """
-        from fused_memory.middleware.recon_code_fix_premise_guard import (
-            load_premise_registry,
-            match_candidate,
-            verify_premise_refuted,
-        )
-
         cfg_path = self._config.curator.recon_code_fix_premise_registry_path
         if cfg_path is None:
             return None
@@ -1057,57 +1034,9 @@ class TaskCurator:
             )
             return None
 
-        # Lazy load — run at most once per TaskCurator instance. Offloaded:
-        # measured 9.9ms for the shipped 11 KB registry, of which 8.15ms is
-        # pure-Python yaml.safe_load (not the 21us read_text) — the largest
-        # single event-loop stall in this method, paid on the first task
-        # submission per process while the per-project curator write lock is
-        # held.
-        #
-        # Double-checked lock: the await point inside the offloaded load
-        # means a concurrent second caller could otherwise observe
-        # load_attempted=True while self._premise_registry is still None and
-        # silently fail the guard open. The outer unlocked check keeps the
-        # steady-state path (every call after the first) lock-free; the
-        # inner re-check under the lock is what makes concurrent first calls
-        # correct. The flag is set only AFTER the assignment so nobody can
-        # observe the attempted-but-unassigned window.
-        if not self._premise_registry_load_attempted:
-            async with self._premise_registry_load_lock:
-                if not self._premise_registry_load_attempted:
-                    raw_path = Path(cfg_path)
-                    if not raw_path.is_absolute():
-                        raw_path = self._cwd / raw_path
-                    try:
-                        self._premise_registry = await asyncio.to_thread(
-                            load_premise_registry, raw_path,
-                        )
-                    except Exception as exc:
-                        # load_premise_registry documents "never raises", but it
-                        # only catches FileNotFoundError/OSError on read_text and
-                        # yaml.YAMLError on parse — a registry that is not valid
-                        # UTF-8 raises UnicodeDecodeError (a ValueError, not an
-                        # OSError). asyncio.to_thread adds a further raise path
-                        # the guard module's internal excepts cannot cover. Fail
-                        # OPEN (guard disabled) rather than escaping into
-                        # curate()/curate_batch_prepared, which call this
-                        # unguarded — an escape fails the whole task submission.
-                        logger.warning(
-                            'task_curator: recon-premise registry load errored for %s, '
-                            'failing open (guard disabled): %s',
-                            raw_path, exc,
-                        )
-                        self._premise_registry = None
-                    # Settled outcome (loaded, or failed open) — latch the
-                    # one-shot contract. Deliberately NOT a `finally`:
-                    # asyncio.CancelledError is a BaseException, so it bypasses
-                    # the except above, and latching in a `finally` would
-                    # permanently disable the guard because an unrelated caller
-                    # was cancelled mid-load. Leaving the flag clear on
-                    # cancellation lets the next call retry.
-                    self._premise_registry_load_attempted = True
-
-        entries = self._premise_registry
+        entries = await self._premise_registry.entries(
+            load_premise_registry, cfg_path, self._cwd,
+        )
         if not entries:
             return None
 
@@ -1116,7 +1045,7 @@ class TaskCurator:
         # thread-pool dispatch (measured 67us) nor extra curator-lock hold.
         # premise_refuted_entry composes exactly these two halves and already
         # short-circuits here; we split it so only the blocking half is offloaded.
-        entry = match_candidate(candidate, entries)
+        entry = match_refuted_premise(candidate, entries)
         if entry is None:
             return None
 
@@ -1152,7 +1081,7 @@ class TaskCurator:
             target_fingerprint=None,
             rewritten_task=None,
             justification=f'recon-premise-refuted: {entry.name}: {entry.reason}',
-            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            pool_sizes=empty_pool_sizes(),
             latency_ms=0,
         )
         # Deliberately NOT self._store_cache(...)'d — see docstring. The guard
@@ -1233,12 +1162,6 @@ class TaskCurator:
             )
             return []
 
-        from fused_memory.middleware.recon_claim_verification_guard import (
-            extract_attributed_claims,
-            make_source_and_history_probe,
-            verify_attributed_claims,
-        )
-
         claims = extract_attributed_claims(self._claim_verification_text(candidate))
         if not claims:
             return []
@@ -1296,7 +1219,10 @@ class TaskCurator:
         ``self._config.curator.operational_ask_registry_path`` on the first
         call and caches the parsed entries for the lifetime of this
         :class:`TaskCurator` instance (no hot-reload; a server restart is
-        required to pick up YAML changes) — mirrors ``_maybe_blocklist_drop``.
+        required to pick up YAML changes). The load runs off the event-loop
+        thread through the shared :class:`_LazyRegistry` (``asyncio.to_thread``),
+        so it cannot stall the fused-memory event loop — mirrors
+        ``_maybe_blocklist_drop``.
 
         Unlike ``_maybe_blocklist_drop``, the resulting decision is
         deliberately NOT written to the idempotency cache
@@ -1329,6 +1255,8 @@ class TaskCurator:
           WARNING logged by the loader).
         - The registry is empty.
         - No entry matches the candidate.
+        - The offloaded load raised (one WARNING logged; the guard then stays
+          disabled for this TaskCurator instance rather than retrying per call).
 
         Note (task δ demotion): a candidate whose ``metadata.execution_class``
         is ``"operational"`` or ``"decision"`` now returns ``None`` here too —
@@ -1344,36 +1272,17 @@ class TaskCurator:
 
         Never raises.
         """
-        from fused_memory.middleware.operational_ask_registry import (
-            load_operational_registry,
-            match_candidate,
-        )
-
         cfg_path = self._config.curator.operational_ask_registry_path
         if cfg_path is None:
             return None
 
-        # Lazy load — run at most once per TaskCurator instance.
-        if not self._operational_registry_load_attempted:
-            self._operational_registry_load_attempted = True
-            raw_path = Path(cfg_path)
-            if not raw_path.is_absolute():
-                if self._cwd is not None:
-                    raw_path = self._cwd / raw_path
-                else:
-                    logger.warning(
-                        'task_curator: operational_ask_registry_path %r is relative but '
-                        'TaskCurator was constructed without cwd — resolving against process '
-                        'CWD which may be incorrect; use an absolute path in CuratorConfig',
-                        cfg_path,
-                    )
-            self._operational_registry = load_operational_registry(raw_path)
-
-        entries = self._operational_registry
+        entries = await self._operational_registry.entries(
+            load_operational_registry, cfg_path, self._cwd,
+        )
         if not entries:
             return None
 
-        entry = match_candidate(candidate, entries)
+        entry = match_operational_ask(candidate, entries)
         if entry is None:
             return None
 
@@ -1383,7 +1292,7 @@ class TaskCurator:
             target_fingerprint=None,
             rewritten_task=None,
             justification=f'operational-ask-registry: {entry.name}: {entry.reason}',
-            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            pool_sizes=empty_pool_sizes(),
             latency_ms=0,
         )
         # Deliberately NOT self._store_cache(...)'d — see docstring.
@@ -1393,16 +1302,158 @@ class TaskCurator:
         )
         return decision
 
+    # ------------------------------------------------------------------
+    # Backend-binary startup self-check (task 4448)
+    # ------------------------------------------------------------------
+
+    async def startup_self_check(self, project_id: str, project_root: str) -> bool:
+        """Report whether the curator's backend CLI binary resolves. Never raises.
+
+        An unresolvable binary degrades every curation; asking once at wiring
+        time escalates it before the first candidate is filed. A verdict, not
+        a precondition: a curator without its binary still fails open to
+        ``action='create'``, whereas raising would reach the interceptor's
+        ``except Exception -> return None`` and disable dedupe outright.
+        """
+        spec = claude_binary_spec()
+        resolved = resolve_claude_binary()
+        if resolved is not None:
+            logger.info(
+                'task_curator: backend binary %r resolves to %s', spec, resolved,
+            )
+            return True
+
+        search_path = os.environ.get('PATH', '')
+        logger.error(
+            'task_curator: backend binary %r does not resolve (PATH=%s) — every '
+            'curation for project %s will degrade to action=create WITHOUT '
+            'dedupe until this is fixed. Set CLAUDE_BINARY to an absolute path, '
+            'or pin Environment=PATH= in the fused-memory systemd unit.',
+            spec, search_path, project_id,
+        )
+        if self._escalator is not None:
+            await self._escalator.report_backend_binary_unresolvable(
+                project_root=project_root,
+                project_id=project_id,
+                binary_spec=spec,
+                search_path=search_path,
+            )
+        return False
+
+    # ------------------------------------------------------------------
+    # Class-agnostic degraded-streak alarm (task 4448)
+    # ------------------------------------------------------------------
+
+    def _reset_degraded_streak(self, project_id: str) -> None:
+        """Clear *project_id*'s streak and re-arm its alarm, on a usable decision."""
+        self._degraded_streaks.pop(project_id, None)
+
+    async def _degraded_create(
+        self,
+        *,
+        justification: str,
+        pool_sizes: dict[str, int],
+        start: float,
+        candidate: CandidateTask,
+        project_id: str,
+        project_root: str,
+        degraded_by_zot: bool = False,
+        zot_escalation_id: str | None = None,
+    ) -> CuratorDecision:
+        """Build a degraded ``action='create'`` decision and count it.
+
+        The only ``TaskCurator`` method that builds a create of its own, which
+        is what lets the streak be counted without enumerating why a curation
+        can degrade; fused-memory/tests/test_curator_arm_instrumentation_guard.py
+        enforces that. Degrading is the designed fail-open, so this neither
+        raises nor alters the decision; it only notices when degrading has
+        stopped being occasional.
+        """
+        decision = CuratorDecision(
+            action='create',
+            justification=justification,
+            pool_sizes=pool_sizes,
+            latency_ms=int((time.monotonic() - start) * 1000),
+            degraded=True,
+            degraded_by_zot=degraded_by_zot,
+            zot_escalation_id=zot_escalation_id,
+        )
+        await self._count_degraded(
+            justification=justification,
+            project_id=project_id,
+            project_root=project_root,
+            candidate_title=candidate.title,
+        )
+        return decision
+
+    async def _count_degraded(
+        self,
+        *,
+        justification: str,
+        project_id: str,
+        project_root: str,
+        candidate_title: str,
+    ) -> None:
+        """Advance *project_id*'s streak by one degraded curation, alarming once.
+
+        Shared by :meth:`_degraded_create` (single-candidate paths) and by
+        :meth:`_call_llm_batch` (items a successful round-trip nonetheless
+        failed to decide).  The alarm is class-agnostic by construction: it
+        takes only the fact that a curation degraded, never the reason.
+        """
+        streak = self._degraded_streaks.setdefault(project_id, _DegradedStreak())
+        streak.count += 1
+        threshold = self._config.curator.degraded_streak_threshold
+        if streak.count < threshold or streak.alarm_fired:
+            return
+
+        streak.alarm_fired = True
+        logger.error(
+            'task_curator: %d consecutive degraded curations for project %s '
+            '(threshold %d) — every candidate in that run was filed without '
+            'dedupe. Last: %s',
+            streak.count, project_id, threshold, justification,
+        )
+        if self._escalator is not None:
+            await self._escalator.report_consecutive_degraded(
+                project_root=project_root,
+                project_id=project_id,
+                streak=streak.count,
+                threshold=threshold,
+                last_justification=justification,
+                candidate_title=candidate_title,
+            )
+
     async def curate(
         self,
         candidate: CandidateTask,
         project_id: str,
         project_root: str,
+        *,
+        prepared: PreparedCandidate | None = None,
     ) -> CuratorDecision:
         """Render a drop/combine/create decision for a candidate task.
 
-        Best-effort: any internal failure returns a ``create`` decision with the
-        failure reason in ``justification``. Never raises.
+        When the candidate cannot be judged this returns
+        :meth:`CuratorDecision.deferred` with the
+        :class:`~fused_memory.middleware.curation_deferral.DeferReason` that
+        says why. A zero-output hang on this candidate's own call is the one
+        outage that creates (``degraded_by_zot``), and an unusable response
+        degrades to a ``create``. A failed LLM call is reported to the
+        escalator, which re-raises :class:`CuratorFailureError` when no
+        orchestrator is running.
+
+        *prepared* hands over a corpus the caller already assembled, so it is
+        not assembled twice.  :meth:`curate_batch_prepared`'s size-1
+        short-circuit is the caller this exists for: a rebuild there costs a
+        full ``get_tasks`` over the task tree plus an embedder call and a
+        qdrant query for work already done, and size-1 batches get MORE likely
+        as per-candidate sections grow, so the cost would otherwise move with
+        exactly the setting that shrinks the batch.  A bundle whose own
+        assembly failed defers, exactly as it does in a larger batch — see
+        ``corpus_error``.
+        Everything ahead of corpus assembly (blocklist, premise, exact-match,
+        idempotency cache, deterministic routing, ZOT breaker) still runs.
         """
         start = time.monotonic()
         payload_hash = candidate.payload_hash()
@@ -1465,36 +1516,30 @@ class TaskCurator:
         now = time.monotonic()
         if self._zero_output_breaker_open(now):
             logger.warning(
-                'task_curator: zero-output-breaker open — short-circuiting '
-                'curator LLM call for candidate %r (consecutive ZOTs=%d)',
+                'task_curator: zero-output-breaker open — deferring curation '
+                'for candidate %r (consecutive ZOTs=%d)',
                 candidate.title,
                 self._consecutive_zero_output_timeouts,
             )
-            return CuratorDecision(
-                action='create',
-                justification='zero-output-breaker-open',
-                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            return CuratorDecision.deferred(
+                DeferReason.ZERO_OUTPUT_BREAKER_OPEN,
+                pool_sizes=empty_pool_sizes(),
                 latency_ms=int((time.monotonic() - start) * 1000),
             )
 
-        try:
-            pool, pool_sizes = await self._build_corpus(
-                candidate, project_id, project_root,
-            )
-        except Exception as exc:
-            logger.warning(
-                'task_curator: corpus assembly failed, falling through to create: %s',
-                exc,
-                exc_info=True,
-            )
-            decision = CuratorDecision(
-                action='create',
-                justification=f'corpus-failed: {exc}',
-                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
-                latency_ms=int((time.monotonic() - start) * 1000),
-            )
-            self._store_cache(payload_hash, decision)
-            return decision
+        if prepared is not None and prepared.corpus_error is not None:
+            return _corpus_failed_deferral(candidate, prepared.corpus_error, start)
+        if prepared is not None:
+            pool = prepared.pool
+            pool_sizes = prepared.pool_sizes
+            withheld = prepared.withheld or PoolWithheld()
+        else:
+            try:
+                pool, pool_sizes, withheld = await self._build_corpus(
+                    candidate, project_id, project_root,
+                )
+            except Exception as exc:
+                return _corpus_failed_deferral(candidate, exc, start, exc_info=True)
 
         # Render the LLM call. A genuine LLM failure raises
         # CuratorFailureError; route it through the escalator if one was
@@ -1504,34 +1549,37 @@ class TaskCurator:
         try:
             decision = await self._call_llm(
                 candidate, pool, pool_sizes, start, project_id, project_root,
+                withheld=withheld,
             )
             # Success: reset the consecutive-ZOT counter so a single hung call
             # that was followed by a healthy one doesn't accumulate toward open.
             self._reset_zero_output_breaker()
-        except AllAccountsCappedException as exc:
-            logger.warning(
-                'task_curator: all accounts capped (%d retries in %.1fs) — deferring to create',
-                exc.retries, exc.elapsed_secs,
-            )
-            if self._escalator is not None:
-                await self._escalator.report_failure(
-                    project_root=project_root,
+            # A completed call can still carry no usable decision (the parser
+            # fails open without raising), so the streak keys on the decision.
+            if decision.degraded:
+                await self._count_degraded(
+                    justification=decision.justification,
                     project_id=project_id,
-                    justification=f'all-accounts-capped: {exc}',
+                    project_root=project_root,
                     candidate_title=candidate.title,
-                    timed_out=False,
-                    duration_ms=int(exc.elapsed_secs * 1000),
                 )
-            decision = CuratorDecision(
-                action='create',
-                justification='all-accounts-capped',
+            else:
+                self._reset_degraded_streak(project_id)
+        except POOL_UNAVAILABLE_ERRORS as exc:
+            decision = CuratorDecision.deferred(
+                pool_defer_reason(exc),
                 pool_sizes=pool_sizes,
                 latency_ms=int((time.monotonic() - start) * 1000),
             )
+            logger.warning(
+                'task_curator: account pool unavailable for %r — deferring: %s',
+                candidate.title, exc,
+            )
         except CuratorFailureError as exc:
+            zot_escalation_id: str | None = None
             if self._escalator is not None:
                 # May re-raise CuratorFailureError on the interactive path.
-                await self._escalator.report_failure(
+                zot_escalation_id = await self._escalator.report_failure(
                     project_root=project_root,
                     project_id=project_id,
                     justification=str(exc),
@@ -1545,31 +1593,58 @@ class TaskCurator:
                     subtype=exc.subtype,
                     cost_usd=exc.cost_usd,
                     pool_sizes=pool_sizes,
+                    transcript_turns=exc.transcript_turns,
+                    tools_used=exc.tools_used,
                 )
             else:
-                logger.warning(
-                    'task_curator: LLM failure with no escalator wired — '
-                    'falling through to create: %s',
-                    exc,
-                )
+                logger.warning('task_curator: LLM failure with no escalator wired: %s', exc)
             if exc.zero_output_timeout:
                 # Capture a fresh timestamp so the cooldown window is measured
                 # from when the failure was observed, not from before the
                 # (potentially 180s) hung LLM call started.
                 self._record_zero_output_timeout(time.monotonic())
-            decision = CuratorDecision(
-                action='create',
-                justification='llm-error-escalated',
-                pool_sizes=pool_sizes,
-                latency_ms=int((time.monotonic() - start) * 1000),
-            )
+                decision = await self._degraded_create(
+                    justification='llm-error-escalated',
+                    pool_sizes=pool_sizes,
+                    start=start,
+                    candidate=candidate,
+                    project_id=project_id,
+                    project_root=project_root,
+                    degraded_by_zot=True,
+                    zot_escalation_id=zot_escalation_id,
+                )
+            else:
+                logger.warning(
+                    'task_curator: LLM call failed, deferring curation of %r', candidate.title,
+                )
+                decision = CuratorDecision.deferred(
+                    DeferReason.LLM_FAILED,
+                    pool_sizes=pool_sizes,
+                    latency_ms=int((time.monotonic() - start) * 1000),
+                )
         except Exception as exc:
+            # An exception class nobody anticipated: defer AND report, like
+            # the named arms.
             logger.warning(
-                'task_curator: LLM call failed, falling through to create: %s', exc,
+                'task_curator: LLM call failed with unexpected %s, deferring curation: %s',
+                type(exc).__name__,
+                exc,
+                exc_info=True,
             )
-            decision = CuratorDecision(
-                action='create',
-                justification=f'llm-failed: {exc}',
+            if self._escalator is not None:
+                # Unguarded on purpose, as in the CuratorFailureError arm: with
+                # no orchestrator to escalate to, report_failure raises
+                # CuratorFailureError and the caller sees a loud failure.
+                await self._escalator.report_failure(
+                    project_root=project_root,
+                    project_id=project_id,
+                    justification=f'unexpected-exception: {type(exc).__name__}: {exc}',
+                    candidate_title=candidate.title,
+                    subtype=f'unexpected-exception:{type(exc).__name__}',
+                    pool_sizes=pool_sizes,
+                )
+            decision = CuratorDecision.deferred(
+                DeferReason.LLM_FAILED,
                 pool_sizes=pool_sizes,
                 latency_ms=int((time.monotonic() - start) * 1000),
             )
@@ -1596,31 +1671,40 @@ class TaskCurator:
         Split out from :meth:`curate_batch` so the interceptor's curator
         worker can incrementally accumulate prepared candidates and decide,
         before fetching the next ticket, whether the in-flight batch has
-        already exceeded the soft ``batch_token_threshold``.  Corpus failures
-        degrade to an empty pool — same behaviour as inside ``curate_batch``.
+        already exceeded the soft ``batch_token_threshold``.  A corpus failure
+        yields an empty pool with ``corpus_error`` set, which the curation
+        paths defer rather than curate over that empty pool.
         """
+        corpus_error: str | None = None
         try:
-            pool, pool_sizes = await self._build_corpus(
+            pool, pool_sizes, withheld = await self._build_corpus(
                 candidate, project_id, project_root,
             )
         except Exception as exc:
             logger.warning(
                 'task_curator: corpus assembly failed for candidate %r, '
-                'continuing with empty pool: %s',
+                'so its curation will defer: %s',
                 candidate.title,
                 exc,
                 exc_info=True,
             )
             pool = []
-            pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            pool_sizes = empty_pool_sizes()
+            withheld = PoolWithheld()
+            corpus_error = str(exc)
         # batch_index=0 is fine for the estimate — only a couple of digits of
         # rendered length difference at most across realistic batch sizes.
-        section = self._build_batch_section(candidate, pool, 0)
+        # The census IS included: the estimate has to be taken over the section
+        # actually emitted, or the accumulator under-counts every truncated
+        # candidate.
+        section = self._build_batch_section(candidate, pool, 0, withheld=withheld)
         return PreparedCandidate(
             candidate=candidate,
             pool=pool,
             pool_sizes=pool_sizes,
             prompt_tokens=estimate_tokens(section),
+            withheld=withheld,
+            corpus_error=corpus_error,
         )
 
     async def curate_batch(
@@ -1671,7 +1755,10 @@ class TaskCurator:
             return []
         if len(prepared) == 1:
             return [
-                await self.curate(prepared[0].candidate, project_id, project_root),
+                await self.curate(
+                    prepared[0].candidate, project_id, project_root,
+                    prepared=prepared[0],
+                ),
             ]
 
         candidates = [p.candidate for p in prepared]
@@ -1763,7 +1850,7 @@ class TaskCurator:
             if refusal is not None:
                 # `replace` (not a fresh CuratorDecision) so the inherited
                 # refusal is FIELD-IDENTICAL to the one it copies — including
-                # the guards' pool_sizes={'anchor': 0, ...}/latency_ms=0
+                # the guards' pool_sizes=empty_pool_sizes()/latency_ms=0
                 # observability shape. A byte-identical duplicate should not
                 # persist a differently-shaped row in tickets.db / the decision
                 # log than the twin it inherited from. Only batch_target_index
@@ -1796,11 +1883,6 @@ class TaskCurator:
         # advisory check.
         claim_probe: Callable[[str], bool] | None = None
         if self._config.curator.recon_claim_verification_enabled and self._cwd is not None:
-            from fused_memory.middleware.recon_claim_verification_guard import (
-                extract_attributed_claims,
-                make_source_and_history_probe,
-            )
-
             any_claims = any(
                 extract_attributed_claims(self._claim_verification_text(candidates[i]))
                 for i in unique_indices
@@ -1822,11 +1904,11 @@ class TaskCurator:
         # round-trip.  `llm_k_list` holds positions *within unique_indices*
         # (k values) for candidates that were NOT in the cache.
         llm_k_list: list[int] = []
-        cache_hit_map: dict[int, CuratorDecision] = {}  # unique-space k → decision
+        decided_without_llm: dict[int, CuratorDecision] = {}  # unique-space k → decision
         for k, original_i in enumerate(unique_indices):
             cached = self._check_cache(candidates[original_i].payload_hash())
             if cached is not None:
-                cache_hit_map[k] = cached
+                decided_without_llm[k] = cached
             else:
                 llm_k_list.append(k)
 
@@ -1855,15 +1937,15 @@ class TaskCurator:
 
         # ── Zero-output-timeout circuit breaker gate (task 1743) ──────────────
         # Check the breaker BEFORE the expensive batch LLM round-trip (up to
-        # batch_timeout_cap_seconds = 360s).  If open, resolve every LLM-bound
-        # unique candidate to action='create' immediately — the bisect fallback
-        # path would eventually reach size-1 curate() calls which check the
-        # breaker individually, but this gate avoids the first batch LLM call
-        # (and the bisect overhead) entirely.
+        # batch_timeout_cap_seconds = 360s).  If open, defer every LLM-bound
+        # unique candidate immediately — the bisect fallback path would
+        # eventually reach size-1 curate() calls which check the breaker
+        # individually, but this gate avoids the first batch LLM call (and the
+        # bisect overhead) entirely.
         #
-        # Breaker-open decisions are NOT written to the idempotency cache (so
-        # once the breaker closes, an identical candidate is re-evaluated by
-        # the real LLM rather than being pinned to a stale 'create' for the TTL).
+        # Breaker-open decisions are NOT written to the idempotency cache:
+        # _store_cache skips every defer, so once the breaker closes an
+        # identical candidate is re-evaluated by the real LLM.
         #
         # Batch ZOT counting: each size-1 curate() that bisects out of a batch
         # ZOT records the failure independently via its own except block.
@@ -1879,22 +1961,35 @@ class TaskCurator:
         # and size-1 alike — not just the size-1 successes handled by
         # curate().
         if llm_k_list and self._zero_output_breaker_open(time.monotonic()):
-            batch_breaker_now = time.monotonic()
             logger.warning(
-                'curate_batch: zero-output-breaker open — short-circuiting %d '
-                'LLM-bound candidate(s) to create (consecutive ZOTs=%d)',
+                'curate_batch: zero-output-breaker open — deferring curation of %d '
+                'LLM-bound candidate(s) (consecutive ZOTs=%d)',
                 len(llm_k_list),
                 self._consecutive_zero_output_timeouts,
             )
-            _empty_pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
             for _k in llm_k_list:
-                cache_hit_map[_k] = CuratorDecision(
-                    action='create',
-                    justification='zero-output-breaker-open',
-                    pool_sizes=_empty_pool_sizes,
-                    latency_ms=int((batch_breaker_now - start) * 1000),
+                decided_without_llm[_k] = CuratorDecision.deferred(
+                    DeferReason.ZERO_OUTPUT_BREAKER_OPEN,
+                    pool_sizes=empty_pool_sizes(),
+                    latency_ms=int((time.monotonic() - start) * 1000),
                 )
             llm_k_list = []
+
+        # ── Failed corpus assembly ─────────────────────────────────────────────
+        # A bundle whose corpus failed carries an empty pool that only LOOKS
+        # like a real one; the batch prompt would tell the LLM to answer
+        # 'create' for it.  Defer it, as curate() does, in curate()'s guard
+        # order: cache → route → breaker → corpus → LLM.
+        llm_bound_k: list[int] = []
+        for _k in llm_k_list:
+            bundle = prepared[unique_indices[_k]]
+            if bundle.corpus_error is None:
+                llm_bound_k.append(_k)
+            else:
+                decided_without_llm[_k] = _corpus_failed_deferral(
+                    bundle.candidate, bundle.corpus_error, start,
+                )
+        llm_k_list = llm_bound_k
 
         # ── LLM dispatch for non-cached unique candidates ────────────────────
         # Re-use the pre-built pools/pool_sizes from the prepared bundles
@@ -1908,16 +2003,14 @@ class TaskCurator:
             pool_sizes_list = [
                 prepared[unique_indices[k]].pool_sizes for k in llm_k_list
             ]
+            withheld_list = [
+                prepared[unique_indices[k]].withheld for k in llm_k_list
+            ]
             try:
                 llm_raw_decisions = await self._call_llm_batch_with_fallback(
                     to_llm_candidates, pools, pool_sizes_list, start,
-                    project_id, project_root,
+                    project_id, project_root, withheld_list=withheld_list,
                 )
-            except AllAccountsCappedException:
-                # Cap exhaustion bubbles up so the caller (worker) can defer
-                # the whole batch instead of N×size-1 amplification of the
-                # cap-retry storm.
-                raise
             except Exception as exc:
                 # CancelledError (BaseException) is not caught here.  Anything
                 # else that escaped the bisect helper is unexpected — log and
@@ -1936,8 +2029,8 @@ class TaskCurator:
         # ── Merge: build unique_decision_map with original-space indices ───────
         # batch_target_index from the helper is in LLM-local space (positions
         # within to_llm_candidates).  Remap LLM-local → unique-space →
-        # original-space.  Cache hits have batch_target_index=None.
-        unique_decisions_by_k: dict[int, CuratorDecision] = dict(cache_hit_map)
+        # original-space.  Decisions made without the LLM have batch_target_index=None.
+        unique_decisions_by_k: dict[int, CuratorDecision] = dict(decided_without_llm)
         for llm_j, k in enumerate(llm_k_list):
             dec = llm_raw_decisions[llm_j]
             if dec.batch_target_index is not None:
@@ -1999,7 +2092,7 @@ class TaskCurator:
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
-            text = self._embedding_text(
+            text = embedding_text(
                 candidate.title, candidate.description, candidate.files_to_modify,
             )
             embedding = await embedder.create(text)
@@ -2115,7 +2208,7 @@ class TaskCurator:
 
         Args:
             query: Free-text query, embedded as-is (NOT passed through
-                ``_embedding_text``, which composes stored-task fields).
+                ``embedding_text``, which composes stored-task fields).
             project_id: Project identifier selecting the collection.
             limit: Max number of hits to return.
             score_threshold: Drop hits below this cosine score server-side.
@@ -2200,7 +2293,7 @@ class TaskCurator:
 
             description = str(task.get('description', '') or '')
             files = _task_files(task)
-            text = self._embedding_text(title, description, files)
+            text = embedding_text(title, description, files)
 
             try:
                 async with sem:
@@ -2325,6 +2418,8 @@ class TaskCurator:
             with _ctx.suppress(Exception):
                 await self._qdrant_client.close()
             self._qdrant_client = None
+        embedder, self._embedder = self._embedder, None
+        await close_wrapped_sdk_clients([embedder])
 
     # ------------------------------------------------------------------
     # Idempotency cache
@@ -2349,6 +2444,8 @@ class TaskCurator:
         return decision
 
     def _store_cache(self, payload_hash: str, decision: CuratorDecision) -> None:
+        if decision.action == 'defer':
+            return
         self._decision_cache[payload_hash] = (decision, time.monotonic())
 
     # ------------------------------------------------------------------
@@ -2360,8 +2457,16 @@ class TaskCurator:
         candidate: CandidateTask,
         project_id: str,
         project_root: str,
-    ) -> tuple[list[_PoolEntry], dict[str, int]]:
-        """Assemble the four-stream pool for the LLM prompt."""
+    ) -> tuple[list[PoolEntry], dict[str, int], PoolWithheld]:
+        """Assemble the four-stream pool for the LLM prompt.
+
+        Returns ``(pool, pool_sizes, withheld)``. ``withheld`` is the
+        :class:`PoolWithheld` census of everything the caps kept out, counted
+        at EVERY cap rather than only at the final :func:`_trim_pool` — under
+        stock config that final trim never fires (see the pool-cap block in
+        ``config/schema.py::CuratorConfig``), so the stream caps are where the
+        genuinely-overlapping task is actually lost.
+        """
         # Resolve lock_depth PER PROJECT, not from a single global scalar:
         # fused-memory serves many projects and each orchestrator resolves its
         # own depth (3..12 across the fleet). The scheduler snapshot already
@@ -2382,11 +2487,11 @@ class TaskCurator:
         lock_depth = await asyncio.to_thread(
             effective_lock_depth, project_root, self._config.curator.lock_depth,
         )
-        pool: list[_PoolEntry] = []
+        pool: list[PoolEntry] = []
         seen_ids: set[str] = set()
 
         # Stream 1: review-chain anchor
-        anchor_entry: _PoolEntry | None = None
+        anchor_entry: PoolEntry | None = None
         if candidate.spawned_from and self._taskmaster is not None:
             try:
                 anchor_task = await self._taskmaster.get_task(
@@ -2416,7 +2521,7 @@ class TaskCurator:
             except Exception as exc:
                 logger.debug('task_curator: get_tasks failed: %s', exc)
 
-        module_matches: list[_PoolEntry] = []
+        module_matches: list[PoolEntry] = []
         for t in all_tasks_flat:
             tid = str(t.get('id', ''))
             if not tid or tid in seen_ids:
@@ -2432,16 +2537,25 @@ class TaskCurator:
                 module_matches.append(entry)
 
         module_matches.sort(key=_module_sort_key)
-        for entry in module_matches[: self._config.curator.pool_module_cap]:
+        module_cap = self._config.curator.pool_module_cap
+        # The sort key is status+priority, NOT relevance, so the entries this
+        # cap discards are not the least-similar ones — a genuinely
+        # overlapping task can sit just past it. Which of them the POOL
+        # actually loses is not known yet: streams 3 and 4 can still admit
+        # one. Hold the ids and count the absent ones once, below.
+        module_overflow_ids = [e.task_id for e in module_matches[module_cap:]]
+        for entry in module_matches[:module_cap]:
             pool.append(entry)
             seen_ids.add(entry.task_id)
 
         # Stream 3: embedding neighbors
-        embedding_matches: list[_PoolEntry] = []
+        embedding_matches: list[PoolEntry] = []
+        embedding_unvisited_ids: list[str] = []
+        embedding_window_full = False
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
-            text = self._embedding_text(
+            text = embedding_text(
                 candidate.title, candidate.description, candidate.files_to_modify,
             )
             embedding = await embedder.create(text)
@@ -2454,7 +2568,8 @@ class TaskCurator:
                 limit=overfetch,
                 with_payload=True,
             )
-            for point in results.points:
+            points = list(results.points)
+            for i, point in enumerate(points):
                 payload = point.payload or {}
                 tid = str(payload.get('task_id', ''))
                 if not tid or tid in seen_ids:
@@ -2469,6 +2584,26 @@ class TaskCurator:
                     continue
                 embedding_matches.append(entry)
                 if len(embedding_matches) >= self._config.curator.pool_embedding_cap:
+                    # The neighbours the cap left unvisited, by id — the count
+                    # is taken below against what the pool finally holds, so a
+                    # neighbour another stream already pooled is not reported
+                    # as lost. It stays an upper bound in one narrower
+                    # respect: an unvisited point might have been unresolvable
+                    # via _fetch_entry_for_neighbor and so never eligible.
+                    # These are ordered by embedding distance, so the closest
+                    # of them are the most likely duplicates in the corpus.
+                    embedding_unvisited_ids = [
+                        str((p.payload or {}).get('task_id', ''))
+                        for p in points[i + 1:]
+                    ]
+                    # And a hard ceiling in the other direction, unlike the
+                    # corpus-exhaustive module/dependency streams: this tail
+                    # can hold at most `overfetch - cap` ids because that is
+                    # all qdrant was asked for. A full window means neighbours
+                    # past it were never fetched, so the count is a FLOOR and
+                    # is reported as one rather than as a count of everything
+                    # excluded.
+                    embedding_window_full = len(points) >= overfetch
                     break
         except Exception as exc:
             logger.debug('task_curator: embedding neighbors failed: %s', exc)
@@ -2478,7 +2613,7 @@ class TaskCurator:
             seen_ids.add(entry.task_id)
 
         # Stream 4: dependency neighbors of the anchor
-        dep_matches: list[_PoolEntry] = []
+        dep_matches: list[PoolEntry] = []
         if anchor_entry is not None and all_tasks_flat:
             anchor_deps = _task_dependencies(
                 next(
@@ -2501,20 +2636,46 @@ class TaskCurator:
                 if entry is not None:
                     dep_matches.append(entry)
 
-        for entry in dep_matches[: self._config.curator.pool_dependency_cap]:
+        dependency_cap = self._config.curator.pool_dependency_cap
+        dep_overflow_ids = [e.task_id for e in dep_matches[dependency_cap:]]
+        for entry in dep_matches[:dependency_cap]:
             pool.append(entry)
             seen_ids.add(entry.task_id)
 
+        # Every stream has run, so seen_ids is now the complete admitted set
+        # and a stream's overflow can be resolved into what the pool actually
+        # lacks. Counting against seen_ids rather than the post-trim pool
+        # keeps the stream counts and total_cap DISJOINT by construction: a
+        # stream can only count ids that were never admitted, the trim only
+        # ids that were, so `total` stays a count of distinct absent entries.
+        module_withheld = _count_absent(module_overflow_ids, seen_ids)
+        embedding_withheld = _count_absent(embedding_unvisited_ids, seen_ids)
+        dependency_withheld = _count_absent(dep_overflow_ids, seen_ids)
+
         # Final cap — trim weakest entries first (embedding, then module, then dep).
-        pool = _trim_pool(pool, self._config.curator.pool_total_cap)
+        pool, total_cap_dropped = _trim_pool(
+            pool, self._config.curator.pool_total_cap,
+        )
 
         pool_sizes = {
-            'anchor': sum(1 for e in pool if e.source == 'anchor'),
-            'module': sum(1 for e in pool if e.source == 'module'),
-            'embedding': sum(1 for e in pool if e.source == 'embedding'),
-            'dependency': sum(1 for e in pool if e.source == 'dependency'),
+            source: sum(1 for e in pool if e.source == source) for source in POOL_SOURCES
         }
-        return pool, pool_sizes
+        withheld = PoolWithheld(
+            by_source={
+                'module': module_withheld,
+                'embedding': embedding_withheld,
+                'dependency': dependency_withheld,
+                'total_cap': total_cap_dropped,
+            },
+            caps={
+                'module': module_cap,
+                'embedding': self._config.curator.pool_embedding_cap,
+                'dependency': dependency_cap,
+                'total_cap': self._config.curator.pool_total_cap,
+            },
+            lower_bounds=('embedding',) if embedding_window_full else (),
+        )
+        return pool, pool_sizes, withheld
 
     async def _fetch_entry_for_neighbor(
         self,
@@ -2524,7 +2685,7 @@ class TaskCurator:
         source: str,
         lock_depth: int,
         project_root: str,
-    ) -> _PoolEntry | None:
+    ) -> PoolEntry | None:
         """Fetch a full task for an embedding neighbor, fall back to payload.
 
         ``get_task`` is called without a ``tag`` — it resolves to
@@ -2567,7 +2728,7 @@ class TaskCurator:
                 # built below, rather than risk dropping a live candidate.
                 pass
         # Fallback: build a thin entry from the qdrant payload
-        return _PoolEntry(
+        return PoolEntry(
             task_id=tid,
             title=str(payload.get('title', '')),
             description=str(payload.get('description', '')),
@@ -2586,20 +2747,131 @@ class TaskCurator:
     # LLM call
     # ------------------------------------------------------------------
 
+    def _transcript_config_dir(self) -> TaskConfigDir | None:
+        """This process's curator config dir, or None when there is no UsageGate.
+
+        Gate-less, no per-call OAuth token is passed, so the CLI needs the login
+        in its default config dir, which an isolated one would hide. Concurrent
+        gated calls share this dir safely: each authenticates from its own
+        ``CLAUDE_CODE_OAUTH_TOKEN``, never from the ``.credentials.json`` they
+        all rewrite (``shared/tests/test_config_dir_credentials_live.py``).
+
+        The dead-PID sweep runs on a worker thread and is not awaited: it
+        reclaims other processes' leftovers, so no call depends on it, and a
+        readdir of a large system tempdir must stall neither the server's event
+        loop nor this call (task 7335).
+        """
+        if self._usage_gate is None:
+            return None
+        if self._config_dir is None:
+            asyncio.get_running_loop().run_in_executor(
+                None, _sweep_stale_curator_config_dirs_once, self._config_dir_base,
+            )
+            self._config_dir = TaskConfigDir(
+                f'{_CONFIG_DIR_TASK_PREFIX}{os.getpid()}', base_dir=self._config_dir_base,
+            )
+        return self._config_dir
+
+    def _ledger_kwargs(self, role: str) -> dict[str, Any]:
+        """The ``invoke_with_cap_retry`` kwargs that land a call in the invocations ledger.
+
+        ``run_id`` is read from the gate, so curator invocations and the gate's
+        own account events share one run key.
+        """
+        run_id = (self._usage_gate.run_id or '') if self._usage_gate is not None else ''
+        return {'cost_store': self._cost_store, 'role': role, 'run_id': run_id}
+
+    def _transcript_scope(self, timeout_seconds: float) -> _TranscriptScope | None:
+        """A fresh transcript scope for one call, or None when there is no UsageGate."""
+        config_dir = self._transcript_config_dir()
+        if config_dir is None:
+            return None
+        return _TranscriptScope(config_dir, str(uuid_mod.uuid4()), timeout_seconds)
+
+    async def _read_failure_evidence(
+        self, transcript_scope: _TranscriptScope,
+    ) -> TranscriptEvidence | None:
+        """What a failed call's own transcript recorded, or None when unknown.
+
+        Reads once per failed call, off the event loop (a bisected batch fails
+        as several concurrent calls), and never raises: a transcript fault must
+        not replace the LLM failure on the synchronous add_task path.
+        """
+        session_id = transcript_scope.session_id
+        try:
+            evidence = await asyncio.to_thread(
+                transcript_evidence_for_session, transcript_scope.config_dir.path, session_id,
+            )
+        except Exception:
+            logger.warning(
+                'TaskCurator: could not read the transcript of failed session %s; '
+                'reporting the failure without it', session_id, exc_info=True,
+            )
+            return None
+        if evidence is not None and evidence.other_tool_uses:
+            logger.warning(
+                'TaskCurator: pure-classifier contract violated: failed session %s '
+                'used tools %s over %d assistant turn(s), but its registry should '
+                "hold only StructuredOutput. Check the schema + '*' -> --tools '' "
+                'substitution in shared.cli_invoke.build_claude_argv.',
+                session_id, list(evidence.other_tool_uses), evidence.assistant_turns,
+            )
+        return evidence
+
+    async def _resolve_failed_result(
+        self, agent_result: AgentResult, transcript_scope: _TranscriptScope | None,
+    ) -> tuple[AgentResult, TranscriptEvidence | None]:
+        """Read a failed call's transcript evidence, and salvage its verdict if allowed.
+
+        Returns ``(result, evidence)``. A successful or gate-less result comes
+        back unchanged and unread. A failed gated one gets ONE evidence read,
+        for reporting.
+        Salvage is only for a run KILLED after the CLI accepted its verdict (the
+        transcript's ``structured_output`` attachment). The result then becomes
+        a success carrying that verdict, which meets exactly the parsing and
+        validation a returned one does. A denied or non-kill failure is never
+        salvaged.
+
+        Known limitation: when ``invoke_with_cap_retry`` re-mints the session id
+        for a fresh retry (after a cap hit or a pre-turn rejection,
+        ``_reset_for_fresh_retry``), the curator's session id names an EARLIER
+        attempt. Evidence is then absent or stale. That can only cause a missed
+        salvage, never a false one, since a capped or rejected attempt has no
+        acceptance record.
+        """
+        if agent_result.success or transcript_scope is None:
+            return agent_result, None
+        evidence = await self._read_failure_evidence(transcript_scope)
+        verdict = _salvageable_verdict(agent_result, evidence)
+        if verdict is None:
+            return agent_result, evidence
+        logger.warning(
+            'TaskCurator: salvaged an accepted verdict from the transcript of killed '
+            'session %s (subtype=%s, transcript_turns=%s); stdout never delivered it: %.300s',
+            transcript_scope.session_id, agent_result.subtype,
+            agent_result.transcript_turns, json.dumps(verdict, default=str),
+        )
+        salvaged = replace(
+            agent_result, success=True, structured_output=verdict, schema_salvaged=True,
+        )
+        return salvaged, evidence
+
     async def _call_llm(
         self,
         candidate: CandidateTask,
-        pool: list[_PoolEntry],
+        pool: list[PoolEntry],
         pool_sizes: dict[str, int],
         start: float,
         project_id: str,
         project_root: str,
+        *,
+        withheld: PoolWithheld | None = None,
     ) -> CuratorDecision:
         # Task 1989: neutral CLI cwd decouples per-call cost from the filing
         # project's CLAUDE.md/MEMORY.md; self._cwd stays project-root for
         # Python-side premise/blocklist resolution (L774/863/870).
         cwd = neutral_cli_cwd()
-        user_prompt = self._build_user_prompt(candidate, pool)
+        user_prompt = self._build_user_prompt(candidate, pool, withheld=withheld)
 
         # max_budget_usd is now a durable flat $2.00 (task 1980 /
         # esc-task-curator-194): max_budget_usd and single_call_budget_cap_usd
@@ -2618,6 +2890,7 @@ class TaskCurator:
             self._config.curator.single_call_budget_cap_usd,
         )
         system_prompt = self._resolve_curator_prompt(CURATOR_SINGLE_SPEC)
+        transcript_scope = self._transcript_scope(self._config.curator.timeout_seconds)
 
         agent_result: AgentResult = await invoke_with_cap_retry(
             usage_gate=self._usage_gate,
@@ -2627,27 +2900,38 @@ class TaskCurator:
             system_prompt=system_prompt,
             cwd=cwd,
             model=self._config.curator.model,
-            # ``max_turns=1`` is incompatible with ``--json-schema`` because
-            # the schema mechanism burns a tool-use turn; the CLI returns
-            # ``error_max_turns`` after the schema turn, even when the
-            # structured payload is already attached. The configured floor
-            # is 3 (schema tool-use + optional reasoning + final response);
-            # the default of 8 leaves headroom for harder combine-vs-create
-            # decisions. Schema salvage in cli_invoke.py covers the boundary.
+            # Never 1: a cap of 1 leaves no room for the prose turn the model
+            # emits before calling ``StructuredOutput`` (see
+            # fused-memory/src/fused_memory/reconciliation/agent_loop.py::_AGENT_CLI_MAX_TURNS).
+            # Schema salvage in cli_invoke is not a backstop for that: on the
+            # measured recon-verify shape the ``error_max_turns`` result carried
+            # no payload, so salvage had nothing to recover.  The curator's own
+            # shape has not been measured, so the ``ge=3`` floor and the default
+            # of 8 are established values, not revalidated ones; 8 leaves
+            # headroom for harder combine-vs-create decisions.
             max_turns=self._config.curator.max_turns,
             max_budget_usd=budget,
-            disallowed_tools=['*'],  # no tool access — this is a pure classifier
+            # Pure classifier: build_claude_argv turns '*' into --tools '', which
+            # removes built-in and deferred tools; the two MCP kwargs remove MCP.
+            disallowed_tools=['*'],
+            mcp_config=no_mcp_servers_config(),
+            strict_mcp_config=True,
             output_schema=CURATOR_OUTPUT_SCHEMA,
             permission_mode='bypassPermissions',
             timeout_seconds=self._config.curator.timeout_seconds,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
+            park_on_frozen_pool=False,
+            **self._ledger_kwargs('task_curator'),
+            **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
 
+        agent_result, evidence = await self._resolve_failed_result(agent_result, transcript_scope)
         latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
             raise CuratorFailureError(
                 f'curator LLM call failed: output={agent_result.output[:200]!r} '
                 f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
+                f'transcript_turns={agent_result.transcript_turns} '
                 f'timed_out={agent_result.timed_out} '
                 f'duration_ms={agent_result.duration_ms} '
                 f'schema_tool_denied={agent_result.schema_tool_denied} '
@@ -2660,6 +2944,8 @@ class TaskCurator:
                 proc_tree=agent_result.proc_tree,
                 account_name=agent_result.account_name,
                 cost_usd=agent_result.cost_usd,
+                transcript_turns=agent_result.transcript_turns,
+                tools_used=evidence.other_tool_uses if evidence else None,
             )
 
         return _parse_decision(
@@ -2670,11 +2956,13 @@ class TaskCurator:
     async def _call_llm_batch(
         self,
         candidates: list[CandidateTask],
-        pools: list[list[_PoolEntry]],
+        pools: list[list[PoolEntry]],
         pool_sizes_list: list[dict[str, int]],
         start: float,
         project_id: str,
         project_root: str,
+        *,
+        withheld_list: list[PoolWithheld | None] | None = None,
     ) -> list[CuratorDecision]:
         """Invoke one batched LLM call for N candidates and parse the result.
 
@@ -2688,7 +2976,9 @@ class TaskCurator:
         # Python-side premise/blocklist resolution (L774/863/870).
         cwd = neutral_cli_cwd()
         n = len(candidates)
-        user_prompt = self._build_batch_user_prompt(candidates, pools)
+        user_prompt = self._build_batch_user_prompt(
+            candidates, pools, withheld_list=withheld_list,
+        )
 
         # Scale by (n-1): the single-call budget (timeout_seconds /
         # max_turns / max_budget_usd) already covers the first item's
@@ -2717,6 +3007,7 @@ class TaskCurator:
             self._config.curator.batch_budget_cap_usd,
         )
         system_prompt = self._resolve_curator_prompt(CURATOR_BATCH_SPEC)
+        transcript_scope = self._transcript_scope(timeout)
 
         agent_result: AgentResult = await invoke_with_cap_retry(
             usage_gate=self._usage_gate,
@@ -2728,19 +3019,28 @@ class TaskCurator:
             model=self._config.curator.model,
             max_turns=max_turns,
             max_budget_usd=budget,
+            # Pure classifier: build_claude_argv turns '*' into --tools '', which
+            # removes built-in and deferred tools; the two MCP kwargs remove MCP.
             disallowed_tools=['*'],
+            mcp_config=no_mcp_servers_config(),
+            strict_mcp_config=True,
             output_schema=CURATOR_BATCH_OUTPUT_SCHEMA,
             permission_mode='bypassPermissions',
             timeout_seconds=timeout,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
+            park_on_frozen_pool=False,
+            **self._ledger_kwargs('task_curator_batch'),
+            **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
 
+        agent_result, evidence = await self._resolve_failed_result(agent_result, transcript_scope)
         latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
             raise CuratorFailureError(
                 f'curator batch LLM call failed: batch_size={n} '
                 f'output={agent_result.output[:200]!r} '
                 f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
+                f'transcript_turns={agent_result.transcript_turns} '
                 f'timed_out={agent_result.timed_out} '
                 f'duration_ms={agent_result.duration_ms} '
                 f'schema_tool_denied={agent_result.schema_tool_denied} '
@@ -2753,6 +3053,8 @@ class TaskCurator:
                 proc_tree=agent_result.proc_tree,
                 account_name=agent_result.account_name,
                 cost_usd=agent_result.cost_usd,
+                transcript_turns=agent_result.transcript_turns,
+                tools_used=evidence.other_tool_uses if evidence else None,
             )
 
         # Success: a real LLM round-trip completed, so the service is not
@@ -2762,10 +3064,9 @@ class TaskCurator:
         # many healthy BATCH calls in a batch-dominant deployment until
         # threshold (default 2) trips the breaker and disables dedupe for
         # the cooldown (default 600s) on a healthy service (task 4143).
-        # Keyed on agent_result.success, not on decision quality:
-        # _parse_batch_decisions degrades unparseable items to
-        # action='create' without raising, and a degraded decision is
-        # still evidence the CLI round-trip completed.
+        # Keyed on agent_result.success, not on decision quality: what this
+        # breaker asserts is a wedged BACKEND, and a completed round-trip
+        # disproves that however unusable its payload turns out to be.
         #
         # This also closes an ALREADY-OPEN breaker/cooldown, not just the
         # counter: _call_llm_batch_with_fallback's two bisect halves run
@@ -2778,23 +3079,45 @@ class TaskCurator:
         # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker).
         self._reset_zero_output_breaker()
 
-        return _parse_batch_decisions(
+        decisions = _parse_batch_decisions(
             agent_result,
             pools=pools,
             pool_sizes_list=pool_sizes_list,
             latency_ms=latency_ms,
         )
 
+        # The streak, unlike the breaker, needs a usable DECISION rather than a
+        # completed round-trip: _parse_batch_decisions fails items open to
+        # action='create' without raising. One usable decision suffices — the
+        # other items' degradation is then the designed per-item fail-open.
+        if any(not d.degraded for d in decisions):
+            self._reset_degraded_streak(project_id)
+        else:
+            for candidate, decision in zip(candidates, decisions, strict=True):
+                await self._count_degraded(
+                    justification=decision.justification,
+                    project_id=project_id,
+                    project_root=project_root,
+                    candidate_title=candidate.title,
+                )
+
+        return decisions
+
     async def _call_llm_batch_with_fallback(
         self,
         candidates: list[CandidateTask],
-        pools: list[list[_PoolEntry]],
+        pools: list[list[PoolEntry]],
         pool_sizes_list: list[dict[str, int]],
         start: float,
         project_id: str,
         project_root: str,
+        *,
+        withheld_list: list[PoolWithheld | None] | None = None,
     ) -> list[CuratorDecision]:
         """Try one batched LLM call; on :exc:`CuratorFailureError` bisect and retry each half.
+
+        Never raises a pool-unavailable error: an account pool that cannot
+        serve yields one :meth:`CuratorDecision.deferred` per candidate.
 
         Decisions returned to the caller are in **input-local space** for this
         invocation (positions 0..N-1 of the *candidates* arg).  The bisect
@@ -2804,8 +3127,9 @@ class TaskCurator:
 
         Failure-type branching:
 
-        * :exc:`AllAccountsCappedException` — re-raised (the caller defers
-          the whole batch instead of repeating the cap-retry storm N times).
+        * ``POOL_UNAVAILABLE_ERRORS`` — every candidate deferred, without
+          bisecting: smaller batches cannot cure a pool that cannot serve, and
+          each half would repeat the cap-retry wait.
         * :exc:`CuratorFailureError` — bisects.  Both recognised subtypes
           (``error_max_budget_usd``, ``error_empty_output``,
           ``error_max_turns``, …) and unknown subtypes shrink with smaller
@@ -2824,13 +3148,24 @@ class TaskCurator:
                 await self.curate(candidates[0], project_id, project_root),
             ]
 
+        censuses: list[PoolWithheld | None] = list(withheld_list or [None] * n)
         try:
             return await self._call_llm_batch(
                 candidates, pools, pool_sizes_list, start,
-                project_id, project_root,
+                project_id, project_root, withheld_list=censuses,
             )
-        except AllAccountsCappedException:
-            raise
+        except POOL_UNAVAILABLE_ERRORS as exc:
+            logger.warning(
+                'curate_batch: account pool unavailable for a size-%d batch — '
+                'deferring every candidate: %s',
+                n, exc,
+            )
+            latency_ms = int((time.monotonic() - start) * 1000)
+            reason = pool_defer_reason(exc)
+            return [
+                CuratorDecision.deferred(reason, pool_sizes=sizes, latency_ms=latency_ms)
+                for sizes in pool_sizes_list
+            ]
         except CuratorFailureError as exc:
             mid = n // 2
             logger.warning(
@@ -2847,10 +3182,12 @@ class TaskCurator:
                 self._call_llm_batch_with_fallback(
                     candidates[:mid], pools[:mid], pool_sizes_list[:mid],
                     start, project_id, project_root,
+                    withheld_list=censuses[:mid],
                 ),
                 self._call_llm_batch_with_fallback(
                     candidates[mid:], pools[mid:], pool_sizes_list[mid:],
                     start, project_id, project_root,
+                    withheld_list=censuses[mid:],
                 ),
             )
             # Right-half decisions came back in [0, n-mid)-local space; shift
@@ -2863,7 +3200,11 @@ class TaskCurator:
             return left + shifted_right
 
     def _build_user_prompt(
-        self, candidate: CandidateTask, pool: list[_PoolEntry],
+        self,
+        candidate: CandidateTask,
+        pool: list[PoolEntry],
+        *,
+        withheld: PoolWithheld | None = None,
     ) -> str:
         desc_cap = self._config.curator.entry_description_chars
         details_cap = self._config.curator.entry_details_chars
@@ -2876,9 +3217,13 @@ class TaskCurator:
         if candidate.spawned_from:
             lines.append(f'  spawned_from: {candidate.spawned_from}')
         if candidate.description:
-            lines.append(f'  description: {candidate.description[:desc_cap]}')
+            lines.append(
+                f'  description: {clip_for_prompt(candidate.description, desc_cap)}',
+            )
         if candidate.details:
-            lines.append(f'  details: {candidate.details[:details_cap]}')
+            lines.append(
+                f'  details: {clip_for_prompt(candidate.details, details_cap)}',
+            )
         if candidate.files_to_modify:
             lines.append(
                 '  files_to_modify: '
@@ -2893,6 +3238,7 @@ class TaskCurator:
             for entry in pool:
                 lines.append(entry.render(desc_cap, details_cap))
                 lines.append('')
+        _append_pool_truncation(lines, withheld)
 
         lines.append(
             'Decide drop / combine / create per the system-prompt rules. '
@@ -2903,8 +3249,10 @@ class TaskCurator:
     def _build_batch_section(
         self,
         candidate: CandidateTask,
-        pool: list[_PoolEntry],
+        pool: list[PoolEntry],
         batch_index: int,
+        *,
+        withheld: PoolWithheld | None = None,
     ) -> str:
         """Build one candidate's section of the batched user prompt.
 
@@ -2925,9 +3273,13 @@ class TaskCurator:
         if candidate.spawned_from:
             lines.append(f'  spawned_from: {candidate.spawned_from}')
         if candidate.description:
-            lines.append(f'  description: {candidate.description[:desc_cap]}')
+            lines.append(
+                f'  description: {clip_for_prompt(candidate.description, desc_cap)}',
+            )
         if candidate.details:
-            lines.append(f'  details: {candidate.details[:details_cap]}')
+            lines.append(
+                f'  details: {clip_for_prompt(candidate.details, details_cap)}',
+            )
         if candidate.files_to_modify:
             lines.append(
                 '  files_to_modify: '
@@ -2942,22 +3294,35 @@ class TaskCurator:
             for entry in pool:
                 lines.append(entry.render(desc_cap, details_cap))
                 lines.append('')
+        _append_pool_truncation(lines, withheld)
         lines.append('')
         return '\n'.join(lines)
 
     def _build_batch_user_prompt(
         self,
         candidates: list[CandidateTask],
-        pools: list[list[_PoolEntry]],
+        pools: list[list[PoolEntry]],
+        *,
+        withheld_list: list[PoolWithheld | None] | None = None,
     ) -> str:
         """Build a batched user prompt containing one labelled section per candidate.
 
         Each section mirrors the single-item :meth:`_build_user_prompt` layout but
         is prefixed ``# Candidate batch_index={i}`` so the model can address
-        decisions by index.  Pools are kept per-candidate (not unioned).
+        decisions by index.  Pools are kept per-candidate (not unioned) — and so
+        is each pool's :class:`PoolWithheld` census, which renders inside its own
+        candidate's section so a truncated pool for one candidate is never read
+        as a qualifier on another's.
+
+        A short or absent *withheld_list* is tolerated: the missing entries
+        simply render nothing, which is what an untruncated pool renders anyway.
         """
+        censuses = withheld_list or []
         sections = [
-            self._build_batch_section(candidate, pool, i)
+            self._build_batch_section(
+                candidate, pool, i,
+                withheld=censuses[i] if i < len(censuses) else None,
+            )
             for i, (candidate, pool) in enumerate(
                 zip(candidates, pools, strict=True),
             )
@@ -2972,6 +3337,32 @@ class TaskCurator:
 # ----------------------------------------------------------------------
 # Pure helpers (module-level — easier to unit-test)
 # ----------------------------------------------------------------------
+
+
+def _count_absent(task_ids: Iterable[str], admitted: set[str]) -> int:
+    """How many DISTINCT ids in *task_ids* the pool never admitted.
+
+    The census counts what the prompt is MISSING, so an id a later stream
+    picked up is not withheld however early a cap skipped it. Counting has to
+    run against the finished admitted set for that reason; counting at the
+    moment each cap fires reports entries that end up present.
+    """
+    return len({tid for tid in task_ids if tid and tid not in admitted})
+
+
+def _append_pool_truncation(
+    lines: list[str], withheld: PoolWithheld | None,
+) -> None:
+    """Append the pool-truncation block to *lines*, if there is one.
+
+    The one place both prompt builders emit the census, so the fact and its
+    guidance cannot end up worded differently on the single and batch paths.
+    Appends nothing when the pool was complete.
+    """
+    rendered = withheld.render() if withheld is not None else None
+    if rendered is not None:
+        lines.append(rendered)
+        lines.append('')
 
 
 def _task_files(task: dict) -> list[str]:
@@ -3002,29 +3393,9 @@ def _task_metadata_spawned_from(task: dict) -> str | None:
     return None
 
 
-def is_combine_eligible_status(status: str) -> bool:
-    """Single source of truth for combine STATUS eligibility (task 4035).
-
-    Called from BOTH the curator's selection snapshot
-    (``_to_pool_entry.combine_eligible``) and the interceptor's
-    execution-time combine guard (``_execute_combine``). Keeping one
-    definition is the point: the two sites previously hand-copied
-    ``status == 'pending'`` and silently diverged, letting 20.2% of combines
-    land on non-pending targets mid-planning.
-
-    Status ONLY. Liveness (``claimant_run_id``) is execution-side and
-    deliberately NOT part of this predicate — the selection snapshot cannot
-    observe it (D11).
-
-    Fails closed: anything outside the canonical vocabulary (an unknown
-    status, a blank, a case variant) is not eligible.
-    """
-    return status == TaskStatus.PENDING.value
-
-
 def _to_pool_entry(
     task: dict | None, *, source: str, lock_depth: int,
-) -> _PoolEntry | None:
+) -> PoolEntry | None:
     if not task or not isinstance(task, dict):
         return None
     tid = str(task.get('id', ''))
@@ -3032,7 +3403,7 @@ def _to_pool_entry(
         return None
     status = str(task.get('status', 'unknown'))
     files = _task_files(task)
-    return _PoolEntry(
+    return PoolEntry(
         task_id=tid,
         title=str(task.get('title', '')),
         description=str(task.get('description', '') or ''),
@@ -3062,19 +3433,28 @@ def flatten_task_tree(tasks_result: Mapping[str, Any]) -> list[dict]:
     return out
 
 
-def _module_sort_key(entry: _PoolEntry) -> tuple[int, int, str]:
+def _module_sort_key(entry: PoolEntry) -> tuple[int, int, str]:
     status_rank = _STATUS_RANK.get(entry.status, 99)
     priority_rank = _PRIORITY_RANK.get(entry.priority, 99)
     return (status_rank, priority_rank, entry.task_id)
 
 
-def _trim_pool(pool: list[_PoolEntry], total_cap: int) -> list[_PoolEntry]:
+def _trim_pool(
+    pool: list[PoolEntry], total_cap: int,
+) -> tuple[list[PoolEntry], int]:
     """Trim a pool that exceeds the total cap, dropping the weakest first.
 
     Weak = dependency > embedding > module > anchor, preserving anchor always.
+
+    Returns ``(kept, dropped_n)``. ``dropped_n`` is how many entries the cap
+    removed, and it feeds the :class:`PoolWithheld` census so the prompt can
+    say that the pool the LLM is reading is incomplete. Reporting the
+    shortfall alongside the result, rather than logging it, is INV-11
+    ``no-silent-fail-soft``: the consumer that makes the combine-vs-create
+    call is the LLM, and the prompt is the only surface it reads.
     """
     if len(pool) <= total_cap:
-        return pool
+        return pool, 0
     weakest_order = ['dependency', 'embedding', 'module', 'anchor']
     result = list(pool)
     for source in weakest_order:
@@ -3090,13 +3470,14 @@ def _trim_pool(pool: list[_PoolEntry], total_cap: int) -> list[_PoolEntry]:
             if len(result) <= total_cap:
                 break
             result.pop(i)
-    return result[:total_cap]
+    kept = result[:total_cap]
+    return kept, len(pool) - len(kept)
 
 
 def _parse_decision_dict(
     raw: dict,
     *,
-    pool: list[_PoolEntry],
+    pool: list[PoolEntry],
     pool_sizes: dict[str, int],
     latency_ms: int,
     cost_usd: float,
@@ -3105,7 +3486,7 @@ def _parse_decision_dict(
 
     Called by both :func:`_parse_decision` (single-item) and
     :func:`_parse_batch_decisions` (per-item inside a batch).  The function
-    **never raises**: every malformed-input path returns a degraded
+    **never raises**: every malformed-input path fails open to
     ``CuratorDecision(action='create', ...)`` instead of propagating an
     exception.  Per-item isolation in the batch path is provided by the
     ``try/except`` wrapper in :func:`_parse_batch_decisions`, not by
@@ -3119,6 +3500,7 @@ def _parse_decision_dict(
             pool_sizes=pool_sizes,
             latency_ms=latency_ms,
             cost_usd=cost_usd,
+            degraded=True,
         )
 
     justification = str(raw.get('justification', ''))
@@ -3162,23 +3544,39 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
         is_within_batch_drop = (
             action == 'drop'
             and batch_target_index is not None
             and target_id is None
         )
-        if not is_within_batch_drop and (not target_id or target_id not in valid_ids):
-            return CuratorDecision(
-                action='create',
-                justification=(
-                    f'invalid-target: action={action} target_id={target_id!r}; '
-                    f'not in pool'
-                ),
-                pool_sizes=pool_sizes,
-                latency_ms=latency_ms,
-                cost_usd=cost_usd,
-            )
+        if not is_within_batch_drop:
+            # Two causes, two branches: they fall on opposite sides of the
+            # degraded line (see CuratorDecision.degraded).
+            if not target_id:
+                return CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'missing-target: action={action} has no target_id'
+                    ),
+                    pool_sizes=pool_sizes,
+                    latency_ms=latency_ms,
+                    cost_usd=cost_usd,
+                    degraded=True,
+                )
+            if target_id not in valid_ids:
+                return CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'invalid-target: action={action} target_id={target_id!r}; '
+                        f'not in pool'
+                    ),
+                    pool_sizes=pool_sizes,
+                    latency_ms=latency_ms,
+                    cost_usd=cost_usd,
+                    degraded=False,
+                )
         # RC3 create-safe guard: never drop/combine against a pool entry whose
         # status is unconfirmable ('unknown' — e.g. a thin fallback entry built
         # after a TRANSIENT get_task failure, see _fetch_entry_for_neighbor).
@@ -3197,6 +3595,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=False,
             )
         # combine-only tasks must also be combine_eligible (pending status).
         if action == 'combine' and target_entry is not None and not target_entry.combine_eligible:
@@ -3209,6 +3608,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=False,
             )
 
     rewritten: RewrittenTask | None = None
@@ -3221,6 +3621,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
         try:
             rewritten = RewrittenTask(
@@ -3237,6 +3638,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
         if not rewritten.title or not rewritten.details:
             return CuratorDecision(
@@ -3245,6 +3647,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
 
     return CuratorDecision(
@@ -3265,7 +3668,7 @@ def _parse_decision(
     *,
     pool_sizes: dict[str, int],
     latency_ms: int,
-    pool: list[_PoolEntry],
+    pool: list[PoolEntry],
 ) -> CuratorDecision:
     """Parse a single-item :class:`AgentResult` into a :class:`CuratorDecision`.
 
@@ -3285,6 +3688,7 @@ def _parse_decision(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=agent_result.cost_usd,
+                degraded=True,
             )
 
     if not isinstance(raw, dict):
@@ -3294,6 +3698,7 @@ def _parse_decision(
             pool_sizes=pool_sizes,
             latency_ms=latency_ms,
             cost_usd=agent_result.cost_usd,
+            degraded=True,
         )
 
     return _parse_decision_dict(
@@ -3323,7 +3728,7 @@ def _shift_batch_target_index(
 def _parse_batch_decisions(
     agent_result: AgentResult,
     *,
-    pools: list[list[_PoolEntry]],
+    pools: list[list[PoolEntry]],
     pool_sizes_list: list[dict[str, int]],
     latency_ms: int,
 ) -> list[CuratorDecision]:
@@ -3371,6 +3776,7 @@ def _parse_batch_decisions(
                 pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
                 latency_ms=latency_ms,
                 cost_usd=cost_per_item,
+                degraded=True,
             ))
             continue
         try:
@@ -3388,6 +3794,7 @@ def _parse_batch_decisions(
                 pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
                 latency_ms=latency_ms,
                 cost_usd=cost_per_item,
+                degraded=True,
             )
         results.append(decision)
 
@@ -3408,6 +3815,7 @@ def _parse_batch_decisions(
                     pool_sizes=d.pool_sizes,
                     latency_ms=d.latency_ms,
                     cost_usd=d.cost_usd,
+                    degraded=True,
                 )
 
     # Build the directed graph for cycle detection (only batch-drop edges).
@@ -3456,6 +3864,7 @@ def _parse_batch_decisions(
             pool_sizes=d.pool_sizes,
             latency_ms=d.latency_ms,
             cost_usd=d.cost_usd,
+            degraded=True,
         )
 
     return results

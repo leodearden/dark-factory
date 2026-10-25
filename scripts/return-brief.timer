@@ -1,0 +1,23 @@
+[Unit]
+Description=Nightly timer for the cross-project return brief (task 5376)
+
+[Timer]
+# Nightly at 05:30 local time, last in this machine's staggered ladder:
+#
+#   03:00  legibility-trickle@
+#   03:30  fused-memory-flag-marker-sweep
+#   04:00  reclaim-orphaned-worktrees  AND  legibility-transcript-check@
+#   04:30  legibility-trickle-health@
+#   05:00  memory-metadata-coverage-census
+#   05:30  this job
+#
+# It sits last because it reads every project's stores, after the nightly jobs
+# that may write them, so the page Leo pulls on return reflects the whole night.
+# Persistent=true catches up a night missed to a sleeping laptop; the randomized
+# delay avoids a thundering herd. See OPERATIONS.md §12 for the ladder as a whole.
+OnCalendar=*-*-* 05:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

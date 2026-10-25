@@ -1,6 +1,6 @@
 """The single findable home for this suite's steward test-scaffolding invariants.
 
-Consolidation lineage 3461 → 3514 → 3551 → 3647.  Task 3461 merged the two
+Consolidation lineage 3461 → 3514 → 3551 → 3647 → 4452.  Task 3461 merged the two
 near-identical ``_make_steward`` copies from ``test_suggestion_triage.py`` and
 ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two that
 remained (``test_out_of_band_routing.py``'s, and ``test_steward.py``'s
@@ -17,7 +17,8 @@ CHECKABLE invariants, matching the ethos the suite already states elsewhere
 guard).  Task 4389 extended the lineage one further, adjudicating the 17
 absolute-``/tmp`` ``project_root`` literals task 3551's sweep had found and left
 classified as "unknown", and turning that ruling into the fourth concern below.
-Four concerns live here, deliberately in ONE module because the lineage's actual
+Task 4452 folded the verdict-gate steward site onto ``make_steward``, retiring
+its sanction.  Four concerns live here, deliberately in ONE module because the lineage's actual
 failure mode is that they keep getting scattered and re-derived:
 
 1. :class:`TestAssertSandboxedProjectRoot` — the contract of
@@ -35,14 +36,10 @@ failure mode is that they keep getting scattered and re-derived:
    COHESION alone: concerns 1 and 2 are already the ``project_root`` sandbox
    invariant, and a fourth address is exactly the scattering described above.
    NOT for cost, and the distinction matters in a module whose premise is that
-   unchecked rationales rot — module membership buys nothing here.
-   ``_scan_tests_tree`` is a per-PROCESS cache, and ``orchestrator/pyproject.toml``
-   runs ``-n auto --dist loadgroup``, which distributes UNGROUPED tests
-   individually; this census therefore lands on an arbitrary worker and pays its
-   own full-tree parse wherever it is written.  Only the ``xdist_group`` tag
-   MEASURED AND REJECTED below would have shared the parse.  So the census adds a
-   third full-tree scan to the suite, accepted for the reason that note gives: on
-   a many-core host the binding constraint is the critical path, not CPU.
+   unchecked rationales rot — module membership buys nothing here.  Each
+   census runs its OWN streaming pass through ``_tests_tree_census``, lands on
+   an arbitrary worker, and pays one full-tree parse there, wherever it is
+   written.
 
 Modelled on ``test_git_repo_isolation_guard.py``, which is exactly this shape for
 the esc-3072-3 incident class: helper unit tests, plus an AST recurrence guard
@@ -53,8 +50,8 @@ from __future__ import annotations
 
 import ast
 import functools
-from collections.abc import Mapping
-from pathlib import Path
+from collections.abc import Callable, Mapping, MutableMapping
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import NamedTuple
 from unittest.mock import MagicMock
@@ -267,14 +264,8 @@ _CANONICAL_OWNER = '_orch_helpers.py'
 # when it drifts; do NOT lower it to silence a failure.
 _MIN_MODULES_SWEPT = 400
 
-# Co-locating the two sweeping tests on one xdist worker was MEASURED and
-# REJECTED, recorded here so it is not re-tried.  `_scan_tests_tree` is a
-# per-PROCESS cache, so an `xdist_group` tag would let the second guard read the
-# first one's parse and halve this module's CPU.  It also SERIALISES the two
-# heaviest tests onto one worker: measured 66s wall for the module grouped vs
-# 44s ungrouped.  The suite runs `-n auto` on a many-core host where the binding
-# constraint is the critical path, not CPU, so the two guards are left free to
-# run in parallel and each pay their own scan.
+# No xdist_group: each census streams its own pass, so grouping would share
+# nothing and only serialise three parses.
 
 
 def _mentions(node: ast.AST, name: str) -> bool:
@@ -382,58 +373,122 @@ def _inline_sandbox_asserts(tree: ast.Module) -> list[str]:
     return offenders
 
 
-class _TreeScan(NamedTuple):
-    """The parsed tests tree, plus what the scan could NOT parse.
+_Detector = Callable[[ast.Module], list[str]]
 
-    ``unparseable`` exists so a module can never vanish from both guards
-    silently: a swallowed ``SyntaxError`` shrinks the swept set, and a shrunken
-    swept set is indistinguishable from "found nothing wrong".  The liveness
-    assertions check it is empty rather than trusting the count alone.
+
+class _Census(NamedTuple):
+    """One detector's findings over a tree, plus what the pass could NOT parse.
+
+    Findings only, never ``ast`` nodes, so nothing a census returns can keep a
+    parsed tree alive.  ``unparseable`` exists so a module can never vanish from
+    a guard silently: a swallowed ``SyntaxError`` shrinks the swept set, and a
+    shrunken swept set is indistinguishable from "found nothing wrong".  The
+    liveness assertions check it is empty rather than trusting the count alone.
     """
 
-    modules: tuple[tuple[Path, ast.Module], ...]
+    parsed: tuple[str, ...]
     unparseable: tuple[str, ...]
+    sites: Mapping[str, tuple[str, ...]]
 
 
-@functools.cache
-def _scan_tests_tree() -> _TreeScan:
-    """Read and ``ast.parse`` EVERY ``*.py`` under this tests tree, once.
+def _census_tree(root: Path, detector: _Detector) -> _Census:
+    """Stream every ``*.py`` under *root* through *detector*, one tree at a time.
 
-    Deliberately unfiltered: both AST guards in this file sweep from here, and
-    each applies its own exclusions at use time.  The recurrence guard drops the
-    canonical owner; the census guard drops nothing, so a steward built in a
-    helper module could never be silently sanctioned by a shared exclusion it
-    was not the subject of.
-
-    COST, and why the consumers are shaped the way they are.  Reading and
-    parsing the 532-module tree is by far the most expensive thing in this file,
-    and it is paid PER PROCESS: under ``pytest-xdist`` a ``functools.cache``
-    buys nothing across workers, so every test that triggers a fresh full-tree
-    scan lands on some worker and pays for it again.  With six sweeping tests
-    that cost the suite ~80s of CPU to compute the same two answers.  Hence:
-    every derived sweep is cached (``_recurrence_swept_modules``,
-    ``_census_by_module``), and each guard exposes ONE test that asserts its
-    offender list, its liveness floor and its exclusions together.  Splitting
-    those assertions back into a test apiece is not free and not more rigorous —
-    it re-triggers the scan on a fresh worker for each one.  Add a case to the
-    detector self-tests (synthetic sources, no scan) instead.
+    Keys are POSIX paths relative to *root*; ``sites`` holds only modules with
+    a finding.  No exclusion is applied here: that belongs to each consuming
+    guard.  A decode error raises rather than landing in ``unparseable``.
     """
-    parsed: list[tuple[Path, ast.Module]] = []
+    parsed: list[str] = []
     unparseable: list[str] = []
-    for path in sorted(_TESTS_DIR.rglob('*.py')):
+    sites: dict[str, tuple[str, ...]] = {}
+    for path in sorted(root.rglob('*.py')):
+        module = path.relative_to(root).as_posix()
         try:
-            parsed.append((path, ast.parse(path.read_text(encoding='utf-8'))))
-        except SyntaxError as exc:  # pragma: no cover - asserted on, not swallowed
-            unparseable.append(f'{path.relative_to(_TESTS_DIR)}: {exc}')
-    return _TreeScan(tuple(parsed), tuple(unparseable))
+            findings = detector(ast.parse(path.read_text(encoding='utf-8')))
+        except SyntaxError as exc:
+            unparseable.append(f'{module}: {exc}')
+            continue
+        parsed.append(module)
+        if findings:
+            sites[module] = tuple(findings)
+    return _Census(tuple(parsed), tuple(unparseable), MappingProxyType(sites))
 
 
 @functools.cache
-def _recurrence_swept_modules() -> tuple[tuple[Path, ast.Module], ...]:
-    """Everything the RECURRENCE guard scans: all modules bar the canonical owner."""
-    return tuple(
-        (p, t) for p, t in _scan_tests_tree().modules if p.name != _CANONICAL_OWNER
-    )
+def _tests_tree_census(detector: _Detector) -> _Census:
+    """*detector*'s census of this tests tree: one streaming pass per detector
+    per process.
+
+    Deliberately UNFILTERED, so each guard applies its own exclusions at use
+    time.  The recurrence guard drops the canonical owner.  The tmp-literal
+    census must keep it, because ``_orch_helpers.py`` OWNS the canonical
+    literal.
+
+    COST.  The pass is the most expensive thing in this file, and it is paid
+    per process AND per detector.  Under ``pytest-xdist`` the cache buys
+    nothing across workers, so each census lands on some worker and pays one
+    full-tree parse there.  NO tree outlives the pass: retaining ~700 parsed
+    modules costs ~800 MB RSS per worker and more than doubles the parse.  The
+    measurement is in plans/pytest-per-test-timeout-measurement-2026-09-17.md
+    (task 6556 addendum).
+
+    Hence each guard exposes ONE test that asserts its offender list, its
+    liveness floor and its exclusions together.  Splitting those into a test
+    apiece is not more rigorous; it re-pays the pass on a fresh worker for each
+    one.  Add a case to the detector self-tests instead (synthetic sources, no
+    scan).
+    """
+    return _census_tree(_TESTS_DIR, detector)
+
+
+class TestCensusTree:
+    """The seam every census below is built on, driven over a real ``tmp_path``
+    tree so no test here triggers a full-tree scan.
+
+    Synthetic sources stay inside string literals: the censuses parse THIS
+    module too, and a real construction or assert block here would self-trip.
+    """
+
+    def test_it_maps_each_module_to_its_own_findings_and_names_what_did_not_parse(
+        self, tmp_path,
+    ) -> None:
+        (tmp_path / 'a.py').write_text('steward = TaskSteward()\n', encoding='utf-8')
+        (tmp_path / 'sub').mkdir()
+        (tmp_path / 'sub' / 'b.py').write_text('x = 1\n', encoding='utf-8')
+        (tmp_path / 'broken.py').write_text('def f(:\n', encoding='utf-8')
+
+        census = _census_tree(tmp_path, _steward_construction_sites)
+
+        assert census.parsed == ('a.py', 'sub/b.py')
+        assert [entry.split(':', 1)[0] for entry in census.unparseable] == ['broken.py']
+        assert dict(census.sites) == {'a.py': ('1 (constructs TaskSteward)',)}
+        assert not isinstance(census.sites, MutableMapping), (
+            'the census is memoised and shared, so its sites must be read-only'
+        )
+
+    def test_it_applies_no_exclusion_of_its_own(self, tmp_path) -> None:
+        """Exclusions belong to the consuming guard: the recurrence guard drops the canonical owner, while the tmp-literal census must keep it."""
+        (tmp_path / '_orch_helpers.py').write_text(
+            'def assert_sandboxed_project_root(project_root, tmp_path):\n'
+            '    assert isinstance(project_root, Path)\n'
+            '    assert project_root.resolve().is_relative_to(tmp_path.resolve())\n',
+            encoding='utf-8',
+        )
+
+        census = _census_tree(tmp_path, _inline_sandbox_asserts)
+
+        assert '_orch_helpers.py' in census.sites
+
+    def test_an_undecodable_module_raises_rather_than_dropping_out(
+        self, tmp_path,
+    ) -> None:
+        """Only a ``SyntaxError`` lands in ``unparseable``; a module the pass
+        cannot even decode must fail the census loudly, not shrink its swept set."""
+        (tmp_path / 'a.py').write_text('x = 1\n', encoding='utf-8')
+        (tmp_path / 'undecodable.py').write_bytes(b'x = "\xff\xfe"\n')
+
+        with pytest.raises(UnicodeDecodeError):
+            _census_tree(tmp_path, _steward_construction_sites)
 
 
 class TestNoInlineSandboxedProjectRootAsserts:
@@ -451,15 +506,16 @@ class TestNoInlineSandboxedProjectRootAsserts:
         Liveness, the canonical-owner exclusion and the offender list are
         asserted together and IN THAT ORDER, so a broken sweep reports itself as
         a broken sweep rather than as "zero recurrences".  They are not split
-        into a test apiece on purpose — see ``_scan_tests_tree`` for the cost.
+        into a test apiece on purpose — see ``_tests_tree_census`` for the cost.
         """
-        swept = _recurrence_swept_modules()
+        census = _tests_tree_census(_inline_sandbox_asserts)
+        swept = [m for m in census.parsed if PurePosixPath(m).name != _CANONICAL_OWNER]
 
         # -- liveness first: a sweep that inspects nothing reads as coverage.
-        assert not _scan_tests_tree().unparseable, (
+        assert not census.unparseable, (
             f'modules under {_TESTS_DIR} failed to parse and so were silently '
             f'absent from this sweep — fix them or this guard is blind to them: '
-            f'{list(_scan_tests_tree().unparseable)}'
+            f'{list(census.unparseable)}'
         )
         assert len(swept) >= _MIN_MODULES_SWEPT, (
             f'the recurrence sweep found only {len(swept)} modules under '
@@ -471,17 +527,18 @@ class TestNoInlineSandboxedProjectRootAsserts:
         assert (_TESTS_DIR / _CANONICAL_OWNER).is_file(), (
             f'{_CANONICAL_OWNER} must exist — it owns {_HELPER_NAME}'
         )
-        assert all(p.name != _CANONICAL_OWNER for p, _ in swept), (
-            f'{_CANONICAL_OWNER} must be excluded: it is the canonical owner of '
-            f'the pattern, so flagging it there would be the guard flagging the fix'
+        assert any(PurePosixPath(m).name == _CANONICAL_OWNER for m in census.parsed), (
+            f'the census must READ {_CANONICAL_OWNER}: it is excluded from the '
+            f'offenders below as the canonical owner of the pattern, never from '
+            f'the sweep itself'
         )
 
-        offenders: list[str] = []
-        for path, tree in swept:
-            offenders.extend(
-                f'{path.relative_to(_TESTS_DIR)}::{hit}'
-                for hit in _inline_sandbox_asserts(tree)
-            )
+        offenders = [
+            f'{module}::{hit}'
+            for module, hits in census.sites.items()
+            if PurePosixPath(module).name != _CANONICAL_OWNER
+            for hit in hits
+        ]
 
         assert not offenders, (
             'Inline re-implementation(s) of the sandboxed-project_root block.\n'
@@ -574,7 +631,7 @@ class _Sanctioned(NamedTuple):
 
     *sites* is deliberately a COUNT, not just a flag.  Sanctioning a module
     wholesale would pre-approve every FUTURE construction it grows — someone
-    could add a fourth idiom inside an already-listed module and the census
+    could add a new idiom inside an already-listed module and the census
     would stay green, which is the exact silent appearance this guard exists to
     stop.  Pinning the count means a new construction in a sanctioned module
     still trips, and still forces its own adjudication.  Line numbers are
@@ -623,19 +680,6 @@ _SANCTIONED_STEWARD_CONSTRUCTION: dict[str, _Sanctioned] = {
             'restate them here'
         ),
     ),
-    'test_verdict_servers_integration_gate.py': _Sanctioned(
-        sites=1,
-        reason=(
-            '`_build_steward_for_triage`: builds a real `TaskSteward` against a '
-            'REAL `OrchestratorConfig` and a real on-disk meta-root, which '
-            "`make_steward`'s `spec_set` MagicMock cannot supply. Rationale and "
-            'the 2488-postdates-3514 history are owned by '
-            '`conftest.make_steward.__doc__`; whether `make_steward` should grow '
-            'a `config=` passthrough is left open and filed as ticket '
-            'tkt_0RSMX59FSJ27QWSS9VKBYRFMFG (task 3647 owned the ADJUDICATION, '
-            'not the redesign)'
-        ),
-    ),
     'test_workflow_e2e.py': _Sanctioned(
         sites=1,
         reason=(
@@ -662,7 +706,7 @@ def _steward_construction_sites(tree: ast.Module) -> list[str]:
     * an ``ast.Call`` whose func is an ``ast.Attribute`` whose ``.attr`` ends in
       ``Steward`` (``harness.TaskSteward(...)``, ``_SpyStewardFactory.Steward()``).
       Matching only the Name form would leave the attribute form invisible, so a
-      fourth idiom could appear silently through a module-qualified or nested
+      new idiom could appear silently through a module-qualified or nested
       name — exactly what this census exists to prevent;
     * an ``ast.ClassDef`` with a base ending in ``Steward`` — a subclass is a
       second steward SHAPE even before it is instantiated, and the standing
@@ -711,22 +755,6 @@ def _steward_construction_sites(tree: ast.Module) -> list[str]:
     return sites
 
 
-@functools.cache
-def _census_by_module() -> Mapping[str, tuple[str, ...]]:
-    """``{module path relative to the tests tree: (site, ...)}``, computed once.
-
-    Cached, and returned read-only, because the full-tree walk is the expensive
-    half of this module: see ``_scan_tests_tree`` for the cost and for why the
-    tests that consume this are collapsed rather than split.
-    """
-    census: dict[str, tuple[str, ...]] = {}
-    for path, tree in _scan_tests_tree().modules:
-        sites = _steward_construction_sites(tree)
-        if sites:
-            census[str(path.relative_to(_TESTS_DIR))] = tuple(sites)
-    return MappingProxyType(census)
-
-
 class TestStewardConstructionSitesAreCensused:
     """Every steward built outside ``make_steward`` is sanctioned, with a reason.
 
@@ -749,23 +777,23 @@ class TestStewardConstructionSitesAreCensused:
         allowlist staleness are asserted together and in that order: a census
         that read nothing sanctions everything, so it must report itself as
         broken before it reports "all clear".  Not split into a test apiece on
-        purpose — see ``_scan_tests_tree`` for the cost.
+        purpose — see ``_tests_tree_census`` for the cost.
         """
-        census = _census_by_module()
+        census = _tests_tree_census(_steward_construction_sites)
 
         # -- liveness first, in both directions: did we read the tree, and does
         #    the detector still match anything at all?
-        assert not _scan_tests_tree().unparseable, (
+        assert not census.unparseable, (
             f'modules under {_TESTS_DIR} failed to parse and so were silently '
             f'absent from this census — a module that cannot be read cannot be '
-            f'censused: {list(_scan_tests_tree().unparseable)}'
+            f'censused: {list(census.unparseable)}'
         )
-        assert len(_scan_tests_tree().modules) >= _MIN_MODULES_SWEPT, (
-            f'the census parsed only {len(_scan_tests_tree().modules)} modules '
+        assert len(census.parsed) >= _MIN_MODULES_SWEPT, (
+            f'the census parsed only {len(census.parsed)} modules '
             f'under {_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A '
             f'census that reads nothing sanctions everything.'
         )
-        assert census, (
+        assert census.sites, (
             'the census found NO steward construction anywhere, not even '
             "conftest.py's `make_steward` — the detector has stopped matching, "
             'so this guard is vacuously green'
@@ -774,14 +802,14 @@ class TestStewardConstructionSitesAreCensused:
         # -- a module nobody has adjudicated at all.
         unsanctioned = {
             module: sites
-            for module, sites in census.items()
+            for module, sites in census.sites.items()
             if module not in _SANCTIONED_STEWARD_CONSTRUCTION
         }
         assert not unsanctioned, (
             'Unsanctioned steward-construction site(s).\n'
             'This suite has ONE steward factory: the `make_steward` fixture in '
             'conftest.py (task 3461 merged two copies into it, task 3514 folded '
-            'in the two that remained). A construction outside it is a fourth '
+            'in the two that remained). A construction outside it is a new '
             'idiom of the kind this census exists to stop appearing silently.\n'
             'Fix, and it is a real choice between two options:\n'
             '  (a) fold the site onto `make_steward` — extend that fixture '
@@ -799,7 +827,7 @@ class TestStewardConstructionSitesAreCensused:
         #    appearance one directory over.
         miscounted = {
             module: (sites, _SANCTIONED_STEWARD_CONSTRUCTION[module].sites)
-            for module, sites in census.items()
+            for module, sites in census.sites.items()
             if len(sites) != _SANCTIONED_STEWARD_CONSTRUCTION[module].sites
         }
         assert not miscounted, (
@@ -820,7 +848,7 @@ class TestStewardConstructionSitesAreCensused:
         #    silently pre-sanctions whatever that module does next. Same shape as
         #    `test_git_repo_isolation_guard.py`'s check that every
         #    `_SELF_INITIALISING_HELPERS` entry still names a live helper.
-        stale = sorted(set(_SANCTIONED_STEWARD_CONSTRUCTION) - set(census))
+        stale = sorted(set(_SANCTIONED_STEWARD_CONSTRUCTION) - set(census.sites))
         assert not stale, (
             f'_SANCTIONED_STEWARD_CONSTRUCTION names {stale}, which no longer '
             f'construct a steward. Remove the entries — a stale sanction '
@@ -908,7 +936,7 @@ class TestMockWorkflowProjectRootContract:
     invariant.
 
     No tree scan in this class, so neither test pays the full-tree parse the two
-    sweeping guards above do — see ``_scan_tests_tree``.
+    sweeping guards above do — see ``_tests_tree_census``.
     """
 
     def test_it_is_an_absolute_real_path_clear_of_pytest_paths(self) -> None:
@@ -1112,6 +1140,15 @@ _ADJUDICATED_TMP_PROJECT_ROOT_LITERALS: dict[str, _Adjudicated] = {
             'family'
         ),
     ),
+    'test_verify_admission_call_sites.py': _Adjudicated(
+        sites=1,
+        reason=(
+            'same ReviewCheckpoint `/tmp/pytest`-guard family as '
+            'test_review_checkpoint_cap.py: its review-checkpoint call-site '
+            'spy builds a real ReviewCheckpoint, whose _run_review refuses any '
+            'tmp_path project_root (task 5628, esc-5628-1)'
+        ),
+    ),
 }
 
 
@@ -1132,20 +1169,18 @@ def _tmp_literal(value: ast.expr) -> str | None:
     cost is that a hypothetical ``/tmpfoo`` would also match, which is a
     false-positive costing one allowlist line rather than a blind spot.
 
-    ONE DELIBERATE FALSE NEGATIVE, recorded so it reads as a decision and not an
-    oversight: a COMPOUND value is not inspected, so
-    ``test_harness_train_callbacks.py``'s
-    ``config.project_root = tmp_path or Path('/tmp/proj')`` does not match.  That
-    site is a hybrid — its ``_tc_config`` factory already takes the sandboxed
-    ``tmp_path`` keyword this task's remedy points authors at, and the ``/tmp``
-    literal is only the fallback when a caller omits it.  Recursing into
-    ``BoolOp``/``IfExp`` would flag it, but the census would then be asserting a
-    COUNT over sites whose literal may never be evaluated, which is a weaker
-    claim than the one the allowlist makes about the other 22.  It is left out
-    of the population rather than adjudicated into it.
+    COMPOUND values are seen through: every ``BoolOp`` operand and both
+    ``IfExp`` branches go through this same rule, but never an ``IfExp``
+    condition, which is not a bound value.  So
+    ``tmp_path or Path('/tmp/proj')`` matches.  A fallback literal escapes
+    whenever a caller omits the sandboxed argument, so it meets the same bar as
+    a plain one.
     """
     if isinstance(value, ast.Constant) and isinstance(value.value, str):
         return value.value if value.value.startswith('/tmp') else None
+    if isinstance(value, ast.BoolOp | ast.IfExp):
+        operands = value.values if isinstance(value, ast.BoolOp) else [value.body, value.orelse]
+        return next(filter(None, map(_tmp_literal, operands)), None)
     if isinstance(value, ast.Call):
         called = (
             value.func.id if isinstance(value.func, ast.Name)
@@ -1166,9 +1201,10 @@ def _names_project_root(name: str) -> bool:
     """True if the bare identifier *name* denotes a ``project_root``.
 
     Split out from ``_is_project_root_target`` because the detector must apply
-    the SAME rule to an ``ast.arg``, whose ``.arg`` is a plain ``str`` and not an
-    expression node.  Two callers, one rule — a second spelling here is how the
-    parameter-default shape would drift out from under the assignment shape.
+    the SAME rule to an ``ast.arg`` and an ``ast.keyword``, whose ``.arg`` is a
+    plain ``str`` and not an expression node.  Three binding shapes, one rule —
+    a second spelling here is how the parameter-default or keyword shape would
+    drift out from under the assignment shape.
     """
     return name.lower().strip('_').endswith('project_root')
 
@@ -1239,9 +1275,10 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
     Shape matches ``_steward_construction_sites``'s return so both censuses read
     the same way in a failure message.
 
-    WHAT IT MATCHES — two BINDING shapes, both of which put the literal in the
-    defining module rather than at a call site, and whose value is a ``/tmp``
-    string literal, bare or wrapped in ``Path(...)`` (see ``_tmp_literal``):
+    WHAT IT MATCHES — three BINDING shapes, each spelling ``project_root`` as an
+    identifier at the binding site, and whose value is a ``/tmp`` string
+    literal — bare, wrapped in ``Path(...)``, or inside a compound value (see
+    ``_tmp_literal``):
 
     * an ``ast.Assign`` or ``ast.AnnAssign`` whose target names a
       ``project_root`` (see ``_is_project_root_target``).  ``Assign.targets`` is
@@ -1259,26 +1296,16 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
       very census the advice was meant to satisfy.  A remedy that opens a hole
       in its own detector is worse than no remedy, so the hole is closed rather
       than documented.
+    * a CALL KEYWORD — an ``ast.keyword`` whose name passes
+      ``_names_project_root`` (``**kwargs``, whose name is ``None``, is
+      skipped).  A keyword binds a real parameter, so it can carry a real
+      escape — which is why keyword sites are sandboxed, not allowlisted.
 
-    WHAT IT DELIBERATELY DOES NOT MATCH, and this is a DECISION rather than a
-    limitation — ``ast.keyword``.  The line is drawn at DEFINITION versus CALL,
-    which is why a parameter default is in scope and a call keyword is not: a
-    default is one literal living in the module that owns the factory, exactly
-    like an assignment, whereas a keyword is one of N literals at N call sites
-    binding someone else's parameter.  The tree holds ~16 call-keyword sites
-    (``LandedReconciler(project_root='/tmp/proj')`` and friends:
-    test_merge_queue_landed_reconciler.py x13,
-    test_merge_queue_landed_dispatch_gate.py, test_multihost_verify_integration.py).
-    Those bind a real constructor/dataclass PARAMETER rather than an attribute on
-    a ``spec_set`` MagicMock — a structurally different population, and not the
-    one task 3551's sweep found or task 4389 was filed to adjudicate.  Widening
-    the rule to cover them would force this guard to either fix 16 out-of-scope
-    sites or pre-approve them wholesale in the allowlist, and a wholesale
-    sanction is precisely the silent appearance this guard family exists to stop
-    (see ``_Sanctioned.__doc__`` on why ``sites`` is a COUNT, not a flag).  So
-    the boundary is structural, it is pinned by a detector self-test so it reads
-    as deliberate rather than as an oversight, and the kwarg population is
-    carried by its own follow-up ticket.
+    WHAT IT DOES NOT MATCH, by decision — a binding with no ``project_root``
+    IDENTIFIER at the site.  A positional argument binds by position to a
+    callee signature a single-module AST walk cannot resolve, and a string dict
+    key is a meaningful string, not a binding.  Pinned by
+    ``test_the_detector_ignores_a_binding_with_no_project_root_identifier``.
 
     A REFERENCE is not a literal.  ``config.project_root = MOCK_WORKFLOW_PROJECT_ROOT``
     does not match: the literal lives once, in ``_orch_helpers``, where it is
@@ -1296,6 +1323,13 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
                 if literal is not None:
                     sites.append(f'{default.lineno} ({literal})')
             continue
+        if isinstance(node, ast.keyword):
+            if node.arg is None or not _names_project_root(node.arg):
+                continue
+            literal = _tmp_literal(node.value)
+            if literal is not None:
+                sites.append(f'{node.value.lineno} ({literal})')
+            continue
         if isinstance(node, ast.Assign):
             targets: list[ast.expr] = list(node.targets)
         elif isinstance(node, ast.AnnAssign):
@@ -1307,32 +1341,10 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
         literal = _tmp_literal(node.value)
         if literal is not None:
             sites.append(f'{node.lineno} ({literal})')
-    # Sorted because the walk is BFS over two different node kinds now, so source
-    # order is not the visit order; a census failure message is read by a human
-    # looking for a line number.
+    # Sorted because the walk is BFS over several node kinds, so source order is
+    # not the visit order; a census failure message is read by a human looking
+    # for a line number.
     return sorted(sites, key=lambda site: int(site.split(' ', 1)[0]))
-
-
-@functools.cache
-def _tmp_literal_census_by_module() -> Mapping[str, tuple[str, ...]]:
-    """``{module path relative to the tests tree: (site, ...)}``, computed once.
-
-    Consumes ``_scan_tests_tree().modules`` UNFILTERED — deliberately NOT
-    ``_recurrence_swept_modules()``, which drops ``_orch_helpers.py`` as the
-    canonical owner of the sandbox-assert block.  That exclusion is right for the
-    recurrence guard and exactly wrong here: ``_orch_helpers.py`` is the module
-    that now OWNS the canonical literal, so reusing the filtered sweep would drop
-    the one site the whole remedy rests on and leave it unpinned.
-
-    Cached and returned read-only for the same reason ``_census_by_module`` is:
-    the full-tree walk is the expensive half of this module.
-    """
-    census: dict[str, tuple[str, ...]] = {}
-    for path, tree in _scan_tests_tree().modules:
-        sites = _absolute_tmp_project_root_literals(tree)
-        if sites:
-            census[str(path.relative_to(_TESTS_DIR))] = tuple(sites)
-    return MappingProxyType(census)
 
 
 class TestAbsoluteTmpProjectRootLiteralsAreCensused:
@@ -1346,13 +1358,14 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
 
     THE POPULATION, named precisely rather than as "every literal", because a
     census that overstates its own reach is the failure it exists to prevent:
-    assignments and parameter DEFAULTS — the shapes that bind a ``/tmp`` literal
-    in the module that owns it.  Three shapes are outside it, each by a recorded
-    decision rather than by omission: ~16 call-KEYWORD sites
-    (``_absolute_tmp_project_root_literals.__doc__``, pinned by
-    ``test_the_detector_ignores_the_call_keyword_shape``), the COMPOUND
-    ``tmp_path or Path('/tmp/proj')`` form (``_tmp_literal.__doc__``), and
-    non-``/tmp`` absolute roots (pinned by
+    assignments, parameter DEFAULTS and call KEYWORDS — every binding that
+    spells ``project_root`` as an identifier at the site — including a ``/tmp``
+    literal inside a COMPOUND value such as ``tmp_path or Path('/tmp/proj')``
+    (``_tmp_literal.__doc__``).  Three shapes are outside it, each by a
+    recorded decision rather than by omission: positional arguments and string
+    dict keys (``_absolute_tmp_project_root_literals.__doc__``, pinned by
+    ``test_the_detector_ignores_a_binding_with_no_project_root_identifier``),
+    and non-``/tmp`` absolute roots (pinned by
     ``test_the_detector_ignores_an_absolute_literal_outside_tmp``).
 
     Same teeth as the steward census above, in both directions: a new
@@ -1367,23 +1380,23 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
         allowlist staleness are asserted together and IN THAT ORDER: a census
         that read nothing sanctions everything, so it must report itself as
         broken before it reports "all clear".  Not split into a test apiece on
-        purpose — see ``_scan_tests_tree`` for the cost.
+        purpose — see ``_tests_tree_census`` for the cost.
         """
-        census = _tmp_literal_census_by_module()
+        census = _tests_tree_census(_absolute_tmp_project_root_literals)
 
         # -- liveness first, in both directions: did we read the tree, and does
         #    the detector still match anything at all?
-        assert not _scan_tests_tree().unparseable, (
+        assert not census.unparseable, (
             f'modules under {_TESTS_DIR} failed to parse and so were silently '
             f'absent from this census — a module that cannot be read cannot be '
-            f'censused: {list(_scan_tests_tree().unparseable)}'
+            f'censused: {list(census.unparseable)}'
         )
-        assert len(_scan_tests_tree().modules) >= _MIN_MODULES_SWEPT, (
-            f'the census parsed only {len(_scan_tests_tree().modules)} modules '
+        assert len(census.parsed) >= _MIN_MODULES_SWEPT, (
+            f'the census parsed only {len(census.parsed)} modules '
             f'under {_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A '
             f'census that reads nothing sanctions everything.'
         )
-        assert census, (
+        assert census.sites, (
             'the census found NO absolute-/tmp project_root literal anywhere, '
             'not even the canonical MOCK_WORKFLOW_PROJECT_ROOT in '
             f'{_CANONICAL_OWNER} — the detector has stopped matching, so this '
@@ -1393,7 +1406,7 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
         # -- a module nobody has adjudicated at all.
         unadjudicated = {
             module: sites
-            for module, sites in census.items()
+            for module, sites in census.sites.items()
             if module not in _ADJUDICATED_TMP_PROJECT_ROOT_LITERALS
         }
         assert not unadjudicated, (
@@ -1426,7 +1439,7 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
         #    appearance one directory over.
         miscounted = {
             module: (sites, _ADJUDICATED_TMP_PROJECT_ROOT_LITERALS[module].sites)
-            for module, sites in census.items()
+            for module, sites in census.sites.items()
             if len(sites) != _ADJUDICATED_TMP_PROJECT_ROOT_LITERALS[module].sites
         }
         assert not miscounted, (
@@ -1446,7 +1459,7 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
         # -- an entry naming a module that no longer holds a literal is rot: it
         #    silently pre-approves whatever that module does next. Same shape as
         #    the steward census's staleness check above.
-        stale = sorted(set(_ADJUDICATED_TMP_PROJECT_ROOT_LITERALS) - set(census))
+        stale = sorted(set(_ADJUDICATED_TMP_PROJECT_ROOT_LITERALS) - set(census.sites))
         assert not stale, (
             f'_ADJUDICATED_TMP_PROJECT_ROOT_LITERALS names {stale}, which no '
             f'longer hold an absolute-/tmp project_root literal. Remove the '
@@ -1628,25 +1641,106 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
 
         assert _absolute_tmp_project_root_literals(tree) == []
 
-    def test_the_detector_ignores_the_call_keyword_shape(self) -> None:
-        """Negative, and this one is a DECISION rather than a limitation — pinned
-        here so it reads as deliberate to whoever finds the excluded sites.
-
-        The tree also holds ~16 ``project_root=<literal>`` CALL-KEYWORD sites
-        (test_merge_queue_landed_reconciler.py x13,
-        test_merge_queue_landed_dispatch_gate.py, test_multihost_verify_integration.py).
-        Those bind a real constructor/dataclass PARAMETER rather than an
-        attribute on a ``spec_set`` MagicMock: a structurally different
-        population that nobody has adjudicated, and not the one task 3551's
-        sweep found or task 4389 was filed to rule on.
-
-        Widening the detector to cover them would force this guard to either fix
-        16 out-of-scope sites or pre-approve them wholesale in the allowlist —
-        and a wholesale sanction is precisely the silent appearance this guard
-        family exists to stop (see ``_Sanctioned.__doc__`` on why ``sites`` is a
-        COUNT rather than a flag).  So the boundary is drawn structurally, at
-        ``ast.keyword``, and a follow-up ticket carries the kwarg population.
+    @pytest.mark.parametrize(
+        ('source', 'literal'),
+        [
+            ("reconcile_landed_row(row, project_root='/tmp/proj')\n", '/tmp/proj'),
+            (
+                "OrchestratorConfig(project_root=Path('/tmp/xcheck-fake'))\n",
+                '/tmp/xcheck-fake',
+            ),
+            ("Foo(review_project_root=pathlib.Path('/tmp/r'))\n", '/tmp/r'),
+        ],
+        ids=['bare-str', 'path-wrapped', 'suffix-name-pathlib-attribute'],
+    )
+    def test_the_detector_matches_a_call_keyword(self, source, literal) -> None:
+        """A call keyword binds a real parameter, so it can carry a real escape:
+        code handed an ``OrchestratorConfig`` writes ``data/orchestrator/runs.db``
+        under its ``project_root``.  The keyword shape is therefore inside the
+        census, under the same name rule as the other shapes.
         """
-        tree = ast.parse("reconciler = LandedReconciler(project_root='/tmp/proj')\n")
+        tree = ast.parse(source)
+
+        sites = _absolute_tmp_project_root_literals(tree)
+
+        assert len(sites) == 1, sites
+        assert literal in sites[0], sites
+
+    def test_the_detector_ignores_a_sandboxed_call_keyword(self) -> None:
+        """Negative: the fix for a keyword site must not trip the guard."""
+        tree = ast.parse("Foo(project_root=tmp_path / 'proj')\n")
+
+        assert _absolute_tmp_project_root_literals(tree) == []
+
+    def test_the_detector_ignores_a_double_star_keyword(self) -> None:
+        """Negative: ``**kwargs`` is an ``ast.keyword`` whose ``arg`` is ``None``,
+        and the keyword arm must skip it rather than crash on it.
+        """
+        tree = ast.parse('Foo(**kwargs)\n')
+
+        assert _absolute_tmp_project_root_literals(tree) == []
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            "GitOps(git_config, Path('/tmp/repo'))\n",
+            "OrchestratorConfig.model_validate({'project_root': '/tmp/x'})\n",
+        ],
+        ids=['positional-argument', 'string-dict-key'],
+    )
+    def test_the_detector_ignores_a_binding_with_no_project_root_identifier(
+        self, source,
+    ) -> None:
+        """The detector's recorded EDGE: it sees a binding only where
+        ``project_root`` is spelled as an identifier at the site.
+
+        A positional argument binds by position to a callee signature a
+        single-module AST walk cannot resolve, and a dict key is a string, not a
+        binding.
+        """
+        tree = ast.parse(source)
+
+        assert _absolute_tmp_project_root_literals(tree) == []
+
+    @pytest.mark.parametrize(
+        ('source', 'literal'),
+        [
+            ("config.project_root = tmp_path or Path('/tmp/proj')\n", '/tmp/proj'),
+            ("config.project_root = Path('/tmp/a') if flag else tmp_path\n", '/tmp/a'),
+            ("config.project_root = tmp_path if flag else '/tmp/b'\n", '/tmp/b'),
+            ("Foo(project_root=root or '/tmp/c')\n", '/tmp/c'),
+        ],
+        ids=['boolop', 'ifexp-body', 'ifexp-orelse', 'compound-call-keyword'],
+    )
+    def test_the_detector_sees_through_a_compound_value(self, source, literal) -> None:
+        """A fallback literal escapes whenever a caller omits the sandboxed
+        argument, so it meets the same bar as any other literal: ONE site per
+        binding.  The keyword case shows value shape and binding shape are
+        orthogonal.
+        """
+        tree = ast.parse(source)
+
+        sites = _absolute_tmp_project_root_literals(tree)
+
+        assert len(sites) == 1, sites
+        assert literal in sites[0], sites
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            'config.project_root = tmp_path or other_root\n',
+            "config.project_root = tmp_path if '/tmp/q' else other_root\n",
+            "config.project_root = tmp_path if flag == '/tmp/q' else other_root\n",
+        ],
+        ids=['references-only', 'ifexp-condition-is-a-literal', 'ifexp-condition-compares-a-literal'],
+    )
+    def test_the_detector_ignores_a_compound_value_that_binds_no_tmp_literal(
+        self, source,
+    ) -> None:
+        """Negative: seeing through a compound must not flag one whose bound
+        operands are all references.  An ``IfExp`` condition selects a value
+        rather than binding one, so a ``/tmp`` literal there is never a site.
+        """
+        tree = ast.parse(source)
 
         assert _absolute_tmp_project_root_literals(tree) == []

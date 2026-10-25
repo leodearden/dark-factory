@@ -39,7 +39,7 @@
 # NO STEP CAN ABORT ANOTHER, AND THE WRAPPER ALWAYS EXITS 0. A recurring
 # `oneshot` that can fail enters systemd `failed` state and STAYS there,
 # silently stopping the whole nightly job (the lesson already written into
-# scripts/reify-closure-staleness-sweep.sh). That matters more here than for
+# scripts/fused-memory-flag-marker-sweep.sh). That matters more here than for
 # most jobs: the census exits 1 BY DESIGN whenever `coverage.complete` is false,
 # which on a live corpus that orchestrators write to during the scroll is a
 # routine outcome, not a fault. Propagating it would wedge the timer on the
@@ -90,7 +90,7 @@ set -uo pipefail
 # commit` shell, or a test harness does not.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR \
       GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE \
-      GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT
+      GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
 
 REPO="${REPO:-/home/leo/src/dark-factory}"
 FM="$REPO/fused-memory"
@@ -146,11 +146,12 @@ fi
 # `git stash` (refs/stash is ONE ref shared by every worktree and the merge
 # worker's advance path also consumes it -- incident 13674d3c68).
 #
-# Same seam and same fallback as scripts/legibility/census.py's
-# _build_default_commit, which already commits docs/legibility/census-state.json
-# from the 03:00 job, and scripts/legibility/nightly.py::_git_commit_docs_only:
-# a path git has never tracked makes `--only` fail with "did not match any
-# file", which is retried once after a scoped `git add -- <paths>`.
+# Same untracked-path fallback as scripts/legibility/unlanded.py::commit_only,
+# the one scoped committer both legibility jobs use (the 03:00 census commits
+# docs/legibility/census-state.json through it): a path git has never tracked
+# makes `--only` fail with "did not match any file", so the commit is retried
+# once after a scoped `git add -- <paths>`. Unlike commit_only, this wrapper
+# does not retry an index.lock contention.
 #
 # BEST-EFFORT, LIKE BOTH OTHER HALVES: the outcome is narrated and never
 # propagated (see the always-exit-0 oneshot rationale in the header), and it
@@ -246,7 +247,7 @@ fi
 echo "memory-metadata-coverage-census: done (census=$census_rc stamp=$stamp_rc commit=$commit_rc commit-step=$commit_step)"
 # Always 0 — a recurring systemd oneshot that exits non-zero enters `failed`
 # state and STAYS there, silently ending the append-only trend this job
-# exists to build (see the header, and scripts/reify-closure-staleness-sweep.sh).
+# exists to build (see the header, and scripts/fused-memory-flag-marker-sweep.sh).
 # That is a strictly worse outcome than the one missed nightly row a refusal
 # costs -- the next run's append restores it. The loud-over-silent-
 # degradation norm this invokes is satisfied by LEGIBILITY, not by a wedged

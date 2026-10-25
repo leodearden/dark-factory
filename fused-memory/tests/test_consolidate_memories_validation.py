@@ -21,7 +21,15 @@ Two properties are load-bearing here and pinned as such:
 
 import pytest
 
-from fused_memory.server.consolidation import validate_consolidate_args
+from fused_memory.config.schema import ConsolidationAutoConfig
+from fused_memory.models.enums import MemoryCategory
+from fused_memory.server.consolidation import (
+    ProposalLimits,
+    ProposalShapeCode,
+    proposal_shape_codes,
+    validate_consolidate_args,
+    validate_proposal_args,
+)
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN
 
 _A = '11111111-1111-4111-8111-111111111111'
@@ -315,3 +323,578 @@ class TestDeleteArmRequiresRunId:
 
         assert '873889a1' in err['error']
         assert 'run_id' in err['error']
+
+
+_SHORT = 'Stage one keeps reproposing the identical cluster'          # 7 words
+_OK = 'Stage one keeps reproposing the identical unaddressed cluster'  # 8 words
+_LIMITS = ProposalLimits(claim_max_chars=200, member_min=2, member_max=20)
+
+
+def _ids(n: int) -> list[str]:
+    """*n* distinct well-formed UUIDs, deterministic so failures are readable."""
+    return [f'{i:08x}-0000-4000-8000-000000000000' for i in range(n)]
+
+
+_PROPOSAL_ARGS = {
+    'topic': _TOPIC,
+    'member_ids': _ids(5),
+    'run_id': 'run-1',
+    'claim': _OK,
+    'category': 'procedural_knowledge',
+    'rationale': 'Five records state the same rule in different words.',
+    'seeded_from': None,
+    'limits': _LIMITS,
+}
+
+
+def _propose(**overrides):
+    """Validate a well-formed PROPOSAL arg set with *overrides* applied.
+
+    `run_id` is present: it is the proposal's ledger identity, not a tombstone
+    attribution.
+    """
+    return validate_proposal_args(**{**_PROPOSAL_ARGS, **overrides})
+
+
+def _propose_through_the_core(**overrides):
+    """The proposal arm reached through `validate_consolidate_args` directly.
+
+    Only for the core's own fail-closed rules: a caller holding the op's
+    parameter names can pass a `canonical_content` alongside `limits`, which
+    `validate_proposal_args` cannot express.
+    """
+    kwargs = {**_PROPOSAL_ARGS, 'canonical_content': None, 'supersedes': None}
+    kwargs['retain'] = kwargs.pop('member_ids')
+    kwargs.update(overrides)
+    return validate_consolidate_args(**kwargs)
+
+
+class TestOpArmIsUnchanged:
+    """The five existing parameters and the op arm's behaviour are untouched.
+
+    `limits=None` selects the op shape, which is what `server/tools.py`'s
+    `consolidate_memories` passes by omission — so the tool needs no edit and
+    stays out of this task's file set.
+    """
+
+    def test_a_valid_op_call_still_passes_unchanged(self):
+        assert _call() == (None, [_A, _B], [])
+
+    def test_a_refused_op_call_is_byte_identical_to_today(self):
+        """Explicit `limits=None` must be indistinguishable from omitting it."""
+        assert _call(topic='memory_consolidation') == validate_consolidate_args(
+            canonical_content=_CONTENT,
+            topic='memory_consolidation',
+            supersedes=[_A, _B],
+            retain=None,
+            run_id=_RUN,
+            claim=None,
+            limits=None,
+        )
+
+    def test_a_claim_without_limits_is_refused_by_name(self):
+        """Fails CLOSED on a mis-wired caller rather than silently ignoring the
+        claim — a silently dropped claim is a silently skipped cap, which is
+        the whole reason the caps exist."""
+        err, _, _ = _call(claim=_OK)
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'claim' in err['error']
+        assert 'limits' in err['error']
+
+
+class TestProposalArm:
+    """`limits is not None` selects the proposal shape (PRD C1).
+
+    Checked at the EMIT boundary, so the LLM that wrote a mis-shaped claim can
+    fix it in-turn rather than having a downstream executor discover it.
+    """
+
+    def test_a_well_formed_proposal_passes(self):
+        err, members = _propose()
+
+        assert err is None, err
+        assert members == _ids(5)
+
+    def test_canonical_content_is_not_required(self):
+        """The op arm's own requirement must not leak into this one: a
+        proposal has no canonical text yet, by construction."""
+        err, _, _ = _propose_through_the_core(canonical_content=None)
+
+        assert err is None, err
+
+    @pytest.mark.parametrize(
+        'content', [_CONTENT, '', '   '], ids=['text', 'empty', 'whitespace']
+    )
+    def test_canonical_content_passed_with_limits_is_refused_by_name(self, content):
+        """Fails CLOSED on a caller that believes it is submitting the op shape:
+        a silently dropped canonical text is the mirror of the silently dropped
+        claim the op arm already refuses. The boundary is `is not None`, so a
+        blank string is refused too rather than dropped."""
+        err, _, _ = _propose_through_the_core(canonical_content=content)
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'canonical_content' in err['error']
+        assert 'limits' in err['error']
+
+    def test_canonical_content_refusal_is_collected_not_short_circuited(self):
+        """Refusing the stray text must not cost the caller the claim checks:
+        one round trip names every problem, on this branch as on every other."""
+        err, _, _ = _propose_through_the_core(canonical_content=_CONTENT, claim=_SHORT)
+
+        assert err is not None
+        assert 'canonical_content' in err['error']
+        assert '8-word minimum' in err['error']
+
+    def test_a_missing_claim_is_refused(self):
+        err, _ = _propose(claim=None)
+
+        assert err is not None
+        assert 'claim' in err['error']
+
+    def test_a_malformed_topic_is_still_refused(self):
+        """The topic rule is shared by both arms — one namespace, one check."""
+        err, _ = _propose(topic='memory_consolidation')
+
+        assert err is not None
+        assert 'topic' in err['error']
+
+    # --- claim shape: one executing test per rule ---
+
+    def test_a_multi_line_claim_is_refused(self):
+        claim = 'Stage one keeps reproposing\nthe identical unaddressed cluster'
+        err, _ = _propose(claim=claim)
+
+        assert err is not None
+        assert 'claim' in err['error']
+        assert 'single line' in err['error']
+
+    def test_a_claim_over_the_cap_is_refused(self):
+        claim = _OK + ' ' + 'z' * (_LIMITS.claim_max_chars - len(_OK))
+        assert len(claim) == _LIMITS.claim_max_chars + 1
+
+        err, _ = _propose(claim=claim)
+
+        assert err is not None
+        assert str(_LIMITS.claim_max_chars) in err['error']
+
+    def test_a_claim_exactly_at_the_cap_is_accepted(self):
+        """The bound is INCLUSIVE — an off-by-one here silently costs the
+        caller a character of the only text that reaches the canonical."""
+        claim = _OK + ' ' + 'z' * (_LIMITS.claim_max_chars - len(_OK) - 1)
+        assert len(claim) == _LIMITS.claim_max_chars
+
+        err, _ = _propose(claim=claim)
+
+        assert err is None, err
+
+    def test_a_bracketed_claim_is_refused(self):
+        """The B6 shape, and what makes a correction-banner body unusable as a
+        claim: a banner opens with `[CORRECTION ...]`, so a claim lifted from
+        one would carry the banner into the canonical's first paragraph."""
+        claim = '[CORRECTION 2026-09-08] Stage one keeps reproposing the cluster'
+        err, _ = _propose(claim=claim)
+
+        assert err is not None
+        assert 'claim' in err['error']
+
+    @pytest.mark.parametrize(
+        'claim',
+        [
+            'INDEX of the dashboard js test substrate cluster records',
+            'CANONICAL: memory consolidation ratchet grew once per pass here',
+        ],
+    )
+    def test_a_label_shaped_claim_is_refused(self, claim):
+        """A claim is an ASSERTION, not a heading. A label-shaped opening reads
+        as a title in the canonical's first paragraph, which is the position
+        PRD §2 measured the retrieval property out of."""
+        err, _ = _propose(claim=claim)
+
+        assert err is not None
+        assert 'claim' in err['error']
+
+    @pytest.mark.parametrize(
+        'claim',
+        [
+            'Indexing the cluster is cheaper than reading every duplicate record',
+            'Canonicalisation of the topic happened before the gate was ever filed',
+        ],
+    )
+    def test_an_ordinary_claim_beginning_with_those_words_is_accepted(self, claim):
+        """The `\\b` and the case-sensitivity are the point: the rule refuses the
+        LABEL `INDEX —`, not every sentence that starts with the same letters."""
+        err, _ = _propose(claim=claim)
+
+        assert err is None, err
+
+    def test_a_claim_that_only_echoes_the_slug_is_refused(self):
+        """A claim built entirely from the topic's own words and stopwords
+        asserts nothing the slug did not already say, so the canonical it
+        would open carries no claim at all."""
+        claim = (
+            'The memory consolidation is a consolidation of the memory for all '
+            'of these'
+        )
+        err, _ = _propose(claim=claim)
+
+        assert err is not None
+        assert 'claim' in err['error']
+
+    def test_a_claim_reusing_slug_words_with_real_content_is_accepted(self):
+        """Reusing the topic's words is normal and must not be punished — only
+        saying NOTHING ELSE is refused."""
+        claim = (
+            'The memory consolidation ratchet grew by one canonical per '
+            'reconciliation pass until gate 3200'
+        )
+        err, _ = _propose(claim=claim)
+
+        assert err is None, err
+
+    def test_a_seven_word_claim_is_refused_and_eight_is_accepted(self):
+        """The boundary, both sides, so an off-by-one cannot pass unnoticed."""
+        short_err, _ = _propose(claim=_SHORT)
+        ok_err, _ = _propose(claim=_OK)
+
+        assert short_err is not None
+        assert ok_err is None, ok_err
+
+    # --- member-count range ---
+
+    @pytest.mark.parametrize('count', [1, 21])
+    def test_a_member_count_outside_the_range_is_refused(self, count):
+        err, _ = _propose(member_ids=_ids(count))
+
+        assert err is not None
+        assert str(count) in err['error']
+        assert 'member_ids' in err['error']
+
+    @pytest.mark.parametrize('count', [2, 20])
+    def test_the_member_count_bounds_are_inclusive(self, count):
+        err, _ = _propose(member_ids=_ids(count))
+
+        assert err is None, err
+
+    def test_the_limits_are_read_from_the_argument_not_a_default(self):
+        """ProposalLimits carries NO defaults: the numbers have exactly one
+        home (ConsolidationAutoConfig) and a default here would be a second."""
+        err, _ = _propose(member_ids=_ids(5), limits=ProposalLimits(200, 6, 20))
+
+        assert err is not None
+        assert '5' in err['error']
+
+    # --- the no-short-circuit bar ---
+
+    def test_every_offender_is_named_in_one_error(self):
+        """PRD C1's reason for checking at the emit boundary: the LLM fixes its
+        shape IN-TURN, which it can only do if one refusal names every fault."""
+        claim = 'INDEX\n' + 'x' * 300
+        err, _ = _propose(claim=claim, member_ids=_ids(1), category='facts')
+
+        assert err is not None
+        assert 'single line' in err['error'], err['error']
+        assert str(_LIMITS.claim_max_chars) in err['error'], err['error']
+        assert 'INDEX' in err['error'], err['error']
+        assert '8' in err['error'], err['error']
+        assert 'member_ids' in err['error'], err['error']
+        assert "category" in err['error'], err['error']
+        assert "'facts'" in err['error'], err['error']
+
+    def test_the_hint_names_the_shape_rules(self):
+        """PRD D3: the emitting stage needs something actionable, not just a
+        list of what it got wrong."""
+        err, _ = _propose(claim=_SHORT)
+
+        assert err is not None
+        assert err['hint']
+        assert 'claim' in err['hint']
+
+
+class TestProposalCategory:
+    """A proposal names the category its canonical is written under (PRD C1)."""
+
+    @pytest.mark.parametrize('bad', ['facts', 'Procedural_Knowledge', None, 3])
+    def test_a_category_outside_the_six_is_refused_by_name(self, bad):
+        err, _ = _propose(category=bad)
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'category' in err['error']
+        assert repr(bad) in err['error']
+
+    @pytest.mark.parametrize('category', [c.value for c in MemoryCategory])
+    def test_each_of_the_six_categories_passes(self, category):
+        err, _ = _propose(category=category)
+
+        assert err is None, err
+
+    def test_the_hint_names_the_six_categories(self):
+        err, _ = _propose(category='facts')
+
+        assert err is not None
+        for category in MemoryCategory:
+            assert category.value in err['hint']
+
+
+class TestProposalRunId:
+    """`run_id` is a component of the proposal row's ledger identity, so a
+    proposal without one has nowhere to land."""
+
+    @pytest.mark.parametrize('missing', [None, '', '   ', 7])
+    def test_a_proposal_without_a_run_id_is_refused(self, missing):
+        err, _ = _propose(run_id=missing)
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'run_id' in err['error']
+        assert 'run_id' in err['hint']
+
+
+class TestProposalReviewerText:
+    """`rationale` and `seeded_from` are stored verbatim in the shared recon
+    ledger and read back in full, so both are bounded; `rationale` is the
+    reviewer's only evidence for the proposal, so it is required."""
+
+    @pytest.mark.parametrize('missing', [None, '', '   ', 7])
+    def test_a_proposal_without_a_rationale_is_refused(self, missing):
+        err, _ = _propose(rationale=missing)
+
+        assert err is not None
+        assert 'rationale' in err['error']
+        assert 'rationale' in err['hint']
+
+    def test_a_rationale_is_bounded_inclusively(self):
+        at_cap, _ = _propose(rationale='r' * 2000)
+        over_cap, _ = _propose(rationale='r' * 2001)
+
+        assert at_cap is None, at_cap
+        assert over_cap is not None
+        assert '`rationale` is 2001 characters, over the 2000 limit' in over_cap['error']
+
+    def test_seeded_from_is_optional(self):
+        err, _ = _propose(seeded_from=None)
+
+        assert err is None, err
+
+    @pytest.mark.parametrize('bad', ['', '   ', 7])
+    def test_a_blank_or_non_string_seeded_from_is_refused(self, bad):
+        err, _ = _propose(seeded_from=bad)
+
+        assert err is not None
+        assert 'seeded_from' in err['error']
+
+    def test_seeded_from_is_bounded_inclusively(self):
+        at_cap, _ = _propose(seeded_from='s' * 500)
+        over_cap, _ = _propose(seeded_from='s' * 501)
+
+        assert at_cap is None, at_cap
+        assert over_cap is not None
+        assert '`seeded_from` is 501 characters, over the 500 limit' in over_cap['error']
+
+    def test_reviewer_text_problems_are_collected_with_the_rest(self):
+        err, _ = _propose(rationale='', seeded_from='s' * 501, claim=_SHORT)
+
+        assert err is not None
+        assert 'rationale' in err['error']
+        assert 'seeded_from' in err['error']
+        assert '8-word minimum' in err['error']
+
+
+class TestTheProposalEntryPoint:
+    def test_it_is_the_core_s_proposal_arm_under_the_proposal_s_names(self):
+        members = _ids(4)
+        members.append('873889a1')
+
+        assert _propose(member_ids=members, topic='bad_topic') == (
+            _propose_through_the_core(retain=members, topic='bad_topic')[0],
+            members,
+        )
+
+
+class TestOpArmRefusesACategory:
+    """The fail-closed mirror of the claim-without-limits rule."""
+
+    @pytest.mark.parametrize('field', ['rationale', 'seeded_from'])
+    def test_reviewer_text_without_limits_is_refused_by_name(self, field):
+        err, _, _ = _call(**{field: 'Five records state the same rule.'})
+
+        assert err is not None
+        assert f'`{field}` was passed without `limits`' in err['error']
+
+    def test_a_category_without_limits_is_refused_by_name(self):
+        err, _, _ = _call(category='procedural_knowledge')
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'category' in err['error']
+        assert 'limits' in err['error']
+
+    def test_an_explicit_none_category_is_indistinguishable_from_omitting_it(self):
+        assert _call(category=None) == _call()
+        assert _call(category=None, topic='bad_topic') == _call(topic='bad_topic')
+
+
+class TestProposalArmSpeaksItsOwnVocabulary:
+    """A proposal's caller passed `member_ids` to `propose_consolidation`; an
+    error naming `retain` and `consolidate_memories` describes an interface
+    that caller never saw."""
+
+    def test_the_error_is_prefixed_with_the_proposal_tool(self):
+        err, _ = _propose(topic='memory_consolidation')
+
+        assert err is not None
+        assert err['error'].startswith('propose_consolidation: ')
+
+    def test_the_op_arm_prefix_is_unchanged(self):
+        err, _, _ = _call(topic='memory_consolidation')
+
+        assert err is not None
+        assert err['error'].startswith('consolidate_memories: ')
+
+    def test_a_malformed_member_is_named_by_its_member_ids_slot(self):
+        members = _ids(5)
+        members[2] = '873889a1'
+        err, _ = _propose(member_ids=members)
+
+        assert err is not None
+        assert "member_ids[2] is not a full 36-character UUID: '873889a1'" in err['error']
+        assert 'retain' not in err['error']
+        assert 'retain' not in err['hint']
+
+    def test_a_repeated_member_names_both_member_ids_slots(self):
+        members = _ids(4)
+        members.append(members[1])
+        err, _ = _propose(member_ids=members)
+
+        assert err is not None
+        assert 'member_ids[4] repeats member_ids[1]' in err['error']
+        assert 'retain' not in err['error']
+        assert 'retain' not in err['hint']
+
+    def test_the_count_problem_names_member_ids(self):
+        err, _ = _propose(member_ids=_ids(1))
+
+        assert err is not None
+        assert 'member_ids' in err['error']
+        assert 'retain' not in err['error']
+        assert 'retain' not in err['hint']
+
+    @pytest.mark.parametrize('empty', [None, []])
+    def test_an_empty_member_list_reports_the_count_not_the_op_arm_rule(self, empty):
+        err, _ = _propose(member_ids=empty)
+
+        assert err is not None
+        assert '0 members' in err['error']
+        assert 'member_ids' in err['error']
+        assert 'requires at least one arm' not in err['error']
+        assert 'add_memory' not in err['hint']
+
+
+def test_proposal_limits_from_config_maps_the_three_leaves():
+    """The ONE place the config -> limits mapping lives (gamma and delta share it)."""
+    config = ConsolidationAutoConfig(claim_max_chars=150, member_min=3, member_max=9)
+
+    assert ProposalLimits.from_config(config) == ProposalLimits(150, 3, 9)
+
+
+# ---------------------------------------------------------------------------
+# proposal_shape_codes: the structured classifier beside the one validator
+# (task 5240, PRD B7). An aged ledger row is re-checked by the executor, which
+# needs a code, not prose.
+# ---------------------------------------------------------------------------
+
+_SHAPE_CASES = {
+    'valid': ({}, ()),
+    'too_many_members': (
+        {'member_ids': _ids(21)},
+        (ProposalShapeCode.MEMBER_COUNT_OUT_OF_RANGE,),
+    ),
+    'too_few_members': (
+        {'member_ids': _ids(1)},
+        (ProposalShapeCode.MEMBER_COUNT_OUT_OF_RANGE,),
+    ),
+    'bad_slug': ({'topic': 'Not A Slug'}, (ProposalShapeCode.INVALID_SLUG,)),
+    'index_label_claim': (
+        {'claim': 'INDEX — foo bar baz qux quux corge grault garply'},
+        (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,),
+    ),
+    'two_line_claim': (
+        {'claim': _OK + '\nand a second line of text'},
+        (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,),
+    ),
+    'over_long_claim': (
+        {'claim': _OK + ' extra' * 40},
+        (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,),
+    ),
+    'correction_banner_claim': (
+        {'claim': '[CORRECTION 2026-07-01] ' + _OK},
+        (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,),
+    ),
+    'five_word_claim': (
+        {'claim': 'Stage one keeps reproposing clusters'},
+        (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,),
+    ),
+    'blank_claim': ({'claim': '   '}, (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,)),
+    'non_string_claim': ({'claim': 42}, (ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,)),
+    'over_long_rationale': (
+        {'rationale': 'x' * 2001},
+        (ProposalShapeCode.PROPOSAL_SHAPE_INVALID,),
+    ),
+    'invalid_category': (
+        {'category': 'not_a_category'},
+        (ProposalShapeCode.PROPOSAL_SHAPE_INVALID,),
+    ),
+    'non_uuid_member': (
+        {'member_ids': [*_ids(4), '873889a1']},
+        (ProposalShapeCode.PROPOSAL_SHAPE_INVALID,),
+    ),
+    'several_offenders': (
+        {
+            'member_ids': _ids(21),
+            'topic': 'Not A Slug',
+            'claim': 'INDEX — foo bar baz qux quux corge grault garply',
+        },
+        (
+            ProposalShapeCode.MEMBER_COUNT_OUT_OF_RANGE,
+            ProposalShapeCode.INVALID_SLUG,
+            ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED,
+        ),
+    ),
+}
+
+
+def _shape_codes(**overrides):
+    return proposal_shape_codes(**{**_PROPOSAL_ARGS, **overrides})
+
+
+class TestProposalShapeCodes:
+    def test_the_code_vocabulary(self):
+        assert [c.value for c in ProposalShapeCode] == [
+            'member_count_out_of_range',
+            'invalid_slug',
+            'claim_not_index_shaped',
+            'proposal_shape_invalid',
+        ]
+
+    @pytest.mark.parametrize('case', list(_SHAPE_CASES))
+    def test_each_case_yields_its_codes(self, case):
+        overrides, expected = _SHAPE_CASES[case]
+        assert _shape_codes(**overrides) == expected
+
+    @pytest.mark.parametrize('case', list(_SHAPE_CASES))
+    def test_the_classifier_agrees_with_the_validator_on_whether_to_refuse(self, case):
+        overrides, _ = _SHAPE_CASES[case]
+        err, _members = _propose(**overrides)
+        assert bool(_shape_codes(**overrides)) == (err is not None)
+
+    def test_the_limits_passed_in_are_the_limits_applied(self):
+        wide = ProposalLimits(claim_max_chars=200, member_min=2, member_max=25)
+        assert _shape_codes(member_ids=_ids(21), limits=wide) == ()
+
+    def test_codes_are_returned_as_a_tuple_of_enum_members(self):
+        codes = _shape_codes(topic='Not A Slug')
+        assert isinstance(codes, tuple)
+        assert all(isinstance(c, ProposalShapeCode) for c in codes)

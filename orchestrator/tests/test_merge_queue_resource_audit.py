@@ -38,7 +38,7 @@ these same classes.
 This module reuses the bare-worker git_repo/git_config/git_ops fixtures and
 _FakeEscalationQueue from test_merge_queue_request_liveness.py (per-file
 duplication convention — see that module's docstring). It imports
-orchestrator.merge_queue LOCALLY inside each test (mirrors
+orchestrator.merge_lane.worker LOCALLY inside each test (mirrors
 test_merge_request_ledger.py's / test_merge_queue_permit_conservation.py's
 convention) so a not-yet-implemented symbol never breaks collection of the
 rest of the file during the RED steps.
@@ -50,6 +50,7 @@ import asyncio
 import concurrent.futures
 import logging
 import os
+import re
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -57,7 +58,7 @@ import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps, _run
-from orchestrator.merge_types import MergeRequest, QueuedBranch
+from orchestrator.merge_lane.types import MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -148,7 +149,7 @@ class TestSpeculationAccountingViolations:
     def test_healthy_worker_reports_no_violations(
         self, git_ops: GitOps, depth: int,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=depth)
 
@@ -157,7 +158,7 @@ class TestSpeculationAccountingViolations:
     def test_forced_speculation_slot_leak_yields_one_violation(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -174,7 +175,7 @@ class TestSpeculationAccountingViolations:
     def test_forced_merge_ahead_cap_leak_yields_one_violation(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -189,7 +190,7 @@ class TestSpeculationAccountingViolations:
         assert 'cap' in violations[0].lower()
 
     def test_both_leaks_yield_two_violations(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -201,7 +202,7 @@ class TestSpeculationAccountingViolations:
         assert len(violations) == 2, f'expected exactly two violations, got: {violations!r}'
 
     def test_not_running_suppresses_violations(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
         worker._speculation_slot._value -= 1
@@ -253,7 +254,7 @@ def _make_spec_item(tmp_path: Path, *, speculative: bool):
     ``max(0.0, now - req.enqueued_at)``, which raises TypeError comparing a
     bare MagicMock against a float.
     """
-    from orchestrator.merge_types import RealMergeItem
+    from orchestrator.merge_lane.types import RealMergeItem
 
     return RealMergeItem(
         request=MagicMock(enqueued_at=1_000_000.0),
@@ -294,7 +295,7 @@ class TestMergeAheadCapHandoffCrossCheck:
     async def test_healthy_queued_item_with_live_permit_no_violation(
         self, git_ops: GitOps, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -313,8 +314,8 @@ class TestMergeAheadCapHandoffCrossCheck:
         never reads the item's stamped token, only the ledger's own
         bookkeeping.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
-        from orchestrator.merge_types import CapPermit
+        from orchestrator.merge_lane.types import CapPermit
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -340,7 +341,7 @@ class TestMergeAheadCapHandoffCrossCheck:
         released token (see the next test for the cleared, non-violating
         state).
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -363,7 +364,7 @@ class TestMergeAheadCapHandoffCrossCheck:
         releasing it through the ledger, (c) no longer sees a non-``None``
         cap_permit on the queued item at all — no transient false-positive.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -394,7 +395,7 @@ class TestRedispatchSpeculativeAccounting:
     async def test_speculative_items_are_counted_via_the_ledger_alone(
         self, git_ops: GitOps, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -419,7 +420,7 @@ class TestRedispatchSpeculativeAccounting:
     def test_nonspeculative_redispatch_item_not_counted(
         self, git_ops: GitOps, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -457,7 +458,7 @@ class TestFinalizeHeadSpeculativeAccounting:
     """
 
     def _make_finalizing_entry(self, tmp_path: Path, *, speculative: bool, permit=None):
-        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.merge_lane.worker import InflightEntry
 
         return InflightEntry(
             item=_make_spec_item(tmp_path, speculative=speculative),
@@ -472,7 +473,7 @@ class TestFinalizeHeadSpeculativeAccounting:
     async def test_finalizing_head_permit_is_counted_via_the_ledger_alone(
         self, git_ops: GitOps, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import InflightEntry, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import InflightEntry, SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -508,7 +509,7 @@ class TestFinalizeHeadSpeculativeAccounting:
         permit and contributes 0 — else the ledger-only invariant would be
         broken and could mask a genuine imbalance.
         """
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import ItemLifecycleState, SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -526,7 +527,7 @@ class TestFinalizeHeadSpeculativeAccounting:
         must still trip exactly one violation: the ledger-only invariant must
         not mask the real leak class the audit exists to catch.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -567,7 +568,7 @@ class TestDispatchGapSpeculativeAccounting:
     async def test_dispatching_item_permit_is_counted_via_the_ledger_alone(
         self, git_ops: GitOps, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=1)
 
@@ -586,7 +587,7 @@ class TestDispatchGapSpeculativeAccounting:
     async def test_dispatching_item_plus_inflight_both_counted(
         self, git_ops: GitOps, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import InflightEntry, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import InflightEntry, SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -618,7 +619,7 @@ class TestDispatchGapSpeculativeAccounting:
         contributes 0 — else the ledger-only invariant would be broken and
         could mask a genuine imbalance.
         """
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import ItemLifecycleState, SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -665,7 +666,7 @@ class TestWorktreeLedgerViolations:
     _NOW = 1_000_000.0
 
     def test_no_on_disk_merge_dirs_yields_no_violations(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -674,7 +675,7 @@ class TestWorktreeLedgerViolations:
         assert worker.worktree_ledger_violations(now=self._NOW) == []
 
     def test_missing_worktree_base_yields_no_violations(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -685,7 +686,7 @@ class TestWorktreeLedgerViolations:
     def test_unregistered_aged_dir_yields_one_violation_naming_the_path(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -699,7 +700,7 @@ class TestWorktreeLedgerViolations:
         assert str(wt.resolve()) in violations[0]
 
     def test_registered_dir_yields_no_violation(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -711,7 +712,7 @@ class TestWorktreeLedgerViolations:
         assert worker.worktree_ledger_violations(now=self._NOW) == []
 
     def test_persistent_verify_worktree_never_flagged(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -722,7 +723,7 @@ class TestWorktreeLedgerViolations:
         assert worker.worktree_ledger_violations(now=self._NOW) == []
 
     def test_wrong_prefix_dir_never_flagged(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -733,7 +734,7 @@ class TestWorktreeLedgerViolations:
     def test_fresh_unregistered_dir_within_grace_yields_no_violation(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -744,7 +745,7 @@ class TestWorktreeLedgerViolations:
     def test_not_running_suppresses_even_aged_unregistered_dir(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -771,7 +772,7 @@ class TestWorktreeLedgerViolations:
     def test_leak_inside_the_reclaim_window_is_marked_as_scheduled(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -792,7 +793,7 @@ class TestWorktreeLedgerViolations:
     def test_leak_past_the_destruction_floor_is_marked_overdue(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -813,7 +814,7 @@ class TestWorktreeLedgerViolations:
         byte-identical, so the substring/count assertions elsewhere in this
         suite and in the reaper/lifecycle gates keep holding.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -850,7 +851,7 @@ class TestWorktreeLedgerViolations:
         """
         import time
 
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -880,7 +881,7 @@ class TestWorktreeLedgerViolations:
     def test_grace_secs_override_can_raise_the_floor_above_an_aged_tree(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -898,7 +899,7 @@ class TestWorktreeLedgerViolations:
     def test_grace_secs_none_is_identical_to_omitting_it(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -918,7 +919,7 @@ class TestWorktreeLedgerViolations:
         self, git_ops: GitOps,
     ) -> None:
         """The override RAISES the floor — it does not disable the check."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -941,7 +942,7 @@ class TestWorktreeLedgerViolations:
         orthogonal to the floor: an excluded tree stays unflagged at ANY
         grace_secs, including 0 (which admits every age).
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
@@ -1000,7 +1001,7 @@ class TestSnapshotResourceAuditKey:
     """
 
     def test_healthy_worker_resource_audit_is_empty(self, git_ops: GitOps) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -1012,7 +1013,7 @@ class TestSnapshotResourceAuditKey:
     def test_forced_leak_surfaces_in_snapshot_resource_audit(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
         worker._speculation_slot._value -= 1
@@ -1024,7 +1025,7 @@ class TestSnapshotResourceAuditKey:
     def test_resource_audit_is_additive_and_matches_direct_audit_calls(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
         worker._speculation_slot._value -= 1
@@ -1066,7 +1067,7 @@ class TestAlarmResourceAudit:
     """
 
     def _call(self, eq, violations, *, event_store=None) -> None:
-        from orchestrator.merge_queue import _alarm_resource_audit
+        from orchestrator.merge_lane.worker import _alarm_resource_audit
 
         _alarm_resource_audit(eq, violations, event_store=event_store)
 
@@ -1093,7 +1094,7 @@ class TestAlarmResourceAudit:
         assert esc.category == 'merge_resource_leak'
 
     def test_escalation_task_id_is_the_fixed_sentinel(self) -> None:
-        from orchestrator.merge_queue import _RESOURCE_AUDIT_SENTINEL
+        from orchestrator.merge_lane.worker import _RESOURCE_AUDIT_SENTINEL
 
         eq = _FakeEscalationQueue(open_l1=False)
         self._call(eq, ['a violation'])
@@ -1151,14 +1152,14 @@ class TestCheckResourceAudit:
     def test_healthy_worker_no_warning_no_streak_no_escalation(
         self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = SpeculativeMergeWorker(
             git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._check_resource_audit(1000.0)
 
         assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 0
@@ -1168,7 +1169,7 @@ class TestCheckResourceAudit:
     def test_single_violating_call_warns_and_bumps_streak_without_escalating(
         self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = SpeculativeMergeWorker(
@@ -1176,7 +1177,7 @@ class TestCheckResourceAudit:
         )
         worker._speculation_slot._value -= 1  # forced permit leak
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._check_resource_audit(1000.0)
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -1188,7 +1189,7 @@ class TestCheckResourceAudit:
     def test_n_consecutive_violations_escalates_exactly_once(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = SpeculativeMergeWorker(
@@ -1218,7 +1219,7 @@ class TestCheckResourceAudit:
     def test_clearing_the_leak_resets_streak_to_zero(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = SpeculativeMergeWorker(
@@ -1285,7 +1286,7 @@ class TestHeartbeatWiringRunsResourceAuditUnconditionally:
     def test_idle_depth_zero_worker_still_warns_on_leak(
         self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = SpeculativeMergeWorker(
@@ -1298,7 +1299,7 @@ class TestHeartbeatWiringRunsResourceAuditUnconditionally:
         # before any resource-audit check ran.
         assert worker.snapshot()['depth'] == 0
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = worker._maybe_log_queue_heartbeat(1000.0)
 
         assert result is False, 'heartbeat must stay idle — no depth to report (depth==0)'
@@ -1310,7 +1311,7 @@ class TestHeartbeatWiringRunsResourceAuditUnconditionally:
     def test_idle_depth_zero_worker_escalates_after_streak_threshold(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = SpeculativeMergeWorker(
@@ -1337,7 +1338,7 @@ class TestHeartbeatWiringRunsResourceAuditUnconditionally:
         caplog: pytest.LogCaptureFixture,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -1351,7 +1352,7 @@ class TestHeartbeatWiringRunsResourceAuditUnconditionally:
 
         monkeypatch.setattr(worker, '_check_resource_audit', _boom)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = worker._maybe_log_queue_heartbeat(1000.0)
 
         assert result is True, 'depth heartbeat must still fire despite the resource-audit bug'
@@ -1368,12 +1369,12 @@ class TestHeartbeatWiringRunsResourceAuditUnconditionally:
         still surfaces the violation both via a heartbeat WARNING log line
         and in the next snapshot()['resource_audit'].
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
         worker._speculation_slot._value -= 1  # forced permit leak
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             worker._maybe_log_queue_heartbeat(1000.0)
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -1400,7 +1401,7 @@ class TestSpeculationLedgerWiring:
     def test_worker_exposes_a_permit_ledger_wrapping_the_speculation_slot(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import PermitLedger, SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import PermitLedger, SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -1415,7 +1416,7 @@ class TestSpeculationLedgerWiring:
         worker's ``_speculation_ledger`` — only possible if both point at
         the same ``PermitLedger`` instance.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -1427,7 +1428,7 @@ class TestSpeculationLedgerWiring:
     def test_speculation_accounting_is_clean_initially_and_after_an_acquire(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
@@ -1465,7 +1466,7 @@ class TestResourceAuditEscalationFloor:
     def test_floor_is_the_reap_age_plus_grace_sweeps_times_the_reap_interval(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
 
@@ -1484,7 +1485,7 @@ class TestResourceAuditEscalationFloor:
         censused in ``snapshot()``) but not yet ESCALATED, because the reaper
         is still scheduled to clear it.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         floor = worker._resource_audit_escalation_age_secs()
@@ -1499,7 +1500,7 @@ class TestResourceAuditEscalationFloor:
     def test_floor_tracks_a_per_instance_monkeypatch_of_the_reap_age(
         self, git_ops: GitOps,
     ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.PERIODIC_REAP_MIN_AGE_SECS = 200.0
@@ -1512,7 +1513,7 @@ class TestResourceAuditEscalationFloor:
         self, git_ops: GitOps,
     ) -> None:
         """Recomputed on every call — the floor never caches a stale interval."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.PERIODIC_REAP_MIN_AGE_SECS = 200.0
@@ -1529,7 +1530,7 @@ class TestResourceAuditEscalationFloor:
         """Declared on the class (per the RESOURCE_AUDIT_*/MAX_* convention) so
         a test can shrink it per-instance without a monkeypatch fixture.
         """
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # Captured BEFORE the per-instance assignment below, so the no-leak
         # check compares against whatever the shipped default happens to be
@@ -1590,7 +1591,7 @@ class TestCheckResourceAuditReclaimBandSuppression:
     _PAST_FLOOR_AGE = 300.0
 
     def _worker(self, git_ops: GitOps, fake_eq: _FakeEscalationQueue):
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(
             git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
@@ -1607,7 +1608,7 @@ class TestCheckResourceAuditReclaimBandSuppression:
         self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
     ) -> None:
         """THE regression. Across more consecutive violating heartbeats than
-        the streak threshold, an in-band leak still warns every time and still
+        the streak threshold, an in-band leak is still reported and still
         drives the streak — but never pages a human.
         """
         fake_eq = _FakeEscalationQueue(open_l1=False)
@@ -1617,7 +1618,7 @@ class TestCheckResourceAuditReclaimBandSuppression:
         )
         calls = worker.RESOURCE_AUDIT_ESCALATION_STREAK + 2
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
             for i in range(1, calls + 1):
                 worker._check_resource_audit(self._NOW + i)
 
@@ -1626,9 +1627,14 @@ class TestCheckResourceAuditReclaimBandSuppression:
         assert len(violations) == 1
         assert str(wt.resolve()) in violations[0]
 
-        # Logging is untouched: one WARNING per violating call.
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warnings) == calls, f'expected {calls} WARNINGs, got: {caplog.text}'
+        # Logging is COALESCED (task 3203): this used to pin one WARNING per
+        # violating call, which is precisely the pathology 3203 retires. The
+        # unchanging violation set is now reported on the exponential
+        # schedule — over these 5 polls, at streaks 1, 2 and 4. Counted
+        # level-agnostically so this survives step-9's level routing.
+        assert _streaks(caplog) == [1, 2, 4], (
+            f'expected the coalesced schedule over {calls} polls, got: {caplog.text}'
+        )
 
         # The streak is untouched: it keeps counting through the band.
         assert worker._resource_audit_violation_streak == calls
@@ -1831,3 +1837,994 @@ class TestCheckResourceAuditReclaimBandSuppression:
             f'must page, got: {fake_eq.submitted!r}'
         )
         assert str(wt.resolve()) in fake_eq.submitted[0].detail
+
+
+# ---------------------------------------------------------------------------
+# task 3203 step-3 RED / step-4 GREEN: _resource_audit_fingerprint()
+# ---------------------------------------------------------------------------
+
+
+class TestResourceAuditFingerprint:
+    """Unit tests for the module-level
+    ``orchestrator.merge_lane.worker._resource_audit_fingerprint(violations)``
+    (task 3203 step-3).
+
+    This is the value the exponential log coalescer keys on: two polls whose
+    violation sets mean the same thing must produce the SAME fingerprint (so
+    the repeat is coalesced), and any real change must produce a DIFFERENT
+    one (so it re-logs immediately at full detail).
+
+    Every worktree case feeds the fingerprint the REAL output of
+    ``worker.worktree_ledger_violations(now=...)`` rather than a hand-written
+    string, so this class doubles as the drift detector for the emitter's
+    format: if ``worktree_ledger_violations`` ever stops embedding
+    ``(age Ns > grace Ms)``, (a) fails here before anyone notices the
+    regression in production.
+
+    RED until step-4 GREEN adds the helper to merge_queue.py.
+    """
+
+    _NOW = 1_000_000.0
+    _DETECT = 100.0
+    # Far above every age exercised below, so the reclaim disposition stays
+    # 'scheduled' and cannot confound the age-stripping cases. The one test
+    # that WANTS a disposition flip (b) overrides it per-instance.
+    _FAR_REAP_AGE = 100_000.0
+    _IN_BAND_AGE = 150.0
+
+    def _worker(self, git_ops: GitOps):
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._DETECT
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._FAR_REAP_AGE
+        return worker
+
+    def test_the_volatile_age_figure_is_stripped(self, git_ops: GitOps) -> None:
+        """(a) The SAME leak audited an hour apart is the same fingerprint.
+
+        The age advances every 30s poll, which is exactly why a naive
+        string-set dedup would never fire — this is the whole reason a
+        normaliser exists.
+        """
+        from orchestrator.merge_lane.worker import _resource_audit_fingerprint
+
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-aging', mtime=self._NOW - self._IN_BAND_AGE)
+
+        early = worker.worktree_ledger_violations(now=self._NOW)
+        later = worker.worktree_ledger_violations(now=self._NOW + 3600.0)
+
+        assert len(early) == 1 and len(later) == 1
+        # Non-vacuous: the raw strings really do differ poll to poll.
+        assert early[0] != later[0], (
+            'precondition: the emitter must embed the volatile age, else this '
+            f'test proves nothing — got {early[0]!r}'
+        )
+        assert _resource_audit_fingerprint(early) == _resource_audit_fingerprint(later)
+
+    def test_the_reclaim_disposition_is_not_stripped(self, git_ops: GitOps) -> None:
+        """(b) Crossing PERIODIC_REAP_MIN_AGE_SECS is a real transition —
+        'scheduled for automatic reclaim' becoming 'reclaim overdue' must
+        force an immediate re-log, not be coalesced away."""
+        from orchestrator.merge_lane.worker import _resource_audit_fingerprint
+
+        worker = self._worker(git_ops)
+        worker.PERIODIC_REAP_MIN_AGE_SECS = 200.0
+        _mkdir_worktree(git_ops, '_merge-crossing', mtime=self._NOW - self._IN_BAND_AGE)
+
+        scheduled = worker.worktree_ledger_violations(now=self._NOW)
+        overdue = worker.worktree_ledger_violations(now=self._NOW + 150.0)
+
+        assert 'scheduled for automatic reclaim' in scheduled[0]
+        assert 'reclaim overdue' in overdue[0]
+        assert _resource_audit_fingerprint(scheduled) != _resource_audit_fingerprint(overdue)
+
+    def test_the_grace_figure_is_not_stripped(self, git_ops: GitOps) -> None:
+        """The DETECTION FLOOR moving is a real change (reviewer_comprehensive
+        amendment).
+
+        The docstring on ``_resource_audit_fingerprint`` lists ``grace`` under
+        'everything else is deliberately kept' and promises 'a deployment that
+        changes the floor SHOULD re-log' — but the regex once elided the grace
+        figure alongside the age, so a hot reload of
+        ``RESOURCE_AUDIT_WORKTREE_GRACE_SECS`` mid-episode was coalesced away
+        and the operator never learned the floor had moved.  No case held the
+        grace non-constant, which is why the contradiction survived; this is
+        that case.
+        """
+        from orchestrator.merge_lane.worker import _resource_audit_fingerprint
+
+        _mkdir_worktree(git_ops, '_merge-floor', mtime=self._NOW - self._IN_BAND_AGE)
+
+        tight = self._worker(git_ops)
+        tight.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = 50.0
+        loose = self._worker(git_ops)
+        loose.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = 100.0
+
+        # Same tree, same clock, same disposition — ONLY the floor differs.
+        at_tight = tight.worktree_ledger_violations(now=self._NOW)
+        at_loose = loose.worktree_ledger_violations(now=self._NOW)
+        assert len(at_tight) == 1 and len(at_loose) == 1
+        assert 'grace 50s' in at_tight[0], at_tight[0]
+        assert 'grace 100s' in at_loose[0], at_loose[0]
+
+        assert _resource_audit_fingerprint(at_tight) != _resource_audit_fingerprint(at_loose), (
+            'moving the detection floor must force an immediate re-log, not be '
+            f'coalesced away — got {_resource_audit_fingerprint(at_tight)}'
+        )
+        # And the age is still elided even with the grace retained, so (a)'s
+        # coalescence property is not bought back by breaking this one.
+        later = tight.worktree_ledger_violations(now=self._NOW + 3600.0)
+        assert _resource_audit_fingerprint(at_tight) == _resource_audit_fingerprint(later)
+
+    def test_set_membership_changes_the_fingerprint(self, git_ops: GitOps) -> None:
+        """(c) Adding a leak changes it; removing that leak restores it."""
+        from orchestrator.merge_lane.worker import _resource_audit_fingerprint
+
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-one', mtime=self._NOW - self._IN_BAND_AGE)
+        one = _resource_audit_fingerprint(worker.worktree_ledger_violations(now=self._NOW))
+
+        second = _mkdir_worktree(
+            git_ops, '_merge-two', mtime=self._NOW - self._IN_BAND_AGE,
+        )
+        two = _resource_audit_fingerprint(worker.worktree_ledger_violations(now=self._NOW))
+        assert two != one
+        assert len(two) == 2
+
+        second.rmdir()
+        back = _resource_audit_fingerprint(worker.worktree_ledger_violations(now=self._NOW))
+        assert back == one
+
+    def test_fingerprint_is_order_independent(self, git_ops: GitOps) -> None:
+        """(d) A filesystem scan reordering its entries is not a change."""
+        from orchestrator.merge_lane.worker import _resource_audit_fingerprint
+
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-a', mtime=self._NOW - self._IN_BAND_AGE)
+        _mkdir_worktree(git_ops, '_merge-b', mtime=self._NOW - self._IN_BAND_AGE)
+        violations = worker.worktree_ledger_violations(now=self._NOW)
+        assert len(violations) == 2
+
+        assert _resource_audit_fingerprint(violations) == _resource_audit_fingerprint(
+            list(reversed(violations))
+        )
+
+    def test_empty_violations_yield_an_empty_fingerprint(self) -> None:
+        """(e)"""
+        from orchestrator.merge_lane.worker import _resource_audit_fingerprint
+
+        assert not _resource_audit_fingerprint([])
+
+    def test_speculation_accounting_strings_pass_through_unmodified(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(f) The permit arm's counts ARE the signal — the normaliser must
+        not eat them, and two leak magnitudes must not collide."""
+        from orchestrator.merge_lane.worker import _resource_audit_fingerprint
+
+        worker = self._worker(git_ops)
+        worker._speculation_slot._value -= 1  # forced permit leak
+        small = worker.speculation_accounting_violations()
+        assert len(small) == 1
+        assert _resource_audit_fingerprint(small) == (small[0],), (
+            'a violation carrying no age figure must survive verbatim'
+        )
+
+        worker._speculation_slot._value -= 1  # a bigger leak
+        big = worker.speculation_accounting_violations()
+        assert _resource_audit_fingerprint(big) != _resource_audit_fingerprint(small)
+
+    def test_mixed_violation_set_is_stable_while_only_ages_advance(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(g) The production shape: permit leak + worktree leak, polled
+        repeatedly, with nothing changing but the clock."""
+        from orchestrator.merge_lane.worker import _resource_audit_fingerprint
+
+        worker = self._worker(git_ops)
+        worker._speculation_slot._value -= 1  # forced permit leak
+        _mkdir_worktree(git_ops, '_merge-mixed', mtime=self._NOW - self._IN_BAND_AGE)
+
+        def _fingerprint_at(now: float) -> tuple[str, ...]:
+            return _resource_audit_fingerprint(
+                worker.speculation_accounting_violations()
+                + worker.worktree_ledger_violations(now=now)
+            )
+
+        first = _fingerprint_at(self._NOW)
+        assert len(first) == 2
+        for i in range(1, 100):
+            assert _fingerprint_at(self._NOW + i * 30.0) == first
+
+
+# ---------------------------------------------------------------------------
+# task 3203 step-5 RED / step-6 GREEN: exponential log coalescence
+# ---------------------------------------------------------------------------
+
+_AUDIT_PREFIX = 'merge queue resource-conservation audit: '
+_CLEAR_PREFIX = 'merge queue resource-conservation audit clear '
+_STREAK_RE = re.compile(r'consecutive streak=(\d+)')
+_UNCHANGED_RE = re.compile(r'unchanged for (\d+) polls')
+
+
+def _audit_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """EVERY audit record, at any level — one per violating poll.
+
+    A suppressed poll is demoted to DEBUG, never dropped, so this is how a
+    test proves a debug-level operator still sees all of them.  The clear
+    line's prefix (``_CLEAR_PREFIX``) is deliberately distinct and is never
+    counted here.
+    """
+    return [r for r in caplog.records if r.getMessage().startswith(_AUDIT_PREFIX)]
+
+
+def _audit_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Audit REPORT records — the ones an operator is meant to read.
+
+    Report lines are counted AGNOSTICALLY BETWEEN WARNING AND INFO, which is
+    what makes every count asserted in this class survive task 3203 step-9
+    (which pins exactly which report lines are WARNING and which are INFO)
+    without a single edit.
+
+    DEBUG is excluded because that IS the coalescence contract: a due repeat
+    reports at INFO and a suppressed poll is demoted to DEBUG, and by
+    deliberate design (step-10) both share one format string, so the level is
+    the only discriminator.  Use :func:`_audit_records` to count every poll.
+    """
+    return [r for r in _audit_records(caplog) if r.levelno >= logging.INFO]
+
+
+def _streaks(caplog: pytest.LogCaptureFixture) -> list[int]:
+    """The ``consecutive streak=N`` value of each emitted audit report line."""
+    out: list[int] = []
+    for record in _audit_lines(caplog):
+        match = _STREAK_RE.search(record.getMessage())
+        assert match is not None, f'audit line carries no streak: {record.getMessage()!r}'
+        out.append(int(match.group(1)))
+    return out
+
+
+class TestResourceAuditLogCoalescence:
+    """The headline of task 3203: an UNCHANGING violation set is reported on
+    an exponentially-backing-off schedule instead of once per 30s poll.
+
+    Before this task a single leaked worktree held for two hours emitted 246
+    identical WARNINGs (one measured incident emitted 897), which destroys the
+    greppability the logging exists to buy.
+
+    Counting is LEVEL-AGNOSTIC here (see :func:`_audit_lines`) — step-9 pins
+    the level routing separately.
+
+    RED until step-6 GREEN wires ExponentialLogCoalescer into
+    _check_resource_audit's logging arm.
+    """
+
+    _NOW = 1_000_000.0
+    _POLL_S = 30.0
+    _DETECT = 100.0
+    # Far above any age reached in these tests, so the reclaim disposition
+    # never flips mid-run (that flip is a real fingerprint change — pinned by
+    # TestResourceAuditFingerprint (b) and step-9 (g)) and so the escalation
+    # floor derived from it is never reached by the worktree arm.
+    _FAR_REAP_AGE = 10_000_000.0
+    _IN_BAND_AGE = 150.0
+
+    def _worker(self, git_ops: GitOps, fake_eq: _FakeEscalationQueue | None = None):
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
+        )
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._DETECT
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._FAR_REAP_AGE
+        return worker
+
+    def _drive(self, worker, polls: int, *, start_poll: int = 0) -> None:
+        for i in range(start_poll, start_poll + polls):
+            worker._check_resource_audit(self._NOW + i * self._POLL_S)
+
+    # ── (a)/(b) the schedule ────────────────────────────────────────────────
+
+    def test_unchanged_violation_set_is_reported_logarithmically_not_linearly(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(a) THE headline verification: 512 violating polls, 10 report lines."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000  # cap must not bind here
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            self._drive(worker, 512)
+
+        assert _streaks(caplog) == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512], (
+            f'expected the powers of two, got {_streaks(caplog)}'
+        )
+        assert len(_audit_lines(caplog)) == 10
+        # Stated explicitly: NOT linear, by more than an order of magnitude.
+        # Reads the OBSERVED count, not the literal 10 — the previous form
+        # (`assert 10 < 512 / 10`) compared two literals and was true
+        # regardless of what the code under test did (reviewer_comprehensive
+        # amendment).
+        assert len(_audit_lines(caplog)) < 512 / 10
+        # The backoff advanced only because the fingerprint held steady even
+        # though the tree's age grew by 30s on every one of those polls.
+        assert worker.worktree_ledger_violations(now=self._NOW)[0] != (
+            worker.worktree_ledger_violations(now=self._NOW + 511 * self._POLL_S)[0]
+        ), 'precondition: the raw violation string really does change every poll'
+
+    def test_cap_binds_and_degrades_the_schedule_to_linear(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(b) The cap is a floor on the cadence, monkeypatchable per-instance."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 4
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            self._drive(worker, 40)
+
+        assert _streaks(caplog) == [1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40], (
+            f'expected doubling-then-capped-at-4, got {_streaks(caplog)}'
+        )
+
+    # ── (c)/(d) nothing is dropped, and a repeat says what it stands for ────
+
+    def test_suppressed_polls_are_not_dropped(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(c) A debug-level operator still sees every single poll — mirrors
+        the _reprobe_last_info precedent's 'Never DROPPED' contract."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            self._drive(worker, 512)
+
+        assert len(_audit_records(caplog)) == 512, (
+            'every violating poll must leave a record at SOME level, got '
+            f'{len(_audit_records(caplog))}'
+        )
+        assert len(_audit_lines(caplog)) == 10, 'only 10 of them are report-level'
+        assert len(_audit_records(caplog)) - len(_audit_lines(caplog)) == 502, (
+            'the other 502 are demoted to DEBUG, not dropped'
+        )
+
+    def test_a_repeat_line_names_what_it_stands_in_for(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(d) Coalescing context, and today's exact format preserved on the
+        first line."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        wt = _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            self._drive(worker, 64)
+
+        lines = _audit_lines(caplog)
+
+        # The first line is the pre-3203 format, byte-for-byte: full detail,
+        # streak=1, every violation string, and NO coalescing suffix.
+        first = lines[0].getMessage()
+        assert first == (
+            'merge queue resource-conservation audit: 1 violation(s) found '
+            f'(consecutive streak=1): {worker.worktree_ledger_violations(now=self._NOW)[0]}'
+        ), f'the first line must match the pre-3203 format exactly, got {first!r}'
+        assert 'unchanged for ' not in first
+        assert str(wt.resolve()) in first
+
+        # Every later line carries the coalescing context, and its
+        # "unchanged for N polls" is the poll index it was emitted on.
+        for record in lines[1:]:
+            message = record.getMessage()
+            assert 'unchanged for ' in message
+            assert ' polls' in message
+            assert 'next report in ' in message
+            unchanged = _UNCHANGED_RE.search(message)
+            streak = _STREAK_RE.search(message)
+            assert unchanged is not None and streak is not None
+            assert int(unchanged.group(1)) == int(streak.group(1)), (
+                f'the coalescing poll count must track the poll index: {message!r}'
+            )
+
+    # ── (e)/(f) a change is never withheld ──────────────────────────────────
+
+    def test_adding_a_leak_mid_backoff_reports_immediately(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(e) At poll 100 the next scheduled report is poll 128; a set that
+        GREW must not wait for it."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        first = _mkdir_worktree(git_ops, '_merge-one', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, 100)
+
+        second = _mkdir_worktree(git_ops, '_merge-two', mtime=self._NOW - self._IN_BAND_AGE)
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            caplog.clear()  # only the polls below are under test
+            self._drive(worker, 1, start_poll=100)   # poll 101 — the change
+            change_lines = list(_audit_lines(caplog))
+            self._drive(worker, 1, start_poll=101)   # poll 102 — due again
+
+        assert len(change_lines) == 1
+        message = change_lines[0].getMessage()
+        assert '2 violation(s) found' in message
+        assert str(first.resolve()) in message
+        assert str(second.resolve()) in message, 'the change line must be full detail'
+        assert 'unchanged for ' not in message, 'a change is not a coalesced repeat'
+
+        # The schedule RESTARTED (interval back to 1) rather than resuming the
+        # 32-poll interval the previous fingerprint had backed off to.
+        assert len(_audit_lines(caplog)) == 2, (
+            'the poll immediately after a change must be due again, got '
+            f'{[r.getMessage() for r in _audit_lines(caplog)]}'
+        )
+
+    def test_removing_one_of_two_leaks_reports_immediately(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(f) Reclamation is a real event and must never be swallowed."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        kept = _mkdir_worktree(git_ops, '_merge-kept', mtime=self._NOW - self._IN_BAND_AGE)
+        gone = _mkdir_worktree(git_ops, '_merge-gone', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, 100)
+
+        gone_path = str(gone.resolve())
+        gone.rmdir()
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            caplog.clear()  # only the poll below is under test
+            self._drive(worker, 1, start_poll=100)
+
+        lines = _audit_lines(caplog)
+        assert len(lines) == 1
+        message = lines[0].getMessage()
+        assert '1 violation(s) found' in message
+        assert str(kept.resolve()) in message
+        assert gone_path not in message
+        assert 'unchanged for ' not in message
+
+    # ── (g)/(h)/(i) everything else is untouched ────────────────────────────
+
+    def test_detection_is_untouched_by_coalescence(self, git_ops: GitOps) -> None:
+        """(g) Coalescence changes logging only, never what the audit sees."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        wt = _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, 512)
+
+        violations = worker.worktree_ledger_violations(now=self._NOW + 512 * self._POLL_S)
+        assert len(violations) == 1
+        assert str(wt.resolve()) in violations[0]
+        assert worker.snapshot()['resource_audit']['worktree_ledger']
+
+    def test_escalation_still_fires_on_a_poll_whose_log_line_was_suppressed(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(h) THE regression guard. The gate sits in the LOGGING arm only —
+        never in front of the escalation predicate.
+
+        With the default streak threshold of 3, poll 3 is a SUPPRESSED poll
+        (due polls are 1, 2, 4, ...), so this fails loudly if the gate were
+        ever hoisted above the streak/escalation block.
+        """
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = self._worker(git_ops, fake_eq)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        worker._speculation_slot._value -= 1  # forced, PERSISTING permit leak
+        n = worker.RESOURCE_AUDIT_ESCALATION_STREAK
+        assert n == 3, 'this test is written against the shipped threshold'
+
+        self._drive(worker, n)
+
+        assert len(fake_eq.submitted) == 1, (
+            f'the L1 must fire on poll {n} even though that poll s log line '
+            f'was coalesced away, got {fake_eq.submitted!r}'
+        )
+        assert fake_eq.submitted[0].category == 'merge_resource_leak'
+
+    def test_streak_is_untouched_by_coalescence(self, git_ops: GitOps) -> None:
+        """(i) The streak counts violating heartbeats, not emitted lines."""
+        worker = self._worker(git_ops)
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, 512)
+
+        assert worker._resource_audit_violation_streak == 512
+
+
+# ---------------------------------------------------------------------------
+# task 3203 step-7 RED / step-8 GREEN: the clear-transition line
+# ---------------------------------------------------------------------------
+
+
+def _clear_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The violating → clean transition line, at any level."""
+    return [r for r in caplog.records if r.getMessage().startswith(_CLEAR_PREFIX)]
+
+
+class TestResourceAuditClearLine:
+    """The END of a resource-conservation episode must be greppable, not
+    inferred from an absence of lines (task 3203 detail item 4).
+
+    Coalescence makes this mandatory rather than merely nice: once the repeat
+    interval has backed off to an hour, "no audit line since 14:02" no longer
+    distinguishes 'fixed' from 'still broken, next report at 15:02'.
+
+    RED until step-8 GREEN adds the clear line to _check_resource_audit's
+    clean arm.
+    """
+
+    _NOW = 1_000_000.0
+    _POLL_S = 30.0
+    _DETECT = 100.0
+    _FAR_REAP_AGE = 10_000_000.0
+    _IN_BAND_AGE = 150.0
+    _RUN = 50
+
+    def _worker(self, git_ops: GitOps):
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(),
+            escalation_queue=_FakeEscalationQueue(open_l1=True),  # never pages
+            speculation_depth=2,
+        )
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._DETECT
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._FAR_REAP_AGE
+        return worker
+
+    def _drive(self, worker, polls: int, *, start_poll: int = 0) -> None:
+        for i in range(start_poll, start_poll + polls):
+            worker._check_resource_audit(self._NOW + i * self._POLL_S)
+
+    def test_exactly_one_clear_line_on_the_first_clean_poll(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(a) One line, not one per clean poll — the inverse spam bug."""
+        worker = self._worker(git_ops)
+        worker._speculation_slot._value -= 1  # forced, PERSISTING permit leak
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            self._drive(worker, self._RUN)
+            worker._speculation_slot._value += 1  # the leak is repaired
+            caplog.clear()
+            self._drive(worker, 1, start_poll=self._RUN)          # first clean poll
+            after_first = list(_clear_lines(caplog))
+            self._drive(worker, 20, start_poll=self._RUN + 1)     # 20 more clean polls
+
+        assert len(after_first) == 1, 'the clear must fire on the FIRST clean poll'
+        assert len(_clear_lines(caplog)) == 1, (
+            f'exactly one clear line, got {[r.getMessage() for r in _clear_lines(caplog)]}'
+        )
+
+    def test_the_clear_line_names_the_run_it_ended(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(b) An operator must be able to size the outage from this one line."""
+        worker = self._worker(git_ops)
+        worker._speculation_slot._value -= 1
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            self._drive(worker, self._RUN)
+            worker._speculation_slot._value += 1
+            self._drive(worker, 1, start_poll=self._RUN)
+
+        message = _clear_lines(caplog)[0].getMessage()
+        assert f'{self._RUN} polls' in message, message
+        # The run began at poll 1 (_NOW) and ended at poll 51 (_NOW + 50*30s).
+        assert f'{self._RUN * self._POLL_S:.0f}s' in message, message
+
+    def test_the_clear_line_sizes_an_episode_whose_set_changed_midway(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The two numbers in the clear line share ONE measurement basis
+        (reviewer_comprehensive amendment).
+
+        (b) above only ever exercised a constant fingerprint, where a
+        whole-episode poll count and a final-segment duration happen to
+        agree.  They do not agree when the violation set changes mid-episode
+        — the case this test adds.  Reading the count off the streak and the
+        span off the gate produced 'clear after 50 polls / 300s' here, a 5x
+        understatement of a 1500s outage, in the single line whose stated
+        purpose is letting an operator size that outage.
+        """
+        worker = self._worker(git_ops)
+        worker._speculation_slot._value -= 1  # persists for the whole episode
+        change_at = 40
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            self._drive(worker, change_at)
+            # The set GROWS at poll 41: a leaked worktree joins the permit
+            # leak, restarting the gate's per-fingerprint segment clock while
+            # the episode runs on.
+            leak = _mkdir_worktree(
+                git_ops, '_merge-midway', mtime=self._NOW - self._IN_BAND_AGE,
+            )
+            self._drive(worker, self._RUN - change_at, start_poll=change_at)
+            worker._speculation_slot._value += 1
+            leak.rmdir()
+            self._drive(worker, 1, start_poll=self._RUN)
+
+        message = _clear_lines(caplog)[0].getMessage()
+        assert f'{self._RUN} polls' in message, message
+        # The EPISODE spans all 50 polls, not the 10 at the final fingerprint.
+        assert f'{self._RUN * self._POLL_S:.0f}s' in message, message
+        assert f'{(self._RUN - change_at) * self._POLL_S:.0f}s' not in message, (
+            f'the duration must span the whole episode, not the last segment: {message}'
+        )
+
+    def test_a_never_violating_worker_emits_nothing_at_all(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(c) THE inverse regression: a healthy idle worker must not spam
+        the journal with clear lines — the exact mirror of the bug 3203
+        fixes."""
+        worker = self._worker(git_ops)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            self._drive(worker, 10)
+
+        assert _clear_lines(caplog) == []
+        assert _audit_records(caplog) == []
+
+    def test_a_fresh_episode_after_a_clear_is_not_a_continuation(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(d) The gate is reset by the clear, so the same leak returning is a
+        new episode at streak=1 with full detail."""
+        worker = self._worker(git_ops)
+        worker._speculation_slot._value -= 1
+        self._drive(worker, self._RUN)
+        worker._speculation_slot._value += 1
+        self._drive(worker, 1, start_poll=self._RUN)
+
+        worker._speculation_slot._value -= 1  # the same leak returns
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            caplog.clear()
+            self._drive(worker, 1, start_poll=self._RUN + 1)
+
+        lines = _audit_lines(caplog)
+        assert len(lines) == 1
+        message = lines[0].getMessage()
+        assert 'consecutive streak=1' in message, message
+        assert 'unchanged for ' not in message, 'a fresh episode is not a coalesced repeat'
+        assert 'speculation' in message.lower(), 'full detail, not the summary form'
+
+    def test_a_worktree_arm_clear_also_reports(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(e) Same property when the run is a leaked worktree that is reaped."""
+        worker = self._worker(git_ops)
+        wt = _mkdir_worktree(git_ops, '_merge-reaped', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, self._RUN)
+
+        wt.rmdir()
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            caplog.clear()
+            self._drive(worker, 1, start_poll=self._RUN)
+
+        lines = _clear_lines(caplog)
+        assert len(lines) == 1, f'got {[r.getMessage() for r in caplog.records]}'
+        assert f'{self._RUN} polls' in lines[0].getMessage()
+
+    def test_a_partial_clear_is_not_a_clear(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(f) The clear fires only when the violation SET is empty; removing
+        one of two leaks is a change line, never a clear."""
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-kept', mtime=self._NOW - self._IN_BAND_AGE)
+        gone = _mkdir_worktree(git_ops, '_merge-gone', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, self._RUN)
+
+        gone.rmdir()
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            caplog.clear()
+            self._drive(worker, 1, start_poll=self._RUN)
+
+        assert _clear_lines(caplog) == [], 'one leak remains — the set is not empty'
+        assert len(_audit_lines(caplog)) == 1, 'but the shrinkage is still reported at once'
+
+
+# ---------------------------------------------------------------------------
+# task 3203 step-9 RED / step-10 GREEN: log-level routing
+# ---------------------------------------------------------------------------
+
+
+def _at_level(records: list[logging.LogRecord], level: int) -> list[logging.LogRecord]:
+    return [r for r in records if r.levelno == level]
+
+
+class TestResourceAuditLogLevels:
+    """The routing contract that keeps ``journalctl -p warning`` meaningful
+    (task 3203).
+
+      WARNING — the first violating poll, and EVERY change to the violation set
+      INFO    — a scheduled steady-state repeat
+      DEBUG   — a suppressed poll (demoted, never dropped)
+      INFO    — the clear line
+
+    RED until step-10 GREEN pins the routing in _check_resource_audit.
+    """
+
+    _NOW = 1_000_000.0
+    _POLL_S = 30.0
+    _DETECT = 100.0
+    _FAR_REAP_AGE = 10_000_000.0
+    _IN_BAND_AGE = 150.0
+
+    def _worker(self, git_ops: GitOps, *, reap_age: float | None = None):
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(),
+            escalation_queue=_FakeEscalationQueue(open_l1=True),  # never pages
+            speculation_depth=2,
+        )
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._DETECT
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._FAR_REAP_AGE if reap_age is None else reap_age
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        return worker
+
+    def _drive(self, worker, polls: int, *, start_poll: int = 0) -> None:
+        for i in range(start_poll, start_poll + polls):
+            worker._check_resource_audit(self._NOW + i * self._POLL_S)
+
+    def test_first_violating_poll_is_warning_at_full_detail(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(a)"""
+        worker = self._worker(git_ops)
+        wt = _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            self._drive(worker, 1)
+
+        records = _audit_records(caplog)
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert str(wt.resolve()) in records[0].getMessage()
+
+    def test_every_set_change_is_a_warning(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(b) A change is never demoted, however deep the backoff."""
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-one', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, 100)  # next scheduled report is poll 128
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            added = _mkdir_worktree(
+                git_ops, '_merge-two', mtime=self._NOW - self._IN_BAND_AGE,
+            )
+            caplog.clear()
+            self._drive(worker, 1, start_poll=100)
+            assert [r.levelno for r in _audit_records(caplog)] == [logging.WARNING], (
+                'a leak APPEARING mid-backoff must warn'
+            )
+
+            added.rmdir()
+            caplog.clear()
+            self._drive(worker, 1, start_poll=101)
+            assert [r.levelno for r in _audit_records(caplog)] == [logging.WARNING], (
+                'a leak DISAPPEARING mid-backoff must warn'
+            )
+
+    def test_steady_state_repeats_are_info_and_suppressed_polls_are_debug(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(c) + (d): exactly one WARNING, 9 INFO repeats, 502 DEBUG — and
+        every DEBUG carries the same coalescing context, so a debug-level
+        operator loses nothing (mirrors the _reprobe_last_info precedent's
+        'Never DROPPED' contract)."""
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            self._drive(worker, 512)
+
+        records = _audit_records(caplog)
+        warnings = _at_level(records, logging.WARNING)
+        infos = _at_level(records, logging.INFO)
+        debugs = _at_level(records, logging.DEBUG)
+
+        assert len(warnings) == 1, 'only the first violating poll warns'
+        assert len(infos) == 9, f'9 scheduled repeats, got {len(infos)}'
+        assert len(debugs) == 502
+        assert len(records) == 512, 'one record per poll — nothing is dropped'
+
+        for record in debugs:
+            message = record.getMessage()
+            assert 'unchanged for ' in message
+            assert 'next report in ' in message
+
+    def test_the_clear_line_is_info(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(e)"""
+        worker = self._worker(git_ops)
+        wt = _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, 50)
+
+        wt.rmdir()
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            caplog.clear()
+            self._drive(worker, 1, start_poll=50)
+
+        assert [r.levelno for r in _clear_lines(caplog)] == [logging.INFO]
+
+    def test_warning_volume_for_the_measured_incident_shape(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(f) The user-visible property this task exists to deliver: one
+        unchanged violation set held for 246 polls (two hours at the 30s
+        heartbeat — the measured reify incident) is 1 WARNING, not 246."""
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            self._drive(worker, 246)
+
+        assert len(_at_level(_audit_records(caplog), logging.WARNING)) == 1, (
+            'journalctl -p warning must show this leak once, not 246 times'
+        )
+        assert len(_audit_records(caplog)) == 246, 'every poll is still recorded'
+
+    def test_a_reclaim_disposition_flip_mid_backoff_is_a_warning(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(g) 'scheduled for automatic reclaim' -> 'reclaim overdue' means
+        the reaper was supposed to destroy this tree and did not. That is a
+        real transition, which is exactly why the step-4 normaliser keeps the
+        disposition in the fingerprint."""
+        # Tree ages 150s at poll 1 and 30s per poll thereafter, so it crosses
+        # the destruction floor on poll 51 — a poll the backoff would
+        # otherwise suppress (due polls are 1, 2, 4, ..., 32, 64).
+        flip_poll = 51
+        worker = self._worker(
+            git_ops, reap_age=self._IN_BAND_AGE + (flip_poll - 1) * self._POLL_S,
+        )
+        _mkdir_worktree(git_ops, '_merge-crossing', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, flip_poll - 1)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            caplog.clear()
+            self._drive(worker, 1, start_poll=flip_poll - 1)
+
+        records = _audit_records(caplog)
+        assert [r.levelno for r in records] == [logging.WARNING], (
+            f'the disposition flip must warn on the very poll it happens, got '
+            f'{[(r.levelname, r.getMessage()) for r in records]}'
+        )
+        assert 'reclaim overdue' in records[0].getMessage()
+
+
+# ---------------------------------------------------------------------------
+# task 3203 step-11 RED / step-12 GREEN: coalescence on the real heartbeat path
+# ---------------------------------------------------------------------------
+
+
+class TestHeartbeatPathCoalescence:
+    """The journal-drowning scenario reproduced through the EXACT call path
+    the measured reify incident used: only ``_maybe_log_queue_heartbeat`` is
+    driven here, never ``_check_resource_audit`` directly.
+
+    Mirrors TestHeartbeatWiringRunsResourceAuditUnconditionally's convention
+    (task 1994 step-11) — the audit runs before the depth==0 short-circuit,
+    inside its own try/except.
+    """
+
+    _NOW = 1_000_000.0
+    _POLL_S = 30.0
+    _DETECT = 100.0
+    _FAR_REAP_AGE = 10_000_000.0
+    _IN_BAND_AGE = 150.0
+
+    def _worker(self, git_ops: GitOps):
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(),
+            escalation_queue=_FakeEscalationQueue(open_l1=True),  # never pages
+            speculation_depth=2,
+        )
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._DETECT
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._FAR_REAP_AGE
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        return worker
+
+    def test_idle_worker_with_a_persisting_leak_is_coalesced_end_to_end(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(a) 512 heartbeats over a leak that never changes: 1 WARNING + 9
+        INFO report lines + 502 DEBUG, on a depth-0 idle pipeline — the shape
+        that used to emit 512 WARNINGs."""
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+        assert worker.snapshot()['depth'] == 0, 'the incident shape is an IDLE pipeline'
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            for i in range(512):
+                assert worker._maybe_log_queue_heartbeat(self._NOW + i * self._POLL_S) is False
+
+        records = _audit_records(caplog)
+        assert len(_at_level(records, logging.WARNING)) == 1
+        assert len(_at_level(records, logging.INFO)) == 9
+        assert len(_at_level(records, logging.DEBUG)) == 502
+        assert _streaks(caplog) == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+    def test_the_depth_heartbeat_keeps_its_own_rate_limiting(
+        self, git_ops: GitOps, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(b) Coalescing the audit must not perturb the depth heartbeat's own
+        _heartbeat_interval_s schedule."""
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        worker._queue.put_nowait(_make_request('hb-task', 'hb-task', wt))
+        assert worker.snapshot()['depth'] > 0
+
+        interval = worker._heartbeat_interval_s  # 300s == 10 polls
+        fired: list[int] = []
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_lane'):
+            for i in range(100):
+                if worker._maybe_log_queue_heartbeat(self._NOW + i * self._POLL_S):
+                    fired.append(i)
+
+        beats = [
+            r for r in caplog.records
+            if r.getMessage().startswith('merge queue heartbeat: ')
+        ]
+        assert len(beats) == len(fired), 'one heartbeat line per firing poll'
+        assert all(r.levelno == logging.INFO for r in beats)
+        # Its cadence is its OWN interval, untouched by the audit's schedule.
+        assert fired[0] == 0
+        for previous, current in zip(fired, fired[1:], strict=False):
+            assert (current - previous) * self._POLL_S >= interval
+        assert len(fired) == 100 * self._POLL_S // interval, (
+            f'expected one beat per {interval}s over 3000s, got {fired}'
+        )
+
+    def test_the_audit_methods_still_run_on_every_single_heartbeat(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """(c) Suppression is of the LOG, never of the CHECK.
+
+        test_merge_queue_concurrent_verify.py relies on this property, and
+        snapshot()['resource_audit'] would go stale without it.
+        """
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        spec_calls = 0
+        wt_calls = 0
+        real_spec = worker.speculation_accounting_violations
+        real_wt = worker.worktree_ledger_violations
+
+        def _counting_spec() -> list[str]:
+            nonlocal spec_calls
+            spec_calls += 1
+            return real_spec()
+
+        def _counting_wt(**kwargs) -> list[str]:
+            nonlocal wt_calls
+            wt_calls += 1
+            return real_wt(**kwargs)
+
+        monkeypatch.setattr(worker, 'speculation_accounting_violations', _counting_spec)
+        monkeypatch.setattr(worker, 'worktree_ledger_violations', _counting_wt)
+
+        for i in range(512):
+            worker._maybe_log_queue_heartbeat(self._NOW + i * self._POLL_S)
+
+        assert spec_calls >= 512, (
+            f'the permit audit must run on every heartbeat, ran {spec_calls}'
+        )
+        assert wt_calls >= 512, (
+            f'the worktree audit must run on every heartbeat, ran {wt_calls}'
+        )

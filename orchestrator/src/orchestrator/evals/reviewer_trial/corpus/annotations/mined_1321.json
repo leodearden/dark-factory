@@ -8,6 +8,54 @@
       "severity": "suggestion",
       "description": "The filter `e.level == 0` preserves ALL non-L0 escalations, including born-at-L2 escalations (level=2, per the deterministic/milestone escalation paths), yet the docstring and harness comments claim only 'Level-1' escalations are preserved. The behavior (preserving L2 too) is likely correct, but the documentation is misleading about which levels survive restart.",
       "mutation_type": "style"
+    },
+    {
+      "id": "mined_1321_pool_01",
+      "location": "escalation/src/escalation/queue.py:358",
+      "category": "naming",
+      "severity": "blocking",
+      "description": "`EscalationQueue.dismiss_all_pending` now dismisses only level-0 pending escalations and silently leaves every other level pending, so its name (and the module/test-class docstrings and skills/escalation-watcher/SKILL.md:463 that describe it) promises a full flush it no longer performs. The orchestrator's restart policy ('only L0 is stale on restart') is hard-coded inside the generic queue primitive rather than being visible at the single harness call site (e.g. via an explicit `level` argument mirroring `get_by_task(..., level=)` or a rename such as `dismiss_pending_l0`). A future caller choosing the method by name (queue reset, teardown, recovery path) will silently leave L1s behind.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1321_pool_02",
+      "location": "escalation/src/escalation/queue.py:375",
+      "category": "structured_data",
+      "severity": "suggestion",
+      "description": "The new restart filter compares the escalation tier against a bare integer literal (`e.level == 0`) with no named constant or enum, adding another raw-int routing site to the existing `level=1` / `level != 0` literals, and filters by hand although `get_by_task` already offers a `level` filter that `get_pending` lacks.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1321_pool_03",
+      "location": "orchestrator/tests/test_stale_escalation_cleanup.py:65",
+      "category": "test_coverage",
+      "severity": "suggestion",
+      "description": "The harness-level tests of `_dismiss_stale_escalations` were not updated for the L0-only contract: every test replaces the queue with a MagicMock, the class docstring and `test_pending_escalations_dismissed` still say pending escalations are 'all dismissed', and no test drives the startup path against a real `EscalationQueue` to show an L1 survives while the L0 is dismissed. The filter itself is covered at the queue layer, as the task required.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1321_pool_04",
+      "location": "orchestrator/src/orchestrator/harness.py:2223",
+      "category": "observability",
+      "severity": "suggestion",
+      "description": "The harness startup log asserts 'L1 escalations preserved across restart' without knowing whether any exist (it only receives the L0 dismissal count), and it is emitted only when at least one L0 was dismissed, so when L1s are carried over and no L0 is dismissed nothing is logged. The operator never sees how many human-attention escalations survived the restart.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1321_pool_05",
+      "location": "orchestrator/src/orchestrator/harness.py:2224",
+      "category": "duplication",
+      "severity": "suggestion",
+      "description": "Both `EscalationQueue.dismiss_all_pending` and `Harness._dismiss_stale_escalations` log an INFO line for the same dismissal count, so each restart emits two near-identical 'Dismissed N stale L0 escalation(s)' lines and any wording change must be made in both; this change edited both copies.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1321_pool_06",
+      "location": "escalation/tests/test_queue.py:244",
+      "category": "test_quality",
+      "severity": "suggestion",
+      "description": "`test_dismiss_all_pending_idempotent_with_l1` repeats the setup and assertions of `test_dismiss_all_pending_skips_level_1_escalations` and adds only a second-call `== 0` check, while more informative cases (an L0 and an L1 on the same task_id; a mixed L0/L1 queue where one L0 resolve raises) are untested.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {
@@ -24,5 +72,43 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "AFK hardening: Persist L1 escalations across orchestrator restart",
+      "description": "Modify dismiss_all_pending() to exclude level=1 escalations so they survive orchestrator restarts. Currently startup auto-dismisses ALL pending escalations including L1 (steward\u2192human), causing ~75% of L1s to be lost on restart over multi-day runs (75/103 over 23 days in reify).",
+      "test_strategy": "",
+      "details": "**File:** escalation/src/escalation/queue.py:358-379\n\n**Change:** In `dismiss_all_pending()`, filter `level=1` out of the pending list before dismissing. The escalation schema (models.py:27) already has `level: int = 0` so the data is there; the only change is the filter.\n\n**Caller:** orchestrator/src/orchestrator/harness.py:2203-2220 `_dismiss_stale_escalations()` (called at startup line 418). Update log message to reflect \"L0 dismissed, L1 preserved\".\n\n**Tests:** Add unit test for dismiss_all_pending that creates one L0 + one L1 pending escalation, calls dismiss, asserts L1 still pending and L0 dismissed.\n\n**Why:** Over 23 days in reify, 75 of 103 L1 escalations were lost to \"auto-dismissed: orchestrator restarted\". For 8-day AFK runs where the orchestrator may restart multiple times, this loss is catastrophic \u2014 L1s represent the things the steward could not handle and need human attention. They must persist across restarts.\n\n**Out of scope:** L0 behavior unchanged. L1 persistence is purely additive \u2014 does not modify or replace existing L0 dismissal logic.",
+      "authored": false,
+      "id": "1321",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-14T17:57:21.362Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "escalation/src/escalation/queue.py",
+      "escalation/tests/test_queue.py",
+      "orchestrator/src/orchestrator/harness.py",
+      "orchestrator/tests/test_stale_escalation_cleanup.py"
+    ],
+    "base_sha": "467b7448c1697117e7680de40bf9e03b41147815",
+    "branch_sha": "a5389c5ac3ec623aa903697ba055354ff1572ec7",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "b7fb91542bc3d26c8b61537c6f18b72581707bce",
+      "merge_base_sha": "467b7448c1697117e7680de40bf9e03b41147815",
+      "diff_reproduces_from": "git diff 467b7448c1 b7fb91542b",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from typing import get_args
 
 import pytest
@@ -37,6 +38,7 @@ from shared.task_metadata import (
     apply_migrations,
     parse_metadata,
     register_metadata_submodel,
+    script_root_kind_conflict,
     validate_model_overrides,
 )
 
@@ -169,6 +171,51 @@ class TestBeforeDone:
         with pytest.raises(ValidationError):
             BeforeDone(script='scripts/x.sh', timeout_secs=60, kind='bogus')  # type: ignore[arg-type]
 
+    def test_script_root_defaults_to_project(self):
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60)
+        assert bd.script_root == 'project'
+
+    def test_factory_script_root_accepted_on_predicate(self):
+        bd = BeforeDone(
+            script='scripts/x.sh', timeout_secs=60, kind='predicate', script_root='factory',
+        )
+        assert bd.script_root == 'factory'
+
+    @pytest.mark.parametrize('kind_fields', [{'kind': 'deploy'}, {}], ids=['explicit', 'default'])
+    def test_factory_script_root_rejected_on_deploy(self, kind_fields):
+        with pytest.raises(ValidationError) as excinfo:
+            BeforeDone(script='scripts/x.sh', timeout_secs=60, script_root='factory', **kind_fields)
+        assert 'script_root' in str(excinfo.value)
+        assert 'predicate' in str(excinfo.value)
+
+    @pytest.mark.parametrize('kind', ['deploy', 'predicate'])
+    def test_project_script_root_accepted_on_both_kinds(self, kind):
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60, kind=kind, script_root='project')
+        assert bd.script_root == 'project'
+
+    def test_script_root_bogus_rejected(self):
+        with pytest.raises(ValidationError):
+            BeforeDone.model_validate(
+                {'script': 'scripts/x.sh', 'timeout_secs': 60, 'script_root': 'elsewhere'},
+            )
+
+    @pytest.mark.parametrize(
+        ('script_root', 'kind', 'refused'),
+        [
+            ('project', 'deploy', False),
+            ('project', 'predicate', False),
+            ('factory', 'predicate', False),
+            ('factory', 'deploy', True),
+        ],
+    )
+    def test_script_root_kind_conflict_matches_the_model(self, script_root, kind, refused):
+        conflict = script_root_kind_conflict(script_root, kind)
+
+        assert (conflict is not None) == refused
+        if conflict is not None:
+            with pytest.raises(ValidationError, match=re.escape(conflict)):
+                BeforeDone(script='scripts/x.sh', timeout_secs=60, kind=kind, script_root=script_root)
+
 
 class TestDoneProvenance:
     def test_merged_with_commit_constructs(self):
@@ -200,11 +247,17 @@ class TestDoneProvenance:
             DoneProvenance(kind='bogus')  # type: ignore[arg-type]
 
     def test_extra_subfields_retained_through_round_trip(self):
+        dp = DoneProvenance.model_validate(
+            {'kind': 'deterministic-deploy-scheduled', 'x_restart_reason': 'self-restart'}
+        )
+        assert dp.model_dump()['x_restart_reason'] == 'self-restart'
+
+    def test_scheduled_deploy_evidence_round_trips(self):
         dp = DoneProvenance(
             kind='deterministic-deploy-scheduled',
             unit='fused-memory.service',
-            transient_unit='fused-memory-restart-1234.service',  # type: ignore[call-arg]
-            fire_delay_secs=5,  # type: ignore[call-arg]
+            transient_unit='fused-memory-restart-1234.service',
+            fire_delay_secs=5,
         )
         dumped = dp.model_dump()
         assert dumped['transient_unit'] == 'fused-memory-restart-1234.service'
@@ -2030,6 +2083,27 @@ class TestParseMetadataFailurePolicy:
         ]
         assert offending == [], f'Expected no unknown_key warning for files_tagged_at; got: {offending}'
 
+    def test_dedupe_skipped_metadata_key_is_blessed(self):
+        """The task curator's no-dedupe-verdict marker must not census-warn (task 4503).
+
+        Stamped on every create the curator's dedupe pass did not judge, and
+        the key a re-dedupe sweep selects on. The unblessed control key shows
+        the scan is live for this blob.
+        """
+        _, warnings = parse_metadata(
+            {
+                'dedupe_skipped': {
+                    'reason': 'create: curator-failed: llm unavailable',
+                    'at': '2026-10-18T12:00:00+00:00',
+                },
+                'dedupe_skipped_control': 'v',
+            },
+            direction='read',
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'dedupe_skipped' not in unknown_key_fields
+        assert 'dedupe_skipped_control' in unknown_key_fields
+
     def test_recurrence_metadata_key_is_blessed(self):
         """The recurring-chain link spec is deliberately blessed AND registered (task 4676).
 
@@ -2068,6 +2142,56 @@ class TestParseMetadataFailurePolicy:
         )
         unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
         assert 'recurrence' not in unknown_key_fields
+
+    def test_merge_lane_metadata_key_is_blessed(self):
+        """The merge-queue priority-lane selector must not census-warn (task 4888).
+
+        ``merge_lane`` is the sole selector for a merge-queue priority lane
+        anywhere in the system: it is machine-written by the orchestrator on
+        the hotfix/main-health task classes and read by
+        ``orchestrator/src/orchestrator/merge_queue.py::lane_for_task_metadata``,
+        which is what decides whether a request is picked ahead of the normal
+        lane. Unblessed, every carrier emits a ``code=unknown_key`` census
+        line. RED until ``'merge_lane'`` is added to
+        ``_BLESSED_METADATA_KEYS``.
+
+        The blessing ground and the carrier census live in the frozenset
+        entry's own comment, which is their single in-repo copy; this
+        docstring cites it rather than restating the figures.
+
+        The parametrized
+        test_every_blessed_metadata_key_individually_suppresses_unknown_key_warning
+        above picks the key up for free once blessed — this test pins the
+        specific key with a real in-vocabulary value, matching the two named
+        precedents above, and carries the rationale rather than the coverage.
+        """
+        _, warnings = parse_metadata({'merge_lane': 'high'}, direction='read')
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'merge_lane'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for merge_lane; got: {offending}'
+        )
+
+    def test_claimant_exception_metadata_key_is_blessed(self):
+        """``claimant_exception`` is a permanent machine stamp written on every
+        explicit-claimant terminal write (docs/prds/claimant-invariant-detection.md
+        D-5), so it must not census-warn on read.
+        """
+        stamp = {
+            'claimant_run_id': 'run/s/pid=1',
+            'target_status': 'done',
+            'agent_id': 'a',
+            'tag': None,
+            'stamped_at': '2026-10-04T00:00:00+00:00',
+        }
+        _, warnings = parse_metadata({'claimant_exception': stamp}, direction='read')
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'claimant_exception'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for claimant_exception; got: {offending}'
+        )
 
     def test_cross_repo_metadata_keys_are_blessed(self):
         """The cross-repo deliverable marker must not census-warn (task 3004).
@@ -2148,6 +2272,46 @@ class TestParseMetadataFailurePolicy:
         ]
         assert offending == [], (
             f'Expected no unknown_key warning for last_blocked_at; got: {offending}'
+        )
+
+    def test_pending_since_metadata_keys_are_blessed(self):
+        """The scheduler's pending-wait anchor must not census-warn (task 3816).
+
+        PRD plans/scheduler-dispatch-scoring-and-lock-layer-prd.md §C1. Both
+        keys are MACHINE-written Tier-A conventions, the same profile as the
+        already-blessed `last_blocked_at` / `files_tagged_at` stamps above.
+
+        `pending_since` is the durable wall-clock anchor written by the
+        fused-memory status chokepoint on every `* -> pending` landing
+        (`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::
+        stamp_pending_since`, called from `add_task`, `set_task_status` and
+        `set_status_and_stamp_audit`), and READ back by the orchestrator
+        scheduler's age term (task beta) and the watchdog idle clock (task
+        delta) — so it is load-bearing on both sides.
+
+        `pending_since_backfilled` marks the population anchored by the
+        one-shot v4 -> v5 migration from `updated_at` rather than observed
+        live, so the deliberate under-aging that back-fill introduces stays
+        COUNTABLE instead of invisible (PRD design decision 4).
+
+        Unblessed, every stamped status write in the factory — i.e. all of
+        them — would manufacture a `code=unknown_key` census line. RED until
+        both keys are added to `_BLESSED_METADATA_KEYS`.
+        """
+        _, warnings = parse_metadata(
+            {
+                'pending_since': '2026-08-06T10:00:00.000Z',
+                'pending_since_backfilled': True,
+            },
+            direction='read',
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'pending_since' not in unknown_key_fields, (
+            f'Expected no unknown_key warning for pending_since; got: {sorted(unknown_key_fields)}'
+        )
+        assert 'pending_since_backfilled' not in unknown_key_fields, (
+            'Expected no unknown_key warning for pending_since_backfilled; '
+            f'got: {sorted(unknown_key_fields)}'
         )
 
     def test_finding_provenance_metadata_keys_are_blessed(self):

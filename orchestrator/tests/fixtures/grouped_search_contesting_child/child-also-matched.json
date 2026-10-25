@@ -1,0 +1,53 @@
+{
+  "results": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "content": "The merge-lane verify timeout is 600 seconds.",
+      "category": "procedural_knowledge",
+      "source_store": "mem0",
+      "relevance_score": 0.9,
+      "provenance": [],
+      "temporal": null,
+      "entities": [],
+      "metadata": {},
+      "created_at": "2026-08-01T00:00:00+00:00",
+      "topic_anchored": false,
+      "grouped": {
+        "amendments": [
+          {
+            "id": "22222222-2222-4222-8222-222222222221",
+            "digest": "Applies to coalesce-train verifies as well.",
+            "created_at": "2026-08-10T00:00:00+00:00",
+            "kind": "amendment"
+          },
+          {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "digest": "Correction: the 600-second merge-lane verify timeout is outdated. Since the coalesce-train rollout the lane runs every verify under a 900-second ceiling, set as git.merge_verify_timeout_seconds in dark-factory-orchestrator.yaml, and a verif…",
+            "created_at": "2026-09-20T00:00:00+00:00",
+            "kind": "amendment",
+            "contested": true
+          }
+        ],
+        "amendment_count": 2,
+        "sighting_count": 0
+      }
+    },
+    {
+      "id": "22222222-2222-4222-8222-222222222222",
+      "content": "Correction: the 600-second merge-lane verify timeout is outdated. Since the coalesce-train rollout the lane runs every verify under a 900-second ceiling, set as git.merge_verify_timeout_seconds in dark-factory-orchestrator.yaml, and a verify that overruns it is parked as verify_timeout rather than retried. Plan around 900 seconds, not 600.",
+      "category": "procedural_knowledge",
+      "source_store": "mem0",
+      "relevance_score": 0.8,
+      "provenance": [],
+      "temporal": null,
+      "entities": [],
+      "metadata": {
+        "kind": "amendment",
+        "parent_id": "11111111-1111-4111-8111-111111111111",
+        "x_contested": true
+      },
+      "created_at": "2026-09-20T00:00:00+00:00",
+      "topic_anchored": false
+    }
+  ]
+}

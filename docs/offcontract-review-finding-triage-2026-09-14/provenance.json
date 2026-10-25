@@ -1,0 +1,176 @@
+{
+  "sweep": "offcontract-review-finding-triage",
+  "task_id": "5430",
+  "origin_escalation": "esc-2896-10",
+  "measured_at": "2026-09-14T16:19:32Z",
+  "branch": "task/5430",
+  "branch_base_sha": "99ab62335a12d7df4982aa8bc194e08a5c344bd0",
+  "branch_base_is_origin_main_tip_at_measurement": true,
+  "branch_commits_beyond_base_at_measurement": 8,
+  "script_sha": "907353ec41ce9944567ab1bf9cf0bf4626508e91",
+  "script_path": "scripts/audit_offcontract_review_findings.py",
+  "what_this_run_touched": "Repo: only the four artifacts in this directory plus the audit script and its test. The 17 subsystem files named by the findings were READ ONLY and none was modified — this task fixes nothing by design. No database was opened. No task was written except the follow-up tasks recorded in report.json -> dispositions[].followup_ticket.",
+  "corpus": {
+    "path": "docs/offcontract-review-finding-triage-2026-09-14/corpus/",
+    "files": 14,
+    "provenance": ".worktrees/.task-meta/<task>/verdicts/reviewer_comprehensive.json, copied byte-for-byte",
+    "copied_at": "2026-09-14T16:35 local (commit 154f41a257)",
+    "integrity": "sha256 verified against source at copy time; see commit 154f41a257",
+    "why_frozen": "`.worktrees/` is gitignored (.gitignore:15), so the source files are untracked runtime state that later re-reviews OVERWRITE IN PLACE. Task 2896's verdict was already overwritten before this task began (mtime 2026-09-12 09:44). Without this copy no reviewer can re-derive a single number below.",
+    "layout_note": "Stored flat as <task>.json. The audit script censuses the live tree layout `<root>/*/verdicts/*.json`, so re-measuring the frozen copies means reshaping them first. The exact command is in `derivation_rule_mirrored.reproduce_frozen_census` — the script was deliberately NOT taught a second layout for a one-off measurement."
+  },
+  "census_live": {
+    "root": "/home/leo/src/dark-factory/.worktrees/.task-meta",
+    "command": "python scripts/audit_offcontract_review_findings.py --json",
+    "files": 1267,
+    "unparseable": 0,
+    "unlocatable": 0,
+    "verdicts_with_issues": 943,
+    "issues": 3331,
+    "off_contract_severity": 74,
+    "location_less": 121,
+    "roles": {
+      "reviewer_comprehensive": 3331
+    },
+    "emitted_first": "2026-07-17T08:32:37.879762+00:00",
+    "emitted_last": "2026-09-14T16:00:02.479590+00:00",
+    "triage_population": 22
+  },
+  "census_frozen": {
+    "root": "the 14 frozen verdicts, reshaped into the tree layout",
+    "files": 14,
+    "unparseable": 0,
+    "unlocatable": 0,
+    "verdicts_with_issues": 14,
+    "issues": 54,
+    "off_contract_severity": 51,
+    "location_less": 51,
+    "roles": {
+      "reviewer_comprehensive": 54
+    },
+    "emitted_first": "2026-07-30T23:36:28.818589+00:00",
+    "emitted_last": "2026-09-12T08:44:21.006640+00:00",
+    "triage_population": 22,
+    "note_on_emitted_last": "2026-09-12 is task 2896's OVERWRITING verdict, not an original emission. It is the single most direct piece of evidence in this artifact set that the corpus is mutable: every other frozen verdict was emitted between 2026-07-30 and 2026-08-09.",
+    "note_on_the_three_on_contract_issues": "54 issues - 51 off-contract = 3, and all three are task 2896's post-overwrite `suggestion` issues. In this corpus off_contract_severity and location_less are the SAME 51 records."
+  },
+  "population_identity_check": {
+    "question": "Does the frozen corpus still contain exactly the findings the roster names?",
+    "live_triage_population_ids": 22,
+    "frozen_triage_population_ids": 22,
+    "live_set_equals_frozen_set": true,
+    "roster_minus_frozen": [
+      "2896-correctness-0"
+    ],
+    "frozen_minus_roster": [],
+    "reading": "The 22 live findings, the 22 frozen findings and 22 of the 23 roster entries are the SAME set. The one roster entry with no record anywhere is 2896's, which is the finding the overwrite destroyed. This is the completeness proof for the roster: it was transcribed from the task description, and it reconciles with the corpus exactly."
+  },
+  "census_drift": {
+    "why_this_is_a_finding_not_a_footnote": "The task description's provenance stanza states six falsifiable measurements and concludes 'so this residue is closed-ended and will not grow'. It does not grow. It SHRINKS. Two of the six no longer hold, and both moved DOWNWARD because re-reviews overwrite verdict files in place. A triage whose job is honest accounting cannot restate a stale census as current fact, and this drift bounds how much of the residue is recoverable at all.",
+    "claims": [
+      {
+        "claim": "1228 stored verdicts",
+        "measured_2026_09_14": 1267,
+        "verdict": "DRIFTED UP",
+        "cause": "new tasks accumulate verdicts continuously"
+      },
+      {
+        "claim": "3158 issues across 905 verdicts",
+        "measured_2026_09_14": "3331 issues across 943 verdicts",
+        "verdict": "DRIFTED UP",
+        "cause": "same — new tasks"
+      },
+      {
+        "claim": "76 off-contract severity",
+        "measured_2026_09_14": 74,
+        "verdict": "SHRANK",
+        "cause": "two off-contract verdicts were overwritten by re-reviews; task 2896's is one of them"
+      },
+      {
+        "claim": "123 issues lacked `location`",
+        "measured_2026_09_14": 121,
+        "verdict": "SHRANK",
+        "cause": "the same two overwrites — every off-contract issue also lacked `location`"
+      },
+      {
+        "claim": "every location-less issue came from role reviewer_comprehensive",
+        "measured_2026_09_14": "121/121 location-less and 74/74 off-contract, all reviewer_comprehensive",
+        "verdict": "CONFIRMED, but see the caveat below"
+      },
+      {
+        "claim": "emission window 2026-07-19 to 2026-08-10 inclusive",
+        "measured_2026_09_14": "2026-07-19T01:24:01Z .. 2026-08-10T12:33:45Z for BOTH the off-contract and the location-less population",
+        "verdict": "CONFIRMED EXACTLY"
+      }
+    ],
+    "the_two_lost_findings_reconcile_exactly": {
+      "description_said": "76 off-contract = 23 medium-and-above + 53 low/minor/nit/trivial",
+      "measured_now": "74 off-contract = 22 medium-and-above + 52 low/minor/nit/trivial",
+      "reading": "Exactly one finding was lost from each band. The one lost from the triage band is task 2896's `high` — the highest-severity finding in this task's own roster, and the only one already known to have been a genuine defect. The description called the population closed-ended; it lost its most important member in the three days between being written and being read.",
+      "severity_breakdown_off_contract_now": {
+        "low": 38,
+        "medium": 17,
+        "minor": 10,
+        "high": 3,
+        "nit": 2,
+        "trivial": 2,
+        "moderate": 1,
+        "major": 1
+      },
+      "description_counted_four_highs": "The description says 'the four `high` plus the one `major`'. Only 3 highs remain measurable. The missing fourth is 2896's. That single digit is the cleanest available proof of the erosion."
+    },
+    "caveat_on_the_role_claim": {
+      "measured": "Two role spellings exist as verdict files in the tree: reviewer_comprehensive.json (1238 files) and merger.json (29 files). All 29 merger verdicts carry ZERO issues.",
+      "why_it_matters": "'Every off-contract issue came from reviewer_comprehensive' is TRUE but nearly vacuous: reviewer_comprehensive is the only role that emits issues at all here, so the measurement does not single it out against peers. It is evidence about which role writes issues, not about which role writes them badly. Recorded because the description's phrasing invites the stronger reading."
+    },
+    "the_two_gates_are_separate_populations": {
+      "off_contract_severity": 74,
+      "location_less": 121,
+      "all_off_contract_are_also_location_less": true,
+      "location_less_but_ON_contract_severity": 47,
+      "breakdown_of_those_47": {
+        "suggestion": 45,
+        "blocking": 2
+      },
+      "reading": "The location-less defect is BROADER than the severity defect: 47 further findings lacked `location` while carrying a contract severity, including 2 `blocking` ones. Those 47 were still adjudicated, because severity is what the gates key on for scope. Only the 74 in the intersection were silently dropped. This is why the census keeps the two tallies separate — folding them together would hide that the two failures have different blast radii."
+    }
+  },
+  "derivation_rule_mirrored": {
+    "issue_enumeration": "verdict.issues[] of every <root>/*/verdicts/*.json",
+    "off_contract_severity_rule": "issue.severity not in {blocking, suggestion} (CONTRACT_SEVERITIES)",
+    "location_less_rule": "issue has no non-blank `location` key, regardless of `file`/`line`",
+    "triage_band_rule": "issue.severity in {high, major, medium, moderate} (TRIAGE_SEVERITIES)",
+    "selection_rule": "off_contract_severity AND triage_band; role is never a filter",
+    "id_rule": "<task>-<category>-<index in verdict.issues[]>, so every id re-resolves against a frozen file",
+    "six_issue_schemas_normalized": "headline from `title` else `short_summary`; primary detail from `description` else `detail` else `summary`; then `failure_scenario`/`reproduce`/`suggestion`/`suggested_fix`/`recommendation` appended when present. See scripts/audit_offcontract_review_findings.py::normalize_issue — the SPOT for the variance.",
+    "reproduce_live_census": "python scripts/audit_offcontract_review_findings.py --json",
+    "reproduce_frozen_census": "F=$(mktemp -d)/task-meta; for f in docs/offcontract-review-finding-triage-2026-09-14/corpus/*.json; do t=$(basename \"$f\" .json); mkdir -p \"$F/$t/verdicts\"; cp \"$f\" \"$F/$t/verdicts/reviewer_comprehensive.json\"; done; python scripts/audit_offcontract_review_findings.py --root \"$F\" --json",
+    "reproduce_completeness_check": "python scripts/audit_offcontract_review_findings.py --validate docs/offcontract-review-finding-triage-2026-09-14/report.json"
+  },
+  "prior_fix_corroborated": {
+    "commit": "b57f8c1402",
+    "claim_in_task_description": "task 2896's storm-escalation dedup bug was fixed by hand on 2026-09-11",
+    "is_ancestor_of_origin_main": true,
+    "note": "Ancestry is confirmed, which is necessary but not sufficient for the (a) disposition. Whether that commit actually changed the filing/query key is checked in report.json, not assumed from the description."
+  },
+  "what_is_out_of_scope": {
+    "the_52_low_severity_off_contract_findings": "low/minor/nit/trivial. The description says 53; 52 are measurable today, the same single-loss-per-band drift recorded above. Deliberately not triaged.",
+    "the_47_location_less_on_contract_findings": "Not part of this task's roster: they were adjudicated normally, since severity is what the gates key on for scope. Recorded here only to bound the two defects' blast radii.",
+    "recurrence_prevention": "Owned by the companion submit_review_verdict validation task.",
+    "fixes": "Every live defect is filed as a follow-up task; none is fixed here."
+  },
+  "script_amended_after_measurement": {
+    "why": "A code review of this task's own audit script surfaced five robustness findings; all five were reproduced and fixed in an amendment pass (commits a77ce79f3e, 296b50e38b). `script_sha` above is left as-is: it is the sha the numbers below were MEASURED with, and rewriting it would make this file claim a provenance it does not have.",
+    "script_sha_after_amendment": "431beb69819de982f04fc23208f14df95dfb210e",
+    "what_changed": [
+      "An unreadable `--root` now raises instead of returning an all-zero census and exit 0.",
+      "Both output modes now name the verdict glob, so a zero-file census says what it searched for.",
+      "A wrongly-TYPED payload is tallied as `unparseable` instead of aborting the walk with an uncaught AttributeError.",
+      "`off_contract_severity` now inspects the refused residue's severity instead of assuming all of it was off-contract.",
+      "`select_population` returns `Population(issues, unselectable)`, so refusals it cannot roster are reported rather than dropped.",
+      "`validate_report` no longer certifies a report with an empty, absent or misspelled roster, nor pairs two entries that both lack an `id`."
+    ],
+    "numbers_unchanged": "Re-measured after the amendment: off_contract_severity 74, location_less 121, triage_population 22, unparseable 0, unlocatable 0, triage_unselectable 0 — every load-bearing number in `census_live` is identical. `files`, `issues` and `verdicts_with_issues` read 1271/3344/947 against the 1267/3331/943 recorded below; that is the ongoing corpus growth `census_drift` already documents, not an effect of the amendment. The four findings about the refused residue were latent throughout: the live tree has never measured a nonzero `unlocatable`.",
+    "reproduce_completeness_check_after_amendment": "Unchanged command, unchanged result: 0 violations, exit 0."
+  }
+}

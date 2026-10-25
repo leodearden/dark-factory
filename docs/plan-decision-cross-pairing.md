@@ -112,7 +112,7 @@ regression. Tests replay only the committed corpus
 Two **independent** findings. They are kept separate deliberately, because they
 fail for different reasons and would be fixed by different work.
 
-### (a) The write-time tripwire is installed on no production server
+### (a) The write-time tripwire was installed on no production server (2026-08-16; closed 2026-08-20)
 
 Measured 2026-08-16. `grep -rn add_middleware --include=*.py` over the repo
 returns exactly **two** in-repo hits, both inside `shared/tests/`
@@ -123,14 +123,37 @@ nowhere outside its own definition in `shared/src/shared/mcp_markup_middleware.p
 and those tests.
 
 - Task **3689** (build `MarkupGuardMiddleware`) — `done`.
-- Task **3690** (register it on all four servers) — **`pending`**.
+- Task **3690** (register it on all four servers) — **registered nowhere as of this
+  measurement**.
+  *Re-attributed: on 2026-08-19 — after this measurement — PRD §9 split that leaf
+  three ways (operator commit `965f3206eb`). **γ1 / task 3690** keeps escalation +
+  verdict-tools, **γ2 / task 4457** carries plan-tools, **γ3 / task 4458** carries
+  fused-memory. The plan-tools registration this section's argument turns on is
+  **γ2 / task 4457**, not 3690.*
 
-**So containment at plan-tools is currently ZERO, for BOTH damage classes.**
-This is a genuine and damning observation about today, and it is recorded here
+**So containment at plan-tools was ZERO on 2026-08-16, for BOTH damage classes.**
+That was a genuine and damning observation about that day, and it is recorded here
 rather than as a test: an assertion that the middleware is registered nowhere
-would go RED the moment 3690 lands, punishing the work that closes the gap.
+would go RED the moment **any** of γ1 / γ2 / γ3 lands — the assertion spans all
+four servers, so no single task id owns it — punishing the work that closes the gap.
 
-### (b) Even once 3690 lands, the tripwire cannot see this shape
+**Re-measured 2026-08-20: the gap is closed, and this finding is now historical.**
+γ1 (task **3690**), γ2 (task **4457**) and γ3 (task **4458**) are all `done`, and the
+tripwire is installed on all four production servers:
+
+| Server | Leaf | Registration site | Landed |
+|---|---|---|---|
+| escalation | γ1 / 3690 | `escalation/src/escalation/server.py::create_server` — `add_middleware` | `07a967fab0` |
+| verdict-tools | γ1 / 3690 | `orchestrator/src/orchestrator/mcp/verdict_tools.py::create_server` — `FORWARD_REPAIR` | `0beb3c706a` |
+| plan-tools | γ2 / 4457 | `orchestrator/src/orchestrator/mcp/plan_tools.py::create_server` — `REJECT_WITH_REPAIR` | `37eed69c97` |
+| fused-memory | γ3 / 4458 | `fused_memory/server/markup_guard.py::install_markup_guard`, called from `fused_memory/server/main.py` | `60293e0d8c` |
+
+The 2026-08-16 measurement and its grep are left exactly as written above and this
+re-measurement is recorded **alongside** them, per the convention stated in
+`plans/toolcall-markup-containment-prd.capability-manifest.md`. Finding (b) below is
+**not** closed by this and still stands.
+
+### (b) Now that γ1–γ3 have landed, the tripwire *still* cannot see this shape
 
 The middleware decides by running `shared.toolcall_markup.detect` over each
 incoming string argument. Measured over the committed corpus: **34 of the 46
@@ -138,8 +161,9 @@ strings** across the 23 positive entries carry **no envelope literal at all**,
 so `detect` returns `None` and the write is admitted.
 
 This is not reasoning from the detector's contract — it is a pinned
-measurement, taken today without waiting for 3690, by driving the **real**
-`MarkupGuardMiddleware` through the shared in-process harness with a
+measurement, taken 2026-08-16 without waiting for the plan-tools registration
+(γ2 / task 4457), by driving the **real** `MarkupGuardMiddleware` through the
+shared in-process harness with a
 cross-paired `add_design_decision` call. See
 `shared/tests/test_decision_pairing_containment.py`:
 
@@ -308,8 +332,12 @@ a negative `N` is rejected rather than silently disabling the gate.
   is a damage class it **does not cover**, and section 3(b) above measures why
   its C2 tripwire cannot be extended to cover it.
 - Task **3689** (`done`) — `MarkupGuardMiddleware` itself.
-- Task **3690** (`pending`) — registers that middleware on all four servers.
-  Until it lands, containment at plan-tools is zero for both damage classes.
+- Task **3690** (`done`) — **γ1**: registers that middleware on the escalation and
+  verdict-tools servers. PRD §9 split the original all-four-servers leaf three ways on
+  2026-08-19 (`965f3206eb`), so 3690 no longer covers plan-tools or fused-memory.
+- Task **4457** (`done`) — **γ2**: registers it on **plan-tools**. This is the task that
+  closed the containment gap section 3(a) measured; it landed 2026-08-20.
+- Task **4458** (`done`) — **γ3**: adapts the guard to fused-memory's bundled FastMCP.
 - Task **3692** (`done`) — read-time envelope repair; declined to assert repair
   of 3567, and its rewrites are why 3567/4096 are inconclusive as wire evidence.
 - Task **3865** (`pending`) — the supersede mechanism and reader-side filter.

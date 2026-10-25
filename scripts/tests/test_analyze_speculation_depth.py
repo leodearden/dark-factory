@@ -24,14 +24,15 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import analyze_speculation_depth as mod
+import pytest
 
 
-def _mv(task_id, passed, *, attempt=0, depth=None):
-    """Build a synthetic merge_verify event dict."""
-    return {
-        'task_id': task_id,
-        'data': {'passed': passed, 'attempt': attempt, 'depth': depth},
-    }
+def _mv(task_id, passed, *, attempt=0, depth=None, chain_items=None):
+    """Build a synthetic merge_verify event dict; ``chain_items`` is written only when given."""
+    data = {'passed': passed, 'attempt': attempt, 'depth': depth}
+    if chain_items is not None:
+        data['chain_items'] = chain_items
+    return {'task_id': task_id, 'data': data}
 
 
 def _ma(task_id, outcome):
@@ -68,15 +69,15 @@ F2_MERGE_ATTEMPT = [
 ]
 
 # ---------------------------------------------------------------------------
-# Fixture F3: real depth signal — depth0/depth1/depth2 buckets.
+# Fixture F3: chain_items buckets 1/2/4, with legacy depth labels riding along.
 # ---------------------------------------------------------------------------
 
 F3_MERGE_VERIFY = [
-    _mv('d0-1', True, depth=0),
-    _mv('d0-2', True, depth=0),
-    _mv('d1-1', True, depth=1),
-    _mv('d1-2', False, depth=1),
-    _mv('d2-1', False, depth=2),
+    _mv('c1-1', True, depth=2, chain_items=1),
+    _mv('c1-2', True, depth=0, chain_items=1),
+    _mv('c2-1', True, depth=1, chain_items=2),
+    _mv('c2-2', False, depth=1, chain_items=2),
+    _mv('c4-1', False, depth=3, chain_items=4),
 ]
 
 
@@ -139,69 +140,67 @@ class TestComputeCalibrationF2:
 
 
 # ---------------------------------------------------------------------------
-# compute_per_depth — buckets merge_verify events by a None-safe int()
-# coercion of data['depth']; absent/None/unparseable depths are skipped.
+# compute_per_chain_items / is_legacy_deep_label — the analyzer keys on
+# chain_items, never on the legacy depth label.
 # ---------------------------------------------------------------------------
 
-class TestComputePerDepth:
-    def test_pass_total_per_depth(self):
-        per_depth = mod.compute_per_depth(F3_MERGE_VERIFY)
-        # compute_per_depth returns dict | None — the None is REAL (it is
-        # format_report's CONFOUNDED runner-split trigger), so it is narrowed
-        # here rather than narrowed away in the signature. These fixtures all
-        # carry usable depths, so None is unreachable in this class.
-        assert per_depth is not None
-        counts = {d: (v['pass'], v['total']) for d, v in per_depth.items()}
-        assert counts == {0: (2, 2), 1: (1, 2), 2: (0, 1)}
+class TestComputePerChainItems:
+    def test_pass_total_per_chain_items(self):
+        per_chain_items = mod.compute_per_chain_items(F3_MERGE_VERIFY)
+        # None is format_report's CONFOUNDED trigger; F3 always contributes.
+        assert per_chain_items is not None
+        counts = {k: (v['pass'], v['total']) for k, v in per_chain_items.items()}
+        assert counts == {1: (2, 2), 2: (1, 2), 4: (0, 1)}, f'{counts=}'
 
-    def test_rate_per_depth(self):
-        per_depth = mod.compute_per_depth(F3_MERGE_VERIFY)
-        assert per_depth is not None
-        rates = {d: v['rate'] for d, v in per_depth.items()}
-        assert rates == {0: 1.0, 1: 0.5, 2: 0.0}
+    def test_rate_per_chain_items(self):
+        per_chain_items = mod.compute_per_chain_items(F3_MERGE_VERIFY)
+        assert per_chain_items is not None
+        rates = {k: v['rate'] for k, v in per_chain_items.items()}
+        assert rates == {1: 1.0, 2: 0.5, 4: 0.0}, f'{rates=}'
 
-    def test_string_depth_coerced_to_int(self):
-        # speculative_merge's _emit_speculative str-converts every value,
-        # so a real event can carry depth as the string "1".
-        events = [_mv('s', True, depth='1')]
-        per_depth = mod.compute_per_depth(events)
-        assert per_depth is not None
-        assert set(per_depth) == {1}
-        assert per_depth[1]['pass'] == 1
-        assert per_depth[1]['total'] == 1
+    @pytest.mark.parametrize(
+        'untrusted', [None, '2', True, 0, -1, 2.0],
+        ids=['none', 'str', 'bool', 'zero', 'negative', 'float'],
+    )
+    def test_untrusted_chain_items_is_skipped_not_coerced(self, untrusted):
+        events = [{'task_id': 'u', 'data': {'passed': True, 'chain_items': untrusted}}]
+        assert mod.compute_per_chain_items(events) is None, f'{untrusted=!r}'
 
-    def test_none_depth_excluded(self):
-        events = [_mv('n', True, depth=None), _mv('z', True, depth=0)]
-        per_depth = mod.compute_per_depth(events)
-        assert per_depth is not None
-        assert set(per_depth) == {0}
+    def test_depth_label_without_chain_items_contributes_no_bucket(self):
+        events = [_mv('legacy', True, depth=3), _mv('live', True, depth=3, chain_items=1)]
+        per_chain_items = mod.compute_per_chain_items(events)
+        assert per_chain_items is not None
+        assert set(per_chain_items) == {1}, f'{per_chain_items=}'
 
-    def test_missing_depth_key_excluded(self):
-        # historical (pre-2340) events carry no 'depth' key at all.
-        events = [{'task_id': 'm', 'data': {'passed': True}}]
-        per_depth = mod.compute_per_depth(events)
-        assert not per_depth
+    def test_no_chain_items_anywhere_yields_none(self):
+        assert mod.compute_per_chain_items(F2_MERGE_VERIFY) is None
 
-    def test_unparseable_depth_excluded(self):
-        events = [_mv('u', True, depth='not-a-number')]
-        per_depth = mod.compute_per_depth(events)
-        assert not per_depth
+    def test_the_depth_curve_has_no_reader_left(self):
+        assert not hasattr(mod, 'compute_per_depth')
 
-    def test_no_depth_anywhere_yields_empty_result(self):
-        # F2: every event has an explicit depth=None — no real signal.
-        # This is the fallback trigger for format_report's CONFOUNDED path.
-        per_depth = mod.compute_per_depth(F2_MERGE_VERIFY)
-        assert not per_depth
+
+class TestIsLegacyDeepLabel:
+    @pytest.mark.parametrize('depth', [3, '2'], ids=['int', 'str'])
+    def test_pre_chain_items_deep_label(self, depth):
+        assert mod.is_legacy_deep_label({'depth': depth}), f'{depth=!r}'
+
+    @pytest.mark.parametrize(
+        'data',
+        [{'depth': 1}, {'depth': 0}, {'depth': None}, {}, {'depth': 'abc'},
+         {'depth': 3, 'chain_items': 1}],
+        ids=['one', 'zero', 'none', 'absent', 'unparseable', 'post-chain_items'],
+    )
+    def test_not_a_legacy_deep_label(self, data):
+        assert not mod.is_legacy_deep_label(data), f'{data=}'
 
 
 # ---------------------------------------------------------------------------
-# format_report — NO-depth calibration falls back to a runner-split section
-# explicitly labelled CONFOUNDED, with a warning (no real depth signal).
+# format_report — the chain_items curve when there is one, else a runner-split
+# section explicitly labelled CONFOUNDED with a warning.
 # ---------------------------------------------------------------------------
 
-class TestFormatReportNoDepth:
-    """format_report(calibration, per_depth=None) on F2 (no event carries a
-    depth field, so per_depth is None/empty — the fallback trigger)."""
+class TestFormatReportNoChainItems:
+    """format_report(calibration, None) on F2 (no event carries chain_items)."""
 
     @classmethod
     def setup_class(cls):
@@ -234,6 +233,35 @@ class TestFormatReportNoDepth:
         assert 'CONFOUNDED' in self.report
         assert 'runner' in self.report.lower()
         assert 'WARNING' in self.report
+
+    def test_fallback_names_the_missing_chain_items_signal(self):
+        assert 'carries chain_items >= 1' in self.report, self.report
+        assert 'task 2340' not in self.report, self.report
+
+    def test_no_legacy_line_when_there_are_no_legacy_rows(self):
+        assert 'legacy depth>=2 rows' not in self.report, self.report
+
+
+class TestFormatReportChainItems:
+    @classmethod
+    def setup_class(cls):
+        cal = mod.compute_calibration(F3_MERGE_VERIFY, [])
+        cls.report = mod.format_report(cal, mod.compute_per_chain_items(F3_MERGE_VERIFY), 2)
+
+    def test_block_header_names_the_truthful_field(self):
+        assert '=== per-chain_items P(pass|chain_items) ===' in self.report, self.report
+
+    def test_one_line_per_bucket(self):
+        lines = self.report.splitlines()
+        assert '  chain_items=1: 2/2 = 1.000' in lines, self.report
+        assert '  chain_items=2: 1/2 = 0.500' in lines, self.report
+        assert '  chain_items=4: 0/1 = 0.000' in lines, self.report
+        assert not any(line.lstrip().startswith('depth=') for line in lines), self.report
+
+    def test_legacy_rows_line(self):
+        assert 'legacy depth>=2 rows (pre-chain_items, not in the curve): 2' in self.report, (
+            self.report
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -303,3 +331,41 @@ class TestMainCLI:
         captured = capsys.readouterr()
         assert ret == 0
         assert '0.5' in captured.out  # F2 per-attempt pass rate == 3/6 == 0.5
+
+    def test_main_opens_db_read_only(self, tmp_path, monkeypatch):
+        """main's handle is opened with a mode=ro URI, so a write on it raises."""
+        db_path = tmp_path / 'runs.db'
+        _seed_events_db(
+            str(db_path),
+            merge_verify_events=F1_MERGE_VERIFY,
+            merge_attempt_events=[],
+        )
+        monkeypatch.setattr(mod, 'load_events', _load_events_attempting_write)
+
+        with pytest.raises(sqlite3.OperationalError, match='readonly'):
+            mod.main([str(db_path)])
+
+    def test_main_reports_chain_items_and_counts_legacy_rows(self, tmp_path, capsys):
+        db_path = str(tmp_path / 'runs.db')
+        _seed_events_db(
+            db_path,
+            merge_verify_events=[
+                _mv('legacy', True, depth=3),
+                _mv('live', True, depth=3, chain_items=4),
+            ],
+            merge_attempt_events=[],
+        )
+
+        assert mod.main([db_path, '--since', '30']) == 0
+
+        out = capsys.readouterr().out
+        assert '  chain_items=4: 1/1 = 1.000' in out, out
+        assert 'legacy depth>=2 rows (pre-chain_items, not in the curve): 1' in out, out
+        assert 'depth=3' not in out, out
+
+
+def _load_events_attempting_write(conn, event_type, since_days):
+    """A load_events stand-in that attempts a write on the handle main passes it."""
+    conn.execute(
+        "INSERT INTO events (timestamp, run_id, event_type) VALUES ('t', 'r', 'x')"
+    )

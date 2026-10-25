@@ -27,8 +27,8 @@ from _orch_helpers import pydantic_spec
 from _workflow_helpers import FakeScheduler
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_lane.types import QueuedBranch
 
 
 @pytest.fixture(autouse=True)
@@ -48,11 +48,11 @@ class TestWorkerSideSurface:
 
     def test_import_train_callbacks_and_factory(self) -> None:
         """Importing TrainCallbacks and TrainCallbackFactory from merge_queue must not raise."""
-        from orchestrator.merge_queue import TrainCallbackFactory, TrainCallbacks  # noqa: F401
+        from orchestrator.merge_lane.types import TrainCallbacks  # noqa: F401
 
     def test_train_callbacks_holds_two_fields(self) -> None:
         """TrainCallbacks is a dataclass with status_check and mark_member_done attributes."""
-        from orchestrator.merge_queue import TrainCallbacks
+        from orchestrator.merge_lane.types import TrainCallbacks
 
         async def _fake_status_check(ids: list[str]) -> dict[str, str]:
             return {}
@@ -69,7 +69,7 @@ class TestWorkerSideSurface:
 
     def test_worker_accepts_train_callback_factory_kwarg(self) -> None:
         """SpeculativeMergeWorker stores the injected factory as _train_callback_factory."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         sentinel = object()
         worker = SpeculativeMergeWorker(
@@ -81,7 +81,7 @@ class TestWorkerSideSurface:
 
     def test_worker_defaults_train_callback_factory_to_none(self) -> None:
         """SpeculativeMergeWorker._train_callback_factory defaults to None."""
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(
             MagicMock(),  # git_ops
@@ -102,7 +102,8 @@ class TestRealTaskFlip:
     async def test_mark_member_done_flips_real_task(self) -> None:
         """Factory callbacks mark a seeded task done with kind='merged' provenance."""
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, TrainCallbacks
+        from orchestrator.merge_lane.types import TrainCallbacks
+        from orchestrator.merge_lane.worker import GroupMergeRequest, MergeOutcome
 
         sched = FakeScheduler()
         await sched.set_task_status('4442', 'merge-deferred')
@@ -383,7 +384,7 @@ class TestRedriveMember:
     async def test_factory_built_redrive_member_is_callable(self) -> None:
         """Factory-built TrainCallbacks.redrive_member is callable (not None)."""
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import TrainCallbacks
+        from orchestrator.merge_lane.types import TrainCallbacks
 
         sched = FakeScheduler()
         factory = build_train_callback_factory(sched)
@@ -468,7 +469,7 @@ class TestHarnessWiring:
         from orchestrator.config import OrchestratorConfig
         from orchestrator.event_store import EventStore
         from orchestrator.harness import Harness
-        from orchestrator.merge_queue import TrainCallbacks
+        from orchestrator.merge_lane.types import TrainCallbacks
 
         config = OrchestratorConfig(project_root=tmp_path)
         harness = Harness(config)
@@ -506,18 +507,18 @@ class TestHarnessWiring:
             async def stop(self) -> None:
                 pass
 
-        # _start_merge_worker imports everything locally from orchestrator.merge_queue,
+        # _start_merge_worker imports everything locally from orchestrator.merge_lane.worker,
         # so we must patch on the merge_queue module (not harness).
         with (
             patch(
-                'orchestrator.merge_queue.SpeculativeMergeWorker',
+                'orchestrator.merge_lane.worker.SpeculativeMergeWorker',
                 CapturingWorker,
             ),
             patch(
-                'orchestrator.merge_queue.enforce_merge_liveness_margin',
+                'orchestrator.merge_lane.liveness.enforce_merge_liveness_margin',
             ),
             patch(
-                'orchestrator.merge_queue.enforce_persistent_worktree_serial_lane',
+                'orchestrator.merge_lane.liveness.enforce_persistent_worktree_serial_lane',
             ),
             patch.object(
                 harness,
@@ -582,11 +583,11 @@ def _tc_block(reason: str = 'failed'):
     )
 
 
-def _tc_config(*, enabled: bool = True, tmp_path: Path | None = None) -> MagicMock:
+def _tc_config(*, tmp_path: Path, enabled: bool = True) -> MagicMock:
     from orchestrator.config import DeliveredChecksConfig
 
     config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    config.project_root = tmp_path or Path('/tmp/proj')
+    config.project_root = tmp_path
     config.delivered_checks = DeliveredChecksConfig(
         enabled=enabled, check_timeout_secs=7.5,
     )

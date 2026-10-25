@@ -19,10 +19,16 @@ the same funnel with a real config and a real ``LocalRunner``.
 
 from __future__ import annotations
 
+import dataclasses
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _flake_golden import merge_gate_deflake_description
+from escalation.queue import EscalationQueue
+from test_flake_debt_drain import _FakeLedgerTaskClient
 from test_merge_boundary_effective_module_configs import (
     _ALPHA_TEST,
     _BETA_FAILING_ID,
@@ -41,15 +47,23 @@ from test_verify_merge_flake_suppression import (
 
 from orchestrator import flake_recorder, verify
 from orchestrator.event_store import EventType
+from orchestrator.flake_debt_drain import run_drain_pass
 from orchestrator.flake_ledger import (
     FlakeCallSite,
     FlakeSuppression,
     FlakeVerdict,
     ledger_db_path,
+    list_open_debt,
+    read_debt,
+    read_due_items,
     read_occurrences,
 )
-from orchestrator.merge_gates import PostMergePyrightResult
-from orchestrator.merge_queue import _run_post_merge_verify
+from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
+from orchestrator.merge_lane.worker import (
+    PRODUCTION_VERIFIER,
+    _run_post_merge_verify,
+)
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import VerifyRunner, result_from_json, result_to_json
 
@@ -117,6 +131,51 @@ def _still_failing(s: FlakeSuppression) -> VerifyResult:
     return replace(_failing_scoped_result(_BETA_FAILING_ID), flake_suppression=s)
 
 
+class _ScriptedRed:
+    """The production ``VerifyPort`` with ONLY the two legs this file scripts.
+
+    ``ProductionVerifier`` holds one zero-argument RESOLVER per leg, so
+    replacing ``scoped`` and ``unscoped`` states this file's scene through the
+    port ``_run_post_merge_verify`` already takes — and no wider.  That pair is
+    leg-for-leg what the two ``orchestrator.merge_lane.worker`` patches
+    (``run_scoped_verification``, ``_run_unscoped_typechecks``) did before the
+    port existed, so the other five legs — the disk guard, post-merge pyright,
+    post-merge equivalence, cold shadow and dry-run — stay genuinely
+    production here, exactly as they were then.  A blanket fake port would
+    answer all seven clean and silently narrow what this file exercises
+    ``_run_post_merge_verify`` on, which no row here asks for.
+
+    The scripted red is the boundary's INPUT, not its answer: it carries
+    ``flake_suppression=None``, so every observation these tests assert on is
+    one the real ``verify.apply_merge_flake_suppression`` produced inside the
+    boundary's own ``LocalRunner`` (verify_runner.py:864) off the isolated
+    re-run.
+
+    ``verified`` records the task ids the scoped leg was asked about — an
+    injection that silently went unused leaves it empty, which is what keeps
+    the local row's "nothing is hand-fed" claim CHECKED rather than asserted.
+    """
+
+    def __init__(self) -> None:
+        self.result = _failing_scoped_result(_BETA_FAILING_ID)
+        self.verified: list[str | None] = []
+
+    async def _scoped(self, *_args: Any, **options: Any) -> VerifyResult:
+        self.verified.append(options.get('task_id'))
+        return self.result
+
+    async def _unscoped(self, *_args: Any, **_options: Any) -> PostMergePyrightResult:
+        return PostMergePyrightResult()
+
+    @property
+    def port(self) -> ProductionVerifier:
+        return dataclasses.replace(
+            cast(ProductionVerifier, PRODUCTION_VERIFIER),
+            scoped=lambda: self._scoped,
+            unscoped=lambda: self._unscoped,
+        )
+
+
 def _remote_runner(*results: VerifyResult) -> MagicMock:
     """A fake REMOTE runner returning *results* in order (one per dispatch)."""
     r = MagicMock(spec=VerifyRunner)
@@ -136,15 +195,21 @@ async def _drive(
     cross_check: bool = False,
     rerun_passes: bool = True,
     max_enospc: int = 1,
+    verifier: VerifyPort | None = None,
 ):
     """Drive the REAL ``_run_post_merge_verify``.
 
-    On the LOCAL path (*runner* None) the boundary builds its own ``LocalRunner``,
-    so ``run_scoped_verification`` is patched to the red and
-    ``verify.run_verification`` to the isolated re-run — the production gate then
-    produces the ``FlakeSuppression`` itself, rather than the test hand-feeding one.
-    On the REMOTE path the injected runner returns its own queued results directly,
-    which is exactly how a real remote's already-suppressed verdict arrives.
+    On the LOCAL path (*runner* None) the boundary builds its own ``LocalRunner``
+    over the INJECTED ``VerifyPort``, so *verifier*'s scoped leg answers the red
+    and ``verify.run_verification`` the isolated re-run — the production gate
+    then produces the ``FlakeSuppression`` itself, rather than the test
+    hand-feeding one.  On the REMOTE path the injected runner returns its own
+    queued results directly, which is exactly how a real remote's
+    already-suppressed verdict arrives.
+
+    Pass *verifier* to inspect the port afterwards; the default is a fresh
+    :class:`_ScriptedRed` port, which leaves five of the seven ``VerifyPort``
+    legs production.
 
     ``verify_cross_check_remote_green`` is OFF by default so the dispatched
     verdict's recording is measured on its own; the one case that needs the
@@ -165,21 +230,14 @@ async def _drive(
     req = _make_req(task_id, task_wt, config)
     req.module_configs = [mc_alpha]
 
-    with (
-        patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            new=AsyncMock(return_value=_failing_scoped_result(_BETA_FAILING_ID)),
-        ),
-        patch(
-            'orchestrator.merge_queue._run_unscoped_typechecks',
-            new=AsyncMock(return_value=PostMergePyrightResult()),
-        ),
-        patch.object(
-            verify, 'run_verification',
-            new=AsyncMock(
-                return_value=_passing_result() if rerun_passes
-                else _failing_scoped_result(_BETA_FAILING_ID),
-            ),
+    # `verify.run_verification` stays PATCHED: it is one layer BELOW the port —
+    # the isolated re-run `apply_merge_flake_suppression` makes to decide the
+    # verdict — so no `VerifyPort` leg covers it.
+    with patch.object(
+        verify, 'run_verification',
+        new=AsyncMock(
+            return_value=_passing_result() if rerun_passes
+            else _failing_scoped_result(_BETA_FAILING_ID),
         ),
     ):
         return await _run_post_merge_verify(
@@ -192,6 +250,7 @@ async def _drive(
             escalation_queue=escalation_queue,
             merge_sha=_MERGE_SHA,
             runner=runner,
+            verifier=_ScriptedRed().port if verifier is None else verifier,
         )
 
 
@@ -255,14 +314,30 @@ class TestDispatcherRecordsTheFlakeObservation:
         Here the production gate inside the boundary's own ``LocalRunner``
         produces the observation — nothing is hand-fed — and the same three
         land, with ``runner`` reading ``'local'`` because that is where it ran.
+
+        The two guards around the drive are what keep "nothing is hand-fed"
+        CHECKED rather than asserted.  Before: the scripted port hands the
+        boundary a bare red carrying no observation at all.  After: the port
+        was actually consulted for this task — an injection that silently went
+        unused would leave ``verified`` empty and make every count below the
+        answer to a question nobody asked.
         """
         store, queue = _FakeEventStore(), _FakeEscalationQueue()
+        verifier = _ScriptedRed()
+        assert verifier.result.flake_suppression is None, (
+            'the injected port must hand the boundary a bare red; a '
+            'pre-suppressed result would make every assertion below vacuous'
+        )
 
         outcome = await _drive(
             tmp_path, task_id='b3-local', runner=None,
-            event_store=store, escalation_queue=queue,
+            event_store=store, escalation_queue=queue, verifier=verifier.port,
         )
 
+        assert verifier.verified == ['b3-local'], (
+            f'the LocalRunner must have gone through the injected port; '
+            f'verified={verifier.verified!r}'
+        )
         assert outcome is None
         assert len(_suppression_events(store)) == 1, store.emits
         rows = _rows(tmp_path)
@@ -474,3 +549,156 @@ class TestDispatcherRecordsTheFlakeObservation:
         assert rows[0].test_id == _BETA_FAILING_ID
         assert len(_suppression_events(store)) == 1, store.emits
         assert flake_recorder._merge_flake_suppression_streak == 1
+
+def _debt(tmp_path: Path):
+    return list_open_debt(ledger_db_path(tmp_path))
+
+
+def _due_items(tmp_path: Path):
+    """Every item on the due list, whatever its backoff, in drain order."""
+    items = read_due_items(
+        ledger_db_path(tmp_path), now=datetime.now(UTC) + timedelta(days=1), limit=1000,
+    )
+    assert items is not None, 'the due list must be readable'
+    return items
+
+
+@pytest.mark.asyncio
+class TestDispatcherEnqueuesDebt:
+    """Boundary row B7 end-to-end (PRD task epsilon-0): a suppressed merge red leaves
+    its occurrence row AND one due-list item, written together on the dispatcher.
+
+    The merge path files nothing: the de-flake task is the drain's job, afterwards.
+    That the debt appears only once the drain runs is this task's user-observable
+    signal, so it is asserted through the REAL ``_run_post_merge_verify`` and the REAL
+    ``run_drain_pass``, not at the recorder's own seam.
+    """
+
+    async def test_local_suppression_enqueues_the_row_and_an_item(
+        self, tmp_path: Path,
+    ) -> None:
+        """The observation here is produced by the production gate inside the
+        boundary's own ``LocalRunner`` - nothing is hand-fed."""
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
+
+        outcome = await _drive(
+            tmp_path, task_id='debt-local', runner=None,
+            event_store=store, escalation_queue=queue,
+        )
+
+        assert outcome is None, f'the suppressed red must still land; got {outcome!r}'
+        assert len(_rows(tmp_path)) == 1, _rows(tmp_path)
+        items = _due_items(tmp_path)
+        assert [i.test_id for i in items] == [_BETA_FAILING_ID], items
+        assert items[0].head == _MERGE_SHA
+        assert items[0].observing_task_id == 'debt-local'
+        assert _debt(tmp_path) == [], 'the merge path must file no debt itself'
+
+    async def test_remote_wire_deserialized_suppression_enqueues_the_same_item(
+        self, tmp_path: Path,
+    ) -> None:
+        """The same observation, genuinely wire-serialized through the runner codec.
+
+        The enqueue must not be a property of WHICH HOST ran the verify: that
+        host-dependence is the defect epsilon fixed for the other three effects.
+        """
+        store, queue = _FakeEventStore(), _FakeEscalationQueue()
+
+        outcome = await _drive(
+            tmp_path, task_id='debt-remote',
+            runner=_remote_runner(_wired(_suppressed_pass(_suppression()))),
+            event_store=store, escalation_queue=queue,
+        )
+
+        assert outcome is None
+        assert len(_rows(tmp_path)) == 1, _rows(tmp_path)
+        items = _due_items(tmp_path)
+        assert [i.test_id for i in items] == [_BETA_FAILING_ID], items
+        assert items[0].call_site == FlakeCallSite.merge_gate
+        assert items[0].head == _MERGE_SHA
+        assert _debt(tmp_path) == []
+
+    async def test_a_non_suppressing_verdict_writes_the_row_and_no_item(
+        self, tmp_path: Path,
+    ) -> None:
+        """Only a suppression owes a de-flake task: the red stays red and is its
+        own signal, so the observation is recorded and nothing is queued."""
+        s = _suppression(
+            FlakeVerdict.unconfirmable, test_ids=(_BETA_FAILING_ID,),
+            reason='no recoverable node-id',
+        )
+
+        outcome = await _drive(
+            tmp_path, task_id='debt-unconf',
+            runner=_remote_runner(_wired(_still_failing(s))),
+            event_store=_FakeEventStore(), escalation_queue=_FakeEscalationQueue(),
+        )
+
+        assert outcome is not None, 'a non-suppressed red must NOT land'
+        assert len(_rows(tmp_path)) == 1, _rows(tmp_path)
+        assert _due_items(tmp_path) == []
+
+    async def test_five_suppressions_then_one_drain_pass_match_the_inline_filing(
+        self, tmp_path: Path,
+    ) -> None:
+        """Scenario 32 at epsilon-0: what the merge path used to leave behind inline
+        is what five merges plus ONE drain pass leave behind now - five occurrence
+        rows, one debt row for the one test, one owner, and the INV-4 storm
+        escalation at the fifth suppression."""
+        store = _FakeEventStore()
+        queue = EscalationQueue(tmp_path / 'queue')
+        for n in range(5):
+            observed = _suppression()
+            observed = dataclasses.replace(
+                observed, observed_at=f'2026-08-22T12:0{n}:00+00:00',
+            )
+            outcome = await _drive(
+                tmp_path, task_id=f'storm-{n}',
+                runner=_remote_runner(_wired(_suppressed_pass(observed))),
+                event_store=store, escalation_queue=queue,
+            )
+            assert outcome is None, f'suppression {n} must still land; got {outcome!r}'
+
+        rows = _rows(tmp_path)
+        assert sorted(r.task_id or '' for r in rows) == [f'storm-{n}' for n in range(5)], rows
+        for r in rows:
+            assert (r.test_id, r.verdict, r.call_site, r.runner, r.merge_sha, r.detail) == (
+                _BETA_FAILING_ID, 'passes_in_isolation', 'merge_gate', _REMOTE, _MERGE_SHA, '{}',
+            )
+        assert len(_due_items(tmp_path)) == 5
+        assert _debt(tmp_path) == [], 'nothing is filed before the drain runs'
+        (storm,) = queue.get_by_task('merge-flake-suppression-storm', status='pending', level=2)
+        assert (storm.category, storm.severity, storm.summary) == (
+            'merge_flake_suppression_storm',
+            'critical',
+            'Merge-verify flake-suppression storm: the isolated-rerun-confirm gate has '
+            'suppressed 5 merge-verify reds since the last reset',
+        )
+
+        client = _FakeLedgerTaskClient()
+        report = await run_drain_pass(
+            ledger_db_path(tmp_path),
+            _make_config(tmp_path).fused_memory.project_id,
+            task_client=client, git=None, escalation_queue=queue,
+        )
+
+        assert report.settled == 5, report
+        assert _due_items(tmp_path) == []
+        debt = _debt(tmp_path)
+        assert [d.test_id for d in debt] == [_BETA_FAILING_ID], debt
+        assert debt[0].owner_task_id, f'section 5.9 breach - the row has no owner: {debt[0]}'
+        (block,) = client.submit_calls
+        row = read_debt(ledger_db_path(tmp_path), _BETA_FAILING_ID)
+        assert row is not None
+        assert block['title'] == (
+            f'Flake debt: {_BETA_FAILING_ID} — passes_in_isolation after a merge-gate red '
+            f'was suppressed, cycle 1'
+        )
+        assert block['description'] == merge_gate_deflake_description(row)
+        assert block['metadata'] == {
+            'spawn_context': 'flake_ledger_debt',
+            'flake_debt_test': _BETA_FAILING_ID,
+            'flake_debt_open_count': 1,
+            'flake_debt_opened_at': row.opened_at,
+        }
+        assert (block['priority'], block['planning_mode']) == ('medium', True)

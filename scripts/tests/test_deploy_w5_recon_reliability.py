@@ -29,6 +29,24 @@ UNIT = "fused-memory.service"
 # script header.
 RECON_MARKER = "test-recon-marker-xyz"
 
+# Trailing bytes the fake journalctl writes AFTER the marker, to provoke the
+# SIGPIPE half of the `| grep -q` misread.
+#
+# THE MEASUREMENTS AND THE "DO NOT LOWER THIS" ARGUMENT LIVE IN ONE PLACE:
+# tests/scripts/shell_sections.py::SIGPIPE_BULK_BYTES. This is a duplicated
+# VALUE, deliberately not a duplicated RATIONALE — restating the trial counts
+# here is how three copies of the same number drift into three different
+# numbers, and a future measurement that moves the threshold should have to
+# edit exactly one comment.
+#
+# It is a duplicated value only because scripts/tests/ cannot import a
+# tests/scripts/ helper: scripts/tests/conftest.py puts scripts/,
+# scripts/legibility/ and scripts/local-model-serving/ on sys.path and NOT
+# tests/scripts/, and widening that conftest to make one constant importable is
+# a directory-boundary change well outside what this constant is worth. Should
+# the boundary ever open, this becomes an import.
+BULK_BYTES = 262144
+
 
 # ---------------------------------------------------------------------------
 # Fake systemctl / curl / journalctl (shared-JSON-state-file + canned
@@ -136,6 +154,25 @@ contract together with `_run_script` (which sets the script's real
 RECON_MARKER env var to the same value), so the test is agnostic to the
 real production marker string. An empty `journalctl_marker` means "never
 emits" (the marker-absent/timeout case).
+
+Two further knobs simulate the `producer | grep -q` misread the
+recon-serving gate is subject to, both defaulting to today's behaviour:
+
+  `journalctl_exit_code` (default 0) -- the status returned AFTER the
+  marker has been printed, i.e. a journalctl that showed the marker and
+  then failed for its own reasons. `pipefail` hands that status to the
+  script's `if`, losing a marker the journal plainly carried.
+
+  `journalctl_bulk_bytes` (default 0) -- that many bytes written after the
+  marker, then an explicit flush. `grep -q` exits on its first match and
+  closes the read end, so the producer dies mid-write.
+
+NOTE ON MECHANISM for the bulk case: this fake is PYTHON, which ignores
+SIGPIPE and raises BrokenPipeError instead, so the interpreter exits
+non-zero (120) on the failed shutdown flush rather than dying of signal
+13. Either way the producer's status is non-zero and `pipefail` hands it
+to the `if` -- which IS the defect under test. Do NOT "fix" this by
+catching BrokenPipeError: that would hide the very status the test needs.
 """
 import json
 import os
@@ -162,10 +199,14 @@ def main(argv):
         state["health_passed_before_first_journalctl"] = state.get("curl_success_count", 0) > 0
     state.setdefault("journalctl_calls", []).append(argv[1:])
     marker = state.get("journalctl_marker", "")
+    bulk = state.get("journalctl_bulk_bytes", 0)
     _save(state)
     if marker:
         print(marker)
-    return 0
+    if bulk:
+        sys.stdout.write("x" * bulk)
+        sys.stdout.flush()
+    return state.get("journalctl_exit_code", 0)
 
 
 if __name__ == "__main__":
@@ -181,7 +222,8 @@ def _state_path(tmp_path):
     return tmp_path / "fake_state.json"
 
 
-def _write_fakes(tmp_path, *, curl_fail_remaining=0, journalctl_marker=""):
+def _write_fakes(tmp_path, *, curl_fail_remaining=0, journalctl_marker="",
+                 journalctl_exit_code=0, journalctl_bulk_bytes=0):
     """Write executable fake `systemctl`/`curl`/`journalctl` into
     <tmp_path>/bin/ plus their shared JSON state file.
 
@@ -205,6 +247,8 @@ def _write_fakes(tmp_path, *, curl_fail_remaining=0, journalctl_marker=""):
         "journalctl_calls": [],
         "curl_fail_remaining": curl_fail_remaining,
         "journalctl_marker": journalctl_marker,
+        "journalctl_exit_code": journalctl_exit_code,
+        "journalctl_bulk_bytes": journalctl_bulk_bytes,
     }))
     return bin_dir, state_path
 
@@ -223,7 +267,9 @@ def _systemctl_calls(tmp_path):
 # Script driver
 # ---------------------------------------------------------------------------
 
-def _run_script(tmp_path, *args, env=None, curl_fail_remaining=0, journalctl_marker=""):
+def _run_script(tmp_path, *args, env=None, curl_fail_remaining=0,
+                journalctl_marker="", journalctl_exit_code=0,
+                journalctl_bulk_bytes=0):
     """Run deploy-w5-recon-reliability.sh via subprocess with fresh fake
     `systemctl`/`curl`/`journalctl` on PATH (state reset each call; see
     `_write_fakes`) so the real script never touches a live systemd,
@@ -234,11 +280,17 @@ def _run_script(tmp_path, *args, env=None, curl_fail_remaining=0, journalctl_mar
     instead of hanging up to the production 30s/180s defaults.
     RECON_MARKER is always set to the shared `RECON_MARKER` test constant,
     which `journalctl_marker` (when set) tells the fake journalctl to emit.
+
+    `journalctl_exit_code` / `journalctl_bulk_bytes` both default to today's
+    behaviour, so every pre-existing test is unaffected; see
+    `_FAKE_JOURNALCTL_SRC` for what each simulates.
     """
     bin_dir, state_path = _write_fakes(
         tmp_path,
         curl_fail_remaining=curl_fail_remaining,
         journalctl_marker=journalctl_marker,
+        journalctl_exit_code=journalctl_exit_code,
+        journalctl_bulk_bytes=journalctl_bulk_bytes,
     )
 
     full_env = dict(os.environ)
@@ -434,6 +486,75 @@ def test_apply_confirms_recon_serving(tmp_path):
     assert state.get("restart_called_before_first_journalctl") is True, (
         f"Expected the recon-serving check to run only after the restart; "
         f"state={state!r}"
+    )
+
+
+# --- the `producer | grep -q` misread at the recon-serving gate -------------
+# `journalctl ... | grep -q "$RECON_MARKER"` reports the PRODUCER's status
+# under `set -o pipefail`, not grep's verdict, so the gate can time out on a
+# journal that plainly CARRIED the marker -- failing a deploy whose service is
+# in fact serving reconciliation. Driven through the WHOLE shipped script, so
+# the restart -> health -> recon-serving ordering witnesses still apply.
+#
+# `test_apply_fails_when_recon_marker_absent` above is already this site's
+# anti-regression guard: it pins that a journal which never emits the marker
+# STILL times out non-zero, so a fix cannot buy these two tests by making the
+# gate unconditionally pass.
+
+_MARKER_TIMEOUT_ERROR = "did not show ledger-backed recon serving"
+
+
+def test_apply_confirms_recon_serving_when_journalctl_exits_nonzero_after_the_marker(
+    tmp_path,
+):
+    """A journal that SHOWED the marker proves recon is serving, whatever journalctl's own status was.
+
+    `journalctl` reports on its own invocation; the marker having appeared is a
+    fact about the OUTPUT. Conflating the two fails a healthy deploy.
+    """
+    result = _run_script(
+        tmp_path,
+        curl_fail_remaining=0,
+        journalctl_marker=RECON_MARKER,
+        journalctl_exit_code=1,
+    )
+
+    assert result.returncode == 0, (
+        f"Expected apply to exit 0: the journal DID show the recon-serving "
+        f"marker, and journalctl's own exit status is a different question; "
+        f"got {result.returncode}\nstdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    assert _MARKER_TIMEOUT_ERROR not in result.stderr, (
+        f"Expected no marker-timeout diagnostic for a journal that carried "
+        f"the marker; stderr={result.stderr!r}"
+    )
+
+
+def test_apply_confirms_recon_serving_when_journalctl_is_sigpiped_after_the_marker(
+    tmp_path,
+):
+    """A producer still writing when grep matches dies mid-write; the marker was still shown.
+
+    `grep -q` exits on its first match and closes the read end, so a journalctl
+    still streaming fails its next write and `pipefail` turns that into "marker
+    never seen" on a journal that plainly carried it.
+    """
+    result = _run_script(
+        tmp_path,
+        curl_fail_remaining=0,
+        journalctl_marker=RECON_MARKER,
+        journalctl_bulk_bytes=BULK_BYTES,
+    )
+
+    assert result.returncode == 0, (
+        f"Expected apply to exit 0: the journal DID show the recon-serving "
+        f"marker before the read end was closed; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert _MARKER_TIMEOUT_ERROR not in result.stderr, (
+        f"Expected no marker-timeout diagnostic for a journal that carried "
+        f"the marker; stderr={result.stderr!r}"
     )
 
 

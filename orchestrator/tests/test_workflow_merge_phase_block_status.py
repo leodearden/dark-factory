@@ -47,7 +47,7 @@ from shared.task_statuses import TaskStatus
 from shared.task_transitions import outcome_allows_status
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.scheduler import TaskAssignment
+from orchestrator.scheduler import TaskAssignment, TerminalExitRejection
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import (
     StewardReescalatedL1,
@@ -83,6 +83,7 @@ def _make_config(tmp_path: Path) -> OrchestratorConfig:
 
 def _make_workflow(
     tmp_path: Path, *, with_queue: bool = False,
+    scheduler: FakeScheduler | None = None,
 ) -> TaskWorkflow:
     """A minimal TaskWorkflow whose scheduler RECORDS every status write."""
     assignment = TaskAssignment(
@@ -102,7 +103,7 @@ def _make_workflow(
         assignment=assignment,
         config=_make_config(tmp_path),
         git_ops=MagicMock(),
-        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        scheduler=scheduler if scheduler is not None else FakeScheduler(),
         briefing=FakeBriefing(),    # type: ignore[arg-type]
         mcp=FakeMcp(),              # type: ignore[arg-type]
         escalation_queue=queue,
@@ -195,14 +196,14 @@ class TestMergePhaseBlockedWritesParkStatus:
             f'merge_phase={merge_phase}: block_status must be honoured by the '
             f'merge-aware park write; got {_statuses(workflow)!r}'
         )
-        # ...and the row it writes must SURVIVE run()'s SM-2 check.  Writing a
-        # status the outcome<->status table forbids would raise AssertionError
-        # straight out of run(), so pin the pairing rather than assuming it:
+        # ...and the row it writes must SATISFY run()'s exit contract.  Writing
+        # a status the outcome<->status table forbids would record a violation
+        # on every such exit, so pin the pairing rather than assuming it:
         # 'infra-hold' is a legitimate BLOCKED exit row (PRD C7/D3), just on
         # the status is_infra_held keys on.
         assert outcome_allows_status(outcome.value, 'infra-hold') is True, (
             "_OUTCOME_ALLOWED['blocked'] must admit INFRA_HOLD — otherwise "
-            'this very write makes SM-2 raise out of run()'
+            "this very write is an exit-contract violation"
         )
 
     @pytest.mark.asyncio
@@ -244,10 +245,10 @@ class TestMergePhaseBlockedWritesParkStatus:
         A different outcome, the same obligation.  ``_run_merge_phase`` exits
         the slot on ANY non-DONE/non-REQUEUED outcome (``return
         merge_outcome``), so an unwritten row here strands exactly the same
-        unclaimed ``in-progress`` shape a BLOCKED return would — and SM-2
-        cannot catch it, because ``outcome_allows_status('escalated',
-        'in-progress')`` is True (asserted below so the blind spot is on the
-        record, not assumed).
+        unclaimed ``in-progress`` shape a BLOCKED return would.  Since task
+        3542 the exit contract flags that shape
+        (``outcome_allows_status('escalated', 'in-progress')`` is False,
+        asserted below), but only the park write makes the exit truthful.
         """
         workflow = _make_workflow(tmp_path, with_queue=True)
         workflow._enter_phase(WorkflowState.MERGE)
@@ -258,9 +259,9 @@ class TestMergePhaseBlockedWritesParkStatus:
         )
 
         assert outcome == WorkflowOutcome.ESCALATED
-        assert outcome_allows_status(outcome.value, 'in-progress') is True, (
-            'SM-2 is blind to an in-progress row on an ESCALATED exit, which '
-            'is precisely why this park write has to be unconditional'
+        assert outcome_allows_status(outcome.value, 'in-progress') is False, (
+            'θ: the exit contract now flags an in-progress row on an ESCALATED '
+            'exit; the park write is still what makes the exit truthful (INV-6)'
         )
         assert _statuses(workflow)[-1:] == ['blocked'], (
             f'merge_phase={merge_phase}: the steward handed off to a human and '
@@ -297,6 +298,85 @@ class TestMergePhaseBlockedWritesParkStatus:
         )
 
 
+class _TerminalRowScheduler(FakeScheduler):
+    """A row a racing writer already made *terminal*.
+
+    A park write (no ``reopen_reason``) meets the server's terminal-exit gate:
+    the row reads *terminal*, and the write raises ``TerminalExitRejection``
+    the way scheduler.py::Scheduler.set_task_status does.
+    """
+
+    def __init__(self, terminal: str) -> None:
+        super().__init__()
+        self.terminal = terminal
+
+    async def set_task_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        done_provenance: dict | None = None,
+        reopen_reason: str | None = None,
+        claimant_run_id: str | None = None,
+        heartbeat_at: str | None = None,
+    ) -> None:
+        if status in ('blocked', 'infra-hold') and reopen_reason is None:
+            self.statuses.setdefault(task_id, []).append(self.terminal)
+            raise TerminalExitRejection(
+                task_id=task_id, old_status=self.terminal,
+                target_status=status, raw='terminal_exit_rejected',
+            )
+        await super().set_task_status(
+            task_id, status,
+            done_provenance=done_provenance, reopen_reason=reopen_reason,
+            claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+        )
+
+
+_OBSERVED_OUTCOME = {
+    'done': WorkflowOutcome.DONE,
+    'cancelled': WorkflowOutcome.CANCELLED,
+}
+
+
+class TestMergePhaseParkMeetsATerminalRow:
+    """Spec §5 relaxation 1: a park write that finds the row already terminal
+    reports that terminal.  BLOCKED or ESCALATED over 'done', or ESCALATED
+    over 'cancelled', is an exit-contract violation."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('terminal', ['done', 'cancelled'])
+    @pytest.mark.parametrize(
+        'slot_exit', ['fall_through', 'escalate_to_human', 'steward_reescalated'],
+    )
+    async def test_park_reports_the_observed_terminal(
+        self, tmp_path: Path, terminal: str, slot_exit: str,
+    ) -> None:
+        workflow = _make_workflow(
+            tmp_path,
+            with_queue=slot_exit != 'fall_through',
+            scheduler=_TerminalRowScheduler(terminal),
+        )
+        workflow._enter_phase(WorkflowState.MERGE)
+        if slot_exit == 'steward_reescalated':
+            _wire_steward(workflow, StewardReescalatedL1(esc_id='esc-6052-1'))
+
+        outcome = await workflow._mark_blocked(
+            'merge verification failed',
+            merge_phase=True,
+            skip_escalation=slot_exit == 'fall_through',
+            escalate_to_human=slot_exit == 'escalate_to_human',
+        )
+
+        assert outcome == _OBSERVED_OUTCOME[terminal]
+        assert outcome_allows_status(outcome, terminal) is True
+        report = workflow._terminal_report
+        assert report is not None
+        assert report.outcome == outcome
+        assert report.phase == workflow.machine.state
+        assert workflow.machine.state is not WorkflowState.BLOCKED
+
+
 # ---------------------------------------------------------------------------
 # The Chesterton's fence — the two returns that must NOT write
 # ---------------------------------------------------------------------------
@@ -305,8 +385,9 @@ class TestMergePhaseFencePreserved:
     """GREEN both before and after: these two returns keep the suppression.
 
     Deleting the ``if not merge_phase:`` ENTRY gate (the naive fix) would break
-    the fence in the other direction — an INV-6 violation SM-2 cannot catch,
-    because ``outcome_allows_status('requeued', BLOCKED)`` is True.
+    the fence in the other direction — an INV-6 violation the exit contract
+    cannot catch, because the in-place retry never leaves the slot (even though
+    ``outcome_allows_status('requeued', BLOCKED)`` is now False).
     """
 
     @pytest.mark.asyncio

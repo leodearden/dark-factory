@@ -1,0 +1,13 @@
+{"type": "queue-operation", "timestamp": "2026-08-05T15:07:53.118Z", "operation": "enqueue"}
+{"type": "queue-operation", "timestamp": "2026-08-05T15:07:53.119Z", "operation": "dequeue"}
+{"type": "attachment", "timestamp": "2026-08-05T15:07:33.073Z", "attachment": {"type": "hook_success"}}
+{"type": "user", "timestamp": "2026-08-05T15:07:53.155Z", "message": {"role": "user", "content": "redacted"}}
+{"type": "attachment", "timestamp": "2026-08-05T15:07:53.153Z", "attachment": {"type": "deferred_tools_delta"}}
+{"type": "attachment", "timestamp": "2026-08-05T15:07:53.153Z", "attachment": {"type": "skill_listing"}}
+{"type": "attachment", "timestamp": "2026-08-05T15:07:53.153Z", "attachment": {"type": "budget_usd"}}
+{"type": "last-prompt", "lastPrompt": "redacted"}
+{"type": "assistant", "timestamp": "2026-08-05T15:08:31.519Z", "message": {"role": "assistant", "model": "claude-sonnet-5", "stop_reason": "tool_use", "content": [{"type": "thinking", "thinking": "redacted", "signature": "redacted"}]}}
+{"type": "assistant", "timestamp": "2026-08-05T15:08:33.852Z", "message": {"role": "assistant", "model": "claude-sonnet-5", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "toolu_fixture_01", "name": "StructuredOutput", "input": {"action": "create", "justification": "redacted", "target_id": null, "target_fingerprint": null, "rewritten_task": null}}]}}
+{"type": "last-prompt", "lastPrompt": "redacted"}
+{"type": "user", "timestamp": "2026-08-05T15:08:48.089Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_fixture_01", "is_error": true, "content": "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.\n\nNote: The user's next message may contain a correction or preference. Pay close attention \u2014 if they explain what went wrong or how they'd prefer you to work, consider saving that to memory for future sessions."}]}}
+{"type": "user", "timestamp": "2026-08-05T15:08:48.099Z", "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user for tool use]"}]}}

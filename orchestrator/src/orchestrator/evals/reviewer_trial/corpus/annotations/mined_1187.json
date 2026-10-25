@@ -16,6 +16,54 @@
       "severity": "suggestion",
       "description": "On search error/timeout the prompt directs the reader to treat suppression as not-in-effect and emit the flag (fail-open with respect to suppression). It justifies this as mirroring filter_suppressed's 'conservative pass-through', but pass-through in the post-processor keeps flags for the opposite reason; here it means an intentionally suppressed task can get a flag emitted on a transient search failure, which is the same false-negative direction and relies entirely on the downstream post-processor still catching it.",
       "mutation_type": "error_handling"
+    },
+    {
+      "id": "mined_1187_pool_01",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:261-283",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "No test pins the hardened suppression-check contract in STAGE1_SYSTEM_PROMPT (categories/stores/limit=50 search params, str-coerced task_id comparison, error/timeout pass-through clause), nor that the named kwargs exist on the MCP `search` tool, so a later prompt edit can silently reintroduce the default limit=10 or strict int comparison.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1187_pool_02",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:247-271",
+      "category": "spot_prompt_restates_code",
+      "severity": "suggestion",
+      "description": "The Flag Suppression Check prose restates implementation facts owned by flag_dedup.py (filter_suppressed's limit=501, its bare 'stage1_flag_suppression' bulk query, the write_suppression_record -> build_suppression_payload int() chain) and reviewer-facing justification (why 50 suffices) that the Stage 1 agent does not need. Nothing ties these literals to the code, so they drift silently, and the producer chain is also repeated in the paragraph below the schema bullet.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1187_pool_03",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:247-252",
+      "category": "inaccurate_rationale",
+      "severity": "suggestion",
+      "description": "The prompt justifies string comparison of metadata.task_id by claiming Mem0 metadata round-trips through JSON and that historical writers in this codebase stored task_id as both int and str. JSON preserves int vs str, and the only programmatic producer (build_suppression_payload) coerces to int; str values could only come from legacy hand-authored records. The string-comparison rule itself is correct and matches filter_suppressed.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1187_pool_04",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:249",
+      "category": "naming",
+      "severity": "suggestion",
+      "description": "The new comparison expression `str(result.metadata.get('task_id')) == str(target_task_id)` uses `target_task_id`, a name the prompt never defines, while the rest of the section names the target task `<N>`.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1187_pool_05",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:279-283",
+      "category": "error_semantics_wording",
+      "severity": "suggestion",
+      "description": "The new error clause says only 'returns an error or times out' without stating the failure shape, whereas the neighbouring Terminal-State Pre-Check section names the `{'error': ..., 'error_type': ...}` field the MCP tools return; the agent must guess what counts as an error.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1187_pool_06",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:281",
+      "category": "misleading_label",
+      "severity": "suggestion",
+      "description": "The error clause calls its fail-open behaviour (emit flags when the suppression search fails) a 'conservative pass-through', while the task brief uses 'conservative alternative' for the opposite, fail-closed policy; the label is ambiguous for later editors. The fail-open policy itself matches filter_suppressed.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {
@@ -32,5 +80,40 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Harden Stage 1 suppression-check prompt: search params, error semantics, task_id type",
+      "description": "Three small but compounding correctness gaps in the new \"Flag Suppression Check\" section of STAGE1_SYSTEM_PROMPT:\n\n1. Search call has no categories/stores/limit. Default limit=10 in memory_service.search means a busy project's suppression record can rank outside top 10 and be silently missed.\n2. No guidance for search-error/timeout. Neighboring \"Terminal-State Pre-Check Discipline\" handles this explicitly; this section will improvise differently across runs.\n3. metadata.task_id is documented as integer with strict `==` comparison. Mem0 metadata round-trips through JSON and writers in this codebase have stored task_id as both int and str \u2014 same bug class that previously bit flag dedup.",
+      "test_strategy": "",
+      "details": "Origin: review suggestions 2, 3, 4 (reviewer_comprehensive) on task 1169.\n\nLocation: fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:234-257\n\nConcrete edits:\n- Replace the search instruction with: `search(query=\"stage1_flag_suppression task_id=<N>\", project_id=..., categories=['observations_and_summaries'], stores=['mem0'], limit=50)`. Including task_id in the query string also helps vector ranking.\n- Add an explicit clause for error/timeout \u2014 recommended: \"If the suppression search returns an error or times out, treat suppression as not-in-effect and proceed with normal flag emission; record the search failure in your cycle summary so operators can re-check.\" (Pick this OR the conservative alternative; commit to one and justify in a sentence.)\n- Pin task_id type: either declare \"writers MUST store metadata.task_id as a string; readers compare as strings\" OR change the comparison instruction to coerce both sides: `str(result.metadata.get('task_id')) == str(target_task_id)`. Mirror the choice in any producer code (see sibling producer task).\n\nIf the post-processor enforcement task lands first, several of these may shift: in that case, only items 2 and 3 still apply to whatever code runs the search.",
+      "authored": false,
+      "id": "1187",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-10T03:23:57.819Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py"
+    ],
+    "base_sha": "431609ef900441672a8e069f323c3db791b30da0",
+    "branch_sha": "225a8ec426670e9a646926ad0eb5df929c5164ca",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "dcd12efdcc9c5d72db7b1274432f90ccde385b42",
+      "merge_base_sha": "431609ef900441672a8e069f323c3db791b30da0",
+      "diff_reproduces_from": "git diff 431609ef90 dcd12efdcc",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

@@ -21,7 +21,10 @@ sentinel literal into a source, test or doc file — a file that contains one
 becomes a specimen of the very corruption under test and trips the read-side
 prefilter. Specimens are BUILT from ``shared.toolcall_markup``'s own constants
 by :func:`_leaked`, exactly as ``shared/tests/test_toolcall_markup.py`` and the
-middleware itself already do.
+middleware itself already do. The rule is enforced mechanically, not by
+convention alone, repo-wide by
+``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``,
+which covers this file and ``markup_guard.py``.
 """
 
 from __future__ import annotations
@@ -42,8 +45,11 @@ import pytest
 # and cannot be confused with this file's own specimen constants.
 import test_consolidate_memories_tool as _consolidate
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import RepairPolicy
-from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
+from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING, RepairPolicy
+from shared.toolcall_markup import (
+    CANONICAL_OPENER_PREFIX,
+    closer_for,
+)
 
 from fused_memory.server.main import _install_safe_tool_wrapper
 from fused_memory.server.markup_guard import (
@@ -730,11 +736,8 @@ class TestStormEscape:
         assert 'toolcall-markup-containment-prd.md' in routing, (
             f'must name the live owner: {routing!r}'
         )
-        # 3083 may be NAMED as the closed predecessor — what must not happen is
-        # the reader being DIRECTED to report a recurrence against it. That
-        # correction is stated explicitly, so assert it explicitly.
-        assert 'not against 3083' in routing, (
-            f'must send recurrences to the PRD, not the closed predecessor: {routing!r}'
+        assert MARKUP_RECURRENCE_ROUTING in routing, (
+            f'must carry the ONE shared routing sentence, not a local copy: {routing!r}'
         )
 
     @pytest.mark.asyncio
@@ -754,8 +757,8 @@ class TestStormEscape:
         assert mine, f'expected one greppable ERROR line; got {caplog.records!r}'
         text = '\n'.join(r.getMessage() for r in mine)
         assert 'toolcall-markup-containment-prd.md' in text
-        assert 'see DF 3083' not in text, (
-            f'must not direct the reader at the closed predecessor: {text!r}'
+        assert MARKUP_RECURRENCE_ROUTING in text, (
+            f'must carry the ONE shared routing sentence, not a local copy: {text!r}'
         )
         # The visible-counter half of the task's remedy, without a schema
         # change. Asserted IN CONTEXT: a bare `str(_BURST) in text` is vacuous
@@ -1209,7 +1212,7 @@ class TestTheFiledProjectRootIsRegistryVouched:
 class TestUnrepairableResidueIsPreserved:
     """A refusal must not destroy the payload it refuses.
 
-    ``</invoke>`` closes the ENVELOPE rather than a parameter, so
+    ``\x3c/invoke>`` closes the ENVELOPE rather than a parameter, so
     ``shared.toolcall_markup.repair`` can attribute the residue to nothing and
     refuses under its NO SILENT PARTIAL REPAIR contract. Per the boundary
     specimen table that is the COMMON outcome for the real corpus shapes, not an

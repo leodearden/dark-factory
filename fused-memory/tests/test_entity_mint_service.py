@@ -1,7 +1,7 @@
 """The MemoryService half of ensure_entity_node (task 4932): lock, pre-read, journal.
 
-Guards 1, 2 and the journal half of 7. The wrapper composes three EXISTING
-backend primitives and adds no new Cypher:
+Guards 1, 2 and the journal half of 7. The wrapper composes three backend
+primitives and adds no new Cypher:
 
   * ``_identity_lock_for`` — the per-group_id write-time-identity lock, acquired
     with a BOUNDED wait (guard 1). This is the second acquisition site in all of
@@ -10,9 +10,9 @@ backend primitives and adds no new Cypher:
     extraction plus ``_reconcile_episode_identity``, which is exactly why an
     unbounded ``async with`` would block an MCP request for tens of seconds.
   * ``get_nodes_by_exact_name`` — the exact-name PRE-READ under that lock
-    (guard 2), which is what makes ``_resolve_or_create_entity``'s irreversible
-    >=2-match COLLAPSE arm structurally unreachable through this tool.
-  * ``ensure_entity_node`` — called unchanged, on the 0-match branch only.
+    (guard 2), and the mint's ONLY identity read.
+  * ``_mint_entity_node`` — on the 0-match branch only. It has no resolve arm,
+    so the irreversible >=2-match COLLAPSE is unreachable through this tool.
 
 TEST POSTURE: backend doubles plus ``install_identity_mocks``, which installs a
 REAL per-group_id ``asyncio.Lock`` registry. A FalkorDriver is NEVER constructed
@@ -27,8 +27,9 @@ import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import install_identity_mocks
+from _fm_helpers import extract_cypher, extract_params, install_identity_mocks
 
+from fused_memory.backends.graphiti_client import _PROVENANCE_RANK_ORDER
 from fused_memory.services.memory_service import (
     _ENTITY_MINT_DEFAULT_LOCK_TIMEOUT_SECONDS,
     MemoryService,
@@ -36,6 +37,7 @@ from fused_memory.services.memory_service import (
 
 _PROJECT = 'dark_factory'
 _NAME = 'Task 3222'
+_EXACT_NAME_READ = 'MATCH (n:Entity {name: $name})'
 
 
 @pytest.fixture
@@ -50,7 +52,8 @@ def service(mock_config):
     svc = MemoryService(mock_config)
     svc.graphiti = MagicMock()
     svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
-    svc.graphiti.ensure_entity_node = AsyncMock(return_value='uuid-new')
+    svc.graphiti._mint_entity_node = AsyncMock(return_value='uuid-new')
+    svc.graphiti.ensure_entity_node = AsyncMock(return_value='uuid-unreached')
     svc.graphiti.merge_entities = AsyncMock()
     install_identity_mocks(svc.graphiti)
     return svc
@@ -69,14 +72,26 @@ class TestMintAndResolve:
             name=_NAME, project_id=_PROJECT, agent_id='curator-x',
         )
 
-        service.graphiti.ensure_entity_node.assert_awaited_once()
-        args, kwargs = service.graphiti.ensure_entity_node.await_args
-        assert args[0] == _NAME
-        assert kwargs['group_id'] == _PROJECT
+        service.graphiti._mint_entity_node.assert_awaited_once_with(
+            _NAME, group_id=_PROJECT, summary='',
+        )
+        service.graphiti.ensure_entity_node.assert_not_awaited()
         assert result['status'] == 'minted'
         assert result['minted'] is True
         assert result['uuid'] == 'uuid-new'
         assert result['name'] == _NAME
+
+    @pytest.mark.asyncio
+    async def test_the_mint_branch_never_reaches_a_resolver(self, service):
+        """The mint primitive has no resolve arm, so the >=2 collapse is
+        unreachable from this tool by construction, not by a flag."""
+        await service.ensure_entity_node(
+            name=_NAME, project_id=_PROJECT, agent_id='curator-x',
+        )
+
+        service.graphiti.ensure_entity_node.assert_not_awaited()
+        service.graphiti._resolve_or_create_entity.assert_not_awaited()
+        service.graphiti.merge_entities.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_one_match_resolves_without_any_backend_write(self, service):
@@ -93,6 +108,7 @@ class TestMintAndResolve:
         assert result['minted'] is False
         assert result['uuid'] == 'uuid-existing'
         service.graphiti.ensure_entity_node.assert_not_awaited()
+        service.graphiti._mint_entity_node.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_two_matches_refuse_and_merge_nothing(self, service):
@@ -118,7 +134,48 @@ class TestMintAndResolve:
         assert isinstance(result.get('error'), str) and result['error']
         assert set(result['uuids']) == {'uuid-a', 'uuid-b'}, result
         service.graphiti.ensure_entity_node.assert_not_awaited()
+        service.graphiti._mint_entity_node.assert_not_awaited()
         service.graphiti.merge_entities.assert_not_awaited()
+
+
+class TestMintBranchRoundTrips:
+    """The wrapper over a REAL GraphitiBackend, counting Cypher on its graph.
+
+    A mocked backend hides any read made inside a backend method, so only the
+    graph's own call log can show how many times the mint branch reads the name.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_mint_branch_reads_the_name_exactly_once_under_the_lock(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        svc = MemoryService(mock_config)
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.client.embedder.create = AsyncMock(return_value=[0.1])
+        svc.graphiti = backend
+
+        result = await svc.ensure_entity_node(
+            name=_NAME, project_id=_PROJECT, agent_id='curator-x',
+        )
+
+        assert result['status'] == 'minted', result
+        reads = [extract_cypher(c) for c in graph.ro_query.call_args_list]
+        exact_name_reads = [r for r in reads if _EXACT_NAME_READ in r]
+        assert len(exact_name_reads) == 1, (
+            'the mint branch must issue exactly one exact-name read inside the '
+            f'identity lock (task 5003); saw {len(exact_name_reads)}'
+        )
+        assert not any(_PROVENANCE_RANK_ORDER in r for r in reads), (
+            'the mint branch must never consult find_duplicate_entity_nodes'
+        )
+        creates = [
+            c for c in graph.query.call_args_list
+            if extract_cypher(c).startswith('CREATE (n:Entity')
+        ]
+        assert len(creates) == 1
+        assert extract_params(creates[0])['uuid'] == result['uuid']
 
 
 class TestIdentityLock:
@@ -160,7 +217,7 @@ class TestIdentityLock:
             observed['locked'] = lock.locked()
             return 'uuid-new'
 
-        service.graphiti.ensure_entity_node = AsyncMock(side_effect=_probe)
+        service.graphiti._mint_entity_node = AsyncMock(side_effect=_probe)
 
         await service.ensure_entity_node(
             name=_NAME, project_id=_PROJECT, agent_id='curator-x',
@@ -192,7 +249,7 @@ class TestIdentityLock:
         assert result['status'] == 'refused'
         assert result['error_type'] == 'EntityMintLockBusy', result
         assert isinstance(result.get('error'), str) and result['error']
-        service.graphiti.ensure_entity_node.assert_not_awaited()
+        service.graphiti._mint_entity_node.assert_not_awaited()
 
     @pytest.mark.parametrize('corrupt', [None, 'x', 0, 0.0, -1.0, True, False])
     @pytest.mark.asyncio
@@ -334,7 +391,7 @@ class TestWriteJournal:
 
     @pytest.mark.asyncio
     async def test_a_backend_failure_is_journalled_and_re_raised(self, service):
-        service.graphiti.ensure_entity_node = AsyncMock(side_effect=RuntimeError('boom'))
+        service.graphiti._mint_entity_node = AsyncMock(side_effect=RuntimeError('boom'))
         journal = self._journal(service)
 
         with pytest.raises(RuntimeError, match='boom'):
@@ -367,7 +424,7 @@ class TestWriteJournal:
 
     @pytest.mark.asyncio
     async def test_the_lock_is_released_even_when_the_backend_raises(self, service):
-        service.graphiti.ensure_entity_node = AsyncMock(side_effect=RuntimeError('boom'))
+        service.graphiti._mint_entity_node = AsyncMock(side_effect=RuntimeError('boom'))
         lock = service.graphiti._identity_lock_for(_PROJECT)
 
         with pytest.raises(RuntimeError):
@@ -581,7 +638,7 @@ class TestEntityMintStormAlarm:
         assert result is not None
         assert result['minted'] is True, result
         assert result['status'] == 'minted'
-        assert service.graphiti.ensure_entity_node.await_count == threshold
+        assert service.graphiti._mint_entity_node.await_count == threshold
 
     @pytest.mark.asyncio
     async def test_an_unregistered_project_escalates_nothing_and_says_so(
@@ -723,7 +780,9 @@ class TestEntityMintStormAlarm:
             await self._mint(service, agent_id=f'curator-{i % 2}')
 
         emitter.assert_not_called()
-        assert set(service._entity_mint_storm_counters) == {'curator-0', 'curator-1'}
+        assert service.entity_mint_storm_tracked_agents == {
+            'curator-0', 'curator-1',
+        }
 
     @pytest.mark.asyncio
     async def test_an_unattributed_mint_labels_as_unattributed(self, stormy):
@@ -735,7 +794,7 @@ class TestEntityMintStormAlarm:
 
         emitter.assert_called_once()
         assert emitter.call_args.kwargs['agent_id'] == '<unattributed>'
-        assert set(service._entity_mint_storm_counters) == {'<unattributed>'}
+        assert service.entity_mint_storm_tracked_agents == {'<unattributed>'}
 
     @pytest.mark.asyncio
     async def test_dormant_counters_are_evicted(self, stormy):
@@ -749,12 +808,28 @@ class TestEntityMintStormAlarm:
         window = service.config.entity_mint.storm_window_seconds
 
         await self._mint(service, agent_id='curator-gone')
-        assert 'curator-gone' in service._entity_mint_storm_counters
+        assert 'curator-gone' in service.entity_mint_storm_tracked_agents
 
         clock.advance(window * 2)
         await self._mint(service, agent_id='curator-live')
 
-        assert set(service._entity_mint_storm_counters) == {'curator-live'}, (
+        assert service.entity_mint_storm_tracked_agents == {'curator-live'}, (
             'a counter whose window has gone empty must be dropped, not merely '
             'self-pruned'
         )
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_storm_leaf_tracks_no_agent(self, stormy):
+        """A bad leaf disables the alarm; it must not also leak a key per agent.
+
+        The sweep never runs while the leaf is bad, so a counter minted per
+        agent BEFORE the config check would accumulate without bound for as
+        long as the leaf stays malformed.
+        """
+        service, _clock, _emitter = stormy
+        service.config.entity_mint.storm_threshold = 'ten'
+
+        await self._mint(service, agent_id='curator-a')
+        await self._mint(service, agent_id='curator-b')
+
+        assert service.entity_mint_storm_tracked_agents == frozenset()

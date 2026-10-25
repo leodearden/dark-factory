@@ -69,6 +69,7 @@ def test_build_workflow_forwards_params():
     initial_plan: Any = object()
     usage_gate: Any = object()
     escalation_queue: Any = object()
+    resume_outcome_sink: Any = object()
 
     wf = build_workflow(
         assignment=assignment,
@@ -82,6 +83,7 @@ def test_build_workflow_forwards_params():
         initial_plan=initial_plan,
         event_store=event_store,
         cost_store=cost_store,
+        resume_outcome_sink=resume_outcome_sink,
     )
 
     assert isinstance(wf, TaskWorkflow)
@@ -98,6 +100,7 @@ def test_build_workflow_forwards_params():
     assert wf.initial_plan is initial_plan
     assert wf.usage_gate is usage_gate
     assert wf.escalation_queue is escalation_queue
+    assert wf.resume_outcome_sink is resume_outcome_sink
 
 
 # Every ``build_workflow`` parameter, in ``TaskWorkflow.__init__`` order. The
@@ -112,6 +115,7 @@ _BUILD_WORKFLOW_PARAMS = (
     'escalation_queue', 'escalation_event', 'usage_gate', 'initial_plan',
     'steward_factory', 'merge_queue', 'merge_worker', 'merge_inflight_registry',
     'event_store', 'cost_store', 'cancel_event', 'resume_session_id', 'run_id',
+    'resume_outcome_sink',
 )
 
 

@@ -2,22 +2,30 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import errno
 import fcntl
+import functools
 import itertools
 import json
 import logging
 import os
+import re
 import time
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 
+from escalation.categories import EscalationCategory
+from escalation.classify import is_done_step_commit_orphan
+from escalation.pins import classify_pins
+from shared import delivered_check_polarity
+from shared.asyncio_tasks import abandon_task
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -25,10 +33,23 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
+from shared.eval_lane import eval_lane_provenance
+from shared.loop_stall import LoopStallMonitor
 from shared.mcp_envelope import resolver_failed
+from shared.project_layout import escalation_queue_dir, orchestrator_data_dir, runs_db
+from shared.repo_paths import (
+    rejected_dark_factory_root_override,
+    resolve_dark_factory_root,
+)
 from shared.storm_counter import StormCounter
-from shared.task_claimant import compose_claimant_run_id, has_live_claimant
+from shared.systemd_listeners import take_systemd_listeners
+from shared.task_claimant import (
+    DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+    compose_claimant_run_id,
+    has_live_claimant,
+)
 from shared.task_metadata import RoutingState
+from shared.task_submit import SubmittedTask
 from shared.timestamps import parse_timestamp_or_warn
 from shared.transcript_archive import (
     archive_task_transcripts,
@@ -37,9 +58,16 @@ from shared.transcript_archive import (
 )
 
 from orchestrator import digest as digest_mod
+from orchestrator import recovery_pins, recut_ruling
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
+from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
+from orchestrator.already_landed_tick_view import (
+    AlreadyLandedTickView,
+    branch_absent_and_unmarked,
+    read_already_landed_tick_view,
+)
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.background_service import (
     DEFAULT_BACKOFF_SECS,
@@ -48,6 +76,8 @@ from orchestrator.background_service import (
     LifecycleRegistry,
     ManagedService,
 )
+from orchestrator.chain_telemetry import ChainTelemetry
+from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
 from orchestrator.config import (
     OrchestratorConfig,
     apply_reload,
@@ -59,28 +89,39 @@ from orchestrator.delivered_checks import (
     gate_mark_done_on_delivered_checks,
 )
 from orchestrator.deploy_state import DeployPhase, DeployState
+from orchestrator.deployed_sha import DeployedSha
 from orchestrator.deterministic_runner import (
     DETERMINISTIC_AGENT_ROLE,
     DeterministicRunner,
     build_milestone_gate_escalation_fields,
 )
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.flake_debt_drain import DRAIN_INTERVAL_SECS, run_drain_pass
+from orchestrator.flake_ledger import ledger_db_path
+from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps, classify_worktree_entry
-from orchestrator.landed_outbox import MergeProvenance
-from orchestrator.landing_evidence import (
+from orchestrator.lane_lifecycle import LaneRecord
+from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
+from orchestrator.mcp_lifecycle import McpLifecycle
+from orchestrator.merge_deferred_recovery import AbandonedMemberSweep
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
     branch_is_degenerate,
     file_unattributed_landing_escalation,
     is_valid_sha_40,
     validate_landing_evidence,
 )
-from orchestrator.lane_lifecycle import LaneRecord
-from orchestrator.lane_lifecycle import LaneState as DurableLaneState
-from orchestrator.mcp_lifecycle import McpLifecycle
-from orchestrator.merge_queue import reconcile_landed_outbox, reconcile_landed_task
-from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
-from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+from orchestrator.merge_lane.queue_store import MergeQueueStore, recover_pending_merges
+from orchestrator.merge_lane.skew_tripwire import emit_pipeline_landing_tripwire
+from orchestrator.merge_lane.worker import (
+    enqueue_merge_request,
+    reconcile_landed_outbox,
+    reconcile_landed_task,
+    select_recovery_winner,
+)
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.module_tagger_prompt import (
     TAGGER_SCHEMA,
@@ -88,6 +129,7 @@ from orchestrator.module_tagger_prompt import (
     build_tagger_prompt,
 )
 from orchestrator.offline_lane import OfflineLaneWorker
+from orchestrator.offline_lane_pass import lane_pass_outcome_hooks
 from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.proc_supervision import EscalationSpec
@@ -110,11 +152,8 @@ from orchestrator.recovery_emission import (
     should_emit_event,
     veto_signature,
 )
-from orchestrator.repo_paths import (
-    rejected_dark_factory_root_override,
-    resolve_dark_factory_root,
-)
-from orchestrator.review_checkpoint import ReviewCheckpoint
+from orchestrator.recovery_pins import records_pin_recovery
+from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.run_store import RunStore
@@ -127,9 +166,18 @@ from orchestrator.scheduler import (
 )
 from orchestrator.service_restart import (
     FLEET_DEPLOY_CLOCK_RELPATH,
+    FLEET_LEASE_RELPATH,
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
+from orchestrator.slot_lease import (
+    SlotLease,
+    SuspendedTask,
+    culprit,
+    suspended_slot_tasks,
+    wedged_slot_escalation,
+)
+from orchestrator.strand_conversion import record_strand_conversion
 from orchestrator.stranded_verified_green import (
     DURABLE_MERGE_FAILURE_STATUSES,
     MERGE_REQUEST_RESUBMIT_GRACE_S,
@@ -144,13 +192,18 @@ from orchestrator.systemd_inspect import (
     inspect_systemd_unit,
 )
 from orchestrator.task_ground_truth import (
+    ON_MAIN_BRANCH_KINDS,
     BranchStateKind,
     ClaimantSource,
-    EscalationRef,
     RecoveryAction,
     TaskGroundTruth,
     leave_reason,
     recovery_shape_str,
+    report_blocked_arm_would_move,
+    report_pins_blocked_done_flip,
+    report_pins_blocked_recovery,
+    report_pins_recovery,
+    report_would_duplicate_a_handoff,
 )
 from orchestrator.task_runtime import TaskRuntimeState, build_task_runtime_snapshot
 from orchestrator.task_status import (
@@ -159,7 +212,14 @@ from orchestrator.task_status import (
     is_infra_held,
 )
 from orchestrator.usage_gate import UsageGate
-from orchestrator.workflow import TerminalReport, WorkflowOutcome, build_workflow
+from orchestrator.verify_admission_watch import ADMISSION_WATCH_INTERVAL_SECS, AdmissionWatch
+from orchestrator.verify_categories import FailureCategory
+from orchestrator.workflow import (
+    ResumeFailure,
+    TerminalReport,
+    WorkflowOutcome,
+    build_workflow,
+)
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 from orchestrator.zero_progress_requeue import (
     ZeroProgressRequeueTracker,
@@ -170,7 +230,7 @@ from orchestrator.zero_progress_requeue import (
 if TYPE_CHECKING:
     from escalation.models import Escalation
 
-    from orchestrator.merge_queue import (
+    from orchestrator.merge_lane.worker import (
         BreakerTrip,
         SpeculativeMergeWorker,
         TrainCallbackFactory,
@@ -180,6 +240,7 @@ if TYPE_CHECKING:
 try:
     from escalation.queue import EscalationQueue
     from escalation.server import create_server
+    from escalation.store_identity import StoreIdentity
     HAS_ESCALATION = True
 except ImportError:
     HAS_ESCALATION = False
@@ -191,6 +252,9 @@ except ImportError:
     HAS_STEWARD = False
 
 logger = logging.getLogger(__name__)
+
+# Force-release claimant clears that outlived their bound, kept referenced until they unwind.
+_UNDRAINED_CLAIMANT_CLEARS: set[asyncio.Task] = set()
 
 # Maximum number of same-signature blocked→pending re-pends allowed before the
 # 4th flip is withheld and a born-at-L2 human escalation is filed.  A module
@@ -281,16 +345,6 @@ _RECONCILE_SWEEP_STATUSES: frozenset[str] = frozenset({'in-progress', 'blocked'}
 # `_cascade_unblock_member` returns first.
 _RESUME_REPEND_STATUSES: frozenset[str] = frozenset({'blocked', 'in-progress'})
 
-# heartbeat_ttl the harness configures TaskGroundTruth (task 2243, W10-θ2)
-# with — the staleness threshold TG-3's live_claimant folding applies to the
-# W2 db claimant signal (shared.task_claimant.is_stranded) and the plan.lock
-# freshness cross-check. No dedicated OrchestratorConfig field exists for
-# this yet, so it is bound explicitly here rather than left to silently ride
-# whatever default TaskGroundTruth ships with; the value mirrors
-# TaskGroundTruth's own _DEFAULT_HEARTBEAT_TTL (task_ground_truth.py) and
-# TaskArtifacts.clear_stale_plan_lock's hardcoded 600s default.
-_RECONCILE_HEARTBEAT_TTL: timedelta = timedelta(minutes=10)
-
 # Non-terminal parked statuses whose worktrees are inviolable — owned by a
 # non-scheduler party, not by the task's own progress — and so must NEVER be
 # selected as warm-lane reclaim victims (task 2018):
@@ -352,6 +406,16 @@ _STRANDED_MERGE_RESUBMIT_GRACE_S: float = MERGE_REQUEST_RESUBMIT_GRACE_S
 # excluded by that re-check and left alone).
 _AUTO_EVAL_SUPERSEDE_SAFE_STATUSES: frozenset[str] = frozenset({'pending'})
 
+# Block categories that never trigger an auto-eval redo whatever their phase:
+# they report the worktree, the host or the run's wall clock, not the plan, so
+# a full-path redo would meet the same failure. The WorktreeConflictError,
+# BranchResetError and VerifyInfraError rows of
+# orchestrator/src/orchestrator/workflow_types.py::_disposition_table route to
+# three of them; see _maybe_auto_eval.
+_AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES: frozenset[str] = frozenset(
+    {'wip_conflict', 'infra_issue', 'branch_reset'},
+)
+
 # Grace period added to the watcher rotation timeout on top of
 # watcher_rotation_hours*3600.  Gives the agent time to emit its digest and
 # exit cleanly before the supervisor kills it with a SIGTERM timeout.
@@ -359,6 +423,10 @@ _WATCHER_TIMEOUT_GRACE_SECS: float = 300.0
 
 # Maximum backoff between unclean watcher exits (seconds).
 _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
+
+# Cap-retry bound for one rotation; past it the supervisor's fresh relaunch and
+# crashloop guard own recovery (mirrors steward.py::_MAX_CAP_RETRIES).
+_WATCHER_MAX_CAP_RETRIES: int = 16
 
 # Fixed quiescent gap after a failed background-loop pass (seconds). Shared by
 # the main-tip sweep and no-landings breaker loops. Guarantees neither loop can
@@ -493,6 +561,8 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     # (promote_to_l2 is needed by the consumer-per-level contract so the
     # watcher can escalate out-of-scope L1s directly to a human L2 stream)
     'mcp__escalation__get_pending_escalations',
+    # archive-inclusive read for the drain (task 3999); get_pending_escalations is pending-only
+    'mcp__escalation__get_task_escalations',
     'mcp__escalation__resolve_issue',
     'mcp__escalation__promote_to_l2',
     # Triage-ack annotation, ungated by level — lets the watcher stamp a
@@ -538,6 +608,8 @@ _WATCHER_DISALLOWED_TOOLS: list[str] = [
     'Bash(git clean:*)',
     'Bash(git merge:*)',
     'Bash(git rebase:*)',
+    # Unscoped on purpose: removes the tool from the CLI registry, so no skill loads; SKILL.md invokes none.
+    'Skill',
 ]
 
 
@@ -682,27 +754,6 @@ def _deterministic_gate_stranded(metadata: dict | None) -> bool:
     )
 
 
-def _is_done_step_commit_orphan(esc: Escalation) -> bool:
-    """Return True iff *esc* is the done-step-commit orphan class filed by
-    ``TaskWorkflow._escalate_unreconciled_done_step`` (workflow.py:5488).
-
-    Task 2725: this is the sole, stable, machine-readable discriminator for
-    the one orphan-L0 class that is a false positive when its subject task
-    was requeue-rebased — the step's recorded ``commit`` SHA is a
-    pre-rebase intermediate no longer reachable from main, but the step's
-    content landed on main under a new SHA via the merge.
-    ``suggested_action='verify_wip_reconciliation'`` is set only by that
-    one filing site (grep-confirmed sole occurrence repo-wide), so matching
-    on it (plus ``agent_role``/``category``) is robust to summary-wording
-    changes, unlike a fragile summary-substring match.
-    """
-    return (
-        esc.agent_role == 'orchestrator'
-        and esc.category == 'infra_issue'
-        and esc.suggested_action == 'verify_wip_reconciliation'
-    )
-
-
 # The "merged family" of done_provenance.kind values that positively confirm
 # a done task's content actually landed on main (task 2725). Deliberately
 # EXCLUDES:
@@ -771,7 +822,58 @@ _BY_DESIGN_SESSION_RESUME_REASONS: frozenset[str] = frozenset({
     'stale',          # sidecar older than the freshness window
     'no_transcript',  # transcript absent / uncorroborable
     'reseeded',       # warm-lane acquire wiped the transcript store (3256)
+    # An age backstop firing is EXPECTED behaviour, exactly like 'capped' and
+    # 'stale' (task 3730 / D3). Distinct from 'stale': "old past the point
+    # resuming is safe, REGARDLESS of reachability" vs "old, with no archive
+    # to redeem it". Leaving it unclassified would make it a genuine feeder by
+    # the extension rule above, so a batch of week-old sidecars after a long
+    # outage would file an L1 telling the operator to check NTP.
+    'aged_out',
 })
+
+
+# The SIBLING carve-out, one seam downstream: which archive-RESTORE outcomes
+# are by design (task ε/3733).  Deliberately NOT merged into the reason set
+# above — the two are evaluated at different seams on different inputs (that
+# predicate runs pre-dispatch against a recovered sidecar; this classifies what
+# `TaskWorkflow._invoke`'s arm block did against the FILESYSTEM), so they are
+# orthogonal dimensions of variability.  Merging them would collapse two sets
+# whose members can no longer be reasoned about uniformly, and would break the
+# reason set's own structural test, which asserts equality against exactly the
+# predicate's producible vocabulary.
+#
+#   'disabled' — the `restore_from_archive` kill switch is off and nothing was
+#                tried: the exact analogue of the reason set's own 'disabled'.
+#   'miss'     — the archive genuinely holds no entry for this session.  This
+#                is the archive-COVERAGE signal, the analogue of
+#                'no_transcript', and task 3728's handoff note assigns it
+#                explicitly to a future RATE watch ("a step change in the rate,
+#                not a run of them").  It must NOT go on the consecutive-run
+#                streak: that detector answers a different question.
+#
+# 'fault' and 'published' are GENUINE feeders, and so is ANY outcome added
+# later — the same fail-loud extension rule the reason set states, applied to
+# the restore vocabulary: a new value feeds the INV-4 storm streak by default,
+# and you must add it HERE to exempt it.  `test_by_design_restore_constant_
+# classifies_every_producible_outcome` reads the producible set structurally
+# out of `_invoke`, so "forgot to classify it" fails a test rather than
+# silently becoming escalation noise.
+_BY_DESIGN_RESTORE_OUTCOMES: frozenset[str] = frozenset({'disabled', 'miss'})
+
+
+# How many ELIGIBLE-BUT-FAILED resumes are kept as evidence for the L1 below.
+# Bounded because the run is unbounded: past the threshold the streak keeps
+# counting while the dedup suppresses further filings, so an unbounded list
+# would grow for as long as the storm lasts and render an escalation detail no
+# operator would read. Comfortably above the shipped threshold of 5, so the
+# filed L1 names every failure in the run that tripped it.
+_MAX_RECORDED_RESUME_FAILURES: int = 20
+
+# The payload itself — :class:`orchestrator.workflow.ResumeFailure` — is
+# defined beside the ``ResumeOutcomeSink`` protocol that names it, in the
+# module that PRODUCES it. harness imports workflow and never the reverse, so
+# the producer owning the interface is the direction that composes; only the
+# CLASSIFICATION (what is by design, above) belongs here.
 
 
 
@@ -957,7 +1059,7 @@ def _acquire_project_lock(project_root: Path) -> IO:
     (closing or GC releases the lock).  Raises ``SystemExit(1)`` if
     another orchestrator instance already holds the lock.
     """
-    lock_path = project_root / 'data' / 'orchestrator' / 'orchestrator.lock'
+    lock_path = orchestrator_data_dir(project_root) / 'orchestrator.lock'
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     lock_file = open(lock_path, 'w')  # noqa: SIM115
@@ -1013,6 +1115,9 @@ class TaskReport:
     block_reason: str = ''
     block_detail: str = ''
     block_phase: str = ''
+    # ``TerminalReport.block_category``: the escalation taxonomy of a
+    # ``_mark_blocked`` exit, read by ``_maybe_auto_eval``'s trigger.
+    block_category: str = ''
     # Task 2988 (PRD ε / W3): whether a REQUEUED outcome counts against the
     # per-task requeue cap.  Mapped from ``TerminalReport.counts_against_
     # requeue_cap`` in _run_slot and passed to
@@ -1049,9 +1154,53 @@ class HarnessReport:
     paused_for_cap: bool = False
     cap_pause_duration_secs: float = 0.0
     review_checkpoints: int = 0
+    review_checkpoints_skipped: int = 0
     review_findings: int = 0
     review_tasks_created: int = 0
     review_cost_usd: float = 0.0
+
+    @property
+    def reviews_attempted(self) -> int:
+        return self.review_checkpoints + self.review_checkpoints_skipped
+
+    def record_review(self, review: ReviewReport) -> None:
+        if not review.ran:
+            self.review_checkpoints_skipped += 1
+            return
+        self.review_checkpoints += 1
+        self.review_findings += review.findings_count
+        self.review_tasks_created += len(review.tasks_created)
+        self.review_cost_usd += review.cost_usd
+
+    def to_dict(self) -> dict:
+        return {
+            'started_at': self.started_at,
+            'completed_at': self.completed_at,
+            'total_tasks': self.total_tasks,
+            'completed': self.completed,
+            'blocked': self.blocked,
+            'escalated': self.escalated,
+            'total_cost_usd': self.total_cost_usd,
+            'paused_for_cap': self.paused_for_cap,
+            'cap_pause_duration_secs': self.cap_pause_duration_secs,
+            'review_checkpoints': self.review_checkpoints,
+            'review_checkpoints_skipped': self.review_checkpoints_skipped,
+            'review_findings': self.review_findings,
+            'review_tasks_created': self.review_tasks_created,
+            'review_cost_usd': self.review_cost_usd,
+            'task_reports': [
+                {
+                    'task_id': r.task_id,
+                    'title': r.title,
+                    'outcome': r.outcome.value,
+                    'cost_usd': r.cost_usd,
+                    'duration_ms': r.duration_ms,
+                    'agent_invocations': r.agent_invocations,
+                    'completed_at': r.completed_at,
+                }
+                for r in self.task_reports
+            ],
+        }
 
     def summary(self) -> str:
         lines = [
@@ -1063,9 +1212,10 @@ class HarnessReport:
         ]
         if self.paused_for_cap:
             lines.append(f'  Cap pause: {self.cap_pause_duration_secs:.0f}s total')
-        if self.review_checkpoints > 0:
+        if self.reviews_attempted > 0:
             lines.append(
-                f'  Review checkpoints: {self.review_checkpoints} '
+                f'  Review checkpoints: {self.review_checkpoints} ran, '
+                f'{self.review_checkpoints_skipped} skipped '
                 f'({self.review_findings} findings, '
                 f'{self.review_tasks_created} tasks, '
                 f'${self.review_cost_usd:.2f})'
@@ -1144,7 +1294,7 @@ def build_train_callback_factory(
     deliberately leaves unguarded, so even a permanently-ERRORing check
     descriptor cannot produce an infinite withhold/revert cycle.
     """
-    from orchestrator.merge_queue import TrainCallbacks
+    from orchestrator.merge_lane.types import TrainCallbacks
 
     async def _delivered_checks_withhold(
         mid: str, *, site: str,
@@ -1424,7 +1574,7 @@ def build_train_callback_factory(
                     mid,
                     kind='found_on_main',
                     sha=sha,
-                    note=f'coalesce-derail re-drive: branch already on main (train {train_id})',
+                    note=f'parked-member re-drive: branch already on main (train {train_id})',
                 )
                 # task 2280 (PRD WA-3): consume the tip's write-ahead LandedRow on
                 # this found_on_main done-write, mirroring mark_member_done above.
@@ -1480,62 +1630,6 @@ def build_train_callback_factory(
 _TRAIN_MEMBER_READY_STATUS: str = 'merge-deferred'
 
 
-class _OfflineLaneTaskClient:
-    """Concrete ``offline_lane.OfflineLaneTaskClient`` adapter over the scheduler.
-
-    Structurally satisfies the ``OfflineLaneTaskClient`` Protocol
-    (``offline_lane.py``) so ``OfflineLaneWorker`` never talks to the
-    fused-memory MCP directly (task 2016, closing Bug #1) — mirrors that
-    module's ``SuiteRunner``/cross-project scope boundary. Delegates
-    entirely to existing, tested ``Scheduler`` helpers; no new MCP plumbing.
-    Module-level (not nested in ``Harness``) so it stays trivially
-    constructible in isolation, e.g. ``_OfflineLaneTaskClient(scheduler)``.
-    """
-
-    def __init__(self, scheduler: Scheduler) -> None:
-        self._scheduler = scheduler
-
-    async def submit_fix_task(self, arguments: dict) -> str:
-        """Submit a new fix task and return its id.
-
-        Reuses ``Harness._extract_task_id`` to normalise the task_id out of
-        the MCP ``tools/call`` response envelope, whatever shape it arrives
-        in (``{'task_id': ...}``, ``structuredContent``, or a ``content``
-        text block).
-        """
-        result = await self._scheduler.dispatch_tool('submit_task', arguments, timeout=30)
-        return Harness._extract_task_id(result) or ''
-
-    async def append_suspect_range(self, task_id: str, suspect_range: str) -> None:
-        """Append a suspect commit range to an already-open fix task.
-
-        Uses ``metadata_mode='additive'`` — a recursive list-union performed
-        server-side — so the range is appended (and dedup'd) atomically with
-        no read-modify-write round-trip.
-        """
-        await self._scheduler.update_task(
-            task_id, {'suspect_ranges': [suspect_range]}, metadata_mode='additive',
-        )
-
-    async def get_status(self, task_id: str) -> str:
-        """Return a previously filed fix task's current status.
-
-        Logs (rather than silently swallows) a non-``None`` error half from
-        ``get_statuses`` — e.g. a transient MCP outage — so it stays
-        observable; the caller (``_maybe_promote_blocker``) still degrades
-        to treating the empty status as "not done, not terminal" either way
-        (task 2016 amendment).
-        """
-        statuses, err = await self._scheduler.get_statuses([task_id])
-        if err is not None:
-            logger.warning(
-                'offline-lane: get_statuses failed for task %s: %s — '
-                'treating status as unknown this check',
-                task_id, err,
-            )
-        return statuses.get(task_id, '')
-
-
 def _extract_tagger_entries(payload: Any) -> list:
     """Peel known StructuredOutput wrapper keys and return the entries list.
 
@@ -1585,11 +1679,35 @@ def _already_landed_gate_shape(*, has_open_escalation: bool | None) -> str:
     return render_shape('pending', None, None, has_open_escalation, None)
 
 
+def _ewa_trip_reason(ewa: float, storm: digest_mod.CategoryShare | None) -> str:
+    """The EWA pause reason: the ``ewa_trip_`` prefix every reader keys on, then the storm share."""
+    if storm is None:
+        return f'ewa_trip_{ewa:.4f}'
+    return f'ewa_trip_{ewa:.4f} · storm: {storm}'
+
+
+REPEND_WHILE_PAUSED_MARKER = (
+    '[!! RE-PENDED INTO A PAUSED SCHEDULER: WILL NOT DISPATCH UNTIL RESUMED !!]'
+)
+
+
+def _repend_while_paused_note(task_id: str, pause_reason: str) -> str:
+    return (
+        f'{REPEND_WHILE_PAUSED_MARKER} task {task_id} is pending, but dispatch is '
+        f'paused ({pause_reason}); it waits until a human resumes the scheduler.'
+    )
+
+
 class Harness:
     """Top-level orchestration loop."""
 
-    def __init__(self, config: OrchestratorConfig):
+    def __init__(
+        self, config: OrchestratorConfig, *, deployed_sha: DeployedSha | None = None,
+    ):
         self.config = config
+        # Task 6565: the commit this process's wire path was imported from,
+        # captured by cli.py::run around the import of this module.
+        self._deployed_sha = deployed_sha
         from orchestrator.agents.sandbox_dispatch import set_backend
         set_backend(config.sandbox.backend)
         self.mcp = McpLifecycle(config)
@@ -1643,6 +1761,9 @@ class Harness:
         #     bound method is late-bound — valid to reference here even though
         #     the Counter itself is created AFTER this Scheduler build, because
         #     it resolves the Counter at CALL time, not at reference time.
+        #   - read_already_landed_tick_view (task 4900): one local-branch
+        #     snapshot per already-landed consult, read through the bound
+        #     method so a test-replaced self.git_ops is honoured.
         self.scheduler = Scheduler(
             config,
             callbacks=SchedulerCallbacks(
@@ -1656,6 +1777,7 @@ class Harness:
                 on_warm_base_promote_l2=self._promote_warm_base_hard_down_l2,
                 on_warm_base_resolve=self._resolve_warm_base_hard_down,
                 suppress_blocked_write=self._is_action_teardown_task,
+                read_already_landed_tick_view=self._read_already_landed_tick_view,
             ),
             override_store=OverrideStore.from_config(config),
             park_eviction_store=ParkEvictionRequestStore.from_config(config),
@@ -1783,8 +1905,11 @@ class Harness:
         # (which flows into build_workflow) to keep the resume payload clean.
         self._recovered_session_config_dirs: dict[str, str] = {}
         # session_resume_fallback streak (task γ storm escape, INV-4).
-        # Incremented in _run_slot on each UNEXPLAINED fallback ('stale' /
-        # 'no_transcript'); reset to 0 on any eligible resume. When it reaches
+        # Incremented on each GENUINE eligible-but-FAILED resume reported to
+        # note_resume_failed; reset to 0 by one that ADOPTED AND SURVIVED
+        # (note_resume_succeeded, task ε/3733) — never by a resume merely
+        # judged ELIGIBLE, which is a pre-dispatch predicate evaluated before
+        # the restore and so not a verdict on any outcome. When it reaches
         # session_resume.fallback_storm_threshold, one deduped L1 is filed.
         # By-design degradations do NOT feed it: disabled, capped, and (task
         # 3256) reseeded.
@@ -1796,9 +1921,31 @@ class Harness:
         # storm). The stamp below is the chain's comparison point, on the
         # MONOTONIC clock — 'stale' is itself produced by clock skew, so a
         # wall-clock decay would be corrupted by the very failure it detects.
-        # None means "no run in progress" (boot, or after an eligible resume).
+        # None means "no run in progress" (boot, or after a surviving resume
+        # retired one).
         self._session_resume_fallback_streak: int = 0
         self._last_session_resume_fallback_at: float | None = None
+        # The EVIDENCE behind that streak (task ε/3733): the genuine
+        # eligible-but-FAILED resumes of the run currently in progress, in
+        # arrival order, so the L1 can NAME what failed instead of telling the
+        # operator to run a census and guess. Cleared in lockstep with the
+        # streak whenever the run is retired — see _retire_session_resume_run.
+        self._eligible_but_failed_resumes: deque[ResumeFailure] = deque(
+            maxlen=_MAX_RECORDED_RESUME_FAILURES,
+        )
+        # The streak's RESET TERM, made observable (task ε/3733, review
+        # amendment): how many armed resumes have SURVIVED since this process
+        # booted, each of which retired any run in progress. Without it the
+        # reset had no trace anywhere — note_resume_succeeded emits no event —
+        # so "a quiet fleet" and "a streak reset a dozen times a day" looked
+        # identical to an operator reading the storm L1 and to
+        # storm_window_bound.py's derivation, which is why that module's
+        # not-inert side can only claim a NECESSARY condition.
+        #
+        # Counts the resets themselves, so unlike the streak it is per-BOOT and
+        # monotonically increasing: _retire_session_resume_run must never clear
+        # it, or the L1 could only ever report zero.
+        self._session_resume_survivals: int = 0
 
         # Rate limiter for _archive_available's fault WARNING (task 3727).
         # The faults that reach that handler are PERSISTENT, not transient —
@@ -1820,8 +1967,14 @@ class Harness:
             ReviewCheckpoint(config, self.mcp, self.usage_gate)
             if config.review.enabled else None
         )
-        self._review_running = False
-        self._pending_review_task: asyncio.Task | None = None
+        # The running focused review checkpoint, if any; dispatch pauses while set.
+        self._review_task: asyncio.Task | None = None
+        # Slot and review-checkpoint tasks still running.  Each task removes
+        # itself from its done-callback, so the set is never rebound.
+        self._live_tasks: set[asyncio.Task] = set()
+        # True only while the run-forever idle branch sleeps between polls:
+        # the one quiet window a polite service restart may use.
+        self._idle_poll_sleeping = False
         self._task_modules: dict[str, list[str]] = {}  # task_id -> modules
 
         # Escalation support
@@ -1849,8 +2002,8 @@ class Harness:
         self._ground_truth: TaskGroundTruth | None = None
 
         # Unified lifecycle seam (task 2241, W10-η — PRD §5.3 LR-1/2/3):
-        # the eleven background-loop/service lifecycles below register into
-        # ONE ordered LifecycleRegistry instead of eleven hand-rolled
+        # every background-loop/service lifecycle registers into
+        # ONE ordered LifecycleRegistry instead of hand-rolled
         # _start_*/_stop_*/_*_loop triplets.  None until
         # _build_lifecycle_registry() first runs (lazily, at the top of
         # run() — idempotent, so a test may pre-build + monkeypatch it
@@ -1897,6 +2050,13 @@ class Harness:
         # fallback when a workflow ignores the soft cancel_event.
         # See task 1491, ITEM 2 (hard-cancel fallback).
         self._workflow_slot_tasks: dict[str, asyncio.Task] = {}
+
+        # Per-task SlotLease (task 6660): the live slot's one-shot release of its
+        # module locks and semaphore permit.  Registered at _run_slot start and
+        # dropped at its exit, or by _force_release_wedged_slot.  Which slot
+        # owns a task id's registrations is decided by this entry's identity.
+        self._slot_leases: dict[str, SlotLease] = {}
+        self._force_released_slots: set[asyncio.Task] = set()
 
         # Per-task cancel CAUSE, stamped by hard_cancel_workflow immediately
         # before task.cancel() and consumed once by _run_slot's
@@ -1983,6 +2143,9 @@ class Harness:
         # Last main SHA successfully swept; used to skip the expensive full
         # verify when main has not advanced since the previous pass.
         self._last_swept_main_sha: str | None = None
+        # Bound on the first sweep tick, once run() has opened runs.db (task 5812).
+        self._main_sweep_cold_control: MainSweepColdControl | None = None
+        self._admission_watch = AdmissionWatch()
 
         # Deterministic-strand reconciliation sweep — task 2074.
         # Periodic recovery sweep for deterministic gate/deploy tasks stranded
@@ -1998,7 +2161,9 @@ class Harness:
         # Pure detection logic lives in merge_queue.NoLandingsCircuitBreaker;
         # I/O wiring (disk-stat, halt/resume, escalation file/resolve) lives
         # here, in a periodic loop mirroring the main-tip-sweep lifecycle.
-        from orchestrator.merge_queue import NoLandingsCircuitBreaker as _NLCB  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import (
+            NoLandingsCircuitBreaker as _NLCB,
+        )
         self._no_landings_breaker: _NLCB = _NLCB(
             window_samples=config.no_landings_breaker_window_samples,
             disk_free_floor_bytes=config.no_landings_breaker_disk_free_floor_bytes,
@@ -2023,15 +2188,27 @@ class Harness:
         self._merge_queue: asyncio.Queue = asyncio.Queue()
         # Single shared registry injected into both the escalation server and
         # every TaskWorkflow so the MCP coalesce gate sees workflow-path merges.
-        from orchestrator.merge_queue import InFlightMergeRegistry
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry
         self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
         self._merge_worker: SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
+        self._abandoned_member_sweep = AbandonedMemberSweep()
+        # This unit's side of the restart drain (task 5371): steers the merge
+        # worker's admission from the heartbeat pass, reports at stop.
+        self._drain_participant = DrainParticipant(
+            lane=lambda: self._merge_worker,
+            fleet_dir=resolve_fleet_dir,
+            identity=lambda: DrainIdentity.from_environ(
+                os.environ,
+                max_age_secs=self.config.orchestrator_restart_lease_max_age_secs,
+            ),
+            emit=self._emit_fleet_drain,
+        )
         # Durable journal for in-flight merge requests (task 1772).
-        # Persisted at data/orchestrator/merge_queue.json; recovered on restart
-        # by _recover_pending_merges (called from run() after _rehydrate_merge_halt).
+        # Recovered on restart by _recover_pending_merges (called from run()
+        # after _rehydrate_merge_halt).
         self._merge_store: MergeQueueStore = MergeQueueStore(
-            config.project_root / 'data' / 'orchestrator' / 'merge_queue.json'
+            orchestrator_data_dir(config.project_root) / 'merge_queue.json'
         )
 
         # Post-merge staleness hook — restart services when a landed diff
@@ -2198,7 +2375,7 @@ class Harness:
         self._last_digest_window_end_iso: str = ''
 
     def _build_lifecycle_registry(self) -> None:
-        """Build ``self._lifecycle`` in the canonical eleven-service order.
+        """Build ``self._lifecycle`` in the canonical service order.
 
         Idempotent — a no-op once ``self._lifecycle`` is already set, so a
         test may pre-build (and monkeypatch) the registry before driving
@@ -2206,21 +2383,34 @@ class Harness:
         W10-η — PRD §5.3 LR-1/2/3).
 
         Registration order (also the ``stop_all()`` REVERSE order — LR-2):
-        escalation-server, merge-worker, offline-lane, orphan-l0-reaper,
-        terminal-status-watcher, watcher-supervisor, stranded-reconcile,
-        main-tip-sweep, no-landings-breaker, deterministic-recon-sweep,
-        warm-lane-gc. escalation-server and merge-worker start first so the
-        recovery block (which runs immediately after ``start_all()``
-        returns) can depend on both being live. The seven sweeps are
-        conditionally registered on their own ``config.X_enabled`` gate —
-        ``BackgroundService`` itself has no ``enabled`` field (PRD §5.3
-        shape); a disabled sweep is simply absent from the registry.
+        loop-stall-monitor, escalation-server, merge-worker, offline-lane,
+        orphan-l0-reaper, terminal-status-watcher, watcher-supervisor,
+        stranded-reconcile, main-tip-sweep, no-landings-breaker,
+        deterministic-recon-sweep, warm-lane-gc, stale-service-restart,
+        merge-heartbeat, verify-admission-watch, flake-debt-drain.
+        loop-stall-monitor starts first so it watches every other service's
+        whole life, and stops last (task 7366). escalation-server and
+        merge-worker start next so the recovery block (which runs immediately
+        after ``start_all()`` returns) can depend on both being live. The
+        seven sweeps are conditionally registered on their own
+        ``config.X_enabled`` gate — ``BackgroundService`` itself has no
+        ``enabled`` field (PRD §5.3 shape); a disabled sweep is simply
+        absent from the registry. The last four always run: they must keep
+        their cadence whatever the dispatch loop is doing (task 5344; the
+        verify-admission watch, task 5628; the flake-debt drain, task 6934).
         """
         if self._lifecycle is not None:
             return
         registry = LifecycleRegistry()
         sweep_backoff = BackoffPolicy(_BG_LOOP_FAILURE_BACKOFF_SECS)
 
+        monitor = LoopStallMonitor()
+        registry.register(ManagedService(
+            name='loop-stall-monitor',
+            start_fn=monitor.start,
+            stop_fn=monitor.stop,
+            stop_timeout_secs=_LIFECYCLE_SERVICE_STOP_TIMEOUT_SECS,
+        ))
         registry.register(ManagedService(
             name='escalation-server',
             start_fn=self._start_escalation_server,
@@ -2308,7 +2498,73 @@ class Harness:
                 stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
                 max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
             ))
+        registry.register(BackgroundService(
+            name='stale-service-restart',
+            pass_fn=self._run_stale_service_restart_pass,
+            interval_secs=self.config.stale_service_restart_interval_secs,
+            backoff=sweep_backoff,
+            stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+            max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+        ))
+        registry.register(BackgroundService(
+            name='merge-heartbeat',
+            pass_fn=self._write_merge_heartbeat,
+            interval_secs=self.config.merge_heartbeat_interval_secs,
+            backoff=sweep_backoff,
+            stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+            max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+        ))
+        registry.register(BackgroundService(
+            name='verify-admission-watch',
+            pass_fn=self._run_verify_admission_watch_pass,
+            interval_secs=ADMISSION_WATCH_INTERVAL_SECS,
+            backoff=sweep_backoff,
+            stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+            max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+        ))
+        drain_client = SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root)
+        registry.register(BackgroundService(
+            name='flake-debt-drain',
+            pass_fn=functools.partial(self._run_flake_debt_drain_pass, drain_client),
+            interval_secs=DRAIN_INTERVAL_SECS,
+            backoff=sweep_backoff,
+            stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+            max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+        ))
         self._lifecycle = registry
+
+    async def _run_flake_debt_drain_pass(
+        self, task_client: SchedulerChronicFlakeTaskClient,
+    ) -> None:
+        """One pass of the flake-debt drain (task 6934).
+
+        ``self._escalation_queue`` and ``self.git_ops`` are read when the pass
+        RUNS, not when the registry is built: the registry is built before
+        ``_start_escalation_server`` creates the queue, so a queue captured at
+        registration would stay ``None`` for the drain's whole life.
+        """
+        await run_drain_pass(
+            ledger_db_path(Path(self.config.project_root)),
+            self.config.fused_memory.project_id,
+            task_client=task_client,
+            git=self.git_ops,
+            escalation_queue=self._escalation_queue,
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
+
+    async def _run_verify_admission_watch_pass(self) -> None:
+        """One tick of the task-verify admission watch on this process's gate.
+
+        Every knob is read per tick, so a reload applies from the next one.
+        """
+        if self.event_store is None:
+            return
+        self._admission_watch.tick(
+            self.event_store,
+            slots_dir=Path(self.config.verify_admission_slots_dir),
+            alarm_secs=self.config.verify_admission_wait_alarm_secs,
+            order=self.config.verify_admission_order,
+        )
 
     async def _run_orphan_l0_reaper_pass(self) -> None:
         """Async ``pass_fn`` wrapper for the orphan-L0 pass.
@@ -2331,15 +2587,48 @@ class Harness:
         await self._scan_for_terminal_active_tasks()
 
     async def _run_stranded_reconcile_pass(self) -> None:
-        """Async ``pass_fn`` wrapper folding the two-call stranded pass.
+        """Async ``pass_fn`` wrapper folding the three-step stranded pass.
 
-        Hoisted verbatim from the deleted ``_stranded_reconcile_loop`` body
-        (task 2241, W10-η): the mid-run stranded-in-progress reconcile
-        followed by the periodic terminal-lane sweep (Diff 7 layer-A
-        backstop).
+        Hoisted from the deleted ``_stranded_reconcile_loop`` body (task 2241,
+        W10-η): the mid-run stranded-in-progress reconcile, then the periodic
+        terminal-lane sweep (Diff 7 layer-A backstop), then the abandoned
+        merge-deferred recovery (task 4737).
         """
         await self._reconcile_stranded_in_progress(mid_run=True)
         await self._reconcile_terminal_lanes()
+        await self._recover_abandoned_merge_deferred()
+
+    async def _recover_abandoned_merge_deferred(self) -> None:
+        """Re-drive merge-deferred members nothing owns any more (task 4737).
+
+        ``_reconcile_one_stranded`` never touches merge-deferred; this sweep
+        is that status's owner.  A fault is logged and swallowed so it never
+        fails the pass and starves the next stranded reconcile.
+        """
+        try:
+            await self._abandoned_member_sweep.run_pass(
+                lane=self._merge_worker,
+                requests=self._merge_inflight_registry,
+                tasks=self.scheduler,
+                escalations=self._escalation_queue,
+                claimant_ttl=timedelta(seconds=self.config.claimant_liveness_ttl_secs),
+            )
+        except Exception:
+            logger.warning('Abandoned merge-deferred sweep failed', exc_info=True)
+
+    async def _run_stale_service_restart_pass(self) -> None:
+        """``pass_fn`` for the stale-service-restart service.
+
+        ``agents_idle`` is True only while the idle branch sleeps with nothing
+        live — never during startup recovery, a full review, a dispatch tick
+        or a mid-run reconcile.  An owed force-fire ignores it (see
+        ``StaleServiceRestartCoordinator.maybe_restart``).  Nothing fires once
+        shutdown has begun.
+        """
+        if self._draining:
+            return
+        agents_idle = self._idle_poll_sleeping and not self._live_tasks
+        await self._maybe_restart_stale_service(agents_idle=agents_idle)
 
     async def run(
         self,
@@ -2401,12 +2690,13 @@ class Harness:
 
         run_id = f'run-{uuid.uuid4().hex[:12]}'
         self._run_id = run_id
-        db_path = self.config.project_root / 'data' / 'orchestrator' / 'runs.db'
+        db_path = runs_db(self.config.project_root)
         try:
             self.event_store = EventStore(db_path, run_id)
             self.scheduler.event_store = self.event_store
         except Exception:
             logger.warning('Failed to create event store', exc_info=True)
+        self._announce_deployed_sha()
 
         # 0a. Create run store and register this run immediately so
         # task_results can be written incrementally as tasks complete.
@@ -2417,6 +2707,7 @@ class Harness:
                 self.config.fused_memory.project_id,
                 self.report.started_at,
                 str(prd_path) if prd_path else '',
+                code_sha=None if self._deployed_sha is None else self._deployed_sha.sha,
             )
         except Exception:
             # Non-fatal, but loud: swallowing this at warning level understated
@@ -2455,10 +2746,8 @@ class Harness:
             # post-construction attribute-wiring pattern above.
             self.review_checkpoint.event_store = self.event_store
 
-        # Hoisted out of the try block so the finally clause can cancel
-        # in-flight workflow tasks even if an exception fires before the
-        # main loop creates them.
-        active: set[asyncio.Task] = set()
+        # Hoisted out of the try block so the finally clause can tally the
+        # reports of slots cancelled at shutdown.
         task_reports: list[TaskReport] = []
 
         try:
@@ -2468,7 +2757,7 @@ class Harness:
 
             # 1b. Start every background-loop/service lifecycle in one
             # ordered ladder (task 2241, W10-η — PRD §5.3 LR-1/2/3):
-            # escalation-server, merge-worker, offline-lane, then the seven
+            # escalation-server, merge-worker, offline-lane, then the
             # sleep-first sweeps. escalation-server + merge-worker start
             # first (canonical order), so the recovery block immediately
             # below — which depends on both being live — is unaffected by
@@ -2743,20 +3032,12 @@ class Harness:
             sem = asyncio.Semaphore(self.config.max_concurrent_tasks)
 
             while True:
-                # Pick up any pending review task spawned by _collect_done_reports
-                if self._pending_review_task is not None:
-                    active.add(self._pending_review_task)
-                    self._pending_review_task = None
-
                 # If a review checkpoint is running, don't acquire new tasks —
-                # wait for in-flight tasks (and the review) to complete.
-                if self._review_running:
-                    if not active:
-                        break  # shouldn't happen — review task is in active
-                    done, active = await asyncio.wait(
-                        active, return_when=asyncio.FIRST_COMPLETED
+                # wait for in-flight tasks (and the review, itself live) to end.
+                if self._review_task is not None:
+                    await asyncio.wait(
+                        set(self._live_tasks), return_when=asyncio.FIRST_COMPLETED,
                     )
-                    self._collect_done_reports(done, task_reports)
                     continue
 
                 # Check daily cost ceilings before dispatching the next task.
@@ -2768,7 +3049,7 @@ class Harness:
                 assignment = await self.scheduler.acquire_next()
 
                 if assignment is None:
-                    if not active:
+                    if not self._live_tasks:
                         if self.scheduler.is_paused:
                             # Paused ≠ done.  acquire_next() returns None while
                             # paused (task-1322); treating that as completion
@@ -2777,7 +3058,7 @@ class Harness:
                             # service.  Idle in-process instead so an in-process
                             # resume_scheduler() (via the still-running
                             # escalation MCP) resumes dispatch without a restart.
-                            # The six background loops keep running while we idle.
+                            # The background services keep running while we idle.
                             now = time.monotonic()
                             if (
                                 now - self._last_paused_idle_log
@@ -2818,10 +3099,9 @@ class Harness:
                         # Idle and re-poll the tree so tasks scheduled after
                         # startup get picked up.
                         #
-                        # Invariant: this branch is only reachable with `active`
-                        # empty and no focused review in flight — _review_running
-                        # / _pending_review_task serialize at the loop top, so a
-                        # full-review-on-idle here can't race a focused review.
+                        # Invariant: this branch is only reachable with no slot
+                        # or focused review live, so a full-review-on-idle here
+                        # can't race a focused review.
                         now = time.monotonic()
                         self._compute_tallies(task_reports)
                         if self.report.completed > 0 or task_reports:
@@ -2836,8 +3116,8 @@ class Harness:
                                     and self.review_checkpoint.should_run_full(now)):
                                 await self._run_full_review_and_tag()
                             # Reset per-cycle aggregates.  Safe to drop the old
-                            # task_reports list here (see invariant above: no
-                            # report is still being collected).  Recompute
+                            # task_reports list here: no live slot still holds
+                            # it (see invariant above).  Recompute
                             # total_tasks cheaply so completed/total stays honest.
                             task_reports = []
                             self.report = HarnessReport(
@@ -2854,76 +3134,23 @@ class Harness:
                                 self.config.idle_poll_secs,
                             )
                             self._last_idle_poll_log = now
-                        # Post-merge staleness hook: restart fused-memory.service
-                        # if a code-touching merge has been debounced and the
-                        # orchestrator is idle (no dispatched agents = quiet window).
-                        await self._maybe_restart_stale_service(agents_idle=True)
-                        # Fleet-common merge-idle heartbeat (task 2395, α): written
-                        # in both rest branches so a saturated unit (steady-state
-                        # busy-wait branch below) still heartbeats.  Does NOT cover
-                        # a unit that is continuously dispatching with spare
-                        # semaphore headroom (never idle, never busy-waiting) — see
-                        # the docstring of _write_merge_heartbeat for why that gap
-                        # is accepted rather than closed with an unconditional
-                        # per-tick call.
-                        await self._write_merge_heartbeat()
-                        await asyncio.sleep(self.config.idle_poll_secs)
+                        self._idle_poll_sleeping = True
+                        try:
+                            await asyncio.sleep(self.config.idle_poll_secs)
+                        finally:
+                            self._idle_poll_sleeping = False
                         continue
-                    # Wait for any active task to complete, then retry.
+                    # Wait for any live task to complete, then retry.
                     # Timeout ensures newly-added tasks are discovered
                     # within 15s even when no running task completes.
-                    done, active = await asyncio.wait(
-                        active, return_when=asyncio.FIRST_COMPLETED,
+                    await asyncio.wait(
+                        set(self._live_tasks), return_when=asyncio.FIRST_COMPLETED,
                         timeout=15,
                     )
-                    self._collect_done_reports(done, task_reports)
-                    # Leaf services (dashboard, require_idle=False) restart
-                    # promptly after their diff lands even while agents are
-                    # dispatching.  fused-memory (require_idle=True) no-ops here
-                    # and is reserved for the idle branch above — the two
-                    # branches are mutually exclusive per tick and maybe_restart
-                    # clears pending on fire, so there is no double-fire.
-                    await self._maybe_restart_stale_service(agents_idle=False)
-                    # Fleet-common merge-idle heartbeat (task 2395, α): a
-                    # saturated unit steady-states in this busy-wait branch, so
-                    # it must heartbeat here too — see the idle branch above.
-                    await self._write_merge_heartbeat()
                     continue
 
                 await sem.acquire()
-                self._task_modules[assignment.task_id] = list(assignment.modules)
-                # Register escalation wake-event BEFORE create_task so Fix #1a
-                # (_on_escalation_resolved orphan-flip gate) sees task_id in
-                # _escalation_events immediately — closing the sub-second race
-                # where a resolving escalation would mis-classify a just-
-                # dispatched task as an orphan and double-flip it.
-                self._register_escalation_event(assignment.task_id)
-                task = asyncio.create_task(
-                    self._run_slot(assignment, sem),
-                    name=f'workflow-{assignment.task_id}',
-                )
-                active.add(task)
-                task.add_done_callback(active.discard)
-                # Guard against the narrow resource-leak window where the slot
-                # task is cancelled before _run_slot's body begins executing
-                # (e.g. hard_cancel_workflow or shutdown sweeping pending tasks
-                # before the event loop schedules the coroutine's first step).
-                # In that case _run_slot's finally block never runs and
-                # _escalation_events[task_id] would leak — permanently
-                # satisfying the active-workflow gate and suppressing both the
-                # stranded_blocked re-file and Fix #1a orphan-flip for that
-                # task forever.  The done_callback fires unconditionally when
-                # the Task reaches any terminal state; pop() is idempotent (a
-                # no-op if _run_slot's finally already removed the entry).
-                _tid = assignment.task_id
-                task.add_done_callback(
-                    lambda _t, tid=_tid: self._escalation_events.pop(tid, None)
-                )
-
-            # Drain remaining
-            if active:
-                done, _ = await asyncio.wait(active)
-                self._collect_done_reports(done, task_reports)
+                self._launch_slot(assignment, sem, task_reports)
 
             self._compute_tallies(task_reports)
 
@@ -2948,24 +3175,26 @@ class Harness:
             # usage_gate — otherwise a cap-hit in a still-running agent can
             # spawn a fresh probe task via _handle_cap_detected AFTER
             # usage_gate.shutdown() has drained the existing ones, leaving
-            # the event loop alive forever.
-            if active:
-                logger.info(f'Cancelling {len(active)} active workflow task(s)')
-                for t in active:
+            # the event loop alive forever.  Each slot's done-callback
+            # collects its synthetic CANCELLED report.
+            if self._live_tasks:
+                live = set(self._live_tasks)
+                logger.info(f'Cancelling {len(live)} active workflow task(s)')
+                for t in live:
                     t.cancel()
                 try:
                     await asyncio.wait_for(
-                        asyncio.gather(*active, return_exceptions=True),
+                        asyncio.gather(*live, return_exceptions=True),
                         timeout=15.0,
                     )
                 except TimeoutError:
                     logger.error('Workflow tasks did not drain within 15s')
-                active.clear()
+            self._compute_tallies(task_reports)
 
             self.report.completed_at = datetime.now(UTC).isoformat()
 
             # Finalize run metrics in SQLite (task_results were written
-            # incrementally in _collect_done_reports; this updates the
+            # incrementally by _collect_slot_report; this updates the
             # runs row with final aggregates).
             if self._run_store and self._run_id:
                 try:
@@ -2980,7 +3209,7 @@ class Harness:
             self._checkpoint_stores()
 
             # Save HarnessReport alongside review checkpoint reports
-            if self.report.review_checkpoints > 0:
+            if self.report.reviews_attempted > 0:
                 self._save_harness_report()
 
             if self.usage_gate:
@@ -3307,9 +3536,8 @@ class Harness:
         name`` (the new ``.task-meta`` sibling location, W11 beta), falling
         back to the legacy ``entry / '.task' / name`` when the new path is
         absent.  Mirrors ``TaskArtifacts._read_path``'s new-then-old
-        contract and ``GitOps._find_lane_by_plan_task_id``'s plan.json scan,
-        for the ``_recover_crashed_tasks`` reads that don't go through a
-        ``TaskArtifacts`` instance.
+        contract, for the ``_recover_crashed_tasks`` reads that don't go
+        through a ``TaskArtifacts`` instance.
         """
         new_path = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, entry.name) / name
         if new_path.exists():
@@ -3397,36 +3625,87 @@ class Harness:
             return None
         key = str(key)
         self._recovered_sessions[key] = session_data
-        # Best-effort: stash the surviving worktree's claude-config dir so the
-        # _run_slot guard (task γ) can RE-glob the transcript at dispatch. The
-        # dir name embeds the branch (``claude-config-<branch>``), not derivable
-        # from task_id at the pre-acquire dispatch point, so *entry* — the
-        # surviving worktree, known only here — is the last place to capture it.
-        # Never raises: a missing/globless .task simply leaves no stash, which
-        # the guard treats as 'no_transcript' (fail-safe fresh dispatch, I3).
+        # Best-effort: stash the surviving worktree's config dir so the
+        # _run_slot guard (task γ) can RE-glob the transcript at dispatch.
+        # *entry* — the surviving worktree — is known only here, which is why
+        # the capture happens at adoption rather than at the pre-acquire
+        # dispatch point.
+        #
+        # DERIVED, not searched. The dir name is a pure function of the task id
+        # by construction: the SOLE mkdir site in the tree is
+        # ``shared/src/shared/config_dir.py::TaskConfigDir.__init__``, which
+        # builds ``base / f'{CONFIG_DIR_PREFIX}{task_id}'`` from a task-id STEM,
+        # reached in production from
+        # ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow`` as
+        # ``TaskConfigDir(self.task_id, base_dir=self.worktree / '.task')``.
+        # And ``key`` above IS the real task id at every call arity (the
+        # plan-derived recovery id, the v2 sidecar's own ``task_id``, or the
+        # cold worktree's dir name — all the same identity).
+        #
+        # Nothing else is EVER stashed: the one other creator,
+        # ``orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock``,
+        # deliberately produces ``claude-config-<task_id>-unblock``, a
+        # legitimate non-owner of this session's transcript.
+        #
+        # What the miss path signals, and the scoping it is emitted under, are
+        # stated once — at ``orchestrator/src/orchestrator/event_store.py::
+        # EventType.session_config_dir_ambiguous``. Read it there.
+        #
+        # Never raises: a missing .task simply leaves no stash, which the guard
+        # treats as 'no_transcript' (fail-safe fresh dispatch, I3). ``.exists()``
+        # can still raise on a broken mount, hence the retained guard.
         try:
-            config_dirs = sorted((entry / '.task').glob('claude-config-*'))
-            if config_dirs:
-                if len(config_dirs) > 1:
-                    # >1 claude-config-<branch> dir in a single surviving
-                    # worktree is abnormal: the lexically-first pick may not be
-                    # the one holding THIS session's transcript, in which case
-                    # the dispatch-time re-glob degrades to a 'no_transcript'
-                    # fresh dispatch. Warn (loud-over-silent) so that otherwise
-                    # silent missed resume is observable.
+            expected = entry / '.task' / f'{CONFIG_DIR_PREFIX}{key}'
+            if expected.exists():
+                self._recovered_session_config_dirs[key] = str(expected)
+            else:
+                # The candidate scan happens ONLY here, on the miss path: the
+                # healthy path costs one stat rather than a directory scan, and
+                # `found` exists solely to populate the signal below — with no
+                # miss there is no consumer for it. (Same reasoning as the
+                # `archive_available` emit site: build the payload inside the
+                # guard that needs it.)
+                found = sorted(
+                    str(p) for p in (entry / '.task').glob(f'{CONFIG_DIR_PREFIX}*')
+                )
+                if found:
+                    # Candidates but not the derived one: another owner's
+                    # worktree, so nothing here can corroborate the session. An
+                    # EMPTY .task/ falls through silently — that is absence, not
+                    # ambiguity (scoping stated at the EventType member cited
+                    # above).
                     logger.warning(
-                        'Recovery: %s has %d claude-config dirs %s — stashing the '
-                        'lexically-first (%s) for session %s; if it lacks the '
-                        'transcript the resume degrades to fresh dispatch',
-                        entry.name, len(config_dirs),
-                        [str(d) for d in config_dirs], config_dirs[0],
+                        'Recovery: %s holds %d config dir(s) %s but NOT the '
+                        'derived %s for session %s — not stashing; the resume '
+                        'will degrade to a fresh dispatch',
+                        entry.name, len(found), found, expected,
                         session_data.get('session_id'),
                     )
-                self._recovered_session_config_dirs[key] = str(config_dirs[0])
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.session_config_dir_ambiguous,
+                            task_id=key,
+                            data={
+                                'expected': str(expected),
+                                'found': found,
+                                'session_id': session_data.get('session_id'),
+                                'task_id': key,
+                            },
+                        )
+                    # AFTER the emit, deliberately: the structured event lands
+                    # in runs.db even when filing is suppressed by dedup or
+                    # fails outright, so the census stays complete while the
+                    # escalation stays at one-open-at-a-time.
+                    self._file_config_dir_ambiguous_escalation(
+                        key=key,
+                        session_id=session_data.get('session_id'),
+                        expected=expected,
+                        found=found,
+                    )
         except OSError as e:
             logger.debug(
-                'Recovery: %s config-dir glob failed (%s) — guard will treat '
-                'the recovered session as uncorroborated', entry.name, e,
+                'Recovery: %s config-dir resolution failed (%s) — guard will '
+                'treat the recovered session as uncorroborated', entry.name, e,
             )
         logger.info(
             'Recovery: adopting agent session for task %s (role=%s, '
@@ -3547,6 +3826,22 @@ class Harness:
         # `dict` is a regression, not a tidy-up.
         session: object,
         config_dir: str | None,
+        *,
+        # Keyword-only and REQUIRED, not defaulted: since task 3730 this is an
+        # ELIGIBILITY input, so a caller that has not decided whether the
+        # session is still in the durable archive must fail loudly rather than
+        # silently inherit the pre-δ answer. Passed IN rather than looked up
+        # here so the predicate acquires no filesystem dependency of its own:
+        # a bool cannot raise, so the I3 totality contract below needs no new
+        # try/except.
+        #
+        # It means REACHABLE VIA THE ARCHIVE, which is the on-disk lookup
+        # narrowed by `restore_from_archive` — an archive nothing will restore
+        # cannot make a session reachable. The _run_slot hoist composes the
+        # two; the fallback event reports the un-narrowed lookup beside these
+        # reasons, and the difference between them is exactly the operator
+        # having pulled that switch.
+        archive_available: bool,
     ) -> frozenset[str]:
         """Return EVERY reason a recovered session is ineligible (task β/3728).
 
@@ -3583,12 +3878,52 @@ class Harness:
                               never evaluated for resume at all — and the
                               corroboration leg's filesystem glob is pure waste
                               on the dispatch path while the feature is off.
-          - 'stale'         — (now - started_at) >= freshness_window_secs, OR
-                              started_at is missing/unparseable (fail-safe).
+          - 'stale'         — the session is OLD AND UNREACHABLE: a computed
+                              age >= freshness_window_secs with NO durable
+                              archive to redeem it. Since task 3730 (δ / D2)
+                              reachability outranks freshness, so an
+                              archive-backed session is never 'stale' on age
+                              — an archived transcript does not decay with
+                              wall-clock, which makes "how old is it" the
+                              wrong question for a session that is still
+                              reachable. ALSO returned, unconditionally and
+                              NEVER suppressed by the archive, when started_at
+                              is missing/unparseable/the wrong type: see the
+                              freshness leg for why that fail-safe is separate.
+          - 'aged_out'      — (now - started_at) >= absolute_resume_age_secs.
+                              The D3 backstop, and the ONE age check the
+                              archive does not suppress. Distinct from 'stale'
+                              because the two are actioned differently:
+                              'stale' is "old, with no archive to redeem it"
+                              (actionable — ask why the archive is missing),
+                              'aged_out' is "old past the point where resuming
+                              is safe regardless of reachability" (the
+                              backstop working). Reusing 'stale' for both
+                              would make the backstop invisible in runs.db and
+                              destroy the co-occurrence census D5 built the
+                              reason SET to enable. The bound is DERIVED, not
+                              chosen — see
+                              orchestrator/resume_age_bound.py.
           - 'capped'        — resume_count >= max_resumes_per_task (B7).
-        Then transcript corroboration, which contributes AT MOST ONE of the
-        following two — they are the two arms of a single check, mutually
-        exclusive by construction:
+                              Deliberately MEDIATION-AGNOSTIC: an
+                              archive-mediated resume increments and is
+                              throttled by exactly the same counter as a
+                              live-dir one, because the archive is transport,
+                              not a fresh start — a rehydrated transcript is
+                              byte-identical to the live one it replaces, so
+                              the risk the cap bounds (a task looping on
+                              resumes, burning budget on the same wedged
+                              context) is identical either way. Resetting it
+                              on the archive path would make the cap
+                              unreachable on the one path δ opens (PRD §11
+                              open question 3).
+        Then transcript corroboration. Since task 3730 the question it asks
+        is REACHABILITY, and a durable archive answers it just as well as a
+        live transcript does: with *archive_available* true neither reason
+        below is added, because the transcript can be rehydrated from the
+        archive at the arm site. With no archive it contributes AT MOST ONE
+        of the following two — they are the two arms of a single check,
+        mutually exclusive by construction:
           - 'no_transcript' — no stashed config_dir, no session_id, the config
                               dir survives but this session's transcript is
                               absent, or the dir is present-but-unreadable
@@ -3634,16 +3969,44 @@ class Harness:
             # corroborates it.
             return frozenset({'stale', 'no_transcript'})
         reasons: set[str] = set()
-        # Freshness — any parse failure or absent started_at is 'stale'.
+        # Freshness — and note this leg folds TWO different facts into one
+        # token, which task 3730 (δ) had to prise apart. "This session is
+        # provably too old" and "we cannot date this session at all" are
+        # actioned differently the moment an archive can suppress the first.
         try:
             started_at = datetime.fromisoformat(session['started_at'])
             if started_at.tzinfo is None:
                 started_at = started_at.replace(tzinfo=UTC)
             age_secs = (datetime.now(UTC) - started_at).total_seconds()
-            if age_secs >= cfg.freshness_window_secs:
-                reasons.add('stale')
         except (KeyError, ValueError, TypeError):
+            # UNDATEABLE — 'stale' unconditionally, NEVER suppressed by the
+            # archive. D2's argument for suppression is that an archived
+            # transcript does not decay with wall-clock, so age is the wrong
+            # question; that applies only to a session whose age we KNOW. Here
+            # the age is unknown, so nothing bounds it — and the absolute
+            # backstop cannot be evaluated either, because there is no age to
+            # compare. Laundering an undateable sidecar into eligibility on
+            # the strength of an archive would be a fail-OPEN regression
+            # against the I3 contract this whole method rests on. Fail-safe
+            # direction: cannot date it, cannot resume it.
             reasons.add('stale')
+        else:
+            # AGE-DERIVED staleness, and the ONLY thing the archive suppresses
+            # (task 3730 / D2). 'stale' now means "old, with no archive to
+            # redeem it" — an actionable population (why is the archive
+            # missing?) rather than a mix of that and the backstop firing.
+            if age_secs >= cfg.freshness_window_secs and not archive_available:
+                reasons.add('stale')
+            # THE ABSOLUTE BACKSTOP (task 3730 / D3), UNCONDITIONAL — the
+            # archive does not suppress it. D2 makes reachability outrank
+            # FRESHNESS; without this leg it would also outrank age entirely,
+            # and a sidecar surviving an arbitrarily long outage would resume
+            # into a world that had moved on. Only reachable from the `else`
+            # branch, i.e. only when the age was actually COMPUTED: an
+            # undateable session has nothing to compare and is already 'stale'
+            # above.
+            if age_secs >= cfg.absolute_resume_age_secs:
+                reasons.add('aged_out')
         # Per-task resume cap (throttling of a healthy long-running task).
         try:
             resume_count = int(session.get('resume_count', 0))
@@ -3663,53 +4026,98 @@ class Harness:
         # positive evidence that the whole store was wiped by an acquire
         # reseed ('reseeded', expected), while a surviving dir missing only
         # this session's transcript is a genuine failure ('no_transcript').
-        # A never-stashed config_dir / session_id stays 'no_transcript': a
-        # reseed clears the out-of-lane meta root together with the lane
-        # (PRD I2), so it destroys the sidecar WITH the transcript and yields
-        # no adoption at all — an adopted session with no config dir is
-        # pathological and must stay loud.
-        session_id = session.get('session_id')
-        if not config_dir or not session_id:
-            reasons.add('no_transcript')
-        elif not transcript_exists(Path(config_dir), session_id):
-            # Discriminate "PROVABLY gone" from "there but unreadable", and do
-            # it with an explicit stat rather than Path.exists(), which is
-            # wrong for this seam in both directions: it swallows exactly
-            # {ENOENT, ENOTDIR, EBADF, ELOOP} into False — so a symlink loop
-            # or bad fd would read as a wipe and land in the SILENT,
-            # storm-exempt 'reseeded' arm — and it RE-RAISES every other
-            # OSError (EACCES on a parent, ESTALE, EIO), which would escape
-            # this method and break the never-raises I3 contract above.
-            # Either way a genuine filesystem fault stops surfacing as the
-            # systematic breakage INV-4 exists to catch. So: only ENOENT/
-            # ENOTDIR earns 'reseeded'; everything else falls through to the
-            # LOUD arm, caught here so the method stays total (ValueError
-            # covers the NUL-bearing path that os.stat rejects outright).
-            wiped = False
-            try:
-                Path(config_dir).stat()
-            except (FileNotFoundError, NotADirectoryError):
-                wiped = True
-            except (OSError, ValueError):
-                pass  # unreadable/faulted != wiped — stay loud
-            reasons.add('reseeded' if wiped else 'no_transcript')
+        # A never-stashed config_dir / session_id stays 'no_transcript' — but
+        # ONLY with no archive, and the reason this clause used to give for it
+        # was wrong. It argued that a reseed clears the out-of-lane meta root
+        # together with the lane (PRD I2), destroying the sidecar WITH the
+        # transcript and yielding no adoption at all, so "an adopted session
+        # with no config dir is pathological and must stay loud".
+        #
+        # CORRECTED (task 3730, from this task's own Details). Production
+        # reaches exactly that state on EVERY crash-recovery path, and by
+        # design: run()'s finally executes an unconditional cleanup_config_dir
+        # teardown (registered by
+        # workflow.py::TaskWorkflow._on_terminal_cleanups, run on every
+        # terminal exit of TaskWorkflow.run) while session_preserved
+        # keeps the sidecar, so the config dir is gone and
+        # _adopt_recovered_session's glob finds nothing. A reseed is not the
+        # only way to arrive here, and it is not the common one. With an
+        # archive present this shape is NORMAL, not pathological. Without an
+        # archive the session really is uncorroborable and the LOUD arm is
+        # still correct.
+        #
+        # So the discrimination is ASKED ONLY OF AN UNREACHABLE SESSION (task
+        # 3730 / D2): with an archive the session is corroborated by it,
+        # neither reason applies, and which live directory survived is not a
+        # question worth answering. 3578's arm site restores from the archive
+        # into the config dir it is about to export and RE-CORROBORATES there,
+        # dispatching fresh with a session_resume_failed(stage='pre_flight')
+        # if the restore did not land — so gating on archive PRESENCE here
+        # cannot arm --resume against a transcript that never arrived.
+        # Presence is also the only thing knowable at this point: the guard
+        # runs BEFORE this dispatch's worktree and config dir exist, so there
+        # is nothing to restore INTO yet.
+        if not archive_available:
+            session_id = session.get('session_id')
+            if not config_dir or not session_id:
+                reasons.add('no_transcript')
+            elif not transcript_exists(Path(config_dir), session_id):
+                # Discriminate "PROVABLY gone" from "there but unreadable",
+                # and do it with an explicit stat rather than Path.exists(),
+                # which is wrong for this seam in both directions: it swallows
+                # exactly {ENOENT, ENOTDIR, EBADF, ELOOP} into False — so a
+                # symlink loop or bad fd would read as a wipe and land in the
+                # SILENT, storm-exempt 'reseeded' arm — and it RE-RAISES every
+                # other OSError (EACCES on a parent, ESTALE, EIO), which would
+                # escape this method and break the never-raises I3 contract
+                # above. Either way a genuine filesystem fault stops surfacing
+                # as the systematic breakage INV-4 exists to catch. So: only
+                # ENOENT/ENOTDIR earns 'reseeded'; everything else falls
+                # through to the LOUD arm, caught here so the method stays
+                # total (ValueError covers the NUL-bearing path that os.stat
+                # rejects outright).
+                wiped = False
+                try:
+                    Path(config_dir).stat()
+                except (FileNotFoundError, NotADirectoryError):
+                    wiped = True
+                except (OSError, ValueError):
+                    pass  # unreadable/faulted != wiped — stay loud
+                reasons.add('reseeded' if wiped else 'no_transcript')
         return frozenset(reasons)
 
     def _archive_available(self, task_id: str, session_id: str | None) -> bool:
         """Was *session_id* recoverable from the durable transcript archive?
 
-        Pure INSTRUMENTATION for the ``session_resume_fallback`` event (task
-        3727, plans/session-resume-eligibility-seam-prd.md §8 / D8): it reports
-        whether the session that just failed to resume still exists in the
-        durable archive, and changes NOTHING about what dispatches. Leaf δ is
-        what may later gate on this signal; task 3578 is what consumes
+        AN ELIGIBILITY INPUT SINCE TASK 3730 (δ / D2), and no longer the pure
+        instrument task 3727 added (plans/session-resume-eligibility-seam-prd.md
+        §8 / D8). The _run_slot guard hoists ONE call per dispatch and feeds
+        the answer both to ``_session_resume_reasons`` — where it is the second
+        source of REACHABILITY, so an archive-backed session is neither
+        'stale' on age nor uncorroborated — and to the
+        ``session_resume_fallback`` event that still reports it. 3727's
+        measurement is what authorised the change: ~91% of post-3578 fallbacks
+        (92 of 101, 2026-09-04) were recoverable and were dispatched fresh
+        anyway. What this method reports is what is ON DISK; the guard narrows
+        it by ``restore_from_archive`` before eligibility consumes it, and
+        reports it un-narrowed on the event, so an operator who disables
+        restoration reverts δ without losing the measurement.
+
+        Task 3578 is what consumes
         :func:`~shared.transcript_archive.durable_archive_path` for the actual
-        restore. Because it is an instrument, False-on-any-fault is the correct
-        degradation — an instrument must never be able to break dispatch — but
-        a fault is reported LOUDLY (one WARNING per process, then DEBUG) rather
-        than silently, so a broken instrument cannot masquerade as a genuinely
-        empty archive. See the handler below for why a plain miss never reaches
-        it and therefore cannot make that WARNING noisy.
+        restore, one layer down at the arm site.
+
+        WHAT A FAULT NOW COSTS, restated because it changed. False-on-any-fault
+        is still the correct degradation and still the fail-SAFE direction — a
+        faulted lookup can only send a dispatch down the pre-δ fresh-dispatch
+        path, never resume something unreachable — but it is no longer free:
+        it costs a RESUME (the session's accumulated context) rather than only
+        a wrong telemetry field. That is why the fault is reported LOUDLY (one
+        WARNING per process, then DEBUG) rather than silently: a broken lookup
+        must not masquerade as a genuinely empty archive, and under δ it also
+        must not masquerade as a quiet drop in the resume rate. See the handler
+        below for why a plain miss never reaches it and therefore cannot make
+        that WARNING noisy.
 
         Total, and the guard is NOT redundant with ``durable_archive_path``'s
         own totality: the LOOKUP is total, but the archive-root COMPOSITION
@@ -3769,10 +4177,12 @@ class Harness:
             if not self._archive_available_fault_logged:
                 self._archive_available_fault_logged = True
                 logger.warning(
-                    'archive_available: instrument faulted for task %s session %s '
-                    '(%s: %s) — the field now reports false for EVERY '
-                    'session_resume_fallback until this is fixed, so treat a 0%% '
-                    'recoverable rate as suspect. Further occurrences at DEBUG.',
+                    'archive_available: lookup faulted for task %s session %s '
+                    '(%s: %s) — until this is fixed the field reports false for '
+                    'EVERY session_resume_fallback (so treat a 0%% recoverable '
+                    'rate as suspect) AND no session resumes from the archive, '
+                    'because since task 3730 this answer is an eligibility '
+                    'input. Further occurrences at DEBUG.',
                     task_id,
                     session_id,
                     type(exc).__name__,
@@ -5098,6 +5508,57 @@ class Harness:
             )
         return released
 
+    def _current_pause_reason(self) -> str:
+        return self.scheduler.pause_reason or '<unknown>'
+
+    async def _still_pending(
+        self, repended: tuple[digest_mod.RependedWhilePaused, ...],
+    ) -> tuple[digest_mod.RependedWhilePaused, ...]:
+        """Drop re-pends whose task has since left 'pending'; an unreadable status keeps them."""
+        if not repended:
+            return ()
+        statuses, err = await self.scheduler.get_statuses([w.task_id for w in repended])
+        if err is not None:
+            logger.warning(
+                '_pause_visibility_for_digest: status re-check failed, listing every '
+                're-pend unverified (fail-open): %s', err,
+            )
+            return repended
+        return tuple(w for w in repended if statuses.get(w.task_id) == 'pending')
+
+    async def _pause_visibility_for_digest(
+        self, events_db_path: Path | None,
+    ) -> digest_mod.PauseVisibility:
+        """Inputs for the digest's '## Paused, waiting' section; fail-open."""
+        paused = self.scheduler.is_paused
+        repended = (
+            await self._still_pending(
+                digest_mod.repended_during_current_pause(events_db_path),
+            )
+            if paused and events_db_path is not None
+            else ()
+        )
+        pending: list[Escalation] = []
+        if self._escalation_queue is not None:
+            try:
+                pending = self._escalation_queue.get_pending()
+            except Exception:
+                logger.warning(
+                    '_pause_visibility_for_digest: get_pending failed (fail-open)',
+                    exc_info=True,
+                )
+        overdue = digest_mod.overdue_pending_escalations(
+            pending,
+            category=self._SCHEDULER_PAUSE_CATEGORY,
+            min_age=digest_mod.SCHEDULER_PAUSE_RESURFACE_AGE,
+            now=datetime.now(UTC),
+        )
+        return digest_mod.PauseVisibility(
+            pause_reason=self._current_pause_reason() if paused else None,
+            repended_waiting=repended,
+            overdue_pause_escalations=overdue,
+        )
+
     async def _stale_lane_assignment_census(self) -> list[str]:
         """Census lines for NON-terminal warm-lane assignments idle past the threshold.
 
@@ -5181,7 +5642,7 @@ class Harness:
                 self.scheduler,
                 self._escalation_queue,
                 self._resolve_task_worktree,
-                heartbeat_ttl=_RECONCILE_HEARTBEAT_TTL,
+                heartbeat_ttl=DEFAULT_CLAIMANT_HEARTBEAT_TTL,
             )
             self._ground_truth = existing
         return existing
@@ -5464,7 +5925,7 @@ class Harness:
             )
             return True
 
-        from orchestrator.merge_types import QueuedBranch  # noqa: PLC0415
+        from orchestrator.merge_lane.types import QueuedBranch
 
         # Build + enqueue + stamp the durable race-guard marker (PRD leaf α §7)
         # via the shared submit primitive — the architect-desync exit (task
@@ -5593,51 +6054,18 @@ class Harness:
     # by omission (the callback never touches them).
     _SUCCESS_TRANSIENT_MERGE_STATUSES: frozenset[str] = SUCCESS_TRANSIENT_MERGE_STATUSES
 
-    # Escalation categories a MERGE can itself remediate (PRD leaf δ §2.2).
-    #
-    # The stranded-blocked reaper's own `stranded_blocked` L1 is filed to
-    # REQUEST exactly the remediation the verified-green auto-merge performs —
-    # so letting it veto that merge is an anti-synergy: the escalation asking
-    # for the merge blocks the merge.  Membership here means "an open
-    # escalation of this class does NOT veto the sweep-side self-heal", and
-    # nothing more: the merge is still gated by detect_verified_green's 3-part
-    # shape check and the merge queue's own re-verify (§2.2 "never bypasses").
-    #
-    # Deliberately MINIMAL — widen only with evidence:
-    #   * `stranded_merge_failed` is EXCLUDED on purpose.  It is the DURABLE
-    #     merge/verify-failure born-at-L2 (see _file_stranded_merge_failed): a
-    #     re-merge cannot remediate a branch that already failed the queue's
-    #     verify, so a task carrying only that escalation must keep vetoing or
-    #     the reaper would re-submit into the same failure.
-    #   * every human-concern class (design_concern / task_failure /
-    #     review_issues / operator-action / infra_issue / ...) is excluded by
-    #     omission — it names a problem a merge does not fix, and must keep
-    #     holding the task for its handler.
-    MERGE_REMEDIABLE_ESC_CATEGORIES: frozenset[str] = frozenset({
-        'stranded_blocked',
-    })
-
-    @staticmethod
-    def _only_merge_remediable(
-        open_escalations: Sequence[EscalationRef],
-    ) -> bool:
-        """Are *open_escalations* ALL of a merge-remediable class?
-
-        The single category authority for the relaxed verified-green veto
-        (INV-5): called at both sweep-side upgrade clauses in
-        :meth:`_reconcile_one_stranded` in place of the former
-        ``not report.open_escalations``.
-
-        Vacuously ``True`` for an empty list — so a task with no open
-        escalation classifies exactly as it does today.  ``False`` as soon as
-        ONE escalation falls outside :attr:`MERGE_REMEDIABLE_ESC_CATEGORIES`,
-        preserving the safety invariant that a human-concern escalation still
-        vetoes the self-heal.
-        """
-        return all(
-            ref.category in Harness.MERGE_REMEDIABLE_ESC_CATEGORIES
-            for ref in open_escalations
-        )
+    # The merge-remediable relaxation MOVED to `orchestrator.recovery_pins`
+    # (task 3541): the single authority for both the category set and the
+    # `all(...)` predicate now lives there, so `scheduler.py` — which cannot
+    # import this class — consumes the SAME relaxation instead of re-deriving a
+    # bare `bool(rows)`.  The two names below are DELEGATIONS, not a second
+    # copy: they exist only so existing call sites and the tests that assert on
+    # `Harness._only_merge_remediable(...)` directly keep their spelling.  The
+    # rationale for the set's membership is documented once, in recovery_pins.
+    MERGE_REMEDIABLE_ESC_CATEGORIES: frozenset[str] = (
+        recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES
+    )
+    _only_merge_remediable = staticmethod(recovery_pins.only_merge_remediable)
 
     def _on_stranded_merge_done(
         self, fut: asyncio.Future, *, tid: str,
@@ -5653,7 +6081,7 @@ class Harness:
         propagated (mirrors ``enqueue_merge_request._on_finalized``).
         """
         try:
-            from orchestrator.merge_types import MergeOutcome  # noqa: PLC0415
+            from orchestrator.merge_lane.types import MergeOutcome
 
             if fut.cancelled():
                 return  # abandoned/superseded — transient, no-op
@@ -5790,7 +6218,7 @@ class Harness:
         infra-held guard, which share this same degeneracy signal.
 
         The predicate itself now lives in
-        :func:`orchestrator.landing_evidence.branch_is_degenerate` (task 3103)
+        :func:`orchestrator.merge_lane.landing_evidence.branch_is_degenerate` (task 3103)
         so the escalation server's merge_status Tier-3.5 and merge_request
         fast-path guard this class with the SAME implementation rather than a
         divergent copy.  See that function for the full fail-open contract
@@ -5814,7 +6242,15 @@ class Harness:
         recovery write — caller handles failure counting + escalation.
 
         Early-return guards (return None without touching the worktree):
-          - open L1 escalation veto (~line 1598): human handoff in progress
+          - the escalation-pin veto in the guard tail: a handoff is in
+            progress.  Since task 3541 that veto is the RESOLVER'S OWN answer
+            (``report_pins_recovery`` -> ``escalation.pins.classify_pins``),
+            not a local ``bool(report.open_escalations)`` re-derivation, so
+            this applier and ``_shape`` cannot disagree about what pins
+            (E7/INV-5).  The two ``deploy_phase`` / ``is_actively_held``
+            guards beside it are NOT policy: they carry facts the
+            ``_RECOVERY`` table structurally cannot express, and are labelled
+            as such in-code.
           - merge-deferred guard (below): task is train-parked (PRD § 9.8);
             the worktree must survive intact for the train-merge worker.
             Mirrors the open-L1 veto pattern — explicit early-return as
@@ -5892,22 +6328,42 @@ class Harness:
         # (_branch_is_degenerate below) — rather than a change to θ1's
         # reviewed table (design decision, task 2243; esc-2243-4).
         #
-        # The open-escalation clause is _only_merge_remediable, not the former
-        # `not report.open_escalations` (PRD leaf δ): a task whose branch landed
-        # while it was still blocked is often held by the reaper's OWN
-        # stranded_blocked — the escalation that ASKED for this landing — and
-        # letting it veto the self-heal pins the task blocked forever after its
-        # work is already on main.  Any non-remediable (human-concern)
-        # escalation still yields False and leaves the task alone, and an empty
-        # list is still True, so every other task classifies exactly as before.
+        # THIS CLAUSE ALONE ASKS THE DONE-FLIP QUESTION.  Its outcome is
+        # MARK_DONE_WITH_PROVENANCE — terminal — so it consumes
+        # `report_pins_blocked_done_flip`, built on
+        # `classify_pins(...).vetoes_done_flip`.  Its twin below
+        # (EXISTS_OFF_MAIN -> RE_FILE_ESCALATION), the CONVERT scoping clause
+        # and `Scheduler._phase_redispatch_stranded_blocked` all ask the OTHER
+        # question and share `report_pins_blocked_recovery` /
+        # `records_pin_blocked_recovery`.
+        #
+        # The two predicates differ on exactly two input classes.  A dead-filer
+        # L0: recovery may proceed past one — its handoff has no consumer left,
+        # and conversion or a re-file is recoverable — but a DONE-FLIP may not.
+        # It is terminal, so completing a task past an unconsumed handoff is the
+        # phantom-done D4 had just closed at the dispatch gate, and PRD D3 /
+        # spec §6 demand 3 say so directly ("any non-info open record still
+        # vetoes MARK_DONE").  The dead L0 is not stranded forever either — part
+        # 4 of this task, the orphan-L0 reaper, promotes it to L1 and gives it
+        # an owner.  And a `preexisting_main_break` pin (task 4645): this clause
+        # ALONE relaxes the wider `recovery_pins.ON_MAIN_REMEDIABLE_ESC_CATEGORIES`,
+        # because it only fires with the branch ON MAIN, where that escalation's
+        # ask (a fixed main so the branch can merge) is already satisfied.  The
+        # off-main clause below keeps the shared set — there the ask is unmet.
+        #
+        # The relaxation itself is why this clause exists at all (PRD leaf δ):
+        # a task whose branch landed while it was still
+        # blocked is usually held by the reaper's OWN stranded_blocked — the
+        # record that ASKED for this landing — and letting it veto the
+        # self-heal pins the task blocked forever after its work is on main.
+        # Any human-concern handoff still pins, and an empty list still
+        # relaxes, so every other task classifies exactly as before.
         if (
             action == RecoveryAction.LEAVE
             and status == 'blocked'
             and report.live_claimant is None
-            and self._only_merge_remediable(report.open_escalations)
-            and report.branch_state.kind in (
-                BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER,
-            )
+            and not report_pins_blocked_done_flip(report)
+            and report.branch_state.kind in ON_MAIN_BRANCH_KINDS
         ):
             action = RecoveryAction.MARK_DONE_WITH_PROVENANCE
 
@@ -5921,20 +6377,21 @@ class Harness:
         # MARK_DONE upgrade above — rather than a change to θ1's reviewed
         # table (design decision, task 2243; esc-2243-5).
         #
-        # The open-escalation clause is _only_merge_remediable, not the former
-        # `not report.open_escalations` (PRD leaf δ): this is the branch shape a
-        # verified-green-but-never-merged task is in, and the escalation
-        # holding it is usually the reaper's OWN stranded_blocked — filed to
-        # REQUEST exactly the merge the verified-green gate below performs.
-        # Letting that request veto its own remediation was the anti-synergy δ
-        # closes.  Any non-remediable (human-concern) escalation still yields
-        # False here and leaves the task alone, and an empty list is still
-        # True, so every other task classifies exactly as before.
+        # The RECOVERY predicate, NOT the done-flip one the clause above uses:
+        # a re-file or an auto-merge is recoverable, so a dead-filer L0 does not
+        # hold it (task 3541).  Otherwise identical in spirit: this is the branch
+        # shape a verified-green-but-never-merged task is in, and the
+        # escalation holding it is usually the reaper's OWN stranded_blocked —
+        # filed to REQUEST exactly the merge the verified-green gate below
+        # performs.  Letting that request veto its own remediation was the
+        # anti-synergy PRD leaf δ closes.  Any non-remediable (human-concern)
+        # handoff still pins here and leaves the task alone, and an empty list
+        # still relaxes, so every other task classifies exactly as before.
         if (
             action == RecoveryAction.LEAVE
             and status == 'blocked'
             and report.live_claimant is None
-            and self._only_merge_remediable(report.open_escalations)
+            and not report_pins_blocked_recovery(report)
             and report.branch_state.kind == BranchStateKind.EXISTS_OFF_MAIN
         ):
             action = RecoveryAction.RE_FILE_ESCALATION
@@ -5972,26 +6429,44 @@ class Harness:
         # A PIN THAT `blocked` ACTUALLY HOLDS.
         #
         # The table cannot make this distinction and must not try: `_RECOVERY`
-        # keys on a BOOLEAN `has_open_escalation` and the module is
+        # keys on the CONSERVATIVE `vetoes_done_flip` answer and the module is
         # deliberately pure and config-free, while "which pin categories does
-        # the blocked arm treat as merge-remediable" is THIS class's policy
-        # (`MERGE_REMEDIABLE_ESC_CATEGORIES`).  So the scoping lives here, with
-        # the other two sweep-side adjustments.
+        # the blocked arm treat as merge-remediable" is orchestrator policy
+        # (`recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES`).  So the scoping
+        # lives here, with the other two sweep-side adjustments.
         #
         # WHY IT IS NEEDED.  `CONVERT_TO_BLOCKED`'s whole justification is that
         # `blocked` is a RESTING state for a pinned row: not dispatchable, and
         # `_RECOVERY`'s only BLOCKED row keys `has_open_escalation=False`, so a
         # converted row can never be recovered out of it by the table.  That
         # holds for a `task_failure` pin (the measured 3717 population) — but
-        # NOT for a pin the two clauses ABOVE deliberately relax on.  For a row
-        # pinned solely by `stranded_blocked`, `_only_merge_remediable` is
-        # True, so the very next sweep would see status='blocked', classify
-        # LEAVE, and be upgraded to MARK_DONE_WITH_PROVENANCE (or, off main, to
+        # NOT for a pin the two clauses ABOVE deliberately relax on.  For such
+        # a row the very next sweep would see status='blocked', classify LEAVE,
+        # and be upgraded to MARK_DONE_WITH_PROVENANCE (or, off main, to
         # RE_FILE_ESCALATION over an escalation that is already open).  That
         # would turn row (f)'s "never second-guess an open escalation, even
         # with on-main landing evidence" veto into a two-sweep auto-done, and
         # (j) into a possible duplicate filing — the exact hazards the rows
         # exist to avoid, arrived at by a route no one reviewed.
+        #
+        # This clause therefore asks the blocked arm's OWN question — "would
+        # those clauses move this row next sweep?" — through
+        # `report_blocked_arm_would_move`, which composes the SAME two
+        # predicates the clauses call (task 3541) and so follows them when they
+        # diverge: the ON_MAIN clause relaxes `preexisting_main_break` (task
+        # 4645) while the recovery predicate still pins it, and an in-progress
+        # on-main row pinned only by that record is held here rather than
+        # converted and then auto-done next sweep.  Before eta it asked with
+        # `_only_merge_remediable`, which WAS that predicate at the time;
+        # keeping the old spelling once the arm moved on would let the two
+        # drift, which is precisely how this hazard reopens.
+        #
+        # Consequence, deliberate: a CONVERT row pinned SOLELY by a dead-filer
+        # L0 in a non-remediable category now lands here instead of converting,
+        # because the blocked arm no longer vetoes on that record either.  Spec
+        # S6 assigns that row's visibility to the ORPHAN-L0 REAPER, which
+        # promotes the aged-out L0 to L1 — after which it is a genuine
+        # QUEUE_HANDOFF and converts on the next sweep.
         #
         # A merge-remediable-pinned strand therefore keeps EXACTLY its
         # pre-3539 disposition: a silent LEAVE, byte-identical emission
@@ -6004,13 +6479,20 @@ class Harness:
         # holds is not in it.
         if (
             action == RecoveryAction.CONVERT_TO_BLOCKED
-            and self._only_merge_remediable(report.open_escalations)
+            and report_blocked_arm_would_move(report)
         ):
+            # Says what the clause ACTUALLY asked.  It used to name the records
+            # "merge-remediable", which was exact while the question WAS
+            # `_only_merge_remediable` — but the predicate now also clears a row
+            # pinned solely by a dead-filer L0 in a NON-remediable category (the
+            # consequence documented above), so that label would tell an
+            # operator the opposite of the truth about why the row was held.
+            # The `id:category` list speaks for itself instead.
             logger.info(
                 'Reconcile: task %s matches a convert_to_blocked row but is '
-                'pinned only by merge-remediable escalation(s) %s — holding '
-                'as before (a converted row would not be at rest: the '
-                'blocked-arm upgrade clauses would move it again next sweep)',
+                'held: the blocked-arm upgrade clauses would move a converted '
+                'row again next sweep, so it would not be at rest '
+                '(open record(s): %s)',
                 tid,
                 ', '.join(
                     f'{ref.id}:{ref.category}' for ref in report.open_escalations
@@ -6096,22 +6578,25 @@ class Harness:
             #
             # CONVERSION IS NOT COMPLETION.  The converted row arrives in
             # `blocked` STILL CARRYING ITS PIN; its exit is a human or task
-            # 3541's `classify_pins` veto collapse, never an automatic
-            # self-heal.  No `done_provenance` is written and no escalation is
-            # filed — the task is already pinned, and a second record would be
+            # the shared `classify_pins` predicate ceasing to call its record
+            # pinning — a human resolves it, or the orphan-L0 reaper promotes a
+            # dead-filer L0 to L1 and a supervised consumer takes it.  Never an
+            # automatic self-heal.  No `done_provenance` is written and no
+            # escalation is filed — the task is already pinned, and a second record would be
             # the duplicate/competing-escalation hazard rows (g)/(h) exist to
             # avoid.
             #
             # That invariant is TRUE OF EVERY ROW THAT REACHES HERE because of
-            # the merge-remediable scoping clause above, not by luck: a pin
-            # inside `MERGE_REMEDIABLE_ESC_CATEGORIES` would be picked up again
-            # by the blocked-arm upgrade clauses on the next sweep, so those
-            # rows are held before they ever get here (review finding #3).
+            # the scoping clause above, not by luck: a row the blocked-arm
+            # upgrade clauses would move again next sweep is held before it
+            # ever gets here (review finding #3).  Since task 3541 that clause
+            # asks those clauses' OWN question, through the same shared
+            # predicate, so the two cannot drift apart.
             logger.warning(
                 'Reconcile: converting task %s in-progress -> blocked '
                 '(shape=%s, branch=%s, pinned by %s) — pinned and unclaimed, '
                 'so it can no longer be re-dispatched; it keeps its pin and '
-                'its exit is a human or task 3541, NOT a self-heal',
+                'its exit is a human or a resolved pin, NOT a self-heal',
                 tid,
                 recovery_shape_str(report),
                 report.branch_state.kind.value,
@@ -6130,6 +6615,13 @@ class Harness:
                     tid, exc_info=True,
                 )
                 return None
+            # The stamp + event naming its pins: orchestrator/src/orchestrator/strand_conversion.py.
+            await record_strand_conversion(
+                tid, report,
+                event_store=self.event_store,
+                update_task=self.scheduler.update_task,
+                now=datetime.now(UTC),
+            )
             return 'converted_to_blocked'
 
         if action == RecoveryAction.MARK_DONE_WITH_PROVENANCE:
@@ -6369,20 +6861,57 @@ class Harness:
                 if await self._maybe_submit_stranded_verified_green(tid, metadata):
                     return None
 
-                # Dedup guard (PRD leaf δ): reaching here with an escalation
-                # ALREADY open means the relaxed veto let us through on a
-                # merge-remediable one (the two clauses above are the only way
-                # in: θ1's resolver rows all require an empty list, and the
-                # EXISTS_OFF_MAIN upgrade now requires _only_merge_remediable)
-                # — and the verified-green submit just declined (non-match).
-                # Re-filing would stack a SECOND stranded_blocked L1 on a task
-                # that already has one pending, so leave the existing
-                # escalation for its handler.  A plain truthiness check
-                # suffices: merge-remediable-ness is already established
-                # upstream, keeping _only_merge_remediable the sole category
-                # authority (INV-5).  The empty case — every task that reached
-                # here before δ — falls through to the unchanged re-file.
-                if report.open_escalations:
+                # DEDUP guard (PRD leaf δ) — "would filing another escalation
+                # stack a DUPLICATE?".  A third question, asked through the
+                # shared module like every other site (task 3541), not a bare
+                # truthiness test: `report_would_duplicate_a_handoff` reads the
+                # OWNED buckets of the same `classify_pins` classification the
+                # clauses above consume.
+                #
+                # THREE routes reach here, all legitimate:
+                #   * `_RECOVERY` row (g) — a stranded `blocked` task with no
+                #     record that vetoes a done-flip.  Since this task made
+                #     `_shape` pin-class-aware, an INFO-only strand takes this
+                #     route, which is precisely why a bare
+                #     `bool(report.open_escalations)` was wrong here: it
+                #     counted the annotation and swallowed the re-file the
+                #     table had just ordered, silently.
+                #   * the ON_MAIN blocked-arm clause, and
+                #   * the EXISTS_OFF_MAIN one — either of which may have
+                #     relaxed past a merge-remediable record, after which the
+                #     verified-green submit declined (non-match).
+                #
+                # An `info` record does NOT dedup: an annotation has no
+                # consumer, so re-filing over it stacks nothing.  A dead-filer
+                # L0 DOES, even though it does not pin recovery: it is still a
+                # record on the task and the orphan-L0 reaper promotes it, so a
+                # second L1 filed now would be the duplicate this guard exists
+                # to prevent.
+                #
+                # The hold SPEAKS (spec §7.3 — never a bare `return None`).
+                # The chokepoint above cannot cover it: `action` here is
+                # RE_FILE_ESCALATION, not LEAVE, so without this the operator
+                # gets no row at all for a task the sweep decided to hold.
+                # Mirrors the chokepoint's emission — INCLUDING `tally` —
+                # so the two cannot disagree about a log-mode hold.  The
+                # tally is not optional here: `_release_recovery_veto_streaks`
+                # pops every tracked entry whose task is absent from
+                # `tally.observed_task_ids`, so an emission that charges the
+                # tracker without folding into the tally is un-charged in the
+                # same pass (esc-3541-7) — the streak can never climb, and a
+                # previously-filed streak alarm is auto-resolved every sweep
+                # while the hold recurs.
+                if report_would_duplicate_a_handoff(report):
+                    if not emitted_recovery:
+                        self._emit_recovery_disposition(
+                            tid,
+                            site=RecoverySite.reconcile_sweep,
+                            reason=downgraded_reason or LeaveReason.escalation_pinned,
+                            shape=recovery_shape_str(report),
+                            records=report.open_escalations,
+                            store_unavailable=report.escalation_store_unavailable,
+                            tally=tally,
+                        )
                     return None
 
                 from escalation.models import Escalation
@@ -6434,9 +6963,17 @@ class Harness:
                 )
             return None
 
-        # Deploy-phase-tracked in-progress tasks are never auto-recovered by
-        # this generic reaper (review amendment, task 2243 W10-θ2
-        # reviewer_comprehensive #2). θ1's _RECOVERY table (task_ground_truth.py)
+        # THE GUARD TAIL.  Task 3541 (eta) separated the two kinds of check
+        # that used to sit here indistinguishably.  What was removed is the
+        # POLICY RE-DERIVATION (the `bool(report.open_escalations)` copy below,
+        # now the resolver's own shared answer — E7/INV-5).  What stays, and
+        # why, is stated on each survivor: both are facts the `_RECOVERY` table
+        # structurally CANNOT express, not second opinions about its output.
+        #
+        # BELT AND BRACES #1 — a deploy phase the table deliberately leaves
+        # unmapped.  Deploy-phase-tracked in-progress tasks are never
+        # auto-recovered by this generic reaper (review amendment, task 2243
+        # W10-θ2 reviewer_comprehensive #2). θ1's _RECOVERY table (task_ground_truth.py)
         # requires deploy_phase is None for EVERY MARK_DONE_WITH_PROVENANCE /
         # REVERT_TO_PENDING row (a/b/c/d) — so an in-progress task carrying a
         # deploy_phase can only reach this point via the LEAVE default
@@ -6458,21 +6995,32 @@ class Harness:
         if report.deploy_phase is not None:
             return None
 
-        # task 2243, W10-θ2 step-12: is_actively_held is the scheduler's own
-        # in-memory dispatch bookkeeping (dispatched / module-lock held /
-        # recent workflow-cancel stamp) — unambiguous, and not something the
-        # applier below independently re-derives (that was the now-deleted
-        # driver-level guard's job). Trust it directly rather than falling
-        # through.
+        # BELT AND BRACES #2 — the scheduler's IN-MEMORY dispatch bookkeeping,
+        # which no `TruthReport` field carries.  task 2243, W10-θ2 step-12:
+        # is_actively_held folds dispatched / module-lock held / recent
+        # workflow-cancel — unambiguous, and not something the applier below
+        # independently re-derives (that was the now-deleted driver-level
+        # guard's job). Trust it directly rather than falling through.
         if self.scheduler.is_actively_held(tid):
             return None
 
-        # An open escalation at ANY level (not just L1 — the resolver's row
-        # (f) folds every level) is the deliberate human/automation-handoff
-        # signal: don't reap it. Replaces the old has_open_l1(tid) veto
-        # (L1-only), which missed an L2-only open escalation and fell
-        # through to an incorrect revert.
-        if report.open_escalations:
+        # THE VETO — and no longer a local re-derivation of it (task 3541,
+        # E7/INV-5).  `report_pins_recovery` is the resolver's OWN
+        # `escalation.pins.classify_pins(...).pins` answer, so this applier and
+        # `_shape` can no longer disagree about whether a record pins: before
+        # the rewiring this read `bool(report.open_escalations)`, which held a
+        # strand on an info-severity ANNOTATION the resolver had already
+        # stopped counting (PRD boundary #8).
+        #
+        # `downgraded_reason is not None` is folded in and is NOT redundant.
+        # Task 3539's log mode (and its merge-remediable scoping clause) turn a
+        # CONVERT row into a LEAVE that must still HOLD, and both reach here.
+        # Without this disjunct a log-mode pinned strand — including a dead-L0
+        # one, which `pins` deliberately calls unpinned — would fall straight
+        # through to `_revert_in_progress_if_no_live_claimant` and be reverted
+        # underneath its responder: the precise demand-1 violation conversion
+        # exists to prevent.
+        if downgraded_reason is not None or report_pins_recovery(report):
             # Task 3535: the SAME hold the chokepoint above already described.
             # Emitting unguarded here would DOUBLE every boundary-#9 row — this
             # early-return and that chokepoint both see an on-main pinned
@@ -6491,9 +7039,14 @@ class Harness:
                     shape=recovery_shape_str(report),
                     records=report.open_escalations,
                     store_unavailable=report.escalation_store_unavailable,
+                    tally=tally,
                 )
             return None
 
+        # BELT AND BRACES #3 — R3, the applier-side fact `_shape` cannot
+        # carry.  `_shape` sees only `live_claimant is not None`; it cannot see
+        # that a PLAN_LOCK-sourced claimant proves nothing mid-run.
+        #
         # A live claimant is a deliberate leave-alone (task 2243, W10-θ2
         # step-16 — this blanket check replaces the applier's own owner_pid
         # re-derivation, now retired), EXCEPT the R3 mid-run exception: a
@@ -6545,6 +7098,8 @@ class Harness:
         function owns only the physical side effects: worktree cleanup, a
         defensive plan.lock unlink, and the
         ``_recovered_plans``/``_preserved_worktrees`` retention bookkeeping.
+        Its pending flip clears the dead claimant first, via
+        ``Scheduler.clear_claim_then_set_status``.
         Task 2763 retired the worktree ``plan.lock`` READ that formerly
         re-classified liveness here — moot once the durable lock moved to the
         meta-root (the worktree lock never exists in production) and the DB
@@ -6689,7 +7244,7 @@ class Harness:
         # exist; the suppress + missing_ok keep it a harmless no-op then.
         with contextlib.suppress(OSError):
             lock_path.unlink(missing_ok=True)
-        await self.scheduler.set_task_status(tid, 'pending')
+        await self.scheduler.clear_claim_then_set_status(tid, 'pending')
         logger.info(
             'Reconcile: reverted task %s to pending', tid
         )
@@ -6891,21 +7446,6 @@ class Harness:
     # task for this condition, matched via get_by_task + this exact role.
     _CASCADE_REJECTION_ROLE: str = 'harness-cascade'
 
-    # Category for the same records.  A NAMED CONSTANT rather than a literal at
-    # the filing site because escalation categories are prose, not a checked
-    # contract: nothing rejects a typo'd category at submit time, and every
-    # categorized reader (auto-watcher triage, category-filtered queue scans)
-    # depends on filer and reader spelling it identically — so the one spelling
-    # this file owns lives in exactly one place.
-    #
-    # escalation/src/escalation/models.py carries a standing REFACTOR TRIGGER
-    # (task 3709) saying the NEXT category addition promotes that prose
-    # vocabulary to an enum or a submit-time lint.  This IS that addition, but
-    # models.py is outside task 3538's locked module scope, so the promotion is
-    # filed as follow-up work instead of done here; this constant is the
-    # interim single source of truth for the spelling.
-    _CASCADE_REJECTION_CATEGORY: str = 'cascade_status_rejection'
-
     def _escalate_cascade_status_rejection(
         self,
         task_id: str,
@@ -6982,7 +7522,7 @@ class Harness:
                 agent_role=self._CASCADE_REJECTION_ROLE,
                 severity='blocking',
                 level=1,
-                category=self._CASCADE_REJECTION_CATEGORY,
+                category=EscalationCategory.CASCADE_STATUS_REJECTION,
                 summary=(
                     f'Cascade resume failed to set task {task_id} to '
                     f'{target_status!r}'
@@ -7039,6 +7579,7 @@ class Harness:
     # so the orphan-L0 reaper (L0-only), _on_escalation (no registered event),
     # and reconcile (no such task) all leave it alone.
     _SCHEDULER_PAUSE_SENTINEL: str = '__scheduler__'
+    _SCHEDULER_PAUSE_CATEGORY: str = EscalationCategory.SCHEDULER_PAUSED
 
     # Synthetic task_id for the no-landings circuit-breaker INFO escalation.
     # Deduped to one open at a time (via get_by_task + agent_role filter).
@@ -7066,11 +7607,13 @@ class Harness:
     _POOL_STORAGE_ABSENT_SENTINEL: str = '__pool_storage_absent__'
     _POOL_STORAGE_ABSENT_ROLE: str = 'orchestrator-pool-storage-absent'
 
-    # Synthetic task_id + agent_role for the session-resume fallback-storm L1
+    # Synthetic task_id + agent_role for the session-resume storm L1
     # (task γ, INV-4).  PER-BOOT — one open L1 at a time, deduped via
     # has_open_l1.  Same class-level immutability guarantees as the sentinels
-    # above.  Fires only on a RUN of consecutive genuine resume fallbacks
-    # (suspected clock skew / wiped transcripts / mass reseed).
+    # above.  Fires only on a RUN of consecutive ELIGIBLE-BUT-FAILED resumes:
+    # since task ε/3733 that population is archive-restore failure and
+    # CLI rejection of a resume we armed, recorded in
+    # _eligible_but_failed_resumes and named individually on the L1.
     _SESSION_RESUME_STORM_SENTINEL: str = '__session_resume_storm__'
     _SESSION_RESUME_STORM_ROLE: str = 'orchestrator-harness'
 
@@ -7082,6 +7625,18 @@ class Harness:
     # time, whatever the burst size.
     _ARCHIVAL_STORM_SENTINEL: str = '__transcript_archival_storm__'
     _ARCHIVAL_STORM_ROLE: str = 'orchestrator-transcript-archival-storm'
+
+    # Synthetic task_id + agent_role for the recovered-config-dir ambiguity L1
+    # (task 3620, INV-4).  DEDICATED, not shared with any sentinel above: a
+    # shared sentinel lets a reap of one queue's resolved escalation close the
+    # OTHER queue's still-open gate (the cross-queue decision-id collision,
+    # task 3528).  Deduped via has_open_l1 — one open ambiguity L1 at a time,
+    # NOT counted against a threshold like the two storm escalations: a single
+    # ambiguous worktree is already a definite lost resume with a definite
+    # cause, whereas a storm needs a RUN to tell breakage from expected noise.
+    # There is consequently nothing to tune and no config knob to add.
+    _CONFIG_DIR_AMBIGUOUS_SENTINEL: str = '__session_config_dir_ambiguous__'
+    _CONFIG_DIR_AMBIGUOUS_ROLE: str = 'orchestrator-session-config-dir-ambiguous'
 
     @staticmethod
     def _errno_label(err: object) -> str:
@@ -7235,6 +7790,102 @@ class Harness:
                 'Failed to file transcript-archival-storm escalation', exc_info=True,
             )
 
+    def _file_config_dir_ambiguous_escalation(
+        self, *, key: str, session_id: object, expected: Path, found: list[str],
+    ) -> None:
+        """File an L1 when a recovered session's config dir cannot be resolved
+        (task 3620, INV-4).
+
+        Called from :meth:`_adopt_recovered_session` when the surviving worktree
+        holds ``claude-config-*`` candidates but NOT the derived
+        ``claude-config-<task_id>``.  Modelled on
+        ``_file_archival_storm_escalation`` / ``_file_pool_storage_absent_escalation``:
+        ``has_open_l1`` dedup so repeated boots do not stack duplicate L1s, a
+        bare-Harness guard so unit-test shapes stay green, and a blanket
+        ``except`` so filing can never break the recovery path it reports on.
+
+        Deduped rather than counted against a threshold: one ambiguous worktree
+        is already a definite lost resume with a definite cause, so there is no
+        RUN to wait for and nothing to tune.  What is at stake — a GUARANTEED
+        ``no_transcript`` fallback, degrading safely — is stated normatively at
+        ``event_store.py::EventType.session_config_dir_ambiguous``, which the
+        ``detail`` below points an operator at rather than restating.
+        """
+        if not self._escalation_queue:        # bare-Harness unit tests stay green
+            return
+        try:
+            if self._escalation_queue.has_open_l1(self._CONFIG_DIR_AMBIGUOUS_SENTINEL):
+                return                         # dedup: one open L1 at a time
+            from escalation.models import Escalation  # noqa: PLC0415
+            shown = found[:20]
+            more = len(found) - len(shown)
+            candidates = '\n'.join(f'  - {p}' for p in shown)
+            if more > 0:
+                # Never let a truncated list read as the whole list.
+                candidates += f'\n  ... and {more} more dir(s) not listed'
+            esc = Escalation(
+                id=self._escalation_queue.make_id(self._CONFIG_DIR_AMBIGUOUS_SENTINEL),
+                task_id=self._CONFIG_DIR_AMBIGUOUS_SENTINEL,
+                agent_role=self._CONFIG_DIR_AMBIGUOUS_ROLE,
+                severity='blocking',
+                category='infra_issue',
+                summary=(
+                    f'Recovered session for task {key} cannot be corroborated: '
+                    f'{expected.parent} holds {len(found)} config dir(s) but '
+                    f'not {expected.name} — the resume is lost'
+                )[:200],
+                detail=(
+                    f'Crash recovery adopted an agent session for task {key} '
+                    f'(session_id={session_id}) from the surviving worktree '
+                    f'{expected.parent.parent}, but could not resolve its '
+                    f'config dir.\n\n'
+                    f'Expected (derived from the task id, which is how '
+                    f'shared/src/shared/config_dir.py::TaskConfigDir names '
+                    f'every config dir it creates):\n  {expected}\n\n'
+                    f'Found instead:\n{candidates}\n\n'
+                    'Consequence: nothing was stashed, so the dispatch-time '
+                    'transcript re-glob has nothing to corroborate the session '
+                    'against. This task is a GUARANTEED session_resume_fallback '
+                    'with no_transcript — the resume is ALREADY LOST, safely, '
+                    'and the agent context it would have preserved is gone. '
+                    'The task itself re-dispatches fresh and completes '
+                    'normally; no manual repair of it is needed.\n\n'
+                    'Likely causes, in this cause\'s terms:\n'
+                    '  - a FOREIGN task\'s config dir left behind in a shared '
+                    'or warm lane (a lane holding claude-config-<other_id> '
+                    'alongside, or instead of, this task\'s);\n'
+                    '  - a NON-SESSION dir being the only candidate — notably '
+                    'claude-config-<task_id>-unblock, created by '
+                    'orchestrator/src/orchestrator/dry_run_unblock.py, which '
+                    'is a legitimate non-owner of this session\'s transcript.\n\n'
+                    'To census the whole population from runs.db, use the SQL '
+                    'recorded with the event itself — orchestrator/src/'
+                    'orchestrator/event_store.py::EventType.'
+                    'session_config_dir_ambiguous.\n\n'
+                    'This is NOT the session-resume fallback storm, does not '
+                    'feed its streak, and shares none of its remediation: '
+                    'clock skew, warm-lane reseeds and the $.reasons census '
+                    'are all irrelevant here.'
+                ),
+                suggested_action=(
+                    'Identify which process created the non-matching dir(s) '
+                    'listed above and whether they should have been cleaned '
+                    'up. Resolve this escalation once the worktree is reaped '
+                    'or the stray dir removed. Recovery already degraded '
+                    'safely, so this is a lost-resume/throughput signal rather '
+                    'than a correctness incident — no repair of the recovered '
+                    'task is required.'
+                ),
+                level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
+            )
+            self._escalation_queue.submit(esc)
+            logger.warning('Filed L1 config-dir-ambiguous escalation %s', esc.id)
+        except Exception:
+            logger.warning(
+                'Failed to file config-dir-ambiguous escalation', exc_info=True,
+            )
+
     def _file_pool_storage_absent_escalation(self) -> None:
         """File an L1 escalation when pool storage (worktree_base) is absent.
 
@@ -7313,30 +7964,207 @@ class Harness:
         except Exception:
             logger.warning('Failed to file pool-storage-absent escalation', exc_info=True)
 
+    def _decay_session_resume_run(self, now: float) -> None:
+        """Retire the run in progress if *now* is a full window past its feed.
+
+        ONE implementation of "when does a run expire" (SPOT), shared by both
+        seams that touch the streak: the ``_run_slot`` eligibility guard and
+        :meth:`note_resume_failed`. Both applied it inline and identically
+        before; two copies of one rule is one copy too many, because the next
+        change to it would be made in one of them.
+
+        The decay is about the PASSAGE OF TIME, not about any particular
+        report, which is why both callers apply it FIRST and unconditionally:
+        "consecutive" means chained within ``storm_window_secs``, so a gap at
+        least that long means the previous run ENDED. Idempotent — it compares
+        against a stamp only a genuine feeder refreshes — so a caller that
+        decays and then reports through :meth:`note_resume_failed` decays
+        twice to the same effect.
+
+        *now* is passed in rather than read here so a caller that also needs
+        the instant for its own bookkeeping uses ONE reading; two calls to
+        ``time.monotonic()`` would let the decay and the increment disagree
+        about when the dispatch happened. MONOTONIC by contract: "stale" is
+        itself produced by clock skew, so a wall-clock decay would be
+        corrupted by the very failure it detects.
+
+        ``storm_window_secs`` is read LIVE, never captured — it is a
+        green-tier reloadable leaf (StormCounter's RELOAD SAFETY contract).
+        """
+        window = self.config.session_resume.storm_window_secs
+        if (
+            self._last_session_resume_fallback_at is not None
+            and (now - self._last_session_resume_fallback_at) >= window
+        ):
+            self._retire_session_resume_run()
+
+    def _retire_session_resume_run(self) -> None:
+        """End the run of genuine resume failures currently in progress.
+
+        The streak, the chain's monotonic comparison stamp and the recorded
+        failures are ONE piece of state and are therefore cleared together: a
+        record surviving a retired run would put a failure on the NEXT L1's
+        detail that is not part of the run being escalated, which is exactly
+        the kind of confident-but-wrong operator guidance task 3733 exists to
+        remove.
+
+        Called on both ways a run can end — an intervening success, and the
+        rolling window expiring — so "retired" has one meaning and one
+        implementation.
+
+        ``_session_resume_survivals`` is deliberately NOT cleared here: it
+        counts retirements across the whole boot rather than describing the
+        run being ended, and clearing it would leave the L1 able to report
+        only zero.
+        """
+        self._session_resume_fallback_streak = 0
+        self._last_session_resume_fallback_at = None
+        self._eligible_but_failed_resumes.clear()
+
+    def note_resume_succeeded(self) -> None:
+        """Report that an armed resume was adopted and SURVIVED (task ε/3733).
+
+        One half of the ``ResumeOutcomeSink`` protocol ``TaskWorkflow`` calls at
+        its arm seam. A success is what makes the streak a CIRCUIT BREAKER
+        rather than a rolling burst count: the escape fires on a RUN of
+        failures with nothing working in between, so one working resume proves
+        the systematic cause is not present and retires the run outright.
+
+        COUNTED, because the reset term was otherwise the one term of the
+        streak with no observable trace at all: this method emits no event, so
+        "a quiet fleet" and "a streak reset to zero a dozen times a day"
+        produced byte-identical evidence in runs.db. Neither an operator
+        reading the storm L1 nor ``storm_window_bound.py``'s derivation could
+        tell them apart, and the derivation's not-inert side is a NECESSARY
+        condition precisely because this population is unmeasurable (see that
+        module's docstring). ``_session_resume_survivals`` counts the resumes
+        that survived this boot, and the log line below names the run a
+        survival cut short.
+
+        Total by contract, like ``_on_archival_failure``: this runs on the
+        production dispatch path, and instrumentation must never be the thing
+        that costs a dispatch (I3).
+        """
+        try:
+            self._session_resume_survivals += 1
+            interrupted = self._session_resume_fallback_streak
+            self._retire_session_resume_run()
+            if interrupted:
+                # Only when a run was actually in progress: a survival on an
+                # idle streak is the ordinary case and says nothing.
+                logger.info(
+                    'Surviving session resume retired a run of %d '
+                    'eligible-but-FAILED resume(s); %d resume(s) have '
+                    'survived this boot',
+                    interrupted, self._session_resume_survivals,
+                )
+        except Exception:
+            logger.warning(
+                'Failed to retire the session-resume run on a successful '
+                'resume', exc_info=True,
+            )
+
+    def note_resume_failed(self, report: ResumeFailure) -> None:
+        """Report one armed resume that did NOT survive (task ε/3733).
+
+        The other half of the sink, and INV-4's feeder. Classification lives
+        here rather than in ``workflow.py`` so there is one home for "what is by
+        design" (beside :data:`_BY_DESIGN_SESSION_RESUME_REASONS`) and so the
+        import direction is respected — harness imports workflow, never the
+        reverse. The workflow REPORTS; the harness CLASSIFIES.
+
+        A by-design restore outcome (:data:`_BY_DESIGN_RESTORE_OUTCOMES`)
+        neither feeds the streak NOR resets it: a drip of expected outcomes
+        must not mask a genuine systematic failure interleaved between them
+        (task 3256's anti-masking rule). Every other outcome — including a
+        ``None`` restore, which is what every cli-stage rejection carries — is
+        GENUINE by default, the fail-loud direction.
+
+        The rolling-window decay is applied FIRST and unconditionally through
+        :meth:`_decay_session_resume_run`, the shared implementation the
+        ``_run_slot`` eligibility guard also calls — it is about the passage of
+        time and not about this report.
+
+        BOTH SEAMS REPORT HERE. The predicate-side guard in ``_run_slot``
+        builds its own ``ResumeFailure`` and calls this method rather than
+        re-implementing the append/stamp/count/file sequence inline, so the
+        streak protocol has ONE implementation (SPOT) and one totality guard.
+
+        ``fallback_storm_threshold`` is read LIVE per call, never captured (as
+        is ``storm_window_secs`` inside the decay): both are green-tier
+        reloadable leaves, and a captured value would make their
+        RELOADABLE_FIELDS registration reloadable-in-name-only (StormCounter's
+        documented RELOAD SAFETY contract).
+
+        Total by contract, for the same reason ``note_resume_succeeded`` is.
+        """
+        try:
+            now = time.monotonic()
+            self._decay_session_resume_run(now)
+
+            if report.restore in _BY_DESIGN_RESTORE_OUTCOMES:
+                return
+
+            # The window was already applied above, so this only EXTENDS the
+            # chain: record the evidence, refresh the comparison stamp, count.
+            # The stamp is refreshed ONLY here, by a genuine feeder.
+            self._eligible_but_failed_resumes.append(report)
+            self._last_session_resume_fallback_at = now
+            self._session_resume_fallback_streak += 1
+            if (
+                self._session_resume_fallback_streak
+                >= self.config.session_resume.fallback_storm_threshold
+            ):
+                self._file_session_resume_storm_escalation()
+        except Exception:
+            logger.warning(
+                'Failed to record an eligible-but-FAILED resume for task %s',
+                getattr(report, 'task_id', None), exc_info=True,
+            )
+
+    @staticmethod
+    def _render_resume_failure(failure: ResumeFailure) -> str:
+        """Render one recorded failure as operator-facing structured facts.
+
+        An absent archive root or path prints "none located" rather than being
+        dropped or printed as a bare ``None``: "the archive was checked and
+        held nothing" and "the lookup itself faulted" are different diagnoses,
+        and a silently missing line reads as the first one.
+        """
+        return (
+            f'  - task {failure.task_id} [{failure.role}] '
+            f'session {failure.session_id}\n'
+            f'      stage={failure.stage} restore={failure.restore or "n/a"}\n'
+            f'      archive root: {failure.archive_root or "none located"}\n'
+            f'      archive path: {failure.archive_path or "none located"}\n'
+            f'      how it failed: {failure.detail or "not recorded"}'
+        )
+
     def _file_session_resume_storm_escalation(self) -> None:
-        """File an L1 when session-resume fallbacks storm (task γ, INV-4).
+        """File an L1 when eligible-but-FAILED resumes storm (task γ/ε, INV-4).
 
-        Called from the _run_slot guard once the
-        ``_session_resume_fallback_streak`` reaches
-        ``session_resume.fallback_storm_threshold``. A single isolated
-        fallback never trips this — only a RUN does, which is the signature of
-        SYSTEMATIC breakage. Only UNEXPLAINED failures feed the streak: EVERY
-        by-design outcome is excluded by construction (task 3728 —
-        :data:`_BY_DESIGN_SESSION_RESUME_REASONS`), extending the exclusion
-        that ``capped`` and then ``reseeded`` already had to the whole
-        currently-producible vocabulary. Reaching the threshold therefore means
-        a reason OUTSIDE that vocabulary fired repeatedly. Deduped by
-        ``has_open_l1`` so the operator sees exactly one open storm L1 at a
-        time.
+        Called once ``_session_resume_fallback_streak`` reaches
+        ``session_resume.fallback_storm_threshold``. A single isolated failure
+        never trips this — only a RUN does, which is the signature of
+        SYSTEMATIC breakage. Only UNEXPLAINED failures feed the streak: every
+        by-design outcome is excluded by construction at BOTH seams that can
+        produce one — :data:`_BY_DESIGN_SESSION_RESUME_REASONS` for the
+        pre-dispatch eligibility predicate, :data:`_BY_DESIGN_RESTORE_OUTCOMES`
+        for the archive restore inside ``TaskWorkflow._invoke``. Reaching the
+        threshold therefore means something outside both vocabularies failed
+        repeatedly.
 
-        With today's vocabulary nothing can feed the streak, so this is
-        unreachable in production until PRD leaf ε (task 3733) installs the
-        archive-restore-failure feeder — a deliberate, waived window. The
-        mechanism is RETAINED rather than deleted precisely so ε re-arms a
-        tested path instead of rebuilding one.
+        ONE renderer for both feeders (SPOT). Whichever seam recorded a
+        failure appended it to ``_eligible_but_failed_resumes`` first, so this
+        reads that one deque rather than taking a payload: the streak that
+        decided to file and the evidence that explains it cannot disagree, and
+        a second feeder cannot arrive with a second escalation shape.
+
+        Deduped by ``has_open_l1`` so the operator sees exactly one open storm
+        L1 at a time.
 
         Best-effort: a missing queue (bare-Harness unit tests) or any submit
-        failure is swallowed so filing never breaks the guard path (I3).
+        failure is swallowed so filing never breaks the caller (I3).
         """
         if not self._escalation_queue:        # bare-Harness unit tests stay green
             return
@@ -7345,6 +8173,10 @@ class Harness:
                 return                         # dedup: one open L1 at a time
             from escalation.models import Escalation  # noqa: PLC0415
             threshold = self.config.session_resume.fallback_storm_threshold
+            rendered = '\n'.join(
+                self._render_resume_failure(failure)
+                for failure in self._eligible_but_failed_resumes
+            )
             esc = Escalation(
                 id=self._escalation_queue.make_id(self._SESSION_RESUME_STORM_SENTINEL),
                 task_id=self._SESSION_RESUME_STORM_SENTINEL,
@@ -7352,50 +8184,60 @@ class Harness:
                 severity='blocking',
                 category='infra_issue',
                 summary=(
-                    'Session-resume fallback storm — '
-                    f'{threshold}+ UNEXPLAINED resume failures in a row; '
+                    'Session-resume storm — '
+                    f'{threshold}+ eligible-but-FAILED resumes in a row; '
                     'resume degraded to fresh dispatch for all'
                 )[:200],
                 detail=(
-                    f'{threshold} or more session-resume eligibility failures '
-                    'occurred in a chained run — each within '
+                    f'{threshold} or more armed session resumes failed in a '
+                    'chained run — each within '
                     'session_resume.storm_window_secs of the previous, with no '
                     'intervening successful resume. Every recovered agent '
-                    'session was rejected and degraded to a fresh dispatch — '
-                    'safe, but a RUN this tight suggests a systematic cause.'
+                    'session was degraded to a fresh dispatch — safe, but a '
+                    'RUN this tight suggests a systematic cause.'
                     '\n\n'
+                    'THE RESUMES THAT FAILED, oldest first ("n/a" = the '
+                    'field does not apply at that stage):\n'
+                    f'{rendered}\n\n'
+                    'RESET TERM: '
+                    f'{self._session_resume_survivals} armed resume(s) have '
+                    'SURVIVED since this orchestrator booted, each of which '
+                    'retired any run then in progress. A HIGH number means '
+                    'resume normally works and broke in a tight run, so look '
+                    'for what changed recently; a ZERO means nothing has '
+                    'resumed successfully at all since boot, which is a '
+                    'broader fault than the run listed above and should be '
+                    'diagnosed first.\n\n'
                     'EVERY by-design degradation is excluded from this streak '
-                    'by construction (harness.py::'
-                    '_BY_DESIGN_SESSION_RESUME_REASONS), so none of them can '
-                    'have contributed and none is worth investigating here. '
-                    'Reaching the threshold means a reason OUTSIDE that '
-                    'vocabulary fired repeatedly — read it off the events '
-                    'rather than guessing, since the set is exactly what the '
-                    'guard classified as unexplained:\n'
-                    "  select json_extract(data,'$.reasons'), count(*) from "
-                    "events where event_type='session_resume_fallback' "
-                    'group by 1 order by 2 desc;\n'
-                    'The list is sorted, so each distinct combination is its '
-                    'own row and a co-occurring by-design reason is visible '
-                    'beside the unexplained one rather than hiding it.\n\n'
+                    'by construction — harness.py::'
+                    '_BY_DESIGN_SESSION_RESUME_REASONS for the pre-dispatch '
+                    'eligibility predicate, harness.py::'
+                    '_BY_DESIGN_RESTORE_OUTCOMES for the archive restore '
+                    "('disabled', the kill switch, and 'miss', the "
+                    'archive-coverage signal) — so none of them appears above '
+                    'and none is worth investigating here. A low archive hit '
+                    'rate is a separate, rate-based question.'
+                    '\n\n'
                     'Fresh dispatch loses the in-flight agent context that '
                     'resume would have preserved, so throughput/cost is '
                     'degraded until the cause is fixed.'
                 ),
                 suggested_action=(
-                    'Run the query above and identify the unexplained reason '
-                    'driving the run, then investigate that specific failure '
-                    'mode — do not start from the by-design population, which '
-                    'is excluded and did not contribute. The streak resets on '
-                    'the next successful resume, or decays after a '
-                    'storm_window_secs gap, so resolve this L1 once the '
-                    'underlying cause is fixed.'
+                    'Start from the failures listed above, not from a census: '
+                    'check that each archive root is present, readable and has '
+                    'free space, then that the restore can write into the '
+                    "agent's config dir. A run whose archive roots are all "
+                    '"none located" is a config regression in '
+                    'transcript_archive.root or project_root rather than a '
+                    'disk fault. The streak resets on the next successful '
+                    'resume, or decays after a storm_window_secs gap, so '
+                    'resolve this L1 once the underlying cause is fixed.'
                 ),
                 level=1,
                 filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self._escalation_queue.submit(esc)
-            logger.warning('Filed L1 session-resume fallback-storm escalation %s', esc.id)
+            logger.warning('Filed L1 session-resume storm escalation %s', esc.id)
         except Exception:
             logger.warning(
                 'Failed to file session-resume storm escalation', exc_info=True
@@ -7467,7 +8309,7 @@ class Harness:
                 task_id=self._SCHEDULER_PAUSE_SENTINEL,
                 agent_role='orchestrator-scheduler',
                 severity='blocking',
-                category='scheduler_paused',
+                category=self._SCHEDULER_PAUSE_CATEGORY,
                 summary=(f'Scheduler paused — dispatch halted: {reason}')[:200],
                 detail=(
                     'The orchestrator scheduler is paused and will dispatch no '
@@ -7561,6 +8403,107 @@ class Harness:
             task_id,
         )
 
+    # ── task 3500: authoring-defect diagnosis for a failed delivered check ──
+
+    #: Recovers the failed check's descriptor from the detail
+    #: ``scheduler._build_delivered_check_escalation`` renders. Parsing a
+    #: rendered string is not the shape anyone would choose — the descriptor
+    #: exists as a dict three frames up — but the ``on_delivered_check_block``
+    #: callback's signature is ``(task_id, *, summary, detail, category)`` and
+    #: widening it means editing ``scheduler.py``, which is outside task 3500's
+    #: lock scope. The coupling is filed as a follow-up; until then this is
+    #: deliberately total-or-nothing (any shape it does not recognise yields
+    #: None -> no diagnosis), and its only consumer is best-effort, so a format
+    #: drift costs the enhancement and never the escalation.
+    _DELIVERED_CHECK_DETAIL_RE = re.compile(
+        r"^Delivered check '(?P<name>[^']*)' \(kind=(?P<kind>[^)]*)\)", re.MULTILINE
+    )
+    _DELIVERED_CHECK_FIELD_RE = re.compile(
+        r'^(?P<key>pattern|paths|expect): (?P<value>.*)$', re.MULTILINE
+    )
+
+    @classmethod
+    def _parse_delivered_check_detail(cls, detail: str) -> dict | None:
+        """Recover ``{name, kind, pattern, expect, paths}`` from *detail*.
+
+        Returns None for anything it does not fully recognise — a grep check
+        without a pattern cannot be linted, and guessing at a half-parsed
+        descriptor would produce a diagnosis about a check nobody authored.
+        """
+        head = cls._DELIVERED_CHECK_DETAIL_RE.search(detail or '')
+        if head is None:
+            return None
+        fields = {
+            m.group('key'): m.group('value')
+            for m in cls._DELIVERED_CHECK_FIELD_RE.finditer(detail)
+        }
+        pattern = fields.get('pattern')
+        if not pattern or pattern == 'None':
+            return None
+        try:
+            # `paths` is rendered as a Python list repr by the escalation
+            # builder; literal_eval, never eval — this string reaches us from
+            # task metadata an agent authored.
+            paths = ast.literal_eval(fields.get('paths') or '[]')
+        except (ValueError, SyntaxError):
+            paths = []
+        return {
+            'name': head.group('name'),
+            'kind': head.group('kind'),
+            'pattern': pattern,
+            'expect': fields.get('expect'),
+            'paths': list(paths) if isinstance(paths, list) else [],
+        }
+
+    def _diagnose_delivered_check_authoring(self, detail: str) -> str | None:
+        """An ``AUTHORING DIAGNOSIS`` block for *detail*, or None if clean.
+
+        THE POINT OF TASK 3500. ``DEP_CAPABILITY_NOT_DELIVERED`` reads
+        identically whether the check is mis-authored or the capability
+        genuinely has not landed, and the two need opposite responses — edit
+        the producer's metadata, or chase work that never happened. Naming the
+        authoring defect here is what separates them at the one moment a human
+        actually reads the record.
+
+        ONLY ``severity='reject'`` findings are surfaced, which in practice
+        means ``filename_shaped``. The exclusions are deliberate:
+
+        * The ``vacuous_*`` codes are unreachable on this path by
+          construction — they fire on a check that PASSES, and we are here
+          precisely because it FAILED.
+        * ``absent_overbroad`` is a WARN defined relative to the producer's
+          declared ``metadata.files``, which this callback does not carry.
+          Reporting it without that input would assert "these matches are
+          outside the task's scope" without being able to check it — a
+          confident-sounding diagnosis built on data we do not have is worse
+          than none, because the reader cannot tell it is unfounded.
+        """
+        parsed = self._parse_delivered_check_detail(detail)
+        if parsed is None:
+            return None
+        findings = [
+            f
+            for f in delivered_check_polarity.lint_delivered_checks(
+                [parsed],
+                files=None,
+                repo_root=self.config.project_root,
+                # The same tree the gate itself evaluated against, so the
+                # diagnosis cannot disagree with the verdict it explains.
+                ref=delivered_check_polarity.GATE_REF,
+            )
+            if f.severity == 'reject'
+        ]
+        if not findings:
+            return None
+        lines = ['', 'AUTHORING DIAGNOSIS — this check appears MIS-AUTHORED, not merely unmet.']
+        for finding in findings:
+            lines.append(f'  code: {finding.code}')
+            lines.append(f'  {finding.message}')
+            for site in finding.detail:
+                lines.append(f'    - {site}')
+        lines.append(f'  remedy: {delivered_check_polarity.polarity_error(findings)["hint"]}')
+        return '\n'.join(lines)
+
     async def _block_and_escalate_delivered_check(
         self,
         task_id: str,
@@ -7593,6 +8536,22 @@ class Harness:
         runner's ``orchestrator-deterministic`` L2). No-ops gracefully when
         no escalation queue is attached (bare-Harness unit tests stay
         green).
+
+        AUTHORING DIAGNOSIS (task 3500). That task's originating complaint is
+        that this escalation reads IDENTICALLY whether the check is malformed
+        or the capability genuinely has not landed: both say
+        ``DEP_CAPABILITY_NOT_DELIVERED``, both name the check, and nothing
+        distinguishes them. The two need opposite responses — repair the
+        producer's metadata, or chase work that never happened — so a reader
+        who cannot tell them apart either waits forever on a check that can
+        never go green (the 5799 -> 5919 wedge) or "fixes" a descriptor that
+        was correct all along. :meth:`_diagnose_delivered_check_authoring`
+        appends a named diagnosis when, and only when, a reject-tier finding
+        fires; that call sits AFTER the dedupe (so it cannot affect what is
+        deduped) and inside its OWN try/except (so a lint failure costs the
+        diagnosis and never the file). It is deliberately ADDITIVE — only
+        ``detail`` grows, ``summary`` is untouched — so no existing assertion
+        on this escalation's shape changes.
         """
         # Set task to blocked regardless of queue state — the queue is only for
         # human notification; the gate stays closed via the delivered-check cache.
@@ -7623,6 +8582,29 @@ class Harness:
             )
             return
 
+        # Task 3500: name the authoring defect, if there is one, so a reader
+        # can tell a mis-authored check from a genuinely undelivered
+        # capability. Its OWN try/except, and deliberately not the caller's:
+        # the escalation is the load-bearing signal and the diagnosis is an
+        # enhancement to it, so a lint failure must cost the enhancement and
+        # nothing else. Runs AFTER the dedupe read so it can neither trigger a
+        # second file nor change what the existing one matches on, and in a
+        # worker thread because the lint shells out to git.
+        try:
+            diagnosis = await asyncio.to_thread(
+                self._diagnose_delivered_check_authoring, detail
+            )
+        except Exception:
+            logger.warning(
+                'Delivered-check block for task %s — authoring diagnosis '
+                'failed; filing the escalation undiagnosed',
+                task_id,
+                exc_info=True,
+            )
+            diagnosis = None
+        if diagnosis:
+            detail = f'{detail}\n{diagnosis}'
+
         from escalation.models import Escalation
 
         esc = Escalation(
@@ -7631,6 +8613,9 @@ class Harness:
             agent_role='orchestrator-scheduler',
             severity='critical',
             category=category,
+            # `summary` is deliberately UNTOUCHED: it is truncated to 200
+            # chars and existing e2e tests assert its contents, so the
+            # diagnosis is additive to `detail` alone.
             summary=summary[:200],
             detail=detail,
             suggested_action='manual_intervention',
@@ -8513,6 +9498,103 @@ class Harness:
             task_id,
         )
 
+    async def _run_recut_ruling_gate(self, assignment) -> recut_ruling.RecutGateResult:
+        """Execute or refuse a task's re-cut ruling before dispatch (task 3154).
+
+        Fails closed: an exception is a refusal. A refusal blocks the task and
+        files one design_concern L1.
+        """
+        task_id = assignment.task_id
+        try:
+            result = await recut_ruling.enforce_recut_ruling(
+                assignment.task,
+                ops=self.git_ops,
+                persist=functools.partial(self.scheduler.update_task, task_id),
+                now=datetime.now(UTC),
+            )
+        except Exception as exc:
+            logger.warning(
+                'recut_ruling: gate raised for task %s: %s', task_id, exc, exc_info=True,
+            )
+            result = recut_ruling.RecutGateResult(
+                recut_ruling.GateVerdict.REFUSED, reason=f'the re-cut gate raised: {exc}',
+            )
+        logger.info(
+            'recut_ruling: task %s verdict=%s reason=%r',
+            task_id, result.verdict.value, result.reason,
+        )
+        if result.executed:
+            self._log_recut_executed(task_id, result)
+        elif result.refused:
+            ruling_id = result.ruling.ruling_id if result.ruling else 'unreadable'
+            await self._block_and_file_dispatch_gate_l1(
+                task_id,
+                category='design_concern',
+                summary=f'RECUT_RULING_REFUSED: task {task_id} ruling {ruling_id} cannot be honoured',
+                detail=(
+                    f'{result.reason}\n'
+                    'Remedy: if metadata.recut_ruling is malformed, correct it to '
+                    '{"ruling_id": <str>, "ruled_at": <ISO-8601>}; otherwise resolve the '
+                    'cause above and unblock the task. A re-dispatch is safe: nothing '
+                    'fresh is cut until the execution record is durable.'
+                ),
+            )
+        return result
+
+    @staticmethod
+    def _log_recut_executed(task_id: str, result: recut_ruling.RecutGateResult) -> None:
+        parked = result.parked
+        logger.warning(
+            'RECUT: task %s ruling %s executed — parked %s @ %s; dispatching fresh off main',
+            task_id,
+            result.ruling.ruling_id if result.ruling else '?',
+            parked.parked_branch if parked and parked.parked_branch else 'nothing',
+            parked.parked_tip if parked and parked.parked_tip else '-',
+        )
+
+    async def _block_and_file_dispatch_gate_l1(
+        self, task_id: str, *, category: str, summary: str, detail: str,
+    ) -> None:
+        """Block *task_id* and file one category-scoped L1 for a dispatch gate."""
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+        except Exception:
+            logger.warning(
+                'Dispatch-gate block for task %s — set_task_status raised; '
+                'will still attempt to file escalation',
+                task_id, exc_info=True,
+            )
+        if not self._escalation_queue:
+            logger.warning(
+                'Dispatch-gate block for task %s — no escalation queue, skipping L1 file',
+                task_id,
+            )
+            return
+        if self._escalation_queue.has_open_l1(task_id, category=category):
+            logger.warning(
+                'Dispatch-gate block for task %s — open %s L1 already exists, '
+                'suppressing duplicate',
+                task_id, category,
+            )
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self._escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='orchestrator-scheduler',
+            severity='blocking',
+            category=category,
+            summary=summary[:200],
+            detail=detail,
+            suggested_action='manual_intervention',
+            level=1,
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
+        self._escalation_queue.submit(esc)
+        logger.warning('Filed L1 %s escalation %s for task %s', category, esc.id, task_id)
+
     async def _run_cross_repo_gate(self, assignment) -> bool:
         """Run the dispatch-time cross-repo admission gate (task 3121).
 
@@ -9059,6 +10141,8 @@ class Harness:
         # preventing the rapid re-block loop where reconciliation immediately
         # re-dispatches the task before it can make progress.
         arm_requeue_cooldown = False
+        lease = SlotLease(assignment.task_id, self.scheduler, sem)
+        self._slot_lease_registry()[assignment.task_id] = lease
         try:
             logger.info(
                 f'Starting workflow for task {assignment.task_id}: '
@@ -9111,6 +10195,22 @@ class Harness:
             # Drop any preserved-worktree marker once the slot picks the task up.
             self._preserved_worktrees.discard(assignment.task_id)
 
+            # ── Re-cut ruling gate (task 3154) ───────────────────────────────
+            # Runs before the session-resume guard so a pre-ruling plan or
+            # session is never resumed. See orchestrator/recut_ruling.py.
+            if recut_ruling.carries_recut_ruling(assignment.task):
+                recut = await self._run_recut_ruling_gate(assignment)
+                if recut.refused:
+                    arm_requeue_cooldown = True
+                    return TaskReport(
+                        task_id=assignment.task_id,
+                        title=assignment.task.get('title', ''),
+                        outcome=WorkflowOutcome.BLOCKED,
+                        block_reason='recut_ruling_refused',
+                    )
+                if recut.executed:
+                    recovered_plan = recovered_session = recovered_config_dir = None
+
             # ── γ session-resume eligibility guard (task 2774) ────────────────
             # A recovered session is injected as --resume below ONLY when it is
             # fresh, under its per-task resume cap, and its transcript is
@@ -9136,14 +10236,26 @@ class Harness:
             # storm-escape at fallback_storm_threshold) is a separate question
             # from which event is emitted: see the streak branch below.
             #
-            # Every session_resume_fallback emit also carries archive_available
-            # (task 3727) — was this session still recoverable from the durable
-            # transcript archive? That is INSTRUMENTATION ONLY (D8 / INV-3
-            # instrument-before-acting): it reports the recoverable population
-            # so it can be MEASURED in production before anything is gated on
-            # it, and changes nothing about what resumes here. Leaf δ is what
-            # may later gate on the signal; task 3578 is what consumes
-            # durable_archive_path to perform an actual restore.
+            # THE DURABLE ARCHIVE IS AN ELIGIBILITY INPUT (task 3730 / δ / D2),
+            # no longer the pure instrument task 3727 added. 3727 wired
+            # archive_available onto every session_resume_fallback emit
+            # precisely so the recoverable population could be MEASURED before
+            # anything gated on it (INV-3 instrument-before-acting); the
+            # measurement came back at ~91% (92 of 101 post-3578 fallbacks,
+            # 2026-09-04), so δ acts on it. The lookup is HOISTED here, once
+            # per dispatch, and feeds two consumers that must never disagree
+            # about what is on disk: the predicate below (which narrows it by
+            # the restore kill switch — see the assignment) and that same
+            # fallback emit. Two independent lookups would be two answers to
+            # one question — an archival pass landing between them would
+            # produce a fallback event whose archive_available contradicts the
+            # reasons printed beside it.
+            #
+            # Hoisted INSIDE the `enabled` check (see the assignment below) so
+            # the kill switch still costs zero filesystem I/O. The ELIGIBLE
+            # path, by contrast, now pays one glob it did not pay before —
+            # a stated, unavoidable regression against D8's "eligible / capped
+            # / disabled do no extra I/O", and the whole point of δ.
             if recovered_session is not None:
                 # Rolling-window decay, evaluated ONCE PER DISPATCH that
                 # carried a recovered session — BEFORE the reasons, because it
@@ -9170,18 +10282,59 @@ class Harness:
                 # the path of tasks that have no recovered session, for no
                 # signal. A by-design outcome still neither feeds NOR resets
                 # the streak — expiry is not a reset, it is the run ending.
-                now = time.monotonic()
-                window = self.config.session_resume.storm_window_secs
-                if (
-                    self._last_session_resume_fallback_at is not None
-                    and (now - self._last_session_resume_fallback_at) >= window
-                ):
-                    self._session_resume_fallback_streak = 0
-                    # Drop the comparison point too, so the next fallback opens
-                    # a fresh run instead of chaining off an expired stamp.
-                    self._last_session_resume_fallback_at = None
+                #
+                # _decay_session_resume_run is the SHARED implementation the
+                # arm-seam sink applies too, so "when does a run expire" has
+                # ONE answer and ONE copy of it (SPOT). It drops the
+                # comparison point and the recorded failures as well, so the
+                # next failure opens a fresh run instead of chaining off an
+                # expired stamp, and a retired run's evidence can never
+                # surface on a later L1.
+                self._decay_session_resume_run(time.monotonic())
+                # THE ONE LOOKUP (task 3730). Guarded on `enabled` so the kill
+                # switch keeps its zero-I/O property: with the feature off the
+                # predicate returns {'disabled'} alone without consulting the
+                # archive, so there is nothing here to inform. False is the
+                # correct short-circuit value for that case — it is also what
+                # `_archive_available` degrades to on any fault, so the
+                # disabled path and the faulted path agree.
+                archive_present = (
+                    self._archive_available(
+                        assignment.task_id, recovered_session.get('session_id')
+                    )
+                    if self.config.session_resume.enabled
+                    else False
+                )
+                # ELIGIBILITY consumes the lookup NARROWED by the arm-site kill
+                # switch; the EVENT below reports it un-narrowed. The two
+                # readings differ only when an operator has pulled
+                # `restore_from_archive`, and they must:
+                #
+                #   - An archive can only make a session REACHABLE if
+                #     something will restore it. With restoration off, δ would
+                #     otherwise arm --resume for an archive-only session, the
+                #     arm site would skip rehydration, re-corroboration would
+                #     fail and it would dispatch fresh anyway — so pulling the
+                #     switch an operator pulls when they suspect a restore
+                #     regression would move every archive-mediated session from
+                #     session_resume_fallback to session_resume, and D8's ratio
+                #     recipe would read 100% resumed while 0% resumed. Narrowed
+                #     here, the switch reverts δ exactly: those sessions fall
+                #     back with their pre-δ reasons.
+                #   - The INSTRUMENT (task 3727) must not be narrowed with it.
+                #     `restore_from_archive`'s whole purpose is to disable
+                #     restoration WITHOUT going blind on the population it was
+                #     meant to fix, and that population is precisely the
+                #     fallbacks carrying archive_available=true. Narrowing the
+                #     event too would make "no archive on disk" and "restore
+                #     switched off" indistinguishable in runs.db.
                 reasons = self._session_resume_reasons(
-                    recovered_session, recovered_config_dir
+                    recovered_session,
+                    recovered_config_dir,
+                    archive_available=(
+                        archive_present
+                        and self.config.session_resume.restore_from_archive
+                    ),
                 )
                 # Capture the session identity for the event BEFORE any nulling.
                 resume_event_data = {
@@ -9189,11 +10342,24 @@ class Harness:
                     'role': recovered_session.get('role'),
                 }
                 if not reasons:
-                    self._session_resume_fallback_streak = 0  # break any storm run
-                    # Drop the chain's comparison point too, so the next
-                    # fallback starts a fresh run instead of chaining off a
-                    # pre-reset stamp (task 3256).
-                    self._last_session_resume_fallback_at = None
+                    # ELIGIBILITY IS NOT SURVIVAL (task ε/3733), so the storm
+                    # run is not touched here. This predicate runs one whole
+                    # process-phase BEFORE the restore it was being read as a
+                    # verdict on — build_workflow is a few lines below, and
+                    # _invoke's restore later still — so retiring the run here
+                    # treated a not-yet-succeeded resume as a success, the exact
+                    # anti-masking rule note_resume_failed's own docstring
+                    # quotes. For ε's headline feeder (an archive-backed session
+                    # judged eligible BECAUSE δ's hoisted lookup found an
+                    # archive, whose restore then faults) every failure was
+                    # preceded by its own reset — eligible → 0 → fault → 1 —
+                    # so the streak could never exceed 1 and INV-4's escape was
+                    # unfireable.
+                    #
+                    # note_resume_succeeded, reported from the arm seam only
+                    # when a resume was adopted AND survived, is now the correct
+                    # and SOLE success reset; the rolling-window decay above
+                    # remains the only other way a run ends.
                     if self.event_store:
                         self.event_store.emit(
                             EventType.session_resume,
@@ -9227,19 +10393,21 @@ class Harness:
                         # EVERY other outcome emits session_resume_fallback
                         # carrying the whole reason set — by-design ones
                         # ('reseeded', a co-occurring 'capped') and genuine
-                        # ones alike. The emit is shared by all of them — ONE
-                        # archive lookup, one filesystem glob per dispatch
-                        # rather than several, and no chance of separate sites
-                        # drifting apart.
+                        # ones alike. The emit is shared by all of them, so no
+                        # two sites can drift apart in what they report.
                         #
-                        # Built INSIDE the event_store guard, not above it.
-                        # archive_available costs a filesystem glob, and with no
-                        # event store there is no consumer for it: the dict
-                        # would be built and dropped (the direct-_run_slot unit
-                        # path, and any event-store-less deployment). On the
-                        # fallback path only, so the eligible / capped /
-                        # disabled paths do no extra I/O and their events stay
-                        # byte-identical (D8).
+                        # archive_available is the HOISTED lookup (task 3730),
+                        # not a second glob: one filesystem answer feeds both
+                        # this field and the predicate above, so the event's
+                        # reasons and its archive_available cannot contradict
+                        # each other about what is ON DISK. It is reported
+                        # UN-NARROWED by `restore_from_archive` — see the hoist
+                        # for why the instrument outlives the kill switch that
+                        # withholds the archive from eligibility. It stays on
+                        # the fallback event
+                        # ONLY — session_resume and session_resume_capped are
+                        # byte-identical to their pre-3727 shape, which is what
+                        # keeps event_store.py's ratio recipe meaningful (D8).
                         #
                         # The session id comes off the snapshot taken above, NOT
                         # off recovered_session — that was set to None at the top
@@ -9256,10 +10424,7 @@ class Harness:
                                     # census. A list, not a set — it has to
                                     # survive the JSON round-trip into runs.db.
                                     'reasons': sorted(reasons),
-                                    'archive_available': self._archive_available(
-                                        assignment.task_id,
-                                        resume_event_data['session_id'],
-                                    ),
+                                    'archive_available': archive_present,
                                 },
                             )
                         # What FEEDS the storm streak is whatever survives
@@ -9280,29 +10445,77 @@ class Harness:
                         # by-design reason co-occurring with a genuine one
                         # cannot LAUNDER it — the difference is still non-empty.
                         #
-                        # G7/INV-4 WAIVER, recorded honestly: with today's
-                        # vocabulary `genuine` is ALWAYS empty, so nothing
-                        # increments the streak and this branch is dead until
-                        # PRD leaf ε (task 3733) installs the
-                        # archive-restore-failure feeder. That window is
-                        # deliberate and waived, not an oversight — do not read
-                        # the unreachable body as a bug, and do not "fix" it by
-                        # putting a by-design reason back on the feeder.
+                        # DEAD BY CONSTRUCTION, and no longer a waived gap.
+                        # With today's vocabulary `genuine` is ALWAYS empty, so
+                        # nothing here increments the streak. This used to be
+                        # recorded as a G7/INV-4 waiver that PRD leaf ε (task
+                        # 3733) would close; ε has LANDED and did not close it,
+                        # because its feeder is the ARM SEAM one process-phase
+                        # downstream (`TaskWorkflow._invoke` ->
+                        # :meth:`note_resume_failed`) rather than a new
+                        # predicate reason. This predicate runs BEFORE the
+                        # restore and takes `archive_available` as a bool
+                        # precisely so it acquires no filesystem dependency, so
+                        # it cannot report that a restore failed.
+                        #
+                        # INV-4's escape therefore HAS a live feeder — just not
+                        # this one. The branch is retained as the predicate-side
+                        # half of the SAME streak and the SAME L1 renderer, so a
+                        # future reason that is genuinely unexplained needs no
+                        # second mechanism. Do not read the unreachable body as
+                        # a bug, and do not "fix" it by putting a by-design
+                        # reason back on the feeder.
                         genuine = reasons - _BY_DESIGN_SESSION_RESUME_REASONS
                         if genuine:
-                            # The window was already applied above, so this
-                            # branch only EXTENDS the chain: refresh the
-                            # comparison stamp and count. The stamp is
-                            # refreshed ONLY here, by a genuine feeder — a drip
-                            # of by-design fallbacks must not keep a chain
-                            # alive across an arbitrarily long gap (task 3256).
-                            self._last_session_resume_fallback_at = now
-                            self._session_resume_fallback_streak += 1
-                            if (
-                                self._session_resume_fallback_streak
-                                >= self.config.session_resume.fallback_storm_threshold
-                            ):
-                                self._file_session_resume_storm_escalation()
+                            # REPORTED through the sink, not re-implemented
+                            # here. Appending the evidence, refreshing the
+                            # comparison stamp, counting and filing at the
+                            # threshold is the STREAK PROTOCOL, and it has one
+                            # implementation — note_resume_failed — so a change
+                            # to it cannot land in one seam and silently miss
+                            # the other (SPOT). Routing through the classifier
+                            # also puts this seam under the same totality guard
+                            # the arm seam has: instrumentation must never be
+                            # what costs a dispatch (I3).
+                            #
+                            # GENUINE BY CONSTRUCTION, so the classifier changes
+                            # no verdict here: restore=None is outside
+                            # _BY_DESIGN_RESTORE_OUTCOMES, which is the only
+                            # thing note_resume_failed carves out. The decay it
+                            # re-applies is idempotent against the stamp read
+                            # above, which nothing has moved since.
+                            #
+                            # One ResumeFailure shape for both seams, so this
+                            # one and ε's arm seam feed ONE streak read by ONE
+                            # L1 renderer: whichever produced the run, the
+                            # operator gets the same named facts. This branch
+                            # stays dead by construction — the record is the
+                            # shape it WOULD take, not a live population.
+                            self.note_resume_failed(
+                                ResumeFailure(
+                                    task_id=str(assignment.task_id),
+                                    # resume_event_data, NOT recovered_session:
+                                    # this else-branch nulls the latter before
+                                    # reaching here, which is exactly why the
+                                    # identity was captured above.
+                                    session_id=str(
+                                        resume_event_data['session_id']
+                                    ),
+                                    role=str(
+                                        resume_event_data['role'] or 'unknown'
+                                    ),
+                                    stage='eligibility',
+                                    restore=None,
+                                    archive_root=None,
+                                    archive_path=None,
+                                    detail=(
+                                        'ineligible before dispatch; '
+                                        'unexplained reasons: '
+                                        + ', '.join(sorted(genuine))
+                                        + f'; archive_available={archive_present}'
+                                    ),
+                                )
+                            )
             # ──────────────────────────────────────────────────────────────────
 
             # Build steward factory — steward starts when the workflow
@@ -9421,6 +10634,14 @@ class Harness:
                 cancel_event=cancel_event,
                 resume_session_id=recovered_session,
                 run_id=self._run_id,
+                # ε (task 3733): the harness IS the sink — it owns the streak,
+                # the by-design carve-outs and the escalation queue. Only the
+                # PRODUCTION dispatch acquires one; evals/runner.py's two
+                # build_workflow calls stay unedited and default to None, so
+                # eval dispatch keeps today's behaviour with no drift. That is
+                # the property the single-construction-point factory exists to
+                # guarantee, and the factory's keyword-set tripwire enforces.
+                resume_outcome_sink=self,
             )
 
             if self.event_store:
@@ -9477,6 +10698,7 @@ class Harness:
                     if terminal_report.blocked_from_phase is not None
                     else ''
                 ),
+                block_category=terminal_report.block_category,
                 # Task 2988: carry the disposition's cap-accounting policy
                 # through to _apply_retry_cap's record_requeue call.
                 counts_against_requeue_cap=terminal_report.counts_against_requeue_cap,
@@ -9533,7 +10755,7 @@ class Harness:
             # consecutive polls.  Catch here (before `except Exception`) so the
             # wrapper asyncio.Task completes normally (returns a result rather than
             # entering CANCELLED state).  A synthetic TaskReport(outcome=CANCELLED)
-            # propagates through _collect_done_reports' normal append path and is
+            # propagates through _collect_slot_report's normal append path and is
             # persisted by _run_store.save_task_result — symmetric with the BLOCKED
             # report from `except Exception`.  The `finally` block still runs
             # unconditionally (lock release, registry cleanup, scheduler.release).
@@ -9579,7 +10801,14 @@ class Harness:
                 # Ladder: stamped cause → drain → honest residue.  Never a
                 # guess that an unattributed cancel "must have been" a drain.
                 block_reason=(
-                    self._cancel_causes().pop(assignment.task_id, None)
+                    (
+                        self._cancel_causes().pop(assignment.task_id, None)
+                        if self._owns_slot(assignment.task_id, lease)
+                        # Force-released (task 6660): only the watcher's
+                        # hard-cancel leads there, and the cause registry may
+                        # hold a re-dispatch's entry by now.
+                        else 'terminal_status_cancel'
+                    )
                     or ('shutdown_drain' if getattr(self, '_draining', False)
                         else 'cancelled_unattributed')
                 ),
@@ -9640,31 +10869,13 @@ class Harness:
                 outcome=WorkflowOutcome.BLOCKED,
             )
         finally:
-            self._escalation_events.pop(assignment.task_id, None)
-            self._workflow_cancel_events.pop(assignment.task_id, None)
-            # NB: deliberately do NOT pop _workflow_cancel_at here.  Popping it
-            # in the finally defeated the R3 reconcile grace window — it only
-            # ever overlapped the period the live slot already protected (via
-            # dispatch-table membership), leaving the brief post-exit window
-            # uncovered.  The stamp is instead cleared at (re)dispatch (top of
-            # _run_slot) and lazily pruned by the sweep's grace-check reader.
-            self._workflow_slot_tasks.pop(assignment.task_id, None)
-            # Defensive merge-phase grace clear (task 2753): mirrors the
-            # inline clear at the durable-enqueue boundary in
-            # _submit_to_merge_queue, covering abnormal slot exits (e.g.
-            # WorkflowCancelled raised before that inline clear). Unlike
-            # _workflow_cancel_at above, clearing here is CORRECT: once the
-            # slot exits there is no more pre-enqueue verify to protect — the
-            # workflow either enqueued (and cleared inline) or died — so
-            # releasing the grace immediately is exactly right (the monotonic
-            # stamp would auto-expire regardless; this just does it promptly).
-            self.scheduler.clear_merge_phase(assignment.task_id)
-            self._terminal_cancel_counts.pop(assignment.task_id, None)
-            # Belt-and-braces (task 3172): the ladder above consumes the cause
-            # on the cancel path; this covers every OTHER slot exit so a
-            # stamped-but-unconsumed entry can never leak into a later
-            # re-dispatch of the same task.
-            self._cancel_causes().pop(assignment.task_id, None)
+            # Task 6660: a slot the terminal-status watcher force-released has
+            # already lost its registrations, its claimant and its locks, and a
+            # fresh dispatch of the same id may own all of them now.  Only the
+            # slot whose lease is still the registered one acts on the task.
+            owns_slot = self._owns_slot(assignment.task_id, lease)
+            if owns_slot:
+                self._unregister_slot(assignment.task_id)
             # W9-θ: the former B2 belt-and-suspenders release (any DONE/CANCELLED
             # that missed B1, e.g. authoritative-cancel returning normally from
             # workflow.run()) is retired.  The workflow's own kind-aware
@@ -9676,7 +10887,7 @@ class Harness:
             # above) never ran on_terminal either; that is intentional — see the
             # comment there — the periodic terminal-lane reconciler reclaims it.
             requeued = report is not None and report.outcome == WorkflowOutcome.REQUEUED
-            if report is not None:
+            if report is not None and owns_slot:
                 requeued = await self._apply_retry_cap(
                     assignment.task_id, report, requeued,
                 )
@@ -9712,15 +10923,15 @@ class Harness:
             # tool/param, absent column, or transient error here can never
             # block scheduler.release/sem.release below. plan.lock forensics
             # are left untouched.
-            with contextlib.suppress(Exception):
-                await self.scheduler.set_task_claimant(
-                    assignment.task_id, claimant_run_id=None, heartbeat_at=None,
-                )
+            if owns_slot:
+                with contextlib.suppress(Exception):
+                    await self.scheduler.set_task_claimant(
+                        assignment.task_id, claimant_run_id=None, heartbeat_at=None,
+                    )
             # arm_requeue_cooldown=True (any unhandled workflow-slot exception) arms
             # the existing requeue_cooldown_secs grace window so a freshly-unblocked
             # task is not immediately re-dispatched and re-blocked in a tight loop.
-            self.scheduler.release(assignment.task_id, requeued=requeued or arm_requeue_cooldown)
-            sem.release()
+            lease.release(requeued=requeued or arm_requeue_cooldown)
 
     async def _run_deterministic_slot(self, assignment) -> TaskReport:
         """Run a deterministic gate task via DeterministicRunner.
@@ -9963,17 +11174,24 @@ class Harness:
           Lever B or Lever C).
         - The original task is NOT itself an auto-eval redo.
         - ``report.block_phase`` is in ``config.auto_eval_phases``.
+        - ``report.block_category`` is not in
+          ``_AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES``. ``auto_eval_phases``
+          excludes merge/infra failures as "unlikely to differ on the full
+          path", but a worktree conflict, a verify-infra failure or a branch
+          reset blocks from a working phase (a setup-time conflict reads as
+          ``plan``); the category is what tells them apart.
         - The 24h auto-eval USD budget has not been exhausted.
 
-        On success, the original branch + worktree are renamed with a
-        ``-skip-attempt`` suffix and a sibling task is submitted via
-        ``submit_task(planning_mode=True)`` (curator dedupe bypass) with
-        ``metadata.force_full_path=True`` to prevent the redo from taking
-        an optimistic path itself.
+        A sibling task is submitted via ``submit_task(planning_mode=True)``
+        (curator dedupe bypass) with ``metadata.force_full_path=True`` to
+        prevent the redo from taking an optimistic path itself, and flipped
+        to pending. Only once that redo exists and is released are the
+        original branch + worktree renamed with a ``-skip-attempt`` suffix,
+        so no failure path leaves the original renamed without a redo.
 
-        Once the replacement redo is confirmed created, any still-'pending'
-        prior redo siblings sharing the same ``spawned_from`` are cancelled
-        (task 2075) so at most one live redo survives per original task.
+        Then any still-'pending' prior redo siblings sharing the same
+        ``spawned_from`` are cancelled (task 2075) so at most one live redo
+        survives per original task.
         'in-progress', 'blocked', 'deferred', 'review', and 'merge-deferred'
         siblings are deliberately left alone — see
         ``_AUTO_EVAL_SUPERSEDE_SAFE_STATUSES``.
@@ -9983,6 +11201,8 @@ class Harness:
         if report.outcome != WorkflowOutcome.BLOCKED:
             return
         if report.block_phase not in self.config.auto_eval_phases:
+            return
+        if report.block_category in _AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES:
             return
 
         task_metadata = (assignment.task.get('metadata') or {})
@@ -10008,29 +11228,7 @@ class Harness:
         # redo, so the not-yet-created replacement is never in this set.
         prior_redo_ids = await self._find_prior_auto_eval_redos(original_id)
 
-        # Rename the original branch + worktree so the new task can use a
-        # fresh task/<original_id>-redo branch (sibling task gets its own
-        # branch from create_worktree on dispatch).
-        old_branch = original_id
         new_branch = f'{original_id}-skip-attempt'
-        old_path = self.git_ops.worktree_base / old_branch
-        new_path = self.git_ops.worktree_base / new_branch
-        renamed = False
-        if old_path.exists():
-            try:
-                await self.git_ops.rename_worktree(
-                    old_path=old_path,
-                    new_path=new_path,
-                    old_branch=old_branch,
-                    new_branch=new_branch,
-                )
-                renamed = True
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    'Task %s: auto-eval rename failed (%s) — continuing '
-                    'without rename',
-                    original_id, exc,
-                )
 
         redo_metadata = {
             'auto_eval_redo': True,
@@ -10048,8 +11246,7 @@ class Harness:
             'routing': {
                 'routing_tier': RoutingState.from_metadata(task_metadata).routing_tier + 1,
             },
-            'modules': list(task_metadata.get('modules') or []),
-            'files': list(task_metadata.get('files') or []),
+            'files': sanitize_files_for_persist(task_metadata.get('files') or []),
         }
 
         title = (
@@ -10058,58 +11255,75 @@ class Harness:
         description = (
             f'Automated full-architect redo of task {original_id} '
             f'(blocked at phase={report.block_phase} via optimistic path '
-            f'{optimistic_path!r}). Original branch+worktree renamed to '
-            f'{new_branch} for forensic comparison.'
+            f'{optimistic_path!r}). Original branch+worktree are renamed to '
+            f'{new_branch} for forensic comparison once this redo is released.'
         )
 
-        try:
-            submit_result = await self.scheduler.dispatch_tool(
-                'submit_task',
-                {
-                    'project_root': str(self.config.project_root),
-                    'title': title,
-                    'description': description,
-                    'priority': str(
-                        assignment.task.get('priority') or 'medium'
-                    ),
-                    'metadata': redo_metadata,
-                    'planning_mode': True,
-                },
-                timeout=30,
-            )
-        except Exception as exc:  # noqa: BLE001
+        outcome = await self.scheduler.submit_task({
+            'project_root': str(self.config.project_root),
+            'title': title,
+            'description': description,
+            'priority': str(assignment.task.get('priority') or 'medium'),
+            'metadata': redo_metadata,
+            'planning_mode': True,
+        })
+        if isinstance(outcome, SubmittedTask) and not outcome.combined:
+            new_task_id = outcome.task_id
+        else:
             logger.warning(
-                'Task %s: auto-eval submit_task raised (%s) — aborting redo',
-                original_id, exc,
-            )
-            return
-
-        new_task_id = self._extract_task_id(submit_result)
-        if not new_task_id:
-            logger.warning(
-                'Task %s: auto-eval submit_task returned no task_id (%r)',
-                original_id, submit_result,
+                'Task %s: auto-eval submit_task produced no redo task this harness may '
+                'flip (%r) — aborting redo',
+                original_id, outcome,
             )
             return
 
         # Flip the new task from deferred → pending so the scheduler picks
-        # it up on the next tick.
+        # it up on the next tick. Scheduler.set_task_status retries transient
+        # rejections and raises on every other one; a raw dispatch_tool would
+        # return a structured ``{'error': ...}`` body without raising and let
+        # the rename below run with the redo still deferred.
         try:
-            await self.scheduler.dispatch_tool(
-                'set_task_status',
-                {
-                    'project_root': str(self.config.project_root),
-                    'id': new_task_id,
-                    'status': 'pending',
-                },
-                timeout=15,
-            )
+            await self.scheduler.set_task_status(new_task_id, 'pending')
         except Exception as exc:  # noqa: BLE001
+            # The flip may have landed despite the failure (a timeout), which
+            # would leave a live pending redo with no back-link or budget
+            # tracking; if it really failed, a deferred orphan would collide
+            # with the next trigger for this original on candidate key. Either
+            # way, cancel the redo.
+            try:
+                await self.scheduler.set_task_status(new_task_id, 'cancelled')
+                disposition = 'redo cancelled'
+            except Exception as cancel_exc:
+                disposition = (
+                    f'cancelling the redo also failed ({cancel_exc}); '
+                    'it is left deferred'
+                )
             logger.warning(
                 'Task %s: auto-eval status flip to pending failed (%s) — '
-                'redo task %s left deferred',
-                original_id, exc, new_task_id,
+                'redo task %s: %s; original not renamed',
+                original_id, exc, new_task_id, disposition,
             )
+            return
+
+        # Only now that the redo is released: set the original's worktree +
+        # branch aside under new_branch for forensic comparison.
+        old_path = self.git_ops.worktree_base / original_id
+        renamed = False
+        if old_path.exists():
+            try:
+                await self.git_ops.rename_worktree(
+                    old_path=old_path,
+                    new_path=self.git_ops.worktree_base / new_branch,
+                    old_branch=original_id,
+                    new_branch=new_branch,
+                )
+                renamed = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'Task %s: auto-eval rename failed (%s) — continuing '
+                    'without rename',
+                    original_id, exc,
+                )
 
         # Supersede prior redo siblings now that the replacement redo is
         # confirmed created — at most one live redo per spawned_from should
@@ -10147,13 +11361,14 @@ class Harness:
                 )
 
         # Cross-reference the new id back onto the original task.
+        # ``task_metadata`` is the dispatch-time snapshot, so only the owned
+        # key is written; see
+        # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_optimistic_path.
         try:
             await self.scheduler.update_task(
                 original_id,
-                metadata={
-                    **task_metadata,
-                    'auto_eval_pair': str(new_task_id),
-                },
+                metadata={'auto_eval_pair': str(new_task_id)},
+                metadata_mode='merge',
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -10307,34 +11522,6 @@ class Harness:
                 total, self.config.orch_daily_cost_ceiling_usd,
             )
             await self.pause_scheduler('cost_ceiling_orch_exceeded')
-
-    @staticmethod
-    def _extract_task_id(submit_result: Any) -> str | None:
-        """Pull the task_id out of an MCP tools/call response wrapper.
-
-        ``dispatch_tool`` returns the raw MCP result envelope. The shape may
-        be ``{'task_id': ...}``, ``{'content': [{'text': '{...}'}], ...}``,
-        or ``{'structuredContent': {...}}`` depending on transport. Normalise.
-        """
-        if not isinstance(submit_result, dict):
-            return None
-        if submit_result.get('task_id'):
-            return str(submit_result['task_id'])
-        for key in ('structuredContent', 'result'):
-            inner = submit_result.get(key)
-            if isinstance(inner, dict) and inner.get('task_id'):
-                return str(inner['task_id'])
-        content = submit_result.get('content')
-        if isinstance(content, list):
-            for chunk in content:
-                if isinstance(chunk, dict) and chunk.get('type') == 'text':
-                    try:
-                        parsed = json.loads(str(chunk.get('text') or ''))
-                    except (TypeError, ValueError):
-                        continue
-                    if isinstance(parsed, dict) and parsed.get('task_id'):
-                        return str(parsed['task_id'])
-        return None
 
     async def _apply_retry_cap(
         self, task_id: str, report: TaskReport, requeued: bool,
@@ -10514,9 +11701,11 @@ class Harness:
           the healthy majority of every sweep, and emitting for it would bury
           the strands this mechanism exists to surface.
 
-        ``classify_pins`` is consulted ONLY to bucket ids for the payload; the
-        veto answer stays with the caller's own untouched predicate (rewiring
-        that is task eta / 3541).
+        ``classify_pins`` is consulted ONLY to bucket ids for the payload and
+        to gate the streak alarm on whether the hold is human-parked.
+        Since task 3541 the veto answer is the caller's, taken from the SAME
+        classifier through ``orchestrator.recovery_pins`` before it ever
+        reaches this method — describing and deciding stay separate.
 
         ``task_id=None`` is a PROCESS-scoped notice with no single subject —
         "this whole site has no escalation queue to read".  With no subject
@@ -10565,9 +11754,10 @@ class Harness:
                 self._recovery_veto_tracker = tracker
 
             # Shared with the Scheduler's twin adapter rather than hand-rolled
-            # here: classify_pins is consulted for BUCKETING only (never for
-            # the veto answer), and records=None carries its store-unavailable
-            # third state, which must never collapse into "no records".
+            # here: classify_pins is consulted for BUCKETING and the streak
+            # alarm's human-parked gate only (never for the veto answer), and
+            # records=None carries its store-unavailable third state, which
+            # must never collapse into "no records".
             pins = pin_buckets(
                 task_id, records, store_unavailable=store_unavailable,
             )
@@ -10593,7 +11783,8 @@ class Harness:
                 # dimension (span) can be cleared on a LATER, quiet observation
                 # than the threshold crossing itself, and a hold that alarms
                 # only when it also happens to be re-stated would be silently
-                # dependent on the event cadence.
+                # dependent on the event cadence.  The alarm is also
+                # pin-class-aware — see recovery_emission's module docstring.
                 if (
                     site in STREAK_CHARGING_SITES
                     and cfg.streak_escalation_enabled
@@ -10613,6 +11804,8 @@ class Harness:
                             as_ageable_records(records), now=datetime.now(UTC),
                         ),
                         filed_at=self._recovery_streak_memo(),
+                        human_parked=pins.human_parked,
+                        suppress_human_parked=cfg.streak_escalation_suppress_human_parked,
                     )
                 if not should_emit_event(
                     observation, threshold=cfg.veto_streak_threshold,
@@ -10828,54 +12021,65 @@ class Harness:
                 'recovery veto-streak release failed (non-fatal): %s', exc,
             )
 
-    def _collect_done_reports(
-        self, done: set[asyncio.Task], task_reports: list[TaskReport]
+    def _collect_slot_report(
+        self, task_reports: list[TaskReport], t: asyncio.Task,
     ) -> None:
-        """Extract TaskReports from completed asyncio.Tasks and track merges for review."""
-        for t in done:
-            # Handle review checkpoint completion
-            if t.get_name() == 'review-checkpoint':
-                self._review_running = False
-                try:
-                    t.result()  # propagate exceptions
-                except Exception as e:
-                    logger.error(f'Review checkpoint error: {e}')
-                continue
+        """Done-callback of a slot task: record its TaskReport the moment it ends.
 
+        ``task_reports`` is the list of the cycle that dispatched the slot.  A
+        task that ends cancelled (before ``_run_slot``'s body ran, or during
+        its cleanup) has no report.
+        """
+        self._live_tasks.discard(t)
+        if t in self._force_released_slot_tasks():
+            self._force_released_slot_tasks().discard(t)
+            logger.warning(
+                '%s ended after its slot was force-released; its report is not recorded',
+                t.get_name(),
+            )
+            return
+        if t.cancelled():
+            logger.warning(
+                '%s was cancelled without returning a report', t.get_name(),
+            )
+            return
+        error = t.exception()
+        if error is not None:
+            logger.error('%s raised: %s', t.get_name(), error, exc_info=error)
+            return
+        report = t.result()
+        if not report:
+            return
+        try:
+            self._record_slot_report(report, task_reports)
+        except Exception:
+            logger.exception('Recording the report of task %s failed', report.task_id)
+
+    def _record_slot_report(
+        self, report: TaskReport, task_reports: list[TaskReport],
+    ) -> None:
+        """Append, persist, and feed a finished slot's report to review checkpoints."""
+        task_reports.append(report)
+        if self._run_store and self._run_id:
             try:
-                report = t.result()
-                if report:
-                    task_reports.append(report)
-                    # Persist task result immediately so it survives crashes
-                    if self._run_store and self._run_id:
-                        try:
-                            self._run_store.save_task_result(
-                                self._run_id, report,
-                                self.config.fused_memory.project_id,
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                f'Failed to persist task result '
-                                f'{report.task_id}: {e}'
-                            )
-                    # Track module merges for review checkpoints
-                    if (report.outcome == WorkflowOutcome.DONE
-                            and self.review_checkpoint):
-                        modules = self._task_modules.pop(report.task_id, [])
-                        self.review_checkpoint.record_merge(modules)
-                        # Check if review should trigger
-                        if (self.review_checkpoint.should_trigger()
-                                and not self._review_running):
-                            self._trigger_review_checkpoint()
+                self._run_store.save_task_result(
+                    self._run_id, report, self.config.fused_memory.project_id,
+                )
             except Exception as e:
-                logger.error(f'Workflow slot error: {e}')
+                logger.warning(f'Failed to persist task result {report.task_id}: {e}')
+        if report.outcome == WorkflowOutcome.DONE and self.review_checkpoint:
+            self.review_checkpoint.record_merge(self._task_modules.pop(report.task_id, []))
+            if (self.review_checkpoint.should_trigger()
+                    and self._review_task is None
+                    and not self._draining):
+                self._trigger_review_checkpoint()
 
     def _compute_tallies(self, task_reports: list[TaskReport]) -> None:
         """Fill ``self.report`` aggregates from the collected task reports.
 
-        Shared by the post-loop (exit / --until-idle) block and the
-        run-forever idle branch, which recomputes per-cycle before logging the
-        cycle summary.
+        Shared by the post-loop (exit / --until-idle) block, the run-forever
+        idle branch, which recomputes per-cycle before logging the cycle
+        summary, and the ``finally``, which counts slots cancelled at shutdown.
         """
         self.report.task_reports = task_reports
         self.report.completed = sum(
@@ -10901,85 +12105,69 @@ class Harness:
         assert self.review_checkpoint is not None
         logger.info('Running full post-completion review...')
         try:
-            review_report = await self.review_checkpoint.run_full()
-            self.report.review_checkpoints += 1
-            self.report.review_findings += review_report.findings_count
-            self.report.review_tasks_created += len(review_report.tasks_created)
-            self.report.review_cost_usd += review_report.cost_usd
-            if review_report.parse_failed:
-                logger.warning(
-                    'Full review %s: reviewer output was unparseable — review '
-                    'inconclusive (findings_count=%d is not a clean pass)',
-                    review_report.review_id,
-                    review_report.findings_count,
-                )
-            logger.info(
-                'Full review complete: %d findings, %d tasks created',
-                review_report.findings_count,
-                len(review_report.tasks_created),
-            )
-            if _MODULE_TAGGER_ENABLED and review_report.tasks_created:
-                try:
-                    await self._tag_task_modules()
-                except Exception as tag_err:
-                    logger.warning(f'Post-review module tagging failed: {tag_err}')
+            await self._account_review(await self.review_checkpoint.run_full(), 'Full review')
         except Exception as e:
             logger.error(f'Full review failed: {e}')
 
     def _trigger_review_checkpoint(self) -> None:
         """Spawn a review checkpoint as a concurrent task.
 
-        The main loop will pause task acquisition while the review runs
-        (``_review_running`` flag) but in-flight tasks continue in their
-        worktrees.
+        The main loop will pause task acquisition while ``_review_task`` is
+        set, but in-flight tasks continue in their worktrees.
         """
-        self._review_running = True
-        # We can't add to active here — the caller's done set is immutable.
-        # Instead, the review task is spawned and tracked; the main loop checks
-        # _review_running and waits on active (which includes this task after
-        # the next iteration adds it).
-
-        # Actually, we need the task in `active` for the main loop's asyncio.wait.
-        # The caller iterates `done`, so we store the task on self for the loop
-        # to pick up.
-        self._pending_review_task = asyncio.create_task(
+        task = asyncio.create_task(
             self._run_review_checkpoint(), name='review-checkpoint',
         )
+        self._review_task = task
+        self._live_tasks.add(task)
+        task.add_done_callback(self._finish_review_checkpoint)
+
+    def _finish_review_checkpoint(self, t: asyncio.Task) -> None:
+        """Done-callback of the review task: let the loop dispatch again."""
+        self._live_tasks.discard(t)
+        self._review_task = None
+        error = None if t.cancelled() else t.exception()
+        if error is not None:
+            logger.error(f'Review checkpoint error: {error}')
 
     async def _run_review_checkpoint(self) -> None:
         """Execute a focused review checkpoint."""
         assert self.review_checkpoint is not None
         logger.info('Starting review checkpoint...')
         try:
-            review_report = await self.review_checkpoint.run_focused()
-            self.report.review_checkpoints += 1
-            self.report.review_findings += review_report.findings_count
-            self.report.review_tasks_created += len(review_report.tasks_created)
-            self.report.review_cost_usd += review_report.cost_usd
-            if review_report.parse_failed:
-                logger.warning(
-                    'Review checkpoint %s: reviewer output was unparseable — '
-                    'review inconclusive (findings_count=%d is not a clean pass)',
-                    review_report.review_id,
-                    review_report.findings_count,
-                )
-            logger.info(
-                'Review checkpoint complete: %d findings, %d tasks created, '
-                'cost=$%.2f',
-                review_report.findings_count,
-                len(review_report.tasks_created),
-                review_report.cost_usd,
+            await self._account_review(
+                await self.review_checkpoint.run_focused(), 'Review checkpoint',
             )
-            # Tag newly created tasks with module metadata (agents may have
-            # included modules, but re-run the batch tagger as a fallback
-            # for any tasks that lack them).
-            if _MODULE_TAGGER_ENABLED and review_report.tasks_created:
-                try:
-                    await self._tag_task_modules()
-                except Exception as tag_err:
-                    logger.warning(f'Post-review module tagging failed: {tag_err}')
         except Exception as e:
             logger.error(f'Review checkpoint failed: {e}')
+
+    async def _account_review(self, review_report: ReviewReport, label: str) -> None:
+        """Tally a finished review, then tag the tasks it created with modules."""
+        self.report.record_review(review_report)
+        if not review_report.ran:
+            logger.warning(
+                '%s %s: %s, not counted as a run',
+                label, review_report.review_id, review_report.outcome.value,
+            )
+            return
+        if review_report.parse_failed:
+            logger.warning(
+                '%s %s: reviewer output was unparseable — review inconclusive '
+                '(findings_count=%d is not a clean pass)',
+                label, review_report.review_id, review_report.findings_count,
+            )
+        logger.info(
+            '%s complete: %d findings, %d tasks created, cost=$%.2f',
+            label, review_report.findings_count, len(review_report.tasks_created),
+            review_report.cost_usd,
+        )
+        # Agents may already have set modules on the tasks they created; the
+        # batch tagger is the fallback for any that lack them.
+        if _MODULE_TAGGER_ENABLED and review_report.tasks_created:
+            try:
+                await self._tag_task_modules()
+            except Exception as tag_err:
+                logger.warning(f'Post-review module tagging failed: {tag_err}')
 
     def _checkpoint_stores(self) -> None:
         """Run WAL TRUNCATE checkpoint on each SQLite store — best-effort.
@@ -11023,36 +12211,8 @@ class Harness:
         ts = self.report.started_at.replace(':', '').replace('-', '')[:15]
         path = reports_dir / f'harness-{ts}.json'
 
-        data = {
-            'started_at': self.report.started_at,
-            'completed_at': self.report.completed_at,
-            'total_tasks': self.report.total_tasks,
-            'completed': self.report.completed,
-            'blocked': self.report.blocked,
-            'escalated': self.report.escalated,
-            'total_cost_usd': self.report.total_cost_usd,
-            'paused_for_cap': self.report.paused_for_cap,
-            'cap_pause_duration_secs': self.report.cap_pause_duration_secs,
-            'review_checkpoints': self.report.review_checkpoints,
-            'review_findings': self.report.review_findings,
-            'review_tasks_created': self.report.review_tasks_created,
-            'review_cost_usd': self.report.review_cost_usd,
-            'task_reports': [
-                {
-                    'task_id': r.task_id,
-                    'title': r.title,
-                    'outcome': r.outcome.value,
-                    'cost_usd': r.cost_usd,
-                    'duration_ms': r.duration_ms,
-                    'agent_invocations': r.agent_invocations,
-                    'completed_at': r.completed_at,
-                }
-                for r in self.report.task_reports
-            ],
-        }
-
         try:
-            path.write_text(json.dumps(data, indent=2))
+            path.write_text(json.dumps(self.report.to_dict(), indent=2))
             logger.info('HarnessReport saved: %s', path)
         except OSError as e:
             logger.warning('Failed to save HarnessReport: %s', e)
@@ -11061,19 +12221,18 @@ class Harness:
         """Start the merge queue worker as a background asyncio task.
 
         Uses SpeculativeMergeWorker (two-coroutine pipeline) — the sole
-        production merge worker (MQ-refactor task ν retired the legacy serial
-        MergeWorker; its readable-reference role now lives as a test-local
-        fixture in ``tests/_serial_merge_worker.py``).
+        merge worker (MQ-refactor task ν retired the legacy serial
+        MergeWorker).
 
         Also builds and stores the StaleServiceRestartCoordinator and wires
         its note_merge method as the merge worker's on_merge_landed callback.
         """
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.liveness import (
             MergeLivenessConfigError,
-            SpeculativeMergeWorker,
             enforce_merge_liveness_margin,
             enforce_persistent_worktree_serial_lane,
         )
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         # K = 1 (local trust-anchor) + number of enabled remote verify runners.
         # Sizes the liveness guard (merge_ahead_bound + num_hosts), the
@@ -11155,6 +12314,8 @@ class Harness:
             usage_gate=getattr(self, 'usage_gate', None),
             cost_store=getattr(self, 'cost_store', None),
             provenance_conflict_sink=self._provenance_conflict_sink,
+            deployed_sha=self._deployed_sha,
+            verify_hosts=[r.name for r in self.config.verify_runners],
         )
 
         # task 2828 (limb 1) — STARTUP SURVIVOR BARRIER.  Reap any orphaned
@@ -11181,8 +12342,16 @@ class Harness:
         logger.info('Speculative merge worker started')
 
     async def _stop_merge_worker(self) -> None:
-        """Stop the merge worker gracefully."""
+        """Stop the merge worker gracefully.
+
+        First closes any honoured restart-drain request still open: what is
+        in flight now is what the stop kills (task 5371).
+        """
         if self._merge_worker_task is not None and self._merge_worker is not None:
+            try:
+                self._drain_participant.on_shutdown()
+            except Exception:
+                logger.warning('fleet_drain shutdown report failed (fail-open)', exc_info=True)
             await self._merge_worker.stop()
             self._merge_worker_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -11256,7 +12425,7 @@ class Harness:
     ) -> None:
         """Advisory pipeline-landing tripwire adapter (task 2382, merge-skew δ).
 
-        Thin fail-open wiring over ``orchestrator.merge_skew_tripwire
+        Thin fail-open wiring over ``orchestrator.merge_lane.skew_tripwire
         .emit_pipeline_landing_tripwire``: reads the per-project
         ``config.git.load_bearing_oracle_cmd`` knob (``None`` disables the
         tripwire — logged no-op), enumerates in-flight tasks (excluding the
@@ -11380,13 +12549,14 @@ class Harness:
         if self._offline_lane_task is not None and not self._offline_lane_task.done():
             return
 
-        lock_path = self.config.project_root / 'data' / 'orchestrator' / 'offline_lane.lock'
+        lock_path = orchestrator_data_dir(self.config.project_root) / 'offline_lane.lock'
         worker = OfflineLaneWorker(
             self.git_ops,
             self.config,
             lock_path=lock_path,
-            task_client=_OfflineLaneTaskClient(self.scheduler),
+            task_client=SchedulerChronicFlakeTaskClient(self.scheduler, self.config.project_root),
             escalation_queue=self._escalation_queue,
+            pass_outcome_hooks=lane_pass_outcome_hooks(self.config, self._escalation_queue),
         )
         if not worker.acquire_lock():
             logger.warning(
@@ -11510,22 +12680,16 @@ class Harness:
         """Construct a StaleServiceRestartCoordinator from the current config.
 
         Called once from _start_merge_worker (where git_ops, event_store, and
-        config are all live).  The coordinator is stored on self so the
-        run-forever idle branch can call maybe_restart(agents_idle=True).
+        config are all live); the stale-service-restart service polls it.
 
         require_idle stays at its True default: a fused-memory ``--drain``
-        restart disrupts in-flight reconciliation, so the polite idle
-        quiet-window is preferred.  But ``force_fire_after_secs`` is wired
-        from config as the anti-starvation backstop (task 2817) — under
-        chronic fleet saturation the run-loop idle branch never runs, so a
-        pending restart armed by ``note_merge`` would otherwise starve
-        forever (the operator then has to restart fused-memory by hand, cf.
-        esc-2814-1).  Once the pending restart is owed past the bound it
-        force-fires on the busy-wait branch anyway (bypassing agents_idle +
-        the debounce).  fused-memory keeps no min_interval rate cap
-        (state_path=None), so nothing throttles that force-fire.  See
-        service_restart.StaleServiceRestartCoordinator.maybe_restart and
-        config.fused_memory_restart_force_fire_after_secs.
+        restart disrupts in-flight reconciliation, so a quiet window with no
+        live agents is preferred.  ``force_fire_after_secs`` is the
+        anti-starvation backstop (task 2817): under chronic fleet saturation
+        there may be no such window, so once owed past the bound the restart
+        fires anyway (bypassing agents_idle + the debounce).  No min_interval
+        cap (state_path=None) throttles it.  See
+        ``StaleServiceRestartCoordinator.maybe_restart``.
         """
         return StaleServiceRestartCoordinator(
             git_ops=self.git_ops,
@@ -11595,21 +12759,14 @@ class Harness:
           restart has been owed for ``orchestrator_restart_force_fire_after_secs``
           (fleet-redeploy PRD task delta), ``maybe_restart`` force-fires and
           bypasses ``agents_idle``, the debounce, AND this precondition —
-          though it never bypasses ``min_interval_secs`` below. This
-          in-process force-fire path is NOT covered by
-          ``restart-all-orchestrators.sh``'s ``--drain`` merge-drain gate
-          (task gamma, ``drain_check.py``) — that gate only guards the
-          separate operator/deploy-triggered script path (e.g. a
-          ``task_kind='deterministic'`` deploy task's ``before_done.script``),
-          which this coordinator never invokes. The executor below always
-          runs ``scripts/restart-orchestrator.sh`` directly via
-          ``schedule_detached_systemd_restart``, and that script's own
-          ``--drain`` is an accepted-and-ignored no-op (see its header):
-          graceful shutdown is SIGTERM → cancel-main-task (``cli.py``'s
-          ``_make_cancel_handler``, bounded by ``TimeoutStopSec=90s``), and a
-          merge interrupted mid-verify by that shutdown is recovered from the
-          merge queue's durable, crash-safe journal (task 1772/2153) on the
-          next startup — not from a merge-drain gate at restart time.
+          though it never bypasses ``min_interval_secs`` below. Whichever
+          path fires, the executor below runs
+          ``config.orchestrator_restart_script`` with ``--drain`` (task 5371):
+          the committed yaml points it at ``restart-all-orchestrators.sh``,
+          whose drain halts every unit's merge admission and waits out each
+          unit's in-flight merge verifies before restarting it; the field
+          default ``scripts/restart-orchestrator.sh`` accepts and ignores
+          ``--drain``.
         - ``merge_phase_hold`` / ``merge_phase_grace_secs`` (task 2753): the
           PRE-enqueue MERGE-phase window (Phase-1 rebase + scoped re-verify,
           before ``merge_queued``) is NOT yet on that durable journal, so it is
@@ -11623,11 +12780,26 @@ class Harness:
           bounds rather than indefinitely vetoes. The check fails toward
           proceeding (no grace) on any internal error, so it can never itself
           introduce a new indefinite veto.
+        - ``lease_path`` / ``lease_max_age_secs`` (task 4755): the in-flight
+          fleet-redeploy lease, and THE ONLY gate on this coordinator that
+          reads disk at gate time. That is not an optimisation choice — it is
+          forced. ``_load_last_fire_wall`` runs once, inside
+          ``StaleServiceRestartCoordinator.__init__``, and is never re-read,
+          so nothing ``restart-all-orchestrators.sh`` writes during this
+          process's lifetime is otherwise observable here. The clock records
+          when a sweep FINISHED; only the lease says one is running NOW, which
+          is why a long sweep previously let this coordinator force-fire on
+          top of it (measured 2026-08-24/25: "pending restart owed 17300s").
+          Gates the polite and force-fire paths alike, defers without clearing
+          pending, and is fail-OPEN — a missing, corrupt or over-age lease
+          redeploys anyway, so a stranded file can never wedge the fleet.
+          The fused-memory and dashboard builders pass neither, leaving their
+          gate disabled and their behaviour byte-identical.
 
-        ``require_idle=True`` and ``script_args=[]`` mirror the fused-memory
-        coordinator (idle-only; restart-orchestrator.sh takes no positional
-        args). Called once from _start_merge_worker alongside the other two
-        builders.
+        ``require_idle=True`` mirrors the fused-memory coordinator (idle-only).
+        ``script_args`` is the one local ``['--drain']`` both the coordinator
+        and its executor are given, so the two cannot drift. Called once from
+        _start_merge_worker alongside the other two builders.
 
         ``on_active_secs`` is clamped to a minimum of 5 (mirroring
         ``DeterministicRunner``'s ``max(int(...), 5)`` clamp on the
@@ -11637,6 +12809,7 @@ class Harness:
         ``--on-active=`` argument at registration.
         """
         counter = itertools.count()
+        script_args = ['--drain']
 
         async def _systemd_run_restart_executor() -> None:
             # transient_unit is computed once and reused below (both for the
@@ -11660,7 +12833,7 @@ class Harness:
             )
             await schedule_detached_systemd_restart(
                 script=self.config.orchestrator_restart_script,
-                script_args=[],
+                script_args=script_args,
                 project_root=self.config.project_root,
                 transient_unit=transient_unit,
                 on_active_secs=max(self.config.orchestrator_restart_on_active_secs, 5),
@@ -11675,6 +12848,10 @@ class Harness:
         # gets a non-zero cap — the fused-memory/dashboard builders keep the
         # 0.0 default (no gating), so their behaviour is unchanged.
         redeploy_state_path = Path(self.config.project_root) / FLEET_DEPLOY_CLOCK_RELPATH
+        # In-flight fleet-redeploy lease (task 4755). The clock above says when
+        # a sweep last FINISHED; this says one is running RIGHT NOW, which the
+        # clock structurally cannot -- see the builder docstring's lease bullet.
+        redeploy_lease_path = Path(self.config.project_root) / FLEET_LEASE_RELPATH
 
         return StaleServiceRestartCoordinator(
             git_ops=self.git_ops,
@@ -11686,7 +12863,7 @@ class Harness:
             project_root=self.config.project_root,
             service_name='orchestrator',
             require_idle=True,
-            script_args=[],
+            script_args=script_args,
             restart_precondition=self._merge_pipeline_idle,
             restart_executor=_systemd_run_restart_executor,
             min_interval_secs=self.config.orchestrator_restart_min_interval_secs,
@@ -11701,6 +12878,14 @@ class Harness:
             # hold, byte-identical).
             merge_phase_hold=self._merge_phase_grace_active,
             merge_phase_grace_secs=self.config.orchestrator_restart_merge_phase_grace_secs,
+            # In-flight fleet-redeploy lease (task 4755). While
+            # restart-all-orchestrators.sh holds it, maybe_restart stands down
+            # on BOTH the polite and the force-fire path, so this coordinator
+            # cannot redeploy the fleet on top of a sweep still restarting it.
+            # The fused-memory/dashboard builders omit both (defaults None /
+            # the class max-age -> no gate, byte-identical).
+            lease_path=redeploy_lease_path,
+            lease_max_age_secs=self.config.orchestrator_restart_lease_max_age_secs,
             state_path=redeploy_state_path,
             # restart-all-orchestrators.sh is the SOLE on-disk clock writer,
             # stamping only on its verified-fresh exit-0 path — the watchdog
@@ -11709,20 +12894,24 @@ class Harness:
             # silently silence the backstop for a full min_interval_secs
             # window (task 2396, fleet-redeploy β; closes hole I2).
             # Caveat: this coordinator's OWN _last_fire_wall still re-seeds
-            # from state_path on every process restart, so it can transiently
-            # lag the script's post-restart stamp by one fire — see
-            # StaleServiceRestartCoordinator's stamp_clock_on_fire docstring.
+            # from state_path on every process restart, so it can lag the
+            # script's post-restart stamp. That used to be described here and
+            # in StaleServiceRestartCoordinator's stamp_clock_on_fire
+            # docstring as "by one fire"; the 2026-08-24/25 measurement
+            # falsified it (it recurred every cycle), and the coordinator's
+            # in-flight fleet-redeploy lease gate is what now covers the race
+            # — see that docstring for the measurement.
             stamp_clock_on_fire=False,
         )
 
     async def _maybe_restart_stale_service(self, *, agents_idle: bool) -> bool:
         """Delegate to all service-restart coordinators in the list.
 
-        Called from the run-forever idle branch (agents_idle=True) and the
-        busy-wait branch (agents_idle=False).  Iterates every coordinator in
-        self._service_restart_coordinators and fires each whose gate conditions
-        are satisfied.  Returns True if at least one coordinator fired a restart,
-        False otherwise.  No-op (returns False) when the list is empty.
+        Called by ``_run_stale_service_restart_pass``.  Iterates every
+        coordinator in self._service_restart_coordinators and fires each whose
+        gate conditions are satisfied.  Returns True if at least one
+        coordinator fired a restart, False otherwise.  No-op (returns False)
+        when the list is empty.
         """
         any_fired = False
         for coord in self._service_restart_coordinators:
@@ -11731,64 +12920,40 @@ class Harness:
         return any_fired
 
     async def _write_merge_heartbeat(self) -> None:
-        """Write this unit's fleet-common merge-idle heartbeat (task 2395, α).
+        """Write this unit's fleet-common merge heartbeat (task 2395, α).
 
-        Gathers ON the event loop: ``ORCH_UNIT`` (self-identification, same
-        env convention as ``deterministic_runner._default_resolve_own_unit``),
-        and ``merge_idle``/``queue_empty``/``depth`` from a SINGLE
-        ``self._merge_worker.snapshot()`` read (when a worker exists) using
-        the exact idle formula and fallback ``_merge_pipeline_idle`` uses
-        (``queue_empty and depth == 0``, missing ``'depth'`` treated as ``1``
-        i.e. active) — so idle-truth and the reported depth are always
-        mutually consistent and the worker is polled at most once per tick,
-        rather than once via ``_merge_pipeline_idle()`` and again here.
-        Offloads only the serialize+atomic-write to a thread
-        (``asyncio.to_thread``), mirroring
-        ``Scheduler._write_snapshot_best_effort``'s loop/thread split — all
-        asyncio/in-memory reads happen here, before the thread hop.
+        The drain participant first steers merge admission from this unit's
+        restart-drain request and reads the lane once (task 5371); its
+        reading supplies ``depth`` and the ``drain`` / ``verifies_in_flight``
+        fields. ``merge_idle`` keeps the exact formula ``_merge_pipeline_idle``
+        uses (``queue_empty and depth == 0``); with no worker it is
+        ``_merge_pipeline_idle()`` itself. The serialize+atomic-write runs in
+        a thread (``asyncio.to_thread``).
 
-        Called from BOTH run-loop rest branches (idle + busy-wait) so a
-        saturated unit — which steady-states in the busy-wait branch — still
-        heartbeats.  Fail-open: any exception (state read or disk write) is
-        swallowed and logged — a heartbeat write must never stop the run loop.
-
-        Known gap: a unit that is continuously dispatching with spare
-        semaphore headroom (an assignment ready every tick, ``sem`` never
-        full) loops through neither rest branch and will not refresh its
-        heartbeat while that lasts.  Closing this with an unconditional
-        per-outer-loop-iteration call was evaluated and reverted: it makes
-        every ``run()`` invocation write to the fleet-common path on its very
-        first tick, and several existing tests drive ``run()`` for real
-        without sandboxing ``ORCH_UNIT``/``ORCH_FLEET_DIR`` — verified to
-        clobber this host's real ``data/fleet/orchestrator-dark-factory.
-        service.json`` when this shell inherits ``ORCH_UNIT`` from the
-        systemd unit.  Fixing that would require test-isolation changes
-        outside this task's locked scope (harness.py only).  Readers (γ
-        drain gate, ε ``--report``) must therefore treat a stale/absent
-        heartbeat conservatively — i.e. NOT idle / restart-eligible only
-        after a grace period — the same fail-safe stance
-        ``_merge_pipeline_idle`` already takes on a read error.
+        The ``pass_fn`` of the merge-heartbeat service, so it refreshes on
+        its own cadence whatever the dispatch loop is doing (task 5344).
+        Fail-open: any exception (state read or disk write) is swallowed and
+        logged.
         """
         try:
             unit = os.environ.get('ORCH_UNIT', '')
+            reading = await self._drain_participant.on_heartbeat_pass()
             queue_empty = self._merge_queue.empty()
-            worker = self._merge_worker
-            if worker is None:
-                # No pipeline to drain (bare / unit-test harness) — mirrors
-                # _merge_pipeline_idle's own worker-is-None short-circuit;
-                # no snapshot() call is involved on this branch.
-                merge_idle = self._merge_pipeline_idle()
-                depth = 0
+            if reading.depth is None:
+                depth, merge_idle = 0, self._merge_pipeline_idle()
             else:
-                depth = int(worker.snapshot().get('depth', 1))
-                merge_idle = queue_empty and depth == 0
-            ts_epoch = time.time()
+                depth, merge_idle = reading.depth, queue_empty and reading.depth == 0
             payload = build_heartbeat_payload(
                 unit=unit,
                 merge_idle=merge_idle,
                 depth=depth,
                 queue_empty=queue_empty,
-                ts_epoch=ts_epoch,
+                ts_epoch=time.time(),
+                drain=reading.drain,
+                verifies_in_flight=reading.verifies_in_flight,
+                deployed_sha=(
+                    None if self._deployed_sha is None else self._deployed_sha.to_wire()
+                ),
             )
             await asyncio.to_thread(write_heartbeat, resolve_fleet_dir(), unit, payload)
         except Exception:
@@ -11796,6 +12961,34 @@ class Harness:
                 'merge heartbeat write failed; continuing (fail-open)',
                 exc_info=True,
             )
+
+    def _announce_deployed_sha(self) -> None:
+        """Log the deployed sha; warn and emit an event when it is flagged (6565 D1).
+
+        A flagged sha keeps the remote gate in use (Leo, 2026-10-20): the flags
+        are made visible here, in the fleet heartbeat and in ``--report``.
+        """
+        deployed = self._deployed_sha
+        if deployed is None:
+            logger.info('deployed sha: unknown (no readable code checkout)')
+            return
+        if not deployed.flagged:
+            logger.info('deployed sha: %s', deployed.sha)
+            return
+        logger.warning(
+            'deployed sha %s is flagged (indeterminate=%s, dirty_wire_path=%s): the '
+            'loaded code may differ from it; restart from a clean, still tree to clear',
+            deployed.sha, deployed.indeterminate, deployed.dirty_wire_path,
+        )
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.deployed_sha_indeterminate, data=deployed.to_wire(),
+            )
+
+    def _emit_fleet_drain(self, event: FleetDrainEvent) -> None:
+        logger.info('fleet_drain: %s', event.as_payload())
+        if self.event_store is not None:
+            self.event_store.emit(EventType.fleet_drain, data=event.as_payload())
 
     def _build_task_status_lookup(self) -> Callable[[str], Awaitable[str | None]]:
         """Return an async callable (task_id) -> str|None backed by the scheduler.
@@ -11871,9 +13064,7 @@ class Harness:
             return
         assert HAS_ESCALATION  # narrows type: EscalationQueue and create_server are defined
 
-        queue_dir = Path(self.config.escalation.queue_dir)
-        if not queue_dir.is_absolute():
-            queue_dir = self.config.project_root / queue_dir
+        queue_dir = escalation_queue_dir(self.config.project_root)
         self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-unbound]
         self._escalation_queue.set_notify_callback(self._on_escalation)
         self._escalation_queue.set_resolve_callback(self._on_escalation_resolved)
@@ -11912,9 +13103,22 @@ class Harness:
             task_status_lookup=self._build_task_status_lookup(),
             task_claimant_lookup=self._build_task_claimant_lookup(),
             merge_inflight_registry=self._merge_inflight_registry,
+            store_identity=StoreIdentity(  # type: ignore[possibly-unbound]
+                kind='project',
+                queue_dir=self._escalation_queue.queue_dir,
+                project_id=self.config.fused_memory.project_id,
+                project_root=self.config.project_root,
+            ),
         )
         host = self.config.escalation.host
         port = self.config.escalation.port
+        listeners = take_systemd_listeners()
+        listener = listeners.pop(port, None)
+        if listeners:
+            logger.warning(
+                'systemd passed listening sockets for ports %s that nothing here serves',
+                sorted(listeners),
+            )
 
         async def _serve():
             import uvicorn
@@ -11923,10 +13127,11 @@ class Harness:
                 app, host=host, port=port, log_level='warning',
             )
             server = uvicorn.Server(uv_config)
-            await server.serve()
+            await server.serve(sockets=[listener] if listener else None)
 
         self._escalation_task = asyncio.create_task(_serve(), name='escalation-server')
-        logger.info(f'Escalation MCP server starting on {host}:{port}')
+        held = ' on the systemd-held socket (survives restarts)' if listener else ''
+        logger.info(f'Escalation MCP server starting on {host}:{port}{held}')
         # Give the server a moment to bind, then verify it didn't crash
         await asyncio.sleep(0.5)
         if self._escalation_task.done():
@@ -12275,6 +13480,8 @@ class Harness:
             main_branch=self.config.git.main_branch,
             branch_prefix=self.config.git.branch_prefix,
             registry=self._merge_inflight_registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
         logger.info(
             '_recover_pending_merges: recovered=%d dropped=%d coalesced=%d '
@@ -12416,7 +13623,16 @@ class Harness:
             delivered_checks_enabled=self.config.delivered_checks.enabled,
         )
 
-    async def _already_landed_dispatch_gate(self, task_id: str) -> bool:
+    async def _read_already_landed_tick_view(self) -> AlreadyLandedTickView:
+        return await read_already_landed_tick_view(self.git_ops)
+
+    async def _already_landed_dispatch_gate(
+        self,
+        task_id: str,
+        *,
+        task: dict | None = None,
+        tick_view: AlreadyLandedTickView | None = None,
+    ) -> bool:
         """Pre-dispatch gate for OUT-OF-BAND already-landed tasks (task 2313).
 
         Architecturally parallel to :meth:`_landed_dispatch_gate` but
@@ -12515,7 +13731,7 @@ class Harness:
         ancestors of main (squashed/rebased/manually-applied) by comparing
         the branch's actual changed files against main
         (:meth:`~orchestrator.git_ops.GitOps.branch_content_in_main`).  It
-        delegates to :func:`~orchestrator.landing_evidence.validate_landing_evidence`
+        delegates to :func:`~orchestrator.merge_lane.landing_evidence.validate_landing_evidence`
         (DISCOVERY mode, task 2678) to discover and attribute the citation
         commit and anchors on it; a content-equivalent landing that carries
         no task-citing commit (or whose citation's effect is no longer
@@ -12596,9 +13812,25 @@ class Harness:
         any-level escalation pin, the degenerate-branch check, and each
         arm's ``validate_landing_evidence`` verdict), so a landing that is
         being refused anyway never pays for check work.
+
+        **Per-tick inputs** (task 4900): ``task`` is the scheduler's candidate
+        dict, so the gate re-reads it via ``scheduler.get_task`` only when it
+        is absent. That dict is tick-start state, minutes old for a late
+        candidate in a long tick. That is safe only while nothing rewrites
+        this gate's veto inputs on a PENDING task mid-tick. ``reopen_at``
+        changes only when a done task is reopened, and fused-memory's
+        ``done_evidence_stale`` gate re-reads the stored value at write time
+        anyway. ``branch_base_sha`` is stamped by the task's own workflow,
+        which runs only after dispatch. A new mid-tick writer of either field
+        must make this gate re-read the task before it flips one.
+        ``tick_view`` is the consult's shared branch snapshot; it
+        is consulted only after every veto above, and only to abstain early —
+        the safety argument lives in
+        ``orchestrator/src/orchestrator/already_landed_tick_view.py``.
         """
         branch = f'{self.git_ops.config.branch_prefix}{task_id}'
-        task = await self.scheduler.get_task(task_id)
+        if task is None:
+            task = await self.scheduler.get_task(task_id)
         metadata = (task.get('metadata') or {}) if task else {}
 
         # task 2677: a prior tick may have already had this exact
@@ -12776,6 +14008,11 @@ class Harness:
                 RecoverySite.already_landed_gate, task_id,
             )
 
+        if tick_view is not None and await branch_absent_and_unmarked(
+            tick_view, self.git_ops, branch,
+        ):
+            return False
+
         branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
         branch_exists = branch_tip_sha is not None
 
@@ -12786,7 +14023,7 @@ class Harness:
                 return False
             # Delegates FIX 2 citation-lineage + FIX 1' effect-present to the
             # shared helper (task 2678, INV-5) — see
-            # orchestrator.landing_evidence's module docstring for the full
+            # orchestrator.merge_lane.landing_evidence's module docstring for the full
             # DISCOVERY-mode contract (citation discovery, both-direction
             # lineage guard, branch-tip-or-citation effect anchor).
             verdict = await validate_landing_evidence(
@@ -12906,7 +14143,7 @@ class Harness:
 
         Delegates the actual filing (queue-None guard, dedup, ``Escalation``
         construction, submit/log/except shape) to the shared
-        :func:`~orchestrator.landing_evidence.file_unattributed_landing_escalation`
+        :func:`~orchestrator.merge_lane.landing_evidence.file_unattributed_landing_escalation`
         (task 2678 amendment, INV-5) — this method now only supplies
         ``agent_role``, the one thing that distinguishes it from
         ``SpeculativeMergeWorker``'s equivalent method.
@@ -12925,19 +14162,31 @@ class Harness:
             self._escalation_task = None
             logger.info('Escalation server stopped')
 
+    #: "not read yet", distinguishable from a genuine ``get_task`` -> ``None``
+    #: (no such row).  Scoped to :meth:`_reap_orphan_l0_escalations`'s per-record
+    #: memo, whose whole point is that ONE record costs at most ONE task read.
+    _UNFETCHED: ClassVar[object] = object()
+
     async def _reap_orphan_l0_escalations(self) -> int:
         """Single pass: promote any overdue orphan L0 to L1.  Returns count.
 
         Extracted from the loop so tests can drive it deterministically.
-        An escalation is an orphan when its ``task_id`` is not in
-        ``_escalation_events`` (no running workflow) AND the scheduler does
-        not show it actively held (task 2878 — see the live-recheck note
-        below), and it is older than ``orphan_l0_timeout_secs``.
+        An escalation is an orphan when it is older than
+        ``orphan_l0_timeout_secs`` and the incarnation that FILED it is no
+        longer live — NOT merely when no workflow is running for its task.
+
+        That distinction is spec ``docs/task-escalation-state-spec.md`` S6 and
+        is what task 3541 changed: "a newer incarnation never keeps a prior
+        incarnation's unconsumed L0 alive".  Before it, ``esc.task_id in
+        _escalation_events`` / ``scheduler.is_actively_held`` deferred on ANY
+        live workflow, so a re-dispatched task's prior-incarnation L0 was
+        IMMORTAL — perpetually deferred, never promoted, never consumed.
 
         Async (task 2725): the done-step-commit orphan class needs to
         ``await self.scheduler.get_task(...)`` to check whether its
         subject task is terminal+merged (rebase-superseded false
-        positive) before promoting.
+        positive) before promoting.  Task 3541's liveness arm reuses that same
+        read rather than adding a second RPC.
         """
         if self._escalation_queue is None:
             return 0
@@ -12951,29 +14200,98 @@ class Harness:
         for esc in self._escalation_queue.get_pending():
             if esc.level != 0:
                 continue
-            if esc.task_id in self._escalation_events:
-                continue  # active workflow will handle it
-            # Task 2878: _escalation_events is a stale sweep-start snapshot
-            # — it's populated at dispatch and popped by the workflow
-            # slot's done-callback, so a task's id can vanish from it (slot
-            # rotation, a coordinated batch-redispatch tick) while a live
-            # or re-dispatched workflow is still actively holding exactly
-            # this task's metadata.files locks. That race produced false
-            # promotions for the plan.files/metadata.files divergence class
-            # (filed by TaskWorkflow._check_scope_invariant during genuine
-            # in-flight scope-reconciliation lag), which watchers then
-            # verified live and closed benign. Re-check live scheduler
-            # state at flag time via the same liveness signal the watchers
-            # use, and defer (not drop) promotion while it's live — the
-            # next sweep re-checks and promotes once genuinely idle.
-            if self.scheduler.is_actively_held(esc.task_id):
-                continue
             try:
                 age_secs = (now - datetime.fromisoformat(esc.timestamp)).total_seconds()
             except (ValueError, TypeError):
                 continue
             if age_secs < timeout:
                 continue
+
+            eval_lane_reason = eval_lane_provenance(esc.task_id, esc.worktree)
+            if eval_lane_reason is not None:
+                self._escalation_queue.resolve(
+                    esc.id,
+                    (
+                        'Dismissed by orphan reaper — eval-lane artifact '
+                        f'({eval_lane_reason}); eval-lane escalations are '
+                        'contained to the eval harness and never promoted to L1/L2'
+                    ),
+                    dismiss=True,
+                    resolved_by='harness-orphan-reaper',
+                )
+                logger.info(
+                    'Orphan L0 reaper: dismissed eval-lane orphan for task_id=%s (%s)',
+                    esc.task_id, eval_lane_reason,
+                )
+                continue
+
+            # The task row, fetched AT MOST ONCE per record and shared by the
+            # liveness arm below with the divergence / done-step-commit
+            # branches further down.  `_UNFETCHED` distinguishes "not read yet"
+            # from a genuine `get_task` -> None (no such row).
+            task: dict | None | object = self._UNFETCHED
+
+            async def _task_row(tid: str = esc.task_id) -> dict | None:
+                nonlocal task
+                if task is self._UNFETCHED:
+                    task = await self.scheduler.get_task(tid)
+                return cast('dict | None', task)
+
+            # LIVENESS — spec S6's filing-incarnation rule (task 3541).
+            #
+            # Both signals below answer "is SOME workflow live for this task?".
+            # Task 2878's note on the first one is still exact and still the
+            # reason the second exists: `_escalation_events` is a stale
+            # sweep-start snapshot — populated at dispatch and popped by the
+            # workflow slot's done-callback — so a task's id can vanish from it
+            # (slot rotation, a coordinated batch-redispatch tick) while a live
+            # or re-dispatched workflow is still actively holding exactly this
+            # task's metadata.files locks.  That race produced false promotions
+            # for the plan.files/metadata.files divergence class, which watchers
+            # verified live and closed benign.
+            #
+            # But "some workflow is live" is the WRONG QUESTION, and answering
+            # it is what made a prior incarnation's L0 immortal.  So a live
+            # signal now only means "ask the classifier", and the classifier
+            # judges the FILER: promotion proceeds ONLY when the record lands in
+            # `dead_l0`, i.e. when both identities are known and DIFFERENT.
+            # Every unprovable case — an unstamped legacy record, an
+            # `is_actively_held`-only IN_MEMORY holder with no identity, a
+            # non-`compose_claimant_run_id`-shaped value on either side — falls
+            # to QUEUE_HANDOFF and therefore to today's deferral.  The chain
+            # that decides this lives in `escalation/pins.py` (link 4) and is
+            # not restated here; inheriting it is what makes this arm strictly
+            # additive rather than a new liveness policy.
+            #
+            # Sited BELOW the age check on purpose: a `get_task` is paid only
+            # for records that are BOTH aged out AND currently deferred, so the
+            # common case (young, or nothing live) costs exactly what it did.
+            #
+            # `liveness_note` records WHICH arm cleared this record, because the
+            # promoted L1's summary and the dismissal note may only claim what
+            # that arm actually established — see the promotion site below.
+            liveness_note = 'no active workflow'
+            if (
+                esc.task_id in self._escalation_events
+                or self.scheduler.is_actively_held(esc.task_id)
+            ):
+                live_row = await _task_row()
+                live_run_id = (live_row or {}).get('claimant_run_id')
+                pins = classify_pins(
+                    esc.task_id,
+                    [esc],
+                    live_claimant=True,
+                    live_claimant_id=live_run_id,
+                )
+                if esc.id not in pins.dead_l0:
+                    # Deferred, not dropped — exactly as before.  The next
+                    # sweep re-checks and promotes once the filer is provably
+                    # gone (or the record is consumed).
+                    continue
+                liveness_note = (
+                    f'filing incarnation {esc.filing_claimant_run_id} is gone, '
+                    f'current claimant is {live_run_id}'
+                )
 
             # Defense-in-depth: never double-escalate a task a human is
             # already looking at.  B1 (commit 1a1eca9a67) stopped the main
@@ -13010,9 +14328,11 @@ class Harness:
             # False -> still promoted (preserves task 2878's boundary guard).
             # Placed after the age check so only aged-out divergence orphans
             # pay the get_task cost; the divergence and done-step-commit
-            # classes are mutually exclusive, so at most one get_task fires.
+            # classes are mutually exclusive, and `_task_row` memoises, so at
+            # most ONE get_task fires per record even when the task 3541
+            # liveness arm above already needed the row.
             if _is_scope_divergence_orphan(esc):
-                task = await self.scheduler.get_task(esc.task_id)
+                task = await _task_row()
                 if _has_fresh_dispatch(
                     task, now, self.config.orphan_l0_dispatch_freshness_secs,
                 ):
@@ -13054,13 +14374,13 @@ class Harness:
                     continue
 
             # Rebase-superseded false positive (task 2725): a done-step-commit
-            # orphan (_is_done_step_commit_orphan) whose subject task is done
+            # orphan (is_done_step_commit_orphan) whose subject task is done
             # is a false positive — the step's recorded commit is a
             # pre-rebase intermediate no longer reachable from main, but its
             # content landed on main under a new SHA via the merge. Dismiss
             # rather than promote a duplicate manual-triage L1.
-            if _is_done_step_commit_orphan(esc):
-                task = await self.scheduler.get_task(esc.task_id)
+            if is_done_step_commit_orphan(esc):
+                task = await _task_row()
                 if _is_terminal_merged(task):
                     self._escalation_queue.resolve(
                         esc.id,
@@ -13086,6 +14406,16 @@ class Harness:
             # the orphan's worktree is ephemeral and likely reaped before a
             # human reads the promoted L1 (see workflow._durable_ref_suffix).
             branch = f'{self.config.git.branch_prefix}{esc.task_id}'
+            # Both strings below are branched on `liveness_note` (task 3541)
+            # rather than asserting "no active workflow" unconditionally.  That
+            # claim was true while the reaper skipped every task with a live
+            # signal; the filing-incarnation arm promotes precisely when a
+            # workflow IS live and only the FILER is gone, so the old wording
+            # would be false in exactly the case this arm adds.  It is not
+            # cosmetic: `TaskWorkflow._wait_for_resolution` polls `get_by_task`
+            # TASK-scoped, not incarnation-scoped, so this dismissal wakes the
+            # live run and its note is the resolution a live agent reads on
+            # resume.
             reesc = Escalation(
                 id=self._escalation_queue.make_id(esc.task_id),
                 task_id=esc.task_id,
@@ -13093,7 +14423,7 @@ class Harness:
                 severity=esc.severity,
                 category=esc.category,
                 summary=(
-                    f'Orphan L0 ({age_secs:.0f}s old, no active workflow): '
+                    f'Orphan L0 ({age_secs:.0f}s old, {liveness_note}): '
                     f'{esc.summary}'
                 ),
                 detail=(
@@ -13111,8 +14441,8 @@ class Harness:
             self._escalation_queue.resolve(
                 esc.id,
                 (
-                    'Auto-promoted to level 1 — orphan L0 (no active '
-                    f'workflow for task_id={esc.task_id})'
+                    f'Auto-promoted to level 1 — orphan L0 for '
+                    f'task_id={esc.task_id} ({liveness_note})'
                 ),
                 dismiss=True,
                 resolved_by='harness-orphan-reaper',
@@ -13151,6 +14481,17 @@ class Harness:
         """True iff a workflow slot is currently active for ``task_id``."""
         return task_id in self._workflow_cancel_events
 
+    async def clear_verify_host_quarantine(self, host: str) -> dict[str, Any]:
+        """Operator clear of a benched remote verify host (task 6565, design D6).
+
+        Delegates to the merge worker's
+        :meth:`~orchestrator.merge_lane.worker.SpeculativeMergeWorker.clear_host_quarantine`;
+        reports ``cleared=False`` with a reason when no merge worker runs.
+        """
+        if self._merge_worker is None:
+            return {'host': host, 'cleared': False, 'reason': 'no merge worker is running'}
+        return await self._merge_worker.clear_host_quarantine(host)
+
     def _cancel_causes(self) -> dict[str, str]:
         """The cancel-cause registry, lazily created when absent.
 
@@ -13165,6 +14506,199 @@ class Harness:
             self._workflow_cancel_causes = causes
         return causes
 
+    def _launch_slot(
+        self, assignment, sem: asyncio.Semaphore, task_reports: list[TaskReport],
+    ) -> asyncio.Task:
+        """Start the slot task for *assignment*, whose *sem* permit is already held."""
+        self._task_modules[assignment.task_id] = list(assignment.modules)
+        # Register escalation wake-event BEFORE create_task so Fix #1a
+        # (_on_escalation_resolved orphan-flip gate) sees task_id in
+        # _escalation_events immediately — closing the sub-second race
+        # where a resolving escalation would mis-classify a just-
+        # dispatched task as an orphan and double-flip it.
+        dispatched_esc_event = self._register_escalation_event(assignment.task_id)
+        task = asyncio.create_task(
+            self._run_slot(assignment, sem),
+            name=f'workflow-{assignment.task_id}',
+        )
+        self._live_tasks.add(task)
+        task.add_done_callback(
+            functools.partial(self._collect_slot_report, task_reports)
+        )
+        # Guard against the narrow resource-leak window where the slot
+        # task is cancelled before _run_slot's body begins executing
+        # (e.g. hard_cancel_workflow or shutdown sweeping pending tasks
+        # before the event loop schedules the coroutine's first step).
+        # In that case _run_slot's finally block never runs and
+        # _escalation_events[task_id] would leak — permanently
+        # satisfying the active-workflow gate and suppressing both the
+        # stranded_blocked re-file and Fix #1a orphan-flip for that
+        # task forever.  The done_callback fires unconditionally when
+        # the Task reaches any terminal state; pop() is idempotent (a
+        # no-op if _run_slot's finally already removed the entry).
+        # Identity-guarded (task 6660): a force-released slot ends
+        # later, maybe after a re-dispatch registered its own event.
+        _tid = assignment.task_id
+        task.add_done_callback(
+            lambda _t, tid=_tid, ev=dispatched_esc_event: (
+                self._escalation_events.pop(tid, None)
+                if self._escalation_events.get(tid) is ev else None
+            )
+        )
+        return task
+
+    def _slot_lease_registry(self) -> dict[str, SlotLease]:
+        """The slot-lease registry, lazily created when absent (``_cancel_causes``'s idiom)."""
+        leases = getattr(self, '_slot_leases', None)
+        if leases is None:
+            leases = {}
+            self._slot_leases = leases
+        return leases
+
+    def _unregister_slot(self, task_id: str) -> None:
+        """Drop every per-slot registration of *task_id*.
+
+        Only the slot that owns them may call this: ``_run_slot``'s ``finally``
+        while its lease is still the registered one, or the watcher's
+        force-release of that slot.
+
+        ``_workflow_cancel_at`` is deliberately NOT dropped: popping it at slot
+        exit defeated the R3 reconcile grace window, which must cover the brief
+        post-exit window.  It is cleared at (re)dispatch (top of ``_run_slot``)
+        and lazily pruned by the sweep's grace-check reader.
+        """
+        self._escalation_events.pop(task_id, None)
+        self._workflow_cancel_events.pop(task_id, None)
+        self._workflow_slot_tasks.pop(task_id, None)
+        self._slot_lease_registry().pop(task_id, None)
+        self._terminal_cancel_counts.pop(task_id, None)
+        # Belt-and-braces (task 3172): the CancelledError ladder consumes the
+        # cause on the cancel path; this covers every OTHER slot exit so a
+        # stamped-but-unconsumed entry can never leak into a later re-dispatch
+        # of the same task.
+        self._cancel_causes().pop(task_id, None)
+        # Defensive merge-phase grace clear (task 2753): mirrors the inline
+        # clear at the durable-enqueue boundary in _submit_to_merge_queue,
+        # covering abnormal slot exits (e.g. WorkflowCancelled raised before
+        # that inline clear).  Unlike _workflow_cancel_at, clearing here is
+        # CORRECT: once the slot is gone there is no pre-enqueue verify left to
+        # protect, so the grace goes now rather than when the monotonic stamp
+        # expires.
+        self.scheduler.clear_merge_phase(task_id)
+
+    def _owns_slot(self, task_id: str, lease: SlotLease) -> bool:
+        """True while *lease* is *task_id*'s registered slot, i.e. not force-released."""
+        return self._slot_lease_registry().get(task_id) is lease
+
+    async def _force_release_wedged_slot(self, task_id: str, status: str, polls: int) -> None:
+        """Release the slot and module locks of a terminal task whose workflow
+        never ended after its hard-cancel.
+
+        The watcher calls this only for rows in ``TERMINAL_STATUSES``, so no
+        live work is ever unlocked.  The coroutine is left running, holding
+        nothing: once its slot is unregistered its ``finally`` no longer acts
+        on the task, and its lease releases at most once.  Same order as that
+        ``finally``: unregister, clear the claimant, then release, so a
+        re-dispatch can never have its fresh claimant cleared.  Loud by INV-11:
+        an ERROR, a ``workflow_slot_force_released`` event and one deduped
+        ``workflow_slot_wedged`` L1 naming the await that holds the slot.
+        """
+        lease = self._slot_lease_registry().get(task_id)
+        slot_task = self._workflow_slot_tasks.get(task_id)
+        if lease is None or slot_task is None or slot_task.done():
+            return
+        modules = sorted(
+            module for module, holder in self.scheduler.lock_table.snapshot_holders().items()
+            if holder == task_id
+        )
+        stuck = suspended_slot_tasks(slot_task)
+        self._force_released_slot_tasks().add(slot_task)
+        self._unregister_slot(task_id)
+        await self._clear_claimant_bounded(task_id)
+        lease.release(requeued=False)
+        blamed = culprit(stuck)
+        logger.error(
+            'Terminal-status watcher: workflow for %s task %s never ended %d polls '
+            'after its hard-cancel; force-released its slot and module locks %s. '
+            'Held by %s at %s',
+            status, task_id, polls, modules, blamed.name, blamed.culprit_frame,
+        )
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.workflow_slot_force_released,
+                task_id=task_id,
+                data={'status': status, 'polls': polls, 'modules': modules},
+            )
+        self._file_slot_wedged_l1(task_id, status, polls, modules, stuck)
+
+    # How long the backstop waits for its claimant clear before releasing anyway.
+    # One set_task_claimant MCP call is bounded at 15s; a stranded one (the
+    # httpcore cancel trap) must not stall the backstop that exists for wedges.
+    _FORCE_RELEASE_CLAIMANT_CLEAR_SECS: float = 20.0
+
+    async def _clear_claimant_bounded(self, task_id: str) -> None:
+        """Clear *task_id*'s claimant, giving up after ``_FORCE_RELEASE_CLAIMANT_CLEAR_SECS``.
+
+        A clear that has not returned by then is cancelled without being
+        awaited and left to unwind; the claimant then self-heals, as any lost
+        clear does (``scheduler.py::Scheduler.set_task_claimant``).
+        """
+        clear = asyncio.create_task(
+            self.scheduler.set_task_claimant(task_id, claimant_run_id=None, heartbeat_at=None),
+            name=f'force-release-claimant-clear-{task_id}',
+        )
+        await asyncio.wait({clear}, timeout=self._FORCE_RELEASE_CLAIMANT_CLEAR_SECS)
+        if clear.done():
+            if not clear.cancelled() and clear.exception() is not None:
+                logger.warning(
+                    'Task %s: claimant clear during force-release failed (non-fatal): %s',
+                    task_id, clear.exception(),
+                )
+            return
+        logger.warning(
+            'Task %s: claimant clear during force-release did not return within '
+            '%.0fs; releasing the slot without it',
+            task_id, self._FORCE_RELEASE_CLAIMANT_CLEAR_SECS,
+        )
+        abandon_task(clear, _UNDRAINED_CLAIMANT_CLEARS)
+
+    def _force_released_slot_tasks(self) -> set[asyncio.Task]:
+        """Slot tasks force-released and not yet ended, lazily created (``_cancel_causes``'s idiom).
+
+        Their eventual report is not recorded: the force-release event is the
+        slot's record, and a late report could land on a re-dispatch's state.
+        """
+        tasks = getattr(self, '_force_released_slots', None)
+        if tasks is None:
+            tasks = set()
+            self._force_released_slots = tasks
+        return tasks
+
+    def _file_slot_wedged_l1(
+        self, task_id: str, status: str, polls: int, modules: list[str],
+        stuck: tuple[SuspendedTask, ...],
+    ) -> None:
+        queue = self._escalation_queue
+        if queue is None:
+            return
+        try:
+            if queue.has_open_l1(task_id, category=EscalationCategory.WORKFLOW_SLOT_WEDGED):
+                return
+            queue.submit(wedged_slot_escalation(
+                escalation_id=queue.make_id(task_id),
+                task_id=task_id,
+                status=status,
+                polls=polls,
+                modules=modules,
+                stuck=stuck,
+                filing_claimant_run_id=self._filing_claimant_run_id,
+            ))
+        except Exception:
+            logger.exception(
+                'Task %s: filing the %s L1 failed; the slot is released regardless',
+                task_id, EscalationCategory.WORKFLOW_SLOT_WEDGED,
+            )
+
     def hard_cancel_workflow(
         self, task_id: str, *, restamp: bool = True, reason: str | None = None
     ) -> bool:
@@ -13173,10 +14707,14 @@ class Harness:
         This is the escalation path when a workflow ignores the soft
         ``cancel_event`` (set by ``cancel_workflow``) for too long.
         Requesting asyncio.Task.cancel() forces a ``CancelledError`` into the
-        coroutine's next await point; the ``_run_slot`` finally block still
-        runs (CancelledError is BaseException, so it bypasses the
-        ``except Exception`` guard at harness.py:1833) ensuring lock release
-        and registry cleanup.
+        coroutine's next await point.  Lock release and registry cleanup
+        happen in ``_run_slot``'s ``finally`` only once the coroutine unwinds,
+        and a cancel-proof await can stop it from ever unwinding.  The run()
+        scope bounds its own terminal cleanup
+        (``orchestrator/src/orchestrator/workflow_types.py::CancellationScope``);
+        for anything else, the terminal-status watcher force-releases the slot
+        ``terminal_status_force_release_polls`` polls later
+        (:meth:`_force_release_wedged_slot`, task 6660).
 
         ``reason`` (task 3172) records WHY, stamped into
         ``_workflow_cancel_causes`` immediately before ``task.cancel()`` and
@@ -13283,7 +14821,9 @@ class Harness:
         final message.  The supervisor-side timeout is rotation_hours*3600 +
         _WATCHER_TIMEOUT_GRACE_SECS so that a wedged agent that ignores its
         own rotation instructions is force-killed (classified as unclean, feeds
-        the crashloop guard).
+        the crashloop guard).  An exhausted cap-retry bound raises
+        AllAccountsCappedException, which the supervisor treats as an unclean
+        exit.
         """
 
         cfg = self.config
@@ -13292,14 +14832,8 @@ class Harness:
         # injected env var and the banner below cannot disagree.
         df_root = resolve_dark_factory_root()
         # One queue string for both the 'Escalation queue:' line and the re-arm
-        # command below, so the two can never disagree (task 3605).  Joined with
-        # Path.__truediv__ -- NOT f-string concatenation -- to match the
-        # authoritative resolution of the same path in _emit_digest: queue_dir is
-        # an unconstrained str, so an operator who configures it ABSOLUTE would
-        # otherwise get '/project//abs/path' here while the harness itself watches
-        # '/abs/path', and the agent would arm an inotify watcher on a directory
-        # that never receives escalations (a silent per-slice timeout).
-        queue_dir = str(Path(cfg.project_root) / cfg.escalation.queue_dir)
+        # command below, so the two can never disagree (task 3605).
+        queue_dir = str(escalation_queue_dir(cfg.project_root))
         if df_root is None:
             # Omitting the key from env_overrides does NOT unset it in the child:
             # cli_invoke seeds the subprocess env from os.environ and updates it
@@ -13366,6 +14900,7 @@ class Harness:
             f'Project root: {cfg.project_root}\n'
             f'Escalation queue: {queue_dir}\n'
             f'{tooling_root_block}'
+            f'\n{WATCHER_REARM_OUTCOME_GUIDANCE}'
         )
         system_prompt = load_skill_system_prompt('escalation-watcher-auto')
         escalation_url = f'http://{cfg.escalation.host}:{cfg.escalation.port}/mcp'
@@ -13397,6 +14932,10 @@ class Harness:
             project_id=cfg.fused_memory.project_id,
             role='escalation-watcher-auto',
             task_id='',
+            # A stateless triage loop over a queue it re-reads every cycle, so a
+            # capped rotation retries fresh.
+            resume_on_cap_hit=False,
+            max_cap_retries=_WATCHER_MAX_CAP_RETRIES,
             prompt=user_prompt,
             system_prompt=system_prompt,
             cwd=cfg.project_root,
@@ -13430,6 +14969,10 @@ class Harness:
         members — a common steady state while a human is slow to resolve
         L2s — defeating the entire cost optimisation this precheck exists
         for.
+
+        A pending member of a RESOLVED or DISMISSED (archived) L2 stays
+        actionable: its L2's best-effort cascade missed it, and the rotation's
+        drain closes it (SKILL.md "Draining pending escalations").
 
         Scope: only L1 work counts.  A queue containing only L0s, or only
         pending L2s, is treated as non-actionable — L0->L1 promotion is
@@ -13764,6 +15307,10 @@ class Harness:
         cancelled the workflow's ``finally`` block clears the registry entry
         so subsequent scans skip the task naturally.
 
+        A workflow still alive ``config.terminal_status_force_release_polls``
+        polls past the hard-cancel never unwound; the scan then releases its
+        slot and locks itself (:meth:`_force_release_wedged_slot`, task 6660).
+
         Counts are cleared when a task's status is no longer terminal so
         stale state cannot accumulate across transient status fluctuations.
 
@@ -13833,8 +15380,23 @@ class Harness:
                         )
                 if result:
                     cancelled += 1
+                if count >= threshold + self.config.terminal_status_force_release_polls:
+                    await self._force_release_wedged_slot(task_id, status, count)
 
         return cancelled
+
+    def _main_sweep_cold_control_for_tick(self) -> MainSweepColdControl:
+        """The sweep's cold-control cadence, bound on first use.
+
+        Lazy because run() opens the RunStore after __init__, and the sweep
+        BackgroundService only ticks after that.  With no RunStore the cadence
+        is in-memory only, so a restart runs the next sweep cold.
+        """
+        if self._main_sweep_cold_control is None:
+            self._main_sweep_cold_control = MainSweepColdControl(
+                self._run_store, self.config.fused_memory.project_id,
+            )
+        return self._main_sweep_cold_control
 
     async def _run_main_tip_sweep(self) -> None:
         """Single testable pass of the main-tip integrity sweep.
@@ -13862,6 +15424,17 @@ class Harness:
         above cannot.  Confirmed-flake (``False``) suppresses the alarm
         without self-healing; confirmed-real (``True``) files it exactly as
         before.
+
+        Each sweep's seed mode comes from ``MainSweepColdControl`` (task 5812):
+        warm by default, cold at most once per
+        ``main_tip_sweep_cold_interval_secs``, persisted in runs.db.  Only a
+        cold sweep that reached a verdict resets that clock; a timed-out sweep
+        reached none.  SHA dedup still gates every sweep, so a due cold control
+        waits for main to advance.
+
+        A timed-out sweep names no failing test, so the confirm gate has nothing
+        to re-run and the harness files it, failing closed as CATEGORY_POLICY
+        does for a timeout; only the tip-advanced arm suppresses it.
         """
         from orchestrator import critical_gate  # noqa: PLC0415
         from orchestrator import verify as verify_mod  # noqa: PLC0415
@@ -13875,11 +15448,22 @@ class Harness:
         if main_sha == self._last_swept_main_sha:
             return
 
+        control = self._main_sweep_cold_control_for_tick()
+        seed_mode: SweepSeedMode = control.seed_mode(
+            self.config.main_tip_sweep_cold_interval_secs
+        )
+        logger.info(
+            'Main-tip integrity sweep: verifying %s with a %s build '
+            '(last cold verdict: %s)',
+            main_sha[:12], seed_mode, control.last_cold_verdict_at or 'never',
+        )
+
         # Pass the already-resolved SHA so verify skips a second git rev-parse
         # and both the dedup gate and the worktree pin use the same value
         # (closes the TOCTOU window — suggestion 2 from the code review).
         outcome = await verify_mod.run_main_tip_sweep(
-            self.config, self.git_ops, main_sha=main_sha
+            self.config, self.git_ops, main_sha=main_sha, seed_mode=seed_mode,
+            event_store=self.event_store,
         )
         if outcome is None:
             # Infra failure in the sweep itself — retry next tick, don't mark swept.
@@ -13887,6 +15471,14 @@ class Harness:
 
         swept_sha, vr = outcome
         self._last_swept_main_sha = swept_sha
+        if vr.category != FailureCategory.INFRA_TIMEOUT:
+            # A timeout is no verdict on the tree, so it cannot be the cold control.
+            control.record_verdict(seed_mode, swept_sha)
+        logger.info(
+            'Main-tip integrity sweep: %s build of %s %s (%s)',
+            seed_mode, swept_sha[:12], 'passed' if vr.passed else 'failed',
+            vr.category,
+        )
 
         if vr.passed:
             await self._close_superseded_main_sweep_escalations(swept_sha)
@@ -14106,8 +15698,14 @@ class Harness:
     async def _recover_stranded_deterministic_task(
         self, tid: str, task: dict, metadata: dict,
         *, tally: RecoverySweepTally | None = None,
-    ) -> None:
+    ) -> bool:
         """Recover a task-2059-shaped stranded deterministic task (Source A).
+
+        Returns True iff an escalation was actually FILED.  The caller uses
+        that to gate its ``recovered_this_pass`` bookkeeping (task 3541): a
+        dedup skip must NOT mark the task recovered, or Source B would stop
+        re-validating its open record for a whole pass — which is exactly what
+        the deleted outer copy's ``continue`` used to achieve by not adding it.
 
         ``tally`` is the calling sweep's per-pass recovery accumulator, OPTIONAL
         and defaulted so every direct caller keeps working untouched (the same
@@ -14115,12 +15713,15 @@ class Harness:
         one gets this site's holds folded in, which is what lets the sweep
         release the streak alarms of tasks it no longer holds.
 
-        Dedup-guarded: skips when a pending escalation already exists for
+        Dedup-guarded: skips when a PINNING escalation is already open for
         *tid* — self-dedupes across sweep passes once filed.  That skip logs
         (unchanged) AND emits a structured ``recovery_vetoed`` naming the
-        pinning records (task 3535); the sweep's Source-A deploy branch
-        implements the same predicate and emits under its own site label, so
-        the duplication is measurable until task eta (3541) collapses it.
+        pinning records (task 3535).  This is now the SOLE copy of that guard:
+        task 3541 deleted the twin in ``_run_deterministic_recon_sweep``'s
+        Source-A deploy branch, which read the same queue and emitted the same
+        veto one line earlier.  THIS copy is the one that survived because the
+        method has direct callers that rely on it — deleting it would make the
+        method unsafe to call standalone.
         Re-validates live systemd health for the deploy's target unit and
         RE-FILES a single L1 escalation — this method NEVER calls
         ``set_task_status`` (RE-FILE-NEVER-FLIP discipline, mirroring the
@@ -14141,24 +15742,36 @@ class Harness:
                 shape=render_shape(None, None, None, None, None),
                 store_unavailable=True,
             )
-            return
+            return False
         # The queue is present: re-arm this site's one-shot notice, exactly as
         # Scheduler._phase_redispatch_stranded_blocked re-arms its own latch.
         self._rearm_recovery_process_notice(RecoverySite.deterministic_recon_deploy)
         _dedup_rows = self._escalation_queue.get_by_task(tid, status='pending')
-        if _dedup_rows:
+        # The SHARED pin predicate (task 3541, INV-5), not a bare
+        # `bool(_dedup_rows)`.  `live_claimant=False` is honest here: the only
+        # production caller enumerates `blocked` tasks in the
+        # stranded-deterministic shape, so no incarnation holds them, and a
+        # direct caller invoking this method is by construction acting on a
+        # task nothing is running.  Under `classify_pins` link 4 that makes a
+        # plain L0 read DEAD_L0.
+        #
+        # Consequence, accepted and correct under spec S6: an info-severity
+        # record and a dead-filer L0 no longer suppress the re-file.  An
+        # annotation is not a handoff, and a dead L0 has no consumer left — in
+        # neither case is there an open handoff for this re-file to duplicate,
+        # which is the only thing this guard exists to prevent.
+        if records_pin_recovery(tid, _dedup_rows, live_claimant=False):
             logger.info(
                 'Deterministic-recon-sweep: task %s already has a pending '
                 'escalation — skipping strand recovery (dedup)',
                 tid,
             )
             # The log line above stays the HUMAN record and the event below is
-            # the machine-readable one; neither replaces the other.  This
-            # predicate is duplicated verbatim in _run_deterministic_recon_
-            # sweep's Source-A deploy branch, which emits under its own
-            # RecoverySite.deterministic_recon_sweep label — task eta (3541)
-            # owns collapsing the pair, and until then BOTH deliberately speak
-            # so the duplication is measurable rather than assumed.
+            # the machine-readable one; neither replaces the other.  Since task
+            # 3541 this is the ONLY emission for this hold: the twin under
+            # RecoverySite.deterministic_recon_sweep is gone, so one pass over
+            # one held task now produces exactly one row under exactly one
+            # site label.
             self._emit_recovery_disposition(
                 tid,
                 site=RecoverySite.deterministic_recon_deploy,
@@ -14170,7 +15783,7 @@ class Harness:
                 records=_dedup_rows,
                 tally=tally,
             )
-            return
+            return False
 
         verdict = await self._revalidate_deterministic_deploy_health(metadata)
         before_done = metadata.get('before_done') or {}
@@ -14240,6 +15853,7 @@ class Harness:
             'L1 %s (category=%s, suggested_action=%s, no status change)',
             tid, verdict, esc.id, category, suggested_action,
         )
+        return True
 
     async def _recover_stranded_deterministic_gate(
         self, tid: str, task: dict, metadata: dict,
@@ -14539,10 +16153,11 @@ class Harness:
         tasks = await self.scheduler.get_tasks(statuses=['blocked'])
         task_by_id: dict[str, dict] = {}
         recovered_this_pass: set[str] = set()
-        # ONE tally across BOTH deterministic sites, deliberately: they are two
-        # halves of one duplicated predicate (task eta / 3541 collapses them)
-        # and the streak alarm they can file is keyed on task_id alone, so
-        # "held ANYWHERE in this pass" is exactly the right release granularity.
+        # ONE tally across BOTH deterministic sites, deliberately: the streak
+        # alarm they can file is keyed on task_id alone, so "held ANYWHERE in
+        # this pass" is exactly the right release granularity.  Since task 3541
+        # collapsed the duplicated predicate only the deploy site can still
+        # CHARGE, but the release below still names both — see there.
         # Bookkeeping only — this sweep has its own logging and does NOT log a
         # second summary line; part (2)'s unconditional summary belongs to the
         # reconcile sweep.
@@ -14573,33 +16188,28 @@ class Harness:
                 if _is_deploy:
                     # Deploy strand: dedup on the pending queue, then re-file an
                     # L1 whose category depends on live systemd unit health.
-                    _deploy_rows = self._escalation_queue.get_by_task(
-                        tid, status='pending',
-                    )
-                    if _deploy_rows:
-                        # Was a completely SILENT `continue`.  Twin of the
-                        # identical predicate at the head of
-                        # _recover_stranded_deterministic_task, which emits
-                        # under RecoverySite.deterministic_recon_deploy; task
-                        # eta (3541) owns collapsing the pair, and until then
-                        # BOTH deliberately emit so the duplication is
-                        # measurable rather than assumed.
-                        self._emit_recovery_disposition(
-                            tid,
-                            site=RecoverySite.deterministic_recon_sweep,
-                            reason=LeaveReason.escalation_pinned,
-                            shape=render_shape(
-                                'blocked', None, None, True,
-                                (metadata.get('deploy_state') or {}).get('phase'),
-                            ),
-                            records=_deploy_rows,
-                            tally=recovery_tally,
-                        )
-                        continue
-                    await self._recover_stranded_deterministic_task(
+                    #
+                    # BOTH of those live in _recover_stranded_deterministic_task
+                    # (task 3541).  This branch used to perform the SAME
+                    # `get_by_task(tid, status='pending')` read and the SAME
+                    # veto one line before calling it, emitting under a second
+                    # site label — so a recovered strand paid for two identical
+                    # reads per pass and a held one produced two rows for one
+                    # hold.  The inner copy is the one that survived because
+                    # the method has direct callers that rely on its own guard.
+                    #
+                    # The return value is what keeps this collapse
+                    # behaviour-preserving.  The deleted `continue` marked a
+                    # dedup-skipped task as NOT recovered_this_pass, so Source
+                    # B still re-validated its open record in the same pass;
+                    # calling through unconditionally and always adding the tid
+                    # would silently skip that re-validation for a whole pass.
+                    # Gating on "did it actually FILE?" reproduces the old
+                    # membership exactly.
+                    if await self._recover_stranded_deterministic_task(
                         tid, task, metadata, tally=recovery_tally,
-                    )
-                    recovered_this_pass.add(tid)
+                    ):
+                        recovered_this_pass.add(tid)
                 elif _is_gate:
                     # Gate strand: the discriminator is an archive-INCLUSIVE,
                     # role-scoped emptiness check (status=None scans queue root +
@@ -14616,6 +16226,25 @@ class Harness:
                     # predicates that stays separate and documented, so
                     # emitting here would blur a boundary drawn on purpose.
                     # Its silence is asserted by a test, not accidental.
+                    #
+                    # CARVE-OUT (task 3541): this check STAYS separate from the
+                    # shared pin predicate, and the reason is the question it
+                    # asks.  Every pin predicate reads only OPEN records and
+                    # asks "is a handoff still holding this task?".  This one
+                    # asks "did a human already ACT?", which is why `status` is
+                    # unset — the read is archive-INCLUSIVE, so a RESOLVED
+                    # record counts.  Narrowing it to `status='pending'` to
+                    # match the pin reads would make a human-resolved gate look
+                    # like a fresh strand and re-fire over it.
+                    #
+                    # PRD D3 names a SECOND carve-out,
+                    # `workflow.py::_is_gating_escalation`.  That one is
+                    # PRODUCER-side and task 3541 deliberately does not touch
+                    # it: task 5222 owns narrowing it (and the
+                    # `_wait_for_resolution` short-circuit) onto
+                    # `escalation.pins.is_queue_handoff` from task 5221, so a
+                    # comment there claiming permanence would be false on
+                    # arrival.  The boundary is recorded here instead.
                     if self._escalation_queue.get_by_task(
                         tid, agent_role=DETERMINISTIC_AGENT_ROLE,
                     ):
@@ -14631,8 +16260,13 @@ class Harness:
 
         # Source A is the only part of this pass that can CHARGE a veto streak,
         # so its end is this sweep's release point.  Both deterministic sites
-        # are named because this pass drives both; releasing only the one that
-        # happened to fire would leave the other's entry to grow forever.
+        # are still named even though task 3541 left only
+        # `deterministic_recon_deploy` able to charge: a pre-collapse
+        # orchestrator charged `deterministic_recon_sweep` too, and a streak
+        # entry under that label survives in the registry across the deploy
+        # that lands this change.  Releasing only the site that can still fire
+        # would leave those entries to grow forever, so the member and the
+        # two-site release both stay.
         # Deliberately after the loop rather than at method exit: the alarm it
         # may resolve is itself a pending record, and standing it down here
         # keeps Source B's re-globbed get_pending() from re-observing an
@@ -14776,7 +16410,14 @@ class Harness:
         fut.add_done_callback(_log_if_raised)
 
     def _on_escalation_resolved(self, escalation) -> None:
-        """Callback when an escalation is resolved — wake the waiting workflow."""
+        """Callback when an escalation is resolved — wake the waiting workflow.
+
+        An eval-lane record (``shared/src/shared/eval_lane.py``) wakes no
+        workflow and dispatches no action, because a numeric id filed from an
+        eval worktree names a production task it must not touch.  The merge-halt
+        and scheduler-pause handlers key on the record's own identity, not its
+        task, so they still run.
+        """
         # Increment for any status transition (resolved or dismissed) — both are
         # escalation events, and resolutions feed the digest GATE so that a
         # window which only drains a backlog still fires a digest (and, with a
@@ -14787,8 +16428,9 @@ class Harness:
         # Best-effort observability counter — same concurrency caveat as _on_escalation
         # above; _maybe_write_digest snapshots it at entry to avoid double-skip drift.
         self._escalation_event_count += 1  # task 1327 AFK hardening
+        eval_lane_reason = eval_lane_provenance(escalation.task_id, escalation.worktree)
         event = self._escalation_events.get(escalation.task_id)
-        if event:
+        if event and eval_lane_reason is None:
             event.set()
 
         # Un-halt the merge queue only when the escalation that OWNS the
@@ -14858,6 +16500,14 @@ class Harness:
         # The _SCHEDULER_PAUSE_SENTINEL is a synthetic task-id that has its own
         # dedicated auto-resume handling above and is not a real task; skip it.
         if escalation.task_id == self._SCHEDULER_PAUSE_SENTINEL:
+            return
+
+        if eval_lane_reason is not None:
+            logger.info(
+                'escalation %s is an eval-lane artifact (%s): no workflow wake and no '
+                'action dispatch on task %s',
+                escalation.id, eval_lane_reason, escalation.task_id,
+            )
             return
 
         action = self._resolve_escalation_action(escalation)
@@ -14987,6 +16637,7 @@ class Harness:
         self._schedule_coro_threadsafe(
             self._action_teardown_and_set_status(
                 escalation.task_id, effect.target_status, action,
+                escalation_id=escalation.id,
             ),
             label=(
                 f'action-teardown task {escalation.task_id} '
@@ -14999,6 +16650,8 @@ class Harness:
         task_id: str,
         target_status: str,
         action: str,
+        *,
+        escalation_id: str,
     ) -> None:
         """Async helper: execute a non-resume resolution action on a task.
 
@@ -15113,6 +16766,8 @@ class Harness:
                     action, task_id, target_status, e,
                 )
                 return
+            if target_status == 'pending':
+                self._flag_repend_while_paused(task_id, escalation_id)
 
             # Restart path: clear deterministic gate stamps so the re-dispatched
             # runner re-fires the gate from scratch.  resume preserves stamps so
@@ -15740,17 +17395,17 @@ class Harness:
              DB-only oracle would read as stranded. ``_escalation_events`` does
              not cover this — it is popped at slot exit, while
              ``is_actively_held`` also folds in the cancel-grace window.
-          2. ``shared.task_claimant.has_live_claimant`` on the store row — the
-             only member of that module that fits, since ``is_stranded`` gates
-             on ``status == 'in-progress'`` and ``is_stranded_blocked`` on
-             ``status == 'blocked'``, so neither can answer the single
+          2. ``shared.task_claimant.has_live_claimant`` on the store row —
+             status-agnostic, unlike ``is_stranded`` (gated on
+             ``status == 'in-progress'``) and ``is_stranded_blocked`` (on
+             ``status == 'blocked'``), neither of which can answer the single
              status-agnostic question this fork asks. This is also the half
              that sees a claimant held by ANOTHER orchestrator, which the
              process-local ``_escalation_events`` check structurally cannot.
 
         TTL choice: ``config.claimant_liveness_ttl_secs`` (300s, operator-
-        tunable and green-tier hot-reloadable), NOT this module's hardcoded
-        600s ``_RECONCILE_HEARTBEAT_TTL``. The re-pend's immediate downstream
+        tunable and green-tier hot-reloadable), NOT the 600s
+        ``shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL``. The re-pend's immediate downstream
         consumer is ``Scheduler._eligible_for_dispatch``, which gates on
         exactly this knob and this same ``has_live_claimant`` call; aligning
         them guarantees we never write ``pending`` to a row the dispatcher
@@ -15983,6 +17638,34 @@ class Harness:
                 'will re-escalate)', task_id, exc_info=True,
             )
 
+    def _flag_repend_while_paused(self, task_id: str, escalation_id: str) -> None:
+        """Mark a resolution that re-pended *task_id* into a paused scheduler; never raises."""
+        if not self.scheduler.is_paused:
+            return
+        reason = self._current_pause_reason()
+        if self._escalation_queue is not None:
+            try:
+                self._escalation_queue.patch_resolution_metadata(
+                    escalation_id,
+                    append_to_resolution=_repend_while_paused_note(task_id, reason),
+                )
+            except Exception:
+                logger.warning(
+                    'repend-while-paused: failed to mark resolution of %s for task %s',
+                    escalation_id, task_id, exc_info=True,
+                )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.repend_while_paused,
+                task_id=task_id,
+                data={'escalation_id': escalation_id, 'pause_reason': reason},
+            )
+        logger.warning(
+            'repend-while-paused: task %s re-pended via %s, but dispatch is paused (%s); '
+            'it will not run until the scheduler is resumed',
+            task_id, escalation_id, reason,
+        )
+
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: re-pend a resolution-resumed task to Table B's target.
 
@@ -16160,6 +17843,8 @@ class Harness:
                 self._escalate_cascade_status_rejection(
                     task_id, 'pending', e, resolved_by=escalation.resolved_by,
                 )
+            else:
+                self._flag_repend_while_paused(task_id, escalation.id)
             return
 
         # Deliberately a fresh, independent round-trip — not reused from
@@ -16329,6 +18014,8 @@ class Harness:
             self._escalate_cascade_status_rejection(
                 task_id, _resume_target, e, resolved_by=escalation.resolved_by,
             )
+        else:
+            self._flag_repend_while_paused(task_id, escalation.id)
 
     def get_merge_halt_status(self) -> dict[str, Any]:
         """Inspect the merge queue's halt state for operator tooling."""
@@ -16855,6 +18542,7 @@ class Harness:
         9. Read parked-task counts from Scheduler state.
         10. Update EWA using EventStore done_count.
         11. Compute trip flag and anomaly flags.
+        11c. Gather the paused-waiting section inputs (fail-open; task 5311).
         12. Write digest file (fail-open via write_digest_entry).
         13. Advance counters/state using the snapshot from step 2 (not the
             live counter), so that concurrent callbacks firing inside this
@@ -16926,9 +18614,7 @@ class Harness:
                 window_start = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
 
             # (6) Gather escalation stats (fail-open via aggregate_escalations).
-            escalations_dir = (
-                Path(self.config.project_root) / self.config.escalation.queue_dir
-            )
+            escalations_dir = escalation_queue_dir(self.config.project_root)
             escalation_stats = digest_mod.aggregate_escalations(
                 escalations_dir, window_start, window_end
             )
@@ -16960,6 +18646,16 @@ class Harness:
                 )
                 if events_db_path is not None
                 else digest_mod.ModelRoleRollup()
+            )
+
+            # (8c) Deep merge-ahead chain telemetry (task 3188, PRD ε).  The
+            # reader is fail-open itself; the guard covers only a missing EventStore.
+            chain_telemetry = (
+                digest_mod.chain_telemetry_in_window(
+                    events_db_path, window_start, window_end
+                )
+                if events_db_path is not None
+                else ChainTelemetry()
             )
 
             # (9) Parked-task counts via public Scheduler properties (task 1327).
@@ -17001,6 +18697,8 @@ class Harness:
             # degraded status read) and runs inside this try/except so a census
             # hiccup can never break the digest write.
             stale_lane_census = await self._stale_lane_assignment_census()
+            # (11c) Paused re-pends and overdue pause L1s (task 5311) — fail-open.
+            pause_visibility = await self._pause_visibility_for_digest(events_db_path)
 
             inputs = digest_mod.DigestInputs(
                 window_start_iso=window_start,
@@ -17021,6 +18719,8 @@ class Harness:
                 # Task 4559: surface the split that produced new_ewa.
                 submissions_in_step=submissions_in_step,
                 lifecycle_events_in_step=diff,
+                pause_visibility=pause_visibility,
+                chain_telemetry=chain_telemetry,
             )
 
             digest_mod.write_digest_entry(digest_dir, inputs)
@@ -17105,7 +18805,9 @@ class Harness:
             # pass (agent-followup-4559-inprocess-ewa-release); do not add an
             # auto-resume here without engaging those three first.
             if tripped and not self.scheduler.is_paused:
-                await self.pause_scheduler(f'ewa_trip_{new_ewa:.4f}')
+                await self.pause_scheduler(
+                    _ewa_trip_reason(new_ewa, escalation_stats.dominant_category())
+                )
 
         except asyncio.CancelledError:
             raise

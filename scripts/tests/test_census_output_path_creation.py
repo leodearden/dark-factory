@@ -27,14 +27,28 @@ which is precisely and only the surface under test here.
 """
 from __future__ import annotations
 
+import itertools
 import json
 from typing import Any
 
-import census as mod
-
-import config as config_mod
+from legibility import census as mod
+from legibility import config as config_mod
+from legibility import embeddings, unlanded
+from legibility_task_store_fake import FakeTaskStore
 
 _DATE = "2026-08-03"
+_EMPTY_SYNTHESIS = json.dumps(
+    {"new": [], "re_observed": [], "phase_refinements": [], "corrections": [], "notes": []},
+)
+_ONE_HOT_AXES = itertools.count()
+
+
+def _distinct_one_hot_embed(texts, *, model):
+    """An embed_fn under which no two texts are ever similar: each text gets
+    a one-hot vector on an axis no earlier text was given."""
+    axes = [next(_ONE_HOT_AXES) for _ in texts]
+    width = max(axes, default=-1) + 1
+    return [[1.0 if index == axis else 0.0 for index in range(width)] for axis in axes]
 
 
 def _minimal_v2_codebook() -> dict:
@@ -56,6 +70,10 @@ def _minimal_v2_codebook() -> dict:
     }
 
 
+def _never_roll_back(**kwargs):
+    raise AssertionError("roll_back must not run on a landed commit")
+
+
 def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
     """Every ``run_census`` seam, wired to trivial inline fakes, with the
     four output paths under directories that do NOT exist in *root*.
@@ -69,14 +87,20 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
     """
     kwargs: dict[str, Any] = dict(
         batch_source=[],
+        selection_of=lambda: None,
         invoke=lambda prompt, model: "pong",
         verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
-        synthesize_fn=lambda verified, *, model: "No novel clusters this census.",
+        synthesize_fn=lambda brief, *, model: _EMPTY_SYNTHESIS,
         submit_fn=lambda payload: {"task_id": "t1"},
+        task_store=FakeTaskStore(),
         escalate_fn=lambda **kw: None,
         status_fetcher=lambda: {"statuses": {}},
-        commit=lambda **kw: None,
+        commit=lambda **kw: unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1),
+        roll_back=_never_roll_back,
         codebook_dict=_minimal_v2_codebook(),
+        embedder=embeddings.Embedder(
+            embed_fn=_distinct_one_hot_embed, cache_path=root / "embeddings.sqlite",
+        ),
         config=config_mod.LegibilityConfig(
             project_id="target_project",
             project_root=str(root),
@@ -91,6 +115,9 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
         census_state_path=root / "docs" / "legibility" / "census-state.json",
         report_path=root / "plans" / f"confusion-census-{_DATE}.md",
         date=_DATE,
+        run_id="census-target_project-20260803",
+        as_of_sha="a" * 40,
+        since=None,
         force=False,
     )
     kwargs.update(overrides)
@@ -203,13 +230,19 @@ def test_advance_census_state_creates_its_own_parent_dir(tmp_path):
 
     mod.advance_census_state(
         state_path,
-        now_iso="2026-08-03T00:00:00+00:00",
+        census_at="2026-08-03",
+        run_id="census-target_project-20260803",
         report_path="plans/confusion-census-2026-08-03.md",
+        as_of_sha="a" * 40,
+        session_watermark=None,
         done_count=7,
     )
 
     assert json.loads(state_path.read_text(encoding="utf-8")) == {
-        "last_census_at": "2026-08-03T00:00:00+00:00",
+        "last_census_at": "2026-08-03",
+        "last_census_run_id": "census-target_project-20260803",
         "last_census_report": "plans/confusion-census-2026-08-03.md",
+        "last_census_as_of_sha": "a" * 40,
+        "session_watermark": None,
         "last_census_done_count": 7,
     }

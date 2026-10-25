@@ -37,13 +37,17 @@ from fused_memory.reconciliation.recon_ledger import (
     MARKER_KINDS,
     ReconLedgerRecord,
     ReconLedgerStore,
+    SuppressionStreakRow,
 )
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_TTL,
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     RECORD_KIND_ENTITY_STANDING_DECISION,
+    RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
     STATE_ACTIVE,
     STATE_EXPIRED,
+    STREAK_PAYLOAD_KEY,
+    STREAK_WINDOW_PAYLOAD_KEY,
 )
 from fused_memory.server import main as server_main
 from fused_memory.services.memory_service import MemoryService
@@ -108,7 +112,7 @@ async def test_initialize_creates_schema_with_expected_columns_and_indexes(tmp_p
     await s.close()
     await s.initialize()
     try:
-        db = s._db
+        db = s._require_access().connection
         assert db is not None
 
         cursor = await db.execute('PRAGMA table_info(recon_ledger)')
@@ -151,7 +155,7 @@ async def test_initialize_migrates_pre_existing_db_adding_entity_uuid_column(tmp
     store = ReconLedgerStore(db_path)
     await store.initialize()
     try:
-        db = store._db
+        db = store._require_access().connection
         assert db is not None
         cursor = await db.execute('PRAGMA table_info(recon_ledger)')
         cols_after = {row[1] for row in await cursor.fetchall()}
@@ -160,7 +164,7 @@ async def test_initialize_migrates_pre_existing_db_adding_entity_uuid_column(tmp
         # Idempotent: a second initialize() re-runs the ADD COLUMN as a no-op
         # (does not raise, does not duplicate the column).
         await store.initialize()
-        db = store._db
+        db = store._require_access().connection
         assert db is not None
         cursor = await db.execute('PRAGMA table_info(recon_ledger)')
         cols_reinit = {row[1] for row in await cursor.fetchall()}
@@ -290,7 +294,7 @@ async def test_double_upsert_same_identity_keeps_one_row_last_write_wins(store):
     await store.upsert(first)
     await store.upsert(second)
 
-    db = store._db
+    db = store._require_access().connection
     cursor = await db.execute('SELECT COUNT(*) FROM recon_ledger')
     row = await cursor.fetchone()
     assert row[0] == 1
@@ -714,7 +718,7 @@ async def test_build_recon_ledger_store_initializes_schema(tmp_path):
         db_file = tmp_path / 'reconciliation.db'
         assert db_file.exists()
 
-        db = built_store._db
+        db = built_store._require_access().connection
         assert db is not None
         cursor = await db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='recon_ledger'"
@@ -1173,6 +1177,361 @@ async def test_gc_flip_defensively_wraps_non_dict_standing_payload(store):
     assert count == 1
 
 
+# ---------------------------------------------------------------------------
+# entity_standing_decision_suppression_streak rows (task 2943)
+#
+# One row per (project, entity, grounds) carrying the count of consecutive
+# full cycles in which that entity's standing decision suppressed a flag. The
+# PK slots mirror the decision row so the two share an identity a reader can
+# join on; unlike the decision row, gc() hard-deletes a streak row on expiry.
+# ---------------------------------------------------------------------------
+
+_STREAK_WRITE = dict(
+    project_id='proj-s',
+    entity_uuid='uuid-streak',
+    grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    streak=2,
+    recent_counts=(),
+    last_run_id='run-2',
+    updated_at='2026-07-01T00:00:00+00:00',
+    expires_at='2026-09-29T00:00:00+00:00',
+)
+
+
+def _streak_row(**overrides: object) -> SuppressionStreakRow:
+    """The decoded row _STREAK_WRITE (plus *overrides*) reads back as."""
+    fields: dict = dict(
+        entity_uuid='uuid-streak',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        streak=2,
+        recent_counts=(),
+        last_run_id='run-2',
+    )
+    fields.update(overrides)
+    return SuppressionStreakRow(**fields)
+
+
+@pytest.mark.asyncio
+async def test_upsert_suppression_streak_round_trips_with_decision_pk_slots(store):
+    """A streak row is listed under its project, decoded, and stored with the
+    decision row's PK-slot mapping (task_id '', flag_type=grounds,
+    run_id=entity_uuid), the entity_uuid column set, state active, and the
+    expiry it was given."""
+    await store.upsert_suppression_streak(**_STREAK_WRITE)
+
+    assert await store.list_suppression_streaks('proj-s') == [_streak_row()]
+
+    record = await store.get_by_identity(
+        'proj-s',
+        RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
+        task_id='',
+        flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        run_id='uuid-streak',
+    )
+    assert record is not None
+    assert record.entity_uuid == 'uuid-streak'
+    assert record.state == STATE_ACTIVE
+    assert record.created_at == '2026-07-01T00:00:00+00:00'
+    assert record.expires_at == '2026-09-29T00:00:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_upsert_suppression_streak_updates_in_place(store):
+    """A second write for the same (entity, grounds) updates that row rather
+    than appending a second one."""
+    await store.upsert_suppression_streak(**_STREAK_WRITE)
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 3, 'last_run_id': 'run-3'}
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=3, last_run_id='run-3')
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_suppression_streaks_is_scoped_to_project_and_kind(store):
+    """Another project's streak row and a same-entity decision row are not
+    listed."""
+    await store.upsert_suppression_streak(**_STREAK_WRITE)
+    await store.upsert_suppression_streak(**{**_STREAK_WRITE, 'project_id': 'proj-other'})
+    await store.upsert_entity_standing_decision(
+        project_id='proj-s',
+        entity_uuid='uuid-streak',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-09-29T00:00:00+00:00',
+        edge_count_at_decision=1,
+        evidence=[],
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [_streak_row()]
+
+
+@pytest.mark.asyncio
+async def test_suppression_streak_rows_are_per_entity_and_per_grounds(store, monkeypatch):
+    """Two entities each get their own row, and so do two grounds for one
+    entity. GROUNDS_ENUM has one member today, so the second grounds value is
+    admitted by widening the enum the store validates against."""
+    from fused_memory.reconciliation import recon_ledger as recon_ledger_module
+
+    monkeypatch.setattr(
+        recon_ledger_module,
+        'GROUNDS_ENUM',
+        frozenset({GROUNDS_STRUCTURAL_SIZE_CONFLATION, 'some_future_grounds'}),
+    )
+    await store.upsert_suppression_streak(**{**_STREAK_WRITE, 'entity_uuid': 'uuid-a'})
+    await store.upsert_suppression_streak(**{**_STREAK_WRITE, 'entity_uuid': 'uuid-b'})
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'entity_uuid': 'uuid-a', 'grounds': 'some_future_grounds'}
+    )
+
+    listed = await store.list_suppression_streaks('proj-s')
+    assert sorted((r.entity_uuid, r.grounds) for r in listed) == [
+        ('uuid-a', 'some_future_grounds'),
+        ('uuid-a', GROUNDS_STRUCTURAL_SIZE_CONFLATION),
+        ('uuid-b', GROUNDS_STRUCTURAL_SIZE_CONFLATION),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('field', 'bad_value'),
+    [
+        ('entity_uuid', ''),
+        ('streak', -1),
+        ('streak', True),
+        ('grounds', 'not_a_real_grounds'),
+        ('expires_at', None),
+    ],
+)
+async def test_upsert_suppression_streak_rejects_malformed_writes_loudly(
+    store, field, bad_value
+):
+    """INV-1: a malformed write raises ValueError naming the failing field and
+    writes no row."""
+    with pytest.raises(ValueError, match=field):
+        await store.upsert_suppression_streak(**{**_STREAK_WRITE, field: bad_value})
+
+    assert await store.list_suppression_streaks('proj-s') == []
+
+
+@pytest.mark.asyncio
+async def test_upsert_suppression_streak_round_trips_its_per_cycle_window(store):
+    """The row carries the streak's recent per-cycle suppression counts, in
+    order, next to the streak count and the last run id.  Every field reading
+    back as written is also what shows that no two of the payload keys the
+    row writes collide: a shared key would let one value overwrite another."""
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 3, 'recent_counts': (2, 1, 2)}
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=3, recent_counts=(2, 1, 2))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_upsert_suppression_streak_accepts_the_reset_shape(store):
+    """A reset is a zero streak with an empty window."""
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 0, 'recent_counts': ()}
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=0, recent_counts=())
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('streak', 'recent_counts'),
+    [
+        pytest.param(3, (1, 0, 1), id='zero-entry'),
+        pytest.param(3, (1, -2), id='negative-entry'),
+        pytest.param(3, (True,), id='bool-entry'),
+        pytest.param(3, ('1',), id='str-entry'),
+        pytest.param(3, '1', id='str-as-the-sequence'),
+        pytest.param(1, (1, 1), id='longer-than-the-streak'),
+    ],
+)
+async def test_upsert_suppression_streak_rejects_a_malformed_window_loudly(
+    store, streak, recent_counts
+):
+    """INV-1: each window entry is one suppressing cycle's count (a non-bool
+    int >= 1), and the window holds at most one entry per cycle of the streak.
+    Anything else raises ValueError naming recent_counts and writes no row."""
+    with pytest.raises(ValueError, match='recent_counts'):
+        await store.upsert_suppression_streak(
+            **{**_STREAK_WRITE, 'streak': streak, 'recent_counts': recent_counts}
+        )
+
+    assert await store.list_suppression_streaks('proj-s') == []
+
+
+@pytest.mark.asyncio
+async def test_upsert_suppression_streak_replaces_the_stored_window(store):
+    """A second write stores exactly the window it was given; it never merges
+    into the one already on the row."""
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 3, 'recent_counts': (2, 1, 2)}
+    )
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 4, 'recent_counts': (5,)}
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=4, recent_counts=(5,))
+    ]
+
+
+async def _seed_raw_streak_record(
+    store: ReconLedgerStore, payload_json: str, *, entity_uuid: str | None = 'uuid-streak'
+) -> None:
+    """A streak record written past upsert_suppression_streak's validation, as
+    a hand-edited or older-shaped row would arrive."""
+    await store.upsert(
+        ReconLedgerRecord(
+            project_id='proj-s',
+            record_kind=RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
+            payload_json=payload_json,
+            state=STATE_ACTIVE,
+            created_at='2026-07-01T00:00:00+00:00',
+            flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+            run_id='uuid-streak',
+            entity_uuid=entity_uuid,
+            expires_at='2026-09-29T00:00:00+00:00',
+        )
+    )
+
+
+def _raw_streak_payload(**fields: object) -> str:
+    payload: dict = {
+        STREAK_PAYLOAD_KEY: 3,
+        STREAK_WINDOW_PAYLOAD_KEY: [2, 1, 2],
+        'last_run_id': 'run-2',
+    }
+    payload.update(fields)
+    return json.dumps(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'payload_json',
+    [
+        pytest.param('not json', id='not-json'),
+        pytest.param('[2, 3]', id='json-array'),
+        pytest.param('"two"', id='json-string'),
+    ],
+)
+async def test_list_suppression_streaks_reads_a_non_object_payload_as_empty(
+    store, payload_json
+):
+    await _seed_raw_streak_record(store, payload_json)
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=0, recent_counts=(), last_run_id='')
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'stored_streak',
+    [
+        pytest.param(True, id='bool'),
+        pytest.param('3', id='str'),
+        pytest.param(-3, id='negative'),
+        pytest.param(None, id='null'),
+    ],
+)
+async def test_list_suppression_streaks_reads_a_malformed_streak_as_zero(
+    store, stored_streak
+):
+    """A zero streak holds no window, so the stored window is dropped with it."""
+    await _seed_raw_streak_record(
+        store, _raw_streak_payload(**{STREAK_PAYLOAD_KEY: stored_streak})
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=0, recent_counts=())
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'stored_window',
+    [
+        pytest.param('2,2', id='str'),
+        pytest.param({'0': 2}, id='object'),
+        pytest.param(4, id='int'),
+        pytest.param([True, 2], id='bool-entry'),
+        pytest.param([2, 0], id='zero-entry'),
+        pytest.param([2, -1], id='negative-entry'),
+        pytest.param([2, '2'], id='str-entry'),
+        pytest.param([1, 1, 1, 1], id='longer-than-the-streak'),
+    ],
+)
+async def test_list_suppression_streaks_reads_a_malformed_window_as_empty(
+    store, stored_window
+):
+    """One malformed entry discards the whole window, and so does a window
+    holding more entries than its streak has cycles."""
+    await _seed_raw_streak_record(
+        store, _raw_streak_payload(**{STREAK_WINDOW_PAYLOAD_KEY: stored_window})
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=3, recent_counts=())
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_suppression_streaks_reads_a_non_string_run_id_as_empty(store):
+    await _seed_raw_streak_record(store, _raw_streak_payload(last_run_id=7))
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=3, recent_counts=(2, 1, 2), last_run_id='')
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_suppression_streaks_falls_back_to_the_run_id_slot_for_the_entity(store):
+    """run_id mirrors entity_uuid on every streak row, so a row whose
+    entity_uuid column is NULL is still attributed to its entity."""
+    await _seed_raw_streak_record(store, _raw_streak_payload(), entity_uuid=None)
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=3, recent_counts=(2, 1, 2))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gc_deletes_expired_streak_row_but_keeps_active_decision(store):
+    """gc() hard-deletes an expired streak row (the TTL-flip arm is scoped to
+    entity_standing_decision alone) and leaves the same entity's unexpired
+    active decision row intact."""
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'expires_at': '2026-06-30T00:00:00+00:00'}
+    )
+    await store.upsert_entity_standing_decision(
+        project_id='proj-s',
+        entity_uuid='uuid-streak',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-06-01T00:00:00+00:00',
+        expires_at='2026-12-01T00:00:00+00:00',
+        edge_count_at_decision=1,
+        evidence=[],
+    )
+
+    count = await store.gc('proj-s', now='2026-07-01T00:00:00+00:00', terminal_task_ids=[])
+
+    assert await store.list_suppression_streaks('proj-s') == []
+    decision = await store.get_active_entity_standing_decision('proj-s', 'uuid-streak')
+    assert decision is not None
+    assert decision.state == STATE_ACTIVE
+    assert count == 1
+
+
 # --------------------------------------------------------------------------
 # mem0_tombstone rows (task 3041)
 #
@@ -1256,6 +1615,65 @@ async def test_get_mem0_tombstone_absent_returns_none(store):
 
 
 @pytest.mark.asyncio
+async def test_mem0_tombstones_with_prefix_lists_only_this_projects_matching_tombstones(store):
+    """A uuid prefix reaches the tombstone rows whose memory id starts with it (task 5323).
+
+    The store is keyed by the FULL memory id, so a prefix needs its own
+    listing. Project, record kind and the prefix itself each scope it, and
+    each row is the same record the exact-id read returns.
+    """
+    reify_b = 'bff81530-0000-4000-8000-00000000000b'
+    reify_a = 'bff81530-0000-4000-8000-00000000000a'
+    for project_id, memory_id in (
+        ('reify', reify_b),
+        ('reify', reify_a),
+        ('other', 'bff81530-0000-4000-8000-00000000000c'),
+        ('reify', 'cafe0000-0000-4000-8000-000000000001'),
+    ):
+        await record_mem0_deletion_tombstone(
+            _tombstone_ms(store),
+            project_id,
+            memory_id,
+            victim_metadata={},
+            victim_created_at=None,
+            deleter='stage1_cycle_summary_trim',
+            deleting_run_id='run-deleter',
+        )
+    await store.upsert(ReconLedgerRecord(
+        project_id='reify',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='bff81530-0000-4000-8000-00000000000d',
+        flag_type='f1',
+    ))
+
+    rows = await store.mem0_tombstones_with_prefix('reify', 'bff81530')
+
+    assert [row.task_id for row in rows] == [reify_a, reify_b]
+    assert rows == [await store.get_mem0_tombstone('reify', memory_id) for memory_id in (reify_a, reify_b)]
+
+
+@pytest.mark.asyncio
+async def test_mem0_tombstones_with_prefix_is_a_literal_case_sensitive_match(store):
+    """LIKE would fold case and read %/_ as wildcards; the prefix must not."""
+    await record_mem0_deletion_tombstone(
+        _tombstone_ms(store),
+        'reify',
+        'bff81530-0000-4000-8000-00000000000a',
+        victim_metadata={},
+        victim_created_at=None,
+        deleter='stage1_cycle_summary_trim',
+        deleting_run_id='run-deleter',
+    )
+
+    assert await store.mem0_tombstones_with_prefix('reify', 'BFF81530') == []
+    assert await store.mem0_tombstones_with_prefix('reify', 'bff8153_') == []
+    assert await store.mem0_tombstones_with_prefix('reify', 'bff%') == []
+
+
+@pytest.mark.asyncio
 async def test_repeat_tombstone_for_same_victim_keeps_one_row(store):
     """A second tombstone for the same victim upserts in place (row count 1).
 
@@ -1275,7 +1693,7 @@ async def test_repeat_tombstone_for_same_victim_keeps_one_row(store):
             now=datetime(2026, 7, 20, tzinfo=UTC),
         )
 
-    cursor = await store._db.execute(
+    cursor = await store._require_access().connection.execute(
         'SELECT COUNT(*) FROM recon_ledger WHERE record_kind = ?',
         (RECORD_KIND_MEM0_TOMBSTONE,),
     )
@@ -1606,3 +2024,211 @@ async def test_tombstone_round_trips_from_writer_to_memory_service(store, mock_c
     # The ROW's own timestamps, kept separate so neither clobbers the victim's.
     assert tombstone['tombstone_created_at'] == '2026-07-20T00:00:00+00:00'
     assert tombstone['tombstone_expires_at'] == '2026-08-19T00:00:00+00:00'
+
+
+# ---------------------------------------------------------------------------
+# list_by_kind: the generic (project, kind, state) reader (task 5239), and the
+# TTL contract a kind gets for free by always stamping expires_at.
+# ---------------------------------------------------------------------------
+
+
+def _kind_row(
+    *,
+    project: str = 'proj-p',
+    kind: str = 'kind-a',
+    state: str = 'proposed',
+    task_id: str = '',
+    flag_type: str = 'topic-a',
+    run_id: str = 'run-1',
+    created_at: str = '2026-07-01T00:00:00+00:00',
+    expires_at: str | None = '2026-07-08T00:00:00+00:00',
+    payload: str = '{"k": 1}',
+) -> ReconLedgerRecord:
+    return ReconLedgerRecord(
+        project_id=project,
+        record_kind=kind,
+        task_id=task_id,
+        flag_type=flag_type,
+        run_id=run_id,
+        payload_json=payload,
+        state=state,
+        created_at=created_at,
+        expires_at=expires_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_by_kind_returns_only_rows_matching_project_kind_and_state(store):
+    """Each of the three selectors excludes a row that differs only in it."""
+    wanted = _kind_row()
+    other_project = _kind_row(project='proj-q')
+    other_kind = _kind_row(kind='kind-b')
+    other_state = _kind_row(state='executed', flag_type='topic-b')
+    await store.upsert_many([wanted, other_project, other_kind, other_state])
+
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == [wanted]
+
+
+@pytest.mark.asyncio
+async def test_list_by_kind_round_trips_every_field(store):
+    record = _kind_row(
+        task_id='',
+        flag_type='topic-x',
+        run_id='run-9',
+        payload='{"member_ids": ["a", "b"], "claim": "c"}',
+        created_at='2026-07-02T03:04:05+00:00',
+        expires_at='2026-07-09T03:04:05+00:00',
+    )
+    await store.upsert(record)
+
+    (fetched,) = await store.list_by_kind('proj-p', 'kind-a', 'proposed')
+
+    assert isinstance(fetched, ReconLedgerRecord)
+    assert fetched == record
+    assert fetched.payload_json == record.payload_json
+    assert fetched.created_at == '2026-07-02T03:04:05+00:00'
+    assert fetched.expires_at == '2026-07-09T03:04:05+00:00'
+    assert fetched.flag_type == 'topic-x'
+    assert fetched.run_id == 'run-9'
+
+
+@pytest.mark.asyncio
+async def test_list_by_kind_is_empty_when_nothing_matches(store):
+    await store.upsert(_kind_row(kind='kind-b'))
+
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == []
+
+
+@pytest.mark.asyncio
+async def test_list_by_kind_orders_by_created_at_then_identity(store):
+    late = _kind_row(flag_type='topic-0', created_at='2026-07-03T00:00:00+00:00')
+    early_b = _kind_row(flag_type='topic-b', created_at='2026-07-01T00:00:00+00:00')
+    early_a_run2 = _kind_row(
+        flag_type='topic-a', run_id='run-2', created_at='2026-07-01T00:00:00+00:00'
+    )
+    early_a_run1 = _kind_row(
+        flag_type='topic-a', run_id='run-1', created_at='2026-07-01T00:00:00+00:00'
+    )
+    await store.upsert_many([late, early_b, early_a_run2, early_a_run1])
+
+    listed = await store.list_by_kind('proj-p', 'kind-a', 'proposed')
+
+    assert listed == [early_a_run1, early_a_run2, early_b, late]
+
+
+@pytest.mark.asyncio
+async def test_gc_reaps_an_expired_consolidation_proposal_row_and_keeps_a_live_one(store):
+    """A kind that always stamps expires_at needs no reaper of its own."""
+    expired = _kind_row(
+        kind='consolidation_proposal',
+        flag_type='topic-old',
+        created_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-07-08T00:00:00+00:00',
+    )
+    live = _kind_row(
+        kind='consolidation_proposal',
+        flag_type='topic-new',
+        created_at='2026-07-10T00:00:00+00:00',
+        expires_at='2026-07-17T00:00:00+00:00',
+    )
+    await store.upsert_many([expired, live])
+
+    await store.gc('proj-p', now='2026-07-12T00:00:00+00:00', terminal_task_ids=[])
+
+    assert await store.list_by_kind('proj-p', 'consolidation_proposal', 'proposed') == [live]
+
+
+# ---------------------------------------------------------------------------
+# list_by_flag_type: every row of one (project, kind, task_id, flag_type)
+# across run ids and states (task 5240).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_by_flag_type_returns_every_state_and_run_in_created_order(store):
+    refused = _kind_row(
+        state='refused', run_id='run-b', created_at='2026-07-02T00:00:00+00:00',
+    )
+    addressed = _kind_row(
+        state='addressed', run_id='run-a', created_at='2026-07-03T00:00:00+00:00',
+    )
+    proposed = _kind_row(
+        state='proposed', run_id='run-c', created_at='2026-07-01T00:00:00+00:00',
+    )
+    decoys = [
+        _kind_row(flag_type='topic-b', run_id='run-d'),
+        _kind_row(kind='kind-b', run_id='run-e'),
+        _kind_row(project='proj-q', run_id='run-f'),
+        _kind_row(task_id='42', run_id='run-g'),
+    ]
+    await store.upsert_many([refused, addressed, proposed, *decoys])
+
+    listed = await store.list_by_flag_type('proj-p', 'kind-a', 'topic-a')
+
+    assert listed == [proposed, refused, addressed]
+    assert [r.state for r in listed] == ['proposed', 'refused', 'addressed']
+
+
+@pytest.mark.asyncio
+async def test_list_by_flag_type_ties_on_created_at_order_by_run_id(store):
+    run2 = _kind_row(run_id='run-2')
+    run1 = _kind_row(run_id='run-1')
+    await store.upsert_many([run2, run1])
+
+    assert await store.list_by_flag_type('proj-p', 'kind-a', 'topic-a') == [run1, run2]
+
+
+@pytest.mark.asyncio
+async def test_list_by_flag_type_honours_an_explicit_task_id(store):
+    scoped = _kind_row(task_id='42')
+    unscoped = _kind_row(run_id='run-2')
+    await store.upsert_many([scoped, unscoped])
+
+    assert await store.list_by_flag_type('proj-p', 'kind-a', 'topic-a', task_id='42') == [
+        scoped
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_by_flag_type_unknown_flag_type_is_empty(store):
+    await store.upsert(_kind_row())
+
+    assert await store.list_by_flag_type('proj-p', 'kind-a', 'topic-zzz') == []
+
+
+# ---------------------------------------------------------------------------
+# upsert_if_state: an overwrite that applies only while the stored row is
+# still in the named state (task 5239 amendment).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_if_state_inserts_a_row_that_does_not_exist(store):
+    record = _kind_row()
+
+    assert await store.upsert_if_state(record, existing_state='proposed') is True
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == [record]
+
+
+@pytest.mark.asyncio
+async def test_upsert_if_state_overwrites_a_row_in_that_state(store):
+    await store.upsert(_kind_row(payload='{"k": 1}'))
+    newer = _kind_row(payload='{"k": 2}', created_at='2026-07-02T00:00:00+00:00')
+
+    assert await store.upsert_if_state(newer, existing_state='proposed') is True
+    assert await store.list_by_kind('proj-p', 'kind-a', 'proposed') == [newer]
+
+
+@pytest.mark.asyncio
+async def test_upsert_if_state_leaves_a_row_in_another_state_untouched(store):
+    acted_on = _kind_row(state='executed', payload='{"k": 1}')
+    await store.upsert(acted_on)
+
+    written = await store.upsert_if_state(
+        _kind_row(payload='{"k": 2}'), existing_state='proposed'
+    )
+
+    assert written is False
+    assert await store.get_by_identity(
+        'proj-p', 'kind-a', flag_type='topic-a', run_id='run-1'
+    ) == acted_on

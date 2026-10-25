@@ -26,14 +26,14 @@ The live units at `$HOME/.config/systemd/user/` already have every placeholder r
 If you do need a full re-render, use the supported path, which reads this host's `DASHBOARD_KNOWN_PROJECT_ROOTS` off the installed unit and puts it back (tasks 4793, 4796):
 
 ```bash
-python3 <DF>/scripts/render_dashboard_unit.py --unit fused-memory \
+python3 <DF>/scripts/render_systemd_unit.py --unit fused-memory \
   --template "<DF>/scripts/fused-memory.service.template" \
   --repo-root "<DF>" --uv-path "$(command -v uv)" \
   --output "$HOME/.config/systemd/user/fused-memory.service"
 # ...and --unit dashboard with dashboard.service.template / dark-factory-dashboard.service
 ```
 
-`<DF>/scripts/setup-host.sh` does exactly this for both units, so re-running it no longer strips the extra roots either. **But do not reach for it here.** Section 4 of that script runs `systemctl --user restart fused-memory` whenever `<DF>/fused-memory/.env` exists — i.e. it performs, unprompted, the destructive restart that step 2 below gates on user confirmation, severing this session's MCP tools — and it re-provisions the whole host around it (docker compose up, `uv sync` of five projects, re-render and enable of every systemd unit this project installs). The two narrow paths are the surgical one-line edit below (the normal registration route) and the direct `render_dashboard_unit.py` invocation above; both leave *when* to restart to you.
+`<DF>/scripts/setup-host.sh` does exactly this for both units, so re-running it no longer strips the extra roots either. **But do not reach for it here.** Section 4 of that script runs `systemctl --user restart fused-memory` whenever `<DF>/fused-memory/.env` exists — i.e. it performs, unprompted, the destructive restart that step 2 below gates on user confirmation, severing this session's MCP tools — and it re-provisions the whole host around it (docker compose up, `uv sync` of five projects, re-render and enable of every systemd unit this project installs). The two narrow paths are the surgical one-line edit below (the normal registration route) and the direct `render_systemd_unit.py` invocation above; both leave *when* to restart to you.
 
 Append `,<TARGET>` with a **surgical one-line edit** to the single `DASHBOARD_KNOWN_PROJECT_ROOTS=` line in **both** live units:
 - `~/.config/systemd/user/fused-memory.service` — governs **reconciliation** (the recon-storm hazard; this is the load-bearing one).

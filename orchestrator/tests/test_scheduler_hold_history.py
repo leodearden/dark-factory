@@ -411,7 +411,7 @@ async def test_a_refinement_widen_opens_the_widened_modules_in_the_history():
         '1', current=held, needed=[*held, _WIDENED],
     )
 
-    assert ok is True
+    assert ok.applied is True
     assert sorted(scheduler._hold_history.open_modules('1')) == sorted([*held, _WIDENED])
 
 

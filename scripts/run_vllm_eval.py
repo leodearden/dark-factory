@@ -40,6 +40,7 @@ from orchestrator.evals.configs import (
     EvalConfig,
     get_config_by_name,
 )
+from orchestrator.evals.results import ResultStore
 from orchestrator.evals.snapshots import eval_worktree_root
 from runpod_toolkit.compute import PodStatus, RunPodClient  # type: ignore[import]
 from runpod_toolkit.config import RunPodConfig  # type: ignore[import]
@@ -55,7 +56,7 @@ with open(SSH_KEY + ".pub") as _fh:
 PROJECT_ROOT = Path("/home/leo/src/dark-factory")
 ORCHESTRATOR_DIR = PROJECT_ROOT / "orchestrator"
 TASKS_DIR = ORCHESTRATOR_DIR / "src/orchestrator/evals/tasks"
-RESULTS_DIR = ORCHESTRATOR_DIR / "src/orchestrator/evals/results"
+RESULT_STORE = ResultStore.packaged()
 
 # Per-task log files for concurrent runs land here. /var/tmp survives reboot
 # (unlike /tmp which is tmpfs); chosen so a mid-batch crash leaves logs
@@ -252,9 +253,10 @@ def build_eval_env() -> dict[str, str]:
 
     THE ROSTER. Evals have NO dedicated account. They draw on the same
     shared fleet pool as every other invocation and tolerate cap/429
-    events via ``invoke_with_cap_retry``'s 48h patience plus session
-    ``--resume`` (see ``orchestrator.evals.runner``), rather than via a
-    private reserve. Account A is reserved for INTERACTIVE use only —
+    events via ``invoke_with_cap_retry``'s shared default cap-wait patience
+    (``shared/src/shared/cli_invoke.py::_DEFAULT_CAP_WAIT_SANITY_SECS``)
+    plus session ``--resume`` (see ``orchestrator.evals.runner``), rather
+    than via a private reserve. Account A is reserved for INTERACTIVE use only —
     Leo's own sessions exhaust its weekly cap most weeks, so it never
     could serve as that reserve (ruling 2026-08-30, tasks 4741/4945).
 
@@ -997,20 +999,17 @@ def find_new_result_file(
     since_mtime: float,
     exclude_paths: set[Path] | None = None,
 ) -> Path | None:
-    """Glob results/ for a result file newer than *since_mtime*.
+    """The newest ``RESULT_STORE`` cell for the pair written after *since_mtime*.
 
-    Returns the newest matching file, or None if no new file appeared.
-    Any path in *exclude_paths* is treated as pre-existing — useful when
-    multiple concurrent tasks share the same results directory and ext4's
-    1-second mtime granularity makes the watermark insufficient on its own.
+    Returns None if no new cell appeared. Any path in *exclude_paths* is
+    treated as pre-existing — useful when multiple concurrent tasks share the
+    same results directory and ext4's 1-second mtime granularity makes the
+    watermark insufficient on its own.
     """
-    if not RESULTS_DIR.exists():
-        return None
     excluded = exclude_paths or set()
-    pattern = f"{task_id}__{config_name}__*.json"
     candidates = [
         p
-        for p in RESULTS_DIR.glob(pattern)
+        for p in RESULT_STORE.paths_matching(task_id, config_name)
         if p.stat().st_mtime > since_mtime and p not in excluded
     ]
     if not candidates:
@@ -1099,11 +1098,9 @@ def run_one_task(
             error="vLLM endpoint unhealthy at task start",
         )
 
-    pre_files = (
-        {p: p.stat().st_mtime for p in RESULTS_DIR.glob(f"{task_id}__{config_name}__*.json")}
-        if RESULTS_DIR.exists()
-        else {}
-    )
+    pre_files = {
+        p: p.stat().st_mtime for p in RESULT_STORE.paths_matching(task_id, config_name)
+    }
     pre_max_mtime = max(pre_files.values(), default=0.0)
 
     task_path = f"src/orchestrator/evals/tasks/{task_id}.json"
@@ -1191,7 +1188,7 @@ def run_one_task(
             result_path=None,
             error=(
                 f"orchestrator subprocess rc={rc} but no new result file "
-                f"under {RESULTS_DIR} matching {task_id}__{config_name}__*.json"
+                f"under {RESULT_STORE.directory} for task {task_id} × config {config_name}"
             ),
             log_path=log_path,
         )

@@ -356,6 +356,11 @@ class TestMaybeEscalateStalledTasks:
         assert submitted.agent_role == 'reconciliation-stage1'
         assert '1155' in submitted.summary
         assert '7' in submitted.summary
+        # The queue is shared across projects, so the SUBJECT project is a
+        # structured field on the record — the same fact as the rendered
+        # detail line, both written from the one `project_id` parameter.
+        assert submitted.project_id == 'dark_factory'
+        assert f'project_id: {submitted.project_id}' in submitted.detail.split('\n')
         # detail includes flag description and run_id
         assert 'Task stalled waiting for human review' in submitted.detail
         assert 'run-abc' in submitted.detail
@@ -756,8 +761,10 @@ class TestMaybeEscalateStalledGateBacklog:
         # WARNING — silently flipping every shape test below to result == [] with no
         # visible error.
         q.get_pending.return_value = []
-        # Pins observed_submit_response to its documented fail-open 'queued' branch
-        # instead of leaning on MagicMock attribute truthiness.
+        # Pins observed_submit_response to its documented 'accepted_unpersisted'
+        # branch instead of leaning on MagicMock attribute truthiness.  The
+        # assertions below read only the returned id list, which that branch
+        # carries exactly as the 'queued' one does.
         q.get.return_value = None
         return q
 
@@ -785,6 +792,13 @@ class TestMaybeEscalateStalledGateBacklog:
         assert submitted.category == 'reconciliation_stale_gate_backlog'
         assert submitted.task_id == '645'
         assert submitted.agent_role == 'reconciliation-stage1'
+        # A DIFFERENT project id from the stalled-tasks site above, so an
+        # implementation hardcoding one constant cannot satisfy both stamps.
+        # It must agree with the detail line, from which
+        # `escalation/dedupe.py::gate_backlog_fingerprint_key` recovers a
+        # legacy parent's identity.
+        assert submitted.project_id == 'autopilot_video'
+        assert f'project_id: {submitted.project_id}' in submitted.detail.split('\n')
 
         combined = f'{submitted.summary}\n{submitted.detail}'
         assert '645' in combined

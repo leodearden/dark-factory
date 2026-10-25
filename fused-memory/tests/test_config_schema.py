@@ -1,5 +1,6 @@
 """Tests for config schema Literal type validation."""
 
+import json
 import os
 import re
 import sys
@@ -13,6 +14,7 @@ from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings
 
 from fused_memory.config.schema import (
+    ConsolidationAutoConfig,
     CuratorConfig,
     EmbedderConfig,
     EntityMintConfig,
@@ -743,6 +745,44 @@ class TestReconciliationConfigJudgeInfraMaxConsecutiveFailures:
             ReconciliationConfig(judge_infra_max_consecutive_failures=-1)
 
 
+class TestReconTranscriptArchiveConfig:
+    """The recon transcript-archive leaves (task 3972)."""
+
+    FM_CONFIG_YAML = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+    LEGIBILITY_YAML = (
+        Path(__file__).resolve().parents[2] / 'docs' / 'legibility' / 'legibility.yaml'
+    )
+
+    def test_defaults(self):
+        cfg = ReconciliationConfig()
+        assert cfg.transcript_archive_enabled is True
+        assert cfg.transcript_archive_root == 'data/orchestrator/agent-transcripts'
+
+    def test_default_root_matches_the_shipped_legibility_archive_roots(self):
+        """Recon archives must land where the legibility miner walks; if the
+        two drift, they are written and never mined."""
+        assert self.LEGIBILITY_YAML.is_file(), f'expected {self.LEGIBILITY_YAML}'
+        legibility = yaml.safe_load(self.LEGIBILITY_YAML.read_text())
+
+        assert (
+            ReconciliationConfig().transcript_archive_root
+            in legibility['agent_transcript_roots']
+        )
+
+    def test_shipped_config_yaml_loads_the_leaves(self, monkeypatch):
+        assert self.FM_CONFIG_YAML.is_file(), f'expected {self.FM_CONFIG_YAML}'
+        shipped = yaml.safe_load(self.FM_CONFIG_YAML.read_text())['reconciliation']
+        assert 'transcript_archive_enabled' in shipped
+        assert 'transcript_archive_root' in shipped
+
+        monkeypatch.setenv('CONFIG_PATH', str(self.FM_CONFIG_YAML))
+        cfg = FusedMemoryConfig().reconciliation
+
+        assert isinstance(cfg.transcript_archive_enabled, bool)
+        assert isinstance(cfg.transcript_archive_root, str)
+        assert cfg.transcript_archive_root
+
+
 class TestReconciliationAutoUnhaltAfterCooldown:
     """Tests for auto_unhalt_after_cooldown (task 2920 deliverable c).
 
@@ -1130,6 +1170,277 @@ class TestReconciliationConfigStormKnobs:
             ReconciliationConfig(dead_owner_suppression_storm_window_seconds=-1.0)
 
 
+class TestConsolidationAutoConfig:
+    """Deterministic auto-consolidation knobs (task 5237, PRD §7).
+
+    Shape copied from the ``TestMem0UpdateConfig`` / ``TestEntityMintConfig``
+    pair above — the same bare-submodel + kill-switch + green-tier posture, for
+    the same reason: auto-consolidation writes to the corpus without a human in
+    the loop, so an operator must be able to stop it and to stage it
+    per-project without a restart.
+
+    A TOP-LEVEL section rather than nested under ReconciliationConfig for the
+    reason that model's own ownership note gives: recon Stage 1 is this
+    machinery's first sanctioned CALLER, not its owner — the proposal tool, the
+    executor and the provenance bar all live on the server side.
+    """
+
+    # --- fail-safe defaults (PRD §7 / §12 Q1) ---
+
+    def test_default_enabled_is_false(self):
+        """Ships OFF, unlike its two sibling gates.
+
+        Mem0UpdateConfig.enabled and EntityMintConfig.enabled both default ON
+        because a narrow self-reported allowlist is the real bar there. Here
+        there is no caller-side bar at all — the machinery consolidates on its
+        own — so the kill switch IS the bar until PRD §11's supervised
+        dry-run cycle has been read by a human.
+        """
+        assert ConsolidationAutoConfig().enabled is False
+
+    def test_default_enabled_projects_is_empty(self):
+        """Empty means no project is staged in — the per-project rollout lever
+        (PRD D13, precedent ``summary_rebuild.projects``)."""
+        assert ConsolidationAutoConfig().enabled_projects == []
+
+    def test_default_predicate_version_is_1(self):
+        assert ConsolidationAutoConfig().predicate_version == '1'
+
+    def test_default_member_range_is_2_to_20(self):
+        cfg = ConsolidationAutoConfig()
+        assert cfg.member_min == 2
+        assert cfg.member_max == 20
+
+    def test_default_claim_max_chars_is_200(self):
+        assert ConsolidationAutoConfig().claim_max_chars == 200
+
+    def test_default_per_cycle_caps_are_3(self):
+        cfg = ConsolidationAutoConfig()
+        assert cfg.max_auto_per_cycle == 3
+        assert cfg.max_gate_filings_per_cycle == 3
+
+    def test_default_backlog_multiplier_is_5(self):
+        assert ConsolidationAutoConfig().backlog_multiplier == 5
+
+    def test_default_refusal_streak_threshold_is_5(self):
+        assert ConsolidationAutoConfig().refusal_streak_threshold == 5
+
+    def test_default_slug_collision_jaccard_is_0_6(self):
+        assert ConsolidationAutoConfig().slug_collision_jaccard == 0.6
+
+    def test_default_proposal_ttl_hours_is_one_week(self):
+        assert ConsolidationAutoConfig().proposal_ttl_hours == 168
+
+    def test_default_canonical_absent_bonus_is_2(self):
+        """A cluster whose topic has no canonical yet ranks as if twice its
+        size (PRD C4 ranking formula; consolidation_flood_control.rank_and_cap)."""
+        assert ConsolidationAutoConfig().canonical_absent_bonus == 2.0
+
+    def test_default_category_weights_are_the_three_mem0_primaries(self):
+        """PRD §12 Q1 — the three Mem0-primary categories, with
+        observations_and_summaries down-weighted because its corpus is
+        session-recap noise far more often than it is a reusable norm."""
+        assert ConsolidationAutoConfig().category_weights == {
+            'procedural_knowledge': 1.0,
+            'preferences_and_norms': 1.0,
+            'observations_and_summaries': 0.7,
+        }
+
+    # --- PRD D5: no runtime cap on canonical length ---
+
+    def test_no_canonical_max_chars_leaf_exists(self):
+        """PRD D5 — the builder's maximum is ~464 chars at every input at its
+        own cap, so a runtime cap would be unreachable dead code. The bound is
+        a unit-test assertion (tests/test_consolidation_auto.py) instead."""
+        assert 'canonical_max_chars' not in ConsolidationAutoConfig.model_fields
+
+    # --- defaults are per-instance, not shared mutables ---
+
+    def test_separate_instances_do_not_share_the_project_list(self):
+        a, b = ConsolidationAutoConfig(), ConsolidationAutoConfig()
+        a.enabled_projects.append('dark_factory')
+        assert b.enabled_projects == []
+
+    def test_separate_instances_do_not_share_the_weight_map(self):
+        a, b = ConsolidationAutoConfig(), ConsolidationAutoConfig()
+        a.category_weights['procedural_knowledge'] = 0.1
+        assert b.category_weights['procedural_knowledge'] == 1.0
+
+    # --- overrides accepted ---
+
+    def test_overrides_accepted(self):
+        cfg = ConsolidationAutoConfig(
+            enabled=True,
+            enabled_projects=['dark_factory'],
+            predicate_version='2',
+            member_min=3,
+            member_max=8,
+            claim_max_chars=120,
+            max_auto_per_cycle=1,
+            max_gate_filings_per_cycle=0,
+            backlog_multiplier=2,
+            refusal_streak_threshold=3,
+            slug_collision_jaccard=0.8,
+            proposal_ttl_hours=24,
+            category_weights={'procedural_knowledge': 0.5},
+        )
+        assert cfg.enabled is True
+        assert cfg.enabled_projects == ['dark_factory']
+        assert cfg.predicate_version == '2'
+        assert (cfg.member_min, cfg.member_max) == (3, 8)
+        assert cfg.claim_max_chars == 120
+        assert (cfg.max_auto_per_cycle, cfg.max_gate_filings_per_cycle) == (1, 0)
+        assert cfg.backlog_multiplier == 2
+        assert cfg.refusal_streak_threshold == 3
+        assert cfg.slug_collision_jaccard == 0.8
+        assert cfg.proposal_ttl_hours == 24
+        assert cfg.category_weights == {'procedural_knowledge': 0.5}
+
+    # --- validation bounds ---
+
+    def test_member_min_below_one_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(member_min=0)
+
+    def test_member_max_below_member_min_rejected(self):
+        """Cross-field: an incoherent range would make every proposal refuse
+        on member count with no configuration that could ever satisfy it."""
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(member_min=10, member_max=4)
+
+    def test_member_min_equal_to_member_max_accepted(self):
+        cfg = ConsolidationAutoConfig(member_min=4, member_max=4)
+        assert (cfg.member_min, cfg.member_max) == (4, 4)
+
+    def test_slug_collision_jaccard_above_one_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(slug_collision_jaccard=1.5)
+
+    def test_slug_collision_jaccard_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(slug_collision_jaccard=-0.1)
+
+    def test_slug_collision_jaccard_endpoints_accepted(self):
+        """0.0 (every slug collides) and 1.0 (only an identical token set
+        collides) are both coherent calibration extremes — PRD §12 Q2."""
+        assert ConsolidationAutoConfig(slug_collision_jaccard=0.0).slug_collision_jaccard == 0.0
+        assert ConsolidationAutoConfig(slug_collision_jaccard=1.0).slug_collision_jaccard == 1.0
+
+    def test_claim_max_chars_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(claim_max_chars=0)
+
+    def test_claim_max_chars_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(claim_max_chars=-1)
+
+    def test_proposal_ttl_hours_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(proposal_ttl_hours=0)
+
+    def test_proposal_ttl_hours_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(proposal_ttl_hours=-1)
+
+    def test_canonical_absent_bonus_below_one_rejected(self):
+        """A bonus below 1 would PENALISE a canonical-absent cluster, inverting
+        the policy it exists to express."""
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(canonical_absent_bonus=0.9)
+
+    def test_canonical_absent_bonus_float_override_accepted(self):
+        assert ConsolidationAutoConfig(canonical_absent_bonus=1.5).canonical_absent_bonus == 1.5
+        assert ConsolidationAutoConfig(canonical_absent_bonus=1.0).canonical_absent_bonus == 1.0
+
+    def test_backlog_multiplier_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(backlog_multiplier=0)
+
+    def test_refusal_streak_threshold_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(refusal_streak_threshold=0)
+
+    def test_negative_per_cycle_caps_rejected(self):
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(max_auto_per_cycle=-1)
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(max_gate_filings_per_cycle=-1)
+
+    def test_zero_per_cycle_caps_accepted_as_off_switches(self):
+        """0 is a LEGAL value on both caps, not a bounds violation: it is the
+        narrow off switch that stops auto-execution (or gate filing) while
+        leaving the rest of the pipeline observing."""
+        cfg = ConsolidationAutoConfig(max_auto_per_cycle=0, max_gate_filings_per_cycle=0)
+        assert cfg.max_auto_per_cycle == 0
+        assert cfg.max_gate_filings_per_cycle == 0
+
+    # --- wired onto FusedMemoryConfig as a top-level section ---
+
+    def test_top_level_field_with_default_factory(self, tmp_path, monkeypatch):
+        """An unconfigured deployment still gets the OFF default.
+
+        CONFIG_PATH is pinned at a missing file because a bare
+        ``FusedMemoryConfig()`` is a BaseSettings that otherwise loads
+        ``config/config.yaml`` from the test cwd — which would silently assert
+        on the shipped YAML rather than the schema default.
+        """
+        monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
+        cfg = FusedMemoryConfig()
+        assert isinstance(cfg.consolidation_auto, ConsolidationAutoConfig)
+        assert cfg.consolidation_auto.enabled is False
+        assert cfg.consolidation_auto.enabled_projects == []
+
+    def test_field_is_bare_submodel_not_optional(self):
+        """Bare (non-Optional) so config/reload.py's _iter_leaves descends into
+        per-leaf paths — an `X | None` submodel is compared whole and lands as a
+        single restart_required entry (esc-2718-1), which would cost `enabled`
+        its green tier, and a restart-only kill switch is no kill switch."""
+        annotation = FusedMemoryConfig.model_fields['consolidation_auto'].annotation
+        assert annotation is ConsolidationAutoConfig, (
+            f'expected a bare ConsolidationAutoConfig annotation, got {annotation!r}'
+        )
+
+    def test_two_configs_do_not_share_the_submodel(self):
+        a, b = FusedMemoryConfig(), FusedMemoryConfig()
+        assert a.consolidation_auto is not b.consolidation_auto
+
+
+class TestReconciliationDeterministicProvenancePrefixes:
+    """PRD C5's caller bar for `deterministic-*` done provenance (task 5237).
+
+    Consumed by task epsilon. Lives on ReconciliationConfig rather than on
+    ConsolidationAutoConfig because the bar governs every deterministic
+    provenance kind, not only auto-consolidation's.
+    """
+
+    def test_default_is_orchestrator_only(self):
+        """The orchestrator sends no agent_id, so tools.py::_resolve_identity
+        falls back to the clientInfo.name the orchestrator advertises
+        (orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY,
+        sent by shared/src/shared/mcp_session.py::McpSession.initialize) — the
+        literal 'orchestrator'."""
+        assert ReconciliationConfig().deterministic_provenance_allowed_agent_prefixes == [
+            'orchestrator',
+        ]
+
+    def test_field_is_a_list_of_str(self):
+        annotation = ReconciliationConfig.model_fields[
+            'deterministic_provenance_allowed_agent_prefixes'
+        ].annotation
+        assert annotation == list[str], f'got {annotation!r}'
+
+    def test_empty_list_accepted_as_deny_all(self):
+        """Deny-on-missing is task epsilon's consumer contract, so the
+        deny-every-caller value must be expressible."""
+        cfg = ReconciliationConfig(deterministic_provenance_allowed_agent_prefixes=[])
+        assert cfg.deterministic_provenance_allowed_agent_prefixes == []
+
+    def test_separate_instances_do_not_share_the_list(self):
+        a, b = ReconciliationConfig(), ReconciliationConfig()
+        a.deterministic_provenance_allowed_agent_prefixes.append('cgl-sched-gate')
+        assert b.deterministic_provenance_allowed_agent_prefixes == ['orchestrator']
+
+
 class TestReconciliationConfigResumeKnobs:
     """Tests for the interrupted-run resume knobs (task 2717 / PRD σ, rec 13).
 
@@ -1362,6 +1673,94 @@ class TestPathScopeAdjudicatorConfigBudget:
         )
 
 
+class TestCuratorDegradedStreakThreshold:
+    """The knob behind the class-agnostic degraded-streak alarm (task 4448).
+
+    Distinct from ``zero_output_breaker_threshold``, which counts only ZOT
+    failures and exists to stop burning 180s per hung call. This one counts
+    degraded DECISIONS of any cause and exists to make the outage visible.
+    """
+
+    def test_default_is_five(self):
+        assert CuratorConfig().degraded_streak_threshold == 5, (
+            'N=5 is chosen against the 2026-08-13 to 08-18 outage: 08-15 alone '
+            'saw 38 consecutive degradations, so N=5 would have escalated '
+            'within minutes of that day starting instead of on day five.'
+        )
+
+    def test_rejects_below_one(self):
+        """N=0 would fire on a healthy curator's first non-LLM decision."""
+        with pytest.raises(ValidationError):
+            CuratorConfig(degraded_streak_threshold=0)
+
+
+class TestCuratorEntryCharCaps:
+    """The per-entry char caps, pinned with the measurement that set them.
+
+    Measured 2026-09-18 against the live task DB (n=5574; 1015 pending):
+    description p50 1813 / p90 3906, with 87.6% of all tasks (96.1% of
+    pending) over the old 500-char cap and a mean 1827-char elision among
+    those clipped; details p50 0 / p90 2827, with 18.6% over 1500. The two
+    caps were INVERTED relative to that data — the near-always-populated,
+    roughly twice-longer field carried the 3x tighter cap.
+    """
+
+    def test_description_cap_shows_the_median_task_in_full(self):
+        assert CuratorConfig().entry_description_chars == 2000, (
+            'entry_description_chars must be 2000 — the smallest round cap '
+            'above the measured description p50 of 1813, taking the clipping '
+            'rate from 87.6% to 44.7% (96.1% -> 69.5% for pending tasks). At '
+            'the old 500 the curator saw roughly the first quarter of 96% of '
+            'combine-eligible descriptions and could not tell.'
+        )
+
+    def test_details_cap_is_unchanged(self):
+        assert CuratorConfig().entry_details_chars == 1500
+
+    def test_description_cap_is_not_tighter_than_the_details_cap(self):
+        """The relationship the measurement established, not just the values.
+
+        description is populated on essentially every task and runs about
+        twice as long as details (p50 1813 vs 0), so it earns the LARGER
+        budget. Any future edit that re-inverts these two is re-introducing
+        the defect, whatever the absolute numbers become.
+        """
+        cfg = CuratorConfig()
+        assert cfg.entry_description_chars >= cfg.entry_details_chars, (
+            f'entry_description_chars ({cfg.entry_description_chars}) must not '
+            f'be tighter than entry_details_chars ({cfg.entry_details_chars}): '
+            f'description is the near-always-populated and roughly twice-longer '
+            f'field (measured p50 1813 vs 0).'
+        )
+
+    def test_the_total_cap_is_unreachable_at_stock_stream_caps(self):
+        """FINDING 1, as an executable invariant rather than a comment.
+
+        A maximal pool is anchor(<=1) + module + embedding + dependency. With
+        stock values that is 29 against a total cap of 30, so ``_trim_pool``
+        short-circuits on every call and the STREAM caps are the binding
+        constraints. This is pinned so a future cap edit that silently
+        re-strands or un-strands the final trim is caught here, at the config
+        layer, rather than being discovered as a permanently-silent
+        ``pool_truncated`` census.
+        """
+        cfg = CuratorConfig()
+        maximal_pool = (
+            1
+            + cfg.pool_module_cap
+            + cfg.pool_embedding_cap
+            + cfg.pool_dependency_cap
+        )
+        assert maximal_pool <= cfg.pool_total_cap, (
+            f'A maximal pool is {maximal_pool} entries against pool_total_cap '
+            f'{cfg.pool_total_cap}. If this ever flips, _trim_pool becomes '
+            f'reachable and the total_cap arm of the PoolWithheld census stops '
+            f'being dead weight — update the schema comment recording the '
+            f'arithmetic, and re-read whether the stream caps are still the '
+            f'binding constraints.'
+        )
+
+
 class TestCuratorConfigBudgetRaise:
     """Regression guard: TaskCurator per-call budget is a durable flat $2.00 (task 1980).
 
@@ -1424,6 +1823,83 @@ class TestCuratorConfigBudgetRaise:
             f'TaskCurator per-call budget to a durable flat $2.00. Check '
             f'config.yaml for an override that pins the budget lower.'
         )
+
+
+class TestCuratorZotDuplicateSweepConfig:
+    """Task 5491: the post-ZOT duplicate sweep's knobs live on CuratorConfig."""
+
+    def test_defaults(self):
+        cfg = CuratorConfig()
+        assert cfg.zot_duplicate_sweep_enabled is True
+        assert cfg.zot_duplicate_score_threshold == pytest.approx(0.65)
+        assert cfg.zot_duplicate_search_limit == 5
+
+    @pytest.mark.parametrize('threshold', [1.5, -0.1])
+    def test_threshold_is_a_cosine_in_unit_interval(self, threshold):
+        with pytest.raises(ValidationError):
+            CuratorConfig(zot_duplicate_score_threshold=threshold)
+
+    @pytest.mark.parametrize('threshold', [0.0, 1.0])
+    def test_threshold_bounds_are_inclusive(self, threshold):
+        assert CuratorConfig(
+            zot_duplicate_score_threshold=threshold,
+        ).zot_duplicate_score_threshold == threshold
+
+    def test_search_limit_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            CuratorConfig(zot_duplicate_search_limit=0)
+
+
+class TestCurationDeferralConfig:
+    """Task 4503: the knobs behind parking a submission the curator could not judge."""
+
+    def test_defaults(self):
+        from fused_memory.config.schema import TicketJanitorConfig
+
+        cfg = CuratorConfig()
+        assert cfg.deferral_backoff_base_seconds == 60.0
+        assert cfg.deferral_backoff_max_seconds == 1800.0
+        assert TicketJanitorConfig().curation_backlog_escalation_min_attempts == 2
+
+    @pytest.mark.parametrize(
+        'field',
+        ['deferral_backoff_base_seconds', 'deferral_backoff_max_seconds'],
+    )
+    @pytest.mark.parametrize('value', [0.0, -1.0])
+    def test_seconds_must_be_positive(self, field, value):
+        with pytest.raises(ValidationError):
+            CuratorConfig(**{field: value})
+
+    def test_backlog_escalation_needs_at_least_one_attempt(self):
+        from fused_memory.config.schema import TicketJanitorConfig
+
+        with pytest.raises(ValidationError):
+            TicketJanitorConfig(curation_backlog_escalation_min_attempts=0)
+        assert TicketJanitorConfig(
+            curation_backlog_escalation_min_attempts=1,
+        ).curation_backlog_escalation_min_attempts == 1
+
+    def test_backoff_max_below_base_is_rejected_naming_both(self):
+        with pytest.raises(ValidationError) as excinfo:
+            CuratorConfig(deferral_backoff_base_seconds=120.0, deferral_backoff_max_seconds=90.0)
+        message = str(excinfo.value)
+        assert '120' in message
+        assert '90' in message
+
+    def test_backoff_max_equal_to_base_is_accepted(self):
+        cfg = CuratorConfig(deferral_backoff_base_seconds=90.0, deferral_backoff_max_seconds=90.0)
+        assert cfg.deferral_backoff_max_seconds == 90.0
+
+    def test_there_is_no_terminal_deferral_bound(self):
+        assert 'deferral_max_seconds' not in CuratorConfig.model_fields
+
+    def test_none_is_hot_reloadable(self):
+        from fused_memory.config.reload import RELOADABLE_FIELDS
+
+        assert not {
+            leaf for leaf in RELOADABLE_FIELDS
+            if 'deferral' in leaf or 'curation_backlog' in leaf
+        }
 
 
 class TestQueueConfigTransientErrorFields:
@@ -2075,6 +2551,56 @@ class TestProceduralTopicGuardClustersDefault:
                             f'occurrence would score two distinct hits and defeat '
                             f'min_phrase_hits'
                         )
+
+
+class TestTopicClusterAutoseedEnabledLeaf:
+    """The kill switch for MACHINE-DERIVED topic clusters (task 3135)."""
+
+    def test_defaults_to_true(self):
+        assert ReconciliationConfig().procedural_knowledge_topic_cluster_autoseed_enabled is True
+
+    def test_round_trips_false(self):
+        cfg = ReconciliationConfig(procedural_knowledge_topic_cluster_autoseed_enabled=False)
+        assert cfg.procedural_knowledge_topic_cluster_autoseed_enabled is False
+
+    def test_round_trips_from_a_config_dict(self):
+        cfg = FusedMemoryConfig.model_validate(
+            {'reconciliation': {'procedural_knowledge_topic_cluster_autoseed_enabled': False}}
+        )
+        assert cfg.reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled is False
+
+
+class TestTopicClusterAutoseedRetiredLeaf:
+    """The per-topic kill switch for MACHINE-DERIVED topic clusters (task 3135 review)."""
+
+    def test_defaults_to_nothing_retired(self):
+        assert ReconciliationConfig().procedural_knowledge_topic_cluster_autoseed_retired == {}
+
+    def test_round_trips_from_a_config_dict(self):
+        cfg = FusedMemoryConfig.model_validate(
+            {
+                'reconciliation': {
+                    'procedural_knowledge_topic_cluster_autoseed_retired': {
+                        'dark_factory': ['worktree-stale-base-premise-verification'],
+                    }
+                }
+            }
+        )
+        assert cfg.reconciliation.procedural_knowledge_topic_cluster_autoseed_retired == {
+            'dark_factory': ['worktree-stale-base-premise-verification'],
+        }
+
+    def test_a_non_slug_topic_id_fails_loud_naming_it_and_the_rule(self):
+        with pytest.raises(ValidationError) as excinfo:
+            ReconciliationConfig(
+                procedural_knowledge_topic_cluster_autoseed_retired={
+                    'dark_factory': ['good-slug', 'worktree_stale_base'],
+                }
+            )
+        message = str(excinfo.value)
+        assert 'worktree_stale_base' in message
+        assert 'dark_factory' in message
+        assert 'fused_memory.topic_slug' in message
 
 
 class TestPytestXdistSerialOverrideCluster:
@@ -3370,30 +3896,58 @@ class TestWriteTriageConfig:
         assert factory().enabled is False  # type: ignore[call-arg]
         assert factory().candidate_k > 5  # type: ignore[call-arg]
 
-    def test_the_shipped_config_yaml_ships_the_flag_off_and_k_wide(self, monkeypatch):
+    def test_the_shipped_config_yaml_ships_the_flag_on_with_the_selected_judge(self, monkeypatch):
         """The pin must hold on the REAL deployment file, not just the model.
 
-        The schema default is what a deployment gets only if config.yaml stays
-        silent. config.yaml carries an explicit `write_triage:` block, so the
-        shipped values there are what the running server actually reads — and
-        they are what an operator (and the next calibration run) can edit.
-        Asserting the class default alone would pass while the deployed file
-        said `enabled: true`.
+        config.yaml carries an explicit `write_triage:` block, so the shipped
+        values there are what the running server reads. Task 3169 flipped the
+        flag on (Leo, 2026-10-11) with the judge that gate Γ3 selected; the
+        judge keys are compared against the committed selection because a null
+        judge_model inherits llm.model, which the comparative scores worse than
+        leaving triage off.
         """
-        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        config_dir = Path(__file__).resolve().parent.parent
+        yaml_path = config_dir / 'config' / 'config.yaml'
         assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
         monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
-        cfg = FusedMemoryConfig()
+        triage = FusedMemoryConfig().write_triage
+        selection = json.loads(
+            (config_dir / 'calibration' / 'write_triage_best_config.json').read_text()
+        )['selection']
 
-        assert cfg.write_triage.enabled is False, (
-            'fused-memory/config/config.yaml must ship write_triage.enabled: '
-            'false — the D10 staged-rollout flag is flipped by task 3169, not '
-            'by the merge that lands the skeleton'
-        )
-        assert cfg.write_triage.candidate_k > 5, (
+        assert triage.enabled is True
+        assert {
+            'judge_provider': triage.judge_provider,
+            'judge_model': triage.judge_model,
+            'judge_reasoning_effort': triage.judge_reasoning_effort,
+            'judge_candidate_count': triage.judge_candidate_count,
+            'field_chars': triage.judge_field_chars,
+        } == {key: selection[key] for key in (
+            'judge_provider', 'judge_model', 'judge_reasoning_effort',
+            'judge_candidate_count', 'field_chars',
+        )}
+        assert triage.candidate_k > 5, (
             'fused-memory/config/config.yaml must ship a candidate_k wider than '
             "the retired guard's limit=5 (measured recall 26.1% @5 vs 69.4% @20)"
         )
+
+    def test_judge_field_chars_defaults_to_4000(self):
+        """The judge's per-field cap ships at 4,000 chars, not the old 1,200.
+
+        Why: task 6076's decision record,
+        calibration/write_triage_judge_field_chars_report.md.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        assert WriteTriageConfig().judge_field_chars == 4000
+
+    @pytest.mark.parametrize('value', [0, -1])
+    def test_judge_field_chars_rejects_a_cap_that_would_empty_every_field(self, value):
+        """A non-positive cap is refused at load and reload, never at write time."""
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(judge_field_chars=value)
 
 
 
@@ -3692,3 +4246,187 @@ def test_shipped_config_max_staleness_still_bounds_latency(monkeypatch):
         'lever 2 raises the steady-state batch on the explicit premise that '
         'max_staleness_seconds still bounds per-event latency independently'
     )
+
+
+class TestWriteJournalConfig:
+    """Task 3212 item 4: `write_ops` retention is operator-tunable and its
+    read/search asymmetry is enforced, not merely documented.
+
+    Measured 2026-09-11 on a never-pruned journal: 35,428,715 rows / 16 GB, of
+    which 97.9% are task-read rows with no downstream consumer and 1.36% are
+    `search` rows that are leaf eta's (task 3213) SOLE data source. A future
+    edit that inverted the two horizons would silently starve that metric while
+    leaving the config looking reasonable, so the ordering is asserted here AND
+    rejected at load time.
+    """
+
+    def test_write_journal_section_is_a_bare_submodel_with_defaults(self):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        section = FusedMemoryConfig().write_journal
+        assert isinstance(section, WriteJournalConfig), (
+            'RED: write_journal must be a BARE (non-Optional) submodel — reload.py '
+            'descends only into required submodels'
+        )
+        assert section.read_retention_days == 30.0
+        assert section.search_retention_days == 365.0
+        assert section.write_retention_days == 730.0
+        assert section.prune_batch_size == 500
+        assert section.prune_max_rows_per_run == 500_000
+        assert section.prune_max_seconds == 30.0
+        assert section.prune_interval_seconds == 1800.0
+
+    def test_search_rows_outlive_task_read_rows(self):
+        section = FusedMemoryConfig().write_journal
+        assert section.search_retention_days > section.read_retention_days, (
+            'RED: search rows are 1.36% of the table and the only rows with a '
+            'consumer; task-read rows are 97.9% and have none. Inverting this '
+            'starves leaf eta while the config still looks plausible.'
+        )
+
+    def test_inverted_horizons_are_rejected_at_load_time(self):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalConfig(read_retention_days=400.0, search_retention_days=30.0)
+        assert 'search_retention_days' in str(excinfo.value), (
+            'RED: the rejection must name the field an operator has to fix'
+        )
+
+    def test_a_zero_prune_interval_is_rejected(self):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalConfig(prune_interval_seconds=0)
+        assert 'prune_interval_seconds' in str(excinfo.value), (
+            'RED: a zero interval would spin the periodic prune loop'
+        )
+
+    def test_values_load_from_yaml(self, tmp_path, monkeypatch):
+        config_data = {
+            'write_journal': {
+                'read_retention_days': 7.0,
+                'search_retention_days': 90.0,
+                'prune_max_seconds': 5.0,
+                'prune_interval_seconds': 600.0,
+            },
+        }
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(yaml.dump(config_data))
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+
+        section = FusedMemoryConfig().write_journal
+
+        assert section.read_retention_days == 7.0, 'RED: the section must be tunable'
+        assert section.search_retention_days == 90.0
+        assert section.prune_max_seconds == 5.0
+        assert section.prune_interval_seconds == 600.0
+        # Unmentioned leaves keep their defaults rather than being clobbered.
+        assert section.write_retention_days == 730.0
+        assert section.prune_batch_size == 500
+
+
+class TestWriteJournalGrowthAlarmConfig:
+    """Task 3311: the write_journal growth alarm's ceilings are operator-tunable.
+
+    The measured basis of the defaults lives in the
+    ``write_journal_growth_alarm`` block of ``fused-memory/config/config.yaml``.
+    """
+
+    def test_section_is_a_bare_submodel_with_defaults(self):
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        section = FusedMemoryConfig().write_journal_growth_alarm
+        assert isinstance(section, WriteJournalGrowthAlarmConfig), (
+            'RED: write_journal_growth_alarm must be a BARE (non-Optional) '
+            'submodel — reload.py descends only into required submodels'
+        )
+        assert section.max_file_bytes == 6_442_450_944
+        assert section.max_rows_inserted_per_day == 75_000
+        assert section.check_interval_seconds == 3600.0
+
+    def test_values_load_from_yaml(self, tmp_path, monkeypatch):
+        config_data = {
+            'write_journal_growth_alarm': {
+                'max_file_bytes': 1024,
+                'check_interval_seconds': 60.0,
+            },
+        }
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(yaml.dump(config_data))
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+
+        section = FusedMemoryConfig().write_journal_growth_alarm
+
+        assert section.max_file_bytes == 1024, 'RED: the section must be tunable'
+        assert section.check_interval_seconds == 60.0
+        assert section.max_rows_inserted_per_day == 75_000
+
+    def test_shipped_config_yaml_carries_exactly_the_schema_defaults(self, monkeypatch):
+        """The schema default and the config.yaml literal are two copies of one
+        number; the yaml's measured-basis comment is where it is justified."""
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        for name in (
+            'WRITE_JOURNAL_GROWTH_ALARM_MAX_FILE_BYTES',
+            'WRITE_JOURNAL_GROWTH_ALARM_MAX_ROWS_PER_DAY',
+            'WRITE_JOURNAL_GROWTH_ALARM_CHECK_INTERVAL_SECONDS',
+        ):
+            monkeypatch.delenv(name, raising=False)
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+
+        assert FusedMemoryConfig().write_journal_growth_alarm == WriteJournalGrowthAlarmConfig()
+
+    @pytest.mark.parametrize(
+        'field',
+        ['max_file_bytes', 'max_rows_inserted_per_day', 'check_interval_seconds'],
+    )
+    def test_non_positive_values_are_rejected(self, field):
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalGrowthAlarmConfig.model_validate({field: 0})
+        assert field in str(excinfo.value), (
+            'RED: a ceiling of 0 fires permanently; the rejection must name the field'
+        )
+
+
+class TestDedupOutageDetectorConfig:
+    """Task 4718: the TicketJanitor's dedup-outage detector is configured under
+    ``curator.janitor.dedup_outage``. The defaults are back-tested in
+    ``plans/curator-dedup-outage-2026-08-15-rca.md``.
+    """
+
+    def test_nested_under_the_ticket_janitor_config(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig, TicketJanitorConfig
+
+        assert isinstance(TicketJanitorConfig().dedup_outage, DedupOutageDetectorConfig)
+
+    def test_defaults(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        cfg = DedupOutageDetectorConfig()
+
+        assert cfg.enabled is True
+        assert cfg.window_seconds == 21600.0
+        assert cfg.min_samples == 10
+        assert cfg.max_median_resolve_seconds == 15.0
+
+    @pytest.mark.parametrize(
+        'field',
+        ['window_seconds', 'max_median_resolve_seconds', 'min_samples'],
+    )
+    def test_non_positive_bounds_are_rejected(self, field):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            DedupOutageDetectorConfig.model_validate({field: 0})
+        assert field in str(excinfo.value)
+
+    def test_reachable_from_the_top_level_config(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        section = FusedMemoryConfig().curator.janitor.dedup_outage
+
+        assert isinstance(section, DedupOutageDetectorConfig)

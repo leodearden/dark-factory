@@ -14,54 +14,17 @@ It is a REPORT, not a gate: nothing in this script or its tests asserts an
 accuracy floor, because D10 makes the human the decision-maker and a floor
 asserted in code would silently become the decision.
 
-Where the ground truth comes from
----------------------------------
-Entirely from alpha's labels, never from a fresh opinion about what the judge
-ought to say. Each non-canonical record in the fixture becomes one judge call,
-shown its cluster's canonical plus cross-cluster distractors, and the label
-the curator assigned names the acceptable answers:
-
-- ``duplicate`` — correct iff the judge ATTACHES, i.e. ``restated`` OR
-  ``amended``. Alpha's labels do not separate a verbatim restatement from a
-  rediscovery that carries a novel fragment; the curator recorded "same claim
-  as the canonical" and stopped there. Scoring one of the two as wrong would
-  invent a label nobody assigned and report a fabricated error rate as a
-  measured one. The restated/amended split is reported as a DISTRIBUTION.
-- ``distinct`` — correct iff ``stored``. Same cluster, same topic,
-  curator-ruled not the same claim: any attach destroys a distinction a human
-  drew.
-- ``pseudo_contradiction`` — correct iff NOT ``contested``. These are
-  adjudicated BOTH-CORRECT pairs (esc-5557/esc-5626): "the contradiction was
-  an omission, not a disagreement".
-- ``distractor`` — a CONTROL class this script adds, since the labels alone do
-  not supply one. One case per cluster, whose slate carries no same-cluster
-  record at all; correct iff ``stored``. Without it the eval cannot tell a
-  judge that classifies from a judge that attaches to whatever it is shown,
-  because every labelled case carries the correct target and "always attach"
-  scores well on all of them.
-
-THE THING THIS FIXTURE CANNOT MEASURE
--------------------------------------
-**There is no positive ``contested`` ground truth anywhere in alpha's
-corpus.** All six ``pseudo_contradiction`` records were adjudicated NOT
-contradictions, and no record is labelled as a genuine one. So this eval
-measures the judge's ``contested`` FALSE-POSITIVE rate and nothing else: there
-is no contested recall or precision to compute here, and reporting one would
-be a number with no measurement behind it. The report states this in its own
-text, under ``contested_ground_truth`` and in the markdown caveats, so the
-operator reading it at the 3169 gate is not misled into thinking the
-contradiction detector was validated in both directions.
-
 Structure
 ---------
-Mirrors the sibling script exactly: a pure synchronous core, unit-tested
-against an injected ``judge_fn``, with the live LLM edge constructed only
-inside the CLI. The whole test suite therefore runs with no
-``OPENAI_API_KEY``, no network and no Qdrant.
-
-Alpha's fixture loader, label vocabulary and ``package_relative`` are IMPORTED
-from ``calibrate_write_triage`` rather than re-implemented (INV-5) — the
-fixture format and the label words have one home.
+Imports point downward only: this CLI -> ``eval_write_triage_cases.py`` ->
+``eval_write_triage_scoring.py``, and this CLI ->
+``eval_write_triage_live_judge.py`` -> ``eval_write_triage_scoring.py``.
+Scoring says what counts as correct and how the report reads, cases builds
+what a run asks, the live judge is the only module that reaches an LLM, and
+this CLI runs, dumps, guards and writes. ``eval_write_triage_retrieval.py`` is
+loaded only for ``--slate-mode retrieved``. Alpha's fixture loader and
+``package_relative`` are IMPORTED from ``calibrate_write_triage`` rather than
+re-implemented (INV-5).
 
 Usage
 -----
@@ -69,29 +32,30 @@ Usage
   # redirected away from the committed artifact — see `guard_committed_report`.
   python scripts/eval_write_triage_judge.py --dry-run
 
-  # A cheap live smoke over the first few cases.
-  python scripts/eval_write_triage_judge.py --limit 5
+  # A cheap live smoke over a few cases, kept off the committed artifact.
+  python scripts/eval_write_triage_judge.py --limit 5 --report-path /tmp/smoke.json
 
-  # The full measured pass, written to calibration/.
-  python scripts/eval_write_triage_judge.py
+  # The committed arbiter (plans/write-triage-flip-readiness-prd.md C2'):
+  # production's retrieval, bands and attach targets, every case dumped as it
+  # completes.
+  python scripts/eval_write_triage_judge.py --slate-mode retrieved --project-id reify \\
+      --canonical-aliases tests/fixtures/write_triage_calibration.canonical_aliases.json \\
+      --report-path calibration/write_triage_judge_accuracy_report.json \\
+      --cases-path calibration/write_triage_judge_accuracy_report.cases.jsonl
 """
 from __future__ import annotations
 
-import importlib.util
+import contextlib
 import json
 import logging
+import sys
 import types
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from fused_memory.server.write_triage import (
-    OUTCOME_AMENDED,
-    OUTCOME_CONTESTED,
-    OUTCOME_RESTATED,
-    OUTCOME_STORED,
-    TRIAGE_OUTCOMES,
-)
+from fused_memory.server.write_triage import OUTCOME_STORED
+from fused_memory.utils.script_loader import load_script
 
 logger = logging.getLogger(__name__)
 
@@ -113,511 +77,261 @@ def _load_calibrate() -> types.ModuleType:
 
     ``scripts/`` is not an importable package, so the sibling is reached the
     same way its own test suite reaches it. Importing it rather than copying
-    its four label constants and its fixture loader is the point: a fixture
-    format change or a fifth label lands in ONE place, and this script either
-    follows it or fails loudly at ``build_judge_cases``.
+    its fixture loader is the point: a fixture format change lands in ONE
+    place, and this script follows it. Its four label constants reach the eval
+    through ``eval_write_triage_scoring.py``, which loads this same module, so
+    a fifth label fails loudly at
+    ``eval_write_triage_cases.py::build_judge_cases``.
     """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'calibrate_write_triage'
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, _CALIBRATE_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {_CALIBRATE_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    return load_script(_CALIBRATE_PATH, 'calibrate_write_triage')
 
 
 _calibrate = _load_calibrate()
 
-# Alpha's vocabulary and fixture handling, re-exported rather than re-spelled.
-LABEL_CANONICAL = _calibrate.LABEL_CANONICAL
-LABEL_DUPLICATE = _calibrate.LABEL_DUPLICATE
-LABEL_DISTINCT = _calibrate.LABEL_DISTINCT
-LABEL_PSEUDO_CONTRADICTION = _calibrate.LABEL_PSEUDO_CONTRADICTION
+
+# Pyright cannot follow the by-path loader, so it alone resolves `_scoring`,
+# `_cases` and `_live_judge` through the scripts/ extraPath; at runtime each is
+# the by-path load.
+if TYPE_CHECKING:
+    import eval_write_triage_cases as _cases
+    import eval_write_triage_live_judge as _live_judge
+    import eval_write_triage_scoring as _scoring
+else:
+    _scoring = load_script(
+        _PACKAGE_ROOT / 'scripts' / 'eval_write_triage_scoring.py', 'eval_write_triage_scoring',
+    )
+    _cases = load_script(
+        _PACKAGE_ROOT / 'scripts' / 'eval_write_triage_cases.py', 'eval_write_triage_cases',
+    )
+    _live_judge = load_script(
+        _PACKAGE_ROOT / 'scripts' / 'eval_write_triage_live_judge.py',
+        'eval_write_triage_live_judge',
+    )
+
+# PRD C2' and task 5807 call this at eval_write_triage_judge.py::score_attachments.
+score_attachments = _scoring.score_attachments
+
+
+_RETRIEVAL_PATH = _PACKAGE_ROOT / 'scripts' / 'eval_write_triage_retrieval.py'
+
+
+def load_retrieval() -> types.ModuleType:
+    """Load the live-store edge, the same by-path way the calibrator loads.
+
+    Deliberately NOT loaded at import: it pulls in the server's retrieval
+    stack, and the whole pure core below is testable without it.
+    """
+    return load_script(_RETRIEVAL_PATH, 'eval_write_triage_retrieval')
+
+
+_WORDING_PATH = _PACKAGE_ROOT / 'scripts' / 'write_triage_judge_wording.py'
+
+
+def load_wording() -> types.ModuleType:
+    """Load the judge-wording knob (PRD §11 D16), the same by-path way.
+
+    Loaded at import, unlike the retrieval edge: it pulls in only the judge
+    module, and the guard's default wording is one of its names.
+    """
+    return load_script(_WORDING_PATH, 'write_triage_judge_wording')
+
+
+_wording = load_wording()
+
+
+# Alpha's fixture handling, re-exported rather than re-spelled.
 load_fixture = _calibrate.load_fixture
+load_canonical_aliases = _calibrate.load_canonical_aliases
 package_relative = _calibrate.package_relative
-
-#: The control class, which is this script's own construct rather than one of
-#: alpha's labels — hence a separate constant, so nothing reads it back as a
-#: curator adjudication.
-CLASS_DISTRACTOR = 'distractor'
-
-#: Every class the report accounts for, in report order. Held as a tuple so
-#: ``per_class`` and ``confusion`` are built from ONE list: a class present in
-#: one and absent from the other is the shape that makes "not measured" and
-#: "measured perfect" indistinguishable.
-EVAL_CLASSES: tuple[str, ...] = (
-    LABEL_DUPLICATE,
-    LABEL_DISTINCT,
-    LABEL_PSEUDO_CONTRADICTION,
-    CLASS_DISTRACTOR,
-)
-
-#: Curator label -> the verdicts that count as correct for it. See the module
-#: docstring for the rationale behind each entry; every one traces to a human
-#: adjudication rather than to an opinion formed here.
-#:
-#: ``LABEL_CANONICAL`` is deliberately ABSENT rather than mapped to anything:
-#: a canonical IS the attach target, so submitting one would score the
-#: fixture's construction rather than the judge. :func:`build_judge_cases`
-#: skips those records, and a label in neither this table nor
-#: ``LABEL_CANONICAL`` RAISES.
-ACCEPTABLE_OUTCOMES: dict[str, frozenset[str]] = {
-    LABEL_DUPLICATE: frozenset({OUTCOME_RESTATED, OUTCOME_AMENDED}),
-    LABEL_DISTINCT: frozenset({OUTCOME_STORED}),
-    LABEL_PSEUDO_CONTRADICTION: frozenset(TRIAGE_OUTCOMES) - {OUTCOME_CONTESTED},
-}
-
-#: The control's expectation. Not in the table above because it is not a label.
-_DISTRACTOR_ACCEPTABLE = frozenset({OUTCOME_STORED})
-
-
-class UnknownLabelError(ValueError):
-    """A fixture record carries a label this eval has no expectation for.
-
-    Raised rather than bucketed. A silently-bucketed fifth label would be
-    scored against an expectation nobody ever set, producing an accuracy
-    figure that looks measured and is not.
-    """
-
-
-# ---------------------------------------------------------------------------
-# Case construction
-# ---------------------------------------------------------------------------
-
-def _acceptable_for(label: str) -> frozenset[str]:
-    try:
-        return ACCEPTABLE_OUTCOMES[label]
-    except KeyError:
-        raise UnknownLabelError(
-            f'no acceptable-outcome expectation for label {label!r}; '
-            f'known labels are '
-            f'{sorted([*ACCEPTABLE_OUTCOMES, LABEL_CANONICAL])}. Add an entry '
-            f'to ACCEPTABLE_OUTCOMES rather than bucketing it.',
-        ) from None
-
-
-def _distractor_pool(records: Sequence[Mapping[str, Any]], cluster_id: Any) -> list[str]:
-    """Every record outside *cluster_id*, ordered by memory_id.
-
-    Sorted rather than shuffled: this script's output is a COMMITTED artifact,
-    and a seeded shuffle would make it reproducible only by someone who also
-    knew the seed, an unseeded one by nobody at all.
-    """
-    return sorted(
-        str(r['memory_id']) for r in records if r['cluster_id'] != cluster_id
-    )
-
-
-def _rotated(pool: list[str], offset: int, count: int) -> list[str]:
-    """*count* entries from *pool*, starting at *offset*, wrapping around.
-
-    The rotation is what stops all N cases being shown the same slate. Taking
-    a plain ``pool[:count]`` would be equally deterministic and would measure
-    one arbitrary handful of clusters over and over instead of the corpus.
-    """
-    if count <= 0:
-        return []
-    if not pool or len(pool) < count:
-        # LOUD rather than silent: a short pool narrows every slate, and the
-        # report's own width provenance is measured downstream rather than
-        # asserted, so the two together are what stop a 1-wide smoke run being
-        # read as the 5-wide measurement the operator is deciding on.
-        logger.warning(
-            'distractor pool holds %d record(s), %d requested — slate narrowed. '
-            'Cross-cluster distractors come only from OTHER clusters, so a '
-            'single-cluster run (typically --limit slicing one cluster) leaves '
-            'nothing to draw from.',
-            len(pool), count,
-        )
-    take = min(count, len(pool))
-    if take <= 0:
-        return []
-    start = offset % len(pool)
-    return [pool[(start + i) % len(pool)] for i in range(take)]
-
-
-def build_judge_cases(
-    records: Sequence[Mapping[str, Any]],
-    *,
-    distractors: int,
-) -> list[dict[str, Any]]:
-    """One judge call per case, with the ground truth its label implies.
-
-    Two kinds of case come out of here.
-
-    LABELLED — one per NON-canonical record. Its slate is the record's own
-    cluster canonical plus *distractors* cross-cluster records, so the attach
-    target is always present: a judge shown a slate without it is answering
-    about a different memory than the one an attach would touch. Canonical
-    records produce no labelled case, because they ARE the target.
-
-    CONTROL (``CLASS_DISTRACTOR``) — one per CLUSTER, capped there on cost,
-    since every case is a paid LLM call and one control per cluster already
-    answers the question the control asks. Its slate is ``distractors + 1``
-    records drawn only from OTHER clusters, so it is exactly as wide as a
-    labelled slate and nothing on it is a correct attach.
-
-    Ordering is deterministic and independent of the input order: records are
-    sorted by ``memory_id`` before anything is drawn, so the committed report
-    is reproducible from the fixture alone.
-
-    An unrecognised label raises :class:`UnknownLabelError`.
-    """
-    ordered = sorted(records, key=lambda r: str(r['memory_id']))
-    cases: list[dict[str, Any]] = []
-
-    for index, record in enumerate(ordered):
-        label = str(record['label'])
-        if label == LABEL_CANONICAL:
-            continue
-        acceptable = _acceptable_for(label)
-        canonical_id = str(record['cluster_id'])
-        pool = _distractor_pool(ordered, record['cluster_id'])
-        slate = [canonical_id, *_rotated(pool, index, distractors)]
-        cases.append({
-            'memory_id': str(record['memory_id']),
-            'content': record['content'],
-            'category': record.get('category'),
-            'candidates': slate,
-            'expected_class': label,
-            'acceptable_outcomes': acceptable,
-        })
-
-    # The control set, appended after the labelled ones so a `--limit` smoke
-    # run covers the classes the labels actually measure first.
-    seen_clusters: set[Any] = set()
-    for index, record in enumerate(ordered):
-        if str(record['label']) == LABEL_CANONICAL:
-            continue
-        if record['cluster_id'] in seen_clusters:
-            continue
-        seen_clusters.add(record['cluster_id'])
-        pool = _distractor_pool(ordered, record['cluster_id'])
-        slate = _rotated(pool, index, distractors + 1)
-        cases.append({
-            'memory_id': str(record['memory_id']),
-            'content': record['content'],
-            'category': record.get('category'),
-            'candidates': slate,
-            'expected_class': CLASS_DISTRACTOR,
-            'acceptable_outcomes': _DISTRACTOR_ACCEPTABLE,
-        })
-
-    return cases
-
-
-# ---------------------------------------------------------------------------
-# Scoring
-# ---------------------------------------------------------------------------
-
-def score_cases(
-    cases: Sequence[Mapping[str, Any]],
-    verdicts: Sequence[str],
-) -> dict[str, Any]:
-    """Count *verdicts* against the expectations *cases* carry. Pure counting.
-
-    Every judgment call was already made in :data:`ACCEPTABLE_OUTCOMES`;
-    nothing here decides what "correct" means.
-
-    *verdicts* is positional — ``verdicts[i]`` answers ``cases[i]``. A length
-    mismatch RAISES rather than zipping to the shorter list, which would drop
-    cases out of the denominator and report an accuracy over a population
-    nobody chose.
-
-    Returned shape, all of it JSON-serializable (it is written to disk
-    verbatim):
-
-    - ``per_class`` — ``{n, correct, accuracy}`` for all four classes,
-      ALWAYS present even at ``n == 0``. ``accuracy`` is ``None`` for an empty
-      class, never ``0.0``: zero reads as "measured, and the judge failed
-      everything", which is the opposite of "not measured".
-    - ``confusion`` — the full 4xN map of expected class to observed outcome.
-      A per-class accuracy cannot tell "every duplicate answered ``stored``"
-      (a wiring bug) from "duplicates split across the two attaches" (a
-      working judge); the shape of this map can.
-    - ``duplicate_outcome_split`` — the restated/amended split within the
-      duplicate class, reported and deliberately NOT charged as error.
-    - ``false_contested`` — every ``contested`` verdict, all of which are
-      false positives here because the corpus carries no positive contested
-      ground truth. Zero is a finding, not an absence, so it is ``0`` rather
-      than ``None``.
-    """
-    if len(cases) != len(verdicts):
-        raise ValueError(
-            f'{len(cases)} case(s) but {len(verdicts)} verdict(s): a positional '
-            f'mismatch would silently drop cases from the denominator',
-        )
-
-    per_class = {name: {'n': 0, 'correct': 0} for name in EVAL_CLASSES}
-    confusion = {
-        name: dict.fromkeys(TRIAGE_OUTCOMES, 0) for name in EVAL_CLASSES
-    }
-    duplicate_split = {OUTCOME_RESTATED: 0, OUTCOME_AMENDED: 0}
-    false_contested = 0
-
-    for case, verdict in zip(cases, verdicts, strict=True):
-        name = str(case['expected_class'])
-        bucket = per_class.setdefault(name, {'n': 0, 'correct': 0})
-        bucket['n'] += 1
-        if verdict in case['acceptable_outcomes']:
-            bucket['correct'] += 1
-        row = confusion.setdefault(name, dict.fromkeys(TRIAGE_OUTCOMES, 0))
-        row[verdict] = row.get(verdict, 0) + 1
-        if name == LABEL_DUPLICATE and verdict in duplicate_split:
-            duplicate_split[verdict] += 1
-        if verdict == OUTCOME_CONTESTED:
-            false_contested += 1
-
-    return {
-        'per_class': {
-            name: {
-                'n': entry['n'],
-                'correct': entry['correct'],
-                'accuracy': (
-                    None if entry['n'] == 0
-                    else round(entry['correct'] / entry['n'], 4)
-                ),
-            }
-            for name, entry in per_class.items()
-        },
-        'confusion': confusion,
-        'duplicate_outcome_split': {
-            'restated': duplicate_split[OUTCOME_RESTATED],
-            'amended': duplicate_split[OUTCOME_AMENDED],
-        },
-        'false_contested': false_contested,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Report assembly
-# ---------------------------------------------------------------------------
-
-#: Why no contested accuracy appears in the report, in alpha's
-#: ``'<code>: <measured detail>'`` reason format so a consumer can branch on
-#: the code without parsing prose.
-CONTESTED_GROUND_TRUTH_REASON = (
-    'no_positive_contested_labels: the fixture carries 6 pseudo_contradiction '
-    'records, every one curator-adjudicated NOT a contradiction, and 0 records '
-    'labelled as a genuine contradiction. Contested recall and precision are '
-    'therefore unmeasurable against this corpus; only the false-positive count '
-    'below is a measurement.'
-)
-
-#: Prose the operator at the task-3169 flip gate has to read BEFORE acting on
-#: any number above it. Held as data rather than inlined into the renderer so
-#: the JSON and the markdown cannot drift apart.
-CAVEATS: tuple[str, ...] = (
-    'No accuracy floor is asserted anywhere in this script or its tests (PRD '
-    'D10). This artifact is evidence for a human decision, not a gate.',
-    'false_contested counts EVERY contested verdict, and every one of them is '
-    'a false positive — see contested_ground_truth. A judge structurally '
-    'incapable of ever answering `contested` would score identically to a '
-    'perfect one here, so a low number is not evidence that the contradiction '
-    'detector works.',
-    'The duplicate class accepts BOTH `restated` and `amended`, because the '
-    "curator's labels do not separate a verbatim restatement from a "
-    'rediscovery carrying a novel fragment. The split between them is '
-    'reported as a distribution and is not scored as error.',
-    'The distractor class is a control this script constructs, not a curator '
-    'label: one case per cluster whose slate carries no correct attach target '
-    'at all. It is what distinguishes a judge that classifies from a judge '
-    'that attaches to whatever it is shown.',
-)
-
-
-def build_report(
-    *,
-    scored: Mapping[str, Any],
-    provenance: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Assemble the JSON-serializable accuracy report.
-
-    Carries ``scored`` verbatim and adds the two things a bare score table
-    cannot say for itself: what the fixture is incapable of measuring
-    (``contested_ground_truth``) and how to read the numbers that are there
-    (``caveats``).
-
-    The provenance keys are ``setdefault``-ed rather than required, the same
-    treatment ``run_calibration`` gives its own: a caller assembling a report
-    from already-scored cases still produces an artifact whose provenance
-    block has every key, with ``None`` where nothing was measured. An ABSENT
-    key cannot be told apart from an artifact predating the field.
-    """
-    per_class = dict(scored['per_class'])
-    run_provenance = dict(provenance)
-    run_provenance.setdefault(
-        'case_count', sum(entry['n'] for entry in per_class.values()),
-    )
-    for key in ('record_count', 'candidate_count', 'distractor_count'):
-        run_provenance.setdefault(key, None)
-
-    return {
-        'per_class': per_class,
-        'confusion': dict(scored['confusion']),
-        'duplicate_outcome_split': dict(scored['duplicate_outcome_split']),
-        'false_contested': scored['false_contested'],
-        'contested_ground_truth': {
-            'available': False,
-            'reason': CONTESTED_GROUND_TRUTH_REASON,
-        },
-        'caveats': list(CAVEATS),
-        'provenance': run_provenance,
-    }
-
-
-def render_markdown(report: Mapping[str, Any]) -> str:
-    """Human-readable sibling. The operator reads THIS, not the JSON."""
-    lines = [
-        '# Write-triage judge accuracy report',
-        '',
-        '## Per-class accuracy',
-        '',
-        '| class | n | correct | accuracy |',
-        '|---|---|---|---|',
-    ]
-    for name in EVAL_CLASSES:
-        entry = report['per_class'][name]
-        lines.append(
-            f'| {name} | {entry["n"]} | {entry["correct"]} | {entry["accuracy"]} |',
-        )
-
-    outcomes = list(TRIAGE_OUTCOMES)
-    lines += [
-        '', '## Confusion — expected class by observed verdict', '',
-        '| class | ' + ' | '.join(outcomes) + ' |',
-        '|---' * (len(outcomes) + 1) + '|',
-    ]
-    for name in EVAL_CLASSES:
-        row = report['confusion'][name]
-        lines.append(
-            f'| {name} | ' + ' | '.join(str(row.get(o, 0)) for o in outcomes) + ' |',
-        )
-
-    split = report['duplicate_outcome_split']
-    lines += [
-        '', '## Duplicate attach split (a distribution, not an error term)', '',
-        f'- `restated`: {split["restated"]}',
-        f'- `amended`: {split["amended"]}',
-        '',
-        '## Contested',
-        '',
-        f'- contested verdicts observed: **{report["false_contested"]}**, all of '
-        f'which are FALSE POSITIVES.',
-        f'- ground truth available: `{report["contested_ground_truth"]["available"]}`',
-        f'- `{report["contested_ground_truth"]["reason"]}`',
-        '',
-        '## Caveats',
-        '',
-    ]
-    lines += [f'- {caveat}' for caveat in report['caveats']]
-    lines += ['', '## Provenance', '']
-    for key, value in report['provenance'].items():
-        lines.append(f'- `{key}`: `{value}`')
-    return '\n'.join(lines) + '\n'
 
 
 # ---------------------------------------------------------------------------
 # The runner
 # ---------------------------------------------------------------------------
 
+def markdown_sibling(report_path: str | Path) -> Path:
+    """Where the markdown for *report_path* goes, or ``ValueError`` if nowhere.
+
+    COMPOSED from the stem, not derived by replacing the last suffix.
+    ``with_suffix('.md')`` maps ``foo.md`` back to ``foo.md``, so the markdown
+    overwrote the JSON that had just been written — every number the run paid
+    for, gone, with no error, on a script whose output is a committed
+    artifact.
+
+    A FUNCTION OF THE ARGUMENT ALONE, which is why it is one: nothing about
+    the collision depends on what the run measures, so it is knowable before
+    any work is done. It used to be evaluated at the bottom of
+    :func:`run_judge_eval`, after ``eval_write_triage_cases.py::build_judge_cases``,
+    after the whole per-case ``judge_fn`` loop and after
+    ``eval_write_triage_scoring.py::score_cases`` — which protected
+    the two FILES and nothing else. On a live run ``--report-path foo.md``
+    spent every LLM call for the corpus and then raised with no artifact
+    written at all, so the operator paid for the run and got nothing.
+    Callers evaluate it up front instead: :func:`run_judge_eval` at its first
+    statement, and :func:`_run` before it so much as reads the fixture.
+
+    ``guard_committed_report`` does not cover this: that guard addresses
+    dry-run/``--limit`` publishing and returns early for any non-committed
+    path, so ``--report-path foo.md`` sailed straight through it.
+    """
+    report_path = Path(report_path)
+    sibling = report_path.parent / (report_path.stem + '.md')
+    if sibling == report_path:
+        raise ValueError(
+            f'report_path {str(report_path)!r} composes the same path as its '
+            f'markdown sibling {str(sibling)!r}, so the markdown would '
+            f'overwrite the JSON report — pass a report_path whose stem+".md" '
+            f'differs from it (e.g. a .json suffix)',
+        )
+    return sibling
+
+
+def _as_answer(value: Any) -> _scoring.JudgeAnswer:
+    """Accept a bare verdict from a ``judge_fn`` that has nothing else to say."""
+    if isinstance(value, _scoring.JudgeAnswer):
+        return value
+    return _scoring.JudgeAnswer(outcome=str(value), verdict=str(value))
+
+
+@contextlib.contextmanager
+def _case_sink(cases_path: str | Path | None) -> Iterator[Any]:
+    """A callable that appends one JSON line per case, flushed as it goes.
+
+    Flushed per line and not per run: a provider 429 partway through is
+    exactly when the rows already paid for matter most. ``None`` yields a
+    sink that discards, so the caller has no branch.
+    """
+    if cases_path is None:
+        yield lambda row: None
+        return
+    path = Path(cases_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('w') as handle:
+        def emit(row: Mapping[str, Any]) -> None:
+            handle.write(json.dumps(row) + '\n')
+            handle.flush()
+
+        yield emit
+    logger.info('Wrote %s', path)
+
+
 def run_judge_eval(
     *,
-    records: Sequence[Mapping[str, Any]],
+    plan: _cases.EvalPlan,
     judge_fn: Any,
     report_path: str | Path,
     provenance: Mapping[str, Any],
-    distractors: int,
+    cases_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Build cases, ask *judge_fn* once each, score, write both artifacts.
+    """Ask *judge_fn* once per case of *plan*, score, dump, write both artifacts.
 
     ``judge_fn(case, candidates)`` receives the case and its slate RESOLVED to
     records — a judge handed bare ids has no text to compare and is answering
-    noise, which is the same defect the production seam's own tests pin.
+    noise, which is the same defect the production seam's own tests pin. It
+    returns a verdict word, or an ``eval_write_triage_scoring.py::JudgeAnswer``
+    when it has more to report: whether an LLM was called at all, what was
+    elided, what was spent.
+
+    Every case is dumped to *cases_path* AS IT COMPLETES, before the next one
+    is asked. A provider failure mid-run therefore costs the remaining cases,
+    not the ones already bought.
 
     Nothing is caught. A judge error propagates exactly as ``run_calibration``
     lets an ``embed_fn`` error propagate: swallowing it would be
     indistinguishable from a genuine misclassification, so it would both
     shrink the measured population and depress the accuracy reported over it.
 
-    A dangling candidate id raises ``KeyError`` for the same reason — a
-    silently-skipped candidate narrows a slate the report claims was 5 wide.
+    A dangling candidate id already raised when *plan* was built: a
+    silently-skipped candidate would narrow a slate the report claims was 5 wide.
+
+    THE MARKDOWN SIBLING NEVER OVERWRITES THE REPORT. :func:`markdown_sibling`
+    composes it and RAISES on a *report_path* that composes back to itself —
+    resolved as this function's FIRST statement, before a single case is
+    built or a single verdict is bought, so the mistake costs nothing rather
+    than merely leaving the two files intact after a paid run.
     """
-    cases = build_judge_cases(records, distractors=distractors)
-    by_id = {str(r['memory_id']): r for r in records}
-    logger.info('Built %d case(s) from %d record(s)', len(cases), len(records))
-
-    verdicts: list[str] = []
-    for index, case in enumerate(cases, 1):
-        candidates = [by_id[cid] for cid in case['candidates']]
-        verdicts.append(judge_fn(case, candidates))
-        if index % 10 == 0:
-            logger.info('Judged %d/%d case(s)', index, len(cases))
-
-    scored = score_cases(cases, verdicts)
-
-    # MEASURED, not asserted. `_rotated` truncates when the pool is short, so
-    # `distractors + 1` is what was REQUESTED and can silently exceed what the
-    # slates actually carried — the failure this function's own docstring says
-    # the KeyError exists to prevent, arriving by the other door. A run whose
-    # slates all came out 1 wide must not publish `candidate_count: 5`.
-    widths = [len(case['candidates']) for case in cases]
-    run_provenance = dict(provenance)
-    run_provenance.setdefault('record_count', len(records))
-    run_provenance.setdefault('case_count', len(cases))
-    run_provenance.setdefault('candidate_count', max(widths) if widths else 0)
-    run_provenance.setdefault('candidate_count_min', min(widths) if widths else 0)
-    run_provenance.setdefault('distractor_count_requested', distractors)
-    run_provenance.setdefault(
-        'distractor_count', (max(widths) - 1) if widths else 0,
-    )
-    if widths and min(widths) != distractors + 1:
-        logger.warning(
-            'slate widths ran %d..%d against a requested %d — the report '
-            'records what was measured, not what was asked for',
-            min(widths), max(widths), distractors + 1,
-        )
-    report = build_report(scored=scored, provenance=run_provenance)
-
     report_path = Path(report_path)
+    markdown_path = markdown_sibling(report_path)
+
+    cases = list(plan.cases)
+    logger.info(
+        'Judging %d case(s) from %d record(s)', len(cases), plan.record_count,
+    )
+
+    rows: list[dict[str, Any]] = []
+    with _case_sink(cases_path) as emit:
+        paired = zip(cases, plan.candidate_records, strict=True)
+        for index, (case, records) in enumerate(paired, 1):
+            answer = _as_answer(judge_fn(case, list(records)))
+            row = _scoring.case_row(index, case, answer, records, plan.fixture_by_id)
+            emit(row)
+            rows.append(row)
+            if index % 10 == 0:
+                logger.info('Judged %d/%d case(s)', index, len(cases))
+
+    scored = _scoring.score_cases(cases, [row['outcome'] for row in rows])
+
+    run_provenance = {**dict(plan.provenance), **dict(provenance)}
+    run_provenance.setdefault('record_count', plan.record_count)
+    run_provenance.setdefault('case_count', len(cases))
+    _record_slate_widths(run_provenance, cases)
+    report = _scoring.build_report(
+        scored=scored,
+        provenance=run_provenance,
+        production_shape=score_attachments(rows),
+    )
+
+    # `markdown_path` was composed (and its collision with `report_path`
+    # rejected) at the top of this function — reused here rather than
+    # recomposed, so the path that was validated is the path that is written.
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2) + '\n')
-    report_path.with_suffix('.md').write_text(render_markdown(report))
-    logger.info('Wrote %s and its .md sibling', report_path)
+    markdown_path.write_text(_scoring.render_markdown(report))
+    logger.info('Wrote %s and %s', report_path, markdown_path)
 
     return report
 
 
-# ---------------------------------------------------------------------------
-# Live edge / CLI
-# ---------------------------------------------------------------------------
+def _record_slate_widths(
+    run_provenance: dict[str, Any], cases: Sequence[Mapping[str, Any]],
+) -> None:
+    """Publish the width the run MEASURED, and warn when it is not the ask.
 
-#: Synthetic per-store cosines stamped on the eval's candidates. The eval
-#: SUPPLIES its slate rather than retrieving it, but ``select_judge_candidates``
-#: orders by ``metadata['store_score']`` and DROPS anything with no numeric
-#: one, so a slate carrying no scores would arrive at the model empty.
-#:
-#: Descending by slate position, which preserves the order
-#: ``build_judge_cases`` chose — the attach target first. These numbers never
-#: reach the model: ``build_judge_prompt`` renders id and text only, no
-#: metadata at all (PRD C1). They exist solely to survive the selector.
-_SYNTHETIC_TOP_SCORE = 0.90
-_SYNTHETIC_SCORE_STEP = 0.01
+    `eval_write_triage_cases.py::_rotated` truncates when the pool is short, so
+    `distractors + 1` is what was REQUESTED and can silently exceed what the
+    slates actually carried. A run whose slates all came out 1 wide must not
+    publish `candidate_count: 5`.
+    """
+    widths = [len(case['candidates']) for case in cases]
+    run_provenance.setdefault('candidate_count', max(widths) if widths else 0)
+    run_provenance.setdefault('candidate_count_min', min(widths) if widths else 0)
+    run_provenance.setdefault(
+        'distractor_count', (max(widths) - 1) if widths else 0,
+    )
+    requested = run_provenance.get('distractor_count_requested')
+    if widths and isinstance(requested, int) and min(widths) != requested + 1:
+        logger.warning(
+            'slate widths ran %d..%d against a requested %d — the report '
+            'records what was measured, not what was asked for',
+            min(widths), max(widths), requested + 1,
+        )
+    # The OTHER direction, and a different mechanism: `judge_write` re-trims
+    # the slate to `judge_candidate_count` before the prompt is built, so a
+    # slate built wider than that cap is measured narrower than it is
+    # published.
+    cap = run_provenance.get('judge_candidate_count')
+    if widths and isinstance(cap, int) and max(widths) > cap:
+        logger.warning(
+            'slate widths ran %d..%d but judge_candidate_count caps the '
+            'prompt at %d — the report records what the model was measured '
+            'on, not the wider slate that was built',
+            min(widths), max(widths), cap,
+        )
 
-#: Passed to ``judge_write`` to satisfy its signature. It reaches no prompt —
-#: C1 forbids repo or task context from reaching the judge, and
-#: ``build_judge_prompt`` interpolates no metadata whatsoever.
-_EVAL_PROJECT_ID = 'dark_factory'
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 #: The answer a ``--dry-run`` gives every case. Chosen as `stored` because it
 #: is the fail-open verdict: a dry run should look like the judge declining to
@@ -647,14 +361,17 @@ def _is_committed_report(report_path: str) -> bool:
 
 
 def guard_committed_report(
-    report_path: str, *, dry_run: bool, limit: int | None,
+    report_path: str, *, dry_run: bool, limit: int | None, slate_mode: str,
+    wording: str = _wording.WORDING_SHIPPED,
 ) -> str:
     """Keep a non-measurement run from publishing itself as the measurement.
 
     The committed report is what ``write_triage.judge_accuracy_report_path``
     points at and, per D10, what the operator reads at the task-3169 flip
-    gate. Two kinds of run can reach it without having measured what it
-    claims, and they are NOT the same hazard, so they get different answers:
+    gate. It is the RETRIEVED-slate arbiter (flip-readiness PRD C2'), so a
+    measurement in any other slate mode aimed at it is refused outright. Two
+    more kinds of run can reach it without having measured what it claims,
+    and they are NOT the same hazard, so they get different answers:
 
     - ``--dry-run`` measures NOTHING. Every number in its report comes from a
       fixed-answer stub, so publishing it would put fabricated figures under
@@ -663,6 +380,8 @@ def guard_committed_report(
       a temp path — the documented "prove the pipeline" invocation keeps
       working and still prints its report, it just cannot overwrite the
       committed one.
+    - a non-shipped ``--wording`` measures a prompt production does not
+      send, so it is refused outright beside the slate-mode refusal.
     - ``--limit N`` measures REALLY, just partially. Its numbers are the
       judge's own, and ``provenance.limit`` records the truncation in the
       artifact itself, so an operator (and
@@ -687,6 +406,18 @@ def guard_committed_report(
         )
         return redirected
 
+    if slate_mode != _scoring.SLATE_RETRIEVED:
+        raise ValueError(
+            f"the committed artifact is the retrieved-slate arbiter (PRD C2'); pass "
+            f'--report-path for a {slate_mode} run',
+        )
+
+    if wording != _wording.WORDING_SHIPPED:
+        raise ValueError(
+            f'the committed artifact measures the shipped wording; pass '
+            f'--report-path for a {wording} run',
+        )
+
     if limit is not None:
         logger.warning(
             'a --limit run is about to OVERWRITE the committed report at '
@@ -699,63 +430,30 @@ def guard_committed_report(
     return report_path
 
 
-def build_judge_fn(config: Any) -> Any:
-    """The LIVE edge: drive the SHIPPED judge, not a re-implementation.
+def apply_field_chars(config: Any, requested: int | None) -> int:
+    """Set this run's ``write_triage.judge_field_chars``; return the width to record.
 
-    ``server/write_triage_judge.judge_write`` is called with a duck-typed
-    service exposing only ``config`` — which is all it reads — so this eval
-    measures the production prompt, the production provider fan-out and the
-    production parser. Re-implementing any of the three here would measure
-    this script instead of the thing the operator is deciding about.
+    Written on the run's own in-memory config, exactly as
+    ``--judge-candidate-count`` is: config.yaml is never written and nothing
+    module-global changes, and the shipped judge reads the leaf live per call.
 
-    The band decision is SYNTHESIZED rather than retrieved: the eval supplies
-    its slate directly, so there is no retrieval to derive a winner from. It
-    names the cluster canonical, which is exactly what a correct retrieval
-    would have found, and marks the middle band — the only band that reaches a
-    judge at all.
+    ``0`` means NO elision. The leaf is a positive cap, so it is spelled there
+    as ``sys.maxsize``, while the returned provenance keeps ``0``. ``None``
+    writes nothing and returns the width the config already resolves to.
 
-    ``asyncio.run`` per case, which is why ``_run`` below is synchronous:
-    ``judge_write`` is the only awaitable in the whole pipeline and it needs
-    no initialized ``MemoryService``, so an async ``_run`` would buy nothing
-    and would force a nested-loop bridge around every single call.
+    A negative width is refused: the resolver would silently read the default
+    instead, so the provenance would record a width the judge never used.
     """
-    import asyncio  # noqa: PLC0415
+    from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        resolve_judge_field_chars,
+    )
 
-    from fused_memory.models.enums import SourceStore  # noqa: PLC0415
-    from fused_memory.models.memory import MemoryResult  # noqa: PLC0415
-    from fused_memory.server.write_triage import OUTCOME_JUDGE, BandDecision  # noqa: PLC0415
-    from fused_memory.server.write_triage_judge import judge_write  # noqa: PLC0415
-
-    service = types.SimpleNamespace(config=config)
-
-    def judge_fn(case: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]) -> str:
-        slate = [
-            MemoryResult(
-                id=str(record['memory_id']),
-                content=str(record['content']),
-                source_store=SourceStore.mem0,
-                metadata={
-                    'store_score': _SYNTHETIC_TOP_SCORE - index * _SYNTHETIC_SCORE_STEP,
-                },
-            )
-            for index, record in enumerate(candidates)
-        ]
-        decision = BandDecision(
-            outcome=OUTCOME_JUDGE,
-            canonical_id=slate[0].id if slate else None,
-            similarity=_SYNTHETIC_TOP_SCORE,
-            t_high=None,
-            t_low=None,
-        )
-        return asyncio.run(judge_write(
-            memory_service=service,
-            content=str(case['content']),
-            project_id=_EVAL_PROJECT_ID,
-            decision=decision,
-            candidates=slate,
-        ))
-
-    return judge_fn
+    if requested is None:
+        return resolve_judge_field_chars(types.SimpleNamespace(config=config))
+    if requested < 0:
+        raise ValueError(f'--field-chars must be 0 (no elision) or positive, got {requested}')
+    config.write_triage.judge_field_chars = sys.maxsize if requested == 0 else requested
+    return requested
 
 
 def _dry_run_judge_fn() -> Any:
@@ -766,11 +464,118 @@ def _dry_run_judge_fn() -> Any:
     return judge_fn
 
 
+def _limited(
+    records: Sequence[Mapping[str, Any]], limit: int,
+) -> list[Mapping[str, Any]]:
+    """*limit* labelled records drawn ROUND-ROBIN across clusters, plus canonicals.
+
+    Truncating RECORDS rather than cases, because a bare head-N slice can cut a
+    cluster's canonical while keeping its members, whose slates then cannot resolve.
+
+    Round-robin and not a head slice: the fixture is grouped by cluster in file
+    order, so `records[:5]` is five records of ONE cluster,
+    `eval_write_triage_cases.py::_distractor_pool` draws only from OTHER
+    clusters and comes back empty, every slate collapses to width 1, and the
+    lone control case gets `candidates == []` — which
+    `judge_write` short-circuits to `stored` with no provider call at all.
+
+    Only NON-canonical records are drawn, since a canonical produces no
+    labelled case; the ones each drawn record's slate needs come along anyway.
+    """
+    by_cluster: dict[str, list[Mapping[str, Any]]] = {}
+    for record in records:
+        if str(record['label']) == _scoring.LABEL_CANONICAL:
+            continue
+        by_cluster.setdefault(str(record['cluster_id']), []).append(record)
+    kept: list[Mapping[str, Any]] = []
+    for depth in range(max((len(v) for v in by_cluster.values()), default=0)):
+        if len(kept) >= limit:
+            break
+        for group in by_cluster.values():
+            if depth < len(group):
+                kept.append(group[depth])
+                if len(kept) >= limit:
+                    break
+
+    kept_ids = {id(r) for r in kept}
+    wanted = {str(r['cluster_id']) for r in kept}
+    canonicals = [
+        r for r in records
+        if str(r['memory_id']) in wanted and id(r) not in kept_ids
+    ]
+    logger.info(
+        '--limit %d: measuring %d record(s) across %d cluster(s) '
+        '(%d canonical(s) pulled in to keep every slate resolvable)',
+        limit, len(kept) + len(canonicals), len(wanted), len(canonicals),
+    )
+    return [*kept, *canonicals]
+
+
+def _retrieved_plan(
+    args: Any,
+    config: Any,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    fixture: Sequence[Mapping[str, Any]],
+    judge_candidate_count: int,
+    aliases: Mapping[str, str],
+) -> _cases.EvalPlan:
+    """Retrieve, band and trim every labelled record exactly as production would.
+
+    The retrieval width and both band edges come from the SAME config the
+    shipped ``triage_write`` reads, so a re-calibration moves this eval with it.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from fused_memory.server.write_triage import (  # noqa: PLC0415
+        resolve_bands,
+        resolve_candidate_k,
+    )
+    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+    retrieval = load_retrieval()
+    service = types.SimpleNamespace(config=config)
+    k = resolve_candidate_k(service)
+    t_high, t_low = resolve_bands(service)
+    labelled = [r for r in records if str(r['label']) != _scoring.LABEL_CANONICAL]
+    logger.info(
+        'Retrieving %d slate(s) from project_id=%s at k=%d, bands t_high=%s '
+        't_low=%s', len(labelled), args.project_id, k, t_high, t_low,
+    )
+
+    async def prefetch() -> dict[str, dict[str, Any]]:
+        memory = MemoryService(config)
+        await memory.initialize()
+        try:
+            return await retrieval.prefetch_retrievals(
+                memory, labelled, project_id=args.project_id, k=k,
+            )
+        finally:
+            await memory.close()
+
+    slates = retrieval.retrieved_slates(
+        labelled, asyncio.run(prefetch()),
+        t_high=t_high, t_low=t_low,
+        judge_candidate_count=judge_candidate_count,
+    )
+    return _cases.plan_from_slates(records, slates, provenance={
+        'project_id': args.project_id,
+        't_high': t_high,
+        't_low': t_low,
+        'candidate_k': k,
+        'canonical_absent': sum(1 for s in slates if not s.canonical_present),
+        'degraded_retrievals': sum(1 for s in slates if s.degraded),
+        'self_retrieved': sum(1 for s in slates if s.self_retrieved),
+    }, aliases=aliases, fixture=fixture)
+
+
 def _run(args: Any) -> int:
     import os  # noqa: PLC0415
 
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
     from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        resolve_judge_candidate_count,
+        resolve_judge_enabled,
         resolve_judge_model,
         resolve_judge_provider,
     )
@@ -779,74 +584,57 @@ def _run(args: Any) -> int:
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
+    # FIRST, ahead of the fixture load and the config: `--report-path foo.md`
+    # is a bad ARGUMENT, and whether it collides with its markdown sibling is
+    # decided by the string alone. `run_judge_eval` re-resolves this on the
+    # path it is finally handed (which `guard_committed_report` may have
+    # redirected); rejecting here just means the operator is told now instead
+    # of after a corpus-wide run they paid for.
+    markdown_sibling(args.report_path)
+
     # BEFORE any work, and outside the --limit block: a bare --dry-run also
     # defaults to the committed path, and used to rewrite both committed
     # artifacts with fixed-answer numbers.
     report_path = guard_committed_report(
         args.report_path, dry_run=args.dry_run, limit=args.limit,
+        slate_mode=args.slate_mode, wording=args.wording,
     )
+    aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else {}
 
     config = FusedMemoryConfig()
+    # Mutated on the in-memory config only — config.yaml is never touched. The
+    # shipped resolvers read live per call, so this is the one place the cap
+    # has to move for both the slate this script builds and the re-trim
+    # `judge_write` applies to it.
+    if args.judge_candidate_count is not None:
+        config.write_triage.judge_candidate_count = args.judge_candidate_count
+    field_chars = apply_field_chars(config, args.field_chars)
     service = types.SimpleNamespace(config=config)
     provider = resolve_judge_provider(service)
     model = resolve_judge_model(service)
+    # Resolved from the SAME config the shipped judge reads, and recorded even
+    # on a --dry-run: the two facts the numbers cannot be read without.
+    # `judge_candidate_count` is the width `judge_write` trims the slate to,
+    # so it — not the width this script builds — is what the model saw.
+    # `judge_enabled` false makes `judge_write` return `stored` on its first
+    # line for every case, which scores the `distractor` control 1.0 and
+    # `duplicate` 0.0 while spending nothing and writing a report that is
+    # otherwise indistinguishable from a measurement.
+    judge_candidate_count = resolve_judge_candidate_count(service)
+    judge_enabled = resolve_judge_enabled(service)
 
-    records = load_fixture(args.fixture)
-    logger.info('Loaded %d labeled record(s) from %s', len(records), args.fixture)
+    fixture = load_fixture(args.fixture)
+    logger.info('Loaded %d labeled record(s) from %s', len(fixture), args.fixture)
+    records = fixture if args.limit is None else _limited(fixture, args.limit)
 
-    if args.limit is not None:
-        # Truncating RECORDS rather than cases, plus whatever canonicals those
-        # records point at. A bare head-N slice can cut a cluster's canonical
-        # while keeping its members, and the runner would then KeyError on an
-        # unresolvable slate partway through a paid run — the right behaviour
-        # for a dangling id in the real fixture, a useless one for a smoke.
-        # Drawn ROUND-ROBIN across clusters, not as a head slice. The fixture
-        # is grouped by cluster in file order, so `records[:5]` is five records
-        # of ONE cluster: `_distractor_pool` draws only from OTHER clusters, so
-        # it comes back empty, every slate collapses to width 1, and the lone
-        # control case gets `candidates == []` — which `judge_write`
-        # short-circuits to `stored` with no provider call at all. The
-        # documented `--limit 5` smoke would then score the distractor class
-        # 100% having asked the model nothing. Taking one record per cluster
-        # before taking a second from any keeps a real cross-cluster pool.
-        #
-        # Only NON-canonical records are drawn: a canonical produces no
-        # labelled case (it IS the attach target), so a slice of them would
-        # report `case_count: 0` and score nothing. The canonicals each drawn
-        # record needs are pulled in below regardless, so `--limit N` means N
-        # labelled cases rather than N lines of the file.
-        by_cluster: dict[str, list[Any]] = {}
-        for record in records:
-            if str(record['label']) == LABEL_CANONICAL:
-                continue
-            by_cluster.setdefault(str(record['cluster_id']), []).append(record)
-        kept: list[Any] = []
-        for depth in range(max((len(v) for v in by_cluster.values()), default=0)):
-            if len(kept) >= args.limit:
-                break
-            for group in by_cluster.values():
-                if depth < len(group):
-                    kept.append(group[depth])
-                    if len(kept) >= args.limit:
-                        break
-
-        # Whatever canonicals those records point at come along too. A slice
-        # that cuts a cluster's canonical while keeping its members would
-        # KeyError on an unresolvable slate partway through a PAID run — the
-        # right behaviour for a dangling id in the real fixture, a useless one
-        # for a smoke.
-        kept_ids = {id(r) for r in kept}
-        wanted = {str(r['cluster_id']) for r in kept}
-        canonicals = [
-            r for r in records
-            if str(r['memory_id']) in wanted and id(r) not in kept_ids
-        ]
-        records = [*kept, *canonicals]
-        logger.info(
-            '--limit %d: measuring %d record(s) across %d cluster(s) '
-            '(%d canonical(s) pulled in to keep every slate resolvable)',
-            args.limit, len(records), len(wanted), len(canonicals),
+    if args.slate_mode == _scoring.SLATE_RETRIEVED:
+        plan = _retrieved_plan(
+            args, config, records, fixture=fixture,
+            judge_candidate_count=judge_candidate_count, aliases=aliases,
         )
+    else:
+        plan = _cases.seeded_plan(records, distractors=args.distractors, aliases=aliases)
+
     if args.dry_run:
         judge_fn = _dry_run_judge_fn()
         provider, model = 'dry-run', f'fixed:{_DRY_RUN_VERDICT}'
@@ -855,25 +643,42 @@ def _run(args: Any) -> int:
         # Logged BEFORE the first call, so a mis-resolved model is visible
         # while the run is still free to abort.
         logger.info('Judge resolves to provider=%s model=%s', provider, model)
-        judge_fn = build_judge_fn(config)
+        judge_fn = (
+            _live_judge.build_retrieved_judge_fn(config)
+            if args.slate_mode == _scoring.SLATE_RETRIEVED
+            else _live_judge.build_judge_fn(config)
+        )
 
-    report = run_judge_eval(
-        records=records,
-        judge_fn=judge_fn,
-        report_path=report_path,
-        provenance={
-            'fixture_path': package_relative(args.fixture),
-            'judge_provider': provider,
-            'judge_model': model,
-            # Present on EVERY run, `None` on a full one. An absent key would
-            # be indistinguishable from an artifact predating the field, and
-            # this is the one field that says a committed report is a partial
-            # smoke rather than the corpus-wide measurement the task-3169
-            # flip gate reads it as.
-            'limit': args.limit,
-        },
-        distractors=args.distractors,
-    )
+    with _wording.judge_wording(args.wording) as prompt_sha256:
+        report = run_judge_eval(
+            plan=plan,
+            judge_fn=judge_fn,
+            report_path=report_path,
+            cases_path=args.cases_path,
+            provenance={
+                'fixture_path': package_relative(args.fixture),
+                'judge_provider': provider,
+                'judge_model': model,
+                'judge_system_prompt_sha256': prompt_sha256,
+                # Present on EVERY run, `None` on a full one. An absent key
+                # would be indistinguishable from an artifact predating the
+                # field, and this is the one field that says a committed
+                # report is a partial smoke rather than the corpus-wide
+                # measurement the task-3169 flip gate reads it as.
+                'limit': args.limit,
+                'canonical_aliases_path': (
+                    package_relative(args.canonical_aliases)
+                    if args.canonical_aliases else None
+                ),
+                'canonical_aliases_count': len(aliases),
+                'cases_path': (
+                    package_relative(args.cases_path) if args.cases_path else None
+                ),
+                'field_chars': field_chars,
+                'judge_candidate_count': judge_candidate_count,
+                'judge_enabled': judge_enabled,
+            },
+        )
     print(json.dumps(report, indent=2))
     return 0
 
@@ -899,6 +704,43 @@ def main() -> int:
                              'provenance.limit')
     parser.add_argument('--dry-run', dest='dry_run', action='store_true',
                         help='score a fixed-answer judge; makes no provider call')
+    parser.add_argument('--slate-mode', dest='slate_mode', default=_scoring.SLATE_SEEDED,
+                        choices=_scoring.SLATE_MODES,
+                        help='seeded: the cluster canonical is placed at slate '
+                             'position 0. retrieved: the slate, the band '
+                             'winner and the band all come from a real '
+                             'retrieval against the live store, as production '
+                             'would produce them (default: seeded)')
+    parser.add_argument('--project-id', dest='project_id', default='reify',
+                        help='the corpus retrieved against under '
+                             '--slate-mode retrieved (default: reify)')
+    parser.add_argument('--field-chars', dest='field_chars', type=int, default=None,
+                        help="override the judge's per-field prompt budget for "
+                             'this run; 0 renders every field UN-elided. '
+                             'Recorded as provenance.field_chars (default: '
+                             'write_triage.judge_field_chars as the config '
+                             'resolves it)')
+    parser.add_argument('--judge-candidate-count', dest='judge_candidate_count',
+                        type=int, default=None,
+                        help='override write_triage.judge_candidate_count for '
+                             'this run, in memory only — config.yaml is not '
+                             'written')
+    parser.add_argument('--canonical-aliases', dest='canonical_aliases', default=None,
+                        help='the {old_cluster_canonical_id: current_memory_id} sidecar: '
+                             "an attach to a rotated canonical's successor counts as an "
+                             'attach to the canonical (default: none)')
+    parser.add_argument('--cases-path', dest='cases_path', default=None,
+                        help='append one JSON line per case as it completes: '
+                             'slate, band winner, the candidate the verdict '
+                             'named, attach target, band, verdict, outcome and '
+                             'elision flags (default: no per-case dump)')
+    parser.add_argument('--wording', default=_wording.WORDING_SHIPPED,
+                        choices=_wording.WORDINGS,
+                        help='the judge system prompt the run is made under; '
+                             'pre-psi is the pre-psi wording as an eval-side '
+                             'override. Recorded as '
+                             'provenance.judge_system_prompt_sha256 '
+                             '(default: shipped)')
     return _run(parser.parse_args())
 
 

@@ -39,15 +39,13 @@
 const { Sparkline: MESpark, StepSpark: MEStep, PALETTE: MEC } = window.DF_CHARTS;
 const MEDF = window.DF_DATA;
 // ME-prefixed like the two lines above.  The prefix is a readability
-// convention here, NOT a collision workaround: this file is a
-// `type="text/babel"` .jsx, and Babel-standalone downlevels .jsx top-level
-// bindings so they never join the classic-script shared global lexical scope.
-// That is an observed fact, not an assumption — tabs.jsx, tab_escalations.jsx
-// and tab_escalation_analytics.jsx each already declare their own top-level
-// `const DF` / `useOpenSet` / `usePersistedState` and all render fine.  See the
-// SCOPE note in dashboard/tests/js/classic_script_scope.test.mjs before
-// "fixing" this.
+// convention here, NOT a collision workaround: .jsx files may repeat each
+// other's top-level names.  See the SCOPE note in
+// dashboard/tests/js/classic_script_scope.test.mjs, which enforces the one
+// clash a .jsx binding can have, before "fixing" this.
 const { useState: MEuS } = React;
+// The storage policy for UI preferences — persisted_state.js.
+const { readPersisted, writePersisted } = window.DF_PERSISTED_STATE;
 
 // The pure, JSX-free helpers live in memory_evals_fmt.js (task 3481); their
 // behavioural suite is dashboard/tests/js/memory_evals_fmt.test.mjs.
@@ -76,14 +74,15 @@ const ME_CHART_BY_TAG = { step: MEStep, spark: MESpark };
 // A real <button>, not an <a href="#esc/...">.  The SPA has no router and no
 // anchors anywhere in static/redux — tab state is React state in app.jsx and
 // rows are selected with onClick handlers — so a fragment href would be a dead
-// affordance.  `onNavigate` is threaded down from app.jsx (step-18); when it is
-// absent the control renders disabled with a title saying so, never silently
-// inert.
+// affordance.  `onOpenEscalation` is bound by MemoryEvalsSection from app.jsx's
+// `onNavigate`; when it is absent the control renders disabled with a title
+// saying so, never silently inert.
 //
-// Built from `escalation.id` alone: the projection carries exactly id, summary,
-// severity, level, created_at and dedupe_fingerprint — there is no url.
-function EscalationLink({ escalation, onNavigate }) {
-  const wired = !!onNavigate;
+// The link addresses `(queue, id)`: an id is unique only within one queue, and
+// the server names the queue (MEMORY_EVALS.escalation_queue), which the
+// section binds into the callback.
+function EscalationLink({ escalation, onOpenEscalation }) {
+  const wired = !!onOpenEscalation;
   return (
     <button
       type="button"
@@ -92,8 +91,8 @@ function EscalationLink({ escalation, onNavigate }) {
       disabled={!wired}
       title={wired
         ? `open escalation ${escalation.id} in the Escalations tab`
-        : 'navigation unavailable — this section was rendered without an onNavigate handler'}
-      onClick={() => { if (onNavigate) onNavigate('esc', escalation.id); }}
+        : 'navigation unavailable — no escalation queue to open it in'}
+      onClick={() => { if (onOpenEscalation) onOpenEscalation(escalation); }}
     >
       <span className="mono">{escalation.id}</span>
       <span style={{ color: 'var(--fg-2)' }}>{escalation.summary}</span>
@@ -105,7 +104,7 @@ function EscalationLink({ escalation, onNavigate }) {
 }
 
 // ── One metric row ──
-function MemoryEvalMetricRow({ metric, onNavigate }) {
+function MemoryEvalMetricRow({ metric, onOpenEscalation }) {
   const m = metric;
   const trend = m.trend || { labels: [], values: [] };
   const Chart = ME_CHART_BY_TAG[chartForKind(m.kind)] || null;
@@ -210,7 +209,7 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
           )
           : m.escalation && (
             <div style={{ marginTop: 4 }}>
-              <EscalationLink escalation={m.escalation} onNavigate={onNavigate} />
+              <EscalationLink escalation={m.escalation} onOpenEscalation={onOpenEscalation} />
             </div>
           )}
         {/* Fingerprints are rendered whole — never parsed. They are the
@@ -355,9 +354,8 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
 
 // ── Limits provenance ──
 //
-// Collapsed by default (a <details>, open state persisted in the
-// useOpenSet/usePersistedState idiom of tab_escalations.jsx:286) so provenance
-// does not dominate the card.
+// Collapsed by default (a <details>, open state persisted through
+// persisted_state.js) so provenance does not dominate the card.
 //
 // The persisted key is PER EVAL — `df.memevals.prov.<eval_id>` — and the open
 // state is held in component state seeded from storage exactly once at mount.
@@ -390,17 +388,11 @@ function provOpenKey(evalId) {
 // The key is a PARAMETER, not a closed-over module constant: that is what
 // makes one global key shared by every card structurally unrepresentable.
 function readProvOpen(key) {
-  try {
-    return localStorage.getItem(key) === '1';
-  } catch (e) {
-    return false;
-  }
+  return !!readPersisted(key, false);
 }
 
 function writeProvOpen(key, open) {
-  try {
-    localStorage.setItem(key, open ? '1' : '0');
-  } catch (e) { /* private mode — the toggle simply does not persist */ }
+  writePersisted(key, !!open, false);
 }
 
 function LimitsProvenance({ ev }) {
@@ -477,7 +469,7 @@ function LimitsProvenance({ ev }) {
 // never the copy repeated on an eval row: the top-level block is the single
 // banner source, so the UI never has to elect a row to read it from and the
 // banner survives a root with zero eval dirs.
-function StormBanner({ storm, onNavigate }) {
+function StormBanner({ storm, onOpenEscalation }) {
   if (!storm) return null;
   return (
     <div
@@ -495,7 +487,7 @@ function StormBanner({ storm, onNavigate }) {
         </span>
       )}
       {storm.escalation
-        ? <EscalationLink escalation={storm.escalation} onNavigate={onNavigate} />
+        ? <EscalationLink escalation={storm.escalation} onOpenEscalation={onOpenEscalation} />
         : (
           <span className="mono" style={{ color: 'var(--fg-3)' }}>
             no open escalation carries this aggregate_fingerprint
@@ -505,7 +497,7 @@ function StormBanner({ storm, onNavigate }) {
   );
 }
 
-function UnmatchedEscalations({ rows, onNavigate }) {
+function UnmatchedEscalations({ rows, onOpenEscalation }) {
   if (!rows || rows.length === 0) return null;
   return (
     <div className="panel">
@@ -516,7 +508,7 @@ function UnmatchedEscalations({ rows, onNavigate }) {
       <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {rows.map(row => (
           <div key={row.id} style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <EscalationLink escalation={row} onNavigate={onNavigate} />
+            <EscalationLink escalation={row} onOpenEscalation={onOpenEscalation} />
             <span className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
               {row.reason} — {unmatchedReasonText(row.reason)}
             </span>
@@ -528,7 +520,7 @@ function UnmatchedEscalations({ rows, onNavigate }) {
 }
 
 // ── One eval card ──
-function MemoryEvalCard({ ev, onNavigate }) {
+function MemoryEvalCard({ ev, onOpenEscalation }) {
   const metrics = ev.metrics || [];
   const corpus = ev.corpus;
   return (
@@ -582,7 +574,7 @@ function MemoryEvalCard({ ev, onNavigate }) {
           </thead>
           <tbody>
             {metrics.map(m => (
-              <MemoryEvalMetricRow key={m.metric_id} metric={m} onNavigate={onNavigate} />
+              <MemoryEvalMetricRow key={m.metric_id} metric={m} onOpenEscalation={onOpenEscalation} />
             ))}
           </tbody>
         </table>
@@ -630,6 +622,9 @@ function IssuesNotice({ issues, issueCount }) {
 function MemoryEvalsSection({ onNavigate }) {
   const payload = MEDF.MEMORY_EVALS;
   const evals = payload.evals || [];
+  const openEscalation = onNavigate && payload.escalation_queue
+    ? escalation => onNavigate('esc', { queue: payload.escalation_queue, id: escalation.id })
+    : null;
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
@@ -661,16 +656,16 @@ function MemoryEvalsSection({ onNavigate }) {
       )}
       {payload.storm_escape && (
         <div className="col-span-12">
-          <StormBanner storm={payload.storm_escape} onNavigate={onNavigate} />
+          <StormBanner storm={payload.storm_escape} onOpenEscalation={openEscalation} />
         </div>
       )}
       {evals.map(ev => (
         <div className="col-span-12" key={ev.eval_id}>
-          <MemoryEvalCard ev={ev} onNavigate={onNavigate} />
+          <MemoryEvalCard ev={ev} onOpenEscalation={openEscalation} />
         </div>
       ))}
       <div className="col-span-12">
-        <UnmatchedEscalations rows={payload.unmatched_escalations} onNavigate={onNavigate} />
+        <UnmatchedEscalations rows={payload.unmatched_escalations} onOpenEscalation={openEscalation} />
       </div>
     </div>
   );

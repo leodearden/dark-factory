@@ -76,7 +76,7 @@ emergency hotfix) it's fine to edit directly:
 This is a `uv` workspace (`pyproject.toml`); the current members are:
 
 ```
-cockpit, dashboard, escalation, fused-memory, orchestrator, sampler, shared
+client-feed, cockpit, dashboard, escalation, fused-memory, orchestrator, sampler, shared
 ```
 
 **`<pkg>/src/<pkg>/` double-nesting.** Every package follows this
@@ -109,6 +109,43 @@ Other top-level dirs:
   watchdog, host setup).
 - **`hooks/`** — git hooks (`pre-commit`, `pre-merge-commit`, see §4-§5),
   install via `hooks/setup.sh`.
+
+**Where repo-wide gates live.** There are two homes, chosen by what the gate
+reads. `shared/tests/` hosts the whole-first-party-tree *source* gates: every
+gate that walks the Python tree through the session-scoped `first_party_tree`
+fixture (`shared/tests/conftest.py`), which parses
+`shared/tests/silent_fallthrough_scan.py::SCOPE_ROOTS` once per session, at
+collection time (`shared/tests/session_prebuild.py`). A new gate over that
+tree takes the fixture instead of growing a private parse;
+`shared/tests/test_tree_scan_sharing.py::TestNoRegrownWholeTreeParse`
+ratchets this. They do not live in `tests/scripts/` because two module
+configs collect that directory, `scripts/orchestrator.yaml` under `-n auto`:
+every xdist worker would pay the parse, whose CPU and resident-memory cost
+`silent_fallthrough_scan.py::parse_first_party_tree`'s docstring measures,
+and a full-breadth merge verify would pay it twice. `tests/scripts/` hosts the
+repo-level sweeps that bring their own reader — config, doc, systemd-unit and
+toolchain parity, and `tests/scripts/test_atomic_write_regrowth.py`, whose
+`_SRC_TREES` is not `SCOPE_ROOTS`.
+
+The consequence is accepted deliberately: `shared/tests/` is not a
+self-contained package suite. It presumes a full dark-factory checkout, and
+nothing runs it any other way, because `dark-factory-shared` is consumed only
+as a `{ workspace = true }` member. So these gates **hard-fail, never skip**,
+when a tree they scan is absent: `iter_first_party_files` raises
+`ScopeRootsMissingError` naming every missing root (pinned by
+`shared/tests/test_tree_scan_sharing.py::TestEveryScopeRootIsRequired`), and
+in the other direction
+`shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership::test_shared_tree_spans_every_production_src_root`
+reds when a new `<pkg>/src` is missing from `SCOPE_ROOTS`. A skip is a green
+run over less code — the silent fallthrough the flagship gate exists to catch
+— so do not add one to make the suite standalone.
+
+An allowlist keyed on a sibling's `(path, qualname)` goes red when you rename
+an allowlisted function in `orchestrator/` or `fused-memory/`. That follows
+from the keying, not the placement: relocating the gate would move the red,
+not remove it. The gate's failure message names the allowlist to edit.
+Reversing this placement means updating this paragraph together with the
+enumerator's required-root check.
 
 <!-- line-pin-policy:begin
      The repo's decision on bare `file.py:NNN` citations (esc-3815-7).
@@ -192,22 +229,50 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   ```
   `dark-factory-orchestrator.yaml`'s `test_command` fans this out across
   every subproject in its own venv (`shared`, `escalation`, `orchestrator`,
-  `fused-memory`, `dashboard`, `sampler`, optionally `cockpit`) — a bare
+  `fused-memory`, `dashboard`, `sampler`, `client-feed`, optionally `cockpit`) — a bare
   repo-root `pytest` instead collects everything into one process against
   only the root `pyproject.toml`, which is slower and less isolated. Mirror
   the fan-out when running the full suite yourself.
+<!-- pytest-timeout-mirror:begin
+     Mirrors [tool.pytest.ini_options].timeout, which every pyproject.toml in
+     the repo declares at the same value. Pinned by
+     tests/scripts/test_pytest_per_test_timeout_policy.py — change the configs
+     and this paragraph goes red until it is updated to match. -->
+  Every pytest config caps a single test at `420` seconds of WALL CLOCK (not CPU
+  time), a value DERIVED FROM MEASUREMENT rather than picked — see
+  `plans/pytest-per-test-timeout-measurement-2026-09-17.md` for the corpus and
+  the arithmetic, and `shared/pyproject.toml` for why the cap exists at all.
+  All nine configs carry it, the repo root included, so a bare root-bound
+  `pytest` is no longer uncapped: pytest reads exactly ONE inifile — the
+  rootdir's — and never merges across `pyproject.toml` files, so a member's
+  setting does nothing for a run rooted elsewhere. Opt a slow test up with
+  `@pytest.mark.timeout(N)`, but note that the marker OVERRIDES the budget in
+  both directions rather than raising a floor under it, so an `N` below the
+  value silently TIGHTENS the run — `orchestrator/tests/_orch_helpers.py`'s
+  constant block is the single home of that reasoning.
+  One caveat with teeth, because it decides what the MERGE GATE enforces: every
+  verify leg passes `--timeout=300` on its CLI, and a CLI `--timeout` overrides
+  the ini. So verify currently runs TIGHTER than a bare local or agent `pytest`
+  — an unmarked test taking 310 seconds passes locally and reds the gate, and
+  the test the value is now derived from (45.48s) runs at only ~6.6x headroom
+  under verify's 300, short of the 8x the measurement demands. Aligning that
+  yaml knob is outside the scope that set these configs and is filed as residue 2 of
+  `plans/pytest-per-test-timeout-measurement-2026-09-17.md`.
+<!-- pytest-timeout-mirror:end -->
 <!-- lint-command-mirror:begin
      Mirrors the `ruff check` leg of `lint_command` in
      dark-factory-orchestrator.yaml. Pinned by
      tests/scripts/test_contributing_lint_command_drift.py — widen the yaml
      head and this line goes red until it is updated to match. -->
-- **Lint**: `uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills`
+- **Lint**: `uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit client-feed conftest.py df_pytest_isolation.py skills`
 <!-- lint-command-mirror:end -->
   That bullet mirrors the `ruff check` leg only; `lint_command` chains one
   more leg the merge gate also runs —
   `fused-memory/scripts/check_bare_magicmock_config.py` over each package's
-  `tests/` — so see `lint_command` in `dark-factory-orchestrator.yaml` for
-  the full chain. Despite its legacy filename that script now carries **three
+  `tests/`, where a directory scan covers `test_*.py`, `conftest.py` and
+  `_*.py` helper modules — so see `lint_command` in
+  `dark-factory-orchestrator.yaml` for the full chain. Despite its legacy
+  filename that script now carries **three
   independent test-quality rules** — two about mock-spec discipline and one
   about wait deadlines, which is not a mock rule at all — each with its own
   suppression code (all three take the form
@@ -220,30 +285,29 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     registered stdlib dataclass (`VerifyResult` today), flagged in **any**
     syntactic position including `return MagicMock(...)`. Remedy:
     `_fake_verify_result(...)` or `MagicMock(spec=VerifyResult)`.
-    Eleven files carry pre-existing debt, grandfathered in the script's
-    `_DATACLASS_DOUBLE_DEBT` baseline. That list is **shrink-only** — entries
-    come off as files are migrated and must never be added. A new offending
-    file is covered by default and will fail the gate.
+    This rule has **no baseline** and is hot for every scanned file — the
+    transitional debt list was retired once its 95 grandfathered sites were
+    migrated (task 4354), so the per-site `# noqa: bare-dataclass-double —
+    <reason>` pragma above is its only suppression.
   - `wall-clock-deadline` — a **load-bearing** synchronisation point awaited on
     a wall-clock deadline: a `MergeRequest.result` future (`req.result`) or a
-    `gate*.wait()` barrier, reached either through a bare
-    `asyncio.wait_for(...)` or carrying a raw numeric `timeout=` literal.
+    zero-argument `.wait()` barrier on any receiver, reached either through a
+    bare `asyncio.wait_for(...)` or carrying a raw numeric literal bound
+    (`timeout=`, `max_wall_s=`, or `asyncio.wait_for`'s positional timeout).
     Remedy: `wait_responsive(...)` with a descriptive `label=`, and a bound
     derived from `MERGE_RESULT_TIMEOUT` rather than a written number — a
-    deadline expiry on such a wait fails a test whose pipeline completed
-    correctly. No class list and no budget threshold decides which sites are
-    scanned, and the teardown join in `_stop_worker` is exempt structurally (a
-    bare `ast.Name` target), not by name. The two legs differ, though: the
-    `req.result` leg is pure **shape**, while the barrier leg additionally
-    requires a receiver `Name` starting with `gate` — a naming convention
-    standing in for "this is an `asyncio.Event`", with a measured
-    false-negative surface of 102 `asyncio.wait_for(<expr>.wait(), ...)` sites
-    it cannot see. That gap is documented, not closed: `wait_responsive` lives
-    in `orchestrator/tests/_orch_helpers.py` and three of the seven scanned
-    packages cannot import it. See the script's Rule C docstring. Twenty files carry pre-existing debt, grandfathered in the script's
-    `_WALL_CLOCK_DEADLINE_DEBT` baseline; like Rule B's it is **shrink-only**
-    and opt-out, so a new offending file fails the gate by default. Unlike
-    Rule B's it is a **budget** rather than a bare list — a listed file is
+    deadline expiry on such a wait fails a test whose awaited event did
+    happen. Both legs are pure **shape**: no receiver name, no class list
+    and no budget threshold decides which sites are scanned, and the teardown
+    join in `_stop_worker` is exempt structurally (a bare `ast.Name` target).
+    `wait_responsive` and `MERGE_RESULT_TIMEOUT` live in
+    `orchestrator/tests/_orch_helpers.py` and are importable only under
+    `orchestrator/tests`, so in any other package the
+    per-site `# noqa: wall-clock-deadline — <reason>` is the remedy. See the
+    script's Rule C docstring. Pre-existing debt, across four packages, is
+    grandfathered in the script's `_WALL_CLOCK_DEADLINE_DEBT` baseline — the
+    last surviving baseline, and **shrink-only** and opt-out, so a new
+    offending file fails the gate by default. It is a **budget** rather than a bare list: a listed file is
     silent at or under its recorded count and reports its overrun above it, so
     a number may only be lowered, never raised.
 - **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part
@@ -269,7 +333,7 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   Reversing this decision means updating this section, `CLAUDE.md` and
   `tests/scripts/test_ruff_format_policy.py` together.
 - **Type-check** (pyright, run from each configured package directory so it
-  picks up that package's `[tool.pyright]` block) — the same seven workspace
+  picks up that package's `[tool.pyright]` block) — the same eight workspace
   members the merge gate checks:
   <!-- type-check-command-mirror:begin
        Mirrors the package DIRECTORIES walked by `type_check_command` in
@@ -280,10 +344,10 @@ Reversing this decision means updating this section, `CLAUDE.md` and
        the yaml chain and this block goes red until it is updated to
        match. -->
   ```bash
-  cd fused-memory && uv run pyright && cd ../orchestrator && uv run pyright && cd ../dashboard && uv run pyright && cd ../shared && uv run pyright && cd ../escalation && uv run pyright && cd ../sampler && uv run pyright && cd ../cockpit && uv run pyright
+  cd fused-memory && uv run pyright && cd ../orchestrator && uv run pyright && cd ../dashboard && uv run pyright && cd ../shared && uv run pyright && cd ../escalation && uv run pyright && cd ../sampler && uv run pyright && cd ../cockpit && uv run pyright && cd ../client-feed && uv run pyright
   ```
   <!-- type-check-command-mirror:end -->
-  `dark-factory-orchestrator.yaml`'s `type_check_command` runs the same seven
+  `dark-factory-orchestrator.yaml`'s `type_check_command` runs the same eight
   workspace members via `npx pyright` (needs Node 22+) — either invocation
   works, and both resolve the SAME pyright version: `uv run pyright` resolves
   the pyright-python wheel `uv.lock` pins, `npx pyright` resolves the repo-root
@@ -305,8 +369,33 @@ branch, before any merge submission:
    and `escalation` are imported by most of the others, so a change there
    should trigger a broader run).
 2. `uv run ruff check <touched packages>`.
-3. `uv run pyright` in each touched, pyright-configured package
-   (`fused-memory`, `orchestrator`, `dashboard`).
+3. `uv run pyright` in each touched, pyright-configured package — any of the
+   eight workspace members the §3 **Type-check** command walks.
+
+The inline-suppression ratchet guard,
+`scripts/tests/test_inline_suppression_ratchet.py`, runs with the suite. A
+malformed disposition marker turns it red now. A new `type: ignore`, `noqa`
+or similar suppression with no disposition marker turns it red only once the
+operator has seeded `scripts/inline_suppression_baseline.json` (step κ1 of
+`plans/inv12-exceptions-owned-or-ratified-prd.md`). Until then that check
+skips and its skip reason says so, so a green suite does not yet mean your
+suppressions were checked.
+
+The merge-lane quality ratchet, `orchestrator/tests/test_merge_lane_ratchet.py`,
+also runs with the suite. Lowering a merge-lane measure is the point; it
+regenerates `orchestrator/tests/merge_lane_ratchet_baseline.json` in the same
+commit (`python scripts/merge_lane_metrics.py --write-baseline <that path>`).
+A raise is never silent: add `--authorize-raise <task-id> --reason "<why>"`,
+which records it as ONE NEW FILE under
+`orchestrator/tests/merge_lane_ratchet_raises/`. The pre-commit auditor
+`scripts/check_staged_ratchet_raise.py` refuses a commit whose raises its own new
+entry files do not cover, and one that modifies, deletes or renames a recorded
+entry. A new entry's task id must be one the branch works on -- the id in its
+name (`task/<id>`, `carry/<id>`, or a name ending `-<id>`) or one an earlier commit
+on the branch cites (`fix(<id>): ...` or `task <id>`) -- and its reason may not
+be blank; the commit being made cannot cite itself. The baseline itself merges through a structured 3-way driver (installed
+by `scripts/setup-host.sh` step 9), so two branches moving different code no
+longer conflict on it.
 
 Do this **before** `merge_request`/`/merge-queue`, not after — a red
 post-merge verify blocks or reverts the merge, which is more expensive than
@@ -316,9 +405,9 @@ catching it locally.
 (installed via `hooks/setup.sh`, which points `core.hooksPath` at `hooks/`):
 it strips any staged `.task/` files (see §8), then on `main` runs `ruff
 check`, the asyncmock/bare-MagicMock style checks on staged test files, and
-**pyright up to 3×** (once per touched package under `PYRIGHT_PACKAGES`, or
-across all three if the change touches a shared dependency like `shared` or
-`escalation`). That stage is path-filtered since task 2551: a commit
+**pyright up to 8×** (once per touched package under `PYRIGHT_PACKAGES` —
+the same eight members the merge gate type-checks — or across all of them if
+the change touches a shared dependency like `shared` or `escalation`). That stage is path-filtered since task 2551: a commit
 staging no `.py` files skips pyright entirely and finishes in seconds
 (`pre-commit: pyright skipped (no Python changes)`), and a staged `.py`
 outside every one of those prefixes (e.g. `scripts/`, a root-level
@@ -332,6 +421,12 @@ two narrow documented exceptions are the *pre-merge-commit* emergency
 bypass (§5) and a **docs-only** commit landing under index-lock contention
 in the machine-operated main checkout (see `OPERATIONS.md` §"Working in
 the main checkout").
+
+These gates are the **floor**. The **bar** is `docs/code-quality.md` — the
+single normative definition of code quality (quality as the cost and risk of
+the next change, fourteen named heuristics, and the comment and test
+stances). Reviewers cite its heuristics by name; a change can pass every gate
+above and still be correctly rejected against it.
 
 ---
 

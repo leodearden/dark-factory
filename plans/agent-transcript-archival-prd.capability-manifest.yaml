@@ -49,7 +49,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: archive_task_transcripts
+      pattern: archive_before_delete
       paths:
       - orchestrator/src/orchestrator/git_ops.py
       expect: present
@@ -123,3 +123,5 @@ tasks:
     delivered_check:
       kind: manual
       reason: the task IS the check suite; its signal is the CI-green boundary matrix
+signal_leaves:
+- ε

@@ -1,9 +1,11 @@
 """Tests for the dispatcher-side flake RECORDER (PRD task ε, `plans/flake-ledger-prd.md`).
 
-`flake_recorder.record_merge_flake_suppression` is the one place the three
-side-effects of a merge-gate flake observation happen: the durable
-``flake_occurrence`` ledger row, the ``merge_flake_suppressed`` structured fact,
-and the INV-4 storm-streak bump.
+`flake_recorder.record_merge_flake_suppression` is the one place the side-effects
+of a merge-gate flake observation happen: the durable ``flake_occurrence`` ledger
+row, the ``merge_flake_suppressed`` structured fact, the INV-4 storm-streak bump, and —
+since ε0 (task 6934) — one due-list item per suppressed test, written in the rows' own
+transaction.  The de-flake owner and the ``regressed_after_resolution`` escalation are
+the drain's (``test_flake_debt_drain.py``).
 
 It lives HERE, on the dispatcher, and not in ``verify.apply_merge_flake_suppression``
 (which runs wherever the WORKTREE is) precisely because the producer's host may be a
@@ -15,19 +17,38 @@ including one case where the observation was genuinely wire-deserialized.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
+import sqlite3
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
+from _flake_golden import merge_gate_deflake_description
+from escalation.queue import EscalationQueue
+from test_flake_debt_drain import _FakeLedgerTaskClient, _RecordingQueue
 
-from orchestrator import flake_recorder
+from orchestrator import flake_debt_drain, flake_recorder
+from orchestrator.flake_debt_drain import run_drain_pass
 from orchestrator.flake_ledger import (
     UNKNOWN_TEST_ID,
+    DebtContext,
+    DebtTrigger,
+    DueRow,
+    EvidenceKind,
+    FailureEvidence,
     FlakeCallSite,
     FlakeSuppression,
     FlakeVerdict,
+    debt_context_from_json,
+    delete_due_item,
     ledger_db_path,
+    list_open_debt,
+    read_debt,
+    read_due_items,
     read_occurrences,
 )
 from orchestrator.verify import VerifyResult
@@ -57,18 +78,32 @@ class _FakeEscalationQueue:
 
     *open_l2* controls the dedup path: when truthy, get_by_task returns it so the
     filer treats an open L2 as already present and does NOT re-submit.
+
+    *pending_from_submitted* answers from what was actually SUBMITTED instead, keyed on
+    ``task_id`` (and the asked-for status and level) the way the real queue's lookup
+    is.  A fixed *open_l2* gives the same answer for every key, so it can only show
+    that the filer ASKS.  Keying on what was filed is what shows a pending escalation
+    under one key leaves every other key free to file.
     """
 
-    def __init__(self, open_l2=None) -> None:
+    def __init__(self, open_l2=None, *, pending_from_submitted: bool = False) -> None:
         self.submitted: list = []
         self.get_by_task_calls: list = []
         self._open_l2 = open_l2
+        self._pending_from_submitted = pending_from_submitted
 
     def make_id(self, task_id: str) -> str:
         return f'esc-{task_id}-1'
 
     def get_by_task(self, task_id, *, status=None, level=None):
         self.get_by_task_calls.append((task_id, status, level))
+        if self._pending_from_submitted:
+            return [
+                esc for esc in self.submitted
+                if esc.task_id == task_id
+                and (status is None or esc.status == status)
+                and (level is None or esc.level == level)
+            ]
         return self._open_l2
 
     def submit(self, esc) -> None:
@@ -118,10 +153,10 @@ def _result(suppression: FlakeSuppression | None) -> VerifyResult:
     )
 
 
-def _record(result: VerifyResult, project_root: Path, **kwargs) -> None:
+async def _record(result: VerifyResult, project_root: Path, **kwargs) -> None:
     kwargs.setdefault('merge_sha', _MERGE_SHA)
     kwargs.setdefault('task_id', _TASK_ID)
-    flake_recorder.record_merge_flake_suppression(
+    await flake_recorder.record_merge_flake_suppression(
         result,
         project_root=project_root,
         project_id=_PROJECT_ID,
@@ -133,19 +168,28 @@ def _occurrences(project_root: Path):
     return read_occurrences(ledger_db_path(project_root))
 
 
+def _due(project_root: Path) -> list[DueRow]:
+    items = read_due_items(
+        ledger_db_path(project_root), now=datetime(2100, 1, 1, tzinfo=UTC), limit=10_000,
+    )
+    assert items is not None
+    return items
+
+
+@pytest.mark.asyncio
 class TestRecordMergeFlakeSuppression:
     """The recorder's contract: ledger ALWAYS, event+streak only on a suppression."""
 
     # -- (a) B13: no observation carried -> nothing happens -------------------
 
-    def test_no_suppression_records_nothing(self, tmp_path: Path) -> None:
+    async def test_no_suppression_records_nothing(self, tmp_path: Path) -> None:
         """B13 (new dispatcher, OLD remote): the key is simply absent from the
         wire payload, so the field defaults to None.  That must be a silent
         no-op, not a crash and not a sentinel row — an old remote is a
         degradation, not an observation."""
         es, q = _FakeEventStore(), _FakeEscalationQueue()
 
-        _record(_result(None), tmp_path, event_store=es, escalation_queue=q)
+        await _record(_result(None), tmp_path, event_store=es, escalation_queue=q)
 
         assert _occurrences(tmp_path) == []
         assert es.emits == []
@@ -154,7 +198,7 @@ class TestRecordMergeFlakeSuppression:
 
     # -- (b) B3: all three side-effects, asserted TOGETHER --------------------
 
-    def test_b3_suppression_writes_ledger_and_emits_and_bumps(self, tmp_path: Path) -> None:
+    async def test_b3_suppression_writes_ledger_and_emits_and_bumps(self, tmp_path: Path) -> None:
         """B3 — the whole point of ε, asserted in ONE test.
 
         Two-out-of-three is the bug this task exists to fix (the remote path used
@@ -164,7 +208,7 @@ class TestRecordMergeFlakeSuppression:
         es, q = _FakeEventStore(), _FakeEscalationQueue()
         s = _suppression()
 
-        _record(_result(s), tmp_path, event_store=es, escalation_queue=q)
+        await _record(_result(s), tmp_path, event_store=es, escalation_queue=q)
 
         # (1) the structured fact
         from orchestrator.event_store import EventType
@@ -194,7 +238,7 @@ class TestRecordMergeFlakeSuppression:
 
     # -- (c) the SAME, for an observation that came off the wire --------------
 
-    def test_wire_deserialized_suppression_records_identically(self, tmp_path: Path) -> None:
+    async def test_wire_deserialized_suppression_records_identically(self, tmp_path: Path) -> None:
         """The remote path, for real: the result is round-tripped through the
         runner codec before recording.
 
@@ -209,7 +253,7 @@ class TestRecordMergeFlakeSuppression:
         es, q = _FakeEventStore(), _FakeEscalationQueue()
         wired = result_from_json(result_to_json(_result(_suppression())))
 
-        _record(wired, tmp_path, event_store=es, escalation_queue=q)
+        await _record(wired, tmp_path, event_store=es, escalation_queue=q)
 
         assert [e[0] for e in es.emits] == [EventType.merge_flake_suppressed]
         rows = _occurrences(tmp_path)
@@ -220,7 +264,7 @@ class TestRecordMergeFlakeSuppression:
 
     # -- (d) non-suppressing verdicts: the ledger only ------------------------
 
-    def test_unconfirmable_records_the_row_only(self, tmp_path: Path) -> None:
+    async def test_unconfirmable_records_the_row_only(self, tmp_path: Path) -> None:
         """§5.5 — record the OBSERVATION, not the remedy.  An unconfirmable
         observation changes no verdict, so it must NOT emit the suppression fact
         or bump the storm streak; but it IS counted, because θ's class-1 health
@@ -231,7 +275,7 @@ class TestRecordMergeFlakeSuppression:
             FlakeVerdict.unconfirmable, test_ids=(), reason='no recoverable node-id',
         )
 
-        _record(_result(s), tmp_path, event_store=es, escalation_queue=q)
+        await _record(_result(s), tmp_path, event_store=es, escalation_queue=q)
 
         rows = _occurrences(tmp_path)
         assert len(rows) == 1, rows
@@ -242,13 +286,13 @@ class TestRecordMergeFlakeSuppression:
         assert q.submitted == []
         assert flake_recorder._merge_flake_suppression_streak == 0
 
-    def test_fails_in_isolation_records_the_row_only(self, tmp_path: Path) -> None:
+    async def test_fails_in_isolation_records_the_row_only(self, tmp_path: Path) -> None:
         """A confirmed real red is still an observation worth counting — it is
         the DENOMINATOR θ's suppression rate divides by — but it is emphatically
         not a suppression, so no fact and no streak bump."""
         es, q = _FakeEventStore(), _FakeEscalationQueue()
 
-        _record(
+        await _record(
             _result(_suppression(FlakeVerdict.fails_in_isolation)),
             tmp_path,
             event_store=es,
@@ -264,7 +308,7 @@ class TestRecordMergeFlakeSuppression:
 
     # -- (e) INV-4: the storm escalation, now reachable from the dispatcher ---
 
-    def test_storm_threshold_files_one_l2_and_resets(self, tmp_path: Path) -> None:
+    async def test_storm_threshold_files_one_l2_and_resets(self, tmp_path: Path) -> None:
         """INV-4's escape hatch, driven end-to-end through the recorder.
 
         Before ε this was unreachable on the remote path (the counter lived in
@@ -278,7 +322,7 @@ class TestRecordMergeFlakeSuppression:
             # Vary observed_at so §8.3's (test_id, observed_at, call_site) dedup
             # does not collapse these into one logical observation.
             s = _suppression(observed_at=f'2026-08-22T12:00:0{i}+00:00')
-            _record(_result(s), tmp_path, event_store=es, escalation_queue=q)
+            await _record(_result(s), tmp_path, event_store=es, escalation_queue=q)
 
         assert len(q.submitted) == 1, q.submitted
         esc = q.submitted[0]
@@ -293,9 +337,25 @@ class TestRecordMergeFlakeSuppression:
         assert len(es.emits) == threshold
         assert len(_occurrences(tmp_path)) == 2 * threshold
 
+    async def test_a_bare_str_test_ids_warns_once_per_suppression(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """The rows and the due items both derive from ``test_ids``; the one upstream
+        bug is reported once, not once per derivation."""
+        s = _suppression(test_ids=cast(Any, _IDS[0]))
+
+        with caplog.at_level(logging.WARNING):
+            await _record(
+                _result(s), tmp_path, event_store=_FakeEventStore(),
+                escalation_queue=_FakeEscalationQueue(),
+            )
+
+        assert caplog.text.count('arrived as a bare str') == 1, caplog.text
+        assert [d.test_id for d in _due(tmp_path)] == [_IDS[0]]
+
     # -- (f) B12: a broken ledger must never cost the other two signals -------
 
-    def test_unwritable_ledger_does_not_raise_and_still_emits(
+    async def test_unwritable_ledger_does_not_raise_and_still_emits(
         self, tmp_path: Path, caplog,
     ) -> None:
         """B12 — a ledger failure must never fail a verify or a merge, AND must
@@ -311,13 +371,13 @@ class TestRecordMergeFlakeSuppression:
         es, q = _FakeEventStore(), _FakeEscalationQueue()
 
         with caplog.at_level(logging.WARNING):
-            _record(_result(_suppression()), tmp_path, event_store=es, escalation_queue=q)
+            await _record(_result(_suppression()), tmp_path, event_store=es, escalation_queue=q)
 
         assert [r.levelname for r in caplog.records].count('WARNING') >= 1, caplog.text
         assert len(es.emits) == 1, es.emits
         assert flake_recorder._merge_flake_suppression_streak == 1
 
-    def test_a_raising_event_store_does_not_disarm_the_storm_detector(
+    async def test_a_raising_event_store_does_not_disarm_the_storm_detector(
         self, tmp_path: Path, caplog,
     ) -> None:
         """B12, the other ordering: a broken EVENT store must not take the INV-4
@@ -337,7 +397,7 @@ class TestRecordMergeFlakeSuppression:
 
         q = _FakeEscalationQueue()
         with caplog.at_level(logging.WARNING):
-            _record(
+            await _record(
                 _result(_suppression()), tmp_path,
                 event_store=_ExplodingEventStore(), escalation_queue=q,
             )
@@ -350,15 +410,82 @@ class TestRecordMergeFlakeSuppression:
 
     # -- (g) the CLI / storeless caller ---------------------------------------
 
-    def test_none_stores_still_write_the_ledger_row(self, tmp_path: Path) -> None:
+    async def test_none_stores_still_write_the_ledger_row(self, tmp_path: Path) -> None:
         """The ledger is the DURABLE evidence trail and does not depend on either
         in-process store, so a caller with neither still contributes to it."""
-        _record(_result(_suppression()), tmp_path)
+        await _record(_result(_suppression()), tmp_path)
 
         assert len(_occurrences(tmp_path)) == 2
         # None-safe all the way through: the streak still advances (it is a
         # module-global, not a store), and nothing raised.
         assert flake_recorder._merge_flake_suppression_streak == 1
+
+
+@pytest.mark.asyncio
+class TestRecordFlakeObservation:
+    """The observation-level entry point every gate shares; the merge-gate
+    adapter above is a B13 None check in front of it."""
+
+    async def _observe(self, s: FlakeSuppression, project_root: Path, **kwargs) -> None:
+        await flake_recorder.record_flake_observation(
+            s,
+            project_root=project_root,
+            project_id=_PROJECT_ID,
+            merge_sha=_MERGE_SHA,
+            task_id=_TASK_ID,
+            **kwargs,
+        )
+
+    async def test_a_main_probe_suppression_records_all_four_side_effects(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.event_store import EventType
+
+        es, q = _FakeEventStore(), _FakeEscalationQueue()
+        s = replace(_suppression(), call_site=FlakeCallSite.main_probe, runner='local')
+
+        await self._observe(s, tmp_path, event_store=es, escalation_queue=q)
+
+        rows = _occurrences(tmp_path)
+        assert {r.test_id for r in rows} == set(_IDS)
+        assert {r.call_site for r in rows} == {'main_probe'}
+        assert {(r.merge_sha, r.task_id) for r in rows} == {(_MERGE_SHA, _TASK_ID)}
+        assert {d.test_id for d in _due(tmp_path)} == set(_IDS)
+        assert [e[0] for e in es.emits] == [EventType.merge_flake_suppressed]
+        assert flake_recorder._merge_flake_suppression_streak == 1
+
+    @pytest.mark.parametrize(
+        'verdict', [FlakeVerdict.fails_in_isolation, FlakeVerdict.unconfirmable],
+    )
+    async def test_a_non_suppressing_observation_records_the_row_only(
+        self, tmp_path: Path, verdict: FlakeVerdict,
+    ) -> None:
+        es, q = _FakeEventStore(), _FakeEscalationQueue()
+        s = replace(_suppression(verdict), call_site=FlakeCallSite.main_probe)
+
+        await self._observe(s, tmp_path, event_store=es, escalation_queue=q)
+
+        assert {r.verdict for r in _occurrences(tmp_path)} == {str(verdict)}
+        assert _due(tmp_path) == []
+        assert es.emits == []
+        assert flake_recorder._merge_flake_suppression_streak == 0
+
+    async def test_the_merge_gate_adapter_records_exactly_what_the_observation_does(
+        self, tmp_path: Path,
+    ) -> None:
+        via_adapter, direct = tmp_path / 'adapter', tmp_path / 'direct'
+        es_a, es_d = _FakeEventStore(), _FakeEventStore()
+        s = _suppression()
+
+        await _record(_result(s), via_adapter, event_store=es_a)
+        await self._observe(s, direct, event_store=es_d)
+
+        def _shape(root: Path) -> list[tuple[str, str, str]]:
+            return sorted((r.test_id, r.verdict, r.call_site) for r in _occurrences(root))
+
+        assert _shape(via_adapter) == _shape(direct) != []
+        assert [e[0] for e in es_a.emits] == [e[0] for e in es_d.emits]
+
 
 
 class TestSuppressionStormStreak:
@@ -430,3 +557,582 @@ class TestSuppressionStormStreak:
 
         # No crash; window resets without filing (no queue to file into).
         assert vm._merge_flake_suppression_streak == 0
+
+
+@pytest.mark.asyncio
+class TestRecordEnqueuesDebt:
+    """Since ε0 (task 6934) a suppression's debt is not filed here: each suppressed test
+    gets an item on the ledger's due list, in the same transaction as its occurrence
+    row, and ``flake_debt_drain`` files the owners afterwards.  No network call is left
+    on this path, and the recorder takes no task client at all.  ASYNC-ONLY CLASS."""
+
+    async def test_nine_suppressed_tests_enqueue_nine_items(self, tmp_path: Path) -> None:
+        ids = tuple(f'orchestrator/tests/test_nine.py::test_{i}' for i in range(9))
+
+        await _record(_result(_suppression(test_ids=ids)), tmp_path)
+
+        items = _due(tmp_path)
+        assert sorted(i.test_id for i in items) == sorted(ids)
+        for item in items:
+            assert (item.head, item.observing_task_id, item.call_site) == (
+                _MERGE_SHA, _TASK_ID, 'merge_gate',
+            )
+            assert item.observed_at == '2026-08-22T12:00:00+00:00'
+            assert (item.attempts, item.context) == (0, '{}')
+        assert len(_occurrences(tmp_path)) == 9
+        assert list_open_debt(ledger_db_path(tmp_path)) == [], 'the drain files, not this path'
+        assert 'task_client' not in inspect.signature(
+            flake_recorder.record_merge_flake_suppression,
+        ).parameters
+
+    async def test_the_rows_and_the_items_land_together_or_not_at_all(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """A due list whose shape refuses the item insert takes the occurrence rows down
+        with it: one transaction, so a crash can never leave one without the other."""
+        db_path = ledger_db_path(tmp_path)
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                'CREATE TABLE flake_debt_due '
+                '(id INTEGER PRIMARY KEY, test_id TEXT, observed_at TEXT, call_site TEXT)'
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with caplog.at_level(logging.WARNING):
+            await _record(_result(_suppression()), tmp_path)
+
+        assert _occurrences(tmp_path) == [], 'no row without its item'
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert conn.execute('SELECT COUNT(*) FROM flake_debt_due').fetchone() == (0,)
+        finally:
+            conn.close()
+        assert flake_recorder._merge_flake_suppression_streak == 1
+        assert 'nothing was written' in caplog.text
+
+    async def test_a_replay_lands_neither_a_second_row_nor_a_second_item(
+        self, tmp_path: Path,
+    ) -> None:
+        s = _suppression()
+        await _record(_result(s), tmp_path)
+        await _record(_result(s), tmp_path)
+
+        assert len(_occurrences(tmp_path)) == 2
+        items = _due(tmp_path)
+        assert len(items) == 2
+        for item in items:
+            assert delete_due_item(ledger_db_path(tmp_path), item.id)
+
+        await _record(_result(s), tmp_path)
+
+        assert len(_occurrences(tmp_path)) == 2
+        assert _due(tmp_path) == [], 'a replay after the drain must not re-run open_debt'
+
+    @pytest.mark.parametrize(
+        ('verdict', 'ids', 'reason'),
+        [
+            (FlakeVerdict.fails_in_isolation, _IDS, None),
+            (FlakeVerdict.unconfirmable, (), 'no recoverable node-id'),
+        ],
+    )
+    async def test_non_suppressing_verdicts_write_rows_and_no_items(
+        self, tmp_path: Path, verdict, ids, reason,
+    ) -> None:
+        """§5.5 — debt is owed for a SUPPRESSION, never for an observation.  The
+        unconfirmable case is also the sentinel row: counted, never enqueued."""
+        await _record(_result(_suppression(verdict, test_ids=ids, reason=reason)), tmp_path)
+
+        assert len(_occurrences(tmp_path)) == (1 if not ids else len(ids))
+        assert _due(tmp_path) == []
+
+    async def test_a_literal_sentinel_on_a_suppression_is_never_enqueued(
+        self, tmp_path: Path,
+    ) -> None:
+        await _record(_result(_suppression(test_ids=(UNKNOWN_TEST_ID,))), tmp_path)
+
+        assert [r.test_id for r in _occurrences(tmp_path)] == [UNKNOWN_TEST_ID]
+        assert _due(tmp_path) == []
+
+    async def test_a_raising_ledger_write_still_bumps_the_storm_streak(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        def _raises(*args, **kwargs):
+            raise RuntimeError('the ledger write blew up')
+
+        monkeypatch.setattr(flake_recorder, 'enqueue_debt', _raises)
+        es = _FakeEventStore()
+
+        with caplog.at_level(logging.WARNING):
+            await _record(_result(_suppression()), tmp_path, event_store=es)
+
+        assert flake_recorder._merge_flake_suppression_streak == 1
+        assert len(es.emits) == 1
+        assert '[ledger]' in caplog.text
+
+    async def test_exploding_test_ids_write_nothing_and_still_bump_the_streak(
+        self, tmp_path: Path,
+    ) -> None:
+        """``FlakeSuppression`` rides the wire unvalidated, so reading ``s.test_ids`` can
+        itself fail; B12 says that costs the merge nothing, and the storm escape stays
+        armed."""
+        class _UniterableIds(tuple[str, ...]):
+            def __iter__(self):
+                raise TypeError('test_ids is not iterable on this wire object')
+
+        s = _suppression(test_ids=_UniterableIds(_IDS))
+        await _record(_result(s), tmp_path)
+
+        assert _occurrences(tmp_path) == []
+        assert _due(tmp_path) == []
+        assert flake_recorder._merge_flake_suppression_streak == 1
+
+    async def test_many_distinct_tests_still_trip_the_storm_at_five(self, tmp_path: Path) -> None:
+        """Distinct tests each owing a de-flake task is a systemic signal the per-test
+        dedup cannot bound; the fixed-sentinel streak still trips across them."""
+        q = _FakeEscalationQueue(open_l2=None)
+        threshold = flake_recorder._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
+
+        for i in range(threshold):
+            s = _suppression(
+                test_ids=(f'orchestrator/tests/test_s.py::test_{i}',),
+                observed_at=f'2026-08-22T12:00:0{i}+00:00',
+            )
+            await _record(_result(s), tmp_path, escalation_queue=q)
+
+        assert len(q.submitted) == 1, q.submitted
+        assert q.submitted[0].task_id == flake_recorder._MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL
+        assert q.submitted[0].level == 2
+        assert len(_due(tmp_path)) == threshold
+
+
+_STORM_AT = 5
+_STORM_SENTINEL = 'merge-flake-suppression-storm'
+_STORM_SUMMARY = (
+    'Merge-verify flake-suppression storm: the isolated-rerun-confirm gate has '
+    f'suppressed {_STORM_AT} merge-verify reds since the last reset'
+)
+
+
+def _storms(queue: EscalationQueue) -> list:
+    return queue.get_by_task(_STORM_SENTINEL, status='pending', level=2)
+
+
+def _merge_gate_title(test_id: str, cycle: int) -> str:
+    return (
+        f'Flake debt: {test_id} — passes_in_isolation after a merge-gate red was '
+        f'suppressed, cycle {cycle}'
+    )
+
+
+def _metadata(row) -> dict:
+    return {
+        'spawn_context': 'flake_ledger_debt',
+        'flake_debt_test': row.test_id,
+        'flake_debt_open_count': row.open_count,
+        'flake_debt_opened_at': row.opened_at,
+    }
+
+
+@pytest.mark.asyncio
+class TestScenario32MergeGateUnchanged:
+    """Scenario 32 (plans/offline-lane-red-path-prd.md): the merge gate through the one
+    recorder body and the drain leaves today's rows, debt, storm escalation and task
+    text, with the cycle now named in the de-flake title.  ASYNC-ONLY CLASS."""
+
+    async def test_five_suppressions_and_one_drain_pass_leave_todays_effects(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'queue')
+        for n in range(_STORM_AT):
+            await _record(
+                _result(_suppression(observed_at=f'2026-08-22T12:00:0{n}+00:00')),
+                tmp_path,
+                task_id=f'{_TASK_ID}-{n}',
+                escalation_queue=queue,
+            )
+        client = _FakeLedgerTaskClient()
+
+        await run_drain_pass(
+            ledger_db_path(tmp_path), _PROJECT_ID,
+            task_client=client, git=None, escalation_queue=queue,
+        )
+
+        rows = _occurrences(tmp_path)
+        assert len(rows) == 10, rows
+        assert {(r.test_id, r.task_id) for r in rows} == {
+            (test_id, f'{_TASK_ID}-{n}') for test_id in _IDS for n in range(_STORM_AT)
+        }
+        for r in rows:
+            assert (r.verdict, r.call_site, r.runner, r.merge_sha, r.detail) == (
+                'passes_in_isolation', 'merge_gate', 'remote-lab-1', _MERGE_SHA, '{}',
+            )
+        assert _due(tmp_path) == []
+        debt = list_open_debt(ledger_db_path(tmp_path))
+        assert sorted(d.test_id for d in debt) == sorted(_IDS)
+        assert all(d.owner_task_id for d in debt), debt
+
+        (storm,) = _storms(queue)
+        assert (storm.category, storm.severity, storm.summary) == (
+            'merge_flake_suppression_storm', 'critical', _STORM_SUMMARY,
+        )
+
+        assert len(client.submit_calls) == 2, client.submit_calls
+        for block in client.submit_calls:
+            row = read_debt(ledger_db_path(tmp_path), block['metadata']['flake_debt_test'])
+            assert row is not None
+            assert block['title'] == _merge_gate_title(row.test_id, 1)
+            assert block['description'] == merge_gate_deflake_description(row)
+            assert block['metadata'] == _metadata(row)
+            assert (block['priority'], block['planning_mode']) == ('medium', True)
+
+
+_HEAD = 'e' * 40
+_LANE_A = 'tests/test_lane.py::test_a'
+_LANE_B = 'tests/test_lane.py::test_b'
+
+
+def _lane_context(trigger: DebtTrigger = DebtTrigger.cleared, **overrides) -> DebtContext:
+    kwargs: dict[str, Any] = {
+        'call_site': FlakeCallSite.offline_lane,
+        'trigger': trigger,
+        'command': 'qdrant-integration',
+        'heads': (_HEAD,),
+        'pass_ids': ('p1',),
+    }
+    kwargs.update(overrides)
+    return DebtContext(**kwargs)
+
+
+def _lane_suppression(
+    verdict: FlakeVerdict = FlakeVerdict.passes_in_isolation,
+    *,
+    test_ids: tuple[str, ...] = (_LANE_A,),
+    observed_at: str = '2026-10-19T12:00:00+00:00',
+    call_site: FlakeCallSite = FlakeCallSite.offline_lane,
+    evidence: dict[str, FailureEvidence] | None = None,
+) -> FlakeSuppression:
+    return FlakeSuppression(
+        verdict=verdict,
+        test_ids=test_ids,
+        observed_at=observed_at,
+        call_site=call_site,
+        runner='local',
+        psi_cpu_some10=12.0,
+        unconfirmable_reason=None,
+        evidence=evidence,
+    )
+
+
+async def _observe(project_root: Path, suppressions, **kwargs) -> None:
+    kwargs.setdefault('call_site', FlakeCallSite.offline_lane)
+    kwargs.setdefault('head_sha', _HEAD)
+    kwargs.setdefault('debt_eligible', {})
+    await flake_recorder.record_call_site_observations(
+        tuple(suppressions), project_root=project_root, project_id=_PROJECT_ID, **kwargs,
+    )
+
+
+def _malform_the_due_list(project_root: Path) -> None:
+    """A due list whose shape refuses the item insert, so the whole write fails."""
+    db_path = ledger_db_path(project_root)
+    db_path.parent.mkdir(parents=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            'CREATE TABLE flake_debt_due '
+            '(id INTEGER PRIMARY KEY, test_id TEXT, observed_at TEXT, call_site TEXT)'
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+class TestRecordCallSiteObservations:
+    """The one recorder body every call site shares (offline-lane PRD D6, §5.8): rows and
+    due items first, under one guard per suppression, then the call site's live signals.
+    ASYNC-ONLY CLASS."""
+
+    async def test_a_recovery_with_no_suppression_enqueues_its_items(self, tmp_path: Path) -> None:
+        recovered = _lane_context(DebtTrigger.recovered)
+
+        await _observe(
+            tmp_path, (),
+            observed_at='2026-10-19T12:00:00Z',
+            debt_eligible={_LANE_A: recovered, _LANE_B: None},
+        )
+
+        assert _occurrences(tmp_path) == []
+        items = {i.test_id: i for i in _due(tmp_path)}
+        assert set(items) == {_LANE_A, _LANE_B}
+        for item in items.values():
+            assert (item.call_site, item.head, item.observing_task_id) == (
+                'offline_lane', _HEAD, None,
+            )
+            assert item.observed_at == '2026-10-19T12:00:00+00:00'
+        assert debt_context_from_json(items[_LANE_A].context) == recovered
+        assert items[_LANE_B].context == '{}'
+
+    async def test_an_unnamed_item_with_no_instant_is_skipped_loudly(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            await _observe(tmp_path, (), observed_at=None, debt_eligible={_LANE_A: None})
+
+        assert _due(tmp_path) == []
+        assert 'observed_at' in caplog.text
+
+    async def test_the_lane_emits_nothing_and_bumps_nothing(self, tmp_path: Path) -> None:
+        """Scenario 30's recorder half: the storm alarm stays the merge gate's.  More lane
+        suppressions than the storm takes raise none, and leave the merge gate's next
+        window whole: its storm comes at its fifth suppression, not before."""
+        es, queue = _FakeEventStore(), EscalationQueue(tmp_path / 'queue')
+
+        for i in range(_STORM_AT + 1):
+            test_id = f'tests/test_lane.py::test_{i}'
+            await _observe(
+                tmp_path,
+                (_lane_suppression(test_ids=(test_id,), observed_at=f'2026-10-19T12:00:0{i}+00:00'),),
+                debt_eligible={test_id: None},
+                event_store=es, escalation_queue=queue,
+            )
+        assert (es.emits, _storms(queue)) == ([], [])
+
+        for i in range(_STORM_AT):
+            assert _storms(queue) == [], f'a storm before merge suppression {i + 1}'
+            await _record(
+                _result(_suppression(observed_at=f'2026-08-22T12:00:0{i}+00:00')),
+                tmp_path, task_id=f'merge-{i}', event_store=es, escalation_queue=queue,
+            )
+
+        assert len(_storms(queue)) == 1
+        assert [task_id for _type, task_id, _data in es.emits] == [
+            f'merge-{i}' for i in range(_STORM_AT)
+        ]
+
+    async def test_every_eligible_test_lands_with_its_context_in_its_rows_transaction(
+        self, tmp_path: Path,
+    ) -> None:
+        cleared = _lane_context()
+        evidence = {
+            _LANE_A: FailureEvidence(kind=EvidenceKind.failed, first_line='AssertionError: a'),
+            _LANE_B: FailureEvidence(kind=EvidenceKind.error, first_line='ImportError: b'),
+        }
+        s = _lane_suppression(
+            test_ids=(_LANE_A, _LANE_B), observed_at='2026-10-19T11:00:00Z', evidence=evidence,
+        )
+
+        await _observe(
+            tmp_path, (s,), observed_at='2026-10-19T12:30:00+00:00', debt_eligible={_LANE_A: cleared},
+        )
+
+        rows = {r.test_id: r for r in _occurrences(tmp_path)}
+        assert json.loads(rows[_LANE_A].detail)['evidence']['first_line'] == 'AssertionError: a'
+        assert json.loads(rows[_LANE_B].detail)['evidence']['first_line'] == 'ImportError: b'
+        (item,) = _due(tmp_path)
+        assert item.test_id == _LANE_A
+        assert item.observed_at == '2026-10-19T11:00:00+00:00', "the suppression's instant"
+        assert debt_context_from_json(item.context) == cleared
+
+    async def test_rows_and_items_land_together_or_not_at_all(self, tmp_path: Path) -> None:
+        _malform_the_due_list(tmp_path)
+
+        await _observe(tmp_path, (_lane_suppression(),), debt_eligible={_LANE_A: _lane_context()})
+
+        assert _occurrences(tmp_path) == []
+        conn = sqlite3.connect(str(ledger_db_path(tmp_path)))
+        try:
+            assert conn.execute('SELECT COUNT(*) FROM flake_debt_due').fetchone() == (0,)
+        finally:
+            conn.close()
+
+    async def test_eligibility_is_the_callers_not_the_verdicts(self, tmp_path: Path) -> None:
+        await _observe(
+            tmp_path, (_lane_suppression(FlakeVerdict.fails_in_isolation),),
+            debt_eligible={_LANE_A: None},
+        )
+        assert [i.test_id for i in _due(tmp_path)] == [_LANE_A]
+
+        other = tmp_path / 'other'
+        await _observe(other, (_lane_suppression(),), debt_eligible={})
+        assert [r.test_id for r in _occurrences(other)] == [_LANE_A]
+        assert _due(other) == []
+
+    async def test_a_suppression_the_ledger_refuses_costs_only_its_own_rows(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        bad = _lane_suppression(test_ids=(_LANE_A,), observed_at='not a time')
+        good = _lane_suppression(test_ids=(_LANE_B,))
+
+        with caplog.at_level(logging.WARNING):
+            await _observe(tmp_path, (bad, good), debt_eligible={_LANE_A: None, _LANE_B: None})
+
+        assert [r.test_id for r in _occurrences(tmp_path)] == [_LANE_B]
+        assert [i.test_id for i in _due(tmp_path)] == [_LANE_B]
+        assert 'nothing was written' in caplog.text
+
+    async def test_a_raising_write_costs_only_its_own_suppression(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        """One guard per suppression: a write that RAISES (``enqueue_debt`` itself never
+        does) is caught by the recorder and named ``[ledger]``."""
+        first = _lane_suppression(test_ids=(_LANE_A,))
+        real = flake_recorder.enqueue_debt
+
+        def _first_raises(*args, **kwargs):
+            if kwargs.get('occurrence') is first:
+                raise RuntimeError('the first write blew up')
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(flake_recorder, 'enqueue_debt', _first_raises)
+        with caplog.at_level(logging.WARNING):
+            await _observe(
+                tmp_path, (first, _lane_suppression(test_ids=(_LANE_B,))),
+                debt_eligible={_LANE_B: None},
+            )
+
+        assert [r.test_id for r in _occurrences(tmp_path)] == [_LANE_B]
+        assert [i.test_id for i in _due(tmp_path)] == [_LANE_B]
+        assert '[ledger]' in caplog.text
+
+    async def test_a_call_site_with_no_row_writes_rows_and_no_live_signal(
+        self, tmp_path: Path,
+    ) -> None:
+        es, queue = _FakeEventStore(), EscalationQueue(tmp_path / 'queue')
+
+        for i in range(_STORM_AT):
+            s = _lane_suppression(
+                call_site=FlakeCallSite.chronic_marker, observed_at=f'2026-10-19T12:00:0{i}+00:00',
+            )
+            await _observe(
+                tmp_path, (s,), call_site=FlakeCallSite.chronic_marker,
+                event_store=es, escalation_queue=queue,
+            )
+
+        assert len(_occurrences(tmp_path)) == _STORM_AT
+        assert es.emits == []
+        assert _storms(queue) == []
+
+    async def test_a_context_naming_another_call_site_is_enqueued_without_it(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """The item's call site is the one source; the owner is still owed."""
+        s = _lane_suppression(call_site=FlakeCallSite.merge_gate)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            await _observe(
+                tmp_path, (s,), call_site=FlakeCallSite.merge_gate,
+                debt_eligible={_LANE_A: _lane_context()},
+            )
+
+        (item,) = _due(tmp_path)
+        assert (item.test_id, item.call_site, item.context) == (_LANE_A, 'merge_gate', '{}')
+        assert 'call_site=offline_lane on a due item at call_site=merge_gate' in caplog.text
+
+    async def test_the_rows_exist_before_the_live_signals_fire(self, tmp_path: Path) -> None:
+        seen: list[int] = []
+
+        class _ReadingEventStore:
+            def emit(self, *args, **kwargs) -> None:
+                seen.append(len(_occurrences(tmp_path)))
+
+        await _observe(
+            tmp_path, (_lane_suppression(call_site=FlakeCallSite.merge_gate),),
+            call_site=FlakeCallSite.merge_gate, observing_task_id=_TASK_ID,
+            event_store=_ReadingEventStore(),
+        )
+
+        assert seen == [1]
+
+    async def test_never_raises_with_no_collaborators(self, tmp_path: Path) -> None:
+        await _observe(
+            tmp_path, (_lane_suppression(call_site=FlakeCallSite.merge_gate),),
+            call_site=FlakeCallSite.merge_gate, debt_eligible={_LANE_A: None},
+            event_store=None, escalation_queue=None,
+        )
+
+        assert len(_occurrences(tmp_path)) == 1
+
+
+_FIX = 'f1' * 20
+_H1 = '1' * 40
+_H2 = '2' * 40
+_LANE_RE_ENTRY = flake_debt_drain.call_site_evidence(
+    'offline_lane', observed_at='2026-10-19T13:00:00+00:00',
+)
+
+
+@pytest.mark.asyncio
+class TestLaneRegressionFromTheDrain:
+    """Scenario 31's ledger half: a lane test that clears again after its de-flake task
+    landed raises the ledger's regression escalation, worded for the lane, and files a
+    second owner the title fold cannot swallow.  ASYNC-ONLY CLASS."""
+
+    async def _first_cycle(self, tmp_path: Path, client: _FakeLedgerTaskClient) -> None:
+        ctx1 = _lane_context(heads=(_H1,), pass_ids=('p1',))
+        await _observe(
+            tmp_path, (_lane_suppression(observed_at='2026-10-19T12:00:00+00:00'),),
+            head_sha=_H1, debt_eligible={_LANE_A: ctx1},
+        )
+        await run_drain_pass(
+            ledger_db_path(tmp_path), _PROJECT_ID, task_client=client, git=None,
+            escalation_queue=None,
+        )
+        assert client.filed == ['deflake-1']
+        assert client.submit_calls[0]['title'].endswith(', cycle 1')
+        client.finish('deflake-1', commit=_FIX)
+
+    async def _drain(self, tmp_path: Path, client: _FakeLedgerTaskClient) -> _RecordingQueue:
+        queue = _RecordingQueue(tmp_path / 'queue')
+        await run_drain_pass(
+            ledger_db_path(tmp_path), _PROJECT_ID, task_client=client, git=None,
+            escalation_queue=queue,
+        )
+        return queue
+
+    async def test_a_clear_after_the_fix_raises_one_lane_worded_regression(
+        self, tmp_path: Path,
+    ) -> None:
+        client = _FakeLedgerTaskClient(folds_titles=True)
+        await self._first_cycle(tmp_path, client)
+        ctx2 = _lane_context(heads=(_H2,), pass_ids=('p2',))
+        await _observe(
+            tmp_path, (_lane_suppression(observed_at='2026-10-19T13:00:00+00:00'),),
+            head_sha=_H2, debt_eligible={_LANE_A: ctx2},
+        )
+
+        queue = await self._drain(tmp_path, client)
+
+        (esc,) = queue.regressions()
+        assert 'an offline-lane clear has now RE-OPENED it' in esc.detail, esc.detail
+        for text in ('cleared', 'p2', _H2, 'qdrant-integration'):
+            assert text in esc.detail, text
+        assert 'merge-gate suppression' not in esc.detail
+        assert 'observed at merge_sha' not in esc.detail
+        assert (esc.level, esc.severity, esc.agent_role, esc.category) == (
+            2, 'critical', 'orchestrator-flake-ledger', 'regressed_after_resolution',
+        )
+        assert _LANE_RE_ENTRY in esc.evidence, esc.evidence
+        assert client.filed == ['deflake-1', 'deflake-2'], 'the title fold swallowed cycle 2'
+        assert client.submit_calls[-1]['title'].endswith(', cycle 2')
+
+    async def test_a_recovery_after_the_fix_raises_a_recovery_worded_regression(
+        self, tmp_path: Path,
+    ) -> None:
+        client = _FakeLedgerTaskClient(folds_titles=True)
+        await self._first_cycle(tmp_path, client)
+        recovered = _lane_context(DebtTrigger.recovered, heads=(_H2,), pass_ids=('p2',))
+        await _observe(
+            tmp_path, (), head_sha=_H2, observed_at='2026-10-19T13:00:00+00:00',
+            debt_eligible={_LANE_A: recovered},
+        )
+
+        queue = await self._drain(tmp_path, client)
+
+        (esc,) = queue.regressions()
+        assert 'an offline-lane recovery has now RE-OPENED it' in esc.detail, esc.detail
+        assert _LANE_RE_ENTRY in esc.evidence, esc.evidence

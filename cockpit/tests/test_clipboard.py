@@ -1,0 +1,347 @@
+"""Tests for cockpit.clipboard — the real system-clipboard path (task 5448).
+
+Why OSC 52 alone was insufficient, and why its tests passed against a copy
+that did nothing, is recorded once in cockpit/src/cockpit/clipboard.py's
+module docstring. What follows from it here: the only boundary that can
+tell "reached a clipboard" from "wrote an escape nobody read" is the
+clipboard helper process, so this module asserts on the exact argv and the
+exact stdin bytes handed to it.
+
+Every dependency is injected as a plain dict/function/class (never
+MagicMock — fused-memory/scripts/check_bare_magicmock_config.py scans
+cockpit/tests), so the environment-gated and command-selection tests are
+hermetic on a host with or without a display. The default runner's own
+tests deliberately do NOT monkeypatch subprocess: the process boundary is
+the thing under test, so they run real `sh` helpers.
+
+`cockpit.clipboard` doesn't exist yet, so every test imports it inline and
+is ImportError-RED until its impl step (mirrors test_backends_wm.py /
+test_backends_base.py conventions).
+"""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+
+def _which_all(name):
+    """A `shutil.which` double for which every clipboard helper resolves."""
+    return f'/usr/bin/{name}'
+
+
+class RecordingWhich:
+    """A `shutil.which` double: records every lookup, resolves all but `missing`."""
+
+    def __init__(self, missing=()):
+        self.lookups: list[str] = []
+        self._missing = set(missing)
+
+    def __call__(self, name):
+        self.lookups.append(name)
+        return None if name in self._missing else f'/usr/bin/{name}'
+
+
+_XCLIP = ('xclip', '-selection', 'clipboard')
+_XSEL = ('xsel', '--clipboard', '--input')
+_WL_COPY = ('wl-copy',)
+
+
+class TestAvailableCopyCommands:
+    def test_wayland_session_prefers_wl_copy(self):
+        """WAYLAND_DISPLAY set -> the Wayland helper is the FIRST candidate.
+
+        Preference order is fixed by the module, not by PATH order, so a
+        Wayland session never reaches for an X11 helper first.
+        """
+        from cockpit.clipboard import available_copy_commands
+
+        commands = available_copy_commands(
+            environ={'WAYLAND_DISPLAY': 'wayland-0'}, which=_which_all
+        )
+
+        assert commands[0] == _WL_COPY
+
+    def test_x11_session_yields_xclip_then_xsel(self):
+        """DISPLAY set (no Wayland) -> exactly the two X11 helpers, xclip first."""
+        from cockpit.clipboard import available_copy_commands
+
+        commands = available_copy_commands(environ={'DISPLAY': ':0'}, which=_which_all)
+
+        assert commands == (_XCLIP, _XSEL)
+
+    def test_a_helper_missing_from_path_is_dropped(self):
+        """`which` is the arbiter of presence: no xclip -> only the xsel candidate survives."""
+        from cockpit.clipboard import available_copy_commands
+
+        which = RecordingWhich(missing={'xclip'})
+
+        commands = available_copy_commands(environ={'DISPLAY': ':0'}, which=which)
+
+        assert commands == (_XSEL,)
+
+    def test_no_display_environment_yields_no_candidates_and_no_lookups(self):
+        """The over-SSH case: neither display var set -> (), and `which` is never consulted.
+
+        With no display there is nothing a local helper could reach, so the
+        caller falls straight through to the OSC 52 fallback without paying
+        for a doomed subprocess — the environment gate runs BEFORE the PATH
+        lookup, which is what the empty `lookups` list proves.
+        """
+        from cockpit.clipboard import available_copy_commands
+
+        which = RecordingWhich()
+
+        commands = available_copy_commands(environ={}, which=which)
+
+        assert commands == ()
+        assert which.lookups == []
+
+    def test_both_display_vars_set_puts_wayland_first_then_x11(self):
+        """A Wayland session running XWayland exports both vars: wl-copy leads, X11 follows."""
+        from cockpit.clipboard import available_copy_commands
+
+        commands = available_copy_commands(
+            environ={'WAYLAND_DISPLAY': 'wayland-0', 'DISPLAY': ':0'}, which=_which_all
+        )
+
+        assert commands == (_WL_COPY, _XCLIP, _XSEL)
+
+
+# Multi-line and non-ASCII on purpose: a real payload is a labeled block
+# (format_copy_payload) and a real question can carry any unicode. No
+# trailing newline, so a runner that helpfully appends one fails the
+# byte-exactness assertion.
+_UNICODE_PAYLOAD = 'question: Wie heißt der Port?\nproject: df — fleet\ntask_id: 5448'
+
+
+class TestRunClipboardCommand:
+    """The DEFAULT runner, against REAL subprocesses.
+
+    Deliberately no monkeypatching of subprocess: the process boundary IS
+    the thing under test, and faking it here would rebuild exactly the
+    self-referential green this task exists to delete.
+    """
+
+    @pytest.mark.timeout(10)
+    def test_text_is_delivered_on_the_helper_stdin_byte_exact(self, tmp_path):
+        """The payload reaches the child's stdin verbatim — nothing added, nothing stripped."""
+        from cockpit.clipboard import run_clipboard_command
+
+        target = tmp_path / 'copied.txt'
+
+        code = run_clipboard_command(['sh', '-c', 'cat > "$1"', 'sh', str(target)], _UNICODE_PAYLOAD)
+
+        assert code == 0
+        assert target.read_text(encoding='utf-8') == _UNICODE_PAYLOAD
+
+    @pytest.mark.timeout(10)
+    def test_missing_binary_returns_nonzero_instead_of_raising(self):
+        """Fail-soft (PRD §2): subprocess.run raises FileNotFoundError here; the cockpit must not."""
+        from cockpit.clipboard import run_clipboard_command
+
+        code = run_clipboard_command(['df-no-such-binary-5448'], 'payload')
+
+        assert code != 0
+
+    @pytest.mark.timeout(10)
+    def test_a_helper_that_forks_a_child_does_not_block_the_caller(self, tmp_path):
+        """The no-pipe contract: stdout/stderr are NOT piped, so a forked child can't stall us.
+
+        Regression guard for a real UI freeze, reproducing the shape a
+        clipboard helper actually has: it owns the selection by forking a
+        background child that outlives the exec and inherits the parent's
+        pipes. run_clipboard_command's docstring carries the measurement
+        that makes DEVNULL a correctness constraint rather than a style
+        choice; this is the test that fails if someone reverts it.
+        """
+        from cockpit.clipboard import run_clipboard_command
+
+        target = tmp_path / 'copied.txt'
+
+        started = time.monotonic()
+        code = run_clipboard_command(
+            ['sh', '-c', 'cat > "$1"; sleep 30 &', 'sh', str(target)], 'payload'
+        )
+        elapsed = time.monotonic() - started
+
+        assert code == 0
+        assert target.read_text(encoding='utf-8') == 'payload'
+        assert elapsed < 5.0
+
+    @pytest.mark.timeout(10)
+    def test_a_helper_that_never_exits_times_out_to_nonzero(self):
+        """A wedged helper degrades to a return code, never a TimeoutExpired out of action_copy."""
+        from cockpit.clipboard import run_clipboard_command
+
+        code = run_clipboard_command(['sh', '-c', 'sleep 30'], 'payload', timeout=0.2)
+
+        assert code != 0
+
+
+class RecordingRunner:
+    """A ClipboardRunner double: records (argv, text) per call, returns scripted codes.
+
+    `codes[i]` is the i-th call's return code; calls past the end reuse the
+    last entry, so a test only scripts the prefix it cares about. Timeouts
+    are recorded apart from `calls` so the budget assertions and the
+    argv/text assertions stay independently readable.
+    """
+
+    def __init__(self, codes=(0,)):
+        self.calls: list[tuple[tuple[str, ...], str]] = []
+        self.timeouts: list[float] = []
+        self._codes = tuple(codes)
+
+    def __call__(self, argv, text, *, timeout):
+        self.calls.append((tuple(argv), text))
+        self.timeouts.append(timeout)
+        return self._codes[min(len(self.calls) - 1, len(self._codes) - 1)]
+
+
+class TestCopyToSystemClipboard:
+    """The candidate walk, asserted at the process boundary it hands off to.
+
+    THIS is the assertion task 2517 never made: the exact argv and the exact
+    text that reach a clipboard helper. `app._clipboard` could not have made
+    it — see cockpit/src/cockpit/clipboard.py's module docstring.
+    """
+
+    def test_first_working_helper_receives_the_exact_argv_and_text(self):
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_to_system_clipboard
+
+        runner = RecordingRunner(codes=(0,))
+
+        attempt = copy_to_system_clipboard(
+            _UNICODE_PAYLOAD, environ={'DISPLAY': ':0'}, which=_which_all, runner=runner
+        )
+
+        assert runner.calls == [(_XCLIP, _UNICODE_PAYLOAD)]
+        assert attempt == CopyAttempt(CopyOutcome.COPIED, _XCLIP)
+
+    def test_a_failing_helper_falls_through_to_the_next_candidate(self):
+        """rc 1 from xclip is not the end: xsel is tried, and COPIED names the one that worked."""
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_to_system_clipboard
+
+        runner = RecordingRunner(codes=(1, 0))
+
+        attempt = copy_to_system_clipboard(
+            'payload', environ={'DISPLAY': ':0'}, which=_which_all, runner=runner
+        )
+
+        assert [argv for argv, _ in runner.calls] == [_XCLIP, _XSEL]
+        assert attempt == CopyAttempt(CopyOutcome.COPIED, _XSEL)
+
+    def test_every_helper_failing_reports_helper_failed_with_the_last_command(self):
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_to_system_clipboard
+
+        runner = RecordingRunner(codes=(1,))
+
+        attempt = copy_to_system_clipboard(
+            'payload', environ={'DISPLAY': ':0'}, which=_which_all, runner=runner
+        )
+
+        assert [argv for argv, _ in runner.calls] == [_XCLIP, _XSEL]
+        assert attempt == CopyAttempt(CopyOutcome.HELPER_FAILED, _XSEL)
+
+    def test_no_candidates_reports_no_helper_without_spawning_anything(self):
+        """The over-SSH case: NO_HELPER, no command, and the runner is never called."""
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_to_system_clipboard
+
+        runner = RecordingRunner(codes=(0,))
+
+        attempt = copy_to_system_clipboard(
+            'payload', environ={}, which=_which_all, runner=runner
+        )
+
+        assert runner.calls == []
+        assert attempt == CopyAttempt(CopyOutcome.NO_HELPER, ())
+
+    def test_the_walk_divides_one_ui_budget_across_the_candidates(self):
+        """Each candidate gets a SLICE of the budget, not the whole thing.
+
+        The walk is synchronous on Textual's message-pump thread, so what
+        the operator experiences is the SUM over the candidates tried. With
+        a per-candidate ceiling an X11 host's two helpers (three, on a
+        Wayland host running XWayland) could each burn it in turn and stall
+        the interface for a multiple of it; dividing pins the bound at the
+        budget itself, whichever helpers happen to be installed.
+        """
+        from cockpit.clipboard import copy_to_system_clipboard
+
+        runner = RecordingRunner(codes=(1,))
+
+        copy_to_system_clipboard(
+            'payload', environ={'DISPLAY': ':0'}, which=_which_all, runner=runner, budget=1.0
+        )
+
+        assert runner.timeouts == [0.5, 0.5]
+
+    def test_a_lone_candidate_gets_the_whole_budget(self):
+        """The split is over the candidates actually available, not a fixed divisor."""
+        from cockpit.clipboard import copy_to_system_clipboard
+
+        runner = RecordingRunner(codes=(0,))
+
+        copy_to_system_clipboard(
+            'payload',
+            environ={'WAYLAND_DISPLAY': 'wayland-0'},
+            which=_which_all,
+            runner=runner,
+            budget=1.0,
+        )
+
+        assert runner.timeouts == [1.0]
+
+
+class TestCopyFeedback:
+    """The operator-visible wording, decided by a pure function.
+
+    No pilot, no event loop, no terminal: what the toast says and whether
+    the OSC 52 fallback still runs are both pinnable here. The incident's
+    primary complaint was that 'y' produced no signal in EITHER direction,
+    which is how a total no-op survived a whole task cycle.
+    """
+
+    def test_success_names_the_mechanism_and_skips_the_fallback(self):
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
+
+        feedback = copy_feedback(CopyAttempt(CopyOutcome.COPIED, _XCLIP))
+
+        assert feedback.severity == 'information'
+        assert feedback.write_osc52 is False
+        assert 'xclip' in feedback.message
+
+    def test_no_helper_warns_and_asks_for_the_osc52_fallback(self):
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
+
+        feedback = copy_feedback(CopyAttempt(CopyOutcome.NO_HELPER))
+
+        assert feedback.severity == 'warning'
+        assert feedback.write_osc52 is True
+        assert 'OSC 52' in feedback.message
+
+    def test_helper_failure_names_both_the_helper_and_the_fallback(self):
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
+
+        feedback = copy_feedback(CopyAttempt(CopyOutcome.HELPER_FAILED, _WL_COPY))
+
+        assert feedback.severity == 'warning'
+        assert feedback.write_osc52 is True
+        assert 'wl-copy' in feedback.message
+        assert 'OSC 52' in feedback.message
+
+    def test_a_failure_with_no_command_still_reads_as_prose(self):
+        """The guarded-exception case (action_copy's except branch) carries no argv.
+
+        Fail-soft must not mean fail-ugly: the operator gets a generic label,
+        never an empty fragment or a literal 'None'/'()' in the toast.
+        """
+        from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
+
+        feedback = copy_feedback(CopyAttempt(CopyOutcome.HELPER_FAILED))
+
+        assert feedback.message
+        assert 'None' not in feedback.message
+        assert '()' not in feedback.message

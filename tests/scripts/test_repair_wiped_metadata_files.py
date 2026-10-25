@@ -1,12 +1,12 @@
 """Tests for scripts/repair_wiped_metadata_files.py — the WRITE counterpart to
 the read-only audit of the DONE-path ``metadata.files`` wipe.
 
-Task 3329 backfills ``metadata.files`` on the records that
-``TaskWorkflow._reconcile_metadata_files_for_done``
-(orchestrator/src/orchestrator/workflow.py:2007) already emptied. Task 3113 owns
-the forward fix and is still ``pending``, so the wiper is LIVE and the damaged
-population keeps growing — which is precisely why the repair re-runs the audit
-in-process on every invocation instead of consuming a pasted candidate list.
+The script backfills ``metadata.files`` on the records that
+``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._reconcile_metadata_files_for_done``
+emptied before task 3113's fix reached main in 1f2f858e40. Task 3329 ran pass
+one and task 3427 pass two. While the wiper was live the damaged population
+kept growing — which is precisely why the repair re-runs the audit in-process
+on every invocation instead of consuming a pasted candidate list.
 
 NO TEST HERE ASSERTS A COUNT OR TASK ID DERIVED FROM THE LIVE DATABASES.
 This norm is inherited verbatim from scripts/tests/test_audit_wiped_metadata_files.py:
@@ -32,6 +32,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 # All three modules live in <repo>/scripts, which tests/scripts/conftest.py puts
 # on sys.path at collection time. As of task 3456, scripts/ and
 # scripts/legibility/ are ALSO listed in [tool.pyright] extraPaths in the root
@@ -41,14 +43,17 @@ from pathlib import Path
 # falsified it. Same correction in
 # tests/scripts/test_migrate_metadata_modules_to_files.py.
 #
-# _task_db_scan is imported by the TEST only, never by
-# repair_wiped_metadata_files.py itself — see the lockstep guard at the bottom of
-# this file for why that asymmetry is deliberate.
+# The AUDIT_EXIT_* ladder is imported by the TEST only, never by
+# repair_wiped_metadata_files.py itself (whose one _task_db_scan import is
+# UNREADABLE_STORE_ERRORS) — see the lockstep guard at the bottom of this file
+# for why that asymmetry is deliberate.
 from _task_db_scan import (
     AUDIT_EXIT_FINDINGS,
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
+    TaskDbProblem,
+    TaskDbUnreadable,
 )
 from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
@@ -292,10 +297,13 @@ def test_the_gate_and_the_payload_read_one_sanitised_list(tmp_path):
 
     assert plan_files_rejection_reason(candidate) is None
     assert writable_plan_files(candidate) == ("a.py", "b.py")
-    assert build_repair_payload(candidate, now_iso=_NOW)["files"] == ["a.py", "b.py"]
+    payload = build_repair_payload(candidate, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    assert payload["files"] == ["a.py", "b.py"]
 
     client = _FakeClient()
-    outcome = asyncio.run(repair_one(client, _ROOT, candidate, now_iso=_NOW))
+    outcome = asyncio.run(
+        repair_one(client, _ROOT, candidate, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     _, arguments = client.calls[0]
     assert json.loads(arguments["metadata"])["files"] == ["a.py", "b.py"]
@@ -311,10 +319,11 @@ def test_the_gate_and_the_payload_read_one_sanitised_list(tmp_path):
 # ---------------------------------------------------------------------------
 
 _NOW = "2026-08-01T00:00:00+00:00"
+_RUN_TASK_ID = "3427"
 
 
 def test_build_repair_payload_has_exactly_two_top_level_keys():
-    payload = build_repair_payload(_candidate(5), now_iso=_NOW)
+    payload = build_repair_payload(_candidate(5), now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
 
     assert set(payload) == {"files", PROVENANCE_KEY}
 
@@ -327,13 +336,15 @@ def test_build_repair_payload_files_is_a_plain_list_in_plan_order():
         "shared/src/shared/locking.py",
         "scripts/audit_wiped_metadata_files.py",
     )
-    payload = build_repair_payload(_candidate(6, plan_files=files), now_iso=_NOW)
+    payload = build_repair_payload(
+        _candidate(6, plan_files=files), now_iso=_NOW, repair_task_id=_RUN_TASK_ID
+    )
 
     assert payload["files"] == list(files)
     assert isinstance(payload["files"], list)
 
 
-def test_build_repair_payload_provenance_carries_this_tasks_id_and_the_audit_fields():
+def test_build_repair_payload_provenance_carries_the_runs_task_id_and_the_audit_fields():
     """(b) the record says WHO wrote it, from WHICH recovered source, under
     WHICH wipe signature and fidelity, and WHEN — everything a later reader
     needs to judge the backfill without re-deriving the audit."""
@@ -344,9 +355,10 @@ def test_build_repair_payload_provenance_carries_this_tasks_id_and_the_audit_fie
         plan_files_fidelity=FIDELITY_FILE_LEVEL,
     )
 
-    provenance = build_repair_payload(candidate, now_iso=_NOW)[PROVENANCE_KEY]
+    payload = build_repair_payload(candidate, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    provenance = payload[PROVENANCE_KEY]
 
-    assert provenance["task"] == REPAIR_TASK_ID == "3329"
+    assert provenance["task"] == _RUN_TASK_ID
     assert provenance["src"] == "phase_skipped_event"
     assert provenance["sig"] == NO_MERGE_EVENT
     assert provenance["fidelity"] == FIDELITY_FILE_LEVEL
@@ -357,7 +369,7 @@ def test_build_repair_payload_never_carries_done_provenance():
     """(c) DoneProvenanceWriteAuthorityError floor: update_task rejects any
     metadata write carrying done_provenance (set_task_status is its only
     sanctioned writer). Checked at the top level AND nested."""
-    payload = build_repair_payload(_candidate(8), now_iso=_NOW)
+    payload = build_repair_payload(_candidate(8), now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
 
     assert "done_provenance" not in payload
     for value in payload.values():
@@ -369,7 +381,7 @@ def test_build_repair_payload_is_never_a_lifecycle_or_tagger_write():
     """(d) no status (StatusWriteAuthorityError floor), and no modules /
     files_tagged_at — this patch restores scope, it does not re-run the tagger
     or move the task through its lifecycle."""
-    payload = build_repair_payload(_candidate(9), now_iso=_NOW)
+    payload = build_repair_payload(_candidate(9), now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
 
     for forbidden in ("status", "modules", "files_tagged_at"):
         assert forbidden not in payload
@@ -378,7 +390,7 @@ def test_build_repair_payload_is_never_a_lifecycle_or_tagger_write():
 def test_build_repair_payload_round_trips_through_json():
     """(e) the payload is handed to json.dumps by the write path, so anything
     non-serialisable here becomes a mid-batch TypeError instead of a write."""
-    payload = build_repair_payload(_candidate(11), now_iso=_NOW)
+    payload = build_repair_payload(_candidate(11), now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
 
     assert json.loads(json.dumps(payload)) == payload
 
@@ -713,7 +725,9 @@ def test_repair_one_issues_exactly_one_merge_mode_update_task():
     client = _FakeClient()
     candidate = _candidate(2464, plan_files=("a.py", "b.py"))
 
-    result = asyncio.run(repair_one(client, _ROOT, candidate, now_iso=_NOW))
+    result = asyncio.run(
+        repair_one(client, _ROOT, candidate, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert result.disposition == REPAIR
     assert len(client.calls) == 1
@@ -724,7 +738,7 @@ def test_repair_one_issues_exactly_one_merge_mode_update_task():
     assert arguments["project_root"] == _ROOT
     assert arguments["metadata_mode"] == "merge"
     assert json.loads(arguments["metadata"]) == build_repair_payload(
-        candidate, now_iso=_NOW
+        candidate, now_iso=_NOW, repair_task_id=_RUN_TASK_ID
     )
 
 
@@ -737,7 +751,7 @@ def test_repair_one_never_uses_replace_or_append_mode():
     use the wiper's own primitive."""
     client = _FakeClient()
 
-    asyncio.run(repair_one(client, _ROOT, _candidate(1), now_iso=_NOW))
+    asyncio.run(repair_one(client, _ROOT, _candidate(1), now_iso=_NOW, repair_task_id=_RUN_TASK_ID))
 
     _, arguments = client.calls[0]
     assert arguments["metadata_mode"] not in ("replace", "append")
@@ -749,7 +763,7 @@ def test_repair_one_passes_no_status_argument():
     metadata write carrying status is rejected outright."""
     client = _FakeClient()
 
-    asyncio.run(repair_one(client, _ROOT, _candidate(1), now_iso=_NOW))
+    asyncio.run(repair_one(client, _ROOT, _candidate(1), now_iso=_NOW, repair_task_id=_RUN_TASK_ID))
 
     _, arguments = client.calls[0]
     assert "status" not in arguments
@@ -764,7 +778,9 @@ def test_repair_one_captures_a_raised_error_instead_of_propagating():
         raises=_DuplicateCandidateKeyError("candidate_key collides with task 9999")
     )
 
-    result = asyncio.run(repair_one(client, _ROOT, _candidate(2464), now_iso=_NOW))
+    result = asyncio.run(
+        repair_one(client, _ROOT, _candidate(2464), now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert result.disposition == FAILED
     assert result.task_id == 2464
@@ -781,7 +797,9 @@ def test_repair_one_treats_an_error_shaped_result_as_failed():
     ):
         client = _FakeClient(returns=payload)
 
-        result = asyncio.run(repair_one(client, _ROOT, _candidate(3), now_iso=_NOW))
+        result = asyncio.run(
+            repair_one(client, _ROOT, _candidate(3), now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+        )
 
         assert result.disposition == FAILED, payload
         assert result.detail, payload
@@ -794,7 +812,9 @@ def test_repair_one_treats_an_empty_reply_as_failed():
     alongside the explicit-error-payload cases above."""
     client = _FakeClient(returns={})
 
-    result = asyncio.run(repair_one(client, _ROOT, _candidate(4), now_iso=_NOW))
+    result = asyncio.run(
+        repair_one(client, _ROOT, _candidate(4), now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert result.disposition == FAILED
     assert result.detail
@@ -822,7 +842,9 @@ def test_repair_one_treats_a_transport_stamped_reply_as_failed():
     ):
         client = _FakeClient(returns=payload)
 
-        result = asyncio.run(repair_one(client, _ROOT, _candidate(5), now_iso=_NOW))
+        result = asyncio.run(
+            repair_one(client, _ROOT, _candidate(5), now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+        )
 
         assert result.disposition == FAILED, payload
         assert result.detail, payload
@@ -836,7 +858,9 @@ def test_repair_one_accepts_a_plain_success_shape():
     for payload in ({"success": True}, {"id": "2464", "status": "done"}):
         client = _FakeClient(returns=payload)
 
-        result = asyncio.run(repair_one(client, _ROOT, _candidate(4), now_iso=_NOW))
+        result = asyncio.run(
+            repair_one(client, _ROOT, _candidate(4), now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+        )
 
         assert result.disposition == REPAIR, payload
 
@@ -864,7 +888,9 @@ def test_repair_one_carries_the_candidates_tag_verbatim():
     client = _FakeClient()
     candidate = _candidate(77, tag="feature-x")
 
-    result = asyncio.run(repair_one(client, _ROOT, candidate, now_iso=_NOW))
+    result = asyncio.run(
+        repair_one(client, _ROOT, candidate, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert result.disposition == REPAIR
     assert len(client.calls) == 1
@@ -889,6 +915,7 @@ _COVERAGE = AuditCoverage(
     tasks_with_lock_level_signal_only=135,
     tasks_without_plan_signal=2277,
     plan_records_without_task=6,
+    event_log_read=True,
 )
 
 
@@ -1244,7 +1271,9 @@ def test_repair_project_re_reads_the_candidates_own_tag_not_the_default(tmp_path
     # update_task reads it as a plain non-error success.
     client = _FakeClient(returns={"id": "77", "status": "done", "metadata": {"files": []}})
 
-    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+    result = asyncio.run(
+        repair_project(client, str(root), apply=True, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert [o.disposition for o in result.outcomes] == [REPAIR]
     assert [o.tag for o in result.outcomes] == ["feature-x"]
@@ -1270,7 +1299,9 @@ def test_repair_project_declines_to_write_when_the_live_task_is_not_terminal(tmp
         returns={"id": "2464", "status": "in-progress", "metadata": {"files": []}}
     )
 
-    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+    result = asyncio.run(
+        repair_project(client, str(root), apply=True, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert [o.disposition for o in result.outcomes] == [SKIP_NOT_TERMINAL]
     called = [name for name, _ in client.calls]
@@ -1279,14 +1310,16 @@ def test_repair_project_declines_to_write_when_the_live_task_is_not_terminal(tmp
 
 def test_repair_project_declines_to_write_when_the_live_task_already_has_files(tmp_path):
     """The idempotency arm of gate 3, enforced rather than merely classified.
-    A second pass (the one expected once 3113 lands) must re-read cheaply and
+    A second pass (task 3427's, run after 3113 landed) must re-read cheaply and
     touch only what is still empty — so the write must not be issued here."""
     root = _wiped_project(tmp_path)
     client = _FakeClient(
         returns={"id": "2464", "status": "done", "metadata": {"files": ["a.py"]}}
     )
 
-    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+    result = asyncio.run(
+        repair_project(client, str(root), apply=True, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert [o.disposition for o in result.outcomes] == [SKIP_FILES_PRESENT]
     called = [name for name, _ in client.calls]
@@ -1310,7 +1343,9 @@ def test_repair_project_short_circuits_a_lock_charter_reject_before_any_mcp_call
         returns={"id": "2464", "status": "done", "metadata": {"files": []}}
     )
 
-    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+    result = asyncio.run(
+        repair_project(client, str(root), apply=True, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert [o.disposition for o in result.outcomes] == [SKIP_LOCK_CHARTER]
     assert client.calls == [], f"the pre-check dialled the server: {client.calls}"
@@ -1331,7 +1366,9 @@ def test_repair_project_reports_a_mid_batch_transport_death_as_failed_live_read(
     root = _wiped_project(tmp_path)
     client = _FakeClient(raises=_ConnectError("Connection refused"))
 
-    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+    result = asyncio.run(
+        repair_project(client, str(root), apply=True, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ]
     detail = result.outcomes[0].detail or ""
@@ -1359,7 +1396,9 @@ def test_repair_project_stops_dialling_after_repeated_transport_failures_mid_bat
     )
     client = _FakeClient(raises=_ConnectError("Connection refused"))
 
-    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+    result = asyncio.run(
+        repair_project(client, str(root), apply=True, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ] * len(task_ids)
     # EXACTLY _MAX_CONSECUTIVE_LIVE_READ_FAILURES calls, not one per
@@ -1387,7 +1426,9 @@ def test_repair_project_treats_an_answered_backend_error_as_failed_live_read(tmp
         returns={"error": "database is locked", "error_type": "OperationalError"}
     )
 
-    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+    result = asyncio.run(
+        repair_project(client, str(root), apply=True, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ]
     assert "OperationalError" in (result.outcomes[0].detail or "")
@@ -1406,7 +1447,9 @@ def test_repair_project_reports_an_unanswered_live_reread_as_failed_live_read(tm
     root = _wiped_project(tmp_path)
     client = _FakeClient(returns={})
 
-    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+    result = asyncio.run(
+        repair_project(client, str(root), apply=True, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ]
     assert [name for name, _ in client.calls] == ["get_task"]
@@ -1447,7 +1490,7 @@ def test_repair_project_reports_a_transport_stamped_live_reread_as_failed_live_r
         client = _FakeClient(returns=reply)
 
         result = asyncio.run(
-            repair_project(client, str(root), apply=True, now_iso=_NOW)
+            repair_project(client, str(root), apply=True, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
         )
 
         assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ], reply
@@ -1471,7 +1514,9 @@ def test_repair_project_still_skips_a_genuinely_missing_task_as_skip_missing(tmp
         }
     )
 
-    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+    result = asyncio.run(
+        repair_project(client, str(root), apply=True, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert [o.disposition for o in result.outcomes] == [SKIP_MISSING]
     assert "TaskNotFoundError" in (result.outcomes[0].detail or "")
@@ -1500,7 +1545,9 @@ def test_repair_project_reports_the_servers_own_reason_for_a_missing_task(tmp_pa
         }
     )
 
-    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+    result = asyncio.run(
+        repair_project(client, str(root), apply=True, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert [o.disposition for o in result.outcomes] == [SKIP_MISSING]
     detail = result.outcomes[0].detail or ""
@@ -1525,7 +1572,9 @@ def test_repair_project_with_a_live_client_and_apply_false_issues_no_write(tmp_p
     root = _wiped_project(tmp_path)
     client = _FakeClient(returns={"id": "2464", "status": "done", "metadata": {"files": []}})
 
-    result = asyncio.run(repair_project(client, str(root), apply=False, now_iso=_NOW))
+    result = asyncio.run(
+        repair_project(client, str(root), apply=False, now_iso=_NOW, repair_task_id=_RUN_TASK_ID)
+    )
 
     assert [o.disposition for o in result.outcomes] == [REPAIR]
     assert result.applied is False
@@ -1678,6 +1727,35 @@ def test_main_one_unreadable_root_does_not_abort_the_other_roots(tmp_path):
     assert "incomplete" in result.stderr
 
 
+def _stub_project(tmp_path, name="stub"):
+    """A project whose tasks.db EXISTS (so discovery keeps it) but is 0 bytes,
+    the shape connect_ro refuses as an EMPTY_STUB."""
+    root = _wiped_project(tmp_path, name=name, task_id=99)
+    (root / ".taskmaster" / "tasks" / "tasks.db").write_bytes(b"")
+    return root
+
+
+def test_main_skips_a_stub_root_naming_connect_ros_reason(tmp_path):
+    """The in-process audit refuses a stub with TaskDbUnreadable, not a
+    sqlite3.Error, so the per-root guard must skip that too — with the
+    refusal's remedy rather than sqlite's `no such table: tasks`."""
+    stub = _stub_project(tmp_path)
+    good = _wiped_project(tmp_path, name="good", task_id=11)
+
+    result = _run_cli(
+        "--project-root", str(stub), "--project-root", str(good), "--json"
+    )
+
+    assert result.returncode == EXIT_OK, result.stderr
+    payload = json.loads(result.stdout)
+    assert [p["project_root"] for p in payload["projects"]] == [str(good)]
+    assert [o["task_id"] for o in payload["projects"][0]["outcomes"]] == [11]
+    assert "skipping unreadable project" in result.stderr
+    stub_db = stub / ".taskmaster" / "tasks" / "tasks.db"
+    refusal = TaskDbUnreadable(stub_db.resolve(), TaskDbProblem.EMPTY_STUB)
+    assert str(refusal) in result.stderr
+
+
 def test_main_exit_3_when_every_resolved_root_is_unreadable(tmp_path):
     """NOTHING SCANNED IS NOT A CLEAN RUN — and it is not a failed write either.
 
@@ -1759,7 +1837,7 @@ def test_main_async_reports_a_mid_batch_transport_death_as_exit_live_read_failed
     root = _wiped_project(tmp_path)
     monkeypatch.setattr(
         "repair_wiped_metadata_files._make_client",
-        lambda server_url: _client_context(
+        lambda server_url, **_kwargs: _client_context(
             _FakeClient(raises=_ConnectError("Connection refused"))
         ),
     )
@@ -1783,7 +1861,7 @@ def test_main_async_returns_exit_ok_when_the_only_outcome_is_skip_missing(
     root = _wiped_project(tmp_path)
     monkeypatch.setattr(
         "repair_wiped_metadata_files._make_client",
-        lambda server_url: _client_context(
+        lambda server_url, **_kwargs: _client_context(
             _FakeClient(
                 returns={
                     "error": "No tasks found for ID(s): 2464",
@@ -1837,7 +1915,7 @@ def test_exit_write_failed_outranks_exit_live_read_failed(tmp_path, monkeypatch)
     )
     monkeypatch.setattr(
         "repair_wiped_metadata_files._make_client",
-        lambda server_url: _client_context(client),
+        lambda server_url, **_kwargs: _client_context(client),
     )
     args = _build_parser().parse_args(
         ["--project-root", str(root_a), "--project-root", str(root_b), "--apply"]
@@ -1928,7 +2006,7 @@ def test_make_client_is_attributable_to_this_repair_not_the_migration():
     ``_make_client`` only constructs — no connection is opened until a call is
     issued — so this costs no server and no network.
     """
-    client = _make_client("http://127.0.0.1:9")
+    client = _make_client("http://127.0.0.1:9", repair_task_id=REPAIR_TASK_ID)
 
     assert client._client_name == CLIENT_NAME
     assert client._client_name != "migrate-metadata"
@@ -2018,7 +2096,7 @@ def test_repair_client_does_not_restate_the_parents_handshake():
         FusedMemoryClient,
     )
 
-    client = _make_client("http://127.0.0.1:9")
+    client = _make_client("http://127.0.0.1:9", repair_task_id=_RUN_TASK_ID)
 
     assert type(client)._initialize is FusedMemoryClient._initialize, (
         "RepairFusedMemoryClient has its own _initialize again. If that is "
@@ -2053,7 +2131,9 @@ def test_repair_handshake_is_the_parents_with_only_the_name_substituted():
         FusedMemoryClient,
     )
 
-    repair_posts = _record_handshake(_make_client("http://127.0.0.1:9"))
+    repair_posts = _record_handshake(
+        _make_client("http://127.0.0.1:9", repair_task_id=REPAIR_TASK_ID)
+    )
     parent_posts = _record_handshake(FusedMemoryClient("http://127.0.0.1:9"))
 
     assert repair_posts[0]["params"]["clientInfo"]["name"] == CLIENT_NAME
@@ -2066,6 +2146,75 @@ def test_repair_handshake_is_the_parents_with_only_the_name_substituted():
         return copied
 
     assert _name_normalised(repair_posts) == _name_normalised(parent_posts)
+
+
+# ---------------------------------------------------------------------------
+# A later pass is attributable to ITS OWN task: --task-id reaches both the
+# provenance stamp and the clientInfo.name fused-memory derives agent_id from.
+# ---------------------------------------------------------------------------
+
+
+def test_make_client_names_the_task_the_run_is_performed_for():
+    posts = _record_handshake(_make_client("http://127.0.0.1:9", repair_task_id="3427"))
+
+    assert posts[0]["params"]["clientInfo"]["name"] == "repair-wiped-metadata-files-3427"
+
+
+def test_a_run_without_the_task_id_flag_handshakes_under_the_first_pass_name():
+    args = _build_parser().parse_args(["--project-root", "x"])
+
+    posts = _record_handshake(
+        _make_client("http://127.0.0.1:9", repair_task_id=args.repair_task_id)
+    )
+
+    assert posts[0]["params"]["clientInfo"]["name"] == CLIENT_NAME
+
+
+def test_task_id_flag_defaults_to_the_first_pass_and_accepts_a_later_task():
+    parser = _build_parser()
+
+    assert parser.parse_args(["--project-root", "x"]).repair_task_id == REPAIR_TASK_ID == "3329"
+    assert (
+        parser.parse_args(["--project-root", "x", "--task-id", "3427"]).repair_task_id
+        == "3427"
+    )
+
+
+@pytest.mark.parametrize("value", ["", " 3427", "3427 ", "0", "03427", "-3427", "34a7", "\u0663"])
+def test_task_id_flag_rejects_a_value_that_names_no_task(value, capsys):
+    """The id is persisted on historical records by a write that cannot cheaply be
+    undone, so a malformed one must stop the run before anything is dialled."""
+    with pytest.raises(SystemExit) as excinfo:
+        _build_parser().parse_args(["--project-root", "x", "--task-id", value])
+
+    assert excinfo.value.code == 2
+    assert repr(value) in capsys.readouterr().err
+
+
+def test_main_async_attributes_an_applied_write_to_the_task_id_flag(
+    tmp_path, monkeypatch
+):
+    root = _wiped_project(tmp_path)
+    client = _ScriptedClient(
+        [{"status": "done", "metadata": {"files": []}}, {"success": True}]
+    )
+    client_task_ids: list[str] = []
+
+    def _fake_make_client(server_url, *, repair_task_id):
+        client_task_ids.append(repair_task_id)
+        return _client_context(client)
+
+    monkeypatch.setattr("repair_wiped_metadata_files._make_client", _fake_make_client)
+    args = _build_parser().parse_args(
+        ["--project-root", str(root), "--task-id", "3427", "--apply"]
+    )
+
+    exit_code = asyncio.run(main_async(args))
+
+    assert exit_code == EXIT_OK
+    assert client_task_ids == ["3427"]
+    [(_name, arguments)] = [call for call in client.calls if call[0] == "update_task"]
+    assert json.loads(arguments["metadata"])[PROVENANCE_KEY]["task"] == "3427"
 
 
 def test_main_project_root_is_repeatable(tmp_path):

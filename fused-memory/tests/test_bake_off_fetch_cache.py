@@ -69,8 +69,11 @@ ANCHOR_COMMIT = 'ff303320c7c3d90b093076965992dac246db062a'
 ANCHOR_FIXTURE_SHA256: dict[str, str] = {
     'write_triage_calibration.jsonl':
         'fa5958f3634ace98b846ac398cdfe28f2e105a746f0348fe48fb5ed08cd03fe3',
+    # Re-pinned by task 4856 (E1-only briefing re-key) without a re-dump: E2
+    # reads only the curator_gate subset (`load_registry_topics`), which
+    # compares equal before and after that edit.
     'memory_eval_topic_registry.json':
-        '23b5ba77d59b10854a000fe57c2ef4766033bedfd51335de45bcec467ae3ae30',
+        'ca17d33fd91708d4124d5c0cec1b30d5d6636c7a874fcf562f47f0574d717bb4',
     'e2_arm_claims.jsonl':
         '0b09c7de1c30c38570543f1705f01c5b4ac5970618f64545facb486e6991c257',
     'e2_query_set.jsonl':
@@ -86,8 +89,8 @@ def _load_module() -> types.ModuleType:
     The module is registered in sys.modules under its bare name so that
     @dataclass and other reflection-based decorators work correctly (they
     call sys.modules.get(cls.__module__)).  That key is SHARED with
-    ``test_bake_off_storage_shape.py`` and with the script-side
-    ``read_transform_selection._load_script``, which is what makes reuse —
+    ``test_bake_off_storage_shape.py`` and with
+    ``read_transform_selection.bake_off()``, which is what makes reuse —
     rather than an unconditional re-exec — the correct behaviour here.
 
     A named seam rather than a direct call at each use site, so the
@@ -109,15 +112,19 @@ import hashlib  # noqa: E402
 
 import pytest  # noqa: E402
 
+# Lease-dir isolation (task 4775), autouse for every test in this module:
+# see _fm_helpers.py::lease_dir_fixture.
+from _fm_helpers import lease_dir_fixture  # noqa: E402,F401
+
 
 class TestTheScriptIsLoadedOnceNotReExecuted:
     """The loader seam must REUSE the script, not re-execute it.
 
     An unconditional re-exec mints a SECOND module object under the same
     ``sys.modules`` key, and whichever loader ran last wins.  The concrete
-    hazard: ``scripts/read_transform_selection.py::_load_script`` returns
-    ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check, so it
-    serves whichever object a test module last registered under
+    hazard: ``read_transform_selection.bake_off()`` loads that key through
+    ``fused-memory/src/fused_memory/utils/script_loader.py::load_script``, so
+    it serves whichever object a test module last registered under
     ``'bake_off_storage_shape'``.  Three test modules register that key, and
     ``fused-memory/pyproject.toml`` sets ``addopts = "-n auto --dist
     loadgroup"``, so collection order is not stable.
@@ -1285,6 +1292,10 @@ class TestDumpFetchesFlag:
         assert isinstance(doc['provenance']['guard_threshold'], float)
 
 
+# Each test runs the bake-off twice (dump, then replay); this overrides verify's
+# --timeout=300. Sized per plans/pytest-per-test-timeout-measurement-2026-09-17.md:
+# 8x the worst measured wall clock, never below the pyproject default.
+@pytest.mark.timeout(540)
 class TestReplayFetchesFlag:
     """`--replay-fetches` must touch NOTHING. Not fewer calls — none."""
 

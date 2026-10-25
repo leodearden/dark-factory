@@ -7,29 +7,42 @@ tests/scripts/test_check_dashboard_unit_parity.py each state in their own
 docstrings.
 
 That rule is load-bearing here for a specific, measured reason rather than
-mere portability. As measured on 2026-08-02, five of the (then seven, now
-nine — see the REBASE NOTE below) registered units (the orchestrator-*.service
-ones) diverge from their committed copies on this host, and — importantly —
-NOT all in the same direction: every installed copy lacks ``RestartSteps=4``
-(so its ``RestartMaxDelaySec=60`` is silently discarded by systemd, and the
-REPO copy is the correct one), while four have an ExecStart ``--config`` path
-where the INSTALLED copy is the correct one (it names the canonical
-``dark-factory-orchestrator.yaml``; the committed copy still names a legacy
-filename that, for reify and autopilot-video, does not exist at all). Fixing
-them is owned by a named follow-up task (see the checker's module docstring)
-— so a test asserting parity against the live host would be red on landing,
-and one asserting drift would flip red the moment that task lands. Either
-encodes host state rather than checker behaviour.
+mere portability, and the strongest evidence for it is that THE HOST HAS
+MOVED UNDER THIS DOCSTRING THREE TIMES — 2026-08-02, 2026-08-16 and
+2026-09-05 — disagreeing on every measurement. A test asserting parity
+against the live host would have been red on landing; one asserting drift
+would have flipped red the moment the owning task landed. Either encodes host
+state rather than checker behaviour, and would have needed re-editing three
+times by now.
 
-REBASE NOTE (2026-08-06): this branch was rebased onto a main that had, in
-the interim, wired orchestrator-know-live.service and
-orchestrator-pump-web-ui.service into setup-host.sh (task 3641) and repointed
-four of the five --config paths above at the canonical filename (task 3512,
-commit 4fcd43eec0, landed 2026-08-04). The two new units are registered below
-to keep the staleness guard satisfied; see
-scripts/check_orchestrator_unit_parity.py's own REBASE NOTE for both — neither
-the two new units nor the 2026-08-02 numbers above were re-measured against
-the live host as part of this rebase.
+HISTORICAL, measured 2026-08-02 and RESOLVED by commit 4fcd43eec0 (task 3512,
+landed 2026-08-04). Five of the then-seven registered orchestrator-*.service
+units diverged from their committed copies, and — importantly — NOT all in
+the same direction: every installed copy lacked ``RestartSteps=4`` (so its
+``RestartMaxDelaySec=60`` was silently discarded by systemd, and the REPO
+copy was the correct one), while four had an ExecStart ``--config`` path
+where the INSTALLED copy was the correct one (it named the canonical
+``dark-factory-orchestrator.yaml``; the committed copy still named a legacy
+filename that, for reify and autopilot-video, did not exist at all). That is
+the instance which motivated the installer's decline-on-drift policy, and it
+is kept here as that policy's recorded reason.
+
+CURRENT, measured 2026-09-05 (task 4882). Seven of the nine registered units
+are clean; orchestrator-reify.service carries a deliberate drop-in
+(``override``) and orchestrator-watchdog.service drifts on one directive.
+The "direction varies per unit" claim SURVIVES on this new evidence, which is
+the point of re-dating rather than deleting it: the live drift is an
+installed-only ``Environment=ORCH_RESTART_MIN_INTERVAL_SECS=259200`` that the
+committed copy lacks (a deliberate, self-expiring deploy pause owned by task
+5020), so the installed side is still not automatically the stale one — only
+now the asymmetry runs the opposite way from 2026-08-02's first bullet.
+Full measurement and owners: the checker's own KNOWN RED section.
+
+The two 2026-08-06 REBASE NOTEs that stood here and in the checker are
+DISCHARGED — orchestrator-know-live.service and
+orchestrator-pump-web-ui.service, the units task 3641 wired into
+setup-host.sh and which were registered below unmeasured, are both clean as
+of 2026-09-05.
 
 The only real-tree reads are REPO-side: the committed scripts/*.service and
 *.timer files, and scripts/setup-host.sh, used by the registry staleness guard.
@@ -38,8 +51,7 @@ Module loading: scripts/ is not a package, so the checker is loaded via
 importlib.util.spec_from_file_location, mirroring
 tests/scripts/test_check_fused_memory_unit_parity.py::_load_checker. The
 shared parser module is imported by NAME (``import systemd_unit_parity``)
-rather than by path, because that is the import the checker itself performs
-and it is what the identity guard below needs to be exercising.
+rather than by path, because that is the import the checker itself performs.
 """
 
 import importlib.util
@@ -51,6 +63,7 @@ import sys
 import types
 
 import pytest
+import systemd_unit_parity
 
 # The parsing of setup-host.sh section 5 is SHARED with
 # tests/scripts/test_orchestrator_service_files.py, which derives its own
@@ -78,7 +91,6 @@ from setup_host_sections import (
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_orchestrator_unit_parity.py"
-DASHBOARD_CHECKER_PATH = REPO_ROOT / "scripts" / "check_dashboard_unit_parity.py"
 SETUP_HOST_PATH = REPO_ROOT / "scripts" / "setup-host.sh"
 
 
@@ -95,11 +107,6 @@ def _load_module(name: str, path: pathlib.Path) -> types.ModuleType:
 def _load_checker() -> types.ModuleType:
     """Load scripts/check_orchestrator_unit_parity.py by file path."""
     return _load_module("check_orchestrator_unit_parity", CHECKER_PATH)
-
-
-def _load_dashboard_checker() -> types.ModuleType:
-    """Load scripts/check_dashboard_unit_parity.py by file path."""
-    return _load_module("check_dashboard_unit_parity", DASHBOARD_CHECKER_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -133,28 +140,44 @@ def test_shared_parser_module_importable_and_exposes_the_parser():
     """``import systemd_unit_parity`` resolves and exposes both parser functions.
 
     Import by NAME, not by path: this is the exact import
-    check_orchestrator_unit_parity.py performs, and it resolves in both
-    contexts the checker runs in — at CLI runtime python puts the script's own
-    directory (scripts/) at sys.path[0], and under pytest
-    tests/scripts/conftest.py explicitly inserts scripts/ onto sys.path
-    (pyproject's ``--import-mode=importlib`` deliberately does NOT).
+    ``scripts/check_orchestrator_unit_parity.py`` performs, and it resolves in
+    both contexts the checker runs in — at CLI runtime python puts the
+    script's own directory (``scripts/``) at ``sys.path[0]``, and under pytest
+    ``tests/scripts/conftest.py`` explicitly inserts ``scripts/`` onto
+    ``sys.path`` (pyproject's ``--import-mode=importlib`` deliberately does
+    NOT).
 
-    The ``# pyright: ignore[reportMissingImports]`` on the import is a
-    STATIC-ANALYSIS artifact, not a papering-over: pyright never executes
-    conftest.py, so it cannot see that sys.path insertion, and the root
-    pyproject's ``[tool.pyright] extraPaths`` deliberately omits ``scripts/``.
-    Do NOT "fix" this by adding scripts/ to extraPaths — scripts/ is knowingly
-    not yet pyright-clean, which is exactly why scripts/orchestrator.yaml
-    declines to declare a ``type_check_command``; widening extraPaths would
-    pull that whole tree into resolution for every consumer. The suppression
-    is the convention already in force at three sibling sites here
-    (test_migrate_metadata_modules_to_files.py, test_repair_wiped_metadata_files.py).
+    NO SUPPRESSION IS NEEDED IN EITHER CONTEXT, because two INDEPENDENT
+    mechanisms cover the two of them. STATICALLY, the root pyproject's
+    ``[tool.pyright] extraPaths`` carries ``"scripts"`` (task 3456), so pyright
+    resolves this name without ever executing ``conftest.py`` — which it
+    cannot do, and which is why the runtime insertion alone would not serve
+    it. AT RUNTIME, ``tests/scripts/conftest.py`` performs that insertion,
+    which is precisely what pytest itself declines to do under importlib
+    import mode.
+
+    This import used to carry a ``reportMissingImports`` suppression, on the
+    then-true premise that ``extraPaths`` omitted ``scripts/``. Task 3456
+    falsified that premise; task 4516 deleted the pragma as vestigial. It had
+    stopped suppressing anything while standing ready to mask a REAL missing
+    import if one ever appeared on this line.
+
+    IF THIS EVER STOPS RESOLVING, RE-ADDING A PRAGMA IS NOT THE REMEDY —
+    restoring the ``extraPaths`` entries is. Removing one is a TWO-gate
+    outage: ``uv run --project shared pyright scripts/`` and
+    ``uv run --project shared pyright tests/scripts/`` are both declared, and
+    both run from the repo root against that same root table. Which is why
+    ``tests/scripts/test_scripts_module_config.py::test_root_pyright_extrapaths_resolves_scripts_imports``
+    pins those entries, and
+    ``tests/scripts/test_no_vestigial_import_pragmas.py::test_no_missing_imports_pragma_on_resolvable_import``
+    pins the converse — that no import they already resolve may carry a
+    suppression.
+
     The runtime import is the assertion; these tests passing IS its proof.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     assert callable(systemd_unit_parity.parse_unit_directives)
-    assert callable(systemd_unit_parity._join_continuations)
 
 
 def test_shared_parser_parses_sections_keys_and_values():
@@ -167,7 +190,7 @@ def test_shared_parser_parses_sections_keys_and_values():
     dropped rather than attributed, and the split taken on the FIRST ``=``
     only so ``Environment=A=1`` yields value ``A=1``.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     parsed = systemd_unit_parity.parse_unit_directives(_SAMPLE_UNIT)
 
@@ -194,50 +217,6 @@ def test_shared_parser_parses_sections_keys_and_values():
     assert parsed["Service"]["Restart"] == ["always"]
 
 
-def test_dashboard_checker_consumes_the_lifted_parser():
-    """IDENTITY guard: the dashboard checker uses the lifted parser, not a copy.
-
-    This is the assertion that makes the extraction worth doing. Re-exporting
-    the parser from check_dashboard_unit_parity.py keeps that module's surface
-    (and its 1677-line test suite) intact, but re-export is only meaningful if
-    it is the SAME function object — if someone later pastes a second copy of
-    the parser back into the dashboard checker, every other test in both
-    suites would still pass while the two implementations quietly drifted
-    apart, which is precisely the failure mode these parity checkers exist to
-    catch. Asserting object identity is the only check that fires on that.
-    """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
-
-    dashboard = _load_dashboard_checker()
-
-    assert dashboard.parse_unit_directives is systemd_unit_parity.parse_unit_directives
-    assert dashboard._join_continuations is systemd_unit_parity._join_continuations
-
-
-def test_find_dropins_is_shared_not_duplicated():
-    """IDENTITY guard for the SECOND lift: ``find_dropins`` has one home.
-
-    ``find_dropins`` arrived in this family ALREADY duplicated — code-identical
-    bodies in check_dashboard_unit_parity.py and check_orchestrator_unit_parity.py,
-    differing only in their docstrings' example directives. A third consumer
-    (check_lms_unit_parity.py) forced the question, and pasting a third copy
-    would reproduce, inside the tooling built to catch silent drift, precisely
-    the failure it exists to report.
-
-    Same assertion shape as the parser guard above, for the same reason: a
-    look-alike copy pasted back into either checker would leave every other
-    test in both suites green while the implementations quietly diverged.
-    Object identity is the only check that fires on that.
-    """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
-
-    checker = _load_checker()
-    dashboard = _load_dashboard_checker()
-
-    assert checker.find_dropins is systemd_unit_parity.find_dropins
-    assert dashboard.find_dropins is systemd_unit_parity.find_dropins
-
-
 def test_shared_find_dropins_counts_only_conf_files(tmp_path: pathlib.Path):
     """The lifted helper counts exactly what systemd would actually merge.
 
@@ -249,7 +228,7 @@ def test_shared_find_dropins_counts_only_conf_files(tmp_path: pathlib.Path):
     ``is_file()``). Counting a stray ``override.conf.bak`` would report an
     override that has no effect at all.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     installed_dir = tmp_path / "user"
     installed_dir.mkdir()
@@ -278,8 +257,11 @@ def test_shared_find_dropins_counts_only_conf_files(tmp_path: pathlib.Path):
 # The unit registry, and its staleness guard  (step-3 / step-4)
 # ---------------------------------------------------------------------------
 
-# The nine units scripts/setup-host.sh installs by copying VERBATIM. Stated
-# as a literal here so a bug in the shell-parsing helper below cannot make the
+# The eighteen units scripts/setup-host.sh installs by copying VERBATIM —
+# including the eight `orchestrator-<project>.socket` units, whose committed
+# source is `<unit>.template` but whose `cp` is exactly as verbatim as every
+# other unit's (see UNITS' own comment for why the name differs). Stated as a
+# literal here so a bug in the shell-parsing helper below cannot make the
 # equality assertion vacuously true against itself.
 _EXPECTED_UNITS = {
     "orchestrator-watchdog.service",
@@ -291,10 +273,19 @@ _EXPECTED_UNITS = {
     "orchestrator-solar-challenge-platform.service",
     "orchestrator-know-live.service",
     "orchestrator-pump-web-ui.service",
+    "orchestrator-stream-touch.service",
+    "orchestrator-dark-factory.socket",
+    "orchestrator-reify.socket",
+    "orchestrator-autopilot-video.socket",
+    "orchestrator-my-solar-challenge.socket",
+    "orchestrator-solar-challenge-platform.socket",
+    "orchestrator-know-live.socket",
+    "orchestrator-pump-web-ui.socket",
+    "orchestrator-stream-touch.socket",
 }
 
-def test_registry_covers_the_nine_verbatim_copied_units():
-    """UNITS registers exactly the nine units setup-host.sh copies verbatim."""
+def test_registry_covers_the_eighteen_verbatim_copied_units():
+    """UNITS registers exactly the eighteen units setup-host.sh copies verbatim."""
     checker = _load_checker()
 
     assert set(checker.UNITS) == _EXPECTED_UNITS, (
@@ -450,7 +441,7 @@ def test_directive_only_in_repo_copy_is_drift():
 
     assert _drift_keys(drifts) == [("Service", "TimeoutStartSec")]
     assert drifts[0].repo_value == "1800"
-    assert drifts[0].installed_value == checker._ABSENT
+    assert drifts[0].installed_value == systemd_unit_parity.ABSENT
     assert "absent from the installed copy" in drifts[0].reason
 
 
@@ -479,7 +470,7 @@ def test_directive_only_in_installed_copy_is_drift():
     drifts = checker.compare_unit("u.timer", repo, installed)
 
     assert _drift_keys(drifts) == [("Timer", "AccuracySec")]
-    assert drifts[0].repo_value == checker._ABSENT
+    assert drifts[0].repo_value == systemd_unit_parity.ABSENT
     assert drifts[0].installed_value == "5s"
     assert "absent from the repo copy" in drifts[0].reason
 
@@ -532,7 +523,7 @@ def test_changed_occurrence_count_of_a_repeated_directive_is_drift():
     # Both sides declare the key, so neither renders as <absent> — the
     # difference is in the list, and the report must show both lists.
     assert "B=2" in drifts[0].repo_value
-    assert drifts[0].installed_value != checker._ABSENT
+    assert drifts[0].installed_value != systemd_unit_parity.ABSENT
 
 
 def test_repeated_values_render_with_unambiguous_occurrence_boundaries():
@@ -591,7 +582,7 @@ def test_section_present_on_one_side_only_surfaces_as_drifts():
 
     assert _drift_keys(drifts) == [("Install", "WantedBy")]
     assert drifts[0].repo_value == "timers.target"
-    assert drifts[0].installed_value == checker._ABSENT
+    assert drifts[0].installed_value == systemd_unit_parity.ABSENT
 
 
 def test_drift_ordering_is_deterministic():
@@ -650,59 +641,6 @@ def _make_trees(
         (installed_dir / unit).write_text(installed_text, encoding="utf-8")
 
     return repo_root, installed_dir
-
-
-def test_find_dropins_returns_empty_when_no_dropin_dir(tmp_path: pathlib.Path):
-    """No `<unit>.d/` directory at all => no overrides."""
-    checker = _load_checker()
-    _, installed_dir = _make_trees(tmp_path)
-
-    assert checker.find_dropins(installed_dir, _REAL_UNIT) == []
-
-
-def test_find_dropins_finds_an_override_conf(tmp_path: pathlib.Path):
-    """A `<unit>.d/override.conf` — what `systemctl --user edit` writes."""
-    checker = _load_checker()
-    _, installed_dir = _make_trees(tmp_path)
-
-    dropin_dir = installed_dir / f"{_REAL_UNIT}.d"
-    dropin_dir.mkdir()
-    override = dropin_dir / "override.conf"
-    override.write_text("[Timer]\nAccuracySec=1min\n", encoding="utf-8")
-
-    assert checker.find_dropins(installed_dir, _REAL_UNIT) == [override]
-
-
-def test_find_dropins_returns_all_conf_files_sorted(tmp_path: pathlib.Path):
-    """Several drop-ins all count, in sorted order (systemd merges them all)."""
-    checker = _load_checker()
-    _, installed_dir = _make_trees(tmp_path)
-
-    dropin_dir = installed_dir / f"{_REAL_UNIT}.d"
-    dropin_dir.mkdir()
-    for fname in ("20-second.conf", "10-first.conf"):
-        (dropin_dir / fname).write_text("[Timer]\n", encoding="utf-8")
-
-    found = checker.find_dropins(installed_dir, _REAL_UNIT)
-
-    assert [p.name for p in found] == ["10-first.conf", "20-second.conf"]
-
-
-def test_find_dropins_ignores_non_conf_files(tmp_path: pathlib.Path):
-    """Non-`.conf` files are ignored, matching what systemd actually merges.
-
-    Counting a stray `override.conf.bak` would report an override that has no
-    effect — a false positive in a report whose whole value is being believed.
-    """
-    checker = _load_checker()
-    _, installed_dir = _make_trees(tmp_path)
-
-    dropin_dir = installed_dir / f"{_REAL_UNIT}.d"
-    dropin_dir.mkdir()
-    (dropin_dir / "override.conf.bak").write_text("[Timer]\n", encoding="utf-8")
-    (dropin_dir / "notes.txt").write_text("hello\n", encoding="utf-8")
-
-    assert checker.find_dropins(installed_dir, _REAL_UNIT) == []
 
 
 def test_dropin_over_identical_units_does_not_report_parity(
@@ -924,7 +862,7 @@ def test_cli_undecodable_repo_unit_names_the_repo_side(tmp_path: pathlib.Path):
 def test_cli_drift_dominates_absence(tmp_path: pathlib.Path):
     """PRECEDENCE: one unit drifted + another absent => 1, not 2.
 
-    With nine units a single run can hit both at once. Returning 2 would let
+    With eighteen units a single run can hit both at once. Returning 2 would let
     an unrelated uninstalled unit MASK an actionable finding, because
     setup-host.sh treats 2 as a benign skip. The absent unit is still
     reported — dominated, not hidden.
@@ -1799,7 +1737,7 @@ def _installer_section() -> str:
 def _fake_repo(
     tmp_path: pathlib.Path, *, checker_body: str | None = None, with_checker: bool = True
 ) -> pathlib.Path:
-    """A tmp repo root holding the nine committed units (+ optionally the checker).
+    """A tmp repo root holding the eighteen committed units (+ optionally the checker).
 
     The unit files are copied from the real repo so the comparison under test is
     the real one; only the TREE is fake.
@@ -1939,6 +1877,50 @@ def test_installer_copies_the_units_when_the_gate_reports_parity(
     assert "installed and enabled" in result.stdout, result.stdout
 
 
+def test_installer_installs_a_socket_unit_under_its_own_name_and_enables_it(
+    tmp_path: pathlib.Path,
+):
+    """A `.socket` unit installs from its `.template` source, named by itself.
+
+    The one property specific to sockets: `_orch_unit_source` reads FROM
+    `<unit>.socket.template` (the committed spelling, forced by the
+    lock-charter extension allowlist), but the installed copy must be named
+    `<unit>.socket` — the plain `cp ... "$UNIT_DIR/"` this section used before
+    would instead have installed a file literally named
+    `orchestrator-dark-factory.socket.template`, which systemd never loads.
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+    socket = unit_dir / "orchestrator-dark-factory.socket"
+    socket.unlink()
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert socket.is_file(), (
+        "orchestrator-dark-factory.socket was absent (install-eligible) but "
+        f"was not installed.\n{result.stdout}"
+    )
+    assert socket.read_text(encoding="utf-8") == (
+        repo / "scripts" / "orchestrator-dark-factory.socket.template"
+    ).read_text(encoding="utf-8"), (
+        "The installed socket's bytes do not match its committed .template "
+        "source."
+    )
+    assert not (unit_dir / "orchestrator-dark-factory.socket.template").exists(), (
+        "The installer wrote the socket under its SOURCE basename "
+        "(...socket.template) rather than its unit name "
+        "(...socket) — systemd never loads a unit installed under the "
+        "wrong name."
+    )
+    assert "orchestrator-dark-factory.socket" in enabled_units(tmp_path), (
+        "orchestrator-dark-factory.socket declares [Install] WantedBy="
+        "sockets.target but was not enabled.\n"
+        f"calls: {systemctl_calls(tmp_path)}"
+    )
+
+
 def test_installer_does_not_overwrite_units_the_gate_reported_drift_on(
     tmp_path: pathlib.Path,
 ):
@@ -1946,11 +1928,16 @@ def test_installer_does_not_overwrite_units_the_gate_reported_drift_on(
 
     A warning is not an intervention point in a non-interactive `set -e`
     script: it scrolls past and the next line overwrites the installed units.
-    And drift does not mean the installed copy is the stale one — measured
-    2026-08-02, two COMMITTED units name --config paths that do not exist on
-    this host, so an unconditional copy would break those orchestrators on
-    their next restart. The installer must decline to act on an unverified
-    diff.
+    And drift does not mean the installed copy is the stale one. The instance
+    that motivated this policy: measured 2026-08-02, two COMMITTED units named
+    --config paths that did not exist on this host, so an unconditional copy
+    would have broken those orchestrators on their next restart (resolved by
+    commit 4fcd43eec0, task 3512). The hazard is not historical, only that
+    instance is — re-measured 2026-09-05, the live drift on
+    orchestrator-watchdog.service is an installed-only
+    Environment=ORCH_RESTART_MIN_INTERVAL_SECS the committed copy lacks, so an
+    unconditional copy would today silently delete a deliberate deploy pause.
+    The installer must decline to act on an unverified diff.
     """
     repo = _fake_repo(tmp_path)
     unit_dir = tmp_path / "installed"
@@ -2230,7 +2217,7 @@ def _verdict_stub(exit_code: int, verdicts: dict[str, str]) -> str:
     is what an older checker, a refactor that dropped the emit, or a registry
     that does not know a unit would each produce.
     """
-    lines = ["[orchestrator_unit_parity] stub report over 9 units"]
+    lines = ["[orchestrator_unit_parity] stub report over 16 units"]
     lines += [
         f"[orchestrator_unit_parity] verdict {unit} {kinds}"
         for unit, kinds in sorted(verdicts.items())

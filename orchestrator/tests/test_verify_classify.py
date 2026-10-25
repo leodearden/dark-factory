@@ -30,6 +30,10 @@ import json
 from pathlib import Path
 
 import pytest
+from _pyright_import_fixtures import (
+    PARTIALLY_PROVISIONED_TYPE_OUTPUT,
+    unresolved_import_lines,
+)
 
 from orchestrator import verify_classify
 from orchestrator.verify_categories import (
@@ -321,6 +325,184 @@ class TestPytestTable:
             'sometool: error: unrecognized arguments: -n --dist --max-worker-restart=0\n'
         )
         assert _classify(ToolKind.PYTEST, output, 4, False) == FailureCategory.UNKNOWN_TEST_FAILURE
+
+
+#: pytest's argparse rejection, captured VERBATIM from the real binary in this
+#: worktree (rc=4) by rendering the merge gate's own spliced re-run command::
+#:
+#:     pytest -p no:xdist -o addopts= --timeout --junitxml /tmp/j.xml 300 <node>
+#:
+#: Not a hypothetical shape: this is what 350 merge-gate isolated re-runs
+#: actually produced between 2026-08-30 and 2026-09-17 (task 5580).
+PYTEST_USAGE_ERROR_OUTPUT = (
+    'ERROR: usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n'
+    'pytest: error: argument --timeout: expected one argument\n'
+    '  inifile: /home/leo/src/dark-factory/orchestrator/pyproject.toml\n'
+    '  rootdir: /home/leo/src/dark-factory/orchestrator\n'
+)
+
+# The SAME rejection from the same binary launched as a module — measured from
+# `python -m pytest --timeout --junitxml /tmp/j.xml 300` in this worktree
+# (rc=4). The two argparse lines are verbatim; the trailing inifile/rootdir
+# paths are normalized to match the sample above, which is the only difference.
+# argparse renders `basename(sys.argv[0])`, so the program name is a fact about
+# the launch, not about the error.
+_PYTEST_USAGE_ERROR_MODULE_LAUNCH_OUTPUT = (
+    'ERROR: usage: __main__.py [options] [file_or_dir] [file_or_dir] [...]\n'
+    '__main__.py: error: argument --timeout: expected one argument\n'
+    '  inifile: /home/leo/src/dark-factory/orchestrator/pyproject.toml\n'
+    '  rootdir: /home/leo/src/dark-factory/orchestrator\n'
+)
+
+
+def _captured_stdout_section(printed: str) -> str:
+    """A pytest report whose captured-stdout section carries *printed*.
+
+    pytest renders `--- Captured stdout call ---` and the captured bytes
+    themselves at COLUMN 0, unindented — which is why a line anchor alone is
+    not the whole false-positive margin.
+    """
+    return (
+        '=================================== FAILURES ===================================\n'
+        '__________________________________ test_forge __________________________________\n'
+        'E   assert False\n'
+        '----------------------------- Captured stdout call -----------------------------\n'
+        f'{printed}'
+        '=========================== short test summary info ============================\n'
+    )
+
+
+class TestPytestUsageError:
+    """pytest REJECTING our argv is its own category, not an unknown failure.
+
+    The distinction is the difference between "the suite ran and we could not
+    read the result" and "the suite never ran at all". Today the second one
+    wears the first one's label: a usage error matches no pattern and falls
+    through to ``unknown_test_failure``, which the isolated-rerun path then
+    reads as a real red.
+
+    The table already carries the exact analogue on the other side —
+    ``CARGO_CLI_ERROR`` means "cargo rejected the CLI invocation" — so the
+    pytest row is a missing member of an existing concept, not a new one.
+    """
+
+    def test_argparse_rejection_classifies_as_pytest_usage_error(self):
+        assert (
+            _classify(ToolKind.PYTEST, PYTEST_USAGE_ERROR_OUTPUT, 4, False)
+            == FailureCategory.PYTEST_USAGE_ERROR
+        )
+
+    def test_the_marker_must_start_a_line(self):
+        """The line anchor, the first of the three parts of the margin.
+
+        pytest writes the marker at column 0 before any test output, but a
+        FAILING TEST that merely quotes the text has it rendered indented
+        behind assertion-diff framing. Without the anchor such a test could
+        forge the category by printing, and the discriminator would stop
+        believing a genuine red — the one failure direction its doctrine
+        forbids.
+
+        The anchor alone is NOT the whole margin, because pytest's own
+        captured-output sections are unindented — see the two tests below for
+        the parts that cover that.
+        """
+        quoted = ''.join(
+            f'E   {line}\n' for line in PYTEST_USAGE_ERROR_OUTPUT.splitlines()
+        )
+        assert (
+            _classify(ToolKind.PYTEST, quoted, 1, False)
+            != FailureCategory.PYTEST_USAGE_ERROR
+        )
+
+    def test_the_program_name_is_not_pinned(self):
+        """`python -m pytest` renders a different prog and the SAME error.
+
+        argparse's prog is `basename(sys.argv[0])`, so pinning `pytest` would
+        have left any target project whose module test_command is
+        `python -m pytest` recording a rejected argv as a real red — this
+        task's own defect, silently un-closed for that project.
+        """
+        assert (
+            _classify(ToolKind.PYTEST, _PYTEST_USAGE_ERROR_MODULE_LAUNCH_OUTPUT, 4, False)
+            == FailureCategory.PYTEST_USAGE_ERROR
+        )
+
+    def test_a_printed_marker_line_alone_is_not_a_rejection(self):
+        """Part two of the margin: argparse's `<prog>: error:` continuation.
+
+        A captured-stdout section is rendered at column 0, so a test that
+        prints the usage line clears the line anchor. It does not clear the
+        adjacency requirement, which the real rejection meets on every
+        measured sample.
+        """
+        output = _captured_stdout_section(
+            'ERROR: usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n'
+        )
+        assert (
+            _classify(ToolKind.PYTEST, output, 1, False)
+            != FailureCategory.PYTEST_USAGE_ERROR
+        )
+
+    def test_a_printed_rejection_beside_real_failures_stays_a_red(self):
+        """Part three: the arm is consulted AFTER the FAILED arms.
+
+        A test that prints the whole two-line rejection verbatim clears both
+        the anchor and the adjacency requirement — but a genuine rejection
+        never ran a test, so it never carries a FAILED line, and an output
+        that has one is a red that merely quotes the text. Ordering decides
+        it, and it stays a red.
+
+        The residual is stated rather than hidden: an output with no FAILED
+        line at all (a collection ERROR leg that prints the two lines) can
+        still forge the category. That direction is honest — the verdict
+        becomes `unconfirmable`, which suppresses nothing — whereas letting a
+        forgery outrank a real FAILED line would stop the discriminator
+        believing a genuine red.
+        """
+        output = _captured_stdout_section(PYTEST_USAGE_ERROR_OUTPUT) + (
+            'FAILED tests/test_forge.py::test_forge - assert False\n'
+        )
+        assert _classify(ToolKind.PYTEST, output, 1, False) == FailureCategory.TEST_FAILURE
+
+    def test_an_ordinary_pytest_failure_is_untouched(self):
+        """The new pattern must not shadow the table it joins."""
+        output = 'FAILED tests/test_foo.py::test_bar - AssertionError\n'
+        assert _classify(ToolKind.PYTEST, output, 1, False) == FailureCategory.TEST_FAILURE
+
+    def test_file_not_found_is_not_a_usage_error(self):
+        """A deliberate scope boundary, not an oversight.
+
+        pytest's other rc=4 shape is branch-reachable in the ordinary way — a
+        diff that deletes or renames a test file produces it legitimately — so
+        reading it as "we could not re-run" would suppress a real red.
+        """
+        output = 'ERROR: file or directory not found: tests/test_gone.py\n'
+        assert (
+            _classify(ToolKind.PYTEST, output, 4, False)
+            == FailureCategory.UNKNOWN_TEST_FAILURE
+        )
+
+    def test_xdist_absence_usage_error_keeps_its_env_transient_verdict(self):
+        """A usage error caused by the xdist plugin vanishing is a HOST
+
+        condition, and ``_classify_pytest`` consults the env-transient
+        patterns first. The new arm must not take that case over: it retries,
+        and the new one deliberately does not.
+        """
+        assert (
+            _classify(ToolKind.PYTEST, _XDIST_USAGE_ERROR_OUTPUT, 4, False)
+            == FailureCategory.ENV_TRANSIENT
+        )
+
+    @pytest.mark.parametrize(
+        'tool', [ToolKind.CARGO_TEST, ToolKind.CARGO_CLIPPY, ToolKind.NPX, ToolKind.OPAQUE],
+    )
+    def test_only_the_pytest_table_carries_it(self, tool):
+        """Invariant C1: a tool-T pattern lives ONLY in tool-T's table."""
+        assert (
+            _classify(tool, PYTEST_USAGE_ERROR_OUTPUT, 4, False)
+            != FailureCategory.PYTEST_USAGE_ERROR
+        )
 
 
 class TestEnvTransientIsPytestScopedC1:
@@ -622,14 +804,13 @@ class TestStructuredOutputParsingC2:
     is a `reason: compiler-message` / `level: error` record whose human text
     matches none of `_CARGO_PATTERNS`, so today it falls through to
     unknown_test_failure — only a JSON-aware parser that reads the
-    structured `level` field can classify it compile_error. The pyright/ruff
-    'preserved mapping' assertions and the non-JSON-fallback assertions
-    already hold today (PYRIGHT/RUFF have no dedicated text table yet, so
-    they fall through the shared OPAQUE placeholder to unknown_test_failure
-    regardless of JSON-awareness — see classify_failure's docstring); kept
-    here to pin the full JSON-first contract once step-8 adds the parsers,
-    per Invariant C2's "falls back to the text table otherwise" / exception-
-    safety requirements.
+    structured `level` field can classify it compile_error.
+
+    Task 4843 gave the pyright/ruff JSON parsers their own members: an
+    error-severity pyright diagnostic is TYPE_ERROR and a ruff violations
+    array is LINT_ERROR. Neither tool has a TEXT table, so human-text output,
+    a JSON payload carrying no error, and malformed JSON all still fall
+    through to the OPAQUE ladder unchanged (Invariant C1/C2), never raising.
     """
 
     def test_cargo_json_compiler_message_error_is_compile_error(self):
@@ -638,22 +819,54 @@ class TestStructuredOutputParsingC2:
             == FailureCategory.COMPILE_ERROR
         )
 
-    def test_pyright_json_error_diagnostic_is_unknown_test_failure(self):
-        """Preserved mapping: no dedicated PYRIGHT category exists (out of
-        scope for this task) — an error-severity generalDiagnostic still maps
-        to unknown_test_failure, matching today's on-the-wire category."""
+    def test_pyright_json_error_diagnostic_is_type_error(self):
         assert (
             _classify(ToolKind.PYRIGHT, _PYRIGHT_JSON_ERROR_DIAGNOSTIC, 1, False)
-            == FailureCategory.UNKNOWN_TEST_FAILURE
+            == FailureCategory.TYPE_ERROR
         )
 
-    def test_ruff_json_violation_is_unknown_test_failure(self):
-        """Preserved mapping: no dedicated RUFF category exists (out of scope
-        for this task) — a violations array still maps to
-        unknown_test_failure, matching today's on-the-wire category."""
+    def test_ruff_json_violation_is_lint_error(self):
         assert (
             _classify(ToolKind.RUFF, _RUFF_JSON_VIOLATIONS, 1, False)
-            == FailureCategory.UNKNOWN_TEST_FAILURE
+            == FailureCategory.LINT_ERROR
+        )
+
+    def test_ruff_empty_violations_array_takes_the_opaque_ladder(self):
+        """`[]` reports no violation, so the parser claims nothing and the
+        leg's category is whatever the OPAQUE ladder says, not LINT_ERROR."""
+        assert _classify(ToolKind.RUFF, '[]', 1, False) == _classify(
+            ToolKind.OPAQUE, '[]', 1, False
+        )
+        assert _classify(ToolKind.RUFF, '[]', 1, False) != FailureCategory.LINT_ERROR
+
+    def test_pyright_warning_only_payload_takes_the_opaque_ladder(self):
+        """Only an error-severity diagnostic is a type error; warnings and
+        information leave the parser silent and the OPAQUE ladder decides."""
+        output = json.dumps({
+            'version': '1.1.408',
+            'generalDiagnostics': [
+                {'file': '/workspace/a.py', 'severity': 'warning', 'message': 'w'},
+                {'file': '/workspace/a.py', 'severity': 'information', 'message': 'i'},
+            ],
+        })
+        assert _classify(ToolKind.PYRIGHT, output, 1, False) == _classify(
+            ToolKind.OPAQUE, output, 1, False
+        )
+        assert _classify(ToolKind.PYRIGHT, output, 1, False) != FailureCategory.TYPE_ERROR
+
+    @pytest.mark.parametrize(
+        ('tool', 'well_formed'),
+        [
+            (ToolKind.RUFF, _RUFF_JSON_VIOLATIONS),
+            (ToolKind.PYRIGHT, _PYRIGHT_JSON_ERROR_DIAGNOSTIC),
+        ],
+    )
+    def test_truncated_json_takes_the_opaque_ladder_without_raising(
+        self, tool, well_formed,
+    ):
+        truncated = well_formed[: len(well_formed) // 2]
+        assert _classify(tool, truncated, 1, False) == _classify(
+            ToolKind.OPAQUE, truncated, 1, False
         )
 
     def test_cargo_non_json_output_still_uses_text_table(self):
@@ -2669,12 +2882,12 @@ class TestSummarizeChecksThreadsToolIdentity:
         assert not passed
         assert category == FailureCategory.TEST_FAILURE
 
-    def test_lint_chain_dispatches_opaque_generic_ladder(self):
-        """A lint command that is a raw-retained `&&`-chain (neither pytest
-        nor a cargo test/clippy chain) resolves to ToolKind.OPAQUE via
-        `_tool_for_cmd` — `_summarize_checks` still classifies its failure
-        through the full legacy generic ladder, byte-identical to today's
-        tool-blind `_classify_failure`."""
+    def test_ruff_lint_chain_human_text_falls_through_to_generic_ladder(self):
+        """A lint command that is a raw-retained `&&`-chain with one argv-head
+        `ruff check` resolves to ToolKind.RUFF via `_tool_for_cmd` (task 4843;
+        it was OPAQUE before). Its human-text failure is not ruff JSON, so it
+        still falls through to the full legacy generic ladder: no category
+        moves for human-text output."""
         lint_cmd = 'ruff check . && mypy src/'
         lint_out = 'flock: failed to acquire lock on /var/lock/mylock\n'
         passed, category, cause_hint, summary = _summarize(
@@ -2691,27 +2904,33 @@ class TestSummarizeChecksThreadsToolIdentity:
 # ---------------------------------------------------------------------------
 
 
-def _unresolved_import_lines(*modules: str, path: str = 'src/fused_memory/server.py') -> str:
-    """Render *modules* in pyright's REAL unresolved-import line shape.
-
-    Captured verbatim during the task-3367 reproduction, e.g.::
-
-        /repo/src/fused_memory/server.py:12:8 - error: Import "pytest" could
-        not be resolved (reportMissingImports)
-    """
-    return '\n'.join(
-        f'  /repo/{path}:{i + 8}:8 - error: Import "{mod}" could not be '
-        f'resolved (reportMissingImports)'
-        for i, mod in enumerate(modules)
-    )
-
-
 # The observed false-red: the baseline sentinel `pytest` is unresolved
 # alongside many other workspace third-party packages, because the resolved
 # interpreter is not this worktree's .venv at all.
-PHANTOM_MISSING_IMPORTS = _unresolved_import_lines(
+PHANTOM_MISSING_IMPORTS = unresolved_import_lines(
     'pytest', 'pydantic', 'aiosqlite', 'openai', 'qdrant_client'
 )
+
+# pyright errors from rules other than reportMissingImports: branch defects.
+OTHER_PYRIGHT_RULES_OUTPUT = (
+    '  /repo/src/a.py:3:9 - error: Argument of type "int" cannot be '
+    'assigned to parameter "x" (reportArgumentType)\n'
+    '  /repo/src/b.py:4:9 - error: Cannot access attribute "foo" for '
+    'class "Bar" (reportAttributeAccessIssue)\n'
+    '  /repo/src/c.py:5:9 - error: "baz" is not a known attribute of '
+    'module "qux" (reportAttributeAccessIssue)\n'
+    '  /repo/src/d.py:6:9 - error: Expression of type "None" is '
+    'incompatible (reportAssignmentType)\n'
+    '  /repo/src/e.py:7:9 - error: No overloads for "get" match '
+    '(reportCallIssue)\n'
+)
+
+NON_PYRIGHT_TEXTS = [
+    'Traceback (most recent call last):\n  File "t.py", line 1\nImportError: x\n',
+    'src/a.py:1:1: F401 [*] `os` imported but unused\nFound 1 error.\n',
+    'error: could not compile `foo` (lib) due to 1 previous error\n',
+    '\x00\x01 not even text — Import " could not be resolved (\n',
+]
 
 
 class TestInterpreterMissingWorkspacePackages:
@@ -2738,7 +2957,7 @@ class TestInterpreterMissingWorkspacePackages:
         five dotted paths that all belong to two top-level packages and must
         not.
         """
-        five_distinct_tops = _unresolved_import_lines(
+        five_distinct_tops = unresolved_import_lines(
             'pytest',
             'graphiti_core.nodes',
             'qdrant_client.models',
@@ -2749,7 +2968,7 @@ class TestInterpreterMissingWorkspacePackages:
             five_distinct_tops
         )
 
-        two_distinct_tops = _unresolved_import_lines(
+        two_distinct_tops = unresolved_import_lines(
             'pytest',
             'qdrant_client.models',
             'qdrant_client.http',
@@ -2763,7 +2982,7 @@ class TestInterpreterMissingWorkspacePackages:
     def test_single_genuine_missing_dependency_is_not_environmental(self) -> None:
         """A real branch defect must stay RED, never be excused as environmental."""
         assert not verify_classify.is_interpreter_missing_workspace_packages(
-            _unresolved_import_lines('brand_new_lib')
+            unresolved_import_lines('brand_new_lib')
         )
 
     def test_many_distinct_modules_without_the_sentinel_is_not_environmental(self) -> None:
@@ -2774,7 +2993,7 @@ class TestInterpreterMissingWorkspacePackages:
         it as a dev dependency, so a healthy env ALWAYS resolves it.
         """
         assert not verify_classify.is_interpreter_missing_workspace_packages(
-            _unresolved_import_lines(
+            unresolved_import_lines(
                 'pydantic', 'aiosqlite', 'openai', 'qdrant_client', 'graphiti_core'
             )
         )
@@ -2784,29 +3003,11 @@ class TestInterpreterMissingWorkspacePackages:
 
     def test_other_pyright_rules_are_not_environmental(self) -> None:
         """Only reportMissingImports counts — other pyright rules are branch defects."""
-        other_rules = (
-            '  /repo/src/a.py:3:9 - error: Argument of type "int" cannot be '
-            'assigned to parameter "x" (reportArgumentType)\n'
-            '  /repo/src/b.py:4:9 - error: Cannot access attribute "foo" for '
-            'class "Bar" (reportAttributeAccessIssue)\n'
-            '  /repo/src/c.py:5:9 - error: "baz" is not a known attribute of '
-            'module "qux" (reportAttributeAccessIssue)\n'
-            '  /repo/src/d.py:6:9 - error: Expression of type "None" is '
-            'incompatible (reportAssignmentType)\n'
-            '  /repo/src/e.py:7:9 - error: No overloads for "get" match '
-            '(reportCallIssue)\n'
+        assert not verify_classify.is_interpreter_missing_workspace_packages(
+            OTHER_PYRIGHT_RULES_OUTPUT
         )
-        assert not verify_classify.is_interpreter_missing_workspace_packages(other_rules)
 
-    @pytest.mark.parametrize(
-        'text',
-        [
-            'Traceback (most recent call last):\n  File "t.py", line 1\nImportError: x\n',
-            'src/a.py:1:1: F401 [*] `os` imported but unused\nFound 1 error.\n',
-            'error: could not compile `foo` (lib) due to 1 previous error\n',
-            '\x00\x01 not even text — Import " could not be resolved (\n',
-        ],
-    )
+    @pytest.mark.parametrize('text', NON_PYRIGHT_TEXTS)
     def test_arbitrary_non_pyright_text_returns_false_without_raising(
         self, text: str
     ) -> None:
@@ -2864,7 +3065,7 @@ class TestInterpreterMisresolutionClassifiesEnvTransient:
 
     def test_single_genuine_missing_import_is_not_excused_as_environmental(self) -> None:
         """A real branch defect keeps its pre-existing category, never ENV_TRANSIENT."""
-        genuine = _unresolved_import_lines('brand_new_lib')
+        genuine = unresolved_import_lines('brand_new_lib')
         assert (
             verify_classify.classify_failure(ToolKind.OPAQUE, 1, genuine, False)
             != FailureCategory.ENV_TRANSIENT
@@ -2879,6 +3080,64 @@ class TestInterpreterMisresolutionClassifiesEnvTransient:
         member is introduced; ENV_TRANSIENT already carries precisely this policy.
         """
         assert FailureCategory.ENV_TRANSIENT in INFRA_TRANSIENT_CATEGORIES
+
+
+# ---------------------------------------------------------------------------
+# task 6127: a partially provisioned cold .venv (esc-6021-3)
+# ---------------------------------------------------------------------------
+
+class TestPartiallyProvisionedVenvTypeFailure:
+    """Pins ``is_partially_provisioned_venv_type_failure`` — task 6127.
+
+    pyright read a cold ``.venv`` that was still being populated: pytest
+    resolved, member-specific third-party packages did not.  A passing PYTEST
+    leg in the same run is the corroboration that the dependency set is fine.
+    """
+
+    @staticmethod
+    def _holds(
+        type_output: str, *, test_tool: ToolKind = ToolKind.PYTEST, test_leg_passed: bool = True,
+    ) -> bool:
+        return verify_classify.is_partially_provisioned_venv_type_failure(
+            type_output, test_tool=test_tool, test_leg_passed=test_leg_passed,
+        )
+
+    def test_measured_shape_with_passing_pytest_leg_is_partially_provisioned_venv(self) -> None:
+        assert self._holds(PARTIALLY_PROVISIONED_TYPE_OUTPUT)
+
+    def test_same_output_without_test_corroboration_is_not(self) -> None:
+        """A failed test leg gives no runtime proof that the packages import."""
+        assert not self._holds(PARTIALLY_PROVISIONED_TYPE_OUTPUT, test_leg_passed=False)
+
+    @pytest.mark.parametrize('test_tool', [t for t in ToolKind if t is not ToolKind.PYTEST])
+    def test_passing_non_pytest_test_leg_gives_no_corroboration(self, test_tool: ToolKind) -> None:
+        """A passing ``true``, JS-only or wrapped test command imported no Python
+        packages that pytest can vouch for, so it cannot excuse the branch."""
+        assert not self._holds(PARTIALLY_PROVISIONED_TYPE_OUTPUT, test_tool=test_tool)
+
+    def test_measured_shape_escapes_the_3367_interpreter_predicate(self) -> None:
+        """Why task 3367 missed it: the pytest sentinel resolved."""
+        assert not verify_classify.is_interpreter_missing_workspace_packages(
+            PARTIALLY_PROVISIONED_TYPE_OUTPUT
+        )
+        assert 'pytest' not in verify_classify.unresolved_top_level_modules(
+            PARTIALLY_PROVISIONED_TYPE_OUTPUT
+        )
+
+    def test_single_genuine_missing_import_with_passing_tests_is_not(self) -> None:
+        assert not self._holds(unresolved_import_lines('brand_new_lib'))
+
+    def test_floor_is_the_shared_distinct_module_floor(self) -> None:
+        four = ('graphiti_core', 'qdrant_client', 'openai', 'falkordb')
+        assert not self._holds(unresolved_import_lines(*four))
+        assert self._holds(unresolved_import_lines(*four, 'mem0'))
+
+    def test_other_pyright_rules_only_is_not(self) -> None:
+        assert not self._holds(OTHER_PYRIGHT_RULES_OUTPUT)
+
+    @pytest.mark.parametrize('text', [*NON_PYRIGHT_TEXTS, ''])
+    def test_arbitrary_non_pyright_text_returns_false_without_raising(self, text: str) -> None:
+        assert self._holds(text) is False
 
 
 # ---------------------------------------------------------------------------
@@ -3211,7 +3470,8 @@ class TestSummarizeChecksReportsEveryFailingLegCategory:
         """CONTROL: SIGSEGV is a genuine fault OF THE CODE UNDER TEST, not an
         external kill — it must stay RED and must never reach the per-leg list
         as 'infra_kill', or the veto gate would wave a segfaulting branch
-        through."""
+        through. Since task 4843 the red lint leg reports its gate,
+        lint_error, rather than unknown_test_failure."""
         from orchestrator.verify import _summarize_checks
 
         _, _, _, _, failing_leg_categories = _summarize_checks(
@@ -3220,7 +3480,7 @@ class TestSummarizeChecksReportsEveryFailingLegCategory:
             0, '', False, None,
             lint_duration=_MEASURED_LINT_DURATION,
         )
-        assert failing_leg_categories == ['unknown_test_failure']
+        assert failing_leg_categories == ['lint_error']
         assert 'infra_kill' not in failing_leg_categories
 
     def test_every_failing_leg_appears_in_test_lint_type_order(self):

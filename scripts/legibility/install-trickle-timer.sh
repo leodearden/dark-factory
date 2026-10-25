@@ -55,6 +55,27 @@ mkdir -p "$UNIT_DIR"
 cp "$TEMPLATES_DIR/legibility-trickle@.service" "$UNIT_DIR/"
 cp "$TEMPLATES_DIR/legibility-trickle@.timer" "$UNIT_DIR/"
 
+# Retire the 2026-09-14 account-pin stopgap (task 5488). NOT cleanup: that
+# drop-in resets and re-spells ExecStart with one account's token inline, and a
+# drop-in's `ExecStart=` reset REPLACES the unit's own -- so leaving it here
+# keeps the trickle pinned to a single account forever while the unit file
+# copied above says otherwise and every part of the multi-account change sits
+# silently inert. Choosing an account is the gate's job now, per invocation.
+#
+# Exactly ONE named file, never the directory's contents: an operator's own
+# override in the same .service.d must survive. `-f` and the `rmdir ... ||
+# true` keep both steps no-ops under `set -euo pipefail` when there is nothing
+# to remove, so a first-time install on a machine that never had the stopgap
+# is not a hard failure. rmdir (not `rm -r`) is the guard that it only ever
+# removes an EMPTY directory.
+DROPIN_DIR="$UNIT_DIR/legibility-trickle@.service.d"
+STALE_DROPIN="$DROPIN_DIR/10-account-pin.conf"
+if [ -e "$STALE_DROPIN" ]; then
+    rm -f "$STALE_DROPIN"
+    rmdir "$DROPIN_DIR" 2>/dev/null || true
+    echo "install-trickle-timer.sh: removed the stale 10-account-pin.conf drop-in (account choice is the usage gate's job now)"
+fi
+
 TIMER_UNIT="legibility-trickle@${PROJECT_ID}.timer"
 
 systemctl --user daemon-reload

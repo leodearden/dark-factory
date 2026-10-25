@@ -1,0 +1,25 @@
+ee22615 2026-10-16 17:07:35 +0100 docs(plans): /review-all program — task 382 ruling (merge-verify frontend gate; 1298 option B; briefing gate 1305) recorded
+42dbc4b 2026-10-16 16:17:26 +0100 docs(prd): amend F22 RULING — tests drive the npm install at merge; B via verify-cache per-step tier (task 382)
+7122838 2026-10-16 14:36:09 +0100 docs(plans): /review-all program — staging-banner follow-up 1304 filed; 2026-10-16 ruling ledger
+07baae0 2026-10-16 14:32:42 +0100 docs(prds): /review-all program — Leo's 2026-10-16 rulings applied: R15 staging rung (S15 Q3; S24 gamma/epsilon2 carry it), 582 vs 617 A-narrow (S13), S16 Q1 option B (delta2 = 1299); S24/S21 PRD cross-reference notes
+d8f3e24 2026-10-16 09:44:58 +0100 docs(ops): spec Panel 5 — Ingest Health, bound in §9; brief regions regenerated (task 438)
+a629f24 2026-10-16 09:26:36 +0100 docs(prds): S16 Q1 ruled by Leo 2026-10-16 — while an account holds no statement its first tariff assignment follows its opening (option B)
+294dbb2 2026-10-16 09:25:05 +0100 docs(prd): RULING 2026-10-16 on F22 — npm lanes gate at merge verify only, fail-closed (task 382)
+d6ea845 2026-10-16 09:12:58 +0100 docs(prds): S15 Q3 ruled by Leo 2026-10-16 — production fails closed; a staging ENVIRONMENT rung (hardened, admits non-production modes, refuses live) carries demos and pre-production testing
+8ad584b 2026-10-16 09:00:44 +0100 docs(prd): RULING 2026-10-16 — 582 owns the lawful-basis table and gate branch; cbs_billing and platform_operation are contract (esc-582-5)
+1c385ce 2026-10-15 21:41:00 +0100 docs(plans): /review-all program — briefing-refresh human gates 1287-1294 filed; Leo's 2026-10-15 dispositions recorded
+0d90315 2026-10-15 21:28:33 +0100 docs(prds): /review-all program — Leo's ruling 2026-10-15: OPERATOR may read consent (S7 theta, task 1271; task 752 kept); gate 1065 committed; 785 and 394 cancelled as accepted
+b9a80a4 2026-10-15 16:37:21 +0100 docs(prds): /review-all program — S15 decomposed (stamped sidecar; PRD decompose notes); FILED table complete for all 26 streams; S9 ProviderMode clause amended per S15 Q1
+b979804 2026-10-15 16:19:16 +0100 docs(prds): /review-all program — S2, S7, S11, S12, S16 decomposed (stamped sidecars; S2/S7 PRD held->wired drift fixed); S23 beta2 (1117) released onto S2 beta1 (1232)
+c3836a9 2026-10-15 15:30:42 +0100 docs(prds): approve-issue-gate — dated AMENDED notes at §0.4, §4 D1 and §9.1 pointing at the review-all S2 push-lifecycle PRD (reciprocal ownership)
+03a1f93 2026-10-15 15:26:36 +0100 docs(prds): /review-all program — S10 epsilon (1205) released onto S1 epsilon (267); over-broad literals check narrowed to the optimiser's paths
+c0cdbfa 2026-10-15 15:20:03 +0100 docs(prds): /review-all program — S1, S4, S10, S13 decomposed (FILED rows; S13 PRD drift fixed); S2, S7, S12, S15, S16 PRDs authored with lead rulings; resumed lead session 2026-10-15
+6791755 2026-10-14 17:41:37 +0100 docs(prds): /review-all program — S5 and S6 decomposed (tasks 1158-1191; 584 adopted as S6 eta); S5 PRD gains leaf nu and INV-11; FILED rows
+38c24d6 2026-10-14 17:34:47 +0100 docs(prds): /review-all program — S21 gamma and S20 delta released; cancellation and edge ledger in the FILED section
+681b7b2 2026-10-14 17:15:32 +0100 docs(prds): /review-all program — S1 billing-engine PRD authored; S3 decomposed (tasks 1137-1153); program amendments and FILED rows
+af1a7fd 2026-10-14 17:05:06 +0100 docs(prds): /review-all program decompose pass, batch 2 — S9, S20, S23, S17, S14 filed; sidecars stamped; FILED table
+5fa0dfd 2026-10-14 16:25:59 +0100 docs(prds): /review-all program author pass, batch 2 — S3, S4, S5, S6, S13 final, S10, S11 new; S9 sidecar stamped; program amendments
+6d51f4c 2026-10-14 15:59:57 +0100 docs(prds): /review-all program decompose pass, batch 1 — S27, S19, S25, S22, S24, S26, S18 filed; sidecars stamped; FILED table
+363f63c 2026-10-14 14:59:41 +0100 docs(prds): /review-all program author pass, batch 1 — 13 agent-mode stream PRDs + program amendments
+207d800 2026-10-14 13:37:11 +0100 docs(plans): /review-all remediation program 2026-10-14 (26 streams, 20 rulings, G4 seam map)
+e4f2a2b 2026-10-14 12:46:33 +0100 docs(plans): /review-all 2026-10-13 report, findings record and metrics snapshot (as_of 40a6556)

@@ -1,0 +1,42 @@
+{
+  "task_id": "5731",
+  "reason": "net-additive: pure converse of the plan-files coverage arms, so the done-time landed_scope_diff stamp reuses the gate's definition of declared instead of re-spelling it",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 350,
+      "current": 356
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 3607,
+      "current": 3643
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 1624,
+      "current": 1634
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4992,
+      "current": 4998
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58693,
+      "current": 58729
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31953,
+      "current": 31963
+    }
+  ]
+}

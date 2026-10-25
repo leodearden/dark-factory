@@ -7,7 +7,8 @@ accompanies a PRD's ``.capability-manifest.md`` (see
 (fused-memory, task γ) is the canonical writer of the sidecar's ``task_id``
 field and of a producer task's ``metadata.delivered_checks``; the scheduler
 (orchestrator, task δ) is the canonical reader of ``metadata.delivered_checks``
-at the dispatch gate.
+at the dispatch gate. :func:`sidecar_path` is the one home of the rule that
+derives a PRD's sidecar path from its PRD key.
 
 This module also registers the ``metadata.delivered_checks`` sub-model with
 ``shared.task_metadata``'s W10 extension point
@@ -22,15 +23,18 @@ comment at the bottom of this module).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from shared.task_metadata import register_metadata_submodel
+from shared.task_metadata import ExternalDep, register_metadata_submodel
 
 __all__ = [
+    'CHECK_SUBJECT_FIELD',
+    'MECHANICAL_CHECK_KINDS',
     'CapabilityManifestDoc',
     'DeliveredCheck',
     'DeliveredCheckMeta',
@@ -38,7 +42,18 @@ __all__ = [
     'ManifestTask',
     'load_capability_manifest',
     'parse_capability_manifest',
+    'sidecar_path',
 ]
+
+_SIDECAR_SUFFIX = '.capability-manifest.yaml'
+
+
+def sidecar_path(prd_key: str) -> str:
+    """The one PRD key → sidecar path rule, for the commit_planning stamper and the dashboard.
+
+    ``plans/x-prd.md`` → ``plans/x-prd.capability-manifest.yaml``.
+    """
+    return re.sub(r'\.md$', '', prd_key) + _SIDECAR_SUFFIX
 
 
 def _check_kind_conditional_fields(
@@ -53,7 +68,7 @@ def _check_kind_conditional_fields(
     timeout_secs: int | None,
     reason: str | None = None,
 ) -> None:
-    """Shared grep/script/manual cross-field validation (PRD §Contract).
+    """Shared grep/script/path/manual cross-field validation (PRD §Contract).
 
     Raises ``ValueError`` naming ``model_name`` (the calling model class),
     ``kind``, and the offending field, so the structured ``ValidationError``
@@ -63,9 +78,15 @@ def _check_kind_conditional_fields(
     (``metadata.delivered_checks`` entries; its own ``kind`` type excludes
     ``'manual'`` and it has no ``reason`` field at all, so those branches
     are unreachable there but kept here so both models enforce identical
-    grep/script rules). Callers without a ``reason`` field simply omit it
-    (default ``None``), which never trips the grep/script ``reason``-forbidden
-    checks below.
+    mechanical rules). Callers without a ``reason`` field simply omit it
+    (default ``None``), which never trips the ``reason``-forbidden checks
+    below.
+
+    The ``'path'`` arm is an explicit ``elif`` ahead of the trailing
+    ``else:  # manual`` fallback, and that placement is load-bearing: a
+    path check reaching the manual arm would be rejected for carrying
+    ``paths`` — with a message naming ``'manual'``, a kind the author
+    never wrote.
     """
     if kind == 'grep':
         if not pattern:
@@ -95,6 +116,34 @@ def _check_kind_conditional_fields(
             raise ValueError(f'{model_name}: paths must not be set when kind={kind!r}.')
         if reason is not None:
             raise ValueError(f'{model_name}: reason must not be set when kind={kind!r}.')
+    elif kind == 'path':
+        if expect is None:
+            raise ValueError(f'{model_name}: expect is required when kind={kind!r}.')
+        if not paths:
+            raise ValueError(
+                f'{model_name}: paths is required and must be non-empty when kind={kind!r}.'
+            )
+        for entry in paths:
+            if not entry.strip() or Path(entry).is_absolute() or '..' in Path(entry).parts:
+                raise ValueError(
+                    f'{model_name}: paths entry {entry!r} is invalid when kind={kind!r} — '
+                    'every entry must be a non-empty repo-relative path with no '
+                    "'..' segment. Stricter than kind='grep' on the same field because "
+                    'here the entry IS the assertion: a pathspec git cannot resolve '
+                    'inside the repository exits 128, which the gate maps to ERRORED, '
+                    'and ERRORED is a fail-safe wait with no streak bump and no '
+                    'escalation — a silent indefinite hold on every dependent.'
+                )
+        if pattern is not None:
+            raise ValueError(f'{model_name}: pattern must not be set when kind={kind!r}.')
+        if script is not None:
+            raise ValueError(f'{model_name}: script must not be set when kind={kind!r}.')
+        if args:
+            raise ValueError(f'{model_name}: args must not be set when kind={kind!r}.')
+        if timeout_secs is not None:
+            raise ValueError(f'{model_name}: timeout_secs must not be set when kind={kind!r}.')
+        if reason is not None:
+            raise ValueError(f'{model_name}: reason must not be set when kind={kind!r}.')
     else:  # manual
         if pattern is not None:
             raise ValueError(f'{model_name}: pattern must not be set when kind={kind!r}.')
@@ -111,11 +160,11 @@ def _check_kind_conditional_fields(
 
 
 class _CheckFieldsBase(BaseModel):
-    """Shared grep/script check-descriptor fields (PRD §Contract).
+    """Shared check-descriptor fields (PRD §Contract).
 
     Private base for :class:`DeliveredCheck` and :class:`DeliveredCheckMeta`,
     factoring out the six descriptor fields common to both so a future field
-    addition only needs to change in one place — the grep/script/manual
+    addition only needs to change in one place — the per-kind
     cross-field *rules* were already centralized in
     :func:`_check_kind_conditional_fields`, but the field *declarations*
     were duplicated verbatim between the two models. ``kind`` (the two
@@ -139,18 +188,52 @@ class _CheckFieldsBase(BaseModel):
 class DeliveredCheck(_CheckFieldsBase):
     """A single sidecar ``delivered_check`` — the gate δ evaluates (PRD §Contract).
 
-    ``kind`` discriminates three mutually exclusive shapes: ``'grep'``
-    (``pattern`` + ``expect``, optional ``paths``), ``'script'`` (``script``
-    + ``timeout_secs``, optional ``args``), and ``'manual'`` (no check
-    fields — excluded from the gate; optional free-text ``reason``, which is
-    itself forbidden on ``'grep'``/``'script'`` — it is documented as
-    manual-only and the validator enforces that).
+    ``kind`` discriminates four mutually exclusive shapes: ``'grep'``
+    (``pattern`` + ``expect``, optional ``paths`` narrowing the search),
+    ``'script'`` (``script`` + ``timeout_secs``, optional ``args``),
+    ``'path'`` (``expect`` + a non-empty ``paths``), and ``'manual'`` (no
+    check fields — excluded from the gate; optional free-text ``reason``,
+    which is itself forbidden on every mechanical kind — it is documented
+    as manual-only and the validator enforces that).
     ``extra='forbid'`` — this is a strict authoring schema whose deliverable
     is rejecting malformed/typo'd entries, unlike ``shared.task_metadata``'s
     ``extra='allow'`` round-trip sub-models.
+
+    ``'path'`` asserts FILE EXISTENCE on the committed tree, where
+    ``'grep'`` asserts file CONTENTS. Reaching for ``'grep'`` to say "file
+    X exists" is a check that can never go green — a test module does not
+    mention its own filename — so a file-existence capability must use
+    ``'path'``. ``paths`` is reused rather than a singular ``path`` field:
+    two near-identical names on one model is a naming trap, and
+    ``paths=['<file>']`` says exactly what ``path='<file>'`` would.
+
+    On ``'path'`` (and only there) ``paths`` entries must be non-empty,
+    repo-relative and free of ``'..'`` segments. The asymmetry with
+    ``'grep'``, which validates the same field not at all, is principled:
+    for grep ``paths`` merely NARROWS a search, so a bad entry degrades to
+    a wider-or-empty scope, whereas for ``'path'`` the entry IS the
+    assertion. A pathspec git cannot resolve inside the repository exits
+    128, which the gate maps to ERRORED — and ERRORED is a fail-safe wait
+    with no streak bump and no escalation, i.e. a silent indefinite hold
+    on every dependent. One typo'd leading slash would wedge a dependent
+    forever while emitting nothing a human would ever see, so the
+    descriptor is refused loudly at authoring time instead.
+
+    WHAT THIS SCHEMA CANNOT EXPRESS. Validity here is purely structural:
+    every field a ``kind`` requires is present and well-typed. It cannot say
+    whether the descriptor will ever CHANGE VERDICT — an ``expect='present'``
+    grep pattern that already matches, or a ``'path'`` that already exists,
+    is green the day it is written and gates nothing, and a grep pattern
+    that names a FILE rather than a symbol inside it can never go green and
+    wedges whatever depends on it. All are schema-valid. Those rules are
+    tree-relative rather than field-relative, so they live in
+    :mod:`shared.delivered_check_polarity`, which ``commit_planning`` and
+    ``stamp_capability_manifests`` run at authoring time (task 3500). Authors
+    hitting a ``DeliveredCheckPolarityViolation`` should read that module's
+    docstring, not this one.
     """
 
-    kind: Literal['grep', 'script', 'manual']
+    kind: Literal['grep', 'script', 'path', 'manual']
     reason: str | None = None
 
     @model_validator(mode='after')
@@ -224,32 +307,93 @@ class ManifestCapability(BaseModel):
 class ManifestTask(BaseModel):
     """A single manifest task block — one per PRD Greek-label task (PRD §Contract).
 
-    ``task_id`` is ``int | None``: ``None`` at authoring time, stamped by
-    ``commit_planning`` — never author-supplied for a real batch. ``title``
-    is a human aid, not load-bearing.
+    A block declares exactly one of THREE binding states, naming which
+    registry (if any) holds the task that produces its capabilities:
+
+    - ``task_id`` set — the producer is a LOCAL dark-factory task, stamped
+      by ``commit_planning``; never author-supplied for a real batch. The one
+      exception, sanctioned by ``plans/dashboard-prd-lanes-prd.md`` §9 ε, is
+      the minimal sidecar that its ε1–ε4 write for a legacy, chain-only PRD:
+      it binds an EXISTING task's id by hand, is not a real batch, and
+      ``commit_planning`` never stamps it. A local
+      ``task_id`` is the ordinary case, and the only one whose
+      ``delivered_check``\\ s this project's dispatch gate evaluates.
+    - ``external_task_id`` set — the producer lives in ANOTHER project's
+      registry, named in the repo's canonical qualified
+      ``"project_id:task_id"`` form (``docs/task-authoring.md`` §3.2, the
+      same spelling as ``metadata.external_deps``), e.g. ``"reify:5613"``.
+      NORMALISED ON VALIDATE to ``ExternalDep.render()``'s canonical
+      spelling, so the stored value is always JOIN-SAFE against an
+      ``external_deps`` entry (see the validator below).
+      ``commit_planning`` never stamps such a block: its step-4 write-back
+      only touches labels present in the batch being committed, a foreign
+      producer is by construction not in a dark-factory batch, and a batch
+      label that does name one is left unstamped and reported in the
+      stamping report's ``external_labels`` bucket.
+    - both ``None`` — authoring time; the block binds nothing yet.
+
+    The two id fields are MUTUALLY EXCLUSIVE (enforced below): a block that
+    named both would claim two different producers in two different
+    registries, which is exactly the misattribution this field exists to
+    prevent. ``title`` is a human aid, not load-bearing.
 
     ``note`` is durable task-level provenance — why a label was split,
-    renamed or re-homed. It is a DECLARED field rather than a YAML comment
-    because ``manifest_stamping``'s write-back is
-    ``yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)``
-    (``fused-memory/src/fused_memory/server/manifest_stamping.py``, step 4),
-    which discards every comment in the sidecar on the next stamp. A
-    declared field survives that rewrite; a comment does not. Surviving is
-    a property of the field being DECLARED, not of step 4 happening to dump
-    the raw decoded dict — it would hold equally under a ``model_dump()``.
-    That survival is asserted end-to-end on the stamping side, not here:
-    see ticket ``tkt_0RSNVJT1ZNWKS5Y7BM5F7A2QAD`` (follow-up from task
-    4471) for the ``test_manifest_stamping`` fixture that stamps a sidecar
-    carrying this field and re-reads it.
+    renamed or re-homed. Comments in a sidecar now survive a stamp too
+    (``fused-memory/src/fused_memory/server/manifest_stamping.py`` step 4
+    rewrites only ``task_id`` values), but ``note`` remains the preferred
+    home: it is declared, validated, and machine-readable, where a comment
+    is none of those. Its survival is asserted end-to-end on the stamping
+    side, not here: see ticket ``tkt_0RSNVJT1ZNWKS5Y7BM5F7A2QAD`` (follow-up
+    from task 4471) for the ``test_manifest_stamping`` fixture that stamps a
+    sidecar carrying this field and re-reads it.
     """
 
     model_config = ConfigDict(extra='forbid')
 
     label: str = Field(min_length=1)
     task_id: int | None = None
+    external_task_id: str | None = None
     title: str | None = None
     note: str | None = None
     capabilities: list[ManifestCapability]
+
+    @model_validator(mode='after')
+    def _check_producer_binding(self) -> ManifestTask:
+        if self.external_task_id is None:
+            return self
+        if self.task_id is not None:
+            raise ValueError(
+                f'ManifestTask {self.label!r}: binds BOTH a local task_id '
+                f'({self.task_id}) and external_task_id '
+                f'{self.external_task_id!r} — a block names exactly one producer.'
+            )
+        # ExternalDep.parse is the single authority for this wire form
+        # (shared/src/shared/task_metadata.py::ExternalDep) — the same one
+        # backing metadata.external_deps. Do not re-implement the
+        # split/strip check here. Re-raised so the message names the
+        # offending label, which ExternalDep cannot know.
+        try:
+            dep = ExternalDep.parse(self.external_task_id)
+        except ValueError as exc:
+            raise ValueError(
+                f'ManifestTask {self.label!r}: malformed external_task_id '
+                f'{self.external_task_id!r}; expected the qualified '
+                f'"project_id:task_id" form (e.g. "reify:5613"). {exc}'
+            ) from exc
+        # NORMALISE rather than store verbatim. ExternalDep.parse STRIPS
+        # before splitting, so ' reify:5613 ' is well-formed but is NOT
+        # equal to the 'reify:5613' a task's metadata.external_deps
+        # carries. Every consumer treats this field as an OPAQUE KEY --
+        # the live-corpus test compares it with ==, and the field is
+        # documented as the same spelling as external_deps -- so a
+        # non-canonical stored value would make any future join between a
+        # manifest block and its producer's external_deps silently MISS.
+        # Normalising here (rather than rejecting the padded form) keeps
+        # the parser's own tolerance intact while making the stored string
+        # the one thing callers may rely on. parse(s).render() == s holds
+        # for the canonical form, so this is idempotent.
+        self.external_task_id = dep.render()
+        return self
 
 
 class CapabilityManifestDoc(BaseModel):
@@ -262,6 +406,13 @@ class CapabilityManifestDoc(BaseModel):
     ``min_length=1`` on ``label`` already rejects an empty label on its
     own, so that branch here is a defense-in-depth restatement of the same
     rule at doc granularity).
+
+    ``signal_leaves`` names the label(s) of the block(s) whose completion
+    delivers the PRD's goal signal, usually its integration gate. The
+    dashboard derives the PRD's delivered / partial / not-yet mark from those
+    tasks' status at read time; nothing writes it at runtime. Absent means
+    the PRD names no signal leaf. Contract: ``plans/dashboard-prd-lanes-prd.md``
+    §4.7 and §5.2.
     """
 
     model_config = ConfigDict(extra='forbid')
@@ -269,6 +420,7 @@ class CapabilityManifestDoc(BaseModel):
     prd: str
     schema_version: Literal[1]
     tasks: list[ManifestTask]
+    signal_leaves: list[str] | None = None
 
     @model_validator(mode='after')
     def _check_labels(self) -> CapabilityManifestDoc:
@@ -279,6 +431,24 @@ class CapabilityManifestDoc(BaseModel):
             if task.label in seen:
                 raise ValueError(f'CapabilityManifestDoc: duplicate task label {task.label!r}.')
             seen.add(task.label)
+        return self
+
+    @model_validator(mode='after')
+    def _check_signal_leaves(self) -> CapabilityManifestDoc:
+        if self.signal_leaves is None:
+            return self
+        if not self.signal_leaves:
+            raise ValueError(
+                'CapabilityManifestDoc: signal_leaves must be non-empty when present — '
+                'omit the field when the PRD names no signal leaf.'
+            )
+        known = [task.label for task in self.tasks]
+        for label in self.signal_leaves:
+            if label not in known:
+                raise ValueError(
+                    f'CapabilityManifestDoc: signal_leaves label {label!r} names no task '
+                    f'block; known labels: {known!r}.'
+                )
         return self
 
 
@@ -307,6 +477,9 @@ def load_capability_manifest(path: str | Path) -> CapabilityManifestDoc:
     return parse_capability_manifest(data)
 
 
+MechanicalCheckKind = Literal['grep', 'script', 'path']
+
+
 class DeliveredCheckMeta(_CheckFieldsBase):
     """A single ``metadata.delivered_checks`` entry (PRD §Contract).
 
@@ -317,12 +490,21 @@ class DeliveredCheckMeta(_CheckFieldsBase):
     excluded from the automated gate) plus a required ``name`` (the
     capability name, so a gate-failure escalation can name which capability
     failed). Shares :class:`DeliveredCheck`'s descriptor fields (via
-    :class:`_CheckFieldsBase`) and grep/script cross-field validation (via
+    :class:`_CheckFieldsBase`) and per-kind cross-field validation (via
     :func:`_check_kind_conditional_fields`).
+
+    This ``kind`` Literal is the definition of "mechanical" — see
+    :data:`MECHANICAL_CHECK_KINDS`, which derives from it.
+
+    Shares :class:`DeliveredCheck`'s limits too: passing this model says the
+    entry is well-SHAPED, not that it can ever change verdict. The
+    authoring-time polarity rules that catch the un-satisfiable shapes live in
+    :mod:`shared.delivered_check_polarity` and run against these entries in
+    ``commit_planning`` and ``stamp_capability_manifests`` (task 3500).
     """
 
     name: str = Field(min_length=1)
-    kind: Literal['grep', 'script']
+    kind: MechanicalCheckKind
 
     @model_validator(mode='after')
     def _check_fields(self) -> DeliveredCheckMeta:
@@ -337,6 +519,55 @@ class DeliveredCheckMeta(_CheckFieldsBase):
             timeout_secs=self.timeout_secs,
         )
         return self
+
+
+MECHANICAL_CHECK_KINDS: tuple[MechanicalCheckKind, ...] = get_args(
+    DeliveredCheckMeta.model_fields['kind'].annotation
+)
+"""The check kinds the automated gate evaluates — everything but ``'manual'``.
+
+DERIVED from :class:`DeliveredCheckMeta`'s ``kind`` Literal rather than
+restated, because "mechanical" is not an independent concept that happens
+to coincide with that vocabulary — it IS that vocabulary, definitionally:
+mechanical means "copied into ``metadata.delivered_checks``", and
+:class:`DeliveredCheckMeta` is precisely the model of a metadata entry. So
+the two can never drift, and adding a kind is a one-place edit.
+
+Deriving from :class:`DeliveredCheckMeta` and not :class:`DeliveredCheck`
+is load-bearing: the latter also carries ``'manual'``, the one kind that
+must never be copied into metadata.
+
+The element type is :data:`MechanicalCheckKind`, not ``str``, so a
+``kind in MECHANICAL_CHECK_KINDS`` test narrows a :class:`DeliveredCheck`
+``kind`` to one :class:`DeliveredCheckMeta` accepts.
+
+Consumers: ``fused-memory``'s ``manifest_stamping`` copy filter and
+``scripts/audit_combine_gate_marker_loss.py``'s sweep, both of which
+previously hand-kept their own copy of the tuple.
+"""
+
+
+CHECK_SUBJECT_FIELD: dict[str, str] = {
+    'grep': 'pattern',
+    'script': 'script',
+    'path': 'paths',
+}
+"""Per-kind name of the field a check's failure is ABOUT.
+
+The one field an operator needs to see when a check fails: which pattern
+did not match, which script exited non-zero, which path was not there.
+Read by the two diagnostic renderers that must name the failing
+descriptor — the ``gate_mark_done_on_delivered_checks`` WARNING and the
+born-at-L2 ``DEP_CAPABILITY_NOT_DELIVERED`` escalation body — both of
+which previously hard-coded a grep/script binary and so, for a third
+kind, named a field the descriptor does not have and printed its ``None``.
+
+A table rather than an if/elif chain (heuristic 12): the next kind is a
+data edit, and a renderer cannot silently fall through to the wrong
+field. Keyed by every mechanical kind — :data:`MECHANICAL_CHECK_KINDS` is
+the authority on that vocabulary, and the paired test asserts the two
+agree so a kind can never be added here and missed there (or vice versa).
+"""
 
 
 # The one sanctioned shared/ registration call (deploy_state.py precedent):

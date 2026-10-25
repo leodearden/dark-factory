@@ -21,16 +21,14 @@ edit from doing that.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import re
-import sys
-import types
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 from shared.task_metadata import parse_metadata
 
 SCRIPT_PATH = (
@@ -38,28 +36,14 @@ SCRIPT_PATH = (
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load migrate_task_metadata_to_x_namespace.py from its file path."""
-    mod_name = 'migrate_task_metadata_to_x_namespace'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='migrate_task_metadata_to_x_namespace')
 plan_x_namespace_migration = _mod.plan_x_namespace_migration
 build_update_payload = _mod.build_update_payload
 build_parser = _mod.build_parser
 DEFAULT_KEYS = _mod.DEFAULT_KEYS
 BACKEND_STRIPPED_KEYS = _mod.BACKEND_STRIPPED_KEYS
+BACKEND_STRIPPED_CONTROL_KEYS = _mod.BACKEND_STRIPPED_CONTROL_KEYS
+BACKEND_STRIPPED_WAIT_ANCHOR_KEYS = _mod.BACKEND_STRIPPED_WAIT_ANCHOR_KEYS
 MigrationCollisionError = _mod.MigrationCollisionError
 assert_write_accepted = _mod.assert_write_accepted
 WriteRejectedError = _mod.WriteRejectedError
@@ -71,11 +55,11 @@ recovery_pointer = _mod.recovery_pointer
 _verify_read_back = _mod._verify_read_back
 
 
-# The six ad-hoc keys measured on task 3083's live blob (2026-08-06) that are
-# x_-renameable: none has a code reader anywhere in orchestrator/,
+# The eleven ad-hoc keys measured on task 3083's live blob (2026-10-01) that
+# are x_-renameable: none has a code reader anywhere in orchestrator/,
 # fused-memory/src, shared/src, escalation/, dashboard/, scripts/ or docs/.
-# The seventh unknown_key on that blob, `last_blocked_at`, is deliberately
-# absent here — it IS machine-read, and was promoted to Tier-A instead.
+# `last_blocked_at`, an unknown_key on the 2026-08-06 blob, is deliberately
+# not a target — it IS machine-read, and was promoted to Tier-A instead.
 _TASK_3083_SHAPED_METADATA = {
     # --- legit keys that must survive untouched ---
     'source': 'reconciliation',
@@ -85,7 +69,7 @@ _TASK_3083_SHAPED_METADATA = {
     'files': ['fused-memory/src/fused_memory/server/markup_tripwire.py'],
     'memory_hints': {'entities': ['A'], 'queries': ['q1']},
     'last_blocked_at': '2026-08-01T07:31:13.914220+00:00',
-    # --- the six migration targets ---
+    # --- the eleven migration targets ---
     # Nested-object values with lists inside, matching the real blob's shape:
     # a value-preserving rename must carry these through byte-identically.
     'markup_tripwire_rejections_20260730': {
@@ -93,6 +77,21 @@ _TASK_3083_SHAPED_METADATA = {
     },
     'markup_tripwire_rejections_20260730_burst3': {
         'rejections': [{'tool': 'add_memory', 'count': 1}, {'tool': 'submit_task', 'count': 3}],
+    },
+    'markup_tripwire_rejections_20260807_burst4': {
+        'rejections': [{'tool': 'update_task', 'count': 1}],
+    },
+    'markup_tripwire_rejections_20260809_burst5': {
+        'rejections': [{'tool': 'submit_task', 'count': 2}],
+    },
+    'markup_tripwire_rejections_20260809_burst6': {
+        'rejections': [{'tool': 'add_memory', 'count': 4}],
+    },
+    'markup_tripwire_rejections_20260810_burst7': {
+        'rejections': [{'tool': 'submit_task', 'count': 1}, {'tool': 'update_task', 'count': 2}],
+    },
+    'markup_tripwire_rejections_20260811_burst8': {
+        'rejections': [{'tool': 'add_memory', 'count': 1}],
     },
     'related_reify_memories': ['mem-1'],
     'related_reify_tasks': ['3141', '3083'],
@@ -137,7 +136,7 @@ def test_every_non_target_key_survives_untouched():
         k: v for k, v in _TASK_3083_SHAPED_METADATA.items() if k not in DEFAULT_KEYS
     }
     assert survivors == expected
-    # No key is invented or lost: 18-key blob in, 18-key blob out.
+    # No key is invented or lost: as many keys out as in.
     assert len(out) == len(_TASK_3083_SHAPED_METADATA)
 
 
@@ -220,7 +219,7 @@ def test_migrated_blob_emits_no_unknown_key_warning_for_any_target():
 
     `parse_metadata` is the deterministic oracle this task measures against
     (replacing the PRD's slow journalctl grep). After the transform, neither
-    the six old spellings NOR their x_ forms may emit code=unknown_key.
+    the old spellings NOR their x_ forms may emit code=unknown_key.
 
     Asserted per-key rather than as a global zero: a caller's blob may
     legitimately carry other unrelated unknown keys, and this transform makes
@@ -283,11 +282,28 @@ def test_update_payload_metadata_round_trips_to_the_given_blob():
 
 # --- case 8: default target list + CLI refuses a corpus-wide sweep ----------
 
-def test_default_keys_are_exactly_the_six_measured_targets():
-    """Pinned so a later edit cannot quietly widen the blast radius."""
+_MEASURED_MARKUP_TRIPWIRE_SPELLINGS = (
+    'markup_tripwire_rejections_20260730',
+    'markup_tripwire_rejections_20260730_burst3',
+    'markup_tripwire_rejections_20260807_burst4',
+    'markup_tripwire_rejections_20260809_burst5',
+    'markup_tripwire_rejections_20260809_burst6',
+    'markup_tripwire_rejections_20260810_burst7',
+    'markup_tripwire_rejections_20260811_burst8',
+)
+
+
+def test_default_keys_are_exactly_the_eleven_measured_targets():
+    """Pinned so a later edit cannot quietly widen the blast radius.
+
+    Widened from six to eleven on 2026-10-01 (task 3777), deliberately: task
+    3083's live blob had accreted five later markup_tripwire_rejections bursts
+    since the 2026-08-06 measurement. Re-measured with parse_metadata, the blob
+    carried eleven unknown_key warnings; migrating all eleven leaves zero. The
+    five additions belong to a family already on the list and have no reader.
+    """
     assert sorted(DEFAULT_KEYS) == sorted([
-        'markup_tripwire_rejections_20260730',
-        'markup_tripwire_rejections_20260730_burst3',
+        *_MEASURED_MARKUP_TRIPWIRE_SPELLINGS,
         'related_reify_memories',
         'related_reify_tasks',
         'origin_escalation',
@@ -298,15 +314,42 @@ def test_default_keys_are_exactly_the_six_measured_targets():
     assert 'last_blocked_at' not in DEFAULT_KEYS
 
 
+def test_default_keys_cover_every_markup_tripwire_burst_spelling():
+    """Every markup_tripwire_rejections target is one of the measured
+    spellings, and the four non-burst targets task 4302 relies on are still
+    present."""
+    burst_targets = [k for k in DEFAULT_KEYS if k.startswith('markup_tripwire_rejections')]
+    assert set(burst_targets) <= set(_MEASURED_MARKUP_TRIPWIRE_SPELLINGS)
+    for key in (
+        'related_reify_memories', 'related_reify_tasks',
+        'origin_escalation', 'origin_reify_task',
+    ):
+        assert key in DEFAULT_KEYS
+
+
+def test_migrated_3083_shaped_blob_emits_zero_unknown_key_warnings():
+    """The task's user-observable signal as a deterministic oracle: after the
+    stock migration, a 3083-shaped blob carries NO unknown_key warning at all.
+
+    A global zero is legitimate here, unlike in the per-key test's general
+    case, because every non-target fixture key is a blessed or typed key that
+    3083 really carries.
+    """
+    out, _ = plan_x_namespace_migration(_TASK_3083_SHAPED_METADATA, DEFAULT_KEYS)
+
+    _, warnings = parse_metadata(json.dumps(out), direction='write')
+    assert [w.field for w in warnings if w.code == 'unknown_key'] == []
+
+
 # --- tool-level rejection must not read as an accepted write ---------------
 
 def test_done_provenance_rejection_is_detected():
     """The VERBATIM rejection observed against the live server on 2026-08-06.
 
-    `update_task` refuses any metadata payload containing `done_provenance`
-    (sqlite_task_backend.py, presence-only write-authority floor, checked
-    BEFORE metadata_mode is resolved) — and returns that refusal inside a
-    normal JSON-RPC success envelope. The shared client only raises on an
+    At the time `update_task` refused any metadata payload containing
+    `done_provenance` (a presence-only floor, narrowed by task 3777 to refuse
+    only an add, change or drop under replace) — and it returns such a
+    refusal inside a normal JSON-RPC success envelope. The shared client only raises on an
     envelope-level error, so without this assertion the script printed
     'write submitted' for a write that never happened.
     """
@@ -467,16 +510,63 @@ def test_verify_read_back_reports_backend_stripped_control_keys_as_info():
     assert notes[0].startswith('(i)')
 
 
+def test_read_back_treats_a_stripped_wait_anchor_as_a_note_not_drift():
+    """A stored wait anchor dropped by the backend must not read as corruption.
+
+    `SqliteTaskBackend.update_task` strips caller-supplied `pending_since` /
+    `pending_since_backfilled` in every mode (task 3816), so a replace write
+    drops the stored anchor by design. Every done task that was pending at the
+    v4->v5 back-fill carries both keys, so this is the common case for a
+    corpus sweep, not an edge.
+    """
+    problems, notes = _run_verify(
+        extra_before={
+            'pending_since': '2026-09-04T14:42:35.252Z',
+            'pending_since_backfilled': True,
+        },
+        mutate=lambda m: (m.pop('pending_since'), m.pop('pending_since_backfilled')),
+    )
+
+    assert problems == [], problems
+    assert len(notes) == 1
+    assert notes[0].startswith('(i)')
+    assert 'pending_since' in notes[0]
+    assert 'pending_since_backfilled' in notes[0]
+
+
 def test_backend_stripped_keys_match_the_backend_source_of_truth():
-    """The literal in the script must not drift from the backend's frozenset.
+    """The literal in the script must not drift from the backend's frozensets.
 
     The script hard-codes the set to keep the heavy backend package off its
-    import path; this is the anti-drift guard that buys that back.
+    import path; this is the anti-drift guard that buys that back. It covers
+    both strip families: leaked call-flags (task 2682) and machine-authored
+    wait anchors (task 3816).
     """
     from fused_memory.backends.sqlite_task_backend import (
+        _MACHINE_AUTHORED_METADATA_KEYS,
         _RESERVED_METADATA_CONTROL_KEYS,
     )
-    assert BACKEND_STRIPPED_KEYS == _RESERVED_METADATA_CONTROL_KEYS
+    assert BACKEND_STRIPPED_KEYS == (
+        _RESERVED_METADATA_CONTROL_KEYS | _MACHINE_AUTHORED_METADATA_KEYS
+    )
+    assert BACKEND_STRIPPED_CONTROL_KEYS == _RESERVED_METADATA_CONTROL_KEYS
+    assert BACKEND_STRIPPED_WAIT_ANCHOR_KEYS == _MACHINE_AUTHORED_METADATA_KEYS
+
+
+def test_read_back_reports_each_strip_family_in_its_own_note():
+    """A blob carrying both a leaked control key and a wait anchor gets one
+    note per family, so an operator can tell them apart without parsing."""
+    problems, notes = _run_verify(
+        extra_before={'append': True, 'pending_since': '2026-09-04T14:42:35.252Z'},
+        mutate=lambda m: (m.pop('append'), m.pop('pending_since')),
+    )
+
+    assert problems == [], problems
+    assert len(notes) == 2
+    assert all(note.startswith('(i)') for note in notes)
+    control_note, anchor_note = notes
+    assert 'append' in control_note and 'pending_since' not in control_note
+    assert 'pending_since' in anchor_note and 'append' not in anchor_note
 
 
 # --- case 10: --keys safety validation --------------------------------------

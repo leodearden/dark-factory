@@ -1,27 +1,36 @@
 """Dashboard data module for host load metrics — /api/load.
 
-Source-of-truth note
---------------------
-``LOAD_SAMPLES_SCHEMA`` is a copy of ``sampler.store._SCHEMA`` (task 1536).
-The dashboard tests run from the ``dashboard/`` subdir and must not take a
-runtime dependency on the sampler package.  If the sampler schema changes,
-this constant MUST be updated to stay aligned — the DB join columns (metric,
-ts, value, window_mean, window_max) are the consumer contract.
+The ``samples`` schema is owned by ``sampler/src/sampler/store.py::SCHEMA``.
 
-9-key allowlist
----------------
-``KNOWN_METRICS`` is the stable set of metric names the dashboard serves.
-Keys not in this tuple are filtered from query results, giving the frontend
-a fixed shape regardless of future sampler additions.  The response always
-contains all 9 keys; absent-from-DB known metrics return the placeholder
-shape ``{current: null, sparkline: [], window_mean: null, window_max: null}``.
+Served metrics
+--------------
+``KNOWN_METRICS`` is the sorted exact names of the sampler groups the
+dashboard serves, a projection of
+``sampler/src/sampler/metrics.py::METRIC_GROUPS``, so a metric added to a
+served group is served with no edit here (the Host load card's own
+presentation list in ``static/redux/tab_overview.jsx`` still needs an entry
+before it displays the metric).  Keys not in this tuple are
+filtered from query results, giving the frontend a fixed shape.  The
+response always contains every key; a known metric with nothing to serve
+returns the placeholder shape
+``{current: null, sparkline: [], window_mean: null, window_max: null}``.
 
-PSI window columns
-------------------
-PSI metrics (``psi_*``) are kernel-windowed: the sampler writes NULL for
-``window_mean`` and ``window_max``.  The data module passes these NULLs
-through as Python ``None`` — callers must not expect numeric window values
-for PSI metrics.
+TWO things produce that placeholder, and only the first is "absent from the
+DB".  The second is a metric whose newest row is older than
+``_RECENCY_SLACK_SECONDS`` before the newest row of ANY served metric — so a
+collection group that stalls while its siblings keep ticking goes to the
+placeholder once the slack elapses.  That is intended, and it is the caller-
+facing consequence of a query design whose reasoning and measurements have
+one home: ``dashboard/src/dashboard/data/load.py::_ANCHOR_SQL``.  Read that
+before changing the bound.  Pinned by
+``test_a_group_that_stops_writing_blanks_while_its_siblings_keep_ticking``.
+
+Unwindowed groups
+-----------------
+A group the sampler records unwindowed (PSI, which the kernel already
+windows) carries NULL ``window_mean`` and ``window_max`` columns.  The data
+module passes these NULLs through as Python ``None``, so callers must not
+expect numeric window values for those metrics.
 """
 
 from __future__ import annotations
@@ -30,56 +39,15 @@ import logging
 from typing import Any
 
 import aiosqlite
+from sampler.metrics import METRIC_GROUPS, GroupName, exact_metric_names
 
 from dashboard.data.db import with_db
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Schema (mirrors sampler.store._SCHEMA — keep in sync)
-# ---------------------------------------------------------------------------
+_SERVED_GROUPS = frozenset({GroupName.PSI, GroupName.PROCESS})
 
-LOAD_SAMPLES_SCHEMA: str = """\
-CREATE TABLE IF NOT EXISTS samples (
-    ts          INTEGER NOT NULL,
-    metric      TEXT    NOT NULL,
-    value       REAL    NOT NULL,
-    window_mean REAL,
-    window_max  REAL
-);
-
-CREATE INDEX IF NOT EXISTS idx_samples_metric_ts
-    ON samples (metric, ts);
-
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-"""
-
-# ---------------------------------------------------------------------------
-# Known metric allowlist
-# ---------------------------------------------------------------------------
-
-# PSI metrics: kernel-windowed; window_mean/window_max always NULL in DB.
-PSI_METRICS: frozenset[str] = frozenset({
-    'psi_cpu_some_avg10',
-    'psi_cpu_full_avg10',
-    'psi_mem_some_avg10',
-    'psi_mem_full_avg10',
-    'psi_io_some_avg10',
-    'psi_io_full_avg10',
-})
-
-# Process metrics: sampler-windowed; window_mean/window_max populated.
-PROCESS_METRICS: frozenset[str] = frozenset({
-    'occt_queue_depth',
-    'verify_concurrency',
-    'verify_rss_total_bytes',
-})
-
-# Stable ordered tuple — the frontend shape contract.
-KNOWN_METRICS: tuple[str, ...] = tuple(sorted(PSI_METRICS | PROCESS_METRICS))
+KNOWN_METRICS: tuple[str, ...] = exact_metric_names(METRIC_GROUPS, _SERVED_GROUPS)
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +68,74 @@ def _default_result() -> dict[str, dict[str, Any]]:
 # Public API
 # ---------------------------------------------------------------------------
 
-_PLACEHOLDERS_SQL = ','.join('?' * len(KNOWN_METRICS))
+# The allowlist as NAMED parameters, bound once by name.  The statement below
+# spells this group twice -- once for the anchor subquery, once for the outer
+# filter -- and with positional `?` that forced the caller to repeat the tuple
+# as many times as the statement happened to contain the group, a coupling
+# invisible at both sites and silently misaligning every parameter if either
+# changed.  Named parameters let the same group appear any number of times.
+_PLACEHOLDERS_SQL = ','.join(f':m{i}' for i in range(len(KNOWN_METRICS)))
+
+# Slack, in seconds, for the recency bound below.  The sparkline is 60 samples
+# at the sampler's 5s tick = 300s, so an hour is 12x headroom: it absorbs
+# sampler restarts and missed ticks without ever truncating a full sparkline.
+_RECENCY_SLACK_SECONDS = 3600
+
+# Why the recency bound exists (task 3592)
+# ---------------------------------------
+# Without `ts >=`, this query's cost is LINEAR IN RETENTION: SQLite does not
+# push `rn <= 60` down into the window function, so it ranks EVERY row of the
+# allowlisted metrics before discarding all but 60 per metric.  When sampler
+# retention widened 24h -> 30d, the 9-metric steady state went 155k -> 4.67M
+# rows.  Measured on a 4,665,600-row probe DB with this exact schema:
+# 11,955 ms unbounded vs 28.7 ms bounded, for byte-identical 540-row output.
+# /api/load is on a 5s frontend poll (tab_overview.jsx::LOAD_POLL_INTERVAL_MS),
+# so the unbounded form took ~2x the poll interval and saturated the aiosqlite
+# pool -- the same unbounded-scan-on-a-polled-endpoint mechanism behind the
+# 2026-07-30 dashboard outage (tasks 3304, 3519).
+#
+# The bound is anchored to the newest sample (MAX(ts)), NOT to wall-clock now().
+# That is load-bearing in two ways.  It keeps the data layer free of any
+# wall-clock dependency, and it preserves behaviour when the sampler is DOWN: a
+# now()-relative bound would blank the card after an outage longer than the
+# slack, whereas anchoring to the data keeps showing the last known samples,
+# exactly as the unbounded query did.
+#
+# The anchor is GLOBAL across the 9 served metrics, not per metric, and the
+# difference shows in the PARTIAL degrade: one collection group stalls while
+# its siblings keep writing, the siblings advance the anchor, and after the
+# slack the stalled group's cards go to the placeholder.  Kept global
+# deliberately.  /api/load is polled every 5 s and the frontend renders
+# `current` as the live number, so a value last written an hour ago is not a
+# stale reading of host load -- it is a reading of a collector that has
+# STOPPED, and "no data" is the honest answer.  A per-metric bound
+# (`ts >= (SELECT MAX(ts) FROM samples s2 WHERE s2.metric = samples.metric)`)
+# would instead report each stalled metric's last value as current forever,
+# and makes the scalar subquery correlated.
+#
+# Cost is linear in the SLACK, not in retention, so the slack must stay modest:
+# measured on the same probe, 1h = 28.7 ms, 24h = 347 ms, 7d = 2,168 ms.
+#
+# The anchor is CLAMPED to now() from ABOVE, and that clamp is a bound, not a
+# switch to a wall-clock anchor: when the sampler is behind or down, MAX(ts) is
+# already <= now() and MIN() returns MAX(ts) unchanged, so every property above
+# still holds. It bites only when MAX(ts) is in the FUTURE, which no healthy
+# tick produces -- the sampler stamps `ts = int(time.time())` with no
+# monotonicity guard (sampler/src/sampler/__main__.py), so an NTP step forward,
+# a VM suspend/resume, or a hand-seeded probe row is enough. Unclamped, ONE
+# such row drags the anchor past every real sample and serves placeholders for
+# all nine metrics -- the silent, total blank-dashboard failure this whole
+# bound exists to prevent, and with nothing to recover it: a future-dated row
+# survives every past-only retention sweep. `sampler.store.cleanup_old` now
+# prunes rows beyond +/- retain_seconds, but that sweep runs daily and only
+# catches the egregious ones; this clamp is what makes the endpoint robust on
+# the very next request, at any skew. Pinned by
+# `test_one_future_dated_row_does_not_blank_the_other_eight_metrics`.
+_ANCHOR_SQL = f"""\
+MIN(
+    (SELECT MAX(ts) FROM samples WHERE metric IN ({_PLACEHOLDERS_SQL})),
+    CAST(strftime('%s', 'now') AS INTEGER)
+)"""
 
 _QUERY_SQL = f"""\
 SELECT metric, value, window_mean, window_max, ts
@@ -109,16 +144,19 @@ FROM (
            ROW_NUMBER() OVER (PARTITION BY metric ORDER BY ts DESC) AS rn
     FROM samples
     WHERE metric IN ({_PLACEHOLDERS_SQL})
+      AND ts >= ({_ANCHOR_SQL}) - {_RECENCY_SLACK_SECONDS}
 )
 WHERE rn <= 60
 ORDER BY metric, ts ASC
 """
 
+_QUERY_PARAMS: dict[str, str] = {f'm{i}': m for i, m in enumerate(KNOWN_METRICS)}
+
 
 async def get_load_metrics(
     db: aiosqlite.Connection | None,
 ) -> dict[str, dict[str, Any]]:
-    """Return the latest value + 60-sample sparkline for each of the 9 known metrics.
+    """Return the latest value + 60-sample sparkline for each metric in KNOWN_METRICS.
 
     Parameters
     ----------
@@ -144,7 +182,7 @@ async def get_load_metrics(
     async def _query(conn: aiosqlite.Connection) -> dict[str, dict[str, Any]]:
         result = _default_result()
 
-        rows = await conn.execute_fetchall(_QUERY_SQL, KNOWN_METRICS)
+        rows = await conn.execute_fetchall(_QUERY_SQL, _QUERY_PARAMS)
 
         # Group rows by metric (already ordered by metric, ts ASC from SQL).
         # Rows are always aiosqlite.Row objects — DbPool.get sets

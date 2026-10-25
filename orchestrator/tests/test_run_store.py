@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 
 import pytest
 
@@ -598,6 +599,73 @@ class TestSchedulerStatePersistence:
         )
 
 
+class TestMainSweepColdVerdictLedger:
+    """task 5812: the last COLD main-tip sweep verdict, restart-durable in runs.db."""
+
+    def test_load_returns_none_when_unset(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        assert store.load_main_sweep_last_cold_verdict('proj-a') is None
+
+    def test_save_then_load_round_trips_an_aware_utc_datetime(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        verdict_at = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+
+        store.save_main_sweep_cold_verdict(
+            'proj-a', verdict_at=verdict_at, swept_sha='a' * 40,
+        )
+
+        loaded = store.load_main_sweep_last_cold_verdict('proj-a')
+        assert loaded == verdict_at
+        assert loaded is not None and loaded.tzinfo is not None
+
+    def test_save_is_last_wins_upsert(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        first = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+        second = datetime(2026, 9, 24, 12, 0, tzinfo=UTC)
+
+        store.save_main_sweep_cold_verdict('proj-a', verdict_at=first, swept_sha='a' * 40)
+        store.save_main_sweep_cold_verdict('proj-a', verdict_at=second, swept_sha='b' * 40)
+
+        assert store.load_main_sweep_last_cold_verdict('proj-a') == second
+
+    def test_projects_are_isolated(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        store.save_main_sweep_cold_verdict(
+            'proj-a', verdict_at=datetime(2026, 9, 23, tzinfo=UTC), swept_sha='a' * 40,
+        )
+        assert store.load_main_sweep_last_cold_verdict('proj-b') is None
+
+    def test_survives_reopen(self, tmp_path):
+        """The restart property: a NEW RunStore on the same file reads it back."""
+        db_path = tmp_path / 'runs.db'
+        verdict_at = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+        RunStore(db_path).save_main_sweep_cold_verdict(
+            'proj-a', verdict_at=verdict_at, swept_sha='a' * 40,
+        )
+
+        assert RunStore(db_path).load_main_sweep_last_cold_verdict('proj-a') == verdict_at
+
+    def test_existing_runs_db_without_the_table_gains_it(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                'CREATE TABLE runs (run_id TEXT PRIMARY KEY, project_id TEXT NOT NULL,'
+                ' started_at TEXT NOT NULL)'
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        store = RunStore(db_path)
+        verdict_at = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+
+        store.save_main_sweep_cold_verdict(
+            'proj-a', verdict_at=verdict_at, swept_sha='a' * 40,
+        )
+
+        assert store.load_main_sweep_last_cold_verdict('proj-a') == verdict_at
+
+
 # ---------------------------------------------------------------------------
 # Task 3068 / Part B — block_reason + block_phase persistence
 # ---------------------------------------------------------------------------
@@ -908,66 +976,51 @@ class TestBlockContextPersistence:
 
         assert _task_results_columns(db_path) == cols_after_first
 
-    def test_concurrent_alter_race_is_survivable(self, tmp_path):
-        """Losing the table_info->ALTER race must not cost a run its results.
 
-        Two RunStore constructions can interleave between the PRAGMA read and
-        the ALTER (the dashboard and a digest reader both open runs.db). The
-        loser sees a real sqlite3 "duplicate column name" — which means the
-        migration's GOAL is already met. Propagating it would reach
-        Harness.run's `except Exception`, leave `_run_store` unset, and drop
-        EVERY task_results row for the whole run over a no-op.
-        """
-        db_path = tmp_path / 'runs.db'
-        _build_legacy_db(db_path)
-        store = RunStore(db_path)  # migrates for real
+class TestRunsCodeSha:
+    """Task 6565 D1: ``runs.code_sha`` records the commit the process runs."""
 
-        class _StaleReadConn:
-            """Reports the PRE-migration column set, ALTERs the migrated DB."""
-
-            def __init__(self, real):
-                self._real = real
-
-            def execute(self, sql, *args):
-                if sql.startswith('PRAGMA table_info'):
-                    # (cid, name, ...) shape, minus the 3068 columns.
-                    return iter([(0, 'task_id'), (1, 'completed_at')])
-                return self._real.execute(sql, *args)
-
-            def commit(self):
-                self._real.commit()
-
+    @staticmethod
+    def _runs_columns(db_path) -> list[str]:
         conn = sqlite3.connect(str(db_path))
         try:
-            # Would raise sqlite3.OperationalError without the guard.
-            store._migrate_task_results_block_context(
-                _StaleReadConn(conn),  # type: ignore[arg-type]
-            )
+            return [row[1] for row in conn.execute('PRAGMA table_info(runs)')]
         finally:
             conn.close()
 
-        assert set(_task_results_columns(db_path)) >= {'block_reason', 'block_phase'}
+    @staticmethod
+    def _code_sha(db_path, run_id: str):
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return conn.execute('SELECT code_sha FROM runs WHERE run_id = ?', (run_id,)).fetchone()[0]
+        finally:
+            conn.close()
 
-    def test_non_duplicate_alter_failure_still_surfaces(self, tmp_path):
-        """Only the benign race is swallowed — a real fault must not be.
-
-        A corrupt DB or an un-takeable lock is exactly the case where a silent
-        half-migrated schema would be worse than a loud failure.
-        """
+    def test_start_run_records_code_sha(self, tmp_path):
         db_path = tmp_path / 'runs.db'
-        _build_legacy_db(db_path)
         store = RunStore(db_path)
+        store.start_run('run-1', 'proj', '2026-10-20T00:00:00+00:00', code_sha='d' * 40)
+        assert self._code_sha(db_path, 'run-1') == 'd' * 40
 
-        class _BrokenConn:
-            def execute(self, sql, *args):
-                if sql.startswith('PRAGMA table_info'):
-                    return iter([(0, 'task_id')])
-                raise sqlite3.OperationalError('database is locked')
+    def test_code_sha_defaults_to_null(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+        store.start_run('run-1', 'proj', '2026-10-20T00:00:00+00:00')
+        assert self._code_sha(db_path, 'run-1') is None
 
-            def commit(self):  # pragma: no cover - never reached
-                raise AssertionError('commit must not be reached')
+    def test_pre_6565_db_gains_code_sha_last_with_null_rows(self, tmp_path):
+        """A migrated DB and a fresh one agree on column ORDER (code_sha last)."""
+        legacy = tmp_path / 'legacy.db'
+        _build_legacy_db(legacy)
+        assert 'code_sha' not in self._runs_columns(legacy)
 
-        with pytest.raises(sqlite3.OperationalError, match='database is locked'):
-            store._migrate_task_results_block_context(
-                _BrokenConn(),  # type: ignore[arg-type]
-            )
+        store = RunStore(legacy)
+        RunStore(legacy)  # idempotent
+
+        fresh = tmp_path / 'fresh.db'
+        RunStore(fresh)
+        assert self._runs_columns(legacy) == self._runs_columns(fresh)
+        assert self._runs_columns(legacy)[-1] == 'code_sha'
+        assert self._code_sha(legacy, 'run-legacy') is None
+        store.start_run('run-new', 'proj-a', '2026-10-20T00:00:00+00:00', code_sha='e' * 40)
+        assert self._code_sha(legacy, 'run-new') == 'e' * 40

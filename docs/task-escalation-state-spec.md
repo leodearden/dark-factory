@@ -374,7 +374,11 @@ the PRD's tasks.
   windows** (`task_transitions.py:279-330`): `escalated`/`requeued`/
   `blocked`/`soft-cancelled` ⊇ {IN_PROGRESS}; `planned` unreachable;
   `requeued→BLOCKED`'s comment cites a flip SM-2 can never observe; two
-  DONE producers can report a cancelled row as DONE.
+  DONE producers can report a cancelled row as DONE. Task 3542 tightened
+  every row to §5 except `soft-cancelled`, which keeps
+  {IN_PROGRESS, MERGE_DEFERRED}: `release_workflow` parks the row only
+  after the slot clears, so at the instant of exit it is still
+  "wherever it was". That part stays open.
 - **E11 — SM-2 violation handling is soft-fail**: AssertionError →
   generic catch → synthetic BLOCKED with empty reason, no escalation —
   the false-done detector's alarm goes to a log line (INV-4).

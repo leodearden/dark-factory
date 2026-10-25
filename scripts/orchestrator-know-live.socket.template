@@ -1,0 +1,21 @@
+# Installed as ~/.config/systemd/user/orchestrator-know-live.socket; committed as .socket.template
+# only because `.socket` is not in the shared lock-charter extension
+# allowlist (see scripts/fused-memory.socket.template).
+[Unit]
+Description=Know-Live Orchestrator escalation MCP socket (held across restarts)
+
+# systemd owns the escalation MCP listening socket so it stays bound while
+# orchestrator-know-live.service restarts: clients connecting mid-restart wait in the kernel
+# backlog instead of being refused, which makes Claude Code's HTTP MCP client
+# give up for good after ~15s. The orchestrator adopts it via
+# shared/src/shared/systemd_listeners.py::take_systemd_listeners. The service's
+# ExecStopPost stops this socket on a deliberate stop, so a stopped or disabled
+# orchestrator is not restarted by the next connection.
+#
+# Must match the port scripts/orchestrator-watchdog.py::WATCHED gives this unit
+# (pinned by tests/scripts/test_orchestrator_socket_units.py).
+[Socket]
+ListenStream=127.0.0.1:8105
+
+[Install]
+WantedBy=sockets.target

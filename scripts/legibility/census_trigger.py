@@ -1,18 +1,21 @@
 """scripts/legibility/census_trigger.py — periodic legibility census trigger
 evaluator + census-state reader.
 
-See plans/confusion-reduction-prd.md §6 (task ζ: fire logic + hard floor),
-§7.4 (per-project census config block), §7.5 (census state contract),
-§8.5 (boundary-test matrix — day-9-no-spike/day-7+130-landed/
-day-6+4-candidates-in-72h/day-4+spike -> no-fire/fire/fire/no-fire(floor)).
+See plans/confusion-reduction-prd.md §6 (task ζ: fire logic), §7.4
+(per-project census config block), §7.5 (census state contract) and §8.5
+(boundary-test matrix). The novelty-spike and floor contract lives in
+plans/census-incremental-prd.md §4.7, superseding §8.5's
+day-6+4-candidates-in-72h row: the spike is relative to a trailing baseline,
+and the floor is anchored on the session watermark.
 
 Evaluated at the end of each nightly trickle run (wired by PRD task ε) and
 via the standalone `evaluate` CLI subcommand below.
 
 Extended census-state READ contract (for task η, which WRITES/advances
 docs/legibility/census-state.json): in addition to the §7.5 minimal shape
-`{last_census_at, last_census_report}`, this module reads an OPTIONAL
-`last_census_done_count` integer baseline — the fused-memory get_statuses()
+`{last_census_at, last_census_report}` and the optional run identity and
+`session_watermark` of plans/census-incremental-prd.md §4.2, this module
+reads an OPTIONAL `last_census_done_count` integer baseline — the fused-memory get_statuses()
 done-task count as of the last census, used to compute the "tasks landed
 since last census" delta for condition (b). fused-memory's get_statuses
 returns only a `{id: status}` status snapshot with no timestamps, so that
@@ -83,7 +86,7 @@ block directly with a light pyyaml read, falling back to defaults on a
 missing/malformed file. Those defaults ARE sourced from β's
 `legibility.config.Census` pydantic model (scripts/legibility/config.py),
 though -- now that β has landed, it is the single source of truth for the
-six §7.4 threshold values, so `CensusConfig`'s fields read their defaults
+census threshold values, so `CensusConfig`'s fields read their defaults
 from it rather than re-hardcoding them (see the `CensusConfig` docstring).
 
 The get_statuses done-count fetch is injected (`status_fetcher`), not a
@@ -121,9 +124,9 @@ envelope's top level). It resolves its `project_root` to an ABSOLUTE path
 before sending it: the MCP
 argument is interpreted by the server's cwd, not the client's, and
 fused-memory's `_normalize_project_root` hard-rejects any relative path
-(task 3291). Whatever the fetcher returns is converted to a number by
-`extract_done_count`, never by an inline `.get("statuses")` -- see that
-function for why.
+(task 3291). Whatever the fetcher returns is validated by
+`extract_statuses` (and counted by `extract_done_count`), never read by an
+inline `.get("statuses")` -- see those functions for why.
 """
 from __future__ import annotations
 
@@ -131,12 +134,14 @@ import argparse
 import json
 import logging
 import os
+import statistics
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
-from typing import overload
+from typing import Any, overload
 
 import yaml
 from legibility import codebook
@@ -174,11 +179,11 @@ def _as_utc(value: datetime | None) -> datetime | None:
 # CensusConfig — §7.4 census: block, with hardcoded defaults
 # ---------------------------------------------------------------------------
 
-# Single source of truth for the six §7.4 threshold *values*: task β's
+# Single source of truth for the census threshold *values*: task β's
 # `Census` pydantic model (scripts/legibility/config.py), instantiated once
 # at import time. `CensusConfig` below stays its own flat dataclass (not
-# `Census` itself) because its nested `novelty_spike.count`/`window_hours`
-# shape doesn't match the flat attributes `evaluate()` and `from_mapping`
+# `Census` itself) because its nested `novelty_spike` block's shape doesn't
+# match the flat attributes `evaluate()` and `from_mapping`
 # read/merge -- but its field *defaults* are pulled from here so the two
 # schemas cannot silently drift apart (review finding, task 2579 amendment
 # pass: config.py did not exist yet when this module was first written).
@@ -187,7 +192,7 @@ _CENSUS_DEFAULTS = _LegibilityCensus()
 
 @dataclass(frozen=True)
 class CensusConfig:
-    """The six §7.4 census-trigger thresholds. Field defaults are sourced
+    """The census-trigger thresholds. Field defaults are sourced
     from `legibility.config.Census` (see `_CENSUS_DEFAULTS` above), not
     re-hardcoded here. `from_mapping` merges a partial override mapping
     (e.g. the `census:` sub-dict of a project's legibility.yaml) over these
@@ -202,6 +207,8 @@ class CensusConfig:
     tasks_landed_min_days: int = _CENSUS_DEFAULTS.tasks_landed_min_days
     novelty_spike_count: int = _CENSUS_DEFAULTS.novelty_spike.count
     novelty_spike_window_hours: int = _CENSUS_DEFAULTS.novelty_spike.window_hours
+    novelty_spike_multiple: int = _CENSUS_DEFAULTS.novelty_spike.multiple
+    novelty_spike_baseline_days: int = _CENSUS_DEFAULTS.novelty_spike.baseline_days
     floor_days: int = _CENSUS_DEFAULTS.floor_days
 
     @classmethod
@@ -221,7 +228,7 @@ class CensusConfig:
         whole batch is reported in exactly one WARNING. This method NEVER
         raises.
 
-        Per-field fallback, not a whole-block reject, because the six
+        Per-field fallback, not a whole-block reject, because the
         thresholds are independent: one typo'd `novelty_spike.count` must not
         also disarm the (a) max-interval backstop.
 
@@ -282,6 +289,14 @@ class CensusConfig:
                 "novelty_spike.window_hours", novelty_spike, "window_hours",
                 defaults.novelty_spike_window_hours,
             ),
+            novelty_spike_multiple=_threshold(
+                "novelty_spike.multiple", novelty_spike, "multiple",
+                defaults.novelty_spike_multiple,
+            ),
+            novelty_spike_baseline_days=_threshold(
+                "novelty_spike.baseline_days", novelty_spike, "baseline_days",
+                defaults.novelty_spike_baseline_days,
+            ),
             floor_days=_threshold(
                 "floor_days", mapping, "floor_days", defaults.floor_days,
             ),
@@ -317,22 +332,87 @@ class Decision:
     reasons: list[str]
 
 
+class FloorAnchorKind(Enum):
+    SESSION_WATERMARK = "session watermark"
+    LAST_CENSUS_AT = "last_census_at (no watermark yet)"
+    EARLIEST_CODEBOOK_DATE = "earliest codebook date (never censused)"
+
+
+@dataclass(frozen=True)
+class FloorAnchor:
+    """The instant the census floor is measured from, and where it came from."""
+
+    kind: FloorAnchorKind
+    at: datetime
+
+
+def _floor_condition(
+    now_utc: datetime, anchor: FloorAnchor | None, config: CensusConfig
+) -> tuple[bool, str]:
+    if anchor is None:
+        return True, (
+            "floor: no anchor (no session watermark, last_census_at or codebook date)"
+            " -> BLOCKS all conditions"
+        )
+    days = (now_utc - _as_utc(anchor.at)).total_seconds() / 86400.0
+    blocks = days < config.floor_days
+    line = f"floor: {days:.1f}d since {anchor.kind.value} (floor {config.floor_days}d)"
+    return blocks, line + (" -> BLOCKS all conditions" if blocks else "")
+
+
+def _count_within(first_seens_utc: list[datetime], *, end: datetime, hours: int) -> int:
+    start = end - timedelta(hours=hours)
+    return sum(1 for fs in first_seens_utc if start <= fs <= end)
+
+
+def _novelty_condition(
+    now_utc: datetime, candidate_first_seens: list[datetime], config: CensusConfig
+) -> tuple[bool, str]:
+    seen = [_as_utc(fs) for fs in candidate_first_seens]
+    hours = config.novelty_spike_window_hours
+    baseline_days = config.novelty_spike_baseline_days
+    count = _count_within(seen, end=now_utc, hours=hours)
+    head = f"novelty-spike: {count} within {hours}h"
+
+    history_days = (now_utc - min(seen)).total_seconds() / 86400.0 if seen else 0.0
+    if history_days < baseline_days:
+        return False, (
+            f"{head} (baseline needs {baseline_days}d of candidate history, "
+            f"have {history_days:.1f}d) -> N/A"
+        )
+
+    baseline = (
+        statistics.median(
+            _count_within(seen, end=now_utc - timedelta(days=k), hours=hours)
+            for k in range(1, baseline_days + 1)
+        )
+        if baseline_days
+        else 0.0
+    )
+    spike = count >= config.novelty_spike_count and count >= config.novelty_spike_multiple * baseline
+    line = f"{head} (baseline median {baseline:g}, x{config.novelty_spike_multiple})"
+    return spike, line + (" -> FIRE" if spike else "")
+
+
 def evaluate(
     *,
     now: datetime,
     last_census_at: datetime | None,
-    never_censused: bool,
+    floor_anchor: FloorAnchor | None,
     tasks_landed: int | None,
     candidate_first_seens: list[datetime],
     config: CensusConfig,
 ) -> Decision:
-    """Pure decision core for the §6/§8.5 fire logic. Fires at the earliest
+    """Pure decision core for the census fire logic. Fires at the earliest
     of condition (a) max_interval_days, (b) tasks_landed_min_days +
-    tasks_landed_threshold, (c) novelty_spike — all three, and the
-    floor_days hard floor that overrides them, are implemented in the body
-    below (`cond_a`, `cond_b`, `cond_c`, `floor_blocks`). No I/O:
-    all inputs are plain values so the full §8.5 matrix is testable without
-    a filesystem or a live get_statuses call.
+    tasks_landed_threshold, (c) novelty_spike, subject to a floor measured
+    from `floor_anchor` (plans/census-incremental-prd.md §4.7 Floor): inside
+    floor_days of the anchor nothing fires. The floor never fires by itself,
+    and its reason line always names its anchor. The novelty condition is
+    relative to the median of the daily window counts over the trailing
+    baseline_days, and N/A until that much candidate history exists (PRD
+    §4.7 (b)). No I/O: all inputs are plain values so the full matrix is
+    testable without a filesystem or a live get_statuses call.
     """
     now_utc = _as_utc(now)
     last_utc = _as_utc(last_census_at)
@@ -371,33 +451,13 @@ def evaluate(
             )
         )
 
-    window_start = now_utc - timedelta(hours=config.novelty_spike_window_hours)
-    in_window = [
-        fs for fs in candidate_first_seens if window_start <= _as_utc(fs) <= now_utc
-    ]
-    cond_c = len(in_window) >= config.novelty_spike_count
-    reasons.append(
-        "novelty-spike: {} candidate(s) within {}h (threshold {}){}".format(
-            len(in_window),
-            config.novelty_spike_window_hours,
-            config.novelty_spike_count,
-            " -> FIRE" if cond_c else "",
-        )
-    )
+    cond_c, novelty_line = _novelty_condition(now_utc, candidate_first_seens, config)
+    reasons.append(novelty_line)
 
-    triggered = cond_a or cond_b or cond_c
+    floor_blocks, floor_line = _floor_condition(now_utc, floor_anchor, config)
+    reasons.append(floor_line)
 
-    floor_blocks = (
-        not never_censused and days_since is not None and days_since < config.floor_days
-    )
-    if floor_blocks:
-        reasons.append(
-            f"floor: only {days_since:.1f}d since last census (floor {config.floor_days}d) -> BLOCKS all conditions"
-        )
-    elif never_censused:
-        reasons.append("floor: never censused -> exempt")
-
-    fire = triggered and not floor_blocks
+    fire = (cond_a or cond_b or cond_c) and not floor_blocks
 
     return Decision(fire=fire, reasons=reasons)
 
@@ -406,18 +466,47 @@ def evaluate(
 # load_census_state — §7.5 census-state.json reader (three-valued)
 # ---------------------------------------------------------------------------
 
+CENSUS_STATE_RELPATH = Path("docs") / "legibility" / "census-state.json"
+
+
+def census_state_path(project_root: str | Path) -> Path:
+    """The ONE spelling of a project's census-state.json path: the census
+    writes it, the trigger reads it, and the nightly records it for
+    ``check_census_progress.py`` to re-read."""
+    return Path(project_root) / CENSUS_STATE_RELPATH
+
+
+_STATE_TIMESTAMP_KEYS = ("last_census_at", "session_watermark")
+
+
+def _unparseable_timestamp(value: object) -> Exception | None:
+    """Why *value* is not a usable state timestamp, or None when it is
+    (absent and null are usable: the key is optional)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return TypeError(f"expected an ISO-8601 string, got {type(value).__name__}")
+    try:
+        datetime.fromisoformat(value)
+    except ValueError as exc:
+        return exc
+    return None
+
+
 def load_census_state(path: str | Path) -> tuple[str, dict | None]:
     """Read `docs/legibility/census-state.json` (§7.5, extended with the
     optional `last_census_done_count` baseline documented in this module's
-    docstring). Three-valued result distinguishing "never censused" from
-    "fail safe":
+    docstring, and with plans/census-incremental-prd.md §4.2's optional
+    `last_census_run_id`, `last_census_as_of_sha` and `session_watermark`).
+    Three-valued result distinguishing "never censused" from "fail safe":
 
     - path does not exist -> `("missing", None)`, no warning logged. A
       project that has never run a census is a normal, expected state, not
       a degradation.
-    - unreadable / invalid JSON / non-dict top level / unparseable
-      `last_census_at` -> `("malformed", None)` + exactly one WARNING.
-      Callers must fail SAFE (never fire) rather than guess a timestamp.
+    - unreadable / invalid JSON / non-dict top level / an unparseable
+      `last_census_at` or `session_watermark` -> `("malformed", None)` +
+      exactly one WARNING. Callers must fail SAFE (never fire) rather than
+      guess a timestamp.
     - otherwise -> `("ok", data)`.
     """
     path = Path(path)
@@ -439,16 +528,15 @@ def load_census_state(path: str | Path) -> tuple[str, dict | None]:
         )
         return "malformed", None
 
-    last_census_at = data.get("last_census_at")
-    if last_census_at is not None:
-        try:
-            datetime.fromisoformat(last_census_at)
-        except (TypeError, ValueError) as exc:
+    for key in _STATE_TIMESTAMP_KEYS:
+        error = _unparseable_timestamp(data.get(key))
+        if error is not None:
             logger.warning(
-                "census state at %s is malformed: unparseable last_census_at %r: %s",
+                "census state at %s is malformed: unparseable %s %r: %s",
                 path,
-                last_census_at,
-                exc,
+                key,
+                data.get(key),
+                error,
             )
             return "malformed", None
 
@@ -476,7 +564,7 @@ def codebook_signal(codebook: dict) -> tuple[datetime | None, list[datetime]]:
     """Extract the census-trigger signal from a `codebook.load()`-shaped
     dict (task γ / 2575's schema): the earliest structured sighting or
     candidate `first_seen`/sighting date across the WHOLE codebook (used to
-    anchor condition (a) when `never_censused`), and every candidate's
+    anchor condition (a) and the floor when never censused), and every candidate's
     `first_seen` date on its own (used for condition (c)'s novelty-spike
     window count). Unparseable dates are skipped rather than raising.
 
@@ -525,7 +613,7 @@ def load_census_config(project_root: str | Path) -> CensusConfig:
     A file that parses but holds an unusable threshold VALUE (a quoted
     `'10'`, a float, a JSON `true`, a negative) is handled one level down by
     `CensusConfig.from_mapping`, which rejects that field alone -- default
-    plus one WARNING for the batch -- so the other five thresholds stay live.
+    plus one WARNING for the batch -- so the other thresholds stay live.
     Between the two, this function returns a fully-typed `CensusConfig` for
     any input whatsoever, which is what makes its never-raises contract, and
     `decide_for_project`'s, actually hold.
@@ -612,9 +700,9 @@ def extract_done_count(payload) -> int:
     `StatusFetchUnavailable` if *payload* is not a usable get_statuses
     envelope.
 
-    This is the SOLE place a get_statuses payload is turned into a number,
-    and it exists because the idiom it replaces silently fabricated
-    baselines. Both `compute_tasks_landed` below and `census.run_census`
+    The count is taken over `extract_statuses(payload)`, the SOLE place a
+    get_statuses payload is validated, and that validation exists because
+    the idiom it replaces silently fabricated baselines. Both `compute_tasks_landed` below and `census.run_census`
     used to inline `sum(1 for v in (payload.get("statuses") or {}).values()
     if v == "done")`. That `or {}` swallowed *every* unusable payload into a
     done-count of 0 -- no warning, no exception, no way to tell a real
@@ -656,6 +744,23 @@ def extract_done_count(payload) -> int:
             is re-emitted into the nightly journal as a single log line (see
             `_bounded_repr`).
     """
+    return count_done(extract_statuses(payload))
+
+
+def count_done(statuses: Mapping[str, Any]) -> int:
+    """How many tasks of an `extract_statuses` mapping are `"done"`."""
+    return sum(1 for status in statuses.values() if status == "done")
+
+
+def extract_statuses(payload) -> Mapping[str, Any]:
+    """The `{task id string: status}` mapping of a get_statuses payload, or
+    raise `StatusFetchUnavailable` if *payload* is not a usable get_statuses
+    envelope (see `extract_done_count` for why each shape is rejected).
+
+    `{"statuses": {}}` is a valid, empty answer. A census run reads one
+    snapshot through here and derives both its outcome feed and its
+    done-count from it, so the two cannot disagree.
+    """
     if not isinstance(payload, dict):
         raise StatusFetchUnavailable(
             f"get_statuses payload is not a dict (got {type(payload).__name__}): "
@@ -686,7 +791,7 @@ def extract_done_count(payload) -> int:
             f"(got {type(statuses).__name__}{sized}): {_bounded_repr(statuses)}"
         )
 
-    return sum(1 for status in statuses.values() if status == "done")
+    return statuses
 
 
 def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
@@ -1271,9 +1376,8 @@ def default_status_fetcher(project_root: str | Path):
     # an `isError: false` JSON-RPC response, so it used to sail through
     # `_extract_tool_result` and get counted as a done-count of 0.
     #
-    # In production this call ALWAYS carried a relative path: census.py's
-    # CLI defaults --project-root to "." and nightly._default_census_launcher
-    # (nightly.py:521) launches census.py with no arguments at all.
+    # census.py resolves its own, now required, --project-root (task 3269);
+    # the `evaluate` CLI's "." default still depends on this resolve().
     #
     # Resolving HERE, at the wire boundary, rather than at each CLI
     # entrypoint, fixes every consumer at once -- census.py's main(), the
@@ -1331,6 +1435,26 @@ def default_status_fetcher(project_root: str | Path):
 # decide_for_project — high-level assembly (config + state + codebook signal)
 # ---------------------------------------------------------------------------
 
+def _trigger_anchors(
+    state: dict | None, *, never_censused: bool, earliest_codebook_date: datetime | None
+) -> tuple[datetime | None, FloorAnchor | None]:
+    """The instant max-interval and tasks-landed measure from, and the floor's anchor."""
+    if never_censused:
+        if earliest_codebook_date is None:
+            return None, None
+        return earliest_codebook_date, FloorAnchor(
+            FloorAnchorKind.EARLIEST_CODEBOOK_DATE, earliest_codebook_date
+        )
+    state = state or {}
+    last_census_at = _parse_date(state.get("last_census_at"))
+    watermark = _parse_date(state.get("session_watermark"))
+    if watermark is not None:
+        return last_census_at, FloorAnchor(FloorAnchorKind.SESSION_WATERMARK, watermark)
+    if last_census_at is None:
+        return None, None
+    return last_census_at, FloorAnchor(FloorAnchorKind.LAST_CENSUS_AT, last_census_at)
+
+
 def decide_for_project(
     project_root: str | Path,
     *,
@@ -1370,9 +1494,7 @@ def decide_for_project(
 
     config = load_census_config(project_root)
 
-    state_status, state = load_census_state(
-        project_root / "docs" / "legibility" / "census-state.json"
-    )
+    state_status, state = load_census_state(census_state_path(project_root))
     if state_status == "malformed":
         return Decision(
             fire=False,
@@ -1391,13 +1513,9 @@ def decide_for_project(
         logger.warning("codebook at %s is unreadable: %s", codebook_path, exc)
         earliest_sighting, candidate_first_seens = None, []
 
-    if never_censused:
-        last_census_at = earliest_sighting
-    else:
-        raw_last_census_at = (state or {}).get("last_census_at")
-        last_census_at = (
-            datetime.fromisoformat(raw_last_census_at) if raw_last_census_at else None
-        )
+    last_census_at, floor_anchor = _trigger_anchors(
+        state, never_censused=never_censused, earliest_codebook_date=earliest_sighting
+    )
 
     try:
         tasks_landed = compute_tasks_landed(state=state, status_fetcher=status_fetcher)
@@ -1424,7 +1542,7 @@ def decide_for_project(
     return evaluate(
         now=now,
         last_census_at=last_census_at,
-        never_censused=never_censused,
+        floor_anchor=floor_anchor,
         tasks_landed=tasks_landed,
         candidate_first_seens=candidate_first_seens,
         config=config,

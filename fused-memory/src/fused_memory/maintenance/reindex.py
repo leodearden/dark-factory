@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from graphiti_core.embedder import OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
 
+from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.maintenance._utils import maintenance_service
 
@@ -115,6 +116,15 @@ class ReindexManager:
                 failed drop propagates — with the partial list logged at ERROR —
                 rather than being reported as a clean run.
 
+                As of task 4777 the drop also WAITS for the FalkorDB index
+                catalog to settle before reading it, so re-running this
+                entrypoint after a failed or interrupted run is safe rather than
+                liable to a spurious ``no such index``.  A catalog that never
+                settles raises ``IndexCatalogUnsettledError``, having dropped
+                nothing, instead of dropping against an undetermined index
+                state.  ``GraphitiBackend.drop_vector_indices``' docstring
+                records the rebuild window behind both.
+
         Returns:
             Dict with reindex_result (ReindexResult), replay_count (int), and
             indices_dropped (list of {label, field} dicts).
@@ -148,7 +158,7 @@ async def run_reindex(
     3. Builds an OpenAIEmbedder with the dimension AND the endpoint
        (embedder.providers.openai.api_url) from config.
     4. Creates a ReindexManager and runs reindex_and_replay().
-    5. Closes all resources in a finally block.
+    5. Closes the embedder and the service in finally blocks.
 
     Args:
         config_path: Optional path to the YAML config file.  When given it is
@@ -189,25 +199,27 @@ async def run_reindex(
             base_url=openai_base_url,
         )
         embedder = OpenAIEmbedder(config=embedder_config)
+        try:
+            manager = ReindexManager(
+                backend=service.graphiti,
+                embedder=embedder,
+                expected_dim=config.embedder.dimensions,
+            )
 
-        manager = ReindexManager(
-            backend=service.graphiti,
-            embedder=embedder,
-            expected_dim=config.embedder.dimensions,
-        )
-
-        result = await manager.reindex_and_replay(
-            service.durable_queue,
-            drop_indices=drop_indices,
-        )
-        ri = result['reindex_result']
-        logger.info(
-            f'run_reindex complete: nodes={ri.nodes_updated}, '
-            f'edges={ri.edges_updated}, errors={ri.errors}, '
-            f'replayed={result["replay_count"]}, '
-            f'indices_dropped={len(result.get("indices_dropped", []))}'
-        )
-        return result
+            result = await manager.reindex_and_replay(
+                service.durable_queue,
+                drop_indices=drop_indices,
+            )
+            ri = result['reindex_result']
+            logger.info(
+                f'run_reindex complete: nodes={ri.nodes_updated}, '
+                f'edges={ri.edges_updated}, errors={ri.errors}, '
+                f'replayed={result["replay_count"]}, '
+                f'indices_dropped={len(result.get("indices_dropped", []))}'
+            )
+            return result
+        finally:
+            await close_wrapped_sdk_clients([embedder])
 
 
 if __name__ == '__main__':

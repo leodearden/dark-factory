@@ -1,0 +1,550 @@
+prd: plans/review-all-s18-evals-measurement-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 6733
+  title: ResultStore owns the persisted eval cell
+  capabilities:
+  - name: result-store-class
+    binding: capability→producer — α introduces `ResultStore` in orchestrator/src/orchestrator/evals/results.py
+      (PRD §5 C2); no results module exists on main ae3047ec3a.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class[[:space:]]+ResultStore[[:space:]]*[(:]
+      paths:
+      - orchestrator/src/orchestrator/evals/results.py
+      expect: present
+  - name: eval-result-home
+    binding: capability→producer — `EvalResult` moves from evals/runner.py into evals/results.py unchanged
+      in fields; compare, report, judge_pilot and the scripts import it from there.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class[[:space:]]+EvalResult[[:space:]]*[(:]
+      paths:
+      - orchestrator/src/orchestrator/evals/results.py
+      expect: present
+  - name: no-second-results-dir
+    binding: heuristic 11 SPOT — the four RESULTS_DIR definitions outside results.py (runner, rereview,
+      scripts/run_vllm_eval.py, orchestrator/scripts/backfill_composite_scores.py; measured at ae3047ec3a)
+      are removed.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^RESULTS_DIR[[:space:]]*=
+      paths:
+      - orchestrator/src/orchestrator/evals/runner.py
+      - orchestrator/src/orchestrator/evals/rereview.py
+      - scripts/run_vllm_eval.py
+      - orchestrator/scripts/backfill_composite_scores.py
+      expect: absent
+  - name: no-second-filename-grammar
+    binding: heuristic 12 — the `{task_id}__{config_name}__*.json` glob (runner._result_exists, run_vllm_eval
+      x2) and rereview._extract_run_id's split('__') go; ResultStore.exists / parse_name replace them.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: __\*\.json|split\('__'\)
+      paths:
+      - orchestrator/src/orchestrator/evals/runner.py
+      - orchestrator/src/orchestrator/evals/rereview.py
+      - scripts/run_vllm_eval.py
+      expect: absent
+  - name: loud-load-two-way
+    binding: boundary test B1 — a cell saved through the executor's save path loads through both
+      scripts/_eval_results_io.load_results_from_dir and ResultStore.load_all; a truncated file fails both
+      naming the file.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: two-way round-trip behaviour; asserted by the new test_eval_results_store.py, not a grep.
+- label: β
+  task_id: 6734
+  title: Typed measurement outcome on the architect path; plan predicates leaf
+  capabilities:
+  - name: unmeasured-cause-enum
+    binding: capability→producer — `UnmeasuredCause` StrEnum in orchestrator/src/orchestrator/evals/measurement.py
+      (PRD §5 C1); values equal today's marker prefixes.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class[[:space:]]+UnmeasuredCause[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/measurement.py
+      expect: present
+  - name: measured-call-helper
+    binding: capability→producer — `measured_call` (async) in evals/measurement.py; γ's five scoring sites
+      and β's judge_plan_quality call it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async[[:space:]]+def[[:space:]]+measured_call[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/measurement.py
+      expect: present
+  - name: classifier-on-shared-seam
+    binding: G4 — `classify_unmeasured` is built on shared.invocation_outcome.classify_invocation (S20 owns;
+      present on main) and replaces metrics.detect_invocation_error.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+classify_unmeasured[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/measurement.py
+      expect: present
+  - name: no-string-marker-producer-or-parser
+    binding: heuristic 12 — the string producer metrics.detect_invocation_error and the ad-hoc parser
+      report._taint_cause are both gone from production code.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def[[:space:]]+(detect_invocation_error|_taint_cause)[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator
+      expect: absent
+  - name: plan-predicates-leaf
+    binding: capability→producer — `is_scorable_plan` moves to orchestrator/src/orchestrator/evals/plan_predicates.py
+      unchanged in reading (S9 later migrates it to PlanState).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+is_scorable_plan[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/plan_predicates.py
+      expect: present
+  - name: no-metrics-judge-local-imports
+    binding: fk-df50bc042300 (weakened, re-verified at ae3047ec3a) — the function-local imports between
+      metrics and judge (and their contradictory cycle comments) go.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^[[:space:]]+from[[:space:]]+(\.|orchestrator\.evals\.)(judge|metrics)[[:space:]]+import
+      paths:
+      - orchestrator/src/orchestrator/evals/metrics.py
+      - orchestrator/src/orchestrator/evals/judge.py
+      expect: absent
+  - name: legacy-and-new-cells-share-buckets
+    binding: boundary test B3 — a legacy string invocation_error cell and a new structured cell land in the
+      same cap_excluded_by_cause bucket; report snapshot over the packaged dir unchanged.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: cross-format equivalence and snapshot diff; asserted by test and the leaf's verification note.
+- label: γ
+  task_id: 6736
+  title: Every LLM scoring site measures or says it did not
+  capabilities:
+  - name: no-neutral-fallback-parse
+    binding: fk-0d4c1014e41f — the `structured_output or json.loads(` neutral-fallback idiom (5 sites at
+      ae3047ec3a; β removes judge_plan_quality's) is gone from the scoring modules; every site goes
+      through measured_call, whose single parse helper lives in evals/measurement.py.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: structured_output or json\.loads\(
+      paths:
+      - orchestrator/src/orchestrator/evals/judge.py
+      - orchestrator/src/orchestrator/evals/compare.py
+      - orchestrator/src/orchestrator/evals/reviewer_trial/scorer.py
+      expect: absent
+  - name: no-fabricated-tie-or-zero
+    binding: fk-0d4c1014e41f — the fabricated verdicts (matcher returns ([], reviewer_issues, cost); judge and
+      assessor fall back to a tie) are removed.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: return \[\], reviewer_issues|Judge output parse failure|Assessment failed. unparseable
+      paths:
+      - orchestrator/src/orchestrator/evals/judge.py
+      - orchestrator/src/orchestrator/evals/compare.py
+      - orchestrator/src/orchestrator/evals/reviewer_trial/scorer.py
+      expect: absent
+  - name: scoring-result-unmeasured-state
+    binding: capability→producer — ScoringResult gains an explicit unmeasured field (PRD §7 D2); the campaign
+      reducer reads it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^[[:space:]]+unmeasured[[:space:]]*:'
+      paths:
+      - orchestrator/src/orchestrator/evals/reviewer_trial/scorer.py
+      expect: present
+  - name: elo-unmeasured-bound
+    binding: PRD §7 D2 — the Elo tournament bounds unmeasured attempts per pair so a capped account cannot
+      spin the loop.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: MAX_UNMEASURED_PER_PAIR
+      paths:
+      - orchestrator/src/orchestrator/evals/elo.py
+      expect: present
+  - name: reducers-exclude-and-count
+    binding: boundary test B2 — a real-shaped refused AgentResult yields Unmeasured at matcher, pairwise judge,
+      assessor and synthesizer; summarize_campaign, build_trial_report, the Elo tournament and compare_models
+      count it and leave every mean unchanged; no score file is cached for it.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: reducer arithmetic over a fixture; asserted by tests, not expressible as a grep.
+- label: δ
+  task_id: 6737
+  title: run_architect_eval as invoke → classify → assemble; one eval gate lifecycle
+  capabilities:
+  - name: architect-attempt-type
+    binding: capability→producer — frozen `ArchitectAttempt` in orchestrator/src/orchestrator/evals/architect_eval.py
+      (PRD §5 C4).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class[[:space:]]+ArchitectAttempt[[:space:]]*[(:]
+      paths:
+      - orchestrator/src/orchestrator/evals/architect_eval.py
+      expect: present
+  - name: pure-classify-step
+    binding: capability→producer — `classify_attempt` carries the taint table as a pure function; B5 tests
+      target it directly.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+classify_attempt[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/architect_eval.py
+      expect: present
+  - name: owned-gate-context-manager
+    binding: capability→producer — `owned_usage_gate` in orchestrator/src/orchestrator/evals/eval_gate.py
+      (PRD §7 D6); ε's executors reuse it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^(async[[:space:]]+)?def[[:space:]]+owned_usage_gate[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/eval_gate.py
+      expect: present
+  - name: tests-stop-patching-private-gate-builder
+    binding: fk-3505aba0481d tests stance — `_build_eval_usage_gate` named on 22 test lines at 6551b75aba;
+      tests inject a gate factory instead.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _build_eval_usage_gate
+      paths:
+      - orchestrator/tests
+      expect: absent
+  - name: no-function-local-collaborator-imports
+    binding: fk-3505aba0481d — the five function-local imports in run_architect_eval (invoke_agent, ARCHITECT,
+      TaskArtifacts, snapshots, judge) become injected deps.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^[[:space:]]+from[[:space:]]+orchestrator\.(agents\.invoke|agents\.roles|artifacts|evals\.judge|evals)[[:space:]]+import
+      paths:
+      - orchestrator/src/orchestrator/evals/runner.py
+      expect: absent
+  - name: rationale-to-docs
+    binding: Comments stance — taint-table and cap-wait rationale moves to docs/plan-scoring-and-judge.md
+      with a pointer left in code.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: prose relocation judged at review.
+- label: ε
+  task_id: 6738
+  title: One workflow-cell executor; RoleUnderTest
+  capabilities:
+  - name: role-under-test-enum
+    binding: capability→producer — `RoleUnderTest` StrEnum in orchestrator/src/orchestrator/evals/metrics.py
+      shared by EvalConfig.role and EvalMetrics.role_under_test (PRD §7 D4).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class[[:space:]]+RoleUnderTest[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/metrics.py
+      expect: present
+  - name: no-role-dict-mutation
+    binding: fk-28ca5c64de06 — run_eval and run_end_to_end stop stamping role by mutating metrics_dict.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: metrics_dict\['role_under_test'\]
+      paths:
+      - orchestrator/src/orchestrator/evals
+      expect: absent
+  - name: one-cell-executor
+    binding: capability→producer — `_run_workflow_cell` in evals/runner.py carries the shared run (PRD §7 D7).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async[[:space:]]+def[[:space:]]+_run_workflow_cell[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/runner.py
+      expect: present
+  - name: no-hand-rolled-gate-teardown
+    binding: fk-b80c8e52e526 — the three `if owns_gate and usage_gate is not None` teardown copies go;
+      δ's owned_usage_gate replaces them.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: owns_gate and usage_gate is not None
+      paths:
+      - orchestrator/src/orchestrator/evals
+      expect: absent
+  - name: metrics-is-a-leaf
+    binding: fk-df50bc042300 — collect_metrics (needs verify, workflow, scoring) leaves metrics.py.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async[[:space:]]+def[[:space:]]+collect_metrics[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/metrics.py
+      expect: absent
+  - name: implementer-survivors-exist
+    binding: G6 — select_survivors(build_composite_report(packaged cells), top_k=3, roles=['implementer'])
+      returned an empty implementer list over 686 cells at ae3047ec3a; after ε (legacy None → implementer at load,
+      new cells stamped) it is non-empty.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: depends on the gitignored packaged results dir in the main checkout; run by hand and recorded.
+- label: ζ
+  task_id: 6739
+  title: One review-payload normaliser
+  capabilities:
+  - name: normalize-review
+    binding: capability→producer — `normalize_review` in orchestrator/src/orchestrator/review_payload.py
+      (PRD §5 C3); orchestrator-owned, evals consume.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+normalize_review[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/review_payload.py
+      expect: present
+  - name: aggregate-reviews-uses-normaliser
+    binding: PRD §5 C3 — TaskArtifacts.aggregate_reviews is rewritten over normalize_review.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: normalize_review
+      paths:
+      - orchestrator/src/orchestrator/artifacts.py
+      expect: present
+  - name: no-error-literal-filters
+    binding: fk-2e8daab1913f — the ERROR-verdict literal comparisons in evals (scoring, compare, rereview,
+      reviewer_trial/scorer, reviewer_trial/__main__) and artifacts.aggregate_reviews are replaced by the
+      Verdict enum via normalize_review.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[!=]=[[:space:]]*[''"]ERROR[''"]'
+      paths:
+      - orchestrator/src/orchestrator/evals
+      - orchestrator/src/orchestrator/artifacts.py
+      expect: absent
+  - name: no-eval-envelope-unwrapper
+    binding: fk-2e8daab1913f — scoring._unwrap_verdict_envelope and compare._read_reviewer_verdict_envelopes'
+      own unwrap go.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def[[:space:]]+_unwrap_verdict_envelope
+      paths:
+      - orchestrator/src/orchestrator/evals
+      expect: absent
+  - name: production-eval-parity
+    binding: boundary test B4 — verdict_tools._envelope output and a legacy payload give identical counts
+      through aggregate_reviews and the eval scorers.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: two-way behavioural parity; asserted by test_review_payload.py.
+- label: η
+  task_id: 6741
+  title: 'Reviewer-trial drivers: one panel cache, one run-and-score loop'
+  capabilities:
+  - name: no-second-panel-cache
+    binding: fk-294ee8dfa70f — __main__._load_or_run_panel (which 'Mirrors the caching logic in runner.py')
+      goes; one cache function in reviewer_trial/runner.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def[[:space:]]+_load_or_run_panel|Mirrors the caching logic
+      paths:
+      - orchestrator/src/orchestrator/evals/reviewer_trial
+      expect: absent
+  - name: panel-result-from-dict
+    binding: capability→producer — PanelRunResult.from_dict replaces two field-by-field rehydrations.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def[[:space:]]+from_dict[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/reviewer_trial/runner.py
+      expect: present
+  - name: run-and-score-helper
+    binding: capability→producer — run_and_score replaces six per-subcommand run/score/report loops.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async[[:space:]]+def[[:space:]]+run_and_score[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/reviewer_trial/runner.py
+      expect: present
+- label: θ
+  task_id: 6743
+  title: 'report.py leaves: stats, prices, cell admission, table rendering, Elo'
+  capabilities:
+  - name: stats-module
+    binding: capability→producer — mean_ci95 and the t-critical table move to orchestrator/src/orchestrator/evals/stats.py.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+mean_ci95[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/stats.py
+      expect: present
+  - name: prices-module
+    binding: capability→producer — build_price_table / build_pairwise_price_table move to evals/prices.py.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+build_price_table[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/prices.py
+      expect: present
+  - name: elo-report-module
+    binding: capability→producer — the seven Elo report symbols move to evals/elo_report.py.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+compute_tiers[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/elo_report.py
+      expect: present
+  - name: cell-admission-module
+    binding: capability→producer — the plan-only cell admission predicates move to evals/cell_admission.py.
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/src/orchestrator/evals/cell_admission.py
+      expect: present
+  - name: table-render-module
+    binding: capability→producer — the fixed-width table renderer moves to evals/table_render.py.
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/src/orchestrator/evals/table_render.py
+      expect: present
+- label: ι
+  task_id: 6746
+  title: 'report.py surfaces: composite and plan-quality; rationale to docs'
+  capabilities:
+  - name: report-module-gone
+    binding: heuristic 13/14 — report.py is deleted, no re-export shim (PRD §7 D9).
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/src/orchestrator/evals/report.py
+      expect: absent
+  - name: composite-report-module
+    binding: capability→producer — build_composite_report, methodology and select_survivors in evals/composite_report.py.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+build_composite_report[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/composite_report.py
+      expect: present
+  - name: plan-quality-report-module
+    binding: capability→producer — build_plan_quality_report and recovery in evals/plan_quality_report.py.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+build_plan_quality_report[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/plan_quality_report.py
+      expect: present
+  - name: snapshot-unchanged
+    binding: PRD §11 report snapshot — composite and plan-quality renders over the packaged dir are unchanged.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: gitignored data in the main checkout; diff recorded in the leaf's verification note.
+- label: κ
+  task_id: 6748
+  title: Eval CLI as a click group in evals/cli.py
+  capabilities:
+  - name: eval-cli-module
+    binding: capability→producer — eval_cmd and the eval drivers live in orchestrator/src/orchestrator/evals/cli.py;
+      orchestrator/cli.py registers the group with main.add_command.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+eval_cmd[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/evals/cli.py
+      expect: present
+  - name: no-eval-drivers-in-cli
+    binding: fk-4352b1ee49f5 — the eval helpers leave orchestrator/cli.py.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def[[:space:]]+(_run_matrix_cmd|_run_plan_only|_run_judge_cmd)[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/cli.py
+      expect: absent
+  - name: evals-never-import-cli
+    binding: heuristic 9 layering — runner.py's upward `from orchestrator.cli import eval_cmd` goes.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from[[:space:]]+orchestrator\.cli[[:space:]]+import
+      paths:
+      - orchestrator/src/orchestrator/evals
+      expect: absent
+  - name: plan-only-routed
+    binding: G3 — orchestrator.routing.resolve_route(RouteInputs, OrchestratorConfig) exists on main; κ's
+      _run_plan_only calls it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: resolve_route\(
+      paths:
+      - orchestrator/src/orchestrator/evals/cli.py
+      expect: present
+  - name: config-preamble-decorator
+    binding: capability→producer — one load_config/ConfigRequiredError decorator in orchestrator/src/orchestrator/cli_config.py.
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/src/orchestrator/cli_config.py
+      expect: present
+- label: λ
+  task_id: 6752
+  title: One checkout root for eval defaults
+  capabilities:
+  - name: no-checkout-literals
+    binding: fk-14926fe151d4 — 14 quoted /home/leo literals in evals Python at ae3047ec3a go; comments and
+      docstrings that mention the path are not matched by the quoted pattern.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[''"]/home/leo/'
+      paths:
+      - orchestrator/src/orchestrator/evals/*.py
+      expect: absent
+  - name: paths-module
+    binding: capability→producer — evals/paths.py resolves defaults from S14's shared.project_layout (upstream
+      dependency; absent on main, wired at decompose).
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/src/orchestrator/evals/paths.py
+      expect: present

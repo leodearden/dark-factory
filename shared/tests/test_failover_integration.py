@@ -20,10 +20,12 @@ import pytest
 from shared.cli_invoke import (
     CAP_HIT_RESUME_PROMPT,
     AgentResult,
+    AllAccountsCappedException,
     invoke_with_cap_retry,
 )
 from shared.config_dir import TaskConfigDir
 from shared.config_models import AccountConfig, UsageCapConfig
+from shared.cost_store import CostStore
 from shared.usage_gate import (
     SessionBudgetExhausted,
     UsageGate,
@@ -55,6 +57,11 @@ def make_result(success=True, output='done', session_id='', stderr='', cost_usd=
     )
 
 
+def make_cap_result(**kw):
+    """A genuine cap: the CLI reports it as a failed turn, banner on stderr."""
+    return make_result(success=False, **kw)
+
+
 def _cap_stderr(account=''):
     """Return stderr text that triggers cap detection."""
     return f"You've hit your usage limit for account {account}. Your limit resets in 5h."
@@ -80,9 +87,9 @@ class TestFullFailoverLifecycle:
             tokens_used.append(token)
             call_count[0] += 1
             if token == 'fake-token-A':
-                return make_result(success=True, output='', stderr=_cap_stderr('A'))
+                return make_cap_result(output='', stderr=_cap_stderr('A'))
             elif token == 'fake-token-B':
-                return make_result(success=True, output='', stderr=_cap_stderr('B'))
+                return make_cap_result(output='', stderr=_cap_stderr('B'))
             else:
                 return make_result(success=True, output='task done', cost_usd=1.23)
 
@@ -118,7 +125,7 @@ class TestFullFailoverLifecycle:
             call_count[0] += 1
             kwargs.get('oauth_token')
             if call_count[0] <= 3:
-                return make_result(success=True, output='', stderr=_cap_stderr())
+                return make_cap_result(output='', stderr=_cap_stderr())
             return make_result(success=True, output='finally done', cost_usd=0.7)
 
         async def background_uncap():
@@ -158,7 +165,7 @@ class TestFullFailoverLifecycle:
             call_count[0] += 1
             kwargs.get('oauth_token')
             if call_count[0] <= 5:
-                return make_result(success=True, output='', stderr=_cap_stderr())
+                return make_cap_result(output='', stderr=_cap_stderr())
             return make_result(success=True, output='done', cost_usd=0.3)
 
         async def background_uncap():
@@ -204,7 +211,7 @@ class TestSessionResumeAcrossFailover:
         """A: session_id='sess-1', cap hit -> B: resume with sess-1 -> success."""
         gate = make_gate(['A', 'B'])
 
-        capped = make_result(session_id='sess-1', stderr=_cap_stderr('A'))
+        capped = make_cap_result(session_id='sess-1', stderr=_cap_stderr('A'))
         ok = make_result(success=True, output='resumed ok', cost_usd=0.8)
 
         with (
@@ -228,9 +235,9 @@ class TestSessionResumeAcrossFailover:
         """A caps (sess-1) -> B resume caps (sess-1) -> C resume with sess-1."""
         gate = make_gate(['A', 'B', 'C'])
 
-        capped_a = make_result(session_id='sess-1', stderr=_cap_stderr('A'))
+        capped_a = make_cap_result(session_id='sess-1', stderr=_cap_stderr('A'))
         # B also caps while resuming — returns the *same* session_id
-        capped_b = make_result(session_id='sess-1', stderr=_cap_stderr('B'))
+        capped_b = make_cap_result(session_id='sess-1', stderr=_cap_stderr('B'))
         ok = make_result(success=True, output='done on C')
 
         with (
@@ -253,7 +260,7 @@ class TestSessionResumeAcrossFailover:
         """A caps (sess-1) -> B resume fails (not cap) -> C fresh with original prompt."""
         gate = make_gate(['A', 'B', 'C'])
 
-        capped_a = make_result(session_id='sess-1', stderr=_cap_stderr('A'))
+        capped_a = make_cap_result(session_id='sess-1', stderr=_cap_stderr('A'))
         failed_resume = make_result(success=False, output='resume error')
         ok = make_result(success=True, output='fresh success')
 
@@ -279,7 +286,7 @@ class TestSessionResumeAcrossFailover:
         gate = make_gate(['A', 'B', 'C'])
 
         results = [
-            make_result(session_id='sess-1', stderr=_cap_stderr('A')),  # A caps
+            make_cap_result(session_id='sess-1', stderr=_cap_stderr('A')),  # A caps
             make_result(success=False, output='resume error'),          # B resume fails
             make_result(success=True, output='ok'),                     # C fresh
         ]
@@ -323,7 +330,7 @@ class TestAllCappedThenResume:
         async def mock_invoke(**kwargs):
             call_count[0] += 1
             if call_count[0] <= 2:
-                return make_result(stderr=_cap_stderr())
+                return make_cap_result(stderr=_cap_stderr())
             return make_result(success=True, output='unblocked')
 
         async def background_uncap():
@@ -360,7 +367,7 @@ class TestAllCappedThenResume:
         async def mock_invoke(**kwargs):
             call_count[0] += 1
             if call_count[0] == 1:
-                return make_result(stderr=_cap_stderr())
+                return make_cap_result(stderr=_cap_stderr())
             return make_result(success=True, output='ok')
 
         async def run_retry():
@@ -433,7 +440,7 @@ class TestSingleAccountFullLifecycle:
         async def mock_invoke(**kwargs):
             call_count[0] += 1
             if call_count[0] == 1:
-                return make_result(stderr=_cap_stderr())
+                return make_cap_result(stderr=_cap_stderr())
             return make_result(success=True, output='solo done')
 
         async def background_uncap():
@@ -474,7 +481,7 @@ class TestSingleAccountFullLifecycle:
         async def mock_invoke(**kwargs):
             call_count[0] += 1
             if call_count[0] <= 2:
-                return make_result(stderr=_cap_stderr())
+                return make_cap_result(stderr=_cap_stderr())
             return make_result(success=True, output='finally done')
 
         async def uncap_on_sleep(duration):
@@ -719,9 +726,7 @@ class TestMixedBackends:
         token = gate._accounts[0].token
         # 'RESOURCE_EXHAUSTED' is only checked for gemini backend
         hit = gate.detect_cap_hit('RESOURCE_EXHAUSTED', '', 'codex', token)
-        # 'resource exhausted' is NOT in CODEX_CAP_PATTERNS but 'rate limit' overlaps.
         # 'RESOURCE_EXHAUSTED' alone should not match codex patterns.
-        # Actually check: CODEX_CAP_PATTERNS has 'rate limit', 'quota exceeded'.
         # 'RESOURCE_EXHAUSTED' does not match any of them (case-insensitive).
         assert hit is False
         assert gate._accounts[0].capped is False
@@ -750,7 +755,7 @@ class TestConcurrentTasksWithFailover:
             await asyncio.sleep(0)
             # First invocation on A triggers cap
             if token == 'fake-token-A' and invoke_count[0] == 1:
-                return make_result(stderr=_cap_stderr('A'), cost_usd=0.0)
+                return make_cap_result(stderr=_cap_stderr('A'), cost_usd=0.0)
             return make_result(success=True, output='ok', cost_usd=0.1)
 
         with (
@@ -818,10 +823,10 @@ class TestConcurrentTasksWithFailover:
             await asyncio.sleep(0)
             # First call on A caps it
             if token == 'fake-token-A' and not gate._accounts[0].capped:
-                return make_result(stderr=_cap_stderr('A'), cost_usd=0.0)
+                return make_cap_result(stderr=_cap_stderr('A'), cost_usd=0.0)
             # First call on B caps it
             if token == 'fake-token-B' and not gate._accounts[1].capped:
-                return make_result(stderr=_cap_stderr('B'), cost_usd=0.0)
+                return make_cap_result(stderr=_cap_stderr('B'), cost_usd=0.0)
             return make_result(success=True, output='ok', cost_usd=0.05)
 
         with (
@@ -884,14 +889,14 @@ class TestConcurrentTasksWithFailover:
 @pytest.mark.asyncio
 class TestCostTrackingIntegration:
 
-    async def test_cap_hit_then_success_records_both_events(self):
-        """Cap hit -> save_account_event('cap_hit'); success -> save_invocation."""
+    async def test_cap_hit_then_success_records_invocation_only(self):
+        """The loop records invocations only; account events are the gate's."""
         gate = make_gate(['A', 'B'])
         cost_store = MagicMock()
         cost_store.save_invocation = AsyncMock()
         cost_store.save_account_event = AsyncMock()
 
-        capped = make_result(stderr=_cap_stderr('A'))
+        capped = make_cap_result(stderr=_cap_stderr('A'))
         ok = make_result(success=True, output='ok', cost_usd=0.5)
 
         with (
@@ -905,9 +910,7 @@ class TestCostTrackingIntegration:
                 prompt='work', system_prompt='sys', cwd=Path('/tmp'),
             )
 
-        cost_store.save_account_event.assert_awaited_once()
-        evt_kwargs = cost_store.save_account_event.call_args.kwargs
-        assert evt_kwargs['event_type'] == 'cap_hit'
+        cost_store.save_account_event.assert_not_awaited()
 
         cost_store.save_invocation.assert_awaited_once()
         inv_kwargs = cost_store.save_invocation.call_args.kwargs
@@ -941,7 +944,7 @@ class TestCostTrackingIntegration:
         cost_store.save_invocation = AsyncMock(side_effect=RuntimeError('db locked'))
         cost_store.save_account_event = AsyncMock(side_effect=RuntimeError('db locked'))
 
-        capped = make_result(stderr=_cap_stderr('A'))
+        capped = make_cap_result(stderr=_cap_stderr('A'))
         ok = make_result(success=True, output='ok')
 
         with (
@@ -956,6 +959,74 @@ class TestCostTrackingIntegration:
             )
 
         assert result.success is True
+
+
+# ---------------------------------------------------------------------------
+# TestCapHitHasOneWriter
+# ---------------------------------------------------------------------------
+
+
+async def _await_account_events(store, start_iso, end_iso, event_type, *, deadline_s=5.0):
+    """Poll the store until an *event_type* row lands; the gate writes its events fire-and-forget."""
+    loop = asyncio.get_running_loop()
+    give_up_at = loop.time() + deadline_s
+    while True:
+        rows = await store.account_events_in_window(start_iso, end_iso, event_type=event_type)
+        if rows or loop.time() >= give_up_at:
+            return rows
+        await asyncio.sleep(0.01)
+
+
+async def _invoke_until_first_detection(gate, store, stderr, cwd):
+    async def _cli(**_kw):
+        return make_cap_result(stderr=stderr)
+
+    with pytest.raises(AllAccountsCappedException):
+        await invoke_with_cap_retry(
+            gate, 'lbl', invoke_fn=_cli,
+            cost_store=store, run_id='run-1', project_id='proj',
+            max_cap_retries=1,
+            prompt='work', system_prompt='sys', cwd=cwd,
+        )
+
+
+@pytest.mark.asyncio
+class TestCapHitHasOneWriter:
+    """Gate and loop share one store: a cap event yields one cap_hit row, the gate's."""
+
+    async def test_one_cap_detection_writes_exactly_one_cap_hit_row(self, tmp_path):
+        start = datetime.now(UTC).isoformat()
+        end = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        async with CostStore(tmp_path / 'runs.db') as store:
+            gate = make_gate(['A', 'B'], cost_store=store)
+            try:
+                await _invoke_until_first_detection(gate, store, _cap_stderr('A'), tmp_path)
+
+                rows = await _await_account_events(store, start, end, 'cap_hit')
+
+                assert len(rows) == 1, [(r['account_name'], r['details']) for r in rows]
+                assert rows[0]['account_name'] == 'A'
+                details = json.loads(rows[0]['details'])
+                assert 'usage limit' in details['reason']
+                assert 'resets_at' in details
+            finally:
+                await gate.shutdown()
+
+    async def test_near_cap_detection_writes_no_cap_hit_row(self, tmp_path):
+        start = datetime.now(UTC).isoformat()
+        end = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        near_cap_stderr = "You're close to your usage limit. resets in 2h"
+        async with CostStore(tmp_path / 'runs.db') as store:
+            gate = make_gate(['A', 'B'], cost_store=store)
+            try:
+                await _invoke_until_first_detection(gate, store, near_cap_stderr, tmp_path)
+
+                near_caps = await _await_account_events(store, start, end, 'near_cap')
+
+                assert [r['account_name'] for r in near_caps] == ['A']
+                assert await store.account_events_in_window(start, end, event_type='cap_hit') == []
+            finally:
+                await gate.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -1003,7 +1074,7 @@ class TestEdgeCases:
         gate = make_gate(['A', 'B'])
 
         long_stderr = 'x' * 10_000 + "\nYou've hit your usage limit. Resets in 3h.\n"
-        capped = make_result(stderr=long_stderr)
+        capped = make_cap_result(stderr=long_stderr)
         ok = make_result(success=True, output='ok')
 
         with (
@@ -1108,7 +1179,7 @@ class TestConfigDirIntegrationWithFailover:
         gate = make_gate(['A', 'B'])
         config_dir = TaskConfigDir('failover-cred-test', base_dir=tmp_path)
 
-        capped = make_result(stderr=_cap_stderr('A'))
+        capped = make_cap_result(stderr=_cap_stderr('A'))
         ok = make_result(success=True, output='ok')
 
         tokens_written = []

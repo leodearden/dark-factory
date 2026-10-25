@@ -1,0 +1,26 @@
+# Installed as ~/.config/systemd/user/fused-memory.socket. Committed as
+# .socket.template only because `.socket` is not in the shared lock-charter
+# extension allowlist (shared/src/shared/locking.py::FILE_EXTENSIONS); it has
+# no placeholders and is installed verbatim.
+[Unit]
+Description=Fused Memory MCP listening socket (held across service restarts)
+
+# systemd owns the listening socket on server.port so it stays bound while
+# fused-memory.service restarts (~50s). Clients connecting mid-restart wait in
+# the kernel backlog and are served by the new process, instead of getting
+# ECONNREFUSED — which makes Claude Code's HTTP MCP client give up after ~15s
+# and withdraw the tools until a manual /mcp. The server adopts the socket via
+# shared/src/shared/systemd_listeners.py::take_systemd_listeners.
+#
+# The service's ExecStopPost (scripts/stop-socket-unless-restarting.sh) stops
+# this socket on a deliberate stop, so no later connection can restart it.
+#
+# Must match fused-memory/config/config.yaml server.host:port and
+# reconciliation.escalation_host:escalation_port (pinned by
+# fused-memory/tests/test_systemd_unit_config.py::TestSocketActivation).
+[Socket]
+ListenStream=0.0.0.0:8002
+ListenStream=127.0.0.1:8103
+
+[Install]
+WantedBy=sockets.target

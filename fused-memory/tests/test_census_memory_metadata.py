@@ -9,42 +9,21 @@ stand-ins throughout.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
 import types
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import load_script_module
 
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'census_memory_metadata.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load census_memory_metadata.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    mod_name = 'census_memory_metadata'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='census_memory_metadata')
 
 
 # ===========================================================================
@@ -1331,11 +1310,16 @@ class TestTopicSlugConformance:
 
 
 class _FakeEntry:
-    """Minimal stand-in for the probe's RegistryEntry (topic + project_id)."""
+    """Minimal stand-in for the probe's RegistryEntry.
 
-    def __init__(self, topic: str, project_id: str):
+    ``is_query_surface`` mirrors the probe's property of that name: an entry
+    keying a query a caller fires, not a ``metadata.topic`` value.
+    """
+
+    def __init__(self, topic: str, project_id: str, *, is_query_surface: bool = False):
         self.topic = topic
         self.project_id = project_id
+        self.is_query_surface = is_query_surface
 
 
 class _FakeRegistry:
@@ -1347,9 +1331,8 @@ class TestRegistryCoverageGauge:
     """The TARGET: every committed registry topic carries exactly one canonical.
 
     A corpus-wide stamping percentage over 49.6k records has no owner and no
-    bounded worklist.  The committed 32-entry registry is a bounded, named,
-    checkable set -- and it is precisely the set E1's retrieval-health run
-    scores 32/32 failing.
+    bounded worklist.  The committed registry is a bounded, named, checkable
+    set -- and it is precisely the set E1's retrieval-health run scores.
 
     NOT a duplicate of E1's METRIC_TOPIC_CANONICAL_PRESENT (INV-5): that one
     is computed from _tripwire_items(observations, TRIPWIRE_K) -- from SEARCH
@@ -1376,24 +1359,19 @@ class TestRegistryCoverageGauge:
         # ::load_topic_registry already established, so the schema
         # check, the zero-entry rejection and the RegistryError type stay
         # single-homed rather than re-parsed here.
-        import importlib.util as _ilu
-        import sys as _sys
-        from pathlib import Path as _Path
-
         assert _mod.__file__ is not None
-        probe_path = _Path(_mod.__file__).parent / 'memory_eval_retrieval_probe.py'
-        cached = _sys.modules.get('memory_eval_retrieval_probe')
-        if cached is None:
-            spec = _ilu.spec_from_file_location('memory_eval_retrieval_probe', probe_path)
-            assert spec is not None and spec.loader is not None
-            cached = _ilu.module_from_spec(spec)
-            _sys.modules['memory_eval_retrieval_probe'] = cached
-            spec.loader.exec_module(cached)
+        # The shared loader IS the reuse check this test used to hand-roll:
+        # test_memory_eval_retrieval_probe.py owns this key, so the probe
+        # comes back rather than being executed a second time (task 3895).
+        probe = load_script_module(
+            Path(_mod.__file__).parent / 'memory_eval_retrieval_probe.py',
+            mod_name='memory_eval_retrieval_probe',
+        )
         # Through the ACCESSOR, not a module attribute: the loader is bound
         # lazily so an unloadable probe degrades to registry_error instead of
         # killing the import (and with it the whole census). The reuse is
         # still pinned by identity.
-        assert _mod.topic_registry_loader() is cached.load_topic_registry
+        assert _mod.topic_registry_loader() is probe.load_topic_registry
 
     # DELIBERATELY NOT TESTED HERE (review of 2026-08-16): that the probe is
     # not loaded AT IMPORT TIME, via `inspect.getsource` +
@@ -1486,7 +1464,8 @@ class TestRegistryCoverageGauge:
             _FakeEntry('missing', 'dark_factory'),
         ])
         block = self._report(cells, registry)['registry_coverage']
-        # The actionable list -- exactly what 3201's retro sweep would stamp.
+        # The whole zero-canonical population, kept for history and
+        # back-compat; the stampable / unpopulated split is tested below.
         assert [r['topic'] for r in block['zero_canonical_topics']] == [
             'bare', 'missing',
         ]
@@ -1604,11 +1583,136 @@ class TestRegistryCoverageGauge:
         second = self._report(cells, registry)
         assert json.dumps(first) == json.dumps(second)
 
-    def test_the_committed_registry_still_holds_the_32_named_targets(self):
+    def test_the_committed_registry_holds_the_gauged_targets(self):
         # The accountable set this task names as the TARGET. If the fixture
         # grows or shrinks, the target moved and the docs must say so.
         registry = _mod.topic_registry_loader()(_mod.DEFAULT_REGISTRY_PATH)
-        assert len(registry.entries) == 32
+        assert sum(1 for e in registry.entries if not e.is_query_surface) == 31
+        assert {e.topic for e in registry.entries if e.is_query_surface} == {
+            'briefing-conventions-generic',
+            'briefing-conventions-area',
+            'briefing-task-semantic',
+        }
+
+    def test_query_surface_entries_are_not_gauged_but_are_named(self):
+        # A query-surface topic keys a query a caller fires, not a
+        # metadata.topic value: no record is ever stamped with it, so gauging
+        # it would add a permanent, unfixable zero-canonical row.
+        cells = {'dark_factory': {OBS: _census([{'topic': 'alpha', 'canonical': True}])}}
+        registry = _FakeRegistry([
+            _FakeEntry('alpha', 'dark_factory'),
+            _FakeEntry('briefing-x', 'dark_factory', is_query_surface=True),
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+        assert [r['topic'] for r in block['topics']] == ['alpha']
+        assert block['registry_topics_total'] == 1
+        assert block['query_surface_topics_not_gauged'] == [
+            {'project_id': 'dark_factory', 'topic': 'briefing-x'},
+        ]
+
+    def test_variant_spelling_records_are_counted_per_row(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'alpha_beta'},
+                    {'topic': 'alpha_beta'},
+                    {'topic': 'alpha-beta'},
+                    {'topic': 'snake-slug'},
+                    {'topic': '!!!'},
+                    {'topic': '!!!'},
+                    {'topic': '???'},
+                ]),
+            },
+        }
+        registry = _FakeRegistry([
+            _FakeEntry('alpha-beta', 'dark_factory'),
+            _FakeEntry('gamma', 'dark_factory'),
+            _FakeEntry('snake_slug', 'dark_factory'),
+            _FakeEntry('???', 'dark_factory'),
+        ])
+        rows = {
+            r['topic']: r
+            for r in self._report(cells, registry)['registry_coverage']['topics']
+        }
+        # records stays the EXACT-spelling count: get_memories_by_metadata is
+        # exact-match, so a variant spelling is not addressable by the slug.
+        assert rows['alpha-beta']['records'] == 1
+        assert rows['alpha-beta']['variant_spelling_records'] == 2
+        assert rows['gamma']['variant_spelling_records'] == 0
+        # The fold runs on BOTH sides.
+        assert rows['snake_slug']['records'] == 0
+        assert rows['snake_slug']['variant_spelling_records'] == 1
+        # A value that folds to None is never a variant, not even of another
+        # value that also folds to None.
+        assert rows['???']['records'] == 1
+        assert rows['???']['variant_spelling_records'] == 0
+
+    def test_zero_canonical_topics_split_into_stamping_worklist_and_unpopulated(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'has-one', 'canonical': True},
+                    {'topic': 'stampable'},
+                    {'topic': 'stampable'},
+                    {'topic': 'legacy_topic'},
+                ]),
+            },
+        }
+        registry = _FakeRegistry([
+            _FakeEntry(t, 'dark_factory')
+            for t in ('has-one', 'stampable', 'legacy-topic', 'absent')
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+
+        stamping = block['stamping_worklist']
+        unpopulated = block['unpopulated_topics']
+        assert [r['topic'] for r in stamping] == ['stampable']
+        assert [r['topic'] for r in unpopulated] == ['absent', 'legacy-topic']
+        assert {r['topic']: r['variant_spelling_records'] for r in unpopulated} == {
+            'absent': 0, 'legacy-topic': 1,
+        }
+        # A partition of the zero-canonical rows, which keep their content.
+        assert sorted(r['topic'] for r in stamping + unpopulated) == sorted(
+            r['topic'] for r in block['zero_canonical_topics']
+        )
+        assert [r['topic'] for r in block['zero_canonical_topics']] == [
+            'absent', 'legacy-topic', 'stampable',
+        ]
+
+    def test_the_markdown_renders_both_worklists(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'stampable'},
+                    {'topic': 'legacy_topic'},
+                    {'topic': 'legacy_topic'},
+                    {'topic': 'legacy_topic'},
+                ]),
+            },
+        }
+        registry = _FakeRegistry([
+            _FakeEntry('stampable', 'dark_factory'),
+            _FakeEntry('legacy-topic', 'dark_factory'),
+            _FakeEntry('briefing-x', 'dark_factory', is_query_surface=True),
+        ])
+        md = _mod.render_markdown(self._report(cells, registry))
+        section = _md_section(
+            md, '### Registry coverage — the accountable target', stop='### ',
+        )
+        table_rows = {
+            row[1]: row
+            for line in section.splitlines() if line.startswith('| `')
+            for row in [[c.strip() for c in line.strip().strip('|').split('|')]]
+        }
+        assert '`stampable`' in table_rows
+        # The unpopulated row carries its variant-spelling count.
+        assert '3' in table_rows['`legacy-topic`']
+        assert '`briefing-x`' in section
+
+    def test_schema_version_is_bumped_for_the_split_worklists(self):
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a'}])}}
+        report = self._report(cells, _FakeRegistry([_FakeEntry('a', 'dark_factory')]))
+        assert report['schema_version'] >= 5
 
 
 def _history_report(registry=None, **kwargs) -> dict:
@@ -2066,6 +2170,36 @@ class TestCoverageDiff:
             },
         ]
 
+    def test_regrowth_names_topics_that_LEFT_the_registry(self):
+        # A re-keyed registry drops a target: registry_topics_total falls and
+        # the zero-canonical count may fall with it. Unnamed, that reads as
+        # stamping progress when the target set merely shrank.
+        prior = _topic_report(
+            {'dark_factory': [
+                {'topic': 'alpha', 'canonical': True}, {'topic': 'alpha'},
+                {'topic': 'retired'}, {'topic': 'retired'},
+            ]},
+            registry=_FakeRegistry([
+                _FakeEntry('alpha', 'dark_factory'), _FakeEntry('retired', 'dark_factory'),
+            ]),
+        )
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), prior, stamp='2026-08-15T05:00:00Z',
+        )
+        regrowth = _mod.build_coverage_diff(self._current(), history)['topic_regrowth']
+        assert regrowth['removed_topics'] == [
+            {
+                'project_id': 'dark_factory', 'topic': 'retired',
+                'records_before': 2, 'canonical_before': 0,
+            },
+        ]
+
+    def test_regrowth_names_no_removed_topic_when_the_registry_only_grew(self):
+        regrowth = _mod.build_coverage_diff(
+            self._current(), self._history_with_prior(),
+        )['topic_regrowth']
+        assert regrowth['removed_topics'] == []
+
     def test_regrowth_scope_is_disclosed_as_registry_bounded(self):
         # The signal is scoped to the committed registry because that is
         # what the history may bound-safely carry. Disclosed, never silently
@@ -2089,6 +2223,7 @@ class TestCoverageDiff:
         assert regrowth['available'] is False
         assert regrowth['reason']
         assert regrowth['new_topics'] == []
+        assert regrowth['removed_topics'] == []
 
     # ---- wiring + determinism -------------------------------------------
 
@@ -3015,6 +3150,20 @@ class TestRenderMarkdownCoverageTrend:
         grew = _md_section(md, '#### Grew in member records')
         assert '| `dark_factory` | `alpha` | 1 | 2 |' in grew
 
+    def test_a_topic_that_left_the_registry_renders_named(self):
+        prior = _topic_report(
+            {'dark_factory': [{'topic': 'retired', 'canonical': True}]},
+            registry=_FakeRegistry([
+                _FakeEntry('alpha', 'dark_factory'), _FakeEntry('retired', 'dark_factory'),
+            ]),
+        )
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), prior, stamp='2026-08-15T05:00:00Z',
+        )
+        md = _mod.render_markdown(_coverage_md_report(history=history))
+        removed = _md_section(md, '#### Left the registry')
+        assert '| `dark_factory` | `retired` | 1 | 1 |' in removed
+
     def test_a_class_with_nothing_to_report_says_so_rather_than_vanishing(self):
         # The mirror image, and why the row assertions above are keyed to
         # their own section: an empty class must render an explicit "(none)"
@@ -3023,6 +3172,7 @@ class TestRenderMarkdownCoverageTrend:
         md = _mod.render_markdown(_coverage_md_report(history=self._history()))
         assert _md_section(md, '#### Lost their `canonical: true`').strip() == '_(none)_'
         assert _md_section(md, '#### Grew in member records').strip() == '_(none)_'
+        assert _md_section(md, '#### Left the registry').strip() == '_(none)_'
 
     def test_regrowth_scope_is_disclosed_in_the_markdown_too(self):
         # `'registry' in md.lower()` could not fail: the document always
@@ -3828,15 +3978,17 @@ class TestRegenCommandCoversTheNewFlags:
         fails the moment the two bases diverge again.
         """
         # Two real, non-default, repo-root-relative paths, so both flags are
-        # emitted and both can be resolved.
+        # emitted and both can be resolved. Only existence matters, so the
+        # history flag names this very module.
+        repo_root = Path(_mod._REPO_ROOT)
+        any_committed_file = Path(__file__).resolve().relative_to(repo_root).as_posix()
         params = {
             'projects': ['dark_factory', 'reify'],
             'registry': 'fused-memory/tests/fixtures/census-grandfather-oracle.json',
-            'history_out': 'plans/memory-metadata-census-report.json',
+            'history_out': any_committed_file,
         }
         command = _mod._regen_command(params)
         tokens = command.split()
-        repo_root = Path(_mod._REPO_ROOT)
 
         script = next(t for t in tokens if t.endswith('census_memory_metadata.py'))
         paths = {'script': script}
@@ -3941,10 +4093,23 @@ class TestCommittedParamsAreCheckoutIndependent:
     async def test_run_records_the_default_paths_repo_relative(self, tmp_path, monkeypatch):
         monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
         monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        reads: list[str] = []
+        writes: list[str] = []
+
+        def _read(path):
+            reads.append(path)
+            return _mod.empty_coverage_history()
+
+        monkeypatch.setattr(_mod, 'load_coverage_history', _read)
+        monkeypatch.setattr(
+            _mod, 'save_coverage_history', lambda history, path: writes.append(path),
+        )
         await _mod._run(_args(
             tmp_path, registry=_mod.DEFAULT_REGISTRY_PATH,
             history_out=_mod.DEFAULT_HISTORY_OUT, no_history=True,
         ))
+        assert reads == [_mod.DEFAULT_HISTORY_OUT]
+        assert writes == []
         params = json.loads((tmp_path / 'census.json').read_text())['params']
         assert params['registry'] == (
             'fused-memory/tests/fixtures/memory_eval_topic_registry.json'

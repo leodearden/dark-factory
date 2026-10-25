@@ -118,9 +118,21 @@ is non-emptiness.
 | Transcript files walked | 5,704 `.jsonl.gz` (nested two directories below the root) |
 | Transcript files unreadable | 0 (skipped and counted, never fatal — see below) |
 | Specimens committed | 504 (deduplicated by `tool_use_id`) |
-| Outcome split | 443 `repaired` / 61 `unrepairable` |
+| Outcome split | 444 `repaired` / 60 `unrepairable` |
 | Records truncated | 438 (5 repaired records refused truncation, see above) |
-| File size | 494,394 bytes |
+| File size | 494,420 bytes |
+
+**What moved under task 4502, and why.** Exactly **one** record was re-scored:
+`toolu_01XbCz5NFCA6pCvmseyqFgvy` (`mcp__escalation__escalate_info` / `detail`)
+moved `unrepairable` to `repaired`, recovering `evidence` and
+`suggested_action`, which is what takes the split from 443/61 to 444/60. Task
+4502 narrowed boundary row B5 from a bare substring refusal — any closing tag
+anywhere in a recovered value — to an alternative-boundary test. The
+over-refused shape is a faithful *report* of a markup leak: such a report
+quotes the pattern that tripped the tripwire, so the quote lands inside a
+swallowed argument and B5 fired on the caller's own prose. Regenerated in place
+through `load_corpus` / `write_corpus` (never by hand), so the diff is one
+line; every other record is byte-identical.
 
 **What moved since the 2026-08-08 snapshot, and why.** That snapshot recorded
 473 specimens and a 456/17 split; this one records 504 and 443/61. Two
@@ -145,7 +157,11 @@ which spends six bytes on every `\x3c` in the file.
 The determinism claim is measured, not assumed: two back-to-back full runs
 (5,704 and 5,705 files walked — the archive is written to live) produced
 byte-identical output, md5 `c4eeedac7d9ae688d513b24ca62420fe`. That is the
-extractor half of boundary row B13; the replay half is in the test.
+extractor half of boundary row B13; the replay half is in the test. The
+committed file now digests to md5 `c40b00e87cd2d3198e7010b5e8040e8a` after task
+4502's one-record re-score; the determinism claim itself is untouched, and was
+re-confirmed at that task by round-tripping the pre-4502 file through
+`load_corpus` / `write_corpus` and recovering the earlier digest byte for byte.
 
 ## Two properties worth knowing before you read a record
 
