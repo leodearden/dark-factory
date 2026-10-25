@@ -409,8 +409,8 @@ def clip_for_prompt(text: str, cap: int) -> str:
 
     The single owner of truncate-and-mark for the curator prompt. Both sides
     of that prompt route through it — the POOL side (:meth:`PoolEntry.render`)
-    and the CANDIDATE side (:meth:`TaskCurator._build_user_prompt` and
-    :meth:`TaskCurator._build_batch_section`) — so the two cannot drift apart
+    and the CANDIDATE side (``task_curator.py::_render_candidate_section``,
+    which both the single and batch prompts use) — so the two cannot drift apart
     (INV-5 ``no-lockstep-duplication``). They previously did: the pool side
     appended a bare ``…`` while the candidate side clipped silently, so the
     reading LLM could not tell a short description from a truncated one.
