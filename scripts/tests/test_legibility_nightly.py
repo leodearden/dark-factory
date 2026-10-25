@@ -448,7 +448,7 @@ def test_nightly_cap_is_an_alias_of_the_sampler_cap_not_a_second_literal():
     assert nightly.DEFAULT_MAX_DIGEST_BYTES is nightly.sampling.DEFAULT_DIGEST_MAX_BYTES
 
 
-def test_select_digest_sessions_charges_real_digest_bytes(tmp_path, monkeypatch):
+def test_select_digest_sessions_charges_real_digest_bytes(tmp_path):
     """The cost basis handed to the sampler must be the REAL rendered digest
     size -- what makes ``max_daily_digest_bytes`` mean what it says.
 
@@ -469,24 +469,9 @@ def test_select_digest_sessions_charges_real_digest_bytes(tmp_path, monkeypatch)
     session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
     _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
 
-    captured = {}
+    sample = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
 
-    def spy_stratified_sample(records, config, *, cost_fn=None):
-        captured['cost_fn'] = cost_fn
-        captured['records'] = list(records)
-        return nightly.sampling.SampleResult(
-            selected=list(records), per_stratum_counts={}, zero_signal_dropped=0,
-            bytes_used=0,
-        )
-
-    monkeypatch.setattr(nightly.sampling, 'stratified_sample', spy_stratified_sample)
-
-    nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
-
-    cost_fn = captured['cost_fn']
-    assert cost_fn is not None, 'select_digest_sessions passed no cost_fn'
-
-    record = captured['records'][0]
+    [record] = sample.selected
     expected = len(
         digest.build_digest(
             record.path,
@@ -494,12 +479,12 @@ def test_select_digest_sessions_charges_real_digest_bytes(tmp_path, monkeypatch)
             max_bytes=nightly.DEFAULT_MAX_DIGEST_BYTES,
         ).encode('utf-8')
     )
-    assert cost_fn(record) == expected
+    assert sample.bytes_used == expected
     assert expected != record.size_bytes
 
 
 def test_select_digest_sessions_costs_at_the_max_bytes_build_digests_renders_with(
-    tmp_path, monkeypatch,
+    tmp_path,
 ):
     """The cap the sampler CHARGES at and the cap ``build_digests`` RENDERS
     at must be the same number, or ``bytes_used`` describes a digest nobody
@@ -523,10 +508,9 @@ def test_select_digest_sessions_costs_at_the_max_bytes_build_digests_renders_wit
         caps.append(kwargs.get('max_bytes'))
         return 'a digest'
 
-    # COST side: select_digest_sessions -> digest_byte_cost_fn, which
-    # resolves digest.build_digest at call time.
-    monkeypatch.setattr(nightly.sampling.digest, 'build_digest', recording_build)
-    sample = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+    sample = nightly.select_digest_sessions(
+        cfg, projects_root, date(2026, 7, 13), build=recording_build,
+    )
     assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES], (
         'the sampler must charge at the nightly cap, not at build_digest\'s own default'
     )
@@ -638,21 +622,15 @@ def test_build_digests_reuses_the_costing_render(tmp_path):
         renders.append(path)
         return real_build(path, **kwargs)
 
-    # select_digest_sessions has no build seam of its own -- the costing
-    # renderer is digest.build_digest, resolved at call time.
-    digest.build_digest = counting_build
-    try:
-        rendered: dict = {}
-        sample = nightly.select_digest_sessions(
-            cfg, projects_root, date(2026, 7, 13), rendered=rendered,
-        )
-        assert renders == [session_path], 'costing must render exactly once'
+    rendered: dict = {}
+    sample = nightly.select_digest_sessions(
+        cfg, projects_root, date(2026, 7, 13), rendered=rendered, build=counting_build,
+    )
+    assert renders == [session_path], 'costing must render exactly once'
 
-        digests, extractor_failures = nightly.build_digests(
-            sample.selected, build=counting_build, rendered=rendered,
-        )
-    finally:
-        digest.build_digest = real_build
+    digests, extractor_failures = nightly.build_digests(
+        sample.selected, build=counting_build, rendered=rendered,
+    )
 
     # Still exactly one render in total: build_digests served the cache.
     assert renders == [session_path]
@@ -682,7 +660,7 @@ def test_build_digests_re_renders_when_no_cache_is_shared(tmp_path):
     assert digests[0].startswith('---\n')
 
 
-def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path, monkeypatch):
+def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path):
     """``run_nightly`` is the only production wiring of the two stages, so
     the reuse only pays off if IT threads one dict through both."""
     work_cwd = str(tmp_path / 'work')
@@ -705,9 +683,6 @@ def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path, monkey
         seen['build'] = kwargs.get('rendered')
         return real_build(selected, **kwargs)
 
-    monkeypatch.setattr(nightly, 'select_digest_sessions', spy_select)
-    monkeypatch.setattr(nightly, 'build_digests', spy_build)
-
     nightly.run_nightly(
         config_path=config_path,
         projects_root=projects_root,
@@ -716,6 +691,8 @@ def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path, monkey
         invoke=lambda prompt, model: '{"proposals": []}',
         status_fetcher=None,
         poster=lambda url, envelope: None,
+        selector=spy_select,
+        digest_builder=spy_build,
         pass_kind=nightly.PassKind.MANUAL,
     )
 
@@ -3472,7 +3449,7 @@ def _crashing_build_digests(selected, **kwargs):
     return [ok_digest], [('session-1.jsonl', 'boom: corrupt transcript')]
 
 
-def test_run_nightly_fail_loud_on_extractor_crash(tmp_path, monkeypatch):
+def test_run_nightly_fail_loud_on_extractor_crash(tmp_path):
     work_cwd = str(tmp_path / 'work')
     repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
 
@@ -3488,8 +3465,6 @@ def test_run_nightly_fail_loud_on_extractor_crash(tmp_path, monkeypatch):
     before_log = subprocess.run(
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
-
-    monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
 
     coder_calls = []
 
@@ -3508,6 +3483,7 @@ def test_run_nightly_fail_loud_on_extractor_crash(tmp_path, monkeypatch):
         invoke=_unexpected_invoke,
         status_fetcher=None,
         poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        digest_builder=_crashing_build_digests,
         pass_kind=nightly.PassKind.MANUAL,
     )
 
@@ -3860,7 +3836,7 @@ _BRANCH_NEEDS_MONKEYPATCH = (
 def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
                      branch=None, recorder=None, budget_bytes=None,
                      invoke=_fake_invoke_known_cause, committer=None, poster=None,
-                     transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+                     digest_builder=None, transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
                      invariants_doc: str | None = None,
                      unreadable_transcripts: bool = False,
                      pass_kind=nightly.PassKind.MANUAL):
@@ -3876,7 +3852,7 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
     branch, and THIS IS THE ONLY PLACE that knowledge lives — a fifth branch
     added to ``run_nightly`` gets wired here once, not in each suite:
 
-    * ``'extractor'``  — ``build_digests`` raises (needs *monkeypatch*)
+    * ``'extractor'``  — the injected digest builder reports a crashed session
     * ``'storm'``      — every digest's coding output is unparseable
     * ``'capped'``     — every digest hits a usage cap (task 4736).  Not a
       fail-loud branch: it returns ``exit_code=0``.  Wired here anyway so
@@ -3890,7 +3866,8 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
     the config with a digest byte budget small enough to suppress the whole
     night, *transcript=False* makes it a genuinely quiet one, *invariants_doc*
     is committed as the project's design-invariants doc, and
-    *recorder* / *committer* / *poster* / *invoke* are the injected seams
+    *recorder* / *committer* / *poster* / *invoke* / *digest_builder* are the
+    injected seams
     (*poster* defaults to a no-op, so a test that does not care about
     escalations never has to build one), and *pass_kind* (default
     ``MANUAL``) is passed through. *unreadable_transcripts* is the
@@ -3937,10 +3914,11 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
         kwargs['recorder'] = recorder
     if committer is not None:
         kwargs['committer'] = committer
+    if digest_builder is not None:
+        kwargs['digest_builder'] = digest_builder
 
     if branch == 'extractor':
-        assert monkeypatch is not None, _BRANCH_NEEDS_MONKEYPATCH.format(branch)
-        monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
+        kwargs['digest_builder'] = _crashing_build_digests
     elif branch == 'storm':
         kwargs['invoke'] = _fake_invoke_unparseable
     elif branch == 'capped':
@@ -4018,11 +3996,9 @@ class TestRunNightlyRecordsTrickleState:
         assert doc['consecutive_barren_runs'] == 0
         assert doc['exit_code'] == 0
 
-    def test_extractor_crash_still_records(self, tmp_path, monkeypatch):
+    def test_extractor_crash_still_records(self, tmp_path):
         recorder, calls = _recorder_spy()
-        result, _repo = _run_e2e_nightly(
-            tmp_path, monkeypatch=monkeypatch, branch='extractor', recorder=recorder,
-        )
+        result, _repo = _run_e2e_nightly(tmp_path, branch='extractor', recorder=recorder)
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
@@ -4067,7 +4043,7 @@ class TestRunNightlyRecordsTrickleState:
         assert doc['exit_code'] == 1
         assert doc['commit_made'] is False
 
-    def test_unexpected_exception_mid_run_still_records(self, tmp_path, monkeypatch):
+    def test_unexpected_exception_mid_run_still_records(self, tmp_path):
         """A crashed night that recorded NOTHING would let the progress
         probe read a stale streak as healthy. The boundary converts the
         exception into a failed, escalated result — recording is not
@@ -4075,11 +4051,12 @@ class TestRunNightlyRecordsTrickleState:
         def _boom(selected, **kwargs):
             raise RuntimeError('synthetic mid-run explosion')
 
-        monkeypatch.setattr(nightly, 'build_digests', _boom)
         recorder, calls = _recorder_spy()
         poster, posted = _capture_poster()
 
-        result, _repo = _run_e2e_nightly(tmp_path, recorder=recorder, poster=poster)
+        result, _repo = _run_e2e_nightly(
+            tmp_path, recorder=recorder, poster=poster, digest_builder=_boom,
+        )
 
         assert result.exit_code == 1
         assert result.escalated is True
@@ -4098,16 +4075,13 @@ class TestRunNightlyRecordsTrickleState:
             'are still recordable'
         )
 
-    def test_a_crash_keeps_what_the_night_had_already_established(
-        self, tmp_path, monkeypatch,
-    ):
+    def test_a_crash_keeps_what_the_night_had_already_established(self, tmp_path):
         """The sampler found a suppressed night and escalated it before the
         crash; neither fact may be lost, even when the crash's own POST
         fails."""
         def _boom(selected, **kwargs):
             raise RuntimeError('synthetic mid-run explosion')
 
-        monkeypatch.setattr(nightly, 'build_digests', _boom)
         recorder, calls = _recorder_spy()
         posted = []
 
@@ -4118,7 +4092,7 @@ class TestRunNightlyRecordsTrickleState:
 
         result, _repo = _run_e2e_nightly(
             tmp_path, recorder=recorder, budget_bytes=10,
-            poster=_server_gone_after_the_first_post,
+            poster=_server_gone_after_the_first_post, digest_builder=_boom,
         )
 
         assert result.exit_code == 1
@@ -5435,19 +5409,23 @@ class TestRunScheduledNight:
         now = datetime(2026, 7, 15, 3, 0, tzinfo=UTC)
         invoke, status_fetcher, poster = object(), object(), object()
         committer, recorder, retry_recorder = object(), object(), object()
+        selector, digest_builder, census_launcher = object(), object(), object()
 
         nightly.run_scheduled_night(
             config_path='legibility.yaml', project_id='proj_a', projects_root='projects',
             target_date=date(2026, 7, 14), now=now, invoke=invoke,
             status_fetcher=status_fetcher, poster=poster, committer=committer,
-            recorder=recorder, retry_recorder=retry_recorder, max_barren_runs=5,
+            recorder=recorder, retry_recorder=retry_recorder, selector=selector,
+            digest_builder=digest_builder, census_launcher=census_launcher,
+            max_barren_runs=5,
         )
 
         shared = dict(
             config_path='legibility.yaml', project_id='proj_a', projects_root='projects',
             now=now, invoke=invoke, status_fetcher=status_fetcher, poster=poster,
             committer=committer, recorder=recorder, retry_recorder=retry_recorder,
-            max_barren_runs=5,
+            selector=selector, digest_builder=digest_builder,
+            census_launcher=census_launcher, max_barren_runs=5,
         )
         assert calls == [
             {**shared, 'target_date': date(2026, 7, 14),
@@ -5738,6 +5716,34 @@ def test_report_sample_outcome_partial_truncation_stays_at_info(tmp_path, caplog
     assert escalated is False
     assert posted == []
     assert _nightly_warnings(caplog) == []
+
+
+def test_an_injected_selector_s_suppressed_sample_is_a_budget_suppressed_night(tmp_path):
+    selector_calls = []
+
+    def _selector(cfg, projects_root, target_date, *, rendered, skip_sessions):
+        selector_calls.append((rendered, skip_sessions))
+        return _sample(budget_skipped=4)
+
+    poster, posted = _capture_poster()
+
+    result = nightly.run_nightly(
+        config_path=_write_config(tmp_path, project_id='testproj'),
+        projects_root=tmp_path / 'projects',
+        target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+        invoke=lambda prompt, model: '{"proposals": []}',
+        status_fetcher=lambda: {'statuses': {}},
+        poster=poster,
+        selector=_selector,
+        pass_kind=nightly.PassKind.MANUAL,
+    )
+
+    assert result.budget_suppressed is True
+    assert 'suppress' in _one_escalation(posted)['summary']
+    [(rendered, skip_sessions)] = selector_calls
+    assert isinstance(rendered, dict)
+    assert skip_sessions == frozenset()
 
 
 # ---------------------------------------------------------------------------
