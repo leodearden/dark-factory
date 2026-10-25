@@ -4094,10 +4094,10 @@ class TestCaptureEnvFingerprintMissingBinary:
 class TestCaptureEnvFingerprintIncludeToolchain:
     """The three hardcoded Rust probes are skippable when nothing compares them.
 
-    On the remote side each probe is a SEPARATE ssh invocation (_SSH_BASE_OPTS
-    sets up no ControlMaster/ControlPersist), so issuing rustc/cargo/sccache
-    for a comparison scoped to extra_probes costs three extra TCP+auth
-    handshakes per host, serially, over a possibly-WAN link.
+    On the remote side each probe is a SEPARATE ssh round trip over the probe
+    master, so issuing rustc/cargo/sccache for a comparison scoped to
+    extra_probes costs three extra round trips per host, serially, over a
+    possibly-WAN link.
     """
 
     def _make_run(self):
@@ -4163,7 +4163,7 @@ class TestCheckEnvSkipsUnreadToolchainProbes:
 
         expected = [list(argv) for _, argv in _ENV_PROBE_SPECS]
         assert local_run.issued == expected
-        assert remote_fake.env_probe_run().issued == expected
+        assert remote_fake.probe_run.issued == expected
 
     async def test_a_toolchain_scope_still_probes_rustc(self):
         """Derived, not hardcoded off: asking for toolchain must MEASURE it.
@@ -5869,6 +5869,7 @@ def _make_env_drift_pool(*, local_output=None, remote_output=None, remote_raises
 
         def __init__(self):
             self.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+            self.probe_run = remote_run
 
         async def health(self) -> bool:
             # Present to satisfy the VerifyRunner Protocol (pyright over tests/
@@ -5877,8 +5878,8 @@ def _make_env_drift_pool(*, local_output=None, remote_output=None, remote_raises
             # health, and check_env only calls env_probe_run.
             return True
 
-        def env_probe_run(self):
-            return remote_run
+        async def env_probe_run(self):
+            return self.probe_run
 
     remote_fake = _FakeRemote()
 
@@ -6241,6 +6242,8 @@ class TestEnvProbeSshTimeout:
 
     def _hanging_runner(self):
         async def fake_run(argv, *, cwd=None):
+            if argv[-1] == 'true':
+                return (0, '', '')
             await asyncio.sleep(60)
             return (0, '', '')
 
@@ -6256,7 +6259,7 @@ class TestEnvProbeSshTimeout:
         """Transport failure, NOT a recorded rc: a wedged link is not a finding."""
         from orchestrator import verify_runner as vr
         monkeypatch.setattr(vr, '_SSH_PROBE_TIMEOUT_SECS', 0.05)
-        adapter = self._hanging_runner().env_probe_run()
+        adapter = await self._hanging_runner().env_probe_run()
         with pytest.raises(vr.RunnerUnavailable) as excinfo:
             await adapter(['uv', '--version'])
         assert 'laptop.local' in str(excinfo.value)
@@ -6376,7 +6379,7 @@ class TestDriftDetectorCheckEnvBadDimensions:
         with pytest.raises(ValueError):
             await detector.check_env(_ENV_PROBE_SPECS, local_run=local_run, dimensions=())
         assert local_run.issued == []
-        assert remote_fake.env_probe_run().issued == []
+        assert remote_fake.probe_run.issued == []
 
 
 # ---------------------------------------------------------------------------
@@ -6413,7 +6416,7 @@ class TestDriftDetectorCheckEnvInconclusive:
         detector = DriftDetector(pool, event_store=MagicMock(), escalation_queue=_FakeEscQueue())
         await detector.check_env([], local_run=local_run)
         assert local_run.issued == []
-        assert remote_fake.env_probe_run().issued == []
+        assert remote_fake.probe_run.issued == []
 
     async def test_no_eligible_remote_is_inconclusive(self):
         """Lever C off, or the remote already quarantined by the verdict path."""
@@ -6676,6 +6679,7 @@ class TestDriftDetectorCheckEnvUnreachableRemote:
         """
         from orchestrator.verify_runner import DriftVerdict
         ssh_run = _make_ssh_seam({
+            'true': (0, '', ''),
             'npx pyright --version': (127, '', 'npx: command not found'),
             'uv --version': (0, 'uv 0.11.6\n', ''),
             'rustc --version': (127, '', 'rustc: command not found'),

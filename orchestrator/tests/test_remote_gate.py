@@ -1086,7 +1086,7 @@ async def test_the_default_transport_hands_ssh_the_dispatchers_own_locale(
         code_checkout=str(tmp_path),
     )
 
-    rc, stdout, _ = await runner.env_probe_run()(['true'])
+    rc, stdout, _ = await (await runner.env_probe_run())(['true'])
 
     assert (rc, stdout) == (0, 'unset|en_GB.UTF-8')
 
