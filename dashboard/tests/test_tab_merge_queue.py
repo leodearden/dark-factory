@@ -1,8 +1,9 @@
 """MergeTab's wiring probes; its behaviour is tested where it can execute.
 
-tabs.jsx and app.jsx are ``type="text/babel"`` behind CDN Babel with no JSX
-render harness, so nothing here renders MergeTab. What the merge-queue tab
-DECIDES lives in plain-JS modules that node runs:
+tabs.jsx and app.jsx are ``type="text/babel"`` behind CDN Babel, so nothing
+here renders MergeTab; dashboard/tests/js/jsx_render.test.mjs mounts it under
+jsdom. What the merge-queue tab DECIDES lives in plain-JS modules that node
+runs:
 
   * "In queue now" — the tile's headline and spark, the per-project "queued"
     pip and the rail badge — reads the one served ``in_queue`` Datum through
@@ -17,6 +18,10 @@ DECIDES lives in plain-JS modules that node runs:
   * The Recent-merges caption ("showing N of M in <window>") is
     ``window_chip.js::recentMergesCaption``, covered by
     dashboard/tests/js/window_chip.test.mjs.
+  * The depth panel's bucket-width caption is
+    ``merge_queue.js::depthBucketCaption``, covered by
+    dashboard/tests/js/merge_queue.test.mjs and, in the mounted MergeTab, by
+    dashboard/tests/js/jsx_render.test.mjs.
 
 What is left for this file is the WIRING that source text can settle and
 behaviour cannot: that MergeTab and the rail stopped reading two wire keys the

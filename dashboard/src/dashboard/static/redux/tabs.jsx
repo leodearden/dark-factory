@@ -30,7 +30,7 @@ const { projectCensus, censusOver, projectRows, viewRows, terminalSelectingProje
 // Windowed headers are labelled from the payload's served-window echo — window_chip.js.
 const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const {
-  projectInQueue, inQueueOver, inQueueHistory, latencyCaption,
+  projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
 } = window.DF_MERGE_QUEUE;
 const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
@@ -936,7 +936,7 @@ function MergeTab({ projectFilter }) {
             <ProjectGroup id={pid} label={pid} open={openMap[pid]} onToggle={() => toggle(pid)} summary={summary}>
               <div className="grid cols-12" style={{ gap: 12 }}>
                 <div className="col-span-7 panel">
-                  <div className="panel-head"><span className="title">Merge attempts · 15-min buckets</span></div>
+                  <div className="panel-head"><span className="title">Merge attempts · {depthBucketCaption(d.depth)}</span></div>
                   <div className="panel-body"><LC labels={d.depth.labels.map(String)} series={[{ values: d.depth.values, color: CP.accent }]} height={180} formatY={formatCountTick} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} /></div>
                 </div>
 
