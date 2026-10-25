@@ -15,7 +15,7 @@ import json
 import logging
 import os
 from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -24,8 +24,8 @@ import yaml
 from escalation.disposition import ObservationConsumed
 from escalation.models import NOTE_TO_FILE_CLASS, Escalation
 from legibility import config as config_mod
+from legibility import nightly, state_docs, trickle_state
 from legibility import plan_deviation_census as mod
-from legibility import state_docs, trickle_state
 from shared.plan_deviation import DEVIATION_KINDS, DeviationRecord
 
 _LOGGER = 'legibility.plan_deviation_census'
@@ -869,3 +869,66 @@ def test_run_an_evaluation_failure_is_a_no_fire_line_not_a_raise(tmp_path, caplo
     assert line.startswith('plan-deviation census: NO-FIRE -- evaluation failed (')
     assert fake.calls == []
     assert [record.levelno for record in _census_records(caplog)] == [logging.WARNING]
+
+
+# ---------------------------------------------------------------------------
+# nightly hook — the census runs from the trickle's one recording point, so a
+# red night still carries its line; a retry pass does not run it
+# ---------------------------------------------------------------------------
+
+def _never_invoked(prompt, model):
+    raise AssertionError('the coder must not be reached on a red night')
+
+
+def _run_red_night(tmp_path: Path, *, pass_kind: nightly.PassKind) -> nightly.NightlyResult:
+    projects_root = tmp_path / 'projects'
+    projects_root.mkdir()
+    posted: list[tuple[str, dict]] = []
+    return nightly.run_nightly(
+        config_path=_write_config(tmp_path),
+        projects_root=projects_root,
+        target_date=date(2026, 10, 24),
+        now=NOW,
+        invoke=_never_invoked,
+        status_fetcher=lambda: {'statuses': {}},
+        poster=lambda url, envelope: posted.append((url, envelope)),
+        pass_kind=pass_kind,
+    )
+
+
+def _crashed_extractor(selected, **kwargs):
+    return [], [('session-1', 'boom')]
+
+
+def test_nightly_red_night_early_return_still_runs_the_census(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    monkeypatch.setattr(nightly, 'build_digests', _crashed_extractor)
+
+    result = _run_red_night(tmp_path, pass_kind=nightly.PassKind.MANUAL)
+
+    assert result.exit_code == 1
+    assert len(_census_records(caplog)) == 1
+
+
+def test_nightly_unexpected_raise_still_runs_the_census(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError('sampler exploded')
+
+    monkeypatch.setattr(nightly, 'select_digest_sessions', _raise)
+
+    result = _run_red_night(tmp_path, pass_kind=nightly.PassKind.MANUAL)
+
+    assert result.exit_code == 1
+    assert len(_census_records(caplog)) == 1
+
+
+def test_nightly_retry_pass_does_not_run_the_census(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    monkeypatch.setattr(nightly, 'build_digests', _crashed_extractor)
+
+    result = _run_red_night(tmp_path, pass_kind=nightly.PassKind.RETRY)
+
+    assert result.exit_code == 1
+    assert _census_records(caplog) == []
