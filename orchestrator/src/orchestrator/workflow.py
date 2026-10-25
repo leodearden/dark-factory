@@ -8558,8 +8558,9 @@ class TaskWorkflow:
 
                 self._emit_review_completed(review_cycle + 1, reviews)
                 # Cap exhausted or nothing in-scope — existing DONE path.
-                # Route suggestions directly to the curator intake (fire-and-
-                # forget); fall back to memory write when there are none.
+                # Route suggestions directly to the curator intake (awaited;
+                # the disposition reports delivery); fall back to memory
+                # write when there are none.
                 # _escalate_suggestions is retained as the steward fallback
                 # but is no longer called from this path.
                 if reviews.suggestions:
@@ -17868,7 +17869,8 @@ class TaskWorkflow:
         delivery rather than intent: CURATOR only when every suggestion holds a
         curator ticket, UNDELIVERED when any does not.  ``submit_task`` only
         inserts a ticket — the curator's ``_curator_worker`` decides later — and
-        each POST is bounded by ``shared.mcp_post.call_mcp_tool``'s 10s timeout.
+        the whole batch is bounded by
+        ``orchestrator.curator_submit.BATCH_DEADLINE_SECS``.
         The in-instance hash is recorded only after full delivery, so DEDUPED
         means "already delivered" and a re-entry retries a batch that did not
         land.

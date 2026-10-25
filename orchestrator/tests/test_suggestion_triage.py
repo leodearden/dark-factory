@@ -290,10 +290,6 @@ class TestRouteReviewSuggestionsToCurator:
 
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-            # Drain background tasks
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         assert len(posted_bodies) == len(suggestions)
 
@@ -311,9 +307,6 @@ class TestRouteReviewSuggestionsToCurator:
 
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         assert len(posted_bodies) == len(suggestions)
         task_id = wf.task_id
@@ -379,9 +372,7 @@ class TestRouteReviewSuggestionsToCurator:
 
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
             await wf._route_review_suggestions_to_curator(_fake_reviews([a, b]))
-            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
             await wf._route_review_suggestions_to_curator(_fake_reviews([b_copy, c]))
-            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
 
         def r4_key(body):
             meta = body['params']['arguments']['metadata']
@@ -405,9 +396,6 @@ class TestRouteReviewSuggestionsToCurator:
                 json=lambda: {'result': {'ticket': 'tkt-1'}},
             )
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         queue.submit.assert_not_called()
 
@@ -423,9 +411,6 @@ class TestRouteReviewSuggestionsToCurator:
                 json=lambda: {'result': {'ticket': 'tkt-1'}},
             )
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         for call in mock_post.call_args_list:
             body = call.kwargs.get('json') or (call.args[1] if len(call.args) > 1 else {})
@@ -462,15 +447,9 @@ class TestRouteReviewSuggestionsToCurator:
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
             # First call with suggestions A
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_a))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
             # Second call with DIFFERENT suggestions B
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_b))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         # Both batches must go through
         expected = len(suggestions_a) + len(suggestions_b)
@@ -569,15 +548,9 @@ class TestRouteReviewSuggestionsToCurator:
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
             # First call — should submit
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
             # Second call with identical suggestions — should be short-circuited
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         # Exactly N posts (one batch), not 2*N
         assert len(posted_bodies) == len(suggestions), (
@@ -668,22 +641,13 @@ class TestRouteReviewSuggestionsToCurator:
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
             # Call 1: A — submitted, cache = hash(A)
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_a))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
             # Call 2: B — submitted (different hash), cache = hash(B)
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_b))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
             # Call 3: A again — hash(A) != hash(B) so NOT short-circuited;
             # re-submitted, cache = hash(A) again.
             await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions_a))
-            tasks = list(wf._background_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
 
         expected = len(suggestions_a) + len(suggestions_b) + len(suggestions_a)
         assert len(posted_bodies) == expected, (
@@ -757,7 +721,6 @@ class TestRouteReviewSuggestionsDisposition:
             disposition = await wf._route_review_suggestions_to_curator(
                 _fake_reviews(self._suggestions())
             )
-            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
         assert disposition == SuggestionDisposition.CURATOR
 
     @pytest.mark.asyncio
@@ -770,7 +733,6 @@ class TestRouteReviewSuggestionsDisposition:
             second = await wf._route_review_suggestions_to_curator(
                 _fake_reviews(self._suggestions())
             )
-            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
         assert (first, second) == (SuggestionDisposition.CURATOR, SuggestionDisposition.DEDUPED)
 
     @pytest.mark.asyncio
@@ -877,7 +839,6 @@ class TestRouteReviewSuggestionsIntegration:
             )
 
         assert post_completed.is_set()
-        assert wf._background_tasks == set()
         assert disposition == SuggestionDisposition.CURATOR
 
 
@@ -1599,11 +1560,8 @@ class TestCuratorSubmitTransport:
             },
         ]
 
-    async def _route_and_drain(self, wf, suggestions):
+    async def _route(self, wf, suggestions):
         await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
-        tasks = list(wf._background_tasks)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_submit_task_call_lands_at_the_mcp_path(self):
@@ -1619,7 +1577,7 @@ class TestCuratorSubmitTransport:
         factory = RecordingClientFactory(server)
 
         with patch('httpx.AsyncClient', factory):
-            await self._route_and_drain(wf, self._suggestions())
+            await self._route(wf, self._suggestions())
 
         calls = server.tool_calls('submit_task')
         assert len(calls) == 1, (
@@ -1638,7 +1596,7 @@ class TestCuratorSubmitTransport:
         factory = RecordingClientFactory(RecordingMcpServer())
 
         with patch('httpx.AsyncClient', factory):
-            await self._route_and_drain(wf, self._suggestions())
+            await self._route(wf, self._suggestions())
 
         factory.assert_follows_redirects()
 
@@ -1653,7 +1611,7 @@ class TestCuratorSubmitTransport:
 
         wf = _make_workflow()
         with patch('httpx.AsyncClient.post', side_effect=capture_post):
-            await self._route_and_drain(wf, self._suggestions())
+            await self._route(wf, self._suggestions())
 
         assert urls, 'no POST was made at all'
         for url in urls:
@@ -1688,7 +1646,7 @@ class TestCuratorSubmitTransport:
             caplog.at_level(logging.WARNING),
             patch('httpx.AsyncClient.post', side_effect=redirect_post),
         ):
-            await self._route_and_drain(wf, self._suggestions())
+            await self._route(wf, self._suggestions())
 
         warnings = [
             r for r in caplog.records

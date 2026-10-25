@@ -10,7 +10,6 @@ stubbed.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import cast
@@ -156,7 +155,6 @@ async def test_esc_4223_1_shape_one_blocking_eight_suggestions(tmp_path: Path):
 
     with patch('httpx.AsyncClient', RecordingClientFactory(server)):
         outcome = await wf._execute_verify_review_loop()
-        await asyncio.gather(*wf._background_tasks, return_exceptions=True)
 
     assert outcome == WorkflowOutcome.ESCALATED
     [esc] = [e for e in queue.get_by_task(TASK_ID) if e.category == 'review_issues']
@@ -210,9 +208,7 @@ async def test_same_instance_identical_reentry_is_deduped(tmp_path: Path):
 
     with patch.object(wf, '_post_submit_tasks', AsyncMock(return_value=delivered)) as post:
         first = await wf._execute_verify_review_loop()
-        await asyncio.gather(*wf._background_tasks, return_exceptions=True)
         second = await wf._execute_verify_review_loop()
-        await asyncio.gather(*wf._background_tasks, return_exceptions=True)
 
     assert first == second == WorkflowOutcome.ESCALATED
     assert dispositions == [SuggestionDisposition.CURATOR, SuggestionDisposition.DEDUPED]
@@ -240,10 +236,8 @@ async def test_blocking_then_done_reentry_reuses_item_keys(tmp_path: Path):
 
     with patch('httpx.AsyncClient.post', side_effect=capture_post):
         first = await wf._execute_verify_review_loop()
-        await asyncio.gather(*wf._background_tasks, return_exceptions=True)
         run_1_count = len(posted_bodies)
         second = await wf._execute_verify_review_loop()
-        await asyncio.gather(*wf._background_tasks, return_exceptions=True)
 
     def r4_key(body: dict) -> tuple[str, str]:
         meta = body['params']['arguments']['metadata']
