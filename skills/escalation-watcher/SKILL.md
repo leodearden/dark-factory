@@ -2063,7 +2063,10 @@ is anything but accept, use the normal park procedure above.
 **Limits.** A second such escalation on the same task goes to the human as a pattern instead: a
 stream of deviations on one task suggests its planning is off. There is no daily cap: Leo discarded
 it on 2026-09-26 ("Discard the cap. You can ratify these without limit."). The human can revoke
-this rule at any time.
+this rule at any time. Whether deviations are rising or clustering across tasks is owned by the
+nightly plan-deviation census (`scripts/legibility/plan_deviation_census.py`), which escalates a
+rate rise or pattern itself as a `blocking` `design_concern` on task id
+`plan-deviation-census-<project_id>`. It is blocking, so this standing rule never closes it.
 
 **Worked examples (2026-09-17).**
 - **Accepted: esc-4876-8.** A planner measured that of three suggested graphiti levers only

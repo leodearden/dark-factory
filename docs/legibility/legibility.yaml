@@ -89,3 +89,21 @@ timeouts:
   census_mining_secs: 120
   census_verify_secs: 900
   census_synthesis_secs: 1800
+# The nightly plan-deviation census (plans/plan-deviation-recording-prd.md
+# D8-D11): counts per-step plan deviations under meta_roots (relative to
+# project_root) plus archived note-to-file / observation-consumed escalations,
+# and on a rate rise or a dominant pattern files ONE blocking design_concern on
+# task id plan-deviation-census-<project_id>. Validated per field, never
+# failing config load, by
+# scripts/legibility/plan_deviation_census.py::settings_from_mapping. Pinned
+# here, like timeouts:, so a schema-default change cannot silently move it.
+plan_deviation_census:
+  enabled: true
+  rate_rise_factor: 2.0
+  min_records: 10
+  pattern_share: 0.5
+  prose_only_min: 3
+  cooldown_days: 7
+  horizon_days: 28
+  meta_roots:
+    - .worktrees/.task-meta
