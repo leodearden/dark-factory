@@ -1040,11 +1040,11 @@ async def _resolve_main_reachable_evidence(
         probe['citation'] = citation
         probe['evidence_source'] = 'citation'
         return citation
-    return await _patch_id_equivalent_on_main(git_ops, head, probe)
+    return await _patch_id_equivalent_on_main(git_ops, head, probe, patch_id_only=False)
 
 
 async def _patch_id_equivalent_on_main(
-    git_ops: GitOps, head: str, probe: dict[str, Any],
+    git_ops: GitOps, head: str, probe: dict[str, Any], *, patch_id_only: bool,
 ) -> str | None:
     """The commit on main whose diff is patch-id equivalent to *head*'s, or None.
 
@@ -1055,8 +1055,9 @@ async def _patch_id_equivalent_on_main(
     produces.  It carries its own refuse-to-guess posture (an ambiguous
     patch-id, or an ambiguous subject in its tier-2 fallback, yields ``None``
     rather than an arbitrary pick), which is inherited here deliberately.
-    Shared by :func:`_resolve_main_reachable_evidence` and
-    :func:`_content_equivalence_anchor`, so both resolve one anchor one way.
+    *patch_id_only* drops that subject tier, whose hit need not carry
+    *head*'s diff: :func:`_content_equivalence_anchor` sets it, and
+    :func:`_resolve_main_reachable_evidence` keeps both tiers.
     """
     base = await git_ops.merge_base_with_main(head)
     probe['merge_base'] = base
@@ -1067,7 +1068,9 @@ async def _patch_id_equivalent_on_main(
         probe['evidence_source'] = 'merge_base_unresolved'
         return None
 
-    equivalent = await git_ops.find_equivalent_commit(git_ops.project_root, base, head)
+    equivalent = await git_ops.find_equivalent_commit(
+        git_ops.project_root, base, head, patch_id_only=patch_id_only,
+    )
     probe['evidence_source'] = (
         'patch_id_equivalent' if equivalent else 'no_equivalent_on_main'
     )
@@ -1198,13 +1201,11 @@ def _new_probe(
 ) -> dict[str, Any]:
     """Seed the structured-facts probe every producer mode carries.
 
-    ``method`` is seeded UP FRONT rather than stamped on the accept: WHICH
-    policy answered is a property of the CALL, not of the outcome, and a
+    ``method`` is seeded UP FRONT, and :func:`_stamped_verdict` restamps the
+    method each verdict is built with, on a reject as on an accept: a
     consumer reading a REJECTED verdict is precisely the one that needs to
     know whether the answer came from the non-decaying patch-id contract or
-    from the legacy effect-present policy.  The one exception is DISCOVERY's
-    citation-miss fallback, which restamps it on its accept because a
-    different policy attributed than the call seeded.
+    from the legacy effect-present policy.
 
     *extra* carries each producer's own seeds — ``upstream_ref`` for
     :func:`branch_work_landed`, ``effect_check_sha`` and
@@ -1248,6 +1249,7 @@ def _stamped_verdict(
     already returned.
     """
     probe['reason'] = reason
+    probe['method'] = method
     verdict = LandingVerdict(
         accepted=accepted,
         evidence_sha=evidence_sha,
@@ -1690,7 +1692,9 @@ async def _content_equivalence_anchor(
         if not await git_ops.branch_content_in_main(branch_tip_sha):
             probe['content_fallback'] = 'not_content_equivalent'
             return None
-        anchor = await _patch_id_equivalent_on_main(git_ops, branch_tip_sha, probe)
+        anchor = await _patch_id_equivalent_on_main(
+            git_ops, branch_tip_sha, probe, patch_id_only=True,
+        )
     except Exception as exc:
         probe['content_fallback'] = 'error'
         probe['content_fallback_error'] = repr(exc)
@@ -1720,7 +1724,6 @@ async def _citation_miss_verdict(
         return _reject_verdict(
             LandingReason.no_citation, probe=probe, method=LandingMethod.citation,
         )
-    probe['method'] = LandingMethod.content_equivalence
     logger.info(
         'task %s: no citation on main, but tip %s is content-equivalent there; '
         'anchored on its patch-id twin %s',

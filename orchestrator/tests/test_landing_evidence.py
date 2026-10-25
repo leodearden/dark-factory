@@ -2925,7 +2925,9 @@ class TestContentEquivalenceFallbackContract:
         assert verdict.probe['method'] == LandingMethod.content_equivalence
         # Content and anchor are judged on ONE tip (the task-3103 TOCTOU hazard).
         git_ops.branch_content_in_main.assert_awaited_once_with(_TIP)
-        git_ops.find_equivalent_commit.assert_awaited_once_with('/repo', _FORK, _TIP)
+        git_ops.find_equivalent_commit.assert_awaited_once_with(
+            '/repo', _FORK, _TIP, patch_id_only=True,
+        )
 
     async def test_content_equivalent_branch_without_twin_still_rejects_no_citation(
         self,
@@ -2952,6 +2954,18 @@ class TestContentEquivalenceFallbackContract:
         assert verdict.reason == 'no_citation'
         assert verdict.evidence_sha is None
         assert verdict.probe['content_fallback'] == 'unanchored'
+
+    async def test_unresolved_fork_point_declines_unanchored(self) -> None:
+        git_ops = _uncited_git_ops(content_in_main=True)
+        git_ops.merge_base_with_main = AsyncMock(return_value=None)
+
+        verdict = await _discover(git_ops)
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.evidence_sha is None
+        assert verdict.probe['content_fallback'] == 'unanchored'
+        assert verdict.probe['evidence_source'] == 'merge_base_unresolved'
+        git_ops.find_equivalent_commit.assert_not_awaited()
 
     async def test_content_not_equivalent_rejects_no_citation(self) -> None:
         git_ops = _uncited_git_ops()
@@ -3079,6 +3093,9 @@ def real_git_ops(real_git_repo: Path) -> GitOps:
     return GitOps(config, real_git_repo)
 
 
+_UNCITED_TIP_SUBJECT = 'test(dashboard/tests): RED — pin the client seam'
+
+
 def _build_uncited_branch(repo: _Repo) -> str:
     """``task/4881`` off main: two commits, no task id in either SUBJECT."""
     repo.git('checkout', '-b', 'task/4881', 'main')
@@ -3087,7 +3104,7 @@ def _build_uncited_branch(repo: _Repo) -> str:
         {'pkg/a.py': _numbered('client', 30)},
     )
     tip = repo.commit(
-        'test(dashboard/tests): RED — pin the client seam',
+        _UNCITED_TIP_SUBJECT,
         {'pkg/b.py': _numbered('seam', 30)},
         body='Task 4881 final step.',
     )
@@ -3154,14 +3171,43 @@ class TestContentEquivalenceFallbackRealGit:
         assert verdict.evidence_sha is None
         assert verdict.probe['content_fallback'] == 'not_content_equivalent'
 
-    async def test_squash_landing_refuses_to_guess_an_anchor(
+    async def test_ancestor_of_main_tip_declines_before_any_anchor_search(
         self, real_git_ops: GitOps, real_git_repo: Path,
     ) -> None:
-        """Byte-identical content but no patch-id twin: never anchor on main HEAD or the tip."""
+        """The is_ancestor-gated DISCOVERY callers rely on this decline."""
+        repo = _Repo(real_git_repo)
+        tip = _build_uncited_branch(repo)
+        repo.git('merge', '--ff-only', 'task/4881')
+        repo.commit('chore: unrelated main work', {'CHANGELOG.md': _numbered('log', 5)})
+        assert repo.is_ancestor(tip, 'main')
+
+        verdict = await validate_landing_evidence(
+            real_git_ops, '4881', 'task/4881', branch_tip_sha=tip,
+        )
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.evidence_sha is None
+        assert verdict.probe['content_fallback'] == 'not_content_equivalent'
+
+    @pytest.mark.parametrize(
+        'squash_subject',
+        [
+            pytest.param('chore: squash import', id='distinct-subject'),
+            pytest.param(_UNCITED_TIP_SUBJECT, id='tip-subject-on-a-different-diff'),
+        ],
+    )
+    async def test_squash_landing_refuses_to_guess_an_anchor(
+        self, real_git_ops: GitOps, real_git_repo: Path, squash_subject: str,
+    ) -> None:
+        """Byte-identical content but no patch-id twin: never anchor on main HEAD or the tip.
+
+        A unique main commit sharing the tip's subject is no twin either: its
+        diff is not the tip's, so it cannot carry the task's provenance.
+        """
         repo = _Repo(real_git_repo)
         tip = _build_uncited_branch(repo)
         repo.git('merge', '--squash', 'task/4881')
-        repo.git('commit', '-m', 'chore: squash import')
+        repo.git('commit', '-m', squash_subject)
         repo.commit('chore: unrelated main work', {'CHANGELOG.md': _numbered('log', 5)})
 
         verdict = await validate_landing_evidence(

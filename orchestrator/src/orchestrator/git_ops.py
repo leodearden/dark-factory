@@ -11892,6 +11892,7 @@ class GitOps:
 
     async def find_equivalent_commit(
         self, worktree: Path, base_sha: str, target_sha: str,
+        *, patch_id_only: bool = False,
     ) -> str | None:
         """Recover the sha a rebase replayed *target_sha* onto, via ``git patch-id``.
 
@@ -11904,6 +11905,8 @@ class GitOps:
 
         The search over ``base_sha..HEAD`` is :meth:`_find_replay`'s two
         tiers (patch-id, then unique exact subject), unnarrowed.
+        *patch_id_only* drops the subject tier's hit, for a caller whose
+        anchor must carry *target_sha*'s diff (task 4862).
 
         Fully fail-safe: any git error, an unresolvable/GC'd *target_sha*, or
         empty patch-id output yields ``None``, letting the caller fall through
@@ -11915,7 +11918,9 @@ class GitOps:
         """
         try:
             match = await self._find_replay(worktree, target_sha, f'{base_sha}..HEAD')
-            return match[0] if match is not None else None
+            if match is None or (patch_id_only and match[1] != 'patch-id'):
+                return None
+            return match[0]
         except Exception:
             # Fully fail-safe: any git error / unresolvable target yields None so
             # the caller falls through to its existing escalation path. Log at
