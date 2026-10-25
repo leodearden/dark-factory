@@ -202,11 +202,15 @@ class OverreachShadowStore:
         directory = Path(data_dir)
         await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
         conn = await connect_daemon(str(directory / SIDECAR_FILENAME))
-        await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
-        access = AtomicConnection(conn)
-        async with access.write() as db:
-            for statement in _DDL:
-                await db.execute(statement)
+        try:
+            await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+            access = AtomicConnection(conn)
+            async with access.write() as db:
+                for statement in _DDL:
+                    await db.execute(statement)
+        except BaseException:
+            await conn.close()
+            raise
         return cls(access, clock=clock)
 
     @classmethod
@@ -215,7 +219,7 @@ class OverreachShadowStore:
         path = Path(db_path)
         if not await asyncio.to_thread(path.is_file):
             raise FileNotFoundError(f'no overreach shadow sidecar at {path}')
-        conn = await connect_daemon(f'file:{path}?mode=ro', uri=True)
+        conn = await connect_daemon(f'{path.resolve().as_uri()}?mode=ro', uri=True)
         return cls(AtomicConnection(conn))
 
     def _require_access(self) -> AtomicConnection:
