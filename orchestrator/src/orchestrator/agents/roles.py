@@ -345,6 +345,12 @@ _PLAN_STATUS_TOOLS = [
     'mcp__plan-tools__mark_step_done',
 ]
 
+# Separate from _PLAN_STATUS_TOOLS because SIMPLE_TASK holds that list too and
+# has no frozen plan and no doctrine (plans/plan-deviation-recording-prd.md D14).
+_PLAN_DEVIATION_TOOLS = [
+    'mcp__plan-tools__record_step_deviation',
+]
+
 # The writer-facing metadata vocabulary spliced onto the tail of
 # _MEMORY_INSTRUCTIONS (task 3202, PRD docs/prds/memory-metadata-vocabulary.md
 # leaf iota).  Before it, the word `metadata` did not appear anywhere in the
@@ -1796,7 +1802,7 @@ The workflow for each step is:
 - If you encounter an unexpected issue that the plan doesn't account for, note it and stop. Do NOT modify the plan.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=10.0,
@@ -1851,7 +1857,7 @@ still ends up staged.
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
