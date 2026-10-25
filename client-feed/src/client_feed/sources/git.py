@@ -7,6 +7,7 @@ import itertools
 import os
 import re
 import subprocess
+import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -199,7 +200,46 @@ def _pipes(process: subprocess.Popen[bytes]) -> tuple[IO[bytes], IO[bytes]]:
     return process.stdin, process.stdout
 
 
-def _read_blob(process: subprocess.Popen[bytes], sha: str) -> bytes:
+@dataclass(frozen=True)
+class _CatFile:
+    """One `git cat-file --batch` session, and how long git has to answer each read and to exit at the end."""
+
+    process: subprocess.Popen[bytes]
+    timeout_secs: float
+
+
+def _timed_out(session: _CatFile) -> GitError:
+    return GitError(
+        subcommand='cat-file', returncode=None, stderr=f'timed out after {session.timeout_secs}s'
+    )
+
+
+@contextlib.contextmanager
+def _deadline(session: _CatFile) -> Iterator[None]:
+    """The block, its session killed once it outlasts the timeout; a killed session's block is a timeout, whatever the pipe gave."""
+    expired = threading.Event()
+
+    def expire() -> None:
+        expired.set()
+        session.process.kill()
+
+    timer = threading.Timer(session.timeout_secs, expire)
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        timer.join()
+        if expired.is_set():
+            raise _timed_out(session)
+
+
+def _read_blob(session: _CatFile, sha: str) -> bytes:
+    with _deadline(session):
+        return _exchange(session.process, sha)
+
+
+def _exchange(process: subprocess.Popen[bytes], sha: str) -> bytes:
     request, reply = _pipes(process)
     try:
         request.write(_require_sha(sha).encode() + b'\n')
@@ -217,12 +257,13 @@ def _read_blob(process: subprocess.Popen[bytes], sha: str) -> bytes:
     return content
 
 
-def _finish(process: subprocess.Popen[bytes]) -> None:
+def _finish(session: _CatFile) -> None:
+    process = session.process
     try:
-        _, stderr = process.communicate(timeout=GIT_TIMEOUT_SECS)
+        _, stderr = process.communicate(timeout=session.timeout_secs)
     except subprocess.TimeoutExpired as exc:
         _abandon(process)
-        raise _cat_file_error(f'timed out after {GIT_TIMEOUT_SECS}s', process) from exc
+        raise _timed_out(session) from exc
     if process.returncode != 0:
         raise GitError(
             subcommand='cat-file',
@@ -237,8 +278,13 @@ def _abandon(process: subprocess.Popen[bytes]) -> None:
 
 
 @contextlib.contextmanager
-def blob_reader(root: Path) -> Iterator[Callable[[str], bytes]]:
-    """`read(blob_sha) -> bytes` over one `git cat-file --batch` session: the only way client_feed reads file content."""
+def blob_reader(
+    root: Path, *, timeout_secs: float = GIT_TIMEOUT_SECS
+) -> Iterator[Callable[[str], bytes]]:
+    """`read(blob_sha) -> bytes` over one `git cat-file --batch` session: the only way client_feed reads file content.
+
+    git has `timeout_secs` to answer each read, so the caller's work between reads never counts against it.
+    """
     try:
         process = subprocess.Popen(
             ['git', 'cat-file', '--batch'],
@@ -250,12 +296,13 @@ def blob_reader(root: Path) -> Iterator[Callable[[str], bytes]]:
         )
     except OSError as exc:
         raise GitError(subcommand='cat-file', returncode=None, stderr=str(exc)) from exc
+    session = _CatFile(process=process, timeout_secs=timeout_secs)
     try:
-        yield lambda sha: _read_blob(process, sha)
+        yield lambda sha: _read_blob(session, sha)
     except BaseException:
         _abandon(process)
         raise
-    _finish(process)
+    _finish(session)
 
 
 def _task_id(branch: str) -> int | None:
