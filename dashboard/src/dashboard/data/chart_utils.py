@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import TypedDict, TypeVar
 
 
 class ChartData(TypedDict):
@@ -10,6 +10,9 @@ class ChartData(TypedDict):
 
     labels: list[str]
     values: list[int | float]
+
+
+_Chart = TypeVar('_Chart', bound=ChartData)
 
 
 def group_top_n(data: ChartData, n: int = 5) -> ChartData:
@@ -58,23 +61,24 @@ def group_top_n(data: ChartData, n: int = 5) -> ChartData:
     }
 
 
-def trim_leading_zero_buckets(data: ChartData) -> ChartData:
-    """Drop leading (label, 0) pairs from ChartData, preserving interior zeros.
+def trim_leading_zero_buckets(data: _Chart) -> _Chart:
+    """Drop leading (label, 0) pairs from a chart's series, keeping its other keys.
 
     Scans the values list from the left and removes consecutive zero-value
     entries until the first non-zero entry is found.  Interior zeros (between
     two non-zero values) and trailing zeros are intentionally kept so that
-    activity gaps remain visible in time-series charts.
+    activity gaps remain visible in time-series charts.  Every key of the
+    chart other than 'labels' and 'values' is kept as it is.
 
-    The input is never mutated; a new ChartData dict is always returned.
+    The input is never mutated; a new chart dict is always returned.
 
     Args:
-        data: ChartData with 'labels' and 'values' lists.
+        data: A ChartData, or a subtype of it, with 'labels' and 'values' lists.
 
     Returns:
-        ChartData with leading zero-value (label, value) pairs stripped.
-        Returns ``{'labels': [], 'values': []}`` when all values are zero or
-        the input is empty.
+        The same chart type with leading zero-value (label, value) pairs
+        stripped.  Its 'labels' and 'values' are empty when all values are
+        zero or the input is empty.
 
     Raises:
         ValueError: If labels and values have different lengths.
@@ -88,16 +92,11 @@ def trim_leading_zero_buckets(data: ChartData) -> ChartData:
             f"(got {len(labels)} labels and {len(values)} values)"
         )
 
-    # Find the first non-zero index.
-    first_nonzero = next((i for i, v in enumerate(values) if v != 0), None)
-    if first_nonzero is None:
-        # All zeros (or empty).
-        return {'labels': [], 'values': []}
-
-    return {
-        'labels': list(labels[first_nonzero:]),
-        'values': list(values[first_nonzero:]),
-    }
+    first_nonzero = next((i for i, v in enumerate(values) if v != 0), len(values))
+    trimmed = data.copy()
+    trimmed['labels'] = list(labels[first_nonzero:])
+    trimmed['values'] = list(values[first_nonzero:])
+    return trimmed
 
 
 def separate_label(
