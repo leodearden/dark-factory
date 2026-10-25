@@ -1489,7 +1489,7 @@ def _spawn_main_health_probe(
     None-safe: no-ops when *handles* is ``None`` (mirrors
     :func:`_spawn_merge_verify_dry_run`'s ``handles is None`` guard) — every
     call site invokes this unconditionally and relies on this internal check,
-    so the solo-reverify, train, and merge_gates module-level
+    so the solo-reverify and train (its gate re-verify included)
     ``_run_post_merge_verify`` callers (which pass no handles) are guaranteed
     no-ops.
 
@@ -3523,8 +3523,9 @@ async def _run_post_merge_verify(
         # pre-existing break is escalated separately, off the critical path,
         # by _run_deferred_main_health_probe once it completes.
         #
-        # SYNCHRONOUS mode (handles is None — solo-reverify, train, merge_gates,
-        # and any other caller that does not pass a probe-handles bundle):
+        # SYNCHRONOUS mode (handles is None — solo-reverify, train (its gate
+        # re-verify included), and any other caller that does not pass a
+        # probe-handles bundle):
         # unchanged behaviour from before this task.
         if main_health_probe_handles is None:
             main_health_outcome = await _classify_main_health_red(
@@ -21145,7 +21146,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Lease release and speculation-slot release happen in the single finally:
           · _cancel_release=True  → cancel_and_release  (DROPPED/REQUEUED,
-                                    unless vacated: lease is None)
+                                    unless vacated: lease is None; and a gate
+                                    re-verify interrupted mid-run, as an
+                                    aborted train's lease is)
           · _cancel_release=False → release              (FAIL/PASS)
           · _skip_release=True    → no allocator call    (PASSTHROUGH: lease is None)
         _n_failed is carried in _n_failed_val (None → defer to 'not advanced').
@@ -21848,6 +21851,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         req.request_id, ItemLifecycleState.FINALIZING,
                         ItemLifecycleState.GATE_REVERIFY, live_obj=entry,
                     )
+                    _cancel_release = True
                     gate = await _reverify_rebased_tree(
                         self._git_ops, req, merge_wt,
                         verified_merge_sha=current_sha,
@@ -21864,6 +21868,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         ),
                         event_store=self._event_store,
                     )
+                    _cancel_release = False
                     if isinstance(gate, MergeOutcome):
                         # task 2604: route through the unified terminal
                         # chokepoint so _retire_item fires (mirrors the three
