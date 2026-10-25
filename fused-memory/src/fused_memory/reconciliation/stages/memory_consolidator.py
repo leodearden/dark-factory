@@ -309,6 +309,9 @@ class MemoryConsolidator(BaseStage):
             self._entity_summary_snapshot_lines_stripped
         )
         report.stats['stage1_fetch_degraded'] = self._fetch_degraded_sources or []
+        report.stats['stage1_assembled_budget'] = (
+            self.assembled_payload.budget_report() if self.assembled_payload is not None else None
+        )
 
         # Always present (task 4574, mirrors stage1_fetch_degraded above): set BEFORE
         # the remediation early-return so the key is unconditionally present, including

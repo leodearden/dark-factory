@@ -98,6 +98,16 @@ class AssembledPayload:
     events_remaining: int = 0  # > 0 exactly when token_budget stopped the assembly
     token_budget: int = 0
 
+    def budget_report(self) -> dict[str, int]:
+        """How much of token_budget this chunk spent, and on how many events and context items."""
+        return {
+            'estimated_tokens': self.total_tokens,
+            'token_budget': self.token_budget,
+            'events': len(self.events),
+            'context_items': len(self.context_items),
+            'events_deferred': self.events_remaining,
+        }
+
 
 class StageReport(BaseModel):
     """Output of each pipeline stage."""
