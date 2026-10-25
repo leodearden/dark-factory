@@ -1138,6 +1138,7 @@ _FORMERLY_MIXED_MODULES = (
     'test_workflow_factory.py',
     'test_eval_boundary_suite.py',
     'test_mcp_post_transport.py',
+    'test_review_checkpoint_working_tree.py',
 )
 
 
