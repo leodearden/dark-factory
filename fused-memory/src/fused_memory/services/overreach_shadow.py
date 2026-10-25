@@ -23,6 +23,7 @@ from typing import Any, Protocol
 
 from shared.async_sqlite_base import (
     AtomicConnection,
+    CheckpointResult,
     apply_full_durability_pragmas,
     connect_daemon,
 )
@@ -227,6 +228,9 @@ class OverreachShadowStore:
             access, self._access = self._access, None
             await access.close()
 
+    async def checkpoint(self) -> CheckpointResult:
+        return await AtomicConnection.checkpoint_or_unavailable(self._access)
+
     async def record(
         self, *, episode: JudgedEpisode, judgements: Sequence[tuple[JudgeEdge, EdgeJudgement]],
     ) -> None:
@@ -404,6 +408,10 @@ class OverreachShadow:
     async def acknowledge(self, page: OverreachFlagPage) -> None:
         """No later page offers what *page* handed over."""
         await self._store.record_handoffs(page.graph, page.handed_over())
+
+    async def checkpoint(self) -> CheckpointResult:
+        """The periodic WAL checkpoint of the sidecar this shadow owns."""
+        return await self._store.checkpoint()
 
     async def close(self) -> None:
         """Cancel in-flight judgements, then close the store; a second call is a no-op.
