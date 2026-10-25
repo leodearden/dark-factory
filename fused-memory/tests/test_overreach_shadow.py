@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -316,6 +317,40 @@ class TestStoreLifecycle:
         runner = _runner(store)
         await runner.close()
         assert await runner.checkpoint() == CheckpointResult.unavailable()
+
+    @pytest.mark.skipif(not Path('/proc/self/fd').is_dir(), reason='needs /proc fd links')
+    @pytest.mark.asyncio
+    async def test_a_failed_open_releases_the_sidecar_file(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / 'corrupt'
+        data_dir.mkdir()
+        sidecar = data_dir / SIDECAR_FILENAME
+        sidecar.write_bytes(b'not a database ' * 64)
+        with pytest.raises(sqlite3.DatabaseError) as excinfo:
+            await OverreachShadowStore.open(data_dir)
+        assert 'not a database' in str(excinfo.value)
+        assert str(sidecar.resolve()) not in _open_fd_targets()
+
+    @pytest.mark.asyncio
+    async def test_the_read_only_view_opens_a_path_that_needs_uri_escaping(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / 'odd #1 %41 ?dir'
+        writer = await OverreachShadowStore.open(data_dir)
+        await writer.record(episode=_episode(), judgements=[_judged('e1', 'overreach')])
+        await writer.close()
+        reader = await OverreachShadowStore.open_read_only(data_dir / SIDECAR_FILENAME)
+        try:
+            assert set(await reader.judgements_for([('g', 'e1')])) == {('g', 'e1')}
+        finally:
+            await reader.close()
+
+
+def _open_fd_targets() -> set[str]:
+    targets: set[str] = set()
+    for fd in os.listdir('/proc/self/fd'):
+        try:
+            targets.add(os.readlink(f'/proc/self/fd/{fd}'))
+        except OSError:
+            continue
+    return targets
 
 
 def _wal_bytes(data_dir: Path) -> int:
