@@ -19,32 +19,46 @@ from pathlib import Path
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _tree_scan import (
+    ORCHESTRATOR_SRC,
+    ORCHESTRATOR_SRC_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+)
 
-import orchestrator
-
-# Ceiling rationale: _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+# The family mark and shared group: _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 # ``TaskWorkflow(`` not preceded by a word char or dot — a construction call,
 # not ``build_workflow`` / ``class TaskWorkflow:`` / an attribute access.
 _CONSTRUCT_RE = re.compile(r"(?<![\w.])TaskWorkflow\(")
 
 
-def _orchestrator_src_root() -> Path:
-    return Path(orchestrator.__file__).resolve().parent
+def _constructs_taskworkflow(module: ParsedModule) -> bool:
+    return any(
+        _CONSTRUCT_RE.search(line.split('#', 1)[0])  # drop trailing comment
+        for line in module.source.splitlines()
+    )
 
 
-def test_single_taskworkflow_construction_point():
+ANALYSIS = TreeAnalysis(
+    name=Path(__file__).stem, files=ORCHESTRATOR_SRC, extract=_constructs_taskworkflow,
+)
+TREE_ANALYSES = (ANALYSIS,)
+
+
+def test_single_taskworkflow_construction_point(tree_pass: TreePass):
     """Only ``workflow.py`` may construct ``TaskWorkflow(`` in production source."""
-    src_root = _orchestrator_src_root()
-    offenders: set[str] = set()
-    for path in src_root.rglob('*.py'):
-        text = path.read_text(encoding='utf-8', errors='ignore')
-        for line in text.splitlines():
-            code = line.split('#', 1)[0]  # drop trailing comment
-            if _CONSTRUCT_RE.search(code):
-                offenders.add(path.relative_to(src_root).as_posix())
-                break
+    offenders = {
+        path.relative_to(ORCHESTRATOR_SRC_DIR).as_posix()
+        for path, constructs in tree_pass.facts(ANALYSIS).items()
+        if constructs
+    }
     assert offenders == {'workflow.py'}, (
         'Direct TaskWorkflow(...) construction is only permitted in workflow.py '
         '(the build_workflow() factory body, the single construction point). '

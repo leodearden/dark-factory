@@ -14,15 +14,27 @@ function is exactly what the invariant is about.
 from __future__ import annotations
 
 import ast
+import dataclasses
+import functools
 from pathlib import Path
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _tree_scan import (
+    ORCHESTRATOR_SRC,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    python_files,
+)
 
-# Ceiling rationale: _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+# The family mark and shared group: _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
-_SRC_DIR = Path(__file__).parent.parent / 'src'
 _CHOKEPOINT = '_emit_lock_event'
 _GUARDED_EVENTS = ('lock_acquired', 'lock_released')
 
@@ -36,9 +48,8 @@ def _enclosing_function_ranges(tree: ast.Module) -> list[tuple[str, int, int]]:
     return ranges
 
 
-def _emit_sites(path: Path, event_name: str) -> list[tuple[str, int, str]]:
-    """``(file, line, enclosing function)`` for each ``…emit(EventType.<event>…)``."""
-    tree = ast.parse(path.read_text())
+def _emit_sites_in(tree: ast.Module) -> tuple[tuple[str, int, str], ...]:
+    """``(event, line, enclosing function)`` for each ``…emit(EventType.<event>…)`` in *tree*."""
     ranges = _enclosing_function_ranges(tree)
     sites: list[tuple[str, int, str]] = []
     for node in ast.walk(tree):
@@ -51,19 +62,26 @@ def _emit_sites(path: Path, event_name: str) -> list[tuple[str, int, str]]:
         for arg in args:
             if (
                 isinstance(arg, ast.Attribute)
-                and arg.attr == event_name
                 and isinstance(arg.value, ast.Name)
                 and arg.value.id == 'EventType'
             ):
                 enclosing = [
                     name for name, lo, hi in ranges if lo <= node.lineno <= hi
                 ]
-                sites.append((path.name, node.lineno, enclosing[-1] if enclosing else '<module>'))
-    return sites
+                sites.append((arg.attr, node.lineno, enclosing[-1] if enclosing else '<module>'))
+    return tuple(sites)
+
+
+def _emit_sites(module: ParsedModule) -> tuple[tuple[str, int, str], ...]:
+    return _emit_sites_in(module.tree)
+
+
+ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=ORCHESTRATOR_SRC, extract=_emit_sites)
+TREE_ANALYSES = (ANALYSIS,)
 
 
 @pytest.mark.parametrize('event_name', _GUARDED_EVENTS)
-def test_lock_events_are_emitted_from_exactly_one_site(event_name: str):
+def test_lock_events_are_emitted_from_exactly_one_site(event_name: str, tree_pass: TreePass):
     """One emit site per lock event, and it is ``_emit_lock_event``.
 
     A second site would emit an event the predictor never sees — and the gap
@@ -73,9 +91,10 @@ def test_lock_events_are_emitted_from_exactly_one_site(event_name: str):
     tree legitimately constructs these events in fixtures.
     """
     sites = [
-        site
-        for path in sorted(_SRC_DIR.rglob('*.py'))
-        for site in _emit_sites(path, event_name)
+        (path.name, line, enclosing)
+        for path, emits in tree_pass.facts(ANALYSIS).items()
+        for event, line, enclosing in emits
+        if event == event_name
     ]
 
     assert len(sites) == 1, f'expected exactly one EventType.{event_name} emit site, got {sites}'
@@ -91,13 +110,13 @@ def test_the_guard_can_actually_find_emit_sites(tmp_path):
     The probe goes in ``tmp_path``, never in the tests tree: this suite runs
     under pytest-xdist, so a fixed path shared by every worker is a race, and a
     hard interrupt mid-test would strand an untracked .py file in
-    ``orchestrator/tests/`` — where the guard's own ``rglob`` would then find it.
+    ``orchestrator/tests/`` — where the tests-tree guards would then find it.
     """
     source = 'from x import EventType\ndef f(self):\n    self.event_store.emit(\n' \
              '        EventType.lock_acquired, task_id="T1", data={})\n'
-    probe = tmp_path / '_guard_meta_probe.py'
-    probe.write_text(source)
+    (tmp_path / '_guard_meta_probe.py').write_text(source)
+    probe = dataclasses.replace(ANALYSIS, files=functools.partial(python_files, tmp_path))
 
-    found = _emit_sites(probe, 'lock_acquired')
+    found = TreePass.run((probe,)).facts(probe)
 
-    assert [(line, fn) for _f, line, fn in found] == [(3, 'f')]
+    assert list(found.values()) == [(('lock_acquired', 3, 'f'),)]
