@@ -18,6 +18,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
 from _orch_helpers import (
     PROBE_HOSTILE_ENV_KEYS,
     assert_isolated_git_repo,
@@ -149,6 +150,34 @@ def _run_script(repo: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+_MAIN_ONLY_TIER_REACHED = 'uv stub: the main-only tier was reached'
+
+
+def _run_hook(repo: Path, branch: str) -> subprocess.CompletedProcess[str]:
+    """Run the copied hook with *branch* passed as $2, never left to its default.
+
+    ``uv`` resolves to a stub that fails loudly, so a run that reaches the
+    main-only tier's ruff can never pass for a refusal, and never runs a real
+    ``uv`` against the throwaway repo.
+    """
+    stub_bin = repo.parent / 'stub_bin'
+    stub_bin.mkdir(exist_ok=True)
+    stub_uv = stub_bin / 'uv'
+    stub_uv.write_text(f'#!/bin/sh\necho "{_MAIN_ONLY_TIER_REACHED}"\nexit 97\n')
+    stub_uv.chmod(0o755)
+    env = _bare_env(repo)
+    env['PATH'] = f'{stub_bin}{os.pathsep}{env["PATH"]}'
+    return subprocess.run(
+        [str(repo / _HOOK), str(repo), branch],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+
+
 class TestTheScriptRendersTheStagedPair:
     def test_an_unchanged_checkout_passes(self, tmp_path: Path) -> None:
         repo = _make_repo(tmp_path)
@@ -234,3 +263,66 @@ class TestTheScriptRendersTheStagedPair:
 
         assert result.returncode == 1, result.stdout + result.stderr
         assert DOC in result.stderr
+
+
+class TestTheHookRunsTheRenderCheck:
+    @pytest.mark.parametrize('branch', ['main', 'task/6107'])
+    def test_a_staged_broken_doc_is_refused_on_every_branch(
+        self, tmp_path: Path, branch: str
+    ) -> None:
+        repo = _make_repo(tmp_path)
+        _stage(repo, DOC, _break_heading(_doc_text(repo)))
+
+        result = _run_hook(repo, branch)
+
+        output = result.stdout + result.stderr
+        assert result.returncode != 0, output
+        assert _LAST_RENDERED_HEADING in output
+        assert 'code-quality render check' in result.stdout
+        assert 'linting (main branch)' not in output
+        assert _MAIN_ONLY_TIER_REACHED not in output
+
+    def test_a_staged_broken_renderer_is_refused_on_a_task_branch(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _make_repo(tmp_path)
+        _stage(repo, RENDERER, _rename_heading_constant(_read(repo, RENDERER)))
+
+        result = _run_hook(repo, 'task/6107')
+
+        output = result.stdout + result.stderr
+        assert result.returncode != 0, output
+        assert _RENAMED_HEADING_CONSTANT in output
+
+    def test_a_valid_doc_edit_commits_on_a_task_branch(self, tmp_path: Path) -> None:
+        repo = _make_repo(tmp_path)
+        _stage(repo, DOC, _valid_reach_edit(_doc_text(repo)))
+
+        result = _run_hook(repo, 'task/6107')
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'code-quality render check' in result.stdout
+
+    def test_an_unrelated_commit_never_spawns_the_render_check(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _make_repo(tmp_path)
+        _stage(repo, 'README.md', '# hello\n')
+
+        result = _run_hook(repo, 'task/6107')
+
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert 'code-quality' not in output
+
+    def test_a_staged_deletion_of_the_doc_is_refused_on_a_task_branch(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _make_repo(tmp_path)
+        _git(repo, 'rm', '--cached', '--quiet', '--', DOC)
+
+        result = _run_hook(repo, 'task/6107')
+
+        output = result.stdout + result.stderr
+        assert result.returncode != 0, output
+        assert DOC in output
