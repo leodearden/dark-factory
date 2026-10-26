@@ -331,7 +331,7 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
 4. Apply shallow RCA across work_batch — detect causal clusters (see Shallow-by-default RCA)
 5. For each escalation in work_batch, apply exactly one terminal disposition (see Terminal dispositions):
    resolve it (autonomous dispatch: path-guard scope_violation closes / dependency / stranded),
-   file-and-resolve it (Convert to tracked work, including cleanup_needed), or
+   file-and-resolve it (Convert to tracked work, including cleanup_needed and review_suggestions), or
    promote it to L2 (judgement classes and anything you cannot address — see routing table below)
 5b. Check that every work_batch member was resolved, filed-and-resolved or promoted;
     an item in none of those states is a triage bug — promote it
@@ -788,6 +788,17 @@ Technical debt or cleanup discovered during development.
    Add to digest: `FILED: cleanup_needed — <task_id> — tracked as task <new_task_id> (<created|combined>) — <summary> [converted]`
 3. **On `refused` / `failed` / a submit error:** follow that section's step 4 (promote). Never resolve with a cleanup claim when no task exists.
 
+#### `review_suggestions`
+
+A `review_suggestions` record exists only when `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._route_review_suggestions_to_curator` had no curator transport and fell back to `_escalate_suggestions`, so the curator never received these suggestions. At L1 it is a `harness-orphan-reaper` re-file: the steward that owned it at L0 is gone. A bare close loses the suggestions; skipping it parks the record.
+
+File and close it with steps 1–4 of [Convert to tracked work](#convert-to-tracked-work-file-and-resolve), unchanged: `close_only` + `converted`, and a promotion on any refused or failed outcome.
+- One filing per record; its `description` carries `detail` verbatim.
+- When `detail` opens with `#hash:<hex16>#` (`orchestrator/src/orchestrator/review_suggestions/dedup.py::hash_marker`), that `<hex16>` is a ready, stable `suggestion_hash`.
+- `combined` is a success: a later run already routed these suggestions to the curator.
+
+These records are severity `info` and nothing waits on them, so never `resume`.
+
 #### `stranded_blocked`
 
 A task is blocked with no active workflow and no pending sibling escalation (filed by the harness stranded-blocked sweep; level=1, agent_role='harness-stranded-blocked-reaper'). Per D5/C6, this auto-resume path keeps genuinely-recovered strands off the human's desk — humans only see genuinely re-failed tasks.
@@ -1155,18 +1166,6 @@ Add to digest: `PROMOTED (L2 <id>): <category> — <task_id or N/A> — <summary
 
 ---
 
-### Skip silently
-
-#### `review_suggestions`
-
-The task curator owns review suggestions. Do NOT handle them.
-- Do NOT call `resolve_issue`
-- Do NOT create tasks
-- Do NOT add to digest
-Skip entirely and move to the next escalation.
-
----
-
 ## Graceful Degradation
 
 Feature-detect **once at startup** (step 2 in the Main Loop) by checking whether each tool appears in your available toolset: `mcp__escalation__promote_to_l2`, and the filing pair `mcp__fused-memory__submit_task` / `mcp__fused-memory__resolve_ticket`. Never make a trial call — it would mutate the queue or file a task.
@@ -1217,6 +1216,7 @@ Mode: <"full (promote_to_l2 + filing pair available)" | "DEGRADED (missing: <too
 ### Filed as tracked work
 - FILED: cleanup_needed — task-99 — tracked as task 6121 (created) — dead code in scheduler.py [converted]
 - FILED: infra_issue — task-61 — tracked as task 6120 (created) — residual: scripts/watcher-rearm.sh still reads the pre-6118 queue path [converted]
+- FILED: review_suggestions — task-71 — tracked as task 6122 (created) — 4 review suggestion(s) the curator never received [converted]
 
 ### Promoted to L2
 - PROMOTED (L2 esc-42-7): task_failure — task-12 — verify exhausted after 3 attempts
@@ -1248,9 +1248,6 @@ Mode: <"full (promote_to_l2 + filing pair available)" | "DEGRADED (missing: <too
 - PENDING: design_concern — task-88 — architectural question about X
 - PENDING (urgent): infra_issue — N/A — Neo4j connection refused
 - PENDING: dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
-
-### Skipped
-- review_suggestions: 3 escalations skipped (curator owned)
 ```
 
 The trailing `[actionable]` / `[benign]` / `[converted]` tag on each `DISPATCHED`, `FILED` and `AUTO-CLOSED` line is the `resolution_class` you stamped on that resolve/close — recorded on **every** `resolve_issue` you make (see [Classify the resolution](#classify-the-resolution-resolution_class)). `PROMOTED` lines carry no class (promotion does not resolve).
