@@ -123,10 +123,10 @@ def land_file(
     target.check_change(base_sha, content)
     deadline = time.monotonic() + float(timeout_secs or DEFAULT_LANDING_TIMEOUT_SECS)
     with (
-        _stop_signals_raised(),
+        _stop_signals_held() as stop,
         _deploy_branch(target, base_sha, content, label=label, message=message) as deploy,
     ):
-        return _land(queue, target, deploy, deadline, description=message)
+        return _land(queue, target, deploy, deadline, stop, description=message)
 
 
 def land_or_exit(repo: str, path: str, base_sha: str, content: bytes, *, prog: str,
@@ -138,11 +138,12 @@ def land_or_exit(repo: str, path: str, base_sha: str, content: bytes, *, prog: s
         die(prog, exc.detail)
 
 
-def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: float, *,
-          description: str) -> Landing:
+def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: float,
+          stop: _StopSignals, *, description: str) -> Landing:
+    stop.check()
     submitted = queue.submit(deploy, description=description)
     settled = (
-        _poll_until_landed(queue, target, deploy, submitted, deadline)
+        _poll_until_landed(queue, target, deploy, submitted, deadline, stop)
         if _submit_pending(submitted) else submitted
     )
     return _confirmed(target, deploy, settled)
@@ -160,38 +161,73 @@ class _Interrupted(BaseException):
     """SIGTERM or SIGINT arrived. A BaseException, so that no transport-fault
     handler can swallow it."""
 
+    def __init__(self, received: signal.Signals):
+        super().__init__(f"interrupted by {received.name}")
+
+
+class _StopSignals:
+    """SIGTERM and SIGINT, held until the landing can act on them.
+
+    A stop that arrives while the landing waits between polls interrupts the
+    wait. One that arrives during a queue call or a git step is held until the
+    step returns: cut mid-call, a submit would leave a request the queue may
+    have accepted with no id to cancel, and an interrupted connection can
+    outlive its call. `check` raises a held stop at a safe point.
+    """
+
+    def __init__(self) -> None:
+        self.received: signal.Signals | None = None
+        self._waiting = False
+
+    def check(self) -> None:
+        if self.received is not None:
+            raise _Interrupted(self.received)
+
+    def wait(self, seconds: float) -> None:
+        self._waiting = True
+        try:
+            self.check()
+            time.sleep(seconds)
+        finally:
+            self._waiting = False
+
+    def handle(self, signum: int, frame: object) -> None:
+        # Later stop signals are ignored: the cancel and teardown the first one
+        # starts must run to the end.
+        for sig in _STOP_SIGNALS:
+            signal.signal(sig, signal.SIG_IGN)
+        self.received = signal.Signals(signum)
+        if self._waiting:
+            raise _Interrupted(self.received)
+
 
 @contextlib.contextmanager
-def _stop_signals_raised() -> Iterator[None]:
-    """SIGTERM and SIGINT raise _Interrupted for the duration, so the
-    deterministic runner's killpg cancels the request instead of killing the
-    process with it live. One escaping this block arrived while no request was
-    being polled."""
-    previous = {sig: signal.signal(sig, _raise_interrupted) for sig in _STOP_SIGNALS}
+def _stop_signals_held() -> Iterator[_StopSignals]:
+    """SIGTERM and SIGINT are a _StopSignals' for the duration, so a killpg
+    or a unit stop cancels the request instead of killing the process with it
+    live. One escaping this block as _Interrupted arrived before any request
+    was submitted. One still held when the landing returns is re-delivered to
+    the previous handler; a refusal already fails the caller."""
+    stop = _StopSignals()
+    previous = {sig: signal.signal(sig, stop.handle) for sig in _STOP_SIGNALS}
     try:
-        yield
-    except _Interrupted as stop:
+        yield stop
+    except _Interrupted as interrupted:
         raise LandingNotConfirmed(
-            LandingFailure.INTERRUPTED, f"{stop} while no merge request was in flight",
+            LandingFailure.INTERRUPTED, f"{interrupted} before any merge request was submitted",
         ) from None
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+    if stop.received is not None:
+        signal.raise_signal(stop.received)
 
 
-def _raise_interrupted(signum: int, frame: object) -> None:
-    # Later stop signals are ignored: the cancel and teardown the first one
-    # starts must run to the end.
-    for sig in _STOP_SIGNALS:
-        signal.signal(sig, signal.SIG_IGN)
-    raise _Interrupted(f"interrupted by {signal.Signals(signum).name}")
-
-
-def _sleep_before_poll(delay: float, deadline: float) -> None:
+def _sleep_before_poll(delay: float, deadline: float, stop: _StopSignals) -> None:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise _CeilingReached("the landing timed out")
-    time.sleep(min(delay, remaining))
+    stop.wait(min(delay, remaining))
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +465,7 @@ def _submit_pending(submitted: dict) -> bool:
 
 
 def _poll_until_landed(queue: _MergeQueue, target: _Target, deploy: _DeployBranch,
-                       submitted: dict, deadline: float) -> dict:
+                       submitted: dict, deadline: float, stop: _StopSignals) -> dict:
     """The merge_status reply that shows the submitted request landed,
     cancelling the request if the deadline or a stop signal comes first."""
     handle = _poll_handle(submitted)
@@ -438,7 +474,7 @@ def _poll_until_landed(queue: _MergeQueue, target: _Target, deploy: _DeployBranc
     backoff = _backoff()
     try:
         while True:
-            _sleep_before_poll(eta if eta is not None else next(backoff), deadline)
+            _sleep_before_poll(eta if eta is not None else next(backoff), deadline, stop)
             reply = queue.poll(handle)
             if reply is None:
                 continue
@@ -447,8 +483,8 @@ def _poll_until_landed(queue: _MergeQueue, target: _Target, deploy: _DeployBranc
             if next_handle is None:
                 return reply
             handle = next_handle
-    except (_CeilingReached, _Interrupted) as stop:
-        raise _stopped(queue, handle, state, stop) from None
+    except (_CeilingReached, _Interrupted) as stopped_by:
+        raise _stopped(queue, handle, state, stopped_by) from None
 
 
 def _poll_handle(submitted: dict) -> dict[str, str]:
@@ -509,13 +545,13 @@ def _not_landed(reply: dict, *, state: str | None) -> LandingNotConfirmed:
 
 
 def _stopped(queue: _MergeQueue, handle: dict[str, str], state: str | None,
-             stop: BaseException) -> LandingNotConfirmed:
-    """The refusal for a poll stopped with the request still *state*, after
-    asking the queue to cancel it."""
-    failure = (LandingFailure.TIMED_OUT if isinstance(stop, _CeilingReached)
+             stopped_by: BaseException) -> LandingNotConfirmed:
+    """The refusal for a poll *stopped_by* the deadline or a stop signal with
+    the request still *state*, after asking the queue to cancel it."""
+    failure = (LandingFailure.TIMED_OUT if isinstance(stopped_by, _CeilingReached)
                else LandingFailure.INTERRUPTED)
     request_id = handle.get("request_id")
-    stopped = f"{stop} with merge request {request_id or handle} still {state}"
+    stopped = f"{stopped_by} with merge request {request_id or handle} still {state}"
     if request_id is None:
         return LandingNotConfirmed(failure, f"{stopped}; it has no request id to cancel", state)
     try:

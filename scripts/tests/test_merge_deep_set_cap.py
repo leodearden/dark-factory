@@ -189,7 +189,10 @@ def test_a_request_still_live_at_the_ceiling_is_cancelled_and_not_reloaded(tmp_p
         tools = _tool_names(server)
 
     assert proc.returncode != 0, f"stdout={proc.stdout}"
-    assert "timed out" in proc.stderr and "verifying" in proc.stderr, proc.stderr
+    assert "timed out" in proc.stderr, proc.stderr
+    # A loaded host can spend the whole second before the first poll answers,
+    # leaving the submit's own 'queued' as the last state the script saw.
+    assert any(f"still {live}" in proc.stderr for live in ("queued", "verifying")), proc.stderr
     assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}]
     assert "reload_config" not in tools, tools
     assert head(repo) == before
@@ -211,8 +214,10 @@ def test_sigterm_while_the_landing_polls_cancels_it_and_tears_down(tmp_path, dep
             start_new_session=True,
         )
         try:
+            # Polls are sequential, so a second one means the script has read
+            # the first reply: the request is 'verifying' to it.
             deadline = time.monotonic() + 60
-            while not queue.calls_to("merge_status"):
+            while len(queue.calls_to("merge_status")) < 2:
                 assert proc.poll() is None, f"the script exited before polling: {proc.communicate()}"
                 assert time.monotonic() < deadline, "the script never polled its request"
                 time.sleep(0.02)
@@ -226,7 +231,7 @@ def test_sigterm_while_the_landing_polls_cancels_it_and_tears_down(tmp_path, dep
 
     assert proc.returncode != 0, f"stderr={stderr}"
     assert "SIGTERM" in stderr and "verifying" in stderr, stderr
-    assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}]
+    assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}], stderr
     assert "reload_config" not in tools, tools
     assert head(repo) == before
     _assert_left_nothing_behind(repo, deploy_env)

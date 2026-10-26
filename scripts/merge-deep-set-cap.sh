@@ -4,23 +4,40 @@
 # #6 cap staging, #7 green-tier hot-reload).
 #
 # Sets merge_deep.chain_cap to <cap> in a target project's
-# dark-factory-orchestrator.yaml, commits ONLY that file, hot-reloads that
+# dark-factory-orchestrator.yaml by LANDING that one-file edit through the
+# target's own merge queue (scripts/_merge_queue_landing.py), never by a direct
+# commit to its main: such a commit is drift the queue never verified, which
+# forces every merge in flight there to re-verify in full
+# (orchestrator/src/orchestrator/merge_lane/gates.py::_disjoint_skip_blockers).
+# The edit is computed against main's committed copy of the file, so the target
+# checkout is never written by this script; only the queue's own landing syncs it.
+#
+# Only once the queue has landed the edit does the script hot-reload that
 # project's running orchestrator via its escalation MCP (reload_config, which
 # always re-reads the orchestrator's OWN config path -- it cannot retarget),
-# and asserts the reload's `applied` disposition carries the merge_deep.chain_cap
+# and assert the reload's `applied` disposition carries the merge_deep.chain_cap
 # knob (proving it hot-applied on the green tier, not silently deferred to a
-# restart).  The escalation MCP is stateful, so the reload goes through the
-# shared reload step (scripts/_config_reload_gate.py), never a single-shot POST.
+# restart).  The escalation MCP is stateful, so every call goes through the
+# shared transport (scripts/_config_reload_gate.py), never a single-shot POST.
 # Forward-transition deploy (0->6->32); it is NOT idempotent at a fixed value
-# -- re-running at the current value has nothing to commit and dies there.
+# -- re-running at the cap main already carries has nothing to land and dies
+# before any MCP call.
+#
+# The landing waits for the target's merge verify, which runs the full gate:
+# minutes to hours.  MERGE_QUEUE_LANDING_TIMEOUT_SECS bounds the wait (default
+# _merge_queue_landing.py::DEFAULT_LANDING_TIMEOUT_SECS); a calling task's
+# before_done.timeout_secs must exceed it.  A request still in flight at that
+# ceiling, or at SIGTERM/SIGINT, is cancelled before the script exits.
 #
 # Usage: merge-deep-set-cap.sh <cap> <config_yaml_path> <escalation_port>
 #   <cap>              non-negative integer, no leading zero (0 = kill switch)
 #   <config_yaml_path> absolute path to the target dark-factory-orchestrator.yaml
 #   <escalation_port>  the target orchestrator's escalation MCP port
 #
-# Exit 0 = knob committed, reloaded, and observed in `applied`.  Non-zero =
-# a failure the caller (a deterministic deploy task) escalates born-at-L2.
+# Exit 0 = knob landed on the target's main, reloaded, and observed in
+# `applied`.  Non-zero = a failure the caller (a deterministic deploy task)
+# escalates born-at-L2; one that did not land names the request's last merge
+# state.
 set -euo pipefail
 
 KNOB_KEY="merge_deep.chain_cap"
@@ -36,19 +53,35 @@ CAP="$1"; CONFIG="$2"; PORT="$3"
 [[ "$PORT" =~ ^[0-9]+$ ]] || die "port must be an integer, got: $PORT"
 [ -f "$CONFIG" ]          || die "config not found: $CONFIG"
 
-# Step 3's reload runs under the SCRIPT's checkout venv and imports from the
-# SCRIPT's checkout -- never from $REPO, the config's checkout (the contract is
-# scripts/_config_reload_gate.py's).  Step 1 is stdlib-only plain python3.
+# Step 3's landing and reload run under the SCRIPT's checkout venv and import
+# from the SCRIPT's checkout -- never from $REPO, the config's checkout (the
+# contract is scripts/_config_reload_gate.py's).  Step 1 is stdlib-only plain
+# python3.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$SCRIPT_DIR/../.venv/bin/python3"
 [ -x "$PY" ] || PY=python3
 
-REPO="$(cd "$(dirname "$CONFIG")" && pwd)"
-CONFIG_BASE="$(basename "$CONFIG")"
+REPO="$(git -C "$(dirname "$CONFIG")" rev-parse --show-toplevel)" \
+    || die "config is not inside a git checkout: $CONFIG"
+REL="$(realpath --relative-to="$(realpath "$REPO")" "$(realpath "$CONFIG")")"
+BASE="$(git -C "$REPO" rev-parse --verify 'main^{commit}')" \
+    || die "no main branch in $REPO"
+
+# Scratch for main's copy and its edit.  Bash runs a TERM/INT trap only once
+# the landing step returns, so a killpg lets that step cancel its request and
+# tear down before this directory goes.
+SCRATCH="$(mktemp -d)"
+trap 'rm -rf "$SCRATCH"' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+MAIN_COPY="$SCRATCH/main.yaml"
+EDITED="$SCRATCH/edited.yaml"
+git -C "$REPO" show "$BASE:$REL" > "$MAIN_COPY" || die "$REL is not tracked on main ($BASE)"
+cp "$MAIN_COPY" "$EDITED"
 
 # 1. Upsert `merge_deep:\n  chain_cap: <cap>` (stdlib python3; line-oriented so
 #    the raw-shell deploy layer needs no yaml library).
-python3 - "$CONFIG" "$CAP" <<'PY'
+python3 - "$EDITED" "$CAP" <<'PY'
 import re, sys
 path, cap = sys.argv[1], sys.argv[2]
 lines = open(path, encoding="utf-8").read().splitlines()
@@ -80,25 +113,37 @@ if not done:
 open(path, 'w', encoding="utf-8").write('\n'.join(out) + '\n')
 PY
 
-# 2. Commit only that file (machine-operated-checkout hygiene: never sweep up
-#    unrelated dirty/staged state -- CLAUDE.md "Working in the main checkout").
-git -C "$REPO" commit --only "$CONFIG_BASE" \
-    -m "chore(merge-deep): set ${KNOB_KEY}=${CAP} (deep merge-ahead canary)" \
-    || die "git commit --only ${CONFIG_BASE} failed (nothing to commit / already at ${CAP}?)"
+# 2. Nothing to land is the documented non-idempotence, refused before any MCP call.
+if cmp -s "$MAIN_COPY" "$EDITED"; then
+    die "nothing to land: main already carries ${KNOB_KEY}=${CAP}"
+fi
 
-SHA="$(git -C "$REPO" rev-parse --short HEAD)"
-
-# 3. Hot-reload the running orchestrator and assert the knob is live.  The
-#    transport, its failure diagnostics and the argv-only heredoc contract are
-#    scripts/_config_reload_gate.py's; this checks only the knob's disposition.
-"$PY" - "$SCRIPT_DIR" "$KNOB_KEY" "$CAP" "$PORT" "$SHA" <<'RELOAD_PY'
+# 3. Land the edit through the target's merge queue, then hot-reload the running
+#    orchestrator and assert the knob is live.  The landing is
+#    scripts/_merge_queue_landing.py's; the transport, its failure diagnostics
+#    and the argv-only heredoc contract are scripts/_config_reload_gate.py's.
+#    This checks only the knob's disposition.
+"$PY" - "$SCRIPT_DIR" "$KNOB_KEY" "$CAP" "$PORT" "$REPO" "$REL" "$BASE" "$EDITED" <<'LAND_PY'
+import os
 import sys
-script_dir, knob, cap, port, sha = sys.argv[1:6]
+script_dir, knob, cap, port, repo, rel, base, edited = sys.argv[1:9]
 sys.path.insert(0, script_dir)
 from _config_reload_gate import die, reload_or_exit
+from _merge_queue_landing import land_or_exit
 
 PROG = "merge-deep-set-cap"
-report = reload_or_exit(port, prog=PROG, committed_as=sha)
+with open(edited, "rb") as edit:
+    content = edit.read()
+landing = land_or_exit(
+    repo, rel, base, content, prog=PROG, port=port,
+    label=f"merge-deep-chain-cap-{cap}",
+    message=f"chore(merge-deep): set {knob}={cap} (deep merge-ahead canary)",
+    timeout_secs=os.environ.get("MERGE_QUEUE_LANDING_TIMEOUT_SECS") or None,
+)
+print(f"{PROG}: landed {landing.branch} request_id={landing.request_id} as {landing.landed_as}",
+      flush=True)
+
+report = reload_or_exit(port, prog=PROG, committed_as=landing.landed_as)
 applied = report.get("applied") or {}
 entry = applied.get(knob)
 if not isinstance(entry, dict):
@@ -107,6 +152,6 @@ if not isinstance(entry, dict):
 if str(entry.get("new")) != cap:
     die(PROG, f"applied {knob} does not carry {cap}: entry={entry}")
 print(f"{PROG}: {knob} applied old={entry.get('old')} new={entry.get('new')}")
-RELOAD_PY
+LAND_PY
 
 echo "merge-deep-set-cap: done cap=${CAP} config=${CONFIG} port=${PORT}"

@@ -3,6 +3,7 @@ over a real loopback socket against the stateful escalation MCP fake, with a
 FakeMergeQueue behind it that lands for real in a temp git repo."""
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import subprocess
@@ -443,12 +444,46 @@ def test_a_poll_the_transport_drops_is_retried(repo, scratch, capsys):
     _assert_left_nothing_behind(repo, scratch)
 
 
+class _SigtermStandIn:
+    """SIGTERM's disposition for a test: records each delivery rather than
+    ending the test run, so a SIGTERM land_file failed to take over, or
+    re-delivered, is observable."""
+
+    def __init__(self):
+        self.caught = []
+
+    def __call__(self, signum, frame):
+        self.caught.append(signum)
+
+
+@contextlib.contextmanager
+def _sigterm_stand_in():
+    stand_in = _SigtermStandIn()
+    previous = signal.signal(signal.SIGTERM, stand_in)
+    try:
+        yield stand_in
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def _terminating_after(handler, *, when=lambda reply: True):
+    """*handler*, sending this process SIGTERM once it has a reply *when*
+    accepts and holding that reply back a moment, so the signal reaches the
+    main thread while it is still waiting on the call."""
+    def terminate_mid_call(arguments):
+        reply = handler(arguments)
+        if when(reply):
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.2)
+        return reply
+    return terminate_mid_call
+
+
 def test_sigterm_while_polling_cancels_and_tears_down(repo, scratch):
     """The deterministic runner stops a deploy with killpg: SIGTERM must
     cancel the request rather than kill the process with it still live."""
     before = _main(repo)
     queue = FakeMergeQueue(repo, states=["verifying"])
-    caught = []
 
     def terminate_once_polled():
         deadline = time.monotonic() + 10
@@ -456,24 +491,55 @@ def test_sigterm_while_polling_cancels_and_tears_down(repo, scratch):
             time.sleep(0.01)
         os.kill(os.getpid(), signal.SIGTERM)
 
-    def stand_in(signum, frame):
-        caught.append(signum)
-
-    # Stands in for pytest's own disposition, so a SIGTERM land_file failed to
-    # take over is recorded rather than ending the test run.
-    previous = signal.signal(signal.SIGTERM, stand_in)
-    try:
+    with _sigterm_stand_in() as stand_in:
         threading.Thread(target=terminate_once_polled, daemon=True).start()
         refusal = _refused_by(repo, queue, timeout_secs=20)
         restored = signal.getsignal(signal.SIGTERM)
-    finally:
-        signal.signal(signal.SIGTERM, previous)
 
-    assert caught == [], "land_file let SIGTERM through to the previous handler"
+    assert stand_in.caught == [], "land_file let SIGTERM through to the previous handler"
     assert restored is stand_in, "land_file did not restore the previous SIGTERM handler"
     assert refusal.failure is LandingFailure.INTERRUPTED
     assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}]
     _assert_untouched(repo, before, scratch)
+
+
+def test_sigterm_during_the_submit_is_held_until_the_request_can_be_cancelled(repo, scratch):
+    """Cut into the submit, a stop would leave a request the queue accepted
+    with no id to cancel, and tear its worktree down under it."""
+    before = _main(repo)
+    queue = FakeMergeQueue(repo, states=["verifying"])
+    handlers = queue.handlers()
+    handlers["merge_request"] = _terminating_after(handlers["merge_request"])
+
+    with _sigterm_stand_in() as stand_in, FakeEscalationMcp(tool_handlers=handlers) as server:
+        refusal = _refusal(repo, server.port, timeout_secs=20)
+
+    assert stand_in.caught == [], "land_file let SIGTERM through to the previous handler"
+    assert refusal.failure is LandingFailure.INTERRUPTED, refusal.detail
+    assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}], refusal.detail
+    assert queue.calls_to("merge_status") == []
+    _assert_untouched(repo, before, scratch)
+
+
+def test_sigterm_held_while_the_request_lands_is_redelivered(repo, scratch):
+    """A stop held through the poll that answers done leaves a real landing
+    to report; the stop then reaches the caller's own handler."""
+    queue = FakeMergeQueue(repo, states=["verifying", "done"])
+    handlers = queue.handlers()
+    handlers["merge_status"] = _terminating_after(
+        handlers["merge_status"], when=lambda reply: reply["state"] == "done",
+    )
+
+    with _sigterm_stand_in() as stand_in, FakeEscalationMcp(tool_handlers=handlers) as server:
+        landing = land_file(
+            str(repo), CONFIG, _main(repo), EDITED,
+            port=str(server.port), label=LABEL, message=MESSAGE, timeout_secs=20,
+        )
+
+    assert landing.landed_as == _main(repo) == queue.merge_sha
+    assert stand_in.caught == [signal.SIGTERM], "a held SIGTERM was swallowed"
+    assert queue.calls_to("merge_cancel") == []
+    _assert_left_nothing_behind(repo, scratch)
 
 
 def test_failure_tags_are_the_wire_vocabulary():
