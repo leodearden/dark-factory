@@ -5,19 +5,19 @@ run of ``scripts/read_transform_selection.py`` over the committed fixtures
 and fetch cache, so a metric change that lands without a regeneration fails
 here.  ``test_read_transform_selection.py`` pins the same artifact AS DATA;
 this file pins that the data is still what the generator produces, and that
-every commit the report stamps is on this history.
+every fixture blob the report stamps is the one HEAD's tree holds.
 
-The two guards split by cause: the comparison ignores commit stamps, so it
-fails only when content moved; the ancestry guard fails only when a stamp is
-off HEAD's history.  Masking does not make a rebase harmless.  A branch that
-commits a change to a stamped fixture (the fetch cache, say) and then
-regenerates stamps its own commit; a rebase rewrites that commit, and the
-ancestry guard fails.  The merge lane rebases
-(``orchestrator/src/orchestrator/git_ops.py::GitOps.advance_main``), so such
-a regeneration holds only once the branch sits on current main.
+The comparison masks only the commit stamps, the one non-reproducible
+field: ``git log -1`` moves with history, and a rebase rewrites them.  The
+blob guard checks that each stamped blob is the blob HEAD's tree holds at
+that path, so it fails only when a stamped fixture's committed content is
+not what the report was generated from.  A rebase rewrites commits but not
+blobs, so a branch that changes a stamped fixture (the fetch cache, say) and
+regenerates stays green through the merge lane's rebases
+(``orchestrator/src/orchestrator/git_ops.py::GitOps.advance_main``).
 
 Merge lane, offline: no network, Qdrant or OPENAI_API_KEY.  Git is needed
-only to resolve the stamps.
+only to take and resolve the fixture stamps.
 
 On failure, re-run the stock command (``REGENERATE_COMMAND``) and commit BOTH
 files.  Never hand-edit either one (PRD G6/D10).
@@ -64,72 +64,17 @@ def _committed_markdown() -> str:
 def _without_commit_stamps(report: dict) -> dict:
     """A copy minus ``fixture_provenance[*].commit``, so a comparison sees content only.
 
-    Each stamp is the fixture's last-touching commit when the report was
-    generated (``fused-memory/scripts/bake_off_storage_shape.py::fixture_provenance``).
-    Masking tolerates a stamp that is still on this history but is no longer
-    the fixture's latest commit, because a later commit touched the fixture
-    without moving a metric.  A stamp that a rebase rewrote also passes here,
-    and ``TestEveryCommittedFixtureStampIsOnThisHistory`` fails it.
+    Each commit stamp is the fixture's last-touching commit when the report
+    was generated (``fused-memory/scripts/bake_off_storage_shape.py::fixture_provenance``),
+    the one field a regeneration cannot reproduce: ``git log -1`` moves when a
+    later commit touches the fixture, and a rebase rewrites it.  The ``blob``
+    stamps stay in: they are content, so a stale one fails here as well as in
+    ``TestEveryCommittedFixtureBlobIsWhatHeadHolds``.
     """
     masked = copy.deepcopy(report)
     for entry in masked.get('fixture_provenance') or []:
         entry.pop('commit', None)
     return masked
-
-
-_UNTRACKED_REASON = (
-    'no commit stamped: the fixture was untracked when the report was '
-    'generated, so the stamp cannot be verified'
-)
-
-_OFF_HISTORY_REASON = (
-    'git has this commit but HEAD does not descend from it; usually a commit '
-    "a rebase rewrote (task 4004's report named two), so regenerate"
-)
-
-
-def _unresolvable_reason(returncode: int, stderr: str) -> str:
-    return (
-        f'git cannot resolve this commit here (rc={returncode}: '
-        f'{stderr.strip() or "no stderr"}); a shallow clone lacks it (deepen '
-        'and re-run), otherwise it is a rewritten commit this clone never '
-        'had, so regenerate'
-    )
-
-
-def _stamps_not_on_head(
-    provenance: list[dict], *, repo: Path = THIS_CHECKOUT,
-) -> list[dict]:
-    """The stamps ``repo``'s HEAD history cannot vouch for, each with a kind and reason.
-
-    ``git merge-base --is-ancestor`` exits 1 only for a commit git has but HEAD
-    does not descend from (``off_history``); any other nonzero exit means git
-    could not resolve the commit at all (``unresolvable``).
-    """
-    off_head = []
-    for entry in provenance:
-        commit = entry.get('commit')
-        if not commit:
-            off_head.append({
-                'path': entry['path'], 'commit': None,
-                'kind': 'untracked', 'reason': _UNTRACKED_REASON,
-            })
-            continue
-        result = subprocess.run(
-            ['git', 'merge-base', '--is-ancestor', commit, 'HEAD'],
-            cwd=repo, capture_output=True, text=True, check=False,
-        )
-        if result.returncode == 1:
-            off_head.append({
-                'path': entry['path'], 'commit': commit,
-                'kind': 'off_history', 'reason': _OFF_HISTORY_REASON,
-            })
-        elif result.returncode != 0:
-            off_head.append({
-                'path': entry['path'], 'commit': commit, 'kind': 'unresolvable',
-                'reason': _unresolvable_reason(result.returncode, result.stderr),
-            })
-    return off_head
 
 
 _UNSTAMPED_REASON = (
@@ -231,7 +176,7 @@ def _differing_leaves(committed, regenerated, path: str = '') -> list[str]:
     return []
 
 
-class TestTheCommitStampMaskHidesOnlyTheStamps:
+class TestTheCommitStampMaskHidesOnlyTheCommitStamps:
     def test_a_restamped_report_compares_equal(self):
         committed = _committed_report()
         restamped = copy.deepcopy(committed)
@@ -253,6 +198,14 @@ class TestTheCommitStampMaskHidesOnlyTheStamps:
         moved['fixture_provenance'][0]['path'] += '.renamed'
 
         assert _without_commit_stamps(moved) != _without_commit_stamps(committed)
+
+    def test_a_changed_blob_still_compares_unequal(self):
+        before = copy.deepcopy(_committed_report())
+        after = copy.deepcopy(_committed_report())
+        before['fixture_provenance'][0]['blob'] = 'a' * 40
+        after['fixture_provenance'][0]['blob'] = 'b' * 40
+
+        assert _without_commit_stamps(after) != _without_commit_stamps(before)
 
     def test_masking_leaves_its_input_untouched(self):
         _without_commit_stamps(_committed_report())
@@ -352,16 +305,18 @@ class TestTheCommittedReportIsWhatTheCacheProduces:
         assert _regenerated_pair()[1] == _committed_markdown(), _STALE_REMEDY
 
 
-@pytest.mark.reads_git_history
-class TestEveryCommittedFixtureStampIsOnThisHistory:
-    def test_every_stamp_is_an_ancestor_of_head(self):
+class TestEveryCommittedFixtureBlobIsWhatHeadHolds:
+    """Depends only on HEAD's tree, so a byte-identical tree under a new
+    parent verifies identically: no ``reads_git_history`` marker."""
+
+    def test_every_stamped_blob_is_the_one_heads_tree_holds(self):
         stamps = _committed_report()['fixture_provenance']
         assert stamps
 
-        off = _stamps_not_on_head(stamps)
+        not_held = _blobs_head_does_not_hold(stamps)
 
-        assert off == [], '\n'.join([
-            *(f'{item["path"]}: {item["commit"]} — {item["reason"]}' for item in off),
-            f'to regenerate, run `{REGENERATE_COMMAND}` on the CURRENT history '
-            'and commit both files — do not hand-edit the sha',
+        assert not_held == [], '\n'.join([
+            *(f'{item["path"]}: {item["blob"]} — {item["reason"]}' for item in not_held),
+            f'to regenerate, run `{REGENERATE_COMMAND}` on the current tree and '
+            'commit the fixture and BOTH report files — never hand-edit a blob',
         ])
