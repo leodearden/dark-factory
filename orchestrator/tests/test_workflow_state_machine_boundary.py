@@ -375,7 +375,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit (mirrors test_workflow_e2e.py)."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -1259,7 +1259,7 @@ class TestHarnessConsumesTerminalReport:
         """
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
         config = OrchestratorConfig(project_root=repo, max_concurrent_tasks=1)
         harness = _build_harness(config)
         # `_build_harness` leaves `Scheduler` a bare MagicMock (only the

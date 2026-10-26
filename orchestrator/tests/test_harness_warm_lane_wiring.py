@@ -280,7 +280,7 @@ class TestCancelledWorkflowLaneRelease:
         # ── Setup: minimal git repo ─────────────────────────────────────────
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         # ── GitOps with warm lane pool ──────────────────────────────────────
         config = OrchestratorConfig(
@@ -431,7 +431,7 @@ class TestB1InFlightHardCancelSkipsRelease:
         # ── Setup: minimal git repo ─────────────────────────────────────────
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -551,7 +551,7 @@ class TestHardCancelLaneRelease:
         # ── Setup: real git repo ────────────────────────────────────────────
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         # Create task/99 branch with an unmerged commit so rev-list main..task/99 > 0.
         # The harness safety net makes no release call on this path, so the
@@ -659,7 +659,7 @@ class TestHardCancelLaneRelease:
         # ── Setup: repo + harness with pool ────────────────────────────────
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -738,7 +738,7 @@ class TestTrainCallbackLaneRelease:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -785,7 +785,7 @@ class TestTrainCallbackLaneRelease:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -836,7 +836,7 @@ class TestTrainCallbackLaneRelease:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -904,7 +904,7 @@ class TestMarkInProgressDoneLaneRelease:
         # ── Setup: minimal git repo ─────────────────────────────────────────
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -988,7 +988,7 @@ class TestTerminalLaneReconciler:
         """Build a harness backed by a real GitOps warm lane pool."""
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
         config = OrchestratorConfig(
             project_root=repo,
             max_concurrent_tasks=pool_size,
@@ -1185,7 +1185,7 @@ class TestRecoveryTerminalTaskLaneRelease:
         """
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
         config = OrchestratorConfig(
             project_root=repo,
             max_concurrent_tasks=1,
@@ -1393,7 +1393,7 @@ class TestMarkInProgressDoneDiskBackstopWiring:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -1977,7 +1977,7 @@ class TestLaneBranchCheckouts:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -2020,7 +2020,7 @@ class TestLaneBranchCheckouts:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -2038,7 +2038,7 @@ class TestLaneBranchCheckouts:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -2075,7 +2075,7 @@ class TestDetachLaneCheckout:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -2128,7 +2128,7 @@ class TestDetachLaneCheckout:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -2183,7 +2183,7 @@ class TestReconcileLaneCheckouts:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         # Pre-create the default warm-lane CoW seed base so the pre-acquire
         # base-health gate sees WarmBaseHealth.OK (mirrors wl_git_repo in
@@ -2496,7 +2496,7 @@ class TestMidRunRecycleLeak:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
 
         # Pre-create the default warm-lane CoW seed base so the pre-acquire
         # base-health gate sees WarmBaseHealth.OK — it runs BEFORE the (here
@@ -2604,7 +2604,7 @@ async def _build_prewarm_harness(
     heavyweight startup neutralised and git_ops.prewarm_pool spied."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    await _init_git_repo(repo)
+    _init_git_repo(repo)
     config = OrchestratorConfig(
         project_root=repo,
         max_concurrent_tasks=3,

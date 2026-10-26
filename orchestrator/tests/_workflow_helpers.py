@@ -828,7 +828,7 @@ def _build_harness(config: OrchestratorConfig) -> Harness:
 GIT_REPO_SEED = RepoSeed(files=(('README.md', '# Test\n'),), message='init')
 
 
-async def _init_git_repo(repo: Path) -> None:
+def _init_git_repo(repo: Path) -> None:
     seed_repo(repo, GIT_REPO_SEED)
 
 
@@ -888,7 +888,7 @@ E2E_REPO_SEED = RepoSeed(
 )
 
 
-async def _init_repo(repo: Path) -> None:
+def _init_repo(repo: Path) -> None:
     seed_repo(repo, E2E_REPO_SEED)
 
 
@@ -1377,7 +1377,7 @@ TRANSCRIPT_REPO_SEED = RepoSeed(
 )
 
 
-async def _init_transcript_repo(repo: Path) -> None:
+def _init_transcript_repo(repo: Path) -> None:
     """Seed a real, committed git repo for the transcript-archival suites.
 
     A THIRD seeder beside the two already in this module, deliberately not a

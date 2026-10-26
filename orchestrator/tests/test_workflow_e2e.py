@@ -158,7 +158,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -5835,7 +5835,7 @@ class TestAmendmentUncommittedWorkGuard:
         # actual repo (the guard commits the dirty tree for real).
         wt = tmp_path / 'wt'
         wt.mkdir()
-        await _init_repo(wt)
+        _init_repo(wt)
         workflow.worktree = wt
         workflow.event_store = _RecordingEventStore()  # type: ignore[assignment]
 
@@ -6053,7 +6053,7 @@ class TestStaleL1DoesNotSinkRun:
 
         # Initialise a real git repo inside wt so the implementer's
         # git commits work (AgentStub._implementer runs `git add`/commit).
-        await _init_repo(wt)
+        _init_repo(wt)
 
         # Disable inter-iteration rebase to avoid main-branch lookups.
         workflow.config.inter_iteration_rebase = False
@@ -6173,7 +6173,7 @@ class TestBornAtL2GatesPostImplementer:
         workflow.artifacts.stamp_plan_provenance(workflow.session_id)
 
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        await _init_repo(wt)
+        _init_repo(wt)
         workflow.config.inter_iteration_rebase = False
 
         outcome = await workflow._execute_iterations()
@@ -6235,7 +6235,7 @@ class TestBornAtL2GatesPostDebugger:
         workflow.artifacts.stamp_plan_provenance(workflow.session_id)
 
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        await _init_repo(wt)
+        _init_repo(wt)
 
         # Mock run_scoped_verification to return a failing result (non-infra_timeout
         # so the opaque-timeout fast-fail does not trigger before the debugger runs).

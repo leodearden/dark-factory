@@ -33,7 +33,7 @@ _GATE_TARGET = 'orchestrator.workflow.gate_mark_done_on_delivered_checks'
 
 async def _fixture(tmp_path: Path, *, branch_on_main: bool) -> _Fixture:
     worktree = tmp_path / 'wt'
-    await _init_git_repo(worktree)
+    _init_git_repo(worktree)
     f = _make(
         worktree=worktree, project_root=tmp_path / 'proj',
         branch_on_main=branch_on_main,
