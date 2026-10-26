@@ -7020,7 +7020,7 @@ async def _resolve_commit_committed_at(project_root: str, sha: str) -> str | Non
         )
         return None
 
-    if result.timed_out or result.returncode != 0:
+    if not result.ok:
         return None
     return result.stdout or None
 

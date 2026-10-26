@@ -5889,7 +5889,9 @@ class TestDeterministicProvenanceCallerBar:
 # the other git call still runs for real.
 
 
-_TIMED_OUT_GIT_RESULT = GitResult(124, '', 'timed out after 5.0s', timed_out=True)
+_TIMED_OUT_RUN_WITH_ZERO_EXIT = GitResult(
+    0, 'deadbeef' * 5, 'timed out after 5.0s', timed_out=True,
+)
 
 
 def _patch_git_subcommand(monkeypatch, subcommand, result=None, raise_exc=None):
@@ -5934,9 +5936,11 @@ async def test_git_probe_reports_timed_out_run_as_unconfirmed(
     tmp_path, monkeypatch, probe, subcommand, expected
 ):
     """A timed-out run is never a verdict: each probe reports its
-    NOT-YET-CONFIRMED outcome. Killing and reaping the child is run_git's
-    contract (shared/tests/test_git_async.py)."""
-    _patch_git_subcommand(monkeypatch, subcommand, result=_TIMED_OUT_GIT_RESULT)
+    NOT-YET-CONFIRMED outcome. The fake carries a zero exit and SHA-shaped
+    output, so only the probe's reading of ``timed_out``, never the
+    returncode, can produce that outcome. Killing and reaping the child is
+    run_git's contract (shared/tests/test_git_async.py)."""
+    _patch_git_subcommand(monkeypatch, subcommand, result=_TIMED_OUT_RUN_WITH_ZERO_EXIT)
 
     assert await probe(str(tmp_path), 'HEAD') == expected
 
@@ -5996,7 +6000,7 @@ async def test_validate_done_provenance_merge_base_timeout_reports_unconfirmed(t
     from fused_memory.middleware.task_interceptor import _validate_done_provenance
 
     sha = _init_git_repo(tmp_path)
-    _patch_merge_base(monkeypatch, result=_TIMED_OUT_GIT_RESULT)
+    _patch_merge_base(monkeypatch, result=_TIMED_OUT_RUN_WITH_ZERO_EXIT)
 
     err, resolved = await _validate_done_provenance(
         '1',
@@ -6155,7 +6159,7 @@ async def test_validate_done_provenance_unreadable_checkout_reports_unresolved(
 @pytest.mark.parametrize(
     ('result', 'raise_exc', 'expected_detail'),
     [
-        (_TIMED_OUT_GIT_RESULT, None, 'git rev-parse timed out'),
+        (_TIMED_OUT_RUN_WITH_ZERO_EXIT, None, 'git rev-parse timed out'),
         (None, FileNotFoundError('git'), 'git binary not found'),
         (None, PermissionError('denied'), 'PermissionError: denied'),
         (GitResult(0, '', ''), None, 'empty rev-parse output'),
