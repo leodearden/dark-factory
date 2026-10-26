@@ -1646,6 +1646,15 @@ class GateCensusIncomplete(RuntimeError):
         self.gaps = gaps
 
 
+def _in_selection(legacy_topic: object, topics: frozenset[str] | None) -> bool:
+    """Whether a ``--topic`` selection covers *legacy_topic*.
+
+    ``None`` is no selection and covers every value.  A selection holds only
+    strings, so a non-string topic (a ``topic_unfoldable`` entry) is never in one.
+    """
+    return topics is None or (isinstance(legacy_topic, str) and legacy_topic in topics)
+
+
 def _census_gaps(gates: GateCensus, projects) -> list[dict]:
     """Every reason this sweep cannot trust its gate pairing, as report entries.
 
@@ -1678,6 +1687,7 @@ async def run(
     client: Any = None,
     page_size: int = DEFAULT_PAGE_SIZE,
     max_pages: int = DEFAULT_MAX_PAGES,
+    topics: frozenset[str] | None = None,
 ) -> dict:
     """Enumerate, plan, pair, write, verify — and report all of it.
 
@@ -1705,6 +1715,12 @@ async def run(
             ``gate_census_incomplete`` instead.  Only the swept projects'
             gates are paired — another project's gate is neither this run's
             work nor its orphan.
+        topics: The legacy values to migrate.  ``None`` (default) migrates
+            every non-conforming value.  A selection narrows the renames and
+            the plan-time refusals to these values.  Enumeration, coverage,
+            the collision index and ``baseline_delta`` stay corpus-wide, so a
+            selected value contested by an unselected spelling is still
+            refused.
 
     Returns:
         The report dict — rendered by :func:`render_json` /
@@ -1803,8 +1819,14 @@ async def run(
             occupied_topics=enumerated['occupied_topics'],
             canonical_ids_by_topic=enumerated['canonical_ids_by_topic'],
         )
-        _record_skips(plan_skips)
-        all_renames.extend(renames)
+        # Narrowed AFTER planning, never before: the planner must see every
+        # legacy value to know which targets are contested.
+        _record_skips([
+            entry for entry in plan_skips
+            if _in_selection(entry.get('old_topic', entry.get('topic')), topics)
+        ])
+        all_renames.extend(
+            rename for rename in renames if _in_selection(rename.old_topic, topics))
 
     groups, gate_skips = pair_gate_blocks(
         all_renames,
