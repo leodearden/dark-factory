@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, ClassVar
 
 
 class Verdict(StrEnum):
@@ -29,7 +29,19 @@ class ReviewPayload:
     reviewer: str | None
     summary: str = ''
 
+    __hash__: ClassVar[None] = None
+
     def __post_init__(self) -> None:
+        if not isinstance(self.reviewer, str | None):
+            raise ReviewPayloadError(
+                f'review names its reviewer with a {type(self.reviewer).__name__}, '
+                f'not a str or None: {self.reviewer!r}'
+            )
+        if not isinstance(self.summary, str):
+            raise ReviewPayloadError(
+                f'summary of the review from {self.reviewer!r} is a '
+                f'{type(self.summary).__name__}, not a str: {self.summary!r}'
+            )
         if self.verdict is Verdict.ERROR and self.issues:
             raise ReviewPayloadError(
                 f'ERROR review from {self.reviewer!r} carries {len(self.issues)} '
@@ -94,13 +106,18 @@ def _issues(payload: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
     return tuple(dict(issue) if isinstance(issue, dict) else issue for issue in raw)
 
 
-def normalize_review(artifact: Mapping[str, Any]) -> ReviewPayload:
+def normalize_review(artifact: object) -> ReviewPayload:
+    if not isinstance(artifact, Mapping):
+        raise ReviewPayloadError(
+            f'review artifact is a {type(artifact).__name__}, not a mapping: {artifact!r}'
+        )
     payload = _inner_payload(artifact)
     verdict = _verdict(payload)
     issues = () if verdict is Verdict.ERROR else _issues(payload)
+    summary = payload.get('summary')
     return ReviewPayload(
         verdict=verdict,
         issues=issues,
         reviewer=payload.get('reviewer'),
-        summary=payload.get('summary') or '',
+        summary='' if summary is None else summary,
     )

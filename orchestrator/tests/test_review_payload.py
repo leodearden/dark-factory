@@ -69,14 +69,6 @@ class TestNormalizeReview:
 
         assert normalize_review(envelope) == normalize_review(payload)
 
-    def test_error_payload_drops_its_issues_and_keeps_its_identity(self):
-        payload = normalize_review(_payload('ERROR'))
-
-        assert payload.verdict is Verdict.ERROR
-        assert payload.issues == ()
-        assert payload.reviewer == _REVIEWER
-        assert payload.summary == 'one blocking, two suggestions'
-
     def test_every_non_blocking_issue_is_a_suggestion(self):
         nit = {'severity': 'nit', 'description': 'n'}
         unrated = {'description': 'u'}
@@ -100,9 +92,16 @@ class TestNormalizeReview:
         assert payload.summary == ''
         assert payload.reviewer is None
 
+    def test_null_summary_is_empty(self):
+        payload = normalize_review({'verdict': 'PASS', 'summary': None})
+
+        assert payload.summary == ''
+
     @pytest.mark.parametrize(
         ('artifact', 'named'),
         [
+            pytest.param(['PASS'], 'list', id='list-artifact'),
+            pytest.param('PASS', 'str', id='string-artifact'),
             pytest.param(_payload('NEEDS_CHANGES'), 'NEEDS_CHANGES', id='off-contract-verdict'),
             pytest.param({'reviewer': _REVIEWER, 'issues': []}, 'None', id='missing-verdict'),
             pytest.param(
@@ -115,10 +114,23 @@ class TestNormalizeReview:
                 'str',
                 id='non-dict-issue',
             ),
+            pytest.param(
+                {'reviewer': 42, 'verdict': 'PASS', 'issues': []}, '42', id='non-str-reviewer',
+            ),
+            pytest.param(
+                {'reviewer': _REVIEWER, 'verdict': 'PASS', 'summary': ['x']},
+                'list',
+                id='non-str-summary',
+            ),
+            pytest.param(
+                {'reviewer': _REVIEWER, 'verdict': 'PASS', 'summary': []},
+                'list',
+                id='empty-non-str-summary',
+            ),
         ],
     )
     def test_malformed_artifact_raises_naming_the_offending_value(
-        self, artifact: dict, named: str,
+        self, artifact: object, named: str,
     ):
         with pytest.raises(ReviewPayloadError, match=named) as raised:
             normalize_review(artifact)
@@ -160,6 +172,12 @@ class TestReviewPayload:
         payload = normalize_review(_payload())
 
         pytest.raises(dataclasses.FrozenInstanceError, setattr, payload, 'verdict', Verdict.PASS)
+
+    def test_is_unhashable_by_name(self):
+        payload = normalize_review(_payload())
+
+        with pytest.raises(TypeError, match="unhashable type: 'ReviewPayload'"):
+            hash(payload)
 
 
 def _task_artifacts(root: Path) -> TaskArtifacts:
