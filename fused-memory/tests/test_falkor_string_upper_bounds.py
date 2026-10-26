@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import uuid
 from typing import Any, NamedTuple
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
@@ -135,3 +136,42 @@ class TestExactStringUpperBoundLiveFalkorDB:
         plan = str(await live.graph.explain(_WINDOW_QUERY, _WINDOW_PARAMS))
 
         assert 'Index Scan' in plan, plan
+
+
+@falkor_skipif()
+@pytest.mark.timeout(60)
+@pytest.mark.integration
+class TestQueryEdgesByTimeRangeLiveFalkorDB:
+    @pytest.mark.asyncio
+    async def test_returns_exactly_the_edges_in_the_window(
+        self, mock_config, make_backend, string_bound_live_graph,
+    ):
+        live = string_bound_live_graph
+        seeded = await _seed_window_edges(live.graph)
+        backend = make_backend(mock_config)
+        backend._driver._get_graph = MagicMock(return_value=live.graph)
+
+        edges = await backend.query_edges_by_time_range(
+            _WINDOW_START, _WINDOW_END, group_id='test',
+        )
+
+        assert {e['uuid'] for e in edges} == _in_window(seeded, _WINDOW_START, _WINDOW_END)
+        assert all(_WINDOW_START <= e['valid_at'] <= _WINDOW_END for e in edges)
+
+    @pytest.mark.asyncio
+    async def test_both_bounds_are_inclusive(
+        self, mock_config, make_backend, string_bound_live_graph,
+    ):
+        live = string_bound_live_graph
+        seeded = await _seed_window_edges(live.graph)
+        backend = make_backend(mock_config)
+        backend._driver._get_graph = MagicMock(return_value=live.graph)
+        start = '2026-10-01T12:00:00+00:00'
+        end = '2026-10-05T12:00:00+00:00'
+
+        edges = await backend.query_edges_by_time_range(start, end, group_id='test')
+
+        assert sorted(e['valid_at'] for e in edges) == [
+            f'2026-10-{day:02d}T12:00:00+00:00' for day in range(1, 6)
+        ]
+        assert {e['uuid'] for e in edges} == _in_window(seeded, start, end)
