@@ -397,8 +397,8 @@ def _needs_human(e: Escalation) -> bool:
       never hand-roll ``severity != 'info'`` here.
 
     The single home of that rule for both consumers: disjuncts 2 and 3 of
-    :func:`_is_gating_escalation`, and the stop-the-line short-circuit in
-    ``TaskWorkflow._wait_for_resolution``.
+    :func:`_is_gating_escalation`, and the stop-the-line checks at the entry
+    and the tail of ``TaskWorkflow._wait_for_resolution``.
     """
     return e.severity in BORN_AT_L2_SEVERITIES or (
         e.level >= 2 and is_queue_handoff(e)
@@ -486,9 +486,10 @@ class _HumanHandoff(Exception):
 
 
 class _StewardReescalated(_HumanHandoff):
-    """The steward filed a hand-off L1 during this wait — through its own
+    """The steward filed a hand-off during this wait — an L1 through its own
     give-up path or its agent's ``escalate_blocker(level=1)`` (consumed by the
-    auto-watcher, which may promote to L2 for a human)."""
+    auto-watcher, which may promote to L2 for a human), or a record
+    :func:`_needs_human` selects."""
 
     def __init__(self, escalations: list[Escalation]):
         super().__init__(escalations, 'Steward re-escalated to human')
@@ -497,7 +498,8 @@ class _StewardReescalated(_HumanHandoff):
 class _NoStewardApplicable(_HumanHandoff):
     """Open records end the wait that no steward acted on: the stop-the-line
     ``'L2'`` records :func:`_needs_human` selects, raised before the wait ever
-    awaits, or ``'L1'`` hand-offs left open by anyone but this wait's steward."""
+    awaits or at its tail, or ``'L1'`` hand-offs left open by anyone but this
+    wait's steward."""
 
     def __init__(self, escalations: list[Escalation], tier: Literal['L1', 'L2']):
         ids = ', '.join(e.id for e in escalations)
@@ -4449,14 +4451,15 @@ class TaskWorkflow:
                 ),
                 escalate_to_human=True,
             )
-        # SINGLE-SHOT re-check.  The wait can return having cleared what it was
-        # waiting on while a DIFFERENT gating record is open — most sharply a
-        # born-at-L2 filed mid-resolution, which the wait cannot see at all
-        # (its loop polls level-0, its stop-the-line check ran at entry before
-        # the record existed, and its tail reads level-1 queue handoffs).
-        # Without this, such a record is merged straight past.  Re-uses the
-        # SAME _is_gating_escalation predicate rather than an equivalent
-        # inline condition, so there is exactly one gate policy in this file.
+        # SINGLE-SHOT re-check, deliberately redundant with the wait's tail.
+        # That tail applies _needs_human to the full pending set, so a
+        # born-at-L2 filed mid-resolution already raises inside the wait.  It
+        # cannot see a gating record filed AFTER its read — including a plain
+        # blocking L0, which it deliberately does not gate — and at merge entry
+        # there is no later gate, so without this such a record is merged
+        # straight past.  Re-uses the SAME _is_gating_escalation predicate
+        # rather than an equivalent inline condition, so there is exactly one
+        # gate policy in this file.
         #
         # Deliberately NOT a loop back into the machinery.  Boundedness (spec
         # S5): the whole merge-entry gate path must cost at most ONE steward
@@ -15077,11 +15080,14 @@ class TaskWorkflow:
         Raises a ``_HumanHandoff``:
         - ``_NoStewardApplicable('L2')`` if any pending escalation needs a
           human — immediate terminal, stop the line, before any await; OR,
-          once the level-0 wait ends with level-1 queue handoffs open (never
-          an info record, PRD D3):
-        - ``_StewardReescalated`` if this wait's steward re-escalated, else
-        - ``_NoStewardApplicable('L1')`` — the L1s predate the wait or came
-          from elsewhere, so no steward acted on them (PRD D13).
+          once the level-0 wait ends with open records that the same
+          :func:`_needs_human` rule selects over the FULL pending set (so a
+          record filed during the wait is caught), or with level-1 queue
+          handoffs open (never an info record, PRD D3):
+        - ``_StewardReescalated`` if this wait's steward filed one of them, else
+        - ``_NoStewardApplicable`` — tier ``'L2'`` if any of them needs a
+          human, otherwise ``'L1'``; they predate the wait or came from
+          elsewhere, so no steward acted on them (PRD D13).
 
         Otherwise returns the task's resolved escalations as attributed
         :class:`CarriedResolution` items in resolution order (see
@@ -15158,8 +15164,9 @@ class TaskWorkflow:
         resumed implementer edits and commits in, so dismissing or resuming
         beside a live steward agent means two agents committing in one git
         worktree.  The tail then yields exactly two dispositions: a
-        ``_HumanHandoff`` (blocking, with the open level-1 queue handoffs) when
-        one is open, or the collected resolutions (resuming) when none is.  It
+        ``_HumanHandoff`` (blocking, with the open hand-off records the Raises
+        list names) when one is open, or the collected resolutions (resuming)
+        when none is.  It
         deliberately does NOT call :meth:`_mark_blocked`, which would file a
         fresh L0 and could add a SECOND full grace window for what is a pure
         wait-timeout.
@@ -15302,7 +15309,7 @@ class TaskWorkflow:
                 # Task 3536: record the give-up for callers that must tell it
                 # apart from a genuine resolution.  They cannot do so from this
                 # method's return value — the tail below dismisses the orphans
-                # and, with no open L1, returns the collected resolutions
+                # and, with no open hand-off, returns the collected resolutions
                 # exactly as a successful wait does.  run()'s ESCALATED branch
                 # deliberately ignores the flag (resuming the implementer on
                 # expiry is safe there: it does more work and the pipeline
@@ -15358,20 +15365,23 @@ class TaskWorkflow:
         # outcome out of _await_steward_completion.
         self._drain_steward_outcomes()
 
-        handoff_l1 = [
-            e for e in self.escalation_queue.get_by_task(
-                self.task_id, status='pending', level=1,
-            )
-            if is_queue_handoff(e)
+        # The entry gate's stop-the-line rule again, over the FULL pending set:
+        # a record that needs a human may have been filed while this waited.
+        open_at_tail = self.escalation_queue.get_by_task(self.task_id, status='pending')
+        handoffs = [
+            e for e in open_at_tail
+            if _needs_human(e) or (e.level == 1 and is_queue_handoff(e))
         ]
-        if handoff_l1:
+        if handoffs:
             steward_filed_one = any(
                 e.agent_role == STEWARD.name and e.id not in open_ids_at_entry
-                for e in handoff_l1
+                for e in handoffs
             )
             if steward_filed_one:
-                raise _StewardReescalated(handoff_l1)
-            raise _NoStewardApplicable(handoff_l1, 'L1')
+                raise _StewardReescalated(handoffs)
+            raise _NoStewardApplicable(
+                handoffs, 'L2' if any(_needs_human(e) for e in handoffs) else 'L1',
+            )
 
         return select_carried_resolutions(self.escalation_queue.get_by_task(self.task_id))
 

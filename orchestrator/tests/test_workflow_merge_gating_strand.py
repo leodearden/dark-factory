@@ -674,20 +674,14 @@ def _make_chained_l2_steward(queue: EscalationQueue, task_id: str) -> type:
     """A steward that resolves its own L0 then files a fresh born-at-L2.
 
     The same chained shape as :func:`_make_chained_gating_steward`, but the
-    follow-on record is one the WAIT provably never waits on — which is what
-    makes it the load-bearing case for the post-wait re-check:
-
-    * ``_wait_for_resolution``'s loop polls ``get_by_task(..., level=0)``, so a
-      level-2 record is invisible to it;
-    * its entry-time ``pending_high_sev`` stop-the-line check already ran,
-      before this record existed;
-    * its tail's ``has_open_l1`` matches level-1 only.
-
-    So the wait returns NORMALLY with no expiry, and without a re-check the
-    handler resumes the merge straight past an open, human-gated record — a D4
-    stop-the-line violation.  (A chained plain-blocking L0, by contrast, IS
-    caught by the wait loop, which re-polls it inside the SAME deadline; see
-    :func:`_make_chained_gating_steward`.)
+    follow-on record is one the wait's LOOP never waits on: the loop polls
+    ``get_by_task(..., level=0)``, and the entry-time stop-the-line check ran
+    before this record existed.  The wait's TAIL applies the same
+    ``_needs_human`` rule to the full pending set, so it raises a
+    ``_HumanHandoff`` there and the handler parks rather than resuming the
+    merge past an open, human-gated record (D4 stop-the-line).  (A chained
+    plain-blocking L0, by contrast, IS caught by the wait loop, which re-polls
+    it inside the SAME deadline; see :func:`_make_chained_gating_steward`.)
 
     Mirrors ``TaskSteward._auto_escalate_to_human``'s real behaviour of filing
     a human-facing record while handing off.
@@ -1373,14 +1367,14 @@ class TestGateReFireIsBounded:
     async def test_chained_l2_is_not_merged_past(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
     ):
-        """The load-bearing case: a chained record the WAIT never waits on.
+        """The load-bearing case: a chained record the wait LOOP never waits on.
 
-        ``_wait_for_resolution`` polls level-0 records only, ran its
-        stop-the-line check before this record existed, and matches level-1 in
-        its ``has_open_l1`` tail — so a level-2 filed mid-resolution slips
-        through all three and the wait returns normally with no expiry.  Only
-        a post-wait re-check of the SAME ``_is_gating_escalation`` predicate
-        catches it.
+        ``_wait_for_resolution`` polls level-0 records only and ran its entry
+        stop-the-line check before this record existed.  Its tail applies the
+        same ``_needs_human`` rule to the full pending set, so a level-2 filed
+        mid-resolution raises a ``_HumanHandoff`` there and the task parks
+        through that arm; the handler's post-wait ``_is_gating_escalation``
+        re-check remains as redundant enforcement behind it.
         """
         queue = EscalationQueue(tmp_path / 'queue')
         task_id = task_assignment.task_id
@@ -1407,9 +1401,9 @@ class TestGateReFireIsBounded:
             f'the task must park visibly for the human the L2 is addressed to; '
             f'got {scheduler.statuses.get(task_id)}'
         )
-        # The human's record survives — the re-check parks, it does not consume.
+        # The human's record survives — the park does not consume it.
         assert len(queue.get_by_task(task_id, status='pending', level=2)) == 1
-        # Single-shot: the re-check parks rather than buying a second window.
+        # Single-shot: the park does not buy a second window.
         assert timing.get('calls') == 1, (
             f'the merge-entry gate must be single-shot; entered the steward '
             f'wait {timing.get("calls")} time(s)'
@@ -1422,8 +1416,8 @@ class TestGateReFireIsBounded:
         """The plain-L0 chain: caught by the wait loop's own re-poll, inside
         the SAME deadline, then parked by the expiry branch.  Pinned here so
         the two chained shapes stay legibly distinct — this one costs one
-        window and needs no re-check; the L2 one above needs the re-check and
-        costs none."""
+        window and needs no re-check; the L2 one above is stopped by the
+        wait's tail and costs none."""
         queue = EscalationQueue(tmp_path / 'queue')
         task_id = task_assignment.task_id
         worktree = await _make_advanced_worktree(git_ops, task_id)
