@@ -1,7 +1,7 @@
 """Meta-guard: every whole-tree AST-scanning test in this directory must carry a
 module-level ``pytest.mark.timeout`` (task 4215).
 
-THE FAILURE MODE, END TO END.  A dozen guard tests under ``orchestrator/tests/``
+THE FAILURE MODE, END TO END.  Whole-tree guard tests under ``orchestrator/tests/``
 sweep the ENTIRE repo -- ``rglob('*.py')`` over ~500 files -- and ``ast.parse``
 each one.  Unloaded and serial that costs 6-9s per call here; the orchestrator
 suite however runs under ``-n auto`` (``[tool.pytest.ini_options].addopts`` in
@@ -45,7 +45,7 @@ parses.
 
 NOT widening the global ``timeout`` *as the remedy for THIS hazard*: doing it
 for that reason would blunt the hang-catching ceiling for the other ~16000
-tests to buy headroom only ~13 modules need.  (The global default did later
+tests to buy headroom only the family needs.  (The global default did later
 move, but for a different hazard -- wall-clock CPU starvation false-redding a
 shifting victim -- and the per-module marks stayed, because a sweep's cost and
 a host's contention are separate things to size against.)
@@ -53,10 +53,10 @@ a host's contention are separate things to size against.)
 WHERE THE RATIONALE LIVES.  The mechanism is restated here because this is the
 module a failing run points at, but the CANONICAL home -- the derivation of the
 ceiling, the full measurement record, and the escalation references -- is the
-``WHOLE_TREE_SCAN_TEST_TIMEOUT`` comment in ``_orch_helpers.py``.  The ~13
-modules that carry the mark point THERE rather than repeating it, so retuning
-the ceiling or switching ``timeout_method`` is one edit plus this file, not
-fourteen.
+``WHOLE_TREE_SCAN_TEST_TIMEOUT`` comment in ``_orch_helpers.py``.  The modules
+that carry the mark point THERE rather than repeating it, so retuning the
+ceiling or switching ``timeout_method`` is one edit plus this file, not one
+per family member.
 """
 from __future__ import annotations
 
@@ -77,6 +77,7 @@ from _orch_helpers import (
 )
 from _tree_scan import (
     ORCHESTRATOR_TESTS,
+    TESTS_DIR,
     TREE_PASS_FIXTURE,
     TREE_PASS_XDIST_GROUP,
     ParsedModule,
@@ -105,16 +106,9 @@ pytestmark = [
     pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
 ]
 
-# This directory, resolved from THIS FILE and never from the process CWD:
-# merge-verify runs pytest from the orchestrator/ cwd while a plain
-# `pytest orchestrator/tests` runs from the repo root, and the census must come
-# out identical under both.  Same idiom as
-# test_marker_registration_drift.py::TESTS_DIR.
-_TESTS_DIR = Path(__file__).resolve().parent
-
 # Anti-vacuity FLOORS, not equalities -- 535 files and 12 scanners measured at
 # authorship time -- so the guard survives the tree growing while still failing
-# loudly if the sweep itself ever breaks (a wrong _TESTS_DIR, a read that
+# loudly if the sweep itself ever breaks (a wrong TESTS_DIR, a read that
 # silently yields nothing, a detector rotted to always-False).  The house
 # pattern for exactly this risk:
 # test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES and
@@ -169,7 +163,8 @@ OUTSIDE_THE_SHARED_PASS_DECLARATION = governed_exceptions(
 # measured on code since replaced retires with that code.  Corpus:
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.  That fixture is a
 # whole-repo complexity measurement rather than an AST sweep of this tree, so
-# one member's cost sets the ceiling for all 21; task 6986 owns separating it.
+# one member's cost sets the ceiling for the whole family; task 6986 owns
+# separating it.
 _MEASURED_UNDER_LOAD_WORST_CASE = 148.65
 
 # ABSOLUTE floor in seconds: the measured worst case above times
@@ -327,7 +322,7 @@ class TestTimeoutConstants:
             f'fallen BELOW the pyproject default ({PYPROJECT_DEFAULT_TIMEOUT}s). '
             'The module-level marks this guard demands are meant to be a FLOOR '
             'that narrows nothing; below the default they would instead TIGHTEN '
-            'every test in ~13 modules, which is the opposite of the intent. '
+            'every test in the family, which is the opposite of the intent. '
             'Raise the constant, or lower the ini default to match.'
         )
 
@@ -351,14 +346,13 @@ def _scans_whole_tree_py(source: str) -> bool:
       give (test_raw_semaphore_access_guard.py::_raw_semaphore_accesses,
       test_prune_chokepoint_guard.py). A docstring or comment merely
       MENTIONING ``rglob('*.py')`` cannot trip it, which matters more here
-      than usual: this module's own docstring is full of such mentions, and so
-      are the per-file comments step-6 adds to the twelve files it marks.
+      than usual: this module's own docstring is full of such mentions.
 
-    * **Matched on the ATTRIBUTE name only**, never on the receiver. All three
-      scan-root idioms in this directory therefore hit the same code path --
-      ``_TESTS_DIR.rglob(...)``, ``_SRC_DIR.rglob(...)``, ``REPO_ROOT.rglob(...)``,
-      ``_orchestrator_src_root().rglob(...)`` -- with no allowlist of receiver
-      names to keep in sync.
+    * **Matched on the ATTRIBUTE name only**, never on the receiver, so every
+      scan-root idiom -- a constant (``REPO_ROOT.rglob(...)``), a parameter
+      (``root.rglob(...)``) or a call's result (``_src_root().rglob(...)``) --
+      hits the same code path, with no allowlist of receiver names to keep in
+      sync.
 
     * **Wildcard required.** ``glob('conftest.py')`` names at most one file
       per directory; the hazard being guarded is ``ast.parse`` over hundreds
@@ -477,8 +471,11 @@ def _module_xdist_group(source: str) -> str | None:
     pinned worker.  Fails soft.
     """
     tree = _parsed(source)
-    if tree is None:
-        return None
+    return None if tree is None else _module_xdist_group_in(tree)
+
+
+def _module_xdist_group_in(tree: ast.Module) -> str | None:
+    """:func:`_module_xdist_group` over an already-parsed module."""
     return next(
         (
             _xdist_group_name(element)
@@ -594,8 +591,11 @@ def _timeout_marks_below_ceiling(source: str) -> tuple[tuple[str, float], ...]:
     one's.  Fails soft.
     """
     tree = _parsed(source)
-    if tree is None:
-        return ()
+    return () if tree is None else _timeout_marks_below_ceiling_in(tree)
+
+
+def _timeout_marks_below_ceiling_in(tree: ast.Module) -> tuple[tuple[str, float], ...]:
+    """:func:`_timeout_marks_below_ceiling` over an already-parsed module."""
     return tuple(
         (site.qualname, site.seconds)
         for site in timeout_marker_sites(tree, _SANCTIONED_CEILING_SECONDS)
@@ -1402,7 +1402,7 @@ class _ModuleCensus:
 
 @dataclass(frozen=True)
 class _TreeCensus:
-    """Every readable module under this directory by file name, and the names that could not be read."""
+    """Every readable module under this directory by :func:`_census_key`, and the keys that could not be read."""
 
     modules: Mapping[str, _ModuleCensus]
     unreadable: tuple[str, ...]
@@ -1431,22 +1431,26 @@ def _module_census(module: ParsedModule) -> _ModuleCensus:
     if not module.may_name(*_GLOB_METHODS, _TREE_ANALYSES_NAME, TREE_PASS_FIXTURE):
         return _ModuleCensus(readable=True, is_family_member=is_family_member)
     try:
-        tree: ast.Module | None = module.tree
+        tree = module.tree
     except (SyntaxError, ValueError):
-        tree = None
-    name = module.path.name
-    sweeps = tree is not None and _sweeps_whole_tree_in(tree)
-    consumes = tree is not None and _consumes_tree_pass_in(tree)
-    judged = (sweeps or consumes) and name.startswith('test_')
+        return _ModuleCensus(readable=True, is_family_member=is_family_member)
+    sweeps = _sweeps_whole_tree_in(tree)
+    consumes = _consumes_tree_pass_in(tree)
+    judged = (sweeps or consumes) and module.path.name.startswith('test_')
     return _ModuleCensus(
         readable=True,
         sweeps_privately=sweeps,
         consumes=consumes,
         is_family_member=is_family_member,
-        offence=_scanner_offence(name, source) if judged else None,
-        xdist_group=_module_xdist_group(source) if consumes else None,
-        low_timeout_marks=_timeout_marks_below_ceiling(source) if consumes else (),
+        offence=_scanner_offence(_census_key(module.path), source) if judged else None,
+        xdist_group=_module_xdist_group_in(tree) if consumes else None,
+        low_timeout_marks=_timeout_marks_below_ceiling_in(tree) if consumes else (),
     )
+
+
+def _census_key(path: Path) -> str:
+    """*path* as the census keys it: POSIX, relative to this directory, so a nested module cannot shadow a top-level one."""
+    return path.relative_to(TESTS_DIR).as_posix()
 
 
 ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=ORCHESTRATOR_TESTS, extract=_module_census)
@@ -1454,11 +1458,11 @@ TREE_ANALYSES = (ANALYSIS,)
 
 
 def _tests_tree_census(tree_pass: TreePass) -> _TreeCensus:
-    """This directory's census by file name, projected from the shared tree pass."""
-    facts = tree_pass.facts(ANALYSIS)
+    """This directory's census by :func:`_census_key`, projected from the shared tree pass."""
+    facts = {_census_key(path): fact for path, fact in tree_pass.facts(ANALYSIS).items()}
     return _TreeCensus(
-        MappingProxyType({path.name: fact for path, fact in facts.items() if fact.readable}),
-        tuple(path.name for path, fact in facts.items() if not fact.readable),
+        MappingProxyType({key: fact for key, fact in facts.items() if fact.readable}),
+        tuple(key for key, fact in facts.items() if not fact.readable),
     )
 
 
@@ -1546,7 +1550,7 @@ def _stale_allowlist_entries(modules: Mapping[str, _ModuleCensus]) -> list[str]:
 
 
 _TIMEOUT_MARK_REMEDY = (
-    f'Whole-tree guard module(s) under {_TESTS_DIR.name}/ lack a module-level '
+    f'Whole-tree guard module(s) under {TESTS_DIR.name}/ lack a module-level '
     'timeout mark AT THE FAMILY CEILING (no mark at all, one pinned lower, or '
     'one not spelled via WHOLE_TREE_SCAN_TEST_TIMEOUT). Add\n\n'
     '    from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
@@ -1666,7 +1670,7 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark(tree_pass: TreePass
     guards = _sweepers(modules) | _consumers(modules)
 
     assert len(modules) >= _MIN_EXPECTED_TEST_FILES, (
-        f'only {len(modules)} .py files examined under {_TESTS_DIR} (expected at '
+        f'only {len(modules)} .py files examined under {TESTS_DIR} (expected at '
         f'least {_MIN_EXPECTED_TEST_FILES}; {len(census.unreadable)} skipped as '
         f'unreadable: {sorted(census.unreadable)}) -- the sweep itself is broken, '
         'so this guard would pass vacuously rather than because the family is '
@@ -1712,7 +1716,13 @@ _FORMERLY_MIXED_MODULES = (
 def test_formerly_mixed_module_is_not_a_family_member(
     module_name: str, tree_pass: TreePass,
 ) -> None:
-    census = _tests_tree_census(tree_pass).modules[module_name]
+    tree_census = _tests_tree_census(tree_pass)
+    census = tree_census.modules.get(module_name)
+    unreadable = ' (it could not be read)' if module_name in tree_census.unreadable else ''
+    assert census is not None, (
+        f'{module_name} is not a readable module under {TESTS_DIR}{unreadable}. '
+        'If it was renamed or deleted, update _FORMERLY_MIXED_MODULES to match.'
+    )
     reason = (
         'Move the incidental whole-tree scan into a dedicated *_guard.py module. '
         'A module-level family mark widens the hang ceiling of every unrelated '
