@@ -12,7 +12,8 @@ or asserting directly off the call (``OrchestratorConfig().x.y == literal``),
 attribute path off that name or call equals a right-hand side that EVALUATES,
 under package defaults, to exactly the package default for that path.  A
 literal is one such right-hand side; so is numeric arithmetic over evaluable
-values, a local bound once to one, and another attribute of a bare config.
+values, a local bound once to one, another attribute of a bare config, or a
+builtin collection constructor over such a value.
 Such an assertion passes only because the repo happens NOT to declare that key
 in ``dark-factory-orchestrator.yaml``; the autouse ``_isolate_orch_config``
 fixture pins that file for every test.  An operator declaring the key turns the
@@ -244,6 +245,13 @@ _MAX_EVALUATED_EXPONENT = 64
 
 _IMMUTABLE_SCALARS = (bool, int, float, complex, str, bytes, type(None))
 
+_COLLECTION_CONSTRUCTORS: Mapping[str, Callable[..., Any]] = MappingProxyType({
+    'frozenset': frozenset,
+    'set': set,
+    'tuple': tuple,
+    'list': list,
+})
+
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -273,6 +281,8 @@ def _evaluate_under_defaults(
         return _evaluate_local(node, scope, resolving)
     if isinstance(node, ast.BinOp):
         return _evaluate_arithmetic(node, scope, resolving)
+    if isinstance(node, ast.Call):
+        return _evaluate_constructor(node, scope, resolving)
     return None
 
 
@@ -320,6 +330,25 @@ def _evaluate_arithmetic(node: ast.BinOp, scope: _TestScope,
     except (ArithmeticError, ValueError):
         return None
     return _Valued(value, left.reads | right.reads)
+
+
+def _evaluate_constructor(node: ast.Call, scope: _TestScope,
+                          resolving: frozenset[str]) -> _Valued | None:
+    """``frozenset(...)`` and kin over an evaluable argument, unless shadowed."""
+    if not isinstance(node.func, ast.Name) or node.func.id in scope.bound:
+        return None
+    construct = _COLLECTION_CONSTRUCTORS.get(node.func.id)
+    if construct is None or node.keywords or len(node.args) > 1:
+        return None
+    if not node.args:
+        return _Valued(construct(), frozenset())
+    arg = _evaluate_under_defaults(node.args[0], scope, resolving)
+    if arg is None:
+        return None
+    try:
+        return _Valued(construct(arg.value), arg.reads)
+    except TypeError:
+        return None
 
 
 def _decorated_with_hatch(node: ast.AST) -> bool:
