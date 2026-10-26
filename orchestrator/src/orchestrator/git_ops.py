@@ -8129,15 +8129,11 @@ class GitOps:
                             f'Inspect the branch and, once wanted work is preserved, '
                             f'remove the other worktree and retry.'
                         )
-                    # Reaching this guard means .task/ (if present) belongs to
-                    # the lane's PREVIOUS occupant — the same-task case already
-                    # returned via the disk-backstop reuse above.  checkout -f
-                    # replaces tracked files but leaves untracked .task/ intact,
-                    # and _reuse_warm_lane deliberately preserves .task/ (its
-                    # same-task contract) — clear it here or the incoming task
-                    # inherits a foreign plan.json/iterations.jsonl/reviews/
-                    # (reify esc-4920-163: _lane-26 4949→4920 contamination).
-                    await remove_tree(lane / '.task', ignore_errors=True)
+                    # See orchestrator/src/orchestrator/lane_task_dir.py::evict_previous_occupant.
+                    await evict_previous_occupant(
+                        lane / '.task', keep_task_id=branch_name,
+                        archive_root=archive_root_for(self.transcript_archive, self.project_root),
+                    )
                     # The sibling .task-meta/<name> (W11 ε1) belongs to the same
                     # previous occupant but, unlike .task/, lives OUTSIDE the
                     # worktree — checkout -f cannot touch it, so it must be
