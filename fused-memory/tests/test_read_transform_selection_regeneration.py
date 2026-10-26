@@ -212,68 +212,69 @@ class TestTheCommitStampMaskHidesOnlyTheStamps:
         assert _committed_report()['fixture_provenance'][0]['commit']
 
 
-class TestAStampOffThisHistoryIsReported:
-    @pytest.mark.reads_git_history
-    def test_an_unresolvable_or_missing_commit_is_reported_and_head_is_not(self):
-        head = subprocess.run(
-            ['git', 'rev-parse', 'HEAD'],
-            cwd=THIS_CHECKOUT,
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        entries = [
-            {'path': 'a', 'commit': '0' * 40},
-            {'path': 'b', 'commit': None},
-            {'path': 'c', 'commit': head},
-        ]
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', '-C', str(repo), *args], capture_output=True, text=True,
+        check=True,
+    ).stdout.strip()
 
-        assert [p['path'] for p in _stamps_not_on_head(entries)] == ['a', 'b']
 
-    @pytest.mark.reads_git_history
-    def test_each_report_names_its_commit_a_kind_and_a_reason(self):
-        entries = [
-            {'path': 'a', 'commit': '0' * 40},
-            {'path': 'b', 'commit': None},
-        ]
+def _commit_files(repo: Path, message: str, **files: str) -> None:
+    for name, text in files.items():
+        (repo / name).write_text(text)
+    _git(repo, 'add', '--', *files)
+    _git(repo, 'commit', '-q', '-m', message)
 
-        reported = _stamps_not_on_head(entries)
 
-        assert len(reported) == 2
-        for item in reported:
-            assert isinstance(item, dict)
-            assert {'path', 'commit', 'kind', 'reason'} <= item.keys()
-            assert item['reason']
-        assert [item['commit'] for item in reported] == ['0' * 40, None]
-        assert [item['kind'] for item in reported] == ['unresolvable', 'untracked']
-
-    def test_a_commit_off_this_history_is_told_apart_from_an_unresolvable_one(
+class TestABlobHeadDoesNotHoldIsReported:
+    def test_a_blob_head_holds_is_not_reported_and_every_other_kind_is(
         self, tmp_path,
     ):
-        root = _init_git_repo(tmp_path)
-        subprocess.run(
-            ['git', '-C', str(tmp_path), 'commit', '-q', '--allow-empty', '-m', 'child'],
-            check=True,
-        )
-        child = subprocess.run(
-            ['git', '-C', str(tmp_path), 'rev-parse', 'HEAD'],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        subprocess.run(
-            ['git', '-C', str(tmp_path), 'checkout', '-q', '--detach', root],
-            check=True,
+        _init_git_repo(tmp_path)
+        _commit_files(
+            tmp_path, 'fixtures',
+            **{'held.json': '{"held": 1}\n', 'differs.json': '{"differs": 1}\n'},
         )
         entries = [
-            {'path': 'child', 'commit': child},
-            {'path': 'missing', 'commit': '0' * 40},
-            {'path': 'root', 'commit': root},
+            {'path': 'held.json', 'blob': _git(tmp_path, 'rev-parse', 'HEAD:held.json')},
+            {'path': 'differs.json', 'blob': 'f' * 40},
+            {'path': 'absent.json', 'blob': 'e' * 40},
+            {'path': 'unstamped.json', 'blob': None},
         ]
 
-        reported = _stamps_not_on_head(entries, repo=tmp_path)
+        reported = _blobs_head_does_not_hold(entries, repo=tmp_path)
 
         assert [(item['path'], item['kind']) for item in reported] == [
-            ('child', 'off_history'),
-            ('missing', 'unresolvable'),
+            ('differs.json', 'differs'),
+            ('absent.json', 'absent_at_head'),
+            ('unstamped.json', 'unstamped'),
         ]
-        assert reported[0]['reason'] != reported[1]['reason']
+        for item in reported:
+            assert {'path', 'blob', 'kind', 'reason'} <= item.keys()
+            assert item['reason']
+        assert len({item['reason'] for item in reported}) == 3
+
+    def test_a_stamp_survives_a_rebase_that_rewrites_its_commit(self, tmp_path):
+        _init_git_repo(tmp_path)
+        _git(tmp_path, 'checkout', '-q', '-b', 'task')
+        _commit_files(tmp_path, 'stamped fixture', **{'fixture.json': '{"v": 2}\n'})
+        stamp = {
+            'path': 'fixture.json',
+            'commit': _git(tmp_path, 'rev-parse', 'HEAD'),
+            'blob': _git(tmp_path, 'rev-parse', 'HEAD:fixture.json'),
+        }
+        _git(tmp_path, 'checkout', '-q', 'main')
+        _commit_files(tmp_path, 'unrelated', **{'unrelated.txt': 'moved main\n'})
+        _git(tmp_path, 'checkout', '-q', 'task')
+        _git(tmp_path, 'rebase', '-q', 'main')
+
+        rewritten = subprocess.run(
+            ['git', '-C', str(tmp_path), 'merge-base', '--is-ancestor',
+             stamp['commit'], 'HEAD'],
+            capture_output=True, text=True, check=False,
+        )
+        assert rewritten.returncode == 1
+        assert _blobs_head_does_not_hold([stamp], repo=tmp_path) == []
 
 
 @pytest.mark.xdist_group('read_transform_regeneration')
