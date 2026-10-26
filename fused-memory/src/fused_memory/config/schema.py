@@ -1622,7 +1622,9 @@ class ReconciliationConfig(BaseModel):
             'only remedy if the archive root breaks: fused-memory installs no '
             'archival-failure storm consumer. Green-tier for that reason; both '
             'archive leaves are read live per stage and per GC through '
-            'reconciliation/cli_stage_runner.py::recon_archive_root.'
+            'reconciliation/cli_stage_runner.py::recon_archive_root. It also '
+            "governs TaskCurator's per-process config-dir archival (task 6008): "
+            'off, the dead-PID sweep removes curator config dirs unarchived.'
         ),
     )
     transcript_archive_root: str = Field(
@@ -1631,7 +1633,8 @@ class ReconciliationConfig(BaseModel):
             'Archive root, resolved against explore_codebase_root (NOT data_dir). '
             "The default deliberately equals the orchestrator's archive root, "
             "which docs/legibility/legibility.yaml's agent_transcript_roots "
-            'already mines.'
+            'already mines. TaskCurator archives its config-dir transcripts '
+            'here too, keyed fm-curator-<pid> (task 6008).'
         ),
     )
 
