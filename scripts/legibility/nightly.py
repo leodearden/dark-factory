@@ -1825,7 +1825,7 @@ def _commit_refusal(
     git's diagnostic, or the traceback of the committer's raise."""
     try:
         result = committer(repo, [_CODEBOOK_RELPATH], message)
-    except Exception as exc:  # noqa: BLE001 — a raise is a refusal, so the dump is rolled back
+    except Exception as exc:
         return ''.join(traceback.format_exception(exc))
     return None if result.ok else result.stderr
 
