@@ -31,7 +31,7 @@ from orchestrator.workflow import WorkflowOutcome, WorkflowState
 _GATE_TARGET = 'orchestrator.workflow.gate_mark_done_on_delivered_checks'
 
 
-async def _fixture(tmp_path: Path, *, branch_on_main: bool) -> _Fixture:
+def _fixture(tmp_path: Path, *, branch_on_main: bool) -> _Fixture:
     worktree = tmp_path / 'wt'
     _init_git_repo(worktree)
     f = _make(
@@ -64,7 +64,7 @@ def _status_writes(f: _Fixture) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_unresolvable_missing_merge_sha_blocks_and_files_l1(tmp_path: Path):
-    f = await _fixture(tmp_path, branch_on_main=False)
+    f = _fixture(tmp_path, branch_on_main=False)
     queue = _arm_escalation_queue(f, tmp_path)
 
     outcome = await f.wf._finalise_merged_done()
@@ -84,7 +84,7 @@ async def test_eval_mode_missing_merge_sha_still_exits_done_without_row_write(
     tmp_path: Path,
 ):
     """Eval runs skip the merge by design, so they reach this tail sha-less."""
-    f = await _fixture(tmp_path, branch_on_main=False)
+    f = _fixture(tmp_path, branch_on_main=False)
     queue = _arm_escalation_queue(f, tmp_path)
     f.wf._worktree_external = True
 
@@ -102,7 +102,7 @@ async def test_landed_branch_without_merge_sha_recovers_found_on_main(
     tmp_path: Path,
 ):
     """An attributable landing stamps the task's own citation, never main's tip."""
-    f = await _fixture(tmp_path, branch_on_main=True)
+    f = _fixture(tmp_path, branch_on_main=True)
     queue = _arm_escalation_queue(f, tmp_path)
     _record_prior_work(f)
 
@@ -119,7 +119,7 @@ async def test_landed_branch_without_merge_sha_recovers_found_on_main(
 
 @pytest.mark.asyncio
 async def test_merge_sha_present_never_consults_the_ladder(tmp_path: Path):
-    f = await _fixture(tmp_path, branch_on_main=True)
+    f = _fixture(tmp_path, branch_on_main=True)
     f.wf._merge_sha = 'c' * 40
     f.wf.git_ops.get_merge_commit_diff_files = AsyncMock(return_value=([], None))
 
@@ -135,7 +135,7 @@ async def test_merge_sha_present_never_consults_the_ladder(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_git_error_during_resolution_blocks_fail_safe(tmp_path: Path):
-    f = await _fixture(tmp_path, branch_on_main=True)
+    f = _fixture(tmp_path, branch_on_main=True)
     queue = _arm_escalation_queue(f, tmp_path)
     _record_prior_work(f)
     f.get_main_sha.side_effect = RuntimeError('main ref unreadable')
@@ -152,7 +152,7 @@ async def test_git_error_during_resolution_blocks_fail_safe(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_withheld_recovery_blocks_instead_of_done(tmp_path: Path):
     """The delivered-checks guard withholding the landing is not a DONE either."""
-    f = await _fixture(tmp_path, branch_on_main=True)
+    f = _fixture(tmp_path, branch_on_main=True)
     queue = _arm_escalation_queue(f, tmp_path)
     _record_prior_work(f)
     guard = AsyncMock(return_value=DeliveredChecksBlock(
@@ -181,7 +181,7 @@ async def test_already_merged_queue_reply_blocks_through_the_merge_phase(
     tmp_path: Path,
 ):
     """The real route: the queue's sha-less ``already_merged`` reaches the DONE tail."""
-    f = await _fixture(tmp_path, branch_on_main=False)
+    f = _fixture(tmp_path, branch_on_main=False)
     queue = _arm_escalation_queue(f, tmp_path)
     wf = f.wf
     wf.merge_queue = merge_queue = asyncio.Queue()
