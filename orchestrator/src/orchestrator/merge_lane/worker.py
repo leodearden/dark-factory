@@ -10796,7 +10796,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``_finalize_inflight``). The ordering invariant (at most one entry
         mid-finalize at a time) makes this uniquely identifiable: the sole
         ``_live_items`` ``InflightEntry`` whose request_id is absent from the
-        ``_inflight`` deque.
+        ``_inflight`` deque.  A head parked on its gate re-verify (task 6155)
+        is back at the front of the deque between its finalize calls, so it
+        is found there rather than here while its gate runs.
 
         task 3082: that window is now bounded on EVERY exit, not just the ones
         that finalize — ``_finalize_inflight``'s DROPPED and REQUEUED sentinel
@@ -15567,6 +15569,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # inside self._verifier_task) finish naturally and resolve its TRUE
         # outcome within the `asyncio.wait(tasks_to_wait, timeout)` shutdown
         # window a few lines down.
+        #
+        # A head parked at _inflight[0] on its gate re-verify (task 6155) is
+        # neither sub-case: its gate can run for an hour, past that window.
+        # It is detached and resolved first, still before any await, so the
+        # block below pre-empts the NEXT head if that one is VERIFYING; the
+        # parked gate is torn down right after the block.
+        _parked_head = self._detach_parked_gate_head()
         _fh_entry = self._finalizing_head_entry()
         if _fh_entry is None and self._inflight:
             _fh_entry = self._inflight[0]
@@ -15603,6 +15612,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     _fh_entry.lease = None
             if _fh_entry.permit is not None:
                 self._speculation_ledger.release(_fh_entry.permit)
+        if _parked_head is not None:
+            await self._release_parked_gate_head(_parked_head)
 
         # Drain per-lane buffers (items already removed from _queue by the merger)
         # Intentionally mutates _lane_buffers directly (not via
@@ -15711,6 +15722,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     _ie.lease, _ie.verify_task, _ie_req.task_id,
                     shutdown_defensive=True,
                 )
+            # A next head the loop finalized during the awaits above can be
+            # parked on its own gate re-verify by now (task 6155).
+            await self._teardown_parked_gate(_ie)
             if _ie.merge_wt is not None:
                 with contextlib.suppress(BaseException):
                     await self._cleanup_owned_merge_worktree(_ie.merge_wt)
@@ -17308,8 +17322,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         item whose merge() Future stop() must resolve.
 
         A cancelled loop also pre-empts a head parked on its gate re-verify
-        (task 6155), which nothing else would ever reap.  Any other exit
-        leaves the gate running on the deque, for a restarted loop to resume.
+        (task 6155), as stop() does, since no loop is left to resume it.  Any
+        other exit leaves the gate running on the deque, for a restarted loop
+        to resume.
         """
         try:
             await self._verifier_loop()
@@ -17324,15 +17339,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             raise
 
     async def _preempt_parked_gate_head(self) -> None:
-        """End a head parked on its gate re-verify with the shutdown outcome (task 6155).
+        """End a head parked on its gate re-verify with the shutdown outcome
+        (task 6155): :meth:`_detach_parked_gate_head`, then
+        :meth:`_release_parked_gate_head`."""
+        head = self._detach_parked_gate_head()
+        if head is not None:
+            await self._release_parked_gate_head(head)
 
-        Everything before the first await runs synchronously, so the head is
-        resolved before its gate can land it: the journal keeps the record and
-        the merge is re-enqueued on the next boot.  Popping it first means
-        nothing else meets it again to release its warm lane or lease twice.
+    def _detach_parked_gate_head(self) -> InflightEntry | None:
+        """Pop the head parked on its gate re-verify and resolve it with the
+        shutdown outcome, without awaiting (task 6155).
+
+        Resolved before any await, the merge can no longer land: the journal
+        keeps the record and the merge is re-enqueued on the next boot.  Popped,
+        nothing else meets the head again to release its warm lane or lease
+        twice.  None when the head is not parked on a gate.
         """
         if not self._inflight or self._inflight[0].gate is None:
-            return
+            return None
         head = self._inflight_popleft()
         req = head.item.request
         if not req.result.done():
@@ -17340,13 +17364,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON),
             )
         self._retire_item(req.request_id)
+        return head
+
+    async def _release_parked_gate_head(self, head: InflightEntry) -> None:
+        """Tear down a detached head's gate, then release its lease, speculation
+        permit and drift base."""
         await self._teardown_parked_gate(head)
         with contextlib.suppress(BaseException):
             await self._cancel_and_release_tracked(head.lease)
         head.lease = None
         if head.permit is not None:
             self._speculation_ledger.release(head.permit)
-        self._drift_base.pop(req.request_id, None)
+        self._drift_base.pop(head.item.request.request_id, None)
 
     async def _teardown_parked_gate(self, entry: InflightEntry) -> None:
         """Cancel and reap *entry*'s parked gate re-verify and return its worktree.
@@ -18518,7 +18547,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         :meth:`_finalize_inflight`'s ``_cancel_release`` path,
         :meth:`_vacate_inflight_entry` (task 4582), an aborted train's
         lease (``_TrainVerifyHost.release``, task 6160), and a pre-empted
-        parked gate's head (:meth:`_preempt_parked_gate_head`, task 6155).
+        parked gate's head (:meth:`_release_parked_gate_head`, task 6155).
 
         MECHANISM (task 3043, reify 2026-07-25).  Against an unreachable host
         ``cancel_verify()`` returns rc != 0 and all ``max_attempts``
