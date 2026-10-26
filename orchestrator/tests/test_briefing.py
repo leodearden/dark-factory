@@ -914,6 +914,29 @@ class TestResumePriorProposal:
         )
 
 
+@pytest.mark.asyncio
+class TestResumePromptArgumentPlacement:
+    """``escalation_summary`` and ``resolution`` are both positional ``str``:
+    each must land under its own section, so a swap cannot pass silently."""
+
+    async def test_issue_and_resolution_land_under_their_own_sections(
+        self, briefing: BriefingAssembler,
+    ):
+        with patch.object(
+            BriefingAssembler, '_get_memory_context', return_value='# Context\n\n_stub_',
+        ):
+            prompt = await briefing.build_resume_prompt(
+                {'id': '3754', 'metadata': {}}, {}, 'ISSUE-SENTINEL', 'RESOLUTION-SENTINEL',
+            )
+
+        assert (
+            prompt.index('## The Issue')
+            < prompt.index('ISSUE-SENTINEL')
+            < prompt.index("## Handler's Resolution")
+            < prompt.index('RESOLUTION-SENTINEL')
+        )
+
+
 class TestPriorProposalStaleness:
     """Staleness guard + robustness for ``_format_prior_proposal``.
 

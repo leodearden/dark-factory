@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from _workflow_helpers import FakeBriefing, _make_resolving_steward
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from test_workflow_escalated_steward_stall import (
     _build_workflow,
     _make_advanced_worktree,
+    _make_evrl_returner,
     _wire_resolve_callback,
 )
 from test_workflow_escalated_steward_stall import config as config
@@ -24,12 +27,15 @@ from test_workflow_escalated_steward_stall import git_ops as git_ops
 from test_workflow_escalated_steward_stall import git_repo as git_repo
 from test_workflow_escalated_steward_stall import task_assignment as task_assignment
 
-from orchestrator.agents.roles import STEWARD
+from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.roles import IMPLEMENTER, STEWARD
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.resume_resolution import MISMATCH_INSTRUCTION, STILL_PENDING_HEADING
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import (
     TaskWorkflow,
+    WorkflowOutcome,
     _HumanHandoff,
     _NoStewardApplicable,
     _StewardReescalated,
@@ -227,3 +233,95 @@ class TestTailGuardCoversRecordsFiledDuringTheWait:
         )
 
         assert [c.resolution for c in carried] == ['resolved by the fake steward']
+
+
+class _ResumeRecordingBriefing(FakeBriefing):
+    def __init__(self) -> None:
+        self.resume_calls: list[tuple[str, str]] = []
+
+    async def build_resume_prompt(
+        self, task: dict, plan: dict, escalation_summary: str, resolution: str, worktree=None,
+    ) -> str:
+        self.resume_calls.append((escalation_summary, resolution))
+        return await super().build_resume_prompt(
+            task, plan, escalation_summary, resolution, worktree,
+        )
+
+
+def _make_prompt_building_invoke(before_building_the_prompt=lambda: None) -> AsyncMock:
+    """An ``_invoke`` that builds the resumed implementer's prompt as the real one does.
+
+    The hook runs before the prompt is built, which is where a record filed in
+    the window between the wait's end and the prompt build lands.
+    """
+
+    async def _invoke(role, prompt_builder, *_args, **_kwargs):
+        if role == IMPLEMENTER:
+            before_building_the_prompt()
+            await prompt_builder()
+        return AgentResult(success=True, output='')
+
+    return AsyncMock(side_effect=_invoke)
+
+
+async def _resume_once(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    task_assignment: TaskAssignment,
+    queue: EscalationQueue,
+    invoke: AsyncMock,
+) -> tuple[_ResumeRecordingBriefing, Escalation]:
+    """Drive ``run()`` through one ESCALATED wait and one implementer resume."""
+    worktree = await _make_advanced_worktree(git_ops, TASK_ID)
+    workflow, _ = _build_workflow(config, git_ops, task_assignment, queue, worktree)
+    briefing = _ResumeRecordingBriefing()
+    workflow.briefing = briefing  # type: ignore[assignment]
+    _wire_resolve_callback(queue, workflow)
+    workflow._steward_factory = _make_resolving_steward(queue, TASK_ID)
+    evrl, _ = _make_evrl_returner([WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE])
+    workflow._execute_verify_review_loop = evrl  # type: ignore[method-assign]
+    workflow._invoke = invoke  # type: ignore[method-assign]
+    answered = _submit(queue, 'verify red at step 19')
+
+    await asyncio.wait_for(workflow.run(), 30)
+
+    return briefing, answered
+
+
+@pytest.mark.asyncio
+class TestResumeBriefingNamesItsEscalations:
+    async def test_record_filed_before_the_prompt_is_built_is_named_as_still_pending(
+        self,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+        task_assignment: TaskAssignment,
+        tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        late: list[Escalation] = []
+        invoke = _make_prompt_building_invoke(
+            lambda: late.append(_submit(queue, 'verify still red at step 20')),
+        )
+
+        briefing, answered = await _resume_once(config, git_ops, task_assignment, queue, invoke)
+
+        ((issue, resolution),) = briefing.resume_calls
+        assert resolution.index(answered.id) < resolution.index('Resolved by FakeSteward')
+        heading = issue.index(STILL_PENDING_HEADING)
+        assert issue.index(answered.id) < heading < issue.index(late[0].id)
+        assert MISMATCH_INSTRUCTION in issue
+
+    async def test_issue_section_names_the_answered_escalation(
+        self,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+        task_assignment: TaskAssignment,
+        tmp_path: Path,
+    ):
+        briefing, answered = await _resume_once(
+            config, git_ops, task_assignment, EscalationQueue(tmp_path / 'queue'),
+            _make_prompt_building_invoke(),
+        )
+
+        ((issue, _resolution),) = briefing.resume_calls
+        assert answered.id in issue
