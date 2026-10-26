@@ -13,16 +13,22 @@ from __future__ import annotations
 
 import contextlib
 import uuid
+from datetime import UTC, datetime
 from typing import Any, NamedTuple
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 from _fm_helpers import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
 from falkordb.asyncio import FalkorDB
+from graphiti_core.cross_encoder.client import CrossEncoderClient
+from graphiti_core.embedder import EmbedderClient
+from graphiti_core.llm_client import LLMClient
+from graphiti_core.nodes import EpisodeType
 
 from fused_memory.backends.falkor_indices import expected_index_set, range_create_statement
 from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
+from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
 
 _WINDOW_START = '2026-10-01T00:00:00Z'
 _WINDOW_END = '2026-10-10T00:00:00Z'
@@ -175,3 +181,150 @@ class TestQueryEdgesByTimeRangeLiveFalkorDB:
             f'2026-10-{day:02d}T12:00:00+00:00' for day in range(1, 6)
         ]
         assert {e['uuid'] for e in edges} == _in_window(seeded, start, end)
+
+
+# ---------------------------------------------------------------------------
+# graphiti-core's previous-episode read, on add_episode's per-group client
+# ---------------------------------------------------------------------------
+
+
+def _backend_over(mock_config, driver: _MultiTenantFalkorDriver) -> GraphitiBackend:
+    backend = GraphitiBackend(mock_config)
+    backend._driver = driver
+    backend._llm_client = MagicMock(spec=LLMClient)
+    backend._embedder = MagicMock(spec=EmbedderClient)
+    backend._cross_encoder = MagicMock(spec=CrossEncoderClient)
+    return backend
+
+
+def _per_group_client(mock_config, records: list[dict]):
+    """add_episode's client for group 'g', its driver answering every query with *records*."""
+    driver = _MultiTenantFalkorDriver(falkor_db=MagicMock(), database='__base__')
+    client = _backend_over(mock_config, driver)._client_for('g')
+    client.driver.execute_query = AsyncMock(return_value=(records, [], None))
+    return client
+
+
+def _episode_record(name: str, valid_at: str) -> dict:
+    return {
+        'uuid': str(uuid.uuid4()),
+        'name': name,
+        'group_id': 'g',
+        'created_at': valid_at,
+        'source': 'text',
+        'source_description': '',
+        'content': name,
+        'valid_at': valid_at,
+        'entity_edges': [],
+    }
+
+
+class TestPerGroupClientPreviousEpisodeRead:
+    @pytest.mark.asyncio
+    async def test_valid_at_upper_bound_cannot_be_index_served(self, mock_config):
+        client = _per_group_client(mock_config, [])
+        reference_time = datetime(2026, 9, 12, tzinfo=UTC)
+
+        await client.retrieve_episodes(
+            reference_time, last_n=3, group_ids=['g'], source=EpisodeType.text,
+        )
+
+        await_args = client.driver.execute_query.await_args
+        cypher = await_args.args[0]
+        assert exact_string_upper_bound('e.valid_at', 'reference_time', inclusive=True) in cypher
+        assert 'e.valid_at <= $reference_time' not in cypher
+        assert await_args.kwargs['reference_time'] is reference_time
+        assert await_args.kwargs['group_ids'] == ['g']
+        assert await_args.kwargs['source'] == 'text'
+        assert await_args.kwargs['num_episodes'] == 3
+
+    @pytest.mark.asyncio
+    async def test_returns_episodes_oldest_first(self, mock_config):
+        client = _per_group_client(mock_config, [
+            _episode_record('sep-10', '2026-09-10T12:00:00+00:00'),
+            _episode_record('sep-05', '2026-09-05T12:00:00+00:00'),
+            _episode_record('sep-01', '2026-09-01T12:00:00+00:00'),
+        ])
+
+        episodes = await client.retrieve_episodes(
+            datetime(2026, 9, 12, tzinfo=UTC), last_n=3, group_ids=['g'], source=EpisodeType.text,
+        )
+
+        assert [e.name for e in episodes] == ['sep-01', 'sep-05', 'sep-10']
+
+    @pytest.mark.asyncio
+    async def test_saga_is_refused_without_querying(self, mock_config):
+        client = _per_group_client(mock_config, [])
+
+        with pytest.raises(NotImplementedError, match='saga'):
+            await client.retrieve_episodes(
+                datetime(2026, 9, 12, tzinfo=UTC), last_n=3, group_ids=['g'], saga='s',
+            )
+
+        client.driver.execute_query.assert_not_awaited()
+
+
+async def _seed_episodes(live: LiveGraph) -> None:
+    episodes = [
+        (f'ep-{month:02d}-{day:02d}', f'2026-{month:02d}-{day:02d}T12:00:00+00:00', 'text')
+        for month in (8, 9, 10)
+        for day in (1, 5, 10, 15, 20, 25)
+    ]
+    episodes.append(('msg-09-11', '2026-09-11T12:00:00+00:00', 'message'))
+    for name, valid_at, source in episodes:
+        await live.graph.query(
+            'CREATE (:Episodic {uuid: $uuid, name: $name, group_id: $group_id, '
+            'created_at: $valid_at, valid_at: $valid_at, source: $source, '
+            "source_description: '', content: $name, entity_edges: []})",
+            {
+                'uuid': str(uuid.uuid4()), 'name': name, 'group_id': live.name,
+                'valid_at': valid_at, 'source': source,
+            },
+        )
+
+
+async def _previous_episode_names(mock_config, live: LiveGraph, reference_time: datetime) -> list[str]:
+    driver = _MultiTenantFalkorDriver(falkor_db=live.client, database=live.name)
+    client = _backend_over(mock_config, driver)._client_for(live.name)
+    episodes = await client.retrieve_episodes(
+        reference_time, last_n=3, group_ids=[live.name], source=EpisodeType.text,
+    )
+    return [e.name for e in episodes]
+
+
+@falkor_skipif()
+@pytest.mark.timeout(60)
+@pytest.mark.integration
+class TestPreviousEpisodeReadLiveFalkorDB:
+    @pytest.mark.asyncio
+    async def test_previous_episodes_precede_the_reference_time(
+        self, mock_config, string_bound_live_graph,
+    ):
+        live = string_bound_live_graph
+        await _seed_episodes(live)
+
+        names = await _previous_episode_names(mock_config, live, datetime(2026, 9, 12, tzinfo=UTC))
+
+        assert names == ['ep-09-01', 'ep-09-05', 'ep-09-10']
+
+    @pytest.mark.asyncio
+    async def test_reference_time_is_inclusive(self, mock_config, string_bound_live_graph):
+        live = string_bound_live_graph
+        await _seed_episodes(live)
+
+        names = await _previous_episode_names(
+            mock_config, live, datetime(2026, 9, 10, 12, tzinfo=UTC),
+        )
+
+        assert names[-1] == 'ep-09-10'
+
+    @pytest.mark.asyncio
+    async def test_reference_after_every_episode_returns_the_newest(
+        self, mock_config, string_bound_live_graph,
+    ):
+        live = string_bound_live_graph
+        await _seed_episodes(live)
+
+        names = await _previous_episode_names(mock_config, live, datetime(2026, 11, 1, tzinfo=UTC))
+
+        assert names == ['ep-10-15', 'ep-10-20', 'ep-10-25']
