@@ -3588,3 +3588,61 @@ class TestTopicSelection:
         assert corpus.topic_of('dark_factory', 'm1') == 'legacy-a'
         assert corpus.topic_of('dark_factory', 'm2') == 'legacy-b'
         assert report['rename_count'] == 2
+
+    @staticmethod
+    def _gated_legacy_a() -> tuple[MagicMock, _FakeCorpus, object]:
+        """``legacy_a`` carries a record and a gate; ``other_slug`` only a gate."""
+        service, corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_a')]})
+        census = _census(tasks=[_gate_task('4220', 'legacy_a'),
+                                _gate_task('4221', 'other_slug')])
+        return service, corpus, census
+
+    @pytest.mark.asyncio
+    async def test_an_unselected_gate_is_neither_paired_nor_an_orphan(self):
+        service, _corpus, census = self._gated_legacy_a()
+
+        report = await run_sweep(service, projects=('dark_factory',), gates=census,
+                                 client=_client(), topics=frozenset({'legacy_a'}))
+
+        assert [(row['gate_task_id'], row['outcome']) for row in report['gate_results']] == [
+            ('4220', 'would_patch_gate'),
+        ]
+        assert report['skips']['orphan_gate_topic'] == []
+
+    @pytest.mark.asyncio
+    async def test_without_a_selection_the_same_gate_is_an_orphan(self):
+        service, _corpus, census = self._gated_legacy_a()
+
+        report = await run_sweep(service, projects=('dark_factory',), gates=census,
+                                 client=_client())
+
+        assert [entry['gate_topic'] for entry in report['skips']['orphan_gate_topic']] == [
+            'other_slug',
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('apply', [False, True])
+    @pytest.mark.parametrize(('topics', 'named'), [
+        (frozenset(), 'empty'),
+        (frozenset({'legacy-a'}), 'legacy-a'),
+        (frozenset({'a' * 101}), 'a' * 101),
+        (frozenset({42}), '42'),
+    ], ids=['empty', 'conforming-target', 'no-fold', 'non-str'])
+    async def test_an_invalid_selection_is_refused_before_anything_is_read(
+        self, monkeypatch, topics, named, apply,
+    ):
+        """A selection names LEGACY values; the likely typo is the target slug.
+
+        The guard is rigged to refuse, so an ``--apply`` that reached the
+        preflight before validating would raise ``StoreMutationUnavailable``.
+        """
+        deny(_mod, monkeypatch)
+        service, corpus = self._two_legacy_values()
+
+        with pytest.raises(ValueError) as refused:
+            await run_sweep(service, projects=('dark_factory',), apply=apply,
+                            topics=topics)
+
+        assert named in str(refused.value)
+        assert corpus.scrolls == []
+        assert corpus.writes == []
