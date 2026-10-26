@@ -487,6 +487,74 @@ async def run_panel(
     )
 
 
+def _cell_filename(variant_name: str, diff_id: str) -> str:
+    return f'{variant_name}__{diff_id}.json'
+
+
+def _load_cached_panel(path: Path, variant: VariantConfig, diff: CorpusDiff) -> PanelRunResult | None:
+    """The panel stored at *path* for this (variant, diff), or None when absent, corrupt or foreign."""
+    try:
+        cached = PanelRunResult.from_dict(json.loads(path.read_text()))
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        logger.info('Re-running %s: its stored panel is unreadable (%s)', path, exc)
+        return None
+    if (cached.variant_name, cached.diff_id) != (variant.name, diff.diff_id):
+        logger.info(
+            'Re-running %s: it records %s__%s', path, cached.variant_name, cached.diff_id,
+        )
+        return None
+    return cached
+
+
+async def run_panel_cached(
+    variant: VariantConfig,
+    diff: CorpusDiff,
+    *,
+    results_dir: Path | None = None,
+    stagger_secs: float = 2.0,
+    prices: dict | None = None,
+    usage_gate: UsageGate | None = None,
+    diff_cap_chars: int = DIFF_CAP_CHARS,
+) -> PanelRunResult:
+    """*variant*'s panel on *diff*, reused from *results_dir* only when stored under an equal PanelRunKey.
+
+    A keyless entry written before the key existed is reused with a warning.
+    Why, and how to re-measure one: docs/plan-scoring-and-judge.md,
+    "Reviewer-trial panel cache and score loop (task 6741)".
+
+    Raises FixtureNotMaterialisable when the panel has to run and its clone cannot be built.
+    """
+    out_dir = results_dir or _RESULTS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / _cell_filename(variant.name, diff.diff_id)
+    wanted = PanelRunKey.of(prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars)
+
+    cached = _load_cached_panel(path, variant, diff)
+    if cached is not None and cached.run_key == wanted:
+        logger.info('Reusing %s', path)
+        return cached
+    if cached is not None and cached.run_key is None:
+        logger.warning('Reusing %s, a legacy panel that records no run key', path)
+        return cached
+    if cached is not None:
+        logger.info('Re-running %s: stored under %s, wanted %s', path, cached.run_key, wanted)
+
+    logger.info('Running %s against %s', variant.name, diff.diff_id)
+    result = await run_panel(
+        variant, diff, stagger_secs=stagger_secs, prices=prices, usage_gate=usage_gate,
+        diff_cap_chars=diff_cap_chars,
+    )
+    path.write_text(json.dumps(asdict(result), indent=2))
+    logger.info(
+        'Completed %s__%s: cost=$%.2f, wall=%dms, errors=%d',
+        variant.name, diff.diff_id,
+        result.total_cost_usd, result.wall_clock_ms, len(result.errors),
+    )
+    return result
+
+
 async def run_trial(
     variants: list[VariantConfig],
     corpus: CorpusManifest,
@@ -495,10 +563,9 @@ async def run_trial(
     results_dir: Path | None = None,
     usage_gate: UsageGate | None = None,
     diff_cap_chars: int = DIFF_CAP_CHARS,
+    stagger_secs: float = 2.0,
 ) -> list[PanelRunResult]:
-    """Run all (variant x diff) pairs with bounded concurrency.
-
-    Persists results incrementally to the results/ directory.
+    """Run all (variant x diff) pairs with bounded concurrency, each through run_panel_cached.
 
     *prices* (default-off) is threaded through to each ``run_panel`` call so
     cross-family (codex/gemini) reviewers get a non-sentinel cost column.
@@ -512,36 +579,15 @@ async def run_trial(
         if unenriched:
             raise FixtureEnrichmentMissing(unenriched)
 
-    out_dir = results_dir or _RESULTS_DIR
-    out_dir.mkdir(parents=True, exist_ok=True)
     semaphore = asyncio.Semaphore(max_parallel_panels)
     all_results: list[PanelRunResult] = []
 
     async def _run_and_save(variant: VariantConfig, diff: CorpusDiff) -> PanelRunResult | None:
         async with semaphore:
-            result_path = out_dir / f'{variant.name}__{diff.diff_id}.json'
-
-            # Skip if already completed
-            if result_path.exists():
-                try:
-                    existing = json.loads(result_path.read_text())
-                    logger.info('Skipping %s__%s (already exists)', variant.name, diff.diff_id)
-                    return PanelRunResult(
-                        variant_name=existing['variant_name'],
-                        diff_id=existing['diff_id'],
-                        reviews=existing.get('reviews', {}),
-                        total_cost_usd=existing.get('total_cost_usd', 0.0),
-                        wall_clock_ms=existing.get('wall_clock_ms', 0),
-                        errors=existing.get('errors', []),
-                    )
-                except (json.JSONDecodeError, KeyError):
-                    pass  # Re-run if result file is corrupt
-
-            logger.info('Running %s against %s', variant.name, diff.diff_id)
             try:
-                result = await run_panel(
-                    variant, diff, prices=prices, usage_gate=usage_gate,
-                    diff_cap_chars=diff_cap_chars,
+                return await run_panel_cached(
+                    variant, diff, results_dir=results_dir, stagger_secs=stagger_secs,
+                    prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars,
                 )
             except FixtureNotMaterialisable as exc:
                 logger.warning(
@@ -549,15 +595,6 @@ async def run_trial(
                     variant.name, diff.diff_id, exc.reason,
                 )
                 return None
-
-            # Persist incrementally
-            result_path.write_text(json.dumps(asdict(result), indent=2))
-            logger.info(
-                'Completed %s__%s: cost=$%.2f, wall=%dms, errors=%d',
-                variant.name, diff.diff_id,
-                result.total_cost_usd, result.wall_clock_ms, len(result.errors),
-            )
-            return result
 
     # Build all (variant, diff) pairs
     tasks = [
