@@ -1096,7 +1096,7 @@
     "orchestrator/tests/test_git_ops_train_solo.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_git_ops_unstack.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_halt_owner.py": {"patch_targets": [], "private_reads": 57},
-    "orchestrator/tests/test_harness.py": {"patch_targets": ["liveness.TOUCH_MISS_TOLERANCE", "worker.SpeculativeMergeWorker.run"], "private_reads": 39},
+    "orchestrator/tests/test_harness.py": {"patch_targets": ["liveness.TOUCH_MISS_TOLERANCE", "worker.SpeculativeMergeWorker.run"], "private_reads": 31},
     "orchestrator/tests/test_harness_abandoned_merge_deferred_wiring.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/test_harness_already_landed_gate_wiring.py": {"patch_targets": [], "private_reads": 282},
     "orchestrator/tests/test_harness_claimant_clear.py": {"patch_targets": [], "private_reads": 16},

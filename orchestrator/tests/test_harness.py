@@ -14,6 +14,7 @@ Asserts that:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -43,6 +44,13 @@ def _install_mock_escalation_queue(harness: Harness) -> MagicMock:
     mock_queue.make_id.return_value = 'esc-test-external-1'
     harness._escalation_queue = mock_queue
     return mock_queue
+
+
+def _delivered_check_callback(harness: Harness) -> Callable[..., Awaitable[None]]:
+    """The wired ``on_delivered_check_block`` callback, asserted installed."""
+    callback = harness.scheduler._callbacks.on_delivered_check_block
+    assert callback is not None
+    return callback
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +202,7 @@ class TestHarnessDeliveredCheckBlockWiring:
         _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
-        await harness.scheduler._callbacks.on_delivered_check_block(
+        await _delivered_check_callback(harness)(
             '42',
             summary=self._SUMMARY,
             detail='detail',
@@ -211,8 +218,7 @@ class TestHarnessDeliveredCheckBlockWiring:
         mock_queue = _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
-        await harness.scheduler._callbacks.on_delivered_check_block(
+        await _delivered_check_callback(harness)(
             '42',
             summary=self._SUMMARY,
             detail='detail',
@@ -247,11 +253,9 @@ class TestHarnessDeliveredCheckBlockWiring:
         mock_queue = _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
-
         # First call — no open L2 yet → submits
         mock_queue.get_by_task.return_value = []
-        await harness.scheduler._callbacks.on_delivered_check_block(
+        await _delivered_check_callback(harness)(
             '42',
             summary=self._SUMMARY,
             detail='detail',
@@ -260,7 +264,7 @@ class TestHarnessDeliveredCheckBlockWiring:
 
         # Second call — an open L2 now exists → must NOT submit again
         mock_queue.get_by_task.return_value = [MagicMock()]
-        await harness.scheduler._callbacks.on_delivered_check_block(
+        await _delivered_check_callback(harness)(
             '42',
             summary=self._SUMMARY,
             detail='detail',
@@ -286,8 +290,7 @@ class TestHarnessDeliveredCheckBlockWiring:
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
         # Must not raise even without a queue.
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
-        await harness.scheduler._callbacks.on_delivered_check_block(
+        await _delivered_check_callback(harness)(
             '99',
             summary=self._SUMMARY,
             detail='detail',
@@ -304,8 +307,7 @@ class TestHarnessDeliveredCheckBlockWiring:
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
         owner: DeliveredCheckOwner = {'task_id': '5', 'check_name': 'cap', 'sidecar': None}
 
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
-        await harness.scheduler._callbacks.on_delivered_check_block(
+        await _delivered_check_callback(harness)(
             '42',
             summary=self._SUMMARY,
             detail='detail',
@@ -331,8 +333,7 @@ class TestHarnessDeliveredCheckBlockWiring:
         mock_queue = _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
 
-        assert harness.scheduler._callbacks.on_delivered_check_block is not None
-        await harness.scheduler._callbacks.on_delivered_check_block(
+        await _delivered_check_callback(harness)(
             '42',
             summary=self._SUMMARY,
             detail='detail',
