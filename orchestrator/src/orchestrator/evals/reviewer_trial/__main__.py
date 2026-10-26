@@ -21,7 +21,7 @@ import logging
 import os
 import subprocess
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -526,6 +526,16 @@ def corpus_audit(min_diffs: int) -> None:
 
 _MINE_SPLIT_SEED = 'reviewer_trial-2495-fn-mining'
 
+@dataclass
+class _MineTally:
+    """How far one `mine` run's labelling has got, across its concurrent workers."""
+
+    attempted: int
+    completed: int = 0
+    added: int = 0
+    cost: float = 0.0
+
+
 @cli.command('mine')
 @click.option('--runs-db', default=None, type=click.Path(path_type=Path),
               help='Path to the offline orchestrator runs.db (env: REVIEWER_TRIAL_RUNS_DB; '
@@ -614,13 +624,10 @@ def mine(
         ))
         click.echo('=' * 60)
 
-        def _resave() -> None:
-            save_corpus(manifest, log, seed=seed, manifest_path=_CORPUS_PATH, log_path=_ADJUDICATION_LOG_PATH)
-
         backfilled = backfill_hand_authored(manifest, log)
         if backfilled:
             click.echo(f'  Backfilled {backfilled} adjudication entries for pre-existing hand-authored diffs.')
-            _resave()
+            save_corpus(manifest, log, seed=seed, manifest_path=_CORPUS_PATH, log_path=_ADJUDICATION_LOG_PATH)
 
         candidates = mine_fn_candidates(runs_db)
         esc_refs = mine_escalation_refs(escalations_dir)
@@ -639,13 +646,12 @@ def mine(
         click.echo()
 
         semaphore = asyncio.Semaphore(max(1, max_parallel))
-        total = len(pool)
-        state = {'completed': 0, 'added': 0, 'cost': 0.0}
+        tally = _MineTally(attempted=len(pool))
 
-        async def _worker(item: RecoveredCandidate) -> None:
+        async def _label(item: RecoveredCandidate) -> None:
             candidate = item.candidate
+            description = frontier_description(candidate, titles.get(candidate.task_id, ''))
             async with semaphore:
-                description = frontier_description(candidate, titles.get(candidate.task_id, ''))
                 try:
                     issues, cost = await propose_labels_frontier(
                         item.diff_text, model=model, description=description,
@@ -657,10 +663,11 @@ def mine(
                     )
                     issues, cost = [], 0.0
 
-            state['completed'] += 1
-            state['cost'] += cost
+            tally.completed += 1
+            tally.cost += cost
+            progress = f'  [{tally.completed}/{tally.attempted}] {candidate.diff_id}:'
             if not issues:
-                click.echo(f'  [{state["completed"]}/{total}] {candidate.diff_id}: no issues proposed -- skipping (cost=${cost:.3f})')
+                click.echo(f'{progress} no issues proposed -- skipping (cost=${cost:.3f})')
                 return
 
             diff = mined_corpus_diff(
@@ -668,17 +675,18 @@ def mine(
                 escalation_refs=esc_refs.get(candidate.task_id, []), runs_db=runs_db,
             )
             admit_mined_diff(manifest, log, diff, frontier_model=model)
-            _resave()
-            state['added'] += 1
+            save_corpus(manifest, log, seed=seed, manifest_path=_CORPUS_PATH, log_path=_ADJUDICATION_LOG_PATH)
+            tally.added += 1
             click.echo(
-                f'  [{state["completed"]}/{total}] {diff.diff_id}: {len(issues)} issues added '
-                f'(cost=${cost:.3f}, corpus now {len(manifest.diffs)})'
+                f'{progress} {len(issues)} issues added (cost=${cost:.3f}, corpus now {len(manifest.diffs)})'
             )
 
-        await asyncio.gather(*(_worker(item) for item in pool))
+        await asyncio.gather(*(_label(item) for item in pool))
 
         click.echo()
-        click.echo(f'Mined {state["added"]}/{total} new diffs this run (frontier cost: ${state["cost"]:.2f}).')
+        click.echo(
+            f'Mined {tally.added}/{tally.attempted} new diffs this run (frontier cost: ${tally.cost:.2f}).'
+        )
         click.echo(f'Corpus: {len(manifest.diffs)} diffs total.')
 
         report = audit_corpus(manifest, log, min_diffs=min_diffs)
