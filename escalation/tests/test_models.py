@@ -621,7 +621,7 @@ class TestEscalationResolutionClass:
     def test_resolution_classes_contains_exactly_the_legal_values(self):
         """RESOLUTION_CLASSES contains exactly {'benign', 'actionable',
         'moot-terminal-subject', 'stale-strand', 'addressed', 'observation-consumed',
-        'converted', 'status-info'} — no extras.
+        'converted', 'status-info', 'note-to-file'} — no extras.
 
         'moot-terminal-subject' is the distinct, non-benign stamp the task-2724
         revalidation sweep writes.
@@ -635,11 +635,15 @@ class TestEscalationResolutionClass:
 
         'addressed', 'observation-consumed', 'converted' and 'status-info' are
         the info-L0 disposition classes of plans/info-l0-disposition-router-prd.md D14.
+
+        'note-to-file' is the filer-declared note-to-file class of
+        plans/plan-deviation-recording-prd.md D2.
         """
         assert (
             frozenset({
                 'benign', 'actionable', 'moot-terminal-subject', 'stale-strand',
                 'addressed', 'observation-consumed', 'converted', 'status-info',
+                'note-to-file',
             })
             == RESOLUTION_CLASSES
         )
@@ -2108,3 +2112,39 @@ class TestEscalationProjectId:
         assert restored.project_id is None, (
             f'Expected project_id=None for legacy JSON, got {restored.project_id!r}'
         )
+
+
+class TestNoteToFileField:
+    """`note_to_file` — a filer-declared record that requests nothing
+    (plans/plan-deviation-recording-prd.md D2).
+
+    These tests pin the FIELD's default and round-trip only; the never-pending
+    invariant is pinned at its enforcement points in test_note_to_file.py.
+    """
+
+    def _make_base_esc(self, **overrides) -> Escalation:
+        return Escalation(
+            id='esc-5751-1',
+            task_id='5751',
+            agent_role='implementer',
+            severity='info',
+            category='design_concern',
+            summary='test escalation for note_to_file',
+            **overrides,
+        )
+
+    def test_note_to_file_default_is_false(self):
+        """Escalation constructed without note_to_file has note_to_file=False."""
+        assert self._make_base_esc().note_to_file is False
+
+    def test_from_dict_legacy_dict_omits_note_to_file(self):
+        """from_dict() on a dict without the note_to_file key yields False — zero migration."""
+        legacy = self._make_base_esc().to_dict()
+        del legacy['note_to_file']
+        assert Escalation.from_dict(legacy).note_to_file is False
+
+    def test_note_to_file_round_trips(self):
+        """note_to_file=True survives to_dict/from_dict and to_json/from_json."""
+        esc = self._make_base_esc(note_to_file=True)
+        assert Escalation.from_dict(esc.to_dict()).note_to_file is True
+        assert Escalation.from_json(esc.to_json()).note_to_file is True

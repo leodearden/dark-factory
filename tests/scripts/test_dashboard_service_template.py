@@ -297,7 +297,8 @@ def test_project_root_env_var_is_pinned_in_both_unit_files() -> None:
     DASHBOARD_KNOWN_PROJECT_ROOTS' self entry already gets. NOTE the treatment
     is only the same for the SUBSTITUTION: DASHBOARD_KNOWN_PROJECT_ROOTS is
     additionally PRESERVED from the installed unit across a reinstall
-    (render_systemd_unit.HOST_LOCAL_ENVIRONMENT), and this variable
+    (systemd_unit_parity.ENV_POLICY's host-local rows, preserved by
+    scripts/render_systemd_unit.py), and this variable
     deliberately is not — its value must equal the SAME copy's
     WorkingDirectory=, which the next test pins.
     """

@@ -49,6 +49,10 @@ from fused_memory.maintenance.link_heal_store import (
     ToolCaller,
     text_sha256,
 )
+from fused_memory.memory_metadata import (
+    ORCHESTRATOR_COMPLETION_SOURCE,
+    TRIAGE_CONTESTED_METADATA_KEY,
+)
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.scope import Scope
@@ -75,6 +79,9 @@ CHILD = '11111111-1111-4111-8111-111111111111'
 PARENT = '22222222-2222-4222-8222-222222222222'
 CHILD_TEXT = 'the child note about link healing'
 PARENT_TEXT = 'the parent note about link healing'
+
+#: The provenance the orchestrator stamps on a task completion record (task 6961).
+COMPLETION_META = {'source': ORCHESTRATOR_COMPLETION_SOURCE, 'task_id': '4242'}
 
 DEFAULT_LIMITS = RunLimits(
     max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3,
@@ -283,16 +290,20 @@ class LinkHealHarness:
         parent_text: str | None = PARENT_TEXT,
         project: str = DF,
         contested: bool = False,
+        contested_by_triage: bool = False,
+        meta: Mapping[str, Any] | None = None,
     ) -> None:
-        """A child linked to a parent; ``parent_text=None`` seeds no parent."""
+        """A child, carrying *meta* too, linked to a parent; ``parent_text=None`` seeds no parent."""
         if parent_text is not None:
             self.seed(project, parent, parent_text)
-        meta: dict[str, object] = {PARENT_ID_KEY: parent}
+        child_meta: dict[str, Any] = {**(meta or {}), PARENT_ID_KEY: parent}
         if kind is not None:
-            meta['kind'] = kind
+            child_meta['kind'] = kind
         if contested:
-            meta[CONTESTED_METADATA_KEY] = True
-        self.seed(project, child, child_text, **meta)
+            child_meta[CONTESTED_METADATA_KEY] = True
+        if contested_by_triage:
+            child_meta[TRIAGE_CONTESTED_METADATA_KEY] = True
+        self.seed(project, child, child_text, **child_meta)
 
     def journal_rows(self, kind: str = 'write') -> list[dict[str, Any]]:
         """The journal's ``write_ops`` rows of *kind*, oldest first, params decoded."""
@@ -364,6 +375,25 @@ async def run_corpus_plan(
     )
 
 
+async def run_deterministic_plan(
+    harness: LinkHealHarness,
+    ledger: LinkHealLedger,
+    plan_path: Path,
+    projects: Sequence[str] = PROJECTS,
+) -> RunReport:
+    """``run_plan`` with no bases: only the deterministic rows plan a heal."""
+    return await run_plan(
+        (),
+        store=harness.store(),
+        census=harness.mem0,
+        ledger=ledger,
+        limits=DEFAULT_LIMITS,
+        projects=projects,
+        source=RunSource.DETERMINISTIC,
+        plan_path_for=lambda _run_id: plan_path,
+    )
+
+
 class RecordingFiler:
     """An ``EscapeFiler`` that files nowhere and remembers every escape."""
 
@@ -390,6 +420,24 @@ async def run_corpus_apply(
         limits=limits,
         filer=filer or RecordingFiler(),
         source=RunSource.CORPUS,
+        approved_plan_sha256=approved_plan_sha256,
+    )
+
+
+async def run_deterministic_apply(
+    harness: LinkHealHarness,
+    ledger: LinkHealLedger,
+    *,
+    filer: EscapeFiler | None = None,
+    approved_plan_sha256: str | None = None,
+) -> RunReport:
+    """``run_apply`` of the deterministically planned heals over the harness's store."""
+    return await run_apply(
+        store=harness.store(),
+        ledger=ledger,
+        limits=DEFAULT_LIMITS,
+        filer=filer or RecordingFiler(),
+        source=RunSource.DETERMINISTIC,
         approved_plan_sha256=approved_plan_sha256,
     )
 

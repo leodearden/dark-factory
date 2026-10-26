@@ -29,23 +29,20 @@ expectation is derived rather than remembered.
 :data:`RECIPE_DOCS`: it is the generic multi-repo template and names no
 dark-factory command to execute.
 
-THE EXTRACTOR IS RE-IMPLEMENTED RATHER THAN IMPORTED from its two siblings in
-this directory, per the no-cross-import-between-guards convention recorded in
-``tests/scripts/conftest.py`` — task 3959 copied it from task 3558 for the
-same reason.
-
 PLACEMENT IS LOAD-BEARING. ``tests/scripts/`` carries its own module config, so
 this guard runs under FULL_SUITE and merge-role ``merge_verify_breadth: full``.
 """
 from __future__ import annotations
 
 import pathlib
+import re
 import shlex
 import sqlite3
 import subprocess
 import sys
 
 import pytest
+import verify_command_invariants as vci
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -74,57 +71,24 @@ _FIXTURE_DDL = "CREATE TABLE tasks (id INTEGER NOT NULL PRIMARY KEY, status TEXT
 
 
 def _marked_command(markdown_text, marker, bullet_label, doc_name):
-    """The inline-code command on the *bullet_label* bullet delimited by *marker*.
+    """The command on the *bullet_label* bullet between *marker*'s begin/end comments.
 
-    Every failure is a loud ``AssertionError`` naming the marker literal and
-    *doc_name*, never a ``''``/``None`` return: an extractor that silently
-    yields nothing turns the execution assertion vacuously green while
-    certifying nothing, which is strictly worse than no guard because the
-    check still reports success. The span regex is anchored on the LABEL
-    rather than on backticks, because keying on backticks alone would extract
-    the begin comment's own explanatory inline code — a plausible-looking
-    string, so the mistake would not announce itself.
+    ``verify_command_invariants.marked_span`` owns the loud marker checks, and
+    every failure names *doc_name*. This guard supplies only the pattern, keyed
+    on the bullet's label rather than on backticks so that inline code in the
+    begin comment is never extracted.
     """
-    begin = f"{marker}:begin"
-    end = f"{marker}:end"
-
-    begin_count = markdown_text.count(begin)
-    assert begin_count == 1, (
-        f"expected exactly one {begin!r} marker, found {begin_count} (task 5330). "
-        f"It delimits the copy-pasteable store-shape command in {doc_name}. "
-        f"If it was deleted, restore it around that "
-        f"bullet; if it was duplicated, one of the two copies is unpinned and "
-        f"free to rot into a command that no longer runs."
-    )
-    end_count = markdown_text.count(end)
-    assert end_count == 1, (
-        f"expected exactly one {end!r} marker to close {begin!r} in {doc_name}, "
-        f"found {end_count} (task 5330) — restore the closing marker below the "
-        f"bullet it wraps"
-    )
-
-    # Inverted markers yield an empty slice, so the next assertion catches that
-    # too, loudly and with the same remedy.
-    marked = markdown_text[markdown_text.index(begin):markdown_text.index(end)]
-    prefix = f"- **{bullet_label}**: `"
-    spans = [
-        segment.split("`", 1)[0]
-        for segment in marked.split(prefix)[1:]
-        if "`" in segment
-    ]
-    assert len(spans) == 1, (
-        f"expected exactly one ``{prefix}<command>``` bullet between {begin!r} "
-        f"and {end!r} in {doc_name}, found {len(spans)}: {spans!r} (task 5330). "
-        f"The marker must wrap that bullet and nothing else; if the bullet was "
-        f"relabelled or the markers were inverted, move the marker back around "
-        f"the copy-pasteable command."
-    )
-
-    command = spans[0].strip()
-    assert command, (
-        f"the command between {begin!r} and {end!r} in {doc_name} is empty (task 5330)"
-    )
-    return command
+    bullet = re.compile(r"- \*\*" + re.escape(bullet_label) + r"\*\*: `([^`]+)`")
+    return vci.marked_span(
+        markdown_text,
+        begin=f"{marker}:begin",
+        end=f"{marker}:end",
+        pattern=bullet,
+        what=f"`- **{bullet_label}**: <command>` bullet",
+        source=doc_name,
+        label=f"the {bullet_label!r} command",
+        task="5330",
+    ).strip()
 
 
 _HAPPY_DOC = """\

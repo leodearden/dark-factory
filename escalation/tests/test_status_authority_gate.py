@@ -649,7 +649,7 @@ class TestCompositionSharedEffectForTable:
 
     _RESOLVE_ACTIONS = ('resume', 'restart', 'park', 'abandon', 'close_only')
     _LEVELS = (0, 1, 2)
-    # Includes 'milestone_gate', a category absent from server.CATEGORIES
+    # Includes 'milestone_gate', a category outside the original agent set
     # (G6 archive verification) — proves category never narrows legality.
     _CATEGORIES = ('scope_violation', 'milestone_gate')
 

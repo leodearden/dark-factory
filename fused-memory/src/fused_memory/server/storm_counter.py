@@ -8,10 +8,10 @@ import ``fused_memory``. So the class moved DOWN to :mod:`shared.storm_counter`
 rather than being copied a fourth time, and this module became a shim: same
 public name, same contract, one home.
 
-Kept rather than deleted so the existing importers
-(:mod:`fused_memory.server.markup_tripwire`,
-:mod:`fused_memory.services.memory_service`) and the prose references in
-``config/reload.py`` and ``config/schema.py`` need no edit, and so
+No source module imports it any more: ``server/markup_tripwire`` stopped at
+task 4458, and ``services/memory_service`` imports :mod:`shared.storm_counter`
+directly since task 5102. It remains so the prose references in
+``config/reload.py`` and ``config/schema.py`` stay true, and so
 ``tests/server/test_storm_counter.py`` keeps exercising the contract through
 this path — which is what pins the shim honest.
 

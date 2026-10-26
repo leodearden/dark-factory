@@ -10,7 +10,7 @@ import logging
 import weakref
 from collections.abc import Iterator
 
-from shared.asyncio_tasks import abandon_task, track_task
+from shared.asyncio_tasks import abandon_task, cancel_bounded, track_task
 
 
 class _Boom(Exception):
@@ -269,4 +269,71 @@ class TestAbandonTask:
             await asyncio.sleep(0)
 
         assert task not in registry
+        assert errors == []
+
+
+async def _survives_cancels(survivals: int, release: asyncio.Event) -> str:
+    """Ignore the first *survivals* cancels, then end on the next one.
+
+    Once *release* is set it returns at its next wake-up, so a test can always
+    retire a task that outlived every cancel it was sent.
+    """
+    absorbed = 0
+    while True:
+        try:
+            await release.wait()
+            return 'released'
+        except asyncio.CancelledError:
+            if absorbed == survivals:
+                raise
+            absorbed += 1
+
+
+class TestCancelBounded:
+    async def test_a_task_that_honours_the_first_cancel_ends_and_reports_true(self):
+        task = asyncio.create_task(_survives_cancels(0, asyncio.Event()))
+        await asyncio.sleep(0)
+
+        assert await cancel_bounded(task, set(), grace_secs=1.0) is True
+        assert task.cancelled()
+
+    async def test_a_task_that_survives_one_cancel_is_ended_by_the_second(self):
+        task = asyncio.create_task(_survives_cancels(1, asyncio.Event()))
+        await asyncio.sleep(0)
+
+        assert await cancel_bounded(task, set(), grace_secs=0.05) is True
+        assert task.cancelled()
+
+    async def test_a_task_that_survives_both_cancels_is_tracked_and_reports_false_within_two_windows(self):
+        release = asyncio.Event()
+        registry: set[asyncio.Task] = set()
+        task = asyncio.create_task(_survives_cancels(2, release))
+        await asyncio.sleep(0)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+
+        ended = await cancel_bounded(task, registry, grace_secs=0.05)
+
+        assert ended is False
+        assert loop.time() - started < 1.0
+        assert task in registry
+        release.set()
+        await _drain(task)
+        assert task not in registry
+
+    async def test_the_task_exception_is_consumed_not_raised(self):
+        async def _raises_on_cancel() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise _Boom('raised while unwinding') from None
+
+        with _recorded_loop_errors() as errors:
+            task = asyncio.create_task(_raises_on_cancel())
+            await asyncio.sleep(0)
+            assert await cancel_bounded(task, set(), grace_secs=1.0) is True
+            task_ref = weakref.ref(task)
+            del task
+            _collect_and_confirm_gone(task_ref)
+
         assert errors == []

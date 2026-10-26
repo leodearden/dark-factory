@@ -3,7 +3,7 @@
 M3 of plans/merge-skew-attribution-prd.md — the proactive pipeline-landing
 tripwire (PRD task δ, invariant I6, boundary rows 5-6).  This module tests
 ONLY the harness-layer adapter that wires the pure
-``orchestrator.merge_skew_tripwire.emit_pipeline_landing_tripwire`` into the
+``orchestrator.merge_lane.skew_tripwire.emit_pipeline_landing_tripwire`` into the
 post-advance ``_note_merge_all`` landing hook: reading
 ``config.git.load_bearing_oracle_cmd``, enumerating in-flight tasks
 (excluding the just-landed task), and injecting real

@@ -1451,7 +1451,8 @@ class TestStaleSpawnFailureCounter:
       cap detection, which the spawn-fault branch deliberately never
       touches); `_account_resume_probe_loop` then exits at its
       `if not acct.capped: return` without clearing anything.
-    - `_on_sighup_async` force-resets EVERY account to AVAILABLE.
+    - `_on_sighup_async` force-resets every non-AUTH_FAILED account to
+      AVAILABLE.
 
     The counter left behind is stale forever, because the account will never
     probe again to zero it, and it breaks the latch in BOTH directions:
@@ -1761,10 +1762,10 @@ class TestSighupSpawnFailureCounter:
     """SIGHUP on a broken host must leave no counter behind (task 4512 review).
 
     The one path that reaches `_note_probe_spawn_failure` for an account which
-    is NOT in a probing phase. `_on_sighup_async` force-resets every account to
-    AVAILABLE — zeroing `probe_spawn_failures` via `_transition` — and only
-    THEN fans out `_reprobe_account` across all of them. With the host broken,
-    every one of those reprobes raised `ProbeSpawnError` and left an AVAILABLE
+    is NOT in a probing phase. `_on_sighup_async` force-resets every
+    non-AUTH_FAILED account to AVAILABLE — zeroing `probe_spawn_failures` via
+    `_transition` — and only THEN fans out `_reprobe_account` across all of
+    them. With the host broken, every one of those reprobes raised `ProbeSpawnError` and left an AVAILABLE
     account holding a count of 1.
 
     Nothing could ever clear it: an AVAILABLE account runs neither

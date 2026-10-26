@@ -1,0 +1,25 @@
+[Unit]
+Description=Nightly timer for the INV-12 owner sweep (task 5608)
+
+[Timer]
+# Nightly at 06:00 local time, after the rest of this machine's staggered
+# ladder:
+#
+#   03:00  legibility-trickle@
+#   03:30  fused-memory-flag-marker-sweep
+#   04:00  reclaim-orphaned-worktrees  AND  legibility-transcript-check@
+#   04:30  legibility-trickle-health@
+#   05:00  memory-metadata-coverage-census
+#   05:30  return-brief
+#   06:00  this job
+#
+# The period must stay one exception_register.SWEEP_PERIOD: --report calls the
+# stamp stale after two. Persistent=true catches up a night missed to a
+# sleeping laptop; the randomized delay avoids a thundering herd. See
+# OPERATIONS.md §12 for the ladder as a whole.
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

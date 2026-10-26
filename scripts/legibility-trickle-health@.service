@@ -16,7 +16,7 @@ WorkingDirectory=/home/leo/src/dark-factory
 Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
 #
 # NO LEGIBILITY_CLAUDE_BIN, deliberately. This unit never launches the coder
-# -- it runs two read-only probes. legibility-trickle@.service pins that
+# -- it runs three read-only probes. legibility-trickle@.service pins that
 # variable for a load-bearing reason (the 2026-08-18 PATH gap) that does not
 # apply here, and a copied pin would be a claim about this unit that is
 # simply false, left to rot until someone trusts it.

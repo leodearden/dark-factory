@@ -48,6 +48,10 @@ import glob
 import json
 import os
 import sys
+from pathlib import Path
+
+import _checkout as _checkout
+from shared.project_layout import default_project_root, escalation_queue_dir
 
 DEDUP_MARKER = 'survivor, stays open'
 TERMINAL_STATUSES = ('resolved', 'dismissed')
@@ -109,11 +113,11 @@ def sweep_queue(queue_dir: str) -> int:
 
 
 def default_queues() -> list[str]:
-    src = os.path.expanduser('~/src')
-    queues = sorted(glob.glob(os.path.join(src, '*', 'data', 'escalations')))
-    recon = os.path.join(src, 'dark-factory', 'data', 'reconciliation', 'escalations')
-    if os.path.isdir(recon):
-        queues.append(recon)
+    every_project = Path(glob.escape(os.path.expanduser('~/src')), '*')
+    queues = sorted(glob.glob(str(escalation_queue_dir(every_project))))
+    recon = default_project_root() / 'data' / 'reconciliation' / 'escalations'
+    if recon.is_dir():
+        queues.append(str(recon))
     return queues
 
 

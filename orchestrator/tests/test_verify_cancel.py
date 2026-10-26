@@ -19,6 +19,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+from shared.proc_group import pid_running
 
 from orchestrator.verify_runner import HEARTBEAT_STOP_JOIN_SECS
 
@@ -1799,24 +1800,13 @@ def _is_running(pid: int) -> bool:
     whether reaping actually happened. A zombie has already been killed; its
     lingering /proc entry just means its parent hasn't called wait() yet.
     """
-    import os
     try:
         os.kill(pid, 0)
     except OSError:
         # Covers ProcessLookupError (no such pid) — a subclass of OSError —
         # alongside PermissionError and friends.
         return False
-    try:
-        stat = Path(f'/proc/{pid}/stat').read_text()
-        # Format: "pid (comm) state ...". comm may itself contain ')' or
-        # spaces, so split on the LAST ')' to reliably find the state field.
-        state = stat.rsplit(')', 1)[1].split()[0]
-    except (OSError, IndexError):
-        # Vanished between kill(0) and reading /proc (FileNotFoundError is
-        # itself an OSError subclass), or /proc unreadable — either way it
-        # is not confirmed running.
-        return False
-    return state != 'Z'
+    return pid_running(pid)
 
 
 def _poll_until(predicate, timeout, interval=0.1):

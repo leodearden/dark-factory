@@ -21,7 +21,7 @@ from _orch_helpers import pydantic_spec
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     WORKTREE_MISSING_REASON_PREFIX,
     MergeOutcome,
 )

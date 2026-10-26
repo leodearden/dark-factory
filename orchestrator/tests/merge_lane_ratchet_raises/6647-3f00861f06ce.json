@@ -1,0 +1,48 @@
+{
+  "task_id": "6647",
+  "reason": "review fix: the same-tree skip runs only when the project declares merge_gate_history_pure (its gate reads no git history); DF ships it false",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 342,
+      "current": 343
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_reverify_rebased_tree",
+      "baseline": 6,
+      "current": 7
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 3550,
+      "current": 3556
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 1604,
+      "current": 1609
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4874,
+      "current": 4875
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57374,
+      "current": 57380
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31627,
+      "current": 31632
+    }
+  ]
+}

@@ -236,6 +236,15 @@ class EmptySelectionError(ValueError):
     """
 
 
+class CensusShapeError(ValueError):
+    """The census parsed, but lacks a table this script reads.
+
+    :func:`load_census_coverage` turns it into ``unavailable_reason``, because a
+    probe run is never fatal on its census. ``--derive-registry`` refuses it
+    with :data:`EXIT_BAD_INPUT`, because there the census IS the input.
+    """
+
+
 class ProbeRunError(RuntimeError):
     """The run could not complete; the message is attributed at the seam that raised it.
 
@@ -707,16 +716,20 @@ def load_topic_registry(path: str | Path) -> TopicRegistry:
 
     entries = [_parse_entry(raw, i) for i, raw in enumerate(raw_entries)]
 
-    seen: dict[str, int] = {}
+    seen: dict[str, tuple[int, str]] = {}
     for i, entry in enumerate(entries):
-        if entry.topic in seen:
+        folded = normalize_topic(entry.topic)
+        if folded in seen:
+            earlier_index, earlier_topic = seen[folded]
             raise _fail(
                 entry.topic,
-                f'duplicate topic slug (also at index {seen[entry.topic]}). The slug is '
-                'the persisted tripwire item key, so a duplicate would make one of the '
-                'two invisible to the grandfather set.',
+                f'duplicate topic: index {earlier_index} already carries '
+                f'{earlier_topic!r}, and both fold to {folded!r} under normalize_topic. '
+                'The slug is the persisted tripwire item key, so a duplicate would make '
+                'one of the two invisible to the grandfather set, and a spelling-variant '
+                'pair would measure one topic twice.',
             )
-        seen[entry.topic] = i
+        seen[folded] = (i, entry.topic)
 
     return TopicRegistry(
         schema_version=schema_version,
@@ -749,6 +762,10 @@ class DerivationResult:
     one dropped for ``count <= 1`` is a healthy census with an uninformative
     tail. Folding them into one number reports a schema break as a corpus
     property, which is the reading that stops anyone looking.
+
+    An absent or misshapen topic table is REFUSED (:class:`CensusShapeError`),
+    not counted, because it would read zero in every census counter, the same
+    as an empty corpus.
     """
 
     candidates: tuple[dict[str, Any], ...]
@@ -873,7 +890,31 @@ class _CensusDerivation(NamedTuple):
     malformed_count: int
 
 
-def _derive_census_candidates(census: dict) -> _CensusDerivation:
+_CENSUS_TOPIC_TABLE_PATH = ('grand_total', 'topic', 'entries')
+
+
+def _census_topic_table(census: Any) -> list[Any]:
+    """The census's ``grand_total.topic.entries`` rows, which may be empty.
+
+    An empty list is a healthy census of a corpus with no topic values. An
+    absent or misshapen table raises :class:`CensusShapeError` naming where
+    the walk stopped, because it would otherwise read zero in every census
+    counter, exactly like that empty corpus.
+    """
+    node, location = census, 'the top level'
+    for depth, key in enumerate(_CENSUS_TOPIC_TABLE_PATH):
+        if not isinstance(node, dict):
+            raise CensusShapeError(f'{location} is {type(node).__name__}, not an object')
+        node = node.get(key)
+        location = '.'.join(_CENSUS_TOPIC_TABLE_PATH[:depth + 1])
+        if node is None:
+            raise CensusShapeError(f'{location} is null or absent')
+    if not isinstance(node, list):
+        raise CensusShapeError(f'{location} is {type(node).__name__}, not a list')
+    return node
+
+
+def _derive_census_candidates(census: Any) -> _CensusDerivation:
     """Multi-entry census topics, plus every row the derivation had to drop.
 
     A count-1 topic has exactly one entry, so "is the canonical in the top k"
@@ -882,9 +923,14 @@ def _derive_census_candidates(census: dict) -> _CensusDerivation:
     reported rather than silently applied. Rows whose ``value`` or ``count``
     is the wrong shape are counted separately, for the reason
     :class:`_CensusDerivation` states.
+
+    Candidates come out most-used first, ties broken by value, whatever order
+    the census file lists its rows in: that order is what lets the folded
+    dedup in :func:`derive_registry_candidates` keep a topic's more-used
+    spelling.
     """
-    table = ((census.get('grand_total') or {}).get('topic') or {}).get('entries') or []
-    candidates: list[dict[str, Any]] = []
+    table = _census_topic_table(census)
+    multi_entry: list[tuple[str, int]] = []
     skipped = 0
     malformed_value = 0
     malformed_count = 0
@@ -902,7 +948,10 @@ def _derive_census_candidates(census: dict) -> _CensusDerivation:
         if count <= 1:
             skipped += 1
             continue
-        candidates.append(_candidate(
+        multi_entry.append((value, count))
+    multi_entry.sort(key=lambda row: (-row[1], row[0]))
+    candidates = [
+        _candidate(
             _slugify(value),
             project_id='dark_factory',
             derived_from='census_topic',
@@ -913,7 +962,9 @@ def _derive_census_candidates(census: dict) -> _CensusDerivation:
             phrasings=[value.replace('_', ' ').replace('-', ' ')],
             members=[],
             provenance={'census_topic_value': value, 'census_count': count},
-        ))
+        )
+        for value, count in multi_entry
+    ]
     return _CensusDerivation(candidates, skipped, malformed_value, malformed_count)
 
 
@@ -939,7 +990,7 @@ def _slugify(value: str) -> str:
 
 def derive_registry_candidates(
     calibration_rows: list[dict],
-    census_report: dict,
+    census_report: Any,
     guard_clusters,
 ) -> DerivationResult:
     """Derive candidate registry entries from the three COMMITTED sources.
@@ -953,12 +1004,16 @@ def derive_registry_candidates(
     per-facet claim needles. Those are hand-authored, which is exactly why the
     CLI band prints rather than overwrites (see :func:`run_derive_registry`).
 
-    When two sources derive the same slug, the richer one is kept and the
-    other is counted in ``slug_collisions_dropped``. A curator gate knows its
+    Two candidates collide when their slugs fold together under
+    :func:`normalize_topic`, because the corpus spells one topic with ``-``
+    and ``_``. The richer one is kept, in its own spelling: curator_gate >
+    topic_guard_cluster > census_topic, since a curator gate knows its
     canonical's hash, a guard cluster carries hand-written match phrases, and
-    a census topic has only a phrasing synthesised from its own slug. So a
-    census that grows a topic equal to a guard slug does not change the
-    entry derived for that slug.
+    a census topic has only a phrasing synthesised from its own slug. Between
+    two census rows, the more-used spelling is kept, and on a tie the
+    lexically first. Every dropped candidate is counted in
+    ``slug_collisions_dropped``, so the per-source counts plus collisions
+    account for every candidate generated.
     """
     curator_candidates, clusters_without_canonical = _derive_curator_gate_candidates(
         calibration_rows,
@@ -974,10 +1029,11 @@ def derive_registry_candidates(
     deduped: list[dict[str, Any]] = []
     collisions = 0
     for candidate in candidates:
-        if candidate['topic'] in seen:
+        folded = normalize_topic(candidate['topic'])
+        if folded in seen:
             collisions += 1
             continue
-        seen.add(candidate['topic'])
+        seen.add(folded)
         deduped.append(candidate)
     deduped.sort(key=lambda c: c['topic'])
 
@@ -1032,8 +1088,20 @@ def run_derive_registry(
         for line in Path(calibration_path).read_text(encoding='utf-8').splitlines()
         if line.strip()
     ]
-    census = json.loads(Path(census_path).read_text(encoding='utf-8'))
-    result = derive_registry_candidates(rows, census, guard_clusters)
+    census_text = Path(census_path).read_text(encoding='utf-8')
+    try:
+        census = json.loads(census_text)
+    except ValueError as exc:
+        raise CensusShapeError(
+            f'the census at {census_path} is not decodable JSON: {exc}'
+        ) from exc
+    try:
+        result = derive_registry_candidates(rows, census, guard_clusters)
+    except CensusShapeError as exc:
+        raise CensusShapeError(
+            f'the census at {census_path} has no usable topic table for '
+            f'--derive-registry: {exc}'
+        ) from exc
     payload = result.as_registry_payload()
     payload['_disclosures'] = result.disclosures
     return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
@@ -2327,23 +2395,19 @@ class CensusCoverage:
     """The registry topics the census deliberately did not gauge."""
 
 
-class _CensusShapeError(ValueError):
-    """The census parsed, but carries no usable registry gauge."""
-
-
 def _census_count(raw: dict, key: str) -> int:
     value = raw.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
-        raise _CensusShapeError(f'a registry_coverage row has a non-integer {key!r}: {raw!r}')
+        raise CensusShapeError(f'a registry_coverage row has a non-integer {key!r}: {raw!r}')
     return value
 
 
 def _parse_census_row(raw: Any) -> CensusTopicRow:
     if not isinstance(raw, dict):
-        raise _CensusShapeError(f'a registry_coverage row is not an object: {raw!r}')
+        raise CensusShapeError(f'a registry_coverage row is not an object: {raw!r}')
     project_id, topic = raw.get('project_id'), raw.get('topic')
     if not isinstance(project_id, str) or not isinstance(topic, str):
-        raise _CensusShapeError(f'a registry_coverage row lacks a project_id or topic: {raw!r}')
+        raise CensusShapeError(f'a registry_coverage row lacks a project_id or topic: {raw!r}')
     return CensusTopicRow(
         project_id=project_id,
         topic=topic,
@@ -2362,7 +2426,7 @@ def _parse_query_surface_topics(raw: Any) -> tuple[str, ...]:
     if not isinstance(raw, list) or not all(
         isinstance(item, dict) and isinstance(item.get('topic'), str) for item in raw
     ):
-        raise _CensusShapeError(f'query_surface_topics_not_gauged is misshapen: {raw!r}')
+        raise CensusShapeError(f'query_surface_topics_not_gauged is misshapen: {raw!r}')
     return tuple(item['topic'] for item in raw)
 
 
@@ -2370,21 +2434,21 @@ def _parse_registry_gauge(
     payload: Any,
 ) -> tuple[dict[tuple[str, str], CensusTopicRow], tuple[str, ...]]:
     if not isinstance(payload, dict):
-        raise _CensusShapeError('the top level is not an object')
+        raise CensusShapeError('the top level is not an object')
     gauge = payload.get('registry_coverage')
     if gauge is None:
-        raise _CensusShapeError(
+        raise CensusShapeError(
             'registry_coverage is null or absent; the census reported '
             f'registry_error={payload.get("registry_error")!r}',
         )
     if not isinstance(gauge, dict) or not isinstance(gauge.get('topics'), list):
-        raise _CensusShapeError('registry_coverage.topics is not a list')
+        raise CensusShapeError('registry_coverage.topics is not a list')
     rows: dict[tuple[str, str], CensusTopicRow] = {}
     for raw in gauge['topics']:
         row = _parse_census_row(raw)
         key = (row.project_id, row.topic)
         if key in rows:
-            raise _CensusShapeError(f'registry_coverage.topics repeats {key!r}')
+            raise CensusShapeError(f'registry_coverage.topics repeats {key!r}')
         rows[key] = row
     return rows, _parse_query_surface_topics(gauge.get('query_surface_topics_not_gauged'))
 
@@ -2409,7 +2473,7 @@ def load_census_coverage(path: str | Path) -> CensusCoverage:
         return unavailable(f'the census at {source} is not decodable JSON: {exc}')
     try:
         rows, query_surface = _parse_registry_gauge(payload)
-    except _CensusShapeError as exc:
+    except CensusShapeError as exc:
         return unavailable(f'the census at {source} carries no usable registry gauge: {exc}')
     return CensusCoverage(
         source=source,
@@ -3128,7 +3192,11 @@ Agrees with ``shared.cli_boundary.EXIT_STDOUT_FAILED``.
 
 EXIT_BAD_INPUT = 2
 """Nothing can be measured until the input is fixed: the registry did not load,
-or ``--project-id`` selected nothing."""
+``--project-id`` selected nothing, or ``--derive-registry``'s census is
+undecodable or carries no usable topic table.
+
+A census file that cannot be read at all, such as a wrong path, is
+:data:`EXIT_RUN_FAILED` instead, like any unreadable derivation source."""
 
 
 def corpus_categories() -> tuple[str, ...]:
@@ -3444,7 +3512,10 @@ def build_parser() -> LoudArgumentParser:
         help=(
             'Metadata census JSON, read for the tripwire split by canonical '
             'presence and by --derive-registry. An unreadable census is named '
-            f'in the report, never fatal to a probe run (default: {DEFAULT_CENSUS_PATH})'
+            'in the report, never fatal to a probe run. --derive-registry '
+            'refuses a census that is undecodable or has no usable topic '
+            'table (exit 2), and fails on one it cannot read at all, such as '
+            f'a wrong path (exit 1) (default: {DEFAULT_CENSUS_PATH})'
         ),
     )
     parser.add_argument(
@@ -3527,7 +3598,7 @@ def main(argv: list[str] | None = None) -> int:
             registry = load_topic_registry(args.registry)
             outcome = asyncio.run(_probe(args, registry))
             text = outcome.report
-    except (RegistryError, EmptySelectionError) as exc:
+    except (RegistryError, EmptySelectionError, CensusShapeError) as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_BAD_INPUT
     except ProbeRunError as exc:

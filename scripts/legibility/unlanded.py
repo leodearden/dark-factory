@@ -1,9 +1,11 @@
-"""scripts/legibility/unlanded.py — put back a machine-written legibility
-write whose commit did not land.
+"""scripts/legibility/unlanded.py — land a machine-written legibility write
+with one bounded, lock-tolerant scoped commit, or put it back when that commit
+does not land.
 
 The trickle and the census write into a target repo's machine-operated main
-checkout and then commit. When that commit does not land — refused by the
-target repo's pre-commit hook, or failed for a plain git reason — the written
+checkout and then commit with :func:`commit_only`. When that commit does not
+land — refused by the target repo's pre-commit hook, still contended after
+its bounded lock retries, or failed for a plain git reason — the written
 paths stay dirty (or, after the scoped ``git add`` fallback, staged). Left
 there they block the target's redeploy, trip the orchestrator's dirty-tree
 escalation and are re-submitted the next night. The remedy, stated here as
@@ -21,20 +23,120 @@ Nothing expires a quarantine; the operator removes one after recovering it.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterable
+import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 from legibility import trickle_state
+
+_LOCK_CONTENTION = re.compile(
+    r"^(?:fatal|error): (?:cannot lock ref\b|unable to create '[^'\n]*\.lock')",
+    re.IGNORECASE | re.MULTILINE,
+)
+"""git's own report of a transient ref/index-lock contention (the merge worker
+or a hook holding the lock in the shared main checkout): retried. Anything
+else, such as a hook refusal, is final: a retry re-runs the whole hook."""
+
+COMMIT_ATTEMPTS = 5
+COMMIT_BACKOFF_SECONDS = 0.2
 
 QUARANTINE_DIRNAME = 'quarantine'
 
 GIT_TIMEOUT_SECONDS = 60.0
 """Bound on each git call :func:`roll_back` makes: a hung git becomes a
 rollback-INCOMPLETE result, so the caller's escalation is still sent."""
+
+
+@dataclass(frozen=True)
+class CommitResult:
+    """What :func:`commit_only` did: landed as ``sha``, or not, with git's
+    diagnostic from the last of its ``attempts``."""
+
+    ok: bool
+    sha: str | None
+    stderr: str
+    attempts: int
+
+
+_Runner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def commit_only(
+    repo: str | os.PathLike[str],
+    paths: Iterable[str | os.PathLike[str]],
+    message: str,
+    *,
+    runner: _Runner | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    max_attempts: int = COMMIT_ATTEMPTS,
+    backoff: float = COMMIT_BACKOFF_SECONDS,
+) -> CommitResult:
+    """Commit only *paths* in *repo* (``git commit --only``), leaving every
+    other staged or dirty path alone. Never stashes, never skips the hooks, and
+    never raises for a git or launch failure.
+
+    A path git does not know yet is made known by a scoped ``git add`` within
+    the same attempt. A lock contention, in the commit or in that add, is
+    retried after ``sleep(backoff)`` for up to *max_attempts* attempts; any
+    other failure is final. *runner* is ``subprocess.run``, looked up at call
+    time.
+    """
+    run = runner if runner is not None else subprocess.run
+    git = ['git', '-C', str(repo)]
+    names = [str(path) for path in paths]
+    attempt = 1
+    while True:
+        result = _attempt_commit(run, git, names, message, attempt)
+        if result.ok or attempt >= max_attempts or not _is_lock_contention(result.stderr):
+            return result
+        sleep(backoff)
+        attempt += 1
+
+
+def _attempt_commit(
+    run: _Runner, git: list[str], paths: list[str], message: str, attempt: int,
+) -> CommitResult:
+    try:
+        failure = _commit_once(run, git, paths, message)
+        if failure is None:
+            head = run([*git, 'rev-parse', 'HEAD'], capture_output=True, text=True)
+            sha = (head.stdout or '').strip() or None
+            return CommitResult(ok=True, sha=sha, stderr='', attempts=attempt)
+    except OSError as exc:
+        failure = f'git could not be run: {exc}'
+    return CommitResult(ok=False, sha=None, stderr=failure, attempts=attempt)
+
+
+def _commit_once(run: _Runner, git: list[str], paths: list[str], message: str) -> str | None:
+    """``None`` once the commit lands, else git's diagnostic for why not."""
+    commit = [*git, 'commit', '--only', *paths, '-m', message]
+    committed = run(commit, capture_output=True, text=True)
+    if committed.returncode == 0:
+        return None
+    failure = _diagnostic(committed)
+    if 'did not match any file' not in failure.lower():
+        return failure
+    added = run([*git, 'add', '--', *paths], capture_output=True, text=True)
+    if added.returncode != 0:
+        return _diagnostic(added)
+    committed = run(commit, capture_output=True, text=True)
+    return None if committed.returncode == 0 else _diagnostic(committed)
+
+
+def _diagnostic(completed: subprocess.CompletedProcess[str]) -> str:
+    """Both of git's streams: hook output arrives on stderr, while git's own
+    verdict on a no-op commit arrives on stdout."""
+    streams = (completed.stderr, completed.stdout)
+    return '\n'.join(text.strip() for text in streams if text and text.strip())
+
+
+def _is_lock_contention(diagnostic: str) -> bool:
+    return _LOCK_CONTENTION.search(diagnostic) is not None
 
 
 def quarantine_root(project_id: str) -> Path:

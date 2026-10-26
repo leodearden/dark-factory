@@ -9,6 +9,7 @@ nested run, remain the main regression detectors for it.
 
 from __future__ import annotations
 
+import getpass
 import subprocess
 from pathlib import Path
 
@@ -51,9 +52,23 @@ def test_the_binding_registers_the_named_fixture(request):
 
 _TRIVIAL_TEST = 'def test_passes():\n    pass\n'
 
+_TEMPROOT_RECORDER = '''\
+import os
+from pathlib import Path
+
+
+def test_records_the_inherited_temproot(tmp_path):
+    record = Path(__file__).resolve().parent / 'inherited-temproot'
+    record.write_text(os.environ.get('PYTEST_DEBUG_TEMPROOT', ''))
+'''
+
 
 def _output(result: subprocess.CompletedProcess[str]) -> str:
     return result.stdout + result.stderr
+
+
+def _listing(root: Path) -> list[str]:
+    return sorted(str(p.relative_to(root)) for p in root.rglob('*'))
 
 
 def test_a_bound_session_runs_against_its_own_copy_in_its_own_tree(tmp_path: Path) -> None:
@@ -100,6 +115,46 @@ def test_a_source_may_not_replace_the_harness_own_files(
         run_nested_pytest(root, {relpath: '', 'test_one.py': _TRIVIAL_TEST})
 
     assert not root.exists()
+
+
+def test_a_nested_session_leaves_the_hosts_default_temp_root_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = tmp_path / 'host-temp'
+    (host / f'pytest-of-{getpass.getuser()}' / 'garbage-seeded' / 'leftover').mkdir(parents=True)
+    before = _listing(host)
+    monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(host))
+    root = tmp_path / 'temproot-probe'
+
+    result = run_nested_pytest(root, {'test_records_temproot.py': _TEMPROOT_RECORDER})
+
+    assert result.returncode == 0, _output(result)
+    assert '1 passed' in _output(result), _output(result)
+    assert (root / 'inherited-temproot').read_text() == str(host), (
+        'nested session did not inherit PYTEST_DEBUG_TEMPROOT'
+    )
+    after = _listing(host)
+    assert after == before, (
+        "nested session touched the host's default temp root\n"
+        f'before: {before}\nafter:  {after}'
+    )
+
+
+@pytest.mark.parametrize(
+    'spelling', [('--basetemp={}',), ('--basetemp', '{}')], ids=['joined', 'separate'],
+)
+def test_a_basetemp_smuggled_through_targets_is_refused_before_any_session_starts(
+    tmp_path: Path, spelling: tuple[str, ...],
+) -> None:
+    smuggled = tmp_path / 'elsewhere'
+    targets = ('test_one.py', *(arg.format(smuggled) for arg in spelling))
+    root = tmp_path / 'smuggling'
+
+    with pytest.raises(ValueError, match='--basetemp') as refused:
+        run_nested_pytest(root, {'test_one.py': _TRIVIAL_TEST}, targets=targets)
+
+    assert targets[1] in str(refused.value)
+    assert not root.exists() and not smuggled.exists(), 'a session started anyway'
 
 
 def test_the_nested_cap_is_below_this_runs_per_test_timeout(

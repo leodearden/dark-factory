@@ -38,10 +38,10 @@ from pathlib import Path
 from _dashboard_helpers import (
     destructure_bindings,
     extract_function_body,
+    node_path,
     strip_js_comments,
     walk_balanced,
 )
-from _lock_chip_matrix import node_path
 
 REDUX = Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
 
@@ -494,13 +494,14 @@ _DASH = '/api/v2/dashboard'
 _TAB_READ_FLOOR = {
     'orch': {f'{_DASH}/scheduler', f'{_DASH}/tasks'},
     'overview': {f'{_DASH}/merge-queue'},
-    'tasks': {f'{_DASH}/tasks'},
+    'tasks': {f'{_DASH}/tasks', f'{_DASH}/invariants'},
 }
 """Reads the derivation must see, as literals: a non-vacuity floor, not the contract.
 
 orch's Deps/Locks cells read ``DF.SCHEDULER``. overview's ``LiveFeed`` reads
 ``MERGE_QUEUE`` through ``buildFeedEntries(window.DF_DATA)``. Both were missing
-from TAB_ENDPOINTS until found by hand. orch and tasks render task rows."""
+from TAB_ENDPOINTS until found by hand. orch and tasks render task rows, and the
+Tasks tab's per-project groups render the claimant-invariant chip."""
 
 
 def test_every_tab_polls_every_endpoint_it_reads(index_html_body: str) -> None:

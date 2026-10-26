@@ -1,0 +1,27 @@
+{
+ "stream": "S9",
+ "prd_path": "docs/prds/review-all-persisted-vocabularies-and-schema-equivalence.md",
+ "manifest_path": "docs/prds/review-all-persisted-vocabularies-and-schema-equivalence.capability-manifest.yaml",
+ "leaves_estimate": 10,
+ "lead_rulings_on_open_questions": [
+  "Q1 (lead ruling, Leo may overturn): the author's default stands — enum_column always derives the CHECK, so a new persisted member lands with a three-line migration that replaces it and tests/models/test_vocabulary.py fails CI on a forgotten one; the DB-level CHECK is the redundant enforcement point (h10) and migration churn is cheap pre-release. check=False is not offered."
+ ],
+ "lead_actions_at_decompose": [
+  "cancel 1028 with x_acceptance_reason naming S9-gamma3",
+  "S9-gamma3 depends on 1036 (key stays there)",
+  "recommend 612 and 613 (onboarding) depend on S9-gamma3; append companion corrections to the onboarding/collection/corrections PRD tasks"
+ ],
+ "cross_reference_lines": [
+  "Shared conventions, Migrations bullet: after S9-epsilon, down_revision is resolved from `alembic heads` / tests/_migration_head.py::chain_head(); no file carries a head literal; second to land renumbers its own file only.",
+  "Shared conventions, new bullet: a new closed-vocabulary column uses models/vocabulary.py::enum_column with the Enum defined in the persisting models module; adding a member lands with a CHECK-replacing migration (tests/models/test_vocabulary.py).",
+  "Seam row migrations chain: amended per the above.",
+  "S2's codec/transition leaves depend on S9-gamma1 (typed BillingRunStatusRow state/recon_status/arrears; enums homed in models/billing_run.py; dead states deleted with a CHECK-replacing migration).",
+  "S4's leaves touching control_command_log/feedback*/provenance depend on S9-gamma2 (ControlMetric, LimitAction moved to models/control_command_log.py).",
+  "S15's mode-column leaf depends on S9-beta and gamma1 (ProviderMode homed in settings.py per S15 Q1 (S18 stratum 0); models/billing_run.py imports it — amended 2026-10-15).",
+  "S13: convert consent_status to enum_column when the EXPIRED-drop migration touches it (D6 convert-when-touched).",
+  "S17-delta1 held on S9-beta; S9-delta drops only the 4 BillBreakdownSegment kWh server defaults.",
+  "S21-alpha held on S9-alpha; enum_column lives in models/vocabulary.py.",
+  "S1's statement.py partition leaves depend on S9-delta.",
+  "S9-alpha held on S27-alpha (INV-8 entry)."
+ ]
+}

@@ -27,6 +27,8 @@ from typing import Any
 
 from shared.task_statuses import ACTIVE as ACTIVE_TASK_STATUSES
 
+from fused_memory.utils.clip_disclosure import window_note
+
 # --------------------------------------------------------------------------- #
 # Count-snapshot detection
 # --------------------------------------------------------------------------- #
@@ -848,6 +850,9 @@ MAX_CANCELLED_TASKS_RETAINED: int = 15
 # always reference the same set of tasks — see task_knowledge_sync.assemble_payload().
 MAX_ACTIVE_TASKS_RENDERED: int = 50
 
+ACTIVE_TASK_TREE_TITLE: str = 'Active Task Tree'
+ACTIVE_TASK_TREE_HEADER: str = f'### {ACTIVE_TASK_TREE_TITLE}'
+
 # Status priority for sorting: lower value = higher priority.
 # Matches _select_proactive_sample in task_knowledge_sync.py.
 # 'done': 4 is included so that _select_proactive_sample (which sorts ALL tasks
@@ -1515,6 +1520,30 @@ def format_task_list(tasks: list[Any]) -> str:
     return '\n'.join(_render_task_line(t) for t in tasks if isinstance(t, dict)) or 'No tasks.'
 
 
+def _retained_window_note(*, status: str, cap_name: str, cap: int, count: int, retained: list[dict]) -> str:
+    return window_note(
+        shown=len(retained),
+        total=count,
+        noun=f'{status} task(s)',
+        window='highest-id (most recent)',
+        cap_name=cap_name,
+        cap=cap,
+    )
+
+
+def render_retained_done_tasks(tree: FilteredTaskTree) -> str:
+    """Render ``tree.done_tasks``, ending with a window note when MAX_DONE_TASKS_RETAINED left some out."""
+    listing = format_task_list(tree.done_tasks)
+    note = _retained_window_note(
+        status='done',
+        cap_name='MAX_DONE_TASKS_RETAINED',
+        cap=MAX_DONE_TASKS_RETAINED,
+        count=tree.done_count,
+        retained=tree.done_tasks,
+    )
+    return f'{listing}\n\n{note}' if note else listing
+
+
 # --------------------------------------------------------------------------- #
 # Surrounding-strings helper
 # --------------------------------------------------------------------------- #
@@ -1538,7 +1567,7 @@ def _format_header(shown: int, omitted_active: int, tree: FilteredTaskTree) -> s
         tree: FilteredTaskTree supplying the done/cancelled/other/total counts.
     """
     return (
-        f'### Active Task Tree\n'
+        f'{ACTIVE_TASK_TREE_HEADER}\n'
         f'({shown} active shown'
         + (f', {omitted_active} more active omitted by max_tasks cap' if omitted_active > 0 else '')
         + f', {tree.done_count} done, {tree.cancelled_count} cancelled, '
@@ -1584,6 +1613,15 @@ def _build_surrounding(
 
     if tree.cancelled_tasks:
         cancelled_lines = '\n'.join(_render_task_line(t) for t in tree.cancelled_tasks)
+        note = _retained_window_note(
+            status='cancelled',
+            cap_name='MAX_CANCELLED_TASKS_RETAINED',
+            cap=MAX_CANCELLED_TASKS_RETAINED,
+            count=tree.cancelled_count,
+            retained=tree.cancelled_tasks,
+        )
+        if note:
+            cancelled_lines = f'{cancelled_lines}\n\n{note}'
         cancelled_section = f'\n### Recently Cancelled Tasks\n{cancelled_lines}\n'
         summary_line = f'{tree.done_count} done — omitted'
     else:
@@ -1823,6 +1861,9 @@ def format_filtered_task_tree(
     - When tree.cancelled_tasks is empty, the section is omitted and the
       summary retains the format '{done_count} done, {cancelled_count}
       cancelled — omitted' for backward compatibility.
+
+    When MAX_CANCELLED_TASKS_RETAINED left cancelled tasks out, the section ends
+    with a note naming the window it shows.
 
     The cancelled section is never truncated by the max_chars clamp — only
     active task lines are trimmed. The cancelled section length is subtracted

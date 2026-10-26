@@ -1,0 +1,235 @@
+{
+ "stream": "S1",
+ "prd_path": "docs/prds/review-all-billing-engine-evidence-module-and-typed-facts.md",
+ "sidecar_path": "docs/prds/review-all-billing-engine-evidence-module-and-typed-facts.capability-manifest.yaml",
+ "filed": [
+  {
+   "label": "alpha",
+   "task_id": "194",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-1bb43508339e",
+    "fk-64412055963f",
+    "fk-e7daee7b0dd3"
+   ],
+   "depends_on": [
+    "380",
+    "1070",
+    "1105",
+    "1122",
+    "1089",
+    "298"
+   ],
+   "note": "alpha, adopted in place"
+  },
+  {
+   "label": "beta",
+   "task_id": "1209",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-1bb43508339e"
+   ],
+   "depends_on": [
+    "194",
+    "298",
+    "1070"
+   ]
+  },
+  {
+   "label": "epsilon",
+   "task_id": "267",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-41e7dcec9005",
+    "fk-9b045b843bb9"
+   ],
+   "depends_on": [
+    "1070",
+    "1129"
+   ],
+   "note": "epsilon, adopted in place; keeps from_governed_finance per C2"
+  },
+  {
+   "label": "theta",
+   "task_id": "1211",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-d6ff2d37d1b6",
+    "fk-1bb43508339e"
+   ],
+   "depends_on": [
+    "194",
+    "1209",
+    "267",
+    "1070"
+   ]
+  },
+  {
+   "label": "zeta1",
+   "task_id": "365",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-c83dadec1029"
+   ],
+   "depends_on": [
+    "1211",
+    "1070"
+   ],
+   "note": "zeta1, adopted in place"
+  },
+  {
+   "label": "zeta2",
+   "task_id": "519",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-20c980862d3f",
+    "fk-2d01f78f6b61",
+    "fk-c83dadec1029"
+   ],
+   "depends_on": [
+    "365",
+    "1070"
+   ],
+   "note": "zeta2, adopted in place"
+  },
+  {
+   "label": "zeta3",
+   "task_id": "1212",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-20c980862d3f"
+   ],
+   "depends_on": [
+    "519",
+    "1213",
+    "1096",
+    "1070"
+   ]
+  },
+  {
+   "label": "zeta4",
+   "task_id": "422",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-d67ab731252e"
+   ],
+   "depends_on": [
+    "686",
+    "365",
+    "1136",
+    "1070"
+   ],
+   "note": "zeta4, adopted in place"
+  },
+  {
+   "label": "delta",
+   "task_id": "555",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-9215f3d84973"
+   ],
+   "depends_on": [
+    "365",
+    "267",
+    "1070"
+   ],
+   "note": "delta, adopted in place"
+  },
+  {
+   "label": "eta",
+   "task_id": "1213",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-7e9b8580c07d"
+   ],
+   "depends_on": [
+    "1211",
+    "1070"
+   ]
+  },
+  {
+   "label": "kappa",
+   "task_id": "1214",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-2426a5a9c9f7"
+   ],
+   "depends_on": [
+    "1211",
+    "493",
+    "1147",
+    "1070"
+   ],
+   "note": "kappa, billing half of fk-2426a5a9c9f7"
+  },
+  {
+   "label": "gamma",
+   "task_id": "1215",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-93399e158742"
+   ],
+   "depends_on": [
+    "1083",
+    "221",
+    "1022"
+   ]
+  },
+  {
+   "label": "iota",
+   "task_id": "1216",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-9b045b843bb9"
+   ],
+   "depends_on": [
+    "555"
+   ]
+  },
+  {
+   "label": "lambda",
+   "task_id": "1217",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-1bb43508339e"
+   ],
+   "depends_on": [
+    "194",
+    "1209",
+    "267",
+    "1211",
+    "365",
+    "519",
+    "1212",
+    "422",
+    "555",
+    "1213",
+    "1214",
+    "1215",
+    "1216"
+   ],
+   "note": "lambda, integration gate"
+  }
+ ],
+ "held_leaves": [],
+ "gate_dependencies_added": [
+  "194",
+  "1209",
+  "267",
+  "1211",
+  "365",
+  "519",
+  "1212",
+  "422",
+  "555",
+  "1213",
+  "1217"
+ ],
+ "commit_planning_result": "success. 8 new leaves moved deferred->pending (1209, 1211, 1212, 1213, 1214, 1215, 1216, 1217). 6 adopted tasks were already pending, so their flip was a no-op (194, 267, 365, 519, 422, 555). manifest_stamping stamped all 14 labels with missing_labels [] and errors []. No polarity rejection. deliver",
+ "lead_rulings": [
+  "Adopted in place and raised to high: 194 (alpha), 267 (epsilon, keeps from_governed_finance per C2), 555 (delta), 365 (zeta1), 519 (zeta2), 422 (zeta4); 8 new leaves 1209, 1211-1217.",
+  "Lead cancellations with x_acceptance_reason: 192 -> 555; 329 -> 519; 280 -> 267 (D6 WARNING + D7 VAT test); 879 -> 194 + 1209 + 1211 (its split contradicts PRD D1).",
+  "Edges 194/1209 -> 298 (in merge queue; extracts segment_registers), 521 -> 555 with a note; coordination notes on 221, 462, 350, 228, 342; zeta3 -> 1096 (chain_head); S6-theta 1180 contention only.",
+  "S10-epsilon 1205 released onto 267 (see S10 row). Briefing (interactive, after 555): retire the known gap 'single-period FinanceConfig'."
+ ]
+}

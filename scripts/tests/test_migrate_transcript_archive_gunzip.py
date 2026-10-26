@@ -501,11 +501,12 @@ def test_cli_apply_performs_the_migration(tmp_path):
 
 
 def test_cli_root_defaults_to_the_archive_root(tmp_path):
-    """(c) --root overrides the default; the default is default_archive_root()
-    — asserted against the parser rather than by sweeping the live archive."""
+    """(c) --root overrides the default; the default is default_archive_root(),
+    resolved by main rather than when the parser is built — asserted against
+    the parser rather than by sweeping the live archive."""
     parser = mig.build_parser()
 
-    assert parser.parse_args([]).root == str(mig.default_archive_root())
+    assert parser.parse_args([]).root is None
     assert parser.parse_args(["--root", str(tmp_path)]).root == str(tmp_path)
     # Dry-run is the parser-level default, not just a runtime convention.
     assert parser.parse_args([]).apply is False

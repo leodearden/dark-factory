@@ -15,15 +15,15 @@ import pytest
 
 # RED in step-1: module does not exist yet; import will fail until step-2.
 from _fm_helpers import as_async_run_git as _as_async_run_git
+from shared.scheduler_state import SchedulerStateSnapshot
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
 import fused_memory.services.live_workflow_detector as detector_module
 from fused_memory.services.live_workflow_detector import (
-    DEFAULT_HEARTBEAT_TTL,
     DEFAULT_MAX_WORKTREE_AGE_HOURS,
     ClaimantLabel,
     WorkflowLiveness,
     _routing_decided_after_restart,
-    _task_in_scheduler_holders_or_parks,
     claimant_label,
     corroboration_for_task,
     detect_live_workflow,
@@ -1708,32 +1708,47 @@ def _routing_metadata(decided_at: str | None) -> dict:
     }
 
 
-class TestTaskInSchedulerHoldersOrParks:
-    """_task_in_scheduler_holders_or_parks: task_id in parks-keys OR holders-values."""
+def _snap(**wire_fields: object) -> SchedulerStateSnapshot:
+    return SchedulerStateSnapshot.from_json(wire_fields)
+
+
+def _scheduler_corroborates(
+    task_id: str | int, scheduler_state: SchedulerStateSnapshot | None,
+) -> bool:
+    return has_live_workflow_corroboration(
+        task_id,
+        claimant_live=False,
+        scheduler_state=scheduler_state,
+        routing_latest_decided_at=None,
+        orchestrator_started_at=None,
+    )
+
+
+class TestSchedulerHoldersOrParksCorroboration:
+    """The scheduler signal: task_id is a parks key OR a current-holders value."""
 
     def test_true_when_task_id_is_parks_key(self):
-        state = {'parks': {_CORROB_TASK_ID: {'reason': 'x'}}, 'current_holders': {}}
-        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, state) is True
+        state = _snap(parks={_CORROB_TASK_ID: {'modules': ['x']}})
+        assert _scheduler_corroborates(_CORROB_TASK_ID, state) is True
 
     def test_true_when_task_id_is_current_holders_value(self):
         # current_holders is {module: task_id}; the task_id is a VALUE, not a key.
-        state = {'parks': {}, 'current_holders': {'reconciliation': _CORROB_TASK_ID}}
-        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, state) is True
+        state = _snap(current_holders={'reconciliation': _CORROB_TASK_ID})
+        assert _scheduler_corroborates(_CORROB_TASK_ID, state) is True
 
     def test_false_when_in_neither(self):
-        state = {'parks': {'9999': {}}, 'current_holders': {'mod': '9999'}}
-        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, state) is False
+        state = _snap(parks={'9999': {}}, current_holders={'mod': '9999'})
+        assert _scheduler_corroborates(_CORROB_TASK_ID, state) is False
 
-    def test_no_raise_when_state_none(self):
-        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, None) is False
+    def test_false_when_state_none(self):
+        assert _scheduler_corroborates(_CORROB_TASK_ID, None) is False
 
-    def test_no_raise_when_keys_missing(self):
-        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, {}) is False
+    def test_false_when_no_producer_has_written(self):
+        assert _scheduler_corroborates(_CORROB_TASK_ID, SchedulerStateSnapshot.empty()) is False
 
-    def test_int_task_id_coerced_to_str(self):
-        # scheduler_state keys/values are strings (JSON); an int task_id still matches.
-        state = {'parks': {'2763': {}}, 'current_holders': {}}
-        assert _task_in_scheduler_holders_or_parks(2763, state) is True
+    def test_int_task_id_matches_str_key(self):
+        # Snapshot keys/values are strings (JSON); an int task_id still matches.
+        assert _scheduler_corroborates(2763, _snap(parks={'2763': {}})) is True
 
 
 class TestRoutingDecidedAfterRestart:
@@ -1780,7 +1795,7 @@ class TestHasLiveWorkflowCorroboration:
         assert has_live_workflow_corroboration(
             _CORROB_TASK_ID,
             claimant_live=False,
-            scheduler_state={'parks': {_CORROB_TASK_ID: {}}, 'current_holders': {}},
+            scheduler_state=_snap(parks={_CORROB_TASK_ID: {}}),
             routing_latest_decided_at=None,
             orchestrator_started_at=None,
         ) is True
@@ -1798,7 +1813,7 @@ class TestHasLiveWorkflowCorroboration:
         assert has_live_workflow_corroboration(
             _CORROB_TASK_ID,
             claimant_live=False,
-            scheduler_state={'parks': {}, 'current_holders': {}},
+            scheduler_state=SchedulerStateSnapshot.empty(),
             routing_latest_decided_at='2026-07-23T09:00:00Z',  # before started
             orchestrator_started_at=self._STARTED,
         ) is False
@@ -1809,8 +1824,31 @@ class TestCorroborationForTask:
 
     _STARTED = datetime(2026, 7, 23, 10, 0, 0, tzinfo=UTC)
 
-    def test_default_heartbeat_ttl_is_ten_minutes(self):
-        assert timedelta(minutes=10) == DEFAULT_HEARTBEAT_TTL
+    def _default_ttl_task(self, heartbeat_at: datetime) -> dict:
+        return {
+            'id': _CORROB_TASK_ID,
+            'status': 'in-progress',
+            'claimant_run_id': 'run-1/sess-1/pid=42',
+            'heartbeat_at': heartbeat_at.isoformat(),
+        }
+
+    def test_default_ttl_just_inside_is_corroborated(self):
+        task = self._default_ttl_task(
+            _CORROB_NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL + timedelta(seconds=1),
+        )
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=None,
+        ) is True
+
+    def test_default_ttl_just_outside_is_not_corroborated(self):
+        task = self._default_ttl_task(
+            _CORROB_NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL - timedelta(seconds=1),
+        )
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=None,
+        ) is False
 
     def test_fresh_heartbeat_true(self):
         task = {
@@ -1834,7 +1872,7 @@ class TestCorroborationForTask:
         }
         assert corroboration_for_task(
             task, _CORROB_TASK_ID, now=_CORROB_NOW,
-            scheduler_state={'parks': {}, 'current_holders': {}},
+            scheduler_state=SchedulerStateSnapshot.empty(),
             orchestrator_started_at=self._STARTED,
         ) is False
 
@@ -1868,7 +1906,7 @@ class TestCorroborationForTask:
         task = {'id': _CORROB_TASK_ID, 'status': 'in-progress', 'claimant_run_id': None}
         assert corroboration_for_task(
             task, _CORROB_TASK_ID, now=_CORROB_NOW,
-            scheduler_state={'parks': {_CORROB_TASK_ID: {}}, 'current_holders': {}},
+            scheduler_state=_snap(parks={_CORROB_TASK_ID: {}}),
             orchestrator_started_at=self._STARTED,
         ) is True
 
@@ -1927,9 +1965,16 @@ class TestClaimantLabel:
     def test_default_ttl_is_the_corroboration_ttl(self):
         just_inside = {
             'claimant_run_id': self._RUN,
-            'heartbeat_at': (self._NOW - DEFAULT_HEARTBEAT_TTL + timedelta(seconds=1)).isoformat(),
+            'heartbeat_at': (self._NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL + timedelta(seconds=1)).isoformat(),
         }
         assert self._label(just_inside) is ClaimantLabel.LIVE
+
+    def test_default_ttl_just_outside_is_stale(self):
+        just_outside = {
+            'claimant_run_id': self._RUN,
+            'heartbeat_at': (self._NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL - timedelta(seconds=1)).isoformat(),
+        }
+        assert self._label(just_outside) is ClaimantLabel.STALE
 
 
 class TestCorroborationGate:

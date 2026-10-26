@@ -57,20 +57,23 @@ def build_heartbeat_payload(
     *,
     drain: Mapping[str, Any] | None,
     verifies_in_flight: Sequence[Mapping[str, Any]],
+    deployed_sha: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Build the on-disk heartbeat payload.
 
-    Returns a dict with exactly the seven fields ``{unit, merge_idle, depth,
-    queue_empty, ts_epoch, drain, verifies_in_flight}`` in that key order,
-    with values passed through unchanged (no coercion) — this is the single
-    definition of the on-disk contract shared with the readers
+    Returns a dict with exactly the eight fields ``{unit, merge_idle, depth,
+    queue_empty, ts_epoch, drain, verifies_in_flight, deployed_sha}`` in that
+    key order, with values passed through unchanged (no coercion) — this is
+    the single definition of the on-disk contract shared with the readers
     (``scripts/drain_check.py``, the watchdog's ``--report``).
 
     ``drain`` and ``verifies_in_flight`` are the restart-drain additions
     (task 5371): the acknowledgement of this unit's drain request (``None``
-    when there is none) and the merge verifies in flight.  They are
-    keyword-only and required so no producer can omit them; their element
-    shapes are defined in ``orchestrator.fleet_drain``.
+    when there is none) and the merge verifies in flight.  ``deployed_sha``
+    (task 6565) is ``orchestrator.deployed_sha.DeployedSha.to_wire()`` for the
+    code this unit runs, or ``None`` when it could not be read.  All three are
+    keyword-only and required so no producer can omit them; the drain shapes
+    are defined in ``orchestrator.fleet_drain``.
     """
     return {
         'unit': unit,
@@ -80,6 +83,7 @@ def build_heartbeat_payload(
         'ts_epoch': ts_epoch,
         'drain': None if drain is None else dict(drain),
         'verifies_in_flight': [dict(v) for v in verifies_in_flight],
+        'deployed_sha': None if deployed_sha is None else dict(deployed_sha),
     }
 
 

@@ -1,0 +1,60 @@
+{
+  "task_id": "4206",
+  "reason": "Net-additive defect fix (task 4206): build_chain now confirms the acquired lane's HEAD is head_merge_commit before stacking any merge and refuses an off-base or unreadable lane as truncated_reason='lane_base_mismatch' (new member of the typed ChainTruncationReason vocabulary in merge_lane/types.py), so a lane left off-base by any acquire_spec_lane route can no longer yield a chain tip rooted at the wrong base for delta's _land_chain_prefix to CAS-advance main onto. Not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2193,
+      "current": 2195
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::build_chain",
+      "baseline": 16,
+      "current": 18
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 1875,
+      "current": 1886
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22091,
+      "current": 22115
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 978,
+      "current": 984
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12521,
+      "current": 12530
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4840,
+      "current": 4842
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57533,
+      "current": 57568
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 32011,
+      "current": 32026
+    }
+  ]
+}

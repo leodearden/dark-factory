@@ -89,17 +89,16 @@ class TestGitAuthorityOutcome:
     def test_is_a_str_enum(self) -> None:
         assert issubclass(GitAuthorityOutcome, enum.StrEnum)
 
-    def test_has_exactly_three_members(self) -> None:
-        """A fourth outcome must not appear without a reviewer seeing this move.
+    def test_has_exactly_four_members(self) -> None:
+        """A fifth outcome must not appear without a reviewer seeing this move.
 
-        ``landed_unconfirmed`` vs ``no_signal`` is this task's answer to "are
-        'landed but unattributable' and 'we know nothing' the same
-        proposition?" — they are NOT, and the distinction is materialized
-        here, on the verdict, rather than on the ``merge_status`` MCP
-        response, whose vocabulary belongs to task 4831.
+        ``landed_unconfirmed`` vs ``no_signal`` vs ``probe_failed`` are three
+        different propositions — "landed but unattributable", "we looked and
+        found nothing", and "we could not look" — and merge_status renders
+        each differently (task 4831).
         """
         assert {m.value for m in GitAuthorityOutcome} == {
-            'found_on_main', 'landed_unconfirmed', 'no_signal',
+            'found_on_main', 'landed_unconfirmed', 'no_signal', 'probe_failed',
         }
 
     @pytest.mark.parametrize(
@@ -108,6 +107,7 @@ class TestGitAuthorityOutcome:
             (GitAuthorityOutcome.found_on_main, 'found_on_main'),
             (GitAuthorityOutcome.landed_unconfirmed, 'landed_unconfirmed'),
             (GitAuthorityOutcome.no_signal, 'no_signal'),
+            (GitAuthorityOutcome.probe_failed, 'probe_failed'),
         ],
     )
     def test_members_round_trip_as_their_plain_spelling(
@@ -397,7 +397,7 @@ def _force_differential_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
         return True
 
     monkeypatch.setattr(
-        'orchestrator.landing_evidence._delivered_checks_differential', _confirm,
+        'orchestrator.merge_lane.landing_evidence._delivered_checks_differential', _confirm,
     )
 
 
@@ -533,7 +533,7 @@ class TestProbeLanding:
     # to catch.
     #
     # The differential is forced through the DEFINING module
-    # (``orchestrator.landing_evidence``), the same way
+    # (``orchestrator.merge_lane.landing_evidence``), the same way
     # ``test_merge_status_git_authority.py``'s
     # ``_record_validate_landing_evidence`` patches its own target, so the
     # REAL ``validate_landing_evidence`` decision logic stays in the loop.
@@ -707,10 +707,12 @@ class TestProbeLanding:
         assert verdict.merge_sha is None, label
 
     async def test_is_fire_safe(self, tmp_path: Path) -> None:
-        """A git fault degrades to the honest ``no_signal``, never propagates.
+        """A git fault degrades to ``probe_failed``, never propagates.
 
         The wrapper lives INSIDE probe_landing so leaf η inherits the
-        fire-safety instead of having to re-add it.
+        fire-safety instead of having to re-add it.  The outcome is NOT
+        ``no_signal``: a probe that could not look must stay distinguishable
+        from one that looked and found nothing.
         """
         verdict = await probe_landing(
             _probe_git_ops(
@@ -720,7 +722,23 @@ class TestProbeLanding:
             harness=_harness(task={'metadata': {}}),
         )
 
-        assert verdict.outcome is GitAuthorityOutcome.no_signal
+        assert verdict.outcome is GitAuthorityOutcome.probe_failed
+        assert verdict.merge_sha is None
+
+    async def test_is_fire_safe_when_is_ancestor_raises(self, tmp_path: Path) -> None:
+        verdict = await probe_landing(
+            _probe_git_ops(
+                resolve_branch_sha=AsyncMock(
+                    side_effect=lambda b: 'a' * 40 if b.startswith('task/') else _MAIN
+                ),
+                is_ancestor=AsyncMock(side_effect=RuntimeError('git exploded')),
+            ),
+            '905', orch_config=_config(tmp_path),
+            harness=_harness(task={'metadata': {}}),
+        )
+
+        assert verdict.outcome is GitAuthorityOutcome.probe_failed
+        assert verdict.merge_sha is None
 
     async def test_site_labels_every_degradation_this_probe_logs(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -738,7 +756,7 @@ class TestProbeLanding:
         wrapper, and the one ``task_metadata`` emits underneath it.
         """
         with caplog.at_level(logging.WARNING):
-            await probe_landing(
+            verdict = await probe_landing(
                 _probe_git_ops(
                     resolve_branch_sha=AsyncMock(side_effect=RuntimeError('git exploded')),
                 ),
@@ -746,6 +764,7 @@ class TestProbeLanding:
                 harness=_harness(raises=True), site='landed_reconciler',
             )
 
+        assert verdict.outcome is GitAuthorityOutcome.probe_failed
         assert 'landed_reconciler' in caplog.text, (
             f'the fire-safe warning must name the CALLER, got: {caplog.text!r}'
         )
@@ -857,10 +876,15 @@ class TestGitAuthorityVerdict:
                 False,
                 'no_signal — nothing established',
             ),
+            (
+                GitAuthorityVerdict(outcome=GitAuthorityOutcome.probe_failed),
+                False,
+                'probe_failed — the probe could not look',
+            ),
         ],
         ids=[
             'fully_guarded', 'citation_gate_skipped', 'rescued',
-            'both_weakenings', 'landed_unconfirmed', 'no_signal',
+            'both_weakenings', 'landed_unconfirmed', 'no_signal', 'probe_failed',
         ],
     )
     def test_merge_sha_fully_guarded(

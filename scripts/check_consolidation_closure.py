@@ -38,8 +38,10 @@ alone):
               the seam would refuse the ``done`` transition with.
   - exit 2  — COULD NOT CHECK (usage or infra). Bad arguments, no such
               task, an unreadable ``tasks.db``, a task that is not a
-              consolidation gate, a gate block with no usable ``topic``, or
-              a store that did not answer.
+              consolidation gate, a gate block with no usable ``topic``, a
+              project root that names no directory or no
+              ``--project-root`` outside any checkout, or a store that did
+              not answer.
 
 Exit 2 is a SEPARATE code on purpose. An unreachable Qdrant and a
 genuinely malformed cluster are different facts and must not share an exit
@@ -83,27 +85,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# IMPORT-RESOLUTION CONTRACT (same idiom, and the same precedence argument,
-# as scripts/scan_task_toolcall_leaks.py:92-116): bind `fused_memory` and
-# `shared` to THIS checkout via a __file__-relative path. The fused-memory
-# editable install is an ordinary .pth entry, so sys.path ORDER decides the
-# winner — without these inserts a worktree run would silently check its
-# cluster against the MAIN checkout's copy of the predicate.
-_FM_SRC = Path(__file__).resolve().parent.parent / "fused-memory" / "src"
-if str(_FM_SRC) not in sys.path:
-    sys.path.insert(0, str(_FM_SRC))
-
-_SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
-if str(_SHARED_SRC) not in sys.path:
-    sys.path.insert(0, str(_SHARED_SRC))
+import _checkout as _checkout
 
 # `_task_db_scan` is a flat sibling in scripts/ and resolves solely because a
 # DIRECTLY-EXECUTED script puts its own directory at sys.path[0] — so never
 # invoke this via `python -m`. It is the single home for the tasks.db path and
 # its read-only open.
-from _task_db_scan import TaskDbUnreadable, connect_ro, tasks_db_path  # noqa: E402
-from fused_memory.middleware.task_interceptor import TaskInterceptor  # noqa: E402
-from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
+from _task_db_scan import TaskDbUnreadable, connect_ro, tasks_db_path
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.reconciliation.consolidation_gate import (
     EXIT_CLOSED,
     EXIT_NOT_CLOSED,
     GATE_METADATA_KEY,
@@ -111,6 +101,8 @@ from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
     evaluate_closure,
     resolve_unstamped_live_ids,
 )
+from shared.project_id import project_id_for_root
+from shared.project_layout import CheckoutRootError, default_project_root
 
 #: "I could not run the check." Distinct from EXIT_NOT_CLOSED by design —
 #: see the EXIT-CODE CONTRACT above.
@@ -120,9 +112,6 @@ EXIT_USAGE = 2
 #: exactly as much of the cluster as the seam does, or the two can disagree
 #: about `scroll_incomplete` on the very cluster the operator is checking.
 SCROLL_LIMIT = TaskInterceptor._CONSOLIDATION_SCROLL_LIMIT
-
-DEFAULT_PROJECT_ROOT = "/home/leo/src/dark-factory"
-DEFAULT_PROJECT_ID = "dark_factory"
 
 
 class UsageError(Exception):
@@ -320,21 +309,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--project-root",
-        default=DEFAULT_PROJECT_ROOT,
-        help="project root owning tasks.db (default: %(default)s)",
+        default=None,
+        help="project root owning tasks.db (default: the main checkout)",
     )
     parser.add_argument(
         "--tag", default="master", help="taskmaster tag (default: %(default)s)"
     )
     parser.add_argument(
         "--project-id",
-        default=DEFAULT_PROJECT_ID,
-        help="memory project_id to scroll (default: %(default)s)",
+        default=None,
+        help="memory project_id to scroll (default: the project id of --project-root)",
     )
     parser.add_argument(
         "--json", action="store_true", dest="as_json", help="emit the verdict as JSON"
     )
     return parser
+
+
+def _project_root(args: argparse.Namespace) -> str:
+    if args.project_root is not None:
+        return str(Path(args.project_root).resolve())
+    try:
+        return str(default_project_root())
+    except CheckoutRootError as exc:
+        raise UsageError(f"no --project-root given and {exc}") from exc
+
+
+def _project_id(args: argparse.Namespace) -> str:
+    if args.project_id is not None:
+        return args.project_id
+    try:
+        return project_id_for_root(_project_root(args))
+    except ValueError as exc:
+        raise UsageError(f"{exc}, or pass --project-id") from exc
 
 
 def _emit(payload: dict, *, as_json: bool, human: str) -> None:
@@ -345,21 +352,15 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
     try:
         if args.task_id:
             raw_metadata: Any = load_task_metadata(
-                args.project_root, args.task_id, args.tag
+                _project_root(args), args.task_id, args.tag
             )
         elif args.metadata_file:
             raw_metadata = Path(args.metadata_file).read_text()
         else:
             raw_metadata = args.metadata_json
         block = extract_gate_block(raw_metadata)
-    except UsageError as exc:
-        _emit(
-            {"checked": False, "exit_code": EXIT_USAGE, "error": str(exc)},
-            as_json=args.as_json,
-            human=f"COULD NOT CHECK: {exc}",
-        )
-        return EXIT_USAGE
-    except OSError as exc:
+        project_id = _project_id(args)
+    except (UsageError, OSError) as exc:
         _emit(
             {"checked": False, "exit_code": EXIT_USAGE, "error": str(exc)},
             as_json=args.as_json,
@@ -374,7 +375,7 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
     store_error: str | None = None
     try:
         scrolled = await scroll_cluster(
-            memory, args.project_id, topic, block=block
+            memory, project_id, topic, block=block
         )
     except Exception as exc:  # noqa: BLE001 — any store failure is "could not check"
         store_error = f"{type(exc).__name__}: {exc}"
@@ -435,8 +436,7 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    return asyncio.run(run(args))
+    return asyncio.run(run(build_parser().parse_args(argv)))
 
 
 if __name__ == "__main__":

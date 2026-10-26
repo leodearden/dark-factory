@@ -144,7 +144,7 @@ From the Phase 2 file set, in this order:
 - `/review-all`'s open findings (Step 1.5);
 - hotspot-ranked areas, minus exonerated churn (Step 1.5);
 - confusion-dense codebook anchors (Step 1.5);
-- modules the metrics snapshot shows in `cycles`, with reach-back or deferred imports, or reached by tests' `private_patch_targets` (Step 1.5);
+- modules the metrics snapshot shows in `cycles`, `hidden_cycles` or `typing_cycles`, with reach-back imports or deferred imports marked `closes_cycle`, or reached by tests' `private_patch_targets` (Step 1.5);
 - server startup, config loading, pipeline stages and orchestration, infrastructure files (Dockerfiles, units, CI), shared utilities;
 - the briefing's `stability_concerns`.
 

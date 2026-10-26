@@ -16,6 +16,7 @@ Step map:
 
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -45,7 +46,7 @@ from _campaign_gate_helpers import (
 )
 
 from orchestrator.evals.configs import EvalConfig
-from orchestrator.evals.runner import EvalResult
+from orchestrator.evals.results import EvalResult, ResultStore
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -358,8 +359,8 @@ class TestBuildEvalOrchConfigJudgeOverride:
 # must key on the judge candidate (not the pinned implementer, which would
 # collide both judge rows) so select_survivors groups judge runs as their own
 # OFAT axis. Boundaries mocked (the _run_end_to_end_hermetic pattern):
-# create_eval_worktree / build_workflow / collect_metrics / load_task /
-# save_result. judge_config=None → byte-identical to today.
+# create_eval_worktree / build_workflow / collect_metrics / load_task, and the
+# injected result store. judge_config=None → byte-identical to today.
 # ---------------------------------------------------------------------------
 
 def _judge_task(tmp_path: Path) -> dict:
@@ -392,14 +393,16 @@ async def _run_eval_hermetic(
     Returns ``(result, captured)`` where ``captured['build_workflow']`` is the
     kwargs dict build_workflow received (for asserting the threaded config).
 
-    ``_build_eval_usage_gate`` is patched UNCONDITIONALLY (task 4427) and
-    exposed as ``captured['build_gate']``. It has to be: the packaged default is
-    ``usage_cap.enabled: true``, so the real builder would otherwise construct a
-    live ``UsageGate`` off ``_base_config``'s resolved cap block — touching the
-    filesystem for probe dirs and account state, and leaving whether the gate
-    resolves to ``None`` dependent on whatever credentials the test machine
-    happens to export. ``gate=`` sets what the patched builder returns (default
-    ``None``, i.e. the ungated cell every pre-4427 case here already meant).
+    The cell's gate builder is replaced UNCONDITIONALLY (task 4427): runner's
+    ``owned_usage_gate`` is rebound to the real context manager with
+    ``captured['build_gate']`` as its ``factory``. It has to be: the packaged
+    default is ``usage_cap.enabled: true``, so the real builder would otherwise
+    construct a live ``UsageGate`` off ``_base_config``'s resolved cap block —
+    touching the filesystem for probe dirs and account state, and leaving
+    whether the gate resolves to ``None`` dependent on whatever credentials the
+    test machine happens to export. ``gate=`` sets what that factory returns
+    (default ``None``, i.e. the ungated cell every pre-4427 case here already
+    meant).
 
     ``injected_gate=`` forwards to ``run_eval``'s own ``usage_gate=`` parameter —
     a gate a campaign owner already built, which this cell must use without
@@ -410,7 +413,7 @@ async def _run_eval_hermetic(
     resolved — which is what proves the owned teardown really is in a
     ``finally``.
     """
-    from orchestrator.evals import runner
+    from orchestrator.evals import eval_gate, runner
 
     captured: dict = {}
 
@@ -429,23 +432,27 @@ async def _run_eval_hermetic(
     metrics_obj = MagicMock()
     metrics_obj.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
     mock_collect = AsyncMock(return_value=metrics_obj, side_effect=collect_side_effect)
-    mock_save = MagicMock()
+    mock_store = MagicMock(spec=ResultStore)
     mock_build_gate = AsyncMock(return_value=gate)
 
     monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', fake_build_workflow)
     monkeypatch.setattr(runner, 'collect_metrics', mock_collect)
     monkeypatch.setattr(runner, 'load_task', lambda _p: task)
-    monkeypatch.setattr(runner, 'save_result', mock_save)
-    monkeypatch.setattr(runner, '_build_eval_usage_gate', mock_build_gate)
+    monkeypatch.setattr(
+        runner, 'owned_usage_gate',
+        functools.partial(eval_gate.owned_usage_gate, factory=mock_build_gate),
+    )
     captured['build_gate'] = mock_build_gate
     captured['wf'] = fake_wf
+    captured['save'] = mock_store.save
 
     extra: dict[str, Any] = (
         {} if injected_gate is _NO_INJECTED_GATE else {'usage_gate': injected_gate}
     )
     result = await runner.run_eval(
-        Path('/fake/task.json'), config, base, judge_config=judge_config, **extra,
+        Path('/fake/task.json'), config, base, judge_config=judge_config,
+        store=mock_store, **extra,
     )
     return result, captured
 
@@ -496,9 +503,10 @@ class TestRunEvalJudgeConfig:
 # via build_workflow(initial_plan=None) so the architect plans live and feeds
 # the live implementer — the only place the plan-style/implementer coupling
 # question exists (PRD decision 9). Boundaries mocked (test_eval_architect
-# pattern): create_eval_worktree / build_workflow / collect_metrics / load_task
-# / save_result. GitOps/scheduler/briefing/mcp construct for real (I/O-free) so
-# the config threaded into build_workflow is the genuine article we assert on.
+# pattern): create_eval_worktree / build_workflow / collect_metrics / load_task,
+# and the injected result store. GitOps/scheduler/briefing/mcp construct for
+# real (I/O-free) so the config threaded into build_workflow is the genuine
+# article we assert on.
 # ---------------------------------------------------------------------------
 
 def _e2e_task(tmp_path: Path) -> dict:
@@ -528,14 +536,15 @@ async def _run_end_to_end_hermetic(
 
     Returns ``(result, captured, mocks)`` where ``captured['build_workflow']``
     is the kwargs dict build_workflow received (for asserting config + plan)
-    and ``mocks['build_gate']`` is the patched ``_build_eval_usage_gate``.
+    and ``mocks['build_gate']`` is the gate factory the cell's
+    ``owned_usage_gate`` was bound to.
 
     The gate knobs (``gate`` / ``injected_gate`` / ``run_side_effect`` /
     ``collect_side_effect``) mean exactly what they mean in
     :func:`_run_eval_hermetic` — see its docstring for why the builder is
-    patched unconditionally.
+    replaced unconditionally.
     """
-    from orchestrator.evals import runner
+    from orchestrator.evals import eval_gate, runner
 
     captured: dict = {}
 
@@ -554,24 +563,26 @@ async def _run_end_to_end_hermetic(
     metrics_obj = MagicMock()
     metrics_obj.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
     mock_collect = AsyncMock(return_value=metrics_obj, side_effect=collect_side_effect)
-    mock_save = MagicMock()
+    mock_store = MagicMock(spec=ResultStore)
     mock_build_gate = AsyncMock(return_value=gate)
 
     monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', fake_build_workflow)
     monkeypatch.setattr(runner, 'collect_metrics', mock_collect)
     monkeypatch.setattr(runner, 'load_task', lambda _p: task)
-    monkeypatch.setattr(runner, 'save_result', mock_save)
-    monkeypatch.setattr(runner, '_build_eval_usage_gate', mock_build_gate)
+    monkeypatch.setattr(
+        runner, 'owned_usage_gate',
+        functools.partial(eval_gate.owned_usage_gate, factory=mock_build_gate),
+    )
 
     extra: dict[str, Any] = (
         {} if injected_gate is _NO_INJECTED_GATE else {'usage_gate': injected_gate}
     )
     result = await runner.run_end_to_end(
-        Path('/fake/task.json'), arch_cfg, impl_cfg, base, **extra,
+        Path('/fake/task.json'), arch_cfg, impl_cfg, base, store=mock_store, **extra,
     )
     return result, captured, {
-        'collect': mock_collect, 'save': mock_save, 'wf': fake_wf,
+        'collect': mock_collect, 'save': mock_store.save, 'wf': fake_wf,
         'build_gate': mock_build_gate,
     }
 
@@ -615,8 +626,9 @@ class TestRunEndToEnd:
         assert result.task_id == 'df_task_e2e'
         assert result.outcome == 'done'
 
-        # (d) persisted via save_result.
+        # (d) persisted through the injected store — the very cell returned.
         mocks['save'].assert_called_once()
+        assert mocks['save'].call_args.args[0] is result
 
 
 @pytest.mark.asyncio
@@ -826,7 +838,7 @@ class TestInjectedGateContract:
 
         from shared.testing import make_gate_mock
 
-        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.eval_gate')
         gate = make_gate_mock()
         gate.shutdown = AsyncMock(side_effect=RuntimeError('teardown boom'))
 

@@ -14,7 +14,7 @@ This module reuses the bare-worker git_repo/git_config/git_ops fixtures from
 test_merge_queue_request_liveness.py (per-file duplication convention — see
 that module's docstring) and, from step-11 onward, the concurrent-verify
 scenario helpers from test_merge_queue_concurrent_verify.py. It imports
-orchestrator.merge_queue / orchestrator.merge_speculation_controller LOCALLY
+orchestrator.merge_lane.worker / orchestrator.merge_lane.speculation_controller LOCALLY
 inside each test (mirrors test_merge_request_ledger.py's convention) so a
 not-yet-wired attribute/key never breaks collection during the RED steps.
 """
@@ -174,7 +174,7 @@ class _InjectedVerifier(FakeVerifier):
     """A ``VerifyPort`` delegating the scoped verify to *run_scoped*.
 
     The injection-shaped replacement for this file's former
-    ``patch('orchestrator.merge_queue.run_scoped_verification', <fn>)``: the
+    ``patch('orchestrator.merge_lane.worker.run_scoped_verification', <fn>)``: the
     same per-test gated async function, now handed to the lane through
     ``MergeLane(..., verifier=...)`` rather than swapped in underneath it.
     Every post-merge gate keeps ``FakeVerifier``'s clean default.

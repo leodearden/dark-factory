@@ -33,7 +33,7 @@ from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import ConflictProbe
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.workflow_types import StewardResolved
 
 
@@ -451,7 +451,7 @@ class TestMergeAndFinalise:
     @pytest.mark.asyncio
     async def test_none_merge_result_runs_finalise_tail_and_returns_done(self):
         # (b) _run_merge_phase returns None (merge SUCCEEDED) → run the finalise
-        # tail and return _finalise_merged_done()'s value, entering DONE.
+        # tail and return _finalise_merged_done()'s value.
         f = _make()
         spies = _wire_finalise_spies(f, merge_result=None)
 
@@ -461,7 +461,6 @@ class TestMergeAndFinalise:
         spies.run_merge_phase.assert_awaited_once()
         spies.write_completion_to_memory.assert_awaited_once()
         spies.await_steward_completion.assert_awaited_once()
-        spies.enter_phase.assert_any_call(WorkflowState.DONE)
         spies.finalise_merged_done.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -477,7 +476,6 @@ class TestMergeAndFinalise:
         assert outcome == WorkflowOutcome.DONE
         spies.run_merge_phase.assert_not_awaited()
         spies.write_completion_to_memory.assert_awaited_once()
-        spies.enter_phase.assert_any_call(WorkflowState.DONE)
         spies.finalise_merged_done.assert_awaited_once()
 
     @pytest.mark.asyncio

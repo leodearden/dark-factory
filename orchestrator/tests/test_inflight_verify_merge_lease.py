@@ -28,8 +28,8 @@ from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeOutcome, MergeRequest, _run_post_merge_verify
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest, _run_post_merge_verify
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_cancel import read_lock_holder_pgid
 

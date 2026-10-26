@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _sdk_client_stubs import sdk_client_double
 from shared.phantom_verdict import (
     UNPARSEABLE_ISSUE_PREFIX,
     UNPARSEABLE_VERDICT_CODE,
@@ -244,7 +245,7 @@ async def test_judge_call_llm_anthropic_normal(mock_journal):
 
     mock_messages = MagicMock()
     mock_messages.create = AsyncMock(return_value=fake_response)
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.messages = mock_messages
 
     with patch('anthropic.AsyncAnthropic', return_value=mock_client):
@@ -273,7 +274,7 @@ async def test_judge_call_llm_anthropic_no_text_blocks(mock_journal):
 
     mock_messages = MagicMock()
     mock_messages.create = AsyncMock(return_value=fake_response)
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.messages = mock_messages
 
     with patch('anthropic.AsyncAnthropic', return_value=mock_client):
@@ -299,7 +300,7 @@ async def test_judge_call_llm_anthropic_mixed_content(mock_journal):
 
     mock_messages = MagicMock()
     mock_messages.create = AsyncMock(return_value=fake_response)
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.messages = mock_messages
 
     with patch('anthropic.AsyncAnthropic', return_value=mock_client):
@@ -334,7 +335,7 @@ async def test_judge_call_llm_openai_normal(mock_journal):
     mock_completions.create = AsyncMock(return_value=fake_response)
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
@@ -727,13 +728,60 @@ async def test_judge_call_llm_openai_none_content(mock_journal):
     mock_completions.create = AsyncMock(return_value=fake_response)
     mock_chat = MagicMock()
     mock_chat.completions = mock_completions
-    mock_client = MagicMock()
+    mock_client = sdk_client_double()
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
         result = await judge._call_llm('Evaluate this run.')
 
     assert result == ''
+
+
+class TestJudgeCallLlmReleasesClient:
+    @pytest.mark.asyncio
+    async def test_the_anthropic_client_is_released(self, mock_journal):
+        judge = Judge(config=_make_judge_config(judge_llm_provider='anthropic'), journal=mock_journal)
+        client = sdk_client_double()
+        client.messages.create = AsyncMock(
+            return_value=FakeAnthropicResponse(content=[FakeAnthropicTextBlock(text='ok')]),
+        )
+
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            await judge._call_llm('p')
+
+        client.__aexit__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_openai_client_is_released(self, mock_journal):
+        judge = Judge(
+            config=_make_judge_config(judge_llm_provider='openai', judge_llm_model='gpt-4o'),
+            journal=mock_journal,
+        )
+        client = sdk_client_double()
+        client.chat.completions.create = AsyncMock(
+            return_value=FakeJudgeOpenAIResponse(
+                choices=[FakeJudgeOpenAIChoice(message=FakeJudgeOpenAIMessage(content='ok'))],
+            ),
+        )
+
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge._call_llm('p')
+
+        client.__aexit__.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_client_is_released_when_the_call_fails(self, mock_journal):
+        judge = Judge(config=_make_judge_config(judge_llm_provider='anthropic'), journal=mock_journal)
+        client = sdk_client_double()
+        client.messages.create = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with (
+            patch('anthropic.AsyncAnthropic', return_value=client),
+            pytest.raises(RuntimeError, match='boom'),
+        ):
+            await judge._call_llm('p')
+
+        client.__aexit__.assert_awaited_once()
 
 
 # --- is_phantom_verdict tests ---
@@ -3131,6 +3179,79 @@ class TestReviewRunInfraFailureHandling:
 
         assert not judge.is_halted('proj-infra-d')
         mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_infra_halt_fires_once_per_run_and_a_fresh_run_needs_the_full_threshold(
+        self, mock_journal,
+    ):
+        """The halt ends the run: after an unhalt, two further failures do not
+        halt again and only the third does."""
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-infra-e',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            for _ in range(3):
+                await judge.review_run('run-infra')
+            assert mock_journal.set_halt.call_count == 1
+
+            await judge.unhalt('proj-infra-e')
+            for _ in range(2):
+                await judge.review_run('run-infra')
+            assert mock_journal.set_halt.call_count == 1
+            assert not judge.is_halted('proj-infra-e')
+
+            await judge.review_run('run-infra')
+
+        assert mock_journal.set_halt.call_count == 2
+        assert judge.is_halted('proj-infra-e')
+
+    @pytest.mark.asyncio
+    async def test_infra_streaks_are_independent_per_project(self, mock_journal):
+        from fused_memory.models.reconciliation import (
+            ReconciliationRun,
+            RunStatus,
+            RunType,
+        )
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-A',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        runs = {
+            f'run-{project}': ReconciliationRun(
+                id=f'run-{project}',
+                project_id=project,
+                run_type=RunType.full,
+                trigger_reason='buffer_size:3',
+                started_at=datetime.now(UTC),
+                events_processed=3,
+                status=RunStatus.completed,
+                stage_reports={},
+            )
+            for project in ('proj-A', 'proj-B')
+        }
+        mock_journal.get_run = AsyncMock(side_effect=lambda run_id: runs[run_id])
+
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            for _ in range(2):
+                await judge.review_run('run-proj-A')
+                await judge.review_run('run-proj-B')
+            assert not judge.is_halted('proj-A')
+            assert not judge.is_halted('proj-B')
+
+            await judge.review_run('run-proj-A')
+
+        assert judge.is_halted('proj-A')
+        assert not judge.is_halted('proj-B')
+        mock_journal.set_halt.assert_called_once()
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -24,6 +24,38 @@
       "severity": "suggestion",
       "description": "The set_task_status response contract is described only as a single per-task record (tasks[n] with camelCase taskId/oldStatus/newStatus) and omits the comma-separated-list wrapper ({\"success\": bool, \"results\": [...]}) and per-id result.error cases. An agent applying the top-level newStatus rule to a batched call, or encountering a per-id error, will mis-count or spuriously flag/escalate a discrepancy \u2014 consistent with the review-passed-but-escalation-created symptom. Field naming is also inconsistent (taskId camelCase vs task_id snake_case used elsewhere).",
       "mutation_type": "api_misuse"
+    },
+    {
+      "id": "mined_1082_pool_01",
+      "location": "fused-memory/tests/test_stages.py",
+      "category": "missing_test",
+      "severity": "suggestion",
+      "description": "The new 'Verifying Task Operations' section of STAGE2_SYSTEM_PROMPT has no test. test_stages.py already pins Stage 2 prompt guidance by substring (e.g. 'Proactive Task Sample'), so the counter-verification rule can be deleted or reworded silently, and nothing pins the prompt's described set_task_status/resolve_ticket response shapes against what the interceptor actually returns.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1082_pool_02",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:99",
+      "category": "llm_only_invariant",
+      "severity": "suggestion",
+      "description": "Task-operation counters are kept honest only by prompt instructions the LLM may ignore, while the codebase already corrects inflated self-reported memory stats deterministically in stats_verifier (journal-derived values overwrite the agent's, originals kept under _reported). _OP_TO_STAT has no task-op entries, so the counting policy for task stats lives in prose with no mechanical check, even though task creation and status transitions are journaled as reconciliation events by the TaskInterceptor.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1082_pool_03",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:106",
+      "category": "inconsistent_instruction",
+      "severity": "suggestion",
+      "description": "The new section names two different destinations for the same kind of discrepancy: the resolve_ticket paragraph says to flag it in 'your report's summary or flagged_items' (stage2.py:105-106), while the set_task_status paragraph says 'flag the discrepancy in your structured report' (stage2.py:115-116). Stage 2 flagged_items feed Stage 3, so the ambiguity affects whether a discrepancy is propagated.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1082_pool_04",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:102",
+      "category": "undefined_stat_keys",
+      "severity": "suggestion",
+      "description": "The prompt refers to stat keys tasks_created and tasks_reopened ('the relevant task-success counter (e.g., tasks_reopened)'), but they are defined nowhere else: StageReport.stats is a free-form dict and no code, schema or verifier reads them. The counter vocabulary exists only in prose, so the agent may vary key names between runs and no downstream consumer can rely on them.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

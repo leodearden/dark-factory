@@ -17,10 +17,14 @@ from __future__ import annotations
 import gc
 import inspect
 import threading
-from unittest.mock import AsyncMock, AsyncMockMixin
+from unittest.mock import AsyncMock, AsyncMockMixin, MagicMock
 
 import pytest
-from _orch_helpers import drain_async_mock_coroutines, track_async_mock_coroutines
+from _async_mock_orphans import (
+    drain_async_mock_coroutines,
+    fail_on_orphaned_async_mock_calls,
+    track_async_mock_coroutines,
+)
 
 
 def _count_open_mock_coros() -> int:
@@ -65,8 +69,9 @@ def test_drain_closes_orphaned_asyncmock_coroutine_in_cycle():
         'Expected at least one orphaned _execute_mock_call coroutine in the GC graph'
     )
 
-    closed = drain_async_mock_coroutines()
-    assert closed >= 1, 'drain_async_mock_coroutines() should have closed >= 1 coroutine'
+    assert len(drain_async_mock_coroutines()) >= 1, (
+        'drain_async_mock_coroutines() should have closed >= 1 coroutine'
+    )
     assert _count_open_mock_coros() == 0, (
         'After drain, no orphaned _execute_mock_call coroutines should remain'
     )
@@ -82,16 +87,74 @@ def test_drain_closes_orphaned_asyncmock_coroutine_in_cycle():
 
 
 def test_drain_is_safe_when_no_orphans():
-    """drain_async_mock_coroutines() returns 0 when there are no orphaned coroutines."""
+    """drain_async_mock_coroutines() returns no records when there are no orphaned coroutines."""
     # First drain to flush any residual orphans from prior tests
     drain_async_mock_coroutines()
     gc.collect()
 
-    count = drain_async_mock_coroutines()
-    assert count == 0, (
-        f'Expected 0 orphaned coroutines but got {count}. '
+    orphans = drain_async_mock_coroutines()
+    assert orphans == (), (
+        f'Expected no orphaned coroutines but got {orphans}. '
         'A prior test may have leaked an un-awaited AsyncMock call.'
     )
+
+
+def test_drain_names_the_mock_and_the_test_that_created_each_orphan(request):
+    drain_async_mock_coroutines()
+    scheduler = MagicMock(name='scheduler')
+    scheduler.notify = AsyncMock()
+    coro = scheduler.notify('task-1')
+
+    orphans = drain_async_mock_coroutines()
+
+    assert [orphan.mock_name for orphan in orphans] == ['scheduler.notify']
+    assert request.node.nodeid in orphans[0].created_during
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+
+
+def test_an_orphan_created_outside_any_test_phase_is_attributed_to_none(monkeypatch):
+    drain_async_mock_coroutines()
+    monkeypatch.delenv('PYTEST_CURRENT_TEST')
+    coro = AsyncMock(name='collection_time_mock')()
+
+    [orphan] = drain_async_mock_coroutines()
+
+    assert orphan.created_during is None
+    assert orphan.mock_name == 'collection_time_mock'
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+
+
+def test_enforcement_fails_naming_the_mock_and_still_closes_the_orphan():
+    drain_async_mock_coroutines()
+    coro = AsyncMock(name='planted_notifier')('task-1')
+
+    with pytest.raises(pytest.fail.Exception, match='planted_notifier'):
+        fail_on_orphaned_async_mock_calls()
+
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+
+
+def test_enforcement_still_fails_when_the_frame_no_longer_names_the_mock(monkeypatch, request):
+    drain_async_mock_coroutines()
+
+    async def drifted_execute_mock_call(mock, /, *args, **kwargs):
+        return None
+
+    monkeypatch.setattr(AsyncMockMixin, '_execute_mock_call', drifted_execute_mock_call)
+    track_async_mock_coroutines()
+    coro = AsyncMock(name='drifted_notifier')()
+
+    with pytest.raises(pytest.fail.Exception, match=request.node.name):
+        fail_on_orphaned_async_mock_calls()
+
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+
+
+@pytest.mark.asyncio
+async def test_enforcement_is_silent_when_every_call_was_awaited():
+    assert await AsyncMock(return_value=7)() == 7
+
+    fail_on_orphaned_async_mock_calls()
 
 
 @pytest.mark.asyncio
@@ -163,7 +226,7 @@ def test_orphan_created_on_a_background_thread_is_closed():
     thread.start()
     thread.join()
 
-    assert drain_async_mock_coroutines() >= 1
+    assert len(drain_async_mock_coroutines()) >= 1
     assert inspect.getcoroutinestate(created[0]) == inspect.CORO_CLOSED
 
 
@@ -202,7 +265,7 @@ def test_drain_finds_orphans_without_searching_the_heap(monkeypatch):
 
     monkeypatch.setattr(gc, 'get_objects', heap_search_is_forbidden)
 
-    assert drain_async_mock_coroutines() >= 1
+    assert len(drain_async_mock_coroutines()) >= 1
     assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
 
 

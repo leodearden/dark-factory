@@ -959,3 +959,5 @@ tasks:
     delivered_check:
       kind: manual
       reason: an explicit non-dependency; recorded so a later reader does not "fix" it
+signal_leaves:
+- σ

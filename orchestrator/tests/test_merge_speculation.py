@@ -90,14 +90,14 @@ from orchestrator.git_ops import (  # noqa: F401
     WorktreeInfo,
     _run,
 )
-from orchestrator.landed_outbox import LandedOutbox  # noqa: F401
-from orchestrator.merge_disposition import (  # noqa: F401
+from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.disposition import (
     ClassificationResult,
     classify_merge_failure_disposition,
 )
-from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.landed_outbox import LandedOutbox
 from orchestrator.merge_lane.shadow import _submit_shadow_divergence_escalation  # noqa: F401
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     MergeRequest,
     _acquire_warm_verify_worktree,
 )
@@ -131,7 +131,7 @@ def _write_recording_script(lane: Path, name: str) -> Path:
         argv_file = script.parent / (script.name + '.argv')
         ...
         recorded = argv_file.read_text().strip()
-        assert recorded == f'{base_target} {lane} --reset-in-place'
+        assert recorded == f'{base_target} {lane} --fresh-checkout'
     """
     scripts_dir = lane / 'scripts'
     scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -329,7 +329,7 @@ async def _add_recording_seed_to_repo(repo: Path) -> None:
 
 @pytest.mark.asyncio
 class TestAcquireSpecLane:
-    """GitOps.acquire_spec_lane: create-once path seeds lane with '--reset-in-place'."""
+    """GitOps.acquire_spec_lane: create-once path seeds lane with '--fresh-checkout'."""
 
     async def test_acquire_spec_lane_returns_warm_tuple(self, spec_git_repo: Path):
         """acquire_spec_lane returns (lane_path, warm=True) for the assigned _spec- lane."""
@@ -367,10 +367,10 @@ class TestAcquireSpecLane:
         assert git_ops.spec_warm_lane_pool is not None
         assert git_ops.spec_warm_lane_pool.state(lane_path) == LaneState.ASSIGNED
 
-    async def test_acquire_spec_lane_invokes_seed_reset_in_place(
+    async def test_acquire_spec_lane_invokes_seed_fresh_checkout(
         self, spec_git_repo: Path,
     ):
-        """acquire_spec_lane invokes seed-warm-lane.sh with base_target + '--reset-in-place'."""
+        """acquire_spec_lane invokes seed-warm-lane.sh with base_target + '--fresh-checkout'."""
         await _add_recording_seed_to_repo(spec_git_repo)
         cfg = _make_spec_git_config(on=True)
         git_ops = GitOps(cfg, spec_git_repo, merge_spec_warm_lane_pool_size=1)
@@ -389,7 +389,7 @@ class TestAcquireSpecLane:
         )
         recorded = argv_file.read_text().strip()
         base_target = str(git_ops.warm_lane_base_target_path)
-        expected = f'{base_target} {lane_path} --reset-in-place'
+        expected = f'{base_target} {lane_path} --fresh-checkout'
         assert recorded == expected, (
             f'Wrong seed argv: got {recorded!r}, expected {expected!r}'
         )
@@ -1298,7 +1298,7 @@ class TestSpecLaneShadowSafetyValve:
 # VERIFY PORT, NOT THE AMBIENT PATCH
 # ----------------------------------
 # The conftest autouse _mock_merge_queue_verification fixture leaves the
-# module-level orchestrator.merge_queue.run_scoped_verification returning
+# module-level orchestrator.merge_lane.worker.run_scoped_verification returning
 # passed=True for anything that still resolves it.  These tests do not rely on
 # it and do not displace it: each builds a _SequencedVerifier and passes it as
 # MergeLane(..., verifier=...), so the lane asks its OWN collaborator, for its
@@ -1438,7 +1438,7 @@ class TestLateArrivalAttaches:
           - ``speculative_merge`` event for B carries the same ``base_sha``
         """
         # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
-        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_lane')
 
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
@@ -1648,7 +1648,7 @@ class TestLateArrivalCleanCAS:
         GREEN (step-2): B.base_sha == A's merge commit == main-after-A → 'advanced'.
         """
         # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
-        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_lane')
 
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
@@ -2603,7 +2603,7 @@ class TestLateArrivalSubmissionOrderCAS:
           (c) Both A and B resolve 'done' (clean CAS, no rebase).
         """
         # Capture DEBUG-level logs so we can assert the ATTACH code path fired.
-        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_queue')
+        caplog.set_level(logging.DEBUG, logger='orchestrator.merge_lane')
 
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
@@ -2796,7 +2796,7 @@ class TestJournalLandedThenAdvanceHelper:
 
     async def test_records_before_advance(self, tmp_path: Path) -> None:
         """The row must already be visible from inside advance_main's own call."""
-        from orchestrator.merge_queue import _journal_landed_then_advance
+        from orchestrator.merge_lane.worker import _journal_landed_then_advance
 
         outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
         merge_wt = tmp_path / '_merge-wt'
@@ -2838,7 +2838,7 @@ class TestJournalLandedThenAdvanceHelper:
 
     async def test_none_outbox_does_not_crash(self, tmp_path: Path) -> None:
         """outbox=None (no project_root) must no-op the record, not raise."""
-        from orchestrator.merge_queue import _journal_landed_then_advance
+        from orchestrator.merge_lane.worker import _journal_landed_then_advance
 
         merge_wt = tmp_path / '_merge-wt2'
         git_ops = MagicMock()

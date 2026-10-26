@@ -193,12 +193,12 @@ fi
 # A non-integer MIN_FREE_INODES would make [ "$avail_inodes" -lt ... ] throw
 # 'integer expression expected', aborting with a non-75 code the orchestrator won't requeue.
 GIB_FLOOR_PATTERN='^(0|[1-9][0-9]{0,4})$'
-if ! printf '%s\n' "$MIN_FREE_GIB" | grep -qE "$GIB_FLOOR_PATTERN"; then
+if ! [[ "$MIN_FREE_GIB" =~ $GIB_FLOOR_PATTERN ]]; then
     err "REIFY_WARM_LANE_DISK_GUARD_MIN_FREE_GIB (or --min-free-gib) is not a valid integer (0-99999, no leading zeros): '$MIN_FREE_GIB'."
     err "Run '$(basename "$0") --help' for usage."
     exit 2
 fi
-if ! printf '%s\n' "$MIN_FREE_INODES" | grep -qE '^[0-9]+$'; then
+if ! [[ "$MIN_FREE_INODES" =~ ^[0-9]+$ ]]; then
     err "REIFY_WARM_LANE_DISK_GUARD_MIN_FREE_INODES (or --min-free-inodes) is not a valid integer: '$MIN_FREE_INODES'."
     err "Run '$(basename "$0") --help' for usage."
     exit 2
@@ -210,12 +210,12 @@ fi
 # measurement outcome — a VALID soft config still fail-closes to 75 on a
 # df failure (E3; see the fail-closed df read below).
 if [ "$SOFT_MODE" -eq 1 ]; then
-    if ! printf '%s\n' "$SOFT_FREE_GIB" | grep -qE "$GIB_FLOOR_PATTERN"; then
+    if ! [[ "$SOFT_FREE_GIB" =~ $GIB_FLOOR_PATTERN ]]; then
         err "REIFY_WARM_LANE_DISK_GUARD_SOFT_FREE_GIB (or --soft-free-gib) is not a valid integer (0-99999, no leading zeros): '$SOFT_FREE_GIB'."
         err "Run '$(basename "$0") --help' for usage."
         exit 2
     fi
-    if ! printf '%s\n' "$SOFT_FREE_INODES" | grep -qE '^[0-9]+$'; then
+    if ! [[ "$SOFT_FREE_INODES" =~ ^[0-9]+$ ]]; then
         err "REIFY_WARM_LANE_DISK_GUARD_SOFT_FREE_INODES (or --soft-free-inodes) is not a valid integer: '$SOFT_FREE_INODES'."
         err "Run '$(basename "$0") --help' for usage."
         exit 2
@@ -250,12 +250,12 @@ avail_bytes="$(printf '%s\n' "$data_line" | awk '{print $1}')"
 avail_inodes="$(printf '%s\n' "$data_line" | awk '{print $2}')"
 
 # Validate integer fields before comparison (fail-closed on non-integer output).
-if ! printf '%s\n' "$avail_bytes" | grep -qE '^[0-9]+$'; then
+if ! [[ "$avail_bytes" =~ ^[0-9]+$ ]]; then
     err "df reported non-integer avail bytes: '$avail_bytes'. Cannot confirm disk health; denying admission (fail-closed)."
     hint "Verify '$DF -B1 --output=avail,iavail -- $MOUNT' produces parseable output."
     exit 75
 fi
-if ! printf '%s\n' "$avail_inodes" | grep -qE '^[0-9]+$'; then
+if ! [[ "$avail_inodes" =~ ^[0-9]+$ ]]; then
     err "df reported non-integer avail inodes: '$avail_inodes'. Cannot confirm disk health; denying admission (fail-closed)."
     hint "Verify '$DF -B1 --output=avail,iavail -- $MOUNT' produces parseable output."
     exit 75

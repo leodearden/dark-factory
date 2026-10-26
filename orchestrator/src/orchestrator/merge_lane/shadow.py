@@ -16,7 +16,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from orchestrator.merge_lane.worker import SpeculativeMergeWorker
     from orchestrator.verify import VerifyResult
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +543,18 @@ def parse_failed_run_all_members(test_output: str) -> list[str]:
             seen.add(name)
             out.append(name)
     return out
+
+
+def select_failed_run_all_members(
+    test_output: str, channel_members: Sequence[str] | None,
+) -> list[str]:
+    """C3 rule 3: the channel's failed set (``VerifyResult.run_all_failed_members``)
+    when a run_all reported into a present channel, else the text marker parse
+    (rule 2). ``[]`` means the full run_all suite.
+    """
+    if channel_members is not None:
+        return list(channel_members)
+    return parse_failed_run_all_members(test_output)
 
 
 # ---------------------------------------------------------------------------
@@ -1208,7 +1220,7 @@ async def _run_cold_shadow_verify_suite(
     Returns:
         The suite-level :class:`VerifyResult` from the cold FULL-gate dispatch.
     """
-    wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
+    wt = await git_ops.create_ephemeral_verify_worktree(merge_commit)
     try:
         # FULL-GATE: task_files=None → the complete workspace suite on the cold
         # leg (verify.py workspace path).  A scoped/no-source spec would trivially
@@ -1243,7 +1255,7 @@ async def _run_cold_shadow_verify(
     """Run a from-scratch cold verify on *merge_commit* in a throwaway worktree.
 
     Creates an ephemeral ``_merge-<uuid>`` worktree at *merge_commit* via
-    :meth:`~orchestrator.git_ops.GitOps.create_throwaway_verify_worktree`,
+    :meth:`~orchestrator.git_ops.GitOps.create_ephemeral_verify_worktree`,
     runs the full merge verify (build_merge_verify_spec + VerifyRunnerPool
     dispatch — the same execution path as ``_run_post_merge_verify``), parses
     the per-test results from the output, and removes the throwaway worktree
@@ -1271,7 +1283,7 @@ async def _run_cold_shadow_verify(
         Per-test verdict map as returned by :func:`parse_per_test_results`.
         Empty dict if the cold verify produced no parseable test output.
     """
-    wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
+    wt = await git_ops.create_ephemeral_verify_worktree(merge_commit)
     try:
         # Hold THIS throwaway lane's flock for the duration of the verify
         # (task 3018).  Three things to know:
@@ -1299,7 +1311,7 @@ async def _run_cold_shadow_verify(
         # (iii) CONTENTION IS NOT A PRACTICAL FAILURE MODE here, so no
         #     MergeVerifyLeaseContended fail-safe branch is warranted: the
         #     `_merge-<uuid>` path was just minted by
-        #     create_throwaway_verify_worktree and is uncontended by
+        #     create_ephemeral_verify_worktree and is uncontended by
         #     construction — nobody else knows it.
         #
         # (iv) FLOCK ONLY, NO GLOBAL RENDEZVOUS (task 4189).  Because `wt` is
@@ -1544,8 +1556,8 @@ async def _run_shadow_compare(
 # build-STAGE categories only (a compile/CLI/tree-sitter/npm build break, where
 # zero test lines is EXPECTED); TEST_FAILURE-class categories with an empty map
 # stay inconclusive since a genuine test failure normally DOES emit parseable
-# lines and an empty map there is more likely a transport/parse hiccup.  Derived
-# from FailureCategory so a new build-stage category can't drift out of the set.
+# lines and an empty map there is more likely a transport/parse hiccup.  Hand-enumerated:
+# lint_error/type_error/infra_abort are not build-STAGE failures and stay inconclusive.
 _COARSE_BUILD_FAILURE_CATEGORIES: frozenset[str] = frozenset({
     FailureCategory.COMPILE_ERROR.value,
     FailureCategory.CARGO_CLI_ERROR.value,

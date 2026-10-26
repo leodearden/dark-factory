@@ -52,6 +52,15 @@ class FixtureTaskRecord:
             record_source=data.get('record_source'),
         )
 
+    def as_task_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'title': self.title,
+            'description': self.description,
+            'details': self.details,
+            'testStrategy': self.test_strategy,
+        }
+
 
 @dataclass
 class FixtureContext:
@@ -232,9 +241,11 @@ class CorpusManifest:
         )
 
 
+DEFAULT_FIXTURE_CWD = Path('/home/leo/src/dark-factory')
+
 # Project → working directory mapping for invoke_agent cwd
 _PROJECT_CWD_MAP = {
-    'dark-factory': Path('/home/leo/src/dark-factory'),
+    'dark-factory': DEFAULT_FIXTURE_CWD,
     'reify': Path('/home/leo/src/reify'),
     'reify-gui': Path('/home/leo/src/reify/gui'),
 }

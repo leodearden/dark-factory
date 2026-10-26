@@ -105,7 +105,7 @@ class AcquireRoute(Enum):
     #: main; ``git worktree add`` (no ``-b``) + seed, then the reuse tail.
     CREATE_ONCE_REATTACH = 'create_once_reattach'
     #: git_ops.py ~3132-3161 — already-registered lane whose
-    #: ``.task-meta/plan.json`` matches this task (post-restart backstop).
+    #: ``.task-meta/<lane>/metadata.json`` names this task (post-restart backstop).
     DISK_BACKSTOP_REUSE = 'disk_backstop_reuse'
     #: git_ops.py ~3163-3213 — already-registered lane whose orphan branch
     #: has commits beyond main; ``git checkout -f`` + the reuse tail.

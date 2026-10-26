@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 from datetime import UTC, datetime
 
 import pytest
 
 from orchestrator.harness import HarnessReport, TaskReport
-from orchestrator.run_store import RunStore
+from orchestrator.run_store import RunStore, TaskResultRecord
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -976,66 +977,204 @@ class TestBlockContextPersistence:
 
         assert _task_results_columns(db_path) == cols_after_first
 
-    def test_concurrent_alter_race_is_survivable(self, tmp_path):
-        """Losing the table_info->ALTER race must not cost a run its results.
 
-        Two RunStore constructions can interleave between the PRAGMA read and
-        the ALTER (the dashboard and a digest reader both open runs.db). The
-        loser sees a real sqlite3 "duplicate column name" — which means the
-        migration's GOAL is already met. Propagating it would reach
-        Harness.run's `except Exception`, leave `_run_store` unset, and drop
-        EVERY task_results row for the whole run over a no-op.
-        """
-        db_path = tmp_path / 'runs.db'
-        _build_legacy_db(db_path)
-        store = RunStore(db_path)  # migrates for real
+class TestRunsCodeSha:
+    """Task 6565 D1: ``runs.code_sha`` records the commit the process runs."""
 
-        class _StaleReadConn:
-            """Reports the PRE-migration column set, ALTERs the migrated DB."""
-
-            def __init__(self, real):
-                self._real = real
-
-            def execute(self, sql, *args):
-                if sql.startswith('PRAGMA table_info'):
-                    # (cid, name, ...) shape, minus the 3068 columns.
-                    return iter([(0, 'task_id'), (1, 'completed_at')])
-                return self._real.execute(sql, *args)
-
-            def commit(self):
-                self._real.commit()
-
+    @staticmethod
+    def _runs_columns(db_path) -> list[str]:
         conn = sqlite3.connect(str(db_path))
         try:
-            # Would raise sqlite3.OperationalError without the guard.
-            store._migrate_task_results_block_context(
-                _StaleReadConn(conn),  # type: ignore[arg-type]
-            )
+            return [row[1] for row in conn.execute('PRAGMA table_info(runs)')]
         finally:
             conn.close()
 
-        assert set(_task_results_columns(db_path)) >= {'block_reason', 'block_phase'}
+    @staticmethod
+    def _code_sha(db_path, run_id: str):
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return conn.execute('SELECT code_sha FROM runs WHERE run_id = ?', (run_id,)).fetchone()[0]
+        finally:
+            conn.close()
 
-    def test_non_duplicate_alter_failure_still_surfaces(self, tmp_path):
-        """Only the benign race is swallowed — a real fault must not be.
-
-        A corrupt DB or an un-takeable lock is exactly the case where a silent
-        half-migrated schema would be worse than a loud failure.
-        """
+    def test_start_run_records_code_sha(self, tmp_path):
         db_path = tmp_path / 'runs.db'
-        _build_legacy_db(db_path)
         store = RunStore(db_path)
+        store.start_run('run-1', 'proj', '2026-10-20T00:00:00+00:00', code_sha='d' * 40)
+        assert self._code_sha(db_path, 'run-1') == 'd' * 40
 
-        class _BrokenConn:
-            def execute(self, sql, *args):
-                if sql.startswith('PRAGMA table_info'):
-                    return iter([(0, 'task_id')])
-                raise sqlite3.OperationalError('database is locked')
+    def test_code_sha_defaults_to_null(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+        store.start_run('run-1', 'proj', '2026-10-20T00:00:00+00:00')
+        assert self._code_sha(db_path, 'run-1') is None
 
-            def commit(self):  # pragma: no cover - never reached
-                raise AssertionError('commit must not be reached')
+    def test_pre_6565_db_gains_code_sha_last_with_null_rows(self, tmp_path):
+        """A migrated DB and a fresh one agree on column ORDER (code_sha last)."""
+        legacy = tmp_path / 'legacy.db'
+        _build_legacy_db(legacy)
+        assert 'code_sha' not in self._runs_columns(legacy)
 
-        with pytest.raises(sqlite3.OperationalError, match='database is locked'):
-            store._migrate_task_results_block_context(
-                _BrokenConn(),  # type: ignore[arg-type]
+        store = RunStore(legacy)
+        RunStore(legacy)  # idempotent
+
+        fresh = tmp_path / 'fresh.db'
+        RunStore(fresh)
+        assert self._runs_columns(legacy) == self._runs_columns(fresh)
+        assert self._runs_columns(legacy)[-1] == 'code_sha'
+        assert self._code_sha(legacy, 'run-legacy') is None
+        store.start_run('run-new', 'proj-a', '2026-10-20T00:00:00+00:00', code_sha='e' * 40)
+        assert self._code_sha(legacy, 'run-new') == 'e' * 40
+
+
+class TestGetTaskOutcome:
+    """Production's latest recorded outcome for a task, across runs (live-shadow PRD S1)."""
+
+    @staticmethod
+    def _report(**overrides) -> TaskReport:
+        fields = {
+            'task_id': '777',
+            'title': 'Ship the widget',
+            'outcome': WorkflowOutcome.DONE,
+            'cost_usd': 1.25,
+            'duration_ms': 42_000,
+            'agent_invocations': 6,
+            'execute_iterations': 2,
+            'verify_attempts': 3,
+            'review_cycles': 1,
+            'steward_cost_usd': 0.4,
+            'steward_invocations': 2,
+            'completed_at': '2026-10-18T09:00:00+00:00',
+            'block_reason': '',
+            'block_phase': '',
+        }
+        fields.update(overrides)
+        return TaskReport(**fields)
+
+    @staticmethod
+    def _save(store: RunStore, run_id: str, report: TaskReport, project_id='dark_factory'):
+        store.start_run(run_id, project_id, '2026-10-18T00:00:00+00:00')
+        store.save_task_result(run_id, report, project_id)
+
+    def test_no_row_reads_none(self, tmp_path):
+        assert RunStore(tmp_path / 'runs.db').get_task_outcome('dark_factory', '777') is None
+
+    def test_a_saved_row_reads_back_typed(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        report = self._report(block_reason='verify failed', block_phase='verify')
+        self._save(store, 'run-a', report)
+
+        record = store.get_task_outcome('dark_factory', '777')
+
+        assert record == TaskResultRecord(
+            run_id='run-a',
+            project_id='dark_factory',
+            task_id='777',
+            title='Ship the widget',
+            outcome=WorkflowOutcome.DONE,
+            cost_usd=1.25,
+            steward_cost_usd=0.4,
+            steward_invocations=2,
+            duration_ms=42_000,
+            agent_invocations=6,
+            execute_iterations=2,
+            verify_attempts=3,
+            review_cycles=1,
+            completed_at=datetime(2026, 10, 18, 9, 0, tzinfo=UTC),
+            block_reason='verify failed',
+            block_phase='verify',
+        )
+        assert record is not None
+        assert record.outcome is WorkflowOutcome.DONE
+        assert record.completed_at is not None
+        assert record.completed_at.utcoffset() is not None
+
+    def test_the_latest_row_across_runs_wins(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-a', self._report(
+            outcome=WorkflowOutcome.REQUEUED, completed_at='2026-10-17T09:00:00+00:00',
+        ))
+        self._save(store, 'run-b', self._report(
+            outcome=WorkflowOutcome.DONE, completed_at='2026-10-18T09:00:00+00:00',
+        ))
+
+        record = store.get_task_outcome('dark_factory', '777')
+
+        assert record is not None
+        assert (record.run_id, record.outcome) == ('run-b', WorkflowOutcome.DONE)
+
+    def test_another_projects_row_is_never_returned(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-x', self._report(), project_id='reify')
+
+        assert store.get_task_outcome('dark_factory', '777') is None
+        record = store.get_task_outcome('reify', '777')
+        assert record is not None
+        assert record.project_id == 'reify'
+
+    def test_an_untimestamped_row_reads_none_and_sorts_last(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-a', self._report(completed_at='2026-10-17T09:00:00+00:00'))
+        self._save(store, 'run-b', self._report(
+            outcome=WorkflowOutcome.BLOCKED, completed_at='',
+        ))
+
+        latest = store.get_task_outcome('dark_factory', '777')
+        assert latest is not None
+        assert latest.run_id == 'run-a'
+
+        only_blank = RunStore(tmp_path / 'other.db')
+        self._save(only_blank, 'run-b', self._report(completed_at=''))
+        record = only_blank.get_task_outcome('dark_factory', '777')
+        assert record is not None
+        assert record.completed_at is None
+
+    def test_an_unknown_stored_outcome_is_refused(self, tmp_path):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-a', self._report())
+        conn = sqlite3.connect(str(tmp_path / 'runs.db'))
+        try:
+            conn.execute("UPDATE task_results SET outcome = 'garbage'")
+            conn.commit()
+        finally:
+            conn.close()
+
+        with pytest.raises(ValueError) as excinfo:
+            store.get_task_outcome('dark_factory', '777')
+        assert '777' in str(excinfo.value)
+        assert 'garbage' in str(excinfo.value)
+
+    def test_null_costs_and_counters_read_as_zero(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+        store.start_run('run-a', 'dark_factory', '2026-10-18T00:00:00+00:00')
+        numeric = (
+            'cost_usd', 'steward_cost_usd', 'steward_invocations', 'duration_ms',
+            'agent_invocations', 'execute_iterations', 'verify_attempts', 'review_cycles',
+        )
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                'INSERT INTO task_results (run_id, task_id, project_id, outcome, '
+                f'{", ".join(numeric)}) VALUES (?, ?, ?, ?, {", ".join("NULL" for _ in numeric)})',
+                ('run-a', '777', 'dark_factory', 'done'),
             )
+            conn.commit()
+        finally:
+            conn.close()
+
+        record = store.get_task_outcome('dark_factory', '777')
+
+        assert record is not None
+        assert {name: getattr(record, name) for name in numeric} == dict.fromkeys(numeric, 0)
+        assert isinstance(record.cost_usd, float)
+        assert isinstance(record.steward_cost_usd, float)
+        assert isinstance(record.steward_invocations, int)
+
+    @pytest.mark.parametrize('field_name', ['outcome', 'run_id', 'completed_at'])
+    def test_the_record_is_frozen(self, tmp_path, field_name):
+        store = RunStore(tmp_path / 'runs.db')
+        self._save(store, 'run-a', self._report())
+        record = store.get_task_outcome('dark_factory', '777')
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(record, field_name, None)

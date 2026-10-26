@@ -63,11 +63,11 @@ from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_work
 from _merge_lane_fakes import FakeVerifier
 from _orch_helpers import wait_responsive
 
-from orchestrator import merge_queue
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import InflightEntry, MergeRequest, SpeculativeMergeWorker
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane import worker as merge_queue
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import InflightEntry, MergeRequest, SpeculativeMergeWorker
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 #

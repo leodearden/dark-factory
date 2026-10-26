@@ -57,13 +57,14 @@ KEEPS ITS PIN and does not self-heal — its exit is a human, or the shared
 resolved, or the orphan-L0 reaper promotes a dead-filer L0 to L1 and a human
 consumes it).
 
-That "does not self-heal" property is a statement about a pin OUTSIDE
-``orchestrator.recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES``, and the
-APPLIER is what makes it
-unconditionally true: a row pinned only by a merge-remediable escalation would
-be picked straight back up by the blocked-arm upgrade clauses on the next
-sweep, so ``Harness._reconcile_one_stranded`` holds those rows at their
-pre-3539 LEAVE instead of converting them (amendment pass, review finding #3).
+That "does not self-heal" property is a statement about a pin OUTSIDE the set
+the blocked arm relaxes on — ``orchestrator.recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES``
+off main, ``ON_MAIN_REMEDIABLE_ESC_CATEGORIES`` on main — and the APPLIER is
+what makes it unconditionally true: a row pinned only by a record the blocked
+arm relaxes on would be picked straight back up by its upgrade clauses on the
+next sweep, so ``Harness._reconcile_one_stranded`` holds those rows at their
+pre-3539 LEAVE instead of converting them, asking :func:`report_blocked_arm_would_move`
+(amendment pass, review finding #3).
 This table cannot express that — it keys on a BOOLEAN ``has_open_escalation``
 and stays pure and config-free — which is exactly why the scoping lives with
 the two sibling sweep-side clauses rather than here. The escalation veto itself is unchanged (no
@@ -89,11 +90,15 @@ from typing import TYPE_CHECKING
 from escalation.pins import classify_pins
 from pydantic import ValidationError
 from shared.deploy_state import DeployPhase, DeployState
-from shared.task_claimant import compose_claimant_run_id, is_stranded
+from shared.task_claimant import (
+    DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+    compose_claimant_run_id,
+    is_stranded_any_status,
+)
 from shared.task_statuses import TaskStatus
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.recovery_emission import LeaveReason, render_shape
 from orchestrator.recovery_pins import (
     records_pin_blocked_done_flip,
@@ -120,12 +125,14 @@ __all__ = [
     'ClaimantSource',
     'EscalationRef',
     'LeaveReason',
+    'ON_MAIN_BRANCH_KINDS',
     'RecoveryAction',
     'TaskGroundTruth',
     'TruthReport',
     'classify_recovery',
     'leave_reason',
     'recovery_shape_str',
+    'report_blocked_arm_would_move',
     'report_pins_blocked_done_flip',
     'report_pins_blocked_recovery',
     'report_pins_recovery',
@@ -145,6 +152,15 @@ class BranchStateKind(enum.StrEnum):
     EXISTS_OFF_MAIN = 'exists_off_main'
     GONE_WITH_MERGE_MARKER = 'gone_with_merge_marker'
     GONE_NO_MARKER = 'gone_no_marker'
+
+
+#: The branch shapes that are evidence the work is ON MAIN.  The one definition
+#: behind the blocked arm's MARK_DONE upgrade and the question of whether that
+#: upgrade would fire (:func:`report_blocked_arm_would_move`).
+ON_MAIN_BRANCH_KINDS: frozenset[BranchStateKind] = frozenset({
+    BranchStateKind.ON_MAIN,
+    BranchStateKind.GONE_WITH_MERGE_MARKER,
+})
 
 
 class ClaimantSource(enum.StrEnum):
@@ -312,13 +328,6 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-# Default staleness threshold for the W2 db claimant signal (TG-3 / step-10).
-# Callers that care about the exact TTL (e.g. harness wiring in θ2) pass
-# their own value explicitly; this default only matters for callers that
-# don't.
-_DEFAULT_HEARTBEAT_TTL = timedelta(minutes=10)
-
-
 def _pid_alive(pid: int) -> bool:
     """Return True if the process identified by *pid* is alive.
 
@@ -365,10 +374,10 @@ def _known_str(value: object) -> str | None:
 def _lock_fresh(locked_at: object, now: datetime, ttl: timedelta) -> bool:
     """Return True if a plan.lock's ``locked_at`` is within *ttl* of *now*.
 
-    Mirrors ``TaskArtifacts.clear_stale_plan_lock``'s own age-based
-    staleness check (its 600s default equals ``_DEFAULT_HEARTBEAT_TTL``
-    here) so a plan.lock owner_pid that happens to be alive isn't honored
-    as a live claimant on that basis alone — under PID reuse, a dead
+    An age bound on the caller's *ttl*, independent of
+    ``TaskArtifacts.clear_stale_plan_lock``'s own eviction window, so a
+    plan.lock owner_pid that happens to be alive isn't honored as a live
+    claimant on that basis alone — under PID reuse, a dead
     orchestrator's pid can be recycled by an unrelated, genuinely-alive
     process, which would otherwise read as a phantom-live claimant and
     silently block recovery of a genuinely stranded task (review finding).
@@ -410,7 +419,7 @@ class TaskGroundTruth:
         worktree_resolver: Callable[[str], Path],
         *,
         now_fn: Callable[[], datetime] = _utc_now,
-        heartbeat_ttl: timedelta = _DEFAULT_HEARTBEAT_TTL,
+        heartbeat_ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     ) -> None:
         self.git_ops = git_ops
         self.scheduler = scheduler
@@ -569,8 +578,8 @@ class TaskGroundTruth:
         1. ``scheduler.is_actively_held(tid)`` — the in-memory public
            accessor (task 2235).
         2. A fresh W2 db claimant: ``claimant_run_id`` present AND NOT
-           ``shared.task_claimant.is_stranded`` against the injected
-           ``now_fn``/``heartbeat_ttl``.
+           ``shared.task_claimant.is_stranded_any_status`` against the
+           injected ``now_fn``/``heartbeat_ttl``.
         3. A live ``plan.lock`` (owner_pid alive AND ``locked_at`` within
            ``heartbeat_ttl`` of ``now_fn()`` — see :func:`_lock_fresh`; the
            staleness cross-check guards against a PID-reuse false-live read,
@@ -585,24 +594,18 @@ class TaskGroundTruth:
            targets, with no legacy fallback (task 4028 — see the comment at
            the read site below).
 
-        A present-but-stale db claimant (``is_stranded`` True) collapses
-        straight to ``None`` — it deliberately does NOT fall through to the
-        plan.lock check, which exists solely for the claimant-absent case.
+        A present-but-stale db claimant (``is_stranded_any_status`` True)
+        collapses straight to ``None`` — it deliberately does NOT fall through
+        to the plan.lock check, which exists solely for the claimant-absent
+        case.
 
-        NOTE (``is_stranded`` is in-progress-only): ``is_stranded`` returns
-        False unconditionally whenever ``db_status`` is anything other than
-        ``'in-progress'`` (its own contract — task 2182). So a non-in-progress
-        task (e.g. ``blocked``) that still carries a non-blank
-        ``claimant_run_id`` — left behind by a crash rather than a clean
-        release, which clears it (harness.py:5810) — is treated as LIVE here
-        regardless of heartbeat age, and ``classify_recovery`` then defers to
-        LEAVE rather than reaching the blocked/no-claimant
-        RE_FILE_ESCALATION row (g). This is an accepted, intentionally scoped
-        edge case, pinned by
-        ``test_stale_db_claimant_on_blocked_task_is_treated_as_live_by_design``
-        — not an oversight. Broadening the staleness check to non-in-progress
-        statuses would mean re-deriving ``is_stranded``'s own contract here;
-        left to a follow-up if this edge case proves to matter in practice.
+        The staleness read is status-agnostic (C4-E6): a claimant stale past
+        ``heartbeat_ttl`` is dead on any status, so a stranded ``blocked`` row
+        reaches ``_RECOVERY`` row (g). The legacy ``metadata.infra_hold``
+        carve-out is retained, so such a row stays live and never takes row
+        (c)/(d) REVERT_TO_PENDING. Rationale:
+        docs/prds/claimant-invariant-enforcement.md D4; pinned by
+        test_task_ground_truth.py::TestDeriveTruthLiveClaimant::test_stale_db_claimant_on_blocked_task_is_not_live.
 
         *task* is the already-fetched row (:meth:`derive_truth` fetches it
         exactly once and shares it across every field that needs it) and
@@ -618,7 +621,7 @@ class TaskGroundTruth:
 
         claimant_run_id = task.get('claimant_run_id')
         if claimant_run_id and str(claimant_run_id).strip():
-            if is_stranded(task, self.now_fn(), self.heartbeat_ttl):
+            if is_stranded_any_status(task, self.now_fn(), self.heartbeat_ttl):
                 return None
             return Claimant(
                 run_id=claimant_run_id,
@@ -896,12 +899,12 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
     # READ THAT PARENTHESIS AS THE PRECONDITION IT IS, not as a property of
     # every converting row (amendment pass, review finding #3). It holds for a
     # `task_failure` pin — the measured 3717 population — and NOT for a
-    # `stranded_blocked` one, which `only_merge_remediable` accepts, so the
-    # next sweep's blocked-arm clauses would move the converted row again
-    # (MARK_DONE on main, RE_FILE off it). The applier therefore holds
-    # merge-remediable-pinned rows at their pre-3539 LEAVE and only genuinely
-    # at-rest rows reach the conversion; see the scoping clause in
-    # `Harness._reconcile_one_stranded`.
+    # `stranded_blocked` one (or, on main, a `preexisting_main_break` one),
+    # which `only_merge_remediable` accepts, so the next sweep's blocked-arm
+    # clauses would move the converted row again (MARK_DONE on main, RE_FILE
+    # off it). The applier therefore holds such rows at their pre-3539 LEAVE
+    # and only genuinely at-rest rows reach the conversion; the scoping clause
+    # in `Harness._reconcile_one_stranded` asks `report_blocked_arm_would_move`.
     #
     # Every CONVERT row is keyed `TaskStatus.IN_PROGRESS` BY CONSTRUCTION.
     # That single fact does two jobs: a converted (`blocked`) task can never
@@ -936,13 +939,6 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
     # shape is absent from this table and falls through to the LEAVE
     # default — re-filing over an already-open escalation would risk a
     # duplicate/competing one (review finding #1).
-    # NOTE (θ2 visibility): unreachable for a 'blocked' task that still
-    # carries a stale-but-present db claimant_run_id — is_stranded is
-    # in-progress-only, so that shape resolves live_claimant=True and hits
-    # the LEAVE default instead of this row. Accepted, intentionally scoped
-    # blind spot — see the NOTE in _resolve_live_claimant's docstring for
-    # the full rationale and the follow-up path if it bites in practice
-    # (review finding).
     (TaskStatus.BLOCKED, False, BranchStateKind.GONE_NO_MARKER, False, None):
         RecoveryAction.RE_FILE_ESCALATION,
     # (h) D1: a deterministic deploy crashed between 'ran' and 'verified',
@@ -1195,8 +1191,9 @@ def report_pins_blocked_recovery(report: TruthReport) -> bool:
 def report_pins_blocked_done_flip(report: TruthReport) -> bool:
     """Do *report*'s open records forbid flipping a BLOCKED task to done?
 
-    :func:`report_pins_blocked_recovery`'s deliberately-more-conservative twin;
-    they differ on exactly one input class.  See
+    :func:`report_pins_blocked_recovery`'s twin; they differ on exactly two
+    input classes (a dead-filer L0, and a ``preexisting_main_break``-only pin,
+    which only the done-flip relaxes).  See
     :func:`orchestrator.recovery_pins.records_pin_blocked_done_flip`.
     """
     return records_pin_blocked_done_flip(
@@ -1204,6 +1201,28 @@ def report_pins_blocked_done_flip(report: TruthReport) -> bool:
         report.open_escalations,
         live_claimant=report.live_claimant is not None,
         live_claimant_id=_live_claimant_id(report),
+    )
+
+
+def report_blocked_arm_would_move(report: TruthReport) -> bool:
+    """Would a blocked-arm upgrade clause move a BLOCKED row with these records?
+
+    The blocked arm's own question, asked about a row that is NOT yet blocked:
+    "if this were status ``blocked`` next sweep, would the self-heal clauses of
+    ``Harness._reconcile_one_stranded`` act on it?"  True when the recovery
+    predicate lets go (the EXISTS_OFF_MAIN re-file clause may fire), or when the
+    branch is ON MAIN and the done-flip predicate lets go.  The CONVERT scoping
+    clause consumes it so a converted row can only ever be one that ``blocked``
+    genuinely rests (task 3539 amendment).
+
+    One function so the clause never re-spells the two predicates: they diverge
+    on exactly the rows task 4645 enumerates, and the clause must follow both.
+    """
+    if not report_pins_blocked_recovery(report):
+        return True
+    return (
+        report.branch_state.kind in ON_MAIN_BRANCH_KINDS
+        and not report_pins_blocked_done_flip(report)
     )
 
 

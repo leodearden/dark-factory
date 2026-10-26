@@ -7,6 +7,16 @@ records. Production cutover (LLM) and the embedding backfill/migration are **fol
 authored only after — and gated on — the verdicts.** They are deliberately unfiled today and are
 not counted as G1 consumers of anything here.
 
+> **Amendment 2026-10-11 (task 6799)** — **the embedding follow-up PRD named in §"Out of scope" is
+> `plans/local-embedder-cutover-prd.md`.** That PRD is the "embedding backfill/migration" follow-up
+> this file and `plans/local-memory-models-eval-decision-embedding.md` §6 defer to, and it carries
+> the `calibrate_write_triage` re-run listed there. It records Leo's rulings of 2026-10-10 on the two
+> axes this PRD evaluated:
+> - **LLM axis:** the LLM stays on `gpt-4o-mini`. No local-LLM production cutover follows.
+> - **Embedding axis:** the embedder moves to `granite-embedding-english-r2` (768 dims).
+>
+> The out-of-scope list, the decision records and every figure in this PRD are unchanged.
+
 > **Amendment 2026-08-06 (task 3748)** — the operating VRAM budget is the MEASURED ~16.4 GiB, not
 > the nominal 19–20GB this PRD was authored against. See D10.
 >

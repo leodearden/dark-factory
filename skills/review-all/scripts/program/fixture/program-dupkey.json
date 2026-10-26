@@ -1,0 +1,102 @@
+{
+  "schema": "review-all-program/1",
+  "run_id": "review-all-fixture-20261019",
+  "project_id": "fixture",
+  "project_root": "/review-all-fixture/project",
+  "as_of_sha": "0000000000000000000000000000000000000000",
+  "record_path": "plans/review-all-fixture-20261019.json",
+  "doc_path": "plans/review-all-program-fixture-20261019.md",
+  "plans_dir": "plans",
+  "streams": [
+    {
+      "id": "S1",
+      "name": "Alpha seam contract",
+      "slug": "fixture-s1",
+      "remedy": "Give the alpha module one seam contract and move OldThing to new_name.py.",
+      "deletable": false,
+      "keys": [
+        "fk-0000000000a1",
+        "fk-0000000000a2"
+      ],
+      "mode": "agent",
+      "size": "M",
+      "risk": "medium",
+      "deps": [],
+      "seams": [
+        "C1",
+        "C2"
+      ]
+    },
+    {
+      "id": "S2",
+      "name": "Beta consumers",
+      "slug": "fixture-s2",
+      "remedy": "Move the beta consumers onto the seam contract S1 delivers.",
+      "deletable": false,
+      "keys": [
+        "fk-0000000000b1"
+      ],
+      "mode": "agent",
+      "size": "S",
+      "risk": "low",
+      "deps": [
+        "S1"
+      ],
+      "seams": [
+        "C1",
+        "C2"
+      ]
+    },
+    {
+      "id": "S3",
+      "name": "Gamma cleanup",
+      "slug": "fixture-s3",
+      "remedy": "Delete the gamma shim once nothing imports it.",
+      "deletable": true,
+      "keys": [
+        "fk-0000000000c1",
+        "fk-0000000000a2"
+      ],
+      "mode": "agent",
+      "size": "S",
+      "risk": "low",
+      "deps": [],
+      "seams": []
+    }
+  ],
+  "seams_extra": [
+    {
+      "seam": "C3",
+      "owner": "S1",
+      "consumers": [
+        "S3"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "n": 1,
+      "statement": "Only the seam contract imports alpha internals.",
+      "owner": "S1",
+      "inv_id": null
+    },
+    {
+      "n": 2,
+      "statement": "A store read declares the capability it needs.",
+      "owner": "S2",
+      "inv_id": "INV-11"
+    }
+  ],
+  "routed": [
+    {
+      "key": "fk-0000000000d1",
+      "route": "phase5-mechanical"
+    }
+  ],
+  "conventions_extra": [
+    "Fixture streams cite code by symbol, never by line."
+  ],
+  "triage": [
+    "fk-0000000000d1 was filed mechanically in Phase 5 as task 107."
+  ]
+}

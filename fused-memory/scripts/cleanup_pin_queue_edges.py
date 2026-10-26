@@ -76,10 +76,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('cleanup_pin_queue_edges')
 
@@ -383,15 +380,16 @@ async def run(
         # BEFORE its rollback-audit memory is written, so a process that cannot
         # write mem0's history would strand invalidated edges with no record of
         # what they said.
-        try:
-            assert_store_mutation_allowed(operation='cleanup_pin_queue_edges --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'cleanup_pin_queue_edges: --apply NOT started (fail-closed) — this '
-                'process cannot write mem0 history. Route through the fused-memory '
-                'MCP server, or re-run without --apply for the report only.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='cleanup_pin_queue_edges --apply',
+            logger=logger,
+            extra_detail=(
+                'each update_edge would supersede its edge and then fail to write '
+                'its rollback-audit memory, stranding invalidated edges with no '
+                'record of what they said. Nothing was read and nothing was '
+                'mutated.'
+            ),
+        )
 
     if graph is None:
         graph = connect_graph(args)

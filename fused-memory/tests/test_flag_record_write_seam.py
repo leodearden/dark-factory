@@ -15,6 +15,7 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.models.enums import MemoryCategory
+from fused_memory.models.memory import ClassificationResult
 from fused_memory.reconciliation import flag_dedup
 from fused_memory.reconciliation.flag_record_contract import (
     STAGE1_FLAG_KIND,
@@ -44,11 +45,9 @@ def service(mock_config):
     svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
     svc.durable_queue = MagicMock()
     svc.durable_queue.enqueue = AsyncMock(return_value=1)
-    classification = MagicMock()
-    classification.primary = MemoryCategory.observations_and_summaries
-    classification.secondary = None
-    classification.confidence = 0.95
-    svc.classifier.classify = AsyncMock(return_value=classification)
+    svc.classifier.classify = AsyncMock(return_value=ClassificationResult(
+        primary=MemoryCategory.observations_and_summaries, confidence=0.95,
+    ))
     return svc
 
 

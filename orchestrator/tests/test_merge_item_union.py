@@ -32,7 +32,8 @@ from _merge_queue_harness import drive_verify_and_advance
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     GroupMergeRequest,
     MergeOutcome,
@@ -40,7 +41,6 @@ from orchestrator.merge_queue import (
     RealMergeItem,
     SpeculativeMergeWorker,
 )
-from orchestrator.merge_types import QueuedBranch
 
 pytestmark = pytest.mark.asyncio
 

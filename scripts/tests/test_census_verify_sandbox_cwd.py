@@ -29,7 +29,7 @@ from pathlib import Path
 
 import census as mod
 import pytest
-from legibility import account_pool, census_trigger, session_runner
+from legibility import account_pool, census_trigger, session_runner, synthesis
 
 import config as config_mod
 
@@ -71,6 +71,12 @@ def _flag_values(argv, flag):
     return values
 
 
+_EMPTY_BRIEF = synthesis.Brief.of(
+    run_id="census-dark_factory-20260803", before={"version": 2, "entries": []},
+    after={"version": 2, "entries": []}, verdicts=[], adopted={}, run_sessions=(), counts={},
+)
+
+
 def _make_seam_driving_run_census():
     """Fake `run_census(**kwargs) -> CensusOutcome` that drives each stage
     seam main() built exactly once — mining, verify, synthesis, in that order
@@ -81,7 +87,7 @@ def _make_seam_driving_run_census():
         calls.append(kwargs)
         kwargs["invoke"]("ping", "haiku")
         kwargs["verify_fn"]([{"title": "x"}], model="sonnet")
-        kwargs["synthesize_fn"]([{"title": "x"}], model="fable")
+        kwargs["synthesize_fn"](_EMPTY_BRIEF, model="fable")
         return mod.CensusOutcome(
             status="done", report_path="plans/confusion-census-2026-08-03.md",
             filed_ticket_ids=[], stop_reason="exhausted",

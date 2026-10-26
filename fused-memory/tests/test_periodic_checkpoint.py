@@ -17,10 +17,15 @@ We test ``_run_checkpoint_cycle`` (the single-pass extraction) directly:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from _overreach_shadow_fixtures import judged_edge, judged_episode, non_judging_shadow
 from shared.async_sqlite_base import CheckpointResult
 
 from fused_memory.server import main as server_main
@@ -28,6 +33,7 @@ from fused_memory.server.tools import (
     _checkpoint_overrides_db_if_exists,
     _open_overrides_db,
 )
+from fused_memory.services.overreach_shadow import SIDECAR_FILENAME, OverreachShadowStore
 
 
 @pytest.fixture(autouse=True)
@@ -221,6 +227,39 @@ async def test_collect_targets_omits_recon_ledger_when_none_or_no_checkpoint():
     assert 'recon_ledger' not in {name for name, _ in targets_no_checkpoint}
 
 
+def _collect_with_memory_service(memory_service) -> list[tuple[str, object]]:
+    return server_main._collect_checkpoint_targets(
+        taskmaster=None,
+        recon_journal=None,
+        event_buffer=None,
+        ticket_store=None,
+        write_journal=None,
+        memory_service=memory_service,
+    )
+
+
+@pytest.mark.asyncio
+async def test_collect_targets_checkpoints_the_overreach_shadow_sidecar(tmp_path: Path) -> None:
+    store = await OverreachShadowStore.open(tmp_path / 'sidecar')
+    await store.record(episode=judged_episode(), judgements=[judged_edge('e1', 'overreach')])
+    shadow = non_judging_shadow(store)
+    try:
+        targets = _collect_with_memory_service(SimpleNamespace(overreach_shadow=shadow))
+        assert 'overreach_shadow' in {name for name, _ in targets}
+
+        await server_main._run_checkpoint_cycle(targets)
+
+        assert server_main._CHECKPOINT_STATUS['overreach_shadow']['busy'] == 0
+        assert (tmp_path / 'sidecar' / f'{SIDECAR_FILENAME}-wal').stat().st_size == 0
+    finally:
+        await shadow.close()
+
+
+def test_collect_targets_omits_an_absent_overreach_shadow() -> None:
+    targets = _collect_with_memory_service(SimpleNamespace(overreach_shadow=None))
+    assert 'overreach_shadow' not in {name for name, _ in targets}
+
+
 # ---------------------------------------------------------------------------
 # Step 1 — existence-guarded override-DB checkpoint helper
 # ---------------------------------------------------------------------------
@@ -410,3 +449,92 @@ async def test_override_target_error_does_not_abort_cycle() -> None:
 
     # Subsequent target still ran and was recorded normally.
     assert server_main._CHECKPOINT_STATUS['other_store']['busy'] == 0
+
+
+# --- the loop itself, with the write-journal growth alarm riding its tick ---
+
+
+class _RecordingAlarm:
+    """Stands in for ``JournalGrowthAlarm``: records each ``maybe_check`` call."""
+
+    def __init__(self, events: list[str], *, fail: bool = False) -> None:
+        self._events = events
+        self._fail = fail
+
+    async def maybe_check(self) -> None:
+        self._events.append('alarm')
+        if self._fail:
+            raise RuntimeError('growth alarm broke')
+
+
+def _recording_target(events: list[str]):
+    async def checkpoint():
+        events.append('checkpoint')
+        return (0, 0, 0)
+
+    return checkpoint
+
+
+async def _run_loop_until(predicate: Callable[[], bool], targets, **kwargs) -> None:
+    task = asyncio.create_task(server_main._periodic_checkpoint_loop(targets, **kwargs))
+
+    async def _until() -> None:
+        while not predicate():
+            await asyncio.sleep(0)
+
+    try:
+        await asyncio.wait_for(_until(), timeout=5.0)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_loop_runs_the_growth_alarm_once_per_tick_after_the_cycle():
+    events: list[str] = []
+
+    await _run_loop_until(
+        lambda: events.count('alarm') >= 3,
+        [('fake', _recording_target(events))],
+        growth_alarm=_RecordingAlarm(events),
+        interval=0.0,
+    )
+
+    assert events[:6] == ['checkpoint', 'alarm'] * 3
+
+
+@pytest.mark.asyncio
+async def test_a_failing_growth_alarm_never_breaks_checkpointing(caplog):
+    caplog.set_level(logging.ERROR, logger=server_main.logger.name)
+    events: list[str] = []
+
+    await _run_loop_until(
+        lambda: events.count('checkpoint') >= 3,
+        [('fake', _recording_target(events))],
+        growth_alarm=_RecordingAlarm(events, fail=True),
+        interval=0.0,
+    )
+
+    alarm_failures = [
+        r for r in caplog.records
+        if r.name == server_main.logger.name
+        and r.levelno == logging.ERROR
+        and r.exc_info is not None
+        and 'growth alarm' in r.getMessage()
+    ]
+    assert len(alarm_failures) == events.count('alarm') >= 2
+    assert server_main._CHECKPOINT_STATUS['fake']['busy'] == 0
+
+
+@pytest.mark.asyncio
+async def test_loop_without_a_growth_alarm_still_checkpoints():
+    events: list[str] = []
+
+    await _run_loop_until(
+        lambda: events.count('checkpoint') >= 3,
+        [('fake', _recording_target(events))],
+        interval=0.0,
+    )
+
+    assert set(events) == {'checkpoint'}

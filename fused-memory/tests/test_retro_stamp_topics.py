@@ -27,6 +27,7 @@ from _store_mutation_preflight_contract import (
 )
 
 from fused_memory import topic_slug as topic_slug_module
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'retro_stamp_topics.py'
 
@@ -2770,7 +2771,7 @@ class TestRunApplyStoreMutationPreflight:
         service = self._service()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await self._run(service, apply=True)
 
@@ -2783,7 +2784,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         service = self._service()
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await self._run(service, apply=True)
 
         service.get_memories_by_metadata.assert_not_awaited()
@@ -2803,9 +2804,8 @@ class TestRunApplyStoreMutationPreflight:
         service.update_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
         """Happy path: a writable environment stamps exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         service = self._service()
 
         report = await self._run(service, apply=True)
@@ -2848,11 +2848,12 @@ class TestRunApplyStoreMutationPreflight:
 
         with (
             caplog.at_level(logging.ERROR),
-            pytest.raises(_mod.StoreMutationUnavailable),
+            pytest.raises(StoreMutationUnavailable),
         ):
             await self._run(service, apply=True)
 
-        assert fail_closed_records(caplog, 'retro_stamp_topics'), (
+        (record,) = fail_closed_records(caplog, 'retro_stamp_topics')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

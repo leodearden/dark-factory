@@ -4887,19 +4887,21 @@ class TestRunBakeOffWiring:
         assert smallest_arm > mod.SEED_CONCURRENCY  # the bound has to actually bite
         assert mem0.max_inflight <= mod.SEED_CONCURRENCY
 
-    async def test_fetching_stays_serial_because_a_swallowed_read_timeout_is_silent(
+    async def test_fetching_stays_serial_because_concurrent_reads_aborted_the_live_run(
         self, monkeypatch,
     ):
-        """The read side is the one half that must NOT be made concurrent.
+        """The read side stays serial until someone re-measures it.
 
         Bounding it at SEED_CONCURRENCY is the obvious efficiency win — 753
         independent, order-insensitive round trips across the three arms — and
         it was implemented and measured. The live run aborted partway through
         the second arm with `MeasurementError: ... returned no results for a
-        10-limit query`. `Mem0Client.search` SWALLOWS its read timeout (logs,
-        returns `{}`), so on the read side concurrency converts a latency win
-        into a silently-empty ranking; `add` propagates its timeout instead,
-        which is why the write side keeps its bound.
+        10-limit query`. The hypothesis at the time: concurrent searches
+        exceeded the backend read timeout, which `search` then returned as
+        `{}`. Since task 5265 that timeout raises instead
+        (`backends/mem0_client.py::Mem0Backend._timed`), so the failure would
+        now be loud rather than an empty ranking, but nobody has re-run the
+        concurrent read path against a live store, so the serial bound stays.
 
         Asserted as the OBSERVABLE property — one search in flight at a time —
         rather than as "no semaphore exists", so a future re-attempt has to
@@ -8266,13 +8268,16 @@ class TestTheSelfHitFilterIsProvenanceBasedNotIdBased:
 
 @pytest.mark.asyncio
 class TestAFailedQueryIsNotAMeasuredZero:
-    """`Mem0Client.search` swallows `TimeoutError` and returns `{}`.
+    """A backend read can come back empty without having measured anything.
 
-    So a network failure and a shape that ranked nothing arrive at `_search`
-    as the same empty list — which this module's own rule ("an empty hits list
-    with a real expectation IS a measured zero") then scores as 0.0 recall,
-    0.0 discoverability and 0.0 guard, indistinguishable in the artifact from
-    a real result.  Every arm seeds the SHARED distractor slab, so an empty
+    The backend's `search` propagates a read `TimeoutError`, but an empty
+    response (`{}`, `None`, no results) is still a possible reply, and a
+    failed query must never be counted as a measured zero.  If a network
+    failure and a shape that ranked nothing ever arrived at `_search` as the
+    same empty list, this module's own rule ("an empty hits list with a real
+    expectation IS a measured zero") would score it as 0.0 recall, 0.0
+    discoverability and 0.0 guard, indistinguishable in the artifact from a
+    real result.  Every arm seeds the SHARED distractor slab, so an empty
     ranking is not a possible outcome here: it is unambiguously detectable and
     must be loud, per the no-silent-fail-soft design invariant.
     """

@@ -25,8 +25,8 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_disposition import MergeFailureDisposition
-from orchestrator.merge_queue import MergeOutcome
+from orchestrator.merge_lane.disposition import MergeFailureDisposition
+from orchestrator.merge_lane.worker import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
@@ -243,7 +243,7 @@ class TestSubmitToMergeQueueIntegrationSkewRouting:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True)
@@ -300,7 +300,7 @@ class TestSubmitToMergeQueueIntegrationSkewRouting:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=False)

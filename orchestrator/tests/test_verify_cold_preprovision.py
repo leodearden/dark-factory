@@ -26,12 +26,18 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
+from orchestrator.verify_runner import (
+    MergeVerifySpec,
+    UnscopedTypecheckSpec,
+    VerifyCommand,
+    run_merge_verify_on_worktree,
+)
 
 # Distinct tokens so the spy can attribute each _run_cmd invocation to a leg.
 # Mirror the ACTUAL deployed command (dark-factory-orchestrator.yaml) so the test
@@ -258,3 +264,55 @@ class TestColdPreprovisionCoalesce:
         # Each call still ran its own three checks (2 calls × 3 legs = 6).
         assert len([c for c in invoked if _is_check(c)]) == 6, invoked
         assert all(r.passed for r in results), results
+
+
+class TestRemoteMergeVerifyLegUsesDispatcherPreprovision:
+    """Task 6127: the remote ``verify-merge`` leg ran the HOST's pre-provision
+    command, because the spec carried none.  On a host whose own value is ''
+    the provision was a no-op, and the root type leg raced the test legs'
+    ``uv run`` venv creation (task 6021).  The dispatcher's command now rides
+    the spec and is applied onto the host config before the real
+    ``run_scoped_verification`` reaches ``_preprovision_shared_venv``."""
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_command_provisions_before_every_check(self, tmp_path: Path):
+        host_config = OrchestratorConfig(
+            project_root=tmp_path,
+            concurrent_verify=True,
+            verify_cold_preprovision_command='',
+            merge_verify_workspace=False,
+            merge_verify_breadth='scoped',
+        )
+        spec = MergeVerifySpec(
+            verify_commands=(),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=None,
+            verify_env={},
+            cold_timeout_secs=60.0,
+            global_verify_command=VerifyCommand(
+                prefix='',
+                test_command=TEST_CMD,
+                lint_command=LINT_CMD,
+                type_check_command=TYPE_CMD,
+            ),
+            verify_cold_preprovision_command=PROVISION_CMD,
+        )
+        gate_clean = MagicMock(
+            broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[],
+        )
+        invoked: list[tuple[str, Path]] = []
+        with patch('orchestrator.verify._run_cmd', side_effect=_spy(invoked)):
+            result = await run_merge_verify_on_worktree(
+                tmp_path, host_config, spec,
+                run_unscoped=AsyncMock(return_value=gate_clean),
+            )
+
+        provisions = [(c, cwd) for (c, cwd) in invoked if _is_provision(c)]
+        assert provisions == [(PROVISION_CMD, tmp_path)], (
+            f"the dispatcher's provision must run exactly once in the worktree: {invoked!r}"
+        )
+        checks_idx = [i for i, (c, _) in enumerate(invoked) if _is_check(c)]
+        assert checks_idx, f'the check legs must run: {invoked!r}'
+        provision_idx = invoked.index((PROVISION_CMD, tmp_path))
+        assert provision_idx < min(checks_idx), f'provision must precede every check: {invoked!r}'
+        assert result.passed is True

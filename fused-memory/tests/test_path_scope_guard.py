@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from fused_memory.middleware.curator_types import CandidateTask
 from fused_memory.middleware.path_scope_guard import (
     _RIGHT_CONTEXT,
     PathGuardVerdict,
@@ -24,7 +25,6 @@ from fused_memory.middleware.path_scope_guard import (
     is_routing_override,
 )
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
-from fused_memory.middleware.task_curator import CandidateTask
 
 
 def _mkproj(parent: Path, name: str, dirs: list[str]) -> Path:

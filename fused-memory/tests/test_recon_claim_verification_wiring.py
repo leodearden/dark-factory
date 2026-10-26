@@ -97,7 +97,8 @@ class TestMaybeFlagUnverifiedClaims:
         even though the probe below would flag every token as absent, proving
         the config flag actually gates the check rather than the result
         coincidentally being empty."""
-        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+        from fused_memory.middleware.curator_types import CandidateTask
+        from fused_memory.middleware.task_curator import TaskCurator
 
         config = _make_config(recon_claim_verification_enabled=False)
         curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
@@ -113,7 +114,8 @@ class TestMaybeFlagUnverifiedClaims:
         """(b) enabled + probe reports the token absent -> returns the
         AttributedClaim AND emits a grep-stable WARNING naming
         recon_claim_verification.unverified + the token."""
-        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+        from fused_memory.middleware.curator_types import CandidateTask
+        from fused_memory.middleware.task_curator import TaskCurator
 
         config = _make_config(recon_claim_verification_enabled=True)
         curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
@@ -136,7 +138,8 @@ class TestMaybeFlagUnverifiedClaims:
     async def test_enabled_verified_token_returns_empty_no_warning(self, tmp_path, caplog):
         """(c) enabled + probe reports the token present -> [] and no
         recon_claim_verification WARNING (self-correcting)."""
-        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+        from fused_memory.middleware.curator_types import CandidateTask
+        from fused_memory.middleware.task_curator import TaskCurator
 
         config = _make_config(recon_claim_verification_enabled=True)
         curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
@@ -155,7 +158,8 @@ class TestMaybeFlagUnverifiedClaims:
         """(d) returns [] fail-open when self._cwd is None, even when enabled
         (no probe injected — proves the cwd-None guard short-circuits before
         ever needing to build/call a probe)."""
-        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+        from fused_memory.middleware.curator_types import CandidateTask
+        from fused_memory.middleware.task_curator import TaskCurator
 
         config = _make_config(recon_claim_verification_enabled=True)
         curator = TaskCurator(config=config, taskmaster=None, cwd=None)
@@ -168,12 +172,12 @@ class TestMaybeFlagUnverifiedClaims:
     async def test_hook_never_returns_decision_and_never_mutates_candidate(self, tmp_path):
         """(e) The hook returns a plain list of AttributedClaim (never a
         CuratorDecision / drop) and never mutates the candidate."""
-        from fused_memory.middleware.recon_claim_verification_guard import AttributedClaim
-        from fused_memory.middleware.task_curator import (
+        from fused_memory.middleware.curator_types import (
             CandidateTask,
             CuratorDecision,
-            TaskCurator,
         )
+        from fused_memory.middleware.recon_claim_verification_guard import AttributedClaim
+        from fused_memory.middleware.task_curator import TaskCurator
 
         config = _make_config(recon_claim_verification_enabled=True)
         curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
@@ -204,7 +208,8 @@ class TestMaybeFlagUnverifiedClaims:
         """
         import threading
 
-        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+        from fused_memory.middleware.curator_types import CandidateTask
+        from fused_memory.middleware.task_curator import TaskCurator
 
         loop_thread_id = threading.get_ident()
         probe_thread_ids: list[int] = []
@@ -249,7 +254,8 @@ class TestMaybeFlagUnverifiedClaims:
         import threading
         from unittest.mock import patch
 
-        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+        from fused_memory.middleware.curator_types import CandidateTask
+        from fused_memory.middleware.task_curator import TaskCurator
 
         loop_thread_id = threading.get_ident()
         build_threads: list[int] = []
@@ -265,7 +271,7 @@ class TestMaybeFlagUnverifiedClaims:
         candidate = CandidateTask(title="T", description=_INCIDENT_DESCRIPTION)
 
         with patch(
-            "fused_memory.middleware.recon_claim_verification_guard."
+            "fused_memory.middleware.task_curator."
             "make_source_and_history_probe",
             side_effect=recording_make_probe,
         ):
@@ -303,12 +309,12 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
         carrying a DISTINCT attributed claim so none is pre-batch-deduped."""
         from unittest.mock import patch
 
-        from fused_memory.middleware.task_curator import (
+        from fused_memory.middleware.curator_types import (
             CandidateTask,
             CuratorDecision,
             PreparedCandidate,
-            TaskCurator,
         )
+        from fused_memory.middleware.task_curator import TaskCurator
 
         config = _make_config(recon_claim_verification_enabled=True)
         curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
@@ -346,7 +352,7 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
 
         with (
             patch(
-                "fused_memory.middleware.recon_claim_verification_guard."
+                "fused_memory.middleware.task_curator."
                 "make_source_and_history_probe",
                 side_effect=fake_make_probe,
             ),
@@ -374,12 +380,12 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
         import asyncio
         from unittest.mock import patch
 
-        from fused_memory.middleware.task_curator import (
+        from fused_memory.middleware.curator_types import (
             CandidateTask,
             CuratorDecision,
             PreparedCandidate,
-            TaskCurator,
         )
+        from fused_memory.middleware.task_curator import TaskCurator
 
         config = _make_config(recon_claim_verification_enabled=True)
         curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
@@ -461,14 +467,15 @@ class TestClaimExtractionSkipsUnneededProbeWork:
         plain-prose candidate carrying no attributed claim."""
         from unittest.mock import patch
 
-        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+        from fused_memory.middleware.curator_types import CandidateTask
+        from fused_memory.middleware.task_curator import TaskCurator
 
         config = _make_config(recon_claim_verification_enabled=True)
         curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
         candidate = CandidateTask(title="T", description="plain description, no claims")
 
         with patch(
-            "fused_memory.middleware.recon_claim_verification_guard."
+            "fused_memory.middleware.task_curator."
             "make_source_and_history_probe",
         ) as mock_make_probe:
             result = await curator._maybe_flag_unverified_claims(candidate)
@@ -484,12 +491,12 @@ class TestClaimExtractionSkipsUnneededProbeWork:
         block)."""
         from unittest.mock import patch
 
-        from fused_memory.middleware.task_curator import (
+        from fused_memory.middleware.curator_types import (
             CandidateTask,
             CuratorDecision,
             PreparedCandidate,
-            TaskCurator,
         )
+        from fused_memory.middleware.task_curator import TaskCurator
 
         config = _make_config(recon_claim_verification_enabled=True)
         curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
@@ -518,7 +525,7 @@ class TestClaimExtractionSkipsUnneededProbeWork:
 
         with (
             patch(
-                "fused_memory.middleware.recon_claim_verification_guard."
+                "fused_memory.middleware.task_curator."
                 "make_source_and_history_probe",
             ) as mock_make_probe,
             patch.object(curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch),
@@ -554,7 +561,8 @@ class TestClaimVerificationGuardFailsOpen:
         propagating out of the advisory check."""
         from unittest.mock import patch
 
-        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+        from fused_memory.middleware.curator_types import CandidateTask
+        from fused_memory.middleware.task_curator import TaskCurator
 
         config = _make_config(recon_claim_verification_enabled=True)
         curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
@@ -562,7 +570,7 @@ class TestClaimVerificationGuardFailsOpen:
 
         with (
             patch(
-                "fused_memory.middleware.recon_claim_verification_guard."
+                "fused_memory.middleware.task_curator."
                 "make_source_and_history_probe",
                 side_effect=RuntimeError("boom"),
             ),
@@ -581,7 +589,8 @@ class TestClaimVerificationGuardFailsOpen:
         """Probe VERIFICATION raising (the injected-probe branch — e.g.
         curate_batch_prepared's shared batch probe, or a test double) is
         caught, logged at WARNING, and returns [] rather than propagating."""
-        from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
+        from fused_memory.middleware.curator_types import CandidateTask
+        from fused_memory.middleware.task_curator import TaskCurator
 
         def exploding_probe(token: str) -> bool:
             raise RuntimeError("probe boom")

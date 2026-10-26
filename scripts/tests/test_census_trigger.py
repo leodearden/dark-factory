@@ -885,6 +885,71 @@ def test_extract_done_count_raises_on_non_dict_payload(payload):
     assert type(payload).__name__ in str(excinfo.value)
 
 
+# ---------------------------------------------------------------------------
+# task 6404: extract_statuses() — the validated {task id: status} mapping a
+# census run reads ONCE and derives both its outcome feed and its done-count
+# from. extract_done_count builds on it, so the two cannot drift.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_statuses_returns_the_validated_mapping():
+    assert dict(ct.extract_statuses({"statuses": {"12": "done", "13": "pending"}})) == {
+        "12": "done",
+        "13": "pending",
+    }
+
+
+def test_extract_statuses_empty_statuses_is_a_valid_empty_mapping():
+    assert dict(ct.extract_statuses({"statuses": {}})) == {}
+
+
+def test_extract_statuses_raises_on_fused_memory_tool_error_envelope():
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_statuses(_TOOL_ERROR_ENVELOPE)
+
+    assert "project_root must be a non-empty absolute path" in str(excinfo.value)
+
+
+def test_extract_statuses_raises_when_statuses_key_absent():
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_statuses({})
+
+    assert "statuses" in str(excinfo.value)
+
+
+def test_extract_statuses_raises_when_statuses_is_not_a_mapping():
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_statuses({"statuses": ["1", "2"]})
+
+    assert "statuses" in str(excinfo.value)
+    assert "list" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("payload", [None, [], "oops", 0])
+def test_extract_statuses_raises_on_non_dict_payload(payload):
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_statuses(payload)
+
+    assert type(payload).__name__ in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"statuses": {}},
+        {"statuses": {"1": "done", "2": "done", "3": "pending"}},
+        {"statuses": {"1": "done"}, "error": "x"},
+        {"statuses": {"7": "cancelled", "8": "done", "9": "in-progress"}},
+    ],
+)
+def test_extract_done_count_is_the_done_count_of_extract_statuses(payload):
+    statuses = ct.extract_statuses(payload)
+
+    assert ct.extract_done_count(payload) == sum(
+        1 for status in statuses.values() if status == "done"
+    )
+
+
 def test_compute_tasks_landed_tool_error_envelope_returns_none_with_one_warning(caplog):
     """Before task 3291 this returned `0 - 500 == -500` with ZERO warnings --
     a silent negative delta from a payload that was never a status snapshot

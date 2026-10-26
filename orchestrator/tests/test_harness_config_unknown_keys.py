@@ -19,9 +19,9 @@ from unittest.mock import patch
 import pytest
 import yaml
 from _orch_helpers import _init_harness_state_for_test
+from escalation.categories import EscalationCategory
 from escalation.models import BORN_AT_L2_SEVERITIES
 from escalation.queue import EscalationQueue
-from escalation.server import CATEGORIES
 
 from orchestrator.config import (
     ConfigIgnoredKey,
@@ -70,7 +70,7 @@ async def test_files_born_at_l2_for_unknown_keys(tmp_path: Path, monkeypatch):
     # Born-at-L2 CONTRACT (assert the contract, not exact string literals).
     assert esc.level == 2
     assert esc.severity in BORN_AT_L2_SEVERITIES
-    assert esc.category in CATEGORIES
+    assert esc.category in EscalationCategory
     assert esc.root_cause.startswith('config_unknown_keys:')
     assert esc.agent_role.startswith(('harness-', 'orchestrator-'))
     # Detail names both the bogus path and its placement hint.

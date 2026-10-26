@@ -169,6 +169,16 @@ function latencyCaption(latency) {
   return 'of ' + l.with_duration + ' with recorded duration · ' + l.without_duration + ' without';
 }
 
+// The width the server counted the depth series at
+// (data/merge_queue.py::BUCKET_LADDER), never assumed here; a series naming none states none.
+function depthBucketCaption(depth) {
+  const minutes = (depth || {}).bucket_minutes;
+  if (!Number.isInteger(minutes) || minutes <= 0) return QUEUE_EM_DASH;
+  if (minutes % 1440 === 0) return `${minutes / 1440}-day buckets`;
+  if (minutes % 60 === 0) return `${minutes / 60}-h buckets`;
+  return `${minutes}-min buckets`;
+}
+
 // Module-unique export const, never a bare `API` — the CANONICAL note in
 // datum.js's header, enforced at runtime by classic_script_scope.test.mjs.
 const MERGE_QUEUE_API = {
@@ -181,6 +191,7 @@ const MERGE_QUEUE_API = {
   hitRateText,
   recentTotal,
   latencyCaption,
+  depthBucketCaption,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

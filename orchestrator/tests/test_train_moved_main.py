@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, call, patch
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _merge_lane_fakes import lane_scene_config, make_lane, merge_through_lane
+from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import git_env_with_ceiling
 from _recording_event_store import _RecordingEventStore
 from df_pytest_isolation import git_redirect_env
@@ -39,7 +40,6 @@ from orchestrator.verify import VerifyResult
 
 pytestmark = pytest.mark.asyncio
 
-_VERIFY_TARGET = 'orchestrator.merge_lane.worker.run_scoped_verification'
 _CAS_DERAIL_REASON = 'Train merge advance failed: cas_failed'
 
 _MEMBER_A, _MEMBER_B, _TIP = _MEMBERS = ('mm-a', 'mm-b', 'mm-c')
@@ -201,7 +201,8 @@ class _VerifyCall:
 
 
 class _VerifyDouble:
-    """``run_scoped_verification`` stand-in that can move main while it runs.
+    """The train's scoped verify, injected through ``ScriptedVerifier``, that
+    can move main while it runs.
 
     Call *n* (1-based) records what it saw, then commits a drift with
     *mover* when *n* is in *move_on*, then answers red when *n* is in
@@ -246,9 +247,11 @@ async def _run_train(
     scene: _Scene, train: _Train, verify: _VerifyDouble, store: _RecordingEventStore,
 ) -> MergeOutcome:
     queue: asyncio.Queue[Any] = asyncio.Queue()
-    lane = make_lane(scene.git_ops, queue, event_store=store)
-    with patch(_VERIFY_TARGET, side_effect=verify.run_scoped_verification):
-        return await merge_through_lane(lane, queue, train.request)
+    lane = make_lane(
+        scene.git_ops, queue,
+        verifier=ScriptedVerifier(verify.run_scoped_verification), event_store=store,
+    )
+    return await merge_through_lane(lane, queue, train.request)
 
 
 def _events(store: _RecordingEventStore, event_type: str) -> list[dict[str, Any]]:
@@ -411,17 +414,24 @@ async def test_rebase_after_a_lost_cas_is_gated_against_the_verified_base_not_th
 
 
 @pytest.mark.parametrize(
-    ('mover', 'breadth', 'expected_verifies'),
+    ('mover', 'breadth', 'expected_verifies', 'expected_reason'),
     [
-        pytest.param(_queue_landed(_disjoint_drift), 'scoped', 1, id='C-disjoint-queue-landed'),
-        pytest.param(_queue_landed(_disjoint_drift), 'full', 2, id='D-disjoint-whole-tree-gate'),
         pytest.param(
-            _queue_landed(_shared_drift), 'scoped', 2, id='E-drift-on-a-non-tip-members-file',
+            _queue_landed(_disjoint_drift), 'scoped', 1, 'disjoint',
+            id='C-disjoint-queue-landed',
+        ),
+        pytest.param(
+            _queue_landed(_disjoint_drift), 'full', 2, 'disjoint_untrusted',
+            id='D-disjoint-whole-tree-gate',
+        ),
+        pytest.param(
+            _queue_landed(_shared_drift), 'scoped', 2, 'overlap',
+            id='E-drift-on-a-non-tip-members-file',
         ),
     ],
 )
 async def test_moved_main_costs_a_reverify_only_when_disjointness_cannot_be_trusted(
-    tmp_path: Path, mover: Mover, breadth: str, expected_verifies: int,
+    tmp_path: Path, mover: Mover, breadth: str, expected_verifies: int, expected_reason: str,
 ) -> None:
     scene = await _stacked_train_scene(tmp_path, merge_verify_breadth=breadth)
     train = _train(scene)
@@ -433,6 +443,13 @@ async def test_moved_main_costs_a_reverify_only_when_disjointness_cannot_be_trus
     assert outcome.status == 'done', outcome
     assert not _events(store, 'train_derailed')
     assert len(verify.calls) == expected_verifies
+    [gate] = _events(store, 'merge_reverify_gate')
+    assert (gate['reason'], gate['reverify']) == (expected_reason, expected_verifies == 2)
+    assert gate['overlap'] == (['shared.txt'] if expected_reason == 'overlap' else [])
+    gate_verifies = [
+        row for row in _events(store, 'merge_verify') if row['merge_sha'] == gate['merge_sha']
+    ]
+    assert len(gate_verifies) == expected_verifies - 1
     [drift] = verify.drifts
     assert {'a.txt', 'b.txt', 'c.txt'} <= _files_at(scene.repo, 'main')
     landed_shared = _shared_lines_at(scene.repo, 'main')

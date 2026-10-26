@@ -72,8 +72,9 @@ def read_worktree_title(worktree: Path) -> str | None:
     falling back to the legacy in-worktree ``<worktree>/.task`` sidecar for
     the compat window. Within EACH root, prefers ``metadata.json`` ``title``,
     falling back to ``plan.json`` ``title`` — mirroring the new-then-old
-    idiom already used for plan.json reads elsewhere (e.g.
-    ``TaskArtifacts._read_path``, the disk-backstop scan in ``git_ops.py``).
+    idiom of ``TaskArtifacts._read_path``. Task 3154 left this title
+    resolution unchanged: only the disk backstop's lane->task MATCH key
+    moved to ``metadata.json``.
 
     Returns ``None`` if no root/file is readable or carries a non-blank
     title — callers treat ``None`` as "unprovable", which

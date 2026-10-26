@@ -31,7 +31,8 @@ def _result(
     category: MemoryCategory | None = MemoryCategory.procedural_knowledge,
     content: str = 'a sibling record on the consolidated topic',
 ) -> MemoryResult:
-    """Build a real post-RRF MemoryResult, mirroring _near_duplicate_result.
+    """Build a real post-RRF MemoryResult, mirroring
+    ``tests/server/write_triage_harness.py::search_candidate``.
 
     *topic* is placed in ``metadata['topic']`` verbatim — including sentinel
     ``...`` to mean "omit the key entirely" — so the selector's defensive

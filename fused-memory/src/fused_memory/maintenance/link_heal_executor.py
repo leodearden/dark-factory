@@ -7,7 +7,9 @@ files nothing: every escape it would raise is recorded as ``would_escape``.
 Its verdicts come from the hand-link corpus (:func:`run_plan`) or from the
 link adjudicator (:func:`run_adjudicator_plan`), which is asked only about the
 links no deterministic row decides and that it has not judged at their
-current texts; its verdicts are ledgered as adjudications.
+current texts; its verdicts are ledgered as adjudications. A deterministic
+plan is :func:`run_plan` with no verdicts at all: only the deterministic rows
+plan a heal, and every other link is reported unexamined.
 
 An apply run drains the pending heals oldest first. Each heal re-reads its
 record live, and is skipped when the record no longer shows what it was
@@ -44,6 +46,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from shared.safe_io import atomic_write_text
+from shared.streak import KeyedStreaks
 
 from fused_memory.maintenance.link_adjudicator import LinkAdjudicator, LinkPair, LinkVerdict
 from fused_memory.maintenance.link_heal import (
@@ -62,6 +65,7 @@ from fused_memory.maintenance.link_heal import (
     apply_change,
     build_plan,
     corroboration_mismatch,
+    corroboration_reads_parent,
     journal_reason,
     needs_verdict,
     plan_links,
@@ -76,8 +80,8 @@ from fused_memory.maintenance.link_heal_ledger import (
     AdjudicationRecord,
     AdjudicationRow,
     LinkHealLedger,
-    RunRow,
     RunSource,
+    UndoTarget,
 )
 from fused_memory.maintenance.link_heal_store import (
     LinkCensus,
@@ -376,6 +380,11 @@ def plan_sha256(document: bytes) -> str:
     return hashlib.sha256(document).hexdigest()
 
 
+def pending_plan_sha256(pending: Sequence[ActionRow]) -> str:
+    """The sha an --approved-plan-sha is checked against: that of the plan document *pending* renders."""
+    return plan_sha256(render_plan_document(pending))
+
+
 def _plan_entry(row: ActionRow) -> dict[str, Any]:
     heal = row.planned
     return {
@@ -491,7 +500,7 @@ async def _publish_plan(
         escape.anchor for escape in (backlog, *shares, *escapes) if escape is not None
     )
     counts = replace(counts, would_escape=would_escape)
-    ledger.finish_run(run_id, counts=counts.as_json(), plan_sha256=sha)
+    ledger.finish_run(run_id, counts=counts.as_json(), plan_sha256=sha, plan_path=plan_path)
     return RunReport(run_id=run_id, counts=counts, plan_sha256=sha, plan_path=plan_path)
 
 
@@ -665,10 +674,15 @@ def _read_failure(phase: str, failure: StoreReadFailed) -> dict[str, Any]:
 
 
 async def _corroborate(store: LinkHealStore, heal: PlannedAction) -> StaleField | None:
-    """Re-read the child, its parent and (for a completion) its children, live."""
+    """Re-read the child, its parent when the heal rests on it, and (for a
+    completion) its children, live."""
     child = await store.read(heal.project_id, heal.child_id)
     parent_id = heal.pre_image.parent_id
-    parent = None if parent_id is None else await store.read(heal.project_id, parent_id)
+    parent = (
+        await store.read(heal.project_id, parent_id)
+        if parent_id is not None and corroboration_reads_parent(heal)
+        else None
+    )
     child_count = (
         await store.count_children(heal.project_id, heal.child_id)
         if heal.action in COMPLETION_ACTIONS
@@ -738,32 +752,44 @@ class ApprovalMismatch(ValueError):
 
 
 def _check_approval(approved: str, pending: Sequence[ActionRow]) -> None:
-    actual = plan_sha256(render_plan_document(pending))
+    actual = pending_plan_sha256(pending)
     if actual != approved:
         raise ApprovalMismatch(expected=approved, actual=actual)
 
 
 @dataclass
 class _Drain:
-    """What one apply run's drain has come to so far."""
+    """What one apply run's drain has come to so far; the drain is one failure run."""
 
+    failures: KeyedStreaks[None]
     outcomes: Counter[ActionState] = field(default_factory=Counter)
     writes: int = 0
-    streak: int = 0
     last_failure: Mapping[str, Any] | None = None
     not_attempted: int = 0
     stopped_by: str | None = None
 
-    def record(self, outcome: _Outcome) -> None:
-        """A failure extends the streak, an applied heal resets it, a skip leaves it."""
+    @classmethod
+    def for_limit(cls, limit: int) -> _Drain:
+        return cls(failures=KeyedStreaks(threshold=limit))
+
+    @property
+    def streak(self) -> int:
+        return self.failures.count(None)
+
+    def record(self, outcome: _Outcome) -> bool:
+        """Count *outcome*; True when this failure brings the streak to the limit.
+
+        A failure extends the streak, an applied heal resets it, a skip leaves it.
+        """
         self.outcomes[outcome.state] += 1
         if outcome.wrote:
             self.writes += 1
         if outcome.state is ActionState.FAILED:
-            self.streak += 1
             self.last_failure = outcome.detail
-        elif outcome.state is ActionState.APPLIED:
-            self.streak = 0
+            return self.failures.failure(None).fired
+        if outcome.state is ActionState.APPLIED:
+            self.failures.success(None)
+        return False
 
     def stop(self, *, not_attempted: int) -> None:
         self.stopped_by = STREAK_STOP
@@ -780,15 +806,14 @@ async def _drain(
     streak_limit: int,
 ) -> _Drain:
     """Heal *pending* in order until *cap* write attempts or *streak_limit* failures."""
-    drain = _Drain()
+    drain = _Drain.for_limit(streak_limit)
     for index, row in enumerate(pending):
         if cap is not None and drain.writes >= cap:
             outcome = _Outcome(ActionState.SKIPPED_CAP)
         else:
             outcome = await _heal_one(row.planned, store=store, run_id=run_id)
         ledger.set_outcome(row.action_id, outcome.state, run_id, outcome.detail)
-        drain.record(outcome)
-        if drain.streak >= streak_limit:
+        if drain.record(outcome):
             drain.stop(not_attempted=len(pending) - index - 1)
             break
     return drain
@@ -948,15 +973,14 @@ async def _undo_heal(
 
 
 async def run_undo(
-    target: RunRow, *, store: LinkHealStore, ledger: LinkHealLedger, limits: RunLimits,
+    target: UndoTarget, *, store: LinkHealStore, ledger: LinkHealLedger, limits: RunLimits,
 ) -> RunReport:
-    """A writing run taking back every heal *target* applied, newest first."""
-    heals = ledger.applied_actions(target.run_id)[::-1]
+    """A writing run taking back every heal *target* still has applied, newest first."""
+    heals = target.heals[::-1]
     run_id = ledger.start_run(RunSource.UNDO, writes=True)
-    drain = _Drain()
+    drain = _Drain.for_limit(limits.write_failure_streak)
     for index, row in enumerate(heals):
-        drain.record(await _undo_heal(row, store=store, ledger=ledger, run_id=run_id))
-        if drain.streak >= limits.write_failure_streak:
+        if drain.record(await _undo_heal(row, store=store, ledger=ledger, run_id=run_id)):
             drain.stop(not_attempted=len(heals) - index - 1)
             break
     counts = _drain_counts(heals, drain)

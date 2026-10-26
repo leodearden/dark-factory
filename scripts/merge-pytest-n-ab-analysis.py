@@ -13,7 +13,7 @@ changed the key, so the cut is by the value actually in force at each merge
 verify's timestamp, not by calendar date. An orchestrator restart re-reads the
 same file, so the file value stays authoritative across restarts.
 
-Stdlib only. Read-only against runs.db (opened with ``mode=ro``). Writes a
+Stdlib plus shared's stdlib-only layout leaf. Read-only against runs.db (opened with ``mode=ro``). Writes a
 markdown report under plans/ (``--no-report`` to skip) and prints a summary
 table plus a trailing single-line JSON verdict.
 
@@ -33,8 +33,10 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import _checkout as _checkout
+from shared.project_layout import default_project_root, runs_db
+
 KEY = 'PYTEST_XDIST_AUTO_NUM_WORKERS'
-DEFAULT_DB = '/home/leo/src/dark-factory/data/orchestrator/runs.db'
 DEFAULT_SINCE = '2026-09-08T10:18:00+00:00'   # the reload that pinned 16 (commit 35b8916784)
 MIN_N = 10
 TOL_SAME = 0.05
@@ -81,17 +83,27 @@ def pct(xs: list[float], p: float) -> float:
     return ys[k]
 
 
+def default_db() -> Path:
+    return runs_db(default_project_root())
+
+
+def default_report_dir() -> Path:
+    return default_project_root() / 'plans'
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--db', default=DEFAULT_DB)
+    ap.add_argument('--db', default=None, help="(default: the main checkout's runs.db)")
     ap.add_argument('--since', default=DEFAULT_SINCE, help='ISO-8601; default = the reload that pinned 16')
-    ap.add_argument('--report-dir', default='/home/leo/src/dark-factory/plans')
+    ap.add_argument('--report-dir', default=None, help="(default: the main checkout's plans/)")
     ap.add_argument('--no-report', action='store_true', help='print only; write no report file')
     ap.add_argument('--commit', action='store_true', help='git commit --only the report (for the scheduled run)')
     args = ap.parse_args()
 
+    db = args.db if args.db is not None else default_db()
+    report_dir = Path(args.report_dir) if args.report_dir is not None else default_report_dir()
     since = parse_ts(args.since)
-    con = sqlite3.connect(f'file:{args.db}?mode=ro', uri=True)
+    con = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
     cur = con.cursor()
     arms = load_arms(cur, since)
 
@@ -146,7 +158,7 @@ def main() -> int:
 
     now = datetime.now(UTC)
     lines = [f'# Merge-leg pytest `-n` A/B (16 vs 8) — cut {now.isoformat(timespec="minutes")}', '',
-             f'Source: `{args.db}` (`merge_verify` events, runner=local, since {since.isoformat(timespec="minutes")}).',
+             f'Source: `{db}` (`merge_verify` events, runner=local, since {since.isoformat(timespec="minutes")}).',
              'Arms from `config_reload` events changing `verify_env.' + KEY + '`:', '']
     for b_ts, v in arms:
         lines.append(f'- {b_ts.isoformat(timespec="minutes")} → `{v}`')
@@ -167,11 +179,11 @@ def main() -> int:
     report = '\n'.join(lines) + '\n'
     print(report)
     if not args.no_report:
-        out = Path(args.report_dir) / f'merge-pytest-n-ab-report-{now.strftime("%Y-%m-%d")}.md'
+        out = report_dir / f'merge-pytest-n-ab-report-{now.strftime("%Y-%m-%d")}.md'
         out.write_text(report, encoding='utf-8')
         print(f'report: {out}', file=sys.stderr)
         if args.commit:
-            repo = str(Path(args.report_dir).parent)
+            repo = str(report_dir.parent)
             subprocess.run(['git', '-C', repo, 'add', '--', str(out)], check=True)
             subprocess.run(['git', '-C', repo, 'commit', '--only', str(out), '-q', '-m',
                             f'plans: merge-leg pytest -n A/B report {now.strftime("%Y-%m-%d")} (scripts/merge-pytest-n-ab-analysis.py)'], check=True)

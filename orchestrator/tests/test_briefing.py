@@ -26,6 +26,7 @@ from _briefing_helpers import (
     memory_transport,
 )
 from shared.capability_manifest import DeliveredCheckMeta
+from shared.task_text_fingerprint import TaskTextDrift
 from test_roles_ancestry_check import _tool_is_granted
 
 from orchestrator.agents.briefing import (
@@ -631,6 +632,17 @@ class TestBuildPlanTighteningPrompt:
         prompt = await _build_tightening_prompt(briefing)
         assert 'claude-task-2656-architect' in prompt
 
+    async def test_offers_the_exits_the_merge_gate_honours_and_forbids_the_rest(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await _build_tightening_prompt(briefing)
+        prescribed, heading, forbidden = prompt.partition(_FORBIDDEN_SECTION_HEADING)
+        assert heading
+        assert 'report_task_already_done' in prescribed
+        for discarded in ('report_ready_to_merge', 'report_blocking_dependency'):
+            assert discarded not in prescribed
+            assert discarded in forbidden
+
 
 @pytest.mark.asyncio
 class TestPlanTighteningPromptToolGrants:
@@ -830,6 +842,46 @@ class TestRevalidationPriorProposal:
         assert 'medium' in prompt
         assert 'orchestrator/x.py' in prompt
         assert '2026-07-13T10:00:00+00:00' in prompt
+
+
+@pytest.mark.asyncio
+class TestRevalidationTextDriftNotice:
+    """Task 4031: a revalidating architect is told when the task text moved."""
+
+    async def _prompt(self, briefing: BriefingAssembler, text_drift: TaskTextDrift | None) -> str:
+        return await briefing.build_revalidation_prompt(
+            {'id': '4031', 'title': 'T', 'description': 'Amended: item 4 added'},
+            existing_plan={'files': ['orchestrator'], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+            text_drift=text_drift,
+        )
+
+    async def test_amended_text_is_announced_beside_the_amended_description(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await self._prompt(briefing, TaskTextDrift.AMENDED)
+        assert 'Amended: item 4 added' in prompt
+        assert '## The Task Text Has Changed' in prompt
+        assert prompt.index('## The Task Text Has Changed') < prompt.index(
+            '## Your Previous Plan',
+        )
+
+    async def test_unstamped_plan_is_announced_as_possibly_changed(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await self._prompt(briefing, TaskTextDrift.UNSTAMPED)
+        assert '## The Task Text May Have Changed' in prompt
+        assert '## The Task Text Has Changed' not in prompt
+
+    @pytest.mark.parametrize('text_drift', [None, TaskTextDrift.CURRENT])
+    async def test_current_text_adds_no_notice(
+        self, briefing: BriefingAssembler, text_drift: TaskTextDrift | None,
+    ):
+        prompt = await self._prompt(briefing, text_drift)
+        assert 'The Task Text' not in prompt
+        assert prompt == await self._prompt(briefing, None)
 
 
 @pytest.mark.asyncio
@@ -1230,3 +1282,49 @@ class TestFormatTaskFieldSurface:
         assert not [line for line in rendered if line.startswith('**Files:**')]
         assert '**ID:** 3254' in rendered
         assert '**Dependencies:** 3659, 3212' in rendered
+
+
+@pytest.mark.asyncio
+class TestFormatTaskTestStrategy:
+    """``testStrategy`` is briefed to the context-complete reviewer only (task 5369).
+
+    ``review.reviewer_briefing`` is the switch that flips and kills the reviewer
+    change, so no role outside it may change with it. The architect briefing is
+    driven here as one of ``_format_task``'s other callers.
+    """
+
+    async def test_the_architect_briefing_renders_no_test_strategy(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {'id': '5369', 'title': 'A task', 'testStrategy': 'Drive the seam with a real repo.'}
+
+        prompt = await briefing.build_architect_prompt(task, context='CTX')
+
+        assert 'Drive the seam with a real repo.' not in prompt
+
+
+@pytest.mark.asyncio
+class TestReviewerPromptDiffCap:
+    """The incumbent's 50,000-char diff cut is a keyword the trial can lift (task 5369)."""
+
+    async def test_a_zero_cap_inlines_a_long_diff_whole(self, briefing: BriefingAssembler):
+        diff = 'x' * 60_000 + 'TAIL'
+
+        prompt = await briefing.build_reviewer_prompt(
+            'reviewer_comprehensive', diff, context='CTX', diff_cap_chars=0,
+        )
+
+        assert diff in prompt
+        assert '[diff truncated]' not in prompt
+
+    async def test_the_default_still_truncates_at_fifty_thousand(
+        self, briefing: BriefingAssembler,
+    ):
+        diff = 'x' * 50_000 + 'TAIL'
+
+        prompt = await briefing.build_reviewer_prompt(
+            'reviewer_comprehensive', diff, context='CTX',
+        )
+
+        assert 'x' * 50_000 + '\n\n... [diff truncated] ...' in prompt
+        assert 'TAIL' not in prompt

@@ -53,8 +53,8 @@ from test_merge_queue_concurrent_verify import (
     git_repo,  # noqa: F401 — pytest fixture re-exported from γ harness
 )
 
-from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import MergeRequest, SpeculativeMergeWorker
 from orchestrator.verify_runner import RunnerUnavailable
 
 # ---------------------------------------------------------------------------

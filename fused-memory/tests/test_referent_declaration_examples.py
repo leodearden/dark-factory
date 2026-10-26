@@ -2,8 +2,9 @@
 
 Task 3675 (PRD ``plans/memory-referent-fidelity-prd.md`` leaf kappa). Several
 sites teach agents to declare a write's referents: the markdown guides, the
-review-checkpoint reflection guidance and the recon prompt fragment. Each one
-carries a hand-transcribed ``entities=`` example that must agree with the live
+review-checkpoint reflection guidance, the system prompts delivered to
+dispatched agents and the recon prompt fragment. Each one carries a
+hand-transcribed ``entities=`` example that must agree with the live
 ``add_memory`` signature and gate. That is the INV-5 lockstep shape, and this
 repo has already seen hand-transcribed prompt text drift twice in one file. So
 the agreement is checked by a machine, here, once for every site.
@@ -49,6 +50,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from orchestrator.agents.roles import ROLES
 from orchestrator.review_checkpoint import render_reflection_instructions
 
 from fused_memory.server.entities_gate import entities_gate
@@ -208,7 +210,12 @@ def _read_repo_doc(relative: str) -> str:
     return path.read_text()
 
 
-_GUARDED_DOCS = ('CLAUDE.md', '.claude/commands/memory.md', 'skills/reflect/SKILL.md')
+_GUARDED_DOCS = (
+    'CLAUDE.md',
+    '.claude/commands/memory.md',
+    'skills/reflect/SKILL.md',
+    'skills/orchestrate/SKILL.md',
+)
 
 _GUARDED_SITES = (
     ('recon-prompt-fragment', render_referent_declaration_guidance),
@@ -217,6 +224,7 @@ _GUARDED_SITES = (
         'review-checkpoint-reflection',
         partial(render_reflection_instructions, project_id=_GROUP_ID, review_id='REV-TEST'),
     ),
+    ('delivered-role-prompts', lambda: '\n'.join(role.system_prompt for role in ROLES.values())),
 )
 
 

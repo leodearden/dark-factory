@@ -23,7 +23,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _workflow_helpers import FakeBriefing, FakeScheduler, _init_git_repo
+from _workflow_helpers import FakeBriefing, FakeScheduler, _init_git_repo, fixed_prompt
 
 from orchestrator.agents import sandbox_dispatch
 from orchestrator.agents.invoke import AgentResult
@@ -241,7 +241,7 @@ class TestInvokeWiresEnsureSandboxDirs:
                 new_callable=AsyncMock,
                 return_value=AgentResult(success=True, output=''),
             ) as mock_cap_retry:
-                await workflow._invoke(IMPLEMENTER, 'PROMPT', cwd)
+                await workflow._invoke(IMPLEMENTER, fixed_prompt('PROMPT'), cwd)
         finally:
             sandbox_dispatch.set_backend(saved_backend)
 

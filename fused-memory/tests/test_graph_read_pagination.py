@@ -1088,6 +1088,118 @@ class TestGetAllValidEdgesBehaviourPreserved:
 
 
 # ---------------------------------------------------------------------------
+# task 4851: enumerate_valid_edges_mentioning, the narrowed per-task edge read
+# ---------------------------------------------------------------------------
+
+_MENTIONING_NEEDLE = '4851'
+
+# Double attribution (A/B on e1), a page-straddling repeat of (A, e1) and two
+# more edges, so page_size=2 spans three pages.
+_MENTIONING_CORPUS = [
+    ['A', 'e1', 'f1', 'n1'],
+    ['B', 'e1', 'f1', 'n1'],
+    ['A', 'e1', 'f1', 'n1'],
+    ['C', 'e2', 'f2', 'n2'],
+    ['C', 'e3', 'f3', 'n3'],
+]
+
+
+class TestEnumerateValidEdgesMentioning:
+    """The narrowed read pages, census-checks and binds its needle. (task 4851)
+
+    FakeCappedGraph does not evaluate CONTAINS: its corpus stands for the rows
+    the predicate already matched. These tests therefore pin the emitted
+    query, the binding, the paging and the grouping, not the server's filter.
+    """
+
+    @pytest.fixture
+    def run(self, mock_config, make_backend):
+        async def _run(graph, substring=_MENTIONING_NEEDLE, **kwargs):
+            backend = make_backend(mock_config)
+            _wire(backend, graph)
+            return await backend.enumerate_valid_edges_mentioning(
+                substring, group_id='test', **kwargs
+            )
+
+        return _run
+
+    @pytest.mark.asyncio
+    async def test_page_and_census_share_the_narrowed_population(self, run):
+        graph = FakeCappedGraph(list(_MENTIONING_CORPUS))
+        await run(graph, page_size=2)
+
+        assert graph.page_queries and graph.census_queries
+        for query in graph.page_queries + graph.census_queries:
+            assert 'MATCH (n:Entity)-[e:RELATES_TO]-()' in query
+            assert 'e.invalid_at IS NULL' in query
+            assert 'e.fact CONTAINS $substring' in query
+        for census in graph.census_queries:
+            assert census.strip().endswith('count(*)')
+            assert 'SKIP' not in census.upper()
+
+    @pytest.mark.asyncio
+    async def test_the_needle_is_bound_never_interpolated(self, run):
+        graph = FakeCappedGraph(list(_MENTIONING_CORPUS))
+        await run(graph, page_size=2)
+
+        assert graph.params
+        assert all(p == {'substring': _MENTIONING_NEEDLE} for p in graph.params)
+        assert not any(_MENTIONING_NEEDLE in query for query in graph.queries)
+
+    @pytest.mark.asyncio
+    async def test_a_multi_page_corpus_comes_back_whole_and_grouped_like_the_full_read(
+        self, run, mock_config, make_backend
+    ):
+        grouped, paged = await run(FakeCappedGraph(list(_MENTIONING_CORPUS)), page_size=2)
+
+        full_backend = make_backend(mock_config)
+        _wire(full_backend, FakeCappedGraph(list(_MENTIONING_CORPUS)))
+        full_grouped, _ = await full_backend.enumerate_all_valid_edges(
+            group_id='test', page_size=2
+        )
+
+        assert paged.complete is True
+        assert len(paged.rows) == len(_MENTIONING_CORPUS)
+        assert grouped == full_grouped
+        assert grouped['A'] == [{'uuid': 'e1', 'fact': 'f1', 'name': 'n1'}]
+        assert grouped['B'] == [{'uuid': 'e1', 'fact': 'f1', 'name': 'n1'}]
+        assert total_attributions(grouped) == 4
+
+    @pytest.mark.asyncio
+    async def test_a_disagreeing_census_reports_incomplete_and_still_returns(self, run):
+        grouped, paged = await run(
+            FakeCappedGraph(
+                list(_MENTIONING_CORPUS),
+                census_override=len(_MENTIONING_CORPUS) + 5,
+            ),
+            page_size=2,
+        )
+
+        assert paged.complete is False
+        assert isinstance(paged.reason, str) and paged.reason
+        assert distinct_edge_uuids(grouped) == {'e1', 'e2', 'e3'}
+
+    @pytest.mark.asyncio
+    async def test_an_empty_substring_is_refused_before_any_query(self, run):
+        """An empty CONTAINS matches every edge: a silent full read."""
+        graph = FakeCappedGraph(list(_MENTIONING_CORPUS))
+
+        with pytest.raises(ValueError, match='substring'):
+            await run(graph, substring='')
+
+        assert graph.queries == []
+
+    @pytest.mark.asyncio
+    async def test_page_query_orders_by_a_total_order(self, run):
+        graph = FakeCappedGraph(list(_MENTIONING_CORPUS))
+        await run(graph, page_size=2)
+
+        order_by = graph.page_queries[0].split('ORDER BY', 1)[1]
+        assert 'e.uuid' in order_by
+        assert 'n.uuid' in order_by
+
+
+# ---------------------------------------------------------------------------
 # step-9: enumerate_entity_nodes, and list_entity_nodes as its shim
 # ---------------------------------------------------------------------------
 #

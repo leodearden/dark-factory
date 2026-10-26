@@ -26,9 +26,13 @@ scenarios #5 and #6, plus a control:
       sha, and no escalation is filed.
   #6  A branch's changed files coincidentally match main's independent
       content (the content-equivalence fallback engages) but no commit on
-      main cites the task — DISCOVERY mode rejects with ``no_citation``.
-      The deleted ``citation or get_main_sha()`` fallback must not
-      resurface: no fabricated anchor, no ``mark_done``, one escalation.
+      main cites the task and none is the tip's patch-id twin — DISCOVERY
+      mode rejects with ``no_citation``.  The deleted
+      ``citation or get_main_sha()`` fallback must not resurface: no
+      fabricated anchor, no ``mark_done``, one escalation.
+  twin #6's narrowing (esc-4862-1): when main's independent commit IS the
+      tip's patch-id twin, that real commit carries the branch's diff, so
+      the gate marks done anchored on it — never on main HEAD.
 """
 
 from __future__ import annotations
@@ -42,6 +46,10 @@ import pytest
 
 from orchestrator.git_ops import _run
 from orchestrator.harness import Harness
+from orchestrator.merge_lane.landing_evidence import (
+    LandingMethod,
+    validate_landing_evidence,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -125,6 +133,13 @@ def _wire_gate_harness(mock_orch_config, repo: Path, *, task_id: str) -> Harness
     return h
 
 
+async def _drive_gate(h: Harness, task_id: str) -> tuple[bool, MagicMock]:
+    """Run the already-landed gate once for *task_id*; return its result and
+    the escalation queue's ``submit`` recorder."""
+    result = await h._already_landed_dispatch_gate(task_id)
+    return result, cast(MagicMock, h._escalation_queue).submit
+
+
 # ---------------------------------------------------------------------------
 # Real-git scenario builders.
 # ---------------------------------------------------------------------------
@@ -183,34 +198,40 @@ async def _land_via_merge_marker(
     return marker_sha
 
 
-async def _land_content_equivalent_without_citation(repo: Path, task_id: str) -> None:
-    """Build a branch whose changed files coincidentally match main's own
+async def _land_content_equivalent_without_citation(
+    repo: Path, task_id: str, *, main_commit_is_twin: bool,
+) -> str:
+    """Build a branch whose changed file coincidentally matches main's own
     INDEPENDENT content (the content-equivalence fallback), with NO commit
-    anywhere citing *task_id* — PRD boundary-test #6 (no attributable
-    citation -> no stamp).  The branch is left live (not merged, not
+    anywhere citing *task_id*.  The branch is left live (not merged, not
     deleted) so the ancestry and marker paths both fall through to the
     content-equivalence fallback.
+
+    Main's independent commit adds the same ``shared.txt``.  When
+    *main_commit_is_twin* is False it also adds ``main_only.txt``, so its
+    diff differs from the branch tip's and main holds no
+    ``git patch-id --stable`` twin of the tip — PRD boundary-test #6 as
+    narrowed by esc-4862-1.  When True its diff equals the tip's, so it IS
+    the tip's twin.  A later unrelated main commit keeps that commit
+    distinct from main HEAD.
+
+    Returns main's independent commit sha.
     """
     branch = f'task/{task_id}'
     rc, _, err = await _run(['git', 'checkout', '-b', branch], cwd=repo)
     assert rc == 0, f'checkout {branch} failed: {err}'
     (repo / 'shared.txt').write_text('coincidental content\n')
-    rc, _, err = await _run(['git', 'add', 'shared.txt'], cwd=repo)
-    assert rc == 0, f'git add failed: {err}'
-    rc, _, err = await _run(
-        ['git', 'commit', '-m', 'wip: add shared.txt on branch'], cwd=repo,
-    )
-    assert rc == 0, f'branch commit failed: {err}'
+    await _commit_all(repo, 'wip: add shared.txt on branch')
 
     rc, _, err = await _run(['git', 'checkout', 'main'], cwd=repo)
     assert rc == 0, f'checkout main failed: {err}'
     (repo / 'shared.txt').write_text('coincidental content\n')
-    rc, _, err = await _run(['git', 'add', 'shared.txt'], cwd=repo)
-    assert rc == 0, f'git add failed: {err}'
-    rc, _, err = await _run(
-        ['git', 'commit', '-m', 'chore: unrelated shared.txt on main'], cwd=repo,
-    )
-    assert rc == 0, f'main commit failed: {err}'
+    if not main_commit_is_twin:
+        (repo / 'main_only.txt').write_text('only main adds this\n')
+    independent = await _commit_all(repo, 'chore: unrelated shared.txt on main')
+    (repo / 'NOTES.md').write_text('a later unrelated note\n')
+    await _commit_all(repo, 'docs: a later unrelated note on main')
+    return independent
 
 
 # ---------------------------------------------------------------------------
@@ -297,29 +318,70 @@ class TestAlreadyLandedGateRealGitBoundaries:
     async def test_content_equivalent_no_citation_escalates_no_mark_done(
         self, mock_orch_config, git_repo,
     ) -> None:
-        """PRD boundary-test #6, end-to-end: branch content coincidentally
-        matches main (content-equivalence fallback engages) but no commit
-        on main cites the task — DISCOVERY mode rejects with reason
-        ``no_citation`` against REAL git state.  The gate must not
-        fabricate an anchor from main HEAD (the deleted
+        """PRD boundary-test #6, end-to-end, as narrowed by esc-4862-1:
+        branch content coincidentally matches main, but no commit on main
+        cites the task AND main holds no patch-id twin of the branch tip —
+        DISCOVERY mode rejects with reason ``no_citation`` against REAL git
+        state, its probe naming the declined fallback ``unanchored``.  The
+        gate must not fabricate an anchor from main HEAD (the deleted
         ``or get_main_sha()`` fallback); it escalates instead of stamping
         done.
         """
         task_id = '77'
         branch = f'task/{task_id}'
-        await _land_content_equivalent_without_citation(git_repo, task_id)
+        await _land_content_equivalent_without_citation(
+            git_repo, task_id, main_commit_is_twin=False,
+        )
         h = _wire_gate_harness(mock_orch_config, git_repo, task_id=task_id)
 
-        result = await h._already_landed_dispatch_gate(task_id)
+        result, submit = await _drive_gate(h, task_id)
 
         assert result is False
         cast(AsyncMock, h.scheduler.mark_done).assert_not_awaited()
-        cast(MagicMock, h._escalation_queue).submit.assert_called_once()
-        esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
+        submit.assert_called_once()
+        esc = submit.call_args[0][0]
         assert esc.category == 'provenance_unattributed'
         assert esc.task_id == task_id
         assert branch in esc.detail
         assert 'no_citation' in esc.detail
+        assert 'unanchored' in esc.detail
+
+    async def test_content_equivalent_patch_id_twin_marks_done_on_the_twin(
+        self, mock_orch_config, git_repo,
+    ) -> None:
+        """The accepting side of #6's narrowing (esc-4862-1): the same
+        uncited, content-equivalent branch, but main's independent commit IS
+        the tip's ``git patch-id --stable`` twin — a real main commit
+        carrying the branch's diff, not a fabricated anchor.  DISCOVERY's
+        fallback attributes it as ``content_equivalence``, and the gate
+        marks the task done anchored on that twin, never on main HEAD or the
+        branch tip, with no escalation.
+        """
+        task_id = '78'
+        branch = f'task/{task_id}'
+        twin = await _land_content_equivalent_without_citation(
+            git_repo, task_id, main_commit_is_twin=True,
+        )
+        h = _wire_gate_harness(mock_orch_config, git_repo, task_id=task_id)
+        tip = await h.git_ops.resolve_branch_sha(branch)
+        assert twin not in (tip, await h.git_ops.get_main_sha())
+
+        verdict = await validate_landing_evidence(
+            h.git_ops, task_id, branch, branch_tip_sha=tip,
+        )
+        assert verdict.method is LandingMethod.content_equivalence
+        assert verdict.evidence_sha == twin
+
+        result, submit = await _drive_gate(h, task_id)
+
+        assert result is True
+        mark_done = cast(AsyncMock, h.scheduler.mark_done)
+        mark_done.assert_awaited_once()
+        call = mark_done.await_args
+        assert call is not None
+        assert call.kwargs['kind'] == 'found_on_main'
+        assert call.kwargs['sha'] == twin
+        submit.assert_not_called()
 
 
 async def _commit_all(repo: Path, message: str) -> str:

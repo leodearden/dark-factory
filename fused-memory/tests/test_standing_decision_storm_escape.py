@@ -69,6 +69,34 @@ def _storm_result(
     )
 
 
+def _seed_legacy_parent(queue, project_id: str, entity_uuid: str, finding_category: str) -> str:
+    """Submit a pending storm-escape parent built exactly as the pre-5466 filer
+    built it, and return its id.
+
+    *finding_category* is passed as the persisted LITERAL, never the module's
+    private constant: the string on disk is the fold contract, so a rename of
+    the constant must break these tests rather than un-fold every live parent.
+    """
+    from escalation.dedupe import compute_content_fingerprint
+    from escalation.models import Escalation
+
+    return queue.submit(Escalation(
+        id=queue.make_id(entity_uuid),
+        task_id=entity_uuid,
+        agent_role='reconciliation-stage1',
+        severity='blocking',
+        category=CATEGORY_STANDING_DECISION_STORM,
+        summary='legacy parent',
+        detail='legacy parent',
+        level=1,
+        dedupe_fingerprint=compute_content_fingerprint(
+            CATEGORY_STANDING_DECISION_STORM,
+            finding_category,
+            [f'{project_id}:{entity_uuid}'],
+        ),
+    ))
+
+
 class TestMaybeEscalateSuppressionStorm:
     """Per-cycle, per-decision storm escape escalation (task 2896 step-7).
 
@@ -156,8 +184,8 @@ class TestMaybeEscalateSuppressionStorm:
 
     @pytest.mark.asyncio
     async def test_escalation_unavailable_returns_empty(self, queue, monkeypatch):
-        """(d) Escalation package unavailable (None) → returns [], no raise, nothing filed."""
-        monkeypatch.setattr(storm_escape, 'Escalation', None)
+        """(d) Escalation package unavailable (filer None) → returns [], no raise, nothing filed."""
+        monkeypatch.setattr(storm_escape, 'file_or_fold_l1', None)
         escalated = await storm_escape.maybe_escalate_suppression_storm(
             queue, self._PID, self._RUN, _storm_result()
         )
@@ -218,6 +246,22 @@ class TestMaybeEscalateSuppressionStorm:
         pending = self._pending(queue)
         assert len(pending) == 1, f'expected one storm escalation, got {len(pending)}'
         assert pending[0].dedupe_count == 1, 'the recurrence must be counted on the parent'
+
+    @pytest.mark.asyncio
+    async def test_folds_into_a_parent_already_on_disk(self, queue):
+        """A pending parent filed before the helper moved still receives the fold."""
+        parent_id = _seed_legacy_parent(
+            queue, self._PID, _ESD_U1, 'entity_standing_decision_suppression_storm',
+        )
+
+        escalated = await storm_escape.maybe_escalate_suppression_storm(
+            queue, self._PID, self._RUN, _storm_result()
+        )
+
+        assert escalated == []
+        parent = queue.get(parent_id)
+        assert parent is not None
+        assert parent.dedupe_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -924,8 +968,24 @@ class TestMaybeEscalateSuppressionStreak:
         assert parent.dedupe_count == 1
 
     @pytest.mark.asyncio
+    async def test_folds_into_a_parent_already_on_disk(self, queue):
+        """A pending parent filed before the helper moved still receives the fold."""
+        parent_id = _seed_legacy_parent(
+            queue, self._PID, _ESD_U1, 'entity_standing_decision_suppression_streak',
+        )
+
+        escalated = await storm_escape.maybe_escalate_suppression_streak(
+            queue, self._PID, self._RUN, [_streak_update()]
+        )
+
+        assert escalated == []
+        parent = queue.get(parent_id)
+        assert parent is not None
+        assert parent.dedupe_count == 1
+
+    @pytest.mark.asyncio
     async def test_escalation_unavailable_returns_empty(self, queue, monkeypatch):
-        monkeypatch.setattr(storm_escape, 'Escalation', None)
+        monkeypatch.setattr(storm_escape, 'file_or_fold_l1', None)
         escalated = await storm_escape.maybe_escalate_suppression_streak(
             queue, self._PID, self._RUN, [_streak_update()]
         )

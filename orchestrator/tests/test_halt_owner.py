@@ -22,7 +22,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
-from orchestrator.merge_queue import SpeculativeMergeWorker
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
 
 @pytest.fixture

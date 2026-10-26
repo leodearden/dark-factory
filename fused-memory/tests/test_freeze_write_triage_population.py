@@ -395,6 +395,91 @@ def _snapshot(frozen_at: str = '2026-10-05T07:00:00+00:00') -> dict:
     }
 
 
+W_AT = '2026-10-01T12:00:00+00:00'
+C_AT = '2026-09-30T12:00:00+00:00'
+
+
+def _dated_write(memory_id: str, created_at: str | None, *candidates: tuple[str, Any]) -> dict:
+    write: dict[str, Any] = {'memory_id': memory_id, 'content': f'content of {memory_id}',
+                             'candidates': []}
+    if created_at is not None:
+        write['created_at'] = created_at
+    for candidate_id, candidate_at in candidates:
+        candidate = {'memory_id': candidate_id, 'content': f'content of {candidate_id}'}
+        if candidate_at is not None:
+            candidate['created_at'] = candidate_at
+        write['candidates'].append(candidate)
+    return write
+
+
+def _dated_snapshot(*writes: dict) -> dict:
+    return {
+        **_snapshot(), 'writes': list(writes),
+        'targets': {'hoisted': {'content': 'an off-slate canonical', 'project_id': 'reify'}},
+    }
+
+
+def _instant(text: str) -> datetime:
+    return datetime.fromisoformat(text)
+
+
+class TestRecordCreatedAt:
+    def test_every_write_and_slate_candidate_maps_to_its_aware_instant(self) -> None:
+        snapshot = _dated_snapshot(
+            _dated_write('w1', W_AT, ('c1', C_AT), ('c2', '2026-09-30T05:00:00-07:00')),
+            _dated_write('w2', '2026-10-02T00:00:00+02:00', ('c3', C_AT)),
+        )
+        assert _mod().record_created_at(snapshot) == {
+            'w1': _instant(W_AT),
+            'c1': _instant(C_AT),
+            'c2': _instant('2026-09-30T12:00:00+00:00'),
+            'w2': _instant('2026-10-01T22:00:00+00:00'),
+            'c3': _instant(C_AT),
+        }
+
+    def test_the_map_holds_aware_instants(self) -> None:
+        mapped = _mod().record_created_at(_dated_snapshot(_dated_write('w1', W_AT, ('c1', C_AT))))
+        assert all(instant.tzinfo is not None for instant in mapped.values())
+
+    @pytest.mark.parametrize('created_at', ['2026-09-30T12:00:00', None, 'not-a-date', '', 7])
+    def test_an_undated_record_is_left_out_never_guessed(self, created_at: Any) -> None:
+        snapshot = _dated_snapshot(
+            _dated_write('w1', W_AT, ('c1', created_at)),
+            _dated_write('w2', created_at, ('c2', C_AT)),
+        )
+        assert set(_mod().record_created_at(snapshot)) == {'w1', 'c2'}
+
+    def test_a_record_undated_in_one_place_takes_its_instant_from_another(self) -> None:
+        snapshot = _dated_snapshot(
+            _dated_write('w1', W_AT, ('c1', None)),
+            _dated_write('w2', W_AT, ('c1', C_AT)),
+        )
+        assert _mod().record_created_at(snapshot)['c1'] == _instant(C_AT)
+
+    def test_a_record_seen_twice_at_one_instant_is_accepted(self) -> None:
+        snapshot = _dated_snapshot(
+            _dated_write('w1', W_AT, ('c1', C_AT)),
+            _dated_write('w2', W_AT, ('c1', '2026-09-30T05:00:00-07:00'), ('w1', W_AT)),
+        )
+        mapped = _mod().record_created_at(snapshot)
+        assert (mapped['c1'], mapped['w1']) == (_instant(C_AT), _instant(W_AT))
+
+    def test_a_record_seen_at_two_instants_is_refused_naming_both(self) -> None:
+        other = '2026-09-30T12:00:01+00:00'
+        snapshot = _dated_snapshot(
+            _dated_write('w1', W_AT, ('c1', C_AT)),
+            _dated_write('w2', W_AT, ('c1', other)),
+        )
+        with pytest.raises(ValueError) as caught:
+            _mod().record_created_at(snapshot)
+        message = str(caught.value)
+        assert all(word in message for word in ('c1', C_AT, other)), message
+
+    def test_hoisted_targets_carry_no_instant_and_are_absent(self) -> None:
+        mapped = _mod().record_created_at(_dated_snapshot(_dated_write('w1', W_AT)))
+        assert mapped == {'w1': _instant(W_AT)}
+
+
 class TestSnapshotFiles:
     def test_the_directory_is_named_for_the_utc_freeze_date(self, tmp_path: Path) -> None:
         path = _mod().write_snapshot(tmp_path, _snapshot('2026-10-04T20:00:00-07:00'))

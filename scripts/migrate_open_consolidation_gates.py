@@ -1,0 +1,909 @@
+#!/usr/bin/env python3
+"""Migrate the open consolidation gates through the auto predicate (PRD θ, task 5244).
+
+``plans/memory-auto-consolidation-prd.md`` D13 / §11 step 4. Every open
+consolidation gate in a project's ``tasks.db`` is a topic cluster a human was
+asked to fold. Many of them are clusters the auto predicate
+(``fused_memory/reconciliation/consolidation_auto.py::evaluate_auto_predicate``)
+would now pass. This script re-reads each gate's cluster live, rules on it,
+and under ``--execute`` writes the consolidation through the executor's own
+retain arm
+(``fused_memory/reconciliation/consolidation_auto_executor.py::apply_auto_verdict``).
+Gates the predicate fails are left to the curator sitting.
+
+One run attempts at most ``consolidation_auto.max_auto_per_cycle`` executions,
+in task-id order. A later passing gate is reported ``deferred`` and runs next
+time. ``--dry-run`` spends the same budget, so its ``would_execute`` gates are
+the ones ``--execute`` will attempt.
+
+It never changes a task's status. The gate closes when its own runner resumes
+it, and the report lists the calls that do that.
+
+Usage
+-----
+  # Report what would happen, writing nothing.
+  python scripts/migrate_open_consolidation_gates.py --dry-run
+
+  # Mint a canonical where a topic has none: the claim comes from the sitting.
+  python scripts/migrate_open_consolidation_gates.py --execute \\
+      --claim some-topic='One assertion line the canonical leads with'
+
+  # Another project, machine-readable.
+  python scripts/migrate_open_consolidation_gates.py --dry-run \\
+      --project-root /path/to/reify --json
+
+Exit codes
+----------
+  0  the run completed.
+  1  a gate this run wrote to is still not closed afterwards.
+  2  the run could not start: bad arguments, an unreadable tasks.db, a store
+     this process may not mutate (--execute), the consolidation_auto kill
+     switch (--execute), or an unavailable canonical-slug list.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import secrets
+import sqlite3
+import sys
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from enum import IntEnum, StrEnum
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import _checkout as _checkout
+import check_consolidation_closure as closure_cli
+from _task_db_scan import TaskDbUnreadable, connect_ro, decode_metadata, tasks_db_path
+from escalation.categories import EscalationCategory
+from escalation.queue import EscalationQueue
+from fused_memory.reconciliation.consolidation_auto import (
+    AutoOutcome,
+    AutoProposal,
+    AutoVerdict,
+    evaluate_auto_predicate,
+)
+from fused_memory.reconciliation.consolidation_auto_executor import (
+    ClusterFacts,
+    RefusalCode,
+    apply_auto_verdict,
+    read_canonical_slugs,
+    read_cluster_facts,
+)
+from fused_memory.reconciliation.consolidation_gate import (
+    GATE_METADATA_KEY,
+    ClosureVerdict,
+    declared_gate_topic,
+    evaluate_closure,
+    observed_members,
+)
+from fused_memory.reconciliation.curator_gate_resolution_sweep import (
+    extract_open_gate_task_ids,
+)
+from fused_memory.server.consolidation import (
+    ProposalLimits,
+    ProposalShapeCode,
+    proposal_shape_codes,
+)
+from fused_memory.services.consolidation_ops import RetainArmRefused
+from fused_memory.topic_slug import is_valid_topic_slug
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
+from fused_memory.utils.validation import is_full_uuid
+from shared.project_id import project_id_for_root
+from shared.project_layout import CheckoutRootError, default_project_root, escalation_queue_dir
+from shared.task_metadata import HUMAN_CURATOR_ADJUDICATED_AT_KEY, HUMAN_CURATOR_GATE_KEY
+from shared.task_statuses import ACTIVE
+
+if TYPE_CHECKING:
+    from fused_memory.config.schema import ConsolidationAutoConfig
+
+logger = logging.getLogger('migrate_open_consolidation_gates')
+
+_EXECUTE_OPERATION = 'migrate_open_consolidation_gates --execute'
+_AGENT_ID = 'curator-migrate-open-consolidation-gates'
+_SOURCE = 'auto_consolidation_migration'
+_RATIONALE = 'Migrated from consolidation gate {task_id} by scripts/migrate_open_consolidation_gates.py'
+
+
+class ExitCode(IntEnum):
+    COMPLETED = 0
+    GATE_LEFT_OPEN = 1
+    COULD_NOT_RUN = 2
+
+
+class Mode(StrEnum):
+    DRY_RUN = 'dry_run'
+    EXECUTE = 'execute'
+
+
+class Disposition(StrEnum):
+    """What this run did, or would do, with one gate."""
+
+    REFUSED = 'refused'
+    LEFT_TO_SITTING = 'left_to_sitting'
+    NOOP = 'noop'
+    WOULD_EXECUTE = 'would_execute'
+    DEFERRED = 'deferred'
+    EXECUTED = 'executed'
+
+
+class MigrationCode(StrEnum):
+    """Refusals only this script can name; the predicate, validator and executor name the rest."""
+
+    GATE_TOPIC_UNUSABLE = 'gate_topic_unusable'
+    MEMBER_SCROLL_UNAVAILABLE = 'member_scroll_unavailable'
+    MEMBER_SCROLL_INCOMPLETE = 'member_scroll_incomplete'
+    CATEGORY_UNDETERMINED = 'category_undetermined'
+    CLAIM_REQUIRED = 'claim_required'
+    CYCLE_CAP_REACHED = 'cycle_cap_reached'
+
+
+class UsageError(Exception):
+    """Anything that stops the run before the first gate: reported as COULD_NOT_RUN."""
+
+
+@dataclass(frozen=True)
+class Reason:
+    code: str
+    ids: tuple[str, ...] = ()
+    detail: str = ''
+
+
+@dataclass(frozen=True)
+class Execution:
+    """What the retain arm wrote for one gate."""
+
+    canonical_id: str
+    minted: bool
+    tagged: tuple[str, ...]
+    retain_failures: tuple[Mapping[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """An MCP call the operator makes next; this script never makes it."""
+
+    tool: str
+    arguments: Mapping[str, Any]
+
+    def render(self) -> str:
+        return f'{self.tool}({", ".join(f"{k}={v!r}" for k, v in self.arguments.items())})'
+
+
+@dataclass(frozen=True)
+class OpenGate:
+    task_id: str
+    metadata: Mapping[str, Any]
+
+    @property
+    def block(self) -> Mapping[str, Any]:
+        return self.metadata[GATE_METADATA_KEY]
+
+
+@dataclass(frozen=True)
+class GateReport:
+    """One gate's outcome. ``reasons`` decided the disposition; ``verdict_reasons`` are the predicate's."""
+
+    task_id: str
+    topic: str | None
+    disposition: Disposition
+    reasons: tuple[Reason, ...] = ()
+    verdict: AutoOutcome | None = None
+    verdict_reasons: tuple[Reason, ...] = ()
+    members: tuple[str, ...] = ()
+    absent_observed: tuple[str, ...] = ()
+    category: str | None = None
+    execution: Execution | None = None
+    closure: ClosureVerdict | None = None
+    next_calls: tuple[ToolCall, ...] = ()
+    note: str | None = None
+
+    @property
+    def codes(self) -> tuple[str, ...]:
+        return tuple(reason.code for reason in self.reasons)
+
+    @property
+    def spends_execution_slot(self) -> bool:
+        """An execution this run attempted, or in a dry run would attempt."""
+        return (
+            self.disposition is Disposition.WOULD_EXECUTE
+            or self.execution is not None
+            or RefusalCode.EXECUTION_REFUSED in self.codes
+        )
+
+    @property
+    def mint_attempted(self) -> bool:
+        """A canonical for this topic was, may have been, or in a dry run would be minted."""
+        return self.verdict is AutoOutcome.PASS and self.spends_execution_slot
+
+    @property
+    def left_open(self) -> bool:
+        """This run wrote to the gate's topic and the gate is still not closed."""
+        return self.disposition is Disposition.EXECUTED and not (self.closure and self.closure.closed)
+
+
+@dataclass(frozen=True)
+class MigrationReport:
+    project_id: str
+    mode: Mode
+    run_id: str
+    gates: tuple[GateReport, ...]
+
+
+@dataclass(frozen=True)
+class RunContext:
+    memory: Any
+    config: ConsolidationAutoConfig
+    project_root: str
+    project_id: str
+    run_id: str
+    now: datetime
+    mode: Mode
+    claims: Mapping[str, str]
+    canonical_slugs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Assessment:
+    """A gate's live cluster read and the predicate's ruling on it."""
+
+    gate: OpenGate
+    topic: str
+    members: tuple[str, ...]
+    absent_observed: tuple[str, ...]
+    facts: ClusterFacts
+    category: str | None
+    verdict: AutoVerdict
+
+    def report(
+        self,
+        disposition: Disposition,
+        reasons: Sequence[Reason] = (),
+        *,
+        execution: Execution | None = None,
+    ) -> GateReport:
+        return GateReport(
+            task_id=self.gate.task_id,
+            topic=self.topic,
+            disposition=disposition,
+            reasons=tuple(reasons),
+            verdict=self.verdict.outcome,
+            verdict_reasons=_verdict_reasons(self.verdict),
+            members=self.members,
+            absent_observed=self.absent_observed,
+            category=self.category,
+            execution=execution,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Enumeration
+# --------------------------------------------------------------------------- #
+
+
+def open_consolidation_gates(project_root: str, tag: str) -> tuple[OpenGate, ...]:
+    """Every ACTIVE gate task carrying a consolidation-gate block, in task-id order."""
+    active = [
+        {'id': task_id, 'metadata': decode_metadata(raw)}
+        for task_id, status, raw in _task_rows(project_root, tag)
+        if status in ACTIVE
+    ]
+    gate_ids = set(extract_open_gate_task_ids(active))
+    gates = [
+        OpenGate(task_id=str(task['id']), metadata=task['metadata'])
+        for task in active
+        if str(task['id']) in gate_ids and isinstance(task['metadata'].get(GATE_METADATA_KEY), Mapping)
+    ]
+    return tuple(sorted(gates, key=lambda gate: _id_order(gate.task_id)))
+
+
+def _task_rows(project_root: str, tag: str) -> list[tuple[Any, str, Any]]:
+    db_path = tasks_db_path(project_root)
+    try:
+        con = connect_ro(db_path)
+    except TaskDbUnreadable as refusal:
+        raise UsageError(str(refusal)) from refusal
+    except sqlite3.Error as exc:
+        raise UsageError(f'could not open {db_path} read-only: {exc}') from exc
+    try:
+        return con.execute(
+            'SELECT id, status, metadata FROM tasks WHERE tag = ?', (tag,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise UsageError(f'could not read the tasks in {db_path}: {exc}') from exc
+    finally:
+        con.close()
+
+
+def _id_order(task_id: str) -> tuple[int, str]:
+    return (int(task_id), '') if task_id.isdigit() else (sys.maxsize, task_id)
+
+
+# --------------------------------------------------------------------------- #
+# Per-gate assessment
+# --------------------------------------------------------------------------- #
+
+
+async def migrate(ctx: RunContext, gates: Iterable[OpenGate]) -> tuple[GateReport, ...]:
+    """Every gate in order, executing at most ``max_auto_per_cycle`` of them per run.
+
+    A dry run spends the same budget, so it previews what ``--execute`` writes.
+    A topic minted earlier in the run joins the slug list later gates are ruled
+    against, so two near-synonym gates cannot both mint and split one topic.
+    """
+    reports: list[GateReport] = []
+    for gate in gates:
+        spent = sum(report.spends_execution_slot for report in reports)
+        report = await migrate_gate(ctx, gate, may_execute=spent < ctx.config.max_auto_per_cycle)
+        if report.mint_attempted and report.topic is not None:
+            ctx = replace(ctx, canonical_slugs=(*ctx.canonical_slugs, report.topic))
+        reports.append(report)
+    return tuple(reports)
+
+
+async def migrate_gate(ctx: RunContext, gate: OpenGate, *, may_execute: bool) -> GateReport:
+    """One gate, isolated: a store failure is reported on this gate and never ends the run."""
+    topic = declared_gate_topic(gate.metadata)
+    if topic is None:
+        return _refused(gate, None, MigrationCode.GATE_TOPIC_UNUSABLE)
+    report = await _rule(ctx, gate, topic, may_execute=may_execute)
+    if ctx.mode is Mode.DRY_RUN:
+        return report
+    return await _settle(ctx, gate, topic, report)
+
+
+async def _rule(ctx: RunContext, gate: OpenGate, topic: str, *, may_execute: bool) -> GateReport:
+    scroll_ids = await _scroll_topic(ctx, topic)
+    if isinstance(scroll_ids, MigrationCode):
+        return _refused(gate, topic, scroll_ids)
+    assessment = await assess(ctx, gate, topic, scroll_ids)
+    report = _dispose(ctx, assessment)
+    if report.disposition is not Disposition.WOULD_EXECUTE:
+        return report
+    if not may_execute:
+        return assessment.report(Disposition.DEFERRED, [Reason(MigrationCode.CYCLE_CAP_REACHED)])
+    if ctx.mode is Mode.DRY_RUN:
+        return report
+    return await _execute(ctx, assessment)
+
+
+def _refused(gate: OpenGate, topic: str | None, code: MigrationCode) -> GateReport:
+    return GateReport(
+        task_id=gate.task_id, topic=topic, disposition=Disposition.REFUSED, reasons=(Reason(code),),
+    )
+
+
+async def _scroll_topic(ctx: RunContext, topic: str) -> tuple[str, ...] | MigrationCode:
+    """The live topic scroll's ids, or why it cannot stand for the whole cluster."""
+    try:
+        rows = await ctx.memory.get_memories_by_metadata(
+            ctx.project_id, {'topic': topic}, limit=closure_cli.SCROLL_LIMIT,
+        )
+    except Exception:
+        logger.warning('topic %r: the member scroll failed', topic, exc_info=True)
+        return MigrationCode.MEMBER_SCROLL_UNAVAILABLE
+    if not isinstance(rows, list) or len(rows) >= closure_cli.SCROLL_LIMIT:
+        return MigrationCode.MEMBER_SCROLL_INCOMPLETE
+    return tuple(str(row['id']) for row in rows if isinstance(row, Mapping) and row.get('id'))
+
+
+async def assess(
+    ctx: RunContext, gate: OpenGate, topic: str, scroll_ids: Sequence[str],
+) -> Assessment:
+    observed_only = _observed_only(gate.block, scroll_ids)
+    facts = await read_cluster_facts(
+        ctx.memory,
+        project_id=ctx.project_id,
+        topic=topic,
+        member_ids=[*scroll_ids, *observed_only],
+    )
+    absent = tuple(i for i in observed_only if facts.members.get(i) is None)
+    live = ClusterFacts(
+        members={i: r for i, r in facts.members.items() if i not in absent},
+        canonical_count=facts.canonical_count,
+    )
+    members = tuple(live.members)
+    category = _gate_category(gate.block, topic, live.members)
+    verdict = evaluate_auto_predicate(
+        AutoProposal(topic=topic, member_ids=members, category=category or ''),
+        members=live.members,
+        canonical_count=live.canonical_count,
+        open_gate_id=None,
+        existing_canonical_slugs=ctx.canonical_slugs,
+        config=ctx.config,
+    )
+    return Assessment(
+        gate=gate,
+        topic=topic,
+        members=members,
+        absent_observed=absent,
+        facts=live,
+        category=category,
+        verdict=verdict,
+    )
+
+
+def _observed_only(block: Mapping[str, Any], scroll_ids: Sequence[str]) -> list[str]:
+    """The gate's full-uuid observed members missing from the live scroll, deduped case-folded."""
+    seen = {i.lower() for i in scroll_ids}
+    extra: list[str] = []
+    for raw in observed_members(block):
+        if not is_full_uuid(raw) or str(raw).lower() in seen:
+            continue
+        seen.add(str(raw).lower())
+        extra.append(str(raw))
+    return extra
+
+
+def _gate_category(
+    block: Mapping[str, Any], topic: str, members: Mapping[str, Any],
+) -> str | None:
+    """The block's recorded proposal category, else the one category the readable peers share."""
+    refusal = block.get('auto_refusal')
+    if isinstance(refusal, Mapping) and isinstance(refusal.get('category'), str):
+        return refusal['category']
+    shared = {
+        record['metadata'].get('category')
+        for record in members.values()
+        if isinstance(record, Mapping)
+        and isinstance(record.get('metadata'), Mapping)
+        and isinstance(record['metadata'].get('category'), str)
+        and not _is_incumbent(record['metadata'], topic)
+    }
+    return shared.pop() if len(shared) == 1 else None
+
+
+def _is_incumbent(metadata: Mapping[str, Any], topic: str) -> bool:
+    return metadata.get('canonical') is True and metadata.get('topic') == topic
+
+
+def _verdict_reasons(verdict: AutoVerdict) -> tuple[Reason, ...]:
+    return tuple(Reason(r.code.value, tuple(r.ids)) for r in verdict.reasons)
+
+
+def _dispose(ctx: RunContext, assessment: Assessment) -> GateReport:
+    outcome = assessment.verdict.outcome
+    if outcome is AutoOutcome.FAIL:
+        return assessment.report(Disposition.LEFT_TO_SITTING, _verdict_reasons(assessment.verdict))
+    if outcome is AutoOutcome.NOOP:
+        return assessment.report(Disposition.NOOP, _verdict_reasons(assessment.verdict))
+    refusals = _actionable_refusals(ctx, assessment)
+    if refusals:
+        return assessment.report(Disposition.REFUSED, refusals)
+    return assessment.report(Disposition.WOULD_EXECUTE)
+
+
+def _actionable_refusals(ctx: RunContext, assessment: Assessment) -> tuple[Reason, ...]:
+    """Why a PASS / PASS_TAG_ONLY may still not be written, in the executor's terms."""
+    category = assessment.category
+    if category is None:
+        return (Reason(MigrationCode.CATEGORY_UNDETERMINED),)
+    if category not in ctx.config.category_weights:
+        return (Reason(RefusalCode.CATEGORY_NOT_CONSOLIDATABLE),)
+    claim = ctx.claims.get(assessment.topic)
+    shape = proposal_shape_codes(
+        topic=assessment.topic,
+        member_ids=list(assessment.members),
+        run_id=ctx.run_id,
+        claim=claim,
+        category=category,
+        rationale=_RATIONALE.format(task_id=assessment.gate.task_id),
+        limits=ProposalLimits.from_config(ctx.config),
+    )
+    reasons = [
+        Reason(code)
+        for code in shape
+        if claim is not None or code is not ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED
+    ]
+    if assessment.verdict.outcome is AutoOutcome.PASS and claim is None:
+        reasons.append(Reason(MigrationCode.CLAIM_REQUIRED))
+    return tuple(reasons)
+
+
+# --------------------------------------------------------------------------- #
+# Execution, closure and the next calls
+# --------------------------------------------------------------------------- #
+
+
+async def _execute(ctx: RunContext, assessment: Assessment) -> GateReport:
+    """Write the verdict through the executor's retain arm."""
+    category = assessment.category
+    if category is None:
+        return assessment.report(Disposition.REFUSED, [Reason(MigrationCode.CATEGORY_UNDETERMINED)])
+    passed = assessment.verdict.outcome is AutoOutcome.PASS
+    try:
+        arm = await apply_auto_verdict(
+            ctx.memory,
+            project_id=ctx.project_id,
+            run_id=ctx.run_id,
+            now=ctx.now,
+            topic=assessment.topic,
+            claim=ctx.claims.get(assessment.topic) if passed else None,
+            category=category,
+            verdict=assessment.verdict,
+            members=assessment.facts.members,
+            agent_id=_AGENT_ID,
+            source=_SOURCE,
+        )
+    except Exception as exc:
+        logger.warning('topic %r: the retain arm raised', assessment.topic, exc_info=True)
+        return assessment.report(Disposition.REFUSED, [_execution_refused(type(exc).__name__)])
+    if isinstance(arm, RetainArmRefused):
+        error_type = str(arm.response.get('error_type'))
+        return assessment.report(Disposition.REFUSED, [_execution_refused(error_type)])
+    return assessment.report(
+        Disposition.EXECUTED,
+        execution=Execution(
+            canonical_id=arm.canonical_id,
+            minted=passed,
+            tagged=tuple(arm.retained),
+            retain_failures=tuple(arm.retain_failures),
+        ),
+    )
+
+
+def _execution_refused(error_type: str) -> Reason:
+    return Reason(RefusalCode.EXECUTION_REFUSED, detail=error_type)
+
+
+async def _settle(ctx: RunContext, gate: OpenGate, topic: str, report: GateReport) -> GateReport:
+    """Judge the gate's closure and, for a closed executed or no-op gate, list how to resume it."""
+    closure = await gate_closure(ctx, gate, topic)
+    report = replace(report, closure=closure)
+    if report.disposition not in (Disposition.EXECUTED, Disposition.NOOP) or not closure.closed:
+        return report
+    return _with_next_calls(ctx, gate, report)
+
+
+async def gate_closure(ctx: RunContext, gate: OpenGate, topic: str) -> ClosureVerdict:
+    """The done-seam's own check over the gate's own block: the verdict its resume will meet."""
+    try:
+        scrolled = await closure_cli.scroll_cluster(ctx.memory, ctx.project_id, topic, block=gate.block)
+    except Exception:
+        logger.warning('topic %r: the closure scroll failed', topic, exc_info=True)
+        return evaluate_closure(
+            gate.block, members=[], scroll_total=None, scroll_truncated=False, scroll_available=False,
+        )
+    return evaluate_closure(
+        gate.block,
+        members=scrolled['members'],
+        scroll_total=scrolled['total'],
+        scroll_truncated=scrolled['truncated'],
+        scroll_available=scrolled['available'],
+        unstamped_live_ids=scrolled['unstamped'],
+    )
+
+
+def _with_next_calls(ctx: RunContext, gate: OpenGate, report: GateReport) -> GateReport:
+    """PRD D9: a human-curator gate is stamped first, or its runner re-blocks it on resume."""
+    calls: list[ToolCall] = []
+    if gate.metadata.get(HUMAN_CURATOR_GATE_KEY) is True:
+        calls.append(ToolCall('update_task', {
+            'id': gate.task_id,
+            'project_root': ctx.project_root,
+            'metadata': {HUMAN_CURATOR_ADJUDICATED_AT_KEY: ctx.now.isoformat()},
+            'metadata_mode': 'merge',
+        }))
+    escalation_id = pending_gate_escalation_id(ctx.project_root, gate.task_id)
+    if escalation_id is None:
+        return replace(
+            report,
+            next_calls=tuple(calls),
+            note=f'no pending milestone_gate escalation for task {gate.task_id}, so there is nothing to resume yet',
+        )
+    verdict = report.verdict.value if report.verdict is not None else '-'
+    calls.append(ToolCall('resolve_issue', {
+        'escalation_id': escalation_id,
+        'resolution': (
+            f'Migrated by scripts/migrate_open_consolidation_gates.py run {ctx.run_id}: '
+            f'{verdict}; evaluate_closure closed'
+        ),
+        'action': 'resume',
+    }))
+    return replace(report, next_calls=tuple(calls))
+
+
+def pending_gate_escalation_id(project_root: str, task_id: str) -> str | None:
+    """The newest pending ``milestone_gate`` escalation for the task, as its runner cites it."""
+    queue_dir = escalation_queue_dir(project_root)
+    if not queue_dir.is_dir():
+        return None
+    records = [
+        record
+        for record in EscalationQueue(queue_dir).get_by_task(task_id, status='pending')
+        if record.category == EscalationCategory.MILESTONE_GATE
+    ]
+    return max(records, key=lambda record: record.timestamp).id if records else None
+
+
+# --------------------------------------------------------------------------- #
+# Rendering
+# --------------------------------------------------------------------------- #
+
+
+def report_payload(report: MigrationReport) -> dict[str, Any]:
+    return {
+        'project_id': report.project_id,
+        'mode': report.mode.value,
+        'run_id': report.run_id,
+        'gate_count': len(report.gates),
+        'gates': [_gate_payload(gate) for gate in report.gates],
+    }
+
+
+def _gate_payload(gate: GateReport) -> dict[str, Any]:
+    return {
+        'task_id': gate.task_id,
+        'topic': gate.topic,
+        'disposition': gate.disposition.value,
+        'codes': list(gate.codes),
+        'reasons': [_reason_payload(r) for r in gate.reasons],
+        'verdict': gate.verdict.value if gate.verdict is not None else None,
+        'verdict_reasons': [_reason_payload(r) for r in gate.verdict_reasons],
+        'members': list(gate.members),
+        'absent_observed': list(gate.absent_observed),
+        'category': gate.category,
+        'execution': _execution_payload(gate.execution),
+        'closure': _closure_payload(gate.closure),
+        'next': [_call_payload(call) for call in gate.next_calls],
+        'note': gate.note,
+    }
+
+
+def _reason_payload(reason: Reason) -> dict[str, Any]:
+    return {'code': reason.code, 'ids': list(reason.ids), 'detail': reason.detail}
+
+
+def _execution_payload(execution: Execution | None) -> dict[str, Any] | None:
+    if execution is None:
+        return None
+    return {
+        'canonical_id': execution.canonical_id,
+        'minted': execution.minted,
+        'tagged': list(execution.tagged),
+        'retain_failures': [dict(f) for f in execution.retain_failures],
+    }
+
+
+def _closure_payload(closure: ClosureVerdict | None) -> dict[str, Any] | None:
+    if closure is None:
+        return None
+    return {
+        'closed': closure.closed,
+        'reasons': [dict(r) for r in closure.reasons],
+        'message': closure.message,
+    }
+
+
+def _call_payload(call: ToolCall) -> dict[str, Any]:
+    return {'tool': call.tool, 'arguments': dict(call.arguments), 'call': call.render()}
+
+
+def render_text(report: MigrationReport) -> str:
+    lines = [
+        f'project_id: {report.project_id}  mode: {report.mode.value}  '
+        f'run_id: {report.run_id}  gates: {len(report.gates)}',
+    ]
+    for gate in report.gates:
+        lines.extend(['', *_gate_lines(gate)])
+    return '\n'.join(lines)
+
+
+def _gate_lines(gate: GateReport) -> list[str]:
+    verdict = gate.verdict.value if gate.verdict is not None else '-'
+    lines = [
+        f'gate {gate.task_id}  topic: {gate.topic or "-"}  '
+        f'disposition: {gate.disposition.value}  verdict: {verdict}',
+        f'  members ({len(gate.members)}): {", ".join(gate.members) or "-"}',
+    ]
+    if gate.absent_observed:
+        lines.append(f'  absent observed: {", ".join(gate.absent_observed)}')
+    lines.extend(f'  [{r.code}] {", ".join(r.ids) or "-"} {r.detail}'.rstrip() for r in gate.reasons)
+    if gate.execution is not None:
+        lines.append(
+            f'  canonical: {gate.execution.canonical_id} (minted: {gate.execution.minted})  '
+            f'tagged: {len(gate.execution.tagged)}  failures: {len(gate.execution.retain_failures)}',
+        )
+    if gate.closure is not None:
+        lines.append(f'  closed: {gate.closure.closed}  {gate.closure.message}')
+    lines.extend(f'  next: {call.render()}' for call in gate.next_calls)
+    if gate.note:
+        lines.append(f'  note: {gate.note}')
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            'Rule on every open consolidation gate with the auto predicate and, '
+            'under --execute, consolidate the ones it passes.'
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--dry-run', action='store_true', help='report only; write nothing')
+    mode.add_argument('--execute', action='store_true', help='write the passing consolidations')
+    parser.add_argument(
+        '--project-root', default=None, help='project root owning tasks.db (default: the main checkout)',
+    )
+    parser.add_argument(
+        '--project-id', default=None, help='memory project_id (default: derived from --project-root)',
+    )
+    parser.add_argument('--tag', default='master', help='taskmaster tag (default: %(default)s)')
+    parser.add_argument(
+        '--claim',
+        action='append',
+        default=[],
+        metavar='TOPIC=TEXT',
+        help='the one-line claim a minted canonical leads with, per topic (repeatable)',
+    )
+    parser.add_argument('--json', action='store_true', dest='as_json', help='emit the report as JSON')
+    return parser
+
+
+def parse_claims(values: Sequence[str]) -> dict[str, str]:
+    """``{topic: claim}`` from repeated ``--claim TOPIC=TEXT``; a malformed one is a UsageError."""
+    claims: dict[str, str] = {}
+    for value in values:
+        topic, separator, text = value.partition('=')
+        topic = topic.strip()
+        if not separator:
+            raise UsageError(f'--claim {value!r} is not TOPIC=TEXT')
+        if not is_valid_topic_slug(topic):
+            raise UsageError(f'--claim topic {topic!r} is not a well-formed topic slug')
+        if topic in claims:
+            raise UsageError(f'--claim topic {topic!r} is given more than once')
+        claims[topic] = text.strip()
+    return claims
+
+
+@dataclass(frozen=True)
+class Invocation:
+    """The command line, resolved and validated."""
+
+    mode: Mode
+    claims: Mapping[str, str]
+    project_root: str
+    project_id: str
+    tag: str
+    as_json: bool
+
+
+def parse_invocation(args: argparse.Namespace) -> Invocation:
+    project_root = _project_root(args)
+    return Invocation(
+        mode=Mode.EXECUTE if args.execute else Mode.DRY_RUN,
+        claims=parse_claims(args.claim),
+        project_root=project_root,
+        project_id=_project_id(args, project_root),
+        tag=args.tag,
+        as_json=args.as_json,
+    )
+
+
+def _project_root(args: argparse.Namespace) -> str:
+    if args.project_root is not None:
+        return str(Path(args.project_root).resolve())
+    try:
+        return str(default_project_root())
+    except CheckoutRootError as exc:
+        raise UsageError(f'no --project-root given and {exc}') from exc
+
+
+def _project_id(args: argparse.Namespace, project_root: str) -> str:
+    if args.project_id is not None:
+        return args.project_id
+    try:
+        return project_id_for_root(project_root)
+    except ValueError as exc:
+        raise UsageError(f'{exc}, or pass --project-id') from exc
+
+
+def kill_switch_refusal(invocation: Invocation, config: ConsolidationAutoConfig) -> str | None:
+    """Why ``--execute`` may not write here, naming the config leaf; ``None`` when it may."""
+    if invocation.mode is not Mode.EXECUTE:
+        return None
+    if not config.enabled:
+        return 'consolidation_auto.enabled is false, so no unattended consolidation may be written'
+    if invocation.project_id not in config.enabled_projects:
+        return (
+            f'{invocation.project_id!r} is not in consolidation_auto.enabled_projects, '
+            'so no unattended consolidation may be written there'
+        )
+    return None
+
+
+def new_run_id(now: datetime) -> str:
+    return f'migrate-gates-{now:%Y%m%dT%H%M%SZ}-{secrets.token_hex(4)}'
+
+
+def _could_not_run(cause: object) -> int:
+    logger.error('could not run: %s', cause)
+    return ExitCode.COULD_NOT_RUN
+
+
+async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
+    """The whole run. *memory* is injected by tests; otherwise the live service is built here.
+
+    ``--execute`` probes the store-mutation capability FIRST, before tasks.db,
+    any scroll, or building the service, and then honours the kill switch.
+    Only a self-built service in execute mode is initialized (and closed).
+    """
+    try:
+        invocation = parse_invocation(args)
+        if invocation.mode is Mode.EXECUTE:
+            assert_store_mutation_allowed(operation=_EXECUTE_OPERATION)
+    except (UsageError, StoreMutationUnavailable) as exc:
+        return _could_not_run(exc)
+    owned = memory is None
+    service = closure_cli.build_memory_service() if owned else memory
+    switched_off = kill_switch_refusal(invocation, service.config.consolidation_auto)
+    if switched_off is not None:
+        return _could_not_run(switched_off)
+    try:
+        gates = open_consolidation_gates(invocation.project_root, invocation.tag)
+    except UsageError as exc:
+        return _could_not_run(exc)
+    live = owned and invocation.mode is Mode.EXECUTE
+    if live:
+        await service.initialize()
+    try:
+        return await _migrate_and_emit(invocation, service, gates)
+    finally:
+        if live:
+            await service.close()
+
+
+async def _migrate_and_emit(
+    invocation: Invocation, memory: Any, gates: Sequence[OpenGate],
+) -> int:
+    slugs = await read_canonical_slugs(memory, invocation.project_id)
+    if slugs is None:
+        return _could_not_run(
+            f'the canonical-slug list for {invocation.project_id!r} is unavailable or may be partial',
+        )
+    now = datetime.now(UTC)
+    ctx = RunContext(
+        memory=memory,
+        config=memory.config.consolidation_auto,
+        project_root=invocation.project_root,
+        project_id=invocation.project_id,
+        run_id=new_run_id(now),
+        now=now,
+        mode=invocation.mode,
+        claims=invocation.claims,
+        canonical_slugs=slugs,
+    )
+    report = MigrationReport(
+        project_id=ctx.project_id, mode=ctx.mode, run_id=ctx.run_id, gates=await migrate(ctx, gates),
+    )
+    print(json.dumps(report_payload(report), indent=2) if invocation.as_json else render_text(report))
+    return exit_code(report)
+
+
+def exit_code(report: MigrationReport) -> ExitCode:
+    """1 when a gate this run wrote to is still not closed: a partial write always shows as one."""
+    if any(gate.left_open for gate in report.gates):
+        return ExitCode.GATE_LEFT_OPEN
+    return ExitCode.COMPLETED
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format='%(levelname)s %(name)s: %(message)s')
+    return asyncio.run(run(build_parser().parse_args(argv)))
+
+
+if __name__ == '__main__':
+    sys.exit(main())

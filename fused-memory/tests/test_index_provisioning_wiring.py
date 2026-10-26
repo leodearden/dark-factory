@@ -250,7 +250,7 @@ class TestFirstWriteProvisioning:
 
     Only the graphiti_core client is stubbed (via ``backend._client_for`` on a
     ``make_backend`` backend), so the real ``add_episode`` /
-    ``ensure_entity_node`` bodies run.
+    ``ensure_entity_node`` / ``_mint_entity_node`` bodies run.
     """
 
     UPSTREAM_RESULT = object()
@@ -416,14 +416,16 @@ class TestFirstWriteProvisioning:
         assert statements_written(graph) == _plan_for(_TRAP_PRESENT)
 
     @pytest.mark.asyncio
-    async def test_ensure_entity_node_on_a_registered_absent_graph_provisions_before_minting(
+    async def test_ensure_entity_node_on_a_registered_absent_graph_provisions_before_its_resolve_read(
         self, mock_config, make_backend, make_graph_mock,
     ):
+        """Every read of a never-written key raises until a write creates it, so
+        provisioning must run before the resolve read, not merely before the mint."""
         backend = make_backend(mock_config, registered_graph_ids={'reg'})
         graph = make_graph_mock([], header=LIVE_HEADER)
 
         async def _ro_query(statement, *args, **kwargs):
-            if 'db.indexes' in statement:
+            if graph.query.await_count == 0:
                 raise EMPTY_KEY_ERROR
             return MagicMock(result_set=[], header=[])  # the resolve read: no such node
 
@@ -437,3 +439,31 @@ class TestFirstWriteProvisioning:
         writes = statements_written(graph)
         mint_at = next(i for i, w in enumerate(writes) if w.startswith('CREATE (n:Entity'))
         assert writes[:mint_at] == _plan_for(set())
+
+    @pytest.mark.asyncio
+    async def test_mint_entity_node_on_a_registered_absent_graph_provisions_before_minting(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The MCP mint path reaches ``_mint_entity_node`` without passing
+        through ``ensure_entity_node``'s own provisioning (task 5003)."""
+        backend = make_backend(mock_config, registered_graph_ids={'reg'})
+        graph = make_graph_mock([], header=LIVE_HEADER)
+
+        async def _ro_query(statement, *args, **kwargs):
+            if 'db.indexes' in statement:
+                raise EMPTY_KEY_ERROR
+            return MagicMock(result_set=[], header=[])
+
+        graph.ro_query = AsyncMock(side_effect=_ro_query)
+        self._wire(backend, graph, listing=[])
+        backend.client.embedder.create = AsyncMock(return_value=[0.1])
+        backend.update_node_embedding = AsyncMock()
+
+        await backend._mint_entity_node('Some Entity', group_id='reg')
+
+        writes = statements_written(graph)
+        mint_at = next(i for i, w in enumerate(writes) if w.startswith('CREATE (n:Entity'))
+        assert writes[:mint_at] == _plan_for(set())
+        assert not any(
+            'MATCH (n:Entity {name: $name})' in read for read in statements_read(graph)
+        ), 'the mint primitive issues no exact-name read'

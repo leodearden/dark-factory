@@ -50,7 +50,7 @@ from test_merge_queue_restart_hook import _GatedAdvanceGitOps
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     MERGE_WORKER_SHUTDOWN_REASON,
     ItemLifecycleState,
     SpeculativeMergeWorker,

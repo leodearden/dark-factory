@@ -114,7 +114,7 @@ Candidates that CAN carry a reference are a MAJORITY (20 of 39): each has a sing
 
 A `planrate_only` fixture carries NO `reference` key at all and instead stamps `provenance.reference_unavailable` with the cause plus `provenance.baseline_source` with the ladder rung that produced its `pre_task_commit`. An empty `reference: {}` block would be indistinguishable from a capture that silently failed; omitting the key and recording why makes it a positive, auditable fact.
 
-A landing merge is accepted under EITHER subject spelling — `Merge task/<id> into main` or `Merge task/<id>: <subject>` — so `reference_unavailable` means no single landing merge exists under either. Both spellings are in live use (censused over reify's `main`: 2741 of the first, 74 of the second) and both are derived in one place, `mint_hard_v2_fixtures.py::_merge_subject_patterns`, mirroring `git_ops.py::_merge_subject`.
+A landing merge is accepted under EITHER subject spelling — `Merge task/<id> into main` or `Merge task/<id>: <subject>` — so `reference_unavailable` means no single landing merge exists under either. Both spellings are in live use (censused over reify's `main`: 2741 of the first, 74 of the second) and both are derived in one place, `shared.merge_subject.merge_subject_pattern`, mirroring `git_ops.py::_merge_subject`.
 
 ## Is the base a true branch point, or an approximation?
 

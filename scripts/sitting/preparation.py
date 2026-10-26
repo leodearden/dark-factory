@@ -27,8 +27,9 @@ from sitting.gates import UNKNOWN, Fact
 from sitting.inventory import ESC_ID_RE, ItemKey, key_str, parse_key, parse_stamp
 
 DEFAULT_PREPARATION_PATH = Path('data', 'sitting', 'preparation.json')
+DEFAULT_INBOX_PATH = Path('data', 'sitting', 'inbox')
 NIGHTLY_CONFINEMENT_ENV = 'SITTING_NIGHTLY_CONFINED'
-"""Set in the unattended run's env; prepare_sitting.py then runs only ``brief`` and ``record`` against the default store."""
+"""Set in the unattended run's env to that run's absolute inbox directory; prepare_sitting.py then runs only ``brief`` and ``record`` of a batch file in that inbox against the default store."""
 STANDING_KINDS = frozenset({'pin', 'hold', 'leo_owned', 'owned'})
 GATE_FACT_NAMES: tuple[str, ...] = ('ruling', 'names_this_record', 'executed', 'session_terminated')
 
@@ -207,6 +208,12 @@ class PreparationStore:
 
     def get(self, item_key: ItemKey) -> Preparation | None:
         return self.entries.get(key_str(item_key))
+
+
+def is_inbox_batch(inbox: Path, path: Path | str) -> bool:
+    """Whether *path* is a batch of *inbox*: a ``.json`` file whose resolved location is directly in it, so a symlink pointing out is not."""
+    resolved = Path(path).resolve()
+    return resolved.suffix == '.json' and resolved.parent == inbox.resolve()
 
 
 def load(path: Path | str) -> PreparationStore:

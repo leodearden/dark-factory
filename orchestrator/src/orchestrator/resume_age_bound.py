@@ -25,23 +25,20 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from shared.project_layout import runs_db
+
+from orchestrator.main_checkout_defaults import env_or_main_checkout
+
 logger = logging.getLogger(__name__)
 
-# Overridable via env var for portability across checkouts -- runs.db is
-# offline, gitignored data that lives in the MAIN repo, not a task worktree
-# (mirrors prompt_opt.__main__'s PROMPT_OPT_RUNS_DB and reviewer_trial's
-# REVIEWER_TRIAL_RUNS_DB idiom). A project_root-relative spelling — the one
-# shared.flake_ledger.ledger_db_path uses — is deliberately NOT reused: in a
-# task worktree that composes against the WRONG tree, so the live derived-bound
-# guard would skip on every verify and the bound would be decorative.
+# Overrides the main checkout's runs.db; see
+# orchestrator/src/orchestrator/main_checkout_defaults.py::env_or_main_checkout.
 RUNS_DB_ENV_VAR = 'RESUME_AGE_RUNS_DB'
-_DEFAULT_RUNS_DB = '/home/leo/src/dark-factory/data/orchestrator/runs.db'
 
 # Trailing window BOTH terms are sampled over. Matches the 90-day retention
 # window the transcript archive keeps, and bounds the derivation to the fleet's
@@ -133,10 +130,10 @@ RESUME_AGE_SAFETY_FACTOR = 1.5
 def default_runs_db_path() -> Path:
     """Return the runs.db the live derived-bound guard measures.
 
-    ``$RESUME_AGE_RUNS_DB`` when set, else the main checkout's absolute path.
-    See :data:`RUNS_DB_ENV_VAR` for why this is not project_root-relative.
+    ``$RESUME_AGE_RUNS_DB`` when set, else the main checkout's runs.db. Raises
+    CheckoutRootError naming the env var when neither resolves.
     """
-    return Path(os.environ.get(RUNS_DB_ENV_VAR, _DEFAULT_RUNS_DB))
+    return env_or_main_checkout(RUNS_DB_ENV_VAR, runs_db)
 
 
 @dataclass(frozen=True)

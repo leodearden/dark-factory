@@ -215,6 +215,10 @@ class TestInfoL0MechanicalRoles:
         class must not collide with a role-keyed one."""
         assert DONE_STEP_COMMIT_ORPHAN_CLASS not in INFO_L0_MECHANICAL_ROLES
 
+    def test_the_lane_role_is_not_registered(self):
+        """The lane's records are not closed as status-info; a missing role routes loudly to the curator."""
+        assert 'orchestrator-offline-lane' not in INFO_L0_MECHANICAL_ROLES
+
 
 class TestIsDoneStepCommitOrphan:
     def test_matches_the_done_step_tripwire_shape(self):

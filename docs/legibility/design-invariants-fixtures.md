@@ -62,7 +62,8 @@ Acceptance: every fixture flags with the correct slug. The base table
 holds 10 rows (INV-1..5); the 2026-08-02 addendum adds 4 (INV-6..7), the
 2026-08-06 addendum adds 2 (INV-8), the 2026-08-24 addendum adds 2
 (INV-9), the 2026-08-30 addendum adds 2 (INV-10), the INV-11 addendum
-adds 2, and the INV-12 addendum adds 2 — 24 rows cumulative, all `Y`.
+adds 2, the INV-12 addendum adds 2, the INV-13 addendum adds 2, and the
+INV-14 addendum adds 2 — 28 rows cumulative, all `Y`.
 
 ## INV-1 `contracts-machine-checked`
 
@@ -496,12 +497,11 @@ def census(path: Path) -> int:
 **Expected disposition**: `flag: exceptions-owned-or-ratified`
 
 **Redesign that clears it**: Name the task or ticket that owns removing the
-exemption in `follow_up` (`Debt(TaskRef(n))` / `Debt(TicketRef(id))`) —
-today the only available disposition, because the ratification table
-(`docs/legibility/exception-ratifications.yaml`) lands with the mechanism
-and is not in the tree yet. Once it is, an exemption that is a deliberate,
-permanent ruling rather than debt may instead add a row there and cite its
-id (`Policy(ratified)`). An entry may never carry neither.
+exemption in `follow_up` (`Debt(TaskRef(n))` / `Debt(TicketRef(id))`), or,
+for an exemption that is a deliberate, permanent ruling rather than debt, add
+a row to the ratification table
+(`docs/legibility/exception-ratifications.yaml`) and cite its id
+(`Policy(ratified)`). An entry may never carry neither.
 
 ### Code-snippet-shaped (`INV-12-CODE`)
 
@@ -550,6 +550,55 @@ def render_health(open_rows: list[DebtRow]) -> str:
 
 ```json
 {"invariant": "readers-prove-their-producer", "file": "orchestrator/src/orchestrator/debt_report.py", "line": 3, "issue": "an empty debt table renders as status=ok, but nothing in this package writes a debt row — the counter is derived from rows that no producer creates, so a ledger with no producer is indistinguishable from a healthy one", "severity": "warning"}
+```
+
+## INV-14 `sampler-vocabulary-one-table`
+
+### PRD-leaf-shaped (`INV-14-PRD`)
+
+> Add a `gpu_busy_avg10` load-sampler metric: emit it from the process
+> collector, append the name to the sampler's process admission set, and
+> append it to the dashboard's served-metric list so `/api/load` returns
+> it. Signal: a new test asserts the dashboard list and the admission set
+> hold the same names.
+
+**Expected disposition**: `flag: sampler-vocabulary-one-table`
+
+**Redesign that clears it**: Add one `MetricSpec('gpu_busy_avg10')` to the
+process group in `sampler.metrics.METRIC_GROUPS`. The collector takes the
+name from that spec, `run_tick` admits it through the group, and the
+dashboard serves it through `exact_metric_names` because it already serves
+the process group. Nothing is left to reconcile, so the agreement test is
+not written.
+
+### Code-snippet-shaped (`INV-14-CODE`)
+
+File `sampler/src/sampler/gpu.py` (new, the violation — illustrative, not
+a real file in this repo):
+
+```python
+_GPU_METRICS = frozenset({'gpu_busy_avg10', 'gpu_read_ok'})
+
+
+def collect_gpu_metrics(read: Callable[[], float | None]) -> Samples:
+    busy = read()
+    if busy is None:
+        return {SampleKey('gpu_read_ok'): 0.0}
+    return {SampleKey('gpu_busy_avg10'): busy, SampleKey('gpu_read_ok'): 1.0}
+```
+
+File `sampler/tests/test_gpu.py` (new, the parity test offered as its
+enforcement — illustrative):
+
+```python
+def test_gpu_admission_matches_collector() -> None:
+    assert {key.metric for key in collect_gpu_metrics(lambda: 0.5)} == _GPU_METRICS
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "sampler-vocabulary-one-table", "file": "sampler/src/sampler/gpu.py", "line": 1, "issue": "the admission set _GPU_METRICS and collect_gpu_metrics each spell gpu_busy_avg10 and gpu_read_ok, and neither is computed from sampler.metrics.METRIC_GROUPS — two homes for one vocabulary, held together only by a parity test", "severity": "warning"}
 ```
 
 ## Rehearsal verdict table
@@ -808,6 +857,54 @@ INV-2 `structured-facts-at-failure`), and the seeded-row test is a test of
 a reader rather than a guard asserting prose (not INV-10
 `guards-exercise-behaviour`) — the family-boundary distinctions the
 normative doc's INV-13 section draws.
+
+### Addendum — INV-14 walk (2026-10-12)
+
+Walked against the as-landed G7 §"Design invariants pass" text and the
+Step 5.5 audit text, both re-read from the working tree at the commit that
+adds INV-14 (task 6773) rather than from the drafting context. Both G7
+paths were walked, as in the 2026-09-25 addendum: the normative path
+(which Reads the doc at run time and auto-extended to INV-14 with no edit)
+and the no-invariants-file fallback path (the trigger-shape list, which
+does NOT auto-extend and gained an INV-14 entry in the same commit).
+
+Step 5.5 has itself changed since the INV-13 walk. The findings-contract
+rewrite (commit `20a3ed0ece`, 2026-10-04) has it record each violation as
+a `findings` entry whose lens, `tags[0]`, is `inv-<n>`, followed by the
+heuristic the invariant encodes when the quality doc names one; it no
+longer emits an `invariant_findings` entry. The expected entry under
+`INV-14-CODE` keeps the legend's `invariant_findings` shape so every CODE
+fixture reads alike, and the Verdict column below records what the current
+text yields.
+
+The same snapshot caveat applies: the Verdict column transcribes phrasing
+as it read on 2026-10-12, not a live pin.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
+|---|---|---|---|---|---|
+| `INV-14-PRD` | PRD | INV-14 sampler-vocabulary-one-table | `sampler-vocabulary-one-table` | Normative path: G7's walk of the checkable question ("Is it a projection of `METRIC_GROUPS`, or a new spelling that something must reconcile?") fires — the row spells the new name in two lists and its only enforcement is a test reconciling them, which the rule names as not compliance. Fallback path: the new trigger-shape entry ("a load-sampler metric name, admission set, arm mapping or dashboard-served metric spelled outside `sampler.metrics.METRIC_GROUPS`") fires on the same row → `flag: sampler-vocabulary-one-table` | Y |
+| `INV-14-CODE` | CODE | INV-14 sampler-vocabulary-one-table | `sampler-vocabulary-one-table` | Step 5.5 ("audit the Phase 2 file set against each invariant's checkable question" — Reads the doc generically) applies INV-14's question to `sampler/src/sampler/gpu.py`: `_GPU_METRICS` and `collect_gpu_metrics` each spell both names and neither is computed from `METRIC_GROUPS` → a `findings` entry with lens `inv-14` (the quality doc names no heuristic for INV-14, so none follows), which the normative heading resolves to `sampler-vocabulary-one-table`; in the legend's shape, `invariant_findings` entry with `invariant="sampler-vocabulary-one-table"`, `severity="warning"` | Y |
+
+**Addendum result: 2/2 match** (cumulative 28/28). No wording change to
+G7's walk instruction or to Step 5.5 was needed — both read the normative
+doc at run time, so INV-14's arrival is enough. The gate-text edits this
+change did require (G7's trigger-shape entry, the family-inventory row and
+the Calibration pointer) are not rehearsal misses: none of those
+enumerations auto-extends, which is why
+`scripts/tests/test_design_invariants_consistency.py` fails the moment a
+heading lands without the first two.
+
+Isolation re-checked while walking. INV-5 `no-lockstep-duplication` is
+adjacent by construction, and the fixtures are seeded on that seam. INV-5
+governs duplicated logic in general and accepts a drift test as a house
+pattern, so a walker applying INV-5 alone can read either fixture's parity
+test as its enforcement; INV-14 governs this one vocabulary and rejects
+that test, which is the distinction the normative doc's INV-14 Family
+boundary paragraph draws. No other trigger shape fires: the names are code
+vocabulary, not a world-fact written into a record or store (not INV-9
+`one-fact-one-home`); the parity test executes the collector rather than
+matching prose (not INV-10 `guards-exercise-behaviour`); and nothing fails
+or falls back (not INV-11 `no-silent-fail-soft`).
 
 ## Reconciliation — 2026-07-14 base walk
 

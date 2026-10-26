@@ -249,13 +249,14 @@ def _classify_record(
     """Map one open escalation to its :class:`PinClass` (see the chain above)."""
     sev = normalised_severity(record.severity)
 
-    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.  Since
-    # task 3976, `escalation.server.promote_to_l2`'s inherited
-    # max(member severities) default can MINT a fresh L2 at severity='info'
-    # (previously the only info-severity L2s were ones `EscalationQueue.park()`
-    # promoted from an already-open L0/L1, never freshly filed ones), so this
-    # link now also decides an inherited-info L2 as NON_PINNING — see
-    # TestInfoAtL2Coupling in escalation/tests/test_pins.py (task 4402).
+    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.  Task
+    # 3976 let `escalation.server.promote_to_l2`'s inherited max(member
+    # severities) default mint a fresh L2 at severity='info'; since task 5222
+    # that default is REFUSED for an all-info cluster, but an explicit
+    # severity='info' promote (and `EscalationQueue.park()` of an already-open
+    # L0/L1) still produce info L2s, and this link decides each of them
+    # NON_PINNING — see TestInfoAtL2Coupling in escalation/tests/test_pins.py
+    # (task 4402).
     if sev == 'info':
         return PinClass.NON_PINNING
 
@@ -279,8 +280,9 @@ def _classify_record(
     # Link 3b — a BORN_AT_L2 severity (critical/urgent) at level 0 is
     # CONTRADICTORY state: such records are created directly at L2 and routed
     # straight to a human, which is why every in-repo producer stamps
-    # `level=2` alongside them and why `workflow.py` already treats the two
-    # signals as one (`e.severity in BORN_AT_L2_SEVERITIES or e.level >= 2`).
+    # `level=2` alongside them and why
+    # `orchestrator/src/orchestrator/workflow.py::_needs_human` treats a
+    # born-at-L2 severity as needing a human at any level.
     # Fail it safe to pinning for exactly the reason link 3 is written `!= 0`
     # — a human-routed record must never fall into the conversion-eligible
     # branch below on the strength of a level field that contradicts it.
@@ -362,22 +364,17 @@ def classify_pins(
     entry point with no orchestrator run_id and no session, so it structurally
     cannot, and which hardcodes ``level=2``),
     ``orchestrator.deterministic_runner`` (all six sites ``level=2`` /
-    ``severity='critical'``) and the other level-1/2-only filers — where link
-    3 makes the identity moot.  The L0 ``severity='info'`` filers (e.g.
-    ``orchestrator.merge_skew_tripwire``, ``orchestrator.offline_lane``'s
-    risk notice, the ``_AMENDMENT_TRUNCATION``/``_ROOT_CAUSE_OVERFOLD``
-    anchors in ``escalation.server``) do not stamp either, but they are moot
+    ``severity='critical'``),
+    ``orchestrator/src/orchestrator/merge_lane/worker.py::_file_main_health_escalation``
+    (level 1, no per-task incarnation; pinned by
+    ``orchestrator/tests/test_merge_queue_main_health_deferred.py::_assert_pins_only_as_queue_handoff``)
+    and the other level-1/2-only filers — where link 3 makes the identity
+    moot.  The L0 ``severity='info'`` filers (e.g.
+    ``orchestrator.merge_lane.skew_tripwire``, the ``_AMENDMENT_TRUNCATION``/
+    ``_ROOT_CAUSE_OVERFOLD`` anchors in ``escalation.server``) do not stamp either, but they are moot
     via link 1, not link 3.
 
-    One residual L0 gap is NOT closed by the stamping above:
-    ``orchestrator/src/orchestrator/merge_queue.py::_file_main_health_escalation``
-    builds at the DEFAULT level 0 with ``severity='blocking'`` (category
-    ``preexisting_main_break``) against a real ``req.task_id``, so links
-    1/2/3/3b all fall through and its records still read as UNKNOWN at link 4
-    — failing safe to pinning.  It is a module-level function with no
-    per-task incarnation, so ``None`` is the honest value there; closing the
-    gap needs a caller-supplied identity, not a stamp.  A second non-stamping
-    L0 ``'blocking'`` producer,
+    The one non-stamping L0 ``'blocking'`` producer,
     ``fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._escalate``,
     files against synthetic ``recon-<run_id>`` task ids on the reconciliation
     queue, which no task-scoped pin read binds to.
@@ -471,9 +468,9 @@ def is_queue_handoff(record: PinRecord) -> bool:
 
     True iff the shared chain classifies *record* as ``QUEUE_HANDOFF``.
     ``live_claimant=True`` with no live id makes an L0 fail safe to a handoff,
-    so in practice only info never gates.  Consumers:
-    ``orchestrator/src/orchestrator/workflow.py::_is_gating_escalation`` and
-    ``::TaskWorkflow._wait_for_resolution`` (task 5222 / PRD gamma).
+    so in practice only info never gates.  Consumer:
+    ``orchestrator/src/orchestrator/workflow.py::_needs_human`` (task 5222 /
+    PRD gamma).
     """
     return bool(classify_pins('', [record], live_claimant=True).queue_handoff)
 

@@ -112,7 +112,7 @@ if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
     from orchestrator.verify import VerifyResult
 
-logger = logging.getLogger('orchestrator.merge_disposition')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 class MergeFailureDisposition(StrEnum):

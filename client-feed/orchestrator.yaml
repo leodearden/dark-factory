@@ -1,0 +1,17 @@
+# client-feed orchestrator configuration: scopes verification to client-feed's own
+# venv (src-layout member). Shape and --directory convention follow
+# sampler/orchestrator.yaml.
+
+test_command: "uv run --directory client-feed pytest tests/ --tb=short -q --timeout=300"
+lint_command: "uv run --directory client-feed ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py client-feed/tests"
+type_check_command: "uv run --directory client-feed pyright --threads 8 src/ tests/"
+
+# Per-module verify budget. Three runs of the test_command above, 2026-10-15,
+# task 6966, all rc=0 with 285 passed, on a contended 32-core host:
+#     7.88s wall @ loadavg 81.70  <- W, the worst
+#     3.83s wall @ loadavg 85.41
+#     3.06s wall @ loadavg 85.29
+# 600 is the absolute floor, not 2.6 x W: see sampler/orchestrator.yaml (2) for
+# why. Rules and the raise-together pin:
+# tests/scripts/test_module_verify_budgets.py::test_module_carries_its_own_measured_verify_budget
+verify_command_timeout_secs: 600

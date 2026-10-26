@@ -12,8 +12,11 @@ from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import pytest_asyncio
+from _qdrant_responses import missing_collection_404
 from qdrant_client.http.exceptions import UnexpectedResponse
 from shared.config_dir import TaskConfigDir
+from shared.project_layout import escalation_queue_dir
+from shared.scheduler_state import SchedulerStateSnapshot
 from shared.testing import make_gate_mock
 
 from fused_memory.models.reconciliation import (
@@ -26,8 +29,12 @@ from fused_memory.models.reconciliation import (
     RunType,
     StageReport,
 )
-from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
-from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope, Scope
+from fused_memory.reconciliation.cli_stage_runner import (
+    recon_archive_root,
+    recon_config_base_dir,
+    run_config_dir_path,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -532,7 +539,7 @@ def _make_s3_findings():
     ]
 
 
-def _make_test_harness(journal, event_buffer, mock_memory_service):
+def _make_test_harness(journal, event_buffer, mock_memory_service, **harness_kwargs):
     """Build a ReconciliationHarness wired to test fixtures with minimal config.
 
     Callers must mock individual stage.run methods as needed.
@@ -559,6 +566,7 @@ def _make_test_harness(journal, event_buffer, mock_memory_service):
         journal=journal,
         event_buffer=event_buffer,
         config=config,
+        **harness_kwargs,
     )
     # task 1143: inject known projects so run_full_cycle pre-flight does not raise
     # for the project_ids used across the existing test suite.  Set BEFORE building
@@ -6067,12 +6075,15 @@ def _assert_run_failure_record(err, *, error_type, failed_stage, message, errorn
     assert err['sqlite_errorcode'] == errorcode
 
 
-def _assert_one_classified_failure_line(caplog, prefix, *, run_id, errorname, errorcode):
+def _assert_one_classified_failure_line(
+    caplog, prefix, *, run_id, errorname, errorcode, level=logging.ERROR,
+):
     lines = [
         r.getMessage() for r in caplog.records
-        if r.levelno == logging.ERROR and r.getMessage().startswith(prefix)
+        if r.levelno == level and r.getMessage().startswith(prefix)
     ]
-    assert len(lines) == 1, f'expected exactly one {prefix!r} ERROR line, got {lines!r}'
+    level_name = logging.getLevelName(level)
+    assert len(lines) == 1, f'expected exactly one {prefix!r} {level_name} line, got {lines!r}'
     assert f'run_id={run_id}' in lines[0]
     assert f'sqlite_errorname={errorname}' in lines[0]
     assert f'sqlite_errorcode={errorcode}' in lines[0]
@@ -6412,6 +6423,471 @@ async def test_escalate_successful_submit_logs_no_drop_warning(
 
     assert _escalation_drop_warnings(caplog) == []
     assert len(esc_queue.get_pending()) == 1
+
+
+# ── Task 5561: durable completion is final ──
+
+
+def _fail_first_call(obj, name, make_exc):
+    """Make `obj.<name>` raise `make_exc()` on its FIRST call only, delegating
+    to the original afterwards so later calls (e.g. the finally's) still land."""
+    original = getattr(obj, name)
+    calls = 0
+
+    async def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise make_exc()
+        return await original(*args, **kwargs)
+
+    setattr(obj, name, fail_once)
+
+
+def _pending_recon_failures(esc_queue) -> list:
+    return [e for e in esc_queue.get_pending() if e.category == 'recon_failure']
+
+
+def _make_completing_harness(
+    journal, event_buffer, mock_memory_service, tmp_path, **harness_kwargs,
+):
+    """A harness whose three stages all complete, with a real escalation queue."""
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service, **harness_kwargs,
+    )
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+    for stage in harness.stages:
+        _mock_stage_run(stage)
+    return harness, esc_queue
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'failing_write', ['update_run_stage_reports', 'mark_judge_pending'],
+)
+async def test_run_full_cycle_post_completion_failure_keeps_run_completed(
+    journal, event_buffer, mock_memory_service, caplog, tmp_path, failing_write,
+):
+    """A tail write failing after complete_run(run_id, 'completed') is a logged
+    degradation: the run stays completed, its drained events stay drained, no
+    recon_failure is filed, and run_full_cycle RETURNS — BacklogIterator.run
+    restores drained events on any raise, so returning is part of the contract."""
+    harness, esc_queue = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    assert harness.judge is not None
+    await event_buffer.push(_make_event())
+    _fail_first_call(journal, failing_write, _sqlite_busy_error)
+
+    with caplog.at_level(logging.WARNING):
+        result = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert result.status == RunStatus.completed
+    row = await journal.get_run(result.id)
+    assert row is not None
+    assert row.status == 'completed'
+    assert '_error' not in row.stage_reports
+    assert (await journal.get_watermark('test-project')).last_full_run_id == result.id
+    assert len(await event_buffer.get_drained_events('test-project', result.id)) == 1
+    assert await event_buffer.count_buffered('test-project') == 0
+    assert _pending_recon_failures(esc_queue) == []
+    assert not [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR and r.getMessage().startswith('Reconciliation failed:')
+    ]
+    _assert_one_classified_failure_line(
+        caplog, 'reconciliation.post_completion_tail_failed',
+        run_id=result.id, errorname='SQLITE_BUSY', errorcode=5, level=logging.WARNING,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('resume_after_restart', [False, True])
+async def test_run_full_cycle_post_completion_cancellation_keeps_run_completed(
+    journal, event_buffer, mock_memory_service, tmp_path, resume_after_restart,
+):
+    """A cancellation landing in the post-completion tail still propagates, but
+    never relabels the durably completed run (interrupted or failed) nor
+    restores its drained events."""
+    harness, esc_queue = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    assert harness.judge is not None
+    harness.config.resume_after_restart = resume_after_restart
+    await event_buffer.push(_make_event())
+
+    entered = asyncio.Event()
+
+    async def stalled_mark_judge_pending(run_id, project_id):
+        entered.set()
+        await asyncio.sleep(999)
+
+    journal.mark_judge_pending = stalled_mark_judge_pending
+    restore_spy = AsyncMock(side_effect=event_buffer.restore_drained)
+    event_buffer.restore_drained = restore_spy
+
+    outer = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    await _cancel_once_entered(outer, entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.status == 'completed'
+    assert '_error' not in row.stage_reports
+    assert row.id not in {r.id for r in await journal.get_interrupted_runs()}
+    restore_spy.assert_not_awaited()
+    assert len(await event_buffer.get_drained_events('test-project', row.id)) == 1
+    assert _pending_recon_failures(esc_queue) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('resume_after_restart', [False, True])
+async def test_run_full_cycle_cancellation_after_the_completion_commit_keeps_run_completed(
+    journal, event_buffer, mock_memory_service, tmp_path, resume_after_restart,
+):
+    """A cancellation reaching run_full_cycle after complete_run(run_id,
+    'completed') has committed (aiosqlite lands a commit whose awaiter was
+    cancelled) still propagates, but never relabels the durably completed run
+    nor restores its drained events."""
+    harness, esc_queue = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    harness.config.resume_after_restart = resume_after_restart
+    await event_buffer.push(_make_event())
+
+    entered = asyncio.Event()
+    original_complete_run = journal.complete_run
+
+    async def complete_run_then_stall(run_id, status):
+        if status != 'completed':
+            return await original_complete_run(run_id, status)
+        await original_complete_run(run_id, status)
+        entered.set()
+        await asyncio.sleep(999)
+
+    journal.complete_run = complete_run_then_stall
+    restore_spy = AsyncMock(side_effect=event_buffer.restore_drained)
+    event_buffer.restore_drained = restore_spy
+
+    outer = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    await _cancel_once_entered(outer, entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.status == 'completed'
+    assert '_error' not in row.stage_reports
+    assert row.id not in {r.id for r in await journal.get_interrupted_runs()}
+    restore_spy.assert_not_awaited()
+    assert len(await event_buffer.get_drained_events('test-project', row.id)) == 1
+    assert (await journal.get_watermark('test-project')).last_full_run_id == row.id
+    assert _pending_recon_failures(esc_queue) == []
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_exception_after_the_completion_commit_keeps_run_completed(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """An Exception raised by complete_run(run_id, 'completed') after its commit
+    landed still propagates, but the failure arm leaves the durably completed
+    run completed, in the stage_reports it persists as in its status, and never
+    restores its drained events."""
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    await event_buffer.push(_make_event())
+    original_complete_run = journal.complete_run
+
+    async def complete_run_then_raise(run_id, status):
+        await original_complete_run(run_id, status)
+        if status == 'completed':
+            raise _sqlite_busy_error()
+
+    journal.complete_run = complete_run_then_raise
+    restore_spy = AsyncMock(side_effect=event_buffer.restore_drained)
+    event_buffer.restore_drained = restore_spy
+
+    with pytest.raises(sqlite3.OperationalError):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.status == 'completed'
+    assert '_error' not in row.stage_reports
+    restore_spy.assert_not_awaited()
+    assert len(await event_buffer.get_drained_events('test-project', row.id)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('resume_after_restart', 'row_status', 'buffered_after'),
+    [(False, 'failed', 1), (True, 'interrupted', 0)],
+)
+async def test_run_full_cycle_cancellation_relabels_when_the_completion_read_fails(
+    journal, event_buffer, mock_memory_service, tmp_path,
+    resume_after_restart, row_status, buffered_after,
+):
+    """The cancelled arm's read of whether the journal already records the run
+    completed is best-effort: when it fails, a run cancelled before completion
+    is relabelled exactly as it would be without that read."""
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    harness.config.resume_after_restart = resume_after_restart
+    await event_buffer.push(_make_event())
+    _fail_first_call(journal, 'is_run_completed', _sqlite_busy_error)
+    entered = asyncio.Event()
+    harness.stages[0].run = _stalling_stage_run(entered)
+
+    outer = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    await _cancel_once_entered(outer, entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.status == row_status
+    assert await event_buffer.count_buffered('test-project') == buffered_after
+
+
+def _lock_restore_drained(event_buffer) -> None:
+    async def restore_drained(project_id, run_id=None, *, include_unattributed=False):
+        raise _sqlite_busy_error()
+
+    event_buffer.restore_drained = restore_drained
+
+
+def _make_failing_harness(journal, event_buffer, mock_memory_service, tmp_path):
+    """A harness whose Stage 1 raises, with a real escalation queue."""
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+    harness.stages[0].run = _raising_stage_run(lambda: RuntimeError('stage exploded'))
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+    return harness, esc_queue
+
+
+_LOCKED_FAILURE_BOOKKEEPING_WRITE = pytest.mark.parametrize(
+    ('lock_write', 'failed_write_prefix', 'row_status', 'buffered_after'),
+    [
+        pytest.param(
+            lambda journal, event_buffer: _lock_complete_run(journal, 'failed'),
+            'complete_run(failed) failed:', 'running', 1,
+            id='complete_run_failed',
+        ),
+        pytest.param(
+            lambda journal, event_buffer: _lock_restore_drained(event_buffer),
+            'restore_drained failed:', 'failed', 0,
+            id='restore_drained',
+        ),
+    ],
+)
+
+
+@pytest.mark.asyncio
+@_LOCKED_FAILURE_BOOKKEEPING_WRITE
+async def test_run_full_cycle_failure_escalates_even_when_failure_bookkeeping_raises(
+    journal, event_buffer, mock_memory_service, caplog, tmp_path,
+    lock_write, failed_write_prefix, row_status, buffered_after,
+):
+    """esc-5545-1: a failing bookkeeping write in the failure handler neither
+    skips the recon_failure escalation, nor skips the OTHER bookkeeping write,
+    nor replaces the stage's own exception."""
+    harness, esc_queue = _make_failing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    await event_buffer.push(_make_event())
+    lock_write(journal, event_buffer)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match='stage exploded'):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    [escalation] = _pending_recon_failures(esc_queue)
+    assert 'memory_consolidator' in escalation.summary
+    _assert_one_classified_failure_line(
+        caplog, failed_write_prefix,
+        run_id=row.id, errorname='SQLITE_BUSY', errorcode=5,
+    )
+    assert row.status == row_status
+    assert await event_buffer.count_buffered('test-project') == buffered_after
+
+
+async def _fail_run_with_exception(harness):
+    harness.stages[0].run = _raising_stage_run(lambda: RuntimeError('stage exploded'))
+    with pytest.raises(RuntimeError, match='stage exploded'):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+
+async def _fail_run_with_all_accounts_capped(harness):
+    from shared.cli_invoke import AllAccountsCappedException
+
+    harness.stages[0].run = AsyncMock(
+        side_effect=AllAccountsCappedException(retries=3, elapsed_secs=1.0, label='x'),
+    )
+    result = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert result.status == RunStatus.failed
+
+
+async def _fail_run_with_cancellation_resume_off(harness):
+    harness.config.resume_after_restart = False
+    entered = asyncio.Event()
+    harness.stages[0].run = _stalling_stage_run(entered)
+    outer = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    await _cancel_once_entered(outer, entered)
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'fail_run',
+    [
+        _fail_run_with_exception,
+        _fail_run_with_all_accounts_capped,
+        _fail_run_with_cancellation_resume_off,
+    ],
+    ids=['exception', 'all_accounts_capped', 'cancelled_resume_off'],
+)
+async def test_run_full_cycle_failure_keeps_an_earlier_completed_runs_events_drained(
+    journal, event_buffer, mock_memory_service, tmp_path, fail_run,
+):
+    """Task 6453: a failed run re-buffers only its own drained events, never
+    those of an earlier run the journal records completed."""
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+    run_a = await harness.run_full_cycle('test-project', 'seed')
+    assert run_a.status == RunStatus.completed
+
+    await event_buffer.push(_make_event())
+    await fail_run(harness)
+
+    assert len(await event_buffer.get_drained_events('test-project', run_a.id)) == 2
+    assert await event_buffer.count_buffered('test-project') == 1
+    row_a = await journal.get_run(run_a.id)
+    assert row_a is not None
+    assert row_a.status == 'completed'
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_failure_escalates_even_when_failure_bookkeeping_is_cancelled(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """esc-5545-1 / F4: shutdown cancelling the failure handler mid-bookkeeping
+    still leaves the recon_failure escalation filed."""
+    harness, esc_queue = _make_failing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    await event_buffer.push(_make_event())
+    original_complete_run = journal.complete_run
+
+    async def complete_run(run_id, status):
+        if status == 'failed':
+            raise asyncio.CancelledError()
+        return await original_complete_run(run_id, status)
+
+    journal.complete_run = complete_run
+
+    with pytest.raises(asyncio.CancelledError):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert len(_pending_recon_failures(esc_queue)) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_failure_bookkeeping_lands_despite_a_second_cancellation(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """Shutdown cancelling the failure handler mid-bookkeeping still lets both
+    writes land, as the cancellation handler's do: the row is not stranded
+    'running' and the drained events are re-buffered."""
+    harness, _ = _make_failing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    await event_buffer.push(_make_event())
+    outer_task_ref: list[asyncio.Task] = []
+    original_complete_run = journal.complete_run
+
+    async def shutdown_cancelling_complete_run(run_id, status):
+        if status == 'failed':
+            outer_task_ref[0].cancel()
+            await asyncio.sleep(0)
+        await original_complete_run(run_id, status)
+
+    journal.complete_run = shutdown_cancelling_complete_run
+
+    outer_task = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    outer_task_ref.append(outer_task)
+    with pytest.raises(asyncio.CancelledError):
+        await outer_task
+
+    async def bookkeeping_landed():
+        [row] = await journal.get_recent_runs('test-project', limit=1)
+        return row.status == 'failed' and await event_buffer.count_buffered('test-project') == 1
+
+    assert await _poll_until(bookkeeping_landed)
+
+
+@pytest.mark.asyncio
+@_LOCKED_FAILURE_BOOKKEEPING_WRITE
+async def test_run_full_cycle_capped_deferral_survives_failing_bookkeeping(
+    journal, event_buffer, mock_memory_service, caplog,
+    lock_write, failed_write_prefix, row_status, buffered_after,
+):
+    """The AllAccountsCapped deferral treats its bookkeeping as the failure
+    handler does: a failing write neither turns the deferral into a raise nor
+    skips the other write."""
+    from shared.cli_invoke import AllAccountsCappedException
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.stages[0].run = _raising_stage_run(
+        lambda: AllAccountsCappedException(retries=3, elapsed_secs=1.0, label='stage'),
+    )
+    await event_buffer.push(_make_event())
+    lock_write(journal, event_buffer)
+
+    with caplog.at_level(logging.ERROR):
+        result = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert result.status == RunStatus.failed
+    err = result.stage_reports['_error']
+    assert isinstance(err, dict)
+    assert err['deferred'] is True
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    _assert_one_classified_failure_line(
+        caplog, failed_write_prefix,
+        run_id=row.id, errorname='SQLITE_BUSY', errorcode=5,
+    )
+    assert row.status == row_status
+    assert await event_buffer.count_buffered('test-project') == buffered_after
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_failed_stage_report_persist_skips_the_judge(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """The judge reads the stage reports back from the journal, so a failed
+    persist skips it rather than have it review what never landed."""
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    assert harness.judge is not None
+    await event_buffer.push(_make_event())
+    _fail_first_call(journal, 'update_run_stage_reports', _sqlite_busy_error)
+    judge_marked_pending = AsyncMock(side_effect=journal.mark_judge_pending)
+    journal.mark_judge_pending = judge_marked_pending
+
+    result = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert result.status == RunStatus.completed
+    judge_marked_pending.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -8034,16 +8510,22 @@ class TestHarnessFilteredTaskTreeWiring:
         # Accessing a staticmethod via the class already unwraps it to a plain function
         real_helper = ReconciliationHarness._configure_task_sync
 
-        def spy(stage, *, filtered_task_tree=None, remediation_mode=False):
+        def spy(
+            stage, *, filtered_task_tree=None, filtered_task_tree_fetched_at=None, remediation_mode=False
+        ):
             spy_calls.append(
                 {
                     'stage': stage,
                     'filtered_task_tree': filtered_task_tree,
+                    'filtered_task_tree_fetched_at': filtered_task_tree_fetched_at,
                     'remediation_mode': remediation_mode,
                 }
             )
             real_helper(
-                stage, filtered_task_tree=filtered_task_tree, remediation_mode=remediation_mode
+                stage,
+                filtered_task_tree=filtered_task_tree,
+                filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
+                remediation_mode=remediation_mode,
             )
 
         ReconciliationHarness._configure_task_sync = staticmethod(spy)  # type: ignore[method-assign]
@@ -8065,6 +8547,7 @@ class TestHarnessFilteredTaskTreeWiring:
         assert isinstance(stage2, TaskKnowledgeSync)
         assert call['stage'] is stage2
         assert call['filtered_task_tree'] is expected_tree
+        assert call['filtered_task_tree_fetched_at'] is not None
         assert call['remediation_mode'] is False
 
     @pytest.mark.asyncio
@@ -8090,16 +8573,22 @@ class TestHarnessFilteredTaskTreeWiring:
         spy_calls: list = []
         real_helper = ReconciliationHarness._configure_task_sync
 
-        def spy(stage, *, filtered_task_tree=None, remediation_mode=False):
+        def spy(
+            stage, *, filtered_task_tree=None, filtered_task_tree_fetched_at=None, remediation_mode=False
+        ):
             spy_calls.append(
                 {
                     'stage': stage,
                     'filtered_task_tree': filtered_task_tree,
+                    'filtered_task_tree_fetched_at': filtered_task_tree_fetched_at,
                     'remediation_mode': remediation_mode,
                 }
             )
             real_helper(
-                stage, filtered_task_tree=filtered_task_tree, remediation_mode=remediation_mode
+                stage,
+                filtered_task_tree=filtered_task_tree,
+                filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
+                remediation_mode=remediation_mode,
             )
 
         ReconciliationHarness._configure_task_sync = staticmethod(spy)  # type: ignore[method-assign]
@@ -8335,6 +8824,89 @@ class TestHarnessFilteredTaskTreeWiring:
             f"fails this ordering check"
         )
 
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_threads_the_pre_stage_tree_read_instant_into_stage2(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """Stage 2 receives the instant stamped right after the tree fetch (task 5093).
+
+        Same ordering proof as the remediation test above: the instant must be at
+        or after the fetch returned and strictly before Stage 1 ran, so a fresh
+        now() taken at Stage-2 configure time fails it.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        tree = self._make_tree()
+        fetch_state: dict = {}
+
+        async def _fetch(project_root):
+            fetch_state['fetched_returned_at'] = datetime.now(UTC)
+            return tree
+
+        harness._fetch_filtered_task_tree = _fetch
+
+        stage_state: dict = {}
+
+        async def _record_stage_ran(stage):
+            await asyncio.sleep(0.05)
+            stage_state['stage_ran_at'] = datetime.now(UTC)
+
+        async def _capture_stage2(stage):
+            stage_state['tree'] = stage.filtered_task_tree
+            stage_state['fetched_at'] = stage.filtered_task_tree_fetched_at
+
+        _mock_stage_run(harness.stages[0], before_return=_record_stage_ran)
+        _mock_stage_run(harness.stages[1], before_return=_capture_stage2)
+        _mock_stage_run(harness.stages[2])
+
+        await event_buffer.push(_make_event())
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+        assert stage_state['tree'] is tree
+        fetched_at = stage_state['fetched_at']
+        assert fetched_at is not None
+        assert fetched_at >= fetch_state['fetched_returned_at']
+        assert fetched_at < stage_state['stage_ran_at']
+
+    @pytest.mark.asyncio
+    async def test_remediation_threads_supplied_tree_read_instant_into_stage2(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """_run_remediation_pass hands Stage 2 the read instant of the tree it was given."""
+        from fused_memory.reconciliation.harness import TierConfig
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+        harness._make_stages = lambda scope, **k: _rescope(stages, scope)
+
+        captured: dict = {}
+
+        async def capture_s2(stage):
+            captured['fetched_at'] = stage.filtered_task_tree_fetched_at
+
+        _mock_stage_run(stages[0])
+        _mock_stage_run(stages[1], before_return=capture_s2)
+        _mock_stage_run(stages[2])
+
+        instant = datetime.now(UTC) - timedelta(minutes=3)
+        await harness._run_remediation_pass(
+            'test-project',
+            'parent-run-id',
+            [_make_s3_findings()[0]],
+            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+            scope=_scope('test-project', '/tmp/test-project'),
+            filtered_task_tree=self._make_tree(),
+            filtered_task_tree_fetched_at=instant,
+        )
+
+        assert captured.get('fetched_at') == instant
+
 
 class TestConfigureTaskSync:
     """Unit tests for the _configure_task_sync staticmethod on ReconciliationHarness."""
@@ -8396,6 +8968,29 @@ class TestConfigureTaskSync:
 
         assert stage2.remediation_mode is True
         assert stage2.filtered_task_tree is tree
+
+    def test_configure_task_sync_sets_and_resets_tree_read_instant(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """The read instant travels with its tree; a configure call without one clears it."""
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        stage2 = harness.stages[1]
+        assert isinstance(stage2, TaskKnowledgeSync)
+
+        instant = datetime.now(UTC)
+        ReconciliationHarness._configure_task_sync(
+            stage2, filtered_task_tree=self._make_tree(), filtered_task_tree_fetched_at=instant
+        )
+        assert stage2.filtered_task_tree_fetched_at is instant
+
+        ReconciliationHarness._configure_task_sync(stage2, filtered_task_tree=self._make_tree())
+        assert stage2.filtered_task_tree_fetched_at is None
 
     def test_configure_task_sync_is_staticmethod(self):
         """_configure_task_sync must be declared as a @staticmethod."""
@@ -10567,7 +11162,9 @@ async def test_resume_interrupted_runs_falls_back_when_unresumable(
 
     # Events restored (fallback path) and the per-run config dir GC'd.
     restore_spy.assert_awaited()
-    gc_mock.assert_called_once_with(journal.data_dir, run.id)
+    gc_mock.assert_called_once_with(
+        journal.data_dir, run.id, archive_root=recon_archive_root(harness.config),
+    )
 
     # The dead predecessor's lock was released by the recovery body (never
     # adopted by this instance on the fallback path).
@@ -10636,7 +11233,9 @@ async def test_resume_interrupted_runs_honours_opt_out_on_resuming_side(
 
     # Events restored, config dir GC'd, dead predecessor's lock released.
     restore_spy.assert_awaited()
-    gc_mock.assert_called_once_with(journal.data_dir, run.id)
+    gc_mock.assert_called_once_with(
+        journal.data_dir, run.id, archive_root=recon_archive_root(harness.config),
+    )
     assert await event_buffer.get_lock_holder_instance_id(project_id) is None
 
     # A deliberate opt-out is NOT a resume failure: the storm counter is not
@@ -11055,6 +11654,103 @@ async def test_known_project_roots_wins_over_event_payload_in_backlog_iterator(
     )
 
 
+def _one_event_per_chunk_assembler(memory_service, taskmaster, config, project_root=''):
+    """A ContextAssembler stand-in whose every chunk is the oldest peeked event."""
+    inst = MagicMock()
+
+    async def assemble(peeked, watermark, project_id):
+        if not peeked:
+            return AssembledPayload(events=[])
+        return AssembledPayload(events=[peeked[0]], events_remaining=len(peeked) - 1)
+
+    inst.assemble = assemble
+    return inst
+
+
+def _first_stage_completes_once_then(harness, later_run) -> None:
+    """Stage 1 completes its first run and behaves as *later_run* afterwards."""
+    first_run = harness.stages[0].run
+    calls = 0
+
+    async def run(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await (first_run if calls == 1 else later_run)(*args, **kwargs)
+
+    harness.stages[0].run = run
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_chunk_failure_restores_only_the_failing_chunk(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """Task 6453: a failed chunk re-buffers only its own event, attributed at
+    drain, and leaves the earlier completed chunk's event drained."""
+    harness, esc_queue = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    _first_stage_completes_once_then(
+        harness, _raising_stage_run(lambda: RuntimeError('chunk 2 exploded')),
+    )
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+    drain_spy = AsyncMock(side_effect=event_buffer.drain_by_ids)
+    event_buffer.drain_by_ids = drain_spy
+
+    with patch(
+        'fused_memory.reconciliation.context_assembler.ContextAssembler',
+        side_effect=_one_event_per_chunk_assembler,
+    ):
+        await BacklogIterator(
+            harness.config, harness.journal, harness.buffer, harness,
+        ).run('test-project')
+
+    failed_chunk, completed_chunk = await journal.get_recent_runs('test-project')
+    assert completed_chunk.status == 'completed'
+    assert failed_chunk.status == 'failed'
+    assert len(await event_buffer.get_drained_events('test-project', completed_chunk.id)) == 1
+    assert await event_buffer.count_buffered('test-project') == 2
+    assert [e for e in esc_queue.get_pending() if e.category == 'recon_backlog_overflow']
+    assert failed_chunk.id in {c.kwargs.get('run_id') for c in drain_spy.await_args_list}
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_deadline_restores_only_the_in_flight_chunk(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """Task 6453: BacklogIterator.run owns its cycle_timeout_seconds deadline.
+    When it fires, the in-flight chunk's event is restored, the earlier
+    completed chunk's event stays drained, and TimeoutError propagates; the
+    deadline expires once the second chunk is in flight, never on the host
+    clock."""
+    deadline = _ManualDeadline()
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    _first_stage_completes_once_then(harness, _expiring_stage_run(deadline))
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    with (
+        patch(
+            'fused_memory.reconciliation.context_assembler.ContextAssembler',
+            side_effect=_one_event_per_chunk_assembler,
+        ),
+        pytest.raises(TimeoutError),
+    ):
+        await BacklogIterator(
+            harness.config, harness.journal, harness.buffer, harness,
+            iteration_deadline=deadline.arm,
+        ).run('test-project')
+
+    assert deadline.delays == [harness.config.cycle_timeout_seconds]
+    [completed_chunk] = [
+        r for r in await journal.get_recent_runs('test-project') if r.status == 'completed'
+    ]
+    assert len(await event_buffer.get_drained_events('test-project', completed_chunk.id)) == 1
+    assert await event_buffer.count_buffered('test-project') == 2
+
+
 # ── Tests for Task 2040: bound BacklogIterator with a cumulative budget ────
 
 
@@ -11122,9 +11818,9 @@ async def test_backlog_iterator_budget_yield_stops_after_one_chunk(
     restore_calls: list[str] = []
     original_restore = event_buffer.restore_drained
 
-    async def spy_restore(pid):
+    async def spy_restore(pid, *args, **kwargs):
         restore_calls.append(pid)
-        return await original_restore(pid)
+        return await original_restore(pid, *args, **kwargs)
 
     event_buffer.restore_drained = spy_restore
 
@@ -11159,69 +11855,71 @@ async def test_backlog_iterator_budget_yield_stops_after_one_chunk(
     )
 
 
+async def _drive_one_project_loop_cycle(harness):
+    """Drive _project_loop until its first cycle has released the lock."""
+    witnessed_complete, completed = _witness_call(harness.buffer.mark_run_complete)
+    with patch.object(harness.buffer, 'mark_run_complete', side_effect=witnessed_complete):
+        await _drive_until(harness._project_loop('test-project'), completed)
+
+
+class _ManualDeadline:
+    """An injected recon deadline (``full_cycle_deadline`` /
+    ``iteration_deadline``) that never expires on the clock, so a test lands
+    the timeout at a chosen point instead of racing the host clock."""
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+        self._armed: asyncio.Timeout | None = None
+
+    def arm(self, delay: float) -> asyncio.Timeout:
+        self.delays.append(delay)
+        self._armed = asyncio.timeout(None)
+        return self._armed
+
+    def expire(self) -> None:
+        assert self._armed is not None, 'expire() called before the deadline was armed'
+        self._armed.reschedule(asyncio.get_running_loop().time())
+
+
+async def _expire_then_wait(deadline: _ManualDeadline) -> None:
+    """Expire *deadline*, then wait for the cancellation that expiry delivers."""
+    deadline.expire()
+    await asyncio.sleep(999)
+
+
+def _expiring_stage_run(deadline: _ManualDeadline):
+    """A stage.run stand-in that expires *deadline* and then waits to be cancelled."""
+
+    async def expiring_run(events, watermark, prior_reports, run_id, model=None):
+        await _expire_then_wait(deadline)
+
+    return expiring_run
+
+
 @pytest.mark.asyncio
-async def test_project_loop_bounds_iterate_branch_with_cycle_timeout(
+async def test_project_loop_logs_iterate_timeout_without_restoring(
     journal, event_buffer, mock_memory_service, caplog
 ):
-    """_project_loop must wrap the iterate branch (BacklogIterator.run) in the
-    same asyncio.wait_for(cycle_timeout_seconds) guard the non-iterate branch
-    already has, so a single wedged chunk is bounded and surfaces as an
-    observable timeout instead of hanging the per-project lock forever.
-
-    Forces the iterate branch via a class-patched BacklogIterator.should_iterate
-    (True) and wedges BacklogIterator.run with an unconditional asyncio.sleep,
-    mirroring the wedge technique in test_timeout_marks_run_failed (~L790). A
-    tiny cycle_timeout_seconds makes the wait_for fire quickly.
-
-    RED before step-6: iterator.run(project_id) is currently awaited
-    unwrapped in _project_loop, so it hangs for the full asyncio.sleep(999)
-    instead of timing out — restore_drained is never called and no
-    'reconciliation.iteration_timed_out' record is logged before the outer
-    test-harness wait_for below cuts the test off.
-    """
+    """The iterator, not the loop, owns restores on its timeout (task 6453)."""
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     harness.config.cycle_timeout_seconds = 1
     await _seed_recon_state(event_buffer)
-
-    restore_calls: list[str] = []
-    original_restore = event_buffer.restore_drained
-
-    async def spy_restore(pid):
-        restore_calls.append(pid)
-        return await original_restore(pid)
-
-    event_buffer.restore_drained = spy_restore
-
-    async def hang_forever(*_a, **_k):
-        await asyncio.sleep(999)
+    restore_spy = AsyncMock(side_effect=event_buffer.restore_drained)
+    event_buffer.restore_drained = restore_spy
 
     with (
         patch.object(BacklogIterator, 'should_iterate', new=AsyncMock(return_value=True)),
-        patch.object(BacklogIterator, 'run', new=AsyncMock(side_effect=hang_forever)),
+        patch.object(BacklogIterator, 'run', new=AsyncMock(side_effect=TimeoutError())),
         caplog.at_level(logging.ERROR, logger='fused_memory.reconciliation.harness'),
-        contextlib.suppress(TimeoutError),
     ):
-        await asyncio.wait_for(harness._project_loop('test-project'), timeout=2.5)
+        await _drive_one_project_loop_cycle(harness)
 
-    # The iterate branch must be bounded the same way the non-iterate branch
-    # is: a TimeoutError from the wrapping wait_for restores the buffer.
-    assert restore_calls, (
-        'Expected buffer.restore_drained to be called after the iterate branch '
-        'timed out, but it was never invoked — iterator.run() is not wrapped in '
-        'asyncio.wait_for(cycle_timeout_seconds).'
-    )
-    assert all(pid == 'test-project' for pid in restore_calls)
-
-    # The timeout must be observable, not silent.
-    timeout_records = [
+    [timeout_record] = [
         r for r in caplog.records if r.getMessage() == 'reconciliation.iteration_timed_out'
     ]
-    assert timeout_records, (
-        'Expected a reconciliation.iteration_timed_out log record after the '
-        f'iterate branch timed out, got records: {[r.getMessage() for r in caplog.records]}'
-    )
-    assert timeout_records[0].__dict__.get('project_id') == 'test-project'
-    assert timeout_records[0].__dict__.get('timeout') == 1
+    assert timeout_record.__dict__.get('project_id') == 'test-project'
+    assert timeout_record.__dict__.get('timeout') == harness.config.cycle_timeout_seconds
+    restore_spy.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -11286,9 +11984,9 @@ async def test_backlog_iterator_budget_bounds_chunks_and_converges_across_invoca
     restore_calls: list[str] = []
     original_restore = event_buffer.restore_drained
 
-    async def spy_restore(pid):
+    async def spy_restore(pid, *args, **kwargs):
         restore_calls.append(pid)
-        return await original_restore(pid)
+        return await original_restore(pid, *args, **kwargs)
 
     event_buffer.restore_drained = spy_restore
 
@@ -13085,6 +13783,134 @@ async def test_project_loop_releases_lock_when_replay_raises(
 
 
 @pytest.mark.asyncio
+async def test_project_loop_timeout_in_post_completion_tail_keeps_events_drained(
+    journal, event_buffer, mock_memory_service, tmp_path, caplog,
+):
+    """Task 6453: a cycle timeout landing after the run durably completed
+    leaves that run's consumed events drained; the deadline expires once the
+    tail is entered, never on the host clock."""
+    deadline = _ManualDeadline()
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+        full_cycle_deadline=deadline.arm,
+    )
+    assert harness.judge is not None
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+
+    async def stalled_mark_judge_pending(run_id, project_id):
+        await _expire_then_wait(deadline)
+
+    journal.mark_judge_pending = stalled_mark_judge_pending
+
+    with caplog.at_level(logging.ERROR, logger='fused_memory.reconciliation.harness'):
+        await _drive_one_project_loop_cycle(harness)
+
+    [run] = await journal.get_recent_runs('test-project')
+    assert run.status == 'completed'
+    assert await event_buffer.count_buffered('test-project') == 0
+    assert len(await event_buffer.get_drained_events('test-project', run.id)) == 2
+    assert [
+        r for r in caplog.records if r.getMessage() == 'reconciliation.full_cycle_timed_out'
+    ]
+    assert deadline.delays == [harness.config.cycle_timeout_seconds]
+
+
+@pytest.mark.asyncio
+async def test_project_loop_timeout_landing_after_the_completion_commit_keeps_events_drained(
+    journal, event_buffer, mock_memory_service, tmp_path, caplog,
+):
+    """A cycle timeout whose cancellation reaches run_full_cycle after
+    complete_run(run_id, 'completed') has committed leaves the run completed
+    and its consumed events drained."""
+    deadline = _ManualDeadline()
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+        full_cycle_deadline=deadline.arm,
+    )
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+    original_complete_run = journal.complete_run
+
+    async def complete_run_then_expire(run_id, status):
+        if status != 'completed':
+            return await original_complete_run(run_id, status)
+        await original_complete_run(run_id, status)
+        await _expire_then_wait(deadline)
+
+    journal.complete_run = complete_run_then_expire
+
+    with caplog.at_level(logging.ERROR, logger='fused_memory.reconciliation.harness'):
+        await _drive_one_project_loop_cycle(harness)
+
+    [run] = await journal.get_recent_runs('test-project')
+    assert run.status == 'completed'
+    assert await event_buffer.count_buffered('test-project') == 0
+    assert len(await event_buffer.get_drained_events('test-project', run.id)) == 2
+    assert len([
+        r for r in caplog.records if r.getMessage() == 'reconciliation.full_cycle_timed_out'
+    ]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('resume_after_restart', [True, False])
+async def test_project_loop_pre_completion_timeout_restores_only_the_timed_out_run(
+    journal, event_buffer, mock_memory_service, tmp_path, resume_after_restart,
+):
+    """Task 6453: a cycle timeout re-buffers the timed-out run's events and
+    leaves an earlier completed run's events drained."""
+    deadline = _ManualDeadline()
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+        full_cycle_deadline=deadline.arm,
+    )
+    harness.config.resume_after_restart = resume_after_restart
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+    run_a = await harness.run_full_cycle('test-project', 'seed')
+    assert run_a.status == RunStatus.completed
+
+    harness.stages[0].run = _expiring_stage_run(deadline)
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+
+    await _drive_one_project_loop_cycle(harness)
+
+    assert len(await event_buffer.get_drained_events('test-project', run_a.id)) == 2
+    assert await event_buffer.count_buffered('test-project') == 2
+    timed_out_run, earlier_run = await journal.get_recent_runs('test-project')
+    assert earlier_run.id == run_a.id
+    assert timed_out_run.status != 'completed'
+    assert deadline.delays == [harness.config.cycle_timeout_seconds]
+
+
+@pytest.mark.asyncio
+async def test_project_loop_full_cycle_raising_before_its_run_row_restores_its_events(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """Task 6453: run_full_cycle raising after its drain but before its own
+    failure arms (journal.start_run) leaves no run row to fail; the loop's
+    bounded call still re-buffers that run's events, and only those."""
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+    run_a = await harness.run_full_cycle('test-project', 'seed')
+    assert run_a.status == RunStatus.completed
+
+    _fail_first_call(journal, 'start_run', lambda: RuntimeError('start_run exploded'))
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+
+    await _drive_one_project_loop_cycle(harness)
+
+    assert len(await event_buffer.get_drained_events('test-project', run_a.id)) == 2
+    assert await event_buffer.count_buffered('test-project') == 2
+    assert [r.id for r in await journal.get_recent_runs('test-project')] == [run_a.id]
+
+
+@pytest.mark.asyncio
 async def test_project_loop_replays_before_releasing_lock_on_halt(
     journal, event_buffer, mock_memory_service
 ):
@@ -14787,6 +15613,133 @@ async def test_get_prior_s3_findings_looks_past_an_all_superseded_run(
     assert await harness._get_prior_s3_findings('test-project') == [older_live]
 
 
+# task-5482: a row its own run superseded is a record of the claim, not an
+# occurrence of it, so it must not count toward the escalation threshold.
+
+
+def _retired_occurrence_of(finding: dict) -> list[dict]:
+    """What get_assembled_report persists for a run that filed *finding* and then
+    retired it; the superseder's category and description differ, so it never
+    shares the claim's fingerprint."""
+    return [
+        {**finding, 'actionable': False, 'superseded_by': _SUPERSEDER_FID},
+        {
+            'description': f"Retracted: {finding['description']}",
+            'severity': finding['severity'],
+            'actionable': False,
+            'category': f"{finding['category']}_resolved",
+            'affected_ids': list(finding['affected_ids']),
+            'suggested_action': 'None: the earlier claim was refuted',
+            'superseded_by': None,
+        },
+    ]
+
+
+def _persistent_unresolved_summaries(esc_queue) -> list[str]:
+    return [
+        e.summary for e in esc_queue.get_pending()
+        if e.category == 'recon_integrity_issue'
+        and e.summary.startswith('Persistently unresolved after remediation')
+    ]
+
+
+async def _cycle_flagging_after_prior_runs(
+    journal, event_buffer, mock_memory_service, tmp_path, live: dict, prior_items: list[dict],
+):
+    """Persist THRESHOLD - 2 completed runs carrying *prior_items*, then run one
+    cycle whose S3 flags *live*; return the escalation queue it files into."""
+    from escalation.queue import EscalationQueue
+
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+    for _ in range(_INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2):
+        await _persist_parent_run(journal, 'test-project', prior_items)
+
+    await event_buffer.push(_make_event())
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=[live])
+
+    await harness.run_full_cycle('test-project', 'buffer_size:1')
+    return esc_queue
+
+
+def _assert_suppressed_at_this_cycles_own_two_runs(esc_queue, caplog) -> None:
+    assert _persistent_unresolved_summaries(esc_queue) == []
+    suppressed = _drop_records(caplog, 'reconciliation.unresolved_after_remediation_suppressed')
+    assert suppressed, 'expected the below-threshold finding to be suppressed'
+    assert suppressed[0].__dict__.get('persistence') == 2
+
+
+@pytest.mark.asyncio
+async def test_superseded_prior_occurrences_do_not_push_a_finding_to_escalation(
+    journal, event_buffer, mock_memory_service, tmp_path, caplog,
+):
+    """Prior runs that filed F and then retired it are not occurrences of F, so
+    only this cycle's parent and remediation runs count: persistence 2, below
+    the threshold, suppressed rather than escalated."""
+    live = _make_s3_findings()[0]
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        esc_queue = await _cycle_flagging_after_prior_runs(
+            journal, event_buffer, mock_memory_service, tmp_path,
+            live, _retired_occurrence_of(live),
+        )
+
+    _assert_suppressed_at_this_cycles_own_two_runs(esc_queue, caplog)
+
+
+@pytest.mark.asyncio
+async def test_an_unfingerprintable_superseded_row_does_not_degrade_the_count(
+    journal, event_buffer, mock_memory_service, tmp_path, caplog,
+):
+    """A retired row can never count, so a malformed one (its ``affected_ids``
+    cannot be iterated, so fingerprinting it raises) must not trip the degraded
+    fail-toward-escalate count either."""
+    live = _make_s3_findings()[0]
+    malformed_retired = {
+        **live, 'affected_ids': 7, 'actionable': False, 'superseded_by': _SUPERSEDER_FID,
+    }
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        esc_queue = await _cycle_flagging_after_prior_runs(
+            journal, event_buffer, mock_memory_service, tmp_path,
+            live, [malformed_retired],
+        )
+
+    assert not _drop_records(caplog, 'reconciliation.persistence_item_fingerprint_failed')
+    _assert_suppressed_at_this_cycles_own_two_runs(esc_queue, caplog)
+
+
+@pytest.mark.asyncio
+async def test_a_standing_copy_beside_a_retired_one_still_counts(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """A run holding a standing copy of F still counts once, even when a retired
+    copy of F precedes it in the same run.
+
+    Guards two wrong implementations that would both read 2 here and suppress:
+    a RUN-level skip, where any superseded match disqualifies the whole run; and
+    a key-PRESENCE test such as ``'superseded_by' in item``, which in production
+    would silence every recon_integrity_issue escalation, because
+    get_assembled_report always projects the key.
+    """
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    live = _make_s3_findings()[0]
+    esc_queue = await _cycle_flagging_after_prior_runs(
+        journal, event_buffer, mock_memory_service, tmp_path,
+        live, _retired_occurrence_of(live) + [{**live, 'superseded_by': None}],
+    )
+
+    summaries = _persistent_unresolved_summaries(esc_queue)
+    assert len(summaries) == 1, summaries
+    assert f'({_INTEGRITY_FINDING_RECURRENCE_THRESHOLD} cycles)' in summaries[0]
+
+
 @pytest.mark.asyncio
 async def test_phantom_stripped_finding_is_referenceless_but_carries_citation_failures():
     """Producer-contract pin, tying _make_phantom_cited_finding() to what the
@@ -15893,9 +16846,10 @@ class TestIntegrityGateInputParityWithRenderer:
     def _heartbeat(delta: timedelta) -> str:
         """ISO heartbeat stamped *delta* from now (negative = past).
 
-        Stale/fresh margins are set against live_workflow_detector's
-        DEFAULT_HEARTBEAT_TTL (10 minutes) with enough slack that real-clock
-        drift during the test can never flip the verdict.
+        Stale/fresh margins are set against
+        shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL (10 minutes) with
+        enough slack that real-clock drift during the test can never flip the
+        verdict.
         """
         return (datetime.now(UTC) + delta).isoformat()
 
@@ -15966,17 +16920,12 @@ class TestIntegrityGateInputParityWithRenderer:
         # dropped by any other process or developer would flip `corroborated` and
         # break test_uncorroborated_in_progress_cited_task_escalates for reasons
         # having nothing to do with the code under test. Stub values mirror the
-        # real absent-file returns exactly: read_scheduler_state's empty skeleton
-        # (scheduler_state.py::_empty_skeleton) and orchestrator_started_at's None
+        # real absent-file returns exactly: read_scheduler_state's
+        # SchedulerStateSnapshot.empty() and orchestrator_started_at's None
         # for an absent/unparseable lock.
         monkeypatch.setattr(
             harness_module, 'read_scheduler_state',
-            lambda _root: {
-                'queue': [], 'parks': {}, 'park_stacks': {},
-                'effective_priorities': {}, 'pin_queue': [], 'overrides': {},
-                'current_holders': {}, 'is_paused': False, 'pause_reason': None,
-                'snapshot_at': None,
-            },
+            lambda _root: SchedulerStateSnapshot.empty(),
         )
         monkeypatch.setattr(harness_module, 'orchestrator_started_at', lambda _root: None)
 
@@ -16510,8 +17459,8 @@ class TestRemediationSnapshotClockPinnedToTreeRead:
     stamped `_tasks_snapshot_at` with a fresh `datetime.now(UTC)` taken AFTER
     the S1->S2->S3 stage loop that follows, which is minutes of LLM work away
     from the actual tree read. Since the gate compares a cited task's
-    `heartbeat_at` against `now - DEFAULT_HEARTBEAT_TTL` (10 minutes,
-    live_workflow_detector.DEFAULT_HEARTBEAT_TTL), that gap could silently
+    `heartbeat_at` against `now - DEFAULT_CLAIMANT_HEARTBEAT_TTL` (10 minutes,
+    shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL), that gap could silently
     age a heartbeat that was fresh at the read past the TTL and let a
     spurious stranded-work escalation through for a task that was
     demonstrably live at the moment the tree was read — precisely the
@@ -16598,12 +17547,7 @@ class TestRemediationSnapshotClockPinnedToTreeRead:
         # /tmp/test-project root).
         monkeypatch.setattr(
             harness_module, 'read_scheduler_state',
-            lambda _root: {
-                'queue': [], 'parks': {}, 'park_stacks': {},
-                'effective_priorities': {}, 'pin_queue': [], 'overrides': {},
-                'current_holders': {}, 'is_paused': False, 'pause_reason': None,
-                'snapshot_at': None,
-            },
+            lambda _root: SchedulerStateSnapshot.empty(),
         )
         monkeypatch.setattr(harness_module, 'orchestrator_started_at', lambda _root: None)
 
@@ -18486,6 +19430,29 @@ class TestHarnessIndexHealthStartupSweep:
 # ── Tests for task 1938: harness._reconcile_status_correction ──────────────────
 
 
+@contextlib.contextmanager
+def _real_metadata_read_raising(harness, config, scroll_failure: BaseException):
+    """Route ``harness.memory.get_memories_by_metadata`` through a REAL
+    MemoryService and Mem0Backend whose Qdrant scroll raises *scroll_failure*.
+    """
+    from fused_memory.services.memory_service import MemoryService
+
+    real_svc = MemoryService(config)
+    client = AsyncMock()
+    client.scroll = AsyncMock(side_effect=scroll_failure)
+    with patch.object(real_svc.mem0, '_get_async_qdrant', AsyncMock(return_value=client)):
+        harness.memory.get_memories_by_metadata = real_svc.get_memories_by_metadata
+        yield
+
+
+def _absent_collection_disclosures(caplog) -> list[logging.LogRecord]:
+    """The Mem0 backend's INFO records announcing a collection read as empty."""
+    return [
+        r for r in caplog.records
+        if r.name == 'fused_memory.backends.mem0_client' and hasattr(r, 'collection')
+    ]
+
+
 class TestHarnessReconcileStatusCorrection:
     """ReconciliationHarness._reconcile_status_correction diffs the cached Mem0
     project_status_correction memory against the live get_statuses census and
@@ -18796,88 +19763,60 @@ class TestHarnessReconcileStatusCorrection:
         )
 
     @pytest.mark.asyncio
-    async def test_missing_collection_404_treated_as_no_prior_corrections(
-        self, journal, event_buffer, mock_memory_service, caplog
+    async def test_missing_collection_reads_as_no_prior_corrections_via_the_primitive(
+        self, journal, event_buffer, mock_memory_service, mock_config, caplog
     ):
         """A project whose Qdrant collection was never provisioned holds no
-        prior corrections — an empty result, not a reconciliation failure.
+        prior corrections: the plain found=False record, with no write and no
+        WARNING.
 
-        Before task 2949 that 404 fell into the generic handler, so every cycle
-        logged a WARNING and returned an `error` record that Stage 3 then
-        re-flagged as an unresolved integrity issue, forever.
-
-        step-3 (RED): the 404 is still classified as a failure.
+        Task 2949 caught that 404 here; task 4858 moved the degradation into
+        the Mem0 primitive, so the read goes through a REAL MemoryService and
+        Mem0Backend and the absent-vs-empty disclosure is the backend's INFO.
         """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness.memory.get_memories_by_metadata = AsyncMock(
-            side_effect=UnexpectedResponse(
-                404,
-                'Not Found',
-                b"Collection `fused_solar_challenge` doesn't exist!",
-                httpx.Headers(),
-            )
+        collection = Scope(project_id='solar_challenge').mem0_collection_name(
+            mock_config.mem0.collection_prefix,
         )
+        missing = missing_collection_404(collection)
 
-        with caplog.at_level(logging.INFO):
+        with (
+            _real_metadata_read_raising(harness, mock_config, missing),
+            caplog.at_level(logging.INFO),
+        ):
             result = await harness._reconcile_status_correction(
                 'solar_challenge', {'1': 'done'}
             )
 
-        assert result is not None
         assert result == {
             'available': True,
             'found': False,
             'diverged': False,
             'superseded': False,
-            'collection_missing': True,
         }
-        assert 'error' not in result
-        # Structurally the same no-op as "no cached memory": nothing written.
         harness.memory.add_memory.assert_not_called()  # type: ignore[attr-defined]
         harness.memory.delete_memory.assert_not_called()  # type: ignore[attr-defined]
-        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
-            'a missing collection is an empty result, not a failure — it must '
-            'not emit the per-cycle WARNING the generic handler logs'
-        )
-        # Loud-over-silent: quiet is NOT the contract, INFO is.  The disclosure
-        # is an operator's only way to tell "collection absent" from "collection
-        # genuinely empty" behind found=False, so pin its presence AND its
-        # structured project_id — not merely the absence of a WARNING, which
-        # deleting the logger.info call outright would also satisfy.
-        missing_records = [
-            r
-            for r in caplog.records
-            if 'reconciliation.status_correction_collection_missing' in r.getMessage()
-        ]
-        assert missing_records, (
-            'Expected an INFO reconciliation.status_correction_collection_missing '
-            f'record disclosing WHY found=False; got '
-            f'{[(r.levelno, r.getMessage()) for r in caplog.records]}'
-        )
-        assert missing_records[0].levelno == logging.INFO
-        assert getattr(missing_records[0], 'project_id', None) == 'solar_challenge', (
-            'the disclosure must name the project in a structured extra= field, '
-            f'got {getattr(missing_records[0], "project_id", None)!r}'
-        )
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert [
+            (r.levelno, getattr(r, 'collection', None))
+            for r in _absent_collection_disclosures(caplog)
+        ] == [(logging.INFO, collection)]
 
     @pytest.mark.asyncio
-    async def test_non_missing_collection_response_still_errors(
-        self, journal, event_buffer, mock_memory_service, caplog
+    async def test_non_missing_collection_failure_still_errors_via_the_primitive(
+        self, journal, event_buffer, mock_memory_service, mock_config, caplog
     ):
         """Boundary: ONLY the missing-collection 404 degrades.  A 500 from the
         same client is a real backend failure and must keep surfacing as an
         error record + WARNING (no-silent-fail).
-
-        step-3 (RED): guards the step-4 catch against over-matching.
         """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness.memory.get_memories_by_metadata = AsyncMock(
-            side_effect=UnexpectedResponse(
-                500, 'Internal Server Error', b'boom', httpx.Headers()
-            )
-        )
+        failure = UnexpectedResponse(500, 'Internal Server Error', b'boom', httpx.Headers())
 
-        with caplog.at_level(logging.WARNING):
+        with (
+            _real_metadata_read_raising(harness, mock_config, failure),
+            caplog.at_level(logging.INFO),
+        ):
             result = await harness._reconcile_status_correction(
                 'solar_challenge', {'1': 'done'}
             )
@@ -18885,10 +19824,10 @@ class TestHarnessReconcileStatusCorrection:
         assert result is not None
         assert 'error' in result
         assert result['superseded'] is False
-        assert 'collection_missing' not in result
         assert any(r.levelno >= logging.WARNING for r in caplog.records), (
             'Expected a WARNING log when the query fails with a non-404'
         )
+        assert _absent_collection_disclosures(caplog) == []
 
     # ------------------------------------------------------------------ #
     # task 1938 amendment: pool-capping + delete-loop resilience
@@ -19273,6 +20212,95 @@ class TestFullCycleWiringDiagnostics:
         )
         assert gqh.get('healthy') is False, (
             f'Expected graphiti_queue_health["healthy"]==False, got {gqh.get("healthy")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_attributes_dead_writes_by_operation(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+        caplog,
+    ):
+        """Stage 1's input and the unhealthy WARNING attribute dead writes per operation.
+
+        Task 5478.  Built through the constructor with the stages stubbed at class
+        level, so no private harness attribute is touched.  The WARNING keeps its
+        bare-token message; its extra carries the breakdown.
+        """
+        from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            IntegrityCheck,
+            TaskKnowledgeSync,
+        )
+
+        dead_by_operation = {'add_episode': 2, 'add_memory_graphiti': 1}
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        mock_memory_service.durable_queue.get_stats = AsyncMock(
+            return_value={
+                'counts': {'dead': 3},
+                'oldest_pending_age_seconds': None,
+                'dead_by_operation': dict(dead_by_operation),
+            }
+        )
+        empty_project = AsyncMock()
+        empty_project.get_tasks = AsyncMock(return_value={'tasks': []})
+        empty_project.get_statuses_fresh = AsyncMock(return_value={})
+        harness = ReconciliationHarness(
+            memory_service=mock_memory_service,
+            taskmaster=empty_project,
+            journal=journal,
+            event_buffer=event_buffer,
+            config=FusedMemoryConfig(
+                reconciliation=ReconciliationConfig(
+                    enabled=True,
+                    explore_codebase_root='/tmp/test',
+                    agent_llm_provider='anthropic',
+                    agent_llm_model='claude-sonnet-4-20250514',
+                    judge_enabled=False,
+                )
+            ),
+            known_projects={'test-project': '/tmp/test-project'},
+        )
+
+        stage1_queue_health: list = []
+
+        async def fake_run(
+            self, events, watermark, prior_reports, run_id, model=None, resume_session_id=None,
+        ):
+            if isinstance(self, MemoryConsolidator):
+                stage1_queue_health.append(self.graphiti_queue_health)
+            now = datetime.now(UTC)
+            return StageReport(stage=self.stage_id, started_at=now, completed_at=now)
+
+        harness_logger = 'fused_memory.reconciliation.harness'
+        with (
+            patch.object(MemoryConsolidator, 'run', fake_run),
+            patch.object(TaskKnowledgeSync, 'run', fake_run),
+            patch.object(IntegrityCheck, 'run', fake_run),
+            caplog.at_level(logging.WARNING, logger=harness_logger),
+        ):
+            await harness.run_full_cycle(
+                'test-project', 'attribution-test', events=[_make_event()],
+            )
+
+        assert len(stage1_queue_health) == 1, (
+            f'expected Stage 1 to run once, saw {stage1_queue_health!r}'
+        )
+        assert stage1_queue_health[0]['dead_by_operation'] == dead_by_operation
+
+        unhealthy = [
+            r for r in caplog.records
+            if r.name == harness_logger
+            and r.getMessage() == 'reconciliation.graphiti_queue_unhealthy'
+        ]
+        assert len(unhealthy) == 1, (
+            f'expected exactly one bare-token unhealthy warning, got {unhealthy!r}'
+        )
+        assert getattr(unhealthy[0], 'dead_by_operation', None) == dead_by_operation, (
+            'the unhealthy warning extra must carry dead_by_operation'
         )
 
     @pytest.mark.asyncio
@@ -20535,18 +21563,15 @@ async def test_run_full_cycle_attributes_drained_events_to_run_id(
     # the next scenario starts from an empty 'buffered' set.
     await event_buffer.drain('test-project')
 
-    # (b) Iterator-fed path: events pre-drained by the caller (mirroring
-    # BacklogIterator.run's drain_by_ids call, which drains BEFORE
-    # run_full_cycle mints a run_id) must be attributed via
-    # buffer.mark_drained_run_id(project_id, event_ids, run_id).
+    # (b) Iterator-fed path: events pre-drained by the caller must be
+    # attributed via buffer.mark_drained_run_id(project_id, event_ids, run_id).
     original_mark = event_buffer.mark_drained_run_id
     harness.buffer.mark_drained_run_id = AsyncMock(side_effect=original_mark)
 
     pre_drained = [_make_event(), _make_event()]
     for e in pre_drained:
         await event_buffer.push(e)
-    # Pre-drain with no run_id, exactly like drain_by_ids leaves them before
-    # run_full_cycle has a run_id to attribute them with.
+    # Pre-drain with no run_id, so only run_full_cycle can attribute them.
     await event_buffer.drain('test-project')
 
     run_b = await harness.run_full_cycle(
@@ -20558,12 +21583,119 @@ async def test_run_full_cycle_attributes_drained_events_to_run_id(
     )
 
 
+@pytest.mark.asyncio
+async def test_run_full_cycle_adopts_a_caller_minted_run_id(
+    journal, event_buffer, mock_memory_service,
+):
+    """A caller-minted run_id names the journal row and the drained events, so
+    a caller whose wait_for timed out can still scope its restore (task 6453)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    for stage in harness.stages:
+        _mock_stage_run(stage)
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+
+    run = await harness.run_full_cycle('test-project', 't', run_id='caller-minted')
+
+    assert run.id == 'caller-minted'
+    row = await journal.get_run('caller-minted')
+    assert row is not None
+    assert row.status == 'completed'
+    assert len(await event_buffer.get_drained_events('test-project', 'caller-minted')) == 2
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_rejects_a_run_id_alongside_resume_run(
+    journal, event_buffer, mock_memory_service,
+):
+    """A resumed run keeps resume_run.id, so also passing run_id is refused
+    before any journal row or drain."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    await event_buffer.push(_make_event())
+    await event_buffer.push(_make_event())
+    resume_run = ReconciliationRun(
+        id='interrupted-run',
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='unit-test',
+        started_at=datetime.now(UTC),
+        status=RunStatus.interrupted,
+    )
+
+    with pytest.raises(ValueError, match=r'resume_run=.*run_id='):
+        await harness.run_full_cycle(
+            'test-project', 't', run_id='x', resume_run=resume_run, events=[],
+        )
+
+    assert await journal.get_recent_runs('test-project') == []
+    assert await event_buffer.count_buffered('test-project') == 2
+
+
+class TestResumeGuardDoesNotCreateTheConfigDir:
+    """The resume-eligibility probe only READS the per-run config dir; probing a
+    run whose dir was already GC'd must not resurrect it (task 3972)."""
+
+    @staticmethod
+    def _run_reaching_the_transcript_rail() -> ReconciliationRun:
+        """Fresh interrupt, no ``_resume`` meta, a captured session: every
+        cheaper rail passes, so evaluation reaches transcript existence."""
+        return ReconciliationRun(
+            id=str(uuid.uuid4()),
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='unit-test',
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            status=RunStatus.interrupted,
+            session_id='0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+            stage_cursor='task_knowledge_sync',
+            instance_id='dead-pred',
+        )
+
+    @pytest.mark.asyncio
+    async def test_probe_leaves_a_gcd_run_dir_absent(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        run = self._run_reaching_the_transcript_rail()
+        before = sorted(p.name for p in journal.data_dir.iterdir())
+
+        reason = harness._resume_guard_reason(run)
+
+        assert reason is not None
+        assert 'no transcript' in reason
+        assert not run_config_dir_path(journal.data_dir, run.id).exists()
+        assert not recon_config_base_dir(journal.data_dir).exists()
+        assert sorted(p.name for p in journal.data_dir.iterdir()) == before
+
+    @pytest.mark.asyncio
+    async def test_probe_still_passes_when_a_transcript_is_present(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        run = self._run_reaching_the_transcript_rail()
+        assert run.session_id is not None
+        session_dir = (
+            run_config_dir_path(journal.data_dir, run.id)
+            / 'projects' / '-home-leo-src-dark-factory'
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / f'{run.session_id}.jsonl').write_text(
+            json.dumps({'sessionId': run.session_id}) + '\n'
+        )
+
+        assert harness._resume_guard_reason(run) is None
+
+
 class TestPerRunConfigDirGC:
-    """The harness GCs each run's per-run recon CLI config dir at every terminal
-    transition (task 2744): run_full_cycle (success AND failure) and
-    _recover_one_run all call gc_run_config_dir(journal.data_dir, run_id).
-    Patching the module-level symbol with a spy sidesteps the generated-run_id /
-    real-dir problem — we assert the call, not the filesystem effect."""
+    """Every terminal transition archives a run's per-run recon CLI config dir,
+    then destroys it (tasks 2744, 3972): gc_run_config_dir(journal.data_dir,
+    run_id, archive_root=recon_archive_root(config)) is called from
+    _recover_one_run and from _persist_stage_reports_then_gc_config_dir, the
+    tail shared by run_full_cycle (success AND failure) and
+    _run_remediation_pass. Patching the module-level symbol with a spy sidesteps
+    the generated-run_id / real-dir problem — we assert the call, not the
+    filesystem effect."""
 
     @pytest.mark.asyncio
     async def test_gc_after_successful_full_cycle(
@@ -20582,7 +21714,9 @@ class TestPerRunConfigDirGC:
             run = await harness.run_full_cycle('test-project', 'test-trigger')
 
         assert run.status == RunStatus.completed
-        gc_spy.assert_any_call(journal.data_dir, run.id)
+        gc_spy.assert_any_call(
+            journal.data_dir, run.id, archive_root=recon_archive_root(harness.config),
+        )
 
     @pytest.mark.asyncio
     async def test_gc_after_failed_full_cycle(
@@ -20600,7 +21734,10 @@ class TestPerRunConfigDirGC:
 
         recent = await journal.get_recent_runs('test-project', limit=1)
         assert recent, 'expected the failed run to be persisted by the journal'
-        gc_spy.assert_any_call(journal.data_dir, recent[0].id)
+        gc_spy.assert_any_call(
+            journal.data_dir, recent[0].id,
+            archive_root=recon_archive_root(harness.config),
+        )
 
     @pytest.mark.asyncio
     async def test_gc_after_recover_one_run(
@@ -20626,7 +21763,85 @@ class TestPerRunConfigDirGC:
         ) as gc_spy:
             await harness._recover_one_run(run, lock_holder=None, lock_age=None)
 
-        gc_spy.assert_any_call(journal.data_dir, run.id)
+        gc_spy.assert_any_call(
+            journal.data_dir, run.id, archive_root=recon_archive_root(harness.config),
+        )
+
+    @pytest.mark.asyncio
+    async def test_gc_passes_none_when_archival_is_disabled(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """The kill switch reaches the destroyer, which degrades to the plain
+        rmtree rather than to some other root."""
+        mock_memory_service.recon_ledger = None
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.config.transcript_archive_enabled = False
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.gc_run_config_dir',
+        ) as gc_spy:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        gc_spy.assert_any_call(journal.data_dir, run.id, archive_root=None)
+
+    @pytest.mark.asyncio
+    async def test_remediation_pass_gc_passes_the_archive_root(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """The third driver reaches the destroyer through the shared tail; moving
+        the GC out of that tail must not silently drop remediation archival."""
+        from fused_memory.reconciliation.harness import TierConfig
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.gc_run_config_dir',
+        ) as gc_spy:
+            await harness._run_remediation_pass(
+                'test-project',
+                'parent-run-id',
+                [_make_s3_findings()[0]],
+                TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+                scope=_scope('test-project', '/tmp/test-project'),
+            )
+
+        expected = recon_archive_root(harness.config)
+        assert expected is not None
+        assert gc_spy.call_args_list, 'the remediation pass never reached the GC'
+        assert all(
+            c.kwargs.get('archive_root') == expected for c in gc_spy.call_args_list
+        ), gc_spy.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_run_loop_announces_the_archive_root_at_startup(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness._recover_stale_runs = AsyncMock(return_value=None)
+        harness._start_escalation_server = AsyncMock()
+        harness._stop_escalation_server = AsyncMock()
+        if harness.judge is not None:
+            harness.judge.initialize = AsyncMock()
+        released = _witness(harness.buffer, 'release_stale_claims')
+        logger_name = 'fused_memory.reconciliation.cli_stage_runner'
+
+        with caplog.at_level(logging.INFO, logger=logger_name):
+            await _drive_run_loop_until(harness, released)
+
+        announced = [
+            r.getMessage() for r in caplog.records if r.name == logger_name
+        ]
+        assert announced == [
+            f'recon transcript archive root: {recon_archive_root(harness.config)}'
+        ]
 
 
 # ── the backlog-mode predicate (task 3049) ────────────────────────────
@@ -21439,15 +22654,6 @@ def _orch_finding(**over) -> dict:
     return finding
 
 
-def _orch_queue_dir(root):
-    """The per-project ORCHESTRATOR escalation queue dir under *root*.
-
-    Distinct from the RECON queue (`config.escalation_queue_dir`, drained by the
-    port-8103 watcher) that `_escalate` writes to — see the A7b scope note.
-    """
-    return root / 'data' / 'escalations'
-
-
 def _wire_orchestrator_queue(harness, tmp_path, monkeypatch, *, live=True):
     """Point 'test-project' at *tmp_path* and force the orchestrator-liveness gate."""
     import fused_memory.reconciliation.harness as _h
@@ -21455,7 +22661,7 @@ def _wire_orchestrator_queue(harness, tmp_path, monkeypatch, *, live=True):
     harness._known_projects = dict(harness._known_projects)
     harness._known_projects['test-project'] = str(tmp_path)
     monkeypatch.setattr(_h, 'is_orchestrator_live_for', lambda _root: live)
-    return _orch_queue_dir(tmp_path)
+    return escalation_queue_dir(tmp_path)
 
 
 def _wire_remediation_tree(harness, task_ids):
@@ -21597,6 +22803,23 @@ def test_file_finding_task_escalation_lands_a_record_on_the_real_task(
     assert detail['run_id'] == 'abcdef0123456789'
     assert detail['project_id'] == 'test-project'
     assert detail['persistence'] == 4
+
+
+def test_file_finding_task_escalation_files_into_the_layout_escalation_queue_when_relocated(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+    escalation_queue_relocation,
+):
+    from escalation.queue import EscalationQueue
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    esc_id = harness._file_finding_task_escalation(
+        'test-project', 'abcdef0123456789', _orch_finding(), 4,
+    )
+
+    assert [e.id for e in EscalationQueue(queue_dir).get_pending()] == [esc_id]
+    assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
 
 def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
@@ -21987,7 +23210,7 @@ def test_unregistered_project_files_nothing(
     assert harness._file_finding_task_escalation(
         'never-registered', 'run-1', _orch_finding(), 4,
     ) is None
-    assert not _orch_queue_dir(tmp_path).exists()
+    assert not escalation_queue_dir(tmp_path).exists()
 
 
 @pytest.mark.parametrize(
@@ -22017,7 +23240,7 @@ def test_unroutable_target_files_nothing_and_touches_no_queue_directory(
     )
 
     assert result is None
-    assert not _orch_queue_dir(tmp_path).exists()
+    assert not escalation_queue_dir(tmp_path).exists()
     assert list(tmp_path.rglob('esc-*')) == []
 
 

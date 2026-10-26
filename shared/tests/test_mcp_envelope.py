@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 import pytest
 
@@ -17,6 +18,7 @@ from shared.mcp_envelope import (
     EnvelopeShape,
     parse_tool_result,
     resolver_failed,
+    write_failure_reason,
 )
 
 # ---------------------------------------------------------------------------
@@ -24,7 +26,7 @@ from shared.mcp_envelope import (
 # ---------------------------------------------------------------------------
 
 
-def _env(payload_obj):
+def _env(payload_obj) -> dict[str, Any]:
     """Build a minimal MCP tool-result envelope around *payload_obj*."""
     return {
         "result": {
@@ -33,6 +35,25 @@ def _env(payload_obj):
             ]
         }
     }
+
+
+def _is_error_env(**extra) -> dict[str, Any]:
+    """An isError reply whose text block would otherwise read as a success."""
+    return {
+        "result": {
+            "isError": True,
+            "content": [{"type": "text", "text": '{"success": true}'}],
+            **extra,
+        }
+    }
+
+
+def _envelope_warnings(caplog):
+    return [
+        r
+        for r in caplog.records
+        if r.name == "shared.mcp_envelope" and r.levelno >= logging.WARNING
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +145,15 @@ _ABNORMAL_CASES = [
     (EnvelopeShape.WRONG_TYPE, _env({"count": 5}), "count", str),
     # WRONG_TYPE — value is None (None is not an instance of dict)
     (EnvelopeShape.WRONG_TYPE, _env({"ptr": None}), "ptr", dict),
+    # IS_ERROR — result.isError is set, even though the text looks like success
+    (EnvelopeShape.IS_ERROR, _is_error_env(), "k", dict),
+    # JSON_RPC_ERROR — the body carries an error member instead of a result
+    (
+        EnvelopeShape.JSON_RPC_ERROR,
+        {"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "Invalid params"}},
+        "k",
+        dict,
+    ),
 ]
 
 # Build the JSON_DECODE_ERROR case properly (None slot was placeholder)
@@ -146,6 +176,8 @@ _ABNORMAL_CASES[5] = (EnvelopeShape.JSON_DECODE_ERROR, _JSON_DECODE_ENV, "k", di
         "key_absent",
         "wrong_type",
         "wrong_type_none_value",
+        "is_error",
+        "json_rpc_error",
     ],
 )
 class TestAbnormalShapes:
@@ -268,6 +300,7 @@ _ALL_FAILURE_INPUTS = [
     (_env({"other": 1}), "missing", dict),
     (_env({"val": "str"}), "val", int),
     (_env({"val": None}), "val", dict),
+    (_is_error_env(), None, dict),
 ]
 
 
@@ -282,6 +315,7 @@ _ALL_FAILURE_INPUTS = [
         "inv_key_absent",
         "inv_wrong_type",
         "inv_none_value",
+        "inv_is_error",
     ],
 )
 class TestInvariant:
@@ -440,3 +474,128 @@ class TestWholeInnerDictMode:
             if r.name == "shared.mcp_envelope" and r.levelno >= logging.WARNING
         ]
         assert warn_records == [], "Empty dict success path must emit zero warnings"
+
+
+# ---------------------------------------------------------------------------
+# result.isError and result.structuredContent
+# ---------------------------------------------------------------------------
+
+
+class TestIsErrorShape:
+    """An isError reply is never a value, whatever its text block says."""
+
+    @pytest.mark.parametrize("key", [None, "success"])
+    def test_is_error_fails_even_when_text_looks_like_success(self, key, caplog):
+        with caplog.at_level(logging.WARNING, logger="shared.mcp_envelope"):
+            value, err = parse_tool_result(_is_error_env(), key, (dict, bool))
+        assert value is None
+        assert isinstance(err, EnvelopeParseError)
+        assert err.shape == EnvelopeShape.IS_ERROR
+        assert err.key == key
+
+    def test_is_error_wins_over_structured_content(self, caplog):
+        env = _is_error_env(structuredContent={"success": True})
+        with caplog.at_level(logging.WARNING, logger="shared.mcp_envelope"):
+            value, err = parse_tool_result(env, None, dict)
+        assert value is None
+        assert err is not None
+        assert err.shape == EnvelopeShape.IS_ERROR
+
+    def test_is_error_emits_one_warning_naming_the_shape(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="shared.mcp_envelope"):
+            parse_tool_result(_is_error_env(), None, dict)
+        warnings = _envelope_warnings(caplog)
+        assert len(warnings) == 1
+        assert "IS_ERROR" in warnings[0].getMessage()
+
+    @pytest.mark.parametrize("is_error", [False, None, "absent"])
+    def test_false_or_absent_is_error_parses_as_before(self, is_error, caplog):
+        env = _env({"success": True})
+        if is_error != "absent":
+            env["result"]["isError"] = is_error
+        with caplog.at_level(logging.WARNING, logger="shared.mcp_envelope"):
+            value, err = parse_tool_result(env, "success", bool)
+        assert err is None
+        assert value is True
+        assert _envelope_warnings(caplog) == []
+
+
+class TestStructuredContentPreference:
+    """A dict structuredContent is the payload; the text block is the fallback."""
+
+    def test_structured_content_without_text_block_returns_value(self, caplog):
+        env = {"result": {"structuredContent": {"statuses": {"a": "done"}}}}
+        with caplog.at_level(logging.WARNING, logger="shared.mcp_envelope"):
+            value, err = parse_tool_result(env, "statuses", dict)
+        assert err is None
+        assert value == {"a": "done"}
+        assert _envelope_warnings(caplog) == []
+
+    def test_structured_content_wins_when_text_block_disagrees(self):
+        env = _env({"statuses": {"from": "text"}})
+        env["result"]["structuredContent"] = {"statuses": {"from": "structured"}}
+        value, err = parse_tool_result(env, "statuses", dict)
+        assert err is None
+        assert value == {"from": "structured"}
+
+    def test_structured_content_gets_the_data_unwrap(self):
+        env = {"result": {"structuredContent": {"data": {"k": 1}}}}
+        assert parse_tool_result(env, "k", int) == (1, None)
+        assert parse_tool_result(env, None, dict) == ({"k": 1}, None)
+
+    def test_non_dict_structured_content_falls_back_to_text_block(self):
+        env = _env({"k": "from-text"})
+        env["result"]["structuredContent"] = ["not", "a", "dict"]
+        value, err = parse_tool_result(env, "k", str)
+        assert err is None
+        assert value == "from-text"
+
+
+# ---------------------------------------------------------------------------
+# write_failure_reason — the one write-success predicate
+# ---------------------------------------------------------------------------
+
+_WRITE_REPLIES = [
+    (None, True),
+    ("ok", True),
+    ([], True),
+    (42, True),
+    ({}, True),
+    ({"success": False}, True),
+    ({"success": None}, True),
+    ({"success": 0}, True),
+    ({"error": "lock_charter_error"}, True),
+    ({"error": "x", "error_type": "ReconciliationBacklogExceeded"}, True),
+    ({"success": False, "error": "status_via_update_task", "task_id": "1"}, True),
+    ({"success": True, "error": "boom"}, True),
+    ({"success": True}, False),
+    ({"id": "1.1", "title": "t"}, False),
+    ({"success": True, "error": None}, False),
+    ({"success": True, "error": ""}, False),
+]
+
+
+class TestWriteFailureReason:
+    @pytest.mark.parametrize("reply,is_failure", _WRITE_REPLIES, ids=repr)
+    def test_truth_table(self, reply, is_failure):
+        reason = write_failure_reason(reply)
+        assert (reason is not None) == is_failure
+        if is_failure:
+            assert isinstance(reason, str) and reason
+
+    def test_error_reason_names_the_error_type_and_text(self):
+        reason = write_failure_reason(
+            {"error": "backlog is 900 deep", "error_type": "ReconciliationBacklogExceeded"}
+        )
+        assert reason is not None
+        assert "ReconciliationBacklogExceeded" in reason
+        assert "backlog is 900 deep" in reason
+
+    @pytest.mark.parametrize("reply", [None, "ok", [], 42], ids=repr)
+    def test_non_dict_reason_names_the_type(self, reply):
+        assert type(reply).__name__ in str(write_failure_reason(reply))
+
+    def test_empty_reply_is_never_success(self):
+        reason = write_failure_reason({})
+        assert reason is not None
+        assert "no positive write signal" in reason

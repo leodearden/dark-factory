@@ -154,6 +154,7 @@ def test_classify_reads_the_orchestrators_own_drain_heartbeat():
         return build_heartbeat_payload(
             unit='u', merge_idle=False, depth=3, queue_empty=False, ts_epoch=now,
             drain=drain, verifies_in_flight=verifies,
+            deployed_sha=None,
         )
 
     def verify(deadline_ts):

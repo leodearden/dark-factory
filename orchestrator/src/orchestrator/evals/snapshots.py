@@ -2,12 +2,12 @@
 
 import asyncio
 import logging
-import shutil
 from collections.abc import Sequence
 from pathlib import Path
 from uuid import uuid4
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.tree_removal import remove_tree
 from orchestrator.verify import _target_subprocess_env
 
 logger = logging.getLogger(__name__)
@@ -300,7 +300,7 @@ async def cleanup_eval_worktree(
     # delete it. Remove it here (best-effort, mirroring the worktree removal)
     # so run_architect_eval — the sole caller — leaves no residue behind.
     meta_root = TaskArtifacts.meta_root_for(worktree_path.parent, worktree_path.name)
-    shutil.rmtree(meta_root, ignore_errors=True)
+    await remove_tree(meta_root, ignore_errors=True)
 
 
 async def get_diff(worktree_path: Path, base_commit: str) -> str:

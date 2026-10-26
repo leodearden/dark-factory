@@ -1,0 +1,72 @@
+{"t": 1791653167.8134723, "event": "whisper_loaded", "secs": 39.32}
+{"t": 1791653169.4872036, "event": "warmup", "secs": 1.6733, "match": 1.0}
+{"t": 1791653170.4614863, "event": "ab", "condition": "ab_idle", "round": 0, "secs": 0.8716, "match": 1.0}
+{"t": 1791653172.7065883, "event": "ab", "condition": "ab_query_3_6", "round": 0, "secs": 0.7404, "match": 1.0}
+{"t": 1791653172.707131, "event": "load_summary", "phase": "ab_query_3_6_r0", "elapsed_s": 2.24, "ok_requests": 10, "ok_vectors": 10, "errors": 0, "vectors_per_s": 4.5, "req_latency_p50_ms": 31.3, "req_latency_p95_ms": 121.7}
+{"t": 1791653174.9932587, "event": "ab", "condition": "ab_query_12", "round": 0, "secs": 0.7847, "match": 1.0}
+{"t": 1791653174.9946117, "event": "load_summary", "phase": "ab_query_12_r0", "elapsed_s": 2.29, "ok_requests": 22, "ok_vectors": 22, "errors": 0, "vectors_per_s": 9.6, "req_latency_p50_ms": 30.1, "req_latency_p95_ms": 36.6}
+{"t": 1791653177.7935803, "event": "ab", "condition": "ab_write_80", "round": 0, "secs": 1.2959, "match": 1.0}
+{"t": 1791653178.071085, "event": "load_summary", "phase": "ab_write_80_r0", "elapsed_s": 3.08, "ok_requests": 15, "ok_vectors": 240, "errors": 0, "vectors_per_s": 78.0, "req_latency_p50_ms": 109.0, "req_latency_p95_ms": 347.6}
+{"t": 1791653178.8466423, "event": "ab", "condition": "ab_idle", "round": 1, "secs": 0.775, "match": 1.0}
+{"t": 1791653181.9235713, "event": "ab", "condition": "ab_query_3_6", "round": 1, "secs": 1.3543, "match": 1.0}
+{"t": 1791653181.9239345, "event": "load_summary", "phase": "ab_query_3_6_r1", "elapsed_s": 2.86, "ok_requests": 13, "ok_vectors": 13, "errors": 0, "vectors_per_s": 4.6, "req_latency_p50_ms": 21.2, "req_latency_p95_ms": 33.4}
+{"t": 1791653184.2655954, "event": "ab", "condition": "ab_query_12", "round": 1, "secs": 0.8399, "match": 1.0}
+{"t": 1791653184.2982898, "event": "load_summary", "phase": "ab_query_12_r1", "elapsed_s": 2.37, "ok_requests": 24, "ok_vectors": 24, "errors": 0, "vectors_per_s": 10.1, "req_latency_p50_ms": 25.0, "req_latency_p95_ms": 37.0}
+{"t": 1791653186.5255754, "event": "ab", "condition": "ab_write_80", "round": 1, "secs": 0.7235, "match": 1.0}
+{"t": 1791653186.5377095, "event": "load_summary", "phase": "ab_write_80_r1", "elapsed_s": 2.24, "ok_requests": 11, "ok_vectors": 176, "errors": 0, "vectors_per_s": 78.6, "req_latency_p50_ms": 110.8, "req_latency_p95_ms": 272.5}
+{"t": 1791653187.3431714, "event": "ab", "condition": "ab_idle", "round": 2, "secs": 0.8053, "match": 1.0}
+{"t": 1791653189.426598, "event": "ab", "condition": "ab_query_3_6", "round": 2, "secs": 0.5777, "match": 1.0}
+{"t": 1791653189.4283724, "event": "load_summary", "phase": "ab_query_3_6_r2", "elapsed_s": 2.08, "ok_requests": 9, "ok_vectors": 9, "errors": 0, "vectors_per_s": 4.3, "req_latency_p50_ms": 28.3, "req_latency_p95_ms": 60.1}
+{"t": 1791653191.6203, "event": "ab", "condition": "ab_query_12", "round": 2, "secs": 0.6891, "match": 1.0}
+{"t": 1791653191.6207519, "event": "load_summary", "phase": "ab_query_12_r2", "elapsed_s": 2.19, "ok_requests": 22, "ok_vectors": 22, "errors": 0, "vectors_per_s": 10.0, "req_latency_p50_ms": 25.2, "req_latency_p95_ms": 33.5}
+{"t": 1791653193.9264126, "event": "ab", "condition": "ab_write_80", "round": 2, "secs": 0.8032, "match": 1.0}
+{"t": 1791653193.927036, "event": "load_summary", "phase": "ab_write_80_r2", "elapsed_s": 2.3, "ok_requests": 12, "ok_vectors": 192, "errors": 0, "vectors_per_s": 83.3, "req_latency_p50_ms": 93.3, "req_latency_p95_ms": 131.6}
+{"t": 1791653194.5652416, "event": "ab", "condition": "ab_idle", "round": 3, "secs": 0.638, "match": 1.0}
+{"t": 1791653196.6346083, "event": "ab", "condition": "ab_query_3_6", "round": 3, "secs": 0.5675, "match": 1.0}
+{"t": 1791653196.6436636, "event": "load_summary", "phase": "ab_query_3_6_r3", "elapsed_s": 2.08, "ok_requests": 10, "ok_vectors": 10, "errors": 0, "vectors_per_s": 4.8, "req_latency_p50_ms": 26.5, "req_latency_p95_ms": 35.1}
+{"t": 1791653198.876495, "event": "ab", "condition": "ab_query_12", "round": 3, "secs": 0.7284, "match": 1.0}
+{"t": 1791653198.8796785, "event": "load_summary", "phase": "ab_query_12_r3", "elapsed_s": 2.23, "ok_requests": 23, "ok_vectors": 23, "errors": 0, "vectors_per_s": 10.3, "req_latency_p50_ms": 24.4, "req_latency_p95_ms": 34.3}
+{"t": 1791653201.1207664, "event": "ab", "condition": "ab_write_80", "round": 3, "secs": 0.7342, "match": 1.0}
+{"t": 1791653201.2019, "event": "load_summary", "phase": "ab_write_80_r3", "elapsed_s": 2.32, "ok_requests": 12, "ok_vectors": 192, "errors": 0, "vectors_per_s": 82.9, "req_latency_p50_ms": 94.3, "req_latency_p95_ms": 173.8}
+{"t": 1791653201.8807847, "event": "ab", "condition": "ab_idle", "round": 4, "secs": 0.6785, "match": 1.0}
+{"t": 1791653204.0183659, "event": "ab", "condition": "ab_query_3_6", "round": 4, "secs": 0.6357, "match": 1.0}
+{"t": 1791653204.0216215, "event": "load_summary", "phase": "ab_query_3_6_r4", "elapsed_s": 2.14, "ok_requests": 10, "ok_vectors": 10, "errors": 0, "vectors_per_s": 4.7, "req_latency_p50_ms": 23.7, "req_latency_p95_ms": 32.7}
+{"t": 1791653206.1894565, "event": "ab", "condition": "ab_query_12", "round": 4, "secs": 0.6668, "match": 1.0}
+{"t": 1791653206.1908634, "event": "load_summary", "phase": "ab_query_12_r4", "elapsed_s": 2.17, "ok_requests": 22, "ok_vectors": 22, "errors": 0, "vectors_per_s": 10.1, "req_latency_p50_ms": 24.0, "req_latency_p95_ms": 29.8}
+{"t": 1791653208.5110598, "event": "ab", "condition": "ab_write_80", "round": 4, "secs": 0.8163, "match": 1.0}
+{"t": 1791653208.5339782, "event": "load_summary", "phase": "ab_write_80_r4", "elapsed_s": 2.34, "ok_requests": 12, "ok_vectors": 192, "errors": 0, "vectors_per_s": 82.0, "req_latency_p50_ms": 126.7, "req_latency_p95_ms": 170.7}
+{"t": 1791653209.2570455, "event": "ab", "condition": "ab_idle", "round": 5, "secs": 0.7227, "match": 1.0}
+{"t": 1791653211.475432, "event": "ab", "condition": "ab_query_3_6", "round": 5, "secs": 0.7122, "match": 1.0}
+{"t": 1791653211.4757757, "event": "load_summary", "phase": "ab_query_3_6_r5", "elapsed_s": 2.22, "ok_requests": 10, "ok_vectors": 10, "errors": 0, "vectors_per_s": 4.5, "req_latency_p50_ms": 24.4, "req_latency_p95_ms": 31.5}
+{"t": 1791653214.1157014, "event": "ab", "condition": "ab_query_12", "round": 5, "secs": 1.1388, "match": 1.0}
+{"t": 1791653214.1214623, "event": "load_summary", "phase": "ab_query_12_r5", "elapsed_s": 2.65, "ok_requests": 26, "ok_vectors": 26, "errors": 0, "vectors_per_s": 9.8, "req_latency_p50_ms": 24.5, "req_latency_p95_ms": 36.8}
+{"t": 1791653216.3361216, "event": "ab", "condition": "ab_write_80", "round": 5, "secs": 0.7094, "match": 1.0}
+{"t": 1791653216.336613, "event": "load_summary", "phase": "ab_write_80_r5", "elapsed_s": 2.22, "ok_requests": 11, "ok_vectors": 176, "errors": 0, "vectors_per_s": 79.5, "req_latency_p50_ms": 105.1, "req_latency_p95_ms": 124.0}
+{"t": 1791653217.0934691, "event": "ab", "condition": "ab_idle", "round": 6, "secs": 0.7567, "match": 1.0}
+{"t": 1791653219.3304186, "event": "ab", "condition": "ab_query_3_6", "round": 6, "secs": 0.7231, "match": 1.0}
+{"t": 1791653219.3321524, "event": "load_summary", "phase": "ab_query_3_6_r6", "elapsed_s": 2.24, "ok_requests": 10, "ok_vectors": 10, "errors": 0, "vectors_per_s": 4.5, "req_latency_p50_ms": 22.4, "req_latency_p95_ms": 30.4}
+{"t": 1791653221.5514438, "event": "ab", "condition": "ab_query_12", "round": 6, "secs": 0.7159, "match": 1.0}
+{"t": 1791653221.5540218, "event": "load_summary", "phase": "ab_query_12_r6", "elapsed_s": 2.22, "ok_requests": 23, "ok_vectors": 23, "errors": 0, "vectors_per_s": 10.4, "req_latency_p50_ms": 22.4, "req_latency_p95_ms": 36.4}
+{"t": 1791653224.0145888, "event": "ab", "condition": "ab_write_80", "round": 6, "secs": 0.9591, "match": 1.0}
+{"t": 1791653224.0550282, "event": "load_summary", "phase": "ab_write_80_r6", "elapsed_s": 2.5, "ok_requests": 13, "ok_vectors": 208, "errors": 0, "vectors_per_s": 83.2, "req_latency_p50_ms": 91.2, "req_latency_p95_ms": 119.1}
+{"t": 1791653224.6742826, "event": "ab", "condition": "ab_idle", "round": 7, "secs": 0.614, "match": 1.0}
+{"t": 1791653227.0386276, "event": "ab", "condition": "ab_query_3_6", "round": 7, "secs": 0.8493, "match": 1.0}
+{"t": 1791653227.040579, "event": "load_summary", "phase": "ab_query_3_6_r7", "elapsed_s": 2.36, "ok_requests": 11, "ok_vectors": 11, "errors": 0, "vectors_per_s": 4.7, "req_latency_p50_ms": 22.0, "req_latency_p95_ms": 46.7}
+{"t": 1791653229.374988, "event": "ab", "condition": "ab_query_12", "round": 7, "secs": 0.8336, "match": 1.0}
+{"t": 1791653229.3783097, "event": "load_summary", "phase": "ab_query_12_r7", "elapsed_s": 2.34, "ok_requests": 24, "ok_vectors": 24, "errors": 0, "vectors_per_s": 10.3, "req_latency_p50_ms": 25.5, "req_latency_p95_ms": 53.6}
+{"t": 1791653231.6924372, "event": "ab", "condition": "ab_write_80", "round": 7, "secs": 0.8052, "match": 1.0}
+{"t": 1791653231.693327, "event": "load_summary", "phase": "ab_write_80_r7", "elapsed_s": 2.31, "ok_requests": 12, "ok_vectors": 192, "errors": 0, "vectors_per_s": 82.9, "req_latency_p50_ms": 82.7, "req_latency_p95_ms": 123.5}
+{"t": 1791653232.5716288, "event": "ab", "condition": "ab_idle", "round": 8, "secs": 0.8778, "match": 1.0}
+{"t": 1791653235.0611887, "event": "ab", "condition": "ab_query_3_6", "round": 8, "secs": 0.9876, "match": 1.0}
+{"t": 1791653235.061566, "event": "load_summary", "phase": "ab_query_3_6_r8", "elapsed_s": 2.49, "ok_requests": 11, "ok_vectors": 11, "errors": 0, "vectors_per_s": 4.4, "req_latency_p50_ms": 23.6, "req_latency_p95_ms": 62.9}
+{"t": 1791653237.3165703, "event": "ab", "condition": "ab_query_12", "round": 8, "secs": 0.7524, "match": 1.0}
+{"t": 1791653237.3187227, "event": "load_summary", "phase": "ab_query_12_r8", "elapsed_s": 2.26, "ok_requests": 23, "ok_vectors": 23, "errors": 0, "vectors_per_s": 10.2, "req_latency_p50_ms": 23.5, "req_latency_p95_ms": 38.1}
+{"t": 1791653239.703013, "event": "ab", "condition": "ab_write_80", "round": 8, "secs": 0.8763, "match": 1.0}
+{"t": 1791653239.735262, "event": "load_summary", "phase": "ab_write_80_r8", "elapsed_s": 2.42, "ok_requests": 12, "ok_vectors": 192, "errors": 0, "vectors_per_s": 79.5, "req_latency_p50_ms": 97.7, "req_latency_p95_ms": 132.1}
+{"t": 1791653240.519479, "event": "ab", "condition": "ab_idle", "round": 9, "secs": 0.7839, "match": 1.0}
+{"t": 1791653242.8288398, "event": "ab", "condition": "ab_query_3_6", "round": 9, "secs": 0.8071, "match": 1.0}
+{"t": 1791653242.8299286, "event": "load_summary", "phase": "ab_query_3_6_r9", "elapsed_s": 2.31, "ok_requests": 11, "ok_vectors": 11, "errors": 0, "vectors_per_s": 4.8, "req_latency_p50_ms": 22.8, "req_latency_p95_ms": 36.7}
+{"t": 1791653245.0228271, "event": "ab", "condition": "ab_query_12", "round": 9, "secs": 0.6893, "match": 1.0}
+{"t": 1791653245.0238247, "event": "load_summary", "phase": "ab_query_12_r9", "elapsed_s": 2.19, "ok_requests": 22, "ok_vectors": 22, "errors": 0, "vectors_per_s": 10.0, "req_latency_p50_ms": 23.6, "req_latency_p95_ms": 44.9}
+{"t": 1791653247.2635381, "event": "ab", "condition": "ab_write_80", "round": 9, "secs": 0.737, "match": 1.0}
+{"t": 1791653247.316863, "event": "load_summary", "phase": "ab_write_80_r9", "elapsed_s": 2.29, "ok_requests": 12, "ok_vectors": 192, "errors": 0, "vectors_per_s": 83.7, "req_latency_p50_ms": 97.2, "req_latency_p95_ms": 142.2}

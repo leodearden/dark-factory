@@ -1,0 +1,36 @@
+{
+  "task_id": "4953",
+  "reason": "Net-additive defect fix: the coalescing pass now refuses singles with no awaiting workflow (no_awaiting_workflow), because a coalesce train lands only once every member is merge-deferred and only a TaskWorkflow parks a task there; adds MergeRequest.awaited_by_workflow and the un-bypassable _coalesce_exclusion_reason check ahead of the injectable risk predicate.",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 1890,
+      "current": 1901
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22124,
+      "current": 22142
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12536,
+      "current": 12547
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57578,
+      "current": 57607
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 32032,
+      "current": 32043
+    }
+  ]
+}

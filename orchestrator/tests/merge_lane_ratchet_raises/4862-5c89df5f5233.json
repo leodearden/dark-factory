@@ -1,0 +1,30 @@
+{
+  "task_id": "4862",
+  "reason": "Task 4862 Defect B: validate_landing_evidence chains a content-equivalence fallback (branch_content_in_main + patch-id twin) before declaring no_citation, and find_equivalent_commit gains patch_id_only so that anchor must carry the tip's diff; net-additive guards on the reject path.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1477,
+      "current": 1479
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::find_equivalent_commit",
+      "baseline": 2,
+      "current": 4
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+      "baseline": 151,
+      "current": 156
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5008,
+      "current": 5015
+    }
+  ]
+}

@@ -42,6 +42,7 @@ from dashboard.data.burndown import (
     compute_parity_alarm,
     get_burndown_series,
 )
+from dashboard.project_labels import ProjectLabels
 
 _LEGACY_BURNDOWN_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -613,7 +614,9 @@ async def _shaped_as_the_route_does(path: Path) -> dict:
         per_pid = await asyncio.gather(
             *(aggregate_burndown_series([db], pid, days=_WINDOW_DAYS, now=_NOW) for pid in projects)
         )
-    return redux_api.shape_burndown(dict(zip(projects, per_pid, strict=True)), served_at=_T2)
+    return redux_api.shape_burndown(
+        dict(zip(projects, per_pid, strict=True)), labels=ProjectLabels.of_roots(()), served_at=_T2,
+    )
 
 
 class TestRaggedTwoProjectStore:

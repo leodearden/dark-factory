@@ -15,11 +15,11 @@ Scope, deliberately narrow. This is option (a) of task 5264's three: REPORT the
 residue. Wiring the census into ``GraphitiBackend._scan_duplicate_entity_names``
 (option b) and running an unattended collapse sweep (option c) are NOT
 authorized by that task and are not implemented here. Nothing in this module
-mutates anything: it calls ``enumerate_entity_nodes`` and
-``find_entity_nodes_by_name_substring``, both ``ro_query``-backed, and nothing
-else. That read-only guarantee is structural rather than a promise in prose —
-tests/test_task_family_census.py asserts it against the backend's mutating
-methods and against the driver's writable query channel.
+mutates anything: it calls ``enumerate_ranked_entity_nodes``, which is
+``ro_query``-backed, and ``list_graphs``, a read-only graph listing, and
+nothing else. That read-only guarantee is structural rather than a promise in
+prose — tests/test_task_family_census.py asserts it against the backend's
+mutating methods and against the driver's writable query channel.
 
 Family membership is decided by ``utils.task_naming.group_task_node_families``,
 the same function the write-path normalizer uses, which is what keeps the two
@@ -45,29 +45,25 @@ logger = logging.getLogger(__name__)
 class VariantSpelling:
     """One node in a fragmented family: how it is spelled, and what it holds.
 
-    ``edge_count`` is the number of still-VALID RELATES_TO edges hanging off the
-    node, and ONLY those. It says how many edges a collapse would have to move.
-    It no longer says which node a collapse would KEEP: since task 4986 the
-    backend ranks survivors by ``provenance_rank`` (``edge_count`` plus the
-    node's Episodic MENTIONS), so an edge-poorer node can legitimately outrank
-    an edge-richer one. Read ``variants[0]`` for the would-be survivor, not the
-    largest ``edge_count``.
+    ``edge_count`` counts still-VALID RELATES_TO edges ONLY — what a collapse
+    would have to move. ``mentions_count`` counts the Episodic MENTIONS
+    pointing at the node. ``provenance_rank`` is the backend's survivor key,
+    copied from the enumerated row and never recomputed here.
     """
 
     name: str
     uuid: str
     edge_count: int
+    mentions_count: int
+    provenance_rank: int
 
 
 @dataclass(frozen=True)
 class FragmentedFamily:
     """One task whose nodes are still split across more than one node.
 
-    ``variants`` holds at least TWO spellings, always: it is what the family
-    was measured to be, so a family the probe fails to confirm is recorded as
-    an :class:`UnconfirmedFamily` instead of as a one- or zero-variant instance
-    of this type. :meth:`TaskFamilyCensus.run` is the only constructor, which
-    is what lets that be an invariant rather than a hope.
+    ``variants`` holds at least TWO spellings, always; ``__post_init__``
+    enforces it.
 
     It is ordered survivor-first — highest provenance_rank (valid RELATES_TO
     plus Episodic MENTIONS), then oldest, then uuid — which is the order the
@@ -80,33 +76,12 @@ class FragmentedFamily:
     canonical_name: str
     variants: tuple[VariantSpelling, ...]
 
-
-@dataclass(frozen=True)
-class UnconfirmedFamily:
-    """A family the enumeration flagged and the per-family probe did not confirm.
-
-    The census makes two reads, and they are neither identically scoped nor a
-    single snapshot. ``enumerate_entity_nodes`` matches every ``:Entity`` node
-    under a graph KEY, while ``find_entity_nodes_by_name_substring`` also
-    requires ``n.group_id = $group_id`` — the predicate that keeps task-2115's
-    cross-graph leak (a node whose group_id names ANOTHER project while sitting
-    physically inside this key) out of any collapse. A leaked node therefore
-    counts toward the enumeration's >1 threshold and then vanishes from the
-    probe. The same shortfall arises with no leak at all: the store is live, so
-    the write-path normalizer can collapse the family between the two reads.
-
-    Either way the family is not residue by the time it was measured, and
-    reporting it as a :class:`FragmentedFamily` of fewer than two variants
-    would contradict that type's meaning and inflate the very number this
-    module exists to produce. Recording it here keeps the count honest without
-    discarding the signal: an occasional one is a race, while a persistent
-    non-zero count is a leak worth chasing, and the two fields are what tell
-    them apart.
-    """
-
-    canonical_name: str
-    enumerated_members: int
-    probed_members: int
+    def __post_init__(self) -> None:
+        if len(self.variants) < 2:
+            raise ValueError(
+                'a fragmented family holds at least two variants; '
+                f'{self.canonical_name!r} has {len(self.variants)}'
+            )
 
 
 @dataclass(frozen=True)
@@ -116,18 +91,14 @@ class GraphCensus:
     The completeness fields are not decoration. This module's entire output is
     a number a human will act on, and a number derived from a silently
     truncated enumeration is worse than no number at all — so the
-    ``PagedRead`` that ``enumerate_entity_nodes`` already returns is carried
+    ``PagedRead`` that ``enumerate_ranked_entity_nodes`` returns is carried
     here verbatim rather than being collapsed into a bare count.
 
-    ``complete`` answers only "was the whole graph read", which is why
-    ``unconfirmed`` sits beside it rather than flipping it: a family the probe
-    did not confirm is a fully-read graph reporting a divergence between its
-    two reads, not a coverage shortfall (see :class:`UnconfirmedFamily`).
+    ``nodes_scanned`` counts the graph's same-group Entity nodes.
     """
 
     group_id: str
     families: tuple[FragmentedFamily, ...]
-    unconfirmed: tuple[UnconfirmedFamily, ...]
     nodes_scanned: int
     complete: bool
     incomplete_kind: str | None
@@ -170,9 +141,17 @@ class CensusSweep:
     graphs: tuple[GraphCensus, ...]
     failures: tuple[GraphFailure, ...]
     total_families: int
-    total_unconfirmed: int
     complete: bool
     elapsed_ms: float
+
+
+def _describe_variants(variants: tuple[VariantSpelling, ...]) -> str:
+    """Each variant's survivor key and the two counts beneath it, in the order given."""
+    return '; '.join(
+        f'{v.name!r} provenance_rank={v.provenance_rank} '
+        f'({v.edge_count} edge(s), {v.mentions_count} mention(s))'
+        for v in variants
+    )
 
 
 class TaskFamilyCensus:
@@ -188,31 +167,18 @@ class TaskFamilyCensus:
     async def run(self, group_id: str) -> GraphCensus:
         """Census one graph.
 
-        Enumerates every Entity node, partitions them into task families, keeps
-        only the families holding MORE THAN ONE node, and asks the backend for
-        each survivor family's per-spelling edge counts.
+        Reads every same-group Entity node, partitions them into task families,
+        and keeps only the families holding MORE THAN ONE node. The >1
+        threshold is the honest one: a single node whose NAME is non-canonical
+        ('task 800' alone) is not a fragmented family — it splits nothing, and
+        the write-path normalizer renames it the next time an episode touches
+        that task.
 
-        The >1 threshold is the honest one: a single node whose NAME is
-        non-canonical ('task 800' alone) is not a fragmented family — it splits
-        nothing, and the write-path normalizer renames it the next time an
-        episode touches that task.
-
-        The threshold is applied TWICE, because the enumeration decides
-        membership and the probe supplies the edge counts, and the two are
-        neither identically scoped nor a single snapshot. A family that thins
-        below two spellings by the time it is probed is recorded as an
-        :class:`UnconfirmedFamily` rather than reported as residue — see that
-        class for the two ways it happens.
-
-        The per-family probe is a second read per fragmented family rather than
-        one widened enumeration. ``enumerate_entity_nodes`` returns
-        uuid/name/summary and is also consumed by ``list_entity_nodes``,
-        ``detect_stale_with_edges`` and ``rebuild_entity_summaries``; adding an
-        edge count to serve this one new reader would change a hot, shared row
-        shape for every one of them. The probe instead reuses the query the
-        write-path normalizer already depends on, so a regression in it shows up
-        in both, and its cost scales with the residue rather than with the
-        graph.
+        Membership and per-node provenance (edge count, mention count, rank)
+        come from ONE group-scoped read, so they cannot disagree. A node whose
+        group_id property names another project (task 2115's leak) is not a
+        member, matching every group-scoped collapse path. Why that read is a dedicated method rather than a
+        widened ``enumerate_entity_nodes``: task 5264, decision 7.
 
         Args:
             group_id: Project graph to census.
@@ -221,45 +187,32 @@ class TaskFamilyCensus:
             A :class:`GraphCensus`, including the completeness of the
             underlying enumeration.
         """
-        nodes, paged = await self.backend.enumerate_entity_nodes(group_id=group_id)
+        rows, paged = await self.backend.enumerate_ranked_entity_nodes(group_id=group_id)
 
         families = []
-        unconfirmed = []
-        for referent, members in group_task_node_families(nodes).items():
-            if len(members) <= 1:
+        for referent, members in group_task_node_families(rows).items():
+            if len(members) < 2:
                 continue
-            candidates = await self.backend.find_entity_nodes_by_name_substring(
-                referent.number, group_id=group_id,
-            )
             variants = tuple(
                 VariantSpelling(
-                    name=row['name'], uuid=row['uuid'], edge_count=row['edge_count'],
+                    name=row['name'],
+                    uuid=row['uuid'],
+                    edge_count=row['edge_count'],
+                    mentions_count=row['mentions_count'],
+                    provenance_rank=row['provenance_rank'],
                 )
-                for row in group_task_node_families(candidates).get(referent, [])
+                for row in members
             )
-            if len(variants) < 2:
-                unconfirmed.append(UnconfirmedFamily(
-                    canonical_name=referent.node_name,
-                    enumerated_members=len(members),
-                    probed_members=len(variants),
-                ))
-                logger.warning(
-                    'unconfirmed task family %s in graph %r: enumerated %d node(s), '
-                    'probe returned %d — a group_id-leaked node (task 2115) or a '
-                    'concurrent collapse; NOT counted as residue',
-                    referent.node_name, group_id, len(members), len(variants),
-                )
-                continue
             family = FragmentedFamily(
                 canonical_name=referent.node_name, variants=variants,
             )
             families.append(family)
             logger.warning(
-                'fragmented task family %s in graph %r: %d node(s) — %s',
+                'fragmented task family %s in graph %r: %d node(s), survivor first — %s',
                 family.canonical_name,
                 group_id,
                 len(variants),
-                ', '.join(f'{v.name!r}={v.edge_count} edge(s)' for v in variants),
+                _describe_variants(variants),
             )
 
         if not paged.complete:
@@ -274,8 +227,7 @@ class TaskFamilyCensus:
         return GraphCensus(
             group_id=group_id,
             families=tuple(families),
-            unconfirmed=tuple(unconfirmed),
-            nodes_scanned=len(nodes),
+            nodes_scanned=len(rows),
             complete=paged.complete,
             incomplete_kind=paged.incomplete_kind,
             rows_seen=paged.rows_seen,
@@ -325,19 +277,16 @@ class TaskFamilyCensus:
 
         elapsed_ms = (time.monotonic() - start) * 1000
         total_families = sum(len(graph.families) for graph in censused)
-        total_unconfirmed = sum(len(graph.unconfirmed) for graph in censused)
         complete = not failures and all(graph.complete for graph in censused)
         logger.info(
             'task-family census complete: graphs_censused=%d graphs_failed=%d '
-            'fragmented_families=%d unconfirmed=%d complete=%s elapsed_ms=%.1f',
-            len(censused), len(failures), total_families, total_unconfirmed,
-            complete, elapsed_ms,
+            'fragmented_families=%d complete=%s elapsed_ms=%.1f',
+            len(censused), len(failures), total_families, complete, elapsed_ms,
         )
         return CensusSweep(
             graphs=tuple(censused),
             failures=tuple(failures),
             total_families=total_families,
-            total_unconfirmed=total_unconfirmed,
             complete=complete,
             elapsed_ms=elapsed_ms,
         )
@@ -407,7 +356,6 @@ def _format_summary(sweep: CensusSweep) -> str:
     line = (
         f'task-family census: {sweep.total_families} fragmented family/families '
         f'across {len(sweep.graphs)} graph(s) [{breakdown}] '
-        f'unconfirmed={sweep.total_unconfirmed} '
         f'complete={sweep.complete} elapsed_ms={sweep.elapsed_ms:.1f}'
     )
     if sweep.failures:
@@ -433,11 +381,6 @@ def main(argv: list[str] | None = None) -> int:
         pass for a clean one to a script reading the exit status — the number it
         reports is then a lower bound, and acting on it as a total would
         under-count the residue.
-
-        An unconfirmed family deliberately does NOT move the exit code: the
-        graph was read in full, and the count it produced is honest precisely
-        because that family was excluded. It is reported in the summary and in
-        the JSON, where a persistent non-zero value is the thing to chase.
     """
     args = _build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO)

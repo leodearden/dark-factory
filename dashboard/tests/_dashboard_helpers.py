@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import html.parser
 import json
+import os
 import re
+import shutil
 import sqlite3
 import threading
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
@@ -874,6 +876,30 @@ async def make_recon_db(
         yield conn
 
 
+def node_path() -> str:
+    """The node binary: a skip locally, a failure under CI (CI carries node)."""
+    path = shutil.which('node')
+    if not path:
+        if os.environ.get('CI'):
+            pytest.fail('node is required in CI but not found on PATH')
+        pytest.skip('node not available')
+    return path
+
+
+def bug_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Every captured WARNING a dashboard handler logs for its own bug, never an outage.
+
+    Matches the sentence ``dashboard/src/dashboard/api/tasks.py::_unknown_after_contract_break``,
+    ``dashboard/src/dashboard/api/tasks.py::_unknown_after_unexpected_error``
+    and the fan-out's catch-all in ``dashboard/src/dashboard/data/active_tasks.py``
+    all put in their message.
+    """
+    return [
+        record.getMessage() for record in caplog.records
+        if 'this is a BUG, not an outage' in record.getMessage()
+    ]
+
+
 # ---------------------------------------------------------------------------
 # JSX source slicing.
 #
@@ -917,6 +943,25 @@ class _JsSpan(NamedTuple):
     closed: bool
 
 
+def _string_literal_end(source: str, quote_at: int) -> tuple[int, bool]:
+    """Return ``(end, closed)`` for the literal whose opening quote is at *quote_at*.
+
+    ``end`` is exclusive and clamped to ``len(source)``; ``closed`` is False
+    when the source ran out first.  A backslash skips the next character, so
+    an escaped quote cannot close the literal.
+    """
+    quote = source[quote_at]
+    i, n = quote_at + 1, len(source)
+    while i < n:
+        if source[i] == '\\':
+            i += 2
+            continue
+        if source[i] == quote:
+            return i + 1, True
+        i += 1
+    return n, False
+
+
 def _scan_js(source: str) -> list[_JsSpan]:
     """Return the string-literal and comment spans of *source*, in order.
 
@@ -933,19 +978,9 @@ def _scan_js(source: str) -> list[_JsSpan]:
         ch = source[i]
 
         if ch in '\'"`':
-            start = i
-            i += 1
-            closed = False
-            while i < n:
-                if source[i] == '\\':  # an escaped char cannot close the literal
-                    i += 2
-                    continue
-                if source[i] == ch:
-                    i += 1
-                    closed = True
-                    break
-                i += 1
-            spans.append(_JsSpan(start, min(i, n), 'string', ch, closed))
+            end, closed = _string_literal_end(source, i)
+            spans.append(_JsSpan(i, end, 'string', ch, closed))
+            i = end
             continue
 
         if source[i : i + 2] == '//':
@@ -1371,6 +1406,57 @@ def extract_df_data_block(src: str, key: str) -> str:
     if m is None:
         return ''
     return walk_balanced(src, m.end() - 1)  # m.end() - 1 is the opening `{`
+
+
+# ---------------------------------------------------------------------------
+# JSX opening-tag walk.
+#
+# Spans one opening tag, attributes included, so a probe can confine itself to
+# that element.  Contract: test_jsx_source_helpers.py::TestJsxOpenTagEnd.
+# ---------------------------------------------------------------------------
+
+
+def jsx_open_tag_end(src: str, start: int) -> int | None:
+    """Return the index JUST PAST the ``>`` closing the opening tag at *start*.
+
+    *start* must index the tag's ``<``, else ``ValueError``.  ``src[start:end]``
+    is the whole tag; ``src[end - 2:end] == '/>'`` tells a self-closing one.  A
+    ``<`` or ``>`` inside a ``{...}`` attribute expression or a string/template
+    literal does not end the tag.
+
+    ``None``, never a raise, when *start* begins no closed opening tag: it is
+    never closed, a literal is never terminated, a bare ``<`` opens at depth 0
+    first, or a ``}`` drives brace depth negative.
+
+    Not comment-aware (pass `strip_js_comments` output), and it shares
+    `_scan_js`'s lexer blind spots.
+    """
+    if src[start : start + 1] != '<':
+        raise ValueError(
+            f"jsx_open_tag_end: start={start} must index the tag's `<`, "
+            f'found {src[start : start + 1]!r}'
+        )
+    depth = 0
+    i = start + 1
+    while i < len(src):
+        c = src[i]
+        if c in '\'"`':
+            i, closed = _string_literal_end(src, i)
+            if not closed:
+                return None
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0 and c == '>':
+            return i + 1
+        elif depth == 0 and c == '<':
+            return None
+        i += 1
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -11,13 +11,17 @@ These are cross-store concurrency regressions, not per-store unit tests — each
 needs a SECOND connection to the same file — so they live in one module instead of
 being split across test_journal.py / test_event_buffer.py / test_recon_ledger.py.
 
+The COLLISION arms, a write queued into a read's pinned snapshot, are
+CONSTRUCTED rather than raced.  ``_StatementGate`` parks the store's own read just
+after it pins its snapshot, so each arm is one deterministic run.  Each arm's
+read certifies the pin by not seeing the row the foreign connection committed
+while it was parked, and each positive arm has a legacy control through the same
+helper: the replaced execute + fetchall read, which the same collision kills.
+
 MEASURED BASELINES, taken on this task's base commit (2026-09-17), recorded so the
 next reader does not re-derive them:
 
-    journal: reaper read vs. write       39/40 SQLITE_BUSY_SNAPSHOT  ->  0/40
-    journal: same loop, nothing stale     0/40                       ->  0/40
     journal: checkpoint vs. write        20/20 SQLITE_LOCKED         ->  0/20
-    EventBuffer: peek vs. heartbeat      ~70% of iterations (28/40)  ->  0/20
     EventBuffer: checkpoint vs. push     20/20 SQLITE_LOCKED         ->  0/20
     ledger: checkpoint vs. upsert        20/20 SQLITE_LOCKED         ->  0/20
     ledger: cancel vs. concurrent write  survivor's row LOST, 3/3   ->  survives
@@ -52,19 +56,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import sqlite3
+import threading
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
+from typing import Any, TypeVar
 
 import aiosqlite
 import pytest
 import pytest_asyncio
-from shared.async_sqlite_base import CheckpointResult
+from shared.async_sqlite_base import CheckpointResult, connect_daemon
 
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
-    Watermark,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -76,11 +83,10 @@ PROJECT_ID = 'atomicity'
 STALE_CUTOFF_SECONDS = 1800.0
 STALE_RUN_AGE_SECONDS = 2000.0
 
-# Enough completed rows that the reaper's full scan of ``runs`` is still in the
-# worker thread when the next statement is queued behind it.  Measured: 0.25 s to
-# seed, 0.93 s for the 40-iteration loop.
-FILLER_RUNS = 24_000
-COLLISION_ITERATIONS = 40
+# How long a parked statement waits to be released.  A hang guard only: never
+# elapses on a passing run.  It turns a harness bug into a legible failure
+# instead of a wedged worker thread.
+_GATE_HANG_GUARD_SECS = 30.0
 
 CHECKPOINT_ITERATIONS = 20
 # This failure class can present as an unbounded block as well as a raise, and a
@@ -88,21 +94,7 @@ CHECKPOINT_ITERATIONS = 20
 # of failing in seconds.  The bound turns that into a legible TimeoutError.
 CHECKPOINT_TIMEOUT_SECONDS = 10
 
-# Enough buffered rows that peek_buffered's ORDER BY timestamp scan is still in the
-# worker thread when the write is queued behind it.  Do NOT tune these counts down:
-# below the reproducing size the arm passes for the wrong reason.  verify appends
-# ``-n 8`` to every pytest leg, so this runs 8-way parallel on a loaded machine,
-# which WIDENS the window rather than narrowing it.
-#
-# Two measurements of the pre-fix failure rate at 4,000 rows, both worth keeping
-# because they bracket what a future tuner should expect: planning measured 28/40
-# iterations (~70%, and 39/40 at 8,000 rows); re-measured here while writing the
-# arm, 28 of 80 iterations across four runs (~35%), worst run 4/20 and never a
-# clean one.  The cause of the spread was not established.  What the second
-# measurement does establish is that 4,000 is comfortably above the reproducing
-# size on this tree, which is the property the count has to have.
-BUFFERED_EVENTS = 4_000
-BUFFER_COLLISION_ITERATIONS = 20
+SEEDED_EVENTS = 3
 
 _INSERT_RUN = """INSERT INTO runs
     (id, project_id, run_type, trigger_reason, started_at, completed_at, status)
@@ -113,9 +105,176 @@ _INSERT_EVENT = """INSERT INTO event_buffer
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)"""
 
 
+class _ConnectTap:
+    """A store's ``connect``: opens through ``connect_daemon`` and keeps the connection.
+
+    The collision arms install their gate on, and issue the legacy controls'
+    reads through, the store's OWN connection; this is how they reach it.
+    """
+
+    def __init__(self) -> None:
+        self.database: str | None = None
+        self._connection: aiosqlite.Connection | None = None
+
+    async def __call__(self, database: str) -> aiosqlite.Connection:
+        self.database = database
+        self._connection = await connect_daemon(database)
+        return self._connection
+
+    @property
+    def connection(self) -> aiosqlite.Connection:
+        if self._connection is None:
+            raise RuntimeError('the store has not opened its connection through this tap')
+        return self._connection
+
+
+@pytest.mark.asyncio
+async def test_each_collision_store_runs_its_statements_on_its_injected_connection(tmp_path):
+    """Each store opens through its ``connect`` and runs its statements on that connection.
+
+    Every collision arm relies on this: a gate installed on the tapped
+    connection parks the store's own read, not some other connection's.
+    """
+    data_dir = tmp_path / 'recon'
+    db_path = str(data_dir / 'reconciliation.db')
+    journal_tap, buffer_tap = _ConnectTap(), _ConnectTap()
+    journal = ReconciliationJournal(data_dir, connect=journal_tap)
+    buffer = EventBuffer(db_path=data_dir / 'reconciliation.db', connect=buffer_tap)
+    try:
+        for name, store, tap, public_read in (
+            ('ReconciliationJournal', journal, journal_tap,
+             lambda: journal.get_stale_runs(STALE_CUTOFF_SECONDS)),
+            ('EventBuffer', buffer, buffer_tap, lambda: buffer.peek_buffered(PROJECT_ID, 10)),
+        ):
+            await store.initialize()
+            traced: list[str] = []
+            await tap.connection.set_trace_callback(traced.append)
+
+            await public_read()
+
+            assert tap.database == db_path, (
+                f'{name} asked its connect for {tap.database!r}, not {db_path!r}'
+            )
+            assert traced, f"{name}'s read did not run on the connection its connect opened"
+    finally:
+        await buffer.close()
+        await journal.close()
+
+
+class _GateState(enum.Enum):
+    ARMED = enum.auto()
+    STARTED = enum.auto()
+    PARKED = enum.auto()
+
+
+class _StatementGate:
+    """Parks the first statement to start on a connection, just after it pins its snapshot.
+
+    Progress callbacks also fire while a statement is being PREPARED, before its
+    snapshot exists, so the gate waits for the statement's own trace callback.
+    The first progress callback after that is past ``OP_Transaction``.  Both
+    callbacks run on the connection's one worker thread, so the state needs no
+    lock.
+
+    Single-use: once parked, both callbacks are inert for the rest of the
+    connection's life, so the gate is never uninstalled.  aiosqlite's
+    annotations do not admit the ``None`` that would clear them.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.parked = asyncio.Event()
+        self._loop = loop
+        self._released = threading.Event()
+        self._state = _GateState.ARMED
+
+    def on_statement(self, sql: str) -> None:
+        if self._state is _GateState.ARMED:
+            self._state = _GateState.STARTED
+
+    def on_progress(self) -> int:
+        if self._state is _GateState.STARTED:
+            self._state = _GateState.PARKED
+            self._loop.call_soon_threadsafe(self.parked.set)
+            if not self._released.wait(timeout=_GATE_HANG_GUARD_SECS):
+                raise TimeoutError('the statement gate was never released')
+        return 0
+
+    async def install(self, conn: aiosqlite.Connection) -> None:
+        await conn.set_trace_callback(self.on_statement)
+        await conn.set_progress_handler(self.on_progress, 1)
+
+    def release(self) -> None:
+        self._released.set()
+
+
+async def _sqlite_error_name(op: Callable[[], Awaitable[object]]) -> str | None:
+    """Await ``op`` and return its SQLite error name, or None if it raised nothing."""
+    try:
+        await op()
+    except sqlite3.OperationalError as exc:
+        return exc.sqlite_errorname
+    return None
+
+
+async def _until_parked(gate: _StatementGate, reader: asyncio.Task[Any]) -> None:
+    """Return once ``reader`` is parked in ``gate``; fail if it finished without parking.
+
+    No deadline: a read that neither parks nor finishes is a genuine hang, which
+    pytest-timeout reports.
+    """
+    parked = asyncio.create_task(gate.parked.wait())
+    try:
+        await asyncio.wait({parked, reader}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        parked.cancel()
+    if not gate.parked.is_set():
+        raise AssertionError('the read finished without the gate parking it: nothing collided')
+
+
+_Rows = TypeVar('_Rows')
+
+
+async def _collide_with_a_pinned_read(
+    conn: aiosqlite.Connection,
+    *,
+    read: Callable[[], Coroutine[Any, Any, _Rows]],
+    write: Callable[[], Awaitable[object]],
+    foreign_commit: Callable[[], Awaitable[None]],
+) -> tuple[_Rows, str | None]:
+    """Issue ``write`` into ``read``'s pinned-snapshot window on ``conn``, after a foreign commit.
+
+    Returns the read's result and the write's SQLite error name (None if it
+    raised nothing).  The order is constructed, not raced:
+
+    1. ``read`` parks in the gate on ``conn`` with its snapshot pinned.
+    2. The writer task is created, then the test suspends on ``foreign_commit``.
+       asyncio's FIFO ready queue runs the writer's first step during that
+       suspension, which either queues its statement behind the parked hop or
+       parks it on :class:`AtomicConnection`'s lock.
+    3. The foreign commit lands, so the pinned snapshot is now stale.
+    4. Only then is the gate released.
+    """
+    gate = _StatementGate(asyncio.get_running_loop())
+    await gate.install(conn)
+    async with asyncio.TaskGroup() as tasks:
+        reader = tasks.create_task(read())
+        try:
+            await _until_parked(gate, reader)
+            writer = tasks.create_task(_sqlite_error_name(write))
+            await foreign_commit()
+        finally:
+            gate.release()
+    return reader.result(), writer.result()
+
+
+@pytest.fixture
+def journal_tap() -> _ConnectTap:
+    return _ConnectTap()
+
+
 @pytest_asyncio.fixture
-async def journal(tmp_path):
-    store = ReconciliationJournal(tmp_path / 'recon')
+async def journal(tmp_path, journal_tap):
+    store = ReconciliationJournal(tmp_path / 'recon', connect=journal_tap)
     await store.initialize()
     try:
         yield store
@@ -127,7 +286,7 @@ async def journal(tmp_path):
 async def second_connection(journal):
     """A second raw connection to the journal's own ``reconciliation.db`` file.
 
-    Both the seeder and the foreign writer: the collisions these arms provoke need
+    Both the seeder and the foreign writer: the collisions these arms construct need
     a commit from a DIFFERENT connection to the same file, and seeding through it
     keeps a bulk-insert method off ``ReconciliationJournal``'s public interface.
 
@@ -146,120 +305,177 @@ async def second_connection(journal):
         await conn.close()
 
 
-async def _seed_runs(conn, *, filler: int, stale_run: bool) -> None:
-    """Insert the run rows the arms race against, in ONE ``executemany``.
+async def _seed_runs(conn, *, stale_run: bool) -> None:
+    """Insert the run rows the arms collide against, in ONE ``executemany``.
 
     ``live`` is the write target (started now, so the reaper's age filter never
-    returns it), ``r3`` is the foreign writer's target, and ``long`` — present only
-    when *stale_run* — is the one row the reaper's scan actually matches.
+    returns it), and ``long`` — present only when *stale_run* — is the one row
+    the reaper's scan matches.
     """
     now = datetime.now(UTC)
-    # completed_at is NULL for a running run, so the element type must admit None:
-    # inferred from the all-`str` filler comprehension alone it would not.
-    rows: list[tuple[str, str, str, str, str, str | None, str]] = [
-        (
-            f'filler-{i}',
-            PROJECT_ID,
-            'full',
-            'seed',
-            (now - timedelta(seconds=STALE_RUN_AGE_SECONDS)).isoformat(),
-            now.isoformat(),
-            'completed',
-        )
-        for i in range(filler)
-    ]
-    rows.append(('live', PROJECT_ID, 'full', 'seed', now.isoformat(), None, 'running'))
-    rows.append(('r3', PROJECT_ID, 'full', 'seed', now.isoformat(), now.isoformat(), 'completed'))
+    rows = [('live', PROJECT_ID, 'full', 'seed', now.isoformat(), None, 'running')]
     if stale_run:
-        rows.append(
-            (
-                'long',
-                PROJECT_ID,
-                'full',
-                'seed',
-                (now - timedelta(seconds=STALE_RUN_AGE_SECONDS)).isoformat(),
-                None,
-                'running',
-            )
-        )
+        started = (now - timedelta(seconds=STALE_RUN_AGE_SECONDS)).isoformat()
+        rows.append(('long', PROJECT_ID, 'full', 'seed', started, None, 'running'))
     async with conn.executemany(_INSERT_RUN, rows):
         pass
     await conn.commit()
 
 
-async def _write_failures_under_a_pinned_read(journal, foreign) -> list[str]:
-    """Race a write against the reaper's read, and report what killed the writes.
+# The reaper's scan, test-owned: the legacy controls run it in the replaced
+# execute + fetchall shape on the journal's own connection.
+_LEGACY_REAPER_SCAN = "SELECT * FROM runs WHERE status = 'running' AND started_at < ?"
 
-    Each iteration puts ``get_stale_runs`` into the connection's worker thread,
-    commits on the *foreign* connection so the file's snapshot moves, then queues a
-    write behind the pinned read.  The foreign UPDATE writes a CHANGING value —
-    a no-op UPDATE does not advance the WAL and the arm would pass vacuously.
+
+async def _legacy_multi_hop_read(
+    conn: aiosqlite.Connection, sql: str, params: tuple[object, ...]
+) -> list[aiosqlite.Row]:
+    """The replaced read shape: execute and fetch as separate queued hops."""
+    async with conn.execute(sql, params) as cur:
+        return list(await cur.fetchall())
+
+
+async def _file_a_late_stale_run(conn: aiosqlite.Connection) -> None:
+    """Commit run ``late``, which the reaper's scan WOULD match, from ``conn``.
+
+    A read pinned before this commit cannot return it, which is how each journal
+    collision arm certifies that the collision really happened.
     """
-    failures: list[str] = []
-    for i in range(COLLISION_ITERATIONS):
-        reaper = asyncio.create_task(journal.get_stale_runs(STALE_CUTOFF_SECONDS))
-        try:
-            await asyncio.sleep(0)
-            async with foreign.execute(
-                'UPDATE runs SET trigger_reason = ? WHERE id = ?', (f'rotate-{i}', 'r3')
-            ):
-                pass
-            await foreign.commit()
-            try:
-                await journal.record_run_session(
-                    'live', session_id=f'session-{i}', stage_cursor=f'stage-{i}'
-                )
-            except sqlite3.OperationalError as exc:
-                failures.append(exc.sqlite_errorname)
-        finally:
-            await reaper
-    return failures
+    started = (datetime.now(UTC) - timedelta(seconds=STALE_RUN_AGE_SECONDS)).isoformat()
+    async with conn.execute(
+        _INSERT_RUN, ('late', PROJECT_ID, 'full', 'seed', started, None, 'running')
+    ):
+        pass
+    await conn.commit()
+
+
+_COLLIDED_SESSION = 'session-collided'
+
+
+async def _record_the_collided_session(journal: ReconciliationJournal) -> None:
+    await journal.record_run_session(
+        'live', session_id=_COLLIDED_SESSION, stage_cursor='stage-collided'
+    )
+
+
+def _reaper_cutoff() -> str:
+    return (datetime.now(UTC) - timedelta(seconds=STALE_CUTOFF_SECONDS)).isoformat()
+
+
+async def _assert_the_collided_write_landed(journal: ReconciliationJournal) -> None:
+    live = await journal.get_run('live')
+    assert live is not None and live.session_id == _COLLIDED_SESSION, (
+        f"the collided write did not land: run 'live' carries "
+        f'{None if live is None else live.session_id!r}'
+    )
 
 
 @pytest.mark.asyncio
-async def test_a_write_survives_the_stale_run_reapers_read(journal, second_connection):
+async def test_a_write_survives_the_stale_run_reapers_read(
+    journal, journal_tap, second_connection
+):
     """Arm A: the reaper's pinned read snapshot must not kill a concurrent write.
+
+    Constructed, not raced: the production ``get_stale_runs`` is parked with its
+    snapshot pinned, a foreign connection files ``late``, and the write is
+    queued into that window.
 
     ``record_run_session`` is the probe because its unit is a SINGLE ``UPDATE`` with
     no preceding SELECT — a pure write opens no read snapshot of its own, so the
-    "expect zero" assertion is structurally sound rather than merely lucky.  A
+    "expect no error" assertion is structurally sound rather than merely lucky.  A
     SELECT-then-write method would be a flaky probe here (see ``AtomicConnection.
     write``'s stated residual).
     """
-    await _seed_runs(second_connection, filler=FILLER_RUNS, stale_run=True)
+    await _seed_runs(second_connection, stale_run=True)
 
-    failures = await _write_failures_under_a_pinned_read(journal, second_connection)
+    stale, error = await _collide_with_a_pinned_read(
+        journal_tap.connection,
+        read=lambda: journal.get_stale_runs(STALE_CUTOFF_SECONDS),
+        write=lambda: _record_the_collided_session(journal),
+        foreign_commit=lambda: _file_a_late_stale_run(second_connection),
+    )
 
-    assert not failures, (
-        f'{len(failures)}/{COLLISION_ITERATIONS} writes died while the stale-run '
-        f'reaper held a read snapshot on the same connection: {sorted(set(failures))}'
+    assert error is None, (
+        f'the write died while the stale-run reaper held a read snapshot on the '
+        f'same connection: {error}'
+    )
+    assert [run.id for run in stale] == ['long'], (
+        f"the reaper returned {[run.id for run in stale]!r}: it was not pinned before "
+        "the foreign commit filed 'late', so this run did not collide at all"
+    )
+    await _assert_the_collided_write_landed(journal)
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_multi_hop_reaper_read_kills_the_write(
+    journal, journal_tap, second_connection
+):
+    """CONTROL: the replaced read shape loses arm A's exact collision.
+
+    Same collision, same production write, same foreign commit; only the read's
+    shape is replaced, by an execute + fetchall on the journal's own connection.
+    That it kills the write is what proves arm A discriminates rather than
+    passing vacuously.
+    """
+    await _seed_runs(second_connection, stale_run=True)
+
+    rows, error = await _collide_with_a_pinned_read(
+        journal_tap.connection,
+        read=lambda: _legacy_multi_hop_read(
+            journal_tap.connection, _LEGACY_REAPER_SCAN, (_reaper_cutoff(),)
+        ),
+        write=lambda: _record_the_collided_session(journal),
+        foreign_commit=lambda: _file_a_late_stale_run(second_connection),
+    )
+
+    assert error == 'SQLITE_BUSY_SNAPSHOT', (
+        f'the replaced reaper read did not kill the write ({error!r}), so this '
+        'collision no longer reproduces the defect arm A guards'
+    )
+    assert [row['id'] for row in rows] == ['long'], (
+        f"the parked read saw {[row['id'] for row in rows]!r}: it was not pinned "
+        "before the foreign commit filed 'late'"
     )
 
 
 @pytest.mark.asyncio
-async def test_no_stale_run_means_no_pinned_read_and_no_failures(journal, second_connection):
-    """Arm B, a permanent control: the same loop, with nothing past the cutoff.
+async def test_no_stale_run_means_no_pinned_read_and_no_failures(
+    journal, journal_tap, second_connection
+):
+    """Arm B, a permanent control: the replaced read shape, with nothing past the cutoff.
 
-    Measured at 0/40 before the fix as well as after.  It is what distinguishes
-    "arm A is keyed to the reaper's pinned snapshot" from "arm A is keyed to the
-    shape of the loop" — without it, a future regression that broke the seeding
-    would turn arm A green and look like a pass.
+    With no row matched, the replaced shape's first step runs to completion and
+    releases its snapshot before the write runs, so nothing is held across hops.
+    Paired with the legacy reaper control, which matches ``long`` and kills the
+    write, this shows SQLITE_BUSY_SNAPSHOT is caused by the HELD row, not by
+    the gate or the foreign commit.
     """
-    await _seed_runs(second_connection, filler=FILLER_RUNS, stale_run=False)
+    await _seed_runs(second_connection, stale_run=False)
 
-    failures = await _write_failures_under_a_pinned_read(journal, second_connection)
-
-    assert not failures, (
-        f'{len(failures)}/{COLLISION_ITERATIONS} writes failed with no run past the '
-        f'cutoff, so this loop collides for a reason arm A does not describe: '
-        f'{sorted(set(failures))}'
+    rows, error = await _collide_with_a_pinned_read(
+        journal_tap.connection,
+        read=lambda: _legacy_multi_hop_read(
+            journal_tap.connection, _LEGACY_REAPER_SCAN, (_reaper_cutoff(),)
+        ),
+        write=lambda: _record_the_collided_session(journal),
+        foreign_commit=lambda: _file_a_late_stale_run(second_connection),
     )
+
+    assert error is None, (
+        f'the write failed with no run past the cutoff, so this collision fails for '
+        f'a reason the held-row control does not describe: {error}'
+    )
+    assert rows == [], (
+        f"the parked read saw {[row['id'] for row in rows]!r}: it was not pinned "
+        "before the foreign commit filed 'late'"
+    )
+    await _assert_the_collided_write_landed(journal)
 
 
 @pytest.mark.asyncio
 async def test_checkpoint_and_write_do_not_lock_each_other_out(journal, second_connection):
     """Arm C: ``checkpoint()`` concurrent with a write — neither side may raise."""
-    await _seed_runs(second_connection, filler=0, stale_run=False)
+    await _seed_runs(second_connection, stale_run=False)
 
     for i in range(CHECKPOINT_ITERATIONS):
         written, checkpointed = await asyncio.wait_for(
@@ -288,16 +504,23 @@ async def test_checkpoint_and_write_do_not_lock_each_other_out(journal, second_c
     )
 
 
+@pytest.fixture
+def buffer_tap() -> _ConnectTap:
+    return _ConnectTap()
+
+
 @pytest_asyncio.fixture
-async def event_buffer(journal):
+async def event_buffer(journal, buffer_tap):
     """An EventBuffer on the journal's OWN ``reconciliation.db`` file.
 
-    Two stores, two connections, one file — production's exact shape, which is
-    what makes the journal a genuine foreign writer rather than a stand-in.  Both
-    open via ``connect_daemon``, so neither carries the shutdown hazard that
+    Several stores, several connections, one file — production's shape.  The
+    collision arms' foreign writer is nonetheless ``second_connection``, not the
+    journal: the pin proof needs the foreign commit to land a row the peek would
+    match, and the journal writes no ``event_buffer`` rows.  Both stores open via
+    ``connect_daemon``, so neither carries the shutdown hazard that
     ``second_connection`` documents.
     """
-    buffer = EventBuffer(db_path=journal.data_dir / 'reconciliation.db')
+    buffer = EventBuffer(db_path=journal.data_dir / 'reconciliation.db', connect=buffer_tap)
     await buffer.initialize()
     try:
         yield buffer
@@ -315,16 +538,20 @@ def _event(index: int) -> ReconciliationEvent:
     )
 
 
+def _seeded_event_ids(count: int = SEEDED_EVENTS) -> list[str]:
+    return [f'seeded-{i}' for i in range(count)]
+
+
 async def _seed_buffered_events(conn, *, count: int) -> None:
     """Fill the buffer with ``count`` ``status='buffered'`` rows, in ONE executemany.
 
-    Distinct descending-age timestamps, so ``peek_buffered``'s ``ORDER BY
-    timestamp`` has real work to do rather than reading an already-ordered heap.
+    Distinct, increasing timestamps, so ``peek_buffered``'s ``ORDER BY
+    timestamp`` returns them in ``_seeded_event_ids`` order.
     """
     now = datetime.now(UTC)
     rows = [
         (
-            f'seeded-{i}',
+            event_id,
             PROJECT_ID,
             'memory_added',
             'agent',
@@ -333,56 +560,138 @@ async def _seed_buffered_events(conn, *, count: int) -> None:
             '{}',
             'buffered',
         )
-        for i in range(count)
+        for i, event_id in enumerate(_seeded_event_ids(count))
     ]
     async with conn.executemany(_INSERT_EVENT, rows):
         pass
     await conn.commit()
 
 
-async def _heartbeat_failures_under_a_pinned_read(buffer, journal) -> list[str]:
-    """Race the buffer's heartbeat against its own peek, with the journal writing.
+# The peek's scan, test-owned: the legacy control runs it in the replaced
+# execute + fetchall shape on the buffer's own connection.
+_LEGACY_PEEK = """SELECT * FROM event_buffer
+    WHERE project_id = ? AND status = 'buffered'
+    ORDER BY timestamp ASC LIMIT ?"""
 
-    The journal is the foreign connection here: its ``update_watermark`` commit —
-    a CHANGING value each iteration, so the WAL really advances — lands while
-    ``peek_buffered`` still holds a read snapshot on the buffer's connection.
+
+async def _buffer_a_late_event(conn: aiosqlite.Connection) -> None:
+    """Commit buffered event ``late``, which the peek WOULD match, from ``conn``.
+
+    A peek pinned before this commit cannot return it, which is how each buffer
+    collision arm certifies that the collision really happened.
     """
-    failures: list[str] = []
-    for i in range(BUFFER_COLLISION_ITERATIONS):
-        reader = asyncio.create_task(buffer.peek_buffered(PROJECT_ID, 1_000_000))
-        try:
-            await asyncio.sleep(0)
-            await journal.update_watermark(
-                Watermark(project_id=PROJECT_ID, last_full_run_id=f'run-{i}')
-            )
-            try:
-                await buffer.heartbeat(PROJECT_ID)
-            except sqlite3.OperationalError as exc:
-                failures.append(exc.sqlite_errorname)
-        finally:
-            await reader
-    return failures
+    async with conn.execute(
+        _INSERT_EVENT,
+        (
+            'late',
+            PROJECT_ID,
+            'memory_added',
+            'agent',
+            None,
+            datetime.now(UTC).isoformat(),
+            '{}',
+            'buffered',
+        ),
+    ):
+        pass
+    await conn.commit()
+
+
+async def _hold_the_lock_with_an_old_heartbeat(
+    buffer: EventBuffer, conn: aiosqlite.Connection
+) -> float:
+    """Take ``buffer``'s lock, backdate its heartbeat from ``conn``, and return that age.
+
+    Half the stale-lock window: old enough that a heartbeat which lands visibly
+    resets it, young enough that ``get_lock_status``'s stale-lock sweep keeps
+    the row.
+    """
+    assert await buffer.mark_run_active(PROJECT_ID), 'the lock was already held'
+    aged_seconds = buffer.stale_lock_seconds / 2
+    heartbeat_at = (datetime.now(UTC) - timedelta(seconds=aged_seconds)).isoformat()
+    async with conn.execute(
+        'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
+        (heartbeat_at, PROJECT_ID),
+    ):
+        pass
+    await conn.commit()
+    return aged_seconds
+
+
+async def _assert_the_heartbeat_landed(buffer: EventBuffer, aged_seconds: float) -> None:
+    holder, age = await buffer.get_lock_status(PROJECT_ID)
+    assert holder == buffer.instance_id and age is not None and age < aged_seconds, (
+        f'the heartbeat did not land: the lock is held by {holder!r} with a heartbeat '
+        f'{age!r}s old, against {aged_seconds}s before the collision'
+    )
 
 
 @pytest.mark.asyncio
 async def test_a_heartbeat_survives_a_peek_on_the_same_connection(
-    journal, event_buffer, second_connection
+    journal, event_buffer, buffer_tap, second_connection
 ):
     """Arm D: a buffer write must survive a buffer read that is still in flight.
+
+    Constructed, not raced: the production ``peek_buffered`` is parked with its
+    snapshot pinned, a foreign connection buffers ``late``, and the heartbeat is
+    queued into that window.  The buffer holds the lock with an old heartbeat, so
+    a heartbeat that survives but changes nothing fails the arm too.
 
     ``heartbeat`` is the probe because its unit is a SINGLE ``UPDATE`` with no
     preceding SELECT — the same property that makes ``record_run_session`` the
     right probe for the journal arm.  Do not substitute another write method
     without re-checking it.
     """
-    await _seed_buffered_events(second_connection, count=BUFFERED_EVENTS)
+    await _seed_buffered_events(second_connection, count=SEEDED_EVENTS)
+    aged_seconds = await _hold_the_lock_with_an_old_heartbeat(event_buffer, second_connection)
 
-    failures = await _heartbeat_failures_under_a_pinned_read(event_buffer, journal)
+    peeked, error = await _collide_with_a_pinned_read(
+        buffer_tap.connection,
+        read=lambda: event_buffer.peek_buffered(PROJECT_ID, 1_000_000),
+        write=lambda: event_buffer.heartbeat(PROJECT_ID),
+        foreign_commit=lambda: _buffer_a_late_event(second_connection),
+    )
 
-    assert not failures, (
-        f'{len(failures)}/{BUFFER_COLLISION_ITERATIONS} heartbeats died while '
-        f'peek_buffered held a read snapshot on the same connection: '
-        f'{sorted(set(failures))}'
+    assert error is None, (
+        f'the heartbeat died while peek_buffered held a read snapshot on the same '
+        f'connection: {error}'
+    )
+    assert [event.id for event in peeked] == _seeded_event_ids(), (
+        f'the peek returned {[event.id for event in peeked]!r}: it was not pinned '
+        "before the foreign commit buffered 'late', so this run did not collide at all"
+    )
+    await _assert_the_heartbeat_landed(event_buffer, aged_seconds)
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_multi_hop_peek_kills_the_heartbeat(
+    journal, event_buffer, buffer_tap, second_connection
+):
+    """CONTROL: the replaced read shape loses arm D's exact collision.
+
+    Same collision, same production heartbeat, same foreign commit; only the
+    peek's shape is replaced, by an execute + fetchall on the buffer's own
+    connection.  That it kills the heartbeat is what proves arm D discriminates.
+    """
+    await _seed_buffered_events(second_connection, count=SEEDED_EVENTS)
+    await _hold_the_lock_with_an_old_heartbeat(event_buffer, second_connection)
+
+    rows, error = await _collide_with_a_pinned_read(
+        buffer_tap.connection,
+        read=lambda: _legacy_multi_hop_read(
+            buffer_tap.connection, _LEGACY_PEEK, (PROJECT_ID, 1_000_000)
+        ),
+        write=lambda: event_buffer.heartbeat(PROJECT_ID),
+        foreign_commit=lambda: _buffer_a_late_event(second_connection),
+    )
+
+    assert error == 'SQLITE_BUSY_SNAPSHOT', (
+        f'the replaced peek did not kill the heartbeat ({error!r}), so this '
+        'collision no longer reproduces the defect arm D guards'
+    )
+    assert [row['id'] for row in rows] == _seeded_event_ids(), (
+        f"the parked peek saw {[row['id'] for row in rows]!r}: it was not pinned "
+        "before the foreign commit buffered 'late'"
     )
 
 

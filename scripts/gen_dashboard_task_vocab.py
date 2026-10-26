@@ -38,6 +38,7 @@ import pathlib
 import sys
 from collections.abc import Sequence
 
+import _checkout as _checkout
 from dashboard.data import census
 from shared.task_statuses import TaskStatus
 

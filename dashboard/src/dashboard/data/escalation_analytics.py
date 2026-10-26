@@ -751,7 +751,8 @@ def build_escalation_analytics(
 
     ``pins_by_project`` is :func:`dashboard.data.escalations.fetch_pins_recovery`'s
     return value passed through verbatim: ``{label: {escalation_id: [task_ids]}
-    | None}``, keyed by project label (``root.name``), as are the queue labels.
+    | None}``, keyed by project label (``dashboard/project_labels.py::ProjectLabels``),
+    as are the queue labels.
     A project absent from the mapping and a project mapped to ``None`` are
     treated identically: UNKNOWN, so nothing is stamped.
 

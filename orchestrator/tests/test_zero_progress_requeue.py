@@ -609,7 +609,7 @@ class TestResolveZeroProgressRequeueAlert:
             agent_role='someone-else',
             severity='blocking',
             level=1,
-            category='merge_conflict',
+            category='merge_error',
             summary='not ours',
             detail='not ours',
         )
@@ -649,6 +649,7 @@ class TestResolveZeroProgressRequeueAlert:
 class TestZeroProgressRequeueConfig:
     """The detector must be operator-visible, tunable, and hot-reloadable."""
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_section_is_registered_on_orchestrator_config(self):
         """OrchestratorConfig exposes zero_progress_requeue with the defaults.
 

@@ -1,6 +1,9 @@
 # PRD — Offline deep-test lane, infra-residue extension (dark-factory)
 
 **Status:** draft (2026-07-01) — for `/prd` check + decompose.
+
+> **Amended 2026-10-12** by plans/offline-lane-red-path-prd.md: IE-D1's 'infra failures ride the fingerprint dedup unchanged' is replaced: the infra leg uses the same engine and its per-test result lines are per-test evidence.
+
 **Slug:** `offline-deep-test-lane-infra-extension`
 **Extends:** `docs/prds/offline-deep-test-lane-worker.md` (Part B — the *numeric* cold-lane worker, filed as DF **#1951–1957**).
 **Consumes (reify Part A primitives):** `/home/leo/src/reify/docs/prds/run-all-host-infra-partition.md` (reify **#4921–4929**, leaves H1–H9).

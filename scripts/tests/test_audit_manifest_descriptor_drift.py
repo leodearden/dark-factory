@@ -28,7 +28,7 @@ by the helpers here, whose contents the test controls exactly.
 The live-corpus tests in this file
 (:func:`test_live_sidecars_carry_the_resynced_descriptors`,
 :func:`test_live_sidecars_still_declare_none_of_the_adjudicated_labels` and
-:func:`test_live_foreign_producer_blocks_declare_their_external_registry`)
+:func:`test_identifier_anchor_names_a_definition_inside_its_certified_suite`)
 read only TRACKED GIT FILES and open no database at all — the same legitimacy
 as shared/tests/test_capability_manifest.py::TestCheckedInManifestCorpus and
 scripts/tests/test_lms_marker_contract.py.
@@ -36,8 +36,11 @@ scripts/tests/test_lms_marker_contract.py.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -52,6 +55,7 @@ from _task_db_scan import (
 from audit_manifest_descriptor_drift import (
     _COVERAGE_CAVEAT,
     _DISCOVERY_FAILED_NOTICE,
+    _SIGNAL_BINDING_CAVEAT,
     _UNBOUND_CAVEAT,
     EXIT_DRIFT,
     EXIT_NO_ROOT,
@@ -60,6 +64,7 @@ from audit_manifest_descriptor_drift import (
     DescriptorDrift,
     ManifestBinding,
     ProjectAudit,
+    StaleSignalBinding,
     TaskStoreScan,
     UnboundLabel,
     _is_dirty,
@@ -69,7 +74,12 @@ from audit_manifest_descriptor_drift import (
     load_task_store_scan,
 )
 from git_checkout_root import checkout_root_or_skip
-from shared.capability_manifest import load_capability_manifest
+from shared.capability_manifest import DeliveredCheck, load_capability_manifest
+from shared.delivered_check_polarity import (
+    CheckOutcome,
+    build_grep_argv,
+    interpret_grep_rc,
+)
 from shared.task_statuses import TERMINAL, TaskStatus
 
 # ---------------------------------------------------------------------------
@@ -789,7 +799,7 @@ def test_a_foreign_block_whose_number_collides_with_a_local_row_stays_foreign(
     project's 5613 is ordinary and says nothing: dark-factory's own ids were
     at 5173 when this field was introduced against reify's 5332-5616, and
     they will pass them. A guard that fired on "the numeric part resolves to
-    a local row" would therefore start misreporting the six legitimately
+    a local row" would therefore start misreporting the legitimately
     foreign blocks in this repo's corpus as mis-authored, on a schedule set
     by task numbering. This test pins that it does not.
     """
@@ -1520,6 +1530,257 @@ def test_live_and_historical_rows_share_one_list(tmp_path, make_tasks_db):
 
 
 # ---------------------------------------------------------------------------
+# THE SIGNAL-BINDING CHECK (task 6582).
+#
+# A sidecar's `signal_leaves` names the block(s) whose task status the
+# dashboard reads as the PRD's signal (plans/dashboard-prd-lanes-prd.md §4.7,
+# §5.2). A signal leaf bound to a task this store lacks, or to a task whose own
+# prd_path is another PRD, is reported as a StaleSignalBinding row, never mixed
+# into the other lists.
+# ---------------------------------------------------------------------------
+
+_SIGNAL_SIDECAR = "plans/x-prd.capability-manifest.yaml"
+
+
+def _signalling(prd, blocks, signal_leaves, *, external=None):
+    """A sidecar binding *blocks* — ``[(label, task_id), ...]`` — with no
+    capabilities, naming *signal_leaves* (the key is omitted when None).
+    *external* maps a label to the external_task_id its block binds instead."""
+    external = external or {}
+    tasks = []
+    for label, task_id in blocks:
+        block: dict[str, object] = {"label": label, "task_id": task_id, "capabilities": []}
+        if label in external:
+            block["external_task_id"] = external[label]
+        tasks.append(block)
+    doc: dict[str, object] = {"prd": prd, "schema_version": 1, "tasks": tasks}
+    if signal_leaves is not None:
+        doc["signal_leaves"] = signal_leaves
+    return doc
+
+
+def _prd_row(task_id, prd_path):
+    """A task row carrying only a prd_path, so it binds no label of its own."""
+    return {"id": task_id, "status": "pending", "metadata": {"prd_path": prd_path}}
+
+
+def _row6_project(tmp_path, make_tasks_db, *, name="row6", signal_label="ζ",
+                  signal_leaves=True):
+    """Boundary row 6: the signal leaf is bound to another PRD's task (8)."""
+    return _make_project(
+        tmp_path, make_tasks_db, name=name,
+        tasks=[_prd_row(7, "plans/x-prd.md"), _prd_row(8, "plans/other-prd.md")],
+        manifests=[(_SIGNAL_SIDECAR, _signalling(
+            "plans/x-prd.md", [("α", 7), (signal_label, 8)],
+            [signal_label] if signal_leaves else None))],
+    )
+
+
+_ROW6 = StaleSignalBinding(
+    manifest=_SIGNAL_SIDECAR, label="ζ", task_id=8, reason="prd_mismatch",
+    sidecar_prd="plans/x-prd.md", task_prd="plans/other-prd.md")
+
+
+def test_scan_collects_each_rows_prd_path(make_tasks_db):
+    """Taken in the SAME one scan, so the signal check reads the snapshot the
+    other two directions read. Only a non-empty string prd_path is kept, and
+    the tag='master' pin covers it too."""
+    db = make_tasks_db([
+        _labelled(7, prd_path="plans/x-prd.md"),
+        _prd_row(8, "plans/y-prd.md"),
+        {"id": 9, "status": "pending", "metadata": {"prd_path": 5}},
+        {"id": 10, "status": "pending", "metadata": {}},
+        {"id": 11, "status": "pending", "metadata": {"prd_path": ""}},
+        {**_prd_row(12, "plans/z-prd.md"), "tag": "other-tag"},
+    ])
+
+    scan = load_task_store_scan(str(db))
+
+    assert scan.prd_paths == {7: "plans/x-prd.md", 8: "plans/y-prd.md"}
+    assert scan.row_ids == {7, 8, 9, 10, 11}
+    assert scan.delivered_checks == {}
+    assert [b.task_id for b in scan.manifest_bindings] == [7]
+
+
+def test_a_signal_label_bound_to_another_prds_task_is_reported(tmp_path, make_tasks_db):
+    """THE ROW-6 SCENARIO, and nothing else moves: the drift findings and every
+    coverage counter but the signal check's own two equal those of the same
+    project with no signal_leaves."""
+    audit = audit_project(str(_row6_project(tmp_path, make_tasks_db)))
+    unsignalled = audit_project(str(_row6_project(
+        tmp_path, make_tasks_db, name="unsignalled", signal_leaves=False)))
+
+    assert audit.stale_signal_bindings == [_ROW6]
+    assert audit.findings == []
+    assert (audit.coverage.signal_leaves_named, audit.coverage.signal_leaves_checked) == (1, 1)
+    assert audit.coverage == unsignalled.coverage._replace(
+        signal_leaves_named=1, signal_leaves_checked=1)
+
+
+def test_a_signal_label_bound_to_a_task_missing_from_the_store_is_reported(
+        tmp_path, make_tasks_db):
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_prd_row(7, "plans/x-prd.md")],
+        manifests=[(_SIGNAL_SIDECAR, _signalling(
+            "plans/x-prd.md", [("α", 7), ("ζ", 9)], ["ζ"]))],
+    )
+
+    assert audit_project(str(root)).stale_signal_bindings == [StaleSignalBinding(
+        manifest=_SIGNAL_SIDECAR, label="ζ", task_id=9, reason="task_missing",
+        sidecar_prd="plans/x-prd.md", task_prd=None)]
+
+
+def test_a_signal_leaf_task_with_no_prd_path_is_a_mismatch(tmp_path, make_tasks_db):
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_prd_row(7, "plans/x-prd.md"),
+               {"id": 8, "status": "pending", "metadata": {}}],
+        manifests=[(_SIGNAL_SIDECAR, _signalling(
+            "plans/x-prd.md", [("α", 7), ("ζ", 8)], ["ζ"]))],
+    )
+
+    assert audit_project(str(root)).stale_signal_bindings == [StaleSignalBinding(
+        manifest=_SIGNAL_SIDECAR, label="ζ", task_id=8, reason="prd_mismatch",
+        sidecar_prd="plans/x-prd.md", task_prd=None)]
+
+
+def test_an_agreeing_signal_binding_is_no_row(tmp_path, make_tasks_db):
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_prd_row(7, "plans/x-prd.md"), _prd_row(8, "plans/x-prd.md")],
+        manifests=[(_SIGNAL_SIDECAR, _signalling(
+            "plans/x-prd.md", [("α", 7), ("ζ", 8)], ["ζ"]))],
+    )
+
+    assert audit_project(str(root)).stale_signal_bindings == []
+
+
+@pytest.mark.parametrize("external", [None, {"ζ": "reify:5613"}],
+                         ids=["unbound", "external"])
+def test_unbound_and_external_signal_leaves_are_no_row(tmp_path, make_tasks_db, external):
+    """Nothing LOCAL to check: an unbound leaf binds no task yet, and an external
+    one names another registry, which plans/dashboard-prd-lanes-prd.md §10
+    leaves unresolved. Such a leaf is NAMED but not CHECKED."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_prd_row(7, "plans/x-prd.md")],
+        manifests=[(_SIGNAL_SIDECAR, _signalling(
+            "plans/x-prd.md", [("α", 7), ("ζ", None)], ["ζ"], external=external))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert audit.stale_signal_bindings == []
+    assert (audit.coverage.signal_leaves_named, audit.coverage.signal_leaves_checked) == (1, 0)
+
+
+def test_a_sidecar_without_signal_leaves_yields_no_row(tmp_path, make_tasks_db):
+    root = _row6_project(tmp_path, make_tasks_db, signal_leaves=False)
+
+    audit = audit_project(str(root))
+
+    assert audit.stale_signal_bindings == []
+    assert (audit.coverage.signal_leaves_named, audit.coverage.signal_leaves_checked) == (0, 0)
+
+
+def test_signal_leaf_counters_sum_across_sidecars(tmp_path, make_tasks_db):
+    """Every named leaf is counted, and every locally bound one is checked,
+    whether or not it turns out stale."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_prd_row(7, "plans/x-prd.md"), _prd_row(8, "plans/other-prd.md"),
+               _prd_row(9, "plans/y-prd.md")],
+        manifests=[
+            (_SIGNAL_SIDECAR, _signalling(
+                "plans/x-prd.md", [("α", 7), ("ζ", 8), ("η", None)], ["α", "ζ", "η"])),
+            ("plans/y-prd.capability-manifest.yaml", _signalling(
+                "plans/y-prd.md", [("β", 9)], ["β"])),
+        ],
+    )
+
+    audit = audit_project(str(root))
+
+    assert [row.label for row in audit.stale_signal_bindings] == ["ζ"]
+    assert (audit.coverage.signal_leaves_named, audit.coverage.signal_leaves_checked) == (4, 3)
+
+
+def _row6_lines(text, label="ζ"):
+    """The lines of *text* naming every value boundary row 6 requires the
+    report to name (label, task and both PRD values), spelled as literals so
+    they are checked independently of the formatter."""
+    fields = (f"manifest={_SIGNAL_SIDECAR}", f"label={label}", "task_id=8",
+              "reason=prd_mismatch", "sidecar_prd=plans/x-prd.md",
+              "task_prd=plans/other-prd.md")
+    return [line for line in text.splitlines() if all(field in line for field in fields)]
+
+
+def test_report_names_the_stale_signal_binding_under_its_own_section(
+        tmp_path, make_tasks_db):
+    report = format_report([audit_project(str(_row6_project(tmp_path, make_tasks_db)))])
+
+    assert "  -- stale signal bindings (1) --" in report.splitlines()
+    assert _SIGNAL_BINDING_CAVEAT in report
+    assert len(_row6_lines(report)) == 1
+
+
+def test_the_signal_binding_section_prints_even_when_empty(tmp_path, make_tasks_db):
+    """Looked and found none, as opposed to never looked — and the coverage
+    block says how many leaves there were to look at."""
+    root = _row6_project(tmp_path, make_tasks_db, signal_leaves=False)
+
+    report = format_report([audit_project(str(root))])
+    lines = report.splitlines()
+
+    assert "  -- stale signal bindings (0) --" in lines
+    assert _SIGNAL_BINDING_CAVEAT in report
+    assert "    signal leaves named:                0" in lines
+    assert "    signal leaves checked:              0" in lines
+
+
+def test_coverage_block_counts_the_signal_leaves_as_aligned_rows(
+        tmp_path, make_tasks_db):
+    report = format_report([audit_project(str(_row6_project(tmp_path, make_tasks_db)))])
+    lines = report.splitlines()
+
+    assert "    signal leaves named:                1" in lines
+    assert "    signal leaves checked:              1" in lines
+
+
+def test_format_json_carries_stale_signal_bindings_and_their_caveat(
+        tmp_path, make_tasks_db):
+    payload = json.loads(format_json(
+        [audit_project(str(_row6_project(tmp_path, make_tasks_db)))]))
+
+    (project,) = payload["projects"]
+    assert project["stale_signal_bindings"] == [
+        {"manifest": _SIGNAL_SIDECAR, "label": "ζ", "task_id": 8,
+         "reason": "prd_mismatch", "sidecar_prd": "plans/x-prd.md",
+         "task_prd": "plans/other-prd.md"},
+    ]
+    assert project["coverage"]["signal_leaves_named"] == 1
+    assert project["coverage"]["signal_leaves_checked"] == 1
+    assert payload["stale_signal_bindings_caveat"] == _SIGNAL_BINDING_CAVEAT
+
+
+def test_a_stale_signal_binding_alone_makes_the_run_dirty(tmp_path, make_tasks_db):
+    """No historical exemption: the dashboard reads a signal leaf whatever its
+    task's status."""
+    assert _is_dirty([audit_project(str(_row6_project(tmp_path, make_tasks_db)))])
+
+
+def test_main_exit_1_when_a_stale_signal_binding_is_the_only_issue(
+        tmp_path, make_tasks_db):
+    """An ASCII label, so no assertion depends on the child's stdout encoding."""
+    root = _row6_project(tmp_path, make_tasks_db, signal_label="zeta")
+
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == EXIT_DRIFT, result.stdout
+    assert len(_row6_lines(result.stdout, label="zeta")) == 1
+
+
+# ---------------------------------------------------------------------------
 # Non-vacuity / loudness. A silently-empty corpus must NEVER render as a clean
 # zero: an empty corpus and a clean corpus are indistinguishable in the finding
 # count, and only one of them is good news.
@@ -2103,16 +2364,17 @@ def test_the_unbound_section_and_its_caveat_print_even_when_empty(
     assert _UNBOUND_CAVEAT in report
 
 
-def test_the_total_line_counts_both_dimensions_and_the_live_rows(
+def test_the_total_line_counts_every_dimension_and_the_live_rows(
         tmp_path, make_tasks_db):
-    """A report carrying two kinds of row must not close on a drift-only total."""
+    """A report carrying several kinds of row must not close on a drift-only total."""
     audits = [_drifted_audit(tmp_path, make_tasks_db),
               _unbound_audit(tmp_path, make_tasks_db)]
 
     last = format_report(audits).splitlines()[-1]
 
     assert last == (
-        "1 drifted descriptor(s), 2 unbound task label(s) (1 live) across 2 project(s)")
+        "1 drifted descriptor(s), 2 unbound task label(s) (1 live), "
+        "0 stale signal binding(s) across 2 project(s)")
 
 
 def test_discovery_failed_notice_sits_above_the_unbound_section_too(
@@ -2367,7 +2629,7 @@ _MEASURED_DRIFT_ROWS = (
         # broke silently if anyone reworded the docstring, so this row now
         # anchors on the suite's own class identifier instead — same rule as
         # the γ1/3536 row below. See
-        # test_alpha4_anchor_is_an_identifier_inside_the_certified_suite.
+        # test_identifier_anchor_names_a_definition_inside_its_certified_suite.
         _grep("test_sandbox_enforcement_matrix", ["orchestrator/tests/"]),
         _grep("TestSandboxEnforcementMatrix", ["orchestrator/tests/"]),
     ),
@@ -2387,6 +2649,8 @@ _MEASURED_DRIFT_ROWS = (
         # THE FILENAME-VS-CONTENT MODE. orchestrator/tests/
         # test_workflow_merge_gating_strand.py DOES exist, but kind=grep
         # searches CONTENT and a test module does not mention its own name.
+        # The resynced anchor is identifier-anchored, checked by
+        # test_identifier_anchor_names_a_definition_inside_its_certified_suite.
         _grep("test_workflow_merge_gating_strand", ["orchestrator/tests/"]),
         _grep("TestNoStrandExitProperty", ["orchestrator/tests/"]),
     ),
@@ -2432,6 +2696,16 @@ _MEASURED_DRIFT_ROWS = (
               expect="absent"),
     ),
 )
+
+#: The rows whose resynced pattern is an IDENTIFIER ANCHOR: a class/def name
+#: certifying that a test suite exists. (task_id, capability) -> the suite file
+#: every hit must stay inside.
+_CERTIFIED_SUITE_BY_ANCHORED_ROW = {
+    (2906, "enforcement-matrix-suite-exists"):
+        "orchestrator/tests/test_sandbox_enforcement_matrix.py",
+    (3536, "no-steward-less-escalated-exit-at-merge-entry"):
+        "orchestrator/tests/test_workflow_merge_gating_strand.py",
+}
 
 
 def _rows_as_project(tmp_path, make_tasks_db, *, sidecar_index):
@@ -2547,6 +2821,35 @@ def test_the_measured_rows_carry_the_two_differing_field_sets(
 # legitimate live assertion where a tasks.db one would not be.
 # ---------------------------------------------------------------------------
 
+def _live_delivered_check(root: str, relpath: str, label: str,
+                          capability: str) -> DeliveredCheck:
+    """The delivered_check of the one *capability* under *label* in a TRACKED sidecar."""
+    # NON-VACUITY FLOOR: assert the sidecar is TRACKED before reading it, so a
+    # renamed or deleted manifest cannot make a caller pass by finding nothing
+    # to check.
+    tracked = subprocess.run(
+        ["git", "-C", root, "ls-files", "--", relpath],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert tracked.stdout.strip(), f"{relpath} is not tracked in {root}"
+
+    doc = load_capability_manifest(Path(root) / relpath)
+    matches = [
+        cap for task in doc.tasks if task.label == label
+        for cap in task.capabilities if cap.name == capability
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one {capability!r} under label {label!r} "
+        f"in {relpath}, found {len(matches)}"
+    )
+
+    check = matches[0].delivered_check
+    assert check is not None, (
+        f"{relpath} label {label} capability {capability} carries no delivered_check"
+    )
+    return check
+
+
 @pytest.mark.parametrize(
     "relpath,task_id,label,capability,resynced",
     [(r[0], r[1], r[2], r[3], r[5]) for r in _MEASURED_DRIFT_ROWS],
@@ -2576,27 +2879,7 @@ def test_live_sidecars_carry_the_resynced_descriptors(
     """
     root = checkout_root_or_skip()
 
-    # NON-VACUITY FLOOR: assert the sidecar is TRACKED before reading it, so a
-    # renamed or deleted manifest cannot make this test pass by finding
-    # nothing to check.
-    tracked = subprocess.run(
-        ["git", "-C", root, "ls-files", "--", relpath],
-        capture_output=True, text=True, timeout=30,
-    )
-    assert tracked.stdout.strip(), f"{relpath} is not tracked in {root}"
-
-    doc = load_capability_manifest(Path(root) / relpath)
-    matches = [
-        cap for task in doc.tasks if task.label == label
-        for cap in task.capabilities if cap.name == capability
-    ]
-    assert len(matches) == 1, (
-        f"expected exactly one {capability!r} under label {label!r} "
-        f"in {relpath}, found {len(matches)}"
-    )
-
-    check = matches[0].delivered_check
-    assert check is not None
+    check = _live_delivered_check(root, relpath, label, capability)
     assert check.model_dump() == {
         "kind": resynced["kind"],
         "pattern": resynced["pattern"],
@@ -2616,146 +2899,147 @@ def test_live_sidecars_carry_the_resynced_descriptors(
     )
 
 
-# ---------------------------------------------------------------------------
-# The six tracked manifest blocks whose PRODUCER lives in reify's registry,
-# not dark-factory's: (manifest relpath, label, expected external_task_id).
-#
-# PROVENANCE (task 4731). Each id was verified as a live `tag='master'` row in
-# /home/leo/src/reify/.taskmaster/tasks/tasks.db whose TITLE matches the block
-# it is bound to. Corroborated three independent ways: γ6a/γ6b's own
-# delivered_check reasons say "foreign-registry task; DF stamper/scheduler
-# cannot carry this check - reify verify owns it"; η/θ/ι/κ's check paths
-# (deploy/systemd/, scripts/refresh-warm-base.sh,
-# scripts/verify-pipeline-paths.txt) are absent from `git ls-files` in THIS
-# repo; and plans/warm-lane-infra-repatriation-prd.md assigns leaf η to a
-# reify-side file by name.
-# ---------------------------------------------------------------------------
-_EXTERNAL_REGISTRY_BLOCKS = (
-    ("plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml",
-     "γ6a", "reify:5332"),
-    ("plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml",
-     "γ6b", "reify:5333"),
-    ("plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
-     "η", "reify:5613"),
-    ("plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
-     "θ", "reify:5614"),
-    ("plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
-     "ι", "reify:5615"),
-    ("plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
-     "κ", "reify:5616"),
-)
+@dataclass(frozen=True)
+class _AnchorReading:
+    """One grep check's working-tree hits, read against the suite it certifies."""
+
+    outcome: CheckOutcome
+    paths_hit: frozenset[str]
+    defines_in_suite: bool
+    stderr: str
+
+
+#: Fills build_grep_argv's mandatory ref slot only to be removed again: with no
+#: tree argument git grep reads the working tree, which is the tree
+#: _live_delivered_check reads the sidecar from.
+_REF_SLOT_PLACEHOLDER = "<working-tree>"
+
+_DEFINED_NAME = re.compile(r"\s*(?:async\s+)?(?:class|def)\s+(\w+)")
+
+
+def _working_tree_grep_argv(root: str, pattern: str,
+                            paths: Sequence[str]) -> list[str]:
+    """build_grep_argv's argv minus its ref, plus the output-only --null and
+    --column, which change neither the match set nor the exit code."""
+    argv = build_grep_argv(pattern, paths, project_root=root,
+                           ref=_REF_SLOT_PLACEHOLDER)
+    removed = argv.pop(argv.index("-e") + 2)
+    assert removed == _REF_SLOT_PLACEHOLDER, (
+        f"build_grep_argv no longer puts its ref right after the pattern: {argv}"
+    )
+    flags_at = argv.index("-E")
+    argv[flags_at:flags_at] = ["--null", "--column"]
+    return argv
+
+
+def _match_starts_in_defined_name(text: str, column: int) -> bool:
+    """Whether git's 1-based byte *column* of a line's first match falls in the
+    name that line's class/def defines, not in a comment or body after it."""
+    defined = _DEFINED_NAME.match(text)
+    if defined is None:
+        return False
+    start, end = (len(text[:offset].encode()) for offset in defined.span(1))
+    return start < column <= end
+
+
+def _read_identifier_anchor(root: str, *, pattern: str, paths: Sequence[str],
+                            expect: str | None, suite: str) -> _AnchorReading:
+    """Run the runtime's grep over the working tree instead of a ref, and judge
+    its exit code with the runtime's own interpret_grep_rc."""
+    completed = subprocess.run(
+        _working_tree_grep_argv(root, pattern, paths),
+        capture_output=True, text=True, timeout=30,
+    )
+    hits = [line.split("\0", 2) for line in completed.stdout.split("\n") if line]
+    return _AnchorReading(
+        outcome=interpret_grep_rc(completed.returncode, expect),
+        paths_hit=frozenset(path for path, _column, _text in hits),
+        defines_in_suite=any(
+            path == suite and _match_starts_in_defined_name(text, int(column))
+            for path, column, text in hits
+        ),
+        stderr=completed.stderr,
+    )
+
+
+@pytest.mark.parametrize("files,outcome,paths_hit,defines_in_suite", [
+    pytest.param({"suite.py": "class TestAnchor:\n    pass\n"},
+                 CheckOutcome.PASS, {"tests/suite.py"}, True,
+                 id="definition-in-suite"),
+    pytest.param({"suite.py": "# TestAnchor is only mentioned here\n"},
+                 CheckOutcome.PASS, {"tests/suite.py"}, False,
+                 id="prose-only-in-suite"),
+    pytest.param({"suite.py": "def helper():  # TestAnchor\n"},
+                 CheckOutcome.PASS, {"tests/suite.py"}, False,
+                 id="prose-on-a-def-line"),
+    pytest.param({"suite.py": "class TestAnchor:\n    pass\n",
+                  "other.py": "# see TestAnchor\n"},
+                 CheckOutcome.PASS, {"tests/suite.py", "tests/other.py"}, True,
+                 id="leaks-outside-suite"),
+    pytest.param({"suite.py": "x = 1\n", "other.py": "class TestAnchor:\n"},
+                 CheckOutcome.PASS, {"tests/other.py"}, False,
+                 id="definition-only-outside-suite"),
+    pytest.param({"suite.py": "x = 1\n"},
+                 CheckOutcome.FAIL, frozenset(), False,
+                 id="matches-nothing"),
+])
+def test_anchor_reading_tells_a_definition_from_prose_a_leak_and_a_miss(
+        tmp_path, files, outcome, paths_hit, defines_in_suite):
+    """Each live identifier-anchor assertion can fail, shown on a synthetic repo."""
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    for name, text in files.items():
+        (tests_dir / name).write_text(text, encoding="utf-8")
+    _git_init(tmp_path)
+
+    reading = _read_identifier_anchor(
+        str(tmp_path), pattern="TestAnchor", paths=["tests/"], expect="present",
+        suite="tests/suite.py")
+
+    assert (reading.outcome, reading.paths_hit, reading.defines_in_suite) == (
+        outcome, paths_hit, defines_in_suite), reading.stderr
 
 
 @pytest.mark.parametrize(
-    "relpath,label,external_task_id",
-    _EXTERNAL_REGISTRY_BLOCKS,
-    ids=[f"{label}" for _, label, _ in _EXTERNAL_REGISTRY_BLOCKS],
+    "key,suite",
+    list(_CERTIFIED_SUITE_BY_ANCHORED_ROW.items()),
+    ids=[f"{task_id}-{capability}"
+         for task_id, capability in _CERTIFIED_SUITE_BY_ANCHORED_ROW],
 )
-def test_live_foreign_producer_blocks_declare_their_external_registry(
-        relpath, label, external_task_id):
-    """The six foreign-producer blocks bind external_task_id, not task_id.
-
-    Parametrized so a failure NAMES its own manifest and label rather than
-    reporting "one of six".
-
-    MAINTENANCE CONTRACT — READ THIS BEFORE "FIXING" A FAILURE HERE. These ids
-    are not guesses: each was verified as a live `tag='master'` row in reify's
-    task store with a title matching its block (see the provenance note on
-    _EXTERNAL_REGISTRY_BLOCKS above). A failure here means a SIDECAR WAS
-    EDITED, not that the test needs relaxing. Two shapes to expect:
-
-      - `task_id` came back on one of these blocks. That is the exact hazard
-        the model's mutual-exclusion validator guards, arriving through the
-        one path the validator cannot see coming: a dark-factory decompose
-        re-using one of these Greek labels, which manifest_stamping step 4
-        stamps without consulting the block's existing contents. The producer
-        is still reify's; do NOT let the local stamp stand.
-      - the label or the id changed. Confirm against reify's registry FIRST,
-        then update the row here in the SAME commit.
-
-    Reads only TRACKED GIT FILES and opens no database — the same legitimacy
-    as test_live_sidecars_carry_the_resynced_descriptors above.
-    """
+def test_identifier_anchor_names_a_definition_inside_its_certified_suite(key, suite):
+    """A suite-exists row's live anchor matches on main, only inside its suite,
+    and there names a class/def rather than prose the suite merely contains."""
     root = checkout_root_or_skip()
 
-    # NON-VACUITY FLOOR: assert the sidecar is TRACKED before reading it, so a
-    # renamed or deleted manifest cannot make this test pass by finding
-    # nothing to check.
-    tracked = subprocess.run(
-        ["git", "-C", root, "ls-files", "--", relpath],
-        capture_output=True, text=True, timeout=30,
+    rows = [r for r in _MEASURED_DRIFT_ROWS if (r[1], r[3]) == key]
+    assert len(rows) == 1, (
+        f"_CERTIFIED_SUITE_BY_ANCHORED_ROW key {key!r} resolves to {len(rows)} "
+        f"_MEASURED_DRIFT_ROWS rows, expected exactly one"
     )
-    assert tracked.stdout.strip(), f"{relpath} is not tracked in {root}"
-
-    doc = load_capability_manifest(Path(root) / relpath)
-    matches = [task for task in doc.tasks if task.label == label]
-    assert len(matches) == 1, (
-        f"expected exactly one task block labelled {label!r} in {relpath}, "
-        f"found {len(matches)}"
+    relpath, task_id, label, capability, _stale, resynced = rows[0]
+    assert resynced["expect"] == "present", (
+        f"{key!r} is expect={resynced['expect']!r}; only a present-polarity row "
+        f"can be an identifier anchor"
     )
 
-    block = matches[0]
-    assert block.external_task_id == external_task_id, (
-        f"{relpath} label {label} binds external_task_id "
-        f"{block.external_task_id!r}, expected {external_task_id!r} — see this "
-        f"test's maintenance contract before changing the expectation."
-    )
-    # THE OTHER HALF, and the one that actually matters: a local task_id here
-    # would misattribute a reify task's capability claim to a dark-factory one.
-    assert block.task_id is None, (
-        f"{relpath} label {label} carries a LOCAL task_id ({block.task_id}) "
-        f"alongside its reify producer {external_task_id!r}."
-    )
-
-
-def test_alpha4_anchor_is_an_identifier_inside_the_certified_suite():
-    """The α4 (task 2906) anchor must name a class/def inside the certified
-    suite, not prose it merely contains — grepped with the argv of
-    orchestrator/src/orchestrator/delivered_checks.py::_run_grep_check, over
-    the working tree instead of a ref."""
-    root = checkout_root_or_skip()
-
-    relpath = "plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml"
-    doc = load_capability_manifest(Path(root) / relpath)
-    matches = [
-        cap for task in doc.tasks if task.label == "α4"
-        for cap in task.capabilities if cap.name == "enforcement-matrix-suite-exists"
-    ]
-    assert len(matches) == 1, (
-        f"expected exactly one enforcement-matrix-suite-exists capability "
-        f"under label α4 in {relpath}, found {len(matches)}"
-    )
-    check = matches[0].delivered_check
-    assert check is not None
-    pattern = check.pattern
-    assert pattern is not None, (
+    check = _live_delivered_check(root, relpath, label, capability)
+    assert check.pattern is not None, (
         f"expected a grep check with a pattern, got kind={check.kind!r}"
     )
+    reading = _read_identifier_anchor(
+        root, pattern=check.pattern, paths=check.paths, expect=check.expect,
+        suite=suite)
 
-    completed = subprocess.run(
-        ["git", "-C", root, "grep", "-E", "-n", "-e", pattern, "--",
-         *check.paths],
-        capture_output=True, text=True, timeout=30,
+    where = (f"{relpath} label {label} (task {task_id}) anchor "
+             f"{check.pattern!r} under {check.paths!r}")
+    assert reading.outcome is CheckOutcome.PASS, (
+        f"{where}: verdict {reading.outcome.value} (stderr: {reading.stderr!r}) — "
+        f"_run_grep_check would not report DELIVERED"
     )
-    assert completed.returncode in (0, 1), (
-        f"git grep errored (rc={completed.returncode}, stderr: "
-        f"{completed.stderr!r}) on pattern {pattern!r} under {check.paths!r} — "
-        f"_run_grep_check would report ERRORED"
+    assert reading.paths_hit == {suite}, (
+        f"{where}: leaked outside the certified suite {suite}: "
+        f"{sorted(reading.paths_hit)}"
     )
-    assert completed.returncode == 0, (
-        f"pattern {pattern!r} matched nothing under {check.paths!r} — "
-        f"_run_grep_check would report FAILED on main"
-    )
-    parsed = [line.split(":", 2) for line in completed.stdout.splitlines() if line]
-    assert parsed, "grep reported rc=0 but produced no output lines"
-
-    paths_matched = {fields[0] for fields in parsed}
-    assert paths_matched == {"orchestrator/tests/test_sandbox_enforcement_matrix.py"}, (
-        f"anchor {pattern!r} leaked outside the certified suite: "
-        f"{sorted(paths_matched)}"
-    )
-
-    assert any(fields[2].lstrip().startswith(("class ", "def ")) for fields in parsed), (
-        f"anchor {pattern!r} does not name a definition the suite "
-        f"owns — no matched line starts with 'class '/'def ' after lstrip()"
+    assert reading.defines_in_suite, (
+        f"{where}: no hit inside {suite} starts in the name a class/def defines"
     )

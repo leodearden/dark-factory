@@ -22,6 +22,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 
+import _checkout as _checkout
+from shared.project_layout import runs_db
 from source_measures import tracked_files
 from suite_census_outcomes import (
     Evidence,
@@ -36,7 +38,6 @@ from suite_census_outcomes import (
 ARCHIVED_JUNIT = 'data/verify-logs/*/attempt-*.junit-*.xml.gz'
 LIVE_JUNIT = '.worktrees/*/.df-verify-junit/report*.xml'
 VERIFY_LOGS = 'data/verify-logs/*/attempt-*.test-*.log'
-RUNS_DB = 'data/orchestrator/runs.db'
 FLAKE_QUERY = 'SELECT rowid, observed_at, test_id FROM flake_occurrence ORDER BY rowid'
 
 # The producer is orchestrator/src/orchestrator/verify.py::_archive_junit_report.
@@ -283,9 +284,14 @@ def _connect_ro(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f'file:{path.resolve()}?mode=ro', uri=True)
 
 
+def _flake_store(project_root: Path) -> tuple[Path, str]:
+    db = runs_db(project_root)
+    return db, db.relative_to(project_root).as_posix()
+
+
 def _flake_window(project_root: Path) -> SourceWindow:
-    db = project_root / RUNS_DB
-    pattern = f'{RUNS_DB}: {FLAKE_QUERY}'
+    db, label = _flake_store(project_root)
+    pattern = f'{label}: {FLAKE_QUERY}'
     absent = SourceWindow('flake_occurrence', pattern, False, 0, None, None)
     if not db.is_file():
         return absent
@@ -302,14 +308,14 @@ def _flake_window(project_root: Path) -> SourceWindow:
 def _flake_records(
     project_root: Path, resolve: Callable[[str], Sequence[TestId]],
 ) -> Iterator[Record]:
-    db = project_root / RUNS_DB
+    db, label = _flake_store(project_root)
     if not db.is_file():
         return
     try:
         with closing(_connect_ro(db)) as conn:
             rows = conn.execute(FLAKE_QUERY).fetchall()
     except sqlite3.Error as exc:
-        yield Unresolved(source='flake_occurrence', raw_id=f'{RUNS_DB}: {exc}')
+        yield Unresolved(source='flake_occurrence', raw_id=f'{label}: {exc}')
         return
     for rowid, _observed_at, test_id in rows:
         yield from _failure_records(

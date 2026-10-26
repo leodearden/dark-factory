@@ -66,7 +66,7 @@ async def test_scripted_invoke_yields_in_order_and_records_calls():
 def test_cap_result_shape():
     r = cap_result('x')
     assert isinstance(r, AgentResult)
-    assert r.success is True
+    assert r.success is False
     assert r.stderr == 'x'
 
 

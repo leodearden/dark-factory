@@ -20,8 +20,8 @@ import enum
 
 import pytest
 
-from orchestrator import landing_evidence
-from orchestrator.landing_evidence import (
+from orchestrator.merge_lane import landing_evidence
+from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
     LandingMethod,
     LandingReason,
@@ -47,9 +47,10 @@ EXPECTED_REASONS = {
     'effect_absent',
 }
 
-#: The four production attribution paths, plus the hand-constructed default.
+#: Every production attribution path, plus the hand-constructed default.
 EXPECTED_METHODS = {
-    'patch_id', 'merge_marker', 'citation', 'reported_claim', 'unspecified',
+    'patch_id', 'merge_marker', 'citation', 'content_equivalence',
+    'reported_claim', 'unspecified',
 }
 
 
@@ -85,7 +86,7 @@ class TestLandingMethodVocabulary:
     def test_is_a_str_enum(self) -> None:
         assert issubclass(LandingMethod, enum.StrEnum)
 
-    def test_members_are_exactly_the_four_paths_plus_unspecified(self) -> None:
+    def test_members_are_exactly_the_attribution_paths_plus_unspecified(self) -> None:
         assert {m.name for m in LandingMethod} == EXPECTED_METHODS
 
     def test_every_member_value_equals_its_name(self) -> None:

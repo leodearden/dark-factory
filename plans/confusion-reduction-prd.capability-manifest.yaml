@@ -1,0 +1,10 @@
+prd: plans/confusion-reduction-prd.md
+schema_version: 1
+tasks:
+- label: epsilon
+  task_id: 2581
+  title: 'Legibility ε: nightly trickle unit'
+  note: 'Minimal sidecar written by task 6586 (plans/dashboard-prd-lanes-prd.md §9 ε): this PRD predates YAML sidecars, so only its signal leaf is declared, hand-bound to the task whose prd_task_label is epsilon.'
+  capabilities: []
+signal_leaves:
+- epsilon

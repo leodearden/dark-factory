@@ -82,8 +82,9 @@ from __future__ import annotations
 
 import logging
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING
+
+from shared.project_layout import escalation_queue_dir
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
@@ -106,8 +107,6 @@ except ImportError:  # pragma: no cover — exercised only in minimal envs
 
 logger = logging.getLogger(__name__)
 
-
-_QUEUE_DIRNAME: str = 'data/escalations'
 
 # Not a ``middleware/_folded_escalation`` filer — see that module's docstring.
 
@@ -328,7 +327,7 @@ class ScopeViolationEscalator:
             return None
         q = self._queues.get(project_root)
         if q is None:
-            q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+            q = EscalationQueue(escalation_queue_dir(project_root))
             self._queues[project_root] = q
         return q
 

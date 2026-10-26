@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _cli_boundary_assertions import closed_pipe_error_line
 from _fm_helpers import load_script_module
 from escalation.dedupe import compute_content_fingerprint, gate_backlog_fingerprint_key
 from escalation.models import Escalation
@@ -1054,3 +1055,41 @@ class TestExitCodes:
     def test_the_exit_codes_are_distinct_and_avoid_argparses_2(self):
         """argparse exits 2 on a usage error; our codes must not collide with it."""
         assert {EXIT_OK, EXIT_BAD_QUEUE_DIR, EXIT_FINGERPRINT_DRIFT} == {0, 1, 3}
+
+
+@pytest.mark.parametrize('buffering', [None, 1], ids=['deferred', 'in-band'])
+class TestALateStdoutFailureNamesTheAppliedRewrites:
+    """The report carries the apply counters, so it is printed AFTER --apply
+    rewrote the records. A stdout failure there must say the rewrites landed:
+    the exit status alone says only that the run could not complete."""
+
+    def test_an_apply_run_names_the_rewrites_already_on_disk(
+        self, monkeypatch, tmp_path: Path, capsys, buffering,
+    ):
+        _seeded_queue(tmp_path, _legacy_esc())
+
+        line = closed_pipe_error_line(
+            monkeypatch, capsys, lambda: main(['--queue-dir', str(tmp_path), '--apply']),
+            buffering=buffering,
+        )
+        monkeypatch.undo()
+
+        assert line.endswith('(--apply already rewrote 1 record(s))')
+        after = json.loads((tmp_path / 'esc-166-1.json').read_text())
+        assert after['summary'] == rebuild_summary('166', ANCHOR)
+
+    def test_a_dry_run_claims_no_rewrite(
+        self, monkeypatch, tmp_path: Path, capsys, buffering,
+    ):
+        _seeded_queue(tmp_path, _legacy_esc())
+
+        line = closed_pipe_error_line(
+            monkeypatch, capsys, lambda: main(['--queue-dir', str(tmp_path)]),
+            buffering=buffering,
+        )
+        monkeypatch.undo()
+
+        assert '(' not in line
+        assert 'rewrote' not in line
+        after = json.loads((tmp_path / 'esc-166-1.json').read_text())
+        assert after['summary'] == LEGACY_SUMMARY

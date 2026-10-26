@@ -34,12 +34,13 @@ from escalation.models import Escalation
 
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps
-from orchestrator.merge_lane.types import MergeRequest
+from orchestrator.merge_lane.types import MergeRequest, _HostUnavailability
+from orchestrator.remote_gate import SHIM_REMEDY, shim_suspected
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
 
-logger = logging.getLogger('orchestrator.merge_queue')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 _MERGE_AHEAD_BOUND = 1
@@ -61,7 +62,7 @@ Cap invariants (all verified by integration tests):
 - Acquired at the single success-enqueue site in _merger_loop for non-speculative
   blocking-path items (trains continue before this site; speculative items are
   governed by _speculation_slot instead), stamped onto the item's
-  :attr:`~orchestrator.merge_types.RealMergeItem.cap_permit`.
+  :attr:`~orchestrator.merge_lane.types.RealMergeItem.cap_permit`.
 - Released ON-DRAIN in _verifier_loop, immediately after ``_verifier_queue.get()``
   returns a non-None item, before any branching or item reassignment.  This
   uniform placement covers all drain paths (normal verify, immediate_outcome,
@@ -146,7 +147,7 @@ def newest_content_mtime(root: Path) -> float | None:
 
     Pure, heartbeat-immune liveness signal backing the merge-worktree
     no-progress budget in
-    :meth:`orchestrator.merge_queue.SpeculativeMergeWorker._run_inflight_verify`.
+    :meth:`orchestrator.merge_lane.worker.SpeculativeMergeWorker._run_inflight_verify`.
     ``root`` itself is never stat'd, and any ``.git`` subtree is pruned from
     the walk entirely — so the #1728 alpha owner-heartbeat
     (``_touch_owned_merge_worktrees``), which calls ``os.utime`` on every
@@ -308,7 +309,7 @@ def check_merge_liveness_margin(
         safety_factor: Fraction of *liveness_secs* that constitutes the
             "comfortably below" threshold.  Default 0.75.
         logger: Logger to use for the WARNING (default: module logger, captured
-            by ``pytest caplog`` as ``orchestrator.merge_queue``).
+            by ``pytest caplog`` as ``orchestrator.merge_lane``).
 
     Returns:
         :class:`MergeLivenessAssessment` with all computed values and the
@@ -476,6 +477,14 @@ _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX = '__verify_host_unreachable__'
 _VERIFY_HOST_RECOVERED_SENTINEL_PREFIX = '__verify_host_recovered__'
 
 
+# Prefix for per-host gate-skew escalation sentinels (task 6565):
+# ``__verify_host_skew__<host>``; the deployed sha is in the detail.  Separate
+# from the unreachability namespace so an open "unreachable" L1 never hides a
+# skew one.  Per host, not per sha, so a restarted process (a new sha) finds
+# and resolves the L1 its predecessor left open.
+_VERIFY_HOST_SKEW_SENTINEL_PREFIX = '__verify_host_skew__'
+
+
 # Sentinel task_id for the merge-worker supervisor loop-death escalation.
 # Per-loop deaths use this as a base key; terminal cap-exceeded escalations
 # append ':terminal' so they form a distinct dedup namespace.  Not dedup'd
@@ -487,6 +496,11 @@ _MERGE_WORKER_LOOP_DIED_SENTINEL = '__merge_worker_loop_died__'
 def _verify_host_unreachable_sentinel(host: str) -> str:
     """Return the per-host dedup sentinel task_id for unreachability alarms."""
     return f'{_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX}{host}'
+
+
+def _verify_host_skew_sentinel(host: str) -> str:
+    """Return the per-host dedup sentinel task_id for skew alarms."""
+    return f'{_VERIFY_HOST_SKEW_SENTINEL_PREFIX}{host}'
 
 
 def _alarm_verify_host_unreachable(
@@ -582,6 +596,153 @@ def _alarm_verify_host_unreachable(
             EventType.verify_host_unreachable,
             data={'host': host, 'reason': reason, 'streak': streak, 'duration_s': duration_s},
         )
+
+
+def _first_line(text: str, limit: int = 300) -> str:
+    """The first line of a multi-line reason, bounded, for a one-line summary."""
+    line = text.strip().splitlines()[0] if text.strip() else ''
+    return line if len(line) <= limit else f'{line[:limit]}…'
+
+
+def _skew_recovery_text(host: str, entry: _HostUnavailability) -> str:
+    if entry.sticky:
+        return (
+            f'STICKY: {host!r} failed a second time on this deployed sha after a '
+            'passing probe, so it is NOT re-admitted automatically.  It returns at '
+            'the next orchestrator restart, or now through the escalation tool '
+            f'clear_verify_host_quarantine(host={host!r}) once the cause is fixed.'
+        )
+    return (
+        'Auto-reprobe is active: the dispatcher re-runs ensure-gate (publish the '
+        'sha, build or reuse the gate checkout, handshake) on every reprobe '
+        'sweep; a pass re-admits the host and resolves this alarm.  A second '
+        'failure on the same sha after that makes the bench sticky.'
+    )
+
+
+def _alarm_verify_host_skew(
+    escalation_queue: Any,
+    host: str,
+    entry: _HostUnavailability,
+    *,
+    code_sha: str | None,
+    duration_s: float,
+) -> None:
+    """Submit a dedup'd L1 for a remote host benched in the 'skew' class (design D6).
+
+    The host was reached but could not run this dispatcher's gate, or its
+    verify failed there: *entry* says how (``kind``, ``reason``, the two gate
+    identities when a handshake mismatched) and whether the bench is sticky.
+    Blocking and non-halting like the unreachability alarm, but in its own
+    category ``verify_host_skew`` and deduped per host, so an open
+    unreachability L1 never hides it; *code_sha* (the deployed sha) goes in
+    the detail.  Names the host-shim remedy when the failure points at the
+    shim.  None-safe on *escalation_queue*.
+    """
+    if escalation_queue is None:
+        return
+    sentinel = _verify_host_skew_sentinel(host)
+    if escalation_queue.has_open_l1(sentinel):
+        return
+    shim = shim_suspected(entry.reason, entry.identity)
+    identity = (
+        'none (the failure came before or after the handshake)' if entry.identity is None
+        else (
+            f'local code_sha={entry.identity.local.code_sha} '
+            f'wire_fingerprint={entry.identity.local.wire_fingerprint}; '
+            f'remote code_sha={entry.identity.remote.code_sha} '
+            f'wire_fingerprint={entry.identity.remote.wire_fingerprint}'
+        )
+    )
+    escalation_queue.submit(Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-verify-host-monitor',
+        severity='blocking',
+        level=1,
+        category='verify_host_skew',
+        summary=(
+            f'Remote verify host {host!r} benched for gate skew ({entry.kind}'
+            f'{", sticky" if entry.sticky else ""}): {_first_line(entry.reason)}'
+        ),
+        detail=(
+            f'Host: {host}\n'
+            f'Kind: {entry.kind}\n'
+            f'Deployed sha: {code_sha}\n'
+            f'Gate identities: {identity}\n'
+            f'Reason: {entry.reason}\n'
+            f'Benched for: {duration_s / 60.0:.1f} min\n'
+            '\n'
+            f'The remote verify runner {host!r} was reached but could not run this '
+            "dispatcher's gate, or its verify produced no usable verdict there.  "
+            'Verifies fall back to the other hosts; correctness is preserved.\n'
+            '\n'
+            f'{_skew_recovery_text(host, entry)}'
+            + (f'\n\nLikely cause: {SHIM_REMEDY}.' if shim else '')
+        ),
+        suggested_action=(
+            SHIM_REMEDY if shim else
+            f'Read the reason above and fix the gate on {host!r} (uv, disk, the '
+            'gate root, the remote config), then let the reprobe re-admit it or '
+            f'call clear_verify_host_quarantine(host={host!r}).'
+        ),
+    ))
+
+
+def _resolve_verify_host_skew(escalation_queue: Any, host: str, resolution: str) -> bool:
+    """Resolve *host*'s pending skew L1s with *resolution*; return whether one was open."""
+    if escalation_queue is None:
+        return False
+    sentinel = _verify_host_skew_sentinel(host)
+    if not escalation_queue.has_open_l1(sentinel):
+        return False
+    for esc in escalation_queue.get_by_task(sentinel, status='pending'):
+        escalation_queue.resolve(
+            esc.id, resolution, resolved_by='orchestrator-verify-host-monitor',
+        )
+    return True
+
+
+def _clear_verify_host_skew(
+    escalation_queue: Any,
+    event_store: Any,
+    host: str,
+    *,
+    downtime_s: float,
+) -> None:
+    """Resolve an open skew alarm for *host* on readmit.
+
+    Emits ``verify_host_recovered`` only when an alarm was open, mirroring
+    :func:`_clear_verify_host_unreachable`.  None-safe on *escalation_queue*.
+    """
+    resolution = (
+        f'Host {host!r} re-admitted after {downtime_s / 60.0:.1f} min benched for gate skew.'
+    )
+    if not _resolve_verify_host_skew(escalation_queue, host, resolution):
+        return
+    if event_store is not None:
+        event_store.emit(
+            EventType.verify_host_recovered,
+            data={'host': host, 'downtime_s': downtime_s, 'quarantine_class': 'skew'},
+        )
+
+
+def _clear_verify_host_skew_of_an_earlier_process(
+    escalation_queue: Any, host: str, *, code_sha: str | None,
+) -> None:
+    """Resolve a skew L1 that a previous orchestrator process left open for *host*.
+
+    A restart clears every bench, sticky ones included (design D6): this
+    process starts with no bench and no skew count, so an L1 still open is
+    about a bench that no longer exists.  If the cause survives, this
+    process benches the host again and files a fresh L1.
+    """
+    _resolve_verify_host_skew(
+        escalation_queue, host,
+        f'Orchestrator restarted at {code_sha}; the skew bench of {host!r} from the '
+        'previous process is cleared (a restart resets every bench).  A new L1 '
+        'follows if the cause survives.',
+    )
 
 
 def _clear_verify_host_unreachable(
@@ -796,7 +957,7 @@ async def acquire_chain_build_lane(
     """Acquire the ONE scratch worktree a deep merge-ahead chain builds in
     (task 3184, PRD β).
 
-    Worktree-routing seam for :func:`orchestrator.merge_queue.build_chain`,
+    Worktree-routing seam for :func:`orchestrator.merge_lane.worker.build_chain`,
     mirroring :func:`_acquire_warm_verify_worktree`'s role for the verify
     path.  Exists so acquire/release are a documented matched pair at one
     place and ``build_chain`` itself contains no worktree-provisioning
@@ -813,7 +974,7 @@ async def acquire_chain_build_lane(
     contend with the serial head verify.
     That method already handles knob-off (``spec_warm_lane_pool is None``) and
     pool exhaustion by cold-falling-back to
-    :meth:`~orchestrator.git_ops.GitOps.create_throwaway_verify_worktree` with
+    :meth:`~orchestrator.git_ops.GitOps.create_ephemeral_verify_worktree` with
     ``warm=False``, so no knob branch is needed here.
 
     **Fail-closed serial-lane guard.**  A resolution that lands on the serial
@@ -844,7 +1005,7 @@ async def acquire_chain_build_lane(
     Returns:
         ``(lane, warm)`` on success; ``(None, False)`` when no chain is
         possible this round.  ``build_chain`` maps ``(None, False)`` to an
-        empty :class:`~orchestrator.merge_types.ChainResult`.
+        empty :class:`~orchestrator.merge_lane.types.ChainResult`.
     """
     del config  # accepted for seam symmetry; lane choice is git_ops-resident
     try:

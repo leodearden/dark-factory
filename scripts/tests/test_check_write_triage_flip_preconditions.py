@@ -49,6 +49,8 @@ _GATE_SCRIPT = _REPO_ROOT / 'scripts' / 'check_write_triage_flip_preconditions.s
 _PROBE = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_target.py'
 #: Item 5's probe: does anything downstream CONSUME the binding item 1 asserts?
 _PROBE5 = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_consumption.py'
+#: The plumbing both probes import as a flat sibling.
+_PROBE_COMMON = _REPO_ROOT / 'scripts' / '_write_triage_probe_common.py'
 
 # The probe's stable stdout vocabulary. Kept as named constants so the tests
 # and the probe cannot drift apart silently, and so it is obvious at a glance
@@ -65,8 +67,9 @@ _ECHO_FORGIVEN = 'ACCEPTED ON AN ECHOED, TARGET-NAMED PARAMETER'
 #: The machine-detectable channel for a name-assisted pass. A WARN alone is
 #: no mitigation: on a PASS the gate exits 0, DeterministicRunner files no
 #: escalation and the gate's stdout is forwarded nowhere, so no operator ever
-#: reads it — verbatim the argument _TARGET_NAME_RE's own comment uses to
-#: reject the `canonical` false PASS.
+#: reads it — verbatim the argument
+#: _write_triage_probe_common.py::TARGET_NAME_RE's own comment uses to reject
+#: the `canonical` false PASS.
 _PENDING = 'PASS-NEEDS-CONFIRMATION'
 _GATE_PENDING = 'ITEM 1 NEEDS CONFIRMATION'
 _BARE_STR = 'returns a bare str'
@@ -541,7 +544,8 @@ def parse_judge_verdict(raw, candidates=None):
     # canonical is interpolated into a header line; nothing binds any verdict to
     # any candidate, the candidate list stays flat and undifferentiated, and
     # parse_judge_verdict still returns a bare str. Reviewer-reported false
-    # PASS: `canonical` was in _TARGET_NAME_RE, so the echo control was forgiven
+    # PASS: `canonical` was in the target-name regex (now
+    # _write_triage_probe_common.py::TARGET_NAME_RE), so the echo control was forgiven
     # and the probe printed "option (b): satisfied ... via 'canonical_id'" and
     # exited 0 -- authorising the production flip on a change that establishes
     # nothing.
@@ -1161,7 +1165,7 @@ class TestProbeCannotPassByExiting:
     whose stated EXIT-CODE CONTRACT is that an invariant which could not be
     verified is not a satisfied one.
 
-    _import_judge already caught BaseException for precisely this reason, so
+    The judge import already caught BaseException for precisely this reason, so
     the convention existed and was simply not applied at the outer arm. Both
     halves are pinned here: the probe must fail closed, AND the gate must not
     take rc==0 on faith from a report that never claimed a PASS.
@@ -1680,7 +1684,12 @@ def publish(report_path):
     return sibling
 '''
 
-_CONFIG_YAML = 'write_triage:\n  enabled: false\n  judge_enabled: true\n'
+_SCORING_FIXED = '''\
+"""Fixture stand-in for fused-memory/scripts/eval_write_triage_scoring.py."""
+EVAL_OUTCOMES = tuple(sorted(TRIAGE_OUTCOMES))
+'''
+
+_CONFIG_YAML ='write_triage:\n  enabled: false\n  judge_enabled: true\n'
 
 
 def _make_gate_repo(
@@ -1691,14 +1700,15 @@ def _make_gate_repo(
     shared_src: bool = False,
     eval_src: str | None = None,
     eval_text: str | None = None,
+    scoring_text: str | None = _SCORING_FIXED,
     repo_name: str = 'gate-repo',
 ) -> Path:
     """A throwaway git repo the gate script can be run from.
 
     The script derives ``REPO`` from ``BASH_SOURCE/..`` with no env override,
-    so BOTH scripts are copied into ``<repo>/scripts/`` — that is what makes
-    the fixture repo, rather than the real checkout, the thing item 1's
-    ``git archive`` reads.
+    so the gate, both probes and their shared helper are copied into
+    ``<repo>/scripts/`` — that is what makes the fixture repo, rather than the
+    real checkout, the thing item 1's ``git archive`` reads.
 
     ``triage`` selects the ``write_triage`` stand-in item 5's probe executes.
     It defaults to ``'band_top1'`` — main's shape, where the attach lands on
@@ -1715,13 +1725,17 @@ def _make_gate_repo(
     ``eval_write_triage_judge.py`` instead of the ``_EVAL_FIXED``/
     ``_EVAL_FAILING`` constants ``eval_src`` selects between (default
     ``'failing'`` when neither is given, matching the historical default).
+
+    ``scoring_text`` is written VERBATIM as the fixture's
+    ``eval_write_triage_scoring.py``, which item 2 also reads; ``None`` leaves
+    that file out of the fixture commit.
     """
     assert eval_text is None or eval_src is None, (
         'eval_text and eval_src are mutually exclusive'
     )
     repo = tmp_path / repo_name
     (repo / 'scripts').mkdir(parents=True)
-    for script in (_GATE_SCRIPT, _PROBE, _PROBE5):
+    for script in (_GATE_SCRIPT, _PROBE, _PROBE5, _PROBE_COMMON):
         dest = repo / 'scripts' / script.name
         dest.write_bytes(script.read_bytes())
         dest.chmod(0o755)
@@ -1743,6 +1757,10 @@ def _make_gate_repo(
     (repo / 'fused-memory' / 'scripts' / 'eval_write_triage_judge.py').write_text(
         eval_source,
     )
+    if scoring_text is not None:
+        (repo / 'fused-memory' / 'scripts' / 'eval_write_triage_scoring.py').write_text(
+            scoring_text,
+        )
     (repo / 'fused-memory' / 'config').mkdir(parents=True)
     (repo / 'fused-memory' / 'config' / 'config.yaml').write_text(_CONFIG_YAML)
 
@@ -1763,6 +1781,7 @@ def _run_gate(
     *,
     ref: str,
     probe_py: str | None = None,
+    probe5_py: str | None = None,
     resolve_interpreter: bool = False,
 ):
     """Execute the gate script DIRECTLY, as DeterministicRunner does.
@@ -1777,6 +1796,7 @@ def _run_gate(
     full_env['WRITE_TRIAGE_GATE_REF'] = ref
     if resolve_interpreter:
         assert probe_py is None, 'resolve_interpreter and probe_py are exclusive'
+        assert probe5_py is None, 'resolve_interpreter and probe5_py are exclusive'
         full_env.pop('CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY', None)
         full_env.pop('CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY', None)
     else:
@@ -1786,7 +1806,7 @@ def _run_gate(
         # item-1 report. Pointing item 5 at it would measure item 1's stub
         # under item 5's marker, so item 5 would fail for a reason that has
         # nothing to do with the triage module the repo carries.
-        full_env['CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY'] = sys.executable
+        full_env['CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY'] = probe5_py or sys.executable
     return subprocess.run(
         [str(script)],
         capture_output=True,
@@ -1944,8 +1964,8 @@ class TestFlipPreconditionsScript:
         target-NAMED, and on a PASS the gate exits 0, DeterministicRunner files
         no escalation, and the gate's stdout is forwarded nowhere. The
         `_echo_forgiven_note` WARN therefore mitigated nothing — which is
-        verbatim the argument `_TARGET_NAME_RE`'s comment uses to reject the
-        `canonical` false PASS. Give it a machine-detectable channel instead.
+        verbatim the argument `_write_triage_probe_common.py::TARGET_NAME_RE`'s
+        comment uses to reject the `canonical` false PASS. Give it a machine-detectable channel instead.
         """
         repo = _make_gate_repo(
             tmp_path,
@@ -2713,6 +2733,129 @@ class TestItemsTwoAndFourReadingIsNotRaceProne:
         assert 'FAIL  item 4' in proc.stdout, proc.stdout[:4000]
         assert 'PASS  item 4' not in proc.stdout, proc.stdout[:4000]
 
+    def test_a_defect_pattern_ahead_of_a_large_scoring_source_fails_item_2(self, tmp_path):
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            eval_src='fixed',
+            scoring_text=_defect_first_eval_source('EVAL_OUTCOMES = list(TRIAGE_OUTCOMES)'),
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert 'FAIL  item 2' in proc.stdout, proc.stdout[:4000]
+        assert 'PASS  item 2' not in proc.stdout, proc.stdout[:4000]
+
+
+_SCORING_MODULE = 'eval_write_triage_scoring.py'
+_CLI_MODULE = 'eval_write_triage_judge.py'
+_REAL_EVAL_SCRIPTS = _REPO_ROOT / 'fused-memory' / 'scripts'
+
+
+def _item2_fail_lines(stdout: str) -> list[str]:
+    return [line for line in stdout.splitlines() if 'FAIL  item 2' in line]
+
+
+class TestItemTwoReadsTheScoringModule:
+    """Since task 5845, EVAL_OUTCOMES and the confusion/per-class order live in
+    eval_write_triage_scoring.py, so an item 2 that reads only the CLI passes
+    whatever happens there. Items 1 and 5 pass throughout, so the FAILING
+    ITEMS line names only the item under test.
+    """
+
+    @pytest.mark.parametrize(
+        'scoring_text',
+        [
+            'EVAL_OUTCOMES = list(TRIAGE_OUTCOMES)\n',
+            'confusion = dict.fromkeys(TRIAGE_OUTCOMES, 0)\n',
+        ],
+    )
+    def test_a_defect_in_the_scoring_module_fails_item_2(self, tmp_path, scoring_text):
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+            scoring_text=scoring_text,
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert any(_SCORING_MODULE in line for line in _item2_fail_lines(proc.stdout)), (
+            proc.stdout
+        )
+        assert 'PASS  item 2' not in proc.stdout, proc.stdout
+        assert 'PASS  item 4' in proc.stdout, proc.stdout
+        assert 'FAILING ITEMS: 2' in proc.stdout.splitlines(), proc.stdout
+
+    def test_a_missing_scoring_module_fails_item_2_closed(self, tmp_path):
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+            scoring_text=None,
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert any(
+            _UNVERIFIABLE in line and _SCORING_MODULE in line
+            for line in _item2_fail_lines(proc.stdout)
+        ), proc.stdout
+        assert 'PASS  item 4' in proc.stdout, proc.stdout
+        assert 'FAILING ITEMS: 2' in proc.stdout.splitlines(), proc.stdout
+
+    def test_a_defect_in_the_cli_is_blamed_on_the_cli(self, tmp_path):
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_text=_EVAL_ITEM2_ONLY_FAILING,
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        fail_lines = _item2_fail_lines(proc.stdout)
+        assert any(_CLI_MODULE in line for line in fail_lines), proc.stdout
+        assert not any(_SCORING_MODULE in line for line in fail_lines), proc.stdout
+
+
+class TestItemTwoPolicesTheRealEvalModules:
+    """Item 2 run over the checkout's OWN eval CLI and scoring sources.
+
+    The clean run is the control that makes the mutation run non-vacuous; the
+    mutation is the reviewer's own, planted where EVAL_OUTCOMES is built today.
+    """
+
+    def _gate_repo(self, tmp_path: Path, *, scoring_text: str) -> Path:
+        return _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_text=(_REAL_EVAL_SCRIPTS / _CLI_MODULE).read_text(),
+            scoring_text=scoring_text,
+        )
+
+    def test_the_real_modules_pass_items_2_and_4(self, tmp_path):
+        repo = self._gate_repo(
+            tmp_path, scoring_text=(_REAL_EVAL_SCRIPTS / _SCORING_MODULE).read_text(),
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert 'PASS  item 2' in proc.stdout, proc.stdout
+        assert 'PASS  item 4' in proc.stdout, proc.stdout
+
+    def test_the_reviewers_mutation_of_the_real_scoring_module_fails_item_2(self, tmp_path):
+        source = (_REAL_EVAL_SCRIPTS / _SCORING_MODULE).read_text()
+        assert source.count('tuple(sorted(TRIAGE_OUTCOMES))') == 1, (
+            'EVAL_OUTCOMES is no longer built in eval_write_triage_scoring.py: '
+            'repoint SCORING in scripts/check_write_triage_flip_preconditions.sh '
+            '(item 2) at its new home, then update this test'
+        )
+        mutated = source.replace('tuple(sorted(TRIAGE_OUTCOMES))', 'list(TRIAGE_OUTCOMES)')
+        repo = self._gate_repo(tmp_path, scoring_text=mutated)
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert 'FAILING ITEMS: 2' in proc.stdout.splitlines(), proc.stdout
+        assert any(_SCORING_MODULE in line for line in _item2_fail_lines(proc.stdout)), (
+            proc.stdout
+        )
+
 
 def _item5_note(stdout: str) -> str:
     """The gate's OWN item-5 verdict block, stopping where the probe's starts.
@@ -2852,3 +2995,130 @@ class TestItemFiveNamesTheBranchThatSatisfiedIt:
         note = _item5_note(proc.stdout)
         assert _BRANCH_JUDGE_TARGET in note, proc.stdout
         assert note in proc.stdout[-_ESCALATION_DETAIL_CHARS:], proc.stdout
+
+
+#: What a probe that died before it could report leaves behind: a traceback on
+#: stderr and nothing on stdout. A missing or broken
+#: scripts/_write_triage_probe_common.py, which both probes import, is the
+#: realistic carrier.
+_CRASH_BEFORE_REPORT = 'crash-before-report: No module named _write_triage_probe_common'
+
+
+def _write_crash_before_report_stub(path: Path) -> Path:
+    """A stand-in probe interpreter that exits 1 having reported nothing."""
+    path.write_text(
+        '#!/bin/sh\n'
+        f"printf '%s\\n' {shlex.quote(_CRASH_BEFORE_REPORT)} >&2\n"
+        'exit 1\n',
+    )
+    path.chmod(0o755)
+    return path
+
+
+class TestARcOneWithoutAVerdictIsUnverifiable:
+    """Exit 1 is a NOT-held verdict only when the report carries one.
+
+    Both probes start every not-held and every unverifiable verdict line with
+    the gate's PROBE_FAIL_PREFIX. A probe that dies before it can report -- a
+    missing or broken shared helper, or a crash of the probe itself -- exits 1
+    too, through Python's own traceback, with an EMPTY stdout. Read as a
+    verdict, that told the operator the judge path does NOT bind (or the
+    candidate is NOT consumed) on a run that measured nothing, and dropped the
+    traceback naming the real cause. The rc-1 twin of the rc-0-without-a-PASS
+    lock: a report that claims no verdict is not one.
+    """
+
+    def _repo(self, tmp_path: Path) -> Path:
+        return _make_gate_repo(
+            tmp_path, judge='by_id', triage=_TRIAGE_CONSUMES, eval_src='fixed',
+        )
+
+    def test_item_1_dying_before_its_report_is_unverifiable(self, tmp_path):
+        repo = self._repo(tmp_path)
+        stub = _write_crash_before_report_stub(tmp_path / 'crashing-probe')
+        proc = _run_gate(
+            repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF, probe_py=str(stub),
+        )
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert 'FAIL  item 1  UNVERIFIABLE' in proc.stdout, proc.stdout
+        assert 'exited 1 without reporting a verdict' in proc.stdout, proc.stdout
+        assert 'does NOT bind' not in proc.stdout, proc.stdout
+        assert _CRASH_BEFORE_REPORT in proc.stdout, proc.stdout
+
+    def test_item_5_dying_before_its_report_is_unverifiable(self, tmp_path):
+        repo = self._repo(tmp_path)
+        stub = _write_crash_before_report_stub(tmp_path / 'crashing-probe5')
+        proc = _run_gate(
+            repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF, probe5_py=str(stub),
+        )
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert f'{_ITEM5_FAIL}  {_UNVERIFIABLE}' in proc.stdout, proc.stdout
+        assert 'exited 1 without reporting a verdict' in proc.stdout, proc.stdout
+        assert 'NOT consumed by the attach' not in proc.stdout, proc.stdout
+        assert _CRASH_BEFORE_REPORT in proc.stdout, proc.stdout
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+
+    def test_a_missing_probe_helper_fails_item_1_unverifiable(self, tmp_path):
+        """The real carrier, end to end: the helper is gone from the tree.
+
+        The gate runs the probes from the WORKING TREE, so unlinking the file
+        is enough; no commit is needed.
+        """
+        repo = self._repo(tmp_path)
+        (repo / 'scripts' / _PROBE_COMMON.name).unlink()
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert 'FAIL  item 1  UNVERIFIABLE' in proc.stdout, proc.stdout
+        assert _PROBE_COMMON.stem in proc.stdout, proc.stdout
+        assert 'FAIL  item 1  the judge path does NOT bind' not in proc.stdout, proc.stdout
+
+    def test_a_missing_probe_helper_fails_item_5_unverifiable(self, tmp_path):
+        """Item 5's twin. Item 1 fails the same way on this repo, so the module
+        name is looked for in item 5's own block, not anywhere in stdout."""
+        repo = self._repo(tmp_path)
+        (repo / 'scripts' / _PROBE_COMMON.name).unlink()
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert f'{_ITEM5_FAIL}  {_UNVERIFIABLE}' in proc.stdout, proc.stdout
+        assert _PROBE_COMMON.stem in _item5_note(proc.stdout), proc.stdout
+        assert 'FAIL  item 5  the judge-bound candidate is NOT consumed' not in proc.stdout, (
+            proc.stdout
+        )
+
+    def test_a_real_not_held_verdict_still_reads_as_one(self, tmp_path):
+        """The control: the new arm must not swallow a verdict the probe made."""
+        repo = _make_gate_repo(
+            tmp_path, judge='flat', triage=_TRIAGE_CONSUMES, eval_src='fixed',
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert 'FAIL  item 1  the judge path does NOT bind' in proc.stdout, proc.stdout
+        assert 'exited 1 without reporting a verdict' not in proc.stdout, proc.stdout
+
+    @pytest.mark.parametrize('variant', ['flat', 'missing'], ids=['not-held', 'unverifiable'])
+    def test_item_1s_every_exit_1_carries_the_gates_fail_prefix(self, tmp_path, variant):
+        """Pinned from both ends, like the PASS marker: a drift here would turn
+        every real item-1 verdict into a misdiagnosed UNVERIFIABLE."""
+        prefix = _gate_marker('PROBE_FAIL_PREFIX')
+        proc = _run_probe(_write_fake_judge(tmp_path / 'src', variant=variant))
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert any(line.startswith(prefix) for line in proc.stdout.splitlines()), (
+            f'the gate reads exit 1 as a verdict only under {prefix!r}:\n{proc.stdout}'
+        )
+
+    @pytest.mark.parametrize(
+        'variant', ['band_top1', 'missing'], ids=['not-held', 'unverifiable'],
+    )
+    def test_item_5s_every_exit_1_carries_the_gates_fail_prefix(self, tmp_path, variant):
+        prefix = _gate_marker('PROBE_FAIL_PREFIX')
+        src_root = write_fake_triage(tmp_path / 'src', variant=variant)
+        proc = subprocess.run(
+            [sys.executable, str(_PROBE5), '--src-root', str(src_root)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert any(line.startswith(prefix) for line in proc.stdout.splitlines()), (
+            f'the gate reads exit 1 as a verdict only under {prefix!r}:\n{proc.stdout}'
+        )

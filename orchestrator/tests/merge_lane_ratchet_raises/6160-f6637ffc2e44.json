@@ -1,0 +1,18 @@
+{
+  "task_id": "6160",
+  "reason": "_TrainMergeHost gained _ensure_host_allocator (H1); MagicMock host fixture must stub it",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_train_attribution.py",
+      "baseline": 8,
+      "current": 9
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6647,
+      "current": 6648
+    }
+  ]
+}

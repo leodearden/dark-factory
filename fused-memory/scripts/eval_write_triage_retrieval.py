@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """The LIVE-store edge of the judge eval: production retrieval and banding.
 
-``eval_write_triage_judge.py``'s seeded slate is a CONSTRUCTION — the correct
-canonical hoisted to position 0 with a synthetic top score. This module is the
-measured alternative: it drives the shipped ``retrieve_candidates``,
-``decide_band`` and ``select_judge_candidates`` so a case's slate, its attach
-target and its band are the ones production would have produced for that
-content against the live corpus.
+The seeded slate (``eval_write_triage_cases.py::seeded_plan``) is a
+CONSTRUCTION — the correct canonical hoisted to position 0 with a synthetic
+top score. This module is the measured alternative: it drives the shipped
+``retrieve_candidates``, ``decide_band`` and ``select_judge_candidates`` so a
+case's slate, its attach target and its band are the ones production would
+have produced for that content against the live corpus.
 
 Nothing here decides what "correct" means, and nothing here calls an LLM. It
-produces :class:`Slate` values; the eval script pairs them with the curator
-labels and scores them.
+produces :class:`Slate` values; ``eval_write_triage_cases.py::plan_from_slates``
+pairs them with the curator labels, and the eval scores them.
 
 Imported by path, the same way the eval script imports the calibrator —
 ``scripts/`` is not an importable package.
@@ -24,7 +24,7 @@ from typing import Any
 
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import (
-    _canonical_id_of,
+    canonical_id_of,
     decide_band,
     retrieve_candidates,
 )
@@ -153,14 +153,14 @@ def normalize(result: MemoryResult) -> dict[str, Any]:
 
     The metadata survives whole because it carries ``store_score`` — the
     cosine ``decide_band`` and ``select_judge_candidates`` both read — and the
-    ``kind``/``parent_id`` pair ``_canonical_id_of`` hoists on.
+    ``kind``/``parent_id`` pair ``canonical_id_of`` hoists on.
     """
     metadata = dict(result.metadata or {})
     return {
         'memory_id': result.id,
         'content': result.content,
         'category': metadata.get('category'),
-        'canonical_id': _canonical_id_of(result),
+        'canonical_id': canonical_id_of(result),
         'store_score': metadata.get('store_score'),
         'metadata': metadata,
     }

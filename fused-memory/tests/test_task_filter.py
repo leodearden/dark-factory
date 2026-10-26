@@ -23,6 +23,7 @@ from fused_memory.reconciliation.task_filter import (
     format_task_list,
     id_key,
     render_active_section,
+    render_retained_done_tasks,
     select_done_since_boundary,
     select_visible_active,
     summarize_statuses,
@@ -1111,6 +1112,82 @@ class TestFormatFilteredTaskTree:
             f'The header must report the post-clamp visible count, '
             f'not the pre-clamp active count.'
         )
+
+
+def _cancelled_section_lines(output: str) -> list[str]:
+    after_header = output.split('### Recently Cancelled Tasks\n', 1)[1]
+    return [line for line in after_header.splitlines() if line][:-1]  # drop the summary line
+
+
+class TestRetainedCapDisclosure:
+    """The done/cancelled retained caps name the window they show, in the payload text."""
+
+    def _tree(self, *, cancelled: int = 0, done: int = 0) -> FilteredTaskTree:
+        tasks = [_make_task(1, 'pending')]
+        tasks += [_make_task(100 + i, 'cancelled') for i in range(cancelled)]
+        tasks += [_make_task(1000 + i, 'done') for i in range(done)]
+        return filter_task_tree({'tasks': tasks})
+
+    def test_cancelled_section_ends_with_a_window_note_over_the_cap(self):
+        total = MAX_CANCELLED_TASKS_RETAINED + 3
+        output = format_filtered_task_tree(self._tree(cancelled=total))
+
+        lines = _cancelled_section_lines(output)
+        assert len([line for line in lines if line.startswith('- [')]) == MAX_CANCELLED_TASKS_RETAINED
+        note = lines[-1]
+        assert note.startswith(
+            f'_NOTE: showing the {MAX_CANCELLED_TASKS_RETAINED} highest-id (most recent) '
+            f'of {total} cancelled task(s)'
+        )
+        assert f'MAX_CANCELLED_TASKS_RETAINED={MAX_CANCELLED_TASKS_RETAINED}' in note
+        assert 'window by design' in note
+        assert 'this cycle' not in note
+
+    @pytest.mark.parametrize('cancelled', [1, MAX_CANCELLED_TASKS_RETAINED])
+    def test_cancelled_section_at_or_under_the_cap_carries_no_note(self, cancelled):
+        output = format_filtered_task_tree(self._tree(cancelled=cancelled))
+
+        assert '### Recently Cancelled Tasks' in output
+        assert '_NOTE:' not in output
+
+    def test_no_cancelled_tasks_renders_no_cancelled_section_even_with_a_count(self):
+        tree = FilteredTaskTree(active_tasks=[_make_task(1, 'pending')], cancelled_count=4, total_count=5)
+
+        output = format_filtered_task_tree(tree)
+
+        assert '### Recently Cancelled Tasks' not in output
+        assert '_NOTE:' not in output
+
+    def test_retained_done_tasks_over_the_cap_end_with_a_window_note(self):
+        total = MAX_DONE_TASKS_RETAINED + 4
+        tree = self._tree(done=total)
+
+        rendered = render_retained_done_tasks(tree)
+
+        list_part, note = rendered.rsplit('\n\n', 1)
+        assert list_part == format_task_list(tree.done_tasks)
+        assert note.startswith(
+            f'_NOTE: showing the {MAX_DONE_TASKS_RETAINED} highest-id (most recent) of {total} done task(s)'
+        )
+        assert f'MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED}' in note
+        assert 'window by design' in note
+        assert 'this cycle' not in note
+
+    @pytest.mark.parametrize('done', [0, 3, MAX_DONE_TASKS_RETAINED])
+    def test_retained_done_tasks_at_or_under_the_cap_is_the_plain_list(self, done):
+        tree = self._tree(done=done)
+
+        assert render_retained_done_tasks(tree) == format_task_list(tree.done_tasks)
+
+    def test_existing_active_cap_strings_are_unchanged(self):
+        tasks = [_make_task(i, 'pending', title='t' * 200) for i in range(1, 80)]
+        tasks += [_make_task(100 + i, 'cancelled') for i in range(MAX_CANCELLED_TASKS_RETAINED + 2)]
+        tree = filter_task_tree({'tasks': tasks})
+
+        capped = format_filtered_task_tree(tree, max_tasks=50)
+        assert '29 more active omitted by max_tasks cap' in capped
+        clamped = format_filtered_task_tree(tree, max_tasks=50, max_chars=4_000)
+        assert re.search(r'\n\.\.\. and \d+ more active \(truncated for budget\)\n', clamped)
 
 
 class TestRenderActiveSection:

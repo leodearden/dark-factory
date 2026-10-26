@@ -20,9 +20,9 @@ flat-test-helper convention (see ``_orch_helpers.py``, ``_merge_lane_fakes.py``
 
 CRITICAL — dynamic module lookup, not from-import: every merge_queue
 module-level symbol is referenced as ``_mq.<name>`` (attribute lookup on the
-module object, resolved at call time), NEVER ``from orchestrator.merge_queue
+module object, resolved at call time), NEVER ``from orchestrator.merge_lane.worker
 import <name>``.  ~15 of the migrated tests do
-``patch('orchestrator.merge_queue.run_scoped_verification', …)`` (and similar
+``patch('orchestrator.merge_lane.worker.run_scoped_verification', …)`` (and similar
 on the other symbols); a from-import would bind the name in THIS module's
 namespace at import time, so the patch on the merge_queue attribute would
 silently fail to reach the helper's reference and the pass-mock would be
@@ -38,10 +38,10 @@ import asyncio
 import time
 from typing import TYPE_CHECKING
 
-import orchestrator.merge_queue as _mq
+import orchestrator.merge_lane.worker as _mq
 
 if TYPE_CHECKING:
-    from orchestrator.merge_queue import (
+    from orchestrator.merge_lane.worker import (
         LocalRunner,
         RealMergeItem,
         SpeculativeMergeWorker,

@@ -36,7 +36,7 @@ from shared.delivered_check_polarity import (
     build_path_argv,
     interpret_grep_rc,
 )
-from shared.proc_group import read_stat_fields
+from shared.proc_group import pid_running
 
 from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import (
@@ -56,6 +56,19 @@ from orchestrator.scheduler import (
     _build_delivered_check_escalation,
     _delivered_checks_descriptor_digest,
 )
+
+
+def _gate_on_config(max_per_module: int) -> OrchestratorConfig:
+    """A config with the delivered-checks gate pinned ON.
+
+    For tests about gate BEHAVIOUR.  The flag's default is
+    ``TestDeliveredChecksConfig::test_default_enabled_is_true``'s claim; every
+    other key still reads the operational config.
+    """
+    config = OrchestratorConfig(max_per_module=max_per_module)
+    config.delivered_checks.enabled = True
+    return config
+
 
 # ---------------------------------------------------------------------------
 # TestRunnerGrepKind (task 2580 — step-1 RED / step-2 GREEN)
@@ -440,8 +453,7 @@ async def _wait_pid_exited(pid: int, timeout: float = 5.0) -> bool:
     """
     deadline = time.monotonic() + timeout
     while True:
-        fields = read_stat_fields(Path('/proc') / str(pid))
-        if fields is None or fields.state in ('Z', 'X'):
+        if not pid_running(pid):
             return True
         if time.monotonic() >= deadline:
             return False
@@ -1333,7 +1345,7 @@ class TestPhaseBackfillTerminalDepRecords:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
+        config = _gate_on_config(max_per_module=1)
         scheduler = Scheduler(config)
         scheduler.finish_startup()
         return scheduler
@@ -1647,6 +1659,7 @@ class TestDeliveredChecksConfig:
     sub-model.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_max_checks_per_tick_is_50(self):
         config = OrchestratorConfig()
         assert config.delivered_checks.max_checks_per_tick == 50
@@ -1666,12 +1679,14 @@ class TestDeliveredChecksConfig:
 
     # --- task 2583 (epsilon) knobs: enabled / grace_cycles / check_timeout_secs -
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_enabled_is_true(self):
         """The gate is inert without metadata.delivered_checks on any dep, so
         it defaults ON — an operator must opt OUT explicitly."""
         config = OrchestratorConfig()
         assert config.delivered_checks.enabled is True
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_grace_cycles_is_3(self):
         config = OrchestratorConfig()
         assert config.delivered_checks.grace_cycles == 3
@@ -1684,6 +1699,7 @@ class TestDeliveredChecksConfig:
         with pytest.raises(ValidationError):
             DeliveredChecksConfig(grace_cycles=-1)
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_check_timeout_secs_is_120(self):
         config = OrchestratorConfig()
         assert config.delivered_checks.check_timeout_secs == 120
@@ -1721,7 +1737,7 @@ class TestDeliveredCheckGateEnabledSwitch:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
+        config = _gate_on_config(max_per_module=1)
         scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
         scheduler.finish_startup()
         return scheduler
@@ -2926,7 +2942,7 @@ class TestDeliveredCheckGraceEscalation:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=1)
+        config = _gate_on_config(max_per_module=1)
         config.delivered_checks.grace_cycles = 3
         scheduler = Scheduler(
             config,
@@ -3241,7 +3257,7 @@ class TestAcquireNextDeliveredGate:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=2)
+        config = _gate_on_config(max_per_module=2)
         scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
         scheduler.finish_startup()
         return scheduler
@@ -3432,7 +3448,7 @@ class TestAcquireNextDeliveredGateRealFilteredFetch:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        config = OrchestratorConfig(max_per_module=2)
+        config = _gate_on_config(max_per_module=2)
         scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
         scheduler.finish_startup()
         return scheduler

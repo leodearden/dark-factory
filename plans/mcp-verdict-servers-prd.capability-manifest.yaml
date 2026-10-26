@@ -1,0 +1,10 @@
+prd: plans/mcp-verdict-servers-prd.md
+schema_version: 1
+tasks:
+- label: θ
+  task_id: 2488
+  title: 'Verdict-servers integration gate (end-to-end boundary tests)'
+  note: 'Minimal sidecar written by task 6588 (plans/dashboard-prd-lanes-prd.md §9 ε): this PRD predates YAML sidecars, so only its signal leaf is declared, hand-bound to the task whose prd_task_label is θ.'
+  capabilities: []
+signal_leaves:
+- θ

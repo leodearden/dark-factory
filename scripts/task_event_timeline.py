@@ -17,8 +17,13 @@ from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
 
-from _task_db_scan import TaskDbProblem, TaskDbUnreadable, connect_ro, decode_metadata
-from audit_wiped_metadata_files import runs_db_path
+from _task_db_scan import (
+    TaskDbProblem,
+    TaskDbUnreadable,
+    connect_ro,
+    decode_metadata,
+    runs_db_path,
+)
 
 EXIT_OK = 0
 EXIT_NO_EVENTS = 1

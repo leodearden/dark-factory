@@ -381,7 +381,10 @@ class TestCancellationScopeSoftCancel:
         on_terminal = _make_recording_on_terminal(log)
         event = asyncio.Event()
         event.set()
-        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+        scope = CancellationScope(
+            cancel_event=event, on_terminal=on_terminal,
+            cancel_grace_secs=CANCEL_SCOPE_PURE_UNIT_TIMEOUT,
+        )
 
         body_cancelled = False
 
@@ -418,7 +421,10 @@ class TestCancellationScopeSoftCancel:
         log: list[tuple[str, str | None]] = []
         on_terminal = _make_recording_on_terminal(log)
         event = asyncio.Event()  # never set — the body raises on its own
-        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+        scope = CancellationScope(
+            cancel_event=event, on_terminal=on_terminal,
+            cancel_grace_secs=CANCEL_SCOPE_PURE_UNIT_TIMEOUT,
+        )
 
         async def _body() -> None:
             await asyncio.sleep(0)
@@ -439,7 +445,10 @@ class TestCancellationScopeSoftCancel:
         log: list[tuple[str, str | None]] = []
         on_terminal = _make_recording_on_terminal(log)
         event = asyncio.Event()  # never set — body wins on its own
-        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+        scope = CancellationScope(
+            cancel_event=event, on_terminal=on_terminal,
+            cancel_grace_secs=CANCEL_SCOPE_PURE_UNIT_TIMEOUT,
+        )
 
         sentinel = object()
 
@@ -473,7 +482,10 @@ class TestCancellationScopeHardCancel:
         log: list[tuple[str, str | None]] = []
         on_terminal = _make_recording_on_terminal(log)
         event = asyncio.Event()  # never set — only the outer task is cancelled
-        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+        scope = CancellationScope(
+            cancel_event=event, on_terminal=on_terminal,
+            cancel_grace_secs=CANCEL_SCOPE_PURE_UNIT_TIMEOUT,
+        )
 
         async def _body() -> None:
             await asyncio.sleep(3600)
@@ -508,7 +520,10 @@ class TestCancellationScopeHardCancel:
         log: list[tuple[str, str | None]] = []
         on_terminal = _make_recording_on_terminal(log)
         event = asyncio.Event()
-        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+        scope = CancellationScope(
+            cancel_event=event, on_terminal=on_terminal,
+            cancel_grace_secs=CANCEL_SCOPE_PURE_UNIT_TIMEOUT,
+        )
 
         async def _body() -> None:
             await asyncio.sleep(0)
@@ -528,7 +543,10 @@ class TestCancellationScopeHardCancel:
         log: list[tuple[str, str | None]] = []
         on_terminal = _make_recording_on_terminal(log, delay=0.05)
         event = asyncio.Event()
-        scope = CancellationScope(cancel_event=event, on_terminal=on_terminal)
+        scope = CancellationScope(
+            cancel_event=event, on_terminal=on_terminal,
+            cancel_grace_secs=CANCEL_SCOPE_PURE_UNIT_TIMEOUT,
+        )
 
         async def _body() -> None:
             await asyncio.sleep(3600)

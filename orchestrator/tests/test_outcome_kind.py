@@ -19,8 +19,8 @@ from pathlib import Path
 import pytest
 
 from orchestrator.event_store import EventStore
-from orchestrator.merge_queue import _emit_merge_attempt
-from orchestrator.merge_types import OutcomeKind
+from orchestrator.merge_lane.types import OutcomeKind
+from orchestrator.merge_lane.worker import _emit_merge_attempt
 
 # The exact 23-member vocabulary emitted through _emit_merge_attempt (see its
 # docstring at merge_queue.py:1363 and plans/dashboard-alignment-prd.md).
@@ -95,7 +95,7 @@ class TestOutcomeKindIsTerminal:
         legitimately EMPTY, so there is nothing a retry could add.  Keeping it
         OUT of the non-terminal frozen set is what stops the dashboard's
         ``_ACTIVE_ONLY`` mirror from showing a finished task as still live."""
-        from orchestrator.merge_types import _NON_TERMINAL_OUTCOMES
+        from orchestrator.merge_lane.types import _NON_TERMINAL_OUTCOMES
 
         assert OutcomeKind.plan_files_already_landed.is_terminal is True
         assert (
@@ -161,7 +161,7 @@ class TestOutcomeKindFrozenContract:
 # ---------------------------------------------------------------------------
 
 _SRC_DIR = Path(__file__).parent.parent / 'src' / 'orchestrator'
-_CALL_SITE_FILES = ['merge_queue.py', 'merge_gates.py', 'workflow.py']
+_CALL_SITE_FILES = ['merge_lane/worker.py', 'merge_lane/gates.py', 'workflow.py']
 
 
 def _is_outcome_kind_attribute(node: ast.expr) -> bool:

@@ -161,11 +161,17 @@ turns ago. An orchestrator-dispatched Claude session is launched with
 `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`
 (`orchestrator/src/orchestrator/agents/invoke.py::apply_bash_cwd_reset_env`),
 which the CLI reads as a request to put its shell back at the dispatch root,
-silently, after every call. The anchor below is correct whether or not that
-happens; use it regardless. Your own
-command text does not show where the command will run: in the transcript behind
-`plans/confusion-census-2026-09-20.md` §1.4, two adjacent Bash calls in one
-session carried different tracked cwds.
+silently, after every call.
+
+Measured 2026-10-18 on CLI 2.1.302 in a dispatched session (task 5987):
+`CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR` reached the shell as `1`, a `cd` was
+undone silently before the next call, and a relative `Grep` path and `Glob`
+pattern both resolved from the worktree root afterwards.
+
+The anchor below is correct whether or not that reset happens; use it
+regardless. Your own command text does not show where the command will run: in
+the transcript behind `plans/confusion-census-2026-09-20.md` §1.4, two adjacent
+Bash calls in one session carried different tracked cwds.
 
 So a bare or repo-relative path in an ad-hoc probe is a guess, and a wrong guess
 arrives as a bare `FileNotFoundError: [Errno 2] No such file or directory:
@@ -404,12 +410,17 @@ sweep overrunning `orchestrator_restart_lease_max_age_secs` loses the lease
 and degrades to the old collision, and the fused-memory tier has no lease at
 all — so read `--report`'s `FLEET-LEASE:` line rather than assuming.
 
-`--drain` (task 5371) is a two-stage drain: Stage A halts merge admission on
-every unit up front, Stage B restarts a unit only once no merge verify is in
-flight on any host (bounded by each verify's own timeout and
-`ORCH_DRAIN_VERIFY_MAX_WAIT_SECS`). Pre-5371 units and refused requests keep
-the old 600s merge-idle gate. The first sweep after a deploy of that code still
-meets old-code units. Detail: `OPERATIONS.md` §"Reading a drain".
+`--drain` (task 5371, per unit since task 7297) is a two-stage drain: Stage A
+halts a unit's merge admission when the sweep reaches it; Stage B restarts it
+once none of its merge verifies is in flight, bounded by each verify's own
+timeout, a per-unit `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS`, and a sweep-wide
+ceiling `ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS` counted from sweep start; past
+the ceiling every unit still gets its request and is restarted at its first
+acknowledged poll. How the ceiling fits under the lease is derived at
+`scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS`.
+Pre-5371 units and refused requests keep the old 600s merge-idle gate. The
+first sweep after a deploy of that code still meets old-code units. Detail:
+`OPERATIONS.md` §"Reading a drain".
 
 ## Working in the main checkout
 
@@ -434,21 +445,20 @@ directly, not just interactive agents.
   instead of halting the queue, and no operator rescue is needed for this
   case. If the grace still expires, that one merge is blocked per-task (see
   `park_lock_contended` in `OPERATIONS.md`) — the queue keeps running.
-- Do not direct-commit to main while a merge verify is **in flight**;
-  queued-only is fine (`depth` counts queued entries, not work). Moving main
-  under a solo merge forces a full re-verify however disjoint the files:
+- A direct-to-main commit may land while a merge verify is in flight; it
+  costs that merge one full re-verify, about what the same change would pay
+  going through the merge queue (INV-1 runs the full gate on a docs-only
+  merge). However disjoint the files, the re-verify is forced:
   `orchestrator/src/orchestrator/merge_lane/gates.py::_disjoint_skip_blockers`
   refuses the disjoint skip here on two counts — this project's
   `merge_verify_breadth: "full"` (a whole-tree gate), and drift the queue did
-  not itself land green (commit `fa95988c8e`). Under a train the price is the
-  same: the train re-verifies its rebased tip, then lands (task 5070). Commit when
-  `get_merge_queue` shows `verify_in_progress` null and
-  `occupancy.inflight_total` 0. It does not show a train's verify (task
-  5245), so also check `data/orchestrator/runs.db` for a `train_started` in the
-  last ~2h with no `train_merged`/`train_derailed` for that `train_id` (a
-  heuristic: restart-orphaned trains leave rows that never close). On a busy
-  lane, sending the docs change through the merge queue costs a verify slot
-  but interrupts nothing.
+  not itself land green (commit `fa95988c8e`). A train pays the same price:
+  it re-verifies its rebased tip, then lands (task 5070), so a moved main no
+  longer derails a train. Batch direct commits rather than landing a burst:
+  each one restarts the in-flight merge's re-verify, and more than
+  `MAX_CAS_RETRIES` (5) in one flight blocks that merge. What the lane must
+  never do is jam tasks in a hard-to-notice way; one extra verify is
+  acceptable.
 - **Never** run `git stash` in **any** dark-factory checkout — `project_root`
   or a `.worktrees/<id>` task worktree. `refs/stash` is a single ref in the
   shared `.git` dir and is *not* per-worktree, so every checkout pushes onto

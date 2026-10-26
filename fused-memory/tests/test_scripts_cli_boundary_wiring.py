@@ -17,14 +17,18 @@ growing a ``_spawn`` of their own.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
+from _cli_boundary_assertions import assert_one_stdout_failure_line
 from _fm_helpers import load_script_module
-from shared.cli_boundary import EXIT_STDOUT_FAILED
+
+from fused_memory.services.write_journal import WriteJournal
 
 _SCRIPTS_DIR = Path(__file__).parent.parent / 'scripts'
 _CORPUS_FIXTURE_ARCHIVE = Path(__file__).parent / 'fixtures' / 'transcript_corpus'
@@ -34,6 +38,11 @@ _MIGRATED_SCRIPTS = [
     ('memory_eval_retrieval_probe.py', '--derive-registry'),
     ('memory_eval_transcript_corpus.py', '--archive-root'),
     ('audit_duplicate_memories.py', '--ann-threshold'),
+    ('telemetry_query.py', '--journal'),
+    ('backfill_gate_backlog_summaries.py', '--queue-dir'),
+    ('investigate_cross_graph_duplication.py', '--uuid'),
+    ('measure_stale_status_snapshot_sweep.py', '--triage-note'),
+    ('repair_recon_citation.py', '--target-run-id'),
 ]
 """``(script, a flag its help must show)`` for every migrated script."""
 
@@ -56,6 +65,37 @@ def _corpus_fixture_run_argv(out_root: Path) -> list[str]:
     ]
 
 
+def _telemetry_seeded_journal_argv(out_root: Path) -> list[str]:
+    """Seeds one row in a real write journal under *out_root*; the run prints it as JSON."""
+    data_dir = out_root / 'telemetry'
+
+    async def _seed() -> None:
+        journal = WriteJournal(data_dir)
+        await journal.initialize()
+        try:
+            write_op_id = str(uuid.uuid4())
+            await journal.log_write_op(
+                write_op_id=write_op_id, operation='add_memory', project_id='p',
+            )
+            await journal.log_backend_op(
+                write_op_id=write_op_id, backend='mem0', operation='add_memory',
+                result_summary='result', duration_ms=1.0,
+            )
+        finally:
+            await journal.close()
+
+    asyncio.run(_seed())
+    return [
+        '--journal', str(data_dir / 'write_journal.db'),
+        '--since', '2000-01-01T00:00:00+00:00',
+    ]
+
+
+def _gate_backlog_dry_run_argv(out_root: Path) -> list[str]:
+    """A dry run over *out_root* as an empty queue: prints a short report, mutates nothing."""
+    return ['--queue-dir', str(out_root)]
+
+
 _STORE_FREE_RUNS = pytest.mark.parametrize(
     ('script', 'argv_for'),
     [
@@ -66,6 +106,14 @@ _STORE_FREE_RUNS = pytest.mark.parametrize(
         pytest.param(
             'memory_eval_transcript_corpus.py', _corpus_fixture_run_argv,
             id='memory_eval_transcript_corpus',
+        ),
+        pytest.param(
+            'telemetry_query.py', _telemetry_seeded_journal_argv,
+            id='telemetry_query',
+        ),
+        pytest.param(
+            'backfill_gate_backlog_summaries.py', _gate_backlog_dry_run_argv,
+            id='backfill_gate_backlog_summaries',
         ),
     ],
 )
@@ -118,18 +166,11 @@ def _spawn(script: str, *argv: str, closed_stdout: bool, unbuffered: bool) -> tu
     )
 
 
-def _error_lines(err: str) -> list[str]:
-    return [line for line in err.splitlines() if line.startswith('error: ')]
-
-
 def _assert_one_clean_stdout_failure(code: int, err: str) -> str:
     """The boundary's contract: its status, no shutdown noise, one error line."""
-    assert code == EXIT_STDOUT_FAILED, err
     assert 'Traceback' not in err
     assert 'Exception ignored' not in err
-    errors = _error_lines(err)
-    assert len(errors) == 1, err
-    return errors[0]
+    return assert_one_stdout_failure_line(code, err)
 
 
 @_MIGRATED

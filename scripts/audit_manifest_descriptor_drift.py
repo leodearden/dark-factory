@@ -72,6 +72,16 @@ cases are recorded in the ``.capability-manifest.md`` twins, each under
 not yet done or cancelled, makes a run dirty. Fixing one is a separate,
 reviewed edit; which edit is stated once, in ``_UNBOUND_CAVEAT``, which the
 report and the JSON both carry.
+
+THE SIGNAL-BINDING CHECK (task 6582). A sidecar's ``signal_leaves`` names the
+blocks whose task status the dashboard reads as the PRD's signal
+(plans/dashboard-prd-lanes-prd.md §4.7, §5.2). A STALE SIGNAL BINDING is a
+signal leaf whose locally bound task is missing from this store, or whose own
+``prd_path`` is not this sidecar's ``prd``. Every such row makes a run dirty;
+what one means and how it is fixed is stated once, in
+``_SIGNAL_BINDING_CAVEAT``. How many leaves were named and how many could be
+checked is in the coverage block, so a run with no signal leaves to check
+never reads as one whose leaves all agreed.
 """
 from __future__ import annotations
 
@@ -81,7 +91,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 # Tier 1 (tasks.db discovery) and Tier 3 (audit-script CLI plumbing: the roots
 # loop, the warn-and-continue skip, the exit-code ladder and the two reporting
@@ -133,6 +143,7 @@ if str(_FUSED_MEMORY_SRC) not in sys.path:
 from fused_memory.models.scope import resolve_project_id_for_root  # noqa: E402
 from shared.capability_manifest import (  # noqa: E402
     MECHANICAL_CHECK_KINDS,
+    CapabilityManifestDoc,
     DeliveredCheckMeta,
     load_capability_manifest,
 )
@@ -228,11 +239,16 @@ class TaskStoreScan(NamedTuple):
 
     ``manifest_bindings`` feeds the label-binding direction: every task the
     stamper would admit, sorted by numeric task id.
+
+    ``prd_paths`` (each task's non-empty string ``prd_path``) feeds the
+    signal-binding check, taken in the same scan for the same no-straddle
+    reason.
     """
 
     row_ids: frozenset[int]
     delivered_checks: dict[int, dict[str, dict]]
     manifest_bindings: tuple[ManifestBinding, ...]
+    prd_paths: dict[int, str]
 
 
 def _delivered_check_entries(metadata: dict) -> dict[str, dict]:
@@ -337,6 +353,7 @@ def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
     row_ids: set[int] = set()
     delivered_checks: dict[int, dict[str, dict]] = {}
     bindings: list[ManifestBinding] = []
+    prd_paths: dict[int, str] = {}
     conn = connect_ro(tasks_db_path)
     try:
         cursor = conn.execute("SELECT id, status, metadata FROM tasks WHERE tag = 'master'")
@@ -353,6 +370,9 @@ def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
             binding = _manifest_binding(tid, status, decoded)
             if binding is not None:
                 bindings.append(binding)
+            prd_path = decoded.get("prd_path")
+            if isinstance(prd_path, str) and prd_path:
+                prd_paths[tid] = prd_path
     finally:
         conn.close()
     bindings.sort(key=lambda binding: binding.task_id)
@@ -360,6 +380,7 @@ def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
         row_ids=frozenset(row_ids),
         delivered_checks=delivered_checks,
         manifest_bindings=tuple(bindings),
+        prd_paths=prd_paths,
     )
 
 
@@ -517,6 +538,13 @@ class AuditCoverage(NamedTuple):
     first is a stamper no-op that numbers in the hundreds live, and would bury
     the rows the report exists to show. The second's sidecar is already named in
     ``manifest_parse_failure_details``.
+
+    THE SIGNAL-BINDING CHECK STATES ITS OWN DENOMINATOR, because zero stale
+    rows reads the same whether every leaf agreed or no sidecar names one.
+    ``signal_leaves_named`` counts every label in a swept sidecar's
+    ``signal_leaves``; ``signal_leaves_checked`` counts those bound by a local
+    ``task_id``, the only ones that can become a ``StaleSignalBinding``. An
+    unbound or ``external_task_id`` leaf is named but not checked.
     """
 
     manifests_swept: int
@@ -537,6 +565,8 @@ class AuditCoverage(NamedTuple):
     tasks_bound_to_a_declared_label: int = 0
     tasks_without_a_tracked_sidecar: int = 0
     tasks_on_an_unparseable_sidecar: int = 0
+    signal_leaves_named: int = 0
+    signal_leaves_checked: int = 0
 
 
 class UnboundLabel(NamedTuple):
@@ -579,6 +609,64 @@ class UnboundLabel(NamedTuple):
         return self.status not in TERMINAL
 
 
+class StaleSignalBinding(NamedTuple):
+    """A signal leaf whose locally bound task is missing from this store or
+    carries another ``prd_path`` (plans/dashboard-prd-lanes-prd.md §5.2).
+
+    ``reason`` says which: ``'task_missing'`` (no row for ``task_id`` in this
+    store, so ``task_prd`` is None) or ``'prd_mismatch'`` (the task's own
+    ``prd_path``, None when it has none, is not the sidecar's ``prd``).
+    ``manifest`` is repo-relative. ``_asdict()`` feeds the JSON writer.
+    """
+
+    manifest: str
+    label: str
+    task_id: int
+    reason: Literal["task_missing", "prd_mismatch"]
+    sidecar_prd: str
+    task_prd: str | None
+
+
+def _locally_bound_signal_leaves(doc: CapabilityManifestDoc) -> list[tuple[str, int]]:
+    """``(label, task_id)`` for each signal leaf of *doc* bound by a local
+    ``task_id``, in ``signal_leaves`` order: the leaves the signal-binding check
+    can test. An unbound leaf, or one bound by ``external_task_id``, has no
+    local task and is not among them."""
+    task_ids = {task.label: task.task_id for task in doc.tasks}
+    return [
+        (label, task_id)
+        for label in doc.signal_leaves or ()
+        if (task_id := task_ids[label]) is not None
+    ]
+
+
+def _stale_signal_bindings(
+    relpath: str, sidecar_prd: str, bound_leaves: list[tuple[str, int]],
+    scan: TaskStoreScan,
+) -> list[StaleSignalBinding]:
+    """Every one of *bound_leaves* whose task is missing from *scan* or whose
+    ``prd_path`` is not *sidecar_prd*, in the order given.
+
+    The task's PRD is its raw ``prd_path`` compared by exact string: ``prd``
+    and ``prd_ref`` are not read, and no ``#anchor`` or ``§section`` suffix is
+    stripped.
+    """
+    rows: list[StaleSignalBinding] = []
+    for label, task_id in bound_leaves:
+        if task_id not in scan.row_ids:
+            reason, task_prd = "task_missing", None
+        else:
+            task_prd = scan.prd_paths.get(task_id)
+            if task_prd == sidecar_prd:
+                continue
+            reason = "prd_mismatch"
+        rows.append(StaleSignalBinding(
+            manifest=relpath, label=label, task_id=task_id, reason=reason,
+            sidecar_prd=sidecar_prd, task_prd=task_prd,
+        ))
+    return rows
+
+
 def _external_project_id(wire: str) -> str | None:
     """The project_id half of an ``external_task_id``, or None if unreadable.
 
@@ -603,7 +691,8 @@ class ProjectAudit(NamedTuple):
 
     ``findings`` is the drift direction (sidecar -> task) and ``unbound_labels``
     the label-binding direction (task -> sidecar); they are separate lists
-    because they are separate defects with separate remedies.
+    because they are separate defects with separate remedies, as is
+    ``stale_signal_bindings``, the signal-binding check.
 
     ``project_root`` owns the tasks.db; ``manifest_root`` owns the sidecars.
     They are the SAME path by default and differ only under ``--manifest-root``
@@ -617,6 +706,7 @@ class ProjectAudit(NamedTuple):
     manifest_root: str
     findings: list[DescriptorDrift]
     unbound_labels: list[UnboundLabel]
+    stale_signal_bindings: list[StaleSignalBinding]
     coverage: AuditCoverage
 
 
@@ -732,6 +822,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
             manifest_root=manifests_root,
             findings=[],
             unbound_labels=[],
+            stale_signal_bindings=[],
             coverage=AuditCoverage(
                 manifests_swept=0,
                 mechanical_capabilities_compared=0,
@@ -769,6 +860,9 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
     # Gathered here so the label-binding direction parses no sidecar twice.
     declared_by_manifest: dict[str, tuple[str, ...]] = {}
     unparseable_manifests: set[str] = set()
+    stale_signal_bindings: list[StaleSignalBinding] = []
+    signal_leaves_named = 0
+    signal_leaves_checked = 0
 
     # Resolved ONCE per root, ahead of the sweep: this is what makes
     # "external" checkable rather than taken on the block's word. Guarded and
@@ -797,6 +891,11 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
 
         manifests_swept += 1
         declared_by_manifest[relpath] = tuple(task.label for task in doc.tasks)
+        bound_signal_leaves = _locally_bound_signal_leaves(doc)
+        signal_leaves_named += len(doc.signal_leaves or ())
+        signal_leaves_checked += len(bound_signal_leaves)
+        stale_signal_bindings.extend(
+            _stale_signal_bindings(relpath, doc.prd, bound_signal_leaves, scan))
         for task in doc.tasks:
             if task.external_task_id is not None:
                 # ANOTHER project's registry, so absent from THIS project's
@@ -936,6 +1035,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
         manifest_root=manifests_root,
         findings=findings,
         unbound_labels=label_bindings.unbound_labels,
+        stale_signal_bindings=stale_signal_bindings,
         coverage=AuditCoverage(
             manifests_swept=manifests_swept,
             mechanical_capabilities_compared=compared,
@@ -954,6 +1054,8 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
             tasks_bound_to_a_declared_label=label_bindings.tasks_bound_to_a_declared_label,
             tasks_without_a_tracked_sidecar=label_bindings.tasks_without_a_tracked_sidecar,
             tasks_on_an_unparseable_sidecar=label_bindings.tasks_on_an_unparseable_sidecar,
+            signal_leaves_named=signal_leaves_named,
+            signal_leaves_checked=signal_leaves_checked,
         ),
     )
 
@@ -990,6 +1092,15 @@ _UNBOUND_CAVEAT = (
     "(keeping prd_path) on a task filed from outside the PRD's decomposition "
     "plan, or complete the sidecar for a label that plan declares - never "
     "invent a sidecar entry for a label the plan does not declare):"
+)
+
+_SIGNAL_BINDING_CAVEAT = (
+    "  STALE SIGNAL BINDINGS (a row is a signal leaf, named in the sidecar's "
+    "signal_leaves, whose locally bound task is missing from this store or "
+    "whose own prd_path is not this sidecar's prd. Unbound and "
+    "external_task_id leaves are not checked. Fixing a row is a separate, "
+    "reviewed edit: re-bind the block's task_id, set the task's prd_path, or "
+    "drop the label from signal_leaves):"
 )
 
 # Printed ABOVE a git-discovery-failed project's rows, because a reader must
@@ -1048,6 +1159,26 @@ def _format_unbound_section(rows: list[UnboundLabel]) -> list[str]:
     return lines
 
 
+def _format_signal_binding_line(row: StaleSignalBinding) -> str:
+    """One stale-signal-binding row, in the sibling audits' ``key=value`` style."""
+    return format_kv_line([
+        ("manifest", row.manifest),
+        ("label", row.label),
+        ("task_id", row.task_id),
+        ("reason", row.reason),
+        ("sidecar_prd", row.sidecar_prd),
+        ("task_prd", row.task_prd),
+    ])
+
+
+def _format_signal_binding_section(rows: list[StaleSignalBinding]) -> list[str]:
+    """Render the signal-binding check: header and caveat EVEN WHEN EMPTY, for
+    the reason given on :func:`_format_unbound_section`, then every row."""
+    lines = [f"  -- stale signal bindings ({len(rows)}) --", _SIGNAL_BINDING_CAVEAT]
+    lines.extend(_format_signal_binding_line(row) for row in rows)
+    return lines
+
+
 def _format_coverage(coverage: AuditCoverage) -> list[str]:
     """Render the always-printed coverage block.
 
@@ -1098,6 +1229,9 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
             ("tasks bound to a declared label:", coverage.tasks_bound_to_a_declared_label),
             ("tasks with no tracked sidecar:", coverage.tasks_without_a_tracked_sidecar),
             ("tasks on an unparseable sidecar:", coverage.tasks_on_an_unparseable_sidecar),
+            # The signal-binding check's denominator; see AuditCoverage.
+            ("signal leaves named:", coverage.signal_leaves_named),
+            ("signal leaves checked:", coverage.signal_leaves_checked),
         ],
         details=(*coverage.manifest_parse_failure_details, *coverage.uncomparable_details),
     )
@@ -1106,10 +1240,11 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
 def format_report(audits: list[ProjectAudit]) -> str:
     """Render *audits* as a human-readable report.
 
-    Every project gets both sections, drifted descriptors and unbound task
-    labels, and its COVERAGE block, INCLUDING projects with nothing to report —
-    see :func:`_format_unbound_section` and :func:`_format_coverage`. The
-    trailing total counts both dimensions, and how many unbound rows are live.
+    Every project gets every section, drifted descriptors, unbound task labels
+    and stale signal bindings, and its COVERAGE block, INCLUDING projects with
+    nothing to report — see :func:`_format_unbound_section` and
+    :func:`_format_coverage`. The trailing total counts every dimension, and
+    how many unbound rows are live.
 
     Both roots are named on the header line so a ``--manifest-root`` run is
     unambiguous: a reader never has to guess which manifest tree was compared
@@ -1118,7 +1253,7 @@ def format_report(audits: list[ProjectAudit]) -> str:
     Pure: returns the text and never prints. ``main()`` does the single print.
     """
     lines: list[str] = []
-    drifted = unbound = live = 0
+    drifted = unbound = live = stale = 0
     for audit in audits:
         if audit.manifest_root == audit.project_root:
             lines.append(f"{audit.project_root}:")
@@ -1142,11 +1277,13 @@ def format_report(audits: list[ProjectAudit]) -> str:
         unbound += len(audit.unbound_labels)
         live += sum(row.is_live for row in audit.unbound_labels)
         lines.extend(_format_unbound_section(audit.unbound_labels))
+        stale += len(audit.stale_signal_bindings)
+        lines.extend(_format_signal_binding_section(audit.stale_signal_bindings))
         lines.extend(_format_coverage(audit.coverage))
 
     lines.append(
         f"{drifted} drifted descriptor(s), {unbound} unbound task label(s) "
-        f"({live} live) across {len(audits)} project(s)"
+        f"({live} live), {stale} stale signal binding(s) across {len(audits)} project(s)"
     )
     return "\n".join(lines)
 
@@ -1166,6 +1303,7 @@ def format_json(audits: list[ProjectAudit]) -> str:
     return json.dumps({
         "caveat": _COVERAGE_CAVEAT,
         "unbound_labels_caveat": _UNBOUND_CAVEAT,
+        "stale_signal_bindings_caveat": _SIGNAL_BINDING_CAVEAT,
         "projects": [
             {
                 "project_root": audit.project_root,
@@ -1176,6 +1314,9 @@ def format_json(audits: list[ProjectAudit]) -> str:
                     {**row._asdict(), "is_live": row.is_live}
                     for row in audit.unbound_labels
                 ],
+                "stale_signal_bindings": [
+                    row._asdict() for row in audit.stale_signal_bindings
+                ],
             }
             for audit in audits
         ],
@@ -1183,8 +1324,8 @@ def format_json(audits: list[ProjectAudit]) -> str:
 
 
 def _is_dirty(audits: list[ProjectAudit]) -> bool:
-    """Exit 1 keys on findings, a failed manifest discovery, OR a LIVE unbound
-    label.
+    """Exit 1 keys on findings, a failed manifest discovery, a LIVE unbound
+    label, OR a stale signal binding.
 
     The second disjunct is not belt-and-braces. An empty corpus and a clean
     corpus are INDISTINGUISHABLE in the finding count, and only one of them is
@@ -1195,11 +1336,15 @@ def _is_dirty(audits: list[ProjectAudit]) -> bool:
     but not dirty, because a done or cancelled task can no longer be touched by
     a future ``commit_planning``. A live one can, and while it is live is the
     only time its label is still cheap to fix. See :attr:`UnboundLabel.is_live`.
+
+    The fourth has no such historical exemption, because the dashboard reads a
+    signal leaf whatever its task's status.
     """
     return any(
         a.findings
         or a.coverage.git_discovery_failed
         or any(row.is_live for row in a.unbound_labels)
+        or a.stale_signal_bindings
         for a in audits
     )
 
@@ -1209,10 +1354,12 @@ def _is_dirty(audits: list[ProjectAudit]) -> bool:
 # so a local re-spelling would drift from what actually gets returned. The
 # label-binding direction changed what makes a run dirty (_is_dirty), not these
 # values. test_exit_constants_alias_the_shared_tier_3_codes keeps them honest.
-EXIT_OK = AUDIT_EXIT_OK                            # swept; no drift and no
-                                                   # LIVE unbound label
+EXIT_OK = AUDIT_EXIT_OK                            # swept; no drift, no LIVE
+                                                   # unbound label and no stale
+                                                   # signal binding
 EXIT_DRIFT = AUDIT_EXIT_FINDINGS                   # a drifted descriptor, a
-                                                   # LIVE unbound label, or a
+                                                   # LIVE unbound label, a stale
+                                                   # signal binding, or a
                                                    # failed manifest discovery
 EXIT_NO_ROOT = AUDIT_EXIT_NO_ROOT                  # no project root resolved to
                                                    # a readable tasks.db
@@ -1232,16 +1379,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "record sits beside a stale sidecar that any re-decompose would "
             "re-stamp over the repair. LABEL BINDING (task -> sidecar): a "
             "task whose prd_task_label its tracked sidecar does not declare, "
-            "so commit_planning binds nothing for it. Reporting only -- never "
-            "mutates a task record or a manifest. Resyncing a drifted sidecar "
-            "or fixing an unbound label is a separate, individually-reviewed "
-            "edit."
+            "so commit_planning binds nothing for it. It also reports STALE "
+            "SIGNAL BINDINGS: a sidecar signal_leaves label whose bound task is "
+            "missing from the store or belongs to another PRD. Reporting only "
+            "-- never mutates a task record or a manifest. Resyncing a drifted "
+            "sidecar, fixing an unbound label or re-binding a signal leaf is a "
+            "separate, individually-reviewed edit."
         ),
         epilog=(
-            "exit codes: 0 = swept, every compared descriptor agrees and no "
-            "unbound label is live; 1 = at least one drifted descriptor, OR a "
-            "LIVE unbound label (its task not yet done or cancelled; a "
-            "historical one is reported but does not count), OR the manifest "
+            "exit codes: 0 = swept, every compared descriptor agrees, no "
+            "unbound label is live and no signal binding is stale; 1 = at "
+            "least one drifted descriptor, OR a LIVE unbound label (its task "
+            "not yet done or cancelled; a historical one is reported but does "
+            "not count), OR a stale signal binding, OR the manifest "
             "corpus could not be enumerated (an empty corpus and a clean "
             "corpus are indistinguishable in the finding count, and only one "
             "is good news); 2 = no project root resolved to a readable "
@@ -1275,8 +1425,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json", action="store_true",
         help=(
-            "Emit a JSON object (findings, unbound labels and coverage) instead "
-            "of a report."
+            "Emit a JSON object (findings, unbound labels, stale signal "
+            "bindings and coverage) instead of a report."
         ),
     )
     return parser
@@ -1322,9 +1472,10 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point: sweep both directions, descriptor drift (sidecar -> task)
     and label binding (task -> sidecar), for every resolved project root.
 
-    Exit codes: 0 = swept, every compared descriptor agrees and no unbound
-    label is live; 1 = a drifted descriptor, a LIVE unbound label, OR a
-    manifest corpus that could not be enumerated; 2 = no project root resolved
+    Exit codes: 0 = swept, every compared descriptor agrees, no unbound label
+    is live and no signal binding is stale; 1 = a drifted descriptor, a LIVE
+    unbound label, a stale signal binding, OR a manifest corpus that could not
+    be enumerated; 2 = no project root resolved
     to a readable tasks.db; 3 = roots resolved but EVERY one failed to audit,
     so NOTHING was swept. A historical unbound label (its task done or
     cancelled) is reported but never makes the run dirty — see

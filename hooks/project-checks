@@ -57,8 +57,12 @@ BRANCH="${2:-main}"
 # listing must mean "nothing staged", never "git could not answer". A corrupt
 # or locked index would otherwise disarm the audit in silence -- the very shape
 # this gate exists to close, reproduced one layer out (INV-11).
+# The ledger is a DIRECTORY, one file per authorization; the retired
+# single-array file stays listed because the commit that splits it, and any
+# commit that stages it back, is the auditor's to judge.
 ratchet_artifacts=(
     orchestrator/tests/merge_lane_ratchet_baseline.json
+    orchestrator/tests/merge_lane_ratchet_raises
     orchestrator/tests/merge_lane_ratchet_authorized_raises.json
 )
 staged_ratchet="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMRD -- \
@@ -88,13 +92,13 @@ if [ -n "$staged_ratchet" ]; then
     # the instrument; it never skips itself.
     (cd "$ROOT" && python3 scripts/check_staged_ratchet_raise.py)
     ratchet_rc=$?
-    # NO DIAGNOSIS IS RESTATED HERE. The auditor has five refusal paths (an
+    # NO DIAGNOSIS IS RESTATED HERE. The auditor has six refusal paths (an
     # unrecorded raise, a staged baseline deletion, a rewritten ledger history,
-    # an unreadable artifact, an unimportable instrument) and prints its own
-    # named cause plus the ONE copy of RAISE_REMEDY for the paths that remedy
-    # fits. A fixed "--authorize-raise it" line here was wrong for four of the
-    # five and sent the committer hunting the wrong thing. Only the exit ladder
-    # is read: 1 policy, 2 instrument.
+    # a retired ledger split wrongly or staged back, an unreadable artifact, an
+    # unimportable instrument) and prints its own named cause plus the ONE copy
+    # of RAISE_REMEDY for the paths that remedy fits. A fixed "--authorize-raise
+    # it" line here was wrong for most of them and sent the committer hunting
+    # the wrong thing. Only the exit ladder is read: 1 policy, 2 instrument.
     if [ "$ratchet_rc" -eq 2 ]; then
         echo "pre-commit: merge-lane ratchet audit could NOT RUN (rc=2); its named cause is above."
         exit 1
@@ -118,13 +122,13 @@ echo "pre-commit: linting (main branch)..."
 # PYRIGHT_PACKAGES, since it also names non-member paths. That leg is the
 # source of truth: tests/scripts/test_hook_ruff_targets_drift.py fails when
 # this list and the leg disagree, so widen both together.
-RUFF_TARGETS=(shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills)
+RUFF_TARGETS=(shared escalation fused-memory orchestrator dashboard sampler cockpit client-feed conftest.py df_pytest_isolation.py skills)
 # Every package the merge gate type-checks, in the order of
 # dark-factory-orchestrator.yaml::type_check_command (all carry [tool.pyright];
 # pyright runs per-package from its directory). That chain is the source of
 # truth: tests/scripts/test_hook_pyright_packages_drift.py fails when this list
 # and the chain disagree, so widen both together.
-PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard shared escalation sampler cockpit)
+PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard shared escalation sampler cockpit client-feed)
 # Dependency packages that the other PYRIGHT_PACKAGES import. They are
 # pyright-checked like any other member, but a staged change here can break a
 # consumer without touching the consumer's files, so it forces a sweep across
@@ -135,7 +139,7 @@ DEP_PACKAGES=(shared escalation)
 # scans, in the order of dark-factory-orchestrator.yaml::lint_command. That leg is
 # the source of truth: tests/scripts/test_hook_magicmock_test_dirs_drift.py fails
 # when this list and the leg disagree, so widen both together.
-MAGICMOCK_TEST_DIRS=(shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests)
+MAGICMOCK_TEST_DIRS=(shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests client-feed/tests)
 
 RUFF_PATHS=()
 for target in "${RUFF_TARGETS[@]}"; do

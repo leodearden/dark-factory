@@ -22,14 +22,15 @@ from typing import IO, Any, Literal, overload
 import pytest
 from _fm_helpers import LoopFreedomProbe
 from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import curator_escalator
 from fused_memory.middleware.curator_escalator import CuratorEscalator
+from fused_memory.middleware.curator_types import CuratorFailureError
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     DUPLICATE_METADATA_KEY,
     DuplicateFinding,
 )
-from fused_memory.middleware.task_curator import CuratorFailureError
 
 
 @overload
@@ -87,6 +88,24 @@ class TestReportFailure:
             assert '"level": 1' in body
             assert 'max_turns exhausted' in body
             assert 'Add Type::Error arm' in body
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_files_into_the_layout_escalation_queue_when_relocated(
+        self, tmp_path, escalation_queue_relocation,
+    ):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path),
+                project_id='proj-x',
+                justification='max_turns exhausted',
+                candidate_title='Add Type::Error arm',
+            )
+
+            assert len(sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))) == 1
+            assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
         finally:
             handle.close()
 
@@ -1070,6 +1089,75 @@ class TestBackendBinaryUnresolvableEscalation:
         errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert errors, 'a dropped alarm must still be loud in the log'
         assert any('claude' in r.getMessage() for r in errors)
+
+
+class TestEveryRouteFilesUnderItsAnchor:
+    """The value filed must be the constant that
+    tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor sweeps, or a
+    site with a diverging literal escapes the collision check."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('method_name', 'kwargs'),
+        [
+            pytest.param(
+                'report_failure',
+                dict(justification='max_turns exhausted', candidate_title='T'),
+                id='failure',
+            ),
+            pytest.param(
+                'report_failure',
+                dict(
+                    justification='denied', candidate_title='T',
+                    schema_tool_denied=True,
+                ),
+                id='schema-tool-denied',
+            ),
+            pytest.param(
+                'report_failure',
+                dict(
+                    justification='ZOT', candidate_title='T',
+                    zero_output_timeout=True, timed_out=True,
+                    duration_ms=181_966, transcript_turns=0, tools_used=(),
+                ),
+                id='zero-output-timeout',
+            ),
+            pytest.param(
+                'report_zot_duplicate',
+                dict(
+                    finding=_FINDING, candidate_title='T',
+                    zot_escalation_id='esc-curator-41', stamped=True,
+                ),
+                id='zot-duplicate',
+            ),
+            pytest.param(
+                'report_consecutive_degraded',
+                dict(
+                    streak=5, threshold=5, last_justification='j',
+                    candidate_title='T',
+                ),
+                id='consecutive-degraded',
+            ),
+            pytest.param(
+                'report_backend_binary_unresolvable',
+                dict(binary_spec='claude', search_path='/usr/bin'),
+                id='backend-binary-unresolvable',
+            ),
+        ],
+    )
+    async def test_the_filed_task_id_is_the_anchor_constant(
+        self, tmp_path, method_name: str, kwargs: dict[str, Any],
+    ):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await getattr(CuratorEscalator(), method_name)(
+                project_root=str(tmp_path), project_id='proj-x', **kwargs,
+            )
+
+            [record] = _pending_records(tmp_path)
+            assert record['task_id'] == curator_escalator._ANCHOR_TASK_ID
+        finally:
+            handle.close()
 
 
 class TestBurstLogCompositeKey:

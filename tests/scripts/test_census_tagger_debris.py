@@ -45,6 +45,7 @@ from _task_db_scan import (
 from audit_wiped_metadata_files import (
     _EVENT_PLAN_SOURCES,
     CONFIRMED_NULL_SHA_DONE_PATH,
+    EVENT_LOG_UNREAD,
     FIDELITY_FILE_LEVEL,
     FIDELITY_LOCK_LEVEL,
     NO_MERGE_EVENT,
@@ -75,9 +76,13 @@ from census_tagger_debris import (
     classify_record,
     load_scope_events,
     load_stamped_records,
+    main,
     render_markdown,
     write_artifacts,
 )
+from shared.project_id import project_id_for_root
+
+from shared import project_layout
 
 # ---------------------------------------------------------------------------
 # The classification vocabulary and the pure three-axis classifier.
@@ -1186,28 +1191,32 @@ def test_merge_signature_defaults_to_no_merge_event_not_to_a_clean_verdict(tmp_p
     assert record.merge_signature == NO_MERGE_EVENT
 
 
-def test_a_missing_event_log_degrades_loudly_not_into_a_clean_project(tmp_path):
-    """(c) NO-SILENT-FAIL-SOFT. Without runs.db, "no scope event postdates the
-    stamp" is UNKNOWN, not measured — but every stamped record must still be
-    reported, and the coverage block must say the event log was unreadable.
-    Reporting the same rows with a silent clean verdict would tell DF 3427 the
-    tagger's guesses were never superseded, which is a claim this run did not
-    make."""
+@pytest.mark.parametrize("event_log", ["absent", "corrupt"])
+def test_an_unread_event_log_degrades_loudly_not_into_a_clean_project(tmp_path, event_log):
+    """(c) NO-SILENT-FAIL-SOFT. Without a readable runs.db, "no scope event
+    postdates the stamp" is UNKNOWN, not measured — but every stamped record
+    must still be reported, and the coverage block must say the event log was
+    unreadable. Reporting the same rows with a silent clean verdict would tell
+    DF 3427 the tagger's guesses were never superseded, which is a claim this
+    run did not make. The merge verdict is the audit's EVENT_LOG_UNREAD, never
+    NO_MERGE_EVENT, which claims a READ log holds no merge_finalized (INV-13)."""
     root = _make_project(
         tmp_path,
-        with_runs_db=False,
+        with_runs_db=event_log == "corrupt",
         tasks=[
             {"id": 1, "status": "pending", "metadata": {"files_tagged_at": _STAMP}},
             {"id": 2, "status": "done", "metadata": {"files_tagged_at": _STAMP}},
         ],
     )
+    if event_log == "corrupt":
+        project_layout.runs_db(root).write_bytes(b"this is not a database")
     census = census_project(str(root))
 
     assert [record.task_id for record in census.records] == [1, 2]
     for record in census.records:
         assert record.reconciliation == NEVER_RECONCILED
         assert record.wipe_signature == NO_PRIOR_SCOPE
-        assert record.merge_signature == NO_MERGE_EVENT
+        assert record.merge_signature == EVENT_LOG_UNREAD
     assert census.coverage.event_log_read is False
     assert census.coverage.stamped_records == 2
 
@@ -1369,13 +1378,31 @@ def test_an_undecided_axis_emits_fidelity_present_and_null(tmp_path):
         assert row[key]["fidelity"] is None
 
 
-def test_project_id_is_the_root_basename_with_underscores(tmp_path):
-    """The six corpora spell their ids with underscores where the directory
-    uses hyphens (solar-challenge-platform -> solar_challenge_platform). The
-    artifact must use the id spelling its consumers already key on."""
-    root = _make_project(tmp_path, name="solar-challenge-platform", tasks=[])
+def test_project_id_is_the_shared_rule_over_the_root_basename(tmp_path):
+    """The six corpora spell their ids lower-case with underscores where the
+    directory uses hyphens (Solar-Challenge-Platform -> solar_challenge_platform).
+    The artifact must use the id spelling its consumers already key on, which
+    is shared.project_id's one rule."""
+    root = _make_project(tmp_path, name="Solar-Challenge-Platform", tasks=[])
 
-    assert census_project(str(root)).coverage.project_id == "solar_challenge_platform"
+    project_id = census_project(str(root)).coverage.project_id
+
+    assert project_id == "solar_challenge_platform" == project_id_for_root(root)
+
+
+def test_a_relative_root_is_censused_under_its_directorys_id(tmp_path, monkeypatch):
+    root = _make_project(tmp_path, name="Know-Live", tasks=[])
+    monkeypatch.chdir(root)
+
+    assert census_project(".").coverage.project_id == "know_live"
+
+
+def test_main_sweeps_a_relative_project_root(tmp_path, monkeypatch, capsys):
+    root = _make_project(tmp_path, name="Know-Live", tasks=[])
+    monkeypatch.chdir(root)
+
+    assert main(["--project-root", ".", "--json"]) == EXIT_OK
+    assert "know_live" in json.loads(capsys.readouterr().out)["projects"]
 
 
 # ---------------------------------------------------------------------------

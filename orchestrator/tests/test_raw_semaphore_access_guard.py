@@ -3,9 +3,9 @@
 (merge-queue-reliability PRD P-2, scope-3 leaf theta, task 2161).
 
 Both semaphores are single-owned by a
-:class:`~orchestrator.merge_speculation_controller.PermitLedger` instance
+:class:`~orchestrator.merge_lane.speculation_controller.PermitLedger` instance
 (``_speculation_ledger`` / ``_merge_ahead_ledger`` on
-:class:`~orchestrator.merge_queue.SpeculativeMergeWorker`): every acquire
+:class:`~orchestrator.merge_lane.worker.SpeculativeMergeWorker`): every acquire
 returns a permit token (``SpecPermit``/``CapPermit``) and every release goes
 through ``ledger.release(token)`` -- or, for the shutdown-only over-release,
 ``ledger.release_for_shutdown(count)``. A raw

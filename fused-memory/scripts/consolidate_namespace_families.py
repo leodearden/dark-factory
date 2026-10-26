@@ -104,10 +104,7 @@ from fused_memory.maintenance.cross_graph_move import (  # noqa: F401
     delete_source_node,
     recreate_subgraph_relationships,
 )
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('consolidate_namespace_families')
 
@@ -1011,27 +1008,19 @@ async def run(
     # ``_get_async_qdrant()`` below, so a refused run never even opens the
     # Qdrant transport.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(
-                operation='consolidate_namespace_families --apply'
-            )
-        except StoreMutationUnavailable:
-            logger.error(
-                'consolidate_namespace_families: --apply NOT started '
-                "(fail-closed) -- this process cannot write mem0's history "
-                'directory, so a consolidation would upsert points and delete '
-                'source nodes without recording either, and a run interrupted '
-                'part-way strands records in the sibling namespace with the '
-                'canonical copy already written -- across four phases that '
-                'each drop a collection, DETACH DELETE a graph, or delete a '
-                'source node. Nothing was enumerated and nothing was mutated, '
-                'and no Qdrant client was opened. Route the consolidation '
-                'through the fused-memory MCP server (the unsandboxed owner '
-                'of the store), or re-run from an unsandboxed operator shell. '
-                'To obtain the preview report safely from anywhere, re-run '
-                'without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='consolidate_namespace_families --apply',
+            logger=logger,
+            extra_detail=(
+                'a consolidation would upsert points and delete source nodes '
+                'without recording either, and a run interrupted part-way strands '
+                'records in the sibling namespace with the canonical copy already '
+                'written -- across four phases that each drop a collection, '
+                'DETACH DELETE a graph, or delete a source node. Nothing was '
+                'enumerated and nothing was mutated, and no Qdrant client was '
+                'opened.'
+            ),
+        )
 
     graphiti = memory_service.graphiti
     qdrant_client = await memory_service.mem0._get_async_qdrant()

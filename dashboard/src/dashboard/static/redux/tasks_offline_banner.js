@@ -3,7 +3,7 @@
 //
 // This is a plain-JS module: no JSX, no Babel. It is loaded two ways:
 //   - In the browser, via a classic `<script src="/static/redux/tasks_offline_banner.js">`
-//     tag (like task_status_counts.js / prd_grouping.js), which assigns
+//     tag (like task_snapshot.js / prd_grouping.js), which assigns
 //     `window.DF_TASKS_OFFLINE_BANNER`.
 //   - In node (no package.json in this repo, so this file resolves as
 //     CommonJS), via `require`/`import` for the `node --test` suite under
@@ -153,7 +153,21 @@ function tasksBannerNotices(state) {
   return notices
 }
 
-const TASKS_OFFLINE_BANNER_API = { tasksBannerNotices }
+// The ONE mapping from DF_DATA's /tasks keys to tasksBannerNotices' state, so
+// the Tasks-tab banner and the System health Taskmaster row cannot disagree.
+// Every key is defaulted, so a pre-fetch DF_DATA yields no notice.
+function tasksBannerNoticesFor(data) {
+  const d = data || {}
+  return tasksBannerNotices({
+    offline: !!d.TASKS_OFFLINE,
+    offlineProjects: d.TASKS_OFFLINE_PROJECTS || [],
+    degradedProjects: d.TASKS_DEGRADED_PROJECTS || [],
+    countUnknownProjects: d.TASKS_COUNT_UNKNOWN_PROJECTS || [],
+    totalProjects: d.TASKS_PROJECT_COUNT || 0,
+  })
+}
+
+const TASKS_OFFLINE_BANNER_API = { tasksBannerNotices, tasksBannerNoticesFor }
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = TASKS_OFFLINE_BANNER_API

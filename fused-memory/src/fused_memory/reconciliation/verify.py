@@ -9,6 +9,7 @@ from shared.agent_result import extract_agent_verdict
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
 from fused_memory.reconciliation.agent_loop import AgentLoop, ToolDefinition
+from fused_memory.utils.clip_disclosure import elide_text, truncation_fields
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,9 @@ CODEBASE_ROOT_UNRESOLVED = 'codebase_root_unresolved'
 # not read-only (fused-memory/scripts/probe_schema_max_turns.py's docstring
 # records the measured `git log --output` write).
 _EXPLORE_CLI_TOOLS = ('Read', 'Grep', 'Glob')
+
+# Clears every ordinary commit's `git show --stat` measured at 2026-09/10.
+_GIT_SHOW_CHARS = 16_000
 
 
 # Sub-reasons for a refused root.  They discriminate the populations hiding
@@ -373,8 +377,8 @@ class CodebaseVerifier:
                     stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-                output = stdout.decode()[:3000]
-                return {'commit': commit, 'output': output}
+                clip = elide_text(stdout.decode(), _GIT_SHOW_CHARS, field='output')
+                return {'commit': commit, 'output': clip.text, **truncation_fields(clip.fact)}
             except Exception as e:
                 return {'error': str(e)}
 

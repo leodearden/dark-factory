@@ -24,6 +24,7 @@ import yaml
 from _fm_helpers import load_script_module
 from _link_heal_harness import (
     ALL_LINK_HEAL_PREFIXES,
+    COMPLETION_META,
     DF,
     REIFY,
     WITHOUT_LINK_HEAL_PREFIX,
@@ -37,7 +38,11 @@ from _link_heal_harness import (
 
 from fused_memory.maintenance.link_adjudicator import AdjudicationFailure
 from fused_memory.maintenance.link_heal import RunCounts, Verdict
-from fused_memory.maintenance.link_heal_executor import SHARE_STOP, RunReport
+from fused_memory.maintenance.link_heal_executor import (
+    ADJUDICATOR_ANCHOR,
+    SHARE_STOP,
+    RunReport,
+)
 from fused_memory.maintenance.link_heal_ledger import (
     LEDGER_FILENAME,
     LOCK_FILENAME,
@@ -63,6 +68,9 @@ NO_WRITING_RUN = 'no link-heal run has written here'
 SERVER_PORT = 8765
 DEFAULT_SERVER_URL = f'http://127.0.0.1:{SERVER_PORT}'
 WRONG_SHA = 'deadbeef' * 8
+PENDING_NOW = 'pending now'
+STALE = 'stale (pending heals changed since; re-plan)'
+NOTHING_PENDING = 'nothing pending'
 
 
 @dataclasses.dataclass
@@ -226,6 +234,21 @@ def printed_report(capsys) -> dict[str, Any]:
     return json.loads(capsys.readouterr().out)
 
 
+def status_lines(capsys) -> list[str]:
+    return capsys.readouterr().out.splitlines()
+
+
+def run_line(lines: list[str], run_id: str) -> str:
+    """The status line listing run *run_id* itself."""
+    (line,) = [line for line in lines if line.startswith(run_id[:8])]
+    return line
+
+
+def latest_plan_line(lines: list[str], source: RunSource) -> str:
+    (line,) = [line for line in lines if line.startswith(f'latest {source.value} plan')]
+    return line
+
+
 async def plan_from(env: Any, workspace: Workspace, corpus: Path, capsys) -> dict[str, Any]:
     assert await run_cli(env, workspace, 'plan', '--from-corpus', str(corpus)) == 0
     return printed_report(capsys)
@@ -263,9 +286,8 @@ class TestStatus:
 
         assert await run_cli(env, workspace, 'status') == 0
 
-        lines = capsys.readouterr().out.splitlines()
-        (run_line,) = [line for line in lines if planned['run_id'][:8] in line]
-        assert 'writes no' in run_line
+        lines = status_lines(capsys)
+        assert 'writes no' in run_line(lines, planned['run_id'])
         assert NO_WRITING_RUN in lines
 
     @pytest.mark.asyncio
@@ -276,10 +298,10 @@ class TestStatus:
 
         assert await run_cli(env, workspace, 'status') == 0
 
-        lines = capsys.readouterr().out.splitlines()
-        (run_line,) = [line for line in lines if applied['run_id'][:8] in line]
-        assert 'writes yes' in run_line
-        assert 'applied 0' in run_line
+        lines = status_lines(capsys)
+        applied_line = run_line(lines, applied['run_id'])
+        assert 'writes yes' in applied_line
+        assert 'applied 0' in applied_line
         assert NO_WRITING_RUN not in lines
 
     @pytest.mark.asyncio
@@ -443,6 +465,55 @@ class TestRefusedBeforeAnyRun:
         assert FailingCensus.DETAIL in capsys.readouterr().err
         assert workspace.runs() == []
 
+    @pytest.mark.asyncio
+    async def test_undo_of_a_plan_run_is_refused_naming_its_kind(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        planned = await plan_from(env, workspace, seed_corpus(harness, workspace, 2), capsys)
+
+        code = await run_cli(env, workspace, 'undo', '--run', planned['run_id'][:8])
+
+        err = capsys.readouterr().err
+        assert code == 2
+        assert planned['run_id'][:8] in err
+        assert 'plan run' in err
+        assert 'no heal still applied' in err
+        assert [run.run_id for run in workspace.runs()] == [planned['run_id']]
+        assert harness.mem0.write_count == 0
+
+    @pytest.mark.asyncio
+    async def test_undo_of_an_already_undone_apply_is_refused(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        await plan_from(env, workspace, seed_corpus(harness, workspace, 1), capsys)
+        _code, applied = await apply(env, workspace, capsys)
+        assert await run_cli(env, workspace, 'undo', '--run', applied['run_id'][:8]) == 0
+        printed_report(capsys)
+        runs_before = len(workspace.runs())
+
+        code = await run_cli(env, workspace, 'undo', '--run', applied['run_id'][:8])
+
+        err = capsys.readouterr().err
+        assert code == 2
+        assert 'apply run' in err
+        assert 'no heal still applied' in err
+        assert len(workspace.runs()) == runs_before
+
+    @pytest.mark.asyncio
+    async def test_a_refused_undo_never_probes_the_server(self, harness, workspace, capsys):
+        planned = await plan_from(
+            env_for(harness, workspace), workspace, seed_corpus(harness, workspace, 1), capsys,
+        )
+        calls: list[tuple[str, dict[str, Any]]] = []
+        env = env_for(harness, workspace, tool_caller=harness.recording_tool_caller(calls))
+
+        code = await run_cli(env, workspace, 'undo', '--run', planned['run_id'][:8])
+
+        assert code == 2
+        assert calls == []
+
 
 class TestTheHomeProject:
     @pytest.mark.asyncio
@@ -588,6 +659,10 @@ class TestPlanFromAdjudicator:
         'source_args',
         [
             pytest.param(['--from-corpus', 'corpus.jsonl', '--from-adjudicator'], id='both'),
+            pytest.param(
+                ['--deterministic', '--from-corpus', 'corpus.jsonl'], id='deterministic_and_corpus',
+            ),
+            pytest.param(['--deterministic', '--from-adjudicator'], id='deterministic_and_adjudicator'),
             pytest.param([], id='neither'),
         ],
     )
@@ -608,8 +683,11 @@ class TestPlanFromAdjudicator:
             'plan', '--from-corpus', str(corpus), '--project', DF,
         )
 
+        err = capsys.readouterr().err
         assert code == 2
-        assert '--project' in capsys.readouterr().err
+        assert '--project' in err
+        assert '--from-adjudicator' in err
+        assert '--deterministic' in err
         assert workspace.runs() == []
 
     @pytest.mark.asyncio
@@ -648,9 +726,7 @@ class TestPlanFromAdjudicator:
 
         assert await run_cli(env, workspace, 'status') == 0
 
-        lines = capsys.readouterr().out.splitlines()
-        (run_line,) = [line for line in lines if report['run_id'][:8] in line]
-        assert 'adjudicator  writes no' in run_line
+        assert 'adjudicator  writes no' in run_line(status_lines(capsys), report['run_id'])
 
     @pytest.mark.asyncio
     async def test_a_partly_failed_adjudication_exits_1(self, harness, workspace, capsys):
@@ -720,3 +796,245 @@ class TestApplyFromAdjudicator:
         assert applied['counts']['stopped_by'] == SHARE_STOP
         assert applied['counts']['applied'] == 0
         assert harness.mem0.write_count == 0
+
+
+def seed_completion_children(
+    harness: LinkHealHarness, *projects: str, first: int = 400,
+) -> None:
+    """One orchestrator completion record per project, each filed as an amendment of its own parent."""
+    for index, project in enumerate(projects, start=first):
+        child, parent = _sighting_ids(index)
+        harness.seed_link(
+            child=child, parent=parent, project=project,
+            child_text=f'cli completion {index}', parent_text=f'cli parent {index}',
+            meta={**COMPLETION_META, 'task_id': str(index)},
+        )
+
+
+async def plan_deterministic(
+    env: Any, workspace: Workspace, capsys, *argv: str,
+) -> tuple[int, dict[str, Any]]:
+    code = await run_cli(env, workspace, 'plan', '--deterministic', *argv)
+    return code, printed_report(capsys)
+
+
+def plan_document_actions(report: dict[str, Any]) -> list[dict[str, Any]]:
+    return json.loads(Path(report['plan_path']).read_text())['actions']
+
+
+class TestPlanDeterministic:
+    @pytest.mark.asyncio
+    async def test_plans_the_completion_detaches_of_every_project_without_a_verdict(
+        self, harness, workspace, capsys,
+    ):
+        seed_completion_children(harness, DF, REIFY)
+        seed_unrated_sightings(harness, 1)
+
+        code, report = await plan_deterministic(
+            env_for(harness, workspace), workspace, capsys, '--project', DF, '--project', REIFY,
+        )
+
+        assert code == 0
+        assert report['counts']['planned_by_action'] == {'detach': 2}
+        assert report['counts']['unexamined'] == 1
+        (run,) = workspace.runs()
+        assert (run.run_id, run.source, run.writes) == (
+            report['run_id'], RunSource.DETERMINISTIC, False,
+        )
+        actions = plan_document_actions(report)
+        assert {action['basis_source'] for action in actions} == {'completion_record'}
+        assert sorted(action['project_id'] for action in actions) == sorted([DF, REIFY])
+        assert harness.mem0.write_count == 0
+
+    @pytest.mark.asyncio
+    async def test_project_defaults_to_the_home_project(self, harness, workspace, capsys):
+        home = resolve_project_id(str(workspace.home_root))
+        seed_completion_children(harness, home, DF)
+
+        code, report = await plan_deterministic(env_for(harness, workspace), workspace, capsys)
+
+        assert code == 0
+        assert [action['project_id'] for action in plan_document_actions(report)] == [home]
+
+    @pytest.mark.asyncio
+    async def test_status_names_the_latest_deterministic_plan_as_pending_now(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        seed_completion_children(harness, DF)
+        _code, planned = await plan_deterministic(env, workspace, capsys, '--project', DF)
+
+        assert await run_cli(env, workspace, 'status') == 0
+
+        line = latest_plan_line(status_lines(capsys), RunSource.DETERMINISTIC)
+        assert planned['run_id'][:8] in line
+        assert planned['plan_path'] in line
+        assert planned['plan_sha256'] in line
+        assert PENDING_NOW in line
+
+
+class TestApplyDeterministic:
+    @pytest.mark.asyncio
+    async def test_an_approved_deterministic_apply_drains_only_its_own_heals(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        await plan_from(env, workspace, seed_corpus(harness, workspace, 1), capsys)
+        seed_completion_children(harness, DF)
+        _code, planned = await plan_deterministic(env, workspace, capsys, '--project', DF)
+
+        code, applied = await apply(
+            env, workspace, capsys, '--deterministic', '--approved-plan-sha', planned['plan_sha256'],
+        )
+
+        assert code == 0
+        assert applied['counts']['applied'] == 1
+        assert applied['counts']['approved_plan_sha256'] == planned['plan_sha256']
+        assert workspace.pending(RunSource.DETERMINISTIC) == 0
+        assert workspace.pending(RunSource.CORPUS) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_completion_detach_a_corpus_plan_ledgered_first_drains_only_through_its_apply(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        seed_completion_children(harness, DF)
+        corpus = await plan_from(env, workspace, seed_corpus(harness, workspace, 1), capsys)
+        _code, deterministic = await plan_deterministic(env, workspace, capsys, '--project', DF)
+
+        _code, drained = await apply(env, workspace, capsys, '--deterministic')
+        _code, applied = await apply(
+            env, workspace, capsys, '--approved-plan-sha', corpus['plan_sha256'],
+        )
+
+        assert corpus['counts']['planned_by_action'] == {'detach': 1, 'relabel': 1}
+        assert deterministic['counts']['already_pending'] == 1
+        assert plan_document_actions(deterministic) == []
+        assert drained['counts']['applied'] == 0
+        assert applied['counts']['applied'] == 2
+        assert workspace.pending(RunSource.CORPUS) == 0
+
+    @pytest.mark.asyncio
+    async def test_deterministic_and_adjudicator_together_is_a_usage_error(self, harness, workspace):
+        with pytest.raises(SystemExit) as exited:
+            await run_cli(
+                env_for(harness, workspace), workspace,
+                'apply', '--deterministic', '--from-adjudicator',
+            )
+
+        assert exited.value.code == 2
+        assert workspace.runs() == []
+
+
+class TestStatusShowsWhatAPlanCameTo:
+    @pytest.mark.asyncio
+    async def test_a_plan_runs_line_shows_adjudication_failed_and_would_escape(
+        self, harness, workspace, capsys,
+    ):
+        seed_unrated_sightings(harness, 2)
+        fake = FakeAdjudicator(
+            lambda text: AdjudicationFailure.PARSE_FAILURE if text.endswith('100') else Verdict.EXTENDS,
+            storm={'count': 3, 'threshold': 3, 'labels': ['parse_failure'], 'model': 'fake-model'},
+        )
+        env = env_for(harness, workspace, adjudicator=fake)
+        code, report = await plan_adjudicated(env, workspace, capsys, '--project', DF)
+        assert code == 1
+
+        assert await run_cli(env, workspace, 'status') == 0
+
+        plan_run_line = run_line(status_lines(capsys), report['run_id'])
+        assert 'adjudication_failed 1' in plan_run_line
+        assert f'would_escape {ADJUDICATOR_ANCHOR}' in plan_run_line
+
+    @pytest.mark.asyncio
+    async def test_a_run_with_nothing_to_escape_says_none(self, harness, workspace, capsys):
+        env = env_for(harness, workspace)
+        planned = await plan_from(env, workspace, seed_corpus(harness, workspace, 1), capsys)
+
+        assert await run_cli(env, workspace, 'status') == 0
+
+        plan_run_line = run_line(status_lines(capsys), planned['run_id'])
+        assert 'would_escape none' in plan_run_line
+        assert 'adjudication_failed 0' in plan_run_line
+
+    @pytest.mark.asyncio
+    async def test_status_names_the_latest_plan_of_each_source_with_its_document_and_sha(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace, adjudicator=always(Verdict.EXTENDS))
+        corpus = seed_corpus(harness, workspace, 2)
+        first = await plan_from(env, workspace, corpus, capsys)
+        second = await plan_from(env, workspace, corpus, capsys)
+        seed_unrated_sightings(harness, 1)
+        _code, adjudicated = await plan_adjudicated(env, workspace, capsys, '--project', DF)
+
+        assert await run_cli(env, workspace, 'status', '--limit', '1') == 0
+
+        lines = status_lines(capsys)
+        corpus_line = latest_plan_line(lines, RunSource.CORPUS)
+        assert second['run_id'][:8] in corpus_line
+        assert second['plan_path'] in corpus_line
+        assert second['plan_sha256'] in corpus_line
+        assert first['run_id'][:8] not in corpus_line
+        adjudicator_line = latest_plan_line(lines, RunSource.ADJUDICATOR)
+        assert adjudicated['run_id'][:8] in adjudicator_line
+        assert adjudicated['plan_path'] in adjudicator_line
+        assert adjudicated['plan_sha256'] in adjudicator_line
+
+    @pytest.mark.asyncio
+    async def test_a_latest_plan_whose_pending_heals_changed_is_marked_stale(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        corpus = seed_corpus(harness, workspace, 3)
+        await plan_from(env, workspace, corpus, capsys)
+        workspace.write_config(max_actions_per_run=1)
+        await apply(env, workspace, capsys)
+
+        assert await run_cli(env, workspace, 'status') == 0
+
+        stale_line = latest_plan_line(status_lines(capsys), RunSource.CORPUS)
+        assert STALE in stale_line
+        assert PENDING_NOW not in stale_line
+
+        replanned = await plan_from(env, workspace, corpus, capsys)
+        assert await run_cli(env, workspace, 'status') == 0
+
+        current_line = latest_plan_line(status_lines(capsys), RunSource.CORPUS)
+        assert replanned['run_id'][:8] in current_line
+        assert PENDING_NOW in current_line
+
+    @pytest.mark.asyncio
+    async def test_a_fully_applied_plan_says_nothing_is_pending_rather_than_stale(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace)
+        planned = await plan_from(env, workspace, seed_corpus(harness, workspace, 2), capsys)
+        code, applied = await apply(env, workspace, capsys)
+        assert (code, applied['counts']['applied']) == (0, 2)
+
+        assert await run_cli(env, workspace, 'status') == 0
+
+        applied_line = latest_plan_line(status_lines(capsys), RunSource.CORPUS)
+        assert planned['plan_sha256'] in applied_line
+        assert NOTHING_PENDING in applied_line
+        assert STALE not in applied_line
+        assert PENDING_NOW not in applied_line
+
+    @pytest.mark.asyncio
+    async def test_a_relative_out_path_is_recorded_absolute(
+        self, harness, workspace, capsys, monkeypatch,
+    ):
+        env = env_for(harness, workspace)
+        corpus = seed_corpus(harness, workspace, 1)
+        monkeypatch.chdir(workspace.root)
+
+        code = await run_cli(
+            env, workspace, 'plan', '--from-corpus', str(corpus), '--out', 'reviewed.json',
+        )
+
+        report = printed_report(capsys)
+        assert code == 0
+        assert report['plan_path'] == str(workspace.root / 'reviewed.json')
+        assert await run_cli(env, workspace, 'status') == 0
+        assert report['plan_path'] in latest_plan_line(status_lines(capsys), RunSource.CORPUS)

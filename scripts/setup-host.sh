@@ -336,7 +336,7 @@ fi
 # ---------------------------------------------------------------------------
 # The install is gated PER UNIT (task 4198). Each unit is judged on its own
 # parity verdict, so a finding on one no longer declines the install of all
-# sixteen. The POLICY is unchanged and still ratified — a unit that did not clear
+# eighteen. The POLICY is unchanged and still ratified — a unit that did not clear
 # is never overwritten without DF_INSTALL_ORCH_UNITS=1, because a difference
 # does not tell you which side is stale — only the blast radius shrinks.
 #
@@ -437,7 +437,7 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # a second run would only restate what the copy just did.)
 #
 # NON-FATAL, but not merely advisory: a finding never aborts this script (the
-# sections below still run, and two of the sixteen registered units carry a
+# sections below still run, and two of the eighteen registered units carry a
 # standing, deliberate finding on this host — re-measured 2026-09-05, see the
 # checker's KNOWN RED section) — it makes the install of THAT UNIT opt-in
 # instead. A bare warning would not be an intervention point
@@ -515,6 +515,7 @@ _orch_units=(
   orchestrator-solar-challenge-platform.service  # joined 2026-06-21, escalation 8107
   orchestrator-know-live.service                 # escalation 8105; committed since e5273d8623, wired in by task 3641 (its absence was an omission, not a policy)
   orchestrator-pump-web-ui.service               # joined 2026-07-17, escalation 8108; ran on the host with no committed template until task 3641 transcribed it
+  orchestrator-stream-touch.service              # joined 2026-10-22, escalation 8110 (project_id stream_touch)
   orchestrator-watchdog.service                  # static (no [Install]) — pulled in by the .timer, so the enable loop below skips it
   orchestrator-watchdog.timer                    # 60s liveness probe + dead-enabled revival: the safety net that revives an orchestrator killed by e.g. a boot-race dependency cancel
   orchestrator-dark-factory.socket               # holds escalation port 8102 across a restart (socket activation)
@@ -524,6 +525,7 @@ _orch_units=(
   orchestrator-solar-challenge-platform.socket   # holds escalation port 8107 across a restart
   orchestrator-know-live.socket                  # holds escalation port 8105 across a restart
   orchestrator-pump-web-ui.socket                # holds escalation port 8108 across a restart
+  orchestrator-stream-touch.socket               # holds escalation port 8110 across a restart
 )
 
 # `.socket` is not in the shared lock-charter extension allowlist, so each
@@ -802,7 +804,7 @@ else
 
   # Reports what was ACTUALLY done, not what was attempted: with a per-unit
   # gate a partial install is now a normal outcome, and an unqualified success
-  # line would read as "all sixteen" on a run that installed one. Counted from the
+  # line would read as "all eighteen" on a run that installed one. Counted from the
   # units that COPIED, so a failed `cp` is never reported as an install.
   if [ "${#_orch_installed_units[@]}" -eq 0 ]; then
     warn "NO orchestrator unit was installed — every copy that cleared the gate"
@@ -1178,6 +1180,15 @@ if [ -x "$REPO_ROOT/hooks/setup.sh" ]; then
   ok "Git hooks configured"
 else
   warn "hooks/setup.sh not found or not executable"
+fi
+
+# dark-factory's own merge driver for the ratchet baseline (.gitattributes names
+# it). hooks/setup.sh is a generic bootstrap any repo can copy, so this lives
+# here. Without it a two-branch baseline merge conflicts instead of composing.
+if (cd "$REPO_ROOT" && python3 scripts/merge_lane_ratchet_merge.py install); then
+  ok "Ratchet-baseline merge driver installed"
+else
+  warn "Ratchet-baseline merge driver NOT installed -- baseline merges will conflict"
 fi
 
 # ---------------------------------------------------------------------------

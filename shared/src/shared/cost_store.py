@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import enum
 import logging
-import sqlite3
-from datetime import datetime
+from collections.abc import Collection
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from shared.async_sqlite_base import AsyncSqliteBase
+from shared.sqlite_column_migration import add_column_if_missing
 
 __all__ = ['CostStore']
 
@@ -234,33 +235,16 @@ class CostStore(AsyncSqliteBase):
     async def _migrate_invocations_columns(self) -> None:
         """Add any :data:`_ADDED_INVOCATION_COLUMNS` an existing table lacks.
 
-        Additive only: probes ``PRAGMA table_info`` and issues one
-        ``ALTER TABLE ... ADD COLUMN`` per missing column.  Idempotent, and a
-        no-op on a fresh DB.  Pre-existing rows read NULL for the new columns,
-        meaning "not recorded".  No ``PRAGMA user_version`` ladder, per the
-        runs.db convention at ``orchestrator/src/orchestrator/flake_ledger.py``.
-
-        ``duplicate column name`` is swallowed: a concurrent ``CostStore`` open
-        added the column between our probe and this ``ALTER``, so the goal is
-        already met.  Any other error surfaces, because a silently
-        half-migrated schema would be worse.  The caller commits.
+        Additive only: one ``ALTER TABLE ... ADD COLUMN`` per missing column.
+        Idempotent, and a no-op on a fresh DB.  Pre-existing rows read NULL for
+        the new columns, meaning "not recorded".  No ``PRAGMA user_version``
+        ladder, per the rule in ``shared/src/shared/sqlite_column_migration.py``.
+        The caller commits.
         """
         conn = self._require_conn()
-        cursor = await conn.execute('PRAGMA table_info(invocations)')
-        existing = {row[1] for row in await cursor.fetchall()}
-        await cursor.close()
         for column, ddl in _ADDED_INVOCATION_COLUMNS:
-            if column in existing:
-                continue
-            try:
-                # Column name and DDL are hard-coded literals, never caller input.
-                await conn.execute(f'ALTER TABLE invocations ADD COLUMN {column} {ddl}')
-            except sqlite3.OperationalError as exc:
-                if 'duplicate column name' not in str(exc).lower():
-                    raise
-                logger.debug('CostStore: invocations.%s already added concurrently', column)
-                continue
-            logger.info('CostStore: added invocations.%s (%s)', column, ddl)
+            if await add_column_if_missing(conn, 'invocations', column, ddl):
+                logger.info('CostStore: added invocations.%s (%s)', column, ddl)
 
     # -- internal helpers -----------------------------------------------------
 
@@ -411,6 +395,53 @@ class CostStore(AsyncSqliteBase):
             'WHERE model = ? AND completed_at BETWEEN ? AND ?',
             (model, start_iso, end_iso),
         ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return 0.0
+        return float(row[0])
+
+    async def task_invocation_cost(
+        self,
+        project_id: str,
+        task_id: str,
+        *,
+        since: datetime | None = None,
+    ) -> float:
+        """One task's production spend; see :meth:`tasks_invocation_cost`."""
+        return await self.tasks_invocation_cost(project_id, (task_id,), since=since)
+
+    async def tasks_invocation_cost(
+        self,
+        project_id: str,
+        task_ids: Collection[str],
+        *,
+        since: datetime | None = None,
+    ) -> float:
+        """Summed production spend of *task_ids* in one query: the single reader of per-task cost.
+
+        *since*, when given, is an inclusive aware lower bound on ``completed_at``
+        (live-shadow PRD S1). Raises ``TypeError`` when *task_ids* is a bare
+        ``str``, ``ValueError`` on a naive *since* and ``RuntimeError`` when the
+        store is not open.
+        """
+        if isinstance(task_ids, str):
+            raise TypeError(
+                f'tasks_invocation_cost: task_ids must be a collection of ids, not a str '
+                f'(got {task_ids!r})'
+            )
+        if since is not None and since.utcoffset() is None:
+            raise ValueError(f'tasks_invocation_cost: since must be timezone-aware (got {since!r})')
+        ids = tuple(task_ids)
+        sql = (
+            'SELECT COALESCE(SUM(cost_usd), 0.0) FROM invocations '
+            f'WHERE project_id = ? AND task_id IN ({", ".join("?" for _ in ids)})'
+        )
+        params: tuple[Any, ...] = (project_id, *ids)
+        if since is not None:
+            sql += ' AND completed_at >= ?'
+            params += (since.astimezone(UTC).isoformat(),)
+        conn = self._require_conn()
+        async with conn.execute(sql, params) as cur:
             row = await cur.fetchone()
         if row is None:
             return 0.0

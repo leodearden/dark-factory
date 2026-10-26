@@ -19,7 +19,7 @@ import pytest
 from shared.eval_lane import is_eval_fixture_task_id, is_eval_worktree_path
 
 from orchestrator.evals import runner
-from orchestrator.evals.live_fixture import ShadowShape, build_live_fixture
+from orchestrator.evals.live_fixture import build_live_fixture
 from orchestrator.evals.snapshots import eval_worktree_root
 from orchestrator.evals.task_sampler import (
     CompletedTaskCandidate,
@@ -27,6 +27,7 @@ from orchestrator.evals.task_sampler import (
     build_fixture_record,
     default_verify_commands,
 )
+from orchestrator.shadow_types import ShadowShape
 
 _EVALS_DIR = Path(runner.__file__).parent
 _FIXTURE_DIRS = (_EVALS_DIR / 'tasks', _EVALS_DIR / 'tasks_hard_v2')

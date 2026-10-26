@@ -1,26 +1,36 @@
 #!/usr/bin/env python3
-"""Heal hand-linked mem0 records from a verdict corpus or the link adjudicator.
+"""Heal hand-linked mem0 records from a verdict corpus, the link adjudicator, or
+the deterministic rows alone.
 
 The contract is plans/write-triage-link-healing-prd.md H1 and H2.
 
 Usage:
     python fused-memory/scripts/link_heal.py [--config PATH] [--server-url URL] COMMAND
 
-    plan (--from-corpus PATH | --from-adjudicator [--project P ...]) [--out PATH]
+    plan (--from-corpus PATH | --from-adjudicator [--project P ...]
+          | --deterministic [--project P ...]) [--out PATH]
         Decide every live link, ledger the heals, and write the plan document.
         Writes nothing to the store. --from-adjudicator asks the link
         adjudicator about the links of each --project (default: the server's
         own project) that no deterministic row decides and that it has not
         judged at their current texts, and ledgers its verdicts.
-    apply [--from-adjudicator] [--approved-plan-sha SHA256]
-        Heal the pending plan of the corpus (default) or of the adjudicator,
-        oldest first. With the sha of the pending plan document, every pending
-        heal is applied and the per-run cap is lifted. When the adjudications
-        behind the pending heals pass a share ceiling, nothing is written.
+        --deterministic plans only the heals the deterministic rows decide (a
+        dangling parent, an orchestrator completion record linked as a child)
+        across each --project, asks no verdict source, and reports every other
+        link unexamined.
+    apply [--from-adjudicator | --deterministic] [--approved-plan-sha SHA256]
+        Heal the pending plan of the corpus (default), of the adjudicator or of
+        the deterministic rows, oldest first. With the sha of the pending plan
+        document, every pending heal is applied and the per-run cap is lifted.
+        When the adjudications behind the pending heals pass a share ceiling,
+        nothing is written.
     undo --run RUN_ID
         Take back every heal one apply run applied. RUN_ID may be its first 8 characters.
+        A run with no heal still applied (a plan run, an undo run, an apply run
+        already undone) is refused.
     status [--limit N]
-        List recent runs from the ledger. Never creates the ledger.
+        List recent runs, and the latest plan of each source with its document,
+        sha and whether it is still the pending plan. Never creates the ledger.
 
 Exit codes: 0 when the run is complete, or partial only by the cap or stale
 skips; 1 when a heal, read or adjudication failed or the run stopped; 2 when
@@ -51,6 +61,7 @@ from fused_memory.maintenance.link_heal_executor import (
     FoldedEscapeFiler,
     RunLimits,
     RunReport,
+    pending_plan_sha256,
     run_adjudicator_plan,
     run_apply,
     run_plan,
@@ -62,6 +73,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     ActionRow,
     AmbiguousRun,
     LinkHealLedger,
+    NothingToUndo,
     RunLock,
     RunLockHeld,
     RunRow,
@@ -84,7 +96,10 @@ EXIT_FAILED = 1
 EXIT_REFUSED = 2
 
 NO_WRITING_RUN = 'no link-heal run has written here'
-STATUS_COUNTS = ('planned', 'applied', 'failed', 'skipped_stale', 'skipped_cap')
+STATUS_COUNTS = (
+    'planned', 'applied', 'failed', 'skipped_stale', 'skipped_cap', 'adjudication_failed',
+)
+PLAN_SOURCES = (RunSource.CORPUS, RunSource.ADJUDICATOR, RunSource.DETERMINISTIC)
 
 
 def load_config(config_path: str | None) -> FusedMemoryConfig:
@@ -141,8 +156,8 @@ class Refused(Exception):
 
 
 REFUSALS = (
-    Refused, RunLockHeld, ApprovalMismatch, UnknownRun, AmbiguousRun, CorpusFormatError,
-    CensusFailed,
+    Refused, RunLockHeld, ApprovalMismatch, UnknownRun, AmbiguousRun, NothingToUndo,
+    CorpusFormatError, CensusFailed,
 )
 
 
@@ -156,20 +171,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest='command', required=True)
     plan = commands.add_parser(
-        'plan', help='ledger the heals a corpus or the adjudicator supports; no writes',
+        'plan',
+        help='ledger the heals a corpus, the adjudicator or the deterministic rows support; no writes',
     )
     source = plan.add_mutually_exclusive_group(required=True)
     source.add_argument('--from-corpus', type=Path, metavar='PATH')
     source.add_argument('--from-adjudicator', action='store_true')
+    source.add_argument(
+        '--deterministic', action='store_true',
+        help=(
+            'plan only the heals the deterministic rows decide, a dangling parent or an '
+            'orchestrator completion record linked as a child; asks no verdict source, so '
+            'every other link is unexamined'
+        ),
+    )
     plan.add_argument(
         '--project', action='append', dest='projects', metavar='PROJECT',
-        help='with --from-adjudicator: a project to plan (repeatable; default: the home project)',
+        help=(
+            'with --from-adjudicator or --deterministic: a project to plan '
+            '(repeatable; default: the home project)'
+        ),
     )
     plan.add_argument('--out', type=Path, metavar='PATH', help='where to write the plan')
     apply = commands.add_parser('apply', help='heal the pending plan')
-    apply.add_argument(
-        '--from-adjudicator', action='store_true', help="heal the adjudicator's pending plan",
+    apply_source = apply.add_mutually_exclusive_group()
+    apply_source.add_argument(
+        '--from-adjudicator', dest='source', action='store_const', const=RunSource.ADJUDICATOR,
+        help="heal the adjudicator's pending plan",
     )
+    apply_source.add_argument(
+        '--deterministic', dest='source', action='store_const', const=RunSource.DETERMINISTIC,
+        help="heal the deterministic rows' pending plan",
+    )
+    apply.set_defaults(source=RunSource.CORPUS)
     apply.add_argument('--approved-plan-sha', metavar='SHA256')
     undo = commands.add_parser('undo', help="take back an apply run's heals")
     undo.add_argument('--run', required=True, metavar='RUN_ID')
@@ -208,6 +242,7 @@ def render_status(ledger_path: Path, limit: int) -> str:
     ledger = LinkHealLedger(ledger_path)
     try:
         lines.extend(_status_line(run) for run in ledger.recent_runs(limit))
+        lines.extend(_latest_plan_lines(ledger))
         if ledger.writing_run_count() == 0:
             lines.append(NO_WRITING_RUN)
     finally:
@@ -218,10 +253,39 @@ def render_status(ledger_path: Path, limit: int) -> str:
 def _status_line(run: RunRow) -> str:
     counts = run.counts or {}
     tallies = '  '.join(f'{name} {counts.get(name, 0)}' for name in STATUS_COUNTS)
+    would_escape = ', '.join(counts.get('would_escape') or ()) or 'none'
     return (
         f'{run.run_id[:8]}  {run.source.value}  writes {"yes" if run.writes else "no"}  '
-        f'finished {run.finished_at or "never"}  {tallies}'
+        f'finished {run.finished_at or "never"}  {tallies}  would_escape {would_escape}'
     )
+
+
+def _latest_plan_lines(ledger: LinkHealLedger) -> list[str]:
+    lines = []
+    for source in PLAN_SOURCES:
+        run = ledger.latest_plan_run(source)
+        if run is not None:
+            lines.append(_plan_line(run, ledger.pending_actions(source)))
+    return lines
+
+
+def _plan_line(run: RunRow, pending: Sequence[ActionRow]) -> str:
+    """The latest plan of *run*'s source, and how it stands against the heals pending now."""
+    heading = f'latest {run.source.value} plan {run.run_id[:8]}'
+    if run.plan_sha256 is None:
+        return f'{heading}  no plan document'
+    return (
+        f'{heading}  plan {run.plan_path or "unrecorded"}  '
+        f'plan_sha256 {run.plan_sha256}  {_plan_standing(run.plan_sha256, pending)}'
+    )
+
+
+def _plan_standing(plan_sha256: str, pending: Sequence[ActionRow]) -> str:
+    if not pending:
+        return 'nothing pending'
+    if plan_sha256 == pending_plan_sha256(pending):
+        return 'pending now'
+    return 'stale (pending heals changed since; re-plan)'
 
 
 @dataclass(frozen=True)
@@ -269,22 +333,32 @@ def _load_corpus(path: Path) -> tuple[LinkBasis, ...]:
 def _plan_path_for(out: Path | None, ledger_dir: Path) -> Callable[[str], Path]:
     if out is None:
         return lambda run_id: ledger_dir / f'link-heal-plan-{run_id[:8]}.json'
-    if not out.parent.is_dir():
-        raise Refused(f'cannot write the plan to {out}: {out.parent} is not a directory')
-    return lambda _run_id: out
+    plan_path = out.absolute()
+    if not plan_path.parent.is_dir():
+        raise Refused(
+            f'cannot write the plan to {plan_path}: {plan_path.parent} is not a directory',
+        )
+    return lambda _run_id: plan_path
 
 
 async def _plan(args: argparse.Namespace, session: _Session) -> RunReport:
     if args.from_adjudicator:
         return await _plan_from_adjudicator(args, session)
+    if args.deterministic:
+        return await _plan_deterministic(args, session)
     if args.projects:
-        raise Refused('--project applies only to --from-adjudicator')
+        raise Refused('--project applies only to --from-adjudicator and --deterministic')
     return await _plan_from_corpus(args, session)
+
+
+def _named_projects(args: argparse.Namespace, session: _Session) -> list[str]:
+    """Each --project once, in the order named; the home project when none is."""
+    return list(dict.fromkeys(args.projects or [resolve_project_id(session.home_root)]))
 
 
 async def _plan_from_adjudicator(args: argparse.Namespace, session: _Session) -> RunReport:
     plan_path_for = _plan_path_for(args.out, session.ledger_dir)
-    projects = list(dict.fromkeys(args.projects or [resolve_project_id(session.home_root)]))
+    projects = _named_projects(args, session)
     await session.probe(projects[0])
     async with session.env.census_for(session.config) as census:
         return await run_adjudicator_plan(
@@ -294,6 +368,23 @@ async def _plan_from_adjudicator(args: argparse.Namespace, session: _Session) ->
             ledger=session.ledger,
             limits=session.limits,
             projects=projects,
+            plan_path_for=plan_path_for,
+        )
+
+
+async def _plan_deterministic(args: argparse.Namespace, session: _Session) -> RunReport:
+    plan_path_for = _plan_path_for(args.out, session.ledger_dir)
+    projects = _named_projects(args, session)
+    await session.probe(projects[0])
+    async with session.env.census_for(session.config) as census:
+        return await run_plan(
+            (),
+            store=session.store,
+            census=census,
+            ledger=session.ledger,
+            limits=session.limits,
+            projects=projects,
+            source=RunSource.DETERMINISTIC,
             plan_path_for=plan_path_for,
         )
 
@@ -318,21 +409,20 @@ async def _plan_from_corpus(args: argparse.Namespace, session: _Session) -> RunR
 
 
 async def _apply(args: argparse.Namespace, session: _Session) -> RunReport:
-    source = RunSource.ADJUDICATOR if args.from_adjudicator else RunSource.CORPUS
-    await session.probe(_first_project(session.ledger.pending_actions(source)))
+    await session.probe(_first_project(session.ledger.pending_actions(args.source)))
     return await run_apply(
         store=session.store,
         ledger=session.ledger,
         limits=session.limits,
         filer=FoldedEscapeFiler(session.home_root),
-        source=source,
+        source=args.source,
         approved_plan_sha256=args.approved_plan_sha,
     )
 
 
 async def _undo(args: argparse.Namespace, session: _Session) -> RunReport:
-    target = session.ledger.resolve_run(args.run)
-    await session.probe(_first_project(session.ledger.applied_actions(target.run_id)))
+    target = session.ledger.undo_target(session.ledger.resolve_run(args.run))
+    await session.probe(_first_project(target.heals))
     return await run_undo(
         target, store=session.store, ledger=session.ledger, limits=session.limits,
     )

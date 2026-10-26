@@ -25,6 +25,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.server.guard_excerpt import excerpt_fields
 
 if TYPE_CHECKING:
     from fused_memory.config.schema import ProceduralTopicCluster
@@ -391,11 +392,10 @@ def build_near_duplicate_block(
         'error': 'procedural_knowledge_near_duplicate_write_blocked',
         'error_type': 'ProceduralKnowledgeNearDuplicateWriteRejected',
         'agent_id': agent_id,
-        'content_excerpt': content[:200],
+        **excerpt_fields(content_excerpt=content, matched_excerpt=match.content),
         'matched_memory_id': match.id,
         'similarity': cosine_of(match),
         'threshold': threshold,
-        'matched_excerpt': match.content[:200],
         'hint': _NEAR_DUPLICATE_HINT,
     }
 
@@ -427,7 +427,7 @@ def build_topic_cluster_block(
         'error': 'procedural_knowledge_known_topic_cluster_write_blocked',
         'error_type': 'ProceduralKnowledgeKnownTopicClusterWriteRejected',
         'agent_id': agent_id,
-        'content_excerpt': content[:200],
+        **excerpt_fields(content_excerpt=content),
         'topic_id': cluster.topic_id,
         'matched_phrases': matched_phrases,
         'hint': cluster.hint or _TOPIC_CLUSTER_DEFAULT_HINT,

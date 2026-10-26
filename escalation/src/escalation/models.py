@@ -434,9 +434,15 @@ AGENT_FILABLE_LEVELS: frozenset[int] = frozenset({0, 1})
 # 'moot-terminal-subject' they are deliberately neither 'benign' nor
 # 'actionable'.  The decision vocabulary lives in
 # escalation/src/escalation/disposition.py.
+#
+# NOTE_TO_FILE_CLASS is stamped only by escalate_info(note_to_file=True), filed
+# resolved at filing; like 'moot-terminal-subject' it is neither benign nor
+# actionable.  Rationale: plans/plan-deviation-recording-prd.md D2.
+NOTE_TO_FILE_CLASS: str = 'note-to-file'
 RESOLUTION_CLASSES: frozenset[str] = frozenset({
     'benign', 'actionable', 'moot-terminal-subject', 'stale-strand',
     'addressed', 'observation-consumed', 'converted', 'status-info',
+    NOTE_TO_FILE_CLASS,
 })
 
 
@@ -446,16 +452,7 @@ class Escalation:
     task_id: str
     agent_role: str
     severity: str  # "blocking" | "info" | "critical" | "urgent"
-    category: str  # scope_violation, design_concern, cleanup_needed,
-    # dependency_discovered, risk_identified, infra_issue,
-    # reconciliation_stale_human_operator, reconciliation_stale_gate_backlog,
-    # recon_missing_index
-    # REFACTOR TRIGGER (task 3709): this vocabulary is prose, not a checked
-    # contract — nothing rejects a typo'd category at submit time, and the
-    # dedup correctness of every categorized detector depends on filer and
-    # reader spelling it identically.  The NEXT category addition promotes
-    # this comment to an enum (or a submit-time lint) instead of growing
-    # another line.
+    category: str  # a registered escalation.categories.EscalationCategory value — enforced at queue submit, never on rehydration
     summary: str  # one-line
     detail: str = ''  # full context
     suggested_action: str = ''  # expand_scope, create_followup_task, abort_task, etc.
@@ -643,7 +640,7 @@ class Escalation:
     # The evidence commit whose landing this filing could NOT attribute — the
     # `verdict.probe['citation']` of the rejected landing-evidence verdict
     # (task 4499).  Written at FILING time by
-    # `orchestrator.landing_evidence::file_unattributed_landing_escalation`,
+    # `orchestrator.merge_lane.landing_evidence::file_unattributed_landing_escalation`,
     # and read back AFTER the record has been resolved as the identity half of
     # the `(task_id, category, citation_sha)` triple that suppresses an
     # identical refile.  That read-after-resolve is the whole point: the reject
@@ -716,6 +713,13 @@ class Escalation:
     # every field above.  Deliberately NOT added to
     # `_COMPACT_ESCALATION_FIELDS` (server.py) — its readers load full records.
     project_id: str | None = None
+    # NOTE TO FILE (plans/plan-deviation-recording-prd.md D2) — a filer-declared
+    # record that requests nothing: never pending (EscalationQueue.submit), and
+    # filed by EscalationQueue.submit_resolved.  Every resolution-class stamp
+    # site refuses this flag without NOTE_TO_FILE_CLASS, and that class without
+    # this flag, via note_to_file_class_conflict.  Zero migration via the
+    # from_dict filter.
+    note_to_file: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -730,3 +734,14 @@ class Escalation:
     @classmethod
     def from_json(cls, text: str) -> Escalation:
         return cls.from_dict(json.loads(text))
+
+
+def note_to_file_class_conflict(escalation: Escalation, resolution_class: str | None) -> str | None:
+    """Why *escalation* cannot carry *resolution_class* under the note-to-file pairing, else None."""
+    if escalation.note_to_file == (resolution_class == NOTE_TO_FILE_CLASS):
+        return None
+    return (
+        f'escalation {escalation.id}: note_to_file={escalation.note_to_file} with '
+        f'resolution_class={resolution_class!r}; {NOTE_TO_FILE_CLASS!r} is stamped on a '
+        'note_to_file record and on nothing else'
+    )

@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 from _distinct_git_repo import init_distinct_git_repo
 from _fm_helpers import load_script_module
+from shared.project_layout import tasks_db
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'audit_unverified_completion_claims.py'
@@ -1750,7 +1751,7 @@ class TestProbeBuilders:
         )
 
         root = tmp_path / 'proj'
-        db_path = root / '.taskmaster' / 'tasks' / 'tasks.db'
+        db_path = tasks_db(root)
         db_path.parent.mkdir(parents=True)
         conn = sqlite3.connect(db_path)
         conn.executescript(_SCHEMA_SQL)

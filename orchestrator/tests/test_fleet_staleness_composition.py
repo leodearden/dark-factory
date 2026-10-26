@@ -221,7 +221,7 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         # Deterministic fire — no need to wait the committed 300s debounce.
         harness.config.orchestrator_restart_debounce_secs = 0.0
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
              patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
@@ -284,7 +284,7 @@ class TestBurstCoalescingUnderCommittedConfig:
         _graft_committed_restart_config(harness, committed)
         harness.config.orchestrator_restart_debounce_secs = 0.0
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
              patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()

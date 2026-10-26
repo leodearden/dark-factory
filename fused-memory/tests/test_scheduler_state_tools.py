@@ -9,6 +9,7 @@ path isn't rejected by the git-worktree validator.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import statistics
 import threading
@@ -18,6 +19,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from orchestrator.config import OrchestratorConfig
+from orchestrator.pin_reservation import PinOrder
+from orchestrator.scheduler import Scheduler
+from shared.project_layout import scheduler_state_json
 
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.server.tools import create_mcp_server
@@ -65,17 +70,24 @@ def mcp_server(memory_service, task_interceptor):
 # Helpers
 # ---------------------------------------------------------------------------
 
-_EMPTY_SKELETON = {
+_COLD_START = {
     'skip_counts': {},
     'parks': {},
     'park_stacks': {},
+    'pin_reservations': {},
     'effective_priorities': {},
     'pin_queue': [],
     'overrides': {},
     'current_holders': {},
+    'lock_depth': None,
     'is_paused': False,
     'pause_reason': None,
+    'requeue_cooldowns': {},
     'snapshot_at': None,
+}
+
+_REQUEUE_COOLDOWN_FIELDS = {
+    'armed_secs', 'envelope_secs', 'transient', 'transient_count', 'armed_at', 'expires_at',
 }
 
 
@@ -104,10 +116,20 @@ _SNAPSHOT_WITH_PARK_STACKS = {
 
 def _write_snapshot(project_root: Path, data: dict) -> Path:
     """Write a synthetic scheduler_state.json under project_root."""
-    path = project_root / 'data' / 'orchestrator' / 'scheduler_state.json'
+    return _write_snapshot_text(project_root, json.dumps(data))
+
+
+def _write_snapshot_text(project_root: Path, text: str) -> Path:
+    path = scheduler_state_json(project_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data), encoding='utf-8')
+    path.write_text(text, encoding='utf-8')
     return path
+
+
+async def _get_scheduler_state(mcp_server, project_root: Path) -> dict:
+    return await mcp_server._tool_manager.call_tool(
+        'get_scheduler_state', {'project_root': str(project_root)},
+    )
 
 
 def _runs_db_path(project_root: Path) -> Path:
@@ -143,7 +165,7 @@ class TestGetSchedulerStateTool:
 
     @pytest.mark.asyncio
     async def test_returns_snapshot_from_disk(self, tmp_path, mcp_server):
-        """Tool round-trips a synthetic snapshot dict written to disk."""
+        """An older producer's body comes back with the keys it lacks at their defaults."""
         synthetic = {
             'skip_counts': {'T1': 3},
             'parks': {'T2': {'modules': ['m/src'], 'installed_at': '2026-01-01T00:00:00+00:00'}},
@@ -158,26 +180,64 @@ class TestGetSchedulerStateTool:
         }
         _write_snapshot(tmp_path, synthetic)
 
-        result = await mcp_server._tool_manager.call_tool(
-            'get_scheduler_state',
-            {'project_root': str(tmp_path)},
-        )
-        assert result == synthetic, (
-            f'Expected round-tripped snapshot, got {result!r}'
-        )
+        result = await _get_scheduler_state(mcp_server, tmp_path)
+        assert result == {**_COLD_START, **synthetic}
 
     @pytest.mark.asyncio
-    async def test_returns_empty_skeleton_when_file_missing(
+    async def test_cold_start_returns_every_key_and_a_null_snapshot_at(
         self, tmp_path, mcp_server
     ):
-        """Tool returns the empty skeleton when scheduler_state.json is missing."""
-        result = await mcp_server._tool_manager.call_tool(
-            'get_scheduler_state',
-            {'project_root': str(tmp_path)},
+        """B6: with no scheduler_state.json, all 13 keys come back empty."""
+        result = await _get_scheduler_state(mcp_server, tmp_path)
+        assert result == _COLD_START
+
+    @pytest.mark.asyncio
+    async def test_returns_the_values_one_scheduler_write_produced(self, tmp_path, mcp_server):
+        """B6: after one real scheduler write the tool returns exactly what it wrote."""
+        scheduler = Scheduler(
+            OrchestratorConfig(project_root=tmp_path, lock_depth=3, max_per_module=1),
         )
-        assert result == _EMPTY_SKELETON, (
-            f'Expected empty skeleton, got {result!r}'
+        scheduler.finish_startup()
+        scheduler.lock_table.install_parks('P', ['pin/mod'], PinOrder(1))
+        scheduler.record_requeue(
+            'T1', phase='execute', reason='agent API error: HTTP 529', detail='',
+            run_id='run-1', cost_usd=0.0, api_error_status=529,
         )
+        scheduler.release('T1', requeued=True)
+        await scheduler.flush_state_snapshot()
+
+        result = await _get_scheduler_state(mcp_server, tmp_path)
+
+        assert result == json.loads(scheduler_state_json(tmp_path).read_text())
+        assert result['lock_depth'] == 3
+        assert 'P' in result['pin_reservations']
+        assert set(result['requeue_cooldowns']['T1']) == _REQUEUE_COOLDOWN_FIELDS
+        assert isinstance(result['snapshot_at'], str)
+
+    @pytest.mark.asyncio
+    async def test_unknown_key_from_a_newer_producer_is_not_returned(
+        self, tmp_path, mcp_server
+    ):
+        _write_snapshot(tmp_path, {**_SNAPSHOT_WITH_PARK_STACKS, 'added_by_a_newer_producer': 1})
+        result = await _get_scheduler_state(mcp_server, tmp_path)
+        assert set(result) == set(_COLD_START)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'body', ['{not json', '[]', '{"lock_depth": true}'],
+        ids=['invalid-json', 'non-object', 'malformed-shape'],
+    )
+    async def test_unparseable_snapshot_reads_as_cold_start_and_warns(
+        self, tmp_path, mcp_server, caplog, body
+    ):
+        _write_snapshot_text(tmp_path, body)
+        with caplog.at_level(logging.WARNING, logger='fused_memory.mcp_tools.scheduler_state'):
+            result = await _get_scheduler_state(mcp_server, tmp_path)
+        assert result == _COLD_START
+        assert any(
+            r.levelno == logging.WARNING and r.name == 'fused_memory.mcp_tools.scheduler_state'
+            for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
 
     @pytest.mark.asyncio
     async def test_invalid_project_root_returns_validation_error(
@@ -194,35 +254,14 @@ class TestGetSchedulerStateTool:
         )
         assert 'error' in result
 
-    def test_read_scheduler_state_empty_skeleton_includes_park_stacks(
-        self, tmp_path
-    ):
-        """read_scheduler_state returns park_stacks == {} when no snapshot file exists.
-
-        RED driver for the _empty_skeleton() gap: before the fix, park_stacks is
-        absent from the skeleton dict and this assertion fails with KeyError.
-        """
-        result = read_scheduler_state(tmp_path)
-        assert result['park_stacks'] == {}, (
-            f"Expected park_stacks == {{}} in file-absent skeleton, got {result.get('park_stacks')!r}"
-        )
-
-    def test_read_scheduler_state_passes_park_stacks_through(self, tmp_path):
-        """read_scheduler_state returns park_stacks verbatim from a snapshot on disk.
-
-        GREEN-from-start regression guard: the file-present path is a verbatim
-        json.loads pass-through; this test locks that contract so a future
-        key-whitelist or schema-coercion step cannot silently strip park_stacks.
-
-        park_stacks shape per scheduler.py:3461 — full LIFO bottom→top:
-          {module: [{owner, rank, shadowed, installed_at}, ...]}
-        """
+    def test_read_scheduler_state_passes_park_stack_entries_through(self, tmp_path):
+        """Park-stack entries are open records: every key survives the parse."""
         _write_snapshot(tmp_path, _SNAPSHOT_WITH_PARK_STACKS)
 
         result = read_scheduler_state(tmp_path)
-        assert result['park_stacks'] == _PARK_STACKS_FIXTURE, (
-            f'Expected park_stacks to be returned verbatim, got {result["park_stacks"]!r}'
-        )
+        assert result.park_stacks == {
+            module: tuple(entries) for module, entries in _PARK_STACKS_FIXTURE.items()
+        }
 
     @pytest.mark.asyncio
     async def test_get_scheduler_state_surfaces_park_stacks(
@@ -610,7 +649,7 @@ class TestSnapshotPerformance:
         _write_snapshot(tmp_path, snapshot)
 
         # A skeleton fallback or truncated payload would make the budget trivially pass.
-        skip_count = len(read_scheduler_state(tmp_path)['skip_counts'])
+        skip_count = len(read_scheduler_state(tmp_path).skip_counts)
         assert skip_count == n, (
             f'Expected {n} skip_counts entries, got {skip_count}: skeleton '
             f'fallback or truncated payload'

@@ -38,7 +38,7 @@ dev = [
     "pytest-xdist>=3.5.0",
     "ruff>=0.4.0",
     # Needed by TestMergeRequestDedup / TestGetMergeQueue in tests/test_server.py
-    # (added by task 1604), which lazily import orchestrator.merge_queue and
+    # (added by task 1604), which lazily import orchestrator.merge_lane.worker and
     # orchestrator.git_ops. Dev-only — does not affect the published escalation
     # package. orchestrator depends on escalation at runtime, so this is a
     # dev-scoped workspace cycle, which uv resolves as one graph.
@@ -55,13 +55,13 @@ orchestrator = { workspace = true }
 # See shared/pyproject.toml for the full rationale, including why this is large
 # rather than the original 60: the cap is WALL-CLOCK, so a healthy test starved
 # of CPU on a loaded 32-core host trips it, and in the xdist packages that
-# reds a SHIFTING VICTIM rather than the starved test. 540 is DERIVED FROM
-# MEASUREMENT (task 5442) — worst unmarked per-test wall clock under real fleet
-# load x the 8x headroom factor — and no longer judgement-picked; the corpus and
-# the arithmetic are in
+# reds a SHIFTING VICTIM rather than the starved test. 420 is DERIVED FROM
+# MEASUREMENT — worst unmarked per-test wall clock under real fleet load x the
+# 8x headroom factor — and no longer judgement-picked; the corpus, the
+# arithmetic and the value's history are in
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # signal method is load-bearing: thread method can't interrupt a blocking
-# syscall in the main thread. UNCHANGED by the 60→300 and 300→540 raises,
+# syscall in the main thread. UNCHANGED by every change of the value,
 # deliberately, and UNCHANGED by task 5408's addopts below.
 # THE PREMISE THIS USED TO GIVE IS CORRECTED, not softened. It read "escalation
 # runs no pytest-xdist so signal is always safe here", and that was false twice
@@ -75,7 +75,7 @@ orchestrator = { workspace = true }
 # pytest-xdist, worker tests run on the worker's main thread, so a signal
 # timeout fails the one test and the worker survives. The signal-vs-thread
 # trade and that evidence live once, in tests/scripts/test_timeout_method_policy.py.
-timeout = 540
+timeout = 420
 timeout_method = "signal"
 
 # PARALLEL TEST EXECUTION (task 5408). Spelling and flag ORDER copy

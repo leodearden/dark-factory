@@ -1,0 +1,44 @@
+{
+  "results": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "content": "Merge-lane verifies run under a 600-second timeout.",
+      "category": "procedural_knowledge",
+      "source_store": "mem0",
+      "relevance_score": 0.9,
+      "provenance": [],
+      "temporal": null,
+      "entities": [],
+      "metadata": {},
+      "created_at": "2026-08-01T00:00:00+00:00",
+      "topic_anchored": false,
+      "grouped": {
+        "amendments": [
+          {
+            "id": "22222222-2222-4222-8222-222222222221",
+            "digest": "Coalesce-train verifies share the 600-second timeout.",
+            "created_at": "2026-08-10T00:00:00+00:00",
+            "kind": "amendment",
+            "metadata": {
+              "x_superseded_by": "0f6c2a4e-8b1d-4c3e-9a7f-5d2e1b0c9a8f"
+            }
+          }
+        ],
+        "amendment_count": 1,
+        "sighting_count": 1,
+        "matched_children": [
+          {
+            "id": "33333333-3333-4333-8333-333333333331",
+            "content": "A verify was parked at the 600-second timeout again.",
+            "created_at": "2026-08-12T00:00:00+00:00",
+            "kind": "sighting",
+            "matched": true,
+            "metadata": {
+              "x_superseded_by": "0f6c2a4e-8b1d-4c3e-9a7f-5d2e1b0c9a8f"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

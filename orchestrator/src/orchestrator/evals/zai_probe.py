@@ -1,21 +1,30 @@
 """One cheap startup assertion that the configured Z.ai key answers on the GLM
 Coding Plan's OpenAI-protocol coding endpoint.
 
-Whoever opens Z.ai eval cells calls ``require_zai_coding_endpoint`` ONCE,
-before the first cell (the production caller is a follow-up for ε2, task
-5388). ``claude_endpoint_candidates()`` and ``get_config_by_name`` deliberately
+Whoever opens Z.ai eval cells calls ``require_zai_coding_endpoint_for`` ONCE
+per campaign, with the campaign's candidate configs, before the first cell. The
+eval CLI drivers (``orchestrator/cli.py::_require_zai_coding_plan``) are its
+callers today; the shadow coordinator (task 5388) is to use the same entry
+point. ``claude_endpoint_candidates()`` and ``get_config_by_name`` deliberately
 never call it: they are offline by-name lookups.
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
 
 import httpx
 
-from orchestrator.evals.configs import GLM_AUTH_TOKEN_ENV, GLM_FLASH_MODEL, ZAI_CODING_BASE_URL
+from orchestrator.evals.configs import (
+    GLM_AUTH_TOKEN_ENV,
+    GLM_BASE_URL,
+    GLM_FLASH_MODEL,
+    ZAI_CODING_BASE_URL,
+    EvalConfig,
+)
 
 
 @dataclass(frozen=True)
@@ -85,3 +94,21 @@ def require_zai_coding_endpoint(
     if not outcome.ok:
         raise ZaiCodingPlanUnavailable(_unavailable_message(outcome.detail), outcome=outcome)
     return outcome
+
+
+def targets_zai_coding_plan(cfg: EvalConfig) -> bool:
+    """True when *cfg*'s cells authenticate against the Z.ai GLM Coding Plan."""
+    return cfg.env_overrides.get('ANTHROPIC_BASE_URL') == GLM_BASE_URL
+
+
+def require_zai_coding_endpoint_for(
+    configs: Iterable[EvalConfig],
+    *,
+    auth_token: str | None = None,
+    client: httpx.Client | None = None,
+    timeout: float = 15.0,
+) -> ZaiProbeOutcome | None:
+    """Probe once for a campaign before its first Z.ai cell; None when no config needs it."""
+    if not any(targets_zai_coding_plan(cfg) for cfg in configs):
+        return None
+    return require_zai_coding_endpoint(auth_token=auth_token, client=client, timeout=timeout)

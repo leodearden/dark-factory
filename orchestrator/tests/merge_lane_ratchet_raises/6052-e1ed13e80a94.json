@@ -1,0 +1,30 @@
+{
+  "task_id": "6052",
+  "reason": "Net-additive: the autouse exit-contract guard now pins its logger level and tears down after _drain_leaked_tasks, so the zero-would-violate soak signal task mu reads cannot go deaf under a raised orchestrator log level or drop a leaked run()'s verdict (conftest.py prose); and a new TestReadyToMergeDispatch pin drives run() through that class's existing stub seams (_invoke, the exit handler, the observed-terminal mapper) to prove a CANCELLED plan-phase exit ends the run instead of paying for an architect (test_workflow_ready_to_merge.py private reads)",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_workflow_ready_to_merge.py",
+      "baseline": 32,
+      "current": 35
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 778,
+      "current": 781
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6653,
+      "current": 6655
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 32110,
+      "current": 32113
+    }
+  ]
+}

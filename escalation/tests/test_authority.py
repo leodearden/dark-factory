@@ -163,6 +163,15 @@ class TestPromoteSentinelBoundRoles:
             f'({RECOVERY_VETO_STREAK_ROLE!r}) must be sentinel-bound'
         )
 
+    def test_offline_lane_role_is_bound_in_lockstep(self) -> None:
+        """The duplicated lane role string stays pinned to the REAL orchestrator constant."""
+        from orchestrator.offline_lane_escalations import LANE_ESCALATION_ROLE
+
+        assert LANE_ESCALATION_ROLE in PROMOTE_SENTINEL_BOUND_ROLES, (
+            f'The role the offline lane actually files under '
+            f'({LANE_ESCALATION_ROLE!r}) must be sentinel-bound'
+        )
+
     def test_disjoint_from_caller_identities(self) -> None:
         assert 'orchestrator-escalation-watcher-auto' not in PROMOTE_SENTINEL_BOUND_ROLES
         assert PROMOTE_SENTINEL_BOUND_ROLES.isdisjoint(PROMOTE_ALLOWED)

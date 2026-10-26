@@ -17,8 +17,8 @@ from orchestrator.session_registry import (
     SessionRecord,
     Status,
     normalize_escalations_dir,
-    normalize_project_token,
 )
+from shared.project_id import fold_project_token
 from sitting import ledger as ledger_mod
 from sitting import preparation as prep_mod
 from sitting import prepare_sitting as mod
@@ -55,6 +55,11 @@ class Env:
     @property
     def preparation(self) -> Path:
         return self.state / 'preparation.json'
+
+    @property
+    def inbox(self) -> Path:
+        """This run's inbox; its sibling ``run-1`` is an earlier night's."""
+        return self.state / 'inbox' / 'run-2'
 
     @property
     def ledger(self) -> Path:
@@ -300,7 +305,7 @@ class TestRecommendOnly:
         assert close['tool'] == 'cli:session_registry'
         argv = close['args'][-1]
         assert argv[argv.index('close-decision') + 1:argv.index('close-decision') + 5] == [
-            '--id', f'{normalize_project_token(env.df.name)}-esc-400-1', '--state', 'answered',
+            '--id', f'{fold_project_token(env.df.name)}-esc-400-1', '--state', 'answered',
         ]
         assert argv[argv.index('--project') + 1] == closeable['esc-400-1']['project']
         assert argv[argv.index('--escalations-dir') + 1] == normalize_escalations_dir(env.queue)
@@ -347,7 +352,7 @@ class TestCloseCollision:
     def test_a_bare_id_collision_leaves_the_other_record_and_files_under_the_derived_id(self, env, capsys):
         self._seed_other_project(env, 'esc-400-1')
         before = self._decision_files(env)
-        project = normalize_project_token(env.df.name)
+        project = fold_project_token(env.df.name)
         derived = f'{project}-esc-400-1'
 
         runs = self._apply_the_close(env, capsys)
@@ -362,7 +367,7 @@ class TestCloseCollision:
         assert (closed.project, closed.escalations_dir) == (project, normalize_escalations_dir(env.queue))
 
     def test_a_forced_derived_id_collision_is_refused_loudly(self, env, capsys):
-        other = self._seed_other_project(env, f'{normalize_project_token(env.df.name)}-esc-400-1')
+        other = self._seed_other_project(env, f'{fold_project_token(env.df.name)}-esc-400-1')
         before = self._decision_files(env)
 
         write, close = self._apply_the_close(env, capsys)
@@ -500,17 +505,110 @@ class TestRecord:
 class TestNightlyConfinement:
     @pytest.fixture
     def confined(self, env, monkeypatch):
-        monkeypatch.setenv(prep_mod.NIGHTLY_CONFINEMENT_ENV, '1')
+        env.inbox.mkdir(parents=True)
+        monkeypatch.setenv(prep_mod.NIGHTLY_CONFINEMENT_ENV, str(env.inbox))
         monkeypatch.setattr(mod, 'DEFAULT_PREPARATION', env.preparation)
         return env
 
-    def test_record_into_the_default_store_is_allowed(self, confined, capsys, monkeypatch):
-        monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps([_prep_payload(confined, 'esc-100-1')])))
+    def _batch(self, directory: Path, esc_id: str = 'esc-100-1', *, env: Env) -> Path:
+        path = directory / 'batch-01.json'
+        path.write_text(json.dumps([_prep_payload(env, esc_id)]))
+        return path
 
-        rc, _, _ = _run(capsys, 'record', '--from', '-')
+    def test_record_from_a_file_in_the_inbox_into_the_default_store_is_allowed(self, confined, capsys):
+        source = self._batch(confined.inbox, env=confined)
+
+        rc, _, _ = _run(capsys, 'record', '--from', str(source))
 
         assert rc == 0
         assert prep_mod.load(confined.preparation).get(escalation_key(normalize_escalations_dir(confined.queue), 'esc-100-1'))
+
+    def test_a_relative_path_into_the_inbox_is_allowed(self, confined, capsys, monkeypatch):
+        self._batch(confined.inbox, env=confined)
+        monkeypatch.chdir(confined.state)
+
+        rc, _, _ = _run(capsys, 'record', '--from', 'inbox/run-2/batch-01.json')
+
+        assert rc == 0
+
+    def test_record_from_stdin_is_refused_and_says_to_use_an_inbox_file(self, confined, capsys, monkeypatch):
+        monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps([_prep_payload(confined, 'esc-100-1')])))
+        before = confined.preparation.read_bytes()
+
+        rc, _, err = _run(capsys, 'record', '--from', '-')
+
+        assert rc == 2
+        assert prep_mod.NIGHTLY_CONFINEMENT_ENV in err and str(confined.inbox) in err and 'write the batch as a .json file' in err
+        assert confined.preparation.read_bytes() == before
+
+    def test_a_file_outside_the_inbox_is_refused(self, confined, capsys):
+        outside = self._batch(confined.state, env=confined)
+        before = confined.preparation.read_bytes()
+
+        rc, _, err = _run(capsys, 'record', '--from', str(outside))
+
+        assert rc == 2 and prep_mod.NIGHTLY_CONFINEMENT_ENV in err
+        assert confined.preparation.read_bytes() == before
+
+    def test_dot_dot_out_of_the_inbox_is_refused(self, confined, capsys):
+        self._batch(confined.state, env=confined)
+        before = confined.preparation.read_bytes()
+
+        rc, _, err = _run(capsys, 'record', '--from', str(confined.inbox / '..' / 'batch-01.json'))
+
+        assert rc == 2 and prep_mod.NIGHTLY_CONFINEMENT_ENV in err
+        assert confined.preparation.read_bytes() == before
+
+    def test_a_symlink_in_the_inbox_pointing_outside_is_refused(self, confined, capsys):
+        outside = self._batch(confined.state, env=confined)
+        link = confined.inbox / 'link.json'
+        link.symlink_to(outside)
+        before = confined.preparation.read_bytes()
+
+        rc, _, err = _run(capsys, 'record', '--from', str(link))
+
+        assert rc == 2 and prep_mod.NIGHTLY_CONFINEMENT_ENV in err
+        assert confined.preparation.read_bytes() == before
+
+    def test_an_earlier_nights_batch_is_refused(self, confined, capsys):
+        earlier = confined.inbox.parent / 'run-1'
+        earlier.mkdir()
+        source = self._batch(earlier, env=confined)
+        before = confined.preparation.read_bytes()
+
+        rc, _, err = _run(capsys, 'record', '--from', str(source))
+
+        assert rc == 2 and str(confined.inbox) in err
+        assert confined.preparation.read_bytes() == before
+
+    @pytest.mark.parametrize('name', ['nested/batch-01.json', 'batch-01.txt'])
+    def test_only_a_json_file_directly_in_the_inbox_is_a_batch(self, confined, capsys, name):
+        source = confined.inbox / name
+        source.parent.mkdir(exist_ok=True)
+        source.write_text(json.dumps([_prep_payload(confined, 'esc-100-1')]))
+        before = confined.preparation.read_bytes()
+
+        rc, _, err = _run(capsys, 'record', '--from', str(source))
+
+        assert rc == 2 and prep_mod.NIGHTLY_CONFINEMENT_ENV in err
+        assert confined.preparation.read_bytes() == before
+
+    def test_a_confining_value_that_is_not_a_directory_admits_no_batch(self, confined, capsys, monkeypatch):
+        source = self._batch(confined.inbox, env=confined)
+        monkeypatch.setenv(prep_mod.NIGHTLY_CONFINEMENT_ENV, '1')
+        before = confined.preparation.read_bytes()
+
+        rc, _, err = _run(capsys, 'record', '--from', str(source))
+
+        assert rc == 2 and prep_mod.NIGHTLY_CONFINEMENT_ENV in err
+        assert confined.preparation.read_bytes() == before
+
+    def test_interactive_record_from_anywhere_is_unchanged(self, env, capsys):
+        source = self._batch(env.state, env=env)
+
+        rc, _, _ = _run(capsys, 'record', '--preparation', str(env.preparation), '--from', str(source))
+
+        assert rc == 0
 
     def test_brief_json_is_allowed(self, confined, capsys):
         _classify(capsys, confined)

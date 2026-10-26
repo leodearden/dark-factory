@@ -104,7 +104,7 @@ A **landing merge** is written under either of two subject spellings, and both
 are accepted — `Merge task/<id> into main` and `Merge task/<id>: <subject>`.
 Both are in live use (censused over reify's `main`: 2741 of the first, 74 of
 the second), and the single derivation both are matched from is
-`scripts/mint_hard_v2_fixtures.py::_merge_subject_patterns`, mirroring
+`shared.merge_subject.merge_subject_pattern`, mirroring
 `orchestrator/src/orchestrator/git_ops.py::_merge_subject`'s
 writer-and-reader-share-one-derivation discipline.
 

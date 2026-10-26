@@ -299,7 +299,7 @@ import uuid
 import warnings
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import Any, assert_never
+from typing import Any, NamedTuple, assert_never
 
 import pytest
 
@@ -1709,6 +1709,49 @@ def run_in_new_session_until(
     return RunUntilOutcome(completed, stopped_on_condition=True)
 
 
+def run_in_new_session_while_progressing(
+    cmd: list[str],
+    *,
+    progress: Callable[[], object],
+    stall_timeout: float,
+    env: dict[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    text: bool = True,
+) -> subprocess.CompletedProcess:
+    """:func:`run_in_new_session` whose deadline counts only time WITHOUT progress.
+
+    The clock re-arms whenever *progress* returns a value unequal to its
+    previous one, so a slow child that is still advancing is never killed and
+    a stuck one is, *stall_timeout* seconds after its last change. *progress*
+    is called every ``_CONDITION_POLL_SLICE_SECS`` and must be cheap and safe
+    to call while the child runs.
+
+    Raises ``TimeoutExpired`` (``timeout == stall_timeout``, partial output
+    attached) on a stall; an exception from *progress* stops the group and
+    propagates.
+    """
+    last: object = object()
+    last_change = time.monotonic()
+
+    def stalled() -> bool:
+        nonlocal last, last_change
+        current = progress()
+        if current != last:
+            last, last_change = current, time.monotonic()
+            return False
+        return time.monotonic() - last_change >= stall_timeout
+
+    outcome = run_in_new_session_until(
+        cmd, condition=stalled, timeout=math.inf, env=env, cwd=cwd, text=text,
+    )
+    if outcome.stopped_on_condition:
+        raise subprocess.TimeoutExpired(
+            cmd, stall_timeout,
+            output=outcome.completed.stdout, stderr=outcome.completed.stderr,
+        )
+    return outcome.completed
+
+
 def _spawn_in_new_session(
     cmd: list[str],
     *,
@@ -1789,6 +1832,11 @@ def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
     ``TimeoutExpired``, and masking that with a signalling error would replace
     a legible timeout with a confusing one. ``ProcessLookupError`` is the
     ordinary case of a child that exited between the timeout and the signal.
+
+    The ``Popen`` sibling of
+    ``shared/src/shared/proc_group.py::sigkill_process_group``, ported rather
+    than imported per this module's import constraint (see the module
+    docstring), so a fix to either belongs in both.
     """
     reason = _unsafe_pgid_reason(pgid)
     if reason is not None:
@@ -1807,7 +1855,9 @@ def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
 # Three test modules prove "a timeout reaches the grandchild too", one per
 # spawner plus this module's own. They need the same three things: a script that
 # forks a survivor, a way to learn that survivor's pid, and a way to wait for it
-# to die. Those live HERE for exactly the reason `run_in_new_session` does —
+# to die. The wait counts a zombie as dead; a caller that needs the pid to name
+# no process at all checks `read_proc_state(pid) is None` instead. Those live
+# HERE for exactly the reason `run_in_new_session` does —
 # `tests/scripts/` and `scripts/tests/` cannot import each other's test modules,
 # so a copy in each is a copy that can only be kept in step by hand. Centralising
 # the spawn while leaving its probes triplicated would just move the "which of
@@ -1858,27 +1908,79 @@ def read_leaked_pid(pidfile: Path, *, timeout: float = 10.0) -> int:
         time.sleep(0.05)
 
 
-def pid_is_gone(pid: int) -> bool:
-    """Whether *pid* no longer exists. Signal 0 is the standard liveness probe."""
+class ProcState(NamedTuple):
+    """A pid's ``/proc/<pid>/stat`` state letter and parent pid."""
+
+    state: str
+    ppid: int
+
+    @property
+    def exited(self) -> bool:
+        """A zombie has terminated and is only awaiting its (possibly reparented) parent's reap."""
+        return self.state in ('Z', 'X')
+
+
+def read_proc_state(pid: int, *, _proc_root: Path = Path('/proc')) -> ProcState | None:
+    """*pid*'s :class:`ProcState`, or None when it has no ``/proc`` entry at all.
+
+    None means neither running nor a zombie; an unreadable entry raises its
+    ``OSError`` and a malformed one ``ValueError``, rather than reading as gone.
+    Parsed after the LAST ``') '`` exactly as
+    :func:`orchestrator.verify_cancel.read_ppid_map` does, since ``comm`` may
+    hold spaces or parens.  A stdlib port of
+    ``shared/src/shared/proc_group.py::read_stat_fields`` (see the module
+    docstring's import constraint); ``_proc_root`` is a test seam.
+    """
+    stat = _proc_root / str(pid) / 'stat'
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        # Alive and owned by someone else — a pid the kernel already recycled.
-        return False
-    return False
+        raw = stat.read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    try:
+        fields = raw.rsplit(') ', 1)[1].split()
+        return ProcState(state=fields[0], ppid=int(fields[1]))
+    except (IndexError, ValueError) as exc:
+        raise ValueError(f'unparseable {stat}: {raw!r}') from exc
+
+
+def wait_pids_exited(
+    pids: set[int],
+    *,
+    timeout: float,
+    interval: float = 0.05,
+    _read_state: Callable[[int], ProcState | None] = read_proc_state,
+    _clock: Callable[[], float] = time.monotonic,
+) -> dict[int, ProcState]:
+    """Poll until every pid in *pids* has exited; return the still-RUNNING ones.
+
+    Each survivor maps to its last observed :class:`ProcState`; an empty dict
+    means every pid exited.  A zombie counts as exited: reaping a reparented
+    orphan is its subreaper's job (``systemd --user`` on this fleet), not the
+    code under test's -- the same criterion as
+    ``orchestrator/tests/test_verify_cancel.py::_is_running`` (task 3955).
+
+    The verdict is always the probe of the returning iteration, so a caller
+    descheduled across the deadline never asserts on a stale observation;
+    ``timeout=0`` is exactly one probe.
+    """
+    deadline = _clock() + timeout
+    while True:
+        running = {
+            pid: state for pid in pids
+            if (state := _read_state(pid)) is not None and not state.exited
+        }
+        if not running or _clock() >= deadline:
+            return running
+        time.sleep(interval)
 
 
 def wait_pid_gone(pid: int, *, timeout: float = 3.0) -> bool:
-    """Poll for *pid* to disappear, allowing for SIGKILL delivery and reaping."""
-    deadline = time.monotonic() + timeout
-    while True:
-        if pid_is_gone(pid):
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
+    """Poll until *pid* has exited; False if it is still running at *timeout*.
+
+    Exited means no ``/proc`` entry, or a zombie (:attr:`ProcState.exited`)
+    awaiting its possibly-reparented parent's reap.  ``timeout=0`` is one probe.
+    """
+    return not wait_pids_exited({pid}, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------

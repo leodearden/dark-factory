@@ -17,7 +17,13 @@ from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
 )
 
-_DTG_LOGGER = 'fused_memory.middleware.deterministic_task_guard'
+_SCHEMA_WARNING = 'task_metadata.schema_warning'
+_SOURCE = 'source=deterministic_task_guard'
+
+
+def _discard_lines(caplog) -> list[str]:
+    messages = (r.getMessage() for r in caplog.records)
+    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
 
 # ---------------------------------------------------------------------------
 # Step-1: invariant matrix tests (no filesystem)
@@ -399,49 +405,28 @@ class TestInjectTaskKind:
         sensible fallback for an unparseable string.
         """
         inject_task_kind = self._import_inject()
-        with caplog.at_level(logging.WARNING, logger=_DTG_LOGGER):
+        with caplog.at_level(logging.WARNING):
             result = inject_task_kind('not valid json!!!', 'normal')
         assert result == {'task_kind': 'normal'}
-        warns = [
-            r for r in caplog.records
-            if r.name == _DTG_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert any('task_metadata.schema_warning' in r.message for r in warns), (
-            f'expected a task_metadata.schema_warning WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
+        assert len(_discard_lines(caplog)) == 1
 
     def test_non_dict_json_value_warns_schema_warning_census_token(self, caplog):
         """A syntactically valid JSON value that isn't an object (a bare list)
         is also a whole-metadata discard and must warn identically."""
         inject_task_kind = self._import_inject()
-        with caplog.at_level(logging.WARNING, logger=_DTG_LOGGER):
+        with caplog.at_level(logging.WARNING):
             result = inject_task_kind('[1,2,3]', 'normal')
         assert result == {'task_kind': 'normal'}
-        warns = [
-            r for r in caplog.records
-            if r.name == _DTG_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert any('task_metadata.schema_warning' in r.message for r in warns), (
-            f'expected a task_metadata.schema_warning WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
+        assert len(_discard_lines(caplog)) == 1
 
     def test_valid_dict_metadata_emits_no_warning(self, caplog):
         """A well-formed dict is not a discard: no schema_warning WARNING, and
         curator-internal extras (spawned_from) survive alongside task_kind."""
         inject_task_kind = self._import_inject()
-        with caplog.at_level(logging.WARNING, logger=_DTG_LOGGER):
+        with caplog.at_level(logging.WARNING):
             result = inject_task_kind({'foo': 'bar', 'spawned_from': 'x'}, 'deterministic')
         assert result == {'foo': 'bar', 'spawned_from': 'x', 'task_kind': 'deterministic'}
-        warns = [
-            r for r in caplog.records
-            if r.name == _DTG_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert not warns, (
-            f'valid dict metadata must not emit a WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
+        assert _discard_lines(caplog) == []
 
     def test_empty_string_metadata_no_warning(self, caplog):
         """Amendment: an empty-string metadata is benign-absent, not a discard.
@@ -451,17 +436,22 @@ class TestInjectTaskKind:
         emitting a task_metadata.schema_warning census line.
         """
         inject_task_kind = self._import_inject()
-        with caplog.at_level(logging.WARNING, logger=_DTG_LOGGER):
+        with caplog.at_level(logging.WARNING):
             result = inject_task_kind('', 'normal')
         assert result == {'task_kind': 'normal'}
-        warns = [
-            r for r in caplog.records
-            if r.name == _DTG_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert not warns, (
-            f'empty-string metadata must not emit a WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
+        assert _discard_lines(caplog) == []
+
+
+class TestDeterministicTaskErrorUnreadableMetadata:
+    """Unreadable metadata reads as empty under the shared wire rule, and is logged."""
+
+    @pytest.mark.parametrize('metadata', ['{not json', 42], ids=repr)
+    def test_unreadable_metadata_breaks_no_invariant_and_logs_one_census_line(
+        self, metadata, caplog
+    ):
+        with caplog.at_level(logging.WARNING):
+            assert deterministic_task_error('normal', metadata, '/proj') is None
+        assert len(_discard_lines(caplog)) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""The LLM candidate slate read from arms.yaml, and each arm's candidate spec (arm_harness/slate.py)."""
+"""The candidate slate read from arms.yaml, and the ArmSpec each arm runs under (arm_harness/slate.py)."""
 
 from pathlib import Path
 
@@ -6,13 +6,26 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from arm_harness._fakes import CODE_SHA, CORPUS_SHA, PREREG_SHA
-from fused_memory.arm_harness.arm_spec import LlmArmSpec, LlmParams
-from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, require_scratch_name
+from arm_harness._fakes import (
+    CODE_SHA,
+    CORPUS_SHA,
+    PREREG_SHA,
+    QWEN_QUERY_PREFIX,
+    embedding_slate_arm,
+)
+from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec, LlmParams, ServingSpec
+from fused_memory.arm_harness.scratch_guard import (
+    GuardCheckpoint,
+    ScratchGuardError,
+    require_scratch_name,
+)
 from fused_memory.arm_harness.slate import (
     SlateArm,
     arm_endpoint,
     candidate_spec,
+    embedding_candidate_spec,
+    embedding_control_spec,
+    load_embedding_slate,
     load_llm_slate,
 )
 
@@ -71,6 +84,19 @@ arms:
     est_vram_gib: 14.5
     max_model_len: 16384
     max_num_seqs: 4
+
+  - arm_id: gte-embed
+    axis: embedding
+    stack: vllm
+    fallback_stack: tei
+    model_ref: Alibaba-NLP/gte
+    quant: none
+    port: 8417
+    served_model_name: gte-embed
+    structured_output_mode: none
+    est_vram_gib: 1.0
+    max_model_len: 8192
+    dims: 768
 """
 
 
@@ -161,11 +187,12 @@ def test_refuses_an_unquoted_yaml_reasoning_on_rather_than_coercing_the_bool(tmp
     ],
     ids=['malformed-yaml', 'top-level-list', 'no-arms', 'arms-not-a-list', 'non-mapping-entry'],
 )
-def test_refuses_a_manifest_of_the_wrong_shape_naming_it(tmp_path, text, fragment):
+@pytest.mark.parametrize('reader', [load_llm_slate, load_embedding_slate], ids=['llm', 'embedding'])
+def test_refuses_a_manifest_of_the_wrong_shape_naming_it(tmp_path, text, fragment, reader):
     path = _write(tmp_path, text)
 
     with pytest.raises(ValueError) as raised:
-        load_llm_slate(path)
+        reader(path)
 
     assert str(path) in str(raised.value)
     assert fragment in str(raised.value)
@@ -246,3 +273,165 @@ def test_a_json_object_llamacpp_arm_yields_a_valid_generic_client_spec():
     assert spec.structured_output_mode == 'json_object'
     assert spec.client_class == 'openai_generic'
     assert spec.serving.stack == 'llamacpp'
+
+
+# --- embedding axis ----------------------------------------------------------------------
+
+
+def _embedding_spec_for(arm) -> EmbeddingArmSpec:
+    return embedding_candidate_spec(
+        arm, code_sha=CODE_SHA, corpus_sha=CORPUS_SHA, preregistration_sha=PREREG_SHA
+    )
+
+
+def test_reads_only_embedding_arms_in_manifest_order(tmp_path):
+    slate = load_embedding_slate(_write(tmp_path, FIXTURE))
+
+    assert slate == (
+        embedding_slate_arm(
+            arm_id='bge-embed', served_model_name='bge-embed', query_prefix='Query: '
+        ),
+        embedding_slate_arm(
+            arm_id='gte-embed', port=8417, served_model_name='gte-embed', dims=768,
+            query_prefix=None,
+        ),
+    )
+    assert slate[1].query_prefix is None
+
+
+def test_embedding_slate_arms_are_frozen(tmp_path):
+    arm = load_embedding_slate(_write(tmp_path, FIXTURE))[0]
+
+    with pytest.raises(ValidationError):
+        arm.dims = 768  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ('field', 'line'),
+    [('dims', '    dims: 1024\n'), ('port', '    port: 8414\n')],
+)
+def test_refuses_an_embedding_arm_missing_a_required_field(tmp_path, field, line):
+    assert FIXTURE.count(line) == 1
+    path = _write(tmp_path, FIXTURE.replace(line, ''))
+
+    with pytest.raises(ValueError, match=rf'(?s)bge-embed.*{field}') as raised:
+        load_embedding_slate(path)
+
+    assert str(path) in str(raised.value)
+
+
+def test_refuses_a_quoted_dims_rather_than_coercing_it(tmp_path):
+    path = _write(tmp_path, FIXTURE.replace('dims: 1024', 'dims: "1024"'))
+
+    with pytest.raises(ValueError, match=r'(?s)bge-embed.*dims'):
+        load_embedding_slate(path)
+
+
+def test_refuses_duplicate_embedding_arm_ids(tmp_path):
+    path = _write(tmp_path, FIXTURE.replace('arm_id: gte-embed', 'arm_id: bge-embed'))
+
+    with pytest.raises(ValueError, match=r'(?s)duplicate.*bge-embed') as raised:
+        load_embedding_slate(path)
+
+    assert str(path) in str(raised.value)
+
+
+def test_the_committed_manifest_loads_as_the_four_iota_embedding_arms():
+    slate = load_embedding_slate(COMMITTED_ARMS)
+
+    assert [(arm.arm_id, arm.dims, arm.query_prefix is not None) for arm in slate] == [
+        ('qwen3-embedding-0.6b', 1024, True),
+        ('granite-embedding-english-r2', 768, False),
+        ('qwen3-embedding-4b', 2560, True),
+        ('gte-modernbert-base', 768, False),
+    ]
+    assert slate[0] == embedding_slate_arm()
+
+
+def test_arm_endpoint_accepts_an_embedding_arm():
+    assert arm_endpoint(embedding_slate_arm(port=8416)) == 'http://127.0.0.1:8416'
+
+
+def test_embedding_candidate_spec_carries_the_arm_and_the_given_pins():
+    spec = _embedding_spec_for(embedding_slate_arm())
+
+    assert isinstance(spec, EmbeddingArmSpec)
+    assert spec.axis == 'embedding'
+    assert spec.arm_id == 'qwen3-embedding-0.6b'
+    assert spec.model_id == 'qwen3-embedding-0.6b'
+    assert spec.serving == ServingSpec(
+        stack='vllm',
+        base_url='http://127.0.0.1:8414/v1',
+        quant='none',
+        unit_name='lms-arm@qwen3-embedding-0.6b.service',
+    )
+    assert spec.embedding_dim == 1024
+    assert spec.query_prefix == QWEN_QUERY_PREFIX
+    assert '\n' in spec.query_prefix
+    assert spec.arm_role == 'candidate'
+    assert spec.code_sha == CODE_SHA
+    assert spec.corpus_sha == CORPUS_SHA
+    assert spec.preregistration_sha == PREREG_SHA
+
+
+def test_an_unprefixed_arm_yields_a_spec_without_a_query_prefix():
+    arm = embedding_slate_arm(
+        arm_id='granite-embedding-english-r2',
+        port=8415,
+        served_model_name='granite-embedding-english-r2',
+        dims=768,
+        query_prefix=None,
+    )
+
+    spec = _embedding_spec_for(arm)
+
+    assert spec.query_prefix is None
+    assert spec.embedding_dim == 768
+
+
+@pytest.mark.parametrize(
+    ('arm_id', 'scratch'),
+    [
+        ('qwen3-embedding-0.6b', 'evalmem_lme_emb_qwen3_embedding_0_6b'),
+        ('granite-embedding-english-r2', 'evalmem_lme_emb_granite_embedding_english_r2'),
+        ('qwen3-embedding-4b', 'evalmem_lme_emb_qwen3_embedding_4b'),
+        ('gte-modernbert-base', 'evalmem_lme_emb_gte_modernbert_base'),
+    ],
+)
+def test_embedding_scratch_group_is_the_sanitised_arm_id(arm_id, scratch):
+    spec = _embedding_spec_for(embedding_slate_arm(arm_id=arm_id, served_model_name=arm_id))
+
+    assert spec.scratch_group_id == scratch
+    assert require_scratch_name(spec.scratch_group_id, checkpoint=GuardCheckpoint.ARM_SPEC)
+
+
+def _control(**overrides) -> EmbeddingArmSpec:
+    kwargs = {
+        'model_id': 'text-embedding-3-small',
+        'embedding_dim': 1536,
+        'code_sha': CODE_SHA,
+        'corpus_sha': CORPUS_SHA,
+        'scratch_group_id': 'evalmem_lme_emb_incumbent_embed_a',
+    }
+    return embedding_control_spec('incumbent-embed-a', **(kwargs | overrides))
+
+
+def test_embedding_control_spec_is_an_unregistered_openai_control():
+    spec = _control()
+
+    assert isinstance(spec, EmbeddingArmSpec)
+    assert spec.arm_id == 'incumbent-embed-a'
+    assert spec.model_id == 'text-embedding-3-small'
+    assert spec.serving == ServingSpec(stack='openai', base_url='https://api.openai.com/v1')
+    assert spec.embedding_dim == 1536
+    assert spec.query_prefix is None
+    assert spec.scratch_group_id == 'evalmem_lme_emb_incumbent_embed_a'
+    assert spec.arm_role == 'control'
+    assert spec.preregistration_sha is None
+    assert spec.code_sha == CODE_SHA
+    assert spec.corpus_sha == CORPUS_SHA
+
+
+def test_embedding_control_spec_refuses_a_live_graph_as_its_scratch_group():
+    with pytest.raises(ScratchGuardError):
+        _control(scratch_group_id='dark_factory')

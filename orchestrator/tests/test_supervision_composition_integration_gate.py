@@ -61,7 +61,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from escalation.queue import EscalationQueue
 
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.task_ground_truth import TaskGroundTruth
 
 # ---------------------------------------------------------------------------

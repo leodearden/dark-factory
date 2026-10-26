@@ -18,6 +18,10 @@ from click.testing import CliRunner
 from shared.testing import make_gate_mock
 
 import orchestrator.evals.reviewer_trial.__main__ as trial_cli
+from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest
+from orchestrator.evals.reviewer_trial.runner import PanelRunResult
+from orchestrator.evals.reviewer_trial.scorer import ScoringResult
+from orchestrator.evals.reviewer_trial.variants import FABLE_EVIDENCE_VARIANTS
 
 _NOT_CALLED = object()
 
@@ -29,7 +33,7 @@ class _CampaignHarness:
         self.gate = make_gate_mock()
         self.factory = MagicMock(return_value=self.gate)
         monkeypatch.setattr('shared.usage_gate.UsageGate', self.factory)
-        monkeypatch.setattr('orchestrator.evals.runner.UsageGate', self.factory)
+        monkeypatch.setattr('orchestrator.evals.eval_gate.UsageGate', self.factory)
         monkeypatch.setattr(trial_cli, '_load_corpus', lambda: SimpleNamespace(diffs=[]))
         self.trial_saw = _NOT_CALLED
 
@@ -97,3 +101,32 @@ def test_a_pool_request_against_a_disabled_usage_cap_refuses_to_run(monkeypatch,
 
     _assert_refused_to_run_ungated(h, h.invoke('--pool'))
     h.factory.assert_not_called()
+
+
+def test_a_pooled_campaign_scores_through_its_gate(monkeypatch, tmp_path):
+    h = _CampaignHarness(monkeypatch, tmp_path)
+    arm = FABLE_EVIDENCE_VARIANTS[0].name
+    diff = CorpusDiff(
+        diff_id='d1', language='python', source='synthetic', diff_text='diff',
+        description='d', ground_truth=[],
+    )
+    monkeypatch.setattr(trial_cli, '_load_corpus', lambda: CorpusManifest(diffs=[diff]))
+
+    async def one_panel(*_args, usage_gate=None, **_kwargs):
+        h.trial_saw = usage_gate
+        return [PanelRunResult(variant_name=arm, diff_id='d1', total_cost_usd=1.0)]
+
+    monkeypatch.setattr('orchestrator.evals.reviewer_trial.runner.run_trial', one_panel)
+    scorer_saw: list[object] = []
+
+    async def recording_score(run, corpus_diff, *, usage_gate=None):
+        scorer_saw.append(usage_gate)
+        return ScoringResult(variant_name=run.variant_name, diff_id=run.diff_id, f1=0.5)
+
+    monkeypatch.setattr('orchestrator.evals.reviewer_trial.scorer.score_panel_run', recording_score)
+
+    result = h.invoke('--pool')
+
+    assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
+    assert scorer_saw == [h.gate], f'the matcher was handed {scorer_saw!r}, not the campaign gate'
+    h.gate.shutdown.assert_awaited_once()

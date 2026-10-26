@@ -36,29 +36,13 @@ from fused_memory.reconciliation.standing_decision_constants import (
     SUPPRESSION_STREAK_VOLUME_THRESHOLD,
 )
 
-# Optional escalation dependency (mirrors stage1_stall_detector's pattern): the
-# reconciliation package must import cleanly even where the escalation package
-# is not installed.  Both filers no-op when Escalation is None.
-#
-# ONE combined block, deliberately (same reasoning as stage1_stall_detector's):
-# all five names bind or fail together, so any ONE identity check suffices at
-# RUNTIME.  Every name is still listed in the guards because only an identity
-# check on the name itself narrows an optionally-imported symbol for the type
-# checker.
+# Optional escalation dependency: the reconciliation package must import
+# cleanly where the escalation package is not installed, and both filers no-op
+# when the name is None.
 try:
-    from escalation.dedupe import (  # type: ignore[import-untyped]
-        DedupeConfig,
-        compute_content_fingerprint,
-        content_fingerprint_key,
-        submit_or_dedupe,
-    )
-    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.dedupe import file_or_fold_l1  # type: ignore[import-untyped]
 except ImportError:
-    Escalation = None  # type: ignore[assignment,misc]
-    DedupeConfig = None  # type: ignore[assignment,misc]
-    compute_content_fingerprint = None  # type: ignore[assignment]
-    content_fingerprint_key = None  # type: ignore[assignment]
-    submit_or_dedupe = None  # type: ignore[assignment]
+    file_or_fold_l1 = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -76,117 +60,8 @@ _STORM_FINDING_CATEGORY: str = 'entity_standing_decision_suppression_storm'
 #: that had ever tripped the other escape.
 _STREAK_FINDING_CATEGORY: str = 'entity_standing_decision_suppression_streak'
 
-
-def _storm_dedupe_config() -> Any:
-    """The fold config both storm-escape filers share, or ``None`` when the
-    escalation package is unavailable.
-
-    The window is UNBOUNDED so a decision that keeps tripping an escape for days
-    still folds into its original parent.
-    """
-    # Any ONE identity check suffices at runtime (all five names bind or fail
-    # together in the module's single import block); each is named so a test
-    # that nulls one of them still disables filing.
-    if (
-        Escalation is None
-        or DedupeConfig is None
-        or compute_content_fingerprint is None
-        or content_fingerprint_key is None
-        or submit_or_dedupe is None
-    ):
-        return None
-    return DedupeConfig(
-        infra_dedupe_enabled=True,
-        infra_dedupe_window_secs=float('inf'),
-        infra_dedupe_categories=(CATEGORY_STANDING_DECISION_STORM,),
-        key_fn=content_fingerprint_key,
-    )
-
-
-def _file_or_fold_storm(
-    escalation_queue: Any,
-    project_id: str,
-    entity_uuid: str,
-    finding_category: str,
-    summary: str,
-    detail: str,
-    config: Any,
-) -> bool:
-    """Submit one storm-escape L1 for *entity_uuid*; return True iff a NEW record
-    was minted.
-
-    Folds on the ``(category, finding_category, project:entity)`` content
-    fingerprint (why: :func:`maybe_escalate_suppression_storm`).  Everything
-    that can fail is inside the try, so a fingerprint, id-gen, constructor,
-    submit or fold failure costs this entity its filing and is logged WARNING —
-    never the rest of the cycle.  A fold logs INFO, so the recurrence is
-    visible in the log stream and not only as a counter on disk.
-
-    ``preservation_specimen_guard.py::_file_or_fold`` is a second copy of this
-    helper and of :func:`_storm_dedupe_config`; task 5466 owns moving both
-    into ``escalation/dedupe.py``.
-    """
-    try:
-        # Unreachable through the callers, which check the whole import block
-        # via _storm_dedupe_config; restated so this helper enforces its own
-        # precondition as a logged WARNING rather than an AttributeError.
-        if Escalation is None or compute_content_fingerprint is None or submit_or_dedupe is None:
-            raise RuntimeError('escalation package unavailable')
-        fingerprint = compute_content_fingerprint(
-            CATEGORY_STANDING_DECISION_STORM,
-            finding_category,
-            [f'{project_id}:{entity_uuid}'],
-        )
-        # Fail closed rather than file with a falsy key: find_dedupe_parent
-        # short-circuits on one, so the record would silently become a second
-        # visible pending record for this entity every cycle. Unreachable via
-        # today's sha256 callee — this guards a future change to it.
-        if not fingerprint:
-            raise ValueError(
-                f'empty dedupe_fingerprint for {finding_category} entity_uuid={entity_uuid}'
-            )
-        esc = Escalation(
-            id=escalation_queue.make_id(entity_uuid),
-            # The entity is the subject, so it occupies task_id: that is the
-            # key get_by_task/has_open_l1 read a storm record back by, and it
-            # is what makes the record greppable per entity. It is NOT the
-            # fold key — dedupe_fingerprint below is — so the two cannot
-            # drift apart the way a task_id-keyed guard once did.
-            task_id=entity_uuid,
-            agent_role='reconciliation-stage1',
-            severity='blocking',
-            category=CATEGORY_STANDING_DECISION_STORM,
-            summary=summary,
-            detail=detail,
-            level=1,
-            dedupe_fingerprint=fingerprint,
-        )
-        outcome = submit_or_dedupe(escalation_queue, esc, config)
-    except Exception as exc:
-        logger.warning(
-            'standing-decision storm escape (%s): failed to escalate entity_uuid=%s '
-            '(fingerprint, id-gen, construction, submit, or fold): %s',
-            finding_category,
-            entity_uuid,
-            exc,
-            extra={'project_id': project_id},
-        )
-        return False
-
-    if outcome.get('status') == 'dedup_skipped':
-        logger.info(
-            'standing-decision storm escape (%s): entity_uuid=%s folded into '
-            'parent_id=%s (child_id=%s) — the condition is recurring',
-            finding_category,
-            entity_uuid,
-            outcome.get('parent_id'),
-            outcome.get('child_id'),
-            extra={'project_id': project_id},
-        )
-        return False
-    # Tested with != rather than == 'queued' so observed_submit_response's
-    # auto-resolved/dismissed branch (a record WAS minted) still counts.
-    return True
+_AGENT_ROLE: str = 'reconciliation-stage1'
+_LOG_LABEL: str = 'standing-decision storm escape'
 
 
 async def maybe_escalate_suppression_storm(
@@ -208,7 +83,7 @@ async def maybe_escalate_suppression_storm(
     cycle is a signal it may be over-broad or the entity's situation changed —
     worth a human look.
 
-    **Filed through** :func:`escalation.dedupe.submit_or_dedupe`, NOT gated on
+    **Filed through** ``escalation/dedupe.py::file_or_fold_l1``, NOT gated on
     ``has_open_l1`` (task 3522). Stage 1 re-evaluates every cycle, so a decision
     that storms once tends to storm every cycle — exactly the recurring-detector
     shape for which the sibling gate-backlog path retired the ``has_open_l1``
@@ -216,13 +91,10 @@ async def maybe_escalate_suppression_storm(
     stayed pinned at 0 and the operator saw no difference between one storm and
     forty. Folding instead keeps ONE pending record per entity and increments
     ``dedupe_count`` on it, which is the steward's recurrence / triage-order
-    signal. The fold key is the ``(category, finding_category, project:entity)``
-    content fingerprint :func:`_file_or_fold_storm` stamps — deliberately NOT the count or run_id,
-    which drift every cycle and would mint a fresh record per breach. The window
-    is UNBOUNDED so a decision storming for days still folds into its original
-    parent. Accepted cost, as on the gate-backlog path: a folded record keeps the
-    PARENT's summary, so the count named there is the FIRST breach's, while
-    ``dedupe_count`` carries how often it has recurred since.
+    signal; the fold key and window are that helper's. Accepted cost, as on the
+    gate-backlog path: a folded record keeps the PARENT's summary, so the count
+    named there is the FIRST breach's, while ``dedupe_count`` carries how often
+    it has recurred since.
 
     Best-effort throughout: returns ``[]`` immediately when the ``escalation``
     package is unavailable; any per-decision fingerprint/id-gen/construction/
@@ -235,8 +107,7 @@ async def maybe_escalate_suppression_storm(
     the same category for a decision whose streak has reached K and that
     suppressed more than N flags in total across its last K cycles.
     """
-    config = _storm_dedupe_config()
-    if config is None:
+    if file_or_fold_l1 is None:
         return []
 
     escalated: list[str] = []
@@ -256,14 +127,17 @@ async def maybe_escalate_suppression_storm(
             f'suppressed_this_cycle: {count}',
             f'threshold: {threshold}',
         ])
-        if _file_or_fold_storm(
+        if file_or_fold_l1(
             escalation_queue,
-            project_id,
-            entity_uuid,
-            _STORM_FINDING_CATEGORY,
-            summary,
-            detail,
-            config,
+            project_id=project_id,
+            subject=entity_uuid,
+            category=CATEGORY_STANDING_DECISION_STORM,
+            finding_category=_STORM_FINDING_CATEGORY,
+            agent_role=_AGENT_ROLE,
+            summary=summary,
+            detail=detail,
+            log=logger,
+            log_label=_LOG_LABEL,
         ):
             escalated.append(entity_uuid)
     return escalated
@@ -506,8 +380,7 @@ async def maybe_escalate_suppression_streak(
 
     Returns the entity_uuids that received a NEW record this cycle.
     """
-    config = _storm_dedupe_config()
-    if config is None:
+    if file_or_fold_l1 is None:
         return []
 
     escalated: list[str] = []
@@ -529,14 +402,17 @@ async def maybe_escalate_suppression_streak(
             f'suppressed_in_window: {update.window_suppressed}',
             f'volume_threshold: {volume_threshold}',
         ])
-        if _file_or_fold_storm(
+        if file_or_fold_l1(
             escalation_queue,
-            project_id,
-            update.entity_uuid,
-            _STREAK_FINDING_CATEGORY,
-            summary,
-            detail,
-            config,
+            project_id=project_id,
+            subject=update.entity_uuid,
+            category=CATEGORY_STANDING_DECISION_STORM,
+            finding_category=_STREAK_FINDING_CATEGORY,
+            agent_role=_AGENT_ROLE,
+            summary=summary,
+            detail=detail,
+            log=logger,
+            log_label=_LOG_LABEL,
         ):
             escalated.append(update.entity_uuid)
     return escalated

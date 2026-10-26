@@ -50,6 +50,9 @@ def make_gate_mock(**overrides) -> MagicMock:
     ``detect_cap_hit``, ``confirm``, ``settle``, ``report`` methods proxy back
     to the gate — so tests can still assert on ``gate.detect_cap_hit.call_args``,
     ``gate.confirm_account_ok.assert_called_with(...)``, etc.
+    ``confirm(...)`` mirrors production :meth:`InvokeSlot.confirm`'s
+    one-verdict rule: a no-op on a slot that ``report`` or a positive
+    ``detect_cap_hit`` already settled (task 6627).
     ``detect_cap_hit(...)`` mirrors production :meth:`InvokeSlot.detect_cap_hit`:
     it forwards ``scope=slot.scope`` (task 4969) and, on a truthy hit, calls
     ``release_probe_slot`` and then settles (task 4096).
@@ -119,6 +122,8 @@ def make_gate_mock(**overrides) -> MagicMock:
                 return hit
 
             def _slot_confirm(cost_usd=0.0):
+                if slot._settled:
+                    return
                 gate.confirm_account_ok(slot.token)
                 gate.on_agent_complete(cost_usd)
                 slot._settled = True

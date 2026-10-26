@@ -5,13 +5,15 @@ Replaces the post-construction ``scheduler._on_*`` monkey-patches with a
 single frozen dataclass passed to ``Scheduler.__init__``.
 
 Covers:
-  (a) ``SchedulerCallbacks`` shape — frozen dataclass, 10 fields, all default
-      ``None``.
+  (a) ``SchedulerCallbacks`` shape — frozen dataclass, exact field set, all
+      default ``None``.
   (b) ``Scheduler(config, callbacks=...)`` construction, with and without an
       explicit ``callbacks=`` argument (omitting it must collapse to an
       all-``None`` ``SchedulerCallbacks`` so bare-Scheduler unit tests are
       unaffected).
   (c) Constructor-injected hooks actually FIRE on their triggers.
+  (d) ``_workflow_helpers.FakeScheduler`` models (c)'s blocked-write
+      suppression.
 """
 
 from __future__ import annotations
@@ -22,13 +24,14 @@ import time
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from _workflow_helpers import FakeScheduler
 
 from orchestrator.config import OrchestratorConfig, StarvationWatchdogConfig
 from orchestrator.scheduler import Scheduler, SchedulerCallbacks
 
 
 class TestSchedulerCallbacksDataclass:
-    """(a) SchedulerCallbacks: frozen dataclass, 10 fields, all default None."""
+    """(a) SchedulerCallbacks: frozen dataclass, exact field set, all default None."""
 
     def test_all_fields_default_none(self):
         callbacks = SchedulerCallbacks()
@@ -42,8 +45,9 @@ class TestSchedulerCallbacksDataclass:
         assert callbacks.on_warm_base_promote_l2 is None
         assert callbacks.on_warm_base_resolve is None
         assert callbacks.suppress_blocked_write is None
+        assert callbacks.read_already_landed_tick_view is None
 
-    def test_field_count_is_exactly_ten(self):
+    def test_field_set_is_exact(self):
         field_names = {f.name for f in dataclasses.fields(SchedulerCallbacks)}
         assert field_names == {
             'on_park_stop_trip',
@@ -56,6 +60,7 @@ class TestSchedulerCallbacksDataclass:
             'on_warm_base_promote_l2',
             'on_warm_base_resolve',
             'suppress_blocked_write',
+            'read_already_landed_tick_view',
         }
 
     def test_is_frozen(self):
@@ -90,6 +95,13 @@ class TestConstructorInjectedHooksFire:
         spy = AsyncMock()
         config = OrchestratorConfig(
             max_per_module=1,
+            # task 4481: pin the trip ON rather than inheriting it.  This test
+            # is about the CALLBACK firing, not about park_stop_enabled's
+            # default; an operator setting park_stop_enabled=false in
+            # dark-factory-orchestrator.yaml disarms the trip and the spy is
+            # never called.  The threshold/window beside it are already pinned
+            # for the same reason.
+            park_stop_enabled=True,
             park_stop_parked_threshold=1,
             park_stop_parked_window_hours=1.0,
         )
@@ -126,6 +138,23 @@ class TestConstructorInjectedHooksFire:
         assert len(scheduler._blocked_transitions) == 0, (
             'Suppressed write must not record a blocked transition'
         )
+
+    def test_blocked_writes_suppressed_reports_the_callback(self):
+        """The suppression is observable as a query, not only as a silent no-op."""
+        config = OrchestratorConfig(max_per_module=1)
+        suppress = Mock(return_value=True)
+        suppressing = Scheduler(
+            config, callbacks=SchedulerCallbacks(suppress_blocked_write=suppress),
+        )
+        not_suppressing = Scheduler(
+            config,
+            callbacks=SchedulerCallbacks(suppress_blocked_write=Mock(return_value=False)),
+        )
+
+        assert suppressing.blocked_writes_suppressed('T1') is True
+        suppress.assert_called_once_with('T1')
+        assert not_suppressing.blocked_writes_suppressed('T1') is False
+        assert Scheduler(config).blocked_writes_suppressed('T1') is False
 
     @pytest.mark.asyncio
     async def test_on_starvation_warn_fires(self):
@@ -177,6 +206,24 @@ class TestConstructorInjectedHooksFire:
         spy.assert_called_once()
         call_args = spy.call_args
         assert call_args.args[0] == 'starved'
+
+
+class TestFakeSchedulerModelsTheBlockedWriteSuppression:
+    """(d) The ``_workflow_helpers.FakeScheduler`` double keeps step with
+    (c)'s suppression, so workflow suites that drive a Table-B teardown
+    through it see what the real Scheduler would do."""
+
+    @pytest.mark.asyncio
+    async def test_absorbs_only_the_suppressed_blocked_write(self):
+        scheduler = FakeScheduler()
+        scheduler.blocked_write_suppressed_ids = {'T1'}
+
+        await scheduler.set_task_status('T1', 'blocked')
+        assert scheduler.statuses.get('T1') is None
+        await scheduler.set_task_status('T1', 'pending')
+        assert scheduler.statuses['T1'] == ['pending']
+        assert scheduler.blocked_writes_suppressed('T1') is True
+        assert scheduler.blocked_writes_suppressed('T2') is False
 
 
 class TestLivenessAccessors:

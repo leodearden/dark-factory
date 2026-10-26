@@ -1,7 +1,7 @@
 """The serial ``MergeWorker`` is gone -- from production and from the tests.
 
 MQ-refactor task ν (R7b) removed the serial worker from
-``orchestrator.merge_queue`` but kept a frozen copy of it under
+``orchestrator.merge_lane.worker`` but kept a frozen copy of it under
 ``orchestrator/tests`` so the tests built on it kept running. Task 5034 (PRD
 ``plans/merge-lane-quality-prd.md`` task δ, decision 4) discarded that copy and
 re-homed the behaviours those tests checked onto the production lane,
@@ -19,7 +19,7 @@ import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 import orchestrator.merge_lane as merge_lane
-import orchestrator.merge_queue as mq
+import orchestrator.merge_lane.worker as mq
 
 # test_no_copy_of_the_serial_worker_anywhere reads every *.py under the tests
 # and the production package; see _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.

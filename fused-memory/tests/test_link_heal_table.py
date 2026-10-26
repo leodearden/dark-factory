@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _link_heal_harness import COMPLETION_META
 
 from fused_memory.maintenance.link_heal import (
     BasisSource,
@@ -24,17 +25,23 @@ from fused_memory.maintenance.link_heal import (
     LinkImage,
     LinkState,
     ParentPresence,
+    PlannedAction,
     Report,
+    StaleField,
     Verdict,
     change_for,
+    corroboration_mismatch,
+    corroboration_reads_parent,
     decide,
     journal_reason,
     kind_class,
     load_corpus_bases,
+    needs_verdict,
     post_image_for,
     undo_changes,
 )
 from fused_memory.maintenance.link_heal_store import LiveRecord, MetadataChange, text_sha256
+from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
     CONTESTED_METADATA_KEY,
@@ -55,17 +62,21 @@ def _state(
     kind: str | None = AMENDMENT_KIND,
     *,
     contested: Any = None,
+    contested_by_triage: Any = None,
     presence: ParentPresence = ParentPresence.FOUND,
     parent_meta: dict[str, Any] | None = None,
     has_children: bool = False,
     child_text: str = CHILD_TEXT,
     parent_text: str = PARENT_TEXT,
+    meta: dict[str, Any] | None = None,
 ) -> LinkState:
-    meta: dict[str, Any] = {PARENT_ID_KEY: PARENT}
+    meta = {**(meta or {}), PARENT_ID_KEY: PARENT}
     if kind is not None:
         meta['kind'] = kind
     if contested is not None:
         meta[CONTESTED_METADATA_KEY] = contested
+    if contested_by_triage is not None:
+        meta[TRIAGE_CONTESTED_METADATA_KEY] = contested_by_triage
     parent = (
         LiveRecord(memory_id=PARENT, text=parent_text, metadata=parent_meta or {})
         if presence is ParentPresence.FOUND
@@ -189,6 +200,66 @@ class TestDecidePrecedence:
         assert kind_class('peer') is KindClass.PEER
 
 
+class TestATriageStampedContest:
+    """H1 row 2 amendment (task 6533): only a hand-declared contest is protected.
+
+    A contest write triage's judge stamped is adjudicated like any other link
+    and healed by detach only.
+    """
+
+    @pytest.mark.parametrize('verdict', [*Verdict, None])
+    def test_a_hand_declared_contest_is_reported_whatever_the_verdict(self, verdict):
+        basis = None if verdict is None else _basis(verdict)
+        assert decide(_state(contested=True), basis).outcome is Report.CONTESTED_REPORTED
+
+    @pytest.mark.parametrize('marker', ['true', 1, False])
+    def test_a_marker_that_is_not_exactly_true_keeps_the_protection(self, marker):
+        state = _state(contested=True, contested_by_triage=marker)
+        assert decide(state, _basis('RELATED')).outcome is Report.CONTESTED_REPORTED
+
+    @pytest.mark.parametrize('verdict', ['RELATED', 'UNRELATED'])
+    def test_a_triage_stamped_misfile_is_detached(self, verdict):
+        decision = decide(_state(contested=True, contested_by_triage=True), _basis(verdict))
+        assert decision.outcome is HealAction.DETACH
+        assert decision.basis_source is BasisSource.CORPUS
+
+    def test_a_triage_stamped_contest_with_its_parent_gone_is_a_deterministic_detach(self):
+        state = _state(
+            contested=True, contested_by_triage=True, presence=ParentPresence.ABSENT,
+        )
+        decision = decide(state, None)
+        assert decision.outcome is HealAction.DETACH
+        assert decision.basis_source is BasisSource.DETERMINISTIC
+
+    @pytest.mark.parametrize(
+        ('kind', 'verdict'),
+        [
+            *((AMENDMENT_KIND, verdict) for verdict in ('SAME', 'EXTENDS', 'SUBSUMED', 'CORRECTS')),
+            *((SIGHTING_KIND, verdict) for verdict in ('EXTENDS', 'CORRECTS')),
+            *((None, verdict) for verdict in ('EXTENDS', 'CORRECTS', 'SAME')),
+        ],
+    )
+    def test_a_triage_stamped_contest_is_healed_by_detach_only(self, kind, verdict):
+        state = _state(kind, contested=True, contested_by_triage=True)
+        assert decide(state, _basis(verdict)).outcome is Report.NO_ACTION
+
+    def test_unclear_stays_unclear(self):
+        state = _state(contested=True, contested_by_triage=True)
+        assert decide(state, _basis('UNCLEAR')).outcome is Report.UNCLEAR
+
+    def test_it_reaches_the_verdict_rows_unrated(self):
+        state = _state(contested=True, contested_by_triage=True)
+        assert decide(state, None).outcome is Report.UNEXAMINED
+
+    def test_a_chain_still_outranks_it(self):
+        state = _state(
+            contested=True,
+            contested_by_triage=True,
+            parent_meta={PARENT_ID_KEY: '33333333-3333-3333-3333-333333333333'},
+        )
+        assert decide(state, _basis('RELATED')).outcome is Report.CHAIN_REPORTED
+
+
 class TestStaleness:
     def test_an_edited_child_is_stale(self):
         state = _state(child_text='edited after rating')
@@ -204,8 +275,16 @@ class TestStaleness:
         assert decision.basis_source is BasisSource.DETERMINISTIC
 
 
-def _image(kind: str | None, *, contested: Any = None, parent: str | None = PARENT) -> LinkImage:
-    return LinkImage(parent_id=parent, kind=kind, contested=contested)
+def _image(
+    kind: str | None,
+    *,
+    contested: Any = None,
+    contested_by_triage: Any = None,
+    parent: str | None = PARENT,
+) -> LinkImage:
+    return LinkImage(
+        parent_id=parent, kind=kind, contested=contested, contested_by_triage=contested_by_triage,
+    )
 
 
 class TestChangeFor:
@@ -255,6 +334,13 @@ class TestChangeFor:
         post = post_image_for(HealAction.DETACH, _image('extension'))
         assert post.as_dict() == {'kind': 'extension'}
 
+    def test_detaching_a_triage_stamped_contest_drops_the_flag_and_its_marker(self):
+        pre = _image(AMENDMENT_KIND, contested=True, contested_by_triage=True)
+        assert change_for(HealAction.DETACH, pre) == MetadataChange.delete_only(
+            [PARENT_ID_KEY, 'kind', CONTESTED_METADATA_KEY, TRIAGE_CONTESTED_METADATA_KEY],
+        )
+        assert post_image_for(HealAction.DETACH, pre).as_dict() == {}
+
 
 class TestUndoChanges:
     def test_undoing_a_detach_restores_parent_and_kind_in_one_patch(self):
@@ -262,6 +348,18 @@ class TestUndoChanges:
         post = post_image_for(HealAction.DETACH, pre)
         assert undo_changes(post, pre) == [
             MetadataChange.patch_only({PARENT_ID_KEY: PARENT, 'kind': AMENDMENT_KIND}),
+        ]
+
+    def test_undoing_a_triage_contest_detach_restores_every_key_in_one_patch(self):
+        pre = _image(AMENDMENT_KIND, contested=True, contested_by_triage=True)
+        post = post_image_for(HealAction.DETACH, pre)
+        assert undo_changes(post, pre) == [
+            MetadataChange.patch_only({
+                PARENT_ID_KEY: PARENT,
+                'kind': AMENDMENT_KIND,
+                CONTESTED_METADATA_KEY: True,
+                TRIAGE_CONTESTED_METADATA_KEY: True,
+            }),
         ]
 
     def test_undoing_a_no_kind_completion_deletes_the_kind(self):
@@ -284,6 +382,137 @@ class TestUndoChanges:
         changes = [change_for(action, pre), *undo_changes(post_image_for(action, pre), pre)]
         for change in changes:
             assert None not in (change.patch or {}).values()
+
+
+CHAINED_PARENT_META = {PARENT_ID_KEY: '33333333-3333-3333-3333-333333333333'}
+
+
+def _planned_detach(
+    state: LinkState, basis_source: BasisSource, parent_sha256: str | None,
+) -> PlannedAction:
+    return PlannedAction.planned(
+        project_id=PROJECT,
+        child_id=CHILD,
+        action=HealAction.DETACH,
+        pre_image=state.link,
+        basis_source=basis_source,
+        basis_key='H000' if basis_source is BasisSource.CORPUS else None,
+        child_sha256=state.child.text_sha256,
+        parent_sha256=parent_sha256,
+    )
+
+
+def _relived(record: LiveRecord, *, text: str | None = None, **meta: Any) -> LiveRecord:
+    return LiveRecord(
+        memory_id=record.memory_id,
+        text=record.text if text is None else text,
+        metadata={**record.metadata, **meta},
+    )
+
+
+class TestTheCompletionRecordRow:
+    """An orchestrator completion record is never a child (task 6961, PRD H1 amendment 2026-10-19)."""
+
+    @pytest.mark.parametrize('kind', [AMENDMENT_KIND, SIGHTING_KIND, None, 'task_completion'])
+    def test_a_linked_completion_record_detaches_whatever_its_kind(self, kind):
+        decision = decide(_state(kind, meta=COMPLETION_META), None)
+        assert decision.outcome is HealAction.DETACH
+        assert decision.basis_source is BasisSource.COMPLETION_RECORD
+
+    @pytest.mark.parametrize(
+        ('state', 'basis'),
+        [
+            (_state(meta=COMPLETION_META), _basis('EXTENDS', matches=False)),
+            (_state(meta=COMPLETION_META, contested=True), _basis('EXTENDS')),
+            (_state(meta=COMPLETION_META, presence=ParentPresence.OTHER_PROJECT), None),
+            (_state(meta=COMPLETION_META, parent_meta=CHAINED_PARENT_META), _basis('SAME')),
+            (_state(meta=COMPLETION_META, presence=ParentPresence.ABSENT), None),
+        ],
+        ids=['stale_basis', 'contested', 'other_project', 'chained_parent', 'absent_parent'],
+    )
+    def test_outranks_every_other_row(self, state, basis):
+        decision = decide(state, basis)
+        assert decision.outcome is HealAction.DETACH
+        assert decision.basis_source is BasisSource.COMPLETION_RECORD
+
+    def _agent_state(self, **kwargs: Any) -> LinkState:
+        return _state(
+            meta={'task_id': '7', 'source': 'agent'}, parent_meta={'task_id': '8'}, **kwargs,
+        )
+
+    def test_an_unrated_agent_written_cross_task_child_is_unexamined(self):
+        assert decide(self._agent_state(), None).outcome is Report.UNEXAMINED
+
+    def test_a_contested_agent_written_cross_task_child_is_reported(self):
+        decision = decide(self._agent_state(contested=True), None)
+        assert decision.outcome is Report.CONTESTED_REPORTED
+
+    def test_an_agent_written_cross_task_child_detaches_only_on_its_verdict(self):
+        decision = decide(self._agent_state(), _basis('RELATED'))
+        assert decision.outcome is HealAction.DETACH
+        assert decision.basis_source is BasisSource.CORPUS
+
+    def test_a_completion_record_needs_no_verdict(self):
+        assert needs_verdict(_state(meta=COMPLETION_META)) is False
+
+    def test_detaching_a_contested_amendment_deletes_every_link_key(self):
+        pre = _image(AMENDMENT_KIND, contested=True)
+        assert change_for(HealAction.DETACH, pre) == MetadataChange.delete_only(
+            [PARENT_ID_KEY, 'kind', CONTESTED_METADATA_KEY],
+        )
+        post = post_image_for(HealAction.DETACH, pre)
+        assert post.as_dict() == {}
+        assert undo_changes(post, pre) == [
+            MetadataChange.patch_only(
+                {PARENT_ID_KEY: PARENT, 'kind': AMENDMENT_KIND, CONTESTED_METADATA_KEY: True},
+            ),
+        ]
+
+    def test_a_completion_record_heal_carries_no_parent_hash(self):
+        state = _state(meta=COMPLETION_META)
+        with pytest.raises(ValueError, match='parent_sha256'):
+            _planned_detach(state, BasisSource.COMPLETION_RECORD, 'a' * 64)
+        assert _planned_detach(state, BasisSource.COMPLETION_RECORD, None).parent_sha256 is None
+
+
+class TestCompletionRecordCorroboration:
+    STATE = _state(meta=COMPLETION_META, contested=True)
+    PLANNED = _planned_detach(STATE, BasisSource.COMPLETION_RECORD, None)
+
+    @pytest.mark.parametrize(
+        'parent',
+        [
+            None,
+            LiveRecord(memory_id=PARENT, text=PARENT_TEXT, metadata={}),
+            LiveRecord(memory_id=PARENT, text='rewritten since', metadata={}),
+        ],
+        ids=['parent_gone', 'parent_unchanged', 'parent_edited'],
+    )
+    def test_an_unchanged_completion_child_corroborates_whatever_its_parent(self, parent):
+        assert corroboration_mismatch(self.PLANNED, self.STATE.child, parent, None) is None
+
+    def test_a_child_no_longer_a_completion_record_is_stale_on_source(self):
+        child = _relived(self.STATE.child, source='agent')
+        mismatch = corroboration_mismatch(self.PLANNED, child, None, None)
+        assert mismatch is StaleField.SOURCE
+        assert mismatch == 'source'
+
+    def test_an_edited_completion_child_is_stale_on_its_hash(self):
+        child = _relived(self.STATE.child, text='edited since planning')
+        assert corroboration_mismatch(self.PLANNED, child, None, None) is StaleField.CHILD_SHA256
+
+    def test_a_reparented_completion_child_is_stale_on_parent_id(self):
+        child = _relived(self.STATE.child, **{PARENT_ID_KEY: '44444444-4444-4444-4444-444444444444'})
+        assert corroboration_mismatch(self.PLANNED, child, None, None) is StaleField.PARENT_ID
+
+    def test_only_a_completion_record_heal_skips_the_parent_read(self):
+        corpus = _planned_detach(_state(), BasisSource.CORPUS, text_sha256(PARENT_TEXT))
+        dangling = _planned_detach(
+            _state(presence=ParentPresence.ABSENT), BasisSource.DETERMINISTIC, None,
+        )
+        assert corroboration_reads_parent(self.PLANNED) is False
+        assert corroboration_reads_parent(corpus) is True
+        assert corroboration_reads_parent(dangling) is True
 
 
 class TestJournalReason:

@@ -123,7 +123,9 @@ dashboard/data/
 # recon-escalation-watcher run manifests (mcp.json + run.sh stay tracked):
 recon-watch/close-manifest*.json
 # /review run reports (review/reports/<run_id>.*) are tracked. Only the
-# pre-contract phase files, which carry no as_of_sha, stay ignored:
+# pre-contract phase1/phase2/summary files, which carry no as_of_sha and are
+# not reports (skills/review/SKILL.md "Report home"), stay ignored.
+# Guard: tests/scripts/test_review_report_home_gitignore.py
 review/reports/phase[12]-*.json
 review/reports/summary-*.md
 # Editor/tool temp-backup files (e.g. foo.py.tmp.<pid>.<hash>) — one was

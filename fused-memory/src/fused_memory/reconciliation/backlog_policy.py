@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 from urllib.parse import quote
 
+from shared.project_layout import escalation_queue_dir
 from shared.safe_io import atomic_write_text
 
 if TYPE_CHECKING:
@@ -427,7 +428,7 @@ class BacklogPolicy:
             )
             return []
 
-        esc_dir = Path(project_root) / 'data' / 'escalations'
+        esc_dir = escalation_queue_dir(project_root)
         if not esc_dir.is_dir():
             logger.info(
                 'backlog_policy: no halt escalation closed for %s — %s absent',
@@ -860,7 +861,7 @@ class BacklogPolicy:
             )
             return None
 
-        esc_dir = Path(project_root) / 'data' / 'escalations'
+        esc_dir = escalation_queue_dir(project_root)
         ts = datetime.fromtimestamp(self._now(), tz=UTC).isoformat()
         esc_id = _escalation_id(kind, project_id, ts)
 

@@ -55,28 +55,44 @@ set -euo pipefail
 # Without --drain, the script behaves exactly as before: an immediate,
 # uncapped restart-all with zero heartbeat reads.
 #
-# TWO-STAGE DRAIN (task 5371): "busy" above only says the merge QUEUE is
-# non-empty, which on a permanently-loaded unit is always, so the gate used to
-# wait out the whole busy grace and then kill whatever merge verify was running.
-# Under --drain the sweep therefore also asks each unit to stop STARTING merge
-# verifies, and waits for the ones already running to finish:
-#   - Stage A (fleet-wide, up front, after the lease is acquired and units are
-#     enumerated): write a drain request <fleet_dir>/<unit>.drain.json for EVERY
-#     unit (drain_stage_a). Each orchestrator's 15 s merge-heartbeat service
-#     reads its own request, halts merge admission and acknowledges it in its
-#     heartbeat. Every unit stops starting verifies at once, so the sweep waits
-#     for about the longest single verify, not the sum. The price: a unit late
-#     in the order (SELF_UNIT is last) keeps its merge lane halted until its
-#     turn comes.
-#   - Stage B (per unit, in the restart loop): drain_gate polls the heartbeat
-#     with the unit's requested_ts. verifying (a merge verify is still inside
-#     its own deadline) is awaited WITHOUT the busy grace, up to
-#     ORCH_DRAIN_VERIFY_MAX_WAIT_SECS counted from Stage A; idle (acknowledged,
-#     halted, nothing in flight) resumes; overdue (every in-flight verify is past
-#     its own command timeout, so it is about to be killed regardless) restarts
-#     at once; refused (the unit examined the request and declined it) drops that
-#     unit back to the merge-idle gate above. A unit still running pre-5371 code
-#     cannot see the request, and keeps the merge-idle gate unchanged.
+# TWO-STAGE DRAIN (task 5371), PER UNIT (task 7297): "busy" above only says
+# the merge QUEUE is non-empty, which on a permanently-loaded unit is always, so
+# the gate used to wait out the whole busy grace and then kill whatever merge
+# verify was running. Under --drain the sweep therefore also asks each unit to
+# stop STARTING merge verifies, and waits for the ones already running to
+# finish. Both stages run for one unit at a time, when the restart loop reaches
+# it (drain_gate):
+#   - Stage A: write the unit's drain request <fleet_dir>/<unit>.drain.json.
+#     The orchestrator's 15 s merge-heartbeat service reads its own request,
+#     halts merge admission and acknowledges it in its heartbeat. Every later
+#     unit keeps admitting merges meanwhile.
+#   - Stage B: poll the heartbeat with the unit's requested_ts. verifying (a
+#     merge verify is still inside its own deadline) is awaited WITHOUT the busy
+#     grace, up to ORCH_DRAIN_VERIFY_MAX_WAIT_SECS counted from this unit's own
+#     request, and never past the sweep-wide ceiling below; idle (acknowledged,
+#     halted, nothing in flight) resumes; overdue (every in-flight verify is
+#     past its own command timeout, so it is about to be killed regardless)
+#     restarts at once; refused (the unit examined the
+#     request and declined it) drops that unit back to the merge-idle gate
+#     above. A unit still running pre-5371 code cannot see the request, and
+#     keeps the merge-idle gate unchanged. Until a unit acknowledges, its
+#     request reads busy, so each unit's first poll usually defers once.
+# SWEEP-WIDE CEILING: ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS, counted from
+# sweep start, bounds verify-awaiting across the whole sweep so that it ends
+# inside the fleet lease; its derivation is at its assignment below. Once it is
+# spent, the unit being awaited is restarted at once, and every later unit
+# still gets its drain request but is restarted at its first acknowledged
+# poll: idle as usual, verifying at once instead of awaited (busy keeps its
+# own bound). At the defaults the ceiling binds before the per-unit cap, which
+# matters only when set lower. A killed verify is the accepted price; a lapsed
+# lease, which lets a second sweep start, is not.
+# What the halt protects is per unit by construction: no new merge starts on a
+# unit between its request and its restart. drain_check.py classifies one
+# unit's OWN verifies, wherever they run, and a restart kills only that unit's
+# verifies; no unit's restart ever waited on another unit's verify, on a shared
+# host or otherwise, so halting every unit up front (5371's first shape) bought
+# a late unit nothing but a halted lane for the whole sweep -- 2 h 13 m for
+# dark-factory on 2026-10-20.
 # A unit's request is removed right after its restart, success or failure, and
 # the EXIT trap removes any still carrying this sweep's pid -- never another
 # sweep's. An orchestrator also drops a request whose sweep pid is dead, so a
@@ -109,12 +125,16 @@ set -euo pipefail
 #                                         drain poll to this file (default:
 #                                         unset = off; no other behaviour
 #                                         changes)
-#   ORCH_DRAIN_VERIFY_MAX_WAIT_SECS       cap on awaiting in-flight merge
-#                                         verifies, counted ONCE from Stage A
-#                                         for the whole sweep, after which the
-#                                         unit is restarted anyway (default:
+#   ORCH_DRAIN_VERIFY_MAX_WAIT_SECS       cap on awaiting one unit's in-flight
+#                                         merge verifies, counted from that
+#                                         unit's own drain request, after which
+#                                         it is restarted anyway (default:
 #                                         11400 = 10800, the longest configured
 #                                         merge-verify command timeout, + 600)
+#   ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS sweep-wide ceiling on verify-awaiting,
+#                                         counted from sweep start (default:
+#                                         10300, derived at its assignment
+#                                         below)
 
 FIELDS="MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic"
 VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
@@ -241,11 +261,31 @@ DRAIN_POLL_INTERVAL_SECS="${ORCH_DRAIN_POLL_INTERVAL_SECS:-30}"
 DRAIN_UNKNOWN_GRACE_SECS="${ORCH_DRAIN_UNKNOWN_GRACE_SECS:-120}"
 DRAIN_POLL_TRACE_FILE="${ORCH_DRAIN_POLL_TRACE_FILE:-}"
 DRAIN_VERIFY_MAX_WAIT_SECS="${ORCH_DRAIN_VERIFY_MAX_WAIT_SECS:-11400}"
-# Sweep state written by drain_stage_a and read by drain_check_verdict: the
-# requested_ts this sweep wrote for each unit (cleared for a unit that refuses
-# it), and the $SECONDS at which Stage A finished.
+# The fleet lease max-age (ORCH_FLEET_LEASE_MAX_AGE_SECS, 14400; its readers'
+# copies are pinned together) is FIXED, and this default is derived to fit
+# under it -- the one home of that arithmetic. Past the ceiling a sweep can still spend, at worst:
+#   - on the unit in progress when it elapses, 1080s: one that never
+#     acknowledges spends a 120s opening stale grace, its 600s busy grace and a
+#     final 120s stale re-probe, then a restart of TimeoutStopSec 90 +
+#     VERIFY_TIMEOUT 30 + VERIFY_GRACE 120 = 240s. A verifying unit is caught
+#     sooner: within one poll + one stale re-probe, 150s, before the same
+#     restart.
+#   - on each of up to 7 later units (8 orchestrator units run, measured
+#     2026-10-21), 420s: two 30s polls to see its acknowledgement, one 120s
+#     stale re-probe and the 240s restart.
+# 14400 - 1080 - 7 x 420 = 10380, rounded down to 10300.
+# Residual: a later unit that never acknowledges while merge-busy (pre-5371
+# code, a refused request, or an unwritable request) waits out its busy grace
+# instead of two polls, up to ~660s more each.
+DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS="${ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS:-10300}"
+# Sweep state written by drain_request_write and read by drain_check_verdict:
+# the requested_ts this sweep wrote for each unit (cleared for a unit that
+# refuses it).
 declare -A DRAIN_REQUESTED_TS=()
-DRAIN_STAGE_A_SECS=0
+# The sweep-wide ceiling's clock, stamped once just before the restart loop,
+# and whether drain_sweep_ceiling_announce has already printed its one line.
+DRAIN_SWEEP_STARTED_AT=0
+DRAIN_SWEEP_CEILING_ANNOUNCED=0
 # Return channel for drain_await_fresh -- never declare 'local' anywhere
 # (full contract and incident rationale live in drain_await_fresh's own
 # docstring, task 3852).
@@ -612,9 +652,22 @@ _drain_validate_verdict() {
     esac
 }
 
+drain_sweep_ceiling_spent() {
+    [[ $((SECONDS - DRAIN_SWEEP_STARTED_AT)) -ge $DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS ]]
+}
+
+drain_sweep_ceiling_announce() {
+    # $1 = the unit the sweep is on when it first finds the ceiling spent.
+    if [[ $DRAIN_SWEEP_CEILING_ANNOUNCED -eq 0 ]]; then
+        DRAIN_SWEEP_CEILING_ANNOUNCED=1
+        echo "sweep-wide drain verify-wait ceiling of ${DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS}s spent after $((SECONDS - DRAIN_SWEEP_STARTED_AT))s, at ${1}; this and later units are force-restarted at their first acknowledged poll"
+    fi
+}
+
 drain_gate() {
-    # $1 = unit name.  Only called when --drain was passed.  Blocks
-    # (poll-and-recheck) until it is safe to restart $1.
+    # $1 = unit name.  Only called when --drain was passed.  Asks $1 to stop
+    # admitting merges (Stage A), then blocks (poll-and-recheck) until it is
+    # safe to restart it (Stage B).
     #
     # - idle (fresh, merge_idle -- or, once the unit has acknowledged this
     #   sweep's drain request, nothing in flight) returns immediately
@@ -640,14 +693,28 @@ drain_gate() {
     #   the forced restart indefinitely.
     # - verifying (a merge verify is still inside its own deadline) waits
     #   WITHOUT the busy grace -- killing the verify is exactly what the grace
-    #   would do -- bounded instead by DRAIN_VERIFY_MAX_WAIT_SECS from Stage A.
+    #   would do -- bounded instead by DRAIN_VERIFY_MAX_WAIT_SECS from this
+    #   unit's request and by the sweep-wide ceiling: once that is spent, a
+    #   verifying unit is restarted at once.
     #
     # A unit that goes stale/absent while waiting is not held for the rest of
     # the wait: a dead unit isn't merging, so it drops into the same bounded
     # drain_await_fresh handling as the top-level stale/absent case.  A line is
     # printed only when the waiting verdict changes.
     local unit="$1"
-    local verdict announced="" busy_start=""
+    local verdict announced="" busy_start="" requested_at
+    if drain_sweep_ceiling_spent; then
+        drain_sweep_ceiling_announce "$unit"
+    fi
+    # A request that cannot be written leaves the unit on the merge-idle gate
+    # (no requested_ts recorded) -- loudly, never by aborting a fleet redeploy
+    # over the drain's own plumbing.
+    if drain_request_write "$unit"; then
+        echo "requested a merge-admission drain on ${unit}"
+    else
+        echo "WARNING: could not write a drain request for ${unit} under ${FLEET_DIR}; using the merge-idle gate for it" >&2
+    fi
+    requested_at=$SECONDS
     drain_await_fresh "$unit"
     verdict="$_DRAIN_VERDICT"
     while true; do
@@ -688,11 +755,16 @@ drain_gate() {
                 fi
                 ;;
             verifying)
+                if drain_sweep_ceiling_spent; then
+                    drain_sweep_ceiling_announce "$unit"
+                    echo "force-restarting ${unit}: sweep-wide drain verify-wait ceiling spent"
+                    return 0
+                fi
                 if [[ "$announced" != "verifying" ]]; then
                     echo "awaiting in-flight merge verify on ${unit}"
                     announced="verifying"
                 fi
-                if [[ $((SECONDS - DRAIN_STAGE_A_SECS)) -ge $DRAIN_VERIFY_MAX_WAIT_SECS ]]; then
+                if [[ $((SECONDS - requested_at)) -ge $DRAIN_VERIFY_MAX_WAIT_SECS ]]; then
                     echo "force-restarting ${unit}: drain verify-wait cap of ${DRAIN_VERIFY_MAX_WAIT_SECS}s exceeded"
                     return 0
                 fi
@@ -710,23 +782,6 @@ drain_gate() {
             verdict="$_DRAIN_VERDICT"
         fi
     done
-}
-
-drain_stage_a() {
-    # $@ = every unit this sweep will restart.  Stage A of the two-stage
-    # drain: ask them ALL to stop starting merge verifies before the first
-    # restart, so the per-unit waits that follow overlap instead of adding up.
-    local unit
-    for unit in "$@"; do
-        # A request that cannot be written leaves that unit on the merge-idle
-        # gate (no requested_ts recorded) -- loudly, never by aborting a fleet
-        # redeploy over the drain's own plumbing.
-        if ! drain_request_write "$unit"; then
-            echo "WARNING: could not write a drain request for ${unit} under ${FLEET_DIR}; using the merge-idle gate for it" >&2
-        fi
-    done
-    DRAIN_STAGE_A_SECS=$SECONDS
-    echo "requested a merge-admission drain on $# orchestrator unit(s)"
 }
 
 stamp_fleet_deploy_clock() {
@@ -804,10 +859,7 @@ fi
 
 echo "Restarting ${#ordered_units[@]} orchestrator unit(s): ${ordered_units[*]}"
 
-if [[ $DRAIN_ENABLED -eq 1 ]]; then
-    drain_stage_a "${ordered_units[@]}"
-fi
-
+DRAIN_SWEEP_STARTED_AT=$SECONDS
 failures=()
 for unit in "${ordered_units[@]}"; do
     # Before the gate, not after it: a unit deferred for its whole busy grace

@@ -25,6 +25,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from shared import project_layout
+
 from orchestrator.event_store import EventType
 
 # Canonical location of the containment probe report (γ4 commits it to main).
@@ -346,9 +348,9 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--repo-root", default=None, help="repo root (default: cwd)")
     parser.add_argument("--events-db", default=None,
-                        help="event store (default: <repo-root>/data/orchestrator/runs.db)")
+                        help="event store (default: shared.project_layout.runs_db(repo-root))")
     parser.add_argument("--tasks-db", default=None,
-                        help="task records (default: <repo-root>/.taskmaster/tasks/tasks.db)")
+                        help="task records (default: shared.project_layout.tasks_db(repo-root))")
     parser.add_argument("--report-ref", default="main",
                         help="git ref the probe report must be tracked on (default: main)")
     parser.add_argument("--report-path", default=PROBE_REPORT_PATH,
@@ -367,11 +369,11 @@ def main(argv=None) -> int:
     repo_root = Path(args.repo_root) if args.repo_root else Path.cwd()
     events_db = (
         Path(args.events_db) if args.events_db
-        else repo_root / "data" / "orchestrator" / "runs.db"
+        else project_layout.runs_db(repo_root)
     )
     tasks_db = (
         Path(args.tasks_db) if args.tasks_db
-        else repo_root / ".taskmaster" / "tasks" / "tasks.db"
+        else project_layout.tasks_db(repo_root)
     )
 
     try:

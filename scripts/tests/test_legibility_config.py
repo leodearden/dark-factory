@@ -274,6 +274,108 @@ class TestNoveltySpikeBaseline:
             mod.load_config(_write(tmp_path, text))
 
 
+class TestAdjudication:
+    """``census.adjudication`` — the similarity stage's thresholds, its
+    per-run queue cap and its embedding model (plans/census-incremental-prd.md
+    D3, D4, T1)."""
+
+    def test_defaults_when_census_block_omitted_entirely(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
+        adjudication = cfg.census.adjudication
+        assert isinstance(adjudication, mod.Adjudication)
+        assert adjudication.attach_min_similarity == 0.90
+        assert adjudication.cluster_min_similarity == 0.85
+        assert adjudication.max_clusters_per_run == 10
+        assert adjudication.embedding_model == 'text-embedding-3-small'
+
+    def test_partial_block_keeps_other_defaults(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {adjudication: {max_clusters_per_run: 3}}\n'
+        adjudication = mod.load_config(_write(tmp_path, text)).census.adjudication
+        assert adjudication.max_clusters_per_run == 3
+        assert adjudication.attach_min_similarity == 0.90
+        assert adjudication.cluster_min_similarity == 0.85
+        assert adjudication.embedding_model == 'text-embedding-3-small'
+
+    def test_full_override_round_trips(self, tmp_path):
+        text = MINIMAL_YAML + textwrap.dedent("""\
+            census:
+              adjudication:
+                attach_min_similarity: 0.95
+                cluster_min_similarity: 0.8
+                max_clusters_per_run: 4
+                embedding_model: text-embedding-3-large
+            """)
+        adjudication = mod.load_config(_write(tmp_path, text)).census.adjudication
+        assert adjudication.attach_min_similarity == 0.95
+        assert adjudication.cluster_min_similarity == 0.8
+        assert adjudication.max_clusters_per_run == 4
+        assert adjudication.embedding_model == 'text-embedding-3-large'
+
+    def test_zero_cap_is_legal(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {adjudication: {max_clusters_per_run: 0}}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.adjudication.max_clusters_per_run == 0
+
+    @pytest.mark.parametrize('bad_value', ['-1', "'10'", '2.5'])
+    def test_negative_or_non_int_cap_raises(self, tmp_path, bad_value):
+        text = MINIMAL_YAML + f'census: {{adjudication: {{max_clusters_per_run: {bad_value}}}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+    @pytest.mark.parametrize('field', ['attach_min_similarity', 'cluster_min_similarity'])
+    @pytest.mark.parametrize('bad_value', ['-0.1', '1.5'])
+    def test_similarity_outside_unit_interval_raises(self, tmp_path, field, bad_value):
+        text = MINIMAL_YAML + f'census: {{adjudication: {{{field}: {bad_value}}}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+    def test_block_is_frozen(self):
+        adjudication = mod.Adjudication()
+        with pytest.raises(ValidationError):
+            adjudication.max_clusters_per_run = 99
+        assert adjudication.max_clusters_per_run == 10
+
+
+class TestLandingGate:
+    """``census.landing_gate`` — the command run in the project's checkout
+    before a census output lands (task 7448). Absent means ungated."""
+
+    def test_block_loads_as_a_frozen_landing_gate(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {landing_gate: {argv: [a, b], timeout_secs: 60}}\n'
+        gate = mod.load_config(_write(tmp_path, text)).census.landing_gate
+        assert isinstance(gate, mod.LandingGate)
+        assert gate.argv == ('a', 'b')
+        assert gate.timeout_secs == 60
+        with pytest.raises(ValidationError):
+            gate.timeout_secs = 1
+
+    def test_timeout_defaults_to_nine_hundred_seconds(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {landing_gate: {argv: [a]}}\n'
+        gate = mod.load_config(_write(tmp_path, text)).census.landing_gate
+        assert gate is not None
+        assert gate.timeout_secs == 900
+
+    def test_no_block_is_ungated(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML + 'census: {floor_days: 5}\n'))
+        assert cfg.census.landing_gate is None
+
+    @pytest.mark.parametrize(
+        'block',
+        [
+            '{argv: []}',
+            "{argv: [a, '']}",
+            '{argv: [a], timeout_secs: 0}',
+            '{argv: [a], timeout_secs: true}',
+            "{argv: [a], timeout_secs: '60'}",
+        ],
+        ids=['empty-argv', 'empty-arg', 'zero-timeout', 'bool-timeout', 'str-timeout'],
+    )
+    def test_a_malformed_block_raises(self, tmp_path, block):
+        text = MINIMAL_YAML + f'census: {{landing_gate: {block}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+
 class TestFullConfigOverridesDefaults:
     """A fully-populated §7.4 YAML round-trips every explicit value."""
 
@@ -545,6 +647,22 @@ class TestShippedDarkFactoryConfig:
         assert cfg.census.novelty_spike.window_hours == 72
         assert cfg.census.novelty_spike.multiple == 2
         assert cfg.census.novelty_spike.baseline_days == 30
+
+    def test_shipped_config_gates_landing_on_the_tests_that_read_the_live_codebook(self):
+        gate = mod.load_config(self.SHIPPED_CONFIG_PATH).census.landing_gate
+        assert gate is not None
+        assert 'scripts/tests/test_codebook.py' in gate.argv
+        assert 'scripts/tests/test_legibility_coder.py' in gate.argv
+
+    def test_shipped_config_landing_gate_names_only_test_files_that_exist(self):
+        # The gate fails closed: a renamed gated test makes pytest exit 4 and
+        # quarantines every dark_factory census, so the rename must go red here.
+        repo_root = Path(__file__).resolve().parents[2]
+        gate = mod.load_config(self.SHIPPED_CONFIG_PATH).census.landing_gate
+        assert gate is not None
+        test_paths = [arg for arg in gate.argv if arg.startswith('scripts/tests/')]
+        assert test_paths
+        assert [path for path in test_paths if not (repo_root / path).is_file()] == []
 
     def test_shipped_config_agent_transcript_roots_set_live(self):
         # The CRITICAL Leo ask (plans/agent-transcript-archival-prd.md, task γ):

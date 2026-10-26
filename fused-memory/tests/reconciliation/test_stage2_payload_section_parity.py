@@ -11,9 +11,10 @@ tells the model to draw an inference from that section's ABSENCE**. Today that
 set has exactly one member, ``### Live-Workflow Signals``, because
 ``prompts/stage2.py`` says:
 
-    "If `### Live-Workflow Signals` is absent from the payload, no task is live
-     this cycle — neither through a per-task signal nor through the project-wide
-     lock — and none has landing evidence; no live-workflow suppression applies."
+    "If `### Live-Workflow Signals` is absent from the payload, no task the
+     `### Active Task Tree` lists is live this cycle — neither through a
+     per-task signal nor through the project-wide lock — and none of them has
+     landing evidence; no live-workflow suppression applies to them."
 
 A builder that omits the section therefore makes the model conclude something
 FALSE, which is what makes the section mandatory.
@@ -25,8 +26,9 @@ THE STAGE-2 SECTION CENSUS — why every other conditional section stays out:
   branch is report-only.
 * Stale Flags Requiring Escalation — presence-conditional only; nothing is
   inferred when it is missing.
-* Done-Task Completion-Memory Audit, Proactive Task Sample, Tasks Needing
-  Memory Hint Attention — omitted on remediation passes BY DESIGN.
+* Done-Task Completion-Memory Audit, Blocked Gate-Task Review Audit, Proactive
+  Task Sample, Tasks Needing Memory Hint Attention — omitted on remediation
+  passes BY DESIGN.
 * Done-task Provenance — every done task carries an explicit label, so absence
   is never read as evidence.
 * Unconditional literal headers — always present; nothing to guard.

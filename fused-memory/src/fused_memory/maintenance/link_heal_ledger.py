@@ -26,6 +26,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from shared.sqlite_column_migration import add_column_if_missing_sync
+
 from fused_memory.maintenance.link_heal import (
     BasisSource,
     HealAction,
@@ -43,7 +45,24 @@ UNDO_ACTION = 'undo'
 class RunSource(StrEnum):
     CORPUS = 'corpus'
     ADJUDICATOR = 'adjudicator'
+    #: A plan whose heals rest on the deterministic rows alone.
+    DETERMINISTIC = 'deterministic'
     UNDO = 'undo'
+
+
+class RunKind(StrEnum):
+    PLAN = 'plan'
+    APPLY = 'apply'
+    UNDO = 'undo'
+
+    @classmethod
+    def of(cls, source: RunSource, *, writes: bool) -> RunKind:
+        if source is RunSource.UNDO:
+            return cls.UNDO
+        return cls.APPLY if writes else cls.PLAN
+
+
+_PLAN_RUNS_SQL = f"source != '{RunSource.UNDO}' AND writes = 0"
 
 
 class ActionState(StrEnum):
@@ -67,7 +86,8 @@ CREATE TABLE IF NOT EXISTS runs (
     started_at TEXT NOT NULL,
     finished_at TEXT,
     counts_json TEXT,
-    plan_sha256 TEXT
+    plan_sha256 TEXT,
+    plan_path TEXT
 );
 CREATE TABLE IF NOT EXISTS adjudications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -162,6 +182,23 @@ class RunRow:
     finished_at: str | None
     counts: Mapping[str, Any] | None
     plan_sha256: str | None
+    plan_path: Path | None
+
+    @property
+    def kind(self) -> RunKind:
+        return RunKind.of(self.source, writes=self.writes)
+
+
+class NothingToUndo(LookupError):
+    """The run has no heal still applied for an undo to take back."""
+
+    def __init__(self, run: RunRow) -> None:
+        self.run = run
+        super().__init__(
+            f'link-heal run {run.run_id[:8]} is a {run.kind.value} run '
+            f'(source {run.source.value}) with no heal still applied; '
+            'undo takes back only the heals an apply run applied',
+        )
 
 
 @dataclass(frozen=True)
@@ -175,6 +212,18 @@ class ActionRow:
     detail: Mapping[str, Any] | None
     executed_run_id: str | None
     undone_run_id: str | None
+
+
+@dataclass(frozen=True)
+class UndoTarget:
+    """An apply run and the heals it still has applied, oldest first. Never empty."""
+
+    run: RunRow
+    heals: tuple[ActionRow, ...]
+
+    def __post_init__(self) -> None:
+        if self.run.kind is not RunKind.APPLY or not self.heals:
+            raise NothingToUndo(self.run)
 
 
 @dataclass(frozen=True)
@@ -228,6 +277,8 @@ class LinkHealLedger:
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        # A ledger written before runs.plan_path existed.
+        add_column_if_missing_sync(self._conn, 'runs', 'plan_path', 'TEXT')
         self._conn.commit()
 
     def close(self) -> None:
@@ -243,13 +294,21 @@ class LinkHealLedger:
         return run_id
 
     def finish_run(
-        self, run_id: str, *, counts: Mapping[str, Any], plan_sha256: str | None = None,
+        self,
+        run_id: str,
+        *,
+        counts: Mapping[str, Any],
+        plan_sha256: str | None = None,
+        plan_path: Path | None = None,
     ) -> None:
         with self._conn:
             self._conn.execute(
-                'UPDATE runs SET finished_at = ?, counts_json = ?, plan_sha256 = ? '
-                'WHERE run_id = ?',
-                (_now(), json.dumps(counts, sort_keys=True), plan_sha256, run_id),
+                'UPDATE runs SET finished_at = ?, counts_json = ?, plan_sha256 = ?, '
+                'plan_path = ? WHERE run_id = ?',
+                (
+                    _now(), json.dumps(counts, sort_keys=True), plan_sha256,
+                    None if plan_path is None else str(plan_path), run_id,
+                ),
             )
 
     def writing_run_count(self) -> int:
@@ -259,6 +318,13 @@ class LinkHealLedger:
     def recent_runs(self, limit: int) -> list[RunRow]:
         rows = self._conn.execute('SELECT * FROM runs ORDER BY id DESC LIMIT ?', (limit,))
         return [_run_row(row) for row in rows]
+
+    def latest_plan_run(self, source: RunSource) -> RunRow | None:
+        row = self._conn.execute(
+            f'SELECT * FROM runs WHERE source = ? AND {_PLAN_RUNS_SQL} ORDER BY id DESC LIMIT 1',
+            (source.value,),
+        ).fetchone()
+        return None if row is None else _run_row(row)
 
     def resolve_run(self, run_ref: str) -> RunRow:
         """The run with id *run_ref*, or the one run whose id starts with it."""
@@ -331,6 +397,11 @@ class LinkHealLedger:
             (executed_run_id, ActionState.APPLIED.value),
         )
 
+    def undo_target(self, run: RunRow) -> UndoTarget:
+        """*run* with the heals an undo of it takes back; refuses a run with none."""
+        heals = self.applied_actions(run.run_id) if run.kind is RunKind.APPLY else []
+        return UndoTarget(run, tuple(heals))
+
     def set_outcome(
         self,
         action_id: int,
@@ -359,7 +430,8 @@ class LinkHealLedger:
         return matches[0] if matches else None
 
     def is_undo_suppressed(self, planned: PlannedAction) -> bool:
-        """An undo took this heal back for this pair at these text hashes."""
+        """An undo took this heal back for this pair at these text hashes, whatever basis
+        planned either: an undo takes back an action on a pair, not a basis."""
         rows = self._same_heal(planned, states=[ActionState.UNDONE.value])
         return any(
             row.planned.pre_image.parent_id == planned.pre_image.parent_id for row in rows
@@ -499,6 +571,7 @@ def _run_row(row: sqlite3.Row) -> RunRow:
         finished_at=row['finished_at'],
         counts=_loads_or_none(row['counts_json']),
         plan_sha256=row['plan_sha256'],
+        plan_path=None if row['plan_path'] is None else Path(row['plan_path']),
     )
 
 

@@ -20,27 +20,26 @@ class TestTasksReadRecord:
     The record is the one source of a read's MCP wire arguments, so a read and
     the request it sends cannot disagree. Two properties carry that:
 
-      * THE WINDOW COMES FROM THE MODE — the only read carrying an offset is
-        ``_OnePage``, whose window ``wire_arguments`` reads off the mode and
-        refuses to be handed a second time; a ``_CompleteRead`` walk varies
-        only the window it is given, page by page.
+      * THE WINDOW COMES FROM THE MODE — the only read carrying a window is
+        ``_OnePage``. ``wire_arguments`` takes NO window argument: it reads
+        the window off the mode, and a ``_CompleteRead`` sends none.
       * STATUSES CROSS THE WIRE BY MEANING — ``None`` (whole tree) omits the
         key, an empty set is SENT as ``[]`` ("no tasks"), and a set crosses
         ``sorted()`` because the SQL ``IN`` list it becomes has no order.
     """
 
-    def test_a_page_and_a_same_size_walk_are_distinct_and_named(self):
-        """A 10-row PAGE and a walk 10 rows at a time are different reads.
+    def test_a_page_and_a_complete_read_are_distinct_and_named(self):
+        """A 10-row PAGE and the complete set are different reads.
 
         They differ in length and content while agreeing on every other
         component, so the mode's TYPE is what says which answer a read
         returns — readable as a named field, not parsed out of a string.
         """
         page = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(10, 0))
-        walk = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead(10))
+        whole = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead())
 
-        assert page != walk
-        assert type(page.mode) is not type(walk.mode)
+        assert page != whole
+        assert type(page.mode) is not type(whole.mode)
 
         # `isinstance` rather than a bare attribute read, because that is how
         # production code must consume this union — and pyright ENFORCES it:
@@ -49,14 +48,13 @@ class TestTasksReadRecord:
         # itself the proof that the discriminator is real rather than
         # decorative, which is exactly what this test exists to pin.
         assert isinstance(page.mode, tasks_mod._OnePage)
-        assert isinstance(walk.mode, tasks_mod._CompleteRead)
+        assert isinstance(whole.mode, tasks_mod._CompleteRead)
         assert page.mode.page_size == 10
-        assert walk.mode.chunk_size == 10
 
     def test_wire_arguments_omits_statuses_entirely_when_none(self):
         """statuses=None means "whole tree": the key is absent from the wire."""
-        read = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead(None))
-        assert read.wire_arguments(None) == {'project_root': '/r'}
+        read = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead())
+        assert read.wire_arguments() == {'project_root': '/r'}
 
     def test_wire_arguments_sends_an_empty_statuses_list(self):
         """frozenset() must be SENT, not dropped.
@@ -66,9 +64,9 @@ class TestTasksReadRecord:
         "whole tree".
         """
         read = tasks_mod._TasksRead(
-            '/r', frozenset(), tasks_mod._CompleteRead(None)
+            '/r', frozenset(), tasks_mod._CompleteRead()
         )
-        assert read.wire_arguments(None) == {'project_root': '/r', 'statuses': []}
+        assert read.wire_arguments() == {'project_root': '/r', 'statuses': []}
 
     def test_wire_arguments_canonicalises_statuses_order(self):
         """A frozenset has no iteration order, so the wire list is sorted.
@@ -78,39 +76,9 @@ class TestTasksReadRecord:
         """
         read = tasks_mod._TasksRead(
             '/r', frozenset({'pending', 'done', 'blocked'}),
-            tasks_mod._CompleteRead(None),
+            tasks_mod._CompleteRead(),
         )
-        assert read.wire_arguments(None)['statuses'] == ['blocked', 'done', 'pending']
-
-    def test_wire_arguments_adds_page_size_and_offset_together_or_not_at_all(self):
-        """The tool takes a window as a pair, so the wire carries both or neither."""
-        read = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead(None))
-
-        without = read.wire_arguments(None)
-        assert 'page_size' not in without and 'offset' not in without
-
-        windowed = read.wire_arguments(tasks_mod._OnePage(25, 50))
-        assert windowed['page_size'] == 25
-        assert windowed['offset'] == 50
-
-    def test_a_walk_varies_the_window_across_pages_of_one_record(self):
-        """The walk re-uses one record across pages, varying only the window.
-
-        Each page of a chunked complete read is the SAME _TasksRead with a
-        different window, which is why the encoder takes a window at all. A
-        ``_CompleteRead`` mode fixes no window of its own, so this is the one
-        mode that may supply one.
-        """
-        read = tasks_mod._TasksRead(
-            '/r', frozenset({'done'}), tasks_mod._CompleteRead(10)
-        )
-        first = read.wire_arguments(tasks_mod._OnePage(10, 0))
-        second = read.wire_arguments(tasks_mod._OnePage(10, 10))
-
-        assert first == {
-            'project_root': '/r', 'statuses': ['done'], 'page_size': 10, 'offset': 0,
-        }
-        assert second['offset'] == 10
+        assert read.wire_arguments()['statuses'] == ['blocked', 'done', 'pending']
 
     def test_a_page_read_takes_its_wire_window_from_its_own_mode(self):
         """The bytes on the wire come from the record's own mode.
@@ -121,23 +89,9 @@ class TestTasksReadRecord:
         """
         read = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(25, 50))
 
-        assert read.wire_arguments(None) == {
+        assert read.wire_arguments() == {
             'project_root': '/r', 'page_size': 25, 'offset': 50,
         }
-
-    def test_a_page_read_refuses_a_second_window(self):
-        """Offering a window to a page read RAISES rather than overriding.
-
-        Silently preferring either one would reintroduce exactly the read/wire
-        disagreement this record exists to eliminate: the record would name
-        one window while the wire carried another. `TypeError`, not
-        `ValueError` — `first_success` treats `ValueError` as a soft per-url
-        failure and would launder a programming error into an offline marker.
-        """
-        read = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(25, 50))
-
-        with pytest.raises(TypeError):
-            read.wire_arguments(tasks_mod._OnePage(25, 75))
 
 
 # ---------------------------------------------------------------------------

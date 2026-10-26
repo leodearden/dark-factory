@@ -1071,7 +1071,7 @@ def test_memory_tab_reads_writes_axis_labels_whole_counts_only(
 def test_merge_tab_attempt_axis_labels_whole_counts_only(
     charts_jsx_body: str, tabs_jsx_body: str
 ) -> None:
-    """MergeTab's "Merge attempts · 15-min buckets" axis counts events per bucket."""
+    """MergeTab's merge-attempts depth axis counts events per bucket."""
     axes = _render_caller_axis(
         charts_jsx_body,
         _component_body(tabs_jsx_body, 'MergeTab'),

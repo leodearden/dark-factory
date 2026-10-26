@@ -181,7 +181,7 @@ class TestStage3RoutingFindingSurvivesSuppressionOnlyWhenActionable:
         state.start_report(run_id, StageId.memory_consolidator, 'dark_factory')
         r = state.add_finding(
             run_id=run_id,
-            severity='low',
+            severity='minor',
             category='cross_project',
             description='Stage 1 cross-project finding about reify/3803',
             suggested_action='Check reify project',

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -49,11 +49,11 @@ class TestHarnessKFromConfig:
     Patching strategy
     -----------------
     _start_merge_worker does a LOCAL import:
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             _MERGE_AHEAD_BOUND, SpeculativeMergeWorker,
             enforce_merge_liveness_margin, enforce_persistent_worktree_serial_lane,
         )
-    Patching the SOURCE module attribute (``orchestrator.merge_queue.*``) is
+    Patching the SOURCE module attribute (``orchestrator.merge_lane.worker.*``) is
     what the local import picks up at call time; patching ``orchestrator.harness.*``
     would have no effect because no module-level binding exists there.
     """
@@ -62,7 +62,7 @@ class TestHarnessKFromConfig:
         """Helper: build harness, patch, call _start_merge_worker, return mocks."""
         h = _build_harness(config)
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator',
                           return_value=MagicMock()), \
              patch('asyncio.create_task', return_value=MagicMock()), \
@@ -70,7 +70,6 @@ class TestHarnessKFromConfig:
              patch('orchestrator.merge_lane.liveness.enforce_persistent_worktree_serial_lane') as mock_serial:
 
             mock_smw = MagicMock()
-            mock_smw.run = AsyncMock(return_value=None)
             mock_smw_cls.return_value = mock_smw
 
             await h._start_merge_worker()
@@ -88,8 +87,12 @@ class TestHarnessKFromConfig:
 
         RED until step-12 wires K from config.enabled_verify_runners.
         """
-        r1 = VerifyRunnerConfig(name='r1', ssh_host='h1.local', git_remote='remote1')
-        r2 = VerifyRunnerConfig(name='r2', ssh_host='h2.local', git_remote='remote2')
+        r1 = VerifyRunnerConfig(
+            name='r1', ssh_host='h1.local', git_remote='remote1', df_checkout_path='/df',
+        )
+        r2 = VerifyRunnerConfig(
+            name='r2', ssh_host='h2.local', git_remote='remote2', df_checkout_path='/df',
+        )
         mock_orch_config.enabled_verify_runners = [r1, r2]
         mock_orch_config.max_concurrent_tasks = 2
         mock_orch_config.fused_memory.project_id = 'test'
@@ -195,6 +198,7 @@ class TestStartMergeWorkerK2LivenessRepro:
                 name='laptop',
                 ssh_host='leo-laptop',
                 git_remote='leo-laptop',
+                df_checkout_path='/home/leo/src/dark-factory',
             )],
             merge_verify_cold_command_timeout_secs=7200,
             git=GitConfig(
@@ -208,7 +212,7 @@ class TestStartMergeWorkerK2LivenessRepro:
 
         h = _build_harness(config)
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator',
                           return_value=MagicMock()), \
              patch('asyncio.create_task', return_value=MagicMock()), \

@@ -79,7 +79,7 @@ def _touch(path: Path, mtime: float, content: bytes = b'x') -> None:
 SHIPPED_LEGIBILITY_YAML = REPO_ROOT / 'docs' / 'legibility' / 'legibility.yaml'
 
 # A real orchestrated-task worktree cwd. Its encoding contains '--worktrees-',
-# which is what makes sampling.classify_agent_class return 'orchestrated-task'
+# which is what makes detectors.classify_agent_class return 'orchestrated-task'
 # and what inventory._enumerate's cheap <enc> pre-filter matches on.
 WORKTREE_CWD = '/home/leo/src/dark-factory/.worktrees/2732'
 SESSION_DATE = date(2026, 8, 17)
@@ -188,8 +188,7 @@ class TestE5MiningEnumeratesTheArchive:
 
         # ...and the session lands in the orchestrated-task stratum, which is
         # the whole point of mining the fleet archive.
-        first_turn = sampling._find_first_user_turn(record.path)
-        assert sampling.classify_agent_class(first_turn, record.path) == 'orchestrated-task'
+        assert sampling.score_session(record).stratum == 'orchestrated-task'
 
     def test_empty_roots_default_is_byte_parity_with_today(self, tmp_path):
         """PARITY — the archive is opt-in. With the empty code default the walk

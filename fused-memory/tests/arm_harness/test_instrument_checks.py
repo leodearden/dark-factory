@@ -55,6 +55,8 @@ def test_instrument_check_ids_are_a_closed_vocabulary():
         'endpoint-conformance',
         'validator-negative-control',
         'index-configuration',
+        'frozen-reference-unchanged',
+        'reembed-integrity',
     }
 
 

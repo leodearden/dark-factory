@@ -92,6 +92,7 @@ import sys
 import tomllib
 
 import pytest
+import verify_command_invariants as vci
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -117,55 +118,23 @@ _QUERY_TIMEOUT_SECS = 60
 
 
 def _marked_command(markdown_text, marker, bullet_label):
-    """The inline-code command on the *bullet_label* bullet delimited by *marker*.
+    """The command on the *bullet_label* bullet between *marker*'s begin/end comments.
 
-    Every failure is a loud ``AssertionError`` naming the marker literal and
-    CLAUDE.md, never a ``''``/``None`` return. That is the vacuity hazard and the
-    whole point: an extractor that silently yields nothing turns every downstream
-    assertion green while certifying nothing — strictly worse than no guard,
-    because the check still reports success. Copied from
-    ``_documented_lint_command`` in ``test_contributing_lint_command_drift.py``
-    (task 3558), including its label-anchored span regex: keying on backticks
-    alone would extract the begin comment's own explanatory inline code, which is
-    a plausible-looking string, so the mistake would not announce itself.
+    ``verify_command_invariants.marked_span`` owns the loud marker checks. This
+    guard supplies only the pattern, keyed on the bullet's label rather than on
+    backticks so that inline code in the begin comment is never extracted.
     """
-    begin = f"{marker}:begin"
-    end = f"{marker}:end"
-
-    begin_count = markdown_text.count(begin)
-    assert begin_count == 1, (
-        f"expected exactly one {begin!r} marker, found {begin_count} (task 3959). "
-        f"This marker delimits the copy-pasteable lookup command in CLAUDE.md's "
-        f"`### Locating installed code` section. If it was deleted, restore it "
-        f"around that bullet; if it was duplicated, one of the two copies is "
-        f"unpinned and free to rot into a command that no longer works."
-    )
-    end_count = markdown_text.count(end)
-    assert end_count == 1, (
-        f"expected exactly one {end!r} marker to close {begin!r} in CLAUDE.md, "
-        f"found {end_count} (task 3959) — restore the closing marker below the "
-        f"bullet it wraps"
-    )
-
-    # Inverted markers yield an empty slice, so the next assertion catches that
-    # too, loudly and with the same remedy.
-    marked = markdown_text[markdown_text.index(begin):markdown_text.index(end)]
-    pattern = re.compile(r"- \*\*" + re.escape(bullet_label) + r"\*\*: `([^`]+)`")
-    spans = pattern.findall(marked)
-    assert len(spans) == 1, (
-        f"expected exactly one ``- **{bullet_label}**: `<command>``` bullet "
-        f"between {begin!r} and {end!r} in CLAUDE.md, found {len(spans)}: "
-        f"{spans!r} (task 3959). The marker must wrap that bullet and nothing "
-        f"else; if the bullet was relabelled or the markers were inverted, move "
-        f"the marker back around the copy-pasteable command."
-    )
-
-    command = spans[0].strip()
-    assert command, (
-        f"the command between {begin!r} and {end!r} in CLAUDE.md is empty "
-        f"(task 3959)"
-    )
-    return command
+    bullet = re.compile(r"- \*\*" + re.escape(bullet_label) + r"\*\*: `([^`]+)`")
+    return vci.marked_span(
+        markdown_text,
+        begin=f"{marker}:begin",
+        end=f"{marker}:end",
+        pattern=bullet,
+        what=f"`- **{bullet_label}**: <command>` bullet",
+        source="CLAUDE.md",
+        label=f"the {bullet_label!r} command",
+        task="3959",
+    ).strip()
 
 
 # Hand-written fixtures. The marker literals are spelled out IN FULL rather than

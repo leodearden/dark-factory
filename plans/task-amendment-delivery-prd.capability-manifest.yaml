@@ -342,3 +342,5 @@ tasks:
         delivered_check:
           kind: manual
           reason: "both are NEGATIVE properties spread across α's and δ's production shapes (a stamp that must not happen; an I/O call that must not be made), and the two positive anchors above already prove η's test modules exist and exercise both packages"
+signal_leaves:
+- "η"

@@ -69,7 +69,6 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
-from enum import StrEnum
 from pathlib import Path
 
 from orchestrator.evals.task_sampler import (
@@ -79,10 +78,10 @@ from orchestrator.evals.task_sampler import (
     default_verify_commands,
     repo_of_project,
 )
-from orchestrator.landing_evidence import is_valid_sha_40
+from orchestrator.merge_lane.landing_evidence import is_valid_sha_40
+from orchestrator.shadow_types import ShadowShape
 
 __all__ = [
-    'ShadowShape',
     'build_live_fixture',
     'live_stratum',
     'live_verify_commands',
@@ -93,51 +92,6 @@ __all__ = [
 # ``runner.py::build_eval_orch_config`` — a different gate than the corpus
 # baseline it is scored against.
 _REQUIRED_GATES = ('test', 'lint', 'typecheck')
-
-
-class ShadowShape(StrEnum):
-    """The closed vocabulary of shadow-cell shapes (C1, ``shadow_cells.shape``).
-
-    A ``StrEnum`` rather than a bare ``str`` parameter: the vocabulary is
-    closed, so a member IS the value stored in the TEXT column and read back
-    with ``ShadowShape(raw)``, while the plan rule below lives beside the
-    vocabulary it constrains instead of being re-derived at each call site.
-
-    Sited in this module deliberately, and not to be re-litigated: leaf α
-    (C1's ``shadow_cells`` store in ``run_store.py``) and this leaf are both
-    ``Prereqs: none``, so this one cannot import α, and it is the vocabulary's
-    first consumer. When α lands it imports this enum rather than restating
-    the four values (heuristic 11, SPOT) — accepting that ``run_store`` then
-    reaches up into ``orchestrator.evals`` and drags ``task_sampler``'s git
-    and sqlite glue along with it. If α would rather not carry that import,
-    relocating the enum down beside its ``ShadowCell`` record (the way
-    ``LandingReason`` lives beside its consumers) is α's call to make, with
-    this module importing it back. What must not happen either way is a second
-    copy of the four values.
-    """
-
-    IMPLEMENTER = 'implementer'
-    ARCHITECT = 'architect'
-    ARCHITECT_CONSEQUENCE = 'architect-consequence'
-    END_TO_END = 'end-to-end'
-
-    @property
-    def requires_plan(self) -> bool:
-        """Whether a cell of this shape must be built with a plan.
-
-        Tracks C1's ``plan_source`` column: ``'production'`` for
-        ``implementer`` (the cell runs production's own accepted plan),
-        ``'candidate'`` for ``architect-consequence`` (consequence leg 2, the
-        incumbent implementer run over the candidate architect's plan), and
-        NULL for the two shapes whose architect is live — ``architect`` (the
-        leg-1 architect cell) and ``end-to-end`` — neither of whose runners
-        reads a plan at all.
-
-        Plan presence is therefore a total function of shape, which is what
-        lets ``build_live_fixture`` refuse in both directions rather than
-        letting a stray plan be silently ignored.
-        """
-        return self in (ShadowShape.IMPLEMENTER, ShadowShape.ARCHITECT_CONSEQUENCE)
 
 
 def _resolved_shape(shape: str) -> ShadowShape:

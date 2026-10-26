@@ -651,8 +651,9 @@ kill "$G5_LOCK_PID" 2>/dev/null || true
 _BGPIDS=()  # clear so cleanup doesn't double-kill
 
 # ── G6: non-integer --critical-free-gib → exit 2 + stderr warning ────────────
-# Regression guard for the CRITICAL_FREE_GIB integer-format validation
-# (scripts/warm-lane-gc-sweep.sh: `grep -qE '^[0-9]+$'` guard, ~L139-143). A
+# Regression guard for warm-lane-gc-sweep.sh's CRITICAL_FREE_GIB validation,
+# which admits only a whole value that is a canonical decimal of at most 5
+# digits (0-99999, no leading zeros) and exits 2 on anything else. A
 # dropped or weakened guard (e.g. accepting "2G" or an empty value) would let
 # the sweep silently compare avail_bytes against a bogus/zero floor and never
 # engage --disk-pressure, with nothing to catch it. Mirrors Block A's
@@ -714,6 +715,15 @@ for G6_BAD in 08 010 9223372036854775807; do
     assert "G6d: --critical-free-gib $G6_BAD gc-script NOT invoked" \
         bash -c '[ ! -f "$1" ] || [ ! -s "$1" ]' _ "$G6_GC_LOG"
 done
+
+# G6g: a multi-line value whose first line is valid is rejected too.
+GC_LOG="$G6_GC_LOG" run_sweep --mount "$G6_MOUNT" --gc-script "$G6_GC_STUB" --critical-free-gib $'2\nx'
+
+assert "G6g: multi-line --critical-free-gib exits 2" test "$RC" -eq 2
+assert "G6g: stderr warns of invalid integer" \
+    bash -c 'grep -qi "valid integer" <<<"$1"' _ "$ERR_OUT"
+assert "G6g: gc-script NOT invoked (usage error precedes exec)" \
+    bash -c '[ ! -f "$1" ] || [ ! -s "$1" ]' _ "$G6_GC_LOG"
 
 # ── G7: df succeeds (exit 0) but reports unparseable avail bytes ─────────────
 # Distinct code path from G3 (which covers a non-zero df EXIT CODE): here df

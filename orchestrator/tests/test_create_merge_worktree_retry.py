@@ -23,7 +23,7 @@ two sites that retry a ``git worktree add`` (``_create_merge_worktree`` and
 git_ops.py:
 
   step-1: ``_worktree_add_failure_is_retryable`` — the single shared
-          predicate, plus the ``_ENOSPC_MARKERS`` single-vocabulary identity
+          predicate, deciding ENOSPC by ``verify_classify.reports_disk_full``
   step-3: ``GitOps._worktree_add_with_retry`` — the single shared driver
   step-5: ``_create_merge_worktree`` absorbs the transient flake
   step-7: ENOSPC fast-fails, and the final error carries rc + both streams
@@ -49,6 +49,7 @@ from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 from _worktree_add_fakes import make_fake_run
 
 import orchestrator.git_ops as git_ops_mod
+import orchestrator.merge_lane.worker as worker_mod
 import orchestrator.verify_classify as verify_classify_mod
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
@@ -85,9 +86,8 @@ class TestWorktreeAddRetryPredicate:
     "contention" allow-list would fail to recognise at least one of the very
     failures this task exists to absorb.
 
-    RED today: ``_worktree_add_failure_is_retryable``,
-    ``_WORKTREE_ADD_MAX_ATTEMPTS`` and ``_ENOSPC_MARKERS`` do not exist in
-    git_ops.py.
+    RED today: ``_worktree_add_failure_is_retryable`` and
+    ``_WORKTREE_ADD_MAX_ATTEMPTS`` do not exist in git_ops.py.
     """
 
     def test_enospc_on_stderr_is_not_retryable(self) -> None:
@@ -109,14 +109,18 @@ class TestWorktreeAddRetryPredicate:
         ) is False
 
     def test_enospc_matching_is_case_insensitive(self) -> None:
-        """Mirrors ``merge_queue._verify_hit_enospc``'s whole-output,
-        case-insensitive match against the same vocabulary."""
         assert git_ops_mod._worktree_add_failure_is_retryable(
-            1, '', 'fatal: write error: ENOSPC',
+            1, '', 'Error: ENOSPC: no space left on device, write',
         ) is False
         assert git_ops_mod._worktree_add_failure_is_retryable(
             1, '', 'No Space Left On Device',
         ) is False
+
+    def test_bare_enospc_token_is_not_disk_full_evidence(self) -> None:
+        """Only an OS error rendering is evidence of a full disk (task 7032)."""
+        assert git_ops_mod._worktree_add_failure_is_retryable(
+            1, '', 'fatal: write error: ENOSPC',
+        ) is True
 
     def test_4215_administrative_race_is_retryable(self) -> None:
         assert git_ops_mod._worktree_add_failure_is_retryable(
@@ -147,18 +151,12 @@ class TestWorktreeAddRetryPredicate:
         3-attempt / [0.5, 1.0]-backoff tests are unaffected."""
         assert git_ops_mod._WORKTREE_ADD_MAX_ATTEMPTS == 3
 
-    def test_enospc_markers_are_imported_not_recopied(self) -> None:
-        """ONE shared vocabulary, imported rather than copied a third time.
-
-        The tuple already exists verbatim twice (verify_classify.py and
-        merge_queue.py), each declaring itself a "single grounded
-        vocabulary ... do not invent new ENOSPC strings; extend that
-        constant instead". Object IDENTITY (not equality) is asserted so a
-        future well-meaning "just inline it" refactor turns this test red
-        rather than quietly forking the vocabulary into a third copy that
-        can drift.
-        """
-        assert git_ops_mod._ENOSPC_MARKERS is verify_classify_mod._ENOSPC_MARKERS
+    def test_disk_full_predicate_is_imported_not_recopied(self) -> None:
+        """ONE disk-full predicate (task 7032). Object IDENTITY is asserted
+        so an "inline it" refactor turns this red rather than forking a copy
+        that can drift."""
+        assert git_ops_mod.reports_disk_full is verify_classify_mod.reports_disk_full
+        assert worker_mod.reports_disk_full is verify_classify_mod.reports_disk_full
 
 
 # ---------------------------------------------------------------------------

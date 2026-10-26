@@ -10,7 +10,7 @@
 // statically detect named exports assigned from a variable, so
 // `import { staleNoticesForTab } from '...'` would come back undefined. We
 // therefore default-import the module and destructure instead (mirrors
-// tasks_offline_banner.test.mjs / task_status_counts.test.mjs). A plain
+// tasks_offline_banner.test.mjs / graph_layout.test.mjs). A plain
 // static ESM import is SAFE here — unlike data.js, this module touches no
 // browser global at load; its `window.DF_ENDPOINT_STALENESS` assignment is
 // guarded by `typeof window !== 'undefined'`.
@@ -27,10 +27,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+
+import { loadDataJs } from './_data_loader.mjs';
 
 const {
   STALE_FAILURE_THRESHOLD,
@@ -199,31 +200,6 @@ test('an endpoint that never succeeded says NEVER, not "0s ago"', () => {
 
 // ── (e) the tab->endpoint map is machine-checked against the real sources ──
 
-// Loads data.js against a shimmed browser-ish global. data.js assigns
-// `window.DF_DATA = {...}` at module scope, and an ESM `import` statement's
-// target module body runs BEFORE the importing file's own body — so
-// `globalThis.window` would still be unset when data.js's top level runs,
-// throwing `ReferenceError: window is not defined`. We therefore shim
-// window/fetch FIRST and only then load via createRequire, exactly as
-// data_poll.test.mjs::loadDataJs documents. `document` is deliberately NOT
-// shimmed, so data.js's auto-start guard stays inert under node.
-//
-// data.js also destructures window.DF_DATUM at module scope (task 5588), and
-// datum.js in turn destructures THIS module's formatAge, so the shim carries
-// DF_ENDPOINT_STALENESS and datum.js is loaded first — index.html's order,
-// endpoint_staleness.js -> datum.js -> data.js, reproduced under node.
-function loadDataJs() {
-  globalThis.window = { dispatchEvent: () => {}, DF_ENDPOINT_STALENESS: staleness };
-  globalThis.fetch = () => Promise.resolve({ ok: true, json: async () => ({}) });
-  const require = createRequire(import.meta.url);
-  const datumSpecifier = '../../src/dashboard/static/redux/datum.js';
-  delete require.cache[require.resolve(datumSpecifier)];
-  require(datumSpecifier);
-  const specifier = '../../src/dashboard/static/redux/data.js';
-  delete require.cache[require.resolve(specifier)];
-  return require(specifier);
-}
-
 // app.jsx is `type="text/babel"` and cannot be imported here, so the tab ids
 // are read out of its source — the same source-text contract idiom the Python
 // suite uses for .jsx (see test_tab_escalation_analytics.py).
@@ -237,7 +213,7 @@ function appTabIds() {
 test('every mapped endpoint is a real endpointsFor() path', () => {
   // A map that silently stops matching a renamed endpoint is a check that
   // quietly stops checking: it would report "healthy" forever.
-  const { endpointsFor, pollKey } = loadDataJs();
+  const { endpointsFor, pollKey } = loadDataJs().api;
   const real = new Set(Object.keys(endpointsFor('24h')).map(pollKey));
 
   for (const [tab, paths] of Object.entries(TAB_ENDPOINTS)) {
@@ -386,7 +362,7 @@ test('data.js prefers THIS module\'s threshold over its own fallback', async () 
   // source, and data.js names that global in a COMMENT explaining the lazy
   // read — so deleting the real read left the assertion green while its
   // message claimed the opposite.
-  const api = loadDataJs();
+  const { api } = loadDataJs();
   // Set AFTER the load, deliberately: loadDataJs installs a fresh
   // globalThis.window, and LAZINESS is exactly the property under test. data.js
   // is the FIRST classic script in index.html, so a module-scope read would be
@@ -437,7 +413,7 @@ test('CHROME_ENDPOINTS is an exported, frozen, duplicate-free array', () => {
 });
 
 test('every CHROME_ENDPOINTS entry is a real endpointsFor() path', () => {
-  const { endpointsFor, pollKey } = loadDataJs();
+  const { endpointsFor, pollKey } = loadDataJs().api;
   const real = new Set(Object.keys(endpointsFor('24h')).map(pollKey));
   for (const p of CHROME_ENDPOINTS) {
     assert.ok(real.has(p),
@@ -548,7 +524,7 @@ function quietDeps(fetchImpl) {
 }
 
 test('over the real data.js: every tab is loading before the first refresh, none after it', async () => {
-  const api = loadDataJs();
+  const { api } = loadDataJs();
   for (const [tab, notice] of Object.entries(liveLoadingNotices(globalThis.window))) {
     assert.deepEqual(notice?.paths, TAB_ENDPOINTS[tab], `${tab}: ${JSON.stringify(notice)}`);
   }
@@ -564,7 +540,7 @@ test('over the real data.js: every tab is loading before the first refresh, none
 });
 
 test('over the real data.js: an endpoint that failed its first poll leaves only its own tab loading', async () => {
-  const api = loadDataJs();
+  const { api } = loadDataJs();
   const curator = `${DASH}/curator`;
   const fetchImpl = url => (
     url.split('?')[0] === curator

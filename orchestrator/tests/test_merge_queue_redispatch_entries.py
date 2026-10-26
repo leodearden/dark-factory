@@ -34,8 +34,8 @@ from _merge_lane_fakes import lane_entry, make_lane
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeRequest
-from orchestrator.merge_types import DecidedItem, MergeOutcome, QueuedBranch, RealMergeItem
+from orchestrator.merge_lane.types import DecidedItem, MergeOutcome, QueuedBranch, RealMergeItem
+from orchestrator.merge_lane.worker import MergeRequest
 
 # ── fixtures (mirrors test_merge_queue_finalize_head_visibility.py) ─────────
 

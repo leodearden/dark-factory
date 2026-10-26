@@ -34,6 +34,7 @@ class _Fixture:
     artifacts: TaskArtifacts
     briefing: MagicMock
     invoke: AsyncMock
+    prompts: list[str]
     handle_no_plan: AsyncMock
 
 
@@ -89,7 +90,13 @@ def _make(tmp_path: Path) -> _Fixture:
     wf.artifacts = artifacts
     wf.worktree = worktree
 
-    invoke = AsyncMock(return_value=_succeeded())
+    prompts: list[str] = []
+
+    async def dispatch(_role, build_prompt, *_args, **_kwargs) -> AgentResult:
+        prompts.append(await build_prompt())
+        return _succeeded()
+
+    invoke = AsyncMock(side_effect=dispatch)
     wf._invoke = invoke  # type: ignore[method-assign]
     wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
     handle_no_plan = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
@@ -101,7 +108,7 @@ def _make(tmp_path: Path) -> _Fixture:
 
     return _Fixture(
         wf=wf, artifacts=artifacts, briefing=briefing,
-        invoke=invoke, handle_no_plan=handle_no_plan,
+        invoke=invoke, prompts=prompts, handle_no_plan=handle_no_plan,
     )
 
 
@@ -140,7 +147,8 @@ async def _drive_plan(
     f = _make(tmp_path)
     calls = {'n': 0}
 
-    async def scripted(*_args, **_kwargs) -> AgentResult:
+    async def scripted(_role, build_prompt, *_args, **_kwargs) -> AgentResult:
+        f.prompts.append(await build_prompt())
         calls['n'] += 1
         if calls['n'] == 1:
             _write_stepless_plan(f.artifacts)
@@ -162,7 +170,7 @@ class TestSchemaRepairDispatch:
         )
 
         assert f.invoke.await_count == 2
-        assert f.invoke.await_args_list[1].args[1] == 'REPAIR PROMPT'
+        assert f.prompts[1] == 'REPAIR PROMPT'
         f.briefing.build_plan_schema_repair_prompt.assert_awaited_once()
         assert f.briefing.build_plan_schema_repair_prompt.await_args.args[0] is f.wf.task
 
@@ -223,4 +231,4 @@ class TestReplanDispatch:
         f.briefing.build_replan_prompt.assert_awaited_once()
         assert f.briefing.build_replan_prompt.await_args.args == (f.wf.task, 'FEEDBACK')
         f.invoke.assert_awaited_once()
-        assert f.invoke.await_args.args[1] == 'REPLAN PROMPT'
+        assert f.prompts == ['REPLAN PROMPT']

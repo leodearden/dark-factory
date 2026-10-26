@@ -1,0 +1,9 @@
+{"v":1,"ts_ns":1792762120274197000,"pid":2670994,"event":"run_start","run_id":"1792762120-2670994","scope":"all","branch":"pool","discovered":3}
+{"v":1,"ts_ns":1792762120304471000,"pid":2671337,"event":"member_start","member":"test_pass.sh","attempt":1,"mode":"capture"}
+{"v":1,"ts_ns":1792762120305518000,"pid":2671332,"event":"member_start","member":"test_fail.sh","attempt":1,"mode":"capture"}
+{"v":1,"ts_ns":1792762120376538000,"pid":2671420,"event":"member_start","member":"test_skippable.sh","attempt":1,"mode":"capture"}
+{"v":1,"ts_ns":1792762120480539000,"pid":2670994,"event":"member_start","member":"test_fail.sh","attempt":2,"mode":"capture"}
+{"v":1,"ts_ns":1792762120610609000,"pid":2670994,"event":"member_finish","member":"test_fail.sh","attempt":2,"rc":1,"verdict":"FAIL","duration_ms":12,"fail_detail":["  FAIL: x"],"fail_detail_omitted":0}
+{"v":1,"ts_ns":1792762120654499000,"pid":2670994,"event":"member_finish","member":"test_pass.sh","attempt":1,"rc":0,"verdict":"PASS","duration_ms":67,"fail_detail":[],"fail_detail_omitted":0}
+{"v":1,"ts_ns":1792762120702698000,"pid":2670994,"event":"member_finish","member":"test_skippable.sh","attempt":1,"rc":0,"verdict":"PASS","duration_ms":27,"fail_detail":[],"fail_detail_omitted":0}
+{"v":1,"ts_ns":1792762120704234000,"pid":2670994,"event":"run_finish","discovered":3,"failures":1,"failed":["test_fail.sh"],"flaky":[],"skipped":[],"interrupted":false,"names_omitted":0}

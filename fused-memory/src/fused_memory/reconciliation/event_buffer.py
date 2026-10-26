@@ -15,6 +15,7 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     connect_daemon,
 )
+from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -22,6 +23,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.reconciliation.throughput import utc_hour_bucket
+from fused_memory.utils.sqlite_connector import Connector
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +119,13 @@ class EventBuffer:
         stale_lock_seconds: float = 7200.0,
         queue_stats_fn: Callable[[], Any] | None = None,
         instance_id: str | None = None,
+        *,
+        connect: Connector = connect_daemon,
     ):
+        """*connect* is how ``initialize`` opens the buffer's one connection.
+
+        It is given the database path and defaults to ``connect_daemon``.
+        """
         # _in_memory is derived from the caller's intent (db_path is None),
         # not from the resolved string ':memory:'.  This means explicitly
         # passing db_path=Path(':memory:') is treated as a file path and
@@ -133,12 +141,13 @@ class EventBuffer:
         self.stale_lock_seconds = stale_lock_seconds
         self._queue_stats_fn = queue_stats_fn
         self.instance_id = instance_id or str(uuid4())
+        self._connect = connect
         self._access: AtomicConnection | None = None
         self._manual_triggers: set[str] = set()
 
     async def initialize(self) -> None:
         """Open SQLite connection and ensure schema exists."""
-        conn = await connect_daemon(self._db_path)
+        conn = await self._connect(self._db_path)
         conn.row_factory = aiosqlite.Row
         # WAL mode cannot be enabled on in-memory SQLite DBs — SQLite
         # returns 'memory' from PRAGMA journal_mode=WAL which would trigger
@@ -158,40 +167,13 @@ class EventBuffer:
         logger.info(f'EventBuffer initialized (db={self._db_path}, instance={self.instance_id})')
 
     async def _migrate(self) -> None:
-        """Add new columns to pre-existing DBs (idempotent).
-
-        Each ALTER TABLE is:
-        * Guarded by a PRAGMA table_info check so we only run it when the column
-          is missing.
-        * Wrapped in try/except to survive the narrow race where two processes both
-          call initialize() on the same file concurrently — SQLite's ALTER TABLE
-          has no IF NOT EXISTS syntax, so the second writer would otherwise fail
-          with 'duplicate column name'.
-        """
-        access = self._require_access()
-        columns = {
-            row['name'] for row in await access.read_all('PRAGMA table_info(deferred_writes)')
-        }
-        eb_columns = {
-            row['name'] for row in await access.read_all('PRAGMA table_info(event_buffer)')
-        }
-
-        # One write unit for every DDL statement below: the PRAGMA probes above
-        # already ran as their own accesses, so nothing here nests.
-        async with access.write() as db:
+        """Add new columns to pre-existing DBs."""
+        async with self._require_access().write() as db:
             # Add drained_by_run_id if missing — attributes a drained row to the run
             # that drained it (task 2711 / E7) so restore_drained() can be scoped to
             # a single run instead of unconditionally restoring the whole project.
-            if 'drained_by_run_id' not in eb_columns:
-                try:
-                    await db.execute('ALTER TABLE event_buffer ADD COLUMN drained_by_run_id TEXT')
-                    logger.info(
-                        'EventBuffer: migrated event_buffer — added drained_by_run_id column'
-                    )
-                except Exception as exc:
-                    if 'duplicate column name' not in str(exc).lower():
-                        raise
-                    logger.debug('EventBuffer: drained_by_run_id already exists (concurrent init)')
+            if await add_column_if_missing(db, 'event_buffer', 'drained_by_run_id', 'TEXT'):
+                logger.info('EventBuffer: migrated event_buffer — added drained_by_run_id column')
 
             # Drop the now-redundant single-column project index.  idx_dw_project_claimed
             # (project_id, claimed_at) is a strict superset; keeping both wastes write
@@ -199,33 +181,18 @@ class EventBuffer:
             # had idx_dw_project.
             await db.execute('DROP INDEX IF EXISTS idx_dw_project')
 
-            # Add claimed_at if missing.
-            if 'claimed_at' not in columns:
-                try:
-                    await db.execute('ALTER TABLE deferred_writes ADD COLUMN claimed_at TEXT')
-                    await db.execute(
-                        'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
-                        ' ON deferred_writes(project_id, claimed_at)'
-                    )
-                    logger.info('EventBuffer: migrated deferred_writes — added claimed_at column')
-                except Exception as exc:
-                    if 'duplicate column name' not in str(exc).lower():
-                        raise
-                    logger.debug('EventBuffer: claimed_at already exists (concurrent init)')
+            if await add_column_if_missing(db, 'deferred_writes', 'claimed_at', 'TEXT'):
+                await db.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_dw_project_claimed'
+                    ' ON deferred_writes(project_id, claimed_at)'
+                )
+                logger.info('EventBuffer: migrated deferred_writes — added claimed_at column')
 
             # Add attempt_count if missing — tracks poison-pill detection across restarts.
-            if 'attempt_count' not in columns:
-                try:
-                    await db.execute(
-                        'ALTER TABLE deferred_writes'
-                        ' ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0'
-                    )
-                    logger.info('EventBuffer: migrated deferred_writes — added attempt_count column')
-                except Exception as exc:
-                    if 'duplicate column name' not in str(exc).lower():
-                        raise
-                    logger.debug('EventBuffer: attempt_count already exists (concurrent init)')
-
+            if await add_column_if_missing(
+                db, 'deferred_writes', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0'
+            ):
+                logger.info('EventBuffer: migrated deferred_writes — added attempt_count column')
 
     def _require_access(self) -> AtomicConnection:
         if self._access is None:
@@ -639,22 +606,25 @@ class EventBuffer:
         ]
 
     async def drain_by_ids(
-        self, project_id: str, ids: list[str],
+        self, project_id: str, ids: list[str], run_id: str,
     ) -> int:
-        """Mark specific event IDs as drained.
+        """Mark specific event IDs as drained by run *run_id*.
 
         Used after the ContextAssembler determines which events fit the
-        token budget.  Returns the number of rows updated.
+        token budget.  Returns the number of rows updated.  *run_id* is
+        stamped as ``drained_by_run_id`` so a later run-scoped
+        ``restore_drained`` can target exactly this chunk; it is required so
+        this path can never leave an unattributed row (task 6453).
         """
         if not ids:
             return 0
         placeholders = ','.join('?' for _ in ids)
         async with self._require_access().write() as db:
             cursor = await db.execute(
-                f"""UPDATE event_buffer SET status = 'drained'
+                f"""UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?
                     WHERE project_id = ? AND id IN ({placeholders})
                       AND status = 'buffered'""",
-                [project_id, *ids],
+                [run_id, project_id, *ids],
             )
             rowcount = cursor.rowcount
         return rowcount
@@ -662,42 +632,35 @@ class EventBuffer:
     async def restore_drained(
         self,
         project_id: str,
-        run_id: str | None = None,
+        run_id: str,
         *,
         include_unattributed: bool = False,
     ) -> int:
-        """Restore drained events to 'buffered' after a failed run.
+        """Restore one run's drained events to 'buffered' after it failed.
 
-        When ``run_id`` is provided, only rows stamped with
-        ``drained_by_run_id = run_id`` are restored — this protects a
-        concurrent live run's drained events from being clobbered when the
-        reaper recovers a *different* orphaned run on the same project (task
-        2711 / E7). When omitted (the default), behaviour is unchanged: every
-        drained row for the project is restored, project-wide.
+        Only rows stamped with ``drained_by_run_id = run_id`` are restored —
+        this protects a concurrent live run's drained events from being
+        clobbered when the reaper recovers a *different* orphaned run on the
+        same project (task 2711 / E7), and an earlier completed run's consumed
+        events from being re-processed (task 6453). There is deliberately no
+        project-wide mode.
 
         ``include_unattributed`` additionally restores rows with
-        ``drained_by_run_id IS NULL`` when ``run_id`` is set (ignored
-        otherwise — the project-wide path already covers them). This closes
-        the upgrade-boundary gap where events drained by a pre-task-2711
-        process carry no run attribution: since every current code path now
-        always stamps ``drained_by_run_id`` on drain, a NULL row can only be
-        left over from a process that no longer exists by the time a recovery
-        pass runs, so it is provably safe to fold into a *specific* run's
-        recovery without reintroducing the concurrent-run clobber the run
-        scoping was added to prevent (task 2711 amendment, reviewer finding).
+        ``drained_by_run_id IS NULL``. This closes the upgrade-boundary gap
+        where events drained by a pre-task-2711 process carry no run
+        attribution: since every production drain path stamps
+        ``drained_by_run_id`` as it drains (``drain_by_ids`` requires a
+        ``run_id``, and ``run_full_cycle``, ``drain``'s only production
+        caller, always passes one; task 6453), a NULL row can only be left
+        over from a process that no longer exists by the time a recovery pass
+        runs, so it is provably safe to fold into a *specific* run's recovery
+        without reintroducing the concurrent-run clobber the run scoping was
+        added to prevent (task 2711 amendment, reviewer finding).
         Callers that need the exact-match-only contract (e.g. one caller's
         ``mark_drained_run_id`` attribution racing another's) must keep the
         default ``False``.
         """
-        if run_id is None:
-            async with self._require_access().write() as db:
-                cursor = await db.execute(
-                    "UPDATE event_buffer SET status = 'buffered' "
-                    "WHERE project_id = ? AND status = 'drained'",
-                    (project_id,),
-                )
-                count = cursor.rowcount
-        elif include_unattributed:
+        if include_unattributed:
             async with self._require_access().write() as db:
                 cursor = await db.execute(
                     "UPDATE event_buffer SET status = 'buffered' "
@@ -723,12 +686,11 @@ class EventBuffer:
     ) -> int:
         """Attribute already-drained rows to the run about to process them.
 
-        Used by the BacklogIterator path: ``drain_by_ids`` drains a chunk's
-        events *before* ``run_full_cycle`` mints that chunk's run_id, so those
-        rows would otherwise carry no ``drained_by_run_id`` attribution. This
-        lets the harness stamp them retroactively so a later run-scoped
-        ``restore_drained`` can restore exactly that chunk's events (task 2711
-        / E7).
+        ``run_full_cycle``'s attribution for caller-supplied ``events``, so a
+        later run-scoped ``restore_drained`` can restore exactly that run's
+        events (task 2711 / E7). BacklogIterator already stamps each chunk's
+        run_id at ``drain_by_ids`` (task 6453), which makes this an idempotent
+        re-stamp on that path.
 
         Only rows currently ``status = 'drained'`` are touched; ids that don't
         exist, aren't currently drained, or are empty are silently ignored (no

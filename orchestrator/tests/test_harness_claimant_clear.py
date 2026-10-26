@@ -24,7 +24,7 @@ from _orch_helpers import _init_harness_state_for_test
 import orchestrator.harness as harness_module
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
-from orchestrator.merge_queue import InFlightMergeRegistry
+from orchestrator.merge_lane.worker import InFlightMergeRegistry
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
 

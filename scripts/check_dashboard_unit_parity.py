@@ -17,31 +17,9 @@ nothing reported that until this check existed.
 
 Exit codes
 ----------
-0 — parity (every compared directive agrees, at least one unit was actually
-    compared, and nothing overrides the units that were)
-1 — drift (one or more compared directives disagree), OR a committed unit
-    VANISHED (no committed copy found, so nothing could be verified for it),
-    OR an installed unit carries a drop-in override (so the unit file was
-    compared but the EFFECTIVE configuration was not)
-2 — installed unit absent (no installed copy found for one or more units)
-
-PRECEDENCE: drift (1) DOMINATES absence (2).  With three units a single run can
-hit both at once, and returning 2 there would let an unrelated uninstalled unit
-mask an actionable finding — ``setup-host.sh`` treats 2 as a benign "not
-installed on this host, skipping" and only 1 as something to act on.
-
-A run that compared ZERO units can NEVER report parity.  A vanished committed
-unit and a drop-in override share exit 1 with drift rather than minting new
-codes, for the same reason: both mean the gate could not make its claim, which
-is the opposite of the benign "not installed here" that 2 denotes, and
-``setup-host.sh`` already branches on this 0/1/2 vocabulary.  Exit 1 therefore
-means "drift or unverifiable", and the three cases are worded APART in the
-report ([drift] / [vanished] / [override]) so an operator is sent to the right
-place.  Before that was true, ``--repo-root`` naming a tree with no units
-compared nothing and still printed "parity — 3 unit(s) match", so a typo'd
-path, a renamed unit or a ``git mv`` of ``dashboard/*.service`` silently
-disarmed the whole check.  The success line therefore reports the number of
-units actually COMPARED, never the number selected.
+The family's codes are defined once, in
+``systemd_unit_parity.py::ParityExit``. Its consumers are listed under
+Design notes below.
 
 Usage
 -----
@@ -123,9 +101,8 @@ checker treats as truth is not the source of the copy it compares against.
 That renderer also PRESERVES the installed copy's host-local ``Environment=``
 values across a re-install, which is why the remediation this report prints
 ("run scripts/setup-host.sh") is now safe to follow on a host carrying nine
-aggregation roots; see the DASHBOARD_KNOWN_PROJECT_ROOTS entry in
-``DIVERGENCE_ALLOWLIST`` below.  The two repo-side
-files are held in lockstep by
+aggregation roots; see its row in ``systemd_unit_parity.py::ENV_POLICY``.
+The two repo-side files are held in lockstep by
 ``tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file``,
 which renders the template with setup-host.sh's own substitutions and asserts
 BYTE-FOR-BYTE equality with the committed unit (see the comment on that
@@ -164,6 +141,22 @@ import pathlib
 import re
 import sys
 from collections.abc import Sequence
+from typing import Final
+
+from systemd_unit_parity import (
+    ABSENT,
+    ENV_POLICY,
+    SERVICE_SECTION,
+    BlockText,
+    Drift,
+    ParityRun,
+    ReportText,
+    UnitFamily,
+    UnitRef,
+    environment_map,
+    parse_unit_directives,
+    run_parity,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -175,96 +168,19 @@ from collections.abc import Sequence
 # greps for over scripts/ (dashboard_unit_parity|DASHBOARD_UNIT_PARITY).
 LOG_TAG = "dashboard_unit_parity"
 
-# Environment variable NAMES whose VALUE is permitted to differ between the
-# committed unit and the installed one, each with the documented reason it is
-# blessed.  Presence is still required — see the Environment= branch of
-# compare_unit: allowlisting a value must never bless the variable vanishing.
-#
-# THIS IS A HOLE IN THE GATE.  Keep it small, and keep every entry's reason
-# specific enough that a reviewer can check it.  The gate's whole value comes
-# from being believable when it fires.
-DIVERGENCE_ALLOWLIST: dict[str, str] = {
-    "DASHBOARD_KNOWN_PROJECT_ROOTS": (
-        "Cost/burndown aggregation roots. The committed unit's own comment "
-        "declares the divergence deliberate: 'additional project roots are "
-        "LOCAL settings, added to the installed unit, not committed here'. "
-        "Measured 2026-08-01: the installed unit carries 9 roots, the "
-        "committed one carries this repo only. Value-comparing it would "
-        "therefore report drift on every run of a correctly-configured host, "
-        "and a gate that is always red gets switched off — taking the "
-        "accidental drift it exists to catch with it. "
-        "SECOND CONSUMER (task 4793): scripts/render_systemd_unit.py now "
-        "PRESERVES this variable's installed value when setup-host.sh "
-        "re-renders the unit. Its HOST_LOCAL_ENVIRONMENT is the host-local "
-        "SUBSET of this allowlist, not the allowlist itself — the two entries "
-        "here are on it for opposite reasons, and preserving the other one "
-        "would pin the data root at the previous checkout. Held by "
-        "tests/scripts/test_render_systemd_unit.py::"
-        "test_host_local_environment_is_a_subset_of_the_divergence_allowlist "
-        "and ::test_host_local_environment_excludes_project_root. So editing "
-        "THIS dict has a second blast radius: adding a name here does not make "
-        "it preserved, but removing one that the renderer preserves turns this "
-        "gate red on every correctly-configured host."
-    ),
-    "DASHBOARD_PROJECT_ROOT": (
-        "The dashboard's data root. The committed unit hardcodes "
-        "/home/leo/src/dark-factory, while setup-host.sh renders the installed "
-        "copy from scripts/dashboard.service.template with THAT host's real "
-        "$REPO_ROOT — so a cross-copy value comparison reports drift on every "
-        "correctly-configured host that is not this one. "
-        "NOT A HOLE, unlike the entry above: the value is still checked, just "
-        "not across copies. UnitSpec.env_matches_directive relates it to the "
-        "SAME copy's WorkingDirectory= (see there for why), and the name-set "
-        "branch still makes a dropped variable drift. The two entries are a "
-        "PAIR — removing either gives back the failure the other prevents."
-    ),
-}
+# Environment variable NAMES whose VALUE may differ between the committed and
+# installed copies; presence is still compared. THIS IS A HOLE IN THE GATE: keep
+# it small. Each row's reason: plans/review-all-s25-scripts-instruments-prd.md D5.
+DIVERGENCE_ALLOWLIST: Final[frozenset[str]] = ENV_POLICY.divergence_allowlist(UnitFamily.DASHBOARD)
 
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent
 _DEFAULT_INSTALLED_DIR = pathlib.Path.home() / ".config" / "systemd" / "user"
 
 
-def _log(message: str, *, stream=None) -> None:
-    """Print *message* prefixed with the log tag."""
-    print(f"[{LOG_TAG}] {message}", file=stream if stream is not None else sys.stdout)
-
-
 # ---------------------------------------------------------------------------
-# Unit parser
+# Unit specs
 # ---------------------------------------------------------------------------
-
-
-# The parser lives in scripts/systemd_unit_parity.py and is RE-EXPORTED here
-# deliberately. A second consumer appeared (check_orchestrator_unit_parity.py),
-# and duplicating ~90 lines of parser into it is how the two copies drift until
-# one silently stops catching the defect -- inside the tooling built to catch
-# exactly that. Re-exporting rather than rewriting call sites keeps the module
-# surface this script's test suite reads (mod.parse_unit_directives,
-# mod._join_continuations) intact, so that suite is the extraction's own
-# regression net.
-#
-# find_dropins moved there too, for a sharper version of the same reason: it
-# was already forked, code-identical, between this file and
-# check_orchestrator_unit_parity.py, and check_lms_unit_parity.py would have
-# been a third copy. Re-exported on the same terms -- this suite's existing
-# find_dropins tests still call mod.find_dropins and are what proves the lift
-# was behaviour-preserving.
-from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
-    _ABSENT,
-    Drift,
-    _join_continuations,  # noqa: F401  (re-exported: read by the test suite)
-    find_dropins,
-    parse_unit_directives,
-)
-
-# ---------------------------------------------------------------------------
-# Drift records and unit specs
-# ---------------------------------------------------------------------------
-
-# ``Drift`` and ``_ABSENT`` are re-exported from scripts/systemd_unit_parity.py
-# (see the import above). They were code-identical in all three checkers; the
-# lift COLLAPSED that fork rather than pre-empting a hypothetical one.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -354,7 +270,7 @@ class UnitSpec:
     # that is merely configured elsewhere.
     #
     # BOTH halves are read out of environment_section — the variable through
-    # _environment_map, the directive through that same section's parsed keys.
+    # environment_map, the directive through that same section's parsed keys.
     # A pair whose directive lives ELSEWHERE (('SOME_VAR', 'WantedBy'), which
     # is in [Install]) would therefore compare against <absent> in both copies
     # forever: permanent, unexplainable drift, which is the always-red-gate
@@ -436,7 +352,7 @@ class UnitSpec:
 def _render(values: list[str] | None) -> str:
     """Render a directive's values for a Drift record / the report."""
     if not values:
-        return _ABSENT
+        return ABSENT
     if len(values) == 1:
         return values[0]
     return " | ".join(values)
@@ -501,38 +417,13 @@ def _compare_exec_start_flags(
                 # send the operator back to a manual diff to find the token
                 # that actually moved.
                 key=f"ExecStart --{flag}",
-                repo_value=repo_value if repo_value is not None else _ABSENT,
-                installed_value=installed_value if installed_value is not None else _ABSENT,
+                repo_value=repo_value if repo_value is not None else ABSENT,
+                installed_value=installed_value if installed_value is not None else ABSENT,
                 reason=reason,
             )
         )
 
     return drifts
-
-
-# _environment_map lives in scripts/systemd_unit_parity.py and is RE-EXPORTED
-# here under its existing PRIVATE name, on the same terms as the parser and
-# find_dropins above.  The THIRD lift, and the first whose second consumer is
-# not another checker: scripts/render_systemd_unit.py must read the INSTALLED
-# unit's Environment= map to preserve this host's host-local
-# DASHBOARD_KNOWN_PROJECT_ROOTS when setup-host.sh re-renders that unit, and a
-# value this checker can SEE has to be exactly a value the installer can
-# PRESERVE -- two readers with two ideas of what an Environment= line means is
-# how the installer silently drops a variable this gate then reports as fine.
-#
-# The renderer deliberately does NOT import this module to get it: the
-# section-8 harness in tests/scripts/test_check_dashboard_unit_parity.py builds
-# a tmp repo where write_checker(body=...) replaces this file with an argparse
-# stub (and with_checker=False omits it entirely), so a renderer importing it
-# would ImportError under the two tests asserting the install still happens
-# when the gate did not run.  Hence DOWN into the shared module, not sideways.
-#
-# Kept under the private name because this suite reads mod._environment_map
-# directly (test_check_dashboard_unit_parity.py's registry-staleness guards),
-# so that surface stays intact and IS the extraction's regression net.
-from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
-    environment_map as _environment_map,
-)
 
 
 def _compare_environment(
@@ -561,8 +452,8 @@ def _compare_environment(
     if section is None:
         return []
 
-    repo_env = _environment_map(repo, section)
-    installed_env = _environment_map(installed, section)
+    repo_env = environment_map(repo, section)
+    installed_env = environment_map(installed, section)
     drifts: list[Drift] = []
 
     for name in sorted(set(repo_env) | set(installed_env)):
@@ -581,8 +472,8 @@ def _compare_environment(
                 unit=spec.name,
                 section=section,
                 key=f"Environment={name}",
-                repo_value=repo_env.get(name, _ABSENT),
-                installed_value=installed_env.get(name, _ABSENT),
+                repo_value=repo_env.get(name, ABSENT),
+                installed_value=installed_env.get(name, ABSENT),
                 reason=reason,
             )
         )
@@ -639,11 +530,11 @@ def _compare_env_matches_directive(
         mismatched_sides: list[str] = []
 
         for side_name, side in (("repo", repo), ("installed", installed)):
-            env = _environment_map(side, section) if section is not None else {}
+            env = environment_map(side, section) if section is not None else {}
             directive = _render(side.get(section or "", {}).get(key))
             if var not in env:
                 # Reported by the name-set branch; see the docstring.
-                observed[side_name] = _ABSENT
+                observed[side_name] = ABSENT
                 continue
             observed[side_name] = f"{var}={env[var]} / {key}={directive}"
             if not env[var].strip() or not directive.strip():
@@ -697,7 +588,7 @@ def compare_unit(
 
     Comparison is SYMMETRIC over the curated key set: a compared directive the
     installed copy declares and the repo copy does not is drift just as much
-    as the reverse.  A missing key is treated as ``_ABSENT`` on its side, so
+    as the reverse.  A missing key is treated as ``ABSENT`` on its side, so
     both asymmetric cases fall out of the same equality test.
 
     The full values LIST is compared, not just the first value, so a repeated
@@ -905,7 +796,7 @@ UNITS: dict[str, UnitSpec] = {
         # EnvironmentFile= is VISIBLE: it could override any Environment= the
         # name-set comparison below just checked, from a file off this tree.
         override_directives=(("Service", "EnvironmentFile"),),
-        environment_section="Service",
+        environment_section=SERVICE_SECTION,
         env_matches_directive=(
             # The dashboard's DATA ROOT (config.py's project_root falls back to
             # Path.cwd() when it is unset), so =/tmp/wrong must not read as
@@ -960,7 +851,7 @@ UNITS: dict[str, UnitSpec] = {
         # policy, so an inline injection here is the same class of hole
         # EnvironmentFile= was registered to close — on the same unit, left
         # open until now.
-        environment_section="Service",
+        environment_section=SERVICE_SECTION,
         unchecked_directives=(("Unit", "Description", _DESCRIPTION_IS_COSMETIC),),
     ),
     "dark-factory-dashboard-watchdog.timer": UnitSpec(
@@ -988,18 +879,27 @@ UNITS: dict[str, UnitSpec] = {
 # ---------------------------------------------------------------------------
 
 
+def _compare(unit: UnitRef, repo_text: str, installed_text: str) -> list[Drift]:
+    return compare_unit(UNITS[unit.name], repo_text, installed_text)
+
+
+_REPORT = ReportText(
+    drift=BlockText(
+        "drift",
+        "{count} directive(s) differ between repo and installed units:",
+        (
+            "To propagate the committed units to this host, run: scripts/setup-host.sh  "
+            "(this checker is read-only by design — see the module docstring for why "
+            "there is no --fix)",
+        ),
+    )
+)
+
+
 def main(argv: Sequence[str]) -> int:
-    """Parse args and run the parity check.
+    """Parse args and run the parity check through ``systemd_unit_parity.run_parity``.
 
-    Returns:
-        0 — parity (and at least one unit was actually compared)
-        1 — drift, OR a committed unit vanished, OR a drop-in override
-        2 — one or more installed units absent
-
-    Drift DOMINATES absence: a run that hits both returns 1.  An absent unit
-    is still reported in that case — dominated, not hidden.  A run that
-    compared ZERO units never reports parity: see the exit-code table in the
-    module docstring.
+    Exit codes: see ``systemd_unit_parity.ParityExit``.
     """
     parser = argparse.ArgumentParser(
         description="Verify parity between the in-repo and installed dashboard units."
@@ -1027,127 +927,11 @@ def main(argv: Sequence[str]) -> int:
         ),
     )
     args = parser.parse_args(argv)
-
-    installed_dir: pathlib.Path = args.installed_dir
-    repo_root: pathlib.Path = args.repo_root
-    selected = args.unit or sorted(UNITS)
-
-    drifts: list[tuple[Drift, pathlib.Path, pathlib.Path]] = []
-    missing: list[pathlib.Path] = []
-    vanished: list[tuple[str, pathlib.Path]] = []
-    overridden: list[tuple[str, list[pathlib.Path]]] = []
-    # Units that actually reached compare_unit. The success line reports THIS
-    # count, not len(selected): a report may only claim what it verified.
-    compared: list[str] = []
-
-    for name in selected:
-        spec = UNITS[name]
-        repo_path = repo_root / spec.repo_relpath
-        installed_path = installed_dir / name
-
-        if not repo_path.is_file():
-            # The committed unit is the source of truth; without it there is
-            # nothing to compare against, so this unit was NOT checked.
-            vanished.append((name, repo_path))
-            continue
-
-        if not installed_path.is_file():
-            missing.append(installed_path)
-            continue
-
-        # Checked even when the unit itself is at parity: a drop-in is layered
-        # OVER a matching unit file, so it is invisible to every text
-        # comparison below.
-        dropins = find_dropins(installed_dir, name)
-        if dropins:
-            overridden.append((name, dropins))
-
-        compared.append(name)
-        for drift in compare_unit(
-            spec,
-            repo_path.read_text(encoding="utf-8"),
-            installed_path.read_text(encoding="utf-8"),
-        ):
-            drifts.append((drift, repo_path, installed_path))
-
-    for path in missing:
-        _log(f"[skip] installed unit not found: {path} (not installed on this host)")
-
-    if vanished:
-        # Deliberately worded apart from the drift block below. Both exit 1,
-        # but they send the operator to different places: a drift is a
-        # directive diff to propagate, whereas this is "the file I compare
-        # against is gone" — telling them to hunt for a diff would waste the
-        # trip.
-        _log(
-            f"[vanished] {len(vanished)} committed unit(s) not found — "
-            "nothing was verified for them:"
-        )
-        for name, repo_path in vanished:
-            _log(f"  {name}: expected committed copy at {repo_path}")
-        _log(
-            "[vanished] The committed unit is this checker's source of truth. "
-            "Check --repo-root, and whether the unit was renamed or moved "
-            "(the paths live in UNITS in this script)."
-        )
-
-    if overridden:
-        # Worded apart from [drift] for the same reason [vanished] is: this is
-        # not a directive diff to propagate. The unit files may match exactly;
-        # what the run could not establish is that the EFFECTIVE configuration
-        # matches, because systemd merges these over the unit at load time.
-        # It shares exit 1 because "I could not verify" belongs with "I found
-        # a difference", not with the benign "not installed here" that 2
-        # denotes — reporting parity here would overstate what was checked.
-        _log(
-            f"[override] {len(overridden)} unit(s) have drop-in overrides — "
-            "the unit files were compared, but the EFFECTIVE configuration "
-            "was NOT verified:"
-        )
-        for name, dropins in overridden:
-            for dropin in dropins:
-                _log(f"  {name}: {dropin}")
-        _log(
-            "[override] systemd merges these over the unit at load time, so a "
-            "directive set here silently wins over the committed value. "
-            "Inspect with: systemctl --user cat <unit>  (and remove the "
-            "drop-in, or move the setting into the committed unit)."
-        )
-
-    if drifts:
-        _log(f"[drift] {len(drifts)} directive(s) differ between repo and installed units:")
-        for drift, repo_path, installed_path in drifts:
-            _log(f"  {drift.unit} [{drift.section}] {drift.key}")
-            _log(f"      {drift.reason}")
-            _log(f"      repo      {repo_path}: {drift.repo_value}")
-            _log(f"      installed {installed_path}: {drift.installed_value}")
-        _log(
-            "[drift] To propagate the committed units to this host, run: "
-            "scripts/setup-host.sh  (this checker is read-only by design — "
-            "see the module docstring for why there is no --fix)"
-        )
-
-    if drifts or vanished or overridden:
-        return 1
-
-    if missing:
-        return 2
-
-    if not compared:
-        # UNREACHABLE BY CONSTRUCTION, kept as defence — not a tested path.
-        # Every unit that was not compared took an earlier `continue` into
-        # `vanished` or `missing`, and both return above, so reaching here
-        # requires `selected` itself to be empty: impossible while UNITS is
-        # non-empty (`args.unit or sorted(UNITS)`) and argparse `choices`
-        # rejects an unknown --unit. It stays because the invariant it
-        # enforces — a run that verified nothing must never report parity — is
-        # one a future early-`continue` could quietly break, and the cost of
-        # holding it is three lines.
-        _log("[error] no units were compared — nothing was verified.")
-        return 1
-
-    _log(f"[ok] parity — {len(compared)} unit(s) match their committed copies.")
-    return 0
+    units = [
+        UnitRef(name, args.repo_root / UNITS[name].repo_relpath, args.installed_dir / name)
+        for name in args.unit or sorted(UNITS)
+    ]
+    return run_parity(ParityRun(LOG_TAG, units, _compare, _REPORT), out=sys.stdout)
 
 
 if __name__ == "__main__":

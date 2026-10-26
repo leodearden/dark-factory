@@ -28,7 +28,8 @@ from _campaign_gate_helpers import (
 
 import orchestrator.evals.runner as runner_mod
 from orchestrator.evals.configs import EvalConfig
-from orchestrator.evals.runner import EvalResult, run_eval_matrix
+from orchestrator.evals.results import EvalResult, ResultStore
+from orchestrator.evals.runner import run_eval_matrix
 
 _CFG = EvalConfig(name='test-cfg', backend='claude', model='sonnet', effort='high')
 
@@ -36,10 +37,10 @@ _CFG = EvalConfig(name='test-cfg', backend='claude', model='sonnet', effort='hig
 def _stem_loader(path: Path) -> dict:
     """Minimal task dict used by all matrix tests.
 
-    Safe because every caller passes ``force=True``, which skips
-    ``_result_exists`` — the only place in the non-mocked ``_run_one``
-    closure that reads ``task['id']``.  ``run_eval`` is separately
-    monkeypatched in each test, so the dict is never deeply inspected.
+    The id is all the non-mocked ``_run_one`` closure reads, for the store's
+    ``exists`` skip check (bypassed under ``force=True``).  ``run_eval`` is
+    separately monkeypatched in each test, so the dict is never deeply
+    inspected.
     """
     return {'id': path.stem}
 
@@ -76,6 +77,36 @@ def single_task_matrix_case(
         return await run_eval_matrix([task_path], [_CFG], force=True)
 
     return task_path, run_matrix_helper
+
+
+@pytest.mark.asyncio
+class TestRunEvalMatrixStore:
+    """The matrix skips pairs its store already holds and threads the store on."""
+
+    async def test_held_pairs_are_skipped_and_the_rest_persist_into_the_store(
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        task_path = tmp_path / 'task_a.json'
+        task_path.touch()
+        store = ResultStore(tmp_path / 'results')
+        store.save(EvalResult('task_a', _CFG.name, 'done', {}, '/tmp/stub', run_id='abcd1234'))
+        missing = EvalConfig(name='missing-cfg', backend='claude', model='sonnet', effort='high')
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def fake_run_eval(task_path: Path, config: EvalConfig, *args, **kwargs) -> EvalResult:
+            calls.append((config.name, kwargs))
+            return EvalResult(task_path.stem, config.name, 'done', {}, '/tmp/stub')
+
+        monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+        assert await run_eval_matrix([task_path], [_CFG], store=store) == []
+        assert calls == []
+
+        results = await run_eval_matrix([task_path], [_CFG, missing], store=store)
+        assert [r.config_name for r in results] == ['missing-cfg']
+        [(config_name, kwargs)] = calls
+        assert config_name == 'missing-cfg'
+        assert kwargs['store'] is store
 
 
 @pytest.mark.asyncio

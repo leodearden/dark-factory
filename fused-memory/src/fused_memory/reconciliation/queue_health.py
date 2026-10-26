@@ -24,6 +24,45 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _optional_counts(stats: dict, key: str) -> tuple[dict[str, int], bool]:
+    """Read an optional ``{name: count}`` field of *stats* as ``(counts, malformed)``.
+
+    Absent (or None) is benign: ``({}, False)``, silently.  Present but not a
+    dict, or holding a count that is not int-convertible, is a malformed
+    producer output: a WARNING and ``malformed`` True.  The returned dict is a
+    fresh copy of the int-convertible entries only, so one bad count never
+    costs the rest of the record.
+    """
+    raw = stats.get(key)
+    if raw is None:
+        return {}, False
+    if not isinstance(raw, dict):
+        logger.warning(
+            "summarize_graphiti_queue_health: stats[%r] is present but not a dict"
+            " (type=%s, repr=%s); forcing healthy=False",
+            key,
+            type(raw).__name__,
+            repr(raw)[:200],
+        )
+        return {}, True
+
+    counts: dict[str, int] = {}
+    unconvertible: dict = {}
+    for name, count in raw.items():
+        try:
+            counts[name] = int(count)
+        except (TypeError, ValueError, OverflowError):
+            unconvertible[name] = count
+    if unconvertible:
+        logger.warning(
+            "summarize_graphiti_queue_health: stats[%r] holds non-integer counts"
+            " (repr=%s); dropping them and forcing healthy=False",
+            key,
+            repr(unconvertible)[:200],
+        )
+    return counts, bool(unconvertible)
+
+
 def summarize_graphiti_queue_health(stats: dict) -> dict:
     """Classify a DurableWriteQueue.get_stats() result into a health record.
 
@@ -32,6 +71,7 @@ def summarize_graphiti_queue_health(stats: dict) -> dict:
             {
                 'counts': {status_str: int, ...},    # may be absent
                 'oldest_pending_age_seconds': float | None,
+                'dead_by_operation': {operation: int, ...},    # may be absent
             }
             Any missing keys default defensively so callers never see KeyError.
 
@@ -41,53 +81,37 @@ def summarize_graphiti_queue_health(stats: dict) -> dict:
             pending_count (int): Writes waiting to be processed.
             retry_count (int): Writes being retried after a transient failure.
             oldest_pending_age_seconds (float | None): Age of the oldest pending/retry item.
+            dead_by_operation (dict[str, int]): Dead writes per operation, {} when
+                none or absent.
             healthy (bool): True when dead_count == 0.
 
-    Emits a WARNING log when *stats* is malformed (not a dict, or 'counts' key
-    present but not a dict) and forces *healthy* to False in those cases.
-    A benign-absent 'counts' key remains silent and healthy.
+    Emits a WARNING log when *stats* is malformed (not a dict, or a 'counts' or
+    'dead_by_operation' key present but not a dict or holding a non-integer
+    count) and forces *healthy* to False in those cases.  A non-integer count
+    is dropped; the remaining counts still report.  A benign-absent 'counts' or
+    'dead_by_operation' key remains silent and healthy.
     """
-    malformed = False
-
-    if not isinstance(stats, dict):
+    stats_malformed = not isinstance(stats, dict)
+    if stats_malformed:
         logger.warning(
             "summarize_graphiti_queue_health: stats is not a dict"
             " (type=%s, repr=%s); forcing healthy=False",
             type(stats).__name__,
             repr(stats)[:200],
         )
-        malformed = True
-        counts = {}
-    else:
-        raw_counts = stats.get('counts')
-        if raw_counts is not None and not isinstance(raw_counts, dict):
-            logger.warning(
-                "summarize_graphiti_queue_health: stats['counts'] is present but"
-                " not a dict (type=%s, repr=%s); forcing healthy=False",
-                type(raw_counts).__name__,
-                repr(raw_counts)[:200],
-            )
-            malformed = True
-            counts = {}
-        elif isinstance(raw_counts, dict):
-            counts = raw_counts
-        else:
-            # 'counts' key absent — benign, stays silent
-            counts = {}
+        stats = {}
 
-    dead_count = int(counts.get('dead', 0))
-    pending_count = int(counts.get('pending', 0))
-    retry_count = int(counts.get('retry', 0))
-    oldest_pending_age_seconds = (
-        stats.get('oldest_pending_age_seconds') if isinstance(stats, dict) else None
-    )
+    counts, counts_malformed = _optional_counts(stats, 'counts')
+    dead_by_operation, breakdown_malformed = _optional_counts(stats, 'dead_by_operation')
+    malformed = stats_malformed or counts_malformed or breakdown_malformed
 
-    healthy = (dead_count == 0) and not malformed
+    dead_count = counts.get('dead', 0)
 
     return {
         'dead_count': dead_count,
-        'pending_count': pending_count,
-        'retry_count': retry_count,
-        'oldest_pending_age_seconds': oldest_pending_age_seconds,
-        'healthy': healthy,
+        'pending_count': counts.get('pending', 0),
+        'retry_count': counts.get('retry', 0),
+        'oldest_pending_age_seconds': stats.get('oldest_pending_age_seconds'),
+        'dead_by_operation': dead_by_operation,
+        'healthy': (dead_count == 0) and not malformed,
     }

@@ -25,7 +25,7 @@ applies to its carrier census.  Eight copies of an argument drift; one does
 not.
 
 Both halves key on the SAME vocabulary.  ``MERGE_LANES`` and
-``lane_for_task_metadata`` are imported from ``orchestrator.merge_queue``,
+``lane_for_task_metadata`` are imported from ``orchestrator.merge_lane.worker``,
 never copied: ``lane_for_task_metadata`` is the same function the
 orchestrator's own submit path uses (``orchestrator/src/orchestrator/
 workflow.py::TaskWorkflow::_submit_to_merge_queue``), so the two submit paths
@@ -89,8 +89,10 @@ class LaneChoice:
     ``metadata == {}`` alone equally cannot distinguish a fact from a fault.
 
     ``source`` is one of ``'argument'`` (the caller passed ``lane=``),
-    ``'task_metadata'`` (the task's ``merge_lane`` key was present), or
-    ``'default'`` (neither).  It is echoed to the submitter as
+    ``'task_metadata'`` (the task's ``merge_lane`` key was present),
+    ``'default'`` (the task was read and carries no such key), or
+    ``'unavailable'`` (the task-store read failed, so what the task carries
+    is unknown and the lane fell open to ``'normal'``).  It is echoed to the submitter as
     ``lane_source`` on the queued and attached responses, which is the audit
     trail for a ``'high'`` submission.
     """
@@ -115,7 +117,7 @@ def validate_requested_lane(requested: Any) -> MergeLane | None:
     """
     if requested is None:
         return None
-    from orchestrator.merge_queue import MERGE_LANES  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import MERGE_LANES
 
     if not isinstance(requested, str) or requested not in MERGE_LANES:
         raise InvalidMergeLane(requested, tuple(MERGE_LANES))
@@ -126,7 +128,10 @@ def validate_requested_lane(requested: Any) -> MergeLane | None:
 
 
 def resolve_merge_lane(
-    *, requested: MergeLane | None, task_metadata: dict | None
+    *,
+    requested: MergeLane | None,
+    task_metadata: dict | None,
+    metadata_unavailable: bool = False,
 ) -> LaneChoice:
     """Apply ``requested > task_metadata['merge_lane'] > 'normal'``.
 
@@ -136,21 +141,35 @@ def resolve_merge_lane(
     is the case that lets an operator hold a task with
     ``metadata.merge_lane='high'`` back to the normal lane.
 
-    The metadata arm delegates to ``orchestrator.merge_queue::
+    The metadata arm delegates to ``orchestrator.merge_lane.worker::
     lane_for_task_metadata`` — see the module docstring for why that, and not
     ``_normalize_lane``, is the right normaliser here.  ``source`` is
     ``'task_metadata'`` iff the ``'merge_lane'`` key is PRESENT — presence,
     not truthiness, and not "the result differs from ``'normal'``" — because
     a task that asked for ``'normal'`` and a task that asked for nothing are
     different facts even though they get the same lane.
+
+    *metadata_unavailable* is ``git_authority.TaskMetadataResult.unavailable``
+    for the read that produced *task_metadata*.  When it is True the ``{}``
+    in *task_metadata* is a fault, not a fact, so ``source`` is
+    ``'unavailable'`` rather than ``'default'`` — "asked for nothing" and "we
+    could not find out" are different facts for the same reason as above.
+    The lane is unchanged (``'normal'``, fail-open); only the provenance
+    gains honesty.  An explicit *requested* lane never reads metadata, so it
+    outranks the flag.
     """
     if requested is not None:
         return LaneChoice(lane=requested, source='argument')
 
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import (
         lane_for_task_metadata,
     )
 
     metadata = task_metadata or {}
-    source = 'task_metadata' if 'merge_lane' in metadata else 'default'
+    if metadata_unavailable:
+        source = 'unavailable'
+    elif 'merge_lane' in metadata:
+        source = 'task_metadata'
+    else:
+        source = 'default'
     return LaneChoice(lane=lane_for_task_metadata(metadata), source=source)

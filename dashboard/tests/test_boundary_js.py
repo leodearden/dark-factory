@@ -39,12 +39,12 @@ from _boundary_payloads import (
     ragged_b,
     ragged_day,
 )
+from _dashboard_helpers import node_path
 from _lock_chip_matrix import (
     CELL_MATRIX,
     heatmap_cell_and_chip,
     heatmap_module,
     heatmap_row,
-    node_path,
 )
 from shared.task_statuses import TaskStatus
 
@@ -268,6 +268,19 @@ def test_sketch_9_the_two_windows_hold_different_merges(served_bodies):
     assert len(week['recent']) != len(day['recent'])
 
 
+@pytest.mark.parametrize('window, bucket_minutes', [('24h', 15), ('7d', 60)])
+def test_the_served_depth_names_the_width_its_labels_are_spaced_at(served_bodies, window, bucket_minutes):
+    depth = served_bodies[f'merge_{window}']['MERGE_QUEUE']['dark-factory']['depth']
+    starts = [datetime.fromisoformat(label) for label in depth['labels']]
+
+    assert depth['bucket_minutes'] == bucket_minutes
+    assert len(starts) >= 2, (
+        "the fixture's merges at 20h and 70h before T0 leave at least two buckets after the leading-zero trim"
+    )
+    gaps = {later - earlier for earlier, later in zip(starts, starts[1:], strict=False)}
+    assert gaps == {timedelta(minutes=bucket_minutes)}
+
+
 @pytest.mark.parametrize('generation', sorted(CORPUS_TTL_GENERATIONS))
 def test_sketch_10_the_pill_and_the_strip_count_one_walk_whatever_its_ttl(served_bodies, generation):
     escalations = served_bodies[f'escalations_{generation}']['ESCALATIONS']
@@ -290,12 +303,24 @@ def test_sketch_10_each_ttl_generation_is_its_own_walk(served_bodies):
 
 
 def test_sketch_11_every_journal_row_is_counted_once_in_the_totals(served_bodies):
-    totals = served_bodies['memory_ops']['MEMORY_OPS']['totals']
+    served = served_bodies['memory_ops']['MEMORY_OPS']['totals']
+    assert served['state'] == 'fresh', served
+    totals = served['value']
     kinds = [kind for _operation, kind in MEMORY_OPS]
 
     assert totals['reads'] + totals['writes'] + totals['other'] == totals['total'] == len(MEMORY_OPS)
     assert (totals['reads'], totals['writes']) == (kinds.count('read'), kinds.count('write'))
     assert totals['other'] == 1, 'the kind outside read and write is counted, as other'
+
+
+def test_sketch_11_a_missing_journal_is_unknown_not_a_quiet_day(served_bodies):
+    ops = served_bodies['memory_ops_missing']['MEMORY_OPS']
+
+    for reading in ('totals', 'newest_hour_total'):
+        assert ops[reading]['state'] == 'unknown', ops[reading]
+        assert (ops[reading]['reason'] or '').strip(), f'an unknown {reading} must say why'
+    for series in ('labels', 'reads', 'writes', 'other', 'total', 'by_operation'):
+        assert ops[series] == [], f'a hole serves no {series} to draw as a flat zero line'
 
 
 def test_sketch_12_an_offline_scheduler_is_named_while_its_tasks_are_still_served(served_bodies):

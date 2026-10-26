@@ -128,7 +128,6 @@ INFO_L0_MECHANICAL_ROLES: frozenset[str] = frozenset({
     'orchestrator-no-landings-breaker',
     'orchestrator-warm-base-hard-down',
     'orchestrator-verify-host-monitor',
-    'orchestrator-offline-lane',
 })
 
 DONE_STEP_COMMIT_ORPHAN_CLASS = 'done-step-commit-orphan'

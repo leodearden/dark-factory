@@ -61,7 +61,7 @@ hand into the lane's internals — items appended to ``_inflight``, verify
 driven by calling ``_run_inflight_verify``/``_finalize_inflight``/
 ``_remerge`` directly, the heartbeat's ``_check_request_liveness`` /
 ``_check_resource_audit`` invoked as methods, and five lane functions
-replaced by ``patch('orchestrator.merge_queue.…')``. A gate asserting
+replaced by ``patch('orchestrator.merge_lane.worker.…')``. A gate asserting
 composition cannot be built out of calls that bypass the composition, so
 every surviving scenario now submits real requests on the public queue of a
 running lane and injects its fault through an injected port (``FakeVerifier``
@@ -83,7 +83,9 @@ Fault-injection inventory (no real ssh/build/merge-to-main):
     verify: pass, fail, raise ``RunnerUnavailable``, or park on an event.
   - a fake remote runner injected through the two-host allocator gives the
     speculative downstream its own host.
-  - ``clock=FakeClock`` ages the heartbeat for row 5 without a real wait.
+  - ``clock=healthy_verify_clock()`` ages the heartbeat for row 5 in
+    production-sized ticks of at most ``FakeClock.sleep_cap`` real each, on
+    a merge worktree the wedged verify keeps writing to.
   - ``patch.object(git_ops, 'advance_main')`` forges the CAS-retry outcome
     row 8 needs (a git_ops method, not a lane internal).
 """
@@ -98,10 +100,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import (
-    FakeClock,
     FakeVerifier,
     VerifyScript,
     fails,
+    healthy_verify_clock,
     lane_scene_config,
     main_health_probe_spawned,
     passes,
@@ -117,7 +119,8 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import AdvanceOutcome, GitOps, MergeResult, _run
 from orchestrator.merge_lane import MergeLane, WaiterRecord
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     InFlightMergeRegistry,
@@ -127,7 +130,6 @@ from orchestrator.merge_queue import (
     coalesce_or_enqueue_merge_request,
     item_merge_wt,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify_runner import RunnerUnavailable
 
 _STOP_TIMEOUT = 30.0
@@ -626,11 +628,17 @@ class TestScenario5LivenessEscalation:
     the heartbeat files a dedup'd category='merge_request_stuck' escalation
     [η=1992].
 
-    The ageing is done by the injected clock, not by waiting: ``FakeClock``
-    advances by whatever the heartbeat asks to sleep, so the lane's own
-    ``_HEARTBEAT_POLL_S`` cadence carries wall-clock time past the threshold
-    within a few event-loop turns. The escalation therefore comes off the
-    real heartbeat wiring rather than a direct call to the check.
+    The ageing is done by the injected clock: each heartbeat poll waits at
+    most ``FakeClock.sleep_cap`` of real time and charges its full
+    ``_HEARTBEAT_POLL_S``, alongside the reprobe loop's interval, so the
+    lane's own cadence carries wall-clock time past the threshold. The
+    escalation therefore comes off the real heartbeat wiring rather than a
+    direct call to the check.
+
+    The clock shows content progress (``healthy_verify_clock``) because a
+    frozen merge worktree would be aborted as dead before the stuck
+    threshold. In production too, a verify must keep writing to stay in
+    flight that long.
     """
 
     async def test_wedged_verify_escalates_liveness(
@@ -644,7 +652,8 @@ class TestScenario5LivenessEscalation:
         escalations = _FakeEscalationQueue(open_l1=False)
 
         async with _running_lane(
-            git_ops, verifier=verifier, escalation_queue=escalations, clock=FakeClock(),
+            git_ops, verifier=verifier, escalation_queue=escalations,
+            clock=healthy_verify_clock(),
         ) as (_lane, queue):
             req = await _submitted(git_ops, config, 'wedge5', 'wedge5.py', 'w = 1\n')
             await queue.put(req)
@@ -667,6 +676,58 @@ class TestScenario5LivenessEscalation:
             )
 
             verify_gate.set()
+
+    async def test_closed_stuck_alarm_is_not_refiled_while_the_request_stays_wedged(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """A closed stuck alarm is not re-filed on every heartbeat (task 5827).
+
+        ``open_l1=False`` models every prior alarm already closed by a human.
+        The wedged request stays in one dequeue episode, so it gets exactly
+        one alarm per ladder tier. Dequeue precedes ``first_seen`` by at least
+        the threshold, so waiting until ``first_seen + max(multiples) x
+        threshold`` passes the last tier with a full threshold of margin.
+        """
+        from orchestrator.merge_lane.request_ledger import STUCK_ALARM_THRESHOLD_MULTIPLES
+        from orchestrator.merge_lane.worker import INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+
+        threshold = 1.5 * INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+        verify_gate = asyncio.Event()
+        verifier = FakeVerifier(scripts={
+            'wedge5b': VerifyScript(result=passes().result, release=verify_gate),
+        })
+        escalations = _FakeEscalationQueue(open_l1=False)
+        clock = healthy_verify_clock()
+
+        async with _running_lane(
+            git_ops, verifier=verifier, escalation_queue=escalations, clock=clock,
+        ) as (_lane, queue):
+            req = await _submitted(git_ops, config, 'wedge5b', 'wedge5b.py', 'w = 1\n')
+            await queue.put(req)
+
+            def stuck_alarms() -> list:
+                return [
+                    e for e in escalations.submitted
+                    if e.category == 'merge_request_stuck' and req.request_id in e.summary
+                ]
+
+            await _until(
+                lambda: bool(stuck_alarms()),
+                what='the heartbeat to escalate the wedged request',
+            )
+            first_seen = clock.now()
+            await _until(
+                lambda: clock.now() > first_seen + max(STUCK_ALARM_THRESHOLD_MULTIPLES) * threshold,
+                what='the heartbeat to age the wedged request past the last alarm tier',
+                timeout=120,
+            )
+
+            alarm_count = len(stuck_alarms())
+            verify_gate.set()
+
+        assert alarm_count == len(STUCK_ALARM_THRESHOLD_MULTIPLES), (
+            f'expected one alarm per ladder tier, got {alarm_count}'
+        )
 
 
 # ── Row 7 — ill-formed item shape raises at construction ─────────────────────

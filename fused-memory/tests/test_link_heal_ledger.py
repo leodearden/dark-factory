@@ -22,9 +22,12 @@ from fused_memory.maintenance.link_heal_ledger import (
     AdjudicationRecord,
     AmbiguousRun,
     LinkHealLedger,
+    NothingToUndo,
+    RunKind,
     RunLock,
     RunLockHeld,
     RunSource,
+    UndoTarget,
     UnknownRun,
 )
 from fused_memory.server.grouped_read import CONTESTED_METADATA_KEY
@@ -101,15 +104,57 @@ class TestSchema:
         finally:
             ledger.close()
 
+    def test_a_ledger_written_before_plan_path_gains_the_column(self, tmp_path):
+        db = tmp_path / 'link_heal.db'
+        old_id = 'a' * 32
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                'CREATE TABLE runs ('
+                'id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL UNIQUE, '
+                'source TEXT NOT NULL, writes INTEGER NOT NULL, started_at TEXT NOT NULL, '
+                'finished_at TEXT, counts_json TEXT, plan_sha256 TEXT)',
+            )
+            conn.execute(
+                'INSERT INTO runs (run_id, source, writes, started_at, finished_at, '
+                'counts_json, plan_sha256) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (
+                    old_id, RunSource.CORPUS.value, 0, '2026-10-08T00:00:00+00:00',
+                    '2026-10-08T00:01:00+00:00', '{}', 'e' * 64,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ledger = LinkHealLedger(db)
+        try:
+            old = ledger.resolve_run(old_id)
+            assert old.plan_path is None
+            assert old.plan_sha256 == 'e' * 64
+            new_id = ledger.start_run(RunSource.CORPUS, writes=False)
+            ledger.finish_run(
+                new_id, counts={}, plan_sha256='f' * 64, plan_path=tmp_path / 'plan.json',
+            )
+            assert ledger.resolve_run(new_id).plan_path == tmp_path / 'plan.json'
+        finally:
+            ledger.close()
+        LinkHealLedger(db).close()
+
 
 class TestRuns:
     def test_start_run_mints_a_32_hex_run_id(self, ledger):
         assert re.fullmatch(r'[0-9a-f]{32}', ledger.start_run(RunSource.CORPUS, writes=False))
 
-    def test_finish_run_stores_counts_and_plan_sha(self, ledger):
+    def test_finish_run_stores_counts_and_plan_sha(self, ledger, tmp_path):
         run_id = ledger.start_run(RunSource.CORPUS, writes=False)
 
-        ledger.finish_run(run_id, counts={'planned': 3, 'would_escape': []}, plan_sha256='f' * 64)
+        ledger.finish_run(
+            run_id,
+            counts={'planned': 3, 'would_escape': []},
+            plan_sha256='f' * 64,
+            plan_path=tmp_path / 'plan.json',
+        )
 
         run = ledger.resolve_run(run_id)
         assert run.run_id == run_id
@@ -118,6 +163,37 @@ class TestRuns:
         assert run.finished_at is not None
         assert run.counts == {'planned': 3, 'would_escape': []}
         assert run.plan_sha256 == 'f' * 64
+        assert run.plan_path == tmp_path / 'plan.json'
+
+    def test_a_run_finished_without_a_plan_has_no_plan_path(self, ledger):
+        run_id = ledger.start_run(RunSource.CORPUS, writes=True)
+
+        ledger.finish_run(run_id, counts={'applied': 0})
+
+        assert ledger.resolve_run(run_id).plan_path is None
+
+    def test_latest_plan_run_is_the_newest_non_writing_run_of_its_source(self, ledger, tmp_path):
+        assert ledger.latest_plan_run(RunSource.CORPUS) is None
+        ledger.start_run(RunSource.CORPUS, writes=False)
+        ledger.start_run(RunSource.CORPUS, writes=True)
+        newest_corpus = ledger.start_run(RunSource.CORPUS, writes=False)
+        adjudicator = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ledger.start_run(RunSource.CORPUS, writes=True)
+
+        corpus_plan = ledger.latest_plan_run(RunSource.CORPUS)
+        adjudicator_plan = ledger.latest_plan_run(RunSource.ADJUDICATOR)
+
+        assert corpus_plan is not None
+        assert corpus_plan.run_id == newest_corpus
+        assert corpus_plan.kind is RunKind.PLAN
+        assert adjudicator_plan is not None
+        assert adjudicator_plan.run_id == adjudicator
+        assert adjudicator_plan.kind is RunKind.PLAN
+        fresh = LinkHealLedger(tmp_path / 'fresh.db')
+        try:
+            assert fresh.latest_plan_run(RunSource.CORPUS) is None
+        finally:
+            fresh.close()
 
     def test_writing_run_count_counts_only_writing_runs(self, ledger):
         ledger.finish_run(ledger.start_run(RunSource.CORPUS, writes=False), counts={})
@@ -156,6 +232,92 @@ class TestRuns:
 
         with pytest.raises(AmbiguousRun):
             ledger.resolve_run('abcdef01')
+
+
+def _plan_and_apply_two(ledger) -> tuple[str, str, list[int]]:
+    plan_run = ledger.start_run(RunSource.CORPUS, writes=False)
+    ids = ledger.add_planned(plan_run, [_planned(1), _planned(2)])
+    apply_run = ledger.start_run(RunSource.CORPUS, writes=True)
+    for action_id in ids:
+        ledger.set_outcome(action_id, ActionState.APPLIED, apply_run, None)
+    return plan_run, apply_run, ids
+
+
+def _undo_run_with_a_step(ledger) -> str:
+    _plan_run, apply_run, _ids = _plan_and_apply_two(ledger)
+    original = ledger.applied_actions(apply_run)[0]
+    undo_run = ledger.start_run(RunSource.UNDO, writes=True)
+    ledger.add_undo_step(
+        undo_run, original,
+        before=original.planned.post_image, after=original.planned.pre_image,
+        state=ActionState.APPLIED, detail=None,
+    )
+    return undo_run
+
+
+def _undone_apply_run(ledger) -> str:
+    plan_run = ledger.start_run(RunSource.CORPUS, writes=False)
+    (action_id,) = ledger.add_planned(plan_run, [_planned()])
+    apply_run = ledger.start_run(RunSource.CORPUS, writes=True)
+    ledger.set_outcome(action_id, ActionState.APPLIED, apply_run, None)
+    ledger.mark_undone(action_id, ledger.start_run(RunSource.UNDO, writes=True))
+    return apply_run
+
+
+class TestUndoTargets:
+    @pytest.mark.parametrize(
+        ('source', 'writes', 'kind'),
+        [
+            (RunSource.CORPUS, False, RunKind.PLAN),
+            (RunSource.ADJUDICATOR, False, RunKind.PLAN),
+            (RunSource.CORPUS, True, RunKind.APPLY),
+            (RunSource.ADJUDICATOR, True, RunKind.APPLY),
+            (RunSource.UNDO, True, RunKind.UNDO),
+        ],
+    )
+    def test_a_runs_kind_follows_its_source_and_writes(self, ledger, source, writes, kind):
+        run_id = ledger.start_run(source, writes=writes)
+
+        assert ledger.resolve_run(run_id).kind is kind
+
+    def test_an_undo_target_holds_the_heals_its_apply_run_applied(self, ledger):
+        _plan_run, apply_run, ids = _plan_and_apply_two(ledger)
+
+        target = ledger.undo_target(ledger.resolve_run(apply_run))
+
+        assert target.run.run_id == apply_run
+        assert [heal.action_id for heal in target.heals] == ids
+
+    @pytest.mark.parametrize(
+        ('target_of', 'kind'),
+        [
+            (lambda ledger: _plan_and_apply_two(ledger)[0], RunKind.PLAN),
+            (_undo_run_with_a_step, RunKind.UNDO),
+            (lambda ledger: ledger.start_run(RunSource.CORPUS, writes=True), RunKind.APPLY),
+            (_undone_apply_run, RunKind.APPLY),
+        ],
+        ids=['plan', 'undo', 'empty apply', 'undone apply'],
+    )
+    def test_a_run_with_no_applied_heal_is_refused(self, ledger, target_of, kind):
+        target = ledger.resolve_run(target_of(ledger))
+
+        with pytest.raises(NothingToUndo) as excinfo:
+            ledger.undo_target(target)
+
+        message = str(excinfo.value)
+        assert target.run_id[:8] in message
+        assert f'{kind.value} run' in message
+        assert 'no heal still applied' in message
+        assert excinfo.value.run.run_id == target.run_id
+
+    def test_an_undo_target_cannot_be_built_empty_or_from_a_non_apply_run(self, ledger):
+        plan_run, apply_run, _ids = _plan_and_apply_two(ledger)
+        heals = tuple(ledger.applied_actions(apply_run))
+
+        with pytest.raises(NothingToUndo):
+            UndoTarget(ledger.resolve_run(apply_run), ())
+        with pytest.raises(NothingToUndo):
+            UndoTarget(ledger.resolve_run(plan_run), heals)
 
 
 class TestActions:

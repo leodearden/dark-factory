@@ -17,6 +17,7 @@ import sys
 import types
 
 import pytest
+import systemd_unit_parity
 from setup_host_sections import (
     enabled_units,
     run_section,
@@ -680,23 +681,6 @@ def test_fm_override_report_carries_the_log_tag_on_every_physical_line(
         if not line.strip():
             continue
         assert line.startswith(f"[{mod.LOG_TAG}]"), f"Untagged output line: {line!r}"
-
-
-def test_fm_checker_reuses_the_shared_find_dropins():
-    """The checker uses the SHARED find_dropins, not a fourth pasted copy.
-
-    Structural anti-fork guard, in the style the three existing lifts are
-    already pinned by (see tests/scripts/test_check_orchestrator_unit_parity.py,
-    which asserts the same identity for the checker and the dashboard). An
-    identity assertion, not an equality one: a pasted copy would satisfy every
-    behavioural test above while reproducing — inside the tooling built to
-    report silent duplication — exactly the duplication it exists to report.
-    """
-    import systemd_unit_parity
-
-    mod = _load_checker()
-
-    assert mod.find_dropins is systemd_unit_parity.find_dropins
 
 
 def test_a_non_conf_file_in_the_dropin_dir_is_not_an_override(
@@ -1396,23 +1380,21 @@ def test_gate_still_names_fix_for_plain_directive_drift(tmp_path: pathlib.Path):
 # DASHBOARD_KNOWN_PROJECT_ROOTS entries survive a re-provision. The obvious
 # question is whether THIS checker then undoes it on the next run.
 #
-# It does not, and the reason is structural rather than incidental:
-# DASHBOARD_KNOWN_PROJECT_ROOTS is absent from REQUIRED_SERVICE_DIRECTIVES, and
-# fix_unit_text only APPENDS missing members of `required` — "Never removes or
-# reorders any existing line". So (i) and (ii) below are expected to pass the
-# moment they are written. They are REGRESSION GUARDS over a latent property,
-# not a red-to-green cycle, and (iii) is what makes them load-bearing rather
-# than decorative: it demonstrates that the hazard they forbid is real.
+# It does not, and the reason is structural rather than incidental: the
+# Environment= part of REQUIRED_SERVICE_DIRECTIVES is ENV_POLICY's required
+# projection, EnvPolicy rejects a row that is both host-local and required (B5,
+# plans/review-all-s25-scripts-instruments-prd.md D5), and fix_unit_text only
+# APPENDS missing members of `required` — "Never removes or reorders any
+# existing line". So (i) and (ii) below pass the moment they are written. They
+# are REGRESSION GUARDS over a latent property, and (iii) is what makes B5
+# load-bearing rather than decorative: it demonstrates that the hazard is real.
 #
-# THE HAZARD. REQUIRED_SERVICE_DIRECTIVES' own comment says "Extend this list to
-# guard additional safety flags". Add
-# `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=<repo_root>` there and, on a
-# correctly-preserved MULTI-root host, find_drift's exact WHOLE-LINE membership
-# reports it missing — so --fix appends the single-root line after the last
-# [Service] line, where systemd's LAST-WINS silently beats the preserved value.
-# On the unit that governs reconciliation, and invisibly: the checker then
-# exits 0. No code inside either module can prevent an edit to a constant in
-# the other, which is why the instrument is a cross-module invariant test.
+# THE HAZARD. Require `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=<repo_root>`
+# and, on a correctly-preserved MULTI-root host, find_drift's exact WHOLE-LINE
+# membership reports it missing — so --fix appends the single-root line after
+# the last [Service] line, where systemd's LAST-WINS silently beats the
+# preserved value. On the unit that governs reconciliation, and invisibly: the
+# checker then exits 0.
 
 _PRESERVED_NAME = "DASHBOARD_KNOWN_PROJECT_ROOTS"
 
@@ -1505,54 +1487,25 @@ def test_checker_and_fix_leave_a_multi_root_unit_untouched(
     assert mod.find_drift(after) == [], mod.find_drift(after)
 
 
-def test_preserved_names_are_disjoint_from_required_service_directives():
-    """(ii) THE INVARIANT, across BOTH modules and EVERY registered unit.
+def test_required_environment_directives_are_the_policy_projection():
+    """(ii) The required Environment= lines are ENV_POLICY's fused-memory projection.
 
-    No name any unit's spec preserves may appear as the VARIABLE of an exact
-    `Environment=<NAME>=...` entry on this checker's required list. The two
-    mechanisms are incompatible by construction: preservation says "this value
-    is the host's", exact whole-line membership says "this value is the
-    committed one", and when they disagree --fix wins by appending last.
-
-    Iterates render_systemd_unit.UNITS rather than naming one variable, so a
-    third unit — or a second preserved name on an existing one — is covered the
-    day it is registered.
-
-    Held HERE rather than by an import in either module: check_* and render_*
-    deliberately do not import each other (see render_systemd_unit's module
-    docstring — a cross-module import would ImportError under the section-8
-    tmp-repo tests that replace one of them with a stub).
+    So a host-local name cannot be among them: EnvPolicy rejects that row at
+    import (B5), and (iii) shows why it must.
     """
-    import render_systemd_unit
-
     mod = _load_checker()
+    required_env = [d for d in mod.REQUIRED_SERVICE_DIRECTIVES if d.startswith("Environment=")]
 
-    preserved = {
-        name
-        for spec in render_systemd_unit.UNITS.values()
-        for name in spec.host_local_environment
-    }
-    required_env_vars = {
-        directive[len("Environment=") :].split("=", 1)[0]
-        for directive in mod.REQUIRED_SERVICE_DIRECTIVES
-        if directive.startswith("Environment=") and "=" in directive[len("Environment=") :]
-    }
-
-    overlap = preserved & required_env_vars
-    assert not overlap, (
-        f"{sorted(overlap)} is BOTH preserved by scripts/render_systemd_unit.py "
-        "and exact-matched by REQUIRED_SERVICE_DIRECTIVES. On a host whose value "
-        "differs from the committed one, find_drift reports the required line as "
-        "missing and --fix APPENDS it after the last [Service] line, where "
-        "systemd's last-wins silently beats the preserved value — and the "
-        "checker then exits 0. See "
-        "test_a_required_known_project_roots_line_would_reclobber for the "
-        "demonstration."
+    assert required_env
+    assert required_env == list(
+        systemd_unit_parity.ENV_POLICY.required_directives(
+            systemd_unit_parity.UnitFamily.FUSED_MEMORY
+        )
     )
 
 
 def test_a_required_known_project_roots_line_would_reclobber():
-    """(iii) THE DEMONSTRATION that makes (ii) load-bearing rather than decorative.
+    """(iii) THE DEMONSTRATION that makes B5 load-bearing rather than decorative.
 
     An invariant nobody can see the point of gets deleted as pedantry. This runs
     the forbidden configuration and shows the damage.
@@ -1590,51 +1543,60 @@ def test_a_required_known_project_roots_line_would_reclobber():
 
 # The SECOND anchor for the invariant above, and the reason it exists.
 #
-# (ii) derives `preserved` solely from render_systemd_unit.UNITS[*].
-# host_local_environment. That is one END of the coupling. The other end —
-# the one that makes a clobber DAMAGING rather than merely untidy — is that
-# fused_memory/models/scope.py reads the variable as reconciliation's
-# project-root scope, and reconciliation/harness.py raises UnknownProjectError
-# for anything outside it.
+# B5 keeps every host-local ENV_POLICY row off the required list, and the
+# renderer preserves exactly those rows. That is one END of the coupling. The
+# other end — the one that makes a clobber DAMAGING rather than merely untidy,
+# and one the table cannot know — is that fused_memory/models/scope.py reads the
+# variable as reconciliation's project-root scope, and
+# reconciliation/harness.py raises UnknownProjectError for anything outside it.
 #
-# Drop the name from a UnitSpec while scope.py still reads it and (ii) goes
-# VACUOUSLY GREEN: `preserved` shrinks, the intersection is empty for the wrong
-# reason, and the hazard is wide open again with a passing test over it. So the
-# invariant is pinned from BOTH ends.
+# Make the variable's row not host-local while scope.py still reads it and B5
+# has nothing to reject: the table constructs, and the hazard is wide open again
+# under a passing suite. So the invariant is pinned from BOTH ends.
 #
-# READ BY `ast`, NOT BY IMPORT, and that is measured rather than stylistic:
-# `uv run --project shared python -c 'import fused_memory'` raises
-# ModuleNotFoundError. tests/scripts/ runs under `--project shared`
-# (scripts/orchestrator.yaml's test_command, whose own comment records that
-# neither target directory is a workspace member), and that environment
-# installs no fused_memory. An import-based guard would fail at COLLECTION with
-# an error bearing no resemblance to the invariant under test.
+# The VALUE lives in shared/src/shared/project_layout.py::KNOWN_PROJECT_ROOTS_ENV
+# (task 6715), which scope.py imports. shared IS installed in the
+# `uv run --project shared` environment tests/scripts/ runs under, so the value
+# is read by import. scope.py is still read by `ast`, NOT by import, and that is
+# measured rather than stylistic: `uv run --project shared python -c 'import
+# fused_memory'` raises ModuleNotFoundError (scripts/orchestrator.yaml's
+# test_command), so an import-based guard would fail at COLLECTION with an
+# error bearing no resemblance to the invariant under test.
 
 _SCOPE_PATH = (
     REPO_ROOT / "fused-memory" / "src" / "fused_memory" / "models" / "scope.py"
 )
 
 
-def _scope_known_project_roots_env() -> str | None:
-    """Return the literal of scope.py's ``KNOWN_PROJECT_ROOTS_ENV: str = ...``.
-
-    A SOURCE read, never an import — see the section comment above for the
-    measurement that forces it. Returns None if the annotated assignment is not
-    found or is not a plain string literal, which callers must treat as a
-    FAILURE rather than as "nothing to check": a rename or a refactor into a
-    computed value has to fail loudly here, not yield None and pass vacuously.
-    That vacuity is the exact failure mode this guard exists to close.
-    """
+def _scope_imports_known_project_roots_env_from_shared() -> bool:
+    """Whether scope.py binds ``KNOWN_PROJECT_ROOTS_ENV`` from ``shared.project_layout``."""
     tree = ast.parse(_SCOPE_PATH.read_text(encoding="utf-8"))
-    for node in tree.body:
-        if not isinstance(node, ast.AnnAssign):
-            continue
-        target = node.target
-        if not isinstance(target, ast.Name) or target.id != "KNOWN_PROJECT_ROOTS_ENV":
-            continue
-        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-            return node.value.value
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "shared.project_layout"
+        and any(
+            alias.name == "KNOWN_PROJECT_ROOTS_ENV" and alias.asname is None
+            for alias in node.names
+        )
+        for node in tree.body
+    )
+
+
+def _scope_known_project_roots_env() -> str | None:
+    """The env-var name scope.py reads as reconciliation's project-root scope.
+
+    Returns None unless scope.py still imports ``KNOWN_PROJECT_ROOTS_ENV`` from
+    ``shared.project_layout`` and that is a non-empty str. Callers must treat
+    None as a FAILURE rather than as "nothing to check": a rename or a move has
+    to fail loudly here, not pass vacuously. That vacuity is the exact failure
+    mode this guard exists to close.
+    """
+    if not _scope_imports_known_project_roots_env_from_shared():
         return None
+    from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV
+
+    if isinstance(KNOWN_PROJECT_ROOTS_ENV, str) and KNOWN_PROJECT_ROOTS_ENV:
+        return KNOWN_PROJECT_ROOTS_ENV
     return None
 
 
@@ -1648,20 +1610,20 @@ def test_scope_known_project_roots_env_is_readable_from_source():
     """
     name = _scope_known_project_roots_env()
     assert isinstance(name, str) and name, (
-        f"Could not read KNOWN_PROJECT_ROOTS_ENV as a string literal from "
-        f"{_SCOPE_PATH}. It was renamed, moved, or made computed. Without it "
-        "the two guards below silently stop checking anything — repair the "
-        "read rather than deleting them, and do NOT switch to importing "
-        "fused_memory: it is not installed in the `uv run --project shared` "
-        "environment this suite runs under."
+        f"{_SCOPE_PATH} no longer imports KNOWN_PROJECT_ROOTS_ENV from "
+        "shared.project_layout, or that constant is no longer a non-empty str. "
+        "Without it the two guards below silently stop checking anything — "
+        "repair the read rather than deleting them, and do NOT switch to "
+        "importing fused_memory: it is not installed in the "
+        "`uv run --project shared` environment this suite runs under."
     )
 
 
 def test_scope_known_project_roots_env_is_disjoint_from_required_service_directives():
     """The CONSUMER's variable name is not on this checker's required list.
 
-    Anchors the (ii) invariant on the module that actually reads the variable,
-    so it keeps meaning something even if the renderer's spec changes. Same
+    Anchors B5 on the module that actually reads the variable, so it keeps
+    meaning something even if the variable's ENV_POLICY row changes. Same
     hazard, stated from the other end: put this name on the required list and
 
       1. find_drift tests EXACT WHOLE-LINE membership, so on a host whose value
@@ -1704,11 +1666,10 @@ def test_scope_known_project_roots_env_is_disjoint_from_required_service_directi
 def test_scope_known_project_roots_env_is_actually_preserved_by_the_renderer():
     """The JOIN between the two anchors: the renderer still preserves what scope.py reads.
 
-    This is what makes the disjointness invariant non-vacuous. If the renderer
-    ever stopped preserving this name while scope.py went on reading it, the
-    (ii) guard's `preserved` set would no longer contain it, the intersection
-    would be empty for the wrong reason, and the hazard would be reopened under
-    a passing test. That state is precisely what goes red here.
+    This is what makes B5 non-vacuous for this variable. If its ENV_POLICY row
+    stopped being host-local while scope.py went on reading it, B5 would have
+    nothing to reject, and the hazard would be reopened under a passing suite.
+    That state is precisely what goes red here.
     """
     import render_systemd_unit
 
@@ -1725,9 +1686,8 @@ def test_scope_known_project_roots_env_is_actually_preserved_by_the_renderer():
         f"{name} is read by {_SCOPE_PATH}::KNOWN_PROJECT_ROOTS_ENV but no "
         f"render_systemd_unit.UNITS spec preserves it (preserved: "
         f"{sorted(preserved)}). Either a re-render now silently drops this "
-        "host's reconciliation scope, or the variable moved and this guard "
-        "plus ::test_preserved_names_are_disjoint_from_required_service_"
-        "directives are both now checking nothing."
+        "host's reconciliation scope, or the variable moved and ENV_POLICY's "
+        "host-local row now protects a name nothing reads."
     )
 
 

@@ -137,6 +137,7 @@ def test_each_committed_spec_is_the_spec_its_run_recorded(arm_id):
     assert load_arm_spec(CONTROLS / 'specs' / f'{arm_id}.json') == _run(arm_id).spec
 
 
+@pytest.mark.reads_git_history
 def test_every_run_is_pinned_to_one_code_sha_and_the_committed_corpus():
     code_shas = {_run(arm_id).spec.code_sha for arm_id in ARMS}
     corpus_shas = {_run(arm_id).spec.corpus_sha for arm_id in ARMS}

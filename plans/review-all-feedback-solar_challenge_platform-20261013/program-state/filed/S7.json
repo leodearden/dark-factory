@@ -1,0 +1,179 @@
+{
+ "stream": "S7",
+ "prd_path": "docs/prds/review-all-tenant-reach-has-one-predicate.md",
+ "sidecar_path": "docs/prds/review-all-tenant-reach-has-one-predicate.capability-manifest.yaml",
+ "filed": [
+  {
+   "label": "alpha",
+   "task_id": "1251",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-137afd14e778",
+    "fk-6532cc131c3a"
+   ],
+   "depends_on": [
+    "1078",
+    "365",
+    "422",
+    "1136"
+   ],
+   "note": "models/occupancy.py after S1 365+422"
+  },
+  {
+   "label": "beta",
+   "task_id": "1254",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-c32f3c61bcc2",
+    "fk-11f4b3ec5056"
+   ],
+   "depends_on": [
+    "442",
+    "1078"
+   ]
+  },
+  {
+   "label": "gamma",
+   "task_id": "1257",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-ec28bb3553ad",
+    "fk-6532cc131c3a",
+    "fk-2d3a9a905420"
+   ],
+   "depends_on": [
+    "1251",
+    "1254"
+   ]
+  },
+  {
+   "label": "delta",
+   "task_id": "1260",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-d2f848d0f31d",
+    "fk-2d3a9a905420"
+   ],
+   "depends_on": [
+    "1254",
+    "1257",
+    "445",
+    "1078"
+   ]
+  },
+  {
+   "label": "epsilon",
+   "task_id": "1265",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-d2f848d0f31d"
+   ],
+   "depends_on": [
+    "1260",
+    "1137",
+    "1145"
+   ],
+   "note": "RoleReach.FLEET per role (Q1)"
+  },
+  {
+   "label": "zeta",
+   "task_id": "1267",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-d2f848d0f31d",
+    "fk-2d3a9a905420",
+    "fk-6532cc131c3a"
+   ],
+   "depends_on": [
+    "1257",
+    "1260",
+    "1265",
+    "707",
+    "1066"
+   ],
+   "note": "raised to high (Q3); INV-6 enforced; supersedes 707"
+  },
+  {
+   "label": "eta",
+   "task_id": "1269",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-137afd14e778"
+   ],
+   "depends_on": [
+    "1251",
+    "517",
+    "1195"
+   ]
+  },
+  {
+   "label": "theta",
+   "task_id": "1271",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-11f4b3ec5056",
+    "fk-c32f3c61bcc2"
+   ],
+   "depends_on": [
+    "1254",
+    "1260",
+    "442",
+    "1193",
+    "1196"
+   ],
+   "note": "752 kept open for Leo (Q4)"
+  },
+  {
+   "label": "iota",
+   "task_id": "1272",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-6532cc131c3a"
+   ],
+   "depends_on": [
+    "1251",
+    "365",
+    "422",
+    "1136"
+   ]
+  },
+  {
+   "label": "kappa",
+   "task_id": "1273",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-d2f848d0f31d",
+    "fk-2d3a9a905420",
+    "fk-11f4b3ec5056",
+    "fk-ec28bb3553ad",
+    "fk-6532cc131c3a",
+    "fk-137afd14e778",
+    "fk-c32f3c61bcc2"
+   ],
+   "depends_on": [
+    "1251",
+    "1254",
+    "1257",
+    "1260",
+    "1265",
+    "1267",
+    "1269",
+    "1271",
+    "1272"
+   ],
+   "note": "integration gate; raised to high (Q3)"
+  }
+ ],
+ "held_leaves": [],
+ "gate_dependencies_added": [
+  "1267",
+  "1273"
+ ],
+ "commit_planning_result": "all 10 pending; sidecar stamped",
+ "lead_rulings": [
+  "Nothing held: every upstream filed and wired (S1 365/422, S17 1136, S3 1137/1145, S13 1193/1195/1196, S26 1078/517, S27 1066, P-Gate 442/445, 707).",
+  "Lead edges 2026-10-15: 752 -> 1271 (Q4 RULED by Leo 2026-10-15: OPERATOR may READ consent; theta admits OPERATOR on the three reads, writes stay CUSTOMER/ADMIN), 972 -> 1269, 342 -> 1272; notes on 707 (superseded by 1267 after it lands), 442, 445, 323.",
+  "Supply-rule home: models/occupancy.py (S7-alpha 1251) after S1's 365/422 land in billing/supply_dates.py.",
+  "Sidecar: alpha's module-imports-downward converted to manual (vacuous on a not-yet-existing file); delta/zeta files widened to clear absent_overbroad."
+ ]
+}

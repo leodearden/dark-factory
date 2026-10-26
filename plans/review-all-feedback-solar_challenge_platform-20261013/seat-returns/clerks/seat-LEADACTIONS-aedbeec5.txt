@@ -1,0 +1,3 @@
+```json
+{"cancelled": [583, 305, 866, 865, 281, 549, 934], "skipped": [], "stamped": ["1174 (x_finding_key now fk-24fc40d4c492, fk-2aabdb20b30f, fk-2426a5a9c9f7; details note appended)"], "edges_added": ["1009 -> 1176"], "notes_appended": [1009, 1066, 1071, 213], "errors": []}
+```

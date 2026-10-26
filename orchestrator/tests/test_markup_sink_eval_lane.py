@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
 
 from orchestrator.mcp import markup_sink
 
@@ -93,7 +94,7 @@ EVAL_LANE_PROVENANCE = pytest.mark.parametrize(
 
 
 def _queue_dir(root: Path) -> Path:
-    return root / markup_sink.MARKUP_QUEUE_DIRNAME
+    return escalation_queue_dir(root)
 
 
 def _pending(root: Path) -> list[Escalation]:

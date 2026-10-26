@@ -207,9 +207,15 @@ class FakeLive:
                 open_journal=_opener(self.journal, log.journal_paths.append),
                 open_falkordb=_opener(self.falkor, lambda: _count(log, 'falkordb_opens')),
                 open_qdrant=_opener(self.qdrant, lambda: _count(log, 'qdrant_opens')),
+                open_embedding_arm_backend=_embedding_only,
+                build_arm_embedder=_embedding_only,
             )
 
         return build
+
+
+def _embedding_only(*args: Any, **kwargs: Any) -> Any:
+    raise AssertionError('only the embedding subcommands (test_embedding_cli.py) build these')
 
 
 def _count(log: DepsLog, name: str) -> None:

@@ -640,41 +640,79 @@ async def test_merge_active_series_uses_provided_now(metrics_db_path: Path):
 # ---------------------------------------------------------------------------
 
 
+def _metrics_table_names() -> list[str]:
+    """Every table METRICS_SCHEMA creates, so a table left out of downsampling fails."""
+    conn = sqlite3.connect(':memory:')
+    try:
+        conn.executescript(METRICS_SCHEMA)
+        return [name for (name,) in conn.execute(
+            "SELECT name FROM sqlite_master"
+            " WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )]
+    finally:
+        conn.close()
+
+
+def _not_null_by_column(conn: sqlite3.Connection, table: str) -> dict[str, bool]:
+    return {row[1]: bool(row[3]) for row in conn.execute(f'PRAGMA table_info({table})')}
+
+
+def _insert_metrics_row(
+    conn: sqlite3.Connection,
+    table: str,
+    not_null_by_column: dict[str, bool],
+    project_id: str | None,
+    ts: str,
+) -> None:
+    values: dict[str, object] = {'ts': ts}
+    if 'project_id' in not_null_by_column:
+        values['project_id'] = project_id
+    for column, not_null in not_null_by_column.items():
+        if not_null and column not in values:
+            values[column] = 0
+    conn.execute(
+        f'INSERT INTO {table} ({", ".join(values)}) VALUES ({", ".join("?" * len(values))})',
+        tuple(values.values()),
+    )
+
+
 @pytest.mark.asyncio
-async def test_downsample_keeps_latest_per_hour_after_7d(metrics_db_path: Path):
-    now = datetime.now(UTC)
-    old = now - timedelta(days=10)
+@pytest.mark.parametrize('table', _metrics_table_names())
+async def test_downsample_keeps_one_row_per_old_hour(metrics_db_path: Path, table: str):
+    later_old_hour = (FIXED_NOW - timedelta(days=10)).replace(minute=0, second=0, microsecond=0)
+    old_hours = (later_old_hour - timedelta(hours=1), later_old_hour)
     conn = sqlite3.connect(str(metrics_db_path))
-    # Two rows in the same hour, project_id='proj' — the older should be culled.
-    conn.execute(
-        'INSERT INTO orchestrator_snapshots (ts, project_id, running_count) VALUES (?, ?, ?)',
-        ((old + timedelta(minutes=5)).isoformat(), 'proj', 1),
-    )
-    conn.execute(
-        'INSERT INTO orchestrator_snapshots (ts, project_id, running_count) VALUES (?, ?, ?)',
-        ((old + timedelta(minutes=55)).isoformat(), 'proj', 9),
-    )
-    # System-wide tables: two same-hour rows, latest wins.
-    conn.execute(
-        'INSERT INTO recon_snapshots (ts, buffered_count, active_agents) VALUES (?, ?, ?)',
-        ((old + timedelta(minutes=10)).isoformat(), 1, 1),
-    )
-    conn.execute(
-        'INSERT INTO recon_snapshots (ts, buffered_count, active_agents) VALUES (?, ?, ?)',
-        ((old + timedelta(minutes=50)).isoformat(), 9, 9),
-    )
+    not_null_by_column = _not_null_by_column(conn, table)
+    per_project = 'project_id' in not_null_by_column
+    projects = ('a', 'b') if per_project else (None,)
+    recent = (projects[0], (FIXED_NOW - timedelta(hours=1)).isoformat())
+    for project in projects:
+        for hour in old_hours:
+            for minute in (10, 50):
+                ts = (hour + timedelta(minutes=minute)).isoformat()
+                _insert_metrics_row(conn, table, not_null_by_column, project, ts)
+    expired_ts = (FIXED_NOW - timedelta(days=100)).isoformat()
+    _insert_metrics_row(conn, table, not_null_by_column, projects[0], expired_ts)
+    _insert_metrics_row(conn, table, not_null_by_column, *recent)
     conn.commit()
     conn.close()
 
     rw = await aiosqlite.connect(str(metrics_db_path))
     try:
-        await downsample_metrics(rw)
+        await downsample_metrics(rw, now=FIXED_NOW)
     finally:
         await rw.close()
 
+    project_column = 'project_id' if per_project else 'NULL'
     inspect = sqlite3.connect(str(metrics_db_path))
-    cnt = inspect.execute('SELECT running_count FROM orchestrator_snapshots').fetchall()
-    rec = inspect.execute('SELECT buffered_count FROM recon_snapshots').fetchall()
+    got = inspect.execute(
+        f'SELECT {project_column}, ts FROM {table} ORDER BY ts, {project_column}'
+    ).fetchall()
     inspect.close()
-    assert cnt == [(9,)]
-    assert rec == [(9,)]
+    newest_of_each_old_hour = [
+        (project, (hour + timedelta(minutes=50)).isoformat())
+        for hour in old_hours
+        for project in projects
+    ]
+    expected = [*newest_of_each_old_hour, recent]
+    assert got == expected, f'{table}: expected survivors {expected}, got {got}'

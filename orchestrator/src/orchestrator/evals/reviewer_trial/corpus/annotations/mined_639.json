@@ -24,6 +24,54 @@
       "severity": "suggestion",
       "description": "`from typing import TYPE_CHECKING` is added but there is no visible usage in the diff; if nothing in the file references it, this is an unused import that will trip linters.",
       "mutation_type": "style"
+    },
+    {
+      "id": "mined_639_pool_01",
+      "location": "orchestrator/src/orchestrator/workflow.py:1953",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "The only production consumer of the new `get_cached_status` seam, the post-steward terminal guard in TaskWorkflow (returns DONE for cached 'done', BLOCKED for other terminal statuses, without re-queueing to pending), is exercised by no test; the new tests only check each double's getter echoes its setter, so a regression in the guard (wrong accessor, wrong task id, mishandled 'cancelled') would pass.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_639_pool_02",
+      "location": "orchestrator/src/orchestrator/evals/runner.py:463",
+      "category": "naming",
+      "severity": "suggestion",
+      "description": "_EvalScheduler's status map is renamed from `_status_cache` to the less informative `_cache` for no reason (the Protocol no longer exposes it), so it no longer says what it holds and no longer matches `Scheduler._status_cache`, which stores the same concept.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_639_pool_03",
+      "location": "orchestrator/tests/test_workflow_e2e.py:2081-2093",
+      "category": "comments",
+      "severity": "suggestion",
+      "description": "The change adds an 11-line banner above the TYPE_CHECKING block defending its placement against a rejected alternative and citing FakeScheduler by line ('line ~361', the class is at 350), a second banner near 2026 narrating history ('replaced the old hasattr/isinstance runtime checks'), and 'Uses get_cached_status() to verify cache contents.' sentences in TestGetTasksSeedsCache/TestCancelledTaskResync docstrings; reviewer-answering and change-history prose plus a drifting line pin, where a one-line pointer suffices.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_639_pool_04",
+      "location": "orchestrator/tests/test_workflow_e2e.py:2064-2076",
+      "category": "redundant_import",
+      "severity": "suggestion",
+      "description": "The TestEvalSchedulerCachedStatus tests import OrchestratorConfig inside each function although the module already imports it at top level (line 21), and import _EvalScheduler separately in each test and again under an alias in the TYPE_CHECKING block.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_639_pool_05",
+      "location": "orchestrator/tests/test_scheduler.py:1296-1303",
+      "category": "redundant_test",
+      "severity": "suggestion",
+      "description": "TestGetCachedStatus.test_get_cached_status_returns_status_after_set_task_status repeats the set_task_status-then-get_cached_status check that TestGetTasksSeedsCache and TestCancelledTaskResync now already make via the new accessor; only the None-for-unknown case adds coverage.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_639_pool_06",
+      "location": "orchestrator/tests/test_workflow_e2e.py:2059",
+      "category": "test_placement",
+      "severity": "suggestion",
+      "description": "Unit tests of the eval stub `_EvalScheduler` (evals/runner.py) are added to the workflow e2e test module instead of an evals-focused module, mixing concerns in that file.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

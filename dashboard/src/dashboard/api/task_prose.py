@@ -1,8 +1,8 @@
 """`/api/v2/dashboard/task/{project}/T-{task_id}` — one task's description and details.
 
 Serves the Tasks tab's Task Detail pane, which fetches the prose of the
-selected task on selection and never polls it. The ACTIVE_TASKS list
-deliberately omits both fields (see
+selected task on selection and never polls it. The task rows served as
+``TASKS_SNAPSHOT[p].rows`` deliberately omit both fields (see
 ``dashboard/src/dashboard/data/active_tasks.py::_build_task_row``).
 """
 
@@ -17,7 +17,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from dashboard.config import DashboardConfig
-from dashboard.data.active_tasks import project_roots_for_label, task_uid
+from dashboard.data.active_tasks import task_uid
 from dashboard.data.tasks import (
     DEFAULT_WHOLE_OPERATION_BUDGET,
     TaskNotFound,
@@ -36,33 +36,24 @@ router = APIRouter()
 _TASK_PROSE_BUDGET = DEFAULT_WHOLE_OPERATION_BUDGET
 
 
-@router.get('/api/v2/dashboard/task/{project}/T-{task_id}')
+@router.get('/api/v2/dashboard/task/{project:path}/T-{task_id}')
 async def api_task_prose(project: str, task_id: int, request: Request) -> JSONResponse:
     """TASK_PROSE:<uid> for the row uid ``<project>/T-<task_id>``.
 
     The project LABEL resolves against the configured roots only, so a request
-    can never aim fused-memory at an arbitrary path. A label naming two roots
-    is refused rather than guessed: a guess could show another task's prose
-    under a correct-looking title.
+    can never aim fused-memory at an arbitrary path. Labels are unique across
+    the configured roots (see ``dashboard/project_labels.py::ProjectLabels``),
+    so a label names at most one.
     """
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
     uid = task_uid(project, task_id)
-    roots = project_roots_for_label(config, project)
-    if not roots:
+    root = config.project_labels.root_for(project)
+    if root is None:
         return JSONResponse({'error': 'unknown_project', 'project': project}, status_code=404)
-    if len(roots) > 1:
-        return JSONResponse(
-            {
-                'error': 'ambiguous_project',
-                'project': project,
-                'roots': [str(root) for root in roots],
-            },
-            status_code=409,
-        )
     try:
         read = await asyncio.wait_for(
-            fetch_task_prose(http_client, config, roots[0], task_id),
+            fetch_task_prose(http_client, config, root, task_id),
             timeout=_TASK_PROSE_BUDGET,
         )
     except TimeoutError:

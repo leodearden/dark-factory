@@ -98,6 +98,11 @@ order).
 
 ### Part 2 — PRD progress view
 
+> *Superseded 2026-10-09 by `plans/dashboard-prd-lanes-prd.md` task 6585 (δ). The PRD box
+> grid (`ProjectPrdGroups`, `PrdBox`, `prd_grouping.js`) is replaced by server-computed lanes.
+> Part 1 stands: `TaskGraph`, `TaskGraphEdges`, `graph_layout.js` and focus mode become the
+> expanded body of a PRD row.*
+
 **Backend** (`data/active_tasks.py` + `data/tasks.py`):
 - Every task row gains a **`prd`** field: coalesce
   `metadata.prd_path → metadata.prd → metadata.prd_ref`, strip `#anchor` and

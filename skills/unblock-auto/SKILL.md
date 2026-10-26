@@ -61,12 +61,13 @@ Read <worktree>/.task/iterations.jsonl  # execution log: what each agent attempt
 Also scan `<worktree>/.task/reviews/` for reviewer verdict files (`*.json`).
 
 ### 1b. Git state (read-only commands only)
+You run with the task worktree as your working directory, and any command outside your read-only allowlist is denied without a prompt.
 ```bash
-git -C <worktree> log --oneline -15
-git -C <worktree> diff $(git -C <worktree> merge-base main HEAD)..HEAD --stat
-git -C <worktree> status --porcelain
+git log --oneline -15
+git diff main...HEAD --stat
+git status --porcelain
 ```
-Use the merge-base/three-dot form, not two-dot `main..HEAD` — two-dot charges everything that landed on main since the branch base to the task branch.
+Use the merge-base/three-dot form `main...HEAD`, not two-dot `main..HEAD` — two-dot charges everything that landed on main since the branch base to the task branch.
 
 ### 1c. Task metadata
 ```
@@ -77,7 +78,7 @@ Check `metadata.dry_run_proposals` — if prior proposals exist, note what was a
 ### 1d. Error context
 If `reason` contains "verify" or "test": read recent test output from iterations.jsonl.
 If `reason` contains "review": read `<worktree>/.task/reviews/*.json` for specific issues.
-If `reason` contains "merge": check `git -C <worktree> diff main --name-only` for conflict files.
+If `reason` contains "merge": check `git diff main --name-only` for conflict files.
 
 ---
 

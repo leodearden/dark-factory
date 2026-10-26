@@ -29,6 +29,7 @@ import json
 from pathlib import Path
 
 import pytest
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.reconciliation.bulk_reset_guard import (
     BulkResetGuard,
@@ -539,6 +540,42 @@ async def test_emits_l1_escalation_on_trip(tmp_path):
     assert data['other_kind_task_ids_in_window'] == [], (
         f"Expected empty cross-kind list, got {data['other_kind_task_ids_in_window']!r}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('uses_project_root', [True, False], ids=['project_root', 'fallback_dir'])
+async def test_escalation_lands_in_the_layout_escalation_queue_when_relocated(
+    tmp_path, escalation_queue_relocation, uses_project_root,
+):
+    clock = [1000.0]
+    guard = BulkResetGuard(
+        done_threshold=3,
+        in_progress_threshold=100,
+        window_seconds=60.0,
+        escalation_rate_limit_seconds=900.0,
+        time_provider=lambda: clock[0],
+        escalations_fallback_dir=tmp_path,
+    )
+
+    async def reverse(task_id: str) -> BulkResetVerdict:
+        clock[0] += 1.0
+        return await guard.observe_attempt(
+            project_id='proj-esc',
+            task_id=task_id,
+            old_status='done',
+            new_status='pending',
+            project_root=str(tmp_path) if uses_project_root else '',
+        )
+
+    for task_id in ('t1', 't2', 't3'):
+        await reverse(task_id)
+    verdict = await reverse('t4')
+
+    assert verdict.outcome == 'escalated'
+    assert verdict.escalation_path is not None
+    assert Path(verdict.escalation_path).parent == escalation_queue_dir(tmp_path)
+    assert Path(verdict.escalation_path).exists()
+    assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
 
 # ---------------------------------------------------------------------------

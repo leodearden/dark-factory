@@ -11,6 +11,10 @@
 #   REIFY_TEST_BLKID_TYPE   — blkid stub (unprivileged) stdout type (default: derived
 #                             from REIFY_TEST_IMG_XFS, see above)
 #   REIFY_TEST_BLKID_STDERR — blkid stub (unprivileged) stderr text (default: none)
+#   REIFY_TEST_BLKID_STDERR_PAD_BYTES — blkid stub (unprivileged): filler bytes
+#                             written to stderr after that text (default: none);
+#                             a byte count, because one env string is capped at
+#                             MAX_ARG_STRLEN (128KiB)
 #   REIFY_TEST_BLKID_SUDO_RC / _TYPE / _STDERR — same three knobs for a blkid
 #                             invocation running under the sudo stub
 #                             (REIFY_TEST_UNDER_SUDO=1), so an under-sudo re-probe
@@ -170,8 +174,10 @@ else
         _type=""
     fi
     _stderr="${REIFY_TEST_BLKID_STDERR:-}"
+    _pad="${REIFY_TEST_BLKID_STDERR_PAD_BYTES:-}"
 fi
 [ -n "$_stderr" ] && echo "$_stderr" >&2
+[ -n "${_pad:-}" ] && head -c "$_pad" /dev/zero | tr '\0' x >&2
 [ -n "$_type" ] && echo "$_type"
 exit "$_rc"
 STUB_EOF
@@ -916,6 +922,30 @@ assert "N2e: bare blkid call precedes the sudo blkid fallback call" \
     ' _ "$CALLS_FILE"
 
 assert "N2f: NO mkfs.xfs (re-attach via fallback classification, not reprovision)" \
+    bash -c '! grep -q "^mkfs.xfs" "$1"' _ "$CALLS_FILE"
+
+# N4: N2 with the permission-denied line followed by bulk stderr. The probe
+# must still see the line and take the sudo re-probe. The pad is
+# tests/scripts/shell_sections.py::SIGPIPE_BULK_BYTES, the size measured to
+# make a pipe into `grep -q` lose its verdict deterministically.
+reset_calls
+REIFY_TEST_MOUNTED="" REIFY_TEST_IMG_XFS="" \
+REIFY_TEST_BLKID_RC=2 REIFY_TEST_BLKID_STDERR='blkid: Permission denied' \
+REIFY_TEST_BLKID_STDERR_PAD_BYTES=262144 \
+REIFY_TEST_BLKID_SUDO_RC=0 REIFY_TEST_BLKID_SUDO_TYPE='xfs' \
+REIFY_TEST_REFLINK_OK=1 REIFY_WARM_LANE_SUDO='sudo -n' \
+    run_helper --img "$N_IMG" --mount "$N_MNT"
+
+assert "N4a: perm-denied line under bulk stderr + sudo fallback -> exits 0" \
+    test "$RC" -eq 0
+
+assert "N4b: privileged 'sudo ... blkid' fallback call recorded" \
+    bash -c 'grep -qE "^sudo.*blkid" "$1"' _ "$CALLS_FILE"
+
+assert "N4c: STDOUT is exactly the mount path" \
+    bash -c '[ "$1" = "$2" ]' _ "$OUT" "$N_MNT"
+
+assert "N4d: NO mkfs.xfs (re-attach, not reprovision)" \
     bash -c '! grep -q "^mkfs.xfs" "$1"' _ "$CALLS_FILE"
 
 

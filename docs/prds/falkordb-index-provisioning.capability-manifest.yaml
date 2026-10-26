@@ -260,3 +260,5 @@ tasks:
       reason: '"does not restate" is a negative prose property; a grep for the statement
         text would false-positive on the composite-trap warning the runbook is required
         to carry'
+signal_leaves:
+- ζ

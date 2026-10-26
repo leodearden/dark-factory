@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from shared.task_submit import SubmitFailed, SubmitOutcome
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
@@ -63,8 +64,11 @@ class _Scheduler:
     ):
         return BlastRadiusResult(applied=False)
 
-    async def dispatch_tool(self, name, arguments, *, timeout=30.0):
+    async def dispatch_tool(self, name: str, arguments: dict, *, timeout: float = 30.0) -> dict:
         return {}
+
+    async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
+        return SubmitFailed('_Scheduler files nothing')
 
     def release(self, tid):
         pass
@@ -88,6 +92,9 @@ class _Scheduler:
 
     def clear_merge_phase(self, tid: str) -> None:
         pass
+
+    def blocked_writes_suppressed(self, tid: str, /) -> bool:
+        return False
 
 
 def _make_workflow(*, tmp_path: Path, task_id: str = '42',

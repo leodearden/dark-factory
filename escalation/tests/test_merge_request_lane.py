@@ -38,10 +38,10 @@ from escalation.server import create_server
 # ---------------------------------------------------------------------------
 try:
     from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.types import MergeOutcome
+    from orchestrator.merge_lane.worker import (
         InFlightMergeRegistry,
     )
-    from orchestrator.merge_types import MergeOutcome  # type: ignore[reportMissingImports]
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
@@ -430,6 +430,30 @@ class TestSubmitResponseEchoesTheResolvedLane:
         result = await _submit_nonblocking(tmp_path, _make_harness(metadata={}))
         assert result.get('lane') == 'normal', result
         assert result.get('lane_source') == 'default', result
+
+    @pytest.mark.parametrize(
+        ('scheduler_raises', 'no_scheduler'),
+        [(True, False), (False, True)],
+        ids=['scheduler_raises', 'no_scheduler'],
+    )
+    async def test_failed_metadata_read_reports_unavailable_not_default(
+        self, tmp_path: Path, scheduler_raises: bool, no_scheduler: bool
+    ):
+        """A degraded task store must not read as "nothing asked at all".
+
+        The lane still fails open to ``'normal'``; only the provenance differs
+        from ``test_neither_source_reports_the_default``.  A harness with no
+        scheduler at all is the same "could not find out" case as one whose
+        scheduler raises, so a scheduler-less deployment reports
+        ``'unavailable'`` on every submission that passes no ``lane``.
+        """
+        harness = _make_harness(
+            scheduler_raises=scheduler_raises, no_scheduler=no_scheduler
+        )
+        result = await _submit_nonblocking(tmp_path, harness)
+        assert result.get('status') == 'queued', result
+        assert result.get('lane') == 'normal', result
+        assert result.get('lane_source') == 'unavailable', result
 
     async def test_queued_response_reports_the_lane_as_applied(self, tmp_path: Path):
         """On the dispatched arm the echo IS the effective lane."""

@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sqlite3
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -29,6 +31,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.project_id import project_id_for_root
+from shared.project_layout import default_project_root, tasks_db
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.consolidation_gate import (
@@ -109,8 +113,10 @@ class FakeMemory:
         self.live = {str(i).lower() for i in live_ids}
         self.raises = raises
         self.point_reads = []
+        self.counted_projects = []
 
     async def count_memories_by_metadata(self, project_id, filters):
+        self.counted_projects.append(project_id)
         return len(self.members)
 
     async def get_memories_by_metadata(self, project_id, filters, limit=None):
@@ -397,3 +403,136 @@ class TestLoadTaskMetadataSurfacesTheRefusal:
             con.close()
 
         assert mod.load_task_metadata(str(tmp_path), '1', 'master') == '{"k": 1}'
+
+
+_LINKED_WORKTREE_COPY = load_script_module(
+    _ROOT / 'scripts' / 'tests' / 'linked_worktree_copy.py', mod_name='linked_worktree_copy'
+)
+
+# Run inside a probe subprocess: a store that records the project_id it is
+# scrolled under, then the script's own run() for --task-id 1 with the verdict
+# swallowed, so stdout carries only that record.
+_SCOPE_PROBE = """
+import asyncio, contextlib, importlib, io, json
+m = importlib.import_module('check_consolidation_closure')
+
+class Memory:
+    def __init__(self):
+        self.counted_projects = []
+
+    async def count_memories_by_metadata(self, project_id, filters):
+        self.counted_projects.append(project_id)
+        return 0
+
+memory = Memory()
+with contextlib.redirect_stdout(io.StringIO()):
+    asyncio.run(m.run(m.build_parser().parse_args(['--task-id', '1']), memory=memory))
+print(json.dumps(memory.counted_projects))
+"""
+
+
+class TestProjectArgsResolveAtUse:
+    """--project-root defaults to the MAIN checkout and --project-id to that
+    root's id. run() resolves both itself, so a parsed Namespace is enough
+    (task 6713).
+
+    The worktree probe sits here rather than in
+    scripts/tests/test_scripts_default_root.py because importing this script
+    needs fused_memory, which only this venv installs.
+    """
+
+    @staticmethod
+    def _scrolled_projects(*argv: str) -> list[str]:
+        memory = FakeMemory()
+        args = mod.build_parser().parse_args(['--metadata-json', json.dumps(_gate_blob()), *argv])
+        asyncio.run(mod.run(args, memory=memory))
+        return memory.counted_projects
+
+    def test_an_unset_project_id_is_the_main_checkouts_id(self):
+        root = default_project_root()
+        assert self._scrolled_projects() == [project_id_for_root(root)]
+
+    def test_an_unset_project_id_follows_an_explicit_project_root(self):
+        assert self._scrolled_projects('--project-root', '/x/y/Know-Live') == ['know_live']
+
+    def test_an_explicit_project_id_wins(self):
+        scrolled = self._scrolled_projects('--project-root', '/x/y/Know-Live', '--project-id', 'reify')
+        assert scrolled == ['reify']
+
+    def test_a_relative_project_root_derives_the_id_of_the_directory_it_names(self, tmp_path, monkeypatch):
+        project = tmp_path / 'Know-Live'
+        (project / 'sub').mkdir(parents=True)
+        monkeypatch.chdir(project)
+        assert self._scrolled_projects('--project-root', '.') == ['know_live']
+        monkeypatch.chdir(project / 'sub')
+        assert self._scrolled_projects('--project-root', '..') == ['know_live']
+
+    def test_a_project_root_with_no_basename_is_could_not_check(self, capsys):
+        memory = FakeMemory()
+        args = mod.build_parser().parse_args(
+            ['--metadata-json', json.dumps(_gate_blob()), '--project-root', '/']
+        )
+        rc = asyncio.run(mod.run(args, memory=memory))
+        assert rc == mod.EXIT_USAGE
+        assert capsys.readouterr().out.startswith('COULD NOT CHECK')
+        assert memory.counted_projects == []
+
+    def test_a_project_root_with_no_basename_is_could_not_check_in_json(self, capsys):
+        memory = FakeMemory()
+        args = mod.build_parser().parse_args(
+            ['--metadata-json', json.dumps(_gate_blob()), '--project-root', '/', '--json']
+        )
+        rc = asyncio.run(mod.run(args, memory=memory))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == mod.EXIT_USAGE
+        assert payload['checked'] is False
+        assert payload['exit_code'] == mod.EXIT_USAGE
+        assert memory.counted_projects == []
+
+    @pytest.mark.parametrize(
+        'argv',
+        [['--task-id', '1'], ['--metadata-json', json.dumps(_gate_blob())]],
+        ids=['store-read', 'id-derivation'],
+    )
+    def test_a_copy_outside_any_checkout_is_could_not_check(self, tmp_path, argv):
+        loose = _LINKED_WORKTREE_COPY.checkout_copy(tmp_path / 'loose', _ROOT)
+        proc = subprocess.run(
+            [sys.executable, '-s', str(loose / 'scripts' / 'check_consolidation_closure.py'), *argv],
+            cwd=tmp_path,
+            env=_LINKED_WORKTREE_COPY.probe_env(),
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        assert proc.returncode == mod.EXIT_USAGE, f'exited {proc.returncode}\n{proc.stderr}'
+        assert 'COULD NOT CHECK' in proc.stdout
+        assert 'no git checkout encloses' in proc.stdout
+
+    def test_a_copy_in_a_linked_worktree_reads_the_main_checkouts_task_store(self, tmp_path):
+        """The copy's worktree holds no task store, so reaching the scroll at
+        all means task 1 was read from the main checkout's."""
+        main = tmp_path / 'Dark-Factory'
+        tree = _LINKED_WORKTREE_COPY.linked_worktree_copy(main, _ROOT)
+        store = tasks_db(main)
+        store.parent.mkdir(parents=True)
+        con = sqlite3.connect(store)
+        try:
+            con.execute('CREATE TABLE tasks (tag TEXT, id INTEGER, metadata TEXT)')
+            con.execute('INSERT INTO tasks VALUES (?, ?, ?)', ('master', 1, json.dumps(_gate_blob())))
+            con.commit()
+        finally:
+            con.close()
+
+        proc = subprocess.run(
+            [sys.executable, '-s', '-c', _SCOPE_PROBE],
+            cwd=tree / 'scripts',
+            env=_LINKED_WORKTREE_COPY.probe_env(),
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+
+        assert proc.returncode == 0, f'probe exited {proc.returncode}\n{proc.stderr}'
+        assert json.loads(proc.stdout) == ['dark_factory']

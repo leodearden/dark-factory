@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.harness import Harness
-from orchestrator.merge_queue_store import MergeQueueStore, PersistedMergeRequest
+from orchestrator.merge_lane.queue_store import MergeQueueStore, PersistedMergeRequest
 
 # ---------------------------------------------------------------------------
 # Shared harness builder — mirrors test_harness_merge_registry_wiring
@@ -121,7 +121,7 @@ class TestStartMergeWorkerInjectsMergeStore:
         mock_worker = MagicMock()
         mock_worker.run = AsyncMock(return_value=None)
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker',
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker',
                    return_value=mock_worker) as mock_cls, \
              patch('orchestrator.merge_lane.liveness.enforce_merge_liveness_margin'), \
              patch('orchestrator.merge_lane.liveness.enforce_persistent_worktree_serial_lane'), \

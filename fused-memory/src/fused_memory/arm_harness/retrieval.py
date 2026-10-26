@@ -6,7 +6,7 @@ its ``episodes`` cite that episode's uuid. Ranks are 1-based, and ``None`` is a 
 """
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 from shared.memory_eval_metrics import Metric
 
@@ -19,6 +19,21 @@ from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, require_scra
 RETRIEVAL_UTILITY_K = 10
 
 Rank = int | None
+
+
+class ProbeTally(NamedTuple):
+    """One probe's ranks, in item order, and how many of its queries could not be embedded."""
+
+    ranks: tuple[Rank, ...]
+    failures: int
+
+
+def tally_probe(outcomes: Sequence[tuple[Rank, bool]]) -> ProbeTally:
+    """``outcomes`` are (rank, failed) per item; a failed query is already a miss in its rank."""
+    return ProbeTally(
+        ranks=tuple(rank for rank, _ in outcomes),
+        failures=sum(1 for _, failed in outcomes if failed),
+    )
 
 
 def known_item_rank(results: Sequence[Any], is_target: Callable[[Any], bool]) -> Rank:
@@ -47,13 +62,13 @@ def recall_metric(metric_id: str, ranks: Sequence[Rank], k: int) -> Metric | Non
     )
 
 
-def mrr_metric(ranks: Sequence[Rank]) -> Metric | None:
+def mrr_metric(ranks: Sequence[Rank], metric_id: str = EmbeddingMetricId.MRR) -> Metric | None:
     _require_one_based(ranks)
     if not ranks:
         return None
     reciprocal = [1 / rank if rank is not None else 0.0 for rank in ranks]
     return Metric(
-        metric_id=EmbeddingMetricId.MRR,
+        metric_id=metric_id,
         kind='scalar',
         value=sum(reciprocal) / len(ranks),
         n=len(ranks),

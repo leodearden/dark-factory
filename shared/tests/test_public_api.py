@@ -93,11 +93,13 @@ class TestModuleLevelAll:
 
         assert hasattr(cli_invoke, '__all__'), 'cli_invoke must define __all__'
         assert set(cli_invoke.__all__) == {
+            'BUDGET_EXHAUSTED_SUBTYPE',
             'CAP_HIT_RESUME_PROMPT',
             'CRASH_RECOVERY_RESUME_PROMPT',
             'AgentFailureClass',
             'AgentFailureKind',
             'AgentResult',
+            'PromptBuilder',
             'AllAccountsCappedException',
             'TranscriptEvidence',
             'build_failure_message',

@@ -7,7 +7,7 @@ running the full owning-package suite instead of a scoped subset (mirrors
 test_config_verify_admission_reload.py's stated rationale).  conftest.py is
 additionally a merge-lane ratchet cluster path with a frozen line count.
 
-RATCHET CONSTRAINT: this module must NEVER import orchestrator.merge_queue or
+RATCHET CONSTRAINT: this module must NEVER import orchestrator.merge_lane.worker or
 anything under orchestrator.merge_lane.  scripts/merge_lane_metrics.py::
 imports_lane_module would then admit this file to the ratchet's `tests` map,
 staling the committed baseline that test_merge_lane_ratchet.py::

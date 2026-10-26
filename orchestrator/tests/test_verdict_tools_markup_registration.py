@@ -39,6 +39,7 @@ from escalation.queue import EscalationQueue
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.project_layout import escalation_queue_dir
 from shared.toolcall_markup import MARKUP_OVERRIDE_KEY
 
 from orchestrator.artifacts import TaskArtifacts
@@ -148,7 +149,7 @@ def journal_lines(root: Path) -> list[dict[str, Any]]:
 
 def queue_under(root: Path) -> EscalationQueue:
     """The real queue a sink steered at *root* files into."""
-    return EscalationQueue(root / markup_sink.MARKUP_QUEUE_DIRNAME)
+    return EscalationQueue(escalation_queue_dir(root))
 
 
 def queued_residue(root: Path) -> list[Any]:
@@ -1334,7 +1335,7 @@ class TestTheVerdictFactReachesADurableJournal:
 
         assert result.data['status'] == 'ok'
         assert artifacts.read_verdict(REVIEWER_ROLE) is not None
-        queue_dir = tmp_path / markup_sink.MARKUP_QUEUE_DIRNAME
+        queue_dir = escalation_queue_dir(tmp_path)
         assert sorted(queue_dir.rglob('esc-*.json')) == [], (
             'a repaired call never reaches the residue channel'
         )

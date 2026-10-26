@@ -86,7 +86,7 @@ def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
 
     async def _fake_fetch_tasks(
         client, config, project_root, *,
-        statuses=None, chunk_size=None, timeout=None,
+        statuses=None, timeout=None,
     ):
         rows = list(tasks)
         if statuses is not None:

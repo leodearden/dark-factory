@@ -28,9 +28,11 @@ from _workflow_helpers import (
     _make_resolving_steward,
     _make_review,
     _make_status_setting_steward,
+    fixed_prompt,
 )
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
+from shared.task_transitions import outcome_allows_status
 
 from orchestrator import session_registry
 from orchestrator.agents.invoke import AgentResult
@@ -168,6 +170,19 @@ def config(git_repo: Path) -> OrchestratorConfig:
         max_execute_iterations=5,
         max_verify_attempts=3,
         max_review_cycles=2,
+        # task 4481: the two remaining loop-shape knobs, pinned for the same
+        # reason as the three above rather than inherited from whatever the
+        # operational dark-factory-orchestrator.yaml happens to say.
+        #   judge_after_each_iteration -> TestHappyPath asserts the exact agent
+        #     invocation sequence and count; an operator opting the judge in
+        #     inserts a 'judge' call and breaks both without touching the code.
+        #     Tests that are ABOUT the judge build their own config via
+        #     _config_with_judge(), so they are unaffected by this pin.
+        #   max_amendment_rounds -> TestAmendmentUncommittedWorkGuard asserts
+        #     'wip: amendment round 1' and exactly one recovery event, both of
+        #     which are functions of this bound.
+        judge_after_each_iteration=False,
+        max_amendment_rounds=1,
         git=GitConfig(
             main_branch='main',
             branch_prefix='task/',
@@ -357,7 +372,7 @@ class TestHappyPath:
         Fails until _submit_to_merge_queue stores merge_sha on self._merge_sha (step-15)
         and workflow.py:554 passes it as done_provenance.
         """
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         stub = AgentStub()
         scheduler = FakeScheduler()
@@ -1037,11 +1052,24 @@ class TestBaseCommitDiff:
 
 @pytest.mark.asyncio
 class TestPostRebaseVerifyFailure:
-    """Post-rebase verification failure is non-blocking — merge queue runs its own verify."""
+    """A red rebased tip still lands: the merge queue runs its own verify (task 1724).
 
-    async def test_post_rebase_verify_fails_proceeds_to_merge(
-        self, config, git_ops, task_assignment, monkeypatch
+    By default the merge phase only rebases (task 6580), so the in-worktree
+    verify is the only call through this stub; with the ``pre_merge_reverify``
+    rollback switch on, the advisory post-rebase verify runs too and its red
+    verdict is non-blocking.
+    """
+
+    @pytest.mark.parametrize(
+        ('pre_merge_reverify', 'expected_verify_calls'),
+        [(False, 1), (True, 2)],
+        ids=['default-rebase-only', 'rollback-reverify'],
+    )
+    async def test_post_rebase_red_tip_proceeds_to_merge(
+        self, config, git_ops, task_assignment, monkeypatch,
+        pre_merge_reverify, expected_verify_calls,
     ):
+        monkeypatch.setattr(config, 'pre_merge_reverify', pre_merge_reverify)
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
@@ -1052,9 +1080,9 @@ class TestPostRebaseVerifyFailure:
         async def verify_fn(cwd, cfg, module_configs=None, **kwargs):
             nonlocal verify_call
             verify_call += 1
-            # First verify: in-worktree (pass).
-            # Second verify: post-rebase (fail) — workflow should still proceed.
-            # The merge queue runs its own verify through conftest's autouse
+            # First verify: in-worktree (pass). Any later call through this
+            # stub is the merge-phase post-rebase verify, and it is RED. The
+            # merge queue runs its own verify through conftest's autouse
             # passed=True stub and never reaches this function.
             if verify_call <= 1:
                 return VerifyResult(
@@ -1071,14 +1099,14 @@ class TestPostRebaseVerifyFailure:
 
         outcome = (await workflow.run()).outcome
 
-        assert verify_call == 2, (
-            'expected exactly the in-worktree + post-rebase verifies through '
-            f'orchestrator.workflow.run_scoped_verification; got {verify_call}. '
-            'A third call means the merge queue no longer runs its own verify '
-            'through conftest, and this stub is now failing a verify it never '
-            'meant to judge.'
+        assert verify_call == expected_verify_calls, (
+            f'expected {expected_verify_calls} verify call(s) through '
+            'orchestrator.workflow.run_scoped_verification (the in-worktree '
+            'verify, plus the post-rebase verify only when pre_merge_reverify '
+            f'is on); got {verify_call}. An extra call means the merge queue '
+            'no longer runs its own verify through conftest, and this stub is '
+            'now failing a verify it never meant to judge.'
         )
-        # Post-rebase verify failure is non-blocking; merge queue handles it
         assert outcome == WorkflowOutcome.DONE
 
 
@@ -3040,7 +3068,7 @@ class TestMarkBlockedFalseDoneGuard:
         """
         from unittest.mock import AsyncMock, patch
 
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
             MergeOutcome,
         )
@@ -3075,7 +3103,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3115,7 +3143,7 @@ class TestMarkBlockedFalseDoneGuard:
         from unittest.mock import AsyncMock, patch
 
         from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
-        from orchestrator.merge_queue import MergeOutcome
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -3145,7 +3173,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3182,7 +3210,7 @@ class TestMarkBlockedFalseDoneGuard:
         """
         from unittest.mock import AsyncMock, patch
 
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             TRANSIENT_INFRA_REASON_PREFIX,
             MergeOutcome,
         )
@@ -3212,7 +3240,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_queue.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -4985,8 +5013,8 @@ class TestRecoverBeforeExecuteGhostLoop:
         # ACTION #2 (Layer C): the pre-computed branch diff must be threaded
         # through override_files into metadata.files — this is what closes
         # task 2125's phantom-done (which stamped metadata.files=[]).
-        # _reconcile_metadata_files_for_done optimistically sets
-        # self.task['metadata'] before the (fake) scheduler.update_task call,
+        # _reconcile_metadata_files_for_done mirrors the payload into
+        # self.task['metadata'] once the (fake) scheduler.update_task lands,
         # so we can assert directly against workflow.task here.
         stamped_files = workflow.task.get('metadata', {}).get('files')
         assert stamped_files, (
@@ -6065,16 +6093,18 @@ class TestStaleL1DoesNotSinkRun:
     ('info', 0, False),
     # info at level 1 — same
     ('info', 1, False),
-    # info at level 2 — gated by the level≥2 catch-all (D4: any L2+ is stop-the-line)
-    ('info', 2, True),
+    # info at level 2 — never gates: a level≥2 record gates only when
+    # escalation.pins classifies it a queue handoff (info-l0-router PRD D3)
+    ('info', 2, False),
 ])
 class TestIsGatingEscalation:
     """Unit test of ``_is_gating_escalation`` (truth table over severity×level).
 
     Pins full PRD C7/D4 semantics including B3 (plain blocking L1 → False)
     and disjunct isolation (critical at level 0 hits severity branch only;
-    blocking at level 2 hits level branch only; info at level 2 hits level≥2
-    catch-all regardless of severity).
+    blocking at level 2 hits level branch only).  A level≥2 record gates only
+    when escalation.pins classifies it a queue handoff, so info at level 2
+    never gates (PRD info-l0-router D3).
     """
 
     def test_predicate(self, severity, level, expected):
@@ -6313,10 +6343,10 @@ class TestBornAtL2GatesMergeEntry:
 class TestFormatReescalationDetail:
     """Unit test of ``_format_reescalation_detail`` (task 2553).
 
-    Pins the rendered detail text built from the ``Escalation`` objects an
-    ``_StewardReescalated`` exception carries, so ``_mark_blocked``'s
-    ``detail=`` stops duplicating ``reason`` when the steward re-escalates
-    to a human (workflow.py:2444's ``except _StewardReescalated`` clause).
+    Pins the rendered detail text built from the ``Escalation`` objects a
+    ``_HumanHandoff`` exception carries, so ``_mark_blocked``'s ``detail=``
+    stops duplicating ``reason`` when the task is handed to a human (the
+    ``except _HumanHandoff`` clause in ``run()``'s ESCALATED branch).
     """
 
     def test_single_escalation_contains_all_fields(self):
@@ -6396,8 +6426,8 @@ class TestBornAtL2HaltsRunViaWaitForResolution:
     already-on-main branch-check (fresh worktree HEAD == main SHA → break),
     then reaches the MERGE gate which returns ESCALATED — so the outcome is
     ESCALATED rather than BLOCKED.  With the fix _wait_for_resolution raises
-    _StewardReescalated for level≥2/born-at-L2, causing run() to call
-    _mark_blocked and return BLOCKED.
+    _NoStewardApplicable for a non-info level≥2 or born-at-L2 record, causing run()
+    to call _mark_blocked and return BLOCKED.
 
     This tests the wait/gate handshake at the run() level, not just the
     inner-gate predicate covered by TestBornAtL2GatesPostImplementer et al.
@@ -6449,7 +6479,7 @@ class TestBornAtL2HaltsRunViaWaitForResolution:
 
         outcome = (await workflow.run()).outcome
 
-        # With the fix: _wait_for_resolution raises _StewardReescalated for the
+        # With the fix: _wait_for_resolution raises _NoStewardApplicable for the
         # pending level-2 escalation → _mark_blocked → BLOCKED.
         # Without the fix: _wait_for_resolution returns '' (no L0 pending) →
         # git ancestry check breaks (fresh branch at main HEAD) → MERGE gate
@@ -6470,22 +6500,29 @@ class TestBornAtL2HaltsRunViaWaitForResolution:
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestReescalationDetailPropagatedToBlockReport:
-    """task 2553: the ``except _StewardReescalated`` clause in ``run()``
-    (workflow.py:2444) must thread the carried escalation payload into
-    ``_mark_blocked``'s ``detail=`` instead of discarding it.
+    """task 2553: the hand-off clause in ``run()``'s ESCALATED branch must
+    thread the carried escalation payload into ``_mark_blocked``'s
+    ``detail=`` instead of discarding it, so ``report.detail`` names the
+    record rather than copying ``report.reason``.
 
     Mirrors ``TestBornAtL2HaltsRunViaWaitForResolution`` but asserts on the
     returned ``TerminalReport.detail``/``.reason`` rather than only
-    ``.outcome``. RED today: the except clause has no ``as reesc`` binding
-    and calls ``_mark_blocked('Steward re-escalated to human',
-    skip_escalation=True)`` with no ``detail=``, so ``_mark_blocked``'s
-    ``detail = detail or reason`` fallback makes ``report.detail`` an exact
-    copy of ``report.reason`` — neither the escalation's detail text nor its
-    id appear anywhere in the report.
+    ``.outcome``.  The REASON names which of ``_wait_for_resolution``'s two
+    hand-offs fired (PRD info-l0-disposition-router D13, task 5222): an open
+    non-info L2 short-circuits before any steward work, so its reason is
+    ``Gated by open L2 <ids>; no steward applicable`` and its detail must not
+    claim a steward acted; an open L1 no steward filed during the wait reads
+    ``Gated by open L1 <ids>; no steward applicable`` for the same reason.
     """
 
+    @pytest.mark.parametrize(('severity', 'level', 'expected_reason'), [
+        ('critical', 2, 'Gated by open L2 {esc_id}; no steward applicable'),
+        ('blocking', 2, 'Gated by open L2 {esc_id}; no steward applicable'),
+        ('blocking', 1, 'Gated by open L1 {esc_id}; no steward applicable'),
+    ])
     async def test_detail_contains_escalation_payload(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+        severity, level, expected_reason,
     ):
         from escalation.models import Escalation
 
@@ -6511,17 +6548,17 @@ class TestReescalationDetailPropagatedToBlockReport:
             call_count += 1
             if call_count == 1:
                 # Simulate a post-implementer/post-debugger gate firing:
-                # the inner loop submitted a critical/level-2 escalation and
-                # returned ESCALATED — which bubbles up to run().
+                # the inner loop submitted an escalation a human must decide
+                # and returned ESCALATED — which bubbles up to run().
                 queue.submit(Escalation(
                     id=esc_id,
                     task_id=task_assignment.task_id,
                     agent_role='implementer',
-                    severity='critical',
+                    severity=severity,
                     category='risk_identified',
-                    summary='Stop-the-line: critical risk needing human review',
-                    detail='Born at L2 — cannot be auto-resolved by steward',
-                    level=2,
+                    summary='Stop-the-line: risk needing human review',
+                    detail='Needs a human decision — no steward can resolve it',
+                    level=level,
                 ))
             return WorkflowOutcome.ESCALATED
 
@@ -6532,11 +6569,11 @@ class TestReescalationDetailPropagatedToBlockReport:
         assert report.outcome == WorkflowOutcome.BLOCKED
         # The escalation's own detail text and id must be recoverable from
         # the block report — not just a copy of the generic reason.
-        assert 'Born at L2 — cannot be auto-resolved by steward' in report.detail
+        assert 'Needs a human decision — no steward can resolve it' in report.detail
         assert esc_id in report.detail
-        # reason stays the stable generic summary; detail must differ from it.
-        assert report.reason == 'Steward re-escalated to human'
+        assert report.reason == expected_reason.format(esc_id=esc_id)
         assert report.detail != report.reason
+        assert 'Steward re-escalated' not in report.detail, report.detail
 
 
 @pytest.mark.asyncio
@@ -7037,10 +7074,9 @@ class TestMarkBlockedBypassDetection:
     ):
         """When done_provenance.commit IS on main, treat as legitimate done.
 
-        The first set_task_status('blocked') is rejected (because the row is
-        already done) but bypass-detection sees a valid provenance commit on
-        main and lets the existing flow continue (which falls through to the
-        steward / DONE path).
+        The set_task_status('blocked') is rejected because the row is already
+        done, and bypass-detection sees a valid provenance commit on main.  The
+        exit reports the observed done, and nothing is filed.
         """
         from orchestrator.scheduler import TerminalExitRejection
 
@@ -7075,19 +7111,14 @@ class TestMarkBlockedBypassDetection:
         scheduler.set_task_status = raising_set  # type: ignore[method-assign]
 
         outcome = await workflow._mark_blocked('synthetic reason')
-        assert outcome == WorkflowOutcome.BLOCKED, (
-            f'Expected BLOCKED on legitimate-done path (no steward), got {outcome!r}'
+        assert outcome == WorkflowOutcome.DONE, (
+            f'Expected the observed DONE on the legitimate-done path, got {outcome!r}'
         )
+        assert outcome_allows_status(outcome, 'done')
 
-        # Legitimate done — no bypass_done L1 and no reopen.
-        bypass_l1 = [
-            e for e in queue.get_by_task(task_assignment.task_id, level=1)
-            if e.category == 'bypass_done'
-        ]
-        assert not bypass_l1, (
-            f'expected no bypass_done L1 for legitimate done, got '
-            f'{[(e.id, e.category) for e in bypass_l1]}'
-        )
+        # Legitimate done — no escalation of any category, and no reopen.
+        filed = queue.get_by_task(task_assignment.task_id)
+        assert filed == [], [(e.id, e.level, e.category) for e in filed]
 
         # The reopen_reason must NOT contain 'bypass detected'.
         assert 'bypass detected' not in scheduler.reopen_reasons.get(
@@ -8220,25 +8251,27 @@ class TestBuildAgentEnvCpuPriority:
     def _make_workflow(self, config, git_ops, task_assignment):
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        # pin: these tests are about _build_agent_env, not cpu_priority's default
+        workflow.config.cpu_priority = CpuPriorityConfig(enabled=True, nice=10)
         return workflow
 
     async def test_architect_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
-        """ARCHITECT gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        """ARCHITECT gets DF_AGENT_CPU_NICE='10' with cpu_priority enabled (nice=10)."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
-        # cpu_priority is enabled by default (nice=10)
+        # _make_workflow pins cpu_priority enabled (nice=10)
         env = workflow._build_agent_env(ARCHITECT)
         assert env is not None
         assert env.get('DF_AGENT_CPU_NICE') == '10'
 
     async def test_implementer_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
-        """IMPLEMENTER gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        """IMPLEMENTER gets DF_AGENT_CPU_NICE='10' with cpu_priority enabled (nice=10)."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
         env = workflow._build_agent_env(IMPLEMENTER)
         assert env is not None
         assert env.get('DF_AGENT_CPU_NICE') == '10'
 
     async def test_debugger_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
-        """DEBUGGER gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        """DEBUGGER gets DF_AGENT_CPU_NICE='10' with cpu_priority enabled (nice=10)."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
         env = workflow._build_agent_env(DEBUGGER)
         assert env is not None
@@ -8332,6 +8365,8 @@ class TestBuildAgentEnvCpuGovern:
     def _make_workflow(self, config, git_ops, task_assignment):
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        # pin: the coexistence test asserts DF_AGENT_CPU_NICE == '10'
+        workflow.config.cpu_priority = CpuPriorityConfig(enabled=True, nice=10)
         return workflow
 
     async def test_architect_receives_df_agent_cpu_govern_and_path(
@@ -8426,7 +8461,7 @@ class TestBuildAgentEnvCpuGovern:
         workflow.worktree = governed_worktree.root
         workflow.config.cpu_governance = self._governance(enabled=True)
         workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
-        # cpu_priority is enabled by default (nice=10)
+        # _make_workflow pins cpu_priority enabled (nice=10)
 
         env = workflow._build_agent_env(IMPLEMENTER)
         assert env is not None
@@ -8698,7 +8733,7 @@ class TestBuildSpawnEnv:
             capturing_invoke_with_cap_retry,
         )
 
-        await workflow._invoke(ARCHITECT, prompt='x', cwd=config.project_root)
+        await workflow._invoke(ARCHITECT, build_prompt=fixed_prompt('x'), cwd=config.project_root)
 
         assert len(captured_calls) == 1
         architect_kwargs = captured_calls[0]
@@ -8707,7 +8742,7 @@ class TestBuildSpawnEnv:
         assert architect_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == workflow.session_id
         assert workflow._architect_spawn_session_id == architect_kwargs['session_id']
 
-        await workflow._invoke(IMPLEMENTER, prompt='y', cwd=config.project_root)
+        await workflow._invoke(IMPLEMENTER, build_prompt=fixed_prompt('y'), cwd=config.project_root)
 
         assert len(captured_calls) == 2
         implementer_kwargs = captured_calls[1]

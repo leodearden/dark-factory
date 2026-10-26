@@ -27,6 +27,7 @@ from fused_memory.backends.graphiti_client import (
     INCOMPLETE_SHORT_READ,
     IncompleteEnumerationError,
 )
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_count_snapshots.py'
 
@@ -1354,7 +1355,7 @@ class TestRunApplyStoreMutationPreflight:
         memory = self._make_memory()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True),
@@ -1374,7 +1375,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         memory = self._make_memory()
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(
                 self._args(apply=True),
                 memory=memory,
@@ -1405,9 +1406,8 @@ class TestRunApplyStoreMutationPreflight:
         memory.update_edge.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
         """Happy path: a writable environment cleans up exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         memory = self._make_memory()
 
         report = await _mod.run(
@@ -1471,11 +1471,12 @@ class TestRunApplyStoreMutationPreflight:
 
         with (
             caplog.at_level(logging.ERROR),
-            pytest.raises(_mod.StoreMutationUnavailable),
+            pytest.raises(StoreMutationUnavailable),
         ):
             _mod.main()
 
-        assert fail_closed_records(caplog, 'cleanup_count_snapshots'), (
+        (record,) = fail_closed_records(caplog, 'cleanup_count_snapshots')
+        assert SENTINEL in record.getMessage(), (
             "main has no handler, so the traceback is all an operator gets "
             'unless the guard site logs the fail-closed diagnosis itself; '
             f'got: {[rec.getMessage() for rec in caplog.records]}'

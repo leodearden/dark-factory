@@ -289,7 +289,7 @@ Labels are PRD-local; task IDs assigned at decompose.
 > this endpoint) and needs its own row — do not silently widen α to chase it.
 
 | **ε** | `/healthz`: whole-handler deadline, deliverable budget | `dashboard/src/dashboard/app.py`, `dashboard/tests/` | — | With a DB made unresponsive, `/healthz` returns **503 `degraded` within its stated budget (< 5s)** instead of hanging (measured today: 50.6s); `conn.execute` is covered by the deadline, not just `fetchone` |
-| **ζ** | write_journal growth alarm (no pruning) | `fused-memory/`, `dashboard/` | α | When `write_journal.db` exceeds the configured size/growth threshold, a loud WARNING **and** an escalation appear naming the measured size (today 6.6 GB / 16.7M rows; **~221 MB/day trailing-7d** — see the growth-rate correction below, *not* the ~50 MB/day lifetime mean this row originally quoted) |
+| **ζ** | write_journal growth alarm (no pruning) | `fused-memory/` | α | When `write_journal.db` exceeds the configured size/growth threshold, a loud WARNING **and** an escalation appear naming the measured size (thresholds and their basis: see the 2026-10-09 re-anchor note under open question 3) |
 | **η** | Dashboard unit-file parity check (in-repo vs installed) | `scripts/`, `dashboard/tests/` | γ, δ | Script exits non-zero and names the drifting directive when the installed unit differs from the repo copy (today: `DASHBOARD_KNOWN_PROJECT_ROOTS` = 9 roots installed vs 1 in repo) |
 | **θ** | Fix `No [object Object] tasks` empty state | `dashboard/static/redux/tabs.jsx` | — | With all three orchestrator filters off, the table reads a plain-English empty state; the string `[object Object]` appears nowhere in rendered output |
 
@@ -385,6 +385,17 @@ no new contract, no fail-soft path.
    *Generalisation for future PRDs: state the measurement **window**
    beside any rate, and never anchor a threshold on a lifetime mean
    without first checking the trend.*
+
+   **RE-ANCHORED 2026-10-09 (task 3311 as implemented).** The 2026-08-02
+   values (10 GiB / 300 MiB/day) had already been exceeded by 2026-09-10,
+   per the task amendment. Task 5247's retention prune (landed 2026-09-13)
+   deletes `write_ops` rows, but `auto_vacuum` is off, so the file no longer
+   shrinks with them or tracks the row count. The growth ceiling is
+   therefore an **insert-rate** ceiling in rows/day, not MB/day. Chosen
+   values: **18 GiB** on-disk file and **1.5M rows inserted per trailing
+   24 h**. Their measured basis lives in the `write_journal_growth_alarm`
+   block of `fused-memory/config/config.yaml`. Task **5405** must re-anchor
+   both after its rollup lands.
 4. ~~**Whether η should also assert the two unit copies' `Environment=` values
    agree**, given the installed copy legitimately carries 9 project roots.~~
    **RESOLVED in η (task 3312).** Presence-and-shape everywhere would have

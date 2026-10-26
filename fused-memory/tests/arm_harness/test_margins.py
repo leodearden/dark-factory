@@ -493,3 +493,38 @@ def test_embedding_margins_are_keyed_per_index_configuration():
         mrr = _entry(entries, EmbeddingMetricId.MRR, configuration)
         assert mrr.floor is None
         assert mrr.margin == 0.0
+
+
+MEM0_METRIC_IDS = ('mem0-known-item-recall@5', 'mem0-known-item-recall@10', 'mem0-mrr')
+
+
+def _mem0_records(spec: EmbeddingArmSpec) -> list[MetricsRecord]:
+    metrics = (
+        _proportion(EmbeddingMetricId.MEM0_KNOWN_ITEM_RECALL_AT_5, 30, 42, 'lower_is_worse'),
+        _proportion(EmbeddingMetricId.MEM0_KNOWN_ITEM_RECALL_AT_10, 36, 42, 'lower_is_worse'),
+        _scalar(EmbeddingMetricId.MEM0_MRR, 0.6, 42),
+    )
+    return [
+        record_for(spec, metric, measured_at=MEASURED_AT, incomplete=False) for metric in metrics
+    ]
+
+
+def test_no_mem0_metric_is_gated():
+    assert set(MEM0_METRIC_IDS) <= EMBEDDING_METRIC_IDS
+    assert not set(MEM0_METRIC_IDS) & set(GATED_METRICS)
+
+
+def test_mem0_records_among_the_controls_yield_no_margin_entries():
+    spec_a, spec_b = _embedding_control('emb-ctl-a'), _embedding_control('emb-ctl-b')
+
+    entries = derive_margins(
+        _embedding_records(spec_a, 160) + _mem0_records(spec_a),
+        _embedding_records(spec_b, 164) + _mem0_records(spec_b),
+        episode_values={},
+    )
+
+    assert [(e.metric_id, e.index_configuration) for e in entries] == sorted(
+        (metric_id, configuration)
+        for metric_id in ('known-item-recall@5', 'known-item-recall@10', 'mrr')
+        for configuration in IndexConfiguration
+    )

@@ -1,6 +1,9 @@
 # Warm-lane infrastructure repatriation — redraw the reify↔dark-factory seam at the toolchain boundary
 
 **Status:** active · **Owner:** dark-factory · **Authored:** 2026-07-26
+
+> **Amended 2026-10-12** by plans/offline-lane-red-path-prd.md: 'a red routes within one advance' becomes 'within `persist_passes` spaced passes'.
+
 **Approach:** B+H (contract + two-way boundary tests) — cross-repo seam, two-repo blast radius, touches the ENOSPC accretion path.
 
 ## 1. Goal

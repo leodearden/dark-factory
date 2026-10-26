@@ -1,0 +1,12 @@
+{
+  "task_id": "4614",
+  "reason": "net-additive regression coverage for the merge-gate narrowing exit reports",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6555,
+      "current": 6557
+    }
+  ]
+}

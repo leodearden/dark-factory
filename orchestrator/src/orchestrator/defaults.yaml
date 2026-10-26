@@ -26,6 +26,7 @@ suppress_resettled_review_suggestions: true
 # Merge conflict reduction
 max_advance_attempts: 3
 max_pre_merge_retries: 2
+pre_merge_reverify: false
 max_merge_retries: 3
 inter_iteration_rebase: true
 # Rebase onto main before each verify retry (Fix 3 — closes the verify-only
@@ -162,6 +163,7 @@ prices:
   gpt-6-astra:
     input_per_1m: 10.00
     output_per_1m: 50.00
+    cached_input_per_1m: 1.00
   gpt-5.6-sol:
     input_per_1m: 4.00
     output_per_1m: 20.00
@@ -452,6 +454,7 @@ review:
   full_review_on_complete: true
   briefing_path: "review/briefing.yaml"
   reports_dir: "data/review-checkpoints"
+  reviewer_briefing: "diff-only"
 
 # Scheduler fairness — anti-starvation for broad-footprint tasks.
 #
@@ -576,7 +579,6 @@ sandbox:
 
 # Escalation
 escalation:
-  queue_dir: "data/escalations"
   port: 8100
   host: "127.0.0.1"
 

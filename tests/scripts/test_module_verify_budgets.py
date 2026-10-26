@@ -288,6 +288,7 @@ MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'dashboard': 653.54,
     'sampler': 22.49,
     'cockpit': 130.50,
+    'client-feed': 7.88,
     # REFRESHED 2026-09-14 from ORCHESTRATOR_BUDGET_CENSUS (5288.0 was a
     # RETIRED-REGIME figure — D17 orders the refresh). This is the prevailing
     # regime's worst GREEN full-suite run.
@@ -524,6 +525,7 @@ SAMPLE_TOUCHED_FILE: dict[str, str] = {
     'dashboard': 'dashboard/src/dashboard/__init__.py',
     'sampler': 'sampler/src/sampler/__init__.py',
     'cockpit': 'cockpit/src/cockpit/__init__.py',
+    'client-feed': 'client-feed/src/client_feed/__init__.py',
     'orchestrator': 'orchestrator/src/orchestrator/__init__.py',
 }
 

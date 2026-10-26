@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/client_feed"]
+
+[project]
+name = "client-feed"
+version = "0.1.0"
+description = "Per-project, client-safe evidence feed for the client portal: contract, fold and publisher"
+requires-python = ">=3.11,<4"
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "dark-factory-shared",
+]
+
+[project.scripts]
+client-feed = "client_feed.cli:main"
+
+[tool.uv.sources]
+dark-factory-shared = { workspace = true }
+
+[tool.pyright]
+include = ["src", "tests"]
+# ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
+# df_pytest_isolation module without letting project dirs shadow their own src/.
+extraPaths = ["src", "../shared/src", ".."]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportUnnecessaryTypeIgnoreComment = "error"
+venvPath = ".."
+venv = ".venv"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "UP", "B", "SIM", "I"]
+ignore = ["E501"]
+
+# NOT an enforced gate — style config only: it shapes an ad-hoc or editor-on-save
+# `ruff format` into a repo-consistent single-quoted diff. Do not delete as unused,
+# do not promote to a gate. Why, and the measurements: CONTRIBUTING.md section 3;
+# both directions guarded by tests/scripts/test_ruff_format_policy.py (task 3441).
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# timeout/timeout_method: the fleet-wide value (plans/pytest-per-test-timeout-measurement-2026-09-17.md)
+# and rationale (shared/pyproject.toml, tests/scripts/test_timeout_method_policy.py).
+timeout = 420
+timeout_method = "signal"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.404",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-timeout>=2.4.0",
+    # verify's injected -n; see tests/scripts/test_merge_gate_parallelism_config.py::RULED_SERIAL_MEMBERS
+    "pytest-xdist>=3.5.0",
+    "ruff>=0.7.1",
+]

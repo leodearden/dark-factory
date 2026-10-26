@@ -1,0 +1,42 @@
+{
+  "task_id": "5751",
+  "reason": "Net-additive feature (plan-deviation alpha): GitOps gains resolve_rebased_citation, a read-only, fail-safe resolver mapping a cited since-rebased SHA to its landed twin on main (backing the new escalation resolve_escalation_shas tool), plus the RebasedCitation/ReplayMatch types; find_equivalent_commit's two-tier replay search was extracted into the shared _find_replay/_unambiguous_patch_ids helpers it now reuses with unchanged behaviour. New capability, not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1467,
+      "current": 1476
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 16151,
+      "current": 16254
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 9342,
+      "current": 9379
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4912,
+      "current": 4921
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58037,
+      "current": 58140
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31782,
+      "current": 31819
+    }
+  ]
+}

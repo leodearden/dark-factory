@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from fused_memory.middleware.task_curator import CandidateTask
+from fused_memory.middleware.curator_types import CandidateTask
 
 # ──────────────────────────────────────────────────────────────────────────────
 # step-1 RED: TestLoadOperationalRegistry
