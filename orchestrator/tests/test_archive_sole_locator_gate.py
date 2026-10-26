@@ -53,6 +53,7 @@ from typing import NamedTuple
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from _tree_scan import (
+    REPO_ROOT,
     TREE_PASS_XDIST_GROUP,
     ParsedModule,
     TreeAnalysis,
@@ -65,8 +66,6 @@ pytestmark = [
     pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
     pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
 ]
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Applied to paths RELATIVE to REPO_ROOT, never to their absolute parts. This
 # is not a stylistic choice: every checkout of this repo used by an agent lives
@@ -155,10 +154,10 @@ def _looks_like_session_id(name: str) -> bool:
 def _production_python_files() -> tuple[Path, ...]:
     """Every ``.py`` under a top-level ``<package>/src`` tree.
 
-    Resolved from THIS FILE rather than the process CWD: merge-verify runs
-    pytest from ``orchestrator/`` while a plain ``pytest orchestrator/tests``
-    runs from the repo root, and the census must come out identical under both
-    (same idiom as test_killpg_frozen_pgid_guard.py::REPO_ROOT).  A src root
+    Anchored at ``_tree_scan.py::REPO_ROOT``, which is resolved from a file
+    and never from the process CWD: merge-verify runs pytest from
+    ``orchestrator/`` while a plain ``pytest orchestrator/tests`` runs from the
+    repo root, and the census must come out identical under both.  A src root
     whose own path crosses a skipped part is dropped whole, so the skip stays
     judged relative to REPO_ROOT end to end.
     """
@@ -238,13 +237,16 @@ def _session_id_globs_in(tree: ast.Module, relpath: str) -> list[_Site]:
 
 
 def _archive_sites(module: ParsedModule) -> tuple[_Site, ...]:
-    """Session-id-keyed globs in *module*: loud if it cannot be read, none if it cannot be parsed."""
+    """Session-id-keyed globs in *module*: loud if it cannot be read, none if it cannot be parsed.
+
+    ``may_name`` reads the source strictly, so an undecodable file raises there,
+    before the parse's fail-soft ``ValueError`` clause could swallow its
+    ``UnicodeDecodeError``.
+    """
     if not module.may_name(*_GLOB_METHODS):
         return ()
     try:
         tree = module.tree
-    except UnicodeDecodeError:
-        raise
     except (SyntaxError, ValueError):
         return ()
     return tuple(_session_id_globs_in(tree, module.path.relative_to(REPO_ROOT).as_posix()))

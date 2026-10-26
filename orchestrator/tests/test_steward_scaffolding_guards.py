@@ -65,6 +65,7 @@ from _orch_helpers import (
 )
 from _tree_scan import (
     ORCHESTRATOR_TESTS,
+    TESTS_DIR,
     TREE_PASS_XDIST_GROUP,
     ParsedModule,
     TreeAnalysis,
@@ -252,7 +253,6 @@ class TestAssertSandboxedProjectRoot:
 # Recurrence guard: nobody re-implements the sandbox block inline (task 3647)
 # ===========================================================================
 
-_TESTS_DIR = Path(__file__).parent
 _HELPER_NAME = 'assert_sandboxed_project_root'
 
 # The canonical OWNER of the pattern, excluded from the sweep by construction:
@@ -469,7 +469,7 @@ def _tests_tree_census(tree_pass: TreePass, detector: _Detector) -> _Census:
     census must keep it, because ``_orch_helpers.py`` OWNS the canonical
     literal.  Each detector's analysis is registered in ``_CENSUS_ANALYSES``.
     """
-    return _census_from(tree_pass.facts(_CENSUS_ANALYSES[detector]), _TESTS_DIR)
+    return _census_from(tree_pass.facts(_CENSUS_ANALYSES[detector]), TESTS_DIR)
 
 
 class TestCensusTree:
@@ -543,18 +543,18 @@ class TestNoInlineSandboxedProjectRootAsserts:
 
         # -- liveness first: a sweep that inspects nothing reads as coverage.
         assert not census.unparseable, (
-            f'modules under {_TESTS_DIR} failed to parse and so were silently '
+            f'modules under {TESTS_DIR} failed to parse and so were silently '
             f'absent from this sweep — fix them or this guard is blind to them: '
             f'{list(census.unparseable)}'
         )
         assert len(swept) >= _MIN_MODULES_SWEPT, (
             f'the recurrence sweep found only {len(swept)} modules under '
-            f'{_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A guard '
+            f'{TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A guard '
             f'that parses nothing reports zero recurrences and reads as coverage.'
         )
 
         # -- the canonical owner is where the block is SUPPOSED to live.
-        assert (_TESTS_DIR / _CANONICAL_OWNER).is_file(), (
+        assert (TESTS_DIR / _CANONICAL_OWNER).is_file(), (
             f'{_CANONICAL_OWNER} must exist — it owns {_HELPER_NAME}'
         )
         assert any(PurePosixPath(m).name == _CANONICAL_OWNER for m in census.parsed), (
@@ -816,13 +816,13 @@ class TestStewardConstructionSitesAreCensused:
         # -- liveness first, in both directions: did we read the tree, and does
         #    the detector still match anything at all?
         assert not census.unparseable, (
-            f'modules under {_TESTS_DIR} failed to parse and so were silently '
+            f'modules under {TESTS_DIR} failed to parse and so were silently '
             f'absent from this census — a module that cannot be read cannot be '
             f'censused: {list(census.unparseable)}'
         )
         assert len(census.parsed) >= _MIN_MODULES_SWEPT, (
             f'the census parsed only {len(census.parsed)} modules '
-            f'under {_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A '
+            f'under {TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A '
             f'census that reads nothing sanctions everything.'
         )
         assert census.sites, (
@@ -1423,13 +1423,13 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
         # -- liveness first, in both directions: did we read the tree, and does
         #    the detector still match anything at all?
         assert not census.unparseable, (
-            f'modules under {_TESTS_DIR} failed to parse and so were silently '
+            f'modules under {TESTS_DIR} failed to parse and so were silently '
             f'absent from this census — a module that cannot be read cannot be '
             f'censused: {list(census.unparseable)}'
         )
         assert len(census.parsed) >= _MIN_MODULES_SWEPT, (
             f'the census parsed only {len(census.parsed)} modules '
-            f'under {_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A '
+            f'under {TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A '
             f'census that reads nothing sanctions everything.'
         )
         assert census.sites, (

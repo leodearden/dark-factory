@@ -67,6 +67,7 @@ from _orch_helpers import (
 )
 from _tree_scan import (
     ORCHESTRATOR_TESTS,
+    TESTS_DIR,
     TREE_PASS_XDIST_GROUP,
     ParsedModule,
     TreeAnalysis,
@@ -105,14 +106,6 @@ _ORCH_YAML = ORCH_DIR / 'orchestrator.yaml'
 def _verify_test_command() -> str:
     """The ``test_command`` merge-verify runs for this package, from :data:`_ORCH_YAML`."""
     return yaml.safe_load(_ORCH_YAML.read_text(encoding='utf-8'))['test_command']
-
-#: This directory, resolved from THIS FILE and never from the process CWD, for
-#: the same reason ``_ORCH_YAML`` is: the census must come out identical under
-#: merge-verify (cwd ``orchestrator/``) and a bare ``pytest orchestrator/tests``
-#: (cwd the repo root).  Same idiom as
-#: test_whole_tree_scan_timeout_guard.py::_TESTS_DIR and
-#: test_marker_registration_drift.py::TESTS_DIR.
-_TESTS_DIR = Path(__file__).resolve().parent
 
 #: The module task 5333 sizes and ratchets: eight real-git classes that all
 #: carried an identical bare ``300`` regardless of weight, which is what made
@@ -269,7 +262,7 @@ def _deep_landing_tree() -> ast.Module:
     tree as it is on disk, and re-reading it per test buys nothing but wall
     clock.
     """
-    tree = _parse((_TESTS_DIR / _DEEP_LANDING_MODULE).read_text(encoding='utf-8'))
+    tree = _parse((TESTS_DIR / _DEEP_LANDING_MODULE).read_text(encoding='utf-8'))
     assert tree is not None, (
         f'{_DEEP_LANDING_MODULE} did not parse, so every pin reading it would '
         'otherwise pass vacuously.'
@@ -671,7 +664,7 @@ class TestSanctionedNameMirrors:
 
         assert not undefined, (
             f'_SANCTIONED_TIMEOUT_NAMES mirrors {undefined}, which no longer '
-            f'name a constant defined anywhere under {_TESTS_DIR}. Drop the '
+            f'name a constant defined anywhere under {TESTS_DIR}. Drop the '
             'entr(y/ies) -- a mirror for a deleted constant sanctions the bare '
             'NAME, so reintroducing it at any value at all would be resolved '
             'to the stale number instead of read as new.'
@@ -816,7 +809,7 @@ class TestSpawnBoundSizingModel:
             pattern: [] for pattern in _SPAWN_MODEL_DEFINITION_PATTERNS
         }
         for py_file, definitions in tree_pass.facts(_SPAWN_MODEL_ANALYSIS).items():
-            module = py_file.relative_to(_TESTS_DIR).as_posix()
+            module = py_file.relative_to(TESTS_DIR).as_posix()
             for pattern, lineno, text in definitions:
                 homes[pattern].append((module, lineno, text))
 
@@ -1639,7 +1632,7 @@ class TestRow7SceneIsGuarded:
         would have satisfied while guarding nothing -- a pin weaker than the
         claim it carries.
         """
-        tree = _parse((_TESTS_DIR / _DEEP_GATE_MODULE).read_text(encoding='utf-8'))
+        tree = _parse((TESTS_DIR / _DEEP_GATE_MODULE).read_text(encoding='utf-8'))
         assert tree is not None, f'{_DEEP_GATE_MODULE} did not parse'
 
         row7 = _class_def(tree, _ROW7_CLASS)
@@ -2025,7 +2018,7 @@ def test_usefixtures_census_ignores_a_mark_bound_somewhere_else() -> None:
 
 #: Set below the 563 files and 148 marker sites MEASURED at authorship time,
 #: so the guard survives the tree growing while still failing loudly if the
-#: sweep itself ever breaks: a wrong _TESTS_DIR, a read that silently yields
+#: sweep itself ever breaks: a wrong TESTS_DIR, a read that silently yields
 #: nothing, an extractor rotted to always-empty.  The house pattern for exactly
 #: this risk: test_whole_tree_scan_timeout_guard.py::_MIN_EXPECTED_TEST_FILES,
 #: test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES.
@@ -2059,7 +2052,7 @@ def _module_markers(module: ParsedModule) -> _ModuleMarkers:
     return _ModuleMarkers(
         readable=True,
         sites=timeout_marker_sites(tree, _SANCTIONED_TIMEOUT_NAMES),
-        bindings=tuple(_sanctioned_bindings_in(tree, module.path.relative_to(_TESTS_DIR).as_posix())),
+        bindings=tuple(_sanctioned_bindings_in(tree, module.path.relative_to(TESTS_DIR).as_posix())),
     )
 
 
@@ -2070,10 +2063,10 @@ TREE_ANALYSES = (_MARKER_ANALYSIS, _SPAWN_MODEL_ANALYSIS)
 
 
 class _MarkerCensus(NamedTuple):
-    """Every ``*.py`` under :data:`_TESTS_DIR`, feeding two extractions.
+    """Every ``*.py`` under :data:`TESTS_DIR`, feeding two extractions.
 
     ``sites`` is the timeout-marker census, each site paired with its module --
-    the path relative to :data:`_TESTS_DIR` -- and carrying the sweep-health
+    the path relative to :data:`TESTS_DIR` -- and carrying the sweep-health
     counters.  ``bindings`` is every assignment of a
     :data:`_SANCTIONED_TIMEOUT_NAMES` name, for :class:`TestSanctionedNameMirrors`.
     """
@@ -2085,12 +2078,12 @@ class _MarkerCensus(NamedTuple):
 def _marker_census(tree_pass: TreePass) -> _MarkerCensus:
     """This tests tree's marker census, projected from the shared tree pass (``_tree_scan.py``)."""
     by_module = {
-        path.relative_to(_TESTS_DIR).as_posix(): markers
+        path.relative_to(TESTS_DIR).as_posix(): markers
         for path, markers in tree_pass.facts(_MARKER_ANALYSIS).items()
     }
     return _MarkerCensus(
         sites=TreeScan(
-            root=_TESTS_DIR,
+            root=TESTS_DIR,
             items=tuple(
                 (module, site) for module, markers in by_module.items() for site in markers.sites
             ),
@@ -2146,7 +2139,7 @@ def test_the_marker_census_is_not_vacuous(tree_pass: TreePass) -> None:
     """The sweep must find a substantial population of markers, in-band or not.
 
     Distinct from the file floor and load-bearing in a way it is not: a
-    correct ``_TESTS_DIR`` with an EXTRACTOR rotted to always-empty would
+    correct ``TESTS_DIR`` with an EXTRACTOR rotted to always-empty would
     examine 563 files, find zero sites, report zero offenders and pass. This is
     the floor that catches that. 148 sites measured at authorship time.
     """

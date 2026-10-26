@@ -67,6 +67,7 @@ from pathlib import Path
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from _tree_scan import (
+    REPO_ROOT,
     TREE_PASS_XDIST_GROUP,
     ParsedModule,
     TreeAnalysis,
@@ -80,8 +81,6 @@ pytestmark = [
     pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
     pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
 ]
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Minimum number of .py files the sweep must actually scan. Measured at 1593
 # unique files, so the floor sits ~8x below reality: low enough not to become

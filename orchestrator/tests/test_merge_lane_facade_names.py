@@ -40,7 +40,7 @@ pytestmark = [
 
 # Same import of the scripts directory as test_merge_lane_ratchet.py:
 # source_measures lists the tracked files.
-_SCRIPTS = Path(__file__).parents[2] / 'scripts'
+_SCRIPTS = REPO_ROOT / 'scripts'
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 

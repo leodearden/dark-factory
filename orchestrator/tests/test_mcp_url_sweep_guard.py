@@ -15,6 +15,7 @@ import pytest
 from _mcp_url_scan import SweepFindings, sweep_parsed
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from _tree_scan import (
+    REPO_ROOT,
     TREE_PASS_XDIST_GROUP,
     ParsedModule,
     TreeAnalysis,
@@ -45,11 +46,6 @@ SWEEP_DIRS = (
     'scripts',
     'fused-memory/scripts',
 )
-
-#: Worktree root.  Same expression as ``conftest.py:38`` and restated here per
-#: that file's conftest-collision note — resolving from ``__file__`` is what
-#: makes the sweep check THIS worktree, the copy the task's verify run gates on.
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: Anti-vacuity floor on the files swept, ~25% below the 1106 measured on
 #: 2026-10-25 (task 4600): a sweep that silently reads nothing must fail rather

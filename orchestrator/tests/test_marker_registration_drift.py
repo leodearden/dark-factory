@@ -68,9 +68,10 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _orch_helpers import ORCH_PYPROJECT, WHOLE_TREE_SCAN_TEST_TIMEOUT
 from _tree_scan import (
     ORCHESTRATOR_TESTS,
+    TESTS_DIR,
     TREE_PASS_XDIST_GROUP,
     ParsedModule,
     TreeAnalysis,
@@ -476,13 +477,6 @@ class TestUnregisteredMarkers:
 # ---------------------------------------------------------------------------
 # The wired guard — REAL tests/ tree vs REAL pytest config
 # ---------------------------------------------------------------------------
-
-# Resolved from THIS FILE, never the process CWD: merge-verify runs pytest
-# from the orchestrator/ cwd (orchestrator/orchestrator.yaml) while a plain
-# `pytest orchestrator/tests` runs from the repo root, and this must resolve
-# identically under both. Same idiom as test_warm_lane_bash_bucket_placement.py.
-TESTS_DIR = Path(__file__).resolve().parent
-ORCH_PYPROJECT = Path(__file__).resolve().parents[1] / 'pyproject.toml'
 
 #: A floor, not an equality — 494 measured at authorship time — so adding
 #: test files over time never breaks this guard.
