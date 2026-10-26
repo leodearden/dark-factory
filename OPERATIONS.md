@@ -2620,17 +2620,24 @@ Agent subprocesses inherit no secret-bearing variable except their own
 are redacted as they are archived (task 6820). This sweep is the backstop for
 everything already on disk.
 
-- **What it scans.** Every `*.jsonl` under each orchestrator unit's
-  `data/orchestrator/agent-transcripts` (the roots
+- **What it scans.** Every regular `*.jsonl` file under each orchestrator
+  unit's `data/orchestrator/agent-transcripts` (the roots
   `scripts/orchestrator_projects.py` reads from
   `~/.config/systemd/user/orchestrator-*.service`) and under
-  `~/.claude/projects`, subagent transcripts included.
+  `~/.claude/projects`, subagent transcripts included. It also scans the
+  `*.jsonl.archive-tmp` staging copies a hard kill can strand mid-archive,
+  which are redacted only after they are staged.
 - **What it matches.** Only the live values the sweep's own environment holds.
   The wrapper sources the repo `.env` for them. It never matches a token-shaped
   pattern. Each hit is replaced in place, by the 2026-10-11 method: a
   `<redacted:VAR>` placeholder padded with `x` to the same length, mode and
-  mtime kept, no backup. A rewrite that would break a JSON line is refused,
-  and that file keeps its value.
+  mtime kept, no backup. A rewrite that would break a JSON line is refused
+  for that line only: the line keeps its value, the rest of the file is still
+  redacted, and the escalation names the path, the line and the variable.
+- **What it cannot see.** A secret defined only in another factory project's
+  own `.env` (simple-algo's `KRAKEN_API_KEY`, say). The wrapper sources
+  dark-factory's `.env` alone, so such a value is never matched. Task 6820
+  filed this gap as a follow-up.
 - **What it files.** One `risk_identified` info escalation per sweep that
   redacted or refused anything, naming each path with its per-variable counts.
   It prints one JSON record line to the journal, and never prints a value.
@@ -2642,7 +2649,8 @@ Installing it is a post-merge deterministic deploy
 run). For a run now: `systemctl --user start transcript-secret-sweep.service`.
 At archive time a refused redaction is counted like any other archival
 failure (`transcript_archive: failed to redact` WARNING), and the transcript is
-held rather than archived with its value.
+held rather than archived with its value. At teardown, its other lines are
+still redacted in place.
 
 ### Legibility trickle accounts (03:00)
 
