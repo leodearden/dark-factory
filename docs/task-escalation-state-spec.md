@@ -408,17 +408,42 @@ against code on 2026-10-26 (task 6082).
   a structured fact); `EscalationRef` drops severity so no site *can*
   discriminate (S6), and no site distinguishes a wrong/unavailable
   store from "no records" (S6 store-correctness). The in-progress applier re-derives resolver policy
-  in guard order (INV-5).
+  in guard order (INV-5). Closed by tasks 3533 (leaf α), 3535 (leaf β)
+  and 3541 (leaf η): `EscalationRef` carries `severity`,
+  `filing_claimant_run_id` and `created_at`. Every recovery, redispatch
+  and done-flip veto asks the one predicate,
+  `escalation/src/escalation/pins.py::classify_pins`, through
+  `orchestrator/src/orchestrator/recovery_pins.py`: `.pins` for recovery
+  and redispatch (including `Scheduler._phase_redispatch_stranded_blocked`),
+  `.vetoes_done_flip` for MARK_DONE (`task_ground_truth.py::_shape`). The
+  in-progress applier consumes the resolver's answer, and the duplicate
+  deterministic-recon pair is collapsed. A failed store read is the third
+  state `TruthReport.escalation_store_unavailable`, which maps to
+  `recovery_left(reason=escalation_store_unavailable)`; every veto emits
+  `recovery_vetoed`/`recovery_left`.
+  `orchestrator/tests/test_recovery_veto_predicate_collapse.py` guards the
+  single predicate.
 - **E8 — `_already_landed_dispatch_gate` (`harness.py:10137-10142`) is
   still L1-only** while every sibling went any-level: a pending task
   with only an open L0/L2 can be auto-flipped to done past a human
   handoff — the live *inverse* hazard (phantom-done). Highest-urgency
-  small fix in the family.
+  small fix in the family. Closed by task 3534 (leaf η0):
+  `harness.py::Harness._already_landed_dispatch_gate` vetoes on
+  `classify_pins(...).vetoes_done_flip` over every open record at any
+  level (info carved out). A failed read is treated as store-unavailable,
+  and since task 3535 both of its holds emit a structured
+  `recovery_vetoed`.
 - **E9 — B2/goal-5 unimplemented**: `_cascade_unblock_member` requires
   `status == 'blocked'` (`harness.py:12873`) and the resolution path
   gates L0 at `level >= 1` (`harness.py:12014`) — `resume` on a strand
   reaches no re-pend path at all; `granted_files` scope grants deliver
-  to nobody.
+  to nobody. Closed by task 3540 (leaf ζ):
+  `harness.py::Harness._cascade_unblock_member` re-pends any
+  `_RESUME_REPEND_STATUSES` row (`blocked`, `in-progress`) with no live
+  claimant (`_resume_repend_liveness`), with an INV-3 corroborating
+  re-read before the write. `Harness._on_escalation_resolved` no longer
+  wraps `resume` in `level >= 1`, and `_fold_granted_files_on_repend`
+  delivers `granted_files` on the re-pend path.
 - **E10 — `_OUTCOME_ALLOWED` loose entries are documented strand
   windows** (`task_transitions.py:279-330`): `escalated`/`requeued`/
   `blocked`/`soft-cancelled` ⊇ {IN_PROGRESS}; `planned` unreachable;
