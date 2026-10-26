@@ -14,7 +14,10 @@ wired for the live transport (a ``verdict-tools`` MCP server, no
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
+from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
 from typing import cast
@@ -46,6 +49,7 @@ from orchestrator.evals.reviewer_trial.runner import (
     PanelRunResult,
     _run_single_reviewer,
     run_panel,
+    run_panel_cached,
     run_trial,
 )
 from orchestrator.evals.reviewer_trial.variants import (
@@ -913,3 +917,164 @@ class TestTrialFixtureReadiness:
         ]
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any(reason in message and d2.name in message for message in warnings), warnings
+
+
+_GATE = cast(UsageGate, object())
+
+
+@contextlib.contextmanager
+def _counted_reviewers() -> Iterator[list[str]]:
+    """Patch both reviewer dispatch paths with a PASS-verdict writer; yield every dispatch, in order."""
+    dispatched: list[str] = []
+    write_verdict = _make_verdict_writing_invoke(verdict='PASS')
+
+    async def _invoke(**kwargs):
+        dispatched.append('ungated')
+        return await write_verdict(**kwargs)
+
+    async def _cap_retry(usage_gate, label, *, invoke_fn, backend, **kwargs):
+        dispatched.append('gated')
+        return await write_verdict(**kwargs)
+
+    with (
+        patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', side_effect=_invoke),
+        patch('orchestrator.evals.reviewer_trial.runner.invoke_with_cap_retry', side_effect=_cap_retry),
+    ):
+        yield dispatched
+
+
+def _full_style() -> dict:
+    return {'prices': default_price_table(), 'usage_gate': _GATE, 'diff_cap_chars': 0}
+
+
+class TestPanelCache:
+    """run_panel_cached reuses a stored panel only when it was produced under the same key."""
+
+    @staticmethod
+    def _entry(results_dir: Path, variant: VariantConfig, diff: CorpusDiff) -> Path:
+        return results_dir / f'{variant.name}__{diff.diff_id}.json'
+
+    @pytest.mark.asyncio
+    async def test_a_full_style_run_never_reuses_a_smoke_entry(self, source: _Source, tmp_path: Path) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **_full_style())
+
+        assert dispatched == ['ungated', 'gated']
+        stored = PanelRunResult.from_dict(json.loads(self._entry(results_dir, variant, diff).read_text()))
+        assert stored.run_key == PanelRunKey.of(**_full_style())
+
+    @pytest.mark.asyncio
+    async def test_an_identical_call_is_served_from_the_cache(self, source: _Source, tmp_path: Path) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            first = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+            second = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+
+        assert dispatched == ['ungated']
+        assert second == first
+
+    @pytest.mark.parametrize('change', [
+        pytest.param(lambda: {'prices': default_price_table()}, id='prices'),
+        pytest.param(lambda: {'usage_gate': _GATE}, id='gate'),
+        pytest.param(lambda: {'diff_cap_chars': 0}, id='cap'),
+    ])
+    @pytest.mark.asyncio
+    async def test_any_one_changed_component_reruns(self, source: _Source, tmp_path: Path, change) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **change())
+
+        assert len(dispatched) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_keyless_legacy_entry_is_honoured_with_a_warning(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+        results_dir.mkdir()
+        legacy = PanelRunResult(
+            variant_name=variant.name, diff_id=diff.diff_id,
+            reviews={'r1': _make_review('r1')}, total_cost_usd=0.75, wall_clock_ms=10,
+        )
+        record = asdict(legacy)
+        del record['run_key']
+        entry = self._entry(results_dir, variant, diff)
+        entry.write_text(json.dumps(record))
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers() as dispatched,
+        ):
+            result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **_full_style())
+
+        assert dispatched == []
+        assert result == legacy
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(str(entry) in message for message in warnings), warnings
+
+    @pytest.mark.parametrize('stored', [
+        pytest.param(lambda variant, diff: '{not json', id='corrupt'),
+        pytest.param(
+            lambda variant, diff: json.dumps(asdict(PanelRunResult(
+                variant_name='another_variant', diff_id=diff.diff_id,
+                run_key=PanelRunKey.of(prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS),
+            ))),
+            id='foreign-variant',
+        ),
+        pytest.param(
+            lambda variant, diff: json.dumps(asdict(PanelRunResult(
+                variant_name=variant.name, diff_id='another_diff',
+                run_key=PanelRunKey.of(prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS),
+            ))),
+            id='foreign-diff',
+        ),
+    ])
+    @pytest.mark.asyncio
+    async def test_a_corrupt_or_foreign_entry_is_rerun_and_overwritten(
+        self, source: _Source, tmp_path: Path, stored,
+    ) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+        results_dir.mkdir()
+        entry = self._entry(results_dir, variant, diff)
+        entry.write_text(stored(variant, diff))
+
+        with _counted_reviewers() as dispatched:
+            result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+
+        assert dispatched == ['ungated']
+        assert PanelRunResult.from_dict(json.loads(entry.read_text())) == result
+        assert (result.variant_name, result.diff_id) == (variant.name, diff.diff_id)
+
+    @pytest.mark.asyncio
+    async def test_run_trial_reruns_a_smoke_entry_under_a_full_style_key(
+        self, source: _Source, tmp_path: Path,
+    ) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+        corpus = CorpusManifest(diffs=[diff])
+
+        with _counted_reviewers() as dispatched:
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+            await run_trial([variant], corpus, results_dir=results_dir, **_full_style())
+            assert dispatched == ['ungated', 'gated']
+            await run_trial([variant], corpus, results_dir=results_dir, **_full_style())
+
+        assert dispatched == ['ungated', 'gated']
+
+    @pytest.mark.asyncio
+    async def test_run_trial_threads_its_stagger_to_each_panel(self, source: _Source, tmp_path: Path) -> None:
+        with (
+            _counted_reviewers(),
+            patch('orchestrator.evals.reviewer_trial.runner.run_panel', wraps=run_panel) as spy,
+        ):
+            await run_trial(
+                [_one_reviewer()], CorpusManifest(diffs=[_diff_in(source)]),
+                results_dir=tmp_path / 'results', stagger_secs=0,
+            )
+
+        assert spy.await_args.kwargs['stagger_secs'] == 0
