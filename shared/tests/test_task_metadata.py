@@ -2779,6 +2779,19 @@ class TestParseMetadataFailurePolicy:
         with pytest.raises((TypeError, ValueError)):
             parse_metadata(blob, direction='write', enforce=True)  # type: ignore[arg-type]
 
+    def test_non_str_non_dict_python_value_is_not_an_object(self):
+        results = [
+            (parse_metadata(42, direction='read'), 'int'),
+            (parse_metadata(1.5, direction='read'), 'float'),
+            (parse_metadata(False, direction='read'), 'bool'),
+            (parse_metadata(['a'], direction='read'), 'list'),
+        ]
+        for (model, warnings), type_name in results:
+            assert model == TaskMetadata()
+            assert len(warnings) == 1, (type_name, warnings)
+            assert warnings[0].code == 'not_an_object'
+            assert warnings[0].message.endswith(f'got {type_name}')
+
 
 class _CheckStub(BaseModel):
     """Throwaway list-element sub-model standing in for capability_manifest's
