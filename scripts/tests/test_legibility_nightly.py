@@ -4584,11 +4584,12 @@ class TestNightlyResultIsOneTypedOutcome:
     def test_barren_escalated_iff_a_barren_streak_alarm_landed(self, alarms, expected):
         assert _result(_Outcome.BARREN, alarms=alarms).barren_escalated is expected
 
-    def test_the_result_is_frozen(self):
+    @pytest.mark.parametrize('field', ['outcome', 'alarms', 'retry_due'])
+    def test_the_result_is_frozen(self, field):
         result = _result()
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            result.outcome = _Outcome.FAILED  # type: ignore[misc]
+            setattr(result, field, None)
 
     @pytest.mark.parametrize(
         ('kind', 'level'),
