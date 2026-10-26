@@ -728,7 +728,32 @@ it, and the gate slug where one corresponds:
 - A record whose `pin_declared_by` field is set, that is under a Leo HOLD, or that names Leo's
   other session or his personal backlog.
 - Priority, pin-queue placement, cross-cluster dependency sequencing.
-- Scope changes: acceptance criteria, cancel-and-refile or re-scope.
+- Scope changes: acceptance criteria, cancel-and-refile or re-scope. **Except** cancelling a task
+  that a PRD decision Leo ruled has superseded (Leo, 2026-10-22; ratified 2026-10-26), which is
+  allowed and reported under **Done**. All four must hold, each checked by you, never taken from
+  the record:
+  1. **The PRD decision is one Leo ruled.** The PRD says so, the program doc records it
+     `ruled_by: human`, or a task's `x_ruling` carries it. A lead ruling, an architect's reading
+     or a `triage_note` does not qualify.
+  2. **The superseding task exists**, in any status except `cancelled`.
+  3. **The superseded task's full scope is covered.** Each of its items is done on main, rendered
+     moot by the decision, or included in the superseding task's description or plan. One
+     uncovered item fails this check: that item goes to Leo, or into the superseding task's
+     `details` while that task is `pending` (self-execute item 5).
+  4. **The superseded task's branch has no commits**: `git rev-list --count main..task/<id>` is 0.
+
+  Then, in order:
+  1. Repoint every task that depends on the superseded task onto the superseding task
+     (`remove_dependency`, then `add_dependency`), and confirm no dependents remain, so the cancel
+     never trips the irreversible-deletion class above.
+  2. Stamp `x_superseded_by: [<id>]` and an `x_ruling` naming the decision with its file:line,
+     using `metadata_mode='merge'`.
+  3. Cancel the task. When an L2 holds it, cancel it with `resolve_issue(action='abandon')`.
+  4. Close its streak alarm.
+
+  Exemplars: 603 (S7 decision 4), 856 (lane-harness decision 9) and 858 (D-S20-8), each ruled
+  cancel by Leo, 2026-10-20..22. A deliverable that landed under another task's commit is not this
+  case: it is marked done `found_on_main` with `delivered_checks` (683, 1058).
 
 Choosing Fable for an H3 investigation seat is your call. The "fable run" key matches a record that
 asks to launch one.
