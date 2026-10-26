@@ -17447,7 +17447,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # STILL RUNNING (not done) AND a host slot is free, race the
                         # next queue item against the running verifies so dispatch-
                         # fill launches N+1 to the free slot while N verifies — but a
-                        # verify *completing* must ALSO wake us so FINALIZE-HEAD runs.
+                        # verify *completing*, or a parked head's gate re-verify
+                        # completing (task 6155), must ALSO wake us so FINALIZE-HEAD
+                        # runs.
                         # Otherwise the last item of a merge burst would hang: its
                         # verify finishes in the background but FINALIZE-HEAD is never
                         # reached, so _finalize_inflight() never runs and the merge()
@@ -17459,7 +17461,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # they are done the head needs to be finalized, not more
                         # items fetched.
                         _has_running_inflight = any(
-                            e.verify_task is not None and not e.verify_task.done()
+                            e.pending_task is not None and not e.pending_task.done()
                             for e in self._inflight
                         )
                         if (
@@ -17474,9 +17476,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                     self._verifier_queue.get()
                                 )
                             _running = {
-                                e.verify_task for e in self._inflight
-                                if e.verify_task is not None
-                                and not e.verify_task.done()
+                                e.pending_task for e in self._inflight
+                                if e.pending_task is not None
+                                and not e.pending_task.done()
                             }
                             await asyncio.wait(
                                 {self._pending_verifier_get, *_running},
@@ -17499,7 +17501,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 is_from_verifier_queue = True
                                 # Fall through with item (None handled below).
                             else:
-                                # A verify finished first, or stop() was requested
+                                # A verify or a parked gate finished first, or stop() was requested
                                 # (it harvests a done getter) → stop filling and
                                 # proceed to FINALIZE-HEAD.  The getter persists to
                                 # the next DISPATCH-FILL iteration so no queue item
@@ -17631,8 +17633,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 #   3. the QueueEmpty branch, which only blocks when
                 #      _has_running_inflight and a host is free -- and then
                 #      races a persistent getter against the running verify
-                #      tasks via asyncio.wait(..., FIRST_COMPLETED), so a
-                #      verify completing first always ends the wait and falls
+                #      and parked-gate tasks via asyncio.wait(...,
+                #      FIRST_COMPLETED), so a verify or gate completing
+                #      first always ends the wait and falls
                 #      through to FINALIZE-HEAD (the esc-1735-5 anti-block
                 #      property); otherwise (no running inflight, or no free
                 #      host) the else there breaks straight to FINALIZE-HEAD.
