@@ -17,13 +17,16 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _eval_refusal import answered, refused_agent_result
+from _orch_helpers import build_usage_gate
+from shared.config_models import AccountConfig
 from shared.usage_gate import UsageGate
 from test_reviewer_trial_checkout import _CHANGE_AT_BASE, _commit, _git, _Source
 
@@ -41,6 +44,7 @@ from orchestrator.evals.reviewer_trial.corpus import (
     CorpusManifest,
     FixtureContext,
     FixtureTaskRecord,
+    GroundTruthIssue,
 )
 from orchestrator.evals.reviewer_trial.runner import (
     DIFF_CAP_CHARS,
@@ -48,10 +52,12 @@ from orchestrator.evals.reviewer_trial.runner import (
     PanelRunKey,
     PanelRunResult,
     _run_single_reviewer,
+    run_and_score,
     run_panel,
     run_panel_cached,
     run_trial,
 )
+from orchestrator.evals.reviewer_trial.scorer import ScoringResult
 from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
     VariantConfig,
@@ -154,14 +160,16 @@ def _parse_verdict_tools_target(mcp_config: dict) -> tuple[Path, str]:
     return meta_root, role
 
 
-def _make_verdict_writing_invoke(verdict: str = 'PASS', success: bool = True, write: bool = True):
+def _make_verdict_writing_invoke(
+    verdict: str = 'PASS', success: bool = True, write: bool = True, issues: Sequence[dict] = (),
+):
     """Build an ``invoke_agent`` side effect that simulates a live reviewer:
     asserts the call was wired for the verdict-tools transport (a
     ``verdict-tools`` MCP server, no ``output_schema``), then — unless
     *write* is False — writes a verdict envelope to the invocation's own
     ``--meta-root`` (via ``TaskArtifacts.write_verdict``, exactly like the
-    real ``submit_review_verdict`` tool), before returning a mock
-    ``AgentResult`` with the given *success*.
+    real ``submit_review_verdict`` tool) carrying *issues*, before returning a
+    mock ``AgentResult`` with the given *success*.
     """
     async def _invoke(**kwargs):
         mcp_config = kwargs.get('mcp_config')
@@ -175,7 +183,7 @@ def _make_verdict_writing_invoke(verdict: str = 'PASS', success: bool = True, wr
         )
         if write:
             meta_root, role = _parse_verdict_tools_target(mcp_config)
-            payload = {'reviewer': role, 'verdict': verdict, 'issues': [], 'summary': 'Trial verdict.'}
+            payload = {'reviewer': role, 'verdict': verdict, 'issues': list(issues), 'summary': 'Trial verdict.'}
             envelope = {
                 'role': role,
                 'schema_version': 1,
@@ -1078,3 +1086,132 @@ class TestPanelCache:
             )
 
         assert spy.await_args.kwargs['stagger_secs'] == 0
+
+
+_BLOCKING_ISSUE = {
+    'severity': 'blocking', 'location': 'a.py:1', 'category': 'bug', 'description': 'x is wrong',
+}
+
+
+def _scored_diff(source: _Source, diff_id: str, marker: str) -> CorpusDiff:
+    """A fixture with one planted blocking issue, whose matcher prompt carries *marker*."""
+    return CorpusDiff(
+        diff_id=diff_id, language='python', source='synthetic', diff_text=marker,
+        description='Test', cwd=source.root,
+        ground_truth=[GroundTruthIssue(
+            id=f'{diff_id}_gt', location='a.py:1', category='bug', severity='blocking',
+            description='x is wrong', mutation_type='logic',
+        )],
+    )
+
+
+class TestRunAndScore:
+    """run_and_score runs every panel through the cache, then scores each, caching measured scores only."""
+
+    @staticmethod
+    def _corpus(source: _Source) -> CorpusManifest:
+        return CorpusManifest(diffs=[
+            _scored_diff(source, 'd_ok', 'OK_MARKER'),
+            _scored_diff(source, 'd_refused', 'REFUSED_MARKER'),
+        ])
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _panels_and_matcher() -> Iterator[list[str]]:
+        """Reviewers find the blocking issue; the matcher matches OK_MARKER's and refuses REFUSED_MARKER's.
+
+        Yields the marker of every matcher prompt, in order.
+        """
+        matched: list[str] = []
+
+        async def matcher(**kwargs: object):
+            refused = 'REFUSED_MARKER' in str(kwargs['prompt'])
+            matched.append('REFUSED_MARKER' if refused else 'OK_MARKER')
+            if refused:
+                return refused_agent_result()
+            return answered({'matches': [{
+                'reviewer_issue_index': 0, 'ground_truth_id': 'd_ok_gt',
+                'confidence': 0.9, 'reasoning': 'same bug',
+            }]}, cost_usd=0.1)
+
+        with (
+            patch(
+                'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+                side_effect=_make_verdict_writing_invoke('ISSUES_FOUND', issues=[_BLOCKING_ISSUE]),
+            ),
+            patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', matcher),
+        ):
+            yield matched
+
+    @pytest.mark.asyncio
+    async def test_one_score_per_panel_in_trial_order(self, source: _Source, tmp_path: Path) -> None:
+        variants = [_one_reviewer('a_panel'), _one_reviewer('b_panel')]
+        seen: list[ScoringResult] = []
+
+        with self._panels_and_matcher():
+            scores = await run_and_score(
+                variants, self._corpus(source), results_dir=tmp_path / 'results',
+                stagger_secs=0, on_scored=seen.append,
+            )
+
+        assert [(s.variant_name, s.diff_id) for s in scores] == [
+            ('a_panel', 'd_ok'), ('a_panel', 'd_refused'), ('b_panel', 'd_ok'), ('b_panel', 'd_refused'),
+        ]
+        assert seen == scores
+        assert scores[0].f1 == 1.0 and scores[0].unmeasured is None
+        assert scores[1].unmeasured is not None
+
+    @pytest.mark.asyncio
+    async def test_a_score_dir_caches_measured_scores_only(self, source: _Source, tmp_path: Path) -> None:
+        variant, corpus = _one_reviewer(), self._corpus(source)
+        dirs = {'results_dir': tmp_path / 'results', 'score_dir': tmp_path / 'scores'}
+
+        with self._panels_and_matcher() as matched:
+            first = await run_and_score([variant], corpus, stagger_secs=0, **dirs)
+            assert matched == ['OK_MARKER', 'REFUSED_MARKER']
+            second = await run_and_score([variant], corpus, stagger_secs=0, **dirs)
+
+        stored = json.loads((dirs['score_dir'] / f'{variant.name}__d_ok.json').read_text())
+        assert ScoringResult.from_dict(stored) == first[0]
+        assert not (dirs['score_dir'] / f'{variant.name}__d_refused.json').exists()
+        assert matched == ['OK_MARKER', 'REFUSED_MARKER', 'REFUSED_MARKER']
+        assert second[0] == first[0]
+        assert second[1].unmeasured is not None
+
+    @pytest.mark.asyncio
+    async def test_without_a_score_dir_every_run_rescores(self, source: _Source, tmp_path: Path) -> None:
+        variant, corpus, results_dir = _one_reviewer(), self._corpus(source), tmp_path / 'results'
+
+        with self._panels_and_matcher() as matched:
+            await run_and_score([variant], corpus, results_dir=results_dir, stagger_secs=0)
+            await run_and_score([variant], corpus, results_dir=results_dir, stagger_secs=0)
+
+        assert matched == ['OK_MARKER', 'REFUSED_MARKER', 'OK_MARKER', 'REFUSED_MARKER']
+        assert {p.parent for p in tmp_path.rglob('*.json')} == {results_dir}
+
+    @pytest.mark.asyncio
+    async def test_a_usage_gate_reaches_the_panels_and_the_matcher(self, source: _Source, tmp_path: Path) -> None:
+        gate = build_usage_gate([AccountConfig(name='max-a', oauth_token_env='CLAUDE_OAUTH_A')], ['tok-a'])
+        reviewer_calls: list[dict] = []
+        matcher_calls: list[dict] = []
+        write_verdict = _make_verdict_writing_invoke('ISSUES_FOUND', issues=[_BLOCKING_ISSUE])
+
+        async def reviewer(**kwargs):
+            reviewer_calls.append(kwargs)
+            return await write_verdict(**kwargs)
+
+        async def matcher(**kwargs: object):
+            matcher_calls.append(kwargs)
+            return answered({'matches': []})
+
+        with (
+            patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', side_effect=reviewer),
+            patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', matcher),
+        ):
+            await run_and_score(
+                [_one_reviewer()], CorpusManifest(diffs=[_scored_diff(source, 'd_ok', 'OK_MARKER')]),
+                results_dir=tmp_path / 'results', stagger_secs=0, usage_gate=gate,
+            )
+
+        assert [c['oauth_token'] for c in reviewer_calls] == ['tok-a']
+        assert [c['oauth_token'] for c in matcher_calls] == ['tok-a']
