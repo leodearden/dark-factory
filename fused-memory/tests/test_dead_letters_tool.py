@@ -7,6 +7,7 @@ import json
 import threading
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -178,6 +179,19 @@ def _make_recon_event(project_id: str) -> ReconciliationEvent:
         timestamp=datetime.now(UTC),
         payload={'key': 'value'},
     )
+
+
+def _seed_dead_letters(path: Path, events: list[ReconciliationEvent]) -> None:
+    """Append ``events`` to ``path`` in the dead-letter record format that replay consumes."""
+    with path.open('a', encoding='utf-8') as fh:
+        for event in events:
+            record = {
+                'event': event.model_dump(mode='json'),
+                'reason': 'non_retriable',
+                'attempts': 1,
+                'failed_at': datetime.now(UTC).isoformat(),
+            }
+            fh.write(json.dumps(record) + '\n')
 
 
 def _make_failing_buf() -> AsyncMock:
@@ -881,8 +895,7 @@ class TestReplayEventDeadLettersTool:
         try:
             # Seed 3 dead-letter records for proj-a directly.
             seeded = [_make_recon_event('proj-a') for _ in range(3)]
-            for event in seeded:
-                eq._write_dead_letter(event, reason='non_retriable', attempts=1)
+            _seed_dead_letters(dl, seeded)
             assert len(dl.read_text().strip().splitlines()) == 3
 
             svc = AsyncMock()
@@ -937,10 +950,7 @@ class TestReplayEventDeadLettersTool:
         )
         await eq.start()
         try:
-            for _ in range(3):
-                eq._write_dead_letter(
-                    _make_recon_event('proj-a'), reason='non_retriable', attempts=1,
-                )
+            _seed_dead_letters(dl, [_make_recon_event('proj-a') for _ in range(3)])
 
             # Record the thread each put_nowait runs on. Patched AFTER start()
             # so recover()'s (loop-thread) puts are excluded — only the replay
