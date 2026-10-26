@@ -454,13 +454,11 @@ class TestUnregisteredMarkers:
         ``chmod(0o000)`` would be (a root process can still read a 0o000
         file, so that path wouldn't reliably raise here) — same technique as
         test_merge_liveness.py's
-        ``test_unreadable_or_vanished_entry_does_not_raise``. The pass keys
-        files by resolved path (``_tree_scan.py``), so the failure names the
-        link's target, the path that could not be read.
+        ``test_unreadable_or_vanished_entry_does_not_raise``.
         """
         broken = tmp_path / 'test_dangling.py'
         broken.symlink_to(tmp_path / 'does-not-exist-target.py')
-        with pytest.raises(AssertionError, match='does-not-exist-target.py.*FileNotFoundError'):
+        with pytest.raises(AssertionError, match='test_dangling.py: FileNotFoundError'):
             _unregistered_markers(tmp_path, frozenset({'slow'}))
 
     def test_recurses_into_nested_subdirs_and_ignores_non_py_siblings(self, tmp_path: Path):

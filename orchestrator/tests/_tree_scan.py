@@ -34,7 +34,7 @@ TREE_PASS_XDIST_GROUP = 'whole_tree_pass'
 
 
 def python_files(*roots: Path, exclude_parts: frozenset[str] = frozenset()) -> tuple[Path, ...]:
-    """Every ``*.py`` under *roots*, resolved, deduplicated and sorted.
+    """Every ``*.py`` under each resolved root in *roots*, deduplicated and sorted.
 
     A path is dropped when any of its parts RELATIVE TO ITS ROOT is in
     *exclude_parts*.  A root that is not an existing directory raises, so a
@@ -47,7 +47,7 @@ def python_files(*roots: Path, exclude_parts: frozenset[str] = frozenset()) -> t
             raise NotADirectoryError(f'python_files root is not an existing directory: {root}')
         for path in resolved_root.rglob('*.py'):
             if exclude_parts.isdisjoint(path.relative_to(resolved_root).parts):
-                found.add(path.resolve())
+                found.add(path)
     return tuple(sorted(found))
 
 
@@ -58,7 +58,7 @@ CHECKOUT_SKIP_PARTS = frozenset({'.worktrees', '.venv', 'node_modules', '__pycac
 
 
 def git_tracked_python_files(repo_root: Path) -> tuple[Path, ...]:
-    """Every ``*.py`` git tracks in *repo_root*, resolved, or ``()`` if git cannot answer.
+    """Every ``*.py`` git tracks in *repo_root*, under its resolved root, or ``()`` if git cannot answer.
 
     NUL-delimited (``-z``) so a path holding a space or newline cannot truncate
     the listing, which would make any completeness check built on it pass
@@ -72,7 +72,7 @@ def git_tracked_python_files(repo_root: Path) -> tuple[Path, ...]:
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return ()
-    return tuple((root / relpath).resolve() for relpath in listing.split('\0') if relpath)
+    return tuple(root / relpath for relpath in listing.split('\0') if relpath)
 
 
 def _package_root_python_files(root: Path) -> tuple[Path, ...]:
@@ -95,7 +95,7 @@ def _package_root_python_files(root: Path) -> tuple[Path, ...]:
 
 def checkout_python_files(repo_root: Path) -> tuple[Path, ...]:
     """Every ``*.py`` in the checkout at *repo_root*: git-tracked UNION the on-disk
-    package roots, resolved, deduplicated and sorted.
+    package roots, deduplicated and sorted.
 
     Neither source alone is enough.  ``git ls-files`` is complete by
     construction for committed work but cannot see a file written and not yet
@@ -112,7 +112,7 @@ def checkout_python_files(repo_root: Path) -> tuple[Path, ...]:
     """
     root = Path(repo_root).resolve()
     candidates = (*git_tracked_python_files(root), *_package_root_python_files(root))
-    return tuple(sorted({path.resolve() for path in candidates if path.is_file()}))
+    return tuple(sorted({path for path in candidates if path.is_file()}))
 
 
 class ParsedModule:
@@ -242,22 +242,34 @@ def _require_unique_names(analyses: tuple[TreeAnalysis[Any], ...]) -> None:
         raise ValueError(f'tree analyses must have unique names; duplicated: {duplicates}')
 
 
-def _resolved_file_sets(
+def _anchored(path: Path) -> Path:
+    """*path* with its directories resolved and its own name kept.
+
+    A symlinked file therefore stays at its link, under the root it was listed
+    from, rather than becoming a target that may lie outside that root.  Paths
+    from :func:`python_files` and :func:`git_tracked_python_files` already have
+    this form.
+    """
+    path = Path(path)
+    return path.parent.resolve() / path.name
+
+
+def _anchored_file_sets(
     analyses: tuple[TreeAnalysis[Any], ...],
     failures: dict[TreeAnalysis[Any], list[AnalysisFailure]],
 ) -> dict[TreeAnalysis[Any], frozenset[Path]]:
-    """Each analysis's resolved file set; one that cannot list its files gets none and a failure."""
-    resolved: dict[Path, Path] = {}
+    """Each analysis's :func:`_anchored` file set; one that cannot list its files gets none and a failure."""
+    anchored: dict[Path, Path] = {}
 
-    def resolve(path: Path) -> Path:
-        if path not in resolved:
-            resolved[path] = Path(path).resolve()
-        return resolved[path]
+    def anchor(path: Path) -> Path:
+        if path not in anchored:
+            anchored[path] = _anchored(path)
+        return anchored[path]
 
     file_sets: dict[TreeAnalysis[Any], frozenset[Path]] = {}
     for analysis in analyses:
         try:
-            file_sets[analysis] = frozenset(resolve(path) for path in analysis.files())
+            file_sets[analysis] = frozenset(anchor(path) for path in analysis.files())
         except Exception as error:
             failures[analysis].append(ListingFailure(type(error).__name__, str(error)))
             file_sets[analysis] = frozenset()
@@ -281,7 +293,7 @@ class TreePass:
         _require_unique_names(declared)
         facts: dict[TreeAnalysis[Any], dict[Path, Any]] = {a: {} for a in declared}
         failures: dict[TreeAnalysis[Any], list[AnalysisFailure]] = {a: [] for a in declared}
-        file_sets = _resolved_file_sets(declared, failures)
+        file_sets = _anchored_file_sets(declared, failures)
         for path in sorted(frozenset().union(*file_sets.values())):
             interested = [a for a in declared if path in file_sets[a]]
             _dispatch_one_file(ParsedModule(path), interested, facts, failures)
@@ -291,7 +303,7 @@ class TreePass:
         )
 
     def facts(self, analysis: TreeAnalysis[T]) -> Mapping[Path, T]:
-        """*analysis*'s facts keyed by resolved path, in sorted order.
+        """*analysis*'s facts keyed by :func:`_anchored` path, in sorted order.
 
         Raises if *analysis* was not part of this pass, or if it could not list
         its files or any of them failed, so a consumer never asserts over a

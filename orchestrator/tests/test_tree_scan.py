@@ -289,7 +289,7 @@ class TestFactInvariant:
 
 
 class TestKeyingAndOrder:
-    def test_facts_are_a_read_only_mapping_keyed_by_resolved_path_in_sorted_order(
+    def test_facts_are_a_read_only_mapping_keyed_by_normalized_path_in_sorted_order(
         self, tmp_path: Path,
     ) -> None:
         zeta = _write(tmp_path, 'zeta.py')
@@ -302,6 +302,20 @@ class TestKeyingAndOrder:
 
         assert list(facts) == [alpha, zeta]
         assert not hasattr(facts, '__setitem__')
+
+    def test_a_symlinked_file_is_keyed_at_its_link_inside_its_root(self, tmp_path: Path) -> None:
+        root = (tmp_path / 'root').resolve()
+        target = _write(tmp_path, 'outside/target.py')
+        link = root / 'link.py'
+        root.mkdir()
+        link.symlink_to(target)
+        analysis = _analysis('linked', lambda: python_files(root), _path_name)
+
+        facts = TreePass.run([analysis]).facts(analysis)
+
+        assert python_files(root) == (link,)
+        assert dict(facts) == {link: 'link.py'}
+        assert [path.relative_to(root) for path in facts] == [Path('link.py')]
 
 
 class TestDeclaration:
@@ -361,7 +375,7 @@ class TestDiscovery:
 
 
 class TestPythonFiles:
-    def test_returns_a_sorted_tuple_of_resolved_python_files_recursively(
+    def test_returns_a_sorted_tuple_of_python_files_recursively(
         self, tmp_path: Path,
     ) -> None:
         deep = _write(tmp_path, 'pkg/deep/inner.py')
@@ -496,7 +510,7 @@ class TestCheckoutPythonFiles:
 
 
 class TestGitTrackedPythonFiles:
-    def test_lists_only_the_tracked_python_files_resolved(
+    def test_lists_only_the_tracked_python_files_under_the_resolved_root(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         repo = _seed_checkout(tmp_path / 'repo', monkeypatch)
