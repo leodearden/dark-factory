@@ -1313,7 +1313,7 @@
     "orchestrator/tests/test_warm_lane_soft_floor.py": {"patch_targets": [], "private_reads": 24},
     "orchestrator/tests/test_warm_lane_steal_retry.py": {"patch_targets": [], "private_reads": 15},
     "orchestrator/tests/test_warm_lane_structural_exhaustion.py": {"patch_targets": [], "private_reads": 44},
-    "orchestrator/tests/test_workflow.py": {"patch_targets": ["gates._check_plan_files_touched_in_branch"], "private_reads": 146},
+    "orchestrator/tests/test_workflow.py": {"patch_targets": ["gates._check_plan_files_touched_in_branch"], "private_reads": 151},
     "orchestrator/tests/test_workflow_agent_session_preserve.py": {"patch_targets": [], "private_reads": 9},
     "orchestrator/tests/test_workflow_branch_base_sha.py": {"patch_targets": [], "private_reads": 10},
     "orchestrator/tests/test_workflow_cancellation.py": {"patch_targets": [], "private_reads": 42},

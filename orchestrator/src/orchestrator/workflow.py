@@ -4662,7 +4662,7 @@ class TaskWorkflow:
         sync — the scope-reconciliation choke point (task 2505) used by every
         path that (re)establishes plan.files against the scheduler's file-lock
         set: the plan boundary (:meth:`_reconcile_plan_scope`) and
-        ``_set_task_scope()``.
+        ``_set_task_scope()`` (which ``_try_narrow_plan`` calls).
 
         Derives the module set from *plan_files*; if it already matches
         ``self.modules`` this is a no-op (returns an applied result without
@@ -4763,36 +4763,40 @@ class TaskWorkflow:
             )
 
     async def _set_task_scope(self, new_files: list[str]) -> BlastRadiusResult:
-        """Orchestrator-side single choke point for widening a task's file
-        scope OUTSIDE the architect/plan-boundary flow (task 2505) — used by
-        the resume-path scope-grant consumer to fold a steward's
-        ``granted_files`` into plan.files without re-invoking the architect.
+        """Orchestrator-side single choke point for widening OR narrowing a
+        task's file scope OUTSIDE the architect/plan-boundary flow (task
+        2505). Two consumers: the resume-path scope-grant consumer, which
+        folds a steward's ``granted_files`` into plan.files without
+        re-invoking the architect, and ``_try_narrow_plan``, which commits an
+        accepted merge-gate narrowing (task 3580).
 
         Writes plan.json first (``self.plan['files'] = new_files`` +
         ``artifacts.set_plan_files`` — preserves ownership/provenance), then
         reconciles the scheduler's locks/metadata.files via
-        ``_reconcile_scope_locks``. On a lock conflict, plan.json is already
-        widened (matching metadata.files, which ``handle_blast_radius_expansion``
-        persists on every successful refinement and the conflict/requeue branch)
-        but ``self.modules`` is left unchanged and the returned result is not
-        ``applied``, so the caller does NOT resume under a foreign lock.
+        ``_reconcile_scope_locks``. On a lock conflict, plan.json already holds
+        *new_files* (matching metadata.files, which
+        ``handle_blast_radius_expansion`` persists on every successful
+        refinement and the conflict/requeue branch) but ``self.modules`` is
+        left unchanged and the returned result is not ``applied``, so the
+        caller does NOT resume under a foreign lock.
 
-        Same-module widen (task 2505 reviewer regression): when the granted
-        file maps to a module the task already locks, ``_reconcile_scope_locks``
-        no-ops the ``handle_blast_radius_expansion`` call — which early-returns
-        WITHOUT persisting ``metadata.files`` (the no-op early return is the
-        only non-persist path). Without a direct persist here, plan.files would
-        be widened while metadata.files stayed behind, tripping the MERGE-entry
-        ``_check_scope_invariant`` divergence tripwire. So on a successful
-        reconcile that left ``self.modules`` UNCHANGED, persist
-        ``metadata.files=new_files`` directly through the
-        :meth:`_persist_metadata_files` seam. On the module-CHANGE success path and the
-        lock-CONFLICT path this is skipped — ``handle_blast_radius_expansion``
-        already persisted ``metadata.files=new_files``. The module-CHANGE
-        success path now ALWAYS persists (widen, narrow, or shift): a pure-widen
-        module change previously did NOT persist, which made skipping the direct
-        write unsound; task 2868 fixed that, so the skip is now sound. Only the
-        SAME-module (no-op) widen still needs the direct persist here, because
+        Same-module change (task 2505 reviewer regression): when *new_files*
+        map to exactly the modules the task already locks,
+        ``_reconcile_scope_locks`` no-ops the ``handle_blast_radius_expansion``
+        call — which early-returns WITHOUT persisting ``metadata.files`` (the
+        no-op early return is the only non-persist path). Without a direct
+        persist here, plan.files would change while metadata.files stayed
+        behind, tripping the MERGE-entry ``_check_scope_invariant`` divergence
+        tripwire. So on a successful reconcile that left ``self.modules``
+        UNCHANGED, persist ``metadata.files=new_files`` directly through the
+        :meth:`_persist_metadata_files` seam. On the module-CHANGE
+        success path and the lock-CONFLICT path this is skipped —
+        ``handle_blast_radius_expansion`` already persisted
+        ``metadata.files=new_files``. The module-CHANGE success path now ALWAYS
+        persists (widen, narrow, or shift): a pure-widen module change
+        previously did NOT persist, which made skipping the direct write
+        unsound; task 2868 fixed that, so the skip is now sound. Only the
+        SAME-module (no-op) change still needs the direct persist here, because
         the blast call early-returns without persisting.
         """
         assert self.artifacts is not None
@@ -4802,7 +4806,7 @@ class TaskWorkflow:
         reconciled = await self._reconcile_scope_locks(new_files)
         if reconciled.applied and set(self.modules) == modules_before:
             await self._persist_metadata_files(
-                new_files, log_context='scope-grant files persist',
+                new_files, log_context='task-scope files persist',
             )
         return reconciled
 
@@ -11584,14 +11588,28 @@ class TaskWorkflow:
         merge gate flagged declared-but-untouched files.
 
         Lenient semantics: the architect may keep some flagged entries
-        (treating them as genuinely needed); the only hard constraint
-        is no NEW files may be added.  The gate's re-check is the
-        source of truth for pass/fail.
+        (treating them as genuinely needed); the only hard constraints
+        are that no NEW files may be added, at least one lock-bearing
+        file must remain, and no module the task does not already hold may
+        be needed.  The gate's re-check is the source of truth
+        for pass/fail.
 
         Returns True when the narrowing pass should be re-checked
         against the gate, False otherwise (one-shot already fired,
-        architect invocation failed, or post-pass subset check rejected
-        the new plan because it introduced new files).
+        architect invocation failed, or the candidate added new files,
+        derives zero lock modules, or needs an unheld module).
+
+        An accepted candidate is committed through ``_set_task_scope``, so
+        metadata.files and the held lock modules follow plan.files. Every
+        declined pass, and an architect invocation that raises, restores the
+        plan.json snapshot taken before the architect ran and leaves
+        ``self.plan``, locks and metadata.files untouched (task 3580). A
+        failure after the commit leaves plan.json narrowed while
+        metadata.files stays wide, a superset the merge-entry tripwire
+        tolerates.
+
+        A narrowing never takes a lock (``_narrowing_rejection``), so the
+        scope reconcile cannot be refused.
         """
         if self._plan_tightened:
             return False
@@ -11606,20 +11624,25 @@ class TaskWorkflow:
 
         assert self.worktree is not None
         assert self.artifacts is not None
-        result = await self._invoke(ARCHITECT, build_prompt, self.worktree)
-        if not result.success:
-            return False
-
-        self.plan = self.artifacts.read_plan()
-        after = set(self.plan.get('files', []))
-        if not after.issubset(before):
-            logger.warning(
-                'Task %s: narrowing pass added new files %s — rejecting',
-                self.task_id, sorted(after - before),
-            )
+        pre_narrow_plan = self.artifacts.read_plan()
+        try:
+            result = await self._invoke(ARCHITECT, build_prompt, self.worktree)
+            candidate = self._narrowing_candidate(result, before)
+        except BaseException:
+            self.artifacts.write_plan(pre_narrow_plan)
+            raise
+        if candidate is None:
+            self.artifacts.write_plan(pre_narrow_plan)
             return False
         # Lenient: partial narrowing or confirm_plan() both fall through
         # to the gate's re-check below.
+        self.plan = candidate
+        candidate_files = list(candidate.get('files', []))
+        reconciled = await self._set_task_scope(candidate_files)
+        assert reconciled.applied, (
+            f'task {self.task_id}: a narrowing that holds every module it '
+            f'needs cannot lose its locks: {candidate_files}'
+        )
         return True
 
     async def _consume_narrowing_exit_report(
@@ -11678,6 +11701,52 @@ class TaskWorkflow:
         return rc == 0 and not any(
             line.startswith('+') for line in out.splitlines()
         )
+
+    def _narrowing_candidate(
+        self, result: AgentResult, before: set[str],
+    ) -> dict | None:
+        """The architect's rewritten plan when it is a legal narrowing of
+        *before*, or None, with the reason logged, when the pass is declined."""
+        assert self.artifacts is not None
+        if not result.success:
+            rejection = 'narrowing pass invocation failed'
+        else:
+            candidate = self.artifacts.read_plan()
+            rejection = self._narrowing_rejection(
+                list(candidate.get('files', [])), before,
+            )
+            if rejection is None:
+                return candidate
+        logger.warning(
+            'Task %s: %s — declining, restoring the pre-narrow plan.json',
+            self.task_id, rejection,
+        )
+        return None
+
+    def _narrowing_rejection(
+        self, candidate_files: list[str], before: set[str],
+    ) -> str | None:
+        """Why a narrowing pass's *candidate_files* must be declined, or None
+        when it is a legal narrowing of *before* that stays inside the held
+        ``self.modules``."""
+        if not set(candidate_files).issubset(before):
+            return (
+                f'narrowing pass added new files '
+                f'{sorted(set(candidate_files) - before)}'
+            )
+        candidate_modules = derive_modules(
+            candidate_files, self.config.lock_depth, task_id=self.task_id,
+        )
+        if not candidate_modules:
+            return (
+                f'narrowing pass left no lock-bearing files {candidate_files}'
+            )
+        if not set(candidate_modules).issubset(self.modules):
+            return (
+                f'narrowing pass needs modules this task does not hold '
+                f'{sorted(set(candidate_modules) - set(self.modules))}'
+            )
+        return None
 
     async def _submit_to_merge_queue(
         self, branch_name: str, pre_rebased: bool = False,
@@ -11903,9 +11972,7 @@ class TaskWorkflow:
                     if exit_outcome is not None:
                         return exit_outcome
                     if narrowed:
-                        # Re-check the (possibly narrowed) plan against the
-                        # gate.  ``_task_files`` reads from ``self.plan``,
-                        # which ``_try_narrow_plan`` has refreshed from disk.
+                        # Re-check the narrowed plan against the gate.
                         rc2, branch_head2, _ = await _run(
                             ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
                         )
@@ -16491,7 +16558,9 @@ class TaskWorkflow:
 
         The scope-reconciliation choke point (``_reconcile_scope_locks`` /
         ``_set_task_scope``) keeps ``plan.files`` and ``metadata.files`` in
-        lockstep on every path that changes either. This surfaces a genuine
+        lockstep on the paths routed through it (listed on
+        ``_reconcile_scope_locks``; the merge-gate narrowing pass
+        ``_try_narrow_plan`` joined them in task 3580). This surfaces a genuine
         divergence loudly (the project's loud-over-silent-degradation norm)
         rather than letting scope drift ship silently into a merge.
 
@@ -16519,8 +16588,9 @@ class TaskWorkflow:
         ``infra_issue`` that routes to a human even though nothing is wrong;
         only a MODULE-set divergence (a real lock/scope-reconciliation bug) is
         escalation-worthy. The stronger file-level equality is still maintained
-        by construction on the resume/grant path (``_set_task_scope`` persists
-        ``metadata.files`` directly), so nothing is lost there.
+        by construction on the resume/grant and narrowing paths
+        (``_set_task_scope`` persists ``metadata.files`` directly), so nothing
+        is lost there.
 
         Fail-safe: an unreadable task (``self.scheduler.get_task`` returns
         ``None`` — e.g. a transient backend hiccup) is treated as "cannot

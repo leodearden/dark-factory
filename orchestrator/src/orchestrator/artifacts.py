@@ -1262,10 +1262,10 @@ class TaskArtifacts:
             return False
 
     def set_plan_files(self, files: list[str], session_id: str) -> None:
-        """Widen plan.json's ``files`` list in place — the orchestrator-side
-        mechanical union used by the resume-path scope-grant consumer
-        (``TaskWorkflow._set_task_scope``) instead of re-invoking the
-        architect for a known file-set append.
+        """Replace plan.json's ``files`` list in place — the orchestrator-side
+        mechanical write used by ``TaskWorkflow._set_task_scope`` (the
+        resume-path scope grant and the merge-gate narrowing pass) instead of
+        re-invoking the architect for a known file set.
 
         Preserves every other plan field (steps, analysis, design_decisions,
         provenance) untouched — only ``files`` is replaced.

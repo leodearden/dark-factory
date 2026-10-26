@@ -31,6 +31,7 @@ from test_workflow import (
     _CheckSequence,
     _make_workflow,
     _merge_attempt_outcomes,
+    _wire_scope_backend,
 )
 
 from orchestrator.agents.invoke import AgentResult
@@ -94,6 +95,10 @@ def _arm_gate(
         return AgentResult(success=True, output='', cost_usd=0.0, turns=1)
     monkeypatch.setattr(wf, '_invoke', fake_invoke)
     wf.briefing.build_plan_tightening_prompt = AsyncMock(return_value='PROMPT')
+
+    # The narrowing pass reconciles scope through the scheduler, so held
+    # modules and metadata.files must be consistent with the plan it narrows.
+    _wire_scope_backend(wf, ['a.py', 'b.py', 'c.py'])
 
     merge_queue: asyncio.Queue = asyncio.Queue()
     wf.merge_queue = merge_queue
