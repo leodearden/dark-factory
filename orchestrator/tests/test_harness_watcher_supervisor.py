@@ -3611,6 +3611,68 @@ class TestWatcherNoParkingSites:
 
 
 # ---------------------------------------------------------------------------
+# task 3726: every per-category routing handler ends in a terminal disposition
+# ---------------------------------------------------------------------------
+
+_ROUTING_TABLE_HEADING = '## Per-Category Routing Table'
+_REVIEW_SUGGESTIONS_HEADING = '#### `review_suggestions`'
+_TERMINAL_CALLS = ('mcp__escalation__resolve_issue(', 'mcp__escalation__promote_to_l2(')
+_TERMINAL_LINKS = ('](#convert-to-tracked-work-file-and-resolve)', '](#promote-to-l2)')
+
+
+def _handler_headings(section: str) -> list[str]:
+    headings = []
+    in_fence = False
+    for line in section.splitlines():
+        if line.lstrip().startswith('```'):
+            in_fence = not in_fence
+        elif not in_fence and line.startswith('#### '):
+            headings.append(line)
+    return headings
+
+
+def _ends_in_terminal_disposition(handler: str) -> bool:
+    code = '\n'.join(_fenced_code_blocks(handler))
+    return any(call in code for call in _TERMINAL_CALLS) or any(
+        link in handler for link in _TERMINAL_LINKS
+    )
+
+
+class TestWatcherRoutingHandlersAreTerminal:
+    """Every `####` routing handler shows a terminal call or links one.
+
+    A terminal call is a fenced resolve_issue/promote_to_l2 call; a terminal
+    link points at the Convert or Promote section. A tool named only in prose
+    does not count: a handler can name resolve_issue to forbid it.
+    """
+
+    def test_every_routing_handler_ends_in_a_terminal_disposition(self) -> None:
+        text = _watcher_skill_text()
+        headings = _handler_headings(_skill_section(text, _ROUTING_TABLE_HEADING))
+        assert headings, f'found no #### handlers under {_ROUTING_TABLE_HEADING!r}'
+        parks = [
+            heading
+            for heading in headings
+            if not _ends_in_terminal_disposition(_skill_section(text, heading))
+        ]
+        assert not parks, (
+            'these routing handlers have no fenced resolve_issue/promote_to_l2 '
+            'call and no link to Convert to tracked work or Promote to L2, so '
+            'each is a park that Harness._watcher_has_actionable_l1 re-arms on '
+            f'every poll: {parks}'
+        )
+
+    def test_review_suggestions_are_filed_not_skipped(self) -> None:
+        section = _skill_section(_watcher_skill_text(), _REVIEW_SUGGESTIONS_HEADING)
+        assert '](#convert-to-tracked-work-file-and-resolve)' in section, (
+            'a review_suggestions record exists only because '
+            'TaskWorkflow._route_review_suggestions_to_curator had no curator '
+            'transport, so the curator never received the suggestions; filing '
+            'them through Convert to tracked work completes that route'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task 2629 step-3: _watcher_has_actionable_l1 — empty-queue rotation precheck
 # ---------------------------------------------------------------------------
 
