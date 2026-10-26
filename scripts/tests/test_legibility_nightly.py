@@ -2834,6 +2834,28 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
     assert str(quarantine_dir) in arguments['detail']
 
 
+def test_run_nightly_rolls_back_the_dump_when_the_committer_raises(tmp_path):
+    """A committer that raises is a refused commit: the dump never stays in
+    the checkout, and the raise reaches the COMMIT_FAILED alarm's detail."""
+
+    def _raising_committer(repo, paths, message):
+        raise RuntimeError('the committer exploded')
+
+    poster, posted = _capture_poster()
+    result, repo = _run_e2e_nightly(tmp_path, committer=_raising_committer, poster=poster)
+
+    assert result.outcome is _Outcome.FAILED
+    assert [alarm.kind for alarm in result.alarms] == [_Kind.COMMIT_FAILED]
+    head_bytes = subprocess.run(
+        ['git', 'show', 'HEAD:docs/legibility/confusion-codebook.yaml'],
+        cwd=repo, check=True, capture_output=True,
+    ).stdout
+    quarantine_dir = _assert_refused_dump_rolled_back(repo, head_bytes, result)
+    detail = _one_escalation(posted)['detail']
+    assert 'RuntimeError: the committer exploded' in detail
+    assert str(quarantine_dir) in detail
+
+
 def test_run_nightly_lands_through_a_transient_index_lock(tmp_path):
     """Boundary row 4: an index.lock held across the commit's first two
     attempts delays the night's commit; it does not roll the night back."""
@@ -4741,33 +4763,9 @@ class TestEveryBranchIsOneOutcomeAndOneAlarmList:
 
 
 def test_a_crash_keeps_every_alarm_posted_before_it(tmp_path):
-    """A deletion-directive night whose commit raises: the deletion alarm was
+    """A suppressed night whose digest stage raises: the budget alarm was
     posted before the crash, so it survives in the one list, and it landed
     even though the crash's own post did not."""
-    work_cwd = str(tmp_path / 'work')
-    _repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
-    projects_root = tmp_path / 'projects'
-    session_dir = projects_root / _encode_cwd(work_cwd)
-    _write_transcript(
-        session_dir / 'session-1.jsonl', cwd=work_cwd,
-        timestamp='2026-07-13T10:00:00Z', session_id='session-1',
-    )
-    _write_transcript(
-        session_dir / 'session-2.jsonl', cwd=work_cwd,
-        timestamp='2026-07-13T11:00:00Z', session_id='session-2',
-        user_text='an entirely different request that also went sideways',
-    )
-    invocations = []
-
-    def _deletion_then_match(prompt, model):
-        invocations.append(prompt)
-        if len(invocations) == 1:
-            return _fake_invoke_deletion_directive(prompt, model)
-        return _fake_invoke_known_cause(prompt, model)
-
-    def _raising_committer(repo, paths, message):
-        raise RuntimeError('the committer exploded')
-
     posted = []
 
     def _server_gone_after_the_first_post(url, envelope):
@@ -4775,24 +4773,16 @@ def test_a_crash_keeps_every_alarm_posted_before_it(tmp_path):
             raise ConnectionError('escalation server went away')
         posted.append(envelope)
 
-    result = nightly.run_nightly(
-        config_path=config_path,
-        projects_root=projects_root,
-        target_date=date(2026, 7, 13),
-        now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
-        invoke=_deletion_then_match,
-        poster=_server_gone_after_the_first_post,
-        committer=_raising_committer,
-        census_launcher=_no_census_launch,
-        pass_kind=nightly.PassKind.MANUAL,
+    result, _repo = _run_e2e_nightly(
+        tmp_path, branch='crash', budget_bytes=10, poster=_server_gone_after_the_first_post,
     )
 
     assert result.outcome is _Outcome.FAILED
     assert [(alarm.kind, alarm.landed) for alarm in result.alarms] == [
-        (_Kind.DELETION_DIRECTIVE, True), (_Kind.CRASHED, False),
+        (_Kind.BUDGET_SUPPRESSED, True), (_Kind.CRASHED, False),
     ]
     assert result.escalated is True
-    assert 'the committer exploded' in (result.reason or '')
+    assert 'synthetic mid-run explosion' in (result.reason or '')
 
 
 class TestEveryPassEndsWithOneJournalLine:

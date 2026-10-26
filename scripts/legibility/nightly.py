@@ -745,6 +745,13 @@ CensusLauncher = Callable[..., None]
 """``census_launcher(project_root, *, config_path, caps)``, shaped like
 :func:`_default_census_launcher`."""
 
+_Recorder = Callable[..., trickle_state.TrickleState]
+"""``recorder(night_fold, *, barren_escalated)``, shaped like
+:func:`trickle_state.write_night`."""
+
+_RetryRecorder = Callable[..., trickle_state.TrickleState | None]
+"""Shaped like :func:`trickle_state.record_retry`."""
+
 
 @dataclass(frozen=True, kw_only=True)
 class _NightSeams:
@@ -756,8 +763,8 @@ class _NightSeams:
     status_fetcher: Callable[[], Any] | None
     poster: Callable[[str, dict], None]
     committer: Callable[..., unlanded.CommitResult]
-    recorder: Callable[..., trickle_state.TrickleState]
-    retry_recorder: Callable[..., trickle_state.TrickleState | None]
+    recorder: _Recorder
+    retry_recorder: _RetryRecorder
     selector: Selector
     digest_builder: DigestBuilder
     census_launcher: CensusLauncher
@@ -834,6 +841,17 @@ def _exit_code_of(outcome: trickle_state.RunOutcome) -> int:
     return 1 if outcome is trickle_state.RunOutcome.FAILED else 0
 
 
+def _capped_of(outcome: trickle_state.RunOutcome) -> bool:
+    """Whether a night of *outcome* had its coding deferred by the usage cap."""
+    return outcome is trickle_state.RunOutcome.DEFERRED
+
+
+def _finished_of(outcome: trickle_state.RunOutcome) -> bool:
+    """Whether a night of *outcome* finished, and so may owe retries
+    (:func:`trickle_state.finished`)."""
+    return trickle_state.finished(exit_code=_exit_code_of(outcome), capped=_capped_of(outcome))
+
+
 @dataclass(frozen=True, kw_only=True)
 class NightlyResult:
     """What one :func:`run_nightly` pass did: its typed ``outcome`` and every
@@ -887,7 +905,7 @@ class NightlyResult:
     @property
     def capped(self) -> bool:
         """The usage cap deferred this night's coding."""
-        return self.outcome is trickle_state.RunOutcome.DEFERRED
+        return _capped_of(self.outcome)
 
     @property
     def escalated(self) -> bool:
@@ -939,8 +957,7 @@ _RESULT_INVARIANTS = (
     ),
     _ResultInvariant(
         'retry-due-implies-finished', 'retry_due',
-        lambda result: not result.retry_due
-        or trickle_state.finished(exit_code=result.exit_code, capped=result.capped),
+        lambda result: not result.retry_due or _finished_of(result.outcome),
     ),
     _ResultInvariant(
         'budget-suppressed-implies-barren-or-failed', 'budget_suppressed',
@@ -1166,7 +1183,8 @@ def _record_trickle_progress(
     target_date: date,
     end: _NightEnd,
     *,
-    seams: _NightSeams,
+    recorder: _Recorder,
+    retry_recorder: _RetryRecorder,
     raise_alarm: _RaiseAlarm,
     now: datetime | None,
     pass_kind: PassKind,
@@ -1187,7 +1205,7 @@ def _record_trickle_progress(
         if pass_kind is PassKind.RETRY:
             _record_retry(
                 cfg.project_id, target_date, end.outcome,
-                commit_made=end.commit_made, retry_recorder=seams.retry_recorder,
+                commit_made=end.commit_made, retry_recorder=retry_recorder,
                 recorded_at=recorded_at,
             )
             return retry_due
@@ -1206,11 +1224,8 @@ def _record_trickle_progress(
                 max_barren_runs=max_barren_runs, raise_alarm=raise_alarm,
             ).landed
         )
-        recorded = seams.recorder(night, barren_escalated=streak_landed)
-        if trickle_state.finished(
-            exit_code=_exit_code_of(end.outcome),
-            capped=end.outcome is trickle_state.RunOutcome.DEFERRED,
-        ):
+        recorded = recorder(night, barren_escalated=streak_landed)
+        if _finished_of(end.outcome):
             retry_due = trickle_state.due_retries(recorded, today=recorded_at.date())
     return retry_due
 
@@ -1219,7 +1234,8 @@ def _record_unloaded_night(
     project_id: str,
     target_date: date,
     *,
-    seams: _NightSeams,
+    recorder: _Recorder,
+    retry_recorder: _RetryRecorder,
     now: datetime | None,
     pass_kind: PassKind,
 ) -> None:
@@ -1231,7 +1247,7 @@ def _record_unloaded_night(
         if pass_kind is PassKind.RETRY:
             _record_retry(
                 project_id, target_date, failed,
-                commit_made=False, retry_recorder=seams.retry_recorder,
+                commit_made=False, retry_recorder=retry_recorder,
                 recorded_at=recorded_at,
             )
             return
@@ -1240,7 +1256,7 @@ def _record_unloaded_night(
             applied=0, commit_made=False, census=None,
             recorded_at=recorded_at, pass_kind=pass_kind,
         )
-        seams.recorder(
+        recorder(
             trickle_state.fold_night(trickle_state.read_prior(project_id), project_id, run),
             barren_escalated=False,
         )
@@ -1275,7 +1291,7 @@ def _record_retry(
         target_date=target_date,
         recorded_at=recorded_at,
         exit_code=_exit_code_of(outcome),
-        capped=outcome is trickle_state.RunOutcome.DEFERRED,
+        capped=_capped_of(outcome),
         commit_made=commit_made,
     )
 
@@ -1300,7 +1316,7 @@ def _night_run(
         applied=applied,
         commit_made=commit_made,
         budget_suppressed=_budget_suppressed(sample),
-        capped=outcome is trickle_state.RunOutcome.DEFERRED,
+        capped=_capped_of(outcome),
         scheduled=pass_kind is PassKind.SCHEDULED,
     )
 
@@ -1444,7 +1460,9 @@ def run_nightly(
         cfg = load_config(resolved_config_path)
     elif project_id is not None:
         resolved_config_path, cfg = _load_config_for_project(
-            project_id, target_date, seams=seams, now=now, pass_kind=pass_kind,
+            project_id, target_date,
+            recorder=seams.recorder, retry_recorder=seams.retry_recorder,
+            now=now, pass_kind=pass_kind,
         )
     else:
         raise ValueError('run_nightly requires either config_path or project_id')
@@ -1461,7 +1479,8 @@ def _load_config_for_project(
     project_id: str,
     target_date: date,
     *,
-    seams: _NightSeams,
+    recorder: _Recorder,
+    retry_recorder: _RetryRecorder,
     now: datetime | None,
     pass_kind: PassKind,
 ) -> tuple[Path, LegibilityConfig]:
@@ -1471,7 +1490,8 @@ def _load_config_for_project(
         return resolve_config(project_id)
     except Exception:
         _record_unloaded_night(
-            project_id, target_date, seams=seams, now=now, pass_kind=pass_kind,
+            project_id, target_date, recorder=recorder, retry_recorder=retry_recorder,
+            now=now, pass_kind=pass_kind,
         )
         raise
 
@@ -1543,7 +1563,8 @@ def _run_configured_nightly(
     try:
         retry_due = _record_trickle_progress(
             cfg, sample, target_date, end,
-            seams=seams, raise_alarm=raise_alarm, now=now, pass_kind=pass_kind,
+            recorder=seams.recorder, retry_recorder=seams.retry_recorder,
+            raise_alarm=raise_alarm, now=now, pass_kind=pass_kind,
             max_barren_runs=max_barren_runs,
         )
     finally:
@@ -1618,7 +1639,9 @@ def _code_and_land(
         return commit_made
     ledger = _ledger_coded_sessions(cfg, merge.merged_records, target_date, now)
     census = _census_stage(
-        cfg, seams, resolved_config_path, target_date, now=now, pass_kind=pass_kind,
+        cfg, resolved_config_path, target_date,
+        status_fetcher=seams.status_fetcher, census_launcher=seams.census_launcher,
+        now=now, pass_kind=pass_kind,
     )
     return _NightEnd(
         outcome=trickle_state.classify_run(
@@ -1768,24 +1791,22 @@ def _commit_stage(
     raise_alarm: _RaiseAlarm,
 ) -> bool | _NightEnd:
     """Dump and commit a merge that changed the codebook; whether a commit
-    landed. A refused commit fails the night loud and never leaves its dump
-    in the checkout (scripts/legibility/unlanded.py)."""
+    landed. A refused commit, the committer's raise included, fails the night
+    loud and never leaves its dump in the checkout
+    (scripts/legibility/unlanded.py)."""
     if merge.mutated:
         codebook.dump(merge.codebook, Path(cfg.project_root) / _CODEBOOK_RELPATH)
         if _git_status_changed(cfg.project_root, _CODEBOOK_RELPATH):
             message = f'legibility: nightly trickle sightings for {target_date.isoformat()}'
-            commit_result = committer(cfg.project_root, [_CODEBOOK_RELPATH], message)
-            if commit_result.ok:
+            refusal = _commit_refusal(committer, cfg.project_root, message)
+            if refusal is None:
                 return True
             rollback = unlanded.roll_back(
                 cfg.project_root, [_CODEBOOK_RELPATH],
                 project_id=cfg.project_id, label=f'trickle-{target_date.isoformat()}',
             )
             summary = 'legibility trickle codebook commit failed'
-            raise_alarm(
-                AlarmKind.COMMIT_FAILED, summary,
-                f'{commit_result.stderr}\n\n{rollback.describe()}',
-            )
+            raise_alarm(AlarmKind.COMMIT_FAILED, summary, f'{refusal}\n\n{rollback.describe()}')
             return _NightEnd(
                 outcome=trickle_state.RunOutcome.FAILED, reason=summary,
                 coder_status=coder_status, applied=merge.counts.mutations, rollback=rollback,
@@ -1795,6 +1816,18 @@ def _commit_stage(
         merge.counts.mutations,
     )
     return False
+
+
+def _commit_refusal(
+    committer: Callable[..., unlanded.CommitResult], repo: str, message: str,
+) -> str | None:
+    """``None`` once *committer* lands the codebook dump, else why it did not:
+    git's diagnostic, or the traceback of the committer's raise."""
+    try:
+        result = committer(repo, [_CODEBOOK_RELPATH], message)
+    except Exception as exc:  # noqa: BLE001 — a raise is a refusal, so the dump is rolled back
+        return ''.join(traceback.format_exception(exc))
+    return None if result.ok else result.stderr
 
 
 def _ledger_reason(ledger: _LedgerWrite) -> str | None:
@@ -1808,10 +1841,11 @@ def _ledger_reason(ledger: _LedgerWrite) -> str | None:
 
 def _census_stage(
     cfg: LegibilityConfig,
-    seams: _NightSeams,
     resolved_config_path: Path,
     target_date: date,
     *,
+    status_fetcher: Callable[[], Any] | None,
+    census_launcher: CensusLauncher,
     now: datetime | None,
     pass_kind: PassKind,
 ) -> _CensusStep | None:
@@ -1831,10 +1865,10 @@ def _census_stage(
     line, fire = evaluate_census_step(
         cfg, now=now,
         status_fetcher=(
-            seams.status_fetcher if seams.status_fetcher is not None
+            status_fetcher if status_fetcher is not None
             else census_trigger.default_status_fetcher(cfg.project_root)
         ),
-        launcher=seams.census_launcher,
+        launcher=census_launcher,
         config_path=resolved_config_path,
     )
     return _CensusStep(
