@@ -14,14 +14,19 @@ real WriteJournal via set_write_journal.
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import uuid
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
+import openai
 import pytest
 import pytest_asyncio
 
 from fused_memory.models.enums import SourceStore
+from fused_memory.models.scope import Scope
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.write_journal import WriteJournal
 
@@ -34,9 +39,8 @@ async def recovery_journal(tmp_path):
     yield journal
 
 
-@pytest_asyncio.fixture
-async def recovery_service(mock_config, recovery_journal):
-    """MemoryService with real DurableWriteQueue + real WriteJournal, mocked backends."""
+async def _service_with_mocked_backends(mock_config) -> MemoryService:
+    """MemoryService with a real DurableWriteQueue and mocked backends, no journal wired."""
     svc = MemoryService(mock_config)
 
     # Mock backends so we never hit real FalkorDB/Qdrant
@@ -55,6 +59,13 @@ async def recovery_service(mock_config, recovery_journal):
 
     # Real initialize — creates DurableWriteQueue with real SQLite
     await svc.initialize()
+    return svc
+
+
+@pytest_asyncio.fixture
+async def recovery_service(mock_config, recovery_journal):
+    """MemoryService with real DurableWriteQueue + real WriteJournal, mocked backends."""
+    svc = await _service_with_mocked_backends(mock_config)
 
     # Real WriteJournal so intent bracketing + recovery hit real SQLite
     svc.set_write_journal(recovery_journal)
@@ -196,6 +207,187 @@ class TestAddMemoryIntentBracketing:
         assert len(completed) == 1
         assert completed[0]['payload_digest'] is None
         assert completed[0]['content'] == content
+
+
+# ---------------------------------------------------------------------------
+# add_memory defers a transient Mem0 failure for server-side retry (task 7397)
+# ---------------------------------------------------------------------------
+
+
+def _rate_limit_error() -> openai.RateLimitError:
+    return openai.RateLimitError(
+        'Error code: 429 - You exceeded your current quota',
+        response=httpx.Response(
+            429,
+            request=httpx.Request('POST', 'https://api.openai.com/v1/embeddings'),
+        ),
+        body=None,
+    )
+
+
+class _IntentDroppingJournal(WriteJournal):
+    """A journal whose write-ahead intent silently does not land."""
+
+    async def log_mem0_intent(self, **kwargs: Any) -> None:
+        return None
+
+
+_DEFERRED_CONTENT = 'always pin dependencies exactly, the full untruncated text ' * 5
+
+
+class TestAddMemoryTransientDeferral:
+    @pytest.mark.asyncio
+    async def test_a_rate_limited_write_is_queued_for_retry(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        svc.mem0.add = AsyncMock(side_effect=_rate_limit_error())
+
+        result = await svc.add_memory(
+            content=_DEFERRED_CONTENT,
+            category='procedural_knowledge',
+            project_id='dark_factory',
+            agent_id='agent-a',
+        )
+
+        assert result.memory_ids == []
+        assert SourceStore.mem0 not in result.stores_written
+        assert result.stores_pending_retry == [SourceStore.mem0]
+        assert 'mem0_pending_retry' in result.message
+        assert 'mem0_error' not in result.message
+        (intent,) = await recovery_journal.get_mem0_intents()
+        assert intent['status'] == 'retrying'
+        assert intent['attempts'] == 1
+        assert datetime.datetime.fromisoformat(
+            intent['next_attempt_at']
+        ) > datetime.datetime.fromisoformat(intent['created_at'])
+        assert intent['content'] == _DEFERRED_CONTENT
+        write_op = await recovery_journal.get_write_op(intent['write_op_id'])
+        assert write_op is not None
+        assert json.loads(write_op['result_summary'])['stores_pending'] == ['mem0']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'error',
+        [RuntimeError('qdrant down'), TimeoutError('Mem0 add timed out after 30.0s')],
+        ids=['runtime-error', 'write-budget-timeout'],
+    )
+    async def test_a_non_transient_failure_keeps_the_failed_path(
+        self, recovery_service, recovery_journal, error
+    ):
+        svc = recovery_service
+        svc.mem0.add = AsyncMock(side_effect=error)
+
+        result = await svc.add_memory(
+            content='always run black before commit',
+            category='procedural_knowledge',
+            project_id='dark_factory',
+        )
+
+        assert 'mem0_error' in result.message
+        assert result.stores_pending_retry == []
+        (intent,) = await recovery_journal.get_mem0_intents()
+        assert intent['status'] == 'failed'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('journal_kind', ['intent-dropping', 'none'])
+    async def test_no_durable_intent_means_no_pending_claim(
+        self, mock_config, tmp_path, journal_kind
+    ):
+        svc = await _service_with_mocked_backends(mock_config)
+        journal: WriteJournal | None = None
+        if journal_kind == 'intent-dropping':
+            journal = _IntentDroppingJournal(tmp_path / 'dropping-wj')
+            await journal.initialize()
+            svc.set_write_journal(journal)
+        svc.mem0.add = AsyncMock(side_effect=_rate_limit_error())
+        try:
+            result = await svc.add_memory(
+                content='always run black before commit',
+                category='procedural_knowledge',
+                project_id='dark_factory',
+            )
+            assert 'mem0_error' in result.message
+            assert result.stores_pending_retry == []
+            if journal is not None:
+                assert await journal.get_mem0_intents(status='retrying') == []
+        finally:
+            await svc.close()
+
+    @pytest.mark.asyncio
+    async def test_a_dual_write_keeps_its_graphiti_leg_and_defers_mem0(
+        self, recovery_service
+    ):
+        svc = recovery_service
+        svc.mem0.add = AsyncMock(side_effect=_rate_limit_error())
+
+        result = await svc.add_memory(
+            content='we chose sqlite for the journal because it is local',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            dual_write=True,
+        )
+
+        assert result.stores_written == [SourceStore.graphiti]
+        assert result.stores_pending_retry == [SourceStore.mem0]
+
+    @pytest.mark.asyncio
+    async def test_the_deferred_write_lands_when_the_retry_pass_runs(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        failing_add = AsyncMock(side_effect=_rate_limit_error())
+        svc.mem0.add = failing_add
+        await svc.add_memory(
+            content=_DEFERRED_CONTENT,
+            category='procedural_knowledge',
+            project_id='dark_factory',
+            agent_id='agent-a',
+            session_id='sess-1',
+            metadata={'x_note': 'kept'},
+        )
+        original = failing_add.call_args.kwargs
+        (intent,) = await recovery_journal.get_mem0_intents()
+        landing_add = AsyncMock(return_value={'results': [{'id': 'mem0-late'}]})
+        svc.mem0.add = landing_add
+
+        summary = await svc.retry_due_mem0_intents(
+            now=datetime.datetime.fromisoformat(intent['next_attempt_at'])
+            + datetime.timedelta(seconds=1)
+        )
+
+        assert summary.landed == 1
+        landing_add.assert_awaited_once()
+        retried = landing_add.call_args.kwargs
+        assert retried['content'] == _DEFERRED_CONTENT
+        assert retried['scope'] == Scope(
+            project_id='dark_factory', agent_id='agent-a', session_id='sess-1'
+        )
+        assert retried['metadata'] == original['metadata']
+        assert retried['metadata']['x_note'] == 'kept'
+        (after,) = await recovery_journal.get_mem0_intents()
+        assert after['status'] == 'completed'
+        mem0_ops = [
+            op
+            for op in await recovery_journal.get_backend_ops_for_write_op(
+                intent['write_op_id']
+            )
+            if op['backend'] == 'mem0'
+        ]
+        assert [op['success'] for op in mem0_ops] == [0, 1]
+
+    @pytest.mark.asyncio
+    async def test_the_tool_payload_carries_the_pending_store(self, recovery_service):
+        svc = recovery_service
+        svc.mem0.add = AsyncMock(side_effect=_rate_limit_error())
+
+        result = await svc.add_memory(
+            content='always run black before commit',
+            category='procedural_knowledge',
+            project_id='dark_factory',
+        )
+
+        assert result.model_dump()['stores_pending_retry'] == ['mem0']
 
 
 # ---------------------------------------------------------------------------
