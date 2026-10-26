@@ -11,7 +11,7 @@ import time
 import uuid as uuid_mod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -200,7 +200,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     ROUTED_KEY,
     TriageFailOpenCounter,
-    attach_write_landed,
+    attach_write_durable,
     declares_attach_keys,
     declares_supersession,
     emit_triage_fail_open_storm_escalation,
@@ -1473,13 +1473,17 @@ def create_mcp_server(
         ``add_memory`` path, so the cheap hop is worth taking.
         """
         esc_id = None
+        storm_with_counts = {
+            **storm,
+            'mem0_intents_in_window': await _mem0_intents_in_window(storm),
+        }
         # `or [project_id]`: a burst whose labels were all unresolvable still
         # deserves an alarm somewhere, and this call's own project is the only
         # queue we can name.
         for pid in storm.get('projects') or [project_id]:
             try:
                 filed = await asyncio.to_thread(
-                    emit_triage_fail_open_storm_escalation, _kp.get(pid), storm,
+                    emit_triage_fail_open_storm_escalation, _kp.get(pid), storm_with_counts,
                 )
             except Exception:  # pragma: no cover — defensive only
                 logger.exception(
@@ -1491,6 +1495,22 @@ def create_mcp_server(
             if filed is not None and esc_id is None:
                 esc_id = filed
         return esc_id
+
+    async def _mem0_intents_in_window(storm: dict) -> dict[str, int] | None:
+        """Mem0 intent counts by status over the storm's window; None when unavailable."""
+        if write_journal is None:
+            return None
+        since = datetime.now(UTC) - timedelta(seconds=float(storm.get('window_seconds') or 0))
+        try:
+            return await write_journal.count_mem0_intents_by_status(since=since)
+        except Exception as exc:
+            logger.warning(
+                'write_triage: could not count mem0_intents for the fail-open storm '
+                'record (%s: %s); it will say the counts are unavailable',
+                type(exc).__name__,
+                exc,
+            )
+            return None
 
     def _known_project_gate(project_id: str) -> dict | None:
         """Return an error dict if project_id is absent from the known_projects registry."""
@@ -3659,6 +3679,13 @@ def create_mcp_server(
         once, in :mod:`shared.toolcall_markup`, and nothing in this package
         spells them.
 
+        If the embedding provider fails transiently (429, 5xx, connection), the
+        Mem0 leg is NOT dropped: the ack carries stores_pending_retry=['mem0'],
+        memory_ids is empty, the message says mem0_pending_retry, and the
+        server retries until the write lands. Do NOT re-submit the same content
+        (that would duplicate it); only a mem0_error means the write did not
+        land.
+
         Args:
             content: The memory itself (a fact, preference, procedure, etc.)
             project_id: Project scope (required)
@@ -4201,14 +4228,17 @@ def create_mcp_server(
                 # Kept for the same reason: the pre-triage write carried the tag.
                 **claim_kwargs,
             )
-        if attached_to is not None and not attach_write_landed(result):
+        if attached_to is not None and not attach_write_durable(result):
             # A RAISE IS ONLY HALF THE FAILURE SURFACE — and the smaller half,
             # the same asymmetry `triage_write` handles for retrieval.
             # `MemoryService.add_memory` does NOT raise when a store fails: it
             # catches the Graphiti/Mem0 exception into `_graphiti_error` /
             # `_mem0_error`, folds it into `message`, and returns an ordinary
-            # AddMemoryResponse with NO memory_ids. So a child write that died
-            # at the store never reaches the `except` arm above, and the ack
+            # AddMemoryResponse with NO memory_ids (a Mem0 leg durably queued
+            # for server-side retry is not such a failure: it lists mem0 under
+            # `stores_pending_retry`, and the retry lands the child the ack
+            # names). So a child write that died at the store never reaches
+            # the `except` arm above, and the ack
             # would otherwise announce `restated` + canonical_id for a link
             # that was never persisted — precisely the "ack claiming an attach
             # that did not happen" the comment below calls worse than no ack.
