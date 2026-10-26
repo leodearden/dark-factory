@@ -145,6 +145,7 @@ from orchestrator.recut_ruling import ruling_to_enforce
 from orchestrator.resume_resolution import (
     CarriedResolution,
     render_carried_resolutions,
+    render_issue_context,
     select_carried_resolutions,
 )
 from orchestrator.review_inputs import gather_review_subject, review_fork_point
@@ -3162,7 +3163,7 @@ class TaskWorkflow:
                         assert self.worktree is not None
                         return await self.briefing.build_resume_prompt(
                             self.task, self._live_plan(),
-                            '\n'.join(e.summary for e in self._check_escalations()),
+                            render_issue_context(self._check_escalations(), carried),
                             render_carried_resolutions(carried), self.worktree,
                         )
 
