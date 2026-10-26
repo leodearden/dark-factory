@@ -39,6 +39,7 @@ from orchestrator.task_verify_dispatch import (
 )
 from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_from_json
 from orchestrator.verify import VerifyInfraError, VerifyResult
+from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 from orchestrator.verify_hosts import HostPool
 from orchestrator.verify_runner import HostAllocator, RunnerUnavailable, result_to_json
 
@@ -731,17 +732,42 @@ class TestRemoteLeg:
         assert h.hooks.recovered == []
         _assert_slot_free(h)
 
-    async def test_an_infra_transient_remote_red_reruns_locally_in_the_same_call(
-        self, tmp_path: Path,
+    @pytest.mark.parametrize('category', sorted(INFRA_TRANSIENT_CATEGORIES))
+    async def test_an_infra_transient_remote_red_is_reported_unavailable_and_reruns_locally(
+        self, tmp_path: Path, category: str,
     ) -> None:
-        remote_red = _result(False, category='env_transient', summary='uv cache locked')
+        remote_red = _result(False, category=category, summary=f'{category} on the host')
         h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(remote_red)))
 
         result = await h.call()
 
         assert result is h.local.result
         assert h.local.calls == [h.expected_call()]
-        assert h.only_sidecar()['reason'] == 'infra_transient'
+        sidecar = h.only_sidecar()
+        assert (sidecar['reason'], sidecar['decision'], sidecar['runner']) == (
+            'infra_transient', 'local', 'local',
+        )
+        assert h.hooks.recovered == []
+        [(name, exc)] = h.hooks.unavailable
+        assert (name, exc.kind) == ('laptop', 'no_verdict')
+        assert str(category) in str(exc)
+        assert h.allocator.is_quarantined('laptop') is False
+        _assert_slot_free(h)
+
+    async def test_a_non_infra_remote_red_is_a_verdict_and_counts_as_recovery(
+        self, tmp_path: Path,
+    ) -> None:
+        remote_red = _result(False, category='test_failure')
+        h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(remote_red)))
+
+        result = await h.call()
+
+        assert result.passed is False
+        assert h.local.calls == []
+        sidecar = h.only_sidecar()
+        assert (sidecar['reason'], sidecar['runner']) == ('remote', 'laptop')
+        assert h.hooks.recovered == ['laptop']
+        assert h.hooks.unavailable == []
         _assert_slot_free(h)
 
     async def test_an_unexpected_transport_error_is_a_dispatcher_error(self, tmp_path: Path) -> None:
