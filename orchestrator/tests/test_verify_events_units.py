@@ -400,3 +400,74 @@ class TestImplementSiteWorkflowVerify:
             'cache_mode': 'off',
             'units': [unit.to_dict() for unit in passing.units or ()],
         }]
+
+
+async def _pre_merge_rebase(workflow: TaskWorkflow) -> bool:
+    return await workflow._rebase_before_enqueue()
+
+
+async def _forked_task_workflow(
+    config: OrchestratorConfig, git_ops: GitOps, store: EventStore, monkeypatch: pytest.MonkeyPatch,
+) -> TaskWorkflow:
+    """A task branch with one commit of its own, forked one commit behind main's tip."""
+    workflow = await _task_workflow(config, git_ops, store, monkeypatch)
+    assert workflow.worktree is not None
+    _commit(workflow.worktree, 'task_change.py')
+    _commit(config.project_root, 'main_change.py')
+    return workflow
+
+
+class TestPreMergeSiteWorkflowVerify:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('passed', 'timed_out'), [(True, False), (False, False), (False, True)])
+    async def test_each_post_rebase_reverify_leaves_one_row(
+        self, config, git_ops, tmp_path, monkeypatch, passed, timed_out,
+    ):
+        config.pre_merge_reverify = True
+        store = EventStore(tmp_path / 'events.db', run_id='r')
+        workflow = await _forked_task_workflow(config, git_ops, store, monkeypatch)
+        plan = _alpha_plan().to_dict()
+        verdict = _result(
+            passed=passed, timed_out=timed_out, summary='' if passed else 'tests failed',
+            plan=plan, duration_secs=7.0, units=(module_leg_unit('alpha', 'test', 0 if passed else 1),),
+        )
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', AsyncMock(return_value=verdict),
+        )
+
+        assert await _pre_merge_rebase(workflow) is passed
+
+        assert workflow.worktree is not None
+        tip = _git(workflow.worktree, 'rev-parse', 'HEAD')
+        main_tip = _git(config.project_root, 'rev-parse', 'main')
+        assert _git(config.project_root, 'merge-base', 'main', tip) == main_tip
+        assert _workflow_verify_rows(store) == [{
+            'passed': passed,
+            'tip_sha': tip,
+            'base_sha': main_tip,
+            'branch': f'task/{_TASK_ID}',
+            'duration_ms': 7000,
+            'slot_wait_secs': None,
+            'site': 'pre_merge',
+            'plan_hash': verify_evidence.plan_hash(plan),
+            'cache_mode': 'off',
+            'units': [unit.to_dict() for unit in verdict.units or ()],
+        }]
+        wastes = [row['data'] for row in store.fetch_events_by_type(EventType.waste_detected)]
+        expect_waste = not passed and not timed_out
+        assert [w['waste_type'] for w in wastes] == (['post_rebase_verify_fail'] if expect_waste else [])
+
+    @pytest.mark.asyncio
+    async def test_without_the_rollback_switch_no_reverify_runs_and_no_row_is_left(
+        self, config, git_ops, tmp_path, monkeypatch,
+    ):
+        assert config.pre_merge_reverify is False
+        store = EventStore(tmp_path / 'events.db', run_id='r')
+        workflow = await _forked_task_workflow(config, git_ops, store, monkeypatch)
+        verify = AsyncMock(return_value=_result())
+        monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify)
+
+        assert await _pre_merge_rebase(workflow) is True
+
+        verify.assert_not_awaited()
+        assert _workflow_verify_rows(store) == []
