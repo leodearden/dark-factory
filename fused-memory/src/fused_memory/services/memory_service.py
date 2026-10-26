@@ -2439,9 +2439,11 @@ class MemoryService:
         # Bounded by the LIVE PROJECT SET — `group_id == project_id`, of which
         # there are a handful — so unlike the per-agent mem0 storm counters
         # above it needs no pruning; there is no unbounded key space to leak.
-        self._referent_repair_streaks: KeyedStreaks[str] = KeyedStreaks(
-            threshold=_REFERENT_REPAIR_STREAK_THRESHOLD,
-        )
+        #
+        # Only the counts are read: the storm gate pages on EVERY breach and
+        # reads `_REFERENT_REPAIR_STREAK_THRESHOLD` at use time, so `fired`
+        # and the threshold given here gate nothing.
+        self._referent_repair_streaks: KeyedStreaks[str] = KeyedStreaks(threshold=1)
         # Process-lifetime totals, monotonic and never reset, keyed by a closed
         # five-member vocabulary so a reader never distinguishes "zero" from
         # "absent". Deliberately SEPARATE from the streaks: the streak is a live

@@ -165,16 +165,21 @@ def _abort_if_tripped(
     step = failures.failure(None)
     if not step.fired:
         return None
-    run = [
-        (outcome.episode_id, outcome.error_class)
-        for outcome in outcomes[-step.count:]
-        if outcome.error_class is not None
-    ]
+    run = outcomes[-step.count:]
     return ArmAbort(
         arm_id=arm_id,
-        item_ids=tuple(item_id for item_id, _ in run),
-        error_classes=tuple(error_class for _, error_class in run),
+        item_ids=tuple(outcome.episode_id for outcome in run),
+        error_classes=tuple(_error_class_of_run_member(outcome) for outcome in run),
     )
+
+
+def _error_class_of_run_member(outcome: EpisodeOutcome) -> str:
+    if outcome.error_class is None:
+        raise AssertionError(
+            'a failure streak of length n must be the last n outcomes, all failed; '
+            f'episode {outcome.episode_id!r} inside the run succeeded'
+        )
+    return outcome.error_class
 
 
 async def _report(

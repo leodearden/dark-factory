@@ -3098,7 +3098,8 @@ class TaskCurator:
     ) -> list[CuratorDecision]:
         """Parse a successful batch call into one decision per candidate, and account for it."""
         # A real LLM round-trip completed, so the service is not wedged — close
-        # the ZOT breaker exactly as TaskCurator.curate does for a single call. Without this, size-1 bisect ZOTs accumulate across
+        # the ZOT breaker exactly as TaskCurator.curate does for a single call.
+        # Without this, size-1 bisect ZOTs accumulate across
         # arbitrarily many healthy BATCH calls in a batch-dominant deployment
         # until threshold (default 2) trips the breaker and disables dedupe for
         # the cooldown (default 600s) on a healthy service (task 4143).
