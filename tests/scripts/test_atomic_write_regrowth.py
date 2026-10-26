@@ -267,6 +267,12 @@ _ALLOWED_RENAMERS = {
         'slot, so this is the same class as escalation sweep._atomic_move / '
         'queue._archive_resolved and atomic_write_text has nothing to be '
         'handed.',
+    ('fused-memory/src/fused_memory/reconciliation/dead_letter_writer.py', 'DeadLetterWriter._rotate'):
+        'MOVES existing files: cascade-rotates dead_letter.jsonl -> .1 -> .2 '
+        '-> ... There is no content string, only os.replace(src, dst) per '
+        'slot, so this is the same class as escalation sweep._atomic_move / '
+        'queue._archive_resolved and atomic_write_text has nothing to be '
+        'handed.',
     ('fused-memory/src/fused_memory/reconciliation/event_queue.py', 'EventQueue.replay_dead_letters'):
         'MOVES an existing file: os.replace snapshots each dead-letter file '
         'onto a ``.replaying`` sibling as an atomic CLAIM — race-safe against '
