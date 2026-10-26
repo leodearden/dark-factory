@@ -15,6 +15,7 @@ wired for the live transport (a ``verdict-tools`` MCP server, no
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, patch
@@ -27,7 +28,7 @@ from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.review_briefing import ReviewBriefing
 from orchestrator.agents.roles import build_reviewer_role
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import OrchestratorConfig, project_review_config
+from orchestrator.config import OrchestratorConfig, default_price_table, project_review_config
 from orchestrator.evals.reviewer_trial.checkout import (
     FixtureEnrichmentMissing,
     fixture_checkout,
@@ -41,6 +42,7 @@ from orchestrator.evals.reviewer_trial.corpus import (
 from orchestrator.evals.reviewer_trial.runner import (
     DIFF_CAP_CHARS,
     REVIEW_SCHEMA,
+    PanelRunKey,
     PanelRunResult,
     _run_single_reviewer,
     run_panel,
@@ -221,6 +223,71 @@ class TestPanelRunResult:
         assert result.reviews == {}
         assert result.total_cost_usd == 0.0
         assert result.errors == []
+
+
+def _full_panel_result(run_key: PanelRunKey | None) -> PanelRunResult:
+    return PanelRunResult(
+        variant_name='v1',
+        diff_id='d1',
+        reviews={'r1': _make_review('r1'), 'r2': _make_review('r2', 'ISSUES_FOUND')},
+        total_cost_usd=1.25,
+        wall_clock_ms=4321,
+        errors=['r3: no result'],
+        run_key=run_key,
+    )
+
+
+class TestPanelRunResultFromDict:
+    @pytest.mark.parametrize('run_key', [
+        PanelRunKey.of(prices=default_price_table(), usage_gate=None, diff_cap_chars=0),
+        None,
+    ])
+    def test_round_trips_asdict(self, run_key: PanelRunKey | None) -> None:
+        result = _full_panel_result(run_key)
+        assert PanelRunResult.from_dict(asdict(result)) == result
+
+    def test_a_legacy_record_loads_with_defaults_and_no_key(self) -> None:
+        loaded = PanelRunResult.from_dict({'variant_name': 'v1', 'diff_id': 'd1'})
+        assert loaded == PanelRunResult(variant_name='v1', diff_id='d1')
+        assert loaded.run_key is None
+
+    @pytest.mark.parametrize('missing', ['variant_name', 'diff_id'])
+    def test_a_record_missing_its_identity_raises(self, missing: str) -> None:
+        record = asdict(_full_panel_result(None))
+        del record[missing]
+        with pytest.raises(KeyError):
+            PanelRunResult.from_dict(record)
+
+
+class TestPanelRunKey:
+    def test_equal_price_tables_give_equal_keys(self) -> None:
+        first = PanelRunKey.of(prices=default_price_table(), usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS)
+        second = PanelRunKey.of(prices=default_price_table(), usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS)
+        assert first == second
+
+    @staticmethod
+    def _one_rate_changed() -> dict:
+        prices = default_price_table()
+        model = sorted(prices)[0]
+        rate = sorted(prices[model])[0]
+        prices[model][rate] += 1.0
+        return prices
+
+    @pytest.mark.parametrize('change', [
+        pytest.param(lambda: {'prices': None}, id='unpriced'),
+        pytest.param(lambda: {'prices': TestPanelRunKey._one_rate_changed()}, id='one-rate-changed'),
+        pytest.param(lambda: {'usage_gate': cast(UsageGate, object())}, id='gated'),
+        pytest.param(lambda: {'diff_cap_chars': 0}, id='cap-lifted'),
+    ])
+    def test_each_component_changes_the_key(self, change) -> None:
+        baseline = {'prices': default_price_table(), 'usage_gate': None, 'diff_cap_chars': DIFF_CAP_CHARS}
+        assert PanelRunKey.of(**{**baseline, **change()}) != PanelRunKey.of(**baseline)
+
+    def test_round_trips_asdict(self) -> None:
+        key = PanelRunKey.of(
+            prices=default_price_table(), usage_gate=cast(UsageGate, object()), diff_cap_chars=0,
+        )
+        assert PanelRunKey.from_dict(asdict(key)) == key
 
 
 class TestRunSingleReviewerLiveTransport:
@@ -411,6 +478,16 @@ class TestRunPanel:
         assert result.reviews['r1'] == normalize_review(result.reviews['r1']).to_record()
         assert result.total_cost_usd == 0.50
         assert result.errors == []
+
+    @pytest.mark.asyncio
+    async def test_stamps_the_key_it_ran_under(self, source: _Source) -> None:
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_verdict_writing_invoke(verdict='PASS'),
+        ):
+            result = await run_panel(_one_reviewer(), _diff_in(source), stagger_secs=0, diff_cap_chars=123)
+
+        assert result.run_key == PanelRunKey.of(prices=None, usage_gate=None, diff_cap_chars=123)
 
     @pytest.mark.asyncio
     async def test_multiple_reviewers(self, source: _Source) -> None:
