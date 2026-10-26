@@ -29,6 +29,9 @@ WHAT COUNTS AS ISOLATED.  Three idioms, all honoured:
   ``monkeypatch.setenv('ORCH_CONFIG_PATH', '')`` (154 uses) and
   ``monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)`` (29 uses).
 
+An ``autouse=True`` fixture defined directly in the test's class or module
+counts too, when the fixture itself meets one of those rules.
+
 DELIBERATE ASYMMETRY.  That last rule is a substring test, so it also silences a
 test that merely *mentions* the variable — and the ``type()`` match below
 silences ``== 1800`` against a ``1800.0`` default.  The evaluator refuses, in
@@ -327,11 +330,9 @@ def _decorated_with_hatch(node: ast.AST) -> bool:
     )
 
 
-def _is_isolated(func: _TestFunc, enclosing_class: ast.ClassDef | None) -> bool:
-    """True if *func* is insulated from the ambient operational config."""
+def _function_isolates(func: _TestFunc) -> bool:
+    """True if *func* — a test or a fixture — insulates from the ambient config."""
     if _decorated_with_hatch(func):
-        return True
-    if enclosing_class is not None and _decorated_with_hatch(enclosing_class):
         return True
     args = func.args
     params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
@@ -340,6 +341,33 @@ def _is_isolated(func: _TestFunc, enclosing_class: ast.ClassDef | None) -> bool:
     return any(
         'ORCH_CONFIG_PATH' in ast.unparse(stmt) for stmt in func.body
     )
+
+
+def _is_autouse_fixture(func: _TestFunc) -> bool:
+    for dec in func.decorator_list:
+        text = ast.unparse(dec)
+        if 'fixture' in text and 'autouse=True' in text.replace(' ', ''):
+            return True
+    return False
+
+
+def _scope_isolates(node: ast.Module | ast.ClassDef) -> bool:
+    """True if every test directly inside *node* is insulated by *node* itself."""
+    if _decorated_with_hatch(node):
+        return True
+    return any(
+        isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and _is_autouse_fixture(sub)
+        and _function_isolates(sub)
+        for sub in node.body
+    )
+
+
+def _is_isolated(func: _TestFunc, enclosing_class: ast.ClassDef | None) -> bool:
+    """True if *func* is insulated from the ambient config by itself or its class."""
+    if _function_isolates(func):
+        return True
+    return enclosing_class is not None and _scope_isolates(enclosing_class)
 
 
 def _paths_overlap(a: str, b: str) -> bool:
@@ -399,6 +427,8 @@ def iter_default_asserting_tests(
     """
     source = Path(path).read_text()
     tree = ast.parse(source, filename=str(path))
+    if _scope_isolates(tree):
+        return
 
     def scan(func, enclosing_class):
         if not func.name.startswith('test'):
