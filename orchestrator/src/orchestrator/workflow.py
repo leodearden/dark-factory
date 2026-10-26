@@ -3986,6 +3986,14 @@ class TaskWorkflow:
                 task_id=self.task_id,
                 event_store=self.event_store,
             )
+        tip = (await self._get_head_commit()) or None
+        self._emit_workflow_verify(
+            site=VerifySite.PRE_MERGE,
+            result=verify,
+            passed=verify.passed,
+            tip_sha=tip,
+            base_sha=await self.git_ops.merge_base_with_main(tip) if tip else None,
+        )
         if not verify.passed:
             if verify.timed_out:
                 logger.warning(
