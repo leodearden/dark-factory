@@ -24,21 +24,26 @@ from _reviewer_trial_mining_fixtures import (
 from click.testing import CliRunner
 from shared.cli_invoke import AgentResult
 
-from orchestrator.evals.reviewer_trial.__main__ import (
-    _infer_language,
-    cli,
-)
+from orchestrator.evals.reviewer_trial.__main__ import cli
 from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog, select_spot_check_subset
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest, GroundTruthIssue
 from orchestrator.evals.reviewer_trial.mining import (
     EscalationRef,
     FnCandidate,
+    RecoveredCandidate,
+    admit_mined_diff,
     assign_split,
     audit_corpus,
     backfill_hand_authored,
+    candidate_pool,
+    fetch_task_titles,
+    frontier_description,
+    infer_language,
     mine_escalation_refs,
     mine_fn_candidates,
+    mined_corpus_diff,
     propose_labels_frontier,
+    recover_candidates,
     recover_diff,
     resolve_merge_sha_by_task_id,
     save_corpus,
@@ -519,7 +524,7 @@ class TestAuditCorpus:
 
 
 class TestInferLanguage:
-    """``__main__._infer_language`` -- majority-vote language sniff from a
+    """``infer_language`` -- majority-vote language sniff from a
     unified diff's ``diff --git`` headers."""
 
     def test_majority_language_wins(self) -> None:
@@ -528,28 +533,28 @@ class TestInferLanguage:
             'diff --git a/b.py b/b.py\n'
             'diff --git a/c.rs b/c.rs\n'
         )
-        assert _infer_language(diff_text) == 'python'
+        assert infer_language(diff_text) == 'python'
 
     def test_tie_breaks_by_first_encountered_file(self) -> None:
         diff_text = (
             'diff --git a/c.rs b/c.rs\n'
             'diff --git a/a.py b/a.py\n'
         )
-        assert _infer_language(diff_text) == 'rust'
+        assert infer_language(diff_text) == 'rust'
 
     def test_unrecognized_extension_defaults_to_python(self) -> None:
         diff_text = 'diff --git a/README.md b/README.md\n'
-        assert _infer_language(diff_text) == 'python'
+        assert infer_language(diff_text) == 'python'
 
     def test_empty_diff_defaults_to_python(self) -> None:
-        assert _infer_language('') == 'python'
+        assert infer_language('') == 'python'
 
     def test_typescript_extension_recognized(self) -> None:
         diff_text = (
             'diff --git a/a.tsx b/a.tsx\n'
             'diff --git a/b.tsx b/b.tsx\n'
         )
-        assert _infer_language(diff_text) == 'typescript'
+        assert infer_language(diff_text) == 'typescript'
 
 
 class TestMineRunsDbValidation:
@@ -685,3 +690,175 @@ class TestBackfillHandAuthored:
 
         assert backfill_hand_authored(manifest, log) == 3
         assert backfill_hand_authored(manifest, log) == 0
+
+
+def _candidate(task_id: str, merge_sha: str | None) -> FnCandidate:
+    return FnCandidate(
+        task_id=task_id, project_id='dark_factory', outcome='requeued', review_cycles=2,
+        verify_attempts=3, merge_sha=merge_sha, signal_reason=['outcome=requeued', 'verify_attempts=3'],
+    )
+
+
+def _commit_task_merge(repo: Path, task_id: str, content: str) -> str:
+    """Commit *content* under the ``Merge task/<id> into main`` message convention; return its sha."""
+    (repo / f'{task_id}.txt').write_text(content)
+    subprocess.run(['git', 'add', f'{task_id}.txt'], cwd=repo, check=True)
+    subprocess.run(['git', 'commit', '-q', '-m', f'Merge task/{task_id} into main'], cwd=repo, check=True)
+    return subprocess.run(
+        ['git', 'rev-parse', 'HEAD'], cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+class TestFetchTaskTitles:
+    """fetch_task_titles reads task_results.title for the requested task ids."""
+
+    def test_returns_the_requested_titles_only(self, tmp_path: Path) -> None:
+        db = build_synthetic_runs_db(tmp_path, [
+            {'task_id': '1', 'title': 'one'}, {'task_id': '2', 'title': 'two'}, {'task_id': '3', 'title': 'three'},
+        ])
+
+        assert fetch_task_titles(db, ['1', '3']) == {'1': 'one', '3': 'three'}
+
+    def test_no_ids_returns_no_titles(self, tmp_path: Path) -> None:
+        db = build_synthetic_runs_db(tmp_path, [{'task_id': '1', 'title': 'one'}])
+
+        assert fetch_task_titles(db, []) == {}
+
+    def test_more_ids_than_one_chunk_still_returns_every_title(self, tmp_path: Path) -> None:
+        rows = [{'task_id': str(i), 'title': f'title {i}'} for i in range(1201)]
+        db = build_synthetic_runs_db(tmp_path, rows)
+
+        assert fetch_task_titles(db, [r['task_id'] for r in rows]) == {r['task_id']: r['title'] for r in rows}
+
+
+class TestRecoverCandidates:
+    """recover_candidates pairs each new candidate with its merge sha and diff, smallest diff first."""
+
+    def test_a_candidate_with_a_merge_sha_is_recovered_from_it(self, tmp_path: Path) -> None:
+        repo, merge_sha = make_git_repo_with_merge(tmp_path)
+
+        [recovered] = recover_candidates([_candidate('1', merge_sha)], existing_ids=set(), repo_path=repo)
+
+        assert (recovered.candidate.task_id, recovered.merge_sha) == ('1', merge_sha)
+        assert recovered.diff_text.strip()
+
+    def test_a_candidate_already_in_the_corpus_is_skipped(self, tmp_path: Path) -> None:
+        repo, merge_sha = make_git_repo_with_merge(tmp_path)
+        candidate = _candidate('1', merge_sha)
+
+        assert candidate.diff_id == 'mined_1'
+        assert recover_candidates([candidate], existing_ids={'mined_1'}, repo_path=repo) == []
+
+    def test_an_unknown_sha_is_skipped(self, tmp_path: Path) -> None:
+        repo, _merge_sha = make_git_repo_with_merge(tmp_path)
+
+        assert recover_candidates([_candidate('1', '0' * 40)], existing_ids=set(), repo_path=repo) == []
+
+    def test_a_candidate_without_a_sha_is_found_by_its_merge_message(self, tmp_path: Path) -> None:
+        repo, _merge_sha = make_git_repo_with_merge(tmp_path)
+        sha = _commit_task_merge(repo, '77', 'fallback\n')
+
+        [recovered] = recover_candidates([_candidate('77', None)], existing_ids=set(), repo_path=repo)
+
+        assert recovered.merge_sha == sha
+        assert '+fallback' in recovered.diff_text
+
+    def test_the_smallest_diff_comes_first(self, tmp_path: Path) -> None:
+        repo, merge_sha = make_git_repo_with_merge(tmp_path)
+        big = _commit_task_merge(repo, '88', ''.join(f'line {i}\n' for i in range(200)))
+
+        recovered = recover_candidates(
+            [_candidate('88', big), _candidate('1', merge_sha)], existing_ids=set(), repo_path=repo,
+        )
+
+        assert [r.candidate.task_id for r in recovered] == ['1', '88']
+
+
+def _recovered(n: int) -> list[RecoveredCandidate]:
+    return [RecoveredCandidate(_candidate(str(i), f'sha{i}'), f'sha{i}', 'x' * (i + 1)) for i in range(n)]
+
+
+class TestCandidatePool:
+    """candidate_pool attempts what the corpus still needs plus an attrition buffer."""
+
+    @pytest.mark.parametrize('corpus_size', [100, 120])
+    def test_a_full_corpus_attempts_nothing(self, corpus_size: int) -> None:
+        assert candidate_pool(_recovered(10), corpus_size=corpus_size, target_total=100, limit=None) == []
+
+    @pytest.mark.parametrize(('corpus_size', 'pool_size'), [(90, 15), (60, 50)])
+    def test_the_pool_is_what_is_needed_plus_a_buffer(self, corpus_size: int, pool_size: int) -> None:
+        recovered = _recovered(100)
+
+        assert candidate_pool(recovered, corpus_size=corpus_size, target_total=100, limit=None) == (
+            recovered[:pool_size]
+        )
+
+    def test_limit_caps_the_pool(self) -> None:
+        recovered = _recovered(100)
+
+        assert candidate_pool(recovered, corpus_size=60, target_total=100, limit=7) == recovered[:7]
+
+
+class TestMinedCorpusDiff:
+    """mined_corpus_diff builds a mined dark-factory diff whose provenance says where it came from."""
+
+    def test_it_is_a_mined_dark_factory_diff(self, tmp_path: Path) -> None:
+        diff_text = 'diff --git a/x.rs b/x.rs\n+fn main() {}\n'
+        issues = [_issue('mined_42')]
+
+        diff = mined_corpus_diff(
+            RecoveredCandidate(_candidate('42', None), 'abc123', diff_text),
+            issues=issues, description='desc', escalation_refs=[], runs_db=tmp_path / 'runs.db',
+        )
+
+        assert (diff.diff_id, diff.source, diff.split, diff.project) == ('mined_42', 'mined', None, 'dark-factory')
+        assert diff.language == infer_language(diff_text) == 'rust'
+        assert (diff.diff_text, diff.description, diff.ground_truth) == (diff_text, 'desc', issues)
+
+    def test_its_provenance_names_the_candidate_merge_runs_db_and_escalations(self, tmp_path: Path) -> None:
+        candidate = _candidate('42', None)
+        ref = EscalationRef(
+            task_id='42', category='review_suggestions', severity='info', summary='s', level=1,
+            path=tmp_path / 'esc-42-1.json',
+        )
+        runs_db = tmp_path / 'runs.db'
+
+        diff = mined_corpus_diff(
+            RecoveredCandidate(candidate, 'abc123', 'diff'),
+            issues=[_issue('mined_42')], description='desc', escalation_refs=[ref], runs_db=runs_db,
+        )
+
+        provenance = diff.provenance
+        assert provenance is not None
+        candidate_fields = {k: v for k, v in asdict(candidate).items() if k != 'merge_sha'}
+        assert {k: provenance[k] for k in candidate_fields} == candidate_fields
+        assert (provenance['kind'], provenance['merge_sha'], provenance['runs_db_path']) == (
+            'mined', 'abc123', str(runs_db),
+        )
+        assert provenance['escalation_refs'] == [{**asdict(ref), 'path': str(ref.path)}]
+
+
+class TestFrontierDescription:
+    def test_it_names_the_task_project_title_and_every_signal(self) -> None:
+        text = frontier_description(_candidate('42', None), 'Fix the widget')
+
+        for part in ('42', 'dark_factory', 'Fix the widget', 'outcome=requeued', 'verify_attempts=3'):
+            assert part in text, (part, text)
+
+
+class TestAdmitMinedDiff:
+    def test_it_appends_the_diff_and_its_log_entry(self) -> None:
+        manifest, log = CorpusManifest(diffs=[]), AdjudicationLog()
+        diff = CorpusDiff(
+            diff_id='mined_42', language='python', source='mined', diff_text='d', description='d',
+            ground_truth=[_issue('mined_42')], provenance={'kind': 'mined'},
+        )
+
+        admit_mined_diff(manifest, log, diff, frontier_model='opus')
+
+        assert manifest.diffs == [diff]
+        [entry] = log.entries
+        assert (entry.diff_id, entry.frontier_model, entry.frontier_proposal, entry.in_spot_check_subset) == (
+            'mined_42', 'opus', [asdict(gt) for gt in diff.ground_truth], False,
+        )
+        assert '42' in entry.notes
