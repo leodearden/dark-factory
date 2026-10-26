@@ -14,6 +14,17 @@ _DEFAULT_START = '2026-03-22T17:50:00+00:00'
 _DEFAULT_END = '2026-03-22T18:15:00+00:00'
 
 
+_REPORTED_OUTSIDE_EDGES = 5
+
+
+class EdgeOutsideWindowError(RuntimeError):
+    """query_edges_by_time_range returned an edge whose valid_at is outside the requested window."""
+
+
+def _valid_at_in_window(value: object, start: str, end: str) -> bool:
+    return isinstance(value, str) and start <= value <= end
+
+
 @dataclass
 class CleanupResult:
     """Result of a cleanup operation."""
@@ -43,8 +54,21 @@ class CleanupManager:
 
         Returns:
             List of edge dicts (uuid, fact, name, valid_at, invalid_at).
+
+        Raises:
+            EdgeOutsideWindowError: The backend returned an edge whose valid_at
+                is missing or outside [start, end]. Every returned uuid is a
+                deletion candidate, so the whole read is refused, dry run too.
         """
         edges = await self.backend.query_edges_by_time_range(start=start, end=end, group_id=self.group_id)
+        outside = [e for e in edges if not _valid_at_in_window(e.get('valid_at'), start, end)]
+        if outside:
+            sample = [(e.get('uuid'), e.get('valid_at')) for e in outside[:_REPORTED_OUTSIDE_EDGES]]
+            raise EdgeOutsideWindowError(
+                f'query_edges_by_time_range returned {len(outside)} edge(s) outside the window '
+                f'[{start}, {end}] in group {self.group_id!r}, e.g. (uuid, valid_at) {sample}; '
+                f'the read is refused rather than acted on'
+            )
         logger.info(f'Found {len(edges)} edge(s) in range [{start}, {end}]')
         return edges
 
