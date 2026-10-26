@@ -1866,7 +1866,7 @@ class InflightEntry:
     gate: PendingGate | None = None
 
     @property
-    def pending_task(self) -> asyncio.Task | None:  # type: ignore[type-arg]
+    def pending_task(self) -> asyncio.Task[Any] | None:
         """The task finalize waits for: the parked gate's, else the verify's."""
         return self.gate.task if self.gate is not None else self.verify_task
 
