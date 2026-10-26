@@ -3502,3 +3502,89 @@ class TestMainWiresTheGateLockstep:
         args = argparse.Namespace(project_roots=['/rf', '/df', '/rf'])
 
         assert _mod.resolve_gate_roots(args) == ('/rf', '/df')
+
+
+# ===========================================================================
+# --topic — narrowing the write set to named legacy values
+# ===========================================================================
+
+class TestTopicSelection:
+    """``run(..., topics=frozenset({...}))`` narrows WHAT is renamed, never what is read.
+
+    A selection names LEGACY source values.  It narrows the planned renames,
+    the plan-time refusals and the gate pairing to those values; enumeration,
+    coverage and the collision index stay corpus-wide, so a selected value an
+    unselected spelling contests is still refused.
+    """
+
+    @staticmethod
+    def _two_legacy_values(*extra: dict) -> tuple[MagicMock, _FakeCorpus]:
+        return _run_service({
+            'dark_factory': [_crec('m1', 'legacy_a'), _crec('m2', 'legacy_b'), *extra],
+        })
+
+    @pytest.mark.asyncio
+    async def test_the_selection_narrows_the_renames(self):
+        service, corpus = self._two_legacy_values()
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True,
+                                 topics=frozenset({'legacy_a'}))
+
+        assert corpus.topic_of('dark_factory', 'm1') == 'legacy-a'
+        assert corpus.topic_of('dark_factory', 'm2') == 'legacy_b'
+        assert report['rename_count'] == 1
+        assert {row['old_topic'] for row in report['results']} == {'legacy_a'}
+        assert resolve_exit(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unselected_values_refusal_is_not_this_runs(self):
+        service, corpus = self._two_legacy_values(
+            _crec('m3', 'dup_topic'), _crec('m4', 'dup-topic'))
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True,
+                                 topics=frozenset({'legacy_a'}))
+
+        assert report['skips']['slug_collision'] == []
+        assert corpus.topic_of('dark_factory', 'm3') == 'dup_topic'
+        assert resolve_exit(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_selected_values_refusal_is_still_filed(self):
+        service, corpus = _run_service({
+            'dark_factory': [_crec('m1', 'dup_topic'), _crec('m2', 'dup-topic')],
+        })
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True,
+                                 topics=frozenset({'dup_topic'}))
+
+        assert [entry['old_topic'] for entry in report['skips']['slug_collision']] == [
+            'dup_topic',
+        ]
+        assert corpus.topic_of('dark_factory', 'm1') == 'dup_topic'
+        assert resolve_exit(report) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_unselected_spelling_still_contests_a_selected_one(self):
+        """The collision index is corpus-wide: the selection filters the plan, not its input."""
+        service, corpus = _run_service({
+            'dark_factory': [_crec('m1', 'foo_bar'), _crec('m2', 'Foo_Bar')],
+        })
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True,
+                                 topics=frozenset({'foo_bar'}))
+
+        assert [entry['old_topic'] for entry in report['skips']['slug_collision']] == [
+            'foo_bar',
+        ]
+        assert corpus.topic_of('dark_factory', 'm1') == 'foo_bar'
+        assert corpus.writes == []
+
+    @pytest.mark.asyncio
+    async def test_no_selection_renames_every_legacy_value(self):
+        service, corpus = self._two_legacy_values()
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        assert corpus.topic_of('dark_factory', 'm1') == 'legacy-a'
+        assert corpus.topic_of('dark_factory', 'm2') == 'legacy-b'
+        assert report['rename_count'] == 2
