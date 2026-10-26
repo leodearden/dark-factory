@@ -1,9 +1,11 @@
-"""Where a full cycle anchors the next cycle's episode/memory windows (task 4465).
+"""Where a full cycle anchors the next cycle's episode, memory and task-change windows.
 
 Invariant: after a completed full cycle, the persisted
 ``last_episode_timestamp`` and ``last_memory_timestamp`` -- the lower bounds of
 the NEXT cycle's "new since the last reconciliation" windows -- are at or
-before the instant Stage 1 fetched its episodes and memories.
+before the instant Stage 1 fetched its episodes and memories (task 4465). The
+persisted ``last_task_change_timestamp`` is at or before the cycle's task-tree
+read, the read Stage 2's done-task audit renders (task 6070).
 
 Why cycle completion is too late: Stage 1 fetches near the start of a cycle,
 then the three stages run for minutes. An item created after that fetch but
@@ -33,9 +35,14 @@ On a resumed run (task sigma) it is the ORIGINAL start of the interrupted run,
 whose Stage 1 may have fetched hours before the resuming invocation -- so a
 clock read taken by the resuming invocation would recreate the hole.
 
-Only the two data-window fields move. ``last_full_run_completed`` keeps its
-completion-time meaning for its other readers (Stage 2's done-task audit and
-the context assembler).
+The task-change window moves too, and the resume argument above applies to it
+unchanged. Its own cost: a task that reaches done between run start and the
+tree read is audited by both cycles, and so is a done task whose ``updatedAt``
+this cycle's own writes bumped. Stage 2's ``stage2_suppress`` count-gate bounds
+both. ``last_full_run_completed`` keeps its completion-time meaning for its
+display readers, ``memory_consolidator.py::_format_watermark`` and the
+dashboard; Stage 2's done-task audit and the context assembler no longer read
+it.
 """
 from __future__ import annotations
 

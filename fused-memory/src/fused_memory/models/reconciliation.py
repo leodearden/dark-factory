@@ -259,7 +259,12 @@ def _normalize_project_id(v: object, *, allow_empty: bool = False) -> object:
 
 
 class Watermark(BaseModel):
-    """Tracks what's been processed per project."""
+    """Tracks what's been processed per project.
+
+    The three ``*_timestamp`` fields are the lower bounds of the next cycle's data
+    windows, anchored at run start (why: tests/reconciliation/test_recon_window_anchor.py);
+    ``last_full_run_completed`` is the completion instant.
+    """
 
     project_id: str
     last_full_run_id: str | None = None
