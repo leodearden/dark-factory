@@ -14,24 +14,48 @@ file is main's. Any other outcome raises `LandingNotConfirmed`, whose
 `.failure` is a wire tag a caller may print. `land_or_exit` is the same call,
 exiting through `_config_reload_gate.die`.
 
+The deploy branch is torn down once its request can no longer land. A request
+still in flight when the deadline passes, or when SIGTERM/SIGINT arrives, is
+cancelled first; if the queue refuses that cancel, the branch and its worktree
+are kept, because the merge worker reads the request's source from them.
+
 The calling heredoc's side of the contract (argv-only inputs, the script's
 directory on sys.path, the checkout venv's interpreter) is
 scripts/_config_reload_gate.py's.
 """
 from __future__ import annotations
 
+import contextlib
 import enum
-import importlib
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from _config_reload_gate import die, load_transport, transport_not_importable_remedy
+
+try:
+    from shared.merge_state import (
+        EPISTEMIC_STATES,
+        LIVE_STATES,
+        SUBMIT_NON_TERMINAL,
+        SUBMIT_TERMINAL,
+        MergeState,
+        MergeSubmitStatus,
+    )
+except ImportError as exc:
+    # Not stdlib. Under the venvless fallback interpreter this fails, and
+    # _MergeQueue.connect turns it into the remedy before any name is used.
+    _MERGE_STATE_UNAVAILABLE: ImportError | None = exc
+else:
+    _MERGE_STATE_UNAVAILABLE = None
 
 DEFAULT_LANDING_TIMEOUT_SECS = 10800
 SUBMIT_WAIT_SECS = 100
@@ -41,15 +65,22 @@ POLL_REPLY_TIMEOUT_SECS = 30.0
 FIRST_BACKOFF_SECS = 15.0
 MAX_POLL_DELAY_SECS = 60.0
 
+_LOG_PREFIX = "merge-queue-landing:"
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
 
 class LandingFailure(enum.StrEnum):
     """Why a landing was not confirmed."""
 
     TRANSPORT_NOT_IMPORTABLE = "transport_not_importable"
     TRANSPORT_FAILED = "transport_failed"
+    SUBMIT_REJECTED = "submit_rejected"
     NOT_LANDED = "not_landed"
+    TIMED_OUT = "timed_out"
+    INTERRUPTED = "interrupted"
     QUEUE_DONE_NOT_ON_MAIN = "queue_done_not_on_main"
     CHECKOUT_NOT_SYNCED = "checkout_not_synced"
+    INVALID_CHANGE = "invalid_change"
 
 
 class LandingNotConfirmed(Exception):
@@ -83,20 +114,19 @@ def land_file(
     *main_branch*, branching from *base_sha*, through the merge queue of the
     orchestrator whose escalation MCP listens on 127.0.0.1:*port*.
 
-    *timeout_secs* bounds the wait for the request to settle, defaulting to
+    *timeout_secs* bounds the whole landing, defaulting to
     DEFAULT_LANDING_TIMEOUT_SECS. A string is read as a number, so a caller
     can pass an environment variable through unparsed.
     """
     queue = _MergeQueue.connect(port)
     target = _Target(Path(repo), path, main_branch)
+    target.check_change(base_sha, content)
     deadline = time.monotonic() + float(timeout_secs or DEFAULT_LANDING_TIMEOUT_SECS)
-    deploy = _DeployBranch.create(target, base_sha, content, label=label, message=message)
-    try:
-        submitted = queue.submit(deploy, description=message)
-        settled = _await_landed(queue, submitted, deadline)
-        return _confirmed(target, deploy, settled)
-    finally:
-        deploy.tear_down()
+    with (
+        _stop_signals_raised(),
+        _deploy_branch(target, base_sha, content, label=label, message=message) as deploy,
+    ):
+        return _land(queue, target, deploy, deadline, description=message)
 
 
 def land_or_exit(repo: str, path: str, base_sha: str, content: bytes, *, prog: str,
@@ -106,6 +136,62 @@ def land_or_exit(repo: str, path: str, base_sha: str, content: bytes, *, prog: s
         return land_file(repo, path, base_sha, content, **kwargs)
     except LandingNotConfirmed as exc:
         die(prog, exc.detail)
+
+
+def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: float, *,
+          description: str) -> Landing:
+    submitted = queue.submit(deploy, description=description)
+    settled = (
+        _poll_until_landed(queue, target, deploy, submitted, deadline)
+        if _submit_pending(submitted) else submitted
+    )
+    return _confirmed(target, deploy, settled)
+
+
+# ---------------------------------------------------------------------------
+# Stopping: the deadline and the stop signals
+# ---------------------------------------------------------------------------
+
+class _CeilingReached(Exception):
+    """The landing's deadline passed with its request still unsettled."""
+
+
+class _Interrupted(BaseException):
+    """SIGTERM or SIGINT arrived. A BaseException, so that no transport-fault
+    handler can swallow it."""
+
+
+@contextlib.contextmanager
+def _stop_signals_raised() -> Iterator[None]:
+    """SIGTERM and SIGINT raise _Interrupted for the duration, so the
+    deterministic runner's killpg cancels the request instead of killing the
+    process with it live. One escaping this block arrived while no request was
+    being polled."""
+    previous = {sig: signal.signal(sig, _raise_interrupted) for sig in _STOP_SIGNALS}
+    try:
+        yield
+    except _Interrupted as stop:
+        raise LandingNotConfirmed(
+            LandingFailure.INTERRUPTED, f"{stop} while no merge request was in flight",
+        ) from None
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _raise_interrupted(signum: int, frame: object) -> None:
+    # Later stop signals are ignored: the cancel and teardown the first one
+    # starts must run to the end.
+    for sig in _STOP_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+    raise _Interrupted(f"interrupted by {signal.Signals(signum).name}")
+
+
+def _sleep_before_poll(delay: float, deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _CeilingReached("the landing timed out")
+    time.sleep(min(delay, remaining))
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +221,25 @@ class _Target:
     path: str
     main_branch: str
 
+    def check_change(self, base_sha: str, content: bytes) -> None:
+        """Raise INVALID_CHANGE unless *content* changes the file *base_sha*
+        carries."""
+        if _run_git(self.repo, "rev-parse", "--verify", "--quiet",
+                    f"{base_sha}^{{commit}}").returncode != 0:
+            raise LandingNotConfirmed(
+                LandingFailure.INVALID_CHANGE, f"base {base_sha} is not a commit in {self.repo}",
+            )
+        base_content = self.blob(base_sha)
+        if base_content is None:
+            raise LandingNotConfirmed(
+                LandingFailure.INVALID_CHANGE, f"{self.path} is not tracked at base {base_sha}",
+            )
+        if base_content == content:
+            raise LandingNotConfirmed(
+                LandingFailure.INVALID_CHANGE,
+                f"nothing to land: {self.path} at base {base_sha} already carries this content",
+            )
+
     def blob(self, rev: str) -> bytes | None:
         """The file's content at *rev*, or None when *rev* has no such file."""
         proc = _run_git(self.repo, "show", f"{rev}:{self.path}")
@@ -160,8 +265,7 @@ class _Target:
 @dataclass(frozen=True)
 class _DeployBranch:
     """The deploy commit, on its own branch, checked out in a worktree under a
-    scratch directory outside the target checkout: the merge worker reads the
-    request's source from that worktree."""
+    scratch directory outside the target checkout."""
 
     repo: Path
     scratch: Path
@@ -195,6 +299,35 @@ class _DeployBranch:
 
     def tear_down(self) -> None:
         _tear_down(self.repo, self.scratch, self.branch)
+
+    def retained(self, refusal: LandingNotConfirmed) -> LandingNotConfirmed:
+        """*refusal*, naming what was kept for a request that may still land."""
+        return LandingNotConfirmed(
+            refusal.failure,
+            f"{refusal.detail}; kept the deploy worktree {self.worktree} and branch "
+            f"{self.branch}, which the request may still land from: if it lands, its value "
+            f"goes live at the next reload or restart",
+            refusal.state,
+        )
+
+
+@contextlib.contextmanager
+def _deploy_branch(target: _Target, base_sha: str, content: bytes, *,
+                   label: str, message: str) -> Iterator[_DeployBranch]:
+    """The deploy branch, torn down on the way out unless a refusal says its
+    request may still land."""
+    deploy = _DeployBranch.create(target, base_sha, content, label=label, message=message)
+    retained = False
+    try:
+        yield deploy
+    except LandingNotConfirmed as refusal:
+        retained = _may_still_land(refusal.state)
+        if retained:
+            raise deploy.retained(refusal) from None
+        raise
+    finally:
+        if not retained:
+            deploy.tear_down()
 
 
 def _worktree_in(scratch: Path) -> Path:
@@ -230,15 +363,15 @@ class _MergeQueue:
 
     @classmethod
     def connect(cls, port: str) -> _MergeQueue:
+        missing = _MERGE_STATE_UNAVAILABLE
         try:
             census_trigger, _ = load_transport()
-            # The poll vocabulary is not stdlib either; proving it here keeps
-            # its absence on the remedy path.
-            importlib.import_module("shared.merge_state")
         except ImportError as exc:
+            missing = exc
+        if missing is not None:
             raise LandingNotConfirmed(
-                LandingFailure.TRANSPORT_NOT_IMPORTABLE, transport_not_importable_remedy(exc),
-            ) from exc
+                LandingFailure.TRANSPORT_NOT_IMPORTABLE, transport_not_importable_remedy(missing),
+            ) from missing
         return cls(f"http://127.0.0.1:{port}/mcp", census_trigger.post_mcp_tool_call)
 
     def submit(self, deploy: _DeployBranch, *, description: str) -> dict:
@@ -252,8 +385,19 @@ class _MergeQueue:
             "lane": "normal",
         }, timeout=SUBMIT_REPLY_TIMEOUT_SECS)
 
-    def status(self, handle: dict[str, str]) -> dict:
-        return self._call("merge_status", handle, timeout=POLL_REPLY_TIMEOUT_SECS)
+    def poll(self, handle: dict[str, str]) -> dict | None:
+        """merge_status for *handle*, or None when the transport dropped the
+        poll: a target restart mid-verify must not abandon a merge that will
+        still land."""
+        try:
+            return self._call("merge_status", handle, timeout=POLL_REPLY_TIMEOUT_SECS)
+        except LandingNotConfirmed as fault:
+            print(f"{_LOG_PREFIX} a poll was dropped; polling on: {fault.detail}", file=sys.stderr)
+            return None
+
+    def cancel(self, request_id: str) -> dict:
+        return self._call("merge_cancel", {"request_id": request_id},
+                          timeout=POLL_REPLY_TIMEOUT_SECS)
 
     def _call(self, tool: str, arguments: dict, *, timeout: float) -> dict:
         try:
@@ -267,36 +411,145 @@ class _MergeQueue:
             ) from exc
 
 
-def _await_landed(queue: _MergeQueue, submitted: dict, deadline: float) -> dict:
-    """The reply that settled the request as landed: the submit's own, or the
-    poll that reached done."""
-    from shared.merge_state import LIVE_STATES, SUBMIT_NON_TERMINAL, MergeState
-
+def _submit_pending(submitted: dict) -> bool:
+    """Whether the submitted request must now be polled; False when the
+    submit itself settled it as landed. Raises for any other settlement."""
     status = submitted.get("status")
-    if status not in SUBMIT_NON_TERMINAL:
-        return submitted
-    handle = {"request_id": submitted["request_id"]}
-    reply = submitted
-    while True:
-        time.sleep(min(_poll_delay(reply), max(0.0, deadline - time.monotonic())))
-        reply = queue.status(handle)
-        state = reply.get("state")
-        if state == MergeState.done:
-            return reply
-        if state not in LIVE_STATES:
-            raise LandingNotConfirmed(
-                LandingFailure.NOT_LANDED,
-                f"merge request {handle['request_id']} settled {state}", state=state,
-            )
+    if "error" in submitted or status not in SUBMIT_NON_TERMINAL | SUBMIT_TERMINAL:
+        code = f" (code {submitted['code']})" if submitted.get("code") else ""
+        raise LandingNotConfirmed(
+            LandingFailure.SUBMIT_REJECTED,
+            f"merge_request refused the submission: {submitted.get('error') or submitted}{code}",
+        )
+    if status in SUBMIT_NON_TERMINAL:
+        return True
+    if status in (MergeSubmitStatus.done, MergeSubmitStatus.already_merged):
+        return False
+    raise _not_landed(submitted, state=status)
 
 
-def _poll_delay(reply: dict) -> float:
-    """The queue's own positive estimate, capped; else the first backoff."""
+def _poll_until_landed(queue: _MergeQueue, target: _Target, deploy: _DeployBranch,
+                       submitted: dict, deadline: float) -> dict:
+    """The merge_status reply that shows the submitted request landed,
+    cancelling the request if the deadline or a stop signal comes first."""
+    handle = _poll_handle(submitted)
+    state = submitted["status"]
+    eta = _eta(submitted)
+    backoff = _backoff()
+    try:
+        while True:
+            _sleep_before_poll(eta if eta is not None else next(backoff), deadline)
+            reply = queue.poll(handle)
+            if reply is None:
+                continue
+            state, eta = reply.get("state"), _eta(reply)
+            next_handle = _next_handle(reply, handle, target, deploy)
+            if next_handle is None:
+                return reply
+            handle = next_handle
+    except (_CeilingReached, _Interrupted) as stop:
+        raise _stopped(queue, handle, state, stop) from None
+
+
+def _poll_handle(submitted: dict) -> dict[str, str]:
+    """The merge_status arguments naming the submitted request: an attached
+    submit names its own handle in `poll_by`."""
+    poll_by = submitted.get("poll_by", "request_id")
+    if poll_by == "task_id":
+        return {"task_id": submitted["inflight_task_id"]}
+    if poll_by == "branch":
+        return {"branch": submitted["branch"]}
+    return {"request_id": submitted["request_id"]}
+
+
+def _next_handle(reply: dict, handle: dict[str, str], target: _Target,
+                 deploy: _DeployBranch) -> dict[str, str] | None:
+    """The handle to poll next, or None once *reply* shows the request
+    landed. Raises when it settled any other way."""
+    state = reply.get("state")
+    if state == MergeState.done:
+        return None
+    if state == MergeState.superseded:
+        return _successor(reply)
+    if state in EPISTEMIC_STATES and target.carries(deploy.tip):
+        return None
+    if _may_still_land(state):
+        return handle
+    raise _not_landed(reply, state=state)
+
+
+def _successor(reply: dict) -> dict[str, str]:
+    """The handle of the next-generation request that superseded this one.
+
+    An MCP submission is never absorbed into a coalesce train (no workflow
+    awaits it), so a coalesce-* successor is a shape this module does not
+    chase: it fails closed."""
+    successor = reply.get("superseded_by") or ""
+    if successor.startswith("mr-"):
+        return {"request_id": successor}
+    raise _not_landed(reply, state=MergeState.superseded)
+
+
+def _may_still_land(state: str | None) -> bool:
+    """Whether a request last seen in *state* may still land: it is in
+    flight, or the server cannot rule that out."""
+    return (state in LIVE_STATES or state in SUBMIT_NON_TERMINAL
+            or state in (MergeState.journaled, MergeState.unknown))
+
+
+def _not_landed(reply: dict, *, state: str | None) -> LandingNotConfirmed:
+    request_id = reply.get("request_id")
+    reason = f" ({reply['reason']})" if reply.get("reason") else ""
+    successor = f" superseded_by={reply['superseded_by']}" if reply.get("superseded_by") else ""
+    return LandingNotConfirmed(
+        LandingFailure.NOT_LANDED,
+        f"merge request {request_id} settled {state}{reason}{successor}: nothing landed",
+        state,
+    )
+
+
+def _stopped(queue: _MergeQueue, handle: dict[str, str], state: str | None,
+             stop: BaseException) -> LandingNotConfirmed:
+    """The refusal for a poll stopped with the request still *state*, after
+    asking the queue to cancel it."""
+    failure = (LandingFailure.TIMED_OUT if isinstance(stop, _CeilingReached)
+               else LandingFailure.INTERRUPTED)
+    request_id = handle.get("request_id")
+    stopped = f"{stop} with merge request {request_id or handle} still {state}"
+    if request_id is None:
+        return LandingNotConfirmed(failure, f"{stopped}; it has no request id to cancel", state)
+    try:
+        reply = queue.cancel(request_id)
+    except LandingNotConfirmed as fault:
+        return LandingNotConfirmed(failure, f"{stopped}; {fault.detail}", state)
+    code = f" code={reply['code']}" if reply.get("code") else ""
+    return LandingNotConfirmed(
+        failure,
+        f"{stopped}; merge_cancel answered cancelled={reply.get('cancelled')} "
+        f"state={reply.get('state')}{code}",
+        reply.get("state") or state,
+    )
+
+
+def _eta(reply: dict) -> float | None:
+    """The queue's own positive estimate of the wait, capped; else None."""
     eta = reply.get("eta_seconds")
     if isinstance(eta, int | float) and eta > 0:
         return min(float(eta), MAX_POLL_DELAY_SECS)
-    return FIRST_BACKOFF_SECS
+    return None
 
+
+def _backoff() -> Iterator[float]:
+    """15 s, 30 s, then 60 s for every wait the queue gives no estimate for."""
+    delay = FIRST_BACKOFF_SECS
+    while True:
+        yield delay
+        delay = min(delay * 2, MAX_POLL_DELAY_SECS)
+
+
+# ---------------------------------------------------------------------------
+# Confirming the landing
+# ---------------------------------------------------------------------------
 
 def _confirmed(target: _Target, deploy: _DeployBranch, reply: dict) -> Landing:
     """The Landing the queue's done *reply* claims, once git agrees."""
@@ -306,14 +559,14 @@ def _confirmed(target: _Target, deploy: _DeployBranch, reply: dict) -> Landing:
             LandingFailure.QUEUE_DONE_NOT_ON_MAIN,
             f"the queue reported request {request_id} done, but {target.main_branch} carries "
             f"{deploy.tip} neither as an ancestor nor as an equal patch",
-            state=reply.get("state") or reply.get("status"),
+            MergeState.done,
         )
     if not target.checkout_synced():
         raise LandingNotConfirmed(
             LandingFailure.CHECKOUT_NOT_SYNCED,
             f"{deploy.branch} landed on {target.main_branch}, but {target.repo / target.path} "
             f"on disk is not {target.main_branch}'s copy, so a reload would re-read the old file",
-            state=reply.get("state") or reply.get("status"),
+            MergeState.done,
         )
     return Landing(
         request_id=str(request_id),
