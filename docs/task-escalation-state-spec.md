@@ -317,7 +317,10 @@ log-mode-first behind a soak, and only after the producer fixes land**
 ## 8. Divergence register (code vs this spec, 2026-08-02)
 
 Verified sites; consequences characterized. E-numbers are referenced by
-the PRD's tasks.
+the PRD's tasks. Each entry's original text stays as the audit trail; the
+closing sentences appended to it ("Closed by task N (leaf X)", "Partly
+closed …", or "Still open …") record what later landed, re-verified
+against code on 2026-10-26 (task 6082).
 
 - **E1 — Path B merge-entry bail** (`workflow.py:3457-3464`): returns
   ESCALATED with no steward, no status write → permanent strand vetoed
@@ -326,11 +329,24 @@ the PRD's tasks.
   observational" comment). Fix: enter the same escalated-wait machinery
   as Path A (bounded; L2/critical short-circuits to `_mark_blocked`).
   The *gate itself is correct* (stop-the-line, repend D4) — the defect
-  is the missing post-bail owner.
+  is the missing post-bail owner. Closed by task 3536 (leaf γ1):
+  `workflow.py::TaskWorkflow._handle_merge_gate_escalations` enters the
+  same steward + `_wait_for_resolution` machinery as Path A. A born-at-L2
+  record, wait expiry, or a gating record still open at the single-shot
+  re-check parks the row via `_mark_blocked`; a steward terminal decision
+  is honoured as written; a cleared gate merges in-slot. No exit leaves
+  `in-progress` without a claimant (pinned by
+  `orchestrator/tests/test_workflow_merge_gating_strand.py`).
 - **E2 — `_mark_blocked(merge_phase=True)` writes no status** (every
   `_submit_to_merge_queue` block path): BLOCKED exits leave
   `in-progress`. Investigate the carve-out's original rationale, then
-  make merge-phase blocks write their park status.
+  make merge-phase blocks write their park status. Closed by task 3537
+  (leaf γ2): every slot-exiting return of `_mark_blocked(merge_phase=True)`
+  writes its park status through
+  `workflow.py::TaskWorkflow._park_merge_phase_row`. The entry-write
+  suppression remains only for the in-slot merge-retry loop, whose live
+  claimant keeps `in-progress` truthful (the investigation is recorded as
+  MERGE_PHASE_RATIONALE in `_mark_blocked`'s docstring).
 - **E3 — merge-halt trio** (`_handle_wip_recovery_no_advance` /
   `_handle_unmerged_state` / `_handle_stash_failed`): unbounded
   `_escalation_event.wait()` (violates S5) and post-resolution BLOCKED
@@ -339,15 +355,35 @@ the PRD's tasks.
   exit when the waiter owns the halt — a bound or an escalate-and-block
   rewrite must exit without that cleanup, and halt rehydration's
   `level == 1` filter must widen before any promotion of halt-owner
-  records is possible.
+  records is possible. Closed by task 3537 (leaf γ2) for the three named
+  handlers: each files its halt-owning L1 (`_file_halt_owning_l1`) and
+  returns `_mark_blocked(...)` without waiting. The record's resolution is
+  the sole unhalt edge, and `harness.py::Harness._rehydrate_merge_halt`
+  matches the halt categories at `level >= 1`. Outside this entry's list
+  and still open: `_handle_wip_conflict` and `_handle_wip_recovery` still
+  await `_submit_halt_escalation_and_wait`'s unbounded
+  `_escalation_event.wait()` in-slot (live claimant, so no strand, but no
+  S5 bound). Task 4224 owns that.
 - **E4 — REQUEUED without `pending`**: `WarmLaneRequeue`
   (`workflow.py:2853-2901`) and the soft-cancel spurious-wakeup fallback
   rely on the sweep; any open escalation converts a transient capacity
-  signal into a Path-B-class strand.
+  signal into a Path-B-class strand. Closed by task 3538 (leaf γ3):
+  `workflow.py::TaskWorkflow._repend_for_requeue` writes `pending` before
+  the REQUEUED exit on the `WarmLaneRequeue` path and the soft-cancel
+  spurious-wakeup fallback (and, since task 3316,
+  `_requeue_on_server_error`). A failed write is recorded in the
+  run()-exit write-failure ledger (`_note_exit_status_write`; §5's
+  status-write-failure relaxation) instead of escaping.
 - **E5 — infra-hold resume manufactures the strand shape**
   (`harness.py:12846-12866` writes claimant-less `in-progress` and
   waits for the sweep): re-creates the 3465 starvation whenever any
   record is open. Resume should write a truthful dispatchable status.
+  Closed by task 3538 (leaf γ3): the infra-hold arm of
+  `harness.py::Harness._cascade_unblock_member` writes `pending`, not
+  claimant-less `in-progress`. Resume-at-verify is branch-keyed
+  (`TaskWorkflow._has_prior_implementation`), not status-keyed. A refused
+  write escalates via `_escalate_cascade_status_rejection` (pinned by
+  `orchestrator/tests/test_harness_infra_resume_truthful.py`).
 - **E6 — blast-radius requeue pending-write failure**
   (`scheduler.py:7024-7037`): held in-memory locks make the row read as
   actively-held → LEAVE until restart; the "next reconcile cycle"
