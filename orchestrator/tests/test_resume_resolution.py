@@ -8,7 +8,12 @@ import itertools
 import pytest
 from escalation.models import Escalation
 
-from orchestrator.resume_resolution import CarriedResolution, select_carried_resolutions
+from orchestrator.resume_resolution import (
+    NO_CARRIED_RESOLUTIONS,
+    CarriedResolution,
+    render_carried_resolutions,
+    select_carried_resolutions,
+)
 
 
 def _esc(
@@ -98,3 +103,54 @@ class TestSelectCarriedResolutions:
         for order in itertools.permutations([filed_last, tie_high_id, tie_low_id]):
             ids = [c.escalation_id for c in select_carried_resolutions(order)]
             assert ids == ['esc-9-2', 'esc-9-3', 'esc-9-1']
+
+
+def _carried(
+    esc_id: str,
+    resolution: str,
+    *,
+    summary: str = 'synthetic blocker',
+    resolved_at: str | None = '2026-08-02T00:00:00+00:00',
+    resolved_by: str | None = 'steward',
+    resolution_action: str | None = 'resume',
+) -> CarriedResolution:
+    return CarriedResolution(
+        escalation_id=esc_id,
+        summary=summary,
+        resolution=resolution,
+        resolved_at=resolved_at,
+        resolved_by=resolved_by,
+        resolution_action=resolution_action,
+    )
+
+
+class TestRenderCarriedResolutions:
+    def test_every_resolution_is_headed_by_its_own_escalation(self):
+        first = _carried(
+            'esc-3713-4', 'RESUME with step 20', summary='step 19 verify red',
+            resolved_at='2026-08-02T01:00:00+00:00', resolution_action='resume',
+        )
+        second = _carried(
+            'esc-3713-7', 'do X instead', summary='scope too narrow',
+            resolved_at='2026-08-04T09:30:00+00:00', resolution_action='restart',
+        )
+
+        text = render_carried_resolutions([first, second])
+
+        first_id = text.index('esc-3713-4')
+        first_prose = text.index('RESUME with step 20')
+        second_id = text.index('esc-3713-7')
+        second_prose = text.index('do X instead')
+        assert first_id < first_prose < second_id < second_prose
+        first_block = text[first_id:second_id]
+        assert 'step 19 verify red' in first_block
+        assert '2026-08-02T01:00:00+00:00' in first_block
+        assert 'resume' in first_block
+        second_block = text[second_id:]
+        assert 'scope too narrow' in second_block
+        assert '2026-08-04T09:30:00+00:00' in second_block
+        assert 'restart' in second_block
+
+    def test_no_resolutions_renders_an_explicit_statement(self):
+        assert NO_CARRIED_RESOLUTIONS
+        assert render_carried_resolutions([]) == NO_CARRIED_RESOLUTIONS
