@@ -7,6 +7,7 @@ import itertools
 import os
 import re
 import subprocess
+import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,6 +27,7 @@ _OBJECT_SHA: Final = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
 _DECIMAL: Final = re.compile(r'[0-9]+')
 _COMMIT_MARK: Final = b'\x01'
 _FIRST_PARENT_DIFF: Final = '--diff-merges=first-parent'
+_PARSE_FAILURE: Final = 'output not understood'
 
 # Mirrors df_pytest_isolation.py::_GIT_REDIRECT_ENV: the variables that make git act on a
 # repository or config other than the one at cwd.
@@ -48,7 +50,7 @@ _REDIRECTING_ENV_PREFIXES: Final = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
 
 
 class GitError(Exception):
-    """A git command that failed; its str names no path and carries no stderr."""
+    """A git command that failed or whose output could not be parsed; its str names no path and carries no stderr."""
 
     def __init__(self, *, subcommand: str, returncode: int | None, stderr: str) -> None:
         self.subcommand = subcommand
@@ -103,6 +105,17 @@ def _run(
             stderr=completed.stderr.decode(errors='replace'),
         )
     return completed
+
+
+@contextlib.contextmanager
+def _parsing(subcommand: str, *, returncode: int | None = 0) -> Iterator[None]:
+    """A ValueError raised while parsing `subcommand`'s output becomes that command's GitError, its detail in stderr."""
+    try:
+        yield
+    except ValueError as exc:
+        raise GitError(
+            subcommand=subcommand, returncode=returncode, stderr=f'{_PARSE_FAILURE}: {exc}'
+        ) from exc
 
 
 def _require_sha(value: str) -> str:
@@ -173,7 +186,8 @@ def _tree_entry(record: bytes) -> TreeEntry:
 def tree_entries(root: Path, commit: str) -> tuple[TreeEntry, ...]:
     """Every file, symlink and submodule entry of `commit`'s whole tree."""
     output = _run(root, 'ls-tree', '-r', '-l', '-z', '--full-tree', _require_sha(commit)).stdout
-    return tuple(_tree_entry(record) for record in output.split(b'\0') if record)
+    with _parsing('ls-tree'):
+        return tuple(_tree_entry(record) for record in output.split(b'\0') if record)
 
 
 def _cat_file_error(reason: str, process: subprocess.Popen[bytes]) -> GitError:
@@ -186,7 +200,46 @@ def _pipes(process: subprocess.Popen[bytes]) -> tuple[IO[bytes], IO[bytes]]:
     return process.stdin, process.stdout
 
 
-def _read_blob(process: subprocess.Popen[bytes], sha: str) -> bytes:
+@dataclass(frozen=True)
+class _CatFile:
+    """One `git cat-file --batch` session, and how long git has to answer each read and to exit at the end."""
+
+    process: subprocess.Popen[bytes]
+    timeout_secs: float
+
+
+def _timed_out(session: _CatFile) -> GitError:
+    return GitError(
+        subcommand='cat-file', returncode=None, stderr=f'timed out after {session.timeout_secs}s'
+    )
+
+
+@contextlib.contextmanager
+def _deadline(session: _CatFile) -> Iterator[None]:
+    """The block, its session killed once it outlasts the timeout; a killed session's block is a timeout, whatever the pipe gave."""
+    expired = threading.Event()
+
+    def expire() -> None:
+        expired.set()
+        session.process.kill()
+
+    timer = threading.Timer(session.timeout_secs, expire)
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        timer.join()
+        if expired.is_set():
+            raise _timed_out(session)
+
+
+def _read_blob(session: _CatFile, sha: str) -> bytes:
+    with _deadline(session):
+        return _exchange(session.process, sha)
+
+
+def _exchange(process: subprocess.Popen[bytes], sha: str) -> bytes:
     request, reply = _pipes(process)
     try:
         request.write(_require_sha(sha).encode() + b'\n')
@@ -196,19 +249,21 @@ def _read_blob(process: subprocess.Popen[bytes], sha: str) -> bytes:
     header = reply.readline().split()
     if len(header) != 3 or header[1] != b'blob':
         raise _cat_file_error(f'object {sha} is not a readable blob', process)
-    size = int(header[2])
+    with _parsing('cat-file', returncode=process.poll()):
+        size = int(header[2])
     content = reply.read(size)
     if len(content) != size or reply.read(1) != b'\n':
         raise _cat_file_error(f'object {sha} truncated', process)
     return content
 
 
-def _finish(process: subprocess.Popen[bytes]) -> None:
+def _finish(session: _CatFile) -> None:
+    process = session.process
     try:
-        _, stderr = process.communicate(timeout=GIT_TIMEOUT_SECS)
+        _, stderr = process.communicate(timeout=session.timeout_secs)
     except subprocess.TimeoutExpired as exc:
         _abandon(process)
-        raise _cat_file_error(f'timed out after {GIT_TIMEOUT_SECS}s', process) from exc
+        raise _timed_out(session) from exc
     if process.returncode != 0:
         raise GitError(
             subcommand='cat-file',
@@ -223,8 +278,13 @@ def _abandon(process: subprocess.Popen[bytes]) -> None:
 
 
 @contextlib.contextmanager
-def blob_reader(root: Path) -> Iterator[Callable[[str], bytes]]:
-    """`read(blob_sha) -> bytes` over one `git cat-file --batch` session: the only way client_feed reads file content."""
+def blob_reader(
+    root: Path, *, timeout_secs: float = GIT_TIMEOUT_SECS
+) -> Iterator[Callable[[str], bytes]]:
+    """`read(blob_sha) -> bytes` over one `git cat-file --batch` session: the only way client_feed reads file content.
+
+    git has `timeout_secs` to answer each read, so the caller's work between reads never counts against it.
+    """
     try:
         process = subprocess.Popen(
             ['git', 'cat-file', '--batch'],
@@ -236,12 +296,13 @@ def blob_reader(root: Path) -> Iterator[Callable[[str], bytes]]:
         )
     except OSError as exc:
         raise GitError(subcommand='cat-file', returncode=None, stderr=str(exc)) from exc
+    session = _CatFile(process=process, timeout_secs=timeout_secs)
     try:
-        yield lambda sha: _read_blob(process, sha)
+        yield lambda sha: _read_blob(session, sha)
     except BaseException:
         _abandon(process)
         raise
-    _finish(process)
+    _finish(session)
 
 
 def _task_id(branch: str) -> int | None:
@@ -275,7 +336,8 @@ def task_branches(root: Path) -> tuple[Branch, ...]:
         f'--format=%(refname)%00%(committerdate:unix)%00%(ahead-behind:{_MAIN_REF})',
         f'{_BRANCH_REFS}{TASK_BRANCH_PREFIX}',
     ).stdout
-    branches = (_branch(record) for record in output.split(b'\n') if record)
+    with _parsing('for-each-ref'):
+        branches = [_branch(record) for record in output.split(b'\n') if record]
     return tuple(sorted(filter(None, branches), key=lambda branch: branch.name))
 
 
@@ -302,17 +364,18 @@ def merge_stats(root: Path, commit: str) -> MergeStats:
     tokens = output.split(b'\0')
     files = insertions = deletions = 0
     index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        index += 1
-        if not token:
-            continue
-        added, deleted, path = token.split(b'\t', 2)
-        if not path:
-            index += 2
-        files += 1
-        insertions += _numstat_lines(added)
-        deletions += _numstat_lines(deleted)
+    with _parsing('diff-tree'):
+        while index < len(tokens):
+            token = tokens[index]
+            index += 1
+            if not token:
+                continue
+            added, deleted, path = token.split(b'\t', 2)
+            if not path:
+                index += 2
+            files += 1
+            insertions += _numstat_lines(added)
+            deletions += _numstat_lines(deleted)
     return MergeStats(files_changed=files, insertions=insertions, deletions=deletions)
 
 
@@ -358,10 +421,11 @@ def last_changes(root: Path, head: str, *, since: str | None) -> dict[str, datet
         revisions, '--',
     ).stdout
     changed: dict[str, datetime] = {}
-    for record in output.split(_COMMIT_MARK)[1:]:
-        when, paths = _commit_changes(record)
-        for path in paths:
-            changed.setdefault(path, when)
+    with _parsing('log'):
+        for record in output.split(_COMMIT_MARK)[1:]:
+            when, paths = _commit_changes(record)
+            for path in paths:
+                changed.setdefault(path, when)
     return changed
 
 
@@ -445,7 +509,8 @@ def tree_changes(root: Path, old: str, new: str) -> tuple[PathChange, ...]:
     output = _run(
         root, 'diff-tree', '-r', '-z', '-M', '--raw', '--no-abbrev', _require_sha(old), _require_sha(new)
     ).stdout
-    return _raw_changes(iter(output.split(b'\0')))
+    with _parsing('diff-tree'):
+        return _raw_changes(iter(output.split(b'\0')))
 
 
 def _change_sets(tokens: Iterator[bytes]) -> tuple[tuple[PathChange, ...], ...]:
@@ -454,6 +519,8 @@ def _change_sets(tokens: Iterator[bytes]) -> tuple[tuple[PathChange, ...], ...]:
     for token in tokens:
         if token.startswith(_COMMIT_MARK):
             sets.append([])
+        elif token and not sets:
+            raise ValueError('raw change record before any commit')
         elif token:
             sets[-1].append(_raw_change(token.removeprefix(b'\n'), tokens))
     return tuple(tuple(changes) for changes in sets)
@@ -467,7 +534,8 @@ def first_parent_changes(root: Path, *, since: str, head: str) -> tuple[tuple[Pa
         '--format=%x01%H',
         f'{_require_sha(since)}..{_require_sha(head)}', '--',
     ).stdout
-    return _change_sets(iter(output.split(b'\0')))
+    with _parsing('log'):
+        return _change_sets(iter(output.split(b'\0')))
 
 
 def added_lines(root: Path, old_blob: str, new_blob: str) -> bytes:

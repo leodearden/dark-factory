@@ -123,6 +123,18 @@ def test_a_revealed_path_stays_grantable_after_its_growth_overspends_the_budget(
     assert not counted.grantable('src/d.py', revealed)
 
 
+@pytest.mark.parametrize('free', [file.path for file in FREE_FILES])
+def test_b14_a_free_file_stays_grantable_once_spent_exceeds_the_budget(free: str) -> None:
+    grown = (tree_file('src/a.py', FileKind.PRODUCTION, 400), *B12_FILES[1:], *FREE_FILES)
+    counted = counted_set(POLICY, grown)
+    revealed = {'src/a.py', 'src/b.py'}
+
+    assert counted.spent(revealed) > counted.budget_lines
+    assert counted.grantable(free, revealed)
+    assert counted.spent(revealed | {free}) == counted.spent(revealed)
+    assert not counted.grantable('src/d.py', revealed)
+
+
 @pytest.fixture
 def delivered_repo(tmp_path: Path) -> tuple[Repo, Policy, str, str]:
     """c1 is delivered; c2 appends a blank line, appends a long line, adds a file and renames one unchanged."""
