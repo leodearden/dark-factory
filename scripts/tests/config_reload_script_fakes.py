@@ -332,14 +332,16 @@ def system_python_without_the_transport():
 
 def venvless_checkout_copy(tmp_path, script):
     """*script* copied into a fresh checkout at <tmp_path>/checkout that holds
-    everything its reload step imports -- the real scripts/legibility and
-    scripts/_config_reload_gate.py, symlinked -- but NO .venv, so the script's
-    bare-`python3` interpreter fallback is the leg taken. Returns the copy."""
+    everything its landing and reload steps import -- the real
+    scripts/legibility, scripts/_config_reload_gate.py and
+    scripts/_merge_queue_landing.py, symlinked -- but NO .venv, so the
+    script's bare-`python3` interpreter fallback is the leg taken. Returns the
+    copy."""
     scripts_dir = tmp_path / "checkout" / "scripts"
     scripts_dir.mkdir(parents=True)
     copy = scripts_dir / script.name
     shutil.copy2(script, copy)
-    for imported in ("legibility", "_config_reload_gate.py"):
+    for imported in ("legibility", "_config_reload_gate.py", "_merge_queue_landing.py"):
         (scripts_dir / imported).symlink_to(script.parent / imported)
     return copy
 
