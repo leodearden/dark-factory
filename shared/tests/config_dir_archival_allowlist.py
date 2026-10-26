@@ -375,11 +375,14 @@ NOTES = (
     """Adjacent unarchived destruction paths (no TaskConfigDir construction, so
     not gate-scanned — but they destroy config dirs someone else built):
 
-      * GitOps._acquire_warm_lane_impl — the reattach path rmtrees the previous
-        occupant's ENTIRE `.task/` dir (`shutil.rmtree(lane / '.task',
-        ignore_errors=True)`, guarded by the "belongs to the lane's PREVIOUS
-        occupant" comment), taking BOTH its `claude-config-<prev>` and its
-        `claude-config-<prev>-unblock` with it, with no archival first.
+      * GitOps._acquire_warm_lane_impl's reattach path and the RECYCLE routes
+        (GitOps._reset_warm_lane) — CLOSED by task 7329. Both now evict the
+        previous occupant's `.task/` through
+        orchestrator/src/orchestrator/lane_task_dir.py::evict_previous_occupant,
+        which archives each foreign `claude-config-*` (`-unblock` included,
+        keyed by its name suffix) through archive_before_delete before deleting
+        it, and on reattach keeps the incoming task's own
+        `claude-config-<incoming>`.
       * GitOps.cleanup_worktree — its warm-lane and spec-lane early returns
         (`release_warm_lane` / `release_spec_lane`, at the very top of the
         method) fire BEFORE the teardown-archival block, so warm-lane tasks
