@@ -4,7 +4,9 @@
 live ``canonical: true`` record each re-keyed topic was keyed to. These tests
 assert, through the probe's own matcher, that the registry finds each frozen
 record by content hash, falls back to its id, and anchors its report on that
-record's opening.
+record's opening. In the other direction, every ``curator_gate`` canonical
+must be keyed from committed content: its calibration row or its frozen
+record.
 
 Pure: no network, no store, no OPENAI_API_KEY.
 """
@@ -21,6 +23,7 @@ from _fm_helpers import load_script_module
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_retrieval_probe.py'
 REGISTRY_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_topic_registry.json'
 SNAPSHOT_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_registry_live_canonicals.json'
+CALIBRATION_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
 
 
 def _mod():
@@ -29,6 +32,15 @@ def _mod():
 
 def _snapshot_records() -> list[dict]:
     return json.loads(SNAPSHOT_PATH.read_text(encoding='utf-8'))['records']
+
+
+def _calibration_canonical_content_by_cluster() -> dict[str, str]:
+    rows = (
+        json.loads(line)
+        for line in CALIBRATION_PATH.read_text(encoding='utf-8').splitlines()
+        if line.strip()
+    )
+    return {row['cluster_id']: row['content'] for row in rows if row['label'] == 'canonical'}
 
 
 class _Hit(NamedTuple):
@@ -98,3 +110,21 @@ def test_every_supersedes_pair_points_at_its_entrys_canonical(registry):
         if pair.successor_hash != entry.canonical.content_hash
     ]
     assert misdirected == []
+
+
+def test_every_curator_gate_canonical_is_keyed_from_committed_content(snapshot, registry):
+    content_key = _mod().content_key
+    calibration = _calibration_canonical_content_by_cluster()
+    frozen = {record['topic']: record['content'] for record in snapshot}
+    curator_gates = [e for e in registry.entries if e.derived_from == 'curator_gate']
+    unauditable = [
+        entry.topic
+        for entry in curator_gates
+        if entry.canonical.content_hash not in {
+            content_key(content)
+            for content in (calibration.get(entry.provenance['cluster_id']), frozen.get(entry.topic))
+            if content is not None
+        }
+    ]
+    assert curator_gates
+    assert unauditable == []

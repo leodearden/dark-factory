@@ -973,7 +973,9 @@ mem0's own md5 of `content`, so a hand-edited copy fails
 module also asserts, through the probe's `canonical_hit`, that each entry
 finds its record by `content_hash`, falls back to its `id`, and anchors
 `content_prefix` on its opening, and that every `supersedes_pairs` successor
-is its entry's canonical.
+is its entry's canonical. In the other direction, it asserts that every
+`curator_gate` canonical hash is the `content_key` of its calibration row or
+of its record here. A re-key that skips step 3 below therefore fails.
 
 Re-keying a topic:
 
