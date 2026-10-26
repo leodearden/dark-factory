@@ -62,7 +62,6 @@ import fcntl
 import math
 import os
 import re
-import select
 import shlex
 import signal
 import socket
@@ -73,19 +72,24 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _gate_fixtures import gate_argv, gated_remote_runner
+from _leader_stderr import assert_watchdog_fire_trigger, drain_exited_stderr
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from click.testing import CliRunner
 from df_pytest_isolation import load_scaled_grace
 from escalation.queue import EscalationQueue
 from shared.proc_group import StatFields, read_stat_fields
 from test_cli import _setup_verify_repo  # noqa: F401 -- reused cross-module
+from test_merge_queue_multihost_wiring import (
+    _drive_runner_unavailable as _mq_drive_runner_unavailable,
+)
 from test_merge_queue_multihost_wiring import (  # noqa: F401 -- reused cross-module
     _make_config as _mq_make_config,
 )
@@ -105,6 +109,7 @@ from orchestrator.merge_lane.worker import (
     _verify_worktree_contention_sentinel,
 )
 from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
+    WatchdogTrigger,
     collect_descendants,
     kill_process_tree,
     lane_lock_path,
@@ -117,6 +122,7 @@ from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
 from orchestrator.verify_runner import (
     FLOCK_CONTENTION_CATEGORY,
     MergeVerifySpec,
+    RunnerUnavailable,
     UnscopedTypecheckSpec,
     VerifyCommand,
     _default_ssh_heartbeat_run,
@@ -421,6 +427,46 @@ def spawn_ssh_heartbeat_dispatcher(
     )
 
 
+def loopback_ssh_run(
+    *, heartbeat_interval: float
+) -> Callable[..., Awaitable[tuple[int, str, str]]]:
+    """A RemoteRunner ``ssh_run`` that runs the remote command locally, as ssh would.
+
+    ssh becomes a transparent pipe: the leader's stdin is the REAL heartbeat
+    pipe of :func:`~orchestrator.verify_runner._default_ssh_heartbeat_run`,
+    and its stderr comes back exactly as ssh relays it.  The gate binary the
+    remote command names is this worktree's own CLI, so the leader runs
+    under the stock bootstrap.  The env reaches the leader ambiently -- see
+    :func:`apply_dispatcher_env`.
+    """
+
+    async def ssh_run(argv: list[str], *, cwd: str | Path | None = None) -> tuple[int, str, str]:
+        assert argv[0] == 'ssh', f'RemoteRunner no longer dispatches through ssh: {argv!r}'
+        cli_args = gate_argv(argv[-1])
+        return await _default_ssh_heartbeat_run(
+            [sys.executable, '-c', STOCK_BOOTSTRAP, *cli_args],
+            cwd=cwd,
+            heartbeat_interval=heartbeat_interval,
+        )
+
+    return ssh_run
+
+
+async def git_push_succeeds(
+    argv: list[str], *, cwd: str | Path | None = None
+) -> tuple[int, str, str]:
+    """A RemoteRunner ``run`` that accepts every ``git push`` and nothing else.
+
+    With no ``main_branch``, and the gate's own calls answered by
+    :func:`~_gate_fixtures.gated_run`, the merge-sha push and its
+    ``--delete`` cleanup are the only commands that reach this ``run``.
+    """
+    assert argv[:2] == ['git', 'push'], (
+        f'RemoteRunner sent a non-push command through run: {argv!r}'
+    )
+    return 0, '', ''
+
+
 # ---------------------------------------------------------------------------
 # In-process controllable dispatcher (Rows 2/3/4/6)
 # ---------------------------------------------------------------------------
@@ -507,30 +553,17 @@ def describe_proc_exit(proc: subprocess.Popen, label: str) -> str:
     causes that were otherwise indistinguishable in every log this timeout
     has ever produced; a non-leader *proc* follows its own exit-code
     conventions, not this taxonomy.  ``stderr`` is read ONLY when
-    ``proc.poll()`` is not None, and even then via a ``select()``-bounded raw
-    read (2s ceiling) rather than a buffered ``.read()`` (which blocks to
-    EOF): ``poll()`` only reports *proc*'s own exit, and a short-lived helper
-    it spawned with inherited fds could still be holding the pipe's write end
-    open, which would hang this helper (and the rest of the suite) rather
-    than raise.  The tail (not head) is kept -- see :func:`stderr_tail` --
-    since the actionable line is at the END.
+    ``proc.poll()`` is not None, and even then through
+    :func:`drain_exited_stderr`'s bounded read, so a helper still holding the
+    write end cannot hang this helper (and the rest of the suite).  The tail
+    (not head) is kept -- see :func:`stderr_tail` -- since the actionable line
+    is at the END.
     """
     rc = proc.poll()
     description = f'{label} rc={rc}'
     if rc is not None and proc.stderr is not None:
         try:
-            chunks = []
-            read_deadline = time.monotonic() + 2.0
-            fd = proc.stderr.fileno()
-            while True:
-                remaining = read_deadline - time.monotonic()
-                if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
-                    break
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            tail = stderr_tail(b''.join(chunks))
+            tail = stderr_tail(drain_exited_stderr(proc))
         except Exception as e:  # noqa: BLE001
             tail = f'<unreadable: {e!r}>'
         description += f'; stderr tail:\n{tail}'
@@ -4997,9 +5030,10 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
 
     Asserts within a bounded T that the verify-merge process itself
     self-exits non-zero (the watchdog's controlled ``os._exit(1)``, not an
-    external kill signal), and that every pid snapshotted from the leader's
-    tree while it was alive -- the leader and the start_new_session build --
-    has exited (see :func:`assert_pre_kill_tree_exited`).
+    external kill signal) with the ``eof`` trigger, and only that trigger, on
+    its stderr, and that every pid snapshotted from the leader's tree while
+    it was alive -- the leader and the start_new_session build -- has exited
+    (see :func:`assert_pre_kill_tree_exited`).
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = tmp_path / 'config.yaml'
@@ -5035,6 +5069,11 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
             )
         assert child.returncode != 0, (
             f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
+        )
+        assert_watchdog_fire_trigger(
+            drain_exited_stderr(child).decode(errors='replace'),
+            WatchdogTrigger.EOF,
+            source='Row 2 leader stderr',
         )
 
         assert_pre_kill_tree_exited(
@@ -5079,9 +5118,10 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     here is ~15s rather than production's ~95s; see ROW_WATCHDOG_ENV's comment
     above for the pin rationale and the honest cliff-moved caveat.
 
-    Asserts the leader self-exits non-zero, and that every pid snapshotted
-    from the leader's tree while it was alive -- the leader and the
-    start_new_session build -- has exited (see
+    Asserts the leader self-exits non-zero with the ``heartbeat_starvation``
+    trigger, and only that trigger, on its stderr, and that every pid
+    snapshotted from the leader's tree while it was alive -- the leader and
+    the start_new_session build -- has exited (see
     :func:`assert_pre_kill_tree_exited`).
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
@@ -5123,6 +5163,11 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
         assert child.returncode != 0, (
             f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
         )
+        assert_watchdog_fire_trigger(
+            drain_exited_stderr(child).decode(errors='replace'),
+            WatchdogTrigger.HEARTBEAT_STARVATION,
+            source='Row 3 leader stderr',
+        )
 
         assert_pre_kill_tree_exited(
             tree,
@@ -5135,6 +5180,97 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     finally:
         heartbeat.stop_heartbeats()
         kill_holder_tree(child, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
+
+
+# ---------------------------------------------------------------------------
+# Task 5556 -- trigger attribution, end to end.  A real RemoteRunner dispatches
+# a real verify-merge through the real heartbeat dispatcher, starves it, and
+# follows the watchdog's trigger token through every hop that relays it: the
+# dispatcher's stderr capture and the RunnerUnavailable reason, live; then the
+# merge worker's elided `remote runner unavailable` WARNING, by replaying that
+# captured reason through the real worker rather than a live dispatch.
+# ---------------------------------------------------------------------------
+
+#: Heads the RunnerUnavailable reason this row's dispatch produces.
+LOOPBACK_SSH_HOST: str = 'loopback-verify-host'
+
+#: Far beyond any wait in this module.  run_stdin_heartbeat's first beat lands
+#: at t=interval, so no beat ever arrives and the leader's watchdog takes its
+#: select-timeout branch.
+STARVED_HEARTBEAT_INTERVAL_SECS: float = 3600.0
+
+
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)
+def test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_warning(
+    tmp_path, monkeypatch, caplog
+):
+    """A starved remote self-kill stays attributable all the way to the worker's log.
+
+    Drives a real RemoteRunner whose only doubles are ``git push``, the
+    gate's publish and ensure calls, and an ssh that is a transparent pipe,
+    so the leader's stdin is the real
+    heartbeat pipe and its stderr comes back exactly as ssh relays it.  The
+    reason must carry the watchdog's controlled rc 1 at its head and the
+    starvation token at its tail.  That captured reason is then replayed,
+    through a runner double, into the real merge worker, whose elided
+    WARNING must still name the token.  The EOF trigger is pinned at Row 2
+    instead, because the real dispatcher closes the heartbeat pipe only
+    after its child has exited.
+    """
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    cfg_file = write_verify_config(tmp_path / 'config.yaml', repo, persistent_merge_worktree=False)
+    tag = uuid.uuid4().hex
+    # CLI startup, then one watchdog window plus load headroom: a wedge
+    # detector that costs nothing on the success path.
+    dispatch_ceiling = row_discovery_ceiling_secs() + ROW_TREE_KILL_CEILING_SECS
+
+    with monkeypatch.context() as env:
+        apply_dispatcher_env(env)
+        for key, value in ROW_WATCHDOG_ENV.items():
+            env.setenv(key, value)
+        env.setenv(HOLDER_TAG_ENV, tag)
+        runner = gated_remote_runner(
+            'loopback',
+            LOOPBACK_SSH_HOST,
+            git_remote=str(repo),
+            cwd=repo,
+            config_path=str(cfg_file),
+            run=git_push_succeeds,
+            ssh_run=loopback_ssh_run(heartbeat_interval=STARVED_HEARTBEAT_INTERVAL_SECS),
+            id_factory=lambda: 'trigger-attribution-e2e',
+        )
+        try:
+            with pytest.raises(RunnerUnavailable) as excinfo:
+                asyncio.run(asyncio.wait_for(
+                    runner.run_merge_verify(head_sha, sleeper_spec(300.0)), dispatch_ceiling,
+                ))
+        except TimeoutError:
+            pytest.fail(
+                f'the remote dispatch did not end within {dispatch_ceiling}s: the starved '
+                f'leader\'s watchdog never fired, so its self-kill could not be attributed'
+            )
+        finally:
+            sweep_tagged(tag)
+
+    reason = str(excinfo.value)
+    assert reason.startswith(f'ssh {LOOPBACK_SSH_HOST} exited 1:'), (
+        f'expected the watchdog\'s controlled self-exit (rc 1), not a transport death; '
+        f'reason head: {reason[:300]!r}'
+    )
+    assert_watchdog_fire_trigger(
+        reason, WatchdogTrigger.HEARTBEAT_STARVATION, source='RunnerUnavailable reason'
+    )
+
+    consumer_dir = tmp_path / 'consumer'
+    consumer_dir.mkdir()
+    _, records = asyncio.run(_mq_drive_runner_unavailable(consumer_dir, caplog, reason))
+    assert len(records) == 1, [record.message for record in records]
+    assert 'exited 1' in records[0].message, records[0].message
+    assert_watchdog_fire_trigger(
+        records[0].message,
+        WatchdogTrigger.HEARTBEAT_STARVATION,
+        source='remote runner unavailable WARNING',
+    )
 
 
 # ---------------------------------------------------------------------------
