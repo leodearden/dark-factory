@@ -19,7 +19,7 @@ import os
 import sys
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +44,7 @@ from orchestrator.evals.reviewer_trial.corpus import (
     CorpusDiff,
     CorpusManifest,
 )
+from orchestrator.evals.reviewer_trial.scorer import ScoringResult, score_panel_run
 from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
     VariantConfig,
@@ -611,3 +612,59 @@ async def run_trial(
             all_results.append(r)
 
     return all_results
+
+
+async def run_and_score(
+    variants: Sequence[VariantConfig],
+    corpus: CorpusManifest,
+    *,
+    results_dir: Path | None = None,
+    score_dir: Path | None = None,
+    max_parallel_panels: int = 3,
+    stagger_secs: float = 2.0,
+    prices: dict | None = None,
+    usage_gate: UsageGate | None = None,
+    diff_cap_chars: int = DIFF_CAP_CHARS,
+    on_scored: Callable[[ScoringResult], None] | None = None,
+) -> list[ScoringResult]:
+    """Every reviewer-trial subcommand's score loop: run_trial's panels, each scored through *usage_gate*.
+
+    With *score_dir*, a stored score is reused and only a measured one is
+    stored. *on_scored* sees each score as it lands. See
+    docs/plan-scoring-and-judge.md, "Reviewer-trial panel cache and score loop (task 6741)".
+    """
+    panels = await run_trial(
+        list(variants), corpus, max_parallel_panels=max_parallel_panels, prices=prices,
+        results_dir=results_dir, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars,
+        stagger_secs=stagger_secs,
+    )
+    scores: list[ScoringResult] = []
+    for panel in panels:
+        diff = corpus.get_diff(panel.diff_id)
+        if diff is None:
+            logger.warning('Not scoring %s__%s: its diff is not in the corpus', panel.variant_name, panel.diff_id)
+            continue
+        score = await _score_cached(panel, diff, score_dir=score_dir, usage_gate=usage_gate)
+        if on_scored is not None:
+            on_scored(score)
+        scores.append(score)
+    return scores
+
+
+async def _score_cached(
+    panel: PanelRunResult,
+    diff: CorpusDiff,
+    *,
+    score_dir: Path | None,
+    usage_gate: UsageGate | None,
+) -> ScoringResult:
+    if score_dir is None:
+        return await score_panel_run(panel, diff, usage_gate=usage_gate)
+    score_dir.mkdir(parents=True, exist_ok=True)
+    path = score_dir / _cell_filename(panel.variant_name, panel.diff_id)
+    if path.exists():
+        return ScoringResult.from_dict(json.loads(path.read_text()))
+    score = await score_panel_run(panel, diff, usage_gate=usage_gate)
+    if score.unmeasured is None:
+        path.write_text(json.dumps(asdict(score), indent=2))
+    return score

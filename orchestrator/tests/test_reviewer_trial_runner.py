@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _eval_refusal import answered, refused_agent_result
 from _orch_helpers import build_usage_gate
+from shared.cli_invoke import AgentResult
 from shared.config_models import AccountConfig
 from shared.usage_gate import UsageGate
 from test_reviewer_trial_checkout import _CHANGE_AT_BASE, _commit, _git, _Source
@@ -1198,7 +1199,8 @@ class TestRunAndScore:
 
         async def reviewer(**kwargs):
             reviewer_calls.append(kwargs)
-            return await write_verdict(**kwargs)
+            await write_verdict(**kwargs)
+            return AgentResult(success=True, output='', cost_usd=0.5, duration_ms=1000, turns=1)
 
         async def matcher(**kwargs: object):
             matcher_calls.append(kwargs)
