@@ -167,13 +167,33 @@ class TestVerifyCheckOwner:
 
         assert verified['sidecar'] == {'path': _SIDECAR_PATH, 'on_main': 'does_not_declare'}
 
-    def test_the_read_is_from_main_not_the_working_tree(self, tmp_path: Path) -> None:
+    def test_an_uncommitted_sidecar_is_not_read(self, tmp_path: Path) -> None:
         root = _init_repo(tmp_path / 'repo')
         _write_sidecar(root, yaml.safe_dump(_sidecar_doc(), sort_keys=False))
 
         verified = verify_check_owner(_owner(), project_root=root)
 
         assert verified['sidecar'] == {'path': _SIDECAR_PATH, 'on_main': 'does_not_declare'}
+
+    @pytest.mark.parametrize(
+        ('on_main_doc', 'working_text', 'expected'),
+        [
+            (_sidecar_doc(), yaml.safe_dump(_sidecar_doc(task_id=1234)), 'declares'),
+            (_sidecar_doc(), 'tasks: [unclosed\n', 'declares'),
+            (_sidecar_doc(task_id=1234), yaml.safe_dump(_sidecar_doc()), 'does_not_declare'),
+        ],
+        ids=['declaring-main-dirty-other-task', 'declaring-main-dirty-malformed', 'other-main-dirty-declaring'],
+    )
+    def test_the_content_is_read_from_main_not_the_dirty_working_tree(
+        self, tmp_path: Path, on_main_doc: dict[str, Any], working_text: str, expected: str
+    ) -> None:
+        root = _init_repo(tmp_path / 'repo')
+        _commit_sidecar(root, yaml.safe_dump(on_main_doc, sort_keys=False))
+        _write_sidecar(root, working_text)
+
+        verified = verify_check_owner(_owner(), project_root=root)
+
+        assert verified['sidecar'] == {'path': _SIDECAR_PATH, 'on_main': expected}
 
     @pytest.mark.parametrize(
         'text',

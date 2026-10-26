@@ -4533,10 +4533,14 @@ class Scheduler:
         if check is None:
             check = {'name': check_name, 'kind': detail.get('kind')}
         dep_status = status_map.get(dep_id, 'unknown')
-        owner = derive_check_owner(
-            dep_id=dep_id,
-            dep_metadata=dep_task.get('metadata') or {},
-            check_name=str(check_name),
+        owner = (
+            derive_check_owner(
+                dep_id=dep_id,
+                dep_metadata=dep_task.get('metadata') or {},
+                check_name=check_name,
+            )
+            if isinstance(check_name, str) and check_name
+            else None
         )
         summary, esc_detail = _build_delivered_check_escalation(
             task_id=task_id,

@@ -1,19 +1,4 @@
-"""orchestrator.delivered_check_owner — who declares a failing delivered check
-(task 7514, absorbing 4934).
-
-A ``DEP_CAPABILITY_NOT_DELIVERED`` escalation is filed against the blocked
-DEPENDENT, but the failing ``metadata.delivered_checks`` entry belongs to the
-DEPENDENCY. This module is the one home for "where is that check declared":
-
-- :func:`derive_check_owner` is pure — the scheduler calls it at tick time, so
-  no file is read and no YAML parsed there.
-- :func:`verify_check_owner` reads the owner's sidecar from ``main`` (never the
-  working tree, which the machine-operated checkout may have dirty) and
-  resolves whether it declares the check. Best-effort: it never raises, and no
-  gate verdict depends on it.
-- :func:`render_check_owner` is pure and renders the detail block from the
-  same value the record stores, so prose and data cannot disagree.
-"""
+"""Derive, verify and render which task owns a failing delivered check, and where it is declared."""
 
 from __future__ import annotations
 

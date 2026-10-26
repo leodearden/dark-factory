@@ -1818,19 +1818,24 @@ of `scripts/sitting/preparation.py::to_json_payload`, where `item` is the `key` 
 - The item's briefing disposition decides whether it is recorded now, after investigation, or as a
   direct ask (see "Disposition before briefing (H1–H6)").
 - A `dependency_capability` record (`DEP_CAPABILITY_NOT_DELIVERED`) is about a check the blocked
-  task does NOT own. Read the owner from the record: `get_escalation` returns
-  `delivered_check_owner` (shape: `escalation/src/escalation/models.py::DeliveredCheckOwner`).
-  Its `task_id` is the dependency whose `metadata.delivered_checks` entry `check_name` failed, and
-  its `sidecar` is that dependency's capability manifest, with `on_main` saying whether the file
-  declares the check on `main`. An option that repaths, re-patterns or drops the check edits the
-  owner's sites only: `update_task` on the owner, re-sending its full `delivered_checks` list, plus
-  the sidecar when `on_main` is `declares` (and its `.capability-manifest.md` twin if that names the
-  old path). Settle `unverified` with `git show main:<path>` before writing the option. The record's
-  own task appears in an option only as the task to re-pend; never propose editing its
-  `delivered_checks` or its sidecar. A record without the field (filed before task 7514, or
-  rewritten by an older process) states the same owner in prose: the dependency in the summary's
-  `dep <id>` and the detail's `Dependency: task <id>`. `get_task` it and derive its sidecar from its
-  `metadata.prd_path` (`.md` becomes `.capability-manifest.yaml`).
+  task does NOT own. Read the owner from the record JSON in the item's own queue: the `brief --json`
+  row's `queue_dir` and `escalation_id` name `<queue_dir>/<escalation_id>.json`, else
+  `<queue_dir>/archive/*/<escalation_id>.json`. `mcp__escalation__get_escalation` reaches only
+  dark-factory's own queue, and without `project_root` it answers a foreign id from a same-numbered
+  local record; use it only for a dark-factory item, and pass `project_root` so a foreign id is
+  refused. The record's `delivered_check_owner`
+  (shape: `escalation/src/escalation/models.py::DeliveredCheckOwner`) has a `task_id`, which is the
+  dependency whose `metadata.delivered_checks` entry `check_name` failed, and a `sidecar`, which is
+  that dependency's capability manifest, with `on_main` saying whether the file declares the check on
+  `main`. An option that repaths, re-patterns or drops the check edits the owner's sites only:
+  `update_task` on the owner, re-sending its full `delivered_checks` list, plus the sidecar when
+  `on_main` is `declares` (and its `.capability-manifest.md` twin if that names the old path). Settle
+  `unverified` with `git show main:<path>` before writing the option. The record's own task appears
+  in an option only as the task to re-pend; never propose editing its `delivered_checks` or its
+  sidecar. A record without the field (filed before task 7514, or rewritten by an older process)
+  states the same owner in prose: the dependency in the summary's `dep <id>` and the detail's
+  `Dependency: task <id>`. `get_task` it and derive its sidecar from its
+  `metadata.prd_path` with `shared/src/shared/capability_manifest.py::sidecar_path`.
 
 #### Gate facts are yours to supply
 
@@ -2026,8 +2031,9 @@ Agent found it depends on work that isn't done yet.
 Filed by the scheduler (`agent_role='orchestrator-scheduler'`) when a dependency's
 `metadata.delivered_checks` entry has failed on `main` for `delivered_checks.grace_cycles` ticks.
 The record's task is the blocked DEPENDENT; the check belongs to the dependency named in
-`delivered_check_owner.task_id` (prose fallback and field meanings: the "Investigate before you
-`record`" bullet above). Two cases, with opposite responses (`docs/task-authoring.md` §3.3):
+`delivered_check_owner.task_id`. Read it from the record JSON in the item's own queue; the prose
+fallback, the field meanings and why not `get_escalation` are in the "Investigate before you
+`record`" bullet above. Two cases, with opposite responses (`docs/task-authoring.md` §3.3):
 
 1. **The capability is on main and the check is stale or mis-authored.** An `AUTHORING DIAGNOSIS`
    block, or your own `git grep` at `main` finding the capability elsewhere, shows this. Editing a

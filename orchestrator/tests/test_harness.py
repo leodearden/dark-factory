@@ -22,6 +22,7 @@ import pytest
 from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
 
+from orchestrator import delivered_check_owner
 from orchestrator.config import OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.liveness import MergeLivenessConfigError
@@ -248,33 +249,49 @@ class TestHarnessDeliveredCheckBlockWiring:
 
     @pytest.mark.asyncio
     async def test_callback_deduplicates_on_open_l2(self, tmp_path: Path) -> None:
-        """Second invocation with an open L2 must NOT submit a duplicate escalation."""
+        """Second invocation with an open L2 must NOT submit a duplicate escalation,
+        and must not pay for the owner's sidecar read either."""
         harness = _make_harness(tmp_path)
         mock_queue = _install_mock_escalation_queue(harness)
         harness.scheduler.set_task_status = AsyncMock(return_value=True)
+        owner: DeliveredCheckOwner = {
+            'task_id': '5',
+            'check_name': 'cap',
+            'sidecar': {'path': 'docs/x.capability-manifest.yaml', 'on_main': 'unverified'},
+        }
+        verified: list[DeliveredCheckOwner] = []
 
-        # First call — no open L2 yet → submits
-        mock_queue.get_by_task.return_value = []
-        await _delivered_check_callback(harness)(
-            '42',
-            summary=self._SUMMARY,
-            detail='detail',
-            category='dependency_capability',
-        )
+        def _record_verify(owner_arg: DeliveredCheckOwner, **_kwargs) -> DeliveredCheckOwner:
+            verified.append(owner_arg)
+            return owner_arg
 
-        # Second call — an open L2 now exists → must NOT submit again
-        mock_queue.get_by_task.return_value = [MagicMock()]
-        await _delivered_check_callback(harness)(
-            '42',
-            summary=self._SUMMARY,
-            detail='detail',
-            category='dependency_capability',
-        )
+        callback = _delivered_check_callback(harness)
+        with patch.object(delivered_check_owner, 'verify_check_owner', _record_verify):
+            # First call — no open L2 yet → submits
+            mock_queue.get_by_task.return_value = []
+            await callback(
+                '42',
+                summary=self._SUMMARY,
+                detail='detail',
+                category='dependency_capability',
+                owner=owner,
+            )
+
+            # Second call — an open L2 now exists → must NOT submit again
+            mock_queue.get_by_task.return_value = [MagicMock()]
+            await callback(
+                '42',
+                summary=self._SUMMARY,
+                detail='detail',
+                category='dependency_capability',
+                owner=owner,
+            )
 
         assert mock_queue.submit.call_count == 1, (
             f'Should deduplicate: submit called {mock_queue.submit.call_count} times '
             f'(expected exactly 1)'
         )
+        assert verified == [owner], 'the deduped call must not read the owner sidecar'
         # Dedupe must be scoped to level=2 + agent_role — NOT the broad
         # has_open_l1 the external-dep filer uses (that would mask/be masked
         # by an unrelated open L1/L2 for the same task).

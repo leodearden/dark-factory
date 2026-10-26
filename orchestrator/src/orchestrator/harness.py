@@ -21,7 +21,7 @@ from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 
 from escalation.categories import EscalationCategory
 from escalation.classify import is_done_step_commit_orphan
-from escalation.models import DeliveredCheckOwner
+from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
 from shared.asyncio_tasks import abandon_task
@@ -227,8 +227,6 @@ from orchestrator.zero_progress_requeue import (
 )
 
 if TYPE_CHECKING:
-    from escalation.models import Escalation
-
     from orchestrator.merge_lane.worker import (
         BreakerTrip,
         SpeculativeMergeWorker,
@@ -8404,7 +8402,7 @@ class Harness:
 
     # ── task 3500: authoring-defect diagnosis for a failed delivered check ──
 
-    def _diagnose_delivered_check_authoring(self, check: Mapping[str, Any]) -> str | None:
+    def _diagnose_delivered_check_authoring(self, check: dict[str, Any]) -> str | None:
         """An ``AUTHORING DIAGNOSIS`` block for the failed *check*, or None if clean.
 
         THE POINT OF TASK 3500. ``DEP_CAPABILITY_NOT_DELIVERED`` reads
@@ -8458,7 +8456,7 @@ class Harness:
         summary: str,
         detail: str,
         category: str,
-        check: Mapping[str, Any] | None = None,
+        check: dict[str, Any] | None = None,
         owner: DeliveredCheckOwner | None = None,
     ) -> None:
         """Block a task and file a BORN-AT-L2 escalation for a delivered
@@ -8579,8 +8577,6 @@ class Harness:
             )
             if part
         )
-
-        from escalation.models import Escalation
 
         esc = Escalation(
             id=self._escalation_queue.make_id(task_id),
