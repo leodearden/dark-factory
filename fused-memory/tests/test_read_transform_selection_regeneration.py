@@ -132,6 +132,54 @@ def _stamps_not_on_head(
     return off_head
 
 
+_UNSTAMPED_REASON = (
+    'no blob stamped: the report predates blob stamps, or git could not read '
+    'the fixture when the report was generated, so it cannot be verified'
+)
+
+_ABSENT_AT_HEAD_REASON = (
+    "HEAD's tree has no file at this path: the fixture was never committed, "
+    'or was renamed after the report was generated'
+)
+
+_DIFFERS_REASON = (
+    "HEAD's tree holds other content at this path: the committed fixture is "
+    'not what the report was generated from'
+)
+
+
+def _blobs_head_does_not_hold(
+    provenance: list[dict], *, repo: Path = THIS_CHECKOUT,
+) -> list[dict]:
+    """The stamped blobs ``repo``'s HEAD tree does not hold, each with a kind and reason.
+
+    A pure function of HEAD's tree, not of its history, so a rebase that
+    rewrites the stamped commits cannot change the verdict.
+    ``rev-parse --verify --quiet``, because a bare ``rev-parse HEAD:<missing>``
+    echoes the argument to stdout.
+    """
+    not_held = []
+    for entry in provenance:
+        blob = entry.get('blob')
+        if not blob:
+            kind, reason = 'unstamped', _UNSTAMPED_REASON
+        else:
+            held = subprocess.run(
+                ['git', 'rev-parse', '--verify', '--quiet', f'HEAD:{entry["path"]}'],
+                cwd=repo, capture_output=True, text=True, check=False,
+            )
+            if held.returncode != 0:
+                kind, reason = 'absent_at_head', _ABSENT_AT_HEAD_REASON
+            elif held.stdout.strip() != blob:
+                kind, reason = 'differs', _DIFFERS_REASON
+            else:
+                continue
+        not_held.append({
+            'path': entry['path'], 'blob': blob, 'kind': kind, 'reason': reason,
+        })
+    return not_held
+
+
 _STALE_REMEDY = (
     f'the committed report is stale: regenerate with `{REGENERATE_COMMAND}` '
     'and commit BOTH plans/read-transform-selection-report.{json,md}; never '
