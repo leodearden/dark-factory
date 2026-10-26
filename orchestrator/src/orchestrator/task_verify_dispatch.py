@@ -269,6 +269,14 @@ def _worktree_reader(worktree: Path) -> Callable[[str], str | None]:
     return read
 
 
+def _infra_transient_unavailability(host: str, result: VerifyResult) -> RunnerUnavailable:
+    return RunnerUnavailable(
+        f'{host!r} returned an infra-transient verify (category {result.category!r}): '
+        f'{result.summary}',
+        kind='no_verdict',
+    )
+
+
 async def _reap(task: asyncio.Future[Any]) -> None:
     task.cancel()
     await asyncio.wait({task})
@@ -411,9 +419,10 @@ class TaskVerifyDispatcher:
             return 'runner_unavailable'
         finally:
             draft.remote_wall_secs = time.monotonic() - started
-        self._pool.mark_recovered(lease)
         if not result.passed and result.category in INFRA_TRANSIENT_CATEGORIES:
+            self._pool.mark_unavailable(lease, _infra_transient_unavailability(lease.name, result))
             return 'infra_transient'
+        self._pool.mark_recovered(lease)
         draft.runner = lease.name
         return result
 
