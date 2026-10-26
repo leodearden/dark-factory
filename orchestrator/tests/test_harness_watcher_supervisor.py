@@ -3223,10 +3223,14 @@ def _fenced_code_blocks(text: str) -> list[str]:
 
 def _skill_section(text: str, heading: str) -> str:
     """`heading` up to the next heading of the same or a shallower level,
-    ignoring lines inside ``` fences."""
+    ignoring lines inside ``` fences. `heading` must occur exactly once."""
     lines = text.splitlines()
-    if heading not in lines:
-        raise AssertionError(f'SKILL.md has no heading line {heading!r}')
+    occurrences = lines.count(heading)
+    if occurrences != 1:
+        raise AssertionError(
+            f'SKILL.md has {occurrences} heading lines {heading!r}; '
+            'a section must be found by exactly one'
+        )
     start = lines.index(heading)
     level = len(heading) - len(heading.lstrip('#'))
     boundary = re.compile(rf'#{{1,{level}}} ')
@@ -3440,17 +3444,24 @@ class TestWatcherConvertToTrackedWork:
             f'submit_only_instructions); missing: {missing}'
         )
 
-    def test_branches_on_every_terminal_ticket_status(self) -> None:
-        section = _convert_section()
+    def test_branches_on_every_resolve_ticket_status(self) -> None:
+        resolve_code = '\n'.join(
+            block
+            for block in _fenced_code_blocks(_convert_section())
+            if 'resolve_ticket(' in block
+        )
+        assert resolve_code, 'the Convert section has no resolve_ticket( code block'
         missing = [
             status
-            for status in ('created', 'combined', 'failed', 'refused')
-            if not re.search(rf'\b{status}\b', section)
+            for status in ('created', 'combined', 'failed', 'refused', 'awaiting_curation')
+            if not re.search(rf'["\']{status}["\']', resolve_code)
         ]
         assert not missing, (
-            'the Convert section must branch on every resolve_ticket status '
+            'the resolve_ticket code block must branch on every status it can '
+            'return, each as a quoted literal '
             '(fused-memory/src/fused_memory/server/tools.py::resolve_ticket); '
-            '`refused` is terminal, carries no task_id and is never retried; '
+            '`refused` is terminal, carries no task_id and is never retried, '
+            '`awaiting_curation` is parked and never re-submitted; '
             f'missing: {missing}'
         )
 
@@ -3644,6 +3655,10 @@ class TestWatcherRoutingHandlersAreTerminal:
     A terminal call is a fenced resolve_issue/promote_to_l2 call; a terminal
     link points at the Convert or Promote section. A tool named only in prose
     does not count: a handler can name resolve_issue to forbid it.
+
+    A link counts wherever it sits, prose included, so a handler that links
+    Promote to L2 only to forbid promoting would pass. Telling an instruction
+    from a mention would mean parsing prose, which these tests do not do.
     """
 
     def test_every_routing_handler_ends_in_a_terminal_disposition(self) -> None:
