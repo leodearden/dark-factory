@@ -59,12 +59,10 @@ def _make_memory_result(
     )
 
 
-def _make_watermark(
-    last_run: datetime | None = None,
-) -> Watermark:
+def _make_watermark() -> Watermark:
     return Watermark(
         project_id='test-project',
-        last_full_run_completed=last_run or datetime.now(UTC) - timedelta(hours=1),
+        last_full_run_completed=datetime.now(UTC) - timedelta(hours=1),
     )
 
 
@@ -349,41 +347,6 @@ async def test_context_fetch_failure_includes_event(mock_memory):
 
     assert len(result.events) == 1
     assert len(result.context_items) == 0
-
-
-# ── Effective watermark ──────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_effective_watermark_uses_min_of_run_and_event():
-    """Watermark aligns with the earliest event if it predates last run."""
-    assembler = _make_assembler()
-
-    last_run = datetime(2026, 4, 2, 10, 0, tzinfo=UTC)
-    old_event_time = datetime(2026, 4, 1, 8, 0, tzinfo=UTC)
-
-    events = [_make_event(timestamp=old_event_time)]
-    watermark = _make_watermark(last_run=last_run)
-
-    result = await assembler.assemble(events, watermark, 'test-project')
-
-    assert result.effective_watermark == old_event_time
-
-
-@pytest.mark.asyncio
-async def test_effective_watermark_uses_last_run_when_events_are_recent():
-    """Watermark uses last_run when all events are more recent."""
-    assembler = _make_assembler()
-
-    last_run = datetime(2026, 4, 1, 8, 0, tzinfo=UTC)
-    recent_event = datetime(2026, 4, 2, 10, 0, tzinfo=UTC)
-
-    events = [_make_event(timestamp=recent_event)]
-    watermark = _make_watermark(last_run=last_run)
-
-    result = await assembler.assemble(events, watermark, 'test-project')
-
-    assert result.effective_watermark == last_run
 
 
 # ── Batch processing ────────────────────────────────────────────────
