@@ -18,6 +18,7 @@ from _dashboard_helpers import (
     mcp_notify_response,
     mcp_tool_response,
 )
+from shared.testing_virtual_clock import virtual_clock_test
 
 # ---------------------------------------------------------------------------
 # Schema — events table from orchestrator/src/orchestrator/event_store.py
@@ -2255,9 +2256,15 @@ class TestFetchLiveMergeQueuesFailure:
         assert result['proj8301']['entries'] == []
         assert 'error' in result['proj8301']
 
-    @pytest.mark.asyncio
+    @virtual_clock_test
     async def test_timeout_yields_unreachable(self, _clean_live_sessions):
-        """(b) Slow port with small per_call_timeout → {reachable: False}."""
+        """(b) Slow port with small per_call_timeout → {reachable: False}.
+
+        The answering project must beat the same deadline the slow one
+        misses, so this is a
+        shared/src/shared/testing_virtual_clock.py::virtual_clock_test and
+        host stalls cannot expire the deadline.
+        """
         from dashboard.data.merge_queue import fetch_live_merge_queues
 
         probe_deadline = 0.05
