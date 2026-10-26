@@ -43,9 +43,10 @@ async def _build_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _pooled_git_ops(repo: Path, *, archive: bool) -> GitOps:
+def _pooled_git_ops(repo: Path, *, archive_root: str | None) -> GitOps:
     transcript_archive = (
-        TranscriptArchiveConfig(enabled=True, root=_ARCHIVE_ROOT) if archive else None
+        None if archive_root is None
+        else TranscriptArchiveConfig(enabled=True, root=archive_root)
     )
     return GitOps(
         warm_pool_git_config(), repo, warm_lane_pool_size=1,
@@ -102,7 +103,7 @@ async def test_recycle_acquire_evicts_released_occupants_config_dirs(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     repo = await _build_repo(tmp_path)
-    git_ops = _pooled_git_ops(repo, archive=True)
+    git_ops = _pooled_git_ops(repo, archive_root=_ARCHIVE_ROOT)
 
     lane, _ = await _recycle_after_occupant_a(git_ops, repo, caplog)
 
@@ -122,11 +123,28 @@ async def test_recycle_without_archive_still_leaves_no_husk(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     repo = await _build_repo(tmp_path)
-    git_ops = _pooled_git_ops(repo, archive=False)
+    git_ops = _pooled_git_ops(repo, archive_root=None)
 
     lane, _ = await _recycle_after_occupant_a(git_ops, repo, caplog)
 
     _assert_no_entry_for_occupant_a(lane / '.task')
+
+
+@pytest.mark.asyncio
+async def test_recycle_holds_a_transcript_the_archive_refused_for_the_next_boot_sweep(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    repo = await _build_repo(tmp_path)
+    unwritable_archive = tmp_path / 'archive-is-a-file'
+    unwritable_archive.write_text('not a directory')
+    git_ops = _pooled_git_ops(repo, archive_root=str(unwritable_archive))
+
+    lane, _ = await _recycle_after_occupant_a(git_ops, repo, caplog)
+
+    held_dir = lane / '.task' / f'{CONFIG_DIR_PREFIX}A'
+    assert (held_dir / 'projects' / '-enc' / 'sA.jsonl').is_file()
+    assert not os.path.lexists(held_dir / '.credentials.json')
+    assert not os.path.lexists(lane / '.task' / 'verify')
 
 
 async def _orphan_branch_with_a_commit(repo: Path, tmp_path: Path, start_ref: str) -> None:
@@ -145,7 +163,7 @@ async def test_reattach_acquire_keeps_incoming_tasks_own_config_and_archives_for
     repo = await _build_repo(tmp_path)
     start_ref = await _git(['rev-parse', 'HEAD'], repo)
     await _orphan_branch_with_a_commit(repo, tmp_path, start_ref)
-    git_ops = _pooled_git_ops(repo, archive=True)
+    git_ops = _pooled_git_ops(repo, archive_root=_ARCHIVE_ROOT)
     info_v = await git_ops.acquire_warm_lane('V', start_ref)
     assert isinstance(info_v, WorktreeInfo), f'seed acquire failed: {info_v!r}'
     lane = info_v.path
