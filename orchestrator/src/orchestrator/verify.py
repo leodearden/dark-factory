@@ -35,7 +35,7 @@ from shared.proc_group import terminate_process_group
 from shared.psi import read_psi_sample
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
-from orchestrator import verify_plan
+from orchestrator import verify_evidence, verify_plan
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
@@ -4742,6 +4742,11 @@ class VerifyResult:
             )
         if self.admission_legs is not None:
             self.admission_legs = legs_from_wire(self.admission_legs)
+
+    @property
+    def plan_hash(self) -> str | None:
+        """Identity of the plan this verdict ran (verify_evidence.py::plan_hash)."""
+        return verify_evidence.plan_hash(self.plan)
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
