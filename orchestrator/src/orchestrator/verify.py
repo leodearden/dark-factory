@@ -8469,10 +8469,9 @@ def _executed_module_configs_from_plan(
 ) -> list[ModuleConfig]:
     """Build the ModuleConfig(s) *plan* prescribes running, for the module-config branch.
 
-    The plan->execution bridge (task κ, verify-scope-inversion-prd.md):
-    groups *plan*.runs by module_prefix and, for each *mc* in
-    *module_configs*, rebuilds its three commands from the corresponding
-    PlannedRun's scope_kind:
+    The plan->execution bridge (task κ, verify-scope-inversion-prd.md): for
+    each *mc* in *module_configs* that *plan* executes, rebuilds its three
+    commands from the corresponding PlannedRun's scope_kind:
 
     - SKIPPED -> ``None`` (that check does not run).
     - FULL_SUITE -> *mc*'s OWN verbatim command (preserves e.g.
@@ -8482,42 +8481,17 @@ def _executed_module_configs_from_plan(
     - FILE_SCOPED -> ``render(run.cmd)`` (identical to ``_scope_to_keyword``'s
       output, which itself renders a VerifyCmd — see ``verify_cmd.render``).
 
-    A module whose ONLY run is the "no files under prefix" SKIPPED emitted by
-    ``verify_plan._derive_module_runs`` (a single-element runs list — the
-    normal 3-run-per-module shape never collapses to one) is dropped from the
-    returned list entirely, mirroring ``scope_module_config`` returning
-    ``None`` for a subproject with zero matching files: the caller must skip
-    that subproject rather than run its full unscoped suite.
+    Which modules execute is ``verify_plan.py::executed_module_prefixes``'s rule.
 
     Copies *mc* via ``dataclasses.replace`` so all non-command fields survive.
-
-    Guard: a TRIVIAL *plan* (``derive_verify_plan``'s top-level "no
-    .py/.rs file at all" short-circuit — a single run with
-    ``module_prefix=''``, which matches no real ``mc.prefix``) means every
-    module has zero matching ``.py`` files by construction, so this returns
-    ``[]`` immediately rather than mis-reading the absent per-module lookup
-    as "no commands configured" and emitting a vacuous ModuleConfig per
-    module (``scope_module_config`` returns ``None`` — excluded — for every
-    *mc* in this case too).
     """
-    if len(plan.runs) == 1 and plan.runs[0].scope_kind is verify_plan.ScopeKind.TRIVIAL:
-        return []
-
-    runs_by_prefix: dict[str, list[verify_plan.PlannedRun]] = {}
-    for run in plan.runs:
-        runs_by_prefix.setdefault(run.module_prefix, []).append(run)
-
+    executed_prefixes = verify_plan.executed_module_prefixes(plan)
     executed: list[ModuleConfig] = []
     for mc in module_configs:
-        runs = runs_by_prefix.get(mc.prefix, [])
-        only_run = runs[0] if len(runs) == 1 else None
-        if (
-            only_run is not None
-            and only_run.cmd is None
-            and only_run.scope_kind is verify_plan.ScopeKind.SKIPPED
-        ):
+        if mc.prefix not in executed_prefixes:
             continue
 
+        runs = [run for run in plan.runs if run.module_prefix == mc.prefix]
         commands: dict[str, str | None] = {}
         for run in runs:
             if run.cmd is None:
