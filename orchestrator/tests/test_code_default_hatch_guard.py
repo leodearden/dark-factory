@@ -413,6 +413,103 @@ def test_inline_explicit():
         )
 
 
+class TestDetectorRefusesUnsoundComputedRightHandSides:
+    """A committed ratchet may admit false negatives; it may not admit false positives."""
+
+    def test_rhs_reading_the_asserted_path_holds_under_any_declaration(self, tmp_path):
+        """Both sides track a declaration of the same key, so neither is a landmine."""
+        src = _write(tmp_path, 'test_synth_overlap.py', '''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_same_key_both_sides():
+    cfg = OrchestratorConfig()
+    other = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == other.starvation_watchdog.skip_threshold
+    assert cfg.git.warm_lane_min_free_gib == OrchestratorConfig().git.warm_lane_min_free_gib * 1
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            'an RHS reading the asserted path itself must not be flagged'
+        )
+
+    def test_oversized_exponent_is_not_evaluated(self, tmp_path):
+        """A pathological power must not stall the whole-suite ratchet."""
+        src = _write(tmp_path, 'test_synth_pow.py', '''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_huge_power():
+    cfg = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == 50 * 2 ** 100000 // 2 ** 100000
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            'a power above the exponent bound must not be evaluated'
+        )
+
+    def test_name_reached_mutable_value_is_not_resolved(self, tmp_path):
+        """The scan cannot see a mutation between binding and assertion."""
+        src = _write(tmp_path, 'test_synth_mutated.py', '''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_mutated_local():
+    cfg = OrchestratorConfig()
+    expected = []
+    expected.append('*.yaml')
+    assert cfg.git.merge_config_only_full_gate_globs == expected
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            'a mutable value reached through a name must not be resolved'
+        )
+
+    def test_rebound_local_is_not_resolved(self, tmp_path):
+        """The scan cannot know which of two bindings the assertion sees."""
+        src = _write(tmp_path, 'test_synth_rebound.py', '''
+from orchestrator.config import OrchestratorConfig, load_config
+
+
+def test_rebound(config_path):
+    cfg = OrchestratorConfig()
+    expected = 50
+    expected = load_config(config_path).starvation_watchdog.skip_threshold
+    assert cfg.starvation_watchdog.skip_threshold == expected
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            'a local bound more than once must not be resolved'
+        )
+
+    def test_rhs_rooted_at_a_non_bare_config(self, tmp_path):
+        """Only a bare config's attributes are valued under package defaults."""
+        src = _write(tmp_path, 'test_synth_loaded_rhs.py', '''
+from orchestrator.config import OrchestratorConfig, load_config
+
+
+def test_loaded_rhs(config_path):
+    cfg = OrchestratorConfig()
+    other = load_config(config_path)
+    assert cfg.no_landings_breaker_disk_free_floor_bytes == other.git.warm_lane_min_free_gib * 1024 ** 3
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            'an RHS rooted at a non-bare config must not be resolved'
+        )
+
+    @pytest.mark.parametrize('rhs', ['25 * 2.0', '100 / 2', 'max(50, 0)'],
+                             ids=['float-product', 'true-division', 'call'])
+    def test_unevaluable_or_type_mismatched_rhs(self, tmp_path, rhs):
+        """A float result never matches an int default; a call is not evaluated."""
+        src = _write(tmp_path, 'test_synth_mismatch.py', f'''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_mismatch():
+    cfg = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == {rhs}
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            f'`== {rhs}` must not be flagged against an int default'
+        )
+
+
 # ---------------------------------------------------------------------------
 # THE RATCHET
 # ---------------------------------------------------------------------------
