@@ -38,10 +38,26 @@ class UnitOutcome(StrEnum):
 
 
 class VerifySite(StrEnum):
-    """Which workflow site emitted a ``workflow_verify`` row."""
+    """Which workflow site emitted a ``workflow_verify`` row, and what each reader makes of it.
+
+    Pinned by orchestrator/tests/test_workflow_verify_site_readers.py:
+
+    - merge_lane/disposition.py::_branch_pre_merge_verify_green (I5) ignores pre-merge reds.
+    - merge_lane/completion.py::merge_completion_eligible: a current-run pre-merge green
+      satisfies its passed-row half.
+    - stranded_verified_green.py::last_verified_green_tip: a pre-merge green at the
+      post-rebase tip becomes the latest green tip, and a red is skipped.
+    - verify_checkpoint.py::green_checkpoint_at_tip: a pre-merge green lets a redispatch
+      at that tip skip VERIFY.
+    """
 
     IMPLEMENT = 'implement'
     PRE_MERGE = 'pre_merge'
+
+
+def counts_as_branch_verdict(data: Mapping[str, Any]) -> bool:
+    """False only for a pre-merge red: it was measured on main's tip after the rebase."""
+    return not (data.get('site') == VerifySite.PRE_MERGE and not data.get('passed'))
 
 
 @dataclass(frozen=True)
