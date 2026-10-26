@@ -29,7 +29,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MergeDemand = Callable[[], bool]
-RefusalReason = Literal['no_host', 'host_parked', 'merge_demand', 'pressure_hold']
+RefusalReason = Literal['no_host', 'host_busy', 'host_quarantined', 'host_parked', 'merge_demand']
+_HOST_STATE_PRECEDENCE: tuple[RefusalReason, ...] = ('host_busy', 'host_quarantined', 'host_parked')
 Unwind = Callable[[], Awaitable[object]]
 
 
@@ -114,6 +115,17 @@ class _CancelThenUnwind:
         return await self.runner.probe_clean()
 
 
+def _blocker(allocator: HostAllocator, name: str) -> RefusalReason | None:
+    """Why remote *name* cannot be leased now, or None when it is free."""
+    if allocator.is_parked(name):
+        return 'host_parked'
+    if allocator.is_quarantined(name):
+        return 'host_quarantined'
+    if allocator.is_busy(name):
+        return 'host_busy'
+    return None
+
+
 def _run_once(unwind: Unwind | None) -> Callable[[], Awaitable[None]]:
     remaining = [] if unwind is None else [unwind]
 
@@ -132,7 +144,8 @@ class HostPool:
     cancel probes the host); the pool never writes the allocator's quarantine set (an
     unavailable host is reported through *on_unavailable* and readmission stays
     with the merge lane's tracker, PRD §4.5); :meth:`acquire_for_task` is
-    synchronous, so its check-then-acquire is atomic on the event loop.
+    synchronous, so its check-then-acquire is atomic on the event loop, and it
+    refuses on host state before it reads merge demand.
     """
 
     def __init__(
@@ -156,18 +169,24 @@ class HostPool:
         return self._allocator
 
     def acquire_for_task(self, task_id: str) -> HostLease | Refusal:
-        """Lease a free remote for *task_id*, or say why none was handed out."""
+        """Lease a free remote for *task_id*, or say why none was handed out.
+
+        No remote configured is ``no_host``; when no remote is free the refusal
+        names the most transient blocker present (busy, then quarantined, then
+        parked); only then is merge demand read.
+        """
         allocator = self._allocator
         remotes = [n for n in allocator.host_names if n != allocator.local_name]
         if not remotes:
             return Refusal('no_host')
-        if all(allocator.is_parked(name) for name in remotes):
-            return Refusal('host_parked')
+        blockers = {_blocker(allocator, name) for name in remotes}
+        if None not in blockers:
+            return Refusal(next(r for r in _HOST_STATE_PRECEDENCE if r in blockers))
         if self._merge_demand():
             return Refusal('merge_demand')
         lease = allocator.acquire_remote()
         if lease is None:
-            return Refusal('no_host')
+            return Refusal('host_busy')
         self._holds[lease.name] = (task_id, lease)
         return lease
 

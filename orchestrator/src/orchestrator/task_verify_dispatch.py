@@ -28,7 +28,7 @@ from orchestrator.task_verify_spec import (
 )
 from orchestrator.verify import run_scoped_verification
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
-from orchestrator.verify_hosts import HostPool, Refusal
+from orchestrator.verify_hosts import HostPool, Refusal, RefusalReason
 from orchestrator.verify_plan import derive_verify_plan, executed_module_prefixes
 from orchestrator.verify_runner import RunnerUnavailable
 
@@ -131,9 +131,8 @@ class RedConfirmation:
 
 
 DispatchReason = Literal[
-    'remote', 'not_eligible', 'no_host', 'host_parked', 'merge_demand', 'pressure_hold',
-    'dirty_tree', 'runner_unavailable', 'infra_transient', 'cross_check',
-    'red_confirm', 'dispatcher_error',
+    RefusalReason, 'remote', 'not_eligible', 'dirty_tree', 'runner_unavailable',
+    'infra_transient', 'cross_check', 'red_confirm', 'dispatcher_error',
 ]
 
 

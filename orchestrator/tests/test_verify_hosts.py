@@ -13,7 +13,7 @@ from collections.abc import Callable
 
 import pytest
 
-from orchestrator.verify_hosts import HostPool, Refusal
+from orchestrator.verify_hosts import HostPool, Refusal, RefusalReason
 from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
 
@@ -170,7 +170,7 @@ class TestAcquireForTask:
 
     @pytest.mark.parametrize(('enter_state', 'reason'), _HOST_STATES)
     def test_a_host_state_refusal_is_given_without_reading_merge_demand(
-        self, enter_state: Callable[[HostAllocator, set[str]], None], reason: str,
+        self, enter_state: Callable[[HostAllocator, set[str]], None], reason: RefusalReason,
     ) -> None:
         hooks = _Hooks(demand=[True])
         quarantine: set[str] = set()
