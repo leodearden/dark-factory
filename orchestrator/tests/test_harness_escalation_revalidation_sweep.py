@@ -48,6 +48,7 @@ from orchestrator.verify import VerifyResult
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 def test_config_defaults_escalation_revalidation() -> None:
     """OrchestratorConfig exposes escalation_revalidation_enabled (True) —
     the single operator kill-switch for both new auto-closure paths."""
@@ -98,7 +99,9 @@ def _make_harness() -> Harness:
     """Build a minimal bare Harness for escalation-revalidation-sweep tests."""
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)
-    h.config = OrchestratorConfig()
+    # pin: these tests are about the sweep, not the flag's default; the
+    # kill-switch tests flip it back off
+    h.config = OrchestratorConfig(escalation_revalidation_enabled=True)
     h.scheduler = MagicMock()
     h._escalation_queue = MagicMock()
     h._escalation_queue.make_id = MagicMock(return_value='esc-revalidation-1')
