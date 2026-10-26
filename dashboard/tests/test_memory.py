@@ -15,8 +15,10 @@ from _dashboard_helpers import (
     cold_session_responses,
     mcp_init_response,
     mcp_notify_response,
+    mcp_sse_tool_response,
     mcp_tool_response,
 )
+from shared.mcp_post import MCP_POST_HEADERS, mcp_endpoint_url
 from shared.testing_virtual_clock import virtual_clock_test
 
 from dashboard.data.datum import Datum, DatumState, unknown_datum, validate_datum
@@ -44,6 +46,10 @@ class _SessionAwareHandler:
       cannot bound, and the one that used to wedge a cached session or park an
       aggregating loop before it reached the remaining urls.
 
+    ``tool_reply`` is the framing knob: the ``tools/call`` answer returned
+    verbatim (an SSE-framed or malformed reply) in place of the default
+    JSON-framed ``tool_response``.
+
     ``__call__`` is ``async`` for the sake of that last knob:
     ``httpx.MockTransport.handle_async_request`` awaits a handler that returns
     an awaitable, so parking here parks the post exactly as a silent server
@@ -54,8 +60,10 @@ class _SessionAwareHandler:
     def __init__(self, tool_response: dict | None = None, *, error_status: int | None = None,
                  error_on_tool: Exception | None = None, error_on_all: Exception | None = None,
                  fail_port: int | None = None,
-                 hang_port: int | None = None, hang_always: bool = False):
+                 hang_port: int | None = None, hang_always: bool = False,
+                 tool_reply: httpx.Response | None = None):
         self.tool_response = tool_response or {}
+        self.tool_reply = tool_reply
         self.error_status = error_status
         self.error_on_tool = error_on_tool
         self.error_on_all = error_on_all
@@ -115,6 +123,8 @@ class _SessionAwareHandler:
             # session cache-able — and therefore wedge-able.
             await self._never.wait()
             raise AssertionError('unreachable')  # pragma: no cover
+        if self.tool_reply is not None:
+            return self.tool_reply
         return mcp_tool_response(self.tool_response, request_id)
 
 
@@ -663,21 +673,46 @@ class TestRemainingHelpersThreadTheirBudget:
 # ── SSE response parsing ───────────────────────────────────────
 
 
+def _sse_reply_without_a_data_line() -> httpx.Response:
+    return httpx.Response(
+        200, text='event: message\n\n', headers={'content-type': 'text/event-stream'},
+    )
+
+
 class TestSseResponseParsing:
-    """Tests for SSE response format handling."""
+    """A Streamable-HTTP SSE answer is decoded through the public seam.
 
-    def test_parse_sse_response(self):
-        from dashboard.data.memory import _parse_sse_response
+    The decoder's own contract (both ``data:`` prefixes, last frame wins, the
+    error wording) is owned and pinned by ``shared/tests/test_mcp_post.py``;
+    these pin only that the dashboard's entry points route through it.
+    """
 
-        sse = 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"content":[]}}\n\n'
-        result = _parse_sse_response(sse)
-        assert result['jsonrpc'] == '2.0'
+    async def test_sse_framed_tool_reply_is_decoded(self):
+        from dashboard.data.memory import mcp_tool_call
 
-    def test_parse_sse_no_data_raises(self):
-        from dashboard.data.memory import _parse_sse_response
+        handler = _SessionAwareHandler(tool_reply=mcp_sse_tool_response({'ok': True}))
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
 
-        with pytest.raises(ValueError, match='No data line'):
-            _parse_sse_response('event: message\n\n')
+        assert result == {'ok': True}
+
+    async def test_sse_reply_without_a_data_line_raises_value_error(self):
+        from dashboard.data.memory import mcp_tool_call
+
+        handler = _SessionAwareHandler(tool_reply=_sse_reply_without_a_data_line())
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(ValueError):
+                await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
+
+    async def test_undecodable_reply_reports_memory_status_offline(self, dashboard_config):
+        """ValueError is a per-URL soft failure (``FANOUT_FAILURE_EXCEPTIONS``)."""
+        from dashboard.data.memory import get_memory_status
+
+        handler = _SessionAwareHandler(tool_reply=_sse_reply_without_a_data_line())
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await get_memory_status(client, dashboard_config)
+
+        assert result['offline'] is True
 
 
 # ── Headers ─────────────────────────────────────────────────────
@@ -686,32 +721,32 @@ class TestSseResponseParsing:
 class TestMcpHeaders:
     """Tests that the MCP client sends correct HTTP headers."""
 
-    async def test_accept_header_includes_both_types(self):
-        """Requests include Accept: application/json, text/event-stream."""
+    async def test_every_post_sends_the_shared_mcp_post_headers_to_the_shared_endpoint(self):
+        """Initialize, notify and tools/call all carry shared.mcp_post's wire contract.
+
+        The base is given WITH a trailing slash: the endpoint must still be the
+        slash-less ``/mcp`` that ``mcp_endpoint_url`` produces.
+        """
         from dashboard.data.memory import mcp_tool_call
 
-        captured_headers: list[dict] = []
+        base_url = 'http://localhost:8000/'
+        server = _SessionAwareHandler({'ok': True})
+        posts: list[httpx.Request] = []
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured_headers.append(dict(request.headers))
-            body = json.loads(request.content)
-            method = body.get('method', '')
-            rid = body.get('id', 1)
-            if method == 'initialize':
-                return mcp_init_response(rid)
-            if method.startswith('notifications/'):
-                return mcp_notify_response()
-            return mcp_tool_response({'ok': True}, rid)
+        async def recording_server(request: httpx.Request) -> httpx.Response:
+            posts.append(request)
+            return await server(request)
 
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(transport=transport) as client:
-            await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(recording_server)) as client:
+            await mcp_tool_call(client, base_url, 'get_status', {})
 
-        # All requests should have the dual Accept header
-        for headers in captured_headers:
-            accept = headers.get('accept', '')
-            assert 'application/json' in accept, f'Missing application/json in {accept}'
-            assert 'text/event-stream' in accept, f'Missing text/event-stream in {accept}'
+        assert [c['method'] for c in server.calls] == [
+            'initialize', 'notifications/initialized', 'tools/call',
+        ]
+        for request in posts:
+            assert request.headers['content-type'] == MCP_POST_HEADERS['Content-Type']
+            assert request.headers['accept'] == MCP_POST_HEADERS['Accept']
+            assert str(request.url) == mcp_endpoint_url(base_url)
 
     async def test_session_id_sent_after_init(self):
         """After initialize, subsequent requests include Mcp-Session-Id header."""
