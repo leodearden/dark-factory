@@ -14,7 +14,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import Enum, StrEnum
+from enum import Enum, StrEnum, unique
 from pathlib import Path
 
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
@@ -1076,6 +1076,33 @@ class EventType(StrEnum):
     #   (INV-4). Age surfacing only; nothing times out. Payload:
     #   {waiter: {task_id, module, role, plan_id, wait_secs}, aged_count, alarm_secs}
     verify_admission_wait_aged = 'verify_admission_wait_aged'
+
+    # Shadow eval (plans/live-shadow-eval-prd.md C2). task_id is the PRODUCTION
+    # task the cell shadows; shadow_cell_skipped's data.reason is a
+    # ShadowSkipReason value. The payloads are owned by the coordinator (ε1).
+    shadow_cell_opened = 'shadow_cell_opened'
+    shadow_cell_skipped = 'shadow_cell_skipped'
+    shadow_cell_settled = 'shadow_cell_settled'
+
+
+@unique
+class ShadowSkipReason(StrEnum):
+    """The closed vocabulary of why a shadow trigger opened no cell (INV-11).
+
+    CREDITS_EXHAUSTED is also the reason that settles a running Coding Plan cell
+    cap_excluded (PRD decision 16).
+    """
+
+    SAMPLED_OUT = 'sampled_out'
+    NO_CREDENTIALS = 'no_credentials'
+    ISOLATION_UNAVAILABLE = 'isolation_unavailable'
+    BUDGET_EXHAUSTED = 'budget_exhausted'
+    CREDITS_EXHAUSTED = 'credits_exhausted'
+    CONCURRENCY_FULL = 'concurrency_full'
+    HOST_SATURATED = 'host_saturated'
+    SHAPE_DISABLED = 'shape_disabled'
+    ALREADY_OPEN = 'already_open'
+    PAUSED = 'paused'
 
 
 _MERGE_FINALIZED_ROWS = f"event_type = '{EventType.merge_finalized.value}'"

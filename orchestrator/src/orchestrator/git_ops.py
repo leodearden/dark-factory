@@ -384,6 +384,15 @@ class TrainStackResult:
 #     otherwise-unmatched subjects such as a ``resolve:``-prefixed commit
 #     that cites the task in parens — closing a latent false ``no_citation``
 #     that stranded genuinely-landed tasks using one of these forms.
+#   - A trailing qualifier after the id in the conventional-scope and
+#     ``(task N)`` alternatives (task 4862): ``impl(4369 step-8):``,
+#     ``feat(3043/step-16):``, ``fix(N, esc-N-2):``, ``(task 5018 step-3)``,
+#     ``(task 3770, step-19)``. The separator is the CLOSED class ``[ ,/]``:
+#     a dot would let subtask ``(15.2 …)`` cite parent 15, a hyphen would
+#     read ``(2-phase …)`` or a range ``(4369-4370)`` as a citation, and the
+#     class plus ``\b`` keeps ``(43690 …)`` from citing 4369. The bare
+#     ``({tid})`` arm is deliberately NOT widened: ``(30 s)`` / ``(3 files)``
+#     is the task-4705 false-positive class.
 #
 # The ``{tid}`` placeholder is interpolated via ``str.format`` with the
 # escaped task id; a ``\b`` (word boundary) at each side of the
@@ -392,7 +401,8 @@ class TrainStackResult:
 # alternatives instead use the literal ``\(``...``\)`` as an exact numeric
 # boundary (no ``\b`` needed): ``(1175)`` never matches tid ``117`` or
 # ``11750``. ``#`` and the space in ``(task 50)`` are literals in both
-# engines, so the widened pattern stays valid as ERE and as Python ``re``.
+# engines, and ``[ ,/]``, ``[^)]`` and ``?`` are standard in both, so the
+# widened pattern stays valid as ERE and as Python ``re``.
 #
 # Collision assumption (task 2870, esc-5252-9): the unanchored ``(#{tid})``
 # and bare ``({tid})`` alternatives assume a parenthesized number in a
@@ -406,7 +416,11 @@ class TrainStackResult:
 # attribution gate: a landed but unrelated commit whose subject happened to
 # carry ``(1175)`` for a non-task reason WOULD be attributed to task 1175
 # (its effect genuinely is on main). That collision is accepted as a
-# deliberate tradeoff given the convention above. If this repo ever begins
+# deliberate tradeoff given the convention above. The widened
+# ``(task N <words>)`` arm likewise reads a parenthetical mention of ANOTHER
+# task, e.g. ``(task 4211 lock-contention seam)`` in a 4930 commit, as citing
+# it: the same accepted collision, tolerable because every landing caller
+# pre-establishes the branch's content on main. If this repo ever begins
 # emitting ``(#N)``/``(N)`` where N is a non-task number (e.g. a PR id),
 # narrow these two alternatives to a citation-prefix-qualified form (or drop
 # the bare-number arm) to restore disambiguation.
@@ -427,10 +441,10 @@ class TrainStackResult:
 # ``--extended-regexp`` (ERE) pattern *and* a Python ``re`` pattern.
 DEFAULT_COMMIT_CITATION_PATTERN: str = (
     r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
-    r'(\(\b{tid}\b[):]|.*\btask/{tid}\b)'
+    r'(\(\b{tid}\b([):]|[ ,/][^)]*\))|.*\btask/{tid}\b)'
     r'|^Merge task/{tid} into '
     r'|\(#?{tid}\)'
-    r'|\(task {tid}\)'
+    r'|\(task {tid}([ ,/][^)]*)?\)'
 )
 
 # Fixed name for the persistent warm merge-verify worktree (task 1692).
@@ -11878,6 +11892,7 @@ class GitOps:
 
     async def find_equivalent_commit(
         self, worktree: Path, base_sha: str, target_sha: str,
+        *, patch_id_only: bool = False,
     ) -> str | None:
         """Recover the sha a rebase replayed *target_sha* onto, via ``git patch-id``.
 
@@ -11890,6 +11905,8 @@ class GitOps:
 
         The search over ``base_sha..HEAD`` is :meth:`_find_replay`'s two
         tiers (patch-id, then unique exact subject), unnarrowed.
+        *patch_id_only* drops the subject tier's hit, for a caller whose
+        anchor must carry *target_sha*'s diff (task 4862).
 
         Fully fail-safe: any git error, an unresolvable/GC'd *target_sha*, or
         empty patch-id output yields ``None``, letting the caller fall through
@@ -11901,7 +11918,9 @@ class GitOps:
         """
         try:
             match = await self._find_replay(worktree, target_sha, f'{base_sha}..HEAD')
-            return match[0] if match is not None else None
+            if match is None or (patch_id_only and match[1] != 'patch-id'):
+                return None
+            return match[0]
         except Exception:
             # Fully fail-safe: any git error / unresolvable target yields None so
             # the caller falls through to its existing escalation path. Log at

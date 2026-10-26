@@ -32,16 +32,17 @@ from fused_memory.middleware.curator_types import (
 )
 from fused_memory.middleware.task_curator import TaskCurator
 
-INVOKE = 'fused_memory.middleware.task_curator.invoke_with_cap_retry'
 DEADLINE_SECS = 30.0
 ZOT_ESCALATION_ID = 'esc-curator-7'
 
 
-def _curator(escalator: AsyncMock | None = None, *, breaker_cooldown: float = 600.0) -> TaskCurator:
+def _curator(
+    invoke: AsyncMock, escalator: AsyncMock | None = None, *, breaker_cooldown: float = 600.0,
+) -> TaskCurator:
     config = make_config()
     config.curator.zero_output_breaker_threshold = 1
     config.curator.zero_output_breaker_cooldown_seconds = breaker_cooldown
-    return TaskCurator(config=config, taskmaster=None, escalator=escalator)
+    return TaskCurator(config=config, taskmaster=None, escalator=escalator, invoke=invoke)
 
 
 def _max_turns() -> AgentResult:
@@ -74,8 +75,8 @@ async def _curate_unprepared(curator: TaskCurator, bundle: PreparedCandidate) ->
 
 
 async def _open_breaker(curator: TaskCurator, project_id: str = 'p') -> None:
-    with patch(INVOKE, new=AsyncMock(return_value=zot_agent_result())):
-        opener = await _curate(curator, prepared('Breaker opener'), project_id)
+    """Open *curator*'s breaker; its LLM must answer this call with a ZOT."""
+    opener = await _curate(curator, prepared('Breaker opener'), project_id)
     assert opener.degraded_by_zot
 
 
@@ -83,14 +84,14 @@ class TestCurateDefersOnCuratorOutage:
     @pytest.mark.asyncio
     async def test_a_failed_corpus_defers_and_is_not_cached(self):
         escalator = escalator_double()
-        curator = _curator(escalator)
         corpus = AsyncMock(side_effect=[
             RuntimeError('qdrant down'),
             (pool_with_ids(('42', 'pending')), {**empty_pool_sizes(), 'module': 1}, PoolWithheld()),
         ])
         invoke = AsyncMock(return_value=_combine_into_42())
+        curator = _curator(invoke, escalator)
 
-        with patch(INVOKE, new=invoke), patch.object(curator, '_build_corpus', new=corpus):
+        with patch.object(curator, '_build_corpus', new=corpus):
             first = await _curate_unprepared(curator, prepared('T'))
             second = await _curate_unprepared(curator, prepared('T'))
 
@@ -103,12 +104,11 @@ class TestCurateDefersOnCuratorOutage:
     @pytest.mark.asyncio
     async def test_a_non_zot_llm_failure_defers_and_keeps_its_diagnostics(self):
         escalator = escalator_double()
-        curator = _curator(escalator)
         invoke = AsyncMock(return_value=_max_turns())
+        curator = _curator(invoke, escalator)
 
-        with patch(INVOKE, new=invoke):
-            first = await _curate(curator, prepared('T'))
-            await _curate(curator, prepared('T'))
+        first = await _curate(curator, prepared('T'))
+        await _curate(curator, prepared('T'))
 
         assert first.action == 'defer'
         assert first.defer_reason is DeferReason.LLM_FAILED
@@ -123,10 +123,9 @@ class TestCurateDefersOnCuratorOutage:
     )
     async def test_an_unexpected_llm_exception_defers_and_reports(self, error):
         escalator = escalator_double()
-        curator = _curator(escalator)
+        curator = _curator(AsyncMock(side_effect=error), escalator)
 
-        with patch(INVOKE, new=AsyncMock(side_effect=error)):
-            decision = await _curate(curator, prepared('T'))
+        decision = await _curate(curator, prepared('T'))
 
         assert decision.action == 'defer'
         assert decision.defer_reason is DeferReason.LLM_FAILED
@@ -135,26 +134,24 @@ class TestCurateDefersOnCuratorOutage:
 
     @pytest.mark.asyncio
     async def test_an_open_breaker_defers_without_calling_the_llm(self):
-        curator = _curator(escalator_double())
-        await _open_breaker(curator)
         invoke = AsyncMock(return_value=zot_agent_result())
+        curator = _curator(invoke, escalator_double())
+        await _open_breaker(curator)
 
-        with patch(INVOKE, new=invoke):
-            decision = await _curate(curator, prepared('Second distinct candidate'))
+        decision = await _curate(curator, prepared('Second distinct candidate'))
 
         assert decision.action == 'defer'
         assert decision.defer_reason is DeferReason.ZERO_OUTPUT_BREAKER_OPEN
         assert decision.degraded_by_zot is False
-        invoke.assert_not_awaited()
+        invoke.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_a_zot_on_the_candidates_own_call_still_creates(self):
         escalator = escalator_double()
         escalator.report_failure = AsyncMock(return_value=ZOT_ESCALATION_ID)
-        curator = _curator(escalator)
+        curator = _curator(AsyncMock(return_value=zot_agent_result()), escalator)
 
-        with patch(INVOKE, new=AsyncMock(return_value=zot_agent_result())):
-            decision = await _curate(curator, prepared('ZOT candidate'))
+        decision = await _curate(curator, prepared('ZOT candidate'))
 
         assert decision.action == 'create'
         assert decision.degraded_by_zot is True
@@ -164,7 +161,6 @@ class TestCurateDefersOnCuratorOutage:
     async def test_a_defer_neither_advances_nor_resets_the_degraded_streak(self):
         escalator = escalator_double()
         cooldown = 0.2
-        curator = _curator(escalator, breaker_cooldown=cooldown)
         unusable = agent_result({'action': 'bogus'})
         invoke = AsyncMock(side_effect=[
             *[unusable] * 4,
@@ -173,9 +169,10 @@ class TestCurateDefersOnCuratorOutage:
             zot_agent_result(),
             unusable,
         ])
+        curator = _curator(invoke, escalator, breaker_cooldown=cooldown)
         corpus = AsyncMock(side_effect=RuntimeError('qdrant down'))
 
-        with patch(INVOKE, new=invoke), patch.object(curator, '_build_corpus', new=corpus):
+        with patch.object(curator, '_build_corpus', new=corpus):
             for i in range(4):
                 assert (await _curate(curator, prepared(f'T{i}'))).degraded
             deferrals = [
@@ -210,7 +207,6 @@ async def _curate_batch(
 class TestBatchDefersOnCuratorOutage:
     @pytest.mark.asyncio
     async def test_a_failed_corpus_bundle_defers_and_stays_out_of_the_prompt(self):
-        curator = _curator(escalator_double())
         batch = [
             prepared('Healthy alpha'),
             prepared('Broken beta', corpus_error='qdrant down'),
@@ -220,9 +216,9 @@ class TestBatchDefersOnCuratorOutage:
             {'candidate_index': 0, 'action': 'create', 'justification': 'new alpha'},
             {'candidate_index': 1, 'action': 'create', 'justification': 'new gamma'},
         ]}))
+        curator = _curator(invoke, escalator_double())
 
-        with patch(INVOKE, new=invoke):
-            decisions = await _curate_batch(curator, batch)
+        decisions = await _curate_batch(curator, batch)
 
         assert [d.action for d in decisions] == ['create', 'defer', 'create']
         assert decisions[1].defer_reason is DeferReason.CORPUS_FAILED
@@ -236,54 +232,53 @@ class TestBatchDefersOnCuratorOutage:
 
     @pytest.mark.asyncio
     async def test_an_open_breaker_defers_every_llm_bound_candidate(self):
-        curator = _curator(escalator_double())
-        await _open_breaker(curator)
         invoke = AsyncMock(return_value=zot_agent_result())
+        curator = _curator(invoke, escalator_double())
+        await _open_breaker(curator)
 
-        with patch(INVOKE, new=invoke):
-            decisions = await _curate_batch(
-                curator, [prepared('Alpha'), prepared('Beta'), prepared('Alpha')],
-            )
+        decisions = await _curate_batch(
+            curator, [prepared('Alpha'), prepared('Beta'), prepared('Alpha')],
+        )
 
         assert [d.action for d in decisions] == ['defer', 'defer', 'drop']
         assert {decisions[0].defer_reason, decisions[1].defer_reason} == {
             DeferReason.ZERO_OUTPUT_BREAKER_OPEN,
         }
         assert decisions[2].batch_target_index == 0
-        invoke.assert_not_awaited()
+        invoke.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_breaker_deferrals_neither_advance_nor_reset_the_degraded_streak(self):
         escalator = escalator_double()
         cooldown = 0.2
-        curator = _curator(escalator, breaker_cooldown=cooldown)
         unusable = agent_result({'action': 'bogus'})
+        curator = _curator(
+            AsyncMock(side_effect=[*[unusable] * 4, zot_agent_result(), unusable]),
+            escalator, breaker_cooldown=cooldown,
+        )
 
-        with patch(INVOKE, new=AsyncMock(return_value=unusable)):
-            for i in range(4):
-                assert (await _curate(curator, prepared(f'T{i}'))).degraded
+        for i in range(4):
+            assert (await _curate(curator, prepared(f'T{i}'))).degraded
         await _open_breaker(curator, project_id='q')
         decisions = await _curate_batch(curator, [prepared('Alpha'), prepared('Beta')])
         assert [d.action for d in decisions] == ['defer', 'defer']
         escalator.report_consecutive_degraded.assert_not_awaited()
 
         await asyncio.sleep(cooldown * 1.5)
-        with patch(INVOKE, new=AsyncMock(return_value=unusable)):
-            await _curate(curator, prepared('T5'))
+        await _curate(curator, prepared('T5'))
 
         escalator.report_consecutive_degraded.assert_awaited_once()
         assert escalator.report_consecutive_degraded.await_args.kwargs['streak'] == 5
 
     @pytest.mark.asyncio
     async def test_failed_bisect_leaves_defer(self):
-        curator = _curator(escalator_double())
         batch_failed = AgentResult(
             success=False, output='boom', subtype='error_max_turns', cost_usd=0.0,
         )
         invoke = AsyncMock(side_effect=[batch_failed, _max_turns(), _max_turns()])
+        curator = _curator(invoke, escalator_double())
 
-        with patch(INVOKE, new=invoke), \
-             patch.object(curator, '_build_corpus', side_effect=empty_corpus):
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
             decisions = await _curate_batch(curator, [prepared('Alpha'), prepared('Beta')])
 
         assert [(d.action, d.defer_reason) for d in decisions] == [

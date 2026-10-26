@@ -29,6 +29,7 @@ from escalation.queue import EscalationQueue
 from shared.cli_invoke import PromptBuilder
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 from shared.locking import normalize_lock
+from shared.task_submit import SubmitFailed, SubmitOutcome
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
@@ -96,6 +97,7 @@ class FakeScheduler:
         # scheduler.py::Scheduler.blocked_writes_suppressed: their 'blocked'
         # writes are absorbed, every other write lands.
         self.blocked_write_suppressed_ids: set[str] = set()
+        self.submit_task_calls: list[tuple[dict, float]] = []
 
     async def set_task_status(
         self,
@@ -194,6 +196,11 @@ class FakeScheduler:
         self, name: str, arguments: dict, *, timeout: float = 15
     ) -> dict:
         return {}
+
+    async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
+        """Record the call; the fake files nothing, so it never claims a SubmittedTask."""
+        self.submit_task_calls.append((arguments, timeout))
+        return SubmitFailed('FakeScheduler files nothing')
 
     def release(self, task_id: str) -> None:
         pass

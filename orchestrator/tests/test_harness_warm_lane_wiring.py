@@ -1631,11 +1631,17 @@ class TestReclaimOnExhaustionKnobWiring:
             '(1933 reclaim-on-exhaustion safety valve on by default fleet-wide)'
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_warm_lane_reclaim_on_exhaustion_default_true(self):
         """Stock OrchestratorConfig().git.warm_lane_reclaim_on_exhaustion is
         True (full config-load default resolution; proves defaults.yaml does
         not shadow the Field default — the knob is deliberately absent from
-        defaults.yaml, per PRD W4 decision 6)."""
+        defaults.yaml, per PRD W4 decision 6).
+
+        task 4481: hatched, because "stock" is precisely what it claims —
+        the project layer must not participate, or an operator declaring the
+        knob would make this assert their value rather than the shipped one.
+        """
         assert OrchestratorConfig().git.warm_lane_reclaim_on_exhaustion is True, (
             'OrchestratorConfig().git.warm_lane_reclaim_on_exhaustion must '
             'default to True (1933 valve on by default fleet-wide, PRD W4)'

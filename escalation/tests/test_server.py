@@ -22,6 +22,7 @@ import pytest
 from _escalation_seed import seed_escalation
 from _filing_tools import call_promote
 from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
+from _resolve_issue_call import call_resolve_issue
 from shared.merge_state import MergeReason
 
 from escalation import server as escalation_server
@@ -1141,7 +1142,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='done', terminate=True,
         )
 
@@ -1161,7 +1162,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='done', terminate=False,
         )
 
@@ -1182,7 +1183,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(server, escalation_id=esc.id, resolution='fixed')
+        result = await call_resolve_issue(server, escalation_id=esc.id, resolution='fixed')
 
         assert result.get('status') == 'resolved', f"Expected resolved; got: {result}"
 
@@ -1193,7 +1194,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='resume',
         )
 
@@ -1208,7 +1209,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='restart approved', action='restart',
         )
 
@@ -1227,7 +1228,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='parked', action='park',
         )
 
@@ -1242,7 +1243,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='abandoned', action='abandon',
         )
 
@@ -1255,7 +1256,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='closed', action='close_only',
         )
 
@@ -1311,7 +1312,7 @@ class TestResolveIssueTableBGate:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='bogus',
         )
 
@@ -1338,7 +1339,7 @@ class TestResolveIssueTableBGate:
         server = create_server(queue)
         esc = self._seed_pending(queue, esc_id='esc-tb-0002', category='milestone_gate')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='resume',
         )
 
@@ -1377,7 +1378,7 @@ class TestResolveIssueResolutionActionPersisted:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='parked for human review', action='park',
         )
 
@@ -1399,7 +1400,7 @@ class TestResolveIssueResolutionActionPersisted:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='resume',
         )
 
@@ -1417,7 +1418,7 @@ class TestResolveIssueResolutionActionPersisted:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='closed', action='close_only',
         )
 
@@ -1449,7 +1450,7 @@ class TestResolveIssueResolutionClass:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='done', action='close_only',
             resolution_class='actionable',
         )
@@ -1474,7 +1475,7 @@ class TestResolveIssueResolutionClass:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='resume',
         )
 
@@ -1489,7 +1490,7 @@ class TestResolveIssueResolutionClass:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='resume',
             resolution_class='meh',
         )
@@ -1520,7 +1521,7 @@ class TestResolveIssueResolutionClass:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='done', action='close_only',
             resolution_class=cls,
         )
@@ -1553,7 +1554,7 @@ class TestResolveIssueGrantedFiles:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='granted', action='resume',
             granted_files=['crate/Cargo.toml'],
         )
@@ -1571,7 +1572,7 @@ class TestResolveIssueGrantedFiles:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='resume',
         )
 
@@ -1967,13 +1968,6 @@ class TestChokepointSeverityDowngrade:
 # ---------------------------------------------------------------------------
 # Helpers for promote_to_l2 tests
 # ---------------------------------------------------------------------------
-
-async def _resolve_issue(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the resolve_issue MCP tool directly (sync tool)."""
-    tool = await server.get_tool('resolve_issue')
-    # resolve_issue is a sync def, so tool.fn(...) returns directly
-    return tool.fn(**kwargs)
-
 
 _L2_DEFAULTS: dict[str, Any] = {
     'task_id': 't-1',
@@ -3376,7 +3370,7 @@ class TestPromoteToL2Cascade:
         l2_id = l2_result['id']
 
         # Resolve the L2 via MCP tool
-        resolve_result = await _resolve_issue(server, escalation_id=l2_id, resolution='Root cause fixed')
+        resolve_result = await call_resolve_issue(server, escalation_id=l2_id, resolution='Root cause fixed')
 
         assert resolve_result.get('status') == 'resolved', (
             f'Expected L2 resolved, got: {resolve_result}'
@@ -3402,7 +3396,7 @@ class TestPromoteToL2Cascade:
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
 
-        await _resolve_issue(server, escalation_id=l2_result['id'], resolution='Fix confirmed in prod')
+        await call_resolve_issue(server, escalation_id=l2_result['id'], resolution='Fix confirmed in prod')
 
         m1 = queue.get('esc-l1-1')
         assert m1 is not None
@@ -3423,7 +3417,7 @@ class TestPromoteToL2Cascade:
         )
         l2_id = l2_result['id']
 
-        await _resolve_issue(server, escalation_id=l2_id, resolution='Fixed')
+        await call_resolve_issue(server, escalation_id=l2_id, resolution='Fixed')
 
         m1 = queue.get('esc-l1-1')
         assert m1 is not None
@@ -3444,7 +3438,7 @@ class TestPromoteToL2Cascade:
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
         )
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server,
             escalation_id=l2_result['id'],
             resolution='Not actionable',
@@ -6786,7 +6780,7 @@ class TestResolveIssueEscalateModel:
         server = create_server(queue, harness=harness)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed',
             action='resume', escalate_model=True,
         )
@@ -6801,7 +6795,7 @@ class TestResolveIssueEscalateModel:
         server = create_server(queue, harness=harness)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed',
             action='restart', escalate_model=True,
         )
@@ -6816,7 +6810,7 @@ class TestResolveIssueEscalateModel:
         server = create_server(queue, harness=harness)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed',
             action='resume', escalate_model=False,
         )
@@ -6833,7 +6827,7 @@ class TestResolveIssueEscalateModel:
         server = create_server(queue, harness=harness)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='needs human',
             action='park', escalate_model=True,
         )
@@ -7898,7 +7892,7 @@ class TestResolveIssueSurfacesLateResolution:
         server = create_server(queue)
         self._auto_dismissed(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
             resolved_by='claude-task-3902-steward',
         )
@@ -7939,7 +7933,7 @@ class TestResolveIssueSurfacesLateResolution:
         )
         queue.submit(esc)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id='esc-3902-2', resolution='really fixed it',
             resolved_by='claude-task-3902-steward',
         )
@@ -7956,17 +7950,16 @@ class TestResolveIssueSurfacesLateResolution:
     async def test_already_terminal_path_does_not_resurrect_the_archived_record(
         self, tmp_path: Path,
     ):
-        """(c) The `rec.status == 'pending'` guard still skips the pre-stamp rewrite.
+        """(c) The already-terminal path leaves no queue-root copy.
 
-        `queue._rewrite` targets the queue ROOT, so running it on an archived
-        record would leave a second copy there — the orphan state
-        `TestResolveIdempotent` exists to prevent.
+        A second copy in the queue ROOT beside the archived one is the orphan
+        state `TestResolveIdempotent` exists to prevent.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         self._auto_dismissed(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
             resolved_by='claude-task-3902-steward',
         )
@@ -7986,7 +7979,7 @@ class TestResolveIssueSurfacesLateResolution:
         server = create_server(queue)
         self._auto_dismissed(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
             resolved_by='claude-task-3902-steward', resolution_class='not-a-class',
         )
@@ -8020,7 +8013,7 @@ class TestResolveIssueSurfacesLateResolution:
         server = create_server(queue)
         self._auto_dismissed(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
             resolved_by='claude-task-3902-steward', resolution_class='benign',
         )
@@ -8071,6 +8064,7 @@ class TestResolveIssueDeclaredPinGuard:
         esc_id: str = 'esc-3371-2',
         task_id: str = '3371',
         level: int = 1,
+        pin_declared_reason: str = '',
     ) -> Escalation:
         esc = Escalation(
             id=esc_id,
@@ -8080,6 +8074,7 @@ class TestResolveIssueDeclaredPinGuard:
             category='design_concern',
             summary='a load-bearing pending record',
             level=level,
+            pin_declared_reason=pin_declared_reason,
         )
         queue.submit(esc)
         return esc
@@ -8097,7 +8092,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='close_only',
         )
 
@@ -8110,7 +8105,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='close_only',
         )
 
@@ -8129,7 +8124,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='close_only',
         )
 
@@ -8149,7 +8144,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='close_only',
         )
 
@@ -8172,7 +8167,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue, esc_id=f'esc-3371-{action}')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='closing', action=action,
         )
 
@@ -8190,7 +8185,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed(queue, esc_id=f'esc-plain-{action}')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='closing', action=action,
         )
 
@@ -8206,13 +8201,9 @@ class TestResolveIssueDeclaredPinGuard:
         """The declarer list is the marker, not the prose."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
-        esc = self._seed(queue)
-        rec = queue.get(esc.id)
-        assert rec is not None
-        rec.pin_declared_reason = 'I feel like this one matters'
-        queue._rewrite(esc.id, rec)
+        esc = self._seed(queue, pin_declared_reason='I feel like this one matters')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='closing', action='close_only',
         )
 
@@ -8236,7 +8227,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='bogus',
         )
 
@@ -8266,7 +8257,7 @@ class TestResolveIssueDeclaredPinGuard:
             escalation_server, 'get_http_headers', lambda: {'x-escalation-levels': '0,1'},
         )
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='close_only',
         )
 
@@ -8310,7 +8301,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='rubber-stamp bulk close',
             action='close_only',
         )
@@ -8325,7 +8316,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
         )
 
@@ -8341,7 +8332,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
         )
 
@@ -8359,7 +8350,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue, marked=('esc-3237-1', 'esc-3371-2'))
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
         )
 
@@ -8386,7 +8377,7 @@ class TestResolveIssueDeclaredPinGuard:
         )
         queue.submit(l2)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
         )
 
@@ -8410,7 +8401,7 @@ class TestResolveIssueDeclaredPinGuard:
         l2 = self._homogeneous_cluster(queue)
 
         # The operator deliberately spends the pin on the member alone.
-        spend = await _resolve_issue(
+        spend = await call_resolve_issue(
             server, escalation_id='esc-3371-2', resolution='deliberately spending it',
             action='close_only', acknowledge_declared_pins=['esc-3371-2'],
         )
@@ -8422,7 +8413,7 @@ class TestResolveIssueDeclaredPinGuard:
             'must filter on status rather than on the marker alone'
         )
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
         )
 
@@ -8437,14 +8428,14 @@ class TestResolveIssueDeclaredPinGuard:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         esc = self._seed_declared(queue)
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='deliberately spending it',
             action='close_only', acknowledge_declared_pins=[esc.id],
         )
 
         # A second close of the now-archived record: queue.resolve no-ops, so
         # there is no pin left to spend and nothing to refuse.
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='again', action='close_only',
         )
 
@@ -8458,7 +8449,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue, marked=())
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
         )
 
@@ -8477,7 +8468,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='holding for a human', action='park',
         )
 
@@ -8496,7 +8487,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='deliberately spending it',
             action='close_only', acknowledge_declared_pins=[esc.id],
         )
@@ -8512,7 +8503,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='deliberately spending it',
             action='close_only', acknowledge_declared_pins=['esc-3371-2'],
         )
@@ -8533,7 +8524,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue, marked=('esc-3237-1', 'esc-3371-2'))
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close',
             action='close_only', acknowledge_declared_pins=['esc-3237-1'],
         )
@@ -8551,7 +8542,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close',
             action='close_only', acknowledge_declared_pins=['esc-not-in-this-cluster'],
         )
@@ -8566,7 +8557,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close',
             action='close_only', acknowledge_declared_pins=None,
         )
@@ -8584,7 +8575,7 @@ class TestResolveIssueDeclaredPinGuard:
         esc = self._seed_declared(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.queue'):
-            await _resolve_issue(
+            await call_resolve_issue(
                 server, escalation_id=esc.id, resolution='deliberately spending it',
                 action='close_only', acknowledge_declared_pins=[esc.id],
             )
@@ -8955,7 +8946,7 @@ class TestDeclarePinTool:
         await _declare_pin(
             server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
         )
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='close_only',
         )
 

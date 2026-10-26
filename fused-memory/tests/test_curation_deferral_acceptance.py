@@ -524,7 +524,6 @@ async def test_llm_outage_queues_escalates_then_curates(server, tmp_path):
     backoff_seconds = 1.0
     config = _config(backoff_seconds=backoff_seconds)
     config.curator.batch_max = 1
-    curator = TaskCurator(config=config, taskmaster=None)
     server.taskmaster.tasks['7'] = {'id': '7', 'title': 'Existing task', 'status': 'pending', 'metadata': {}}
     llm_down = True
 
@@ -533,12 +532,13 @@ async def test_llm_outage_queues_escalates_then_curates(server, tmp_path):
             raise FileNotFoundError(2, 'No such file or directory', 'claude')
         return agent_result(_overlapping_or_new(kwargs['prompt']))
 
+    curator = TaskCurator(config=config, taskmaster=None, invoke=AsyncMock(side_effect=invoke))
+
     titles = ['Overlapping work', 'New work A', 'New work B']
     queue = EscalationQueue(escalation_queue_dir(str(tmp_path)))
     with (
         patch.object(TaskCurator, '_build_corpus', _a_corpus_holding_task_7),
         patch.object(TaskCurator, 'record_task', AsyncMock()),
-        patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', AsyncMock(side_effect=invoke)),
     ):
         interceptor, janitor, _ = await server.boot(
             config, curator, known_projects={PROJECT_ID: str(tmp_path)},

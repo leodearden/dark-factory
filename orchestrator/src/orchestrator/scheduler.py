@@ -913,6 +913,9 @@ class SchedulerFacade(Protocol):
     async def dispatch_tool(
         self, name: str, arguments: dict, *, timeout: float = ...,
     ) -> dict: ...
+    async def submit_task(
+        self, arguments: dict, *, timeout: float = ...,
+    ) -> SubmitOutcome: ...
     async def get_tasks(self, *, statuses: Iterable[str] | None = ...) -> list[dict]: ...
     async def get_statuses(
         self, ids: list[str] | None = ...,

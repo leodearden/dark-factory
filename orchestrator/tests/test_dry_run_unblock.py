@@ -30,6 +30,7 @@ from shared.cli_invoke import (
     classify_agent_failure,
 )
 from shared.config_dir import TaskConfigDir
+from shared.process_cost import ProcessCostBasis
 from shared.testing import make_gate_mock
 
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
@@ -559,6 +560,46 @@ class TestEventTagging:
         data = emit_call.kwargs.get('data', {})
         assert data.get('dry_run') is True
         assert 'risk_label' in data
+
+    @pytest.mark.asyncio
+    async def test_event_records_how_the_cost_was_derived(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+        from orchestrator.event_store import EventType
+
+        agent_result = AgentResult(
+            success=True,
+            output='',
+            cost_usd=0.5,
+            structured_output={
+                'proposal_text': 'Rebase on main',
+                'risk_label': 'medium',
+                'files_referenced': [],
+            },
+            cost_basis=ProcessCostBasis.SESSION_DELTA,
+        )
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+        event_store = MagicMock()
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='55',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+                event_store=event_store,
+            )
+
+        [data] = [
+            c.kwargs['data'] for c in event_store.emit.call_args_list
+            if c.args and c.args[0] == EventType.invocation_end
+        ]
+        assert data['cost_basis'] == 'session_delta'
+        assert data['cost_delta_clamped'] is False
 
 
 # ---------------------------------------------------------------------------

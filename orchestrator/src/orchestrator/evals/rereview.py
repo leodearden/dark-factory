@@ -38,6 +38,7 @@ from orchestrator.evals.reviewer_trial.corpus import CorpusDiff
 from orchestrator.evals.reviewer_trial.runner import _run_single_reviewer
 from orchestrator.evals.reviewer_trial.variants import VARIANT_A
 from orchestrator.evals.snapshots import get_diff
+from orchestrator.review_payload import Verdict
 
 logger = logging.getLogger(__name__)
 
@@ -313,14 +314,13 @@ async def rereview_one(
     except Exception as e:
         return RereviewOutcome.error(cand.run_id, f'reviewer raised: {e}')
 
-    if review is None or review.get('verdict') == 'ERROR':
+    if review is None or review.verdict is Verdict.ERROR:
         return RereviewOutcome.error(
             cand.run_id, 'reviewer returned no parseable result',
         )
 
-    issues = review.get('issues') or []
-    blocking = sum(1 for i in issues if i.get('severity') == 'blocking')
-    suggestions = sum(1 for i in issues if i.get('severity') == 'suggestion')
+    blocking = len(review.blocking_issues)
+    suggestions = len(review.suggestions)
 
     # 3. Dump the raw review JSON (atomic).
     raw_path = (
@@ -331,7 +331,7 @@ async def rereview_one(
         'config_name': cand.config_name,
         'run_id': cand.run_id,
         'reviewer': name,
-        'review': review,
+        'review': review.to_record(),
         'cost_usd': cost,
         'timestamp': datetime.now(tz=UTC).isoformat(),
         'base_commit': cand.base_commit,

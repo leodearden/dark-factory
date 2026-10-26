@@ -170,6 +170,19 @@ def config(git_repo: Path) -> OrchestratorConfig:
         max_execute_iterations=5,
         max_verify_attempts=3,
         max_review_cycles=2,
+        # task 4481: the two remaining loop-shape knobs, pinned for the same
+        # reason as the three above rather than inherited from whatever the
+        # operational dark-factory-orchestrator.yaml happens to say.
+        #   judge_after_each_iteration -> TestHappyPath asserts the exact agent
+        #     invocation sequence and count; an operator opting the judge in
+        #     inserts a 'judge' call and breaks both without touching the code.
+        #     Tests that are ABOUT the judge build their own config via
+        #     _config_with_judge(), so they are unaffected by this pin.
+        #   max_amendment_rounds -> TestAmendmentUncommittedWorkGuard asserts
+        #     'wip: amendment round 1' and exactly one recovery event, both of
+        #     which are functions of this bound.
+        judge_after_each_iteration=False,
+        max_amendment_rounds=1,
         git=GitConfig(
             main_branch='main',
             branch_prefix='task/',
@@ -8238,25 +8251,27 @@ class TestBuildAgentEnvCpuPriority:
     def _make_workflow(self, config, git_ops, task_assignment):
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        # pin: these tests are about _build_agent_env, not cpu_priority's default
+        workflow.config.cpu_priority = CpuPriorityConfig(enabled=True, nice=10)
         return workflow
 
     async def test_architect_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
-        """ARCHITECT gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        """ARCHITECT gets DF_AGENT_CPU_NICE='10' with cpu_priority enabled (nice=10)."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
-        # cpu_priority is enabled by default (nice=10)
+        # _make_workflow pins cpu_priority enabled (nice=10)
         env = workflow._build_agent_env(ARCHITECT)
         assert env is not None
         assert env.get('DF_AGENT_CPU_NICE') == '10'
 
     async def test_implementer_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
-        """IMPLEMENTER gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        """IMPLEMENTER gets DF_AGENT_CPU_NICE='10' with cpu_priority enabled (nice=10)."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
         env = workflow._build_agent_env(IMPLEMENTER)
         assert env is not None
         assert env.get('DF_AGENT_CPU_NICE') == '10'
 
     async def test_debugger_receives_df_agent_cpu_nice(self, config, git_ops, task_assignment):
-        """DEBUGGER gets DF_AGENT_CPU_NICE='10' with default (enabled) cpu_priority."""
+        """DEBUGGER gets DF_AGENT_CPU_NICE='10' with cpu_priority enabled (nice=10)."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
         env = workflow._build_agent_env(DEBUGGER)
         assert env is not None
@@ -8350,6 +8365,8 @@ class TestBuildAgentEnvCpuGovern:
     def _make_workflow(self, config, git_ops, task_assignment):
         stub = AgentStub()
         workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+        # pin: the coexistence test asserts DF_AGENT_CPU_NICE == '10'
+        workflow.config.cpu_priority = CpuPriorityConfig(enabled=True, nice=10)
         return workflow
 
     async def test_architect_receives_df_agent_cpu_govern_and_path(
@@ -8444,7 +8461,7 @@ class TestBuildAgentEnvCpuGovern:
         workflow.worktree = governed_worktree.root
         workflow.config.cpu_governance = self._governance(enabled=True)
         workflow.config.jobserver = JobserverConfig(enabled=True, task_fifo=str(fifo))
-        # cpu_priority is enabled by default (nice=10)
+        # _make_workflow pins cpu_priority enabled (nice=10)
 
         env = workflow._build_agent_env(IMPLEMENTER)
         assert env is not None

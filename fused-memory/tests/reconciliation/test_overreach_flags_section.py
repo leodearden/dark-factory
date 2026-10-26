@@ -7,22 +7,27 @@ edges.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import sqlite3
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _overreach_shadow_fixtures import judged_edge, judged_episode, non_judging_shadow
 
 from fused_memory.config.schema import (
     FusedMemoryConfig,
-    OverreachGuardConfig,
     ReconciliationConfig,
 )
 from fused_memory.models.reconciliation import (
     AssembledPayload,
+    ReconciliationRun,
     RunStatus,
+    RunType,
+    StageId,
     StageReport,
     Watermark,
 )
@@ -41,14 +46,11 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
 )
-from fused_memory.services.overreach_guard import PROMPT_VERSION, EdgeJudgement, JudgeEdge
+from fused_memory.services.overreach_guard import PROMPT_VERSION
 from fused_memory.services.overreach_shadow import (
-    JudgedEpisode,
     OverreachFlag,
     OverreachFlagPage,
-    OverreachShadow,
     OverreachShadowStore,
-    ShadowOutcome,
 )
 from reconciliation.consolidator_fixtures import make_consolidator
 
@@ -56,11 +58,6 @@ MODULE_LOGGER = 'fused_memory.reconciliation.overreach_flags'
 PROJECT, OTHER = 'proj', 'other'
 T0 = datetime(2026, 10, 17, 12, 0, 0, tzinfo=UTC)
 T1 = T0 + timedelta(minutes=5)
-
-
-class _NeverJudges:
-    async def generate_response(self, *args, **kwargs):
-        raise AssertionError('fetching flags must never judge')
 
 
 class _Graph:
@@ -82,41 +79,21 @@ def _clock(*instants: datetime) -> Callable[[], datetime]:
     return lambda: queue.pop(0) if len(queue) > 1 else queue[0]
 
 
-def _episode(graph: str, uuid: str) -> JudgedEpisode:
-    return JudgedEpisode(
-        graph=graph, episode_uuid=uuid, judge_model='judge-m', prompt_version=PROMPT_VERSION,
-        classifiers=('category_decisions',), minted_count=2, outcome=ShadowOutcome.judged,
-    )
-
-
-def _judged(edge_uuid: str, label: str) -> tuple[JudgeEdge, EdgeJudgement]:
-    return (
-        JudgeEdge(uuid=edge_uuid, fact=f'fact of {edge_uuid}', source_name='S', target_name='T'),
-        EdgeJudgement(edge_uuid=edge_uuid, label=label, rationale=f'span for {edge_uuid}'),
-    )
-
-
-def _shadow(store: OverreachShadowStore, graph: _Graph | None = None) -> OverreachShadow:
-    return OverreachShadow(
-        store, _NeverJudges(), 'judge-m', graph or _Graph(), lambda: OverreachGuardConfig(),
-    )
-
-
 async def _seeded_store(tmp_path) -> OverreachShadowStore:
     store = await OverreachShadowStore.open(tmp_path / 'sidecar', clock=_clock(T0, T1, T1))
-    await store.record(episode=_episode(PROJECT, 'ep-a'), judgements=[
-        _judged('a1', 'overreach'), _judged('a2', 'holding'),
+    await store.record(episode=judged_episode('ep-a', graph=PROJECT), judgements=[
+        judged_edge('a1', 'overreach'), judged_edge('a2', 'holding'),
     ])
-    await store.record(episode=_episode(PROJECT, 'ep-b'), judgements=[
-        _judged('b2', 'overreach'), _judged('b1', 'overreach'),
+    await store.record(episode=judged_episode('ep-b', graph=PROJECT), judgements=[
+        judged_edge('b2', 'overreach'), judged_edge('b1', 'overreach'),
     ])
-    await store.record(episode=_episode(OTHER, 'ep-x'), judgements=[_judged('x1', 'overreach')])
+    await store.record(episode=judged_episode('ep-x', graph=OTHER), judgements=[judged_edge('x1', 'overreach')])
     return store
 
 
 @pytest_asyncio.fixture
 async def shadow(tmp_path):
-    runner = _shadow(await _seeded_store(tmp_path))
+    runner = non_judging_shadow(await _seeded_store(tmp_path), _Graph())
     yield runner
     await runner.close()
 
@@ -173,7 +150,7 @@ class TestFetch:
 
     @pytest.mark.asyncio
     async def test_a_flag_whose_edge_is_gone_or_retired_is_not_offered(self, tmp_path) -> None:
-        runner = _shadow(await _seeded_store(tmp_path), _Graph(gone=['b1'], retired=['b2']))
+        runner = non_judging_shadow(await _seeded_store(tmp_path), _Graph(gone=['b1'], retired=['b2']))
         try:
             page = await fetch_overreach_flags(runner, PROJECT)
             await acknowledge_overreach_flags(runner, page)
@@ -221,10 +198,10 @@ class TestCarryOver:
             tmp_path / 'burst', clock=_clock(*(T0 + timedelta(seconds=i) for i in range(count))),
         )
         for i in range(count):
-            await store.record(episode=_episode(PROJECT, f'ep-{i:02d}'), judgements=[
-                _judged(f'e-{i:02d}', 'overreach'),
+            await store.record(episode=judged_episode(f'ep-{i:02d}', graph=PROJECT), judgements=[
+                judged_edge(f'e-{i:02d}', 'overreach'),
             ])
-        runner = _shadow(store)
+        runner = non_judging_shadow(store, _Graph())
         try:
             first = await fetch_overreach_flags(runner, PROJECT)
             await acknowledge_overreach_flags(runner, first)
@@ -382,6 +359,68 @@ class TestHarnessWiring:
         assert [_keys(page) for page in stage_1_pages] == [
             [('ep-a', 'a1'), ('ep-b', 'b1'), ('ep-b', 'b2')],
         ] * 2
+
+    @pytest.mark.parametrize('error', [
+        pytest.param(sqlite3.OperationalError('disk I/O error'), id='raises'),
+        pytest.param(asyncio.CancelledError(), id='cancelled'),
+    ])
+    @pytest.mark.asyncio
+    async def test_a_cycle_whose_complete_run_fails_leaves_its_flags_for_the_next(
+        self, cycle_harness, shadow, stage_1_pages, error,
+    ) -> None:
+        cycle_harness.memory.overreach_shadow = shadow
+        real_complete_run = cycle_harness.journal.complete_run
+        completions_failed: list[str] = []
+
+        async def complete_run_failing_once(run_id: str, status: str) -> None:
+            if status == 'completed' and not completions_failed:
+                completions_failed.append(run_id)
+                raise error
+            await real_complete_run(run_id, status)
+
+        with (
+            patch.object(cycle_harness.journal, 'complete_run', complete_run_failing_once),
+            pytest.raises(type(error)),
+        ):
+            await cycle_harness.run_full_cycle(PROJECT, 'test-trigger')
+        await cycle_harness.run_full_cycle(PROJECT, 'test-trigger')
+        assert [_keys(page) for page in stage_1_pages] == [
+            [('ep-a', 'a1'), ('ep-b', 'b1'), ('ep-b', 'b2')],
+        ] * 2
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_run_that_skips_stage_1_acknowledges_nothing(
+        self, cycle_harness, shadow, stage_1_pages,
+    ) -> None:
+        cycle_harness.memory.overreach_shadow = shadow
+        interrupted_at = datetime.now(UTC) - timedelta(minutes=10)
+        interrupted = ReconciliationRun(
+            id='run-to-resume',
+            project_id=PROJECT,
+            run_type=RunType.full,
+            trigger_reason='test-trigger',
+            started_at=interrupted_at,
+            status=RunStatus.interrupted,
+            stage_reports={StageId.memory_consolidator.value: StageReport(
+                stage=StageId.memory_consolidator,
+                started_at=interrupted_at,
+                completed_at=interrupted_at,
+            )},
+            session_id='S',
+            stage_cursor=StageId.task_knowledge_sync.value,
+            instance_id=cycle_harness.buffer.instance_id,
+        )
+        await cycle_harness.journal.start_run(interrupted)
+
+        resumed = await cycle_harness.run_full_cycle(
+            PROJECT, 'resume_after_restart', resume_run=interrupted, events=[],
+        )
+        fresh = await cycle_harness.run_full_cycle(PROJECT, 'test-trigger')
+
+        assert (resumed.status, fresh.status) == (RunStatus.completed, RunStatus.completed)
+        assert [_keys(page) for page in stage_1_pages] == [
+            [('ep-a', 'a1'), ('ep-b', 'b1'), ('ep-b', 'b2')],
+        ]
 
     @pytest.mark.asyncio
     async def test_no_shadow_runs_the_cycle_without_flags(self, cycle_harness, stage_1_pages) -> None:

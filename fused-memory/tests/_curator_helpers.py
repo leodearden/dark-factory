@@ -6,7 +6,7 @@ A plain module rather than conftest.py, for the reason ``_fm_helpers.py`` gives.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -61,17 +61,80 @@ def pool_with_ids(*pairs: tuple[str, str]) -> list[PoolEntry]:
 
 
 def prepared(
-    title: str, pool: Iterable[PoolEntry] = (), corpus_error: str | None = None,
+    title: str,
+    pool: Iterable[PoolEntry] = (),
+    corpus_error: str | None = None,
+    *,
+    candidate: CandidateTask | None = None,
+    withheld: PoolWithheld | None = None,
 ) -> PreparedCandidate:
-    """A prepared bundle for *title* over *pool*; *corpus_error* marks a failed assembly."""
+    """A prepared bundle for *title* over *pool*; *corpus_error* marks a failed assembly.
+
+    *candidate* replaces the title-only candidate when a test needs every
+    field, and *withheld* is the census of what the caps kept out of *pool*.
+    """
     entries = list(pool)
     return PreparedCandidate(
-        candidate=CandidateTask(title=title),
+        candidate=candidate if candidate is not None else CandidateTask(title=title),
         pool=entries,
         pool_sizes={**empty_pool_sizes(), 'module': len(entries)},
         prompt_tokens=0,
+        withheld=withheld,
         corpus_error=corpus_error,
     )
+
+
+def batch_create_result(n: int) -> AgentResult:
+    """A successful batch verdict that creates each of *n* candidates."""
+    return agent_result({
+        'decisions': [
+            {'candidate_index': i, 'action': 'create', 'justification': f'c{i}'}
+            for i in range(n)
+        ],
+    })
+
+
+_BATCH_CANDIDATE_HEADING = '# Candidate batch_index='
+
+
+def candidates_in(prompt: str) -> int:
+    """How many candidates a batch *prompt* carries; 0 for a single-candidate prompt."""
+    return prompt.count(_BATCH_CANDIDATE_HEADING)
+
+
+InvokeArm = AgentResult | BaseException | Callable[[dict[str, Any]], AgentResult]
+
+
+def _answer(arm: InvokeArm, kwargs: dict[str, Any]) -> AgentResult:
+    if isinstance(arm, BaseException):
+        raise arm
+    if isinstance(arm, AgentResult):
+        return arm
+    return arm(kwargs)
+
+
+def invoke_by_role(*, single: InvokeArm, batch: InvokeArm) -> AsyncMock:
+    """An ``invoke_with_cap_retry`` stand-in that answers each curator call by its ledger role.
+
+    A ``'task_curator'`` call is answered by *single* and a
+    ``'task_curator_batch'`` call by *batch*. An arm is returned when it is an
+    ``AgentResult``, raised when it is an exception, and otherwise called with
+    the call's keyword arguments. Any other role fails the test.
+    """
+    arms = {'task_curator': single, 'task_curator_batch': batch}
+
+    async def invoke(**kwargs: Any) -> AgentResult:
+        role = kwargs.get('role')
+        if role not in arms:
+            raise AssertionError(f'unexpected curator invocation role {role!r}')
+        return _answer(arms[role], kwargs)
+
+    return AsyncMock(side_effect=invoke)
+
+
+def must_not_invoke() -> AsyncMock:
+    """An ``invoke_with_cap_retry`` stand-in for paths that must never reach the LLM."""
+    return AsyncMock(side_effect=AssertionError('the curator must not call the LLM'))
 
 
 def zot_agent_result() -> AgentResult:

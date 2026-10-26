@@ -1252,12 +1252,15 @@ class TestValidateAssignment:
 class TestParkStopConfig:
     """park_stop_* config fields: defaults and ge/gt validators."""
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_park_stop_enabled_default_true(self):
         assert OrchestratorConfig().park_stop_enabled is True
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_park_stop_parked_threshold_default(self):
         assert OrchestratorConfig().park_stop_parked_threshold == 15
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_park_stop_parked_window_hours_default(self):
         assert OrchestratorConfig().park_stop_parked_window_hours == 1.0
 
@@ -1269,6 +1272,7 @@ class TestParkStopConfig:
         with pytest.raises(ValidationError):
             OrchestratorConfig(park_stop_parked_window_hours=0.0)
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults_yaml_has_park_stop_block(self):
         """defaults.yaml must carry the park_stop_* keys with the documented defaults.
 
@@ -2025,6 +2029,7 @@ class TestJobserverConfig:
         with pytest.raises(ValidationError):
             JobserverConfig(enabled=True, task_fifo='')
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_has_jobserver_field(self):
         """OrchestratorConfig exposes a jobserver field that defaults to disabled."""
         cfg = OrchestratorConfig()
@@ -2083,6 +2088,7 @@ class TestCpuPriorityConfig:
         assert cfg.nice == 19
         assert cfg.agent_env() == {'DF_AGENT_CPU_NICE': '19'}
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_has_cpu_priority_field(self):
         """OrchestratorConfig exposes a cpu_priority field defaulting to enabled."""
         cfg = OrchestratorConfig()
@@ -2196,6 +2202,7 @@ class TestCpuGovernConfig:
         assert cfg.resolved_exec_path(tmp_path) == str(exec_file)
         assert cfg.resolved_shim_dir(tmp_path) == str(agent_bin)
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_has_cpu_governance_field(self):
         """OrchestratorConfig exposes a cpu_governance field defaulting to enabled=False."""
         from orchestrator.config import CpuGovernConfig
@@ -2425,6 +2432,7 @@ class TestParkBackfillConfig:
     instead of silently breaking the admission gate.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults(self):
         """Bare OrchestratorConfig() exposes the four backfill leaves.
 
@@ -2573,6 +2581,7 @@ class TestPinReservationConfig:
     def test_pin_reservation_leaves_are_green_tier_reloadable(self, leaf):
         assert leaf in RELOADABLE_FIELDS
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_reloading_the_kill_switch_flips_the_live_config(self):
         live = OrchestratorConfig()
         assert live.pin_reservations_enabled is True, 'premise: enabled before the reload'
@@ -2810,6 +2819,7 @@ class TestNoLandingsBreakerTuning:
             f'disk_free_floor_bytes ({floor:,}) must be >= 1 GiB; got {floor}'
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_disk_free_floor_matches_warm_lane_min_free_gib_default(self):
         """Default disk_free_floor_bytes is aligned with git.warm_lane_min_free_gib.
 
@@ -2839,6 +2849,7 @@ class TestNoLandingsBreakerTuning:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestWarmLaneGcConfig:
     """OrchestratorConfig exposes the two new warm-lane-GC cadence knobs.
 
@@ -3999,6 +4010,7 @@ class TestSessionResumeConfig:
         )
         assert widened.absolute_resume_age_secs > widened.freshness_window_secs
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_exposed_on_orchestrator_config(self):
         """A default OrchestratorConfig exposes `.session_resume` as a
         SessionResumeConfig instance under the literal field name.
@@ -4044,6 +4056,7 @@ class TestSessionResumeConfig:
                 '(green-tier hot-reloadable via _submodel_leaf_paths)'
             )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_restore_from_archive_defaults_on(self):
         """task 3578: the arm-site rehydration ships ON, with its own switch.
 
@@ -4089,6 +4102,7 @@ class TestMainTipSweepIsolatedPrefilterEnabled:
     ``main_tip_sweep_rerun_confirm_enabled``.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults_to_true(self):
         """Default-on, matching the rest of the main_tip_sweep family."""
         assert OrchestratorConfig().main_tip_sweep_isolated_prefilter_enabled is True
@@ -4636,6 +4650,7 @@ class TestInfoL0RouterConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults(self):
         config = OrchestratorConfig()
         assert config.info_l0_router_enabled is True

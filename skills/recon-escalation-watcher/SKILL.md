@@ -239,12 +239,9 @@ show freshness, because the heartbeat is the file's mtime.
 1. Drain all pending recon escalations
 2. Start the watcher: `scripts/watcher-rearm.sh` (background task, recon queue
    dir, NO --level, --timeout 3600)
-3. Wait for it to exit. THREE exit paths — tell them apart, don't assume a fire:
-     FIRED   (exit 0, escalation JSON on stdout) → go to 4
-     CEILING (exit 124, NO escalation payload)   → the bounded slice just
-             expired; SKIP step 4 and fall through to the drain (5)
-     KILLED / ERROR (any OTHER rc: 137|143|144, or 2 for a usage/env
-             failure) → STOP and report to the human; do NOT re-arm
+3. Wait for it to exit, then branch per "Distinguishing the exits at step 3"
+   below: FIRED → 4; CEILING → 5, skipping 4; KILLED / ERROR → that table's
+   row and its identical-retry cap
 4. Read the escalation from watcher output; fetch full detail via MCP
 5. Reap orphans again (step 0), then drain any other pending escalations
 6. Handle each
@@ -257,32 +254,27 @@ show freshness, because the heartbeat is the file's mtime.
 9. Go to 2
 ```
 
-**Distinguishing the exits at step 3.** The wrapper emits a machine-readable
-`WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` line to
-**stderr** on every run — use it rather than inventing your own vocabulary. A
-`CEILING` wake carries no escalation payload; reading it as a fired-but-empty
-escalation is the mistake this step exists to prevent. It is not an error and
-needs no report — just re-drain and re-arm.
+**Distinguishing the exits at step 3.** The wrapper prints a machine-readable
+`WATCHER_REARM_OUTCOME: <OUTCOME> exit=<rc>` line to **stderr** on every watcher
+run — branch on it rather than inventing your own vocabulary, and check the exit
+**code** first (exit 2 prints no marker). A `CEILING` wake carries no escalation
+payload; reading it as a fired-but-empty escalation is the mistake this table
+exists to prevent.
 
-`KILLED` (137/143/144) and `ERROR` (any other rc) are **not** re-arm paths.
-Report to the human and stop the loop: something killed the watcher or the
-launch itself failed, and neither self-heals by trying again. The one you are
-most likely to hit is **exit 2** — a usage/env guard, most often an unset
-`DARK_FACTORY_ROOT` (thrice-observed startup failure,
-`plans/confusion-census-2026-07-24.md` §1.5). It returns *instantly*, before
-the watcher is ever invoked, so falling through to "re-drain and re-arm" turns
-a mis-configured launch into a hot busy-loop of failed invocations — and this
-queue's **sole closer** would never actually be watching. Note that exit 2
-prints a plain stderr diagnostic and **no** `WATCHER_REARM_OUTCOME` marker
-(`scripts/watcher-rearm.sh` header, lines 59-63), so check the exit **code**
-first; do not infer "no marker" means the run is still in flight.
+| Marker | Exit | Next |
+|---|---|---|
+| `WATCHER_REARM_OUTCOME: FIRED` | 0 | Go to step 4 and drain. Exit 0 with EMPTY stdout is a caught SIGTERM (`escalation.watcher` converts it to a clean `sys.exit(0)`; `scripts/watcher-rearm.sh` header), a non-fire that counts against the cap: this queue's **sole closer** must not silently skip a cycle on it. |
+| `WATCHER_REARM_OUTCOME: CEILING` | 124 | The bounded slice expired. Not an error, no report: skip step 4, re-drain and re-arm. The cap exempts it. |
+| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Something reaped the background task (codebook `watcher-loop-harness-mismatch`). Re-touch the `recon-watcher-<project>` lease, then re-arm per the cap. Counts against the cap. |
+| `WATCHER_REARM_OUTCOME: ERROR` | any other; exit 2 prints NO marker | Read the stderr diagnostic before any retry. Exit 2 is a usage/env guard (most often an unset `DARK_FACTORY_ROOT`, `plans/confusion-census-2026-07-24.md` §1.5): it returns *instantly*, before the watcher runs (`scripts/watcher-rearm.sh` header), and recurs until the invocation is fixed, so fix it instead of spending the retry on it. Every other rc counts against the cap. |
 
-Also: **exit 0 with EMPTY stdout is a non-fire**, never proof an escalation was
-printed. `escalation.watcher` installs a SIGTERM handler that converts a
-SIGTERM into a clean `sys.exit(0)`, so a killed watcher surfaces as
-`FIRED exit=0` with nothing on stdout (`scripts/watcher-rearm.sh` header,
-lines 65-72). Check for non-empty stdout before treating exit 0 as a fire —
-this queue's **sole closer** must not silently skip a cycle on a caught signal.
+**Identical-retry cap: 1.** After KILLED, ERROR, a missing marker or an
+empty-stdout FIRED, re-issue the identical invocation (same script, flags and
+background launch) at most once. If it fails again, change the invocation
+materially or stop the loop and report the outcome to the human; never loop on
+the identical call. Falling through to "re-drain and re-arm" on a failing
+launch turns a mis-configured launch into a hot busy-loop of failed invocations
+while this queue's sole closer is not actually watching.
 
 ### Reaping orphans (standing authorization — Leo, esc-5793-2, 2026-09-23)
 

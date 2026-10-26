@@ -658,6 +658,7 @@ def _load_package_defaults() -> dict:
 class TestZeroProgressRequeueConfig:
     """The detector must be operator-visible, tunable, and hot-reloadable."""
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_section_is_registered_on_orchestrator_config(self):
         """OrchestratorConfig exposes zero_progress_requeue with the defaults.
 

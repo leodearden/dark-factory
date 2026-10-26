@@ -27,6 +27,7 @@ from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     extract_open_gate_task_ids,
     sweep_resolved_curator_gates,
 )
+from fused_memory.reconciliation.dangling_citation import render_dangling_citation_line
 from fused_memory.reconciliation.degenerate_task_node_sweep import (
     extract_terminal_task_ids,
     sweep_degenerate_task_nodes,
@@ -2115,7 +2116,9 @@ def _format_findings(findings: list[dict]) -> str:
 
     Each finding is formatted with its header fields (description, severity,
     category, suggested_action) followed by the four typed citation lists
-    (cited_entities, cited_edges, cited_tasks, cited_memories) from PRD §9.3.
+    (cited_entities, cited_edges, cited_tasks, cited_memories) from PRD §9.3,
+    then the dangling-citation line naming the repair ids when the finding
+    carries that handoff record (task 5749).
     Empty citation lists are omitted from output.
 
     Rendering limits (reviewer finding incomplete_rendering):
@@ -2206,6 +2209,10 @@ def _format_findings(findings: list[dict]) -> str:
                 memory_strs += f', ... +{extra} more'
                 logger.debug('_format_findings: finding %d cited_memories truncated (%d dropped)', i, extra)
             parts.append(f'   Cited memories: {memory_strs}')
+
+        line = render_dangling_citation_line(f)
+        if line is not None:
+            parts.append(f'   {line}')
 
         lines.append('\n'.join(parts))
     return '\n'.join(lines)

@@ -86,7 +86,6 @@ from orchestrator.agents.roles import (
     AgentRole,
     reviewers_for,
 )
-from orchestrator.agents.triage import suggestion_hash
 from orchestrator.agents.write_set import (
     WriteSet,
     compute_write_set,
@@ -97,8 +96,10 @@ from orchestrator.artifacts import (
     PLAN_TASK_TEXT_FP_KEY,
     ReviewAggregation,
     TaskArtifacts,
+    iteration_entry_written_by_orchestrator,
 )
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
 from orchestrator.delivered_checks import (
     DeliveredChecksBlock,
     gate_mark_done_on_delivered_checks,
@@ -119,6 +120,7 @@ from orchestrator.git_ops import (
     _run,
     is_wip_safety_commit,
 )
+from orchestrator.l0_promotion import promote_l0_to_l1
 from orchestrator.main_health_actions import MainHealthNextAction
 from orchestrator.main_health_fix_owner import (
     FixOwner,
@@ -138,9 +140,13 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_reported_landing,
 )
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
+from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.recut_ruling import ruling_to_enforce
 from orchestrator.review_inputs import gather_review_subject, review_fork_point
 from orchestrator.review_outcome import review_completed_payload
+from orchestrator.review_suggestions.curator_intake import (
+    review_suggestion_submit_arguments,
+)
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.routing import (
     PlanShape,
@@ -5436,28 +5442,20 @@ class TaskWorkflow:
 
         assert result is not None  # range(2) always executes at least once
 
-        # RC2 deterministic catch: the architect filed a fresh L0 escalation
-        # in lieu of writing a plan.  Route straight to L1 (skip the steward,
-        # skip the no-plan loop) — the architect already filed an L0, so
-        # _mark_blocked must not create another one.
+        # RC2 deterministic catch: the architect escalated in lieu of writing
+        # a plan.  Its new L0s are promoted verbatim to L1 and the task blocks
+        # behind them, skipping the steward and the no-plan loop.  An
+        # info-only filing is not an escalation in lieu of a plan; it falls
+        # through to the no-plan handler.  A refused promotion does not: a
+        # fallback L1 carries the L0's finding.
         if not self.plan and self.escalation_queue:
             post_l0 = self.escalation_queue.get_by_task(
                 self.task_id, status='pending', level=0,
             )
             new_l0 = [e for e in post_l0 if e.id not in pre_l0_ids]
-            if new_l0:
-                summary = new_l0[0].summary
-                logger.warning(
-                    'Task %s: architect filed L0 without plan (%s) — '
-                    'auto-promoting to L1 to break no-plan loop',
-                    self.task_id, summary[:120],
-                )
-                return await self._mark_blocked(
-                    f'Architect filed L0 without plan: {summary}',
-                    detail=new_l0[0].detail,
-                    escalate_to_human=True,
-                    skip_escalation=True,  # the architect already filed one
-                )
+            blocked = await self._block_on_architect_escalations(new_l0)
+            if blocked is not None:
+                return blocked
 
         if not self.plan:
             cls = classify_agent_failure(result)
@@ -6375,6 +6373,87 @@ class TaskWorkflow:
             )
 
         return await self._mark_blocked(reason, detail=detail)
+
+    async def _block_on_architect_escalations(
+        self, filed: list[Escalation],
+    ) -> WorkflowOutcome | None:
+        """Promote every L0 the architect *filed* to L1 and block behind them.
+
+        Returns ``None`` when none of *filed* is a queue handoff.  An L0 that
+        cannot be promoted is carried by a fallback L1 instead.
+        """
+        lead = next((e for e in filed if is_queue_handoff(e)), None)
+        if lead is None:
+            return None
+        promoted: list[Escalation] = []
+        refused: list[Escalation] = []
+        for l0 in filed:
+            l1 = self._promote_architect_l0(l0)
+            if l1 is None:
+                refused.append(l0)
+            else:
+                promoted.append(l1)
+        if self.event_store:
+            for l1 in promoted:
+                self.event_store.emit(
+                    EventType.escalation_created,
+                    task_id=self.task_id, phase=self.state.value,
+                    data={
+                        'escalation_id': l1.id, 'category': l1.category,
+                        'severity': l1.severity, 'level': 1,
+                        'summary': l1.summary[:200],
+                    },
+                )
+        promoted_ids = ', '.join(l1.id for l1 in promoted)
+        if refused:
+            refused_ids = ', '.join(e.id for e in refused)
+            logger.warning(
+                'Task %s: architect filed L0 without plan — promoted to [%s]; '
+                'could not promote [%s], filing a fallback L1 that carries them',
+                self.task_id, promoted_ids, refused_ids,
+            )
+            return await self._mark_blocked(
+                f'Architect filed L0 without plan; could not promote '
+                f'{refused_ids} to L1: {refused[0].summary}',
+                detail='\n\n'.join(
+                    f'[{e.id}] {e.summary}\n{e.detail}' for e in refused
+                ),
+                escalate_to_human=True,
+            )
+        logger.warning(
+            'Task %s: architect filed L0 without plan (%s) — promoted to %s '
+            'to break no-plan loop',
+            self.task_id, lead.summary[:120], promoted_ids,
+        )
+        return await self._mark_blocked(
+            f'Architect filed L0 without plan: {lead.summary}',
+            detail=lead.detail,
+            skip_escalation=True,
+        )
+
+    def _promote_architect_l0(self, l0: Escalation) -> Escalation | None:
+        """Promote one architect L0 to L1.
+
+        Returns ``None`` when its L1 cannot be filed, leaving the L0 pending
+        for the caller's fallback.
+        """
+        assert self.escalation_queue is not None
+        try:
+            return promote_l0_to_l1(
+                self.escalation_queue, l0,
+                agent_role='orchestrator-workflow',
+                why='architect filed it in lieu of a plan',
+                detail_suffix=self._durable_ref_suffix(),
+                filing_claimant_run_id=self._filing_claimant_run_id,
+                resolved_by='orchestrator-workflow',
+            )
+        except (OSError, ValueError):
+            logger.warning(
+                'Task %s: could not promote architect L0 %s (%s) to L1; '
+                'leaving it pending',
+                self.task_id, l0.id, l0.summary[:120], exc_info=True,
+            )
+            return None
 
     async def _check_infra_resume_thrash(self) -> WorkflowOutcome | None:
         """Fix 2 — detect & escalate repeated infra-issue resume thrash.
@@ -8558,8 +8637,9 @@ class TaskWorkflow:
 
                 self._emit_review_completed(review_cycle + 1, reviews)
                 # Cap exhausted or nothing in-scope — existing DONE path.
-                # Route suggestions directly to the curator intake (fire-and-
-                # forget); fall back to memory write when there are none.
+                # Route suggestions directly to the curator intake (awaited;
+                # the disposition reports delivery); fall back to memory
+                # write when there are none.
                 # _escalate_suggestions is retained as the steward fallback
                 # but is no longer called from this path.
                 if reviews.suggestions:
@@ -9991,7 +10071,7 @@ class TaskWorkflow:
         """Re-derive stale-``pending`` plan steps to ``done`` from the
         durable iteration log's ``steps_completed`` records (task 2387).
 
-        Unions every ``.task/iterations.jsonl`` entry's ``steps_completed``
+        Unions every ``iterations.jsonl`` entry's ``steps_completed``
         into the set of step IDs genuinely completed on this branch, then
         flips any plan.json step currently "pending" whose ID is in that set
         to "done".
@@ -10051,24 +10131,15 @@ class TaskWorkflow:
         base. Reuses ``status.entries`` from the guard call rather than
         re-reading the iteration log.
 
-        **Granularity caveat**: the guard above is branch-level, not
-        per-step — it only asserts that *some* genuine work landed on this
-        branch, then trusts every step id named anywhere in the union of
-        ``steps_completed``. It does not verify that any individual step's
-        own commit is reachable or that its claimed files actually changed.
-        A log entry that over-claims (names a step in ``steps_completed``
-        whose own change was later reverted or failed) is still flipped to
-        "done" as long as the branch has real work elsewhere. This mirrors
-        the project's existing trust-the-durable-log design (see this
-        task's design_decisions) — per-step correctness depends entirely on
-        implementer log fidelity, not on independent per-step verification.
-
-        Entries recording no durable commit (``committed is False``, task
-        2759) are excluded from the ``steps_completed`` union: a step marked
-        completed in a round where HEAD never advanced did not actually land
-        on the branch, so it must not be re-derived to done even when the
-        branch has other genuine work. Legacy entries lacking the ``committed``
-        key are unaffected.
+        **Which entries count as evidence.** Only entries the orchestrator
+        itself wrote (``artifacts.py::iteration_entry_written_by_orchestrator``)
+        feed the union and the per-step commit map: agents also append to
+        this file by hand (task 5726). Of those, an entry recording no
+        durable commit (``committed is False``, task 2759) is skipped too,
+        since its step never landed; legacy entries lacking the key count.
+        Within the remaining entries the trust is the implementer ledger's
+        per-round done-diff, not independent per-step verification — the
+        guard above is branch-level — and VERIFY remains the semantic gate.
 
         Emits a single ``event='plan_step_rederive'`` iteration-log entry
         (naming every re-derived step id) when at least one step is
@@ -10105,11 +10176,11 @@ class TaskWorkflow:
             # of a step is the one whose sha the plan should carry.
             step_commit: dict[str, str] = {}
             for entry in status.entries:
-                # An entry that explicitly recorded no durable commit
-                # (committed:False, task 2759) did not land its step on the
-                # branch — exclude it from the union so a step "completed" with
-                # no commit is not re-derived to done even when the branch has
-                # other real work. Legacy entries lack the key and fall through.
+                # Agent-appended lines (task 5726) and rounds that recorded no
+                # durable commit (task 2759) are evidence of neither a step's
+                # completion nor its commit.
+                if not iteration_entry_written_by_orchestrator(entry):
+                    continue
                 if entry.get('committed') is False:
                     continue
                 entry_steps = entry.get('steps_completed') or []
@@ -14901,6 +14972,10 @@ class TaskWorkflow:
                     'model_id': result.model_id,
                     'capped': capped,
                     'capped_reason': capped_reason,
+                    # How cost_usd was derived (shared.process_cost, task
+                    # 5818); mirrors the steward emitter.
+                    'cost_basis': result.cost_basis.value,
+                    'cost_delta_clamped': result.cost_delta_clamped,
                 },
             )
 
@@ -16985,8 +17060,14 @@ class TaskWorkflow:
         :func:`orchestrator.task_status.is_infra_held`) see it.  The internal
         ``WorkflowState.BLOCKED`` transition and escalation filing below are
         unaffected by this choice.
-        *skip_escalation* suppresses escalation creation when a level-1
-        escalation already exists (e.g. steward re-escalated to human).
+        *skip_escalation* states that the caller has ALREADY filed the task's
+        human-facing level>=1 record (e.g. the steward's re-escalation, a
+        halt-owning L1, the L1s promoted from the architect's L0s).  So this
+        method files no L0, starts no steward and files no fall-through L1.
+        Pending L0s are dismissed on the way out only while an open handoff
+        covers them (:meth:`_dismiss_l0s_covered_by_handoff`).  It cannot be
+        combined with *escalate_to_human*, which would be silently ignored;
+        that pair raises ``ValueError``.
         *merge_phase* suppresses the ENTRY task-status transition
         (blocked/pending) so the caller can retry the merge in-place rather
         than requeueing through the scheduler.  It does NOT suppress the park
@@ -17031,6 +17112,14 @@ class TaskWorkflow:
         human-judgement/infra cases and must NOT receive a proposal — leave
         their callers with spawn_dry_run=False (the default).
         """
+        if escalate_to_human and skip_escalation:
+            raise ValueError(
+                '_mark_blocked: escalate_to_human=True cannot be combined with '
+                'skip_escalation=True. skip_escalation means the caller already '
+                'filed the human-facing level>=1 record, so escalate_to_human '
+                'would be silently ignored. File the L1 first, then pass '
+                'skip_escalation alone.'
+            )
         if self.machine.is_terminal():
             logger.warning(
                 'Task %s: already %s, ignoring late blocked transition: %s',
@@ -17146,27 +17235,6 @@ class TaskWorkflow:
                 block_class=(disposition.block_class if disposition is not None else None),
             )
         logger.warning(f'Task {self.task_id} BLOCKED: {reason}')
-
-        if self.escalation_queue and skip_escalation:
-            # Defensive cleanup: L0 should already be cleared by
-            # _wait_for_resolution, but dismiss any stragglers (race
-            # between the L0-empty check and the L1 check).
-            remaining_l0 = self.escalation_queue.get_by_task(
-                self.task_id, status='pending', level=0,
-            )
-            if remaining_l0:
-                logger.warning(
-                    'Task %s: %d L0 escalation(s) still pending at '
-                    'mark_blocked(skip_escalation=True) — dismissing',
-                    self.task_id, len(remaining_l0),
-                )
-                for esc in remaining_l0:
-                    self.escalation_queue.resolve(
-                        esc.id,
-                        'Auto-dismissed: task blocked after steward re-escalation',
-                        dismiss=True,
-                        resolved_by='auto-dismissed',
-                    )
 
         if self.escalation_queue and not skip_escalation:
             # Fix C short-circuit: the caller determined this failure is not
@@ -17466,7 +17534,8 @@ class TaskWorkflow:
         # skip_escalation guard (task 2757): a skip_escalation=True caller has
         # ALREADY filed its own signature-specific L1 (train halt → wip_conflict/
         # unmerged_state; main-health auto-heal → preexisting_main_break; architect
-        # no-plan → the promoted L0; steward re-escalation → the steward's L1).
+        # no-plan → the L1s promoted from its L0s; steward re-escalation → the
+        # steward's L1).
         # Before the terminal gate became signature-aware, the bare
         # has_open_l1(task_id) dedup masked this fall-through for those callers
         # (any open L1 suppressed it).  Now that _ensure_l1_escalation_for_blocked
@@ -17481,39 +17550,56 @@ class TaskWorkflow:
                 reason, detail or reason, category=category,
             )
 
-        # Fix #2 — dismiss any still-pending L0 now that we are exiting BLOCKED.
-        # The steward has finished (or never ran) and this workflow slot is
-        # about to exit, so the L0's only consumer is dead.  Leaving it pending
-        # strands an orphan that the orphan-L0 reaper later promotes into a
-        # DUPLICATE L1 (esc-3576-234 in the 2026-05-29 incident) — pure churn,
-        # since _ensure_l1_escalation_for_blocked above already filed the human-
-        # facing L1.  Mirrors the defensive dismissal block at the
-        # skip_escalation path above.  Guarded on escalation_queue because the
-        # fall-through is also reached when no queue is wired.
+        # Fix #2 — this slot is exiting BLOCKED, so a pending L0's only
+        # consumer is dead; left pending, the orphan-L0 reaper later promotes
+        # it into a DUPLICATE of the L1 already open (esc-3576-234).  The
+        # dismissal is gated on that L1 actually covering it: see
+        # _dismiss_l0s_covered_by_handoff.
         if self.escalation_queue:
-            orphan_l0 = self.escalation_queue.get_by_task(
-                self.task_id, status='pending', level=0,
-            )
-            for esc in orphan_l0:
-                self.escalation_queue.resolve(
-                    esc.id,
-                    'Auto-dismissed: workflow exiting BLOCKED, steward done '
-                    '(L1 filed for human handoff)',
-                    dismiss=True,
-                    resolved_by='auto-dismissed',
-                )
-            if orphan_l0:
-                logger.info(
-                    'Task %s: dismissed %d orphan L0(s) on BLOCKED fall-through '
-                    '(steward consumer dead; L1 already filed)',
-                    self.task_id, len(orphan_l0),
-                )
+            self._dismiss_l0s_covered_by_handoff()
         observed = await self._park_merge_phase_row(
             merge_phase, block_status,
             why=f'BLOCKED fall-through: {reason[:80]}',
         )
         return _record(
             observed if observed is not None else WorkflowOutcome.BLOCKED,
+        )
+
+    def _dismiss_l0s_covered_by_handoff(self) -> None:
+        """Dismiss pending L0s only while open level>=1 records pin the block.
+
+        Coverage is the stranded-blocked sweep's own veto, so a dismissal can
+        never leave a blocked row unpinned.  An uncovered L0 stays pending,
+        named in a WARNING, for the orphan-L0 reaper to promote.
+        """
+        assert self.escalation_queue is not None
+        pending = self.escalation_queue.get_by_task(self.task_id, status='pending')
+        l0s = [e for e in pending if e.level == 0]
+        if not l0s:
+            return
+        handoffs = [e for e in pending if e.level >= 1]
+        if not records_pin_blocked_recovery(
+            self.task_id, handoffs, live_claimant=False,
+        ):
+            for esc in l0s:
+                logger.warning(
+                    'Task %s: leaving L0 %s (agent_role=%s, category=%s) '
+                    'pending on BLOCKED exit: no open level>=1 handoff covers '
+                    'it, so the orphan-L0 reaper will promote it',
+                    self.task_id, esc.id, esc.agent_role, esc.category,
+                )
+            return
+        covering = ', '.join(e.id for e in handoffs)
+        for esc in l0s:
+            self.escalation_queue.resolve(
+                esc.id,
+                f'Auto-dismissed: workflow exiting BLOCKED; covered by open {covering}',
+                dismiss=True,
+                resolved_by='auto-dismissed',
+            )
+        logger.info(
+            'Task %s: dismissed %d L0(s) on BLOCKED exit, covered by open %s',
+            self.task_id, len(l0s), covering,
         )
 
     async def _park_merge_phase_row(
@@ -17917,52 +18003,34 @@ class TaskWorkflow:
         except Exception as e:
             logger.warning(f'Failed to write suggestions to memory: {e}')
 
-    async def _post_submit_tasks(self, arguments_list: list[dict]) -> None:
-        """Fire-and-forget: POST all submit_task calls to the fused-memory MCP.
+    async def _post_submit_tasks(self, arguments_list: list[dict]) -> SubmitBatchResult:
+        """Submit every ``submit_task`` in *arguments_list* and report what each became.
 
-        Uses a single shared client — ``shared.mcp_post.open_mcp_client`` —
-        for the entire batch so only one TCP connection pool is opened per
-        routing call regardless of how many suggestions are being submitted.
-        That is why the client is opened here rather than inside
-        ``post_mcp_tool_call``.  Runs inside ``asyncio.create_task`` so the
-        caller returns immediately.
-
-        Per-POST exceptions are caught and logged as warnings; a failure on one
-        suggestion does not abort the remaining submissions.
+        A thin seam over ``orchestrator.curator_submit.submit_task_batch``,
+        which owns the transport and its never-raise, warn-per-failure policy.
         """
         if self.mcp is None:
-            return
-        try:
-            async with open_mcp_client() as client:
-                for arguments in arguments_list:
-                    try:
-                        await post_mcp_tool_call(
-                            client,
-                            self.mcp.url,
-                            'submit_task',
-                            arguments,
-                            context=f'curator submit_task for task {self.task_id}',
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            'Task %s: failed to submit curator task (fire-and-forget): %s',
-                            self.task_id, exc,
-                        )
-        except Exception as exc:
-            logger.warning(
-                'Task %s: failed to open HTTP client for curator submits: %s',
-                self.task_id, exc,
-            )
+            return SubmitBatchResult.failed(arguments_list, 'no MCP transport configured')
+        return await submit_task_batch(
+            self.mcp.url,
+            arguments_list,
+            context=f'curator submit_task for task {self.task_id}',
+        )
 
     async def _route_review_suggestions_to_curator(
         self, reviews: ReviewAggregation,
     ) -> SuggestionDisposition:
-        """Route review suggestions directly to the curator intake (fire-and-forget).
+        """Hand review suggestions to the curator intake and report whether they landed.
 
-        Inserts suggestions as CandidateTask tickets via ``submit_task`` MCP calls.
-        The curator's ``_curator_worker`` drains tickets asynchronously; this method
-        returns immediately after scheduling regardless of curator speed, and
-        reports which sink it handed the batch to.
+        One ``submit_task`` per suggestion, AWAITED, so the disposition states
+        delivery rather than intent: CURATOR only when every suggestion holds a
+        curator ticket, UNDELIVERED when any does not.  ``submit_task`` only
+        inserts a ticket — the curator's ``_curator_worker`` decides later — and
+        the whole batch is bounded by
+        ``orchestrator.curator_submit.BATCH_DEADLINE_SECS``.
+        The in-instance hash is recorded only after full delivery, so DEDUPED
+        means "already delivered" and a re-entry retries a batch that did not
+        land.
 
         Cross-submission dedup is handled by the curator R4 gate
         ``_check_escalation_idempotency`` which matches
@@ -17974,8 +18042,7 @@ class TaskWorkflow:
         is left to the curator's semantic dedup.
 
         Must NOT call curate_batch — that dispatches invoke_with_cap_retry and
-        can stall up to 31 minutes.  Uses asyncio.create_task +
-        ``self._background_tasks`` (mirrors ``_spawn_dry_run_unblock``).
+        can stall up to 31 minutes.
 
         When ``self.mcp`` is not configured (e.g. CLI / dry-run / test contexts),
         falls back to ``_escalate_suggestions`` if an escalation queue is available,
@@ -18029,53 +18096,24 @@ class TaskWorkflow:
                 return SuggestionDisposition.DROPPED
         task_id = self.task_id
         project_root = str(self.config.project_root)
-
-        all_arguments = []
-        for suggestion in suggestions:
-            cat = suggestion.get('category', '')
-            loc = suggestion.get('location', '')
-            desc = suggestion.get('description', '')
-            title = f'[{cat}] {loc}: {desc[:60]}'
-
-            all_arguments.append({
-                'title': title,
-                'description': desc,
-                'details': json.dumps(suggestion),
-                'priority': 'low',
-                'project_root': project_root,
-                'metadata': {
-                    'spawned_from': task_id,
-                    'spawn_context': 'review_suggestions',
-                    'escalation_id': f'review-suggestions-{task_id}',
-                    'suggestion_hash': suggestion_hash(suggestion),
-                },
-            })
-
-        # Schedule the entire batch as one background task with a shared HTTP
-        # client — avoids opening N separate connection pools for N suggestions.
-        try:
-            _task = asyncio.create_task(
-                self._post_submit_tasks(all_arguments),
-                name=f'route-suggestions-{task_id}',
+        result = await self._post_submit_tasks([
+            review_suggestion_submit_arguments(
+                suggestion, task_id=task_id, project_root=project_root,
             )
-            self._background_tasks.add(_task)
-            _task.add_done_callback(self._background_tasks.discard)
-            # Record the hash only on successful scheduling so that a
-            # create_task failure does not prevent a retry with the same
-            # suggestion set.  The curator R4 gate is the durable backstop
-            # for duplicates that slip through on a successful retry.
-            self._last_routed_suggestion_hash = content_hash
-        except Exception as exc:
+            for suggestion in suggestions
+        ])
+        if not result.all_delivered:
             logger.warning(
-                'Task %s: failed to schedule curator submits: %s',
-                task_id, exc,
+                'Task %s: %d of %d review suggestion(s) hold no curator ticket '
+                '(hash=%s)',
+                task_id, len(result.failures), len(suggestions), content_hash,
             )
-            return SuggestionDisposition.ERROR
-
+            return SuggestionDisposition.UNDELIVERED
+        self._last_routed_suggestion_hash = content_hash
         logger.info(
-            'Task %s: scheduled %d suggestion(s) for direct curator intake '
-            '(hash=%s)',
-            task_id, len(suggestions), content_hash,
+            'Task %s: delivered %d suggestion(s) to curator intake '
+            '(hash=%s, tickets=%s)',
+            task_id, len(suggestions), content_hash, result.tickets,
         )
         return SuggestionDisposition.CURATOR
 

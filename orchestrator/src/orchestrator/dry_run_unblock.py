@@ -856,6 +856,8 @@ async def run_dry_run_unblock(
                     'risk_label': entry.get('risk_label', _HUMAN_REVIEW_REQUIRED),
                     'success': getattr(result, 'success', False),
                     'status': entry.get('status', 'ok'),
+                    'cost_basis': str(getattr(result, 'cost_basis', 'reported')),
+                    'cost_delta_clamped': bool(getattr(result, 'cost_delta_clamped', False)),
                 },
             )
         except Exception as exc:

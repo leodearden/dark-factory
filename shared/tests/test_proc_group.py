@@ -14,8 +14,9 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import cast
+from typing import NamedTuple, cast
 
 import pytest
 
@@ -197,6 +198,33 @@ def _sigkill_running_members(pgid: int) -> None:
         if not member.terminated:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(member.pid, signal.SIGKILL)
+
+
+class _KillpgCall(NamedTuple):
+    target: int
+    sig: int
+    at: float
+
+
+def _record_killpg(monkeypatch: pytest.MonkeyPatch) -> list[_KillpgCall]:
+    """Record every ``os.killpg`` call in this process, then forward it to the real one.
+
+    The patch target resolves to the ``os`` module itself, so it replaces
+    ``os.killpg`` process-wide: calls from the test's own helpers are
+    recorded alongside ``shared.proc_group``'s. Each call is stamped with
+    ``time.monotonic()`` before it is forwarded. The returned list is live:
+    it keeps growing until *monkeypatch* undoes the patch, so snapshot it
+    before any later call that probes with killpg.
+    """
+    real = os.killpg
+    calls: list[_KillpgCall] = []
+
+    def recording(target: int, sig: int) -> None:
+        calls.append(_KillpgCall(target, sig, time.monotonic()))
+        real(target, sig)
+
+    monkeypatch.setattr('shared.proc_group.os.killpg', recording)
+    return calls
 
 
 @pytest.fixture
@@ -759,7 +787,7 @@ class TestTerminateProcessGroup:
         ],
     )
     async def test_a_member_that_ignores_sigterm_is_sigkilled_after_the_leader_exits(
-        self, survivor_cmd
+        self, monkeypatch, survivor_cmd
     ):
         """The escalation follows the group, not the leader.
 
@@ -767,6 +795,8 @@ class TestTerminateProcessGroup:
         the grace; one that released it lets ``proc.wait()`` return at once.
         Either way the SIGTERM leg spends one grace, and the SIGKILL leg ends
         as soon as the group is dead rather than spending a second one.
+        Each leg is timed from its own killpg, because the /proc walks around
+        the end of the grace cost a load-dependent amount.
         """
         grace_secs = 5.0
         proc = await asyncio.create_subprocess_shell(
@@ -779,14 +809,24 @@ class TestTerminateProcessGroup:
         try:
             await _await_shell_ready(proc, what='survivor SIGTERM trap installed')
             await _await_group_membership(pgid, total=2, comm='sleep', comm_count=1)
-            loop = asyncio.get_running_loop()
-            started = loop.time()
+            calls = _record_killpg(monkeypatch)
 
             await terminate_process_group(proc, pgid, grace_secs=grace_secs)
 
-            elapsed = loop.time() - started
-            assert elapsed < grace_secs + 2.0, (
-                f'the SIGKILL leg outlived the dead group: {elapsed:.2f}s for grace {grace_secs}s'
+            returned_at = time.monotonic()
+            dispatched = tuple(calls)
+            assert [(c.target, c.sig) for c in dispatched] == [
+                (pgid, signal.SIGTERM),
+                (pgid, signal.SIGKILL),
+            ], f'expected one SIGTERM then one SIGKILL of group {pgid}; killpg calls: {dispatched}'
+            sigterm, sigkill = dispatched
+            assert sigkill.at - sigterm.at >= grace_secs, (
+                f'the SIGTERM leg was cut short: SIGKILL came '
+                f'{sigkill.at - sigterm.at:.2f}s after SIGTERM, for grace {grace_secs}s'
+            )
+            assert returned_at - sigkill.at < grace_secs, (
+                f'the SIGKILL leg spent its own grace instead of ending once the group was '
+                f'dead: {returned_at - sigkill.at:.2f}s after SIGKILL, for grace {grace_secs}s'
             )
             assert proc.returncode == -signal.SIGTERM, (
                 f'the leader must die of the SIGTERM itself, got {proc.returncode}'
@@ -808,17 +848,10 @@ class TestTerminateProcessGroup:
             start_new_session=True,
         )
         pgid = proc.pid
-        real_killpg = os.killpg
-        calls: list[tuple[int, int]] = []
-
-        def recording_killpg(target: int, sig: int) -> None:
-            calls.append((target, sig))
-            real_killpg(target, sig)
-
         try:
             await _await_shell_ready(proc, what='both background jobs forked')
             await _await_group_membership(pgid, total=3, comm='sleep', comm_count=2)
-            monkeypatch.setattr('shared.proc_group.os.killpg', recording_killpg)
+            calls = _record_killpg(monkeypatch)
             loop = asyncio.get_running_loop()
             started = loop.time()
 
@@ -826,7 +859,7 @@ class TestTerminateProcessGroup:
 
             elapsed = loop.time() - started
             assert elapsed < 30.0, f'a group dead on SIGTERM cost the grace: {elapsed:.2f}s'
-            assert signal.SIGKILL not in [sig for _, sig in calls], (
+            assert signal.SIGKILL not in [c.sig for c in calls], (
                 f'a group dead on SIGTERM must not be SIGKILLed; killpg calls: {calls}'
             )
             await _await_group_terminated(pgid)

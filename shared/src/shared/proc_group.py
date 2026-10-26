@@ -333,9 +333,11 @@ async def _group_terminated_within(
 ) -> bool:
     """True iff *proc* exits and none of its group *pgid* still runs within *timeout*.
 
-    Each /proc walk costs tens of milliseconds of a worker thread, so the walks
+    Each /proc walk reads every host pid's stat on a worker thread and can cost
+    hundreds of milliseconds, or over a second on a loaded host, so the walks
     back off from ``_SURVIVOR_POLL_FIRST_SECS``, doubling up to
-    ``_SURVIVOR_POLL_MAX_SECS``, and never sleep past the deadline.
+    ``_SURVIVOR_POLL_MAX_SECS``, and never sleep past the deadline.  A walk
+    started before the deadline can still end well after it.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout

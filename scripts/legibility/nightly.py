@@ -51,6 +51,7 @@ from legibility import (  # noqa: E402
     digest,
     invariants,
     inventory,
+    plan_deviation_census,
     sampling,
     session_ledger,
     session_runner,
@@ -1761,12 +1762,18 @@ def _run_configured_nightly(
             if runner is not None:
                 runner.close()
         finally:
-            _record_trickle_progress(
-                cfg, sample, target_date, result, census=census_observation,
-                recorder=recorder, retry_recorder=retry_recorder,
-                poster=poster, now=now, pass_kind=pass_kind,
-                max_barren_runs=max_barren_runs,
-            )
+            try:
+                _record_trickle_progress(
+                    cfg, sample, target_date, result, census=census_observation,
+                    recorder=recorder, retry_recorder=retry_recorder,
+                    poster=poster, now=now, pass_kind=pass_kind,
+                    max_barren_runs=max_barren_runs,
+                )
+            finally:
+                # plans/plan-deviation-recording-prd.md D8: after the health
+                # signal, so census I/O can never delay or pre-empt it.
+                if pass_kind is not PassKind.RETRY:
+                    plan_deviation_census.run(cfg, now=now)
 
 
 def _crashed_night(

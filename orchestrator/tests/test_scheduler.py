@@ -2213,6 +2213,7 @@ class TestRequeueCooldown:
 class TestDispatchCooldownConfig:
     """Validate the dispatch_cooldown_secs config field defaults and constraints."""
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_dispatch_cooldown_secs(self):
         """OrchestratorConfig() defaults dispatch_cooldown_secs to 1800.0."""
         config = OrchestratorConfig()
@@ -6166,6 +6167,7 @@ class TestFairnessConfigSchema:
             'scheduler_v2 field must be removed from FairnessConfig'
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_skip_threshold_is_per_tier_dict(self):
         """Default skip_threshold is a per-tier dict."""
         cfg = OrchestratorConfig()
@@ -7892,7 +7894,10 @@ class TestClaimantLivenessDispatchGate:
 
     def test_live_claimant_refuses_dispatch(self):
         heartbeat = (self.FIXED_DT - timedelta(minutes=1)).isoformat()  # fresh (ttl=300s default)
-        config = OrchestratorConfig(max_per_module=1)
+        # pin: this test is about the gate refusing dispatch, not the default
+        config = OrchestratorConfig(
+            max_per_module=1, claimant_dispatch_gate_enabled=True,
+        )
         scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
 
         task = self._pending_task_with_claimant('5001', 'run-x/session-y/pid=1', heartbeat)
@@ -8534,6 +8539,7 @@ class TestParkStopTrip:
         import re
 
         config = OrchestratorConfig(
+            park_stop_enabled=True,  # pin: these tests are about the trip, not the default
             max_per_module=1,
             park_stop_parked_threshold=3,
             park_stop_parked_window_hours=1.0,
@@ -8656,6 +8662,7 @@ class TestParkStopTrip:
         reached the guard returns early.
         """
         config = OrchestratorConfig(
+            park_stop_enabled=True,  # pin: these tests are about the trip, not the default
             max_per_module=1,
             park_stop_parked_threshold=3,
             park_stop_parked_window_hours=1.0,
@@ -8705,6 +8712,7 @@ class TestParkStopTrip:
         is_paused must still be False.
         """
         config = OrchestratorConfig(
+            park_stop_enabled=True,  # pin: these tests are about the trip, not the default
             max_per_module=1,
             park_stop_parked_threshold=3,
             park_stop_parked_window_hours=1.0,

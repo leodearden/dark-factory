@@ -53,6 +53,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     recon_archive_root,
     run_config_dir_path,
 )
+from fused_memory.reconciliation.dangling_citation import dangling_citation_identity
 from fused_memory.reconciliation.drained_event_restore import (
     restore_unless_completed_best_effort,
 )
@@ -382,9 +383,13 @@ def _derive_affected_ids(finding: dict) -> list[str]:
     recurrence counting still works against pre-cutover journal rows that carry
     the old shape.
 
+    A Stage-3 dangling-citation finding cites nothing, so its
+    ``dangling_citation`` handoff record supplies its identity
+    (``dangling_citation.py::dangling_citation_identity``, task 5749).
+
     The top-level ``add_finding`` ``task_id`` is deliberately NOT an identity
-    source: only the legacy ``affected_ids`` and the typed ``cited_*`` lists
-    are.  Guarded by
+    source: only the legacy ``affected_ids``, the typed ``cited_*`` lists and
+    the ``dangling_citation`` record are.  Guarded by
     ``tests/reconciliation/test_derive_affected_ids.py::TestDeriveAffectedIds``
     (task-4772 section).
     """
@@ -409,6 +414,7 @@ def _derive_affected_ids(finding: dict) -> list[str]:
         mid = c.get('memory_id') if isinstance(c, dict) else None
         if mid:
             ids.append(str(mid))
+    ids.extend(dangling_citation_identity(finding))
     return ids
 
 
@@ -3784,8 +3790,6 @@ class ReconciliationHarness:
         # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
         graphiti_queue_health = await self._check_graphiti_queue_health(scope.project_id)
 
-        overreach_flags = await fetch_overreach_flags(self.memory.overreach_shadow, scope.project_id)
-
         # Check FalkorDB index provisioning and escalate on drift (task 3709 / PRD δ).
         # This is the recon-cadence half of Q3; the startup sweep calls the SAME
         # detector.  Kept here, outside the _active_runs.track block below, so a
@@ -3823,6 +3827,7 @@ class ReconciliationHarness:
             index_health = None
 
         current_stage_name: str | None = None
+        stage_1_overreach_flags: OverreachFlagPage | None = None
         cycle_start_time = datetime.now(UTC)
         stages = self._make_stages(scope)
         with self._active_runs.track(
@@ -3893,6 +3898,9 @@ class ReconciliationHarness:
 
                     # Apply tier limits, prior S3 findings, cycle fence, and task tree to Stage 1
                     if isinstance(stage, MemoryConsolidator):
+                        stage_1_overreach_flags = await fetch_overreach_flags(
+                            self.memory.overreach_shadow, scope.project_id,
+                        )
                         self._configure_consolidator(
                             stage, tier,
                             prior_s3_findings=prior_s3_findings,
@@ -3903,7 +3911,7 @@ class ReconciliationHarness:
                             graphiti_queue_health=graphiti_queue_health,
                             index_health=index_health,
                             status_correction_reconciliation=status_correction_reconciliation,
-                            overreach_flags=overreach_flags,
+                            overreach_flags=stage_1_overreach_flags,
                         )
 
                     # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)
@@ -3955,7 +3963,6 @@ class ReconciliationHarness:
                     'last_task_change_timestamp': completed_at,
                 })
                 await self.journal.update_watermark(watermark)
-                await acknowledge_overreach_flags(self.memory.overreach_shadow, overreach_flags)
 
                 run.completed_at = datetime.now(UTC)
                 run.status = RunStatus.completed
@@ -3971,6 +3978,9 @@ class ReconciliationHarness:
                 raise
             else:
                 # Durably completed: the handlers above can no longer relabel it.
+                await acknowledge_overreach_flags(
+                    self.memory.overreach_shadow, stage_1_overreach_flags,
+                )
                 await self._finish_durably_completed_cycle(
                     project_id, run_id, run, tier,
                     scope=scope,
