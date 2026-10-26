@@ -42,6 +42,7 @@ the follower alone in flight and the second item stranded at
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import dataclasses
 from collections.abc import AsyncIterator, Callable
@@ -63,7 +64,7 @@ from _fill_drive_harness import (  # noqa: F401,E402
 from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, hangs_until, passes
 from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 from test_merge_queue_concurrent_verify import (
-    _inject_two_host_allocator,
+    _inject_host_allocator,
     _make_branch_with_file,
     _make_request,
     config,  # noqa: F401 — pytest fixture re-exported from γ harness
@@ -71,10 +72,12 @@ from test_merge_queue_concurrent_verify import (
     git_ops,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_repo,  # noqa: F401 — pytest fixture re-exported from γ harness
 )
+from test_merge_queue_rebased_landing_dead_base import _land_foreign_commit
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeLane
+from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
 #: The item whose verify fails, triggering the head-failure cascade.
@@ -185,10 +188,15 @@ async def _running_lane(
     config: OrchestratorConfig,
     *,
     remote: Callable[[asyncio.Event], Any] = _hanging_remote,
+    verifier: FakeVerifier | None = None,
+    extra_remote_names: tuple[str, ...] = (),
 ) -> AsyncIterator[_Lane]:
     """Start a two-host lane with scripted verifies; stop it on the way out.
 
     *remote* builds the second host's runner from the lane's ``remote_gate``.
+    *verifier* replaces the default scripted ``FakeVerifier``, and each of
+    *extra_remote_names* adds one more :func:`_hanging_remote` host behind
+    ``remote_gate``; ``_Lane.remote`` stays the first remote.
 
     Teardown releases every gate before stopping, so a failing test leaves no
     verify hanging and no dangling task behind, and goes through
@@ -199,19 +207,21 @@ async def _running_lane(
     head_gate = asyncio.Event()
     local_gate = asyncio.Event()
     remote_gate = asyncio.Event()
-    verifier = FakeVerifier(
-        default=hangs_until(local_gate),
-        scripts={
-            HEAD: VerifyScript(
-                result=fails(category='test_failure', summary='head verify failed').result,
-                release=head_gate,
-            ),
-        },
-    )
+    if verifier is None:
+        verifier = FakeVerifier(
+            default=hangs_until(local_gate),
+            scripts={
+                HEAD: VerifyScript(
+                    result=fails(category='test_failure', summary='head verify failed').result,
+                    release=head_gate,
+                ),
+            },
+        )
     queue: asyncio.Queue = asyncio.Queue()
     worker = MergeLane(git_ops, queue, speculation_depth=2, verifier=verifier)
     remote_runner = remote(remote_gate)
-    allocator = _inject_two_host_allocator(worker, remote_runner)
+    extras = [_hanging_remote(remote_gate, name) for name in extra_remote_names]
+    allocator = _inject_host_allocator(worker, remote_runner, *extras)
     lane = _Lane(
         worker=worker, queue=queue, git_ops=git_ops, config=config,
         head_gate=head_gate, local_gate=local_gate, remote_gate=remote_gate,
@@ -689,3 +699,113 @@ class TestHostFreedWhileHeadVerifies:
                 f'its merge() Future was never resolved; {lane.observed()}'
             )
             assert _hosts_of(lane) == {}, lane.observed()
+
+
+# ---------------------------------------------------------------------------
+# task 6155: the head's gate re-verify must not park the verifier loop
+# ---------------------------------------------------------------------------
+
+#: A head whose CAS finds main moved under it, so it lands through the gate.
+GATED_HEAD = 'gr-head'
+#: The item submitted while GATED_HEAD's gate re-verify runs.
+GATE_WAITER = 'gr-waiter'
+
+
+class _GateVerifier(FakeVerifier):
+    """Holds GATED_HEAD's own verify and then its gate re-verify on events.
+
+    GATED_HEAD's first call is its verify, gated on ``head_entered`` /
+    ``head_release``; its second is the gate, gated on ``gate_entered`` /
+    ``gate_release`` and returning *gate_result*.  Every other call passes.
+    ``cancelled`` lists the task id of every call torn down mid-run.
+    """
+
+    def __init__(self, *, gate_result: VerifyResult | None = None) -> None:
+        super().__init__()
+        self.head_entered = asyncio.Event()
+        self.head_release = asyncio.Event()
+        self.gate_entered = asyncio.Event()
+        self.gate_release = asyncio.Event()
+        self.cancelled: list[str | None] = []
+        self.gate_result = gate_result or passes().result
+        self.calls: collections.Counter[str | None] = collections.Counter()
+
+    def next_script(self, task_id: str | None) -> VerifyScript:
+        self.calls[task_id] += 1
+        if task_id != GATED_HEAD:
+            return self.default
+        if self.calls[task_id] == 1:
+            return VerifyScript(
+                result=passes().result, release=self.head_release, entered=self.head_entered,
+            )
+        if self.calls[task_id] == 2:
+            return VerifyScript(
+                result=self.gate_result, release=self.gate_release, entered=self.gate_entered,
+            )
+        return self.default
+
+    async def run_scoped(
+        self,
+        worktree: Any,
+        config: Any,
+        module_configs: list[Any],
+        task_files: list[str] | None = None,
+        **options: Any,
+    ) -> VerifyResult:
+        try:
+            return await super().run_scoped(
+                worktree, config, module_configs, task_files, **options,
+            )
+        except asyncio.CancelledError:
+            self.cancelled.append(options.get('task_id'))
+            raise
+
+
+async def _gate_head(lane: _Lane, verifier: _GateVerifier) -> tuple[Any, str]:
+    """Drive GATED_HEAD into its gate re-verify on local and hold it there.
+
+    Main moves by a direct commit while the head verifies, so its CAS rebases.
+    That commit is unverified drift, so the gate cannot take the disjoint skip
+    and really re-verifies.  Returns the head's request and that main sha.
+    """
+    head = await lane.enqueue(GATED_HEAD)
+    await wait_responsive(verifier.head_entered.wait(), label=f'{GATED_HEAD} verify under way')
+    assert _hosts_of(lane) == {'local': [GATED_HEAD]}, lane.observed()
+    await _land_foreign_commit(lane.git_ops.project_root)
+    drift = await lane.git_ops.get_main_sha()
+    verifier.head_release.set()
+    await wait_responsive(
+        verifier.gate_entered.wait(), label=f'{GATED_HEAD} gate re-verify under way',
+    )
+    await lane.settle(
+        lambda: lane.states().get(GATED_HEAD) == 'gate_reverify',
+        expected=f'{GATED_HEAD} in gate_reverify',
+        why='main moved under the verified head, so its CAS must rebase and gate.',
+    )
+    return head, drift
+
+
+@pytest.mark.asyncio
+class TestGateReverifyDoesNotParkTheLoop:
+    """The head's gate re-verify runs like a head verify: through the lane's
+    verify port, and without parking DISPATCH-FILL or FINALIZE-HEAD.
+    """
+
+    async def test_gate_reverify_runs_through_the_lanes_verify_port(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier()
+        verifier.gate_release.set()
+        async with _running_lane(git_ops, config, verifier=verifier) as lane:
+            head = await lane.enqueue(GATED_HEAD)
+            await wait_responsive(
+                verifier.head_entered.wait(), label=f'{GATED_HEAD} verify under way',
+            )
+            await _land_foreign_commit(lane.git_ops.project_root)
+            verifier.head_release.set()
+
+            outcome = await wait_responsive(head.result, label=f'{GATED_HEAD} outcome')
+
+            assert outcome.status == 'done', outcome
+            assert verifier.verified.count(GATED_HEAD) == 2, verifier.verified
+            assert verifier.gate_entered.is_set(), verifier.verified

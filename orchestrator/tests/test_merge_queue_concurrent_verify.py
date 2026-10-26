@@ -1138,7 +1138,16 @@ def _inject_two_host_allocator(
     models a concurrent acquirer.  Returns the allocator so callers can
     introspect slot state or verify calls.
     """
-    allocator = allocator_cls([fake_remote], quarantine=worker._runner_quarantine)
+    return _inject_host_allocator(worker, fake_remote, allocator_cls=allocator_cls)
+
+
+def _inject_host_allocator(
+    worker: SpeculativeMergeWorker,
+    *fake_remotes: Any,
+    allocator_cls: type[HostAllocator] = HostAllocator,
+) -> HostAllocator:
+    """Inject a HostAllocator over local plus every one of *fake_remotes*."""
+    allocator = allocator_cls(list(fake_remotes), quarantine=worker._runner_quarantine)
     worker._host_allocator = allocator
     return allocator
 
