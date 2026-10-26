@@ -6538,12 +6538,14 @@ class BacklogIterator:
         buffer: EventBuffer,
         harness: ReconciliationHarness,
         time_provider: Callable[[], float] = time.monotonic,
+        iteration_deadline: Callable[[float], asyncio.Timeout] = asyncio.timeout,
     ):
         self.config = config
         self.journal = journal
         self.buffer = buffer
         self.harness = harness
         self.time_provider = time_provider
+        self._iteration_deadline = iteration_deadline
 
     async def should_iterate(self, project_id: str) -> bool:
         """Buffer count > 150% of trigger threshold.
@@ -6566,9 +6568,10 @@ class BacklogIterator:
         token-budgeted payload via ContextAssembler, then drains only the
         events that fit.  Stops when no events remain before the cutoff.
 
-        The whole invocation is bounded by cycle_timeout_seconds (task 2040).
-        On that deadline the in-flight run's events are restored unless it
-        completed, and TimeoutError propagates to the caller's log (task 6453).
+        The whole invocation is bounded by cycle_timeout_seconds under the
+        injected ``iteration_deadline`` (task 2040).  On that deadline the
+        in-flight run's events are restored unless it completed, and
+        TimeoutError propagates to the caller's log (task 6453).
         """
         from fused_memory.reconciliation.context_assembler import ContextAssembler
 
@@ -6593,7 +6596,7 @@ class BacklogIterator:
 
         in_flight_run_id: str | None = None
         try:
-            async with asyncio.timeout(self.config.cycle_timeout_seconds):
+            async with self._iteration_deadline(self.config.cycle_timeout_seconds):
                 watermark = await self.journal.get_watermark(project_id)
 
                 chunk_num = 0
