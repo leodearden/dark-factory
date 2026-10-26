@@ -62,6 +62,10 @@ def _names(results):
     return {(cls, test) for cls, test, _lineno, _attr, _lit in results}
 
 
+#: A frozenset default's members, read live so no case spells them as literals.
+_ALLOWLIST_MEMBERS = sorted(DEFAULT_CONFIG.escalation_revalidation_allowlist)
+
+
 # ---------------------------------------------------------------------------
 # MUST FLAG
 # ---------------------------------------------------------------------------
@@ -309,6 +313,33 @@ def test_derived_inline_default():
         assert _names(found) == {(None, 'test_derived_inline_default')}, (
             f'expected an RHS rooted at an inline bare config to be flagged; '
             f'got {found!r}'
+        )
+
+    @pytest.mark.parametrize('rhs', [
+        'frozenset({' + ', '.join(map(repr, _ALLOWLIST_MEMBERS)) + '})',
+        f'frozenset({_ALLOWLIST_MEMBERS!r})',
+    ], ids=['set-literal-arg', 'list-arg'])
+    def test_flags_collection_constructor_over_a_literal(self, tmp_path, rhs):
+        """There is no frozenset literal, so ``frozenset({...})`` is how a
+        frozenset default is spelled — and ``ast.literal_eval`` rejects it."""
+        src = _write(tmp_path, 'test_synth_ctor.py', f'''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_ctor_default():
+    cfg = OrchestratorConfig()
+    assert cfg.escalation_revalidation_allowlist == {rhs}
+''')
+        found = list(iter_default_asserting_tests(src))
+        assert _names(found) == {(None, 'test_ctor_default')}, (
+            f'expected `== {rhs}` to be flagged; got {found!r}'
+        )
+        _cls, _test, _lineno, attr, value = found[0]
+        assert attr == 'escalation_revalidation_allowlist', (
+            f'expected the asserted attribute path; got {attr!r}'
+        )
+        assert value == DEFAULT_CONFIG.escalation_revalidation_allowlist, (
+            f'expected the constructed value; got {value!r}'
         )
 
 
@@ -616,6 +647,35 @@ def test_mismatch():
 ''')
         assert list(iter_default_asserting_tests(src)) == [], (
             f'`== {rhs}` must not be flagged against an int default'
+        )
+
+    def test_constructor_over_an_unresolvable_argument(self, tmp_path):
+        """A constructor is valued only when its argument is."""
+        src = _write(tmp_path, 'test_synth_ctor_call.py', '''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_ctor_over_call():
+    cfg = OrchestratorConfig()
+    assert cfg.escalation_revalidation_allowlist == frozenset(load_categories())
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            'a constructor over an unevaluable argument must not be resolved'
+        )
+
+    def test_shadowed_constructor_name(self, tmp_path):
+        """A locally bound ``frozenset`` is not the builtin."""
+        src = _write(tmp_path, 'test_synth_ctor_shadowed.py', f'''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_shadowed_ctor(make_allowlist):
+    frozenset = make_allowlist
+    cfg = OrchestratorConfig()
+    assert cfg.escalation_revalidation_allowlist == frozenset({_ALLOWLIST_MEMBERS!r})
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            'a shadowed constructor name must not be treated as the builtin'
         )
 
 
