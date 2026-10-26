@@ -1551,7 +1551,7 @@ def _cardinality_mismatch_message(
 
 
 def parse_metadata(
-    blob: dict | str | None,
+    blob: object,
     *,
     direction: Literal['read', 'write'],
     enforce: bool = False,
@@ -1575,6 +1575,8 @@ def parse_metadata(
       rather than a validated value — reported under the same failure policy
       as any other malformed slice, and distinct from ``invalid_submodel``
       (which means the shape was right but an element/field failed).
+    * any other value, including a JSON string that decodes to a non-object,
+      is a ``not_an_object`` finding under the failure policy below.
 
     Failure policy (never the old silent-``{}`` discard — I4): ``write`` with
     ``enforce=True`` raises (``ValueError``/``ValidationError``) on malformed
@@ -1589,15 +1591,10 @@ def parse_metadata(
 
     warnings: list[SchemaWarning] = []
 
-    # A dedicated, non-Optional-and-non-str local: reassigning the `blob`
-    # parameter itself (declared `dict | str | None`) would reset pyright's
-    # narrowed type back to the full declared union on every assignment
-    # (json.loads returns `Any`, and assigning `Any` to a declared-type
-    # variable narrows to the *declared* type, not to `dict`).
-    parsed: dict
+    decoded: object
     if isinstance(blob, str):
         try:
-            parsed = json.loads(blob)
+            decoded = json.loads(blob)
         except ValueError as exc:
             if direction == 'write' and enforce:
                 raise
@@ -1610,21 +1607,21 @@ def parse_metadata(
             )
             return TaskMetadata(), warnings
     else:
-        parsed = blob
+        decoded = blob
 
-    if not isinstance(parsed, dict):
+    if not isinstance(decoded, dict):
         if direction == 'write' and enforce:
-            raise TypeError(f'metadata must be a JSON object, got {type(parsed).__name__}')
+            raise TypeError(f'metadata must be a JSON object, got {type(decoded).__name__}')
         warnings.append(
             SchemaWarning(
                 field=_WHOLE_METADATA_FIELD,
                 code='not_an_object',
-                message=f'metadata is not a JSON object: got {type(parsed).__name__}',
+                message=f'metadata is not a JSON object: got {type(decoded).__name__}',
             )
         )
         return TaskMetadata(), warnings
 
-    parsed = apply_migrations(parsed)
+    parsed: dict = apply_migrations(decoded)
 
     for key, submodel in _SUBMODEL_REGISTRY.items():
         if key not in parsed:
