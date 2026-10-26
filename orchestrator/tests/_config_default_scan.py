@@ -43,13 +43,18 @@ key; see the task-4481 commit log for that measurement.
 from __future__ import annotations
 
 import ast
+import operator
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 from unittest import mock
 
 from orchestrator.config import OrchestratorConfig
+
+_TestFunc = ast.FunctionDef | ast.AsyncFunctionDef
 
 #: Path guaranteed not to exist, so ``YamlSettingsSource`` skips the layer-2
 #: project file and only the package-bundled ``defaults.yaml`` loads.  Same
@@ -114,11 +119,179 @@ def _is_bare_config_call(node: ast.AST | None) -> bool:
     )
 
 
-def _is_config_root(root: ast.expr, names: set[str]) -> bool:
+def _is_config_root(root: ast.expr, names: frozenset[str]) -> bool:
     """True if *root* is a name bound to a bare config, or a bare call itself."""
     if isinstance(root, ast.Name):
         return root.id in names
     return _is_bare_config_call(root)
+
+
+def _plain_binding_values(func: _TestFunc) -> dict[ast.Name, ast.expr]:
+    """Map each ``name = value`` / ``name: T = value`` target to its value."""
+    plain: dict[ast.Name, ast.expr] = {}
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    plain[target] = node.value
+        elif (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+              and node.value is not None):
+            plain[node.target] = node.value
+    return plain
+
+
+def _opaque_bound_names(node: ast.AST, func: _TestFunc) -> list[str]:
+    """Names *node* binds without an ``ast.Name`` target the scan could value."""
+    if isinstance(node, ast.arg):
+        return [node.arg]
+    if isinstance(node, ast.ExceptHandler) and node.name:
+        return [node.name]
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return [(alias.asname or alias.name).split('.')[0] for alias in node.names]
+    if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node is not func):
+        return [node.name]
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+        return [node.name]
+    if isinstance(node, ast.MatchMapping) and node.rest:
+        return [node.rest]
+    return []
+
+
+def _local_bindings(func: _TestFunc) -> dict[str, list[ast.expr | None]]:
+    """Every binding of every name in *func*, nested scopes included.
+
+    One entry per binding: the bound VALUE for a plain ``name = value``, and
+    ``None`` for any binding whose value the scan cannot see (parameters,
+    unpacking, loop and ``with`` targets, augmented assignment, ``del``...).
+    Counting nested scopes only adds bindings, which only ever disqualifies.
+    """
+    plain = _plain_binding_values(func)
+    bindings: dict[str, list[ast.expr | None]] = {}
+    for node in ast.walk(func):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bindings.setdefault(node.id, []).append(plain.get(node))
+        for name in _opaque_bound_names(node, func):
+            bindings.setdefault(name, []).append(None)
+    return bindings
+
+
+@dataclass(frozen=True)
+class _TestScope:
+    """What one test's local bindings let the scan conclude.
+
+    ``bare_configs`` — names whose every binding is a bare
+    ``OrchestratorConfig()``.  ``once_bound`` — names bound exactly once, by a
+    plain assignment, to that expression.  ``bound`` — every local name.
+    """
+
+    bare_configs: frozenset[str]
+    once_bound: Mapping[str, ast.expr]
+    bound: frozenset[str]
+
+
+def _test_scope(func: _TestFunc) -> _TestScope:
+    bindings = _local_bindings(func)
+    return _TestScope(
+        bare_configs=frozenset(
+            name for name, values in bindings.items()
+            if all(_is_bare_config_call(value) for value in values)
+        ),
+        once_bound=MappingProxyType({
+            name: values[0] for name, values in bindings.items()
+            if len(values) == 1 and values[0] is not None
+        }),
+        bound=frozenset(bindings),
+    )
+
+
+@dataclass(frozen=True)
+class _Valued:
+    """A right-hand side's value under package defaults, and the config paths
+    it read to get there."""
+
+    value: Any
+    reads: frozenset[str]
+
+
+_LITERAL_EVAL_ERRORS = (ValueError, TypeError, SyntaxError, MemoryError,
+                        RecursionError)
+
+_ARITHMETIC: Mapping[type[ast.operator], Callable[[Any, Any], Any]] = MappingProxyType({
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+})
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _evaluate_under_defaults(
+    node: ast.expr, scope: _TestScope, resolving: frozenset[str] = frozenset(),
+) -> _Valued | None:
+    """Value *node* as it would evaluate under package defaults, or ``None``.
+
+    *resolving* holds the local names already being expanded, so a
+    self-referential binding (``x = x + 1``) terminates as unevaluable.
+    """
+    try:
+        return _Valued(ast.literal_eval(node), frozenset())
+    except _LITERAL_EVAL_ERRORS:
+        pass
+    if isinstance(node, ast.Attribute):
+        return _evaluate_config_attribute(node, scope)
+    if isinstance(node, ast.Name):
+        return _evaluate_local(node, scope, resolving)
+    if isinstance(node, ast.BinOp):
+        return _evaluate_arithmetic(node, scope, resolving)
+    return None
+
+
+def _evaluate_config_attribute(node: ast.Attribute,
+                               scope: _TestScope) -> _Valued | None:
+    chain = _attr_chain(node)
+    if chain is None:
+        return None
+    root, path = chain
+    if not _is_config_root(root, scope.bare_configs):
+        return None
+    default = _resolve_default(path)
+    if default is _UNRESOLVED:
+        return None
+    return _Valued(default, frozenset({path}))
+
+
+def _evaluate_local(node: ast.Name, scope: _TestScope,
+                    resolving: frozenset[str]) -> _Valued | None:
+    name = node.id
+    bound = scope.once_bound.get(name)
+    if bound is None or name in scope.bare_configs or name in resolving:
+        return None
+    return _evaluate_under_defaults(bound, scope, resolving | {name})
+
+
+def _evaluate_arithmetic(node: ast.BinOp, scope: _TestScope,
+                         resolving: frozenset[str]) -> _Valued | None:
+    apply = _ARITHMETIC.get(type(node.op))
+    if apply is None:
+        return None
+    left = _evaluate_under_defaults(node.left, scope, resolving)
+    right = _evaluate_under_defaults(node.right, scope, resolving)
+    if left is None or right is None:
+        return None
+    if not (_is_number(left.value) and _is_number(right.value)):
+        return None
+    try:
+        value = apply(left.value, right.value)
+    except (ArithmeticError, ValueError):
+        return None
+    return _Valued(value, left.reads | right.reads)
 
 
 def _decorated_with_hatch(node: ast.AST) -> bool:
@@ -129,8 +302,7 @@ def _decorated_with_hatch(node: ast.AST) -> bool:
     )
 
 
-def _is_isolated(func: ast.FunctionDef | ast.AsyncFunctionDef,
-                 enclosing_class: ast.ClassDef | None) -> bool:
+def _is_isolated(func: _TestFunc, enclosing_class: ast.ClassDef | None) -> bool:
     """True if *func* is insulated from the ambient operational config."""
     if _decorated_with_hatch(func):
         return True
@@ -145,70 +317,60 @@ def _is_isolated(func: ast.FunctionDef | ast.AsyncFunctionDef,
     )
 
 
-def _bare_config_names(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
-    """Names bound to a bare ``OrchestratorConfig()`` and to nothing else.
-
-    A name reassigned from anything other than a bare construction (a
-    ``load_config(...)`` result, a kwargs-built config, a later mutation) is
-    dropped: the scan cannot know which binding an assertion sees, and a
-    committed ratchet must not guess.
-    """
-    bare: set[str] = set()
-    other: set[str] = set()
-    for node in ast.walk(func):
-        if isinstance(node, ast.Assign):
-            targets, value = node.targets, node.value
-        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-            targets, value = [node.target], node.value
-        else:
-            continue
-        bucket = bare if _is_bare_config_call(value) else other
-        for target in targets:
-            if isinstance(target, ast.Name):
-                bucket.add(target.id)
-    return bare - other
+def _paths_overlap(a: str, b: str) -> bool:
+    """True if one dotted path equals, or is a segment prefix of, the other."""
+    return a == b or a.startswith(b + '.') or b.startswith(a + '.')
 
 
-def _default_assertions(func: ast.FunctionDef | ast.AsyncFunctionDef,
-                        names: set[str]) -> Iterator[tuple[int, str, Any]]:
-    """Yield ``(lineno, attr_path, literal)`` for each default-asserting compare."""
+def _default_assertion(cmp_node: ast.Compare,
+                       scope: _TestScope) -> tuple[int, str, Any] | None:
+    """``(lineno, attr_path, value)`` if *cmp_node* asserts a package default."""
+    if len(cmp_node.ops) != 1 or len(cmp_node.comparators) != 1:
+        return None
+    if not isinstance(cmp_node.ops[0], (ast.Eq, ast.Is)):
+        return None
+    chain = _attr_chain(cmp_node.left)
+    if chain is None:
+        return None
+    root, attr_path = chain
+    if not _is_config_root(root, scope.bare_configs):
+        return None
+    valued = _evaluate_under_defaults(cmp_node.comparators[0], scope)
+    if valued is None:
+        return None
+    if any(_paths_overlap(read, attr_path) for read in valued.reads):
+        return None
+    default = _resolve_default(attr_path)
+    if default is _UNRESOLVED:
+        return None
+    # The type() match keeps True/1 and False/0 from colliding.
+    if type(default) is type(valued.value) and default == valued.value:
+        return cmp_node.lineno, attr_path, valued.value
+    return None
+
+
+def _default_assertions(func: _TestFunc,
+                        scope: _TestScope) -> Iterator[tuple[int, str, Any]]:
+    """Yield ``(lineno, attr_path, value)`` for each default-asserting compare."""
     for node in ast.walk(func):
         if not isinstance(node, ast.Assert):
             continue
         for cmp_node in ast.walk(node.test):
-            if not isinstance(cmp_node, ast.Compare):
-                continue
-            if len(cmp_node.ops) != 1 or len(cmp_node.comparators) != 1:
-                continue
-            if not isinstance(cmp_node.ops[0], (ast.Eq, ast.Is)):
-                continue
-            chain = _attr_chain(cmp_node.left)
-            if chain is None:
-                continue
-            root, attr_path = chain
-            if not _is_config_root(root, names):
-                continue
-            try:
-                literal = ast.literal_eval(cmp_node.comparators[0])
-            except (ValueError, TypeError, SyntaxError, MemoryError,
-                    RecursionError):
-                continue
-            default = _resolve_default(attr_path)
-            if default is _UNRESOLVED:
-                continue
-            # The type() match keeps True/1 and False/0 from colliding.
-            if type(default) is type(literal) and default == literal:
-                yield cmp_node.lineno, attr_path, literal
+            if isinstance(cmp_node, ast.Compare):
+                found = _default_assertion(cmp_node, scope)
+                if found is not None:
+                    yield found
 
 
 def iter_default_asserting_tests(
     path: str | Path,
 ) -> Iterator[tuple[str | None, str, int, str, Any]]:
-    """Yield ``(class_name, test_name, lineno, attr_path, literal)`` for *path*.
+    """Yield ``(class_name, test_name, lineno, attr_path, value)`` for *path*.
 
-    ``class_name`` is ``None`` for a module-level test function.  One tuple is
-    yielded per offending ASSERTION, so a test with several default assertions
-    appears several times.
+    ``value`` is what the asserted right-hand side evaluates to under package
+    defaults.  ``class_name`` is ``None`` for a module-level test function.
+    One tuple is yielded per offending ASSERTION, so a test with several
+    default assertions appears several times.
     """
     source = Path(path).read_text()
     tree = ast.parse(source, filename=str(path))
@@ -218,10 +380,10 @@ def iter_default_asserting_tests(
             return
         if _is_isolated(func, enclosing_class):
             return
-        names = _bare_config_names(func)
+        scope = _test_scope(func)
         class_name = enclosing_class.name if enclosing_class is not None else None
-        for lineno, attr_path, literal in _default_assertions(func, names):
-            yield class_name, func.name, lineno, attr_path, literal
+        for lineno, attr_path, value in _default_assertions(func, scope):
+            yield class_name, func.name, lineno, attr_path, value
 
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
