@@ -488,14 +488,42 @@ against code on 2026-10-26 (task 6082).
   pre-veto sweep; `_reconcile_one_stranded` docstring says "L1-only"
   and cites a dead line; `workflow.py:3438-3439` "purely observational";
   stale `resolve_issue` docstring; `_UNION`'s call-site anchors rotted.
+  Partly closed.
+  - Closed:
+    - ARCHITECTURE.md §3.1 (the diagram now draws Table A in full,
+      including the deterministic `pending→blocked` edge), §3.6 (both
+      ESCALATED dispositions, MERGE entry included) and §3.7 (the veto
+      and every sibling `blocked` writer), by task 3544 (leaf κ); task
+      4172 later moved §3.7/§6 to present tense.
+    - The "purely observational" tripwire comment, by task 3536 (leaf γ1).
+    - The `_reconcile_one_stranded` veto bullet, by task 3541 (leaf η).
+    - The `_UNION` anchors, now `path::symbol`, by task 3542 (leaf θ).
+    - The `resolve_issue` NOTE calling Table B wiring an out-of-scope
+      follow-up, by task 6607.
+  - Still open (task 7506 owns all three):
+    - `escalation/src/escalation/server.py`'s `resolve_issue` action
+      table still lists `resume`'s task-status effect as "stays
+      in-progress", true since task 3540 only for a live claimant.
+    - `harness.py::Harness._warm_lane_reclaim_candidates` still grounds
+      its ownership invariant on the sweep reverting stranded rows.
+    - `_reconcile_one_stranded`'s merge-deferred bullet still says
+      "open-L1 veto pattern".
 - **E14 — `review` status has zero code writers** — vocabulary residue;
-  decide retire-or-document.
+  decide retire-or-document. Still open, by decision: no code writer
+  exists (`TaskStatus.REVIEW` appears only in Table A pairs and
+  `shared/src/shared/task_claimant.py`). The PRD's out-of-scope list and
+  open question 3 keep `review` in the vocabulary as human-only, and no
+  task owns its retirement.
 - **E15 — adjacent tasks**: 3429 (tripwire gating decision — correctly
   identifies the contradiction and defers the strand to 3423) and 3423
   (the strand-fix owner on paper, but recon has since redirected its
   description to the reify-5879 flap investigation, so no task currently
   owns the strand fix; its `metadata.files` still names the never-landed
-  strand test). Reconciled at PRD queue time.
+  strand test). Reconciled at PRD queue time. Closed at PRD queue time
+  per PRD D11: task 3423's strand-fix half moved to 3536/3542 (its
+  `metadata.files` were emptied) and the task was cancelled on
+  2026-08-03; task 3429 is done; and task 3536 (leaf γ1) delivered the
+  promised `orchestrator/tests/test_workflow_merge_gating_strand.py`.
 
 ## 9. Non-goals
 
