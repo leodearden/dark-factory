@@ -105,6 +105,7 @@ from _merge_lane_fakes import (
     passes,
     raises,
 )
+from _merge_queue_harness import finalize_through_gate
 
 # task 5582: the nine real-git classes below are ALL sized by measurement. The
 # spawn census, the bounded-wait term, the rounding and the three ceilings it
@@ -2490,7 +2491,7 @@ async def _adopt_head_only(s: dict, *, timeout: float = DEEP_LANDING_ADOPT_WAIT_
         s['spec_item'], _local_lease(), chain=s['chain'],
     )
     s['head_advanced'] = await asyncio.wait_for(
-        worker._finalize_inflight(s['head_entry']), timeout=timeout,
+        finalize_through_gate(worker, s['head_entry']), timeout=timeout,
     )
     await asyncio.sleep(0)
     return s
