@@ -120,6 +120,7 @@ from fused_memory.services.mem0_write_retry import (
     Mem0RetryPassSummary,
     Mem0RetryPolicy,
     classify_transient_provider_failure,
+    mem0_write_op_landed,
     retry_reason,
 )
 from fused_memory.services.memory_metadata_census import (
@@ -7209,8 +7210,9 @@ class MemoryService:
           re-issue.
         - only FAILED mem0 backend_op(s) → ``add()`` raised. In the common
           (clean, pre-persist) failure mem0 did not land, so re-issue is safe
-          (0 prior writes + 1 = 1): rebuild ``Scope`` + metadata and call
-          ``mem0.add``; ``completed`` on success, ``dead`` on error. Crash
+          (0 prior writes + 1 = 1): ``reissue_mem0_intent``; ``completed`` on
+          success, ``retrying`` on a transient provider error (the periodic
+          retry pass takes it over), ``dead`` on any other error. Crash
           after re-issue: ``fused-memory/tests/test_mem0_intent_recovery.py::TestRecoverMem0Intents::test_crash_after_successful_reissue_is_reconciled_not_reissued_again``.
           RESIDUAL DUPLICATE RISK (accepted, documented): a failure raised
           AFTER mem0 committed but at/near the response (e.g. a read-timeout
@@ -7230,7 +7232,13 @@ class MemoryService:
         plus a loud log line. Idempotent — no pending intents ⇒ zeroed
         summary — so it is safe to run on every startup.
         """
-        summary = {'scanned': 0, 'reconciled': 0, 'reissued': 0, 'dead_lettered': 0}
+        summary = {
+            'scanned': 0,
+            'reconciled': 0,
+            'reissued': 0,
+            'deferred': 0,
+            'dead_lettered': 0,
+        }
         if self._write_journal is None:
             return summary
 
@@ -7245,9 +7253,8 @@ class MemoryService:
                 write_op_id
             )
             mem0_beops = [b for b in beops if b.get('backend') == 'mem0']
-            any_success = any(b.get('success') for b in mem0_beops)
 
-            if any_success:
+            if mem0_write_op_landed(beops):
                 # Write landed; only the completion stamp was lost.
                 await self._write_journal.resolve_mem0_intent(
                     intent_id,
@@ -7267,23 +7274,7 @@ class MemoryService:
                 # note in this method's docstring for the narrow
                 # post-commit-failure case where this can mint a duplicate twin.
                 try:
-                    scope = Scope(
-                        project_id=intent.get('project_id') or 'main',
-                        agent_id=intent.get('agent_id'),
-                        session_id=intent.get('session_id'),
-                    )
-                    metadata = json.loads(intent.get('metadata') or '{}')
-                    content = intent.get('content') or ''
-                    await self._journaled_backend_call(
-                        write_op_id=write_op_id,
-                        causation_id=intent.get('causation_id'),
-                        backend='mem0',
-                        operation='add',
-                        payload={'content': content[:200]},
-                        coro=self.mem0.add(
-                            content=content, scope=scope, metadata=metadata
-                        ),
-                    )
+                    await self.reissue_mem0_intent(intent)
                     await self._write_journal.resolve_mem0_intent(
                         intent_id,
                         'completed',
@@ -7297,20 +7288,25 @@ class MemoryService:
                         write_op_id,
                     )
                 except Exception as e:
-                    reason = (
-                        f're-issue failed: {type(e).__name__}: {e} '
-                        f'(write_op_id={write_op_id}, payload_digest={payload_digest})'
-                    )
-                    await self._write_journal.resolve_mem0_intent(
-                        intent_id, 'dead', reason=reason
-                    )
-                    summary['dead_lettered'] += 1
-                    logger.error(
-                        'recover_mem0_intents: intent %s dead-lettered — re-issue '
-                        'raised: %s',
-                        intent_id,
-                        e,
-                    )
+                    if await self._defer_mem0_write_for_retry(
+                        e, intent_id=intent_id, write_op_id=write_op_id
+                    ):
+                        summary['deferred'] += 1
+                    else:
+                        reason = (
+                            f're-issue failed: {type(e).__name__}: {e} '
+                            f'(write_op_id={write_op_id}, payload_digest={payload_digest})'
+                        )
+                        await self._write_journal.resolve_mem0_intent(
+                            intent_id, 'dead', reason=reason
+                        )
+                        summary['dead_lettered'] += 1
+                        logger.error(
+                            'recover_mem0_intents: intent %s dead-lettered — re-issue '
+                            'raised: %s',
+                            intent_id,
+                            e,
+                        )
             else:
                 # No backend_op → UNKNOWN outcome → dead-letter (never silent).
                 reason = (

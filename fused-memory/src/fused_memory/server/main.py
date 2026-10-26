@@ -43,6 +43,10 @@ from fused_memory.server.tools import (  # noqa: E402
 from fused_memory.server.wal_status import (  # noqa: E402
     CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
 )
+from fused_memory.services.mem0_write_retry import (  # noqa: E402
+    DEFAULT_MEM0_RETRY_POLICY,
+    run_periodic_mem0_retry,
+)
 from fused_memory.services.memory_service import MemoryService  # noqa: E402
 
 if TYPE_CHECKING:
@@ -1167,6 +1171,18 @@ async def run_server():
         config.write_journal.prune_max_rows_per_run,
     )
 
+    mem0_retry_task = asyncio.create_task(
+        run_periodic_mem0_retry(
+            memory_service.retry_due_mem0_intents,
+            interval_seconds=DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds,
+        ),
+    )
+    logger.info(
+        '  Mem0 write retry loop: every %.0fs, up to %d due intents per pass',
+        DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds,
+        DEFAULT_MEM0_RETRY_POLICY.batch_size,
+    )
+
     remint_sweep_task: asyncio.Task[None] | None = _start_remint_sweep(
         taskmaster,
         task_interceptor.remint_broken_recurrence_chains,
@@ -1349,6 +1365,9 @@ async def run_server():
         write_ops_prune_task.cancel()
         with contextlib.suppress(BaseException):
             await write_ops_prune_task
+        mem0_retry_task.cancel()
+        with contextlib.suppress(BaseException):
+            await mem0_retry_task
         if remint_sweep_task is not None:
             remint_sweep_task.cancel()
             with contextlib.suppress(BaseException):
