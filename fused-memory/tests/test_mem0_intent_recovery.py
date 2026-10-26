@@ -577,6 +577,39 @@ class TestRecoverMem0Intents:
         assert 'reissue boom' in (mem0_beops[1]['error'] or '')
 
     @pytest.mark.asyncio
+    async def test_a_transient_reissue_failure_is_deferred_not_dead_lettered(
+        self, recovery_service, recovery_journal
+    ):
+        """A provider still rate-limited at restart must not dead-letter the crash-recovered write."""
+        svc = recovery_service
+        write_op_id = str(uuid.uuid4())
+        intent_id = str(uuid.uuid4())
+        await _seed_pending_intent(
+            recovery_journal,
+            write_op_id=write_op_id,
+            intent_id=intent_id,
+            content='reissue me later',
+        )
+        await recovery_journal.log_backend_op(
+            write_op_id=write_op_id,
+            backend='mem0',
+            operation='add',
+            success=False,
+            error='RateLimitError: 429',
+        )
+        svc.mem0.add = AsyncMock(side_effect=_rate_limit_error())
+
+        summary = await svc.recover_mem0_intents()
+
+        (intent,) = await recovery_journal.get_mem0_intents()
+        assert intent['id'] == intent_id
+        assert intent['status'] == 'retrying'
+        assert intent['attempts'] == 1
+        assert intent['next_attempt_at'] is not None
+        assert summary['deferred'] == 1
+        assert summary['dead_lettered'] == 0
+
+    @pytest.mark.asyncio
     async def test_reissue_journals_success_backend_op_under_same_write_op_id(
         self, recovery_service, recovery_journal
     ):
@@ -646,6 +679,7 @@ class TestRecoverMem0Intents:
             'scanned': 1,
             'reconciled': 1,
             'reissued': 0,
+            'deferred': 0,
             'dead_lettered': 0,
         }
         completed = await recovery_journal.get_mem0_intents(status='completed')
@@ -676,6 +710,7 @@ class TestRecoverMem0Intents:
             'scanned': 0,
             'reconciled': 0,
             'reissued': 0,
+            'deferred': 0,
             'dead_lettered': 0,
         }
         svc.mem0.add.assert_not_called()
@@ -695,6 +730,7 @@ class TestRecoverMem0Intents:
             'scanned': 0,
             'reconciled': 0,
             'reissued': 0,
+            'deferred': 0,
             'dead_lettered': 0,
         }
         svc.mem0.add.assert_not_called()
