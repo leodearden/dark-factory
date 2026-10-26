@@ -514,7 +514,7 @@ Typical sources: `harness-orphan-reaper` L0→L1 promotions of completion-time n
 - **Curator-origin records** — `agent_role` is `fused-memory/task-curator` or `fused-memory/ticket-janitor`. The curator is the failing component, so a re-file feeds a watcher→curator→watcher loop. Handle them under [Curator-origin records](#curator-origin-records--promote-never-re-file); never call `submit_task` for them.
 - **A record that already reports a curator `refused` outcome.** A refusal is a deterministic guard; a re-file re-hits it.
 
-**Clusters.** Several L1s carrying ONE finding become ONE filing (one `suggestion_hash`), with every member id in the description; resolve each member citing the same task id.
+**Clusters.** Several L1s carrying ONE finding become ONE filing, with every member id in the description; resolve each member citing the same task id. A re-drain of the cluster must reproduce both R4 keys exactly, so pick them by rule, not by whichever member you read first: `escalation_id` is the earliest-filed member's id (smallest `timestamp`, ties broken by the smallest id), which a member joining later cannot displace; `suggestion_hash` is derived from the finding itself, never from a member id.
 
 **1. File.** The `description` must stand alone WITHOUT this rotation's context: name the escalation id(s), the subject task id, the concrete file paths, and the measured evidence copied VERBATIM from `summary`/`detail`. `escalation_id` and `suggestion_hash` are the R4 idempotency keys, so a re-drain dedupes instead of double-filing.
 
@@ -528,7 +528,7 @@ ticket = mcp__fused-memory__submit_task(
         "spawn_context": "watcher_l1_convert",
         "spawned_from": "<subject task id, or 'N/A' for a synthetic anchor>",
         "files": ["path/to/file-or-dir", ...],
-        "escalation_id": esc["id"],
+        "escalation_id": esc["id"],  # a cluster: its earliest-filed member's id
         "suggestion_hash": "<stable hash of the finding>",
     },
     project_root=<project_root>,
@@ -546,6 +546,9 @@ result = mcp__fused-memory__resolve_ticket(ticket=ticket["ticket"], project_root
 #              Never retry, never cite an id → step 4, carrying result["reason"].
 # "failed" with reason "timeout" → call resolve_ticket ONCE more on the SAME ticket
 #              (a wait, not a re-file); still not created/combined → step 4.
+# "awaiting_curation" → NOT terminal: the ticket is parked durably and has no task_id yet.
+#              Never re-submit; call resolve_ticket ONCE more as for a timeout,
+#              then step 4, carrying the ticket id.
 # "failed" with any other reason → step 4, carrying result["reason"] and the ticket id.
 ```
 
@@ -590,7 +593,7 @@ Every `resolve_issue` you call — an autonomous-dispatch `resume` **or** a `clo
 
 - **`actionable`** — a real action or decision accompanied the close: a `resume`/re-pend (scope expanded, dependency added, agent continued, strand re-dispatched), a requeue/restart, a dependency added, or a fix filed. The escalation led to a state change.
 - **`benign`** — a confirmed **no-action** close: the stated condition was stale, superseded, already-cleared, or a duplicate, and nothing real changed beyond closing the record. This covers the [L2 rubber-stamp carve-out](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) closes and the [`stranded_blocked`](#stranded_blocked) predicate-stale close.
-- **`converted`** — the close cites a task you filed via [Convert to tracked work](#convert-to-tracked-work-file-and-resolve): a curator-created task now carries the work. Stamp it on every close whose resolution cites such a task. It is neither `benign` nor `actionable` (`escalation/src/escalation/models.py::RESOLUTION_CLASSES`).
+- **`converted`** — the close cites a task you filed via [Convert to tracked work](#convert-to-tracked-work-file-and-resolve): a curator-created task now carries the work. Stamp it when the filed task carries the closed record's own work. A close that cites a task filed about something else, such as the [eval-lane](#eval-lane-records-any-category--close-never-promote) bypass report, keeps its own class. It is neither `benign` nor `actionable` (`escalation/src/escalation/models.py::RESOLUTION_CLASSES`).
 
 The class describes the **escalation's usefulness**, not your effort — a `resume` you performed in one call is still `actionable`; a stale record you spent effort verifying is still `benign`. `promote_to_l2` takes **no** `resolution_class` (promotion does not resolve — member L1s stay pending; the class is stamped only when the resulting L2 is finally resolved). When genuinely unsure, prefer `actionable` (it never suppresses a record from the human-review benign-rate metric).
 
@@ -620,7 +623,7 @@ mcp__escalation__resolve_issue(
 
 Close it; do not `stamp_triage` it. A stamp leaves the record pending, and a pending L1 keeps `_watcher_has_actionable_l1` (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) respawning rotations.
 
-**Report, don't just close.** The live queue held no eval-lane records on 2026-10-01, when containment was built, so a pending eval-lane record with a later `timestamp` most likely reached the queue without passing `escalation/src/escalation/server.py::_chokepoint_or_submit`. File the suspected bypass with steps 1–2 of [Convert to tracked work](#convert-to-tracked-work-file-and-resolve): one filing per rotation however many such records it meets, `files=["escalation/src/escalation/server.py"]`, and a description naming each record's id, `timestamp` and `agent_role`. Then close each record `benign` as above, ending its `resolution` with the filed task id — or, if the filing yielded none, its `status` and `reason`. Never promote it instead: `promote_to_l2` refuses eval-lane members. Appending `— BYPASS? filed <timestamp>` to the record's digest line remains a convenience, not the report.
+**Report, don't just close.** The live queue held no eval-lane records on 2026-10-01, when containment was built, so a pending eval-lane record with a later `timestamp` most likely reached the queue without passing `escalation/src/escalation/server.py::_chokepoint_or_submit`. File the suspected bypass with steps 1–2 of [Convert to tracked work](#convert-to-tracked-work-file-and-resolve): one filing per rotation however many such records it meets, `files=["escalation/src/escalation/server.py"]`, and a description naming each record's id, `timestamp` and `agent_role`. Its R4 keys follow the Convert section's **Clusters** rule: `escalation_id` is the earliest-filed such record's id, and `suggestion_hash` is derived from the bypass finding. Then close each record `benign` as above, ending its `resolution` with the filed task id — or, if the filing yielded none, its `status` and `reason`. The close stays `benign`, not `converted`: the filed task carries the bypass, and the record itself carries no work. Never promote it instead: `promote_to_l2` refuses eval-lane members. Appending `— BYPASS? filed <timestamp>` to the record's digest line remains a convenience, not the report.
 
 **Digest — one line per record, mandatory:**
 
