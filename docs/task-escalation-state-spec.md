@@ -387,7 +387,20 @@ against code on 2026-10-26 (task 6082).
 - **E6 — blast-radius requeue pending-write failure**
   (`scheduler.py:7024-7037`): held in-memory locks make the row read as
   actively-held → LEAVE until restart; the "next reconcile cycle"
-  comment is false.
+  comment is false. Partly closed by task 6051 (spawned from θ's review;
+  not a PRD leaf): `scheduler.py::Scheduler.handle_blast_radius_expansion`
+  returns `BlastRadiusResult(applied=False, repend_error=e)` instead of a
+  bare `False`, and `workflow.py::TaskWorkflow._requeue_on_lock_conflict`
+  records the error in the run()-exit write-failure ledger, so the failure
+  yields one STORE_UNAVAILABLE exit-contract record. Still open: the
+  scheduler keeps its locks "for reconcile to recover", but
+  `harness.py::Harness._run_slot`'s exit releases them anyway
+  (`SlotLease.release` → `Scheduler.release`). The row is left
+  `(in-progress, NULL claimant)`, an ordinary strand for the stranded
+  sweep rather than the actively-held LEAVE described above. Task 5735
+  owns making that contract explicit; task 6119 owns
+  `TaskWorkflow._apply_revalidation_skip` falling through on a
+  not-applied result instead of exiting.
 - **E7 — the recovery veto is `bool(open)` at any level/severity**,
   five hand-rolled copies (task_ground_truth `_shape`; harness
   `:5560`; scheduler `:5719`; harness `:11759`+`:11373`), silent at
