@@ -22,11 +22,10 @@ A CONFLICTED MERGE has two parents, and pre-commit runs when one is finished
 with `git commit`, with MERGE_HEAD set; only a clean merge skips it. Read
 against HEAD alone, every measure MERGE_HEAD moved is a "raise" -- 18 of them
 refused esc-3620-11's resolver, all main's own. So a merge's artifacts are
-audited against BOTH parents: each measure is bounded by the 3-way rule git
-applies to the text (a side's own move stands, up or down; where both sides
-moved, the higher one bounds it), and only the ledger entry files the merge
-itself adds cover anything above that bound. The restore carve-out is a
-single-parent rule and is not consulted.
+audited against BOTH parents: each measure is held to the 3-way bound defined
+by merge_lane_metrics.py::compare_merged_baseline_files, and only the ledger
+entry files the merge itself adds cover anything above that bound. The restore
+carve-out is a single-parent rule and is not consulted.
 
 THE LEDGER IS A DIRECTORY, one file per authorization
 (``metrics.LEDGER_DIR_RELPATH``), so append-only is a comparison of file
@@ -478,12 +477,11 @@ def _audit_merged_baseline(
         return []
     return [
         *refusals,
-        'FINISHING A MERGE where both sides raised one key: the bound is the '
-        "higher side, so the composed value (the ratchet-baseline driver's, or "
-        'a regeneration\'s) is this merge\'s own raise -- and --write-baseline '
-        'records nothing over a file that already holds it. Run `git checkout '
+        'FINISHING A MERGE: a value above that bound is this merge\'s own raise '
+        '-- and --write-baseline records nothing over a file that already holds '
+        'it. Run `git checkout '
         f'HEAD -- {metrics.BASELINE_RELPATH}` (ours; `--ours` is a no-op once the '
-        'driver resolved the file), then the --write-baseline --authorize-raise '
+        'ratchet-baseline driver resolved the file), then the --write-baseline --authorize-raise '
         "command above: it measures from ours and records the merge's own entry.",
     ]
 
