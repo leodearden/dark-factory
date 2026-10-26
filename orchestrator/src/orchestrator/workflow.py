@@ -142,6 +142,11 @@ from orchestrator.merge_lane.landing_evidence import (
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.recut_ruling import ruling_to_enforce
+from orchestrator.resume_resolution import (
+    CarriedResolution,
+    render_carried_resolutions,
+    select_carried_resolutions,
+)
 from orchestrator.review_inputs import gather_review_subject, review_fork_point
 from orchestrator.review_outcome import review_completed_payload
 from orchestrator.review_suggestions.curator_intake import (
@@ -3029,7 +3034,7 @@ class TaskWorkflow:
                     await self._ensure_steward_started()
                     logger.info(f'Task {self.task_id}: waiting for escalation resolution')
                     try:
-                        resolution = await self._wait_for_resolution()
+                        carried = await self._wait_for_resolution()
                     except _HumanHandoff as handoff:
                         return await self._mark_blocked(
                             handoff.block_reason,
@@ -3104,7 +3109,7 @@ class TaskWorkflow:
                     # free-text resolution prose and the resumed
                     # implementer's briefing/_task_files never reflect the
                     # expanded scope. granted_files is read from resolved
-                    # escalation records, not the joined `resolution` string.
+                    # escalation records, not from the prose in `carried`.
                     granted = self._collect_granted_files()
                     if granted:
                         current_files = self.plan.get('files', [])
@@ -3150,13 +3155,13 @@ class TaskWorkflow:
                     # Resume with resolution context
                     logger.info(f'Task {self.task_id}: resuming after escalation resolution')
                     async def build_resume_prompt(
-                        resolution: str = resolution,
+                        carried: tuple[CarriedResolution, ...] = carried,
                     ) -> str:
                         assert self.worktree is not None
                         return await self.briefing.build_resume_prompt(
                             self.task, self._live_plan(),
                             '\n'.join(e.summary for e in self._check_escalations()),
-                            resolution, self.worktree,
+                            render_carried_resolutions(carried), self.worktree,
                         )
 
                     await self._invoke(IMPLEMENTER, build_resume_prompt, self.worktree)
@@ -15058,7 +15063,7 @@ class TaskWorkflow:
             return []
         return self.escalation_queue.get_by_task(self.task_id, status='pending')
 
-    async def _wait_for_resolution(self) -> str:
+    async def _wait_for_resolution(self) -> tuple[CarriedResolution, ...]:
         """Wait for all level-0 pending escalations to be resolved.
 
         Pending escalations that :func:`_needs_human` selects (a born-at-L2
@@ -15078,10 +15083,12 @@ class TaskWorkflow:
         - ``_NoStewardApplicable('L1')`` — the L1s predate the wait or came
           from elsewhere, so no steward acted on them (PRD D13).
 
-        When no escalation queue is available (e.g. eval mode), returns
-        an empty string immediately — the caller treats this as "no
-        resolution" and the workflow proceeds to ESCALATED/BLOCKED
-        via its normal path.
+        Otherwise returns the task's resolved escalations as attributed
+        :class:`CarriedResolution` items in resolution order (see
+        ``orchestrator/src/orchestrator/resume_resolution.py``).  When no
+        escalation queue is available (e.g. eval mode), returns an empty
+        tuple immediately — the caller treats this as "no resolution" and
+        the workflow proceeds to ESCALATED/BLOCKED via its normal path.
 
         **Bounded (task 3170, fix C + review fixes D1/D2/D3).** The level-0
         wait is bounded by an IDLE window
@@ -15168,7 +15175,7 @@ class TaskWorkflow:
                 '(eval mode?) — returning immediately',
                 self.task_id,
             )
-            return ''
+            return ()
 
         # Reset once per wait, AFTER the no-queue early return, so each wait
         # reports its OWN outcome and a stale True from an earlier wait can
@@ -15181,7 +15188,7 @@ class TaskWorkflow:
         # Records that need a human are stop-the-line: no auto-watcher or
         # steward can resolve them, so waiting for the
         # L0 loop to clear makes no sense and risks a busy resume-spin (gate
-        # fires → _wait_for_resolution returns '' → resume → gate fires again).
+        # fires → _wait_for_resolution returns nothing → resume → gate fires again).
         # Raised as a _HumanHandoff so run() calls _mark_blocked and halts for
         # human intervention rather than looping; the reason says no steward
         # was applicable (D13).
@@ -15366,13 +15373,7 @@ class TaskWorkflow:
                 raise _StewardReescalated(handoff_l1)
             raise _NoStewardApplicable(handoff_l1, 'L1')
 
-        # Collect resolutions (filter ensures resolution is non-None str for join)
-        resolutions = [
-            e.resolution
-            for e in self.escalation_queue.get_by_task(self.task_id)
-            if e.status == 'resolved' and e.resolution is not None
-        ]
-        return '\n'.join(resolutions)
+        return select_carried_resolutions(self.escalation_queue.get_by_task(self.task_id))
 
     async def _get_head_commit(self) -> str:
         """Return the HEAD commit SHA for the current worktree."""

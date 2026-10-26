@@ -83,6 +83,7 @@ from orchestrator.config import (
     TimeoutsConfig,
 )
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.resume_resolution import CarriedResolution
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.verify import VerifyResult
@@ -304,7 +305,7 @@ def _time_the_wait(workflow: TaskWorkflow) -> dict[str, float]:
     timing: dict[str, float] = {}
     original = workflow._wait_for_resolution
 
-    async def _timed() -> str:
+    async def _timed() -> tuple[CarriedResolution, ...]:
         started = asyncio.get_running_loop().time()
         timing['calls'] = timing.get('calls', 0) + 1
         try:
