@@ -1102,6 +1102,12 @@ async def census_consolidation_gates(client, roots) -> GateCensus:
     )
 
 
+def _gate_topic(task: dict) -> object:
+    """The ``topic`` of a gate task's block, or ``None`` when it carries no block."""
+    block = (task.get('metadata') or {}).get(GATE_METADATA_KEY)
+    return block.get('topic') if isinstance(block, dict) else None
+
+
 def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
     """Pair each slug's renames with the consolidation gate filed against it.
 
@@ -1145,11 +1151,7 @@ def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
     # every verdict below is a property of the corpus rather than of read order.
     gates_by_topic: dict[tuple[str, str], list[dict]] = {}
     for task in gate_tasks or ():
-        metadata = task.get('metadata') or {}
-        block = metadata.get(GATE_METADATA_KEY)
-        if not isinstance(block, dict):
-            continue
-        topic = block.get('topic')
+        topic = _gate_topic(task)
         if not isinstance(topic, str) or not topic:
             continue
         key = (str(task.get('project_id') or ''), topic)
@@ -1655,6 +1657,42 @@ def _in_selection(legacy_topic: object, topics: frozenset[str] | None) -> bool:
     return topics is None or (isinstance(legacy_topic, str) and legacy_topic in topics)
 
 
+def _selection_defect(topic: object) -> str | None:
+    """Why *topic* cannot be a selected legacy value, or ``None`` if it can."""
+    if not isinstance(topic, str):
+        return 'not a string'
+    if is_valid_topic_slug(topic):
+        return 'already conforms; name the legacy value that folds onto it'
+    if derive_topic_slug(topic) is None:
+        return 'has no fold'
+    return None
+
+
+def _refuse_invalid_selection(topics: frozenset[str] | None) -> None:
+    """Raise ``ValueError`` unless *topics* is ``None`` or names foldable legacy values.
+
+    Passing the target slug instead of its source is the likely typo.  Left
+    unrefused, it would plan nothing and exit 0, which reads as a clean run.
+    A legacy value no record carries is NOT refused: a re-run after a
+    successful ``--apply`` legitimately finds the value drained.
+    """
+    if topics is None:
+        return
+    if not topics:
+        raise ValueError(
+            'empty topic selection: name at least one legacy topic value, or '
+            'omit --topic to migrate every non-conforming value')
+    defects = sorted(
+        f'{topic!r} ({defect})'
+        for topic in topics
+        if (defect := _selection_defect(topic)) is not None
+    )
+    if defects:
+        raise ValueError(
+            'a topic selection names LEGACY source values, never target slugs; '
+            'refused: ' + ', '.join(defects))
+
+
 def _census_gaps(gates: GateCensus, projects) -> list[dict]:
     """Every reason this sweep cannot trust its gate pairing, as report entries.
 
@@ -1716,16 +1754,19 @@ async def run(
             gates are paired — another project's gate is neither this run's
             work nor its orphan.
         topics: The legacy values to migrate.  ``None`` (default) migrates
-            every non-conforming value.  A selection narrows the renames and
-            the plan-time refusals to these values.  Enumeration, coverage,
-            the collision index and ``baseline_delta`` stay corpus-wide, so a
-            selected value contested by an unselected spelling is still
-            refused.
+            every non-conforming value.  A selection narrows the renames, the
+            plan-time refusals and the gate pairing to these values, so an
+            unselected gate is neither paired nor an orphan.  Enumeration,
+            coverage, the collision index and ``baseline_delta`` stay
+            corpus-wide, so a selected value contested by an unselected
+            spelling is still refused.  An invalid selection raises
+            ``ValueError`` before anything is read.
 
     Returns:
         The report dict — rendered by :func:`render_json` /
         :func:`render_markdown` and graded by :func:`resolve_exit_code`.
     """
+    _refuse_invalid_selection(topics)
     gaps = _census_gaps(gates, projects)
 
     # Fail-CLOSED capability preflight: ONE probe per run, ABOVE the scroll.
@@ -1830,7 +1871,11 @@ async def run(
 
     groups, gate_skips = pair_gate_blocks(
         all_renames,
-        [task for task in gates.tasks if task.get('project_id') in projects],
+        [
+            task for task in gates.tasks
+            if task.get('project_id') in projects
+            and _in_selection(_gate_topic(task), topics)
+        ],
     )
     _record_skips(gate_skips)
 
