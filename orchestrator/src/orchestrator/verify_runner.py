@@ -93,6 +93,7 @@ from orchestrator.verify_cancel import (
     start_stdin_heartbeat,
 )
 from orchestrator.verify_categories import FailureCategory, _assert_sentinels_disjoint
+from orchestrator.verify_evidence import verify_event_fields
 from orchestrator.verify_spec_shared import (
     VerifyCommand,
     apply_spec_to_host_config,
@@ -896,6 +897,9 @@ class LocalRunner:
                 # likely to occur under load — and would REGRESS an emission that
                 # happened inline before the recorder was split out.
                 flake_suppression=getattr(scoped, 'flake_suppression', None),
+                # The scoped plan did run; the unscoped gate is not one of its units.
+                plan=scoped.plan,
+                units=scoped.units,
             )
 
         return scoped
@@ -2609,6 +2613,7 @@ class VerifyRunnerPool:
                     # spec.verify_env, so a narrowed retry is never miscounted as
                     # a full green gate.
                     **retry_scope_event_fields(spec.verify_env),
+                    **verify_event_fields(result),
                 },
             )
 

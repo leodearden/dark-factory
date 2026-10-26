@@ -7,7 +7,7 @@ import hashlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 
 from orchestrator.verify_spec_shared import canonical_json
 
@@ -90,3 +90,23 @@ def plan_hash(plan: Mapping[str, Any] | None) -> str | None:
         for run in plan['runs']
     ]
     return hashlib.sha256(canonical_json(runs).encode()).hexdigest()
+
+
+class VerifyEvidence(Protocol):
+    @property
+    def plan(self) -> Mapping[str, Any] | None: ...
+    @property
+    def cache_mode(self) -> CacheMode: ...
+    @property
+    def units(self) -> tuple[VerifyUnit, ...] | None: ...
+
+
+def verify_event_fields(result: VerifyEvidence | None) -> dict[str, Any]:
+    """The always-present slice of a verify event that *result* attests; all None without a verdict."""
+    if result is None:
+        return {'plan_hash': None, 'cache_mode': None, 'units': None}
+    return {
+        'plan_hash': plan_hash(result.plan),
+        'cache_mode': str(result.cache_mode),
+        'units': None if result.units is None else [unit.to_dict() for unit in result.units],
+    }

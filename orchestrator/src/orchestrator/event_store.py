@@ -200,6 +200,9 @@ class EventType(StrEnum):
     #                Measured by _deep_chain_placement, not by build_chain, so
     #                it covers the FULL stall: lane acquisition, the sequential
     #                merges, and the asyncio.timeout wrapper's overhead.
+    # PLUS three always-present, nullable keys (task 5651): plan_hash,
+    # cache_mode and units, defined by
+    # orchestrator/src/orchestrator/verify_evidence.py::verify_event_fields.
     merge_verify = 'merge_verify'
     # A merge-role scoped-verify red that the isolated-rerun-confirm gate
     # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a
