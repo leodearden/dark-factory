@@ -24,7 +24,6 @@ import sqlite3
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import Iterable
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -592,36 +591,6 @@ def _fetch_titles(db_path: Path, task_ids: list[str]) -> dict[str, str]:
         conn.close()
 
 
-def _select_spot_check_subset(
-    diff_ids: list[str],
-    fraction: float = 0.1,
-    minimum: int = 5,
-    sticky: Iterable[str] = (),
-) -> set[str]:
-    """Deterministic, evenly-spread sample of *diff_ids* for the documented
-    human spot-check subset (~10% of mined diffs, floor 5, capped at N).
-
-    Membership only grows: any id in *sticky* (already flagged
-    ``in_spot_check_subset=True``, or carrying a non-``'pending'``
-    ``spot_check_status`` from a prior save -- i.e. a human has already
-    acted on it) is always kept in the result, even though the
-    deterministic even-spread sample below runs over a larger *diff_ids* on
-    every call as the corpus grows and would not, on its own, land on the
-    same ids twice. New ids are added -- via that same deterministic
-    sampling -- only to grow the subset toward the target fraction; prior
-    sign-off is never silently dropped (see corpus/README.md's spot-check
-    protocol)."""
-    ordered = sorted(diff_ids)
-    n = len(ordered)
-    if n == 0:
-        return set()
-    sticky_ids = {diff_id for diff_id in sticky if diff_id in ordered}
-    k = min(n, max(minimum, round(n * fraction)))
-    step = n / k
-    sampled = {ordered[int(i * step)] for i in range(k)}
-    return sticky_ids | sampled
-
-
 @cli.command('mine')
 @click.option('--runs-db', default=None, type=click.Path(path_type=Path),
               help='Path to the offline orchestrator runs.db (env: REVIEWER_TRIAL_RUNS_DB; '
@@ -722,18 +691,7 @@ def mine(
             corpus grows. Only newly-sampled ids are added to grow the
             subset toward the target fraction; prior human sign-off is never
             silently dropped (see corpus/README.md's spot-check protocol)."""
-            mined_ids = sorted(d.diff_id for d in manifest.diffs if d.source == 'mined')
-            entries_by_id = {e.diff_id: e for e in log.entries}
-            sticky = {
-                diff_id for diff_id in mined_ids
-                if (entry := entries_by_id.get(diff_id)) is not None
-                and (entry.in_spot_check_subset or entry.spot_check_status != 'pending')
-            }
-            subset = _select_spot_check_subset(mined_ids, sticky=sticky) if mined_ids else set()
-            for diff_id in mined_ids:
-                entry = entries_by_id.get(diff_id)
-                if entry is not None:
-                    entry.in_spot_check_subset = diff_id in subset
+            log.grow_spot_check_subset(d.diff_id for d in manifest.diffs if d.source == 'mined')
 
             assignment = assign_split([d.diff_id for d in manifest.diffs], seed=seed)
             for d in manifest.diffs:
