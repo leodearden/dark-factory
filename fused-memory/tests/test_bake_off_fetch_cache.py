@@ -69,11 +69,11 @@ ANCHOR_COMMIT = 'ff303320c7c3d90b093076965992dac246db062a'
 ANCHOR_FIXTURE_SHA256: dict[str, str] = {
     'write_triage_calibration.jsonl':
         'fa5958f3634ace98b846ac398cdfe28f2e105a746f0348fe48fb5ed08cd03fe3',
-    # Re-pinned by task 4856 (E1-only briefing re-key) without a re-dump: E2
-    # reads only the curator_gate subset (`load_registry_topics`), which
-    # compares equal before and after that edit.
+    # Re-pinned without a re-dump by tasks 4856 and 6094: every ARM_SHAPES
+    # `corpus_fingerprint` still equals e2_fetch_cache.json
+    # `provenance.corpus_fingerprints`.
     'memory_eval_topic_registry.json':
-        'ca17d33fd91708d4124d5c0cec1b30d5d6636c7a874fcf562f47f0574d717bb4',
+        '356d0559b934ec58d2ee0a788a7b93aa1338c546b471fde838c9d3bfe6580483',
     'e2_arm_claims.jsonl':
         '0b09c7de1c30c38570543f1705f01c5b4ac5970618f64545facb486e6991c257',
     'e2_query_set.jsonl':

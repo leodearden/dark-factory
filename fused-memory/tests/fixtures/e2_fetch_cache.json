@@ -32760,7 +32760,7 @@
       },
       {
         "path": "fused-memory/tests/fixtures/memory_eval_topic_registry.json",
-        "sha256": "ca17d33fd91708d4124d5c0cec1b30d5d6636c7a874fcf562f47f0574d717bb4"
+        "sha256": "356d0559b934ec58d2ee0a788a7b93aa1338c546b471fde838c9d3bfe6580483"
       },
       {
         "path": "fused-memory/tests/fixtures/e2_arm_claims.jsonl",
