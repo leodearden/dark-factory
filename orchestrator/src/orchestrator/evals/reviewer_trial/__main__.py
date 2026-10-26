@@ -19,11 +19,8 @@ import asyncio
 import json
 import logging
 import os
-import re
-import sqlite3
 import subprocess
 import sys
-from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -529,68 +526,6 @@ def corpus_audit(min_diffs: int) -> None:
 
 _MINE_SPLIT_SEED = 'reviewer_trial-2495-fn-mining'
 
-_LANG_EXTENSIONS = {
-    'python': {'.py', '.pyi'},
-    'rust': {'.rs'},
-    'typescript': {'.ts', '.tsx'},
-}
-
-
-def _infer_language(diff_text: str) -> str:
-    """Best-effort language sniff from a unified diff's ``diff --git`` headers.
-
-    Tallies changed-file extensions against the corpus's three known
-    languages and returns the majority; defaults to 'python' (dark_factory
-    is an all-Python monorepo) when no file matches or the diff carries no
-    recognizable header.
-    """
-    paths = re.findall(r'^diff --git a/(\S+) b/\S+', diff_text, re.M)
-    counts: Counter[str] = Counter()
-    for p in paths:
-        suffix = Path(p).suffix
-        for lang, exts in _LANG_EXTENSIONS.items():
-            if suffix in exts:
-                counts[lang] += 1
-                break
-    if not counts:
-        return 'python'
-    return counts.most_common(1)[0][0]
-
-
-_FETCH_TITLES_CHUNK_SIZE = 500  # stay well under SQLite's SQLITE_MAX_VARIABLE_NUMBER
-                                  # (999 on older builds, 32766 on modern ones) -- the
-                                  # candidate set scales with run history and is unbounded.
-
-
-def _fetch_titles(db_path: Path, task_ids: list[str]) -> dict[str, str]:
-    """Supplementary read-only lookup of ``task_results.title``, keyed by task_id.
-
-    Kept separate from ``mining.mine_fn_candidates`` (whose FnCandidate field
-    set is unit-tested) -- this is CLI-only convenience for building a
-    human-readable frontier-prompt description.
-
-    Queries in chunks of ``_FETCH_TITLES_CHUNK_SIZE`` task_ids rather than one
-    giant ``IN (...)`` so an unbounded candidate set never risks a
-    ``sqlite3.OperationalError`` from exceeding SQLite's placeholder limit.
-    """
-    if not task_ids:
-        return {}
-    conn = sqlite3.connect(str(db_path))
-    try:
-        titles: dict[str, str] = {}
-        for i in range(0, len(task_ids), _FETCH_TITLES_CHUNK_SIZE):
-            chunk = task_ids[i:i + _FETCH_TITLES_CHUNK_SIZE]
-            placeholders = ','.join('?' for _ in chunk)
-            rows = conn.execute(
-                f'SELECT task_id, title FROM task_results WHERE task_id IN ({placeholders})',
-                chunk,
-            ).fetchall()
-            titles.update((row[0], row[1] or '') for row in rows)
-        return titles
-    finally:
-        conn.close()
-
-
 @cli.command('mine')
 @click.option('--runs-db', default=None, type=click.Path(path_type=Path),
               help='Path to the offline orchestrator runs.db (env: REVIEWER_TRIAL_RUNS_DB; '
@@ -635,16 +570,19 @@ def mine(
 
     async def _run() -> int:
         from .adjudication import AdjudicationLog
-        from .corpus import CorpusDiff
         from .mining import (
-            FnCandidate,
+            RecoveredCandidate,
+            admit_mined_diff,
             audit_corpus,
             backfill_hand_authored,
+            candidate_pool,
+            fetch_task_titles,
+            frontier_description,
             mine_escalation_refs,
             mine_fn_candidates,
+            mined_corpus_diff,
             propose_labels_frontier,
-            recover_diff,
-            resolve_merge_sha_by_task_id,
+            recover_candidates,
             save_corpus,
         )
 
@@ -688,37 +626,13 @@ def mine(
         esc_refs = mine_escalation_refs(escalations_dir)
         click.echo(f'  {len(candidates)} FN candidates mined from runs.db')
 
-        titles = _fetch_titles(runs_db, [c.task_id for c in candidates])
-
-        existing_ids = {d.diff_id for d in manifest.diffs}
-        recovered: list[tuple[FnCandidate, str, str]] = []
-        for c in candidates:
-            diff_id = f'mined_{c.task_id}'
-            if diff_id in existing_ids:
-                continue
-            sha = c.merge_sha or resolve_merge_sha_by_task_id(c.task_id, repo_path)
-            if not sha:
-                continue
-            text = recover_diff(sha, repo_path)
-            if not text or not text.strip():
-                continue
-            recovered.append((c, sha, text))
-
-        # Smallest diffs first: propose_labels_frontier truncates its prompt
-        # context to 10K chars, so prioritizing smaller (fully-visible) diffs
-        # both biases toward higher-fidelity frontier labels and, since most
-        # recovered merge-commit diffs are far larger than 10K chars, keeps
-        # per-call prompt size (and cost) down across the batch.
-        recovered.sort(key=lambda item: len(item[2]))
-
-        needed = max(0, target_total - len(manifest.diffs))
-        if needed == 0:
-            pool = []
-        else:
-            pool_size = needed + max(5, needed // 4)  # buffer for attrition
-            pool = recovered[:pool_size]
-        if limit is not None:
-            pool = pool[:limit]
+        titles = fetch_task_titles(runs_db, [c.task_id for c in candidates])
+        recovered = recover_candidates(
+            candidates, existing_ids={d.diff_id for d in manifest.diffs}, repo_path=repo_path,
+        )
+        pool = candidate_pool(
+            recovered, corpus_size=len(manifest.diffs), target_total=target_total, limit=limit,
+        )
 
         click.echo(f'  {len(recovered)} candidates have a recoverable diff not already in the corpus')
         click.echo(f'  Attempting {len(pool)} this run (target_total={target_total}, limit={limit})')
@@ -728,17 +642,13 @@ def mine(
         total = len(pool)
         state = {'completed': 0, 'added': 0, 'cost': 0.0}
 
-        async def _worker(candidate: FnCandidate, sha: str, diff_text: str) -> None:
+        async def _worker(item: RecoveredCandidate) -> None:
+            candidate = item.candidate
             async with semaphore:
-                title = titles.get(candidate.task_id, '')
-                description = (
-                    f'Task {candidate.task_id} ({candidate.project_id}): {title}. '
-                    f'Flagged as a false-negative candidate -- review passed but '
-                    f'{"; ".join(candidate.signal_reason)}.'
-                )
+                description = frontier_description(candidate, titles.get(candidate.task_id, ''))
                 try:
                     issues, cost = await propose_labels_frontier(
-                        diff_text, model=model, description=description,
+                        item.diff_text, model=model, description=description,
                         oauth_token=oauth_token, max_turns=max_turns,
                     )
                 except Exception as exc:  # noqa: BLE001 -- offline generation script; one bad candidate must not sink the batch
@@ -749,65 +659,23 @@ def mine(
 
             state['completed'] += 1
             state['cost'] += cost
-            diff_id = f'mined_{candidate.task_id}'
             if not issues:
-                click.echo(f'  [{state["completed"]}/{total}] {diff_id}: no issues proposed -- skipping (cost=${cost:.3f})')
+                click.echo(f'  [{state["completed"]}/{total}] {candidate.diff_id}: no issues proposed -- skipping (cost=${cost:.3f})')
                 return
 
-            provenance = {
-                'kind': 'mined',
-                'task_id': candidate.task_id,
-                'project_id': candidate.project_id,
-                'outcome': candidate.outcome,
-                'review_cycles': candidate.review_cycles,
-                'verify_attempts': candidate.verify_attempts,
-                'signal_reason': candidate.signal_reason,
-                'merge_sha': sha,
-                'runs_db_path': str(runs_db),
-                'runs_db_query': (
-                    'SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM '
-                    'task_results WHERE review_cycles >= 1, cross-referenced with events '
-                    '(escalation_created, merge_finalized) -- see mining.mine_fn_candidates.'
-                ),
-                'escalation_refs': [
-                    {
-                        'task_id': ref.task_id,
-                        'category': ref.category,
-                        'severity': ref.severity,
-                        'summary': ref.summary,
-                        'level': ref.level,
-                        'path': str(ref.path),
-                    }
-                    for ref in esc_refs.get(candidate.task_id, [])
-                ],
-            }
-            diff = CorpusDiff(
-                diff_id=diff_id,
-                language=_infer_language(diff_text),
-                source='mined',
-                diff_text=diff_text,
-                description=description,
-                ground_truth=issues,
-                project='dark-factory',
-                split=None,
-                provenance=provenance,
+            diff = mined_corpus_diff(
+                item, issues=issues, description=description,
+                escalation_refs=esc_refs.get(candidate.task_id, []), runs_db=runs_db,
             )
-            manifest.diffs.append(diff)
-            log.append(
-                diff.diff_id,
-                frontier_proposal=diff.ground_truth,
-                in_spot_check_subset=False,  # corrected by _resave()'s stratified pass
-                frontier_model=model,
-                notes=f'Frontier-proposed labels for FN candidate task {candidate.task_id}.',
-            )
+            admit_mined_diff(manifest, log, diff, frontier_model=model)
             _resave()
             state['added'] += 1
             click.echo(
-                f'  [{state["completed"]}/{total}] {diff_id}: {len(issues)} issues added '
+                f'  [{state["completed"]}/{total}] {diff.diff_id}: {len(issues)} issues added '
                 f'(cost=${cost:.3f}, corpus now {len(manifest.diffs)})'
             )
 
-        await asyncio.gather(*(_worker(c, sha, text) for c, sha, text in pool))
+        await asyncio.gather(*(_worker(item) for item in pool))
 
         click.echo()
         click.echo(f'Mined {state["added"]}/{total} new diffs this run (frontier cost: ${state["cost"]:.2f}).')

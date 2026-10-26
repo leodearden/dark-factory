@@ -253,7 +253,7 @@ class TestMineMinDiffsThreading:
                 return_value={},
             ),
             patch(
-                'orchestrator.evals.reviewer_trial.__main__._fetch_titles',
+                'orchestrator.evals.reviewer_trial.mining.fetch_task_titles',
                 return_value={},
             ),
             patch(
