@@ -76,7 +76,7 @@ from test_merge_queue_rebased_landing_dead_base import _land_foreign_commit
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane import MERGE_WORKER_SHUTDOWN_REASON, MergeLane
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
@@ -928,6 +928,33 @@ class TestGateReverifyDoesNotParkTheLoop:
             assert head_outcome.status == 'done', head_outcome
             assert GATE_WAITER in lane.inflight_ids(), lane.observed()
             assert not waiter.result.done(), lane.observed()
+
+    async def test_stop_preempts_a_parked_gate_reverify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier()
+        async with _running_lane(git_ops, config, verifier=verifier) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            head, drift = await _gate_head(lane, verifier)
+            assert lane.run_task is not None
+
+            await lane.worker.stop()
+
+            assert head.result.done(), lane.observed()
+            outcome = head.result.result()
+            assert (outcome.status, outcome.reason) == (
+                'blocked', MERGE_WORKER_SHUTDOWN_REASON,
+            ), outcome
+            assert verifier.cancelled == [GATED_HEAD], (
+                f"the parked gate's verify was orphaned, not torn down; "
+                f'cancelled={verifier.cancelled!r} {lane.observed()}'
+            )
+            try:
+                await asyncio.wait_for(asyncio.shield(lane.run_task), timeout=5.0)
+            except TimeoutError:
+                pytest.fail(f'the lane never finished after stop(); {lane.observed()}')
+            assert _hosts_of(lane) == {}, lane.observed()
+            assert await lane.git_ops.get_main_sha() == drift, lane.observed()
 
 
 async def _git_rc(repo: Any, *args: str) -> int:
