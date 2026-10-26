@@ -308,6 +308,8 @@ _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
             'duration_secs',
             'flake_suppression',
             'admission_legs',
+            'units',
+            'cache_mode',
             'test_leg_failed',
         }),
         anchors=frozenset({'passed'}),
