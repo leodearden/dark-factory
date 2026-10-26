@@ -127,3 +127,44 @@ async def test_recycle_without_archive_still_leaves_no_husk(
     lane, _ = await _recycle_after_occupant_a(git_ops, repo, caplog)
 
     _assert_no_entry_for_occupant_a(lane / '.task')
+
+
+async def _orphan_branch_with_a_commit(repo: Path, tmp_path: Path, start_ref: str) -> None:
+    scratch_worktree = tmp_path / 'scratch-task-B'
+    await _git(['worktree', 'add', '-b', 'task/B', str(scratch_worktree), start_ref], repo)
+    (scratch_worktree / 'wip.txt').write_text('B work\n')
+    await _git(['add', '-A'], scratch_worktree)
+    await _git(['commit', '-m', 'B wip'], scratch_worktree)
+    await _git(['worktree', 'remove', '--force', str(scratch_worktree)], repo)
+
+
+@pytest.mark.asyncio
+async def test_reattach_acquire_keeps_incoming_tasks_own_config_and_archives_foreign(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    repo = await _build_repo(tmp_path)
+    start_ref = await _git(['rev-parse', 'HEAD'], repo)
+    await _orphan_branch_with_a_commit(repo, tmp_path, start_ref)
+    git_ops = _pooled_git_ops(repo, archive=True)
+    info_v = await git_ops.acquire_warm_lane('V', start_ref)
+    assert isinstance(info_v, WorktreeInfo), f'seed acquire failed: {info_v!r}'
+    lane = info_v.path
+    task_dir = lane / '.task'
+    await _plant_occupant_config_dir(task_dir, 'V', 'sV')
+    own_transcript = _plant_transcript(task_dir / f'{CONFIG_DIR_PREFIX}B', 'sB')
+    own_bytes = own_transcript.read_bytes()
+    (task_dir / 'iterations.jsonl').write_text('{"task": "V"}\n')
+    (task_dir / 'reviews').mkdir()
+    (task_dir / 'reviews' / 'merge.json').write_text('{"task": "V"}')
+    await git_ops.release_warm_lane(lane, 'V')
+
+    with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+        info_b = await git_ops.acquire_warm_lane('B', start_ref)
+
+    assert isinstance(info_b, WorktreeInfo), f'reattach acquire failed: {info_b!r}'
+    assert 'route=reset_in_place_reattach edge=' in caplog.text, caplog.text
+    assert own_transcript.read_bytes() == own_bytes
+    assert not os.path.lexists(task_dir / f'{CONFIG_DIR_PREFIX}V')
+    assert durable_archive_path(repo / _ARCHIVE_ROOT, 'V', 'sV') is not None
+    assert not os.path.lexists(task_dir / 'iterations.jsonl')
+    assert not os.path.lexists(task_dir / 'reviews')
