@@ -76,6 +76,9 @@ Dry run is the default — the operator runbook
    markdown.  Nothing is modified.  ``--project-root`` REPLACES the default
    (this checkout alone), so a swept corpus whose checkout is not named is a
    ``gate_census_incomplete`` gap: the dry run exits 1 and names it.
+   ``--topic <legacy value>`` (repeatable) narrows the write set to the named
+   legacy spellings; it is how one registry topic is normalized without
+   sweeping the whole project.
 
 2. **Read the refusal buckets and resolve them BY HAND.**  ``slug_collision``,
    ``canonical_collision``, ``topic_unfoldable`` and ``gate_ambiguous`` are
@@ -205,6 +208,7 @@ __all__ = [
     'resolve_exit_code',
     'resolve_gate_roots',
     'resolve_projects',
+    'resolve_topics',
     'run',
     'run_live',
     'rename_one',
@@ -1929,6 +1933,7 @@ async def run(
             'listed project is enumerated by scroll, not addressed by id'
         ),
         'projects': list(projects),
+        'topic_selection': None if topics is None else sorted(topics),
         'coverage': coverage,
         'coverage_complete': coverage_complete,
         'candidate_count': candidate_count,
@@ -2037,6 +2042,16 @@ def _render_gate_census(census: dict) -> str:
     )
 
 
+def _render_topic_selection(selection: list[str] | None) -> str:
+    if selection is None:
+        return '**Topic selection:** every non-conforming value'
+    return (
+        f'**Topic selection:** {", ".join(f"`{topic}`" for topic in selection)} '
+        '(renames, refusals and gate pairing are narrowed to these; enumeration '
+        'and the collision check stay corpus-wide)'
+    )
+
+
 def render_markdown(report: dict) -> str:
     """The human-readable artifact.
 
@@ -2052,6 +2067,7 @@ def render_markdown(report: dict) -> str:
         '',
         f'**Mode:** {mode}',
         f'**Projects:** {", ".join(report.get("projects") or [])}',
+        _render_topic_selection(report.get('topic_selection')),
         (
             '**Scope:** corpus-wide — every record in every census category '
             'of every listed project is enumerated by scroll, not addressed '
@@ -2205,6 +2221,15 @@ def resolve_gate_roots(args) -> tuple[str, ...]:
     return tuple(dict.fromkeys(args.project_roots))
 
 
+def resolve_topics(args) -> frozenset[str] | None:
+    """``--topic`` REPLACES "every value"; absent, it is ``None``, never empty.
+
+    The rule :func:`resolve_projects` follows: naming a legacy value narrows
+    the write set and never widens it.  :func:`run` validates the values.
+    """
+    return None if args.topics is None else frozenset(args.topics)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -2227,6 +2252,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f'Checkout whose task store the consolidation-gate census reads; '
              f'repeatable, one per swept project. Replaces the default '
              f'({", ".join(DEFAULT_GATE_ROOTS)}) rather than extending it.',
+    )
+    parser.add_argument(
+        '--topic', dest='topics', action='append', default=None,
+        help='Legacy (non-conforming) topic value to migrate; repeatable. '
+             'Replaces the default (every non-conforming value) rather than '
+             'extending it. Name the SOURCE value, never its target slug.',
     )
     parser.add_argument(
         '--server-url', default=None,
@@ -2297,6 +2328,7 @@ async def run_live(args, *, open_memory_service, open_client) -> dict:
                 apply=args.apply,
                 client=client,
                 gates=census,
+                topics=resolve_topics(args),
             )
 
 
