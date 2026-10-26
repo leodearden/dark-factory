@@ -142,9 +142,9 @@ from orchestrator.merge_lane.shadow import (
     build_warm_shadow_results,
     did_not_pass_subset,
     nextest_filter_ids,
-    parse_failed_run_all_members,
     parse_nextest_list_planned,
     parse_per_test_results,
+    select_failed_run_all_members,
 )
 from orchestrator.merge_lane.speculation_controller import (
     PermitLedger,
@@ -2204,8 +2204,8 @@ async def _build_attempt0_payload(
 
     Sources, all DF-owned except the two pins:
 
-    * ``verify.test_output`` → per-test verdicts (:func:`parse_per_test_results`)
-      and the {failed} run_all members (:func:`parse_failed_run_all_members`);
+    * ``verify.test_output`` → per-test verdicts (:func:`parse_per_test_results`);
+      the {failed} run_all members → :func:`select_failed_run_all_members`;
     * a ``cargo nextest list`` probe → the authoritative planned set;
     * reify's sidecar → ONLY ``tree_oid`` (the INV-3 pin) and ``profiles``.
 
@@ -2300,7 +2300,7 @@ async def _build_attempt0_payload(
         debug_verdicts=per_profile['debug'][1],
         release_planned=per_profile['release'][0],
         release_verdicts=per_profile['release'][1],
-        run_all_members=parse_failed_run_all_members(verify.test_output),
+        run_all_members=select_failed_run_all_members(verify.test_output, verify.run_all_failed_members),
         # Deliberately empty (task 3059): no real reify gui failure log was
         # available to pin a fixture to, and authoring one from prose is the
         # drift class this leaf corrects.  verify.sh:2127-2158 treats an empty
