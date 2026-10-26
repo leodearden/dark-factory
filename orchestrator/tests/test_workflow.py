@@ -399,24 +399,33 @@ class TestSubmitToMergeQueuePlanTightening:
         assert backend.blob['files'] == wf.plan['files'] == narrowed
 
     @pytest.mark.parametrize(
-        ('rewrite', 'success'),
+        ('rewrite', 'success', 'held'),
         [
             pytest.param(
-                ['pkg_a/mod/x.py', 'pkg_c/mod/z.py'], True, id='superset_rewrite',
+                ['pkg_a/mod/x.py', 'pkg_c/mod/z.py'], True, None,
+                id='superset_rewrite',
             ),
-            pytest.param(['pkg_a/mod/x.py'], False, id='failed_invocation'),
+            pytest.param(['pkg_a/mod/x.py'], False, None, id='failed_invocation'),
+            pytest.param(
+                ['pkg_b/mod/y.py'], True, ['pkg_a/mod/x.py'],
+                id='needs_an_unheld_module',
+            ),
         ],
     )
     async def test_declined_narrowing_leaves_plan_and_scope_untouched(
         self, tmp_path: Path, rewrite: list[str], success: bool,
+        held: list[str] | None,
     ):
         """A declined narrowing pass leaves plan, plan.json, locks and
         metadata.files exactly as it found them, and files no divergence
-        escalation.
+        escalation.  *held* narrows the held lock modules below the plan's,
+        the shape of an unreadable-``get_task`` tripwire skip.
         """
         wf = _make_workflow(tmp_path=tmp_path)
         pre = ['pkg_a/mod/x.py', 'pkg_b/mod/y.py']
         backend = _wire_scope_backend(wf, pre)
+        if held is not None:
+            wf.modules = derive_modules(held, wf.config.lock_depth)
         wf.escalation_queue = EscalationQueue(tmp_path / 'queue')
 
         _stub_architect(wf, rewrite, success=success)

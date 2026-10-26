@@ -11589,28 +11589,27 @@ class TaskWorkflow:
 
         Lenient semantics: the architect may keep some flagged entries
         (treating them as genuinely needed); the only hard constraints
-        are that no NEW files may be added and at least one lock-bearing
-        file must remain.  The gate's re-check is the source of truth
+        are that no NEW files may be added, at least one lock-bearing
+        file must remain, and no module the task does not already hold may
+        be needed.  The gate's re-check is the source of truth
         for pass/fail.
 
         Returns True when the narrowing pass should be re-checked
         against the gate, False otherwise (one-shot already fired,
-        architect invocation failed, or the candidate added new files or
-        derives zero lock modules).
+        architect invocation failed, or the candidate added new files,
+        derives zero lock modules, or needs an unheld module).
 
         An accepted candidate is committed through ``_set_task_scope``, so
         metadata.files and the held lock modules follow plan.files. Every
-        declined pass, and every invocation that raises, restores the
+        declined pass, and an architect invocation that raises, restores the
         plan.json snapshot taken before the architect ran and leaves
-        ``self.plan``, locks and metadata.files untouched (task 3580).
+        ``self.plan``, locks and metadata.files untouched (task 3580). A
+        failure after the commit leaves plan.json narrowed while
+        metadata.files stays wide, a superset the merge-entry tripwire
+        tolerates.
 
-        Reconciling inside the merge-retry loop is safe: a file-level narrow
-        is a module-level narrow-or-no-op, so
-        ``scheduler.py::Scheduler.handle_blast_radius_expansion`` never
-        reaches ``try_acquire_additional`` and cannot requeue. The zero-module
-        rejection keeps it from ever being asked to release every lock.
-        ``merge_types.py::MergeRequest`` snapshots scope by value and the
-        merge queue never consults the lock table.
+        A narrowing never takes a lock (``_narrowing_rejection``), so the
+        scope reconcile cannot be refused.
         """
         if self._plan_tightened:
             return False
@@ -11640,11 +11639,10 @@ class TaskWorkflow:
         self.plan = candidate
         candidate_files = list(candidate.get('files', []))
         reconciled = await self._set_task_scope(candidate_files)
-        if not reconciled.applied:
-            logger.warning(
-                'Task %s: narrowing pass could not reconcile scope locks to %s',
-                self.task_id, candidate_files,
-            )
+        assert reconciled.applied, (
+            f'task {self.task_id}: a narrowing that holds every module it '
+            f'needs cannot lose its locks: {candidate_files}'
+        )
         return True
 
     async def _consume_narrowing_exit_report(
@@ -11729,17 +11727,24 @@ class TaskWorkflow:
         self, candidate_files: list[str], before: set[str],
     ) -> str | None:
         """Why a narrowing pass's *candidate_files* must be declined, or None
-        when it is a legal narrowing of *before*."""
+        when it is a legal narrowing of *before* that stays inside the held
+        ``self.modules``."""
         if not set(candidate_files).issubset(before):
             return (
                 f'narrowing pass added new files '
                 f'{sorted(set(candidate_files) - before)}'
             )
-        if not derive_modules(
+        candidate_modules = derive_modules(
             candidate_files, self.config.lock_depth, task_id=self.task_id,
-        ):
+        )
+        if not candidate_modules:
             return (
                 f'narrowing pass left no lock-bearing files {candidate_files}'
+            )
+        if not set(candidate_modules).issubset(self.modules):
+            return (
+                f'narrowing pass needs modules this task does not hold '
+                f'{sorted(set(candidate_modules) - set(self.modules))}'
             )
         return None
 
@@ -11967,9 +11972,7 @@ class TaskWorkflow:
                     if exit_outcome is not None:
                         return exit_outcome
                     if narrowed:
-                        # Re-check the (possibly narrowed) plan against the
-                        # gate.  ``_task_files`` reads from ``self.plan``,
-                        # which ``_try_narrow_plan`` has refreshed from disk.
+                        # Re-check the narrowed plan against the gate.
                         rc2, branch_head2, _ = await _run(
                             ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
                         )
