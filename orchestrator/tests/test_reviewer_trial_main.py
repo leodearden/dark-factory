@@ -27,7 +27,7 @@ from orchestrator.evals.reviewer_trial.corpus import (
     CorpusManifest,
     GroundTruthIssue,
 )
-from orchestrator.evals.reviewer_trial.mining import AuditReport
+from orchestrator.evals.reviewer_trial.mining import AuditReport, FnCandidate, RecoveredCandidate
 from orchestrator.evals.reviewer_trial.runner import PanelRunResult
 from orchestrator.evals.reviewer_trial.scorer import ScoringResult
 from orchestrator.evals.reviewer_trial.variants import (
@@ -284,6 +284,62 @@ class TestMineMinDiffsThreading:
             f'got {actual_min_diffs!r} (call_args={call_args!r}).\n'
             f'Output:\n{result.output}'
         )
+
+
+class TestMineDelegates:
+    """`mine` is a thin CLI: it composes mining's pipeline and persists only through mining.save_corpus."""
+
+    @staticmethod
+    def _candidate(task_id: str) -> FnCandidate:
+        return FnCandidate(
+            task_id=task_id, project_id='dark_factory', outcome='requeued', review_cycles=1,
+            verify_attempts=2, merge_sha=f'sha{task_id}', signal_reason=['outcome:requeued'],
+        )
+
+    def test_one_labelled_candidate_is_admitted_and_saved(self, tmp_path: Path) -> None:
+        manifest = CorpusManifest(diffs=[
+            CorpusDiff(diff_id='mined_1', language='python', source='mined', diff_text='',
+                       description='m1', ground_truth=[], split='test', provenance={'kind': 'mined'}),
+        ])
+        labelled, failing = self._candidate('101'), self._candidate('102')
+        recovered = [
+            RecoveredCandidate(labelled, 'sha101', 'LABELLED_DIFF'),
+            RecoveredCandidate(failing, 'sha102', 'FAILING_DIFF'),
+        ]
+
+        async def propose(diff_text: str, **_kwargs: object):
+            if diff_text == 'LABELLED_DIFF':
+                return [_gt('frontier_1')], 0.1
+            raise RuntimeError('frontier call failed')
+
+        runs_db = tmp_path / 'runs.db'
+        runs_db.touch()
+        with (
+            patch('orchestrator.evals.reviewer_trial.__main__._load_corpus', return_value=manifest),
+            patch('orchestrator.evals.reviewer_trial.mining.mine_fn_candidates', return_value=[labelled, failing]),
+            patch('orchestrator.evals.reviewer_trial.mining.mine_escalation_refs', return_value={}),
+            patch('orchestrator.evals.reviewer_trial.mining.fetch_task_titles', return_value={}),
+            patch('orchestrator.evals.reviewer_trial.mining.recover_candidates', return_value=recovered),
+            patch('orchestrator.evals.reviewer_trial.mining.propose_labels_frontier',
+                  new_callable=AsyncMock, side_effect=propose),
+            patch('orchestrator.evals.reviewer_trial.mining.save_corpus') as save_corpus,
+            patch('orchestrator.evals.reviewer_trial.mining.audit_corpus',
+                  return_value=AuditReport(ok=True, diff_count=2, failures=[])),
+        ):
+            result = CliRunner().invoke(cli, ['mine', '--runs-db', str(runs_db), '--target-total', '10'])
+
+        assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
+        save_corpus.assert_called_once()
+        saved_manifest, saved_log = save_corpus.call_args.args
+        assert [d.diff_id for d in saved_manifest.diffs] == ['mined_1', 'mined_101']
+        admitted = saved_manifest.diffs[-1]
+        assert admitted.provenance is not None
+        assert (admitted.provenance['kind'], admitted.provenance['merge_sha']) == ('mined', 'sha101')
+        assert [(e.diff_id, e.frontier_model) for e in saved_log.entries if e.diff_id == 'mined_101'] == [
+            ('mined_101', 'opus'),
+        ]
+        assert not any(e.diff_id == 'mined_102' for e in saved_log.entries)
+        assert 'Mined 1/2 new diffs' in result.output, result.output
 
 
 class TestRefreshCommand:
