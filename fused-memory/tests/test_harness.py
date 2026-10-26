@@ -11720,26 +11720,30 @@ async def test_backlog_iterator_deadline_restores_only_the_in_flight_chunk(
 ):
     """Task 6453: BacklogIterator.run owns its cycle_timeout_seconds deadline.
     When it fires, the in-flight chunk's event is restored, the earlier
-    completed chunk's event stays drained, and TimeoutError propagates."""
+    completed chunk's event stays drained, and TimeoutError propagates; the
+    deadline expires once the second chunk is in flight, never on the host
+    clock."""
+    deadline = _ManualDeadline()
     harness, _ = _make_completing_harness(
         journal, event_buffer, mock_memory_service, tmp_path,
     )
-    harness.config.cycle_timeout_seconds = 2
-    _first_stage_completes_once_then(harness, _stalling_stage_run(asyncio.Event()))
+    _first_stage_completes_once_then(harness, _expiring_stage_run(deadline))
     for _ in range(3):
         await event_buffer.push(_make_event())
 
-    with patch(
-        'fused_memory.reconciliation.context_assembler.ContextAssembler',
-        side_effect=_one_event_per_chunk_assembler,
+    with (
+        patch(
+            'fused_memory.reconciliation.context_assembler.ContextAssembler',
+            side_effect=_one_event_per_chunk_assembler,
+        ),
+        pytest.raises(TimeoutError),
     ):
-        task = asyncio.create_task(BacklogIterator(
+        await BacklogIterator(
             harness.config, harness.journal, harness.buffer, harness,
-        ).run('test-project'))
-        await asyncio.wait([task], timeout=30)
+            iteration_deadline=deadline.arm,
+        ).run('test-project')
 
-    assert task.done()
-    assert isinstance(task.exception(), TimeoutError)
+    assert deadline.delays == [harness.config.cycle_timeout_seconds]
     [completed_chunk] = [
         r for r in await journal.get_recent_runs('test-project') if r.status == 'completed'
     ]
@@ -11859,8 +11863,9 @@ async def _drive_one_project_loop_cycle(harness):
 
 
 class _ManualDeadline:
-    """A ``full_cycle_deadline`` that never expires on the clock, so a test
-    lands the cycle timeout at a chosen point instead of racing the host clock."""
+    """An injected recon deadline (``full_cycle_deadline`` /
+    ``iteration_deadline``) that never expires on the clock, so a test lands
+    the timeout at a chosen point instead of racing the host clock."""
 
     def __init__(self) -> None:
         self.delays: list[float] = []
@@ -11874,6 +11879,16 @@ class _ManualDeadline:
     def expire(self) -> None:
         assert self._armed is not None, 'expire() called before the deadline was armed'
         self._armed.reschedule(asyncio.get_running_loop().time())
+
+
+def _expiring_stage_run(deadline: _ManualDeadline):
+    """A stage.run stand-in that expires *deadline* and then waits to be cancelled."""
+
+    async def expiring_run(events, watermark, prior_reports, run_id, model=None):
+        deadline.expire()
+        await asyncio.sleep(999)
+
+    return expiring_run
 
 
 @pytest.mark.asyncio
