@@ -193,23 +193,24 @@ both fakes parse argv and discard the unit token outright: the name never
 reaches the factory, only the real subprocess.  That divergence is deliberate;
 do not "fix" it back into line with the others.
 
-WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO.  Nine conftests
+WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO.  Ten conftests
 import from this module; the git ceiling and the deploy-clock guard are in
-all nine.  ``_df_no_leaked_drain_processes`` was, from task 3798 through task
+all ten.  ``_df_no_leaked_drain_processes`` was, from task 3798 through task
 3931, wired only into the ROOT conftest (covering ``tests/``) and
 ``scripts/tests/conftest.py`` — exactly the two rootdirs that spawn the drain
-script, and the two the incident came from.  Task 3932 closed that gap: the
-guard is now wired into all nine, including the seven subproject rootdirs
-(``cockpit``, ``dashboard``, ``escalation``, ``fused-memory``,
-``orchestrator``, ``sampler``, ``shared``) that run as their own pytest
-sessions from their own venvs, so the root conftest's binding no longer needs
-to reach them — each stamps its own token.  Before task 3932, none of those
-seven carried the guard, so no token was stamped there and
-``leaked_drain_processes`` failed CLOSED on an absent token: those sessions
-reported all-clear unconditionally rather than falsely, and a green run had
-to be read as "unmeasured", never as "no leak".  That interim reading no
-longer applies — a green run of any of the nine now means the guard actually
-checked.  ``orchestrator`` was the one to watch during the gap, since
+script, and the two the incident came from.  Task 3932 wired it into the
+seven subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
+``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) that run as
+their own pytest sessions from their own venvs, so the root conftest's
+binding no longer needs to reach them — each stamps its own token.  Before
+task 3932, none of those seven carried the guard, so no token was stamped
+there and ``leaked_drain_processes`` failed CLOSED on an absent token: those
+sessions reported all-clear unconditionally rather than falsely, and a green
+run had to be read as "unmeasured", never as "no leak".  That reading no
+longer applies to those nine — a green run of any of them now means the guard
+actually checked.  It STILL applies to the tenth, ``client-feed``, whose
+conftest landed after task 3932 was planned and does not bind the guard.
+``orchestrator`` was the one to watch during the gap, since
 ``orchestrator/src/orchestrator/service_restart.py`` is the PRODUCTION caller
 of the drain script and its tests historically only asserted on config
 strings; it is covered now like the rest.
