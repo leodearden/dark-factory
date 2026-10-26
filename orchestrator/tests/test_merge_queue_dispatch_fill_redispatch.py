@@ -898,6 +898,37 @@ class TestGateReverifyDoesNotParkTheLoop:
                 lane.git_ops.project_root, 'cat-file', '-e', 'main:gr_head.py',
             ) != 0, "the red-gated head's file reached main"
 
+    async def test_gate_completion_wakes_the_fill_ahead_race(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier()
+        async with _running_lane(
+            git_ops, config, verifier=verifier, extra_remote_names=('laptop2',),
+        ) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            head, _drift = await _gate_head(lane, verifier)
+            waiter = await lane.enqueue(GATE_WAITER)
+            await lane.settle(
+                lambda: lane.inflight_ids() == {GATED_HEAD, GATE_WAITER}
+                and _hosts_of(lane).get('local') == [GATED_HEAD],
+                expected=f'{GATE_WAITER} verifying on a remote beside the gated head',
+                why="the verifier loop is parked inside the head's gate re-verify.",
+            )
+            assert lane.free_hosts() == 1, lane.observed()
+
+            verifier.gate_release.set()
+            head_outcome = await wait_responsive(
+                head.result,
+                label=(
+                    f'{GATED_HEAD} outcome: a finished gate must end the fill-ahead '
+                    f'race, which otherwise waits on {GATE_WAITER}\'s verify'
+                ),
+            )
+
+            assert head_outcome.status == 'done', head_outcome
+            assert GATE_WAITER in lane.inflight_ids(), lane.observed()
+            assert not waiter.result.done(), lane.observed()
+
 
 async def _git_rc(repo: Any, *args: str) -> int:
     """Exit status of ``git *args`` run in *repo*."""
