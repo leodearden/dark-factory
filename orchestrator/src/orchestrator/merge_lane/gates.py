@@ -1907,7 +1907,7 @@ async def _resolve_already_landed_branch(
     evidence exactly: 3604's landed file set equals its 3 declared plan
     files, 3572's equals its 7.
 
-    **4. SURVIVAL** — :meth:`GitOps.describe_commit_effect_in_main` says the
+    **4. SURVIVAL** — ``describe_commit_effect_in_main(...).present`` says the
     attributing commit's own effect is STILL PRESENT at main's current HEAD
     (amendment pass, review finding #1).  Signals 1-3 are all statements about
     IMMUTABLE HISTORY: a merge commit stays an ancestor of main forever, and

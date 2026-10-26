@@ -1779,8 +1779,9 @@ class TestResolveAlreadyLandedBranch:
         assert 'post-hoc revert' not in msg
         assert 'failure=effect_not_survived' in msg
         assert 'added_lines_total=30' in msg
-        assert 'aggregate_survival=0' in msg
+        assert 'aggregate_survival=0.0 ' in msg
         assert 'worst_guarded_path=src/pkg/rewritten.py' in msg
+        assert 'worst_guarded_survival=0.0 ' in msg
         assert not any(r.exc_info for r in caplog.records)
 
     # --- (9) SIGNAL 2 PRECISION — a mention is not a delivery ---------------
