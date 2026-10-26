@@ -455,12 +455,31 @@ against code on 2026-10-26 (task 6082).
   "wherever it was". That part stays open.
 - **E11 — SM-2 violation handling is soft-fail**: AssertionError →
   generic catch → synthetic BLOCKED with empty reason, no escalation —
-  the false-done detector's alarm goes to a log line (INV-4).
+  the false-done detector's alarm goes to a log line (INV-4). Closed by
+  task 3542 (leaf θ), enforced by task 3546 (leaf μ): `run()` judges both
+  SM-2 halves through
+  `orchestrator/src/orchestrator/exit_contract.py::judge_exit` and
+  records the verdict with `record_exit_verdict` (a WARNING plus a
+  `workflow_exit_contract` event). It always returns its real report, so
+  there is no synthetic BLOCKED. Since μ, the
+  `workflow_exit_contract_enforce` key in `dark-factory-orchestrator.yaml`
+  is on, so a violation also files one deduped blocking L1.
 - **E12 — silent sweeps**: the stranded sweep logs nothing when every
   candidate is vetoed; summary tallies omit vetoed/left; Path B's bail
   logs a count, not ids; burndown counts strands as active (859/7871
   snapshots over cap, peak 33 vs 24) with no parity alarm; dashboards
   drop claimant fields at ingest and render strands with an agent chip.
+  Closed by tasks 3535 (leaf β) and 3543 (leaf ι); Path B's bail is gone
+  (E1). The stranded sweep logs a summary every pass, with held/left
+  tallies and pinning ids
+  (`orchestrator/src/orchestrator/recovery_emission.py::RecoverySweepTally`);
+  vetoes emit `recovery_vetoed`/`recovery_left` naming the ids; and a veto
+  streak raises an alarm. The burndown splits `in_progress` into
+  live/stranded with a parity alarm
+  (`dashboard/src/dashboard/data/burndown.py::compute_parity_alarm`).
+  Dashboard task rows keep `claimant_run_id`/`heartbeat_at` and render a
+  stranded badge, and escalations carry a `pins_recovery` annotation
+  shown as a PINNING chip.
 - **E13 — doc/comment divergences**: ARCHITECTURE.md §3.6 (no Path B),
   §3.7 (veto omitted; "sole choke point" false — six other blocked
   writers), transition diagram missing 8+ live edges (incl. the
