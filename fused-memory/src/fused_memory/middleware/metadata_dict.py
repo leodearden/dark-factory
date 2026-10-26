@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 __all__ = ['raw_metadata_dict']
 
 
-def raw_metadata_dict(metadata: Any, *, source: str) -> dict[str, Any]:
+def raw_metadata_dict(metadata: object, *, source: str) -> dict[str, Any]:
     """Return *metadata* as its raw dict, under ``coerce_task_metadata``'s rule.
 
     Absent metadata gives ``{}``. Readable metadata gives its raw dict (the

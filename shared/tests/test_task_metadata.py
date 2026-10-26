@@ -2759,7 +2759,7 @@ class TestParseMetadataFailurePolicy:
 
     @pytest.mark.parametrize('blob', _NON_OBJECT_BLOBS)
     def test_non_object_blob_read_warns_never_raises(self, blob):
-        model, warnings = parse_metadata(blob, direction='read')  # type: ignore[arg-type]
+        model, warnings = parse_metadata(blob, direction='read')
         assert model == TaskMetadata()
         assert len(warnings) == 1
         assert warnings[0].code == 'not_an_object'
@@ -2767,7 +2767,7 @@ class TestParseMetadataFailurePolicy:
 
     @pytest.mark.parametrize('blob', _NON_OBJECT_BLOBS)
     def test_non_object_blob_write_warn_mode_accepts(self, blob):
-        model, warnings = parse_metadata(  # type: ignore[arg-type]
+        model, warnings = parse_metadata(
             blob, direction='write', enforce=False
         )
         assert model == TaskMetadata()
@@ -2777,7 +2777,7 @@ class TestParseMetadataFailurePolicy:
     @pytest.mark.parametrize('blob', _NON_OBJECT_BLOBS)
     def test_non_object_blob_write_enforce_raises(self, blob):
         with pytest.raises((TypeError, ValueError)):
-            parse_metadata(blob, direction='write', enforce=True)  # type: ignore[arg-type]
+            parse_metadata(blob, direction='write', enforce=True)
 
     def test_non_str_non_dict_python_value_is_not_an_object(self):
         results = [
