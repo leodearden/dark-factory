@@ -9,12 +9,14 @@ WHAT IT LOOKS FOR.  A test is flagged when it (1) builds a *bare*
 ``OrchestratorConfig()`` — no args, no keywords — either binding a name to it
 or asserting directly off the call (``OrchestratorConfig().x.y == literal``),
 (2) is not isolated from the ambient operational config, and (3) asserts an
-attribute path off that name or call equals a literal that is exactly the
-package default for that path.  Such an assertion passes only because the
-repo happens NOT to declare that key in ``dark-factory-orchestrator.yaml``; the
-autouse ``_isolate_orch_config`` fixture pins that file for every test.  An
-operator declaring the key turns the test red without touching any code the
-test is about (task 3886's incident).
+attribute path off that name or call equals a right-hand side that EVALUATES,
+under package defaults, to exactly the package default for that path.  A
+literal is one such right-hand side; so is numeric arithmetic over evaluable
+values, a local bound once to one, and another attribute of a bare config.
+Such an assertion passes only because the repo happens NOT to declare that key
+in ``dark-factory-orchestrator.yaml``; the autouse ``_isolate_orch_config``
+fixture pins that file for every test.  An operator declaring the key turns the
+test red without touching any code the test is about (task 3886's incident).
 
 WHAT COUNTS AS ISOLATED.  Three idioms, all honoured:
 
@@ -29,10 +31,15 @@ WHAT COUNTS AS ISOLATED.  Three idioms, all honoured:
 
 DELIBERATE ASYMMETRY.  That last rule is a substring test, so it also silences a
 test that merely *mentions* the variable — and the ``type()`` match below
-silences ``== 1800`` against a ``1800.0`` default.  Both admit false NEGATIVES
-and neither admits a false POSITIVE.  That is the trade a *committed* ratchet
-requires: a guard that occasionally misses a landmine is a nuisance, while one
-that occasionally invents one gets disabled.
+silences ``== 1800`` against a ``1800.0`` default.  The evaluator refuses, in
+the same direction: a right-hand side reading the asserted path (or a prefix or
+extension of it), since both sides track a declaration of that key; a value
+reached through a local name unless it is immutable, since a mutation between
+binding and assertion is invisible here; a power above
+``_MAX_EVALUATED_EXPONENT``; and arithmetic over anything but non-bool numbers.
+All of these admit false NEGATIVES and none admits a false POSITIVE.  That is
+the trade a *committed* ratchet requires: a guard that occasionally misses a
+landmine is a nuisance, while one that occasionally invents one gets disabled.
 
 NOT DETECTED HERE.  Tests that exercise default-only *behaviour* without
 asserting any config literal are invisible to a static scan (e.g. a section's
@@ -228,8 +235,21 @@ _ARITHMETIC: Mapping[type[ast.operator], Callable[[Any, Any], Any]] = MappingPro
 })
 
 
+#: A pathological RHS must not stall the whole-suite ratchet, whose 300s
+#: timeout ``os._exit()``s an xdist worker.
+_MAX_EVALUATED_EXPONENT = 64
+
+_IMMUTABLE_SCALARS = (bool, int, float, complex, str, bytes, type(None))
+
+
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_immutable(value: Any) -> bool:
+    if isinstance(value, (tuple, frozenset)):
+        return all(_is_immutable(member) for member in value)
+    return isinstance(value, _IMMUTABLE_SCALARS)
 
 
 def _evaluate_under_defaults(
@@ -273,7 +293,10 @@ def _evaluate_local(node: ast.Name, scope: _TestScope,
     bound = scope.once_bound.get(name)
     if bound is None or name in scope.bare_configs or name in resolving:
         return None
-    return _evaluate_under_defaults(bound, scope, resolving | {name})
+    valued = _evaluate_under_defaults(bound, scope, resolving | {name})
+    if valued is None or not _is_immutable(valued.value):
+        return None
+    return valued
 
 
 def _evaluate_arithmetic(node: ast.BinOp, scope: _TestScope,
@@ -286,6 +309,8 @@ def _evaluate_arithmetic(node: ast.BinOp, scope: _TestScope,
     if left is None or right is None:
         return None
     if not (_is_number(left.value) and _is_number(right.value)):
+        return None
+    if isinstance(node.op, ast.Pow) and abs(right.value) > _MAX_EVALUATED_EXPONENT:
         return None
     try:
         value = apply(left.value, right.value)
