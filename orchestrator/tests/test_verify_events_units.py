@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from pathlib import Path
 from typing import Any, Literal
 
 import pytest
 
 from orchestrator import verify_evidence
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.verify import VerifyResult
+from orchestrator.verify import VerifyResult, run_scoped_verification, run_verification
+from orchestrator.verify_evidence import CacheMode, UnitOutcome, UnitTier, VerifyUnit
 from orchestrator.verify_plan import ScopeKind, VerifyPlan, derive_verify_plan
+from orchestrator.verify_runner import result_from_dict, result_to_dict
 
 _ALPHA = ModuleConfig(
     prefix='alpha',
@@ -88,3 +91,68 @@ class TestPlanHash:
 
         assert result.plan_hash == verify_evidence.plan_hash(plan)
         assert (result.plan_hash is None) is not has_plan
+
+
+def _module_unit(module: str, leg: str, outcome: UnitOutcome) -> VerifyUnit:
+    return VerifyUnit(
+        unit=f'module:{module}:{leg}', tier=UnitTier.MODULE, key=None,
+        outcome=outcome, evidence_event_id=None,
+    )
+
+
+class TestUnitsOnResult:
+    @staticmethod
+    async def _green_test_red_lint(worktree: Path) -> VerifyResult:
+        module = ModuleConfig(
+            prefix='alpha', test_command='true', lint_command='false', type_check_command=None,
+        )
+        return await run_verification(worktree, OrchestratorConfig(), module, role='merge')
+
+    @pytest.mark.asyncio
+    async def test_each_leg_that_ran_is_a_unit_with_its_outcome(self, tmp_path):
+        result = await self._green_test_red_lint(tmp_path)
+
+        assert result.units == (
+            _module_unit('alpha', 'test', UnitOutcome.RAN_GREEN),
+            _module_unit('alpha', 'lint', UnitOutcome.RAN_RED),
+        )
+        assert result.cache_mode is CacheMode.OFF
+
+    @pytest.mark.asyncio
+    async def test_units_round_trip_the_wire_codec(self, tmp_path):
+        result = await self._green_test_red_lint(tmp_path)
+
+        rebuilt = result_from_dict(json.loads(json.dumps(result_to_dict(result))))
+
+        assert rebuilt == result
+        assert isinstance(rebuilt.units, tuple)
+        assert all(isinstance(unit, VerifyUnit) for unit in rebuilt.units)
+        assert rebuilt.cache_mode is CacheMode.OFF
+
+    def test_an_older_remote_without_units_rebuilds_as_unrecorded(self):
+        wire = result_to_dict(_result())
+        del wire['units'], wire['cache_mode']
+
+        rebuilt = result_from_dict(wire)
+
+        assert rebuilt.units is None
+        assert rebuilt.cache_mode is CacheMode.OFF
+
+    def test_an_unknown_outcome_is_refused_by_name(self):
+        wire = result_to_dict(_result())
+        wire['units'] = [{
+            'unit': 'module:alpha:test', 'tier': 'module', 'key': None,
+            'outcome': 'bogus', 'evidence_event_id': None,
+        }]
+
+        with pytest.raises(ValueError, match='bogus'):
+            result_from_dict(wire)
+
+    @pytest.mark.asyncio
+    async def test_a_trivial_pass_records_that_nothing_ran(self, tmp_path):
+        result = await run_scoped_verification(
+            tmp_path, OrchestratorConfig(), [], task_files=['docs/x.md'], role='task',
+        )
+
+        assert result.trivial
+        assert result.units == ()
