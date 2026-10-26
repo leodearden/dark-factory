@@ -181,6 +181,91 @@ def test_inline_default():
         assert literal == 50, f'expected the asserted literal; got {literal!r}'
 
 
+class TestDetectorFlagsComputedRightHandSides:
+    """A right-hand side that EVALUATES to the default is as much a landmine as
+    a literal spelling of it."""
+
+    @pytest.mark.parametrize('rhs', ['5 * 10', '100 // 2', '2 ** 6 - 14'],
+                             ids=['mult', 'floordiv', 'pow-sub'])
+    def test_flags_constant_arithmetic(self, tmp_path, rhs):
+        """Arithmetic over literals, which ``ast.literal_eval`` rejects."""
+        src = _write(tmp_path, 'test_synth_arith.py', f'''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_arith_default():
+    cfg = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == {rhs}
+''')
+        found = list(iter_default_asserting_tests(src))
+        assert _names(found) == {(None, 'test_arith_default')}, (
+            f'expected `== {rhs}` to be flagged; got {found!r}'
+        )
+        value = found[0][4]
+        assert value == 50 and type(value) is int, (
+            f'expected the evaluated int value 50; got {value!r}'
+        )
+
+    def test_flags_local_bound_once_to_a_literal(self, tmp_path):
+        """A name bound exactly once to a literal stands for that literal."""
+        src = _write(tmp_path, 'test_synth_local.py', '''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_local_default():
+    cfg = OrchestratorConfig()
+    expected = 50
+    assert cfg.starvation_watchdog.skip_threshold == expected
+''')
+        found = list(iter_default_asserting_tests(src))
+        assert _names(found) == {(None, 'test_local_default')}, (
+            f'expected `== expected` bound to the default to be flagged; '
+            f'got {found!r}'
+        )
+
+    def test_flags_rhs_computed_from_another_attribute_of_the_same_config(
+        self, tmp_path,
+    ):
+        """The task-4481 exemplar: both sides read DIFFERENT undeclared keys."""
+        src = _write(tmp_path, 'test_synth_derived.py', '''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_derived_default():
+    config = OrchestratorConfig()
+    warm_lane_gib = config.git.warm_lane_min_free_gib
+    expected = warm_lane_gib * 1024 ** 3
+    assert config.no_landings_breaker_disk_free_floor_bytes == expected
+''')
+        found = list(iter_default_asserting_tests(src))
+        assert _names(found) == {(None, 'test_derived_default')}, (
+            f'expected the derived-RHS exemplar to be flagged; got {found!r}'
+        )
+        _cls, _test, _lineno, attr, value = found[0]
+        assert attr == 'no_landings_breaker_disk_free_floor_bytes', (
+            f'expected the asserted attribute path; got {attr!r}'
+        )
+        assert value == DEFAULT_CONFIG.no_landings_breaker_disk_free_floor_bytes, (
+            f'expected the RHS valued under package defaults; got {value!r}'
+        )
+
+    def test_flags_rhs_rooted_at_an_inline_bare_config(self, tmp_path):
+        """An inline bare construction on the RIGHT is a config root too."""
+        src = _write(tmp_path, 'test_synth_derived_inline.py', '''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_derived_inline_default():
+    cfg = OrchestratorConfig()
+    assert cfg.no_landings_breaker_disk_free_floor_bytes == OrchestratorConfig().git.warm_lane_min_free_gib * 1024 ** 3
+''')
+        found = list(iter_default_asserting_tests(src))
+        assert _names(found) == {(None, 'test_derived_inline_default')}, (
+            f'expected an RHS rooted at an inline bare config to be flagged; '
+            f'got {found!r}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # MUST NOT FLAG
 # ---------------------------------------------------------------------------
