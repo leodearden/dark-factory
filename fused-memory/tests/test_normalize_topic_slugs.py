@@ -3646,3 +3646,58 @@ class TestTopicSelection:
         assert named in str(refused.value)
         assert corpus.scrolls == []
         assert corpus.writes == []
+
+    @staticmethod
+    def _selection_line(rendered: str) -> str:
+        [line] = [line for line in rendered.splitlines()
+                  if line.startswith('**Topic selection:**')]
+        return line
+
+    @pytest.mark.asyncio
+    async def test_the_report_states_its_selection(self):
+        service, _corpus = self._two_legacy_values()
+
+        narrowed = await run_sweep(service, projects=('dark_factory',),
+                                   topics=frozenset({'legacy_b', 'legacy_a'}))
+        default = await run_sweep(service, projects=('dark_factory',))
+
+        assert narrowed['topic_selection'] == ['legacy_a', 'legacy_b']
+        assert default['topic_selection'] is None
+
+    @pytest.mark.asyncio
+    async def test_the_markdown_names_the_selection(self):
+        service, _corpus = self._two_legacy_values()
+
+        narrowed = await run_sweep(service, projects=('dark_factory',),
+                                   topics=frozenset({'legacy_a', 'legacy_b'}))
+        default = await run_sweep(service, projects=('dark_factory',))
+
+        narrowed_line = self._selection_line(_mod.render_markdown(narrowed))
+        assert 'legacy_a' in narrowed_line
+        assert 'legacy_b' in narrowed_line
+        assert 'every non-conforming value' in self._selection_line(
+            _mod.render_markdown(default))
+
+    def test_topic_is_repeatable_and_replaces_every_value(self):
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--topic', 'a_b', '--topic', 'c_d'])
+
+        assert args.topics == ['a_b', 'c_d']
+        assert _mod.resolve_topics(args) == frozenset({'a_b', 'c_d'})
+        assert parser.parse_args([]).topics is None
+        assert _mod.resolve_topics(parser.parse_args([])) is None
+
+    def test_main_narrows_an_apply_to_the_named_value(self, tmp_path):
+        corpus = _FakeCorpus({
+            'dark_factory': [_crec('df1', 'legacy_a'), _crec('df2', 'legacy_b')],
+        })
+        client = _census_client({'/repo': _listing('dark_factory', '/repo')})
+        open_memory, open_client, _urls = _openers(corpus, client)
+
+        code = _mod.main(_argv(tmp_path, '--apply', '--topic', 'legacy_a'),
+                         open_memory_service=open_memory, open_client=open_client)
+
+        assert corpus.topic_of('dark_factory', 'df1') == 'legacy-a'
+        assert corpus.topic_of('dark_factory', 'df2') == 'legacy_b'
+        assert _written_report(tmp_path)['topic_selection'] == ['legacy_a']
+        assert code == 0
