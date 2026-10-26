@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import subprocess
 from collections import Counter
+from collections.abc import Collection
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -26,18 +28,20 @@ from orchestrator.evals.reviewer_trial.__main__ import (
     _infer_language,
     cli,
 )
-from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
+from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog, select_spot_check_subset
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest, GroundTruthIssue
 from orchestrator.evals.reviewer_trial.mining import (
     EscalationRef,
     FnCandidate,
     assign_split,
     audit_corpus,
+    backfill_hand_authored,
     mine_escalation_refs,
     mine_fn_candidates,
     propose_labels_frontier,
     recover_diff,
     resolve_merge_sha_by_task_id,
+    save_corpus,
 )
 
 
@@ -566,3 +570,118 @@ class TestMineRunsDbValidation:
         assert result.exit_code == 1
         assert 'runs.db not found' in result.output
         assert str(missing_db) in result.output
+
+
+_SEED = 'test-seed'
+_MINED_IDS = [f'mined_{i:02d}' for i in range(12)]
+
+
+def _issue(diff_id: str) -> GroundTruthIssue:
+    return GroundTruthIssue(
+        id=f'{diff_id}_gt', location='a.py:1', category='bug', severity='blocking',
+        description=f'a bug in {diff_id}', mutation_type='logic',
+    )
+
+
+def _corpus_and_log(*, mined_flagged: Collection[str] = ()) -> tuple[CorpusManifest, AdjudicationLog]:
+    """3 synthetic plus 12 mined diffs, each with a log entry; *mined_flagged* start in the spot-check subset."""
+    synthetic = [
+        CorpusDiff(diff_id=f'syn_{i}', language='python', source='synthetic',
+                   diff_text=f'syn {i}\n', description=f'syn {i}', ground_truth=[_issue(f'syn_{i}')])
+        for i in range(3)
+    ]
+    mined = [
+        CorpusDiff(diff_id=diff_id, language='python', source='mined', diff_text=f'{diff_id}\n',
+                   description=diff_id, ground_truth=[_issue(diff_id)], provenance={'kind': 'mined'})
+        for diff_id in _MINED_IDS
+    ]
+    manifest = CorpusManifest(diffs=[*synthetic, *mined])
+    log = AdjudicationLog()
+    for diff in manifest.diffs:
+        log.append(diff.diff_id, diff.ground_truth, in_spot_check_subset=diff.diff_id in mined_flagged)
+    return manifest, log
+
+
+def _flagged(log: AdjudicationLog) -> set[str]:
+    return {e.diff_id for e in log.spot_check_subset()}
+
+
+class TestSaveCorpus:
+    """save_corpus grows the spot-check subset over mined diffs, re-splits every diff, and saves both."""
+
+    @staticmethod
+    def _save(tmp_path: Path, manifest: CorpusManifest, log: AdjudicationLog) -> tuple[Path, Path]:
+        manifest_path = tmp_path / 'corpus' / 'manifest.json'
+        log_path = tmp_path / 'corpus' / 'adjudication_log.jsonl'
+        save_corpus(manifest, log, seed=_SEED, manifest_path=manifest_path, log_path=log_path)
+        return manifest_path, log_path
+
+    def test_every_diff_is_split_under_the_seed(self, tmp_path: Path) -> None:
+        manifest, log = _corpus_and_log()
+
+        self._save(tmp_path, manifest, log)
+
+        assert {d.diff_id: d.split for d in manifest.diffs} == assign_split(
+            [d.diff_id for d in manifest.diffs], seed=_SEED,
+        )
+        assert manifest.split_seed == _SEED
+
+    def test_the_spot_check_subset_is_sampled_over_mined_diffs_only(self, tmp_path: Path) -> None:
+        manifest, log = _corpus_and_log()
+
+        self._save(tmp_path, manifest, log)
+
+        assert _flagged(log) == select_spot_check_subset(_MINED_IDS)
+
+    def test_what_it_saves_reads_back(self, tmp_path: Path) -> None:
+        manifest, log = _corpus_and_log()
+
+        manifest_path, log_path = self._save(tmp_path, manifest, log)
+
+        loaded = CorpusManifest.load(manifest_path)
+        assert {d.diff_id: d.split for d in loaded.diffs} == {d.diff_id: d.split for d in manifest.diffs}
+        assert loaded.split_seed == _SEED
+        assert _flagged(AdjudicationLog.load(log_path)) == _flagged(log)
+
+    def test_a_flagged_mined_entry_stays_flagged(self, tmp_path: Path) -> None:
+        unsampled = sorted(set(_MINED_IDS) - select_spot_check_subset(_MINED_IDS))[0]
+        manifest, log = _corpus_and_log(mined_flagged={unsampled})
+
+        self._save(tmp_path, manifest, log)
+
+        assert unsampled in _flagged(log)
+
+
+class TestBackfillHandAuthored:
+    """backfill_hand_authored logs each unlogged hand-authored diff with its own ground truth."""
+
+    def test_each_unlogged_hand_authored_diff_gets_one_entry(self) -> None:
+        manifest, _ = _corpus_and_log()
+        log = AdjudicationLog()
+
+        backfill_hand_authored(manifest, log)
+
+        assert [
+            (e.diff_id, e.frontier_model, e.frontier_proposal, e.in_spot_check_subset) for e in log.entries
+        ] == [
+            (d.diff_id, 'hand-authored', [asdict(gt) for gt in d.ground_truth], False)
+            for d in manifest.diffs if d.source != 'mined'
+        ]
+
+    def test_mined_and_already_logged_diffs_are_skipped(self) -> None:
+        manifest, _ = _corpus_and_log()
+        log = AdjudicationLog()
+        log.append('syn_0', [], in_spot_check_subset=False, frontier_model='opus')
+
+        backfill_hand_authored(manifest, log)
+
+        assert [(e.diff_id, e.frontier_model) for e in log.entries] == [
+            ('syn_0', 'opus'), ('syn_1', 'hand-authored'), ('syn_2', 'hand-authored'),
+        ]
+
+    def test_it_returns_how_many_it_added(self) -> None:
+        manifest, _ = _corpus_and_log()
+        log = AdjudicationLog()
+
+        assert backfill_hand_authored(manifest, log) == 3
+        assert backfill_hand_authored(manifest, log) == 0
