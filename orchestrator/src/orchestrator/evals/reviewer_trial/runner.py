@@ -12,15 +12,17 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import json
 import logging
 import os
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 from shared.cli_invoke import invoke_with_cap_retry
 from shared.usage_gate import UsageGate
@@ -96,6 +98,40 @@ DIFF_CAP_CHARS = DIFF_ONLY_DIFF_CAP_CHARS
 _NO_PLAN_REASON = 'the fixture records neither a plan nor why it has none'
 
 
+@dataclass(frozen=True)
+class PanelRunKey:
+    """What, besides the variant and the fixture, decides a panel run's result."""
+
+    prices_sha256: str | None
+    gated: bool
+    diff_cap_chars: int
+
+    @classmethod
+    def of(
+        cls,
+        *,
+        prices: dict | None,
+        usage_gate: UsageGate | None,
+        diff_cap_chars: int,
+    ) -> PanelRunKey:
+        prices_sha256 = None if prices is None else hashlib.sha256(
+            json.dumps(prices, sort_keys=True, default=str).encode(),
+        ).hexdigest()
+        return cls(
+            prices_sha256=prices_sha256,
+            gated=usage_gate is not None,
+            diff_cap_chars=diff_cap_chars,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PanelRunKey:
+        return cls(
+            prices_sha256=data['prices_sha256'],
+            gated=data['gated'],
+            diff_cap_chars=data['diff_cap_chars'],
+        )
+
+
 @dataclass
 class PanelRunResult:
     """Result of running one panel variant against one corpus diff."""
@@ -106,6 +142,20 @@ class PanelRunResult:
     total_cost_usd: float = 0.0
     wall_clock_ms: int = 0
     errors: list[str] = field(default_factory=list)
+    run_key: PanelRunKey | None = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PanelRunResult:
+        run_key = data.get('run_key')
+        return cls(
+            variant_name=data['variant_name'],
+            diff_id=data['diff_id'],
+            reviews=dict(data.get('reviews', {})),
+            total_cost_usd=data.get('total_cost_usd', 0.0),
+            wall_clock_ms=data.get('wall_clock_ms', 0),
+            errors=list(data.get('errors', [])),
+            run_key=None if run_key is None else PanelRunKey.from_dict(run_key),
+        )
 
 
 @functools.cache
@@ -433,6 +483,7 @@ async def run_panel(
         total_cost_usd=total_cost,
         wall_clock_ms=elapsed_ms,
         errors=errors,
+        run_key=PanelRunKey.of(prices=prices, usage_gate=usage_gate, diff_cap_chars=diff_cap_chars),
     )
 
 
