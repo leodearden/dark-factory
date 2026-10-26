@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,7 +21,6 @@ from fused_memory.middleware.task_curator import CandidateTask, TaskCurator
 from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
 
 _CURATOR_MODULE = 'fused_memory.middleware.task_curator'
-_INVOKE = f'{_CURATOR_MODULE}.invoke_with_cap_retry'
 _SWEEP = f'{_CURATOR_MODULE}.sweep_stale_pid_dirs'
 _CURATOR_SWEEP_PREFIX = CONFIG_DIR_PREFIX + 'fm-curator-'
 _SWEEP_CEILING_SECONDS = 30.0
@@ -65,14 +64,22 @@ def _plant_dead_curator_dir(base: Path, pid: int) -> Path:
     return config_dir
 
 
-def _gated_curator(config_dir_base: Path, config: FusedMemoryConfig) -> TaskCurator:
-    return TaskCurator(
+class _GatedCurator(NamedTuple):
+    curator: TaskCurator
+    invoke: AsyncMock
+
+
+def _gated_curator(config_dir_base: Path, config: FusedMemoryConfig) -> _GatedCurator:
+    invoke = AsyncMock(return_value=agent_result(_CREATE))
+    curator = TaskCurator(
         config=config,
         taskmaster=None,
         usage_gate=MagicMock(spec=UsageGate),
         config_dir_base=config_dir_base,
         escalator=escalator_double(),
+        invoke=invoke,
     )
+    return _GatedCurator(curator, invoke)
 
 
 class _CompletingSweep:
@@ -92,15 +99,14 @@ class _CompletingSweep:
             self.done.set()
 
 
-async def _curate_and_sweep(curator: TaskCurator) -> dict[str, Any]:
+async def _curate_and_sweep(gated: _GatedCurator) -> dict[str, Any]:
     """One successful gated curate; returns its LLM call kwargs once the sweep has run."""
     sweep = _CompletingSweep()
-    invoke = AsyncMock(return_value=agent_result(_CREATE))
-    with patch(_SWEEP, new=sweep), patch(_INVOKE, new=invoke), \
-            patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-        await curator.curate(CandidateTask(title='T'), project_id='p', project_root='/p')
+    with patch(_SWEEP, new=sweep), \
+            patch.object(gated.curator, '_build_corpus', side_effect=empty_corpus):
+        await gated.curator.curate(CandidateTask(title='T'), project_id='p', project_root='/p')
         assert await asyncio.to_thread(sweep.done.wait, _SWEEP_CEILING_SECONDS)
-    return dict(invoke.call_args.kwargs)
+    return dict(gated.invoke.call_args.kwargs)
 
 
 def _archive_root(config: FusedMemoryConfig) -> Path:
@@ -255,11 +261,11 @@ class TestCloseArchivesThisProcessesDir:
     @pytest.mark.asyncio
     async def test_close_archives_this_process_transcripts_and_removes_its_dir(self, tmp_path):
         config = make_config()
-        curator = _gated_curator(tmp_path / 'tmp', config)
-        kwargs = await _curate_and_sweep(curator)
+        gated = _gated_curator(tmp_path / 'tmp', config)
+        kwargs = await _curate_and_sweep(gated)
         _plant_live_transcript(kwargs)
 
-        await curator.close()
+        await gated.curator.close()
 
         archived = (
             _archive_root(config) / f'fm-curator-{os.getpid()}' / _LIVE_ENC
@@ -273,13 +279,13 @@ class TestCloseArchivesThisProcessesDir:
         self, tmp_path,
     ):
         config = make_config()
-        curator = _gated_curator(tmp_path / 'tmp', config)
-        kwargs = await _curate_and_sweep(curator)
+        gated = _gated_curator(tmp_path / 'tmp', config)
+        kwargs = await _curate_and_sweep(gated)
         transcript = _plant_live_transcript(kwargs)
         kwargs['config_dir'].write_credentials('secret')
         _make_archive_root_unreachable(config)
 
-        await curator.close()
+        await gated.curator.close()
 
         assert transcript.read_bytes() == _LIVE_TRANSCRIPT
         assert not (kwargs['config_dir'].path / '.credentials.json').exists()
@@ -287,13 +293,13 @@ class TestCloseArchivesThisProcessesDir:
     @pytest.mark.asyncio
     async def test_close_with_archival_switched_off_leaves_the_dir_for_the_sweep(self, tmp_path):
         config = make_config()
-        curator = _gated_curator(tmp_path / 'tmp', config)
-        kwargs = await _curate_and_sweep(curator)
+        gated = _gated_curator(tmp_path / 'tmp', config)
+        kwargs = await _curate_and_sweep(gated)
         transcript = _plant_live_transcript(kwargs)
         would_be_root = _archive_root(config)
         object.__setattr__(config.reconciliation, 'transcript_archive_enabled', False)
 
-        await curator.close()
+        await gated.curator.close()
 
         assert kwargs['config_dir'].path.is_dir()
         assert transcript.read_bytes() == _LIVE_TRANSCRIPT
