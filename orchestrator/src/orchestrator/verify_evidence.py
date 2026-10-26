@@ -37,6 +37,13 @@ class UnitOutcome(StrEnum):
     UNAVAILABLE = 'unavailable'
 
 
+class VerifySite(StrEnum):
+    """Which workflow site emitted a ``workflow_verify`` row."""
+
+    IMPLEMENT = 'implement'
+    PRE_MERGE = 'pre_merge'
+
+
 @dataclass(frozen=True)
 class VerifyUnit:
     """One verified unit and how its verdict was reached; ``key`` is its cache key, when it has one."""

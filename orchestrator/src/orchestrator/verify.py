@@ -4758,6 +4758,13 @@ class VerifyResult:
         """Identity of the plan this verdict ran (verify_evidence.py::plan_hash)."""
         return verify_evidence.plan_hash(self.plan)
 
+    @property
+    def slot_wait_secs(self) -> float | None:
+        """The admission queueing ``duration_secs`` excludes: each gated leg's turn wait plus flock wait."""
+        if self.admission_legs is None:
+            return None
+        return sum(leg.waited_secs + leg.flock_wait_secs for leg in self.admission_legs)
+
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
         sections = []

@@ -191,6 +191,7 @@ from orchestrator.verify_categories import (
     FailureCategory,
 )
 from orchestrator.verify_checkpoint import green_checkpoint_at_tip
+from orchestrator.verify_evidence import VerifySite, verify_event_fields
 from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     BlockDisposition,
     CancellationScope,
@@ -1437,6 +1438,8 @@ class TaskWorkflow:
         # workflow_verify payload as the durable checkpoint key for the next run.
         self._verify_checkpoint_hit: bool = False
         self._verify_green_tip_sha: str | None = None
+        # The passing VerifyResult behind _verify_green_tip_sha (task 5651); reset each VERIFY pass.
+        self._verify_green_result: VerifyResult | None = None
         # Set by _verify_debugfix_loop when a failure is classified as inherited
         # from main (preexisting break).  Read at the call site (run()) to route
         # _mark_blocked with dedupe_fingerprint instead of the generic reason.
@@ -2595,17 +2598,46 @@ class TaskWorkflow:
                 and new_state is WorkflowState.REVIEW
                 and not self._verify_checkpoint_hit
             ):
-                self.event_store.emit(
-                    EventType.workflow_verify,
-                    task_id=self.task_id,
-                    data={
-                        'passed': True,
-                        'tip_sha': self._verify_green_tip_sha,
-                        'base_sha': self._base_commit,
-                        'branch': f'{self.config.git.branch_prefix}{self.task_id}',
-                    },
+                self._emit_workflow_verify(
+                    site=VerifySite.IMPLEMENT,
+                    result=self._verify_green_result,
+                    passed=True,
+                    tip_sha=self._verify_green_tip_sha,
+                    base_sha=self._base_commit,
                 )
         self._phase_cost_at_entry = self.metrics.total_cost_usd
+
+    def _emit_workflow_verify(
+        self,
+        *,
+        site: VerifySite,
+        result: VerifyResult | None,
+        passed: bool,
+        tip_sha: str | None,
+        base_sha: str | None,
+    ) -> None:
+        """Record one task-role verify verdict; both workflow sites emit through here.
+
+        The escalation-side merge_request(verified_green=True) row carries only
+        passed/base_sha/branch, and gains these keys through task 5409's shared
+        emit_workflow_verify constructor.
+        """
+        if self.event_store is None:
+            return
+        self.event_store.emit(
+            EventType.workflow_verify,
+            task_id=self.task_id,
+            data={
+                'passed': passed,
+                'tip_sha': tip_sha,
+                'base_sha': base_sha,
+                'branch': f'{self.config.git.branch_prefix}{self.task_id}',
+                'duration_ms': None if result is None else round(result.duration_secs * 1000),
+                'slot_wait_secs': None if result is None else result.slot_wait_secs,
+                'site': str(site),
+                **verify_event_fields(result),
+            },
+        )
 
     async def _setup_worktree_and_artifacts(self, branch_name: str) -> None:
         """Set in-progress, create/inspect the worktree, init artifacts, scrub .task/.
@@ -8390,6 +8422,7 @@ class TaskWorkflow:
             # Task 2749's tree-hash verdict cache then skips REVIEW below,
             # composing into the fast-path to merge.
             self._verify_checkpoint_hit = False
+            self._verify_green_result = None
             self._enter_phase(WorkflowState.VERIFY)
             if self.event_store is not None:
                 try:
@@ -10617,6 +10650,7 @@ class TaskWorkflow:
             if not result.passed:
                 self._last_verify_result = result
             if result.passed:
+                self._verify_green_result = result
                 return WorkflowOutcome.DONE
 
             verify_attempt += 1
