@@ -444,6 +444,33 @@ def test_explicit():
             'landmine'
         )
 
+    @pytest.mark.parametrize('write, asserted', [
+        ('cfg.starvation_watchdog.skip_threshold = 50',
+         'cfg.starvation_watchdog.skip_threshold == 50'),
+        ('cfg.git.merge_config_only_full_gate_globs[:] = []',
+         'cfg.git.merge_config_only_full_gate_globs == []'),
+        ('cfg.git.warm_lane_min_free_gib = 7',
+         'cfg.no_landings_breaker_disk_free_floor_bytes == '
+         'cfg.git.warm_lane_min_free_gib * 1024 ** 3'),
+    ], ids=['attribute', 'subscript', 'rhs-attribute'])
+    def test_config_written_through_before_the_assertion(
+        self, tmp_path, write, asserted,
+    ):
+        """A config the test itself wrote into no longer reads package defaults."""
+        src = _write(tmp_path, 'test_synth_written_through.py', f'''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_written_through():
+    cfg = OrchestratorConfig()
+    {write}
+    assert {asserted}
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            f'a config written through by `{write}` must not be valued at '
+            f'package defaults'
+        )
+
     def test_literal_differing_from_the_default(self, tmp_path):
         """An assertion that does not match the package default is not a
         default assertion at all."""
@@ -572,18 +599,78 @@ def test_same_key_both_sides():
             'an RHS reading the asserted path itself must not be flagged'
         )
 
-    def test_oversized_exponent_is_not_evaluated(self, tmp_path):
-        """A pathological power must not stall the whole-suite ratchet."""
-        src = _write(tmp_path, 'test_synth_pow.py', '''
+    @pytest.mark.parametrize('rhs', [
+        '50 * 2 ** 100000 // 2 ** 100000',
+        '50 * (10 ** 64) ** 64 // (10 ** 64) ** 64',
+    ], ids=['huge-exponent', 'huge-base'])
+    def test_oversized_power_is_not_evaluated(self, tmp_path, rhs):
+        """A pathological power must not stall the whole-suite ratchet.
+
+        Bounding the exponent alone is not enough: each nested power
+        multiplies the width of an already-large base again.
+        """
+        src = _write(tmp_path, 'test_synth_pow.py', f'''
 from orchestrator.config import OrchestratorConfig
 
 
 def test_huge_power():
     cfg = OrchestratorConfig()
-    assert cfg.starvation_watchdog.skip_threshold == 50 * 2 ** 100000 // 2 ** 100000
+    assert cfg.starvation_watchdog.skip_threshold == {rhs}
 ''')
         assert list(iter_default_asserting_tests(src)) == [], (
-            'a power above the exponent bound must not be evaluated'
+            f'`{rhs}` computes an oversized int and must not be evaluated'
+        )
+
+    @pytest.mark.parametrize('bindings, name', [
+        ('x = x + 1', 'x'),
+        ('a = b\n    b = a', 'a'),
+    ], ids=['self-referential', 'mutually-referential'])
+    def test_cyclic_local_is_not_resolved(self, tmp_path, bindings, name):
+        """A local defined in terms of itself has no value to give, and must
+        not recurse the scan to death trying."""
+        src = _write(tmp_path, 'test_synth_cycle.py', f'''
+from orchestrator.config import OrchestratorConfig
+
+
+def test_cycle():
+    cfg = OrchestratorConfig()
+    {bindings}
+    assert cfg.starvation_watchdog.skip_threshold == {name}
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            f'a cyclic local `{bindings!r}` must not be resolved'
+        )
+
+    @pytest.mark.parametrize('nested_scope, nested_binding, asserted', [
+        ('def helper():', 'EXPECTED = 50',
+         'OrchestratorConfig().starvation_watchdog.skip_threshold == EXPECTED'),
+        ('class Helper:', 'EXPECTED = 50',
+         'OrchestratorConfig().starvation_watchdog.skip_threshold == EXPECTED'),
+        ('def helper():', 'cfg = OrchestratorConfig()',
+         'cfg.starvation_watchdog.skip_threshold == 50'),
+    ], ids=['local-in-def', 'local-in-class', 'bare-config-in-def'])
+    def test_binding_in_a_nested_scope_is_not_the_tests_own(
+        self, tmp_path, nested_scope, nested_binding, asserted,
+    ):
+        """The test reads the MODULE global; the nested binding is another
+        variable that merely shares its name."""
+        src = _write(tmp_path, 'test_synth_nested_scope.py', f'''
+from orchestrator.config import OrchestratorConfig, StarvationWatchdogConfig
+
+EXPECTED = OrchestratorConfig().starvation_watchdog.skip_threshold
+cfg = OrchestratorConfig(
+    starvation_watchdog=StarvationWatchdogConfig(skip_threshold=50),
+)
+
+
+def test_reads_module_globals():
+    {nested_scope}
+        {nested_binding}
+    assert {asserted}
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            f'`{nested_binding}` inside `{nested_scope}` must not stand for '
+            f'the module global the test reads'
         )
 
     def test_name_reached_mutable_value_is_not_resolved(self, tmp_path):

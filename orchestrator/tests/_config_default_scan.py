@@ -39,8 +39,11 @@ silences ``== 1800`` against a ``1800.0`` default.  The evaluator refuses, in
 the same direction: a right-hand side reading the asserted path (or a prefix or
 extension of it), since both sides track a declaration of that key; a value
 reached through a local name unless it is immutable, since a mutation between
-binding and assertion is invisible here; a power above
-``_MAX_EVALUATED_EXPONENT``; and arithmetic over anything but non-bool numbers.
+binding and assertion is invisible here; arithmetic on an int wider than
+``_MAX_EVALUATED_INT_BITS``, or a power that could yield one; and arithmetic
+over anything but non-bool numbers.  Nor is a name valued from a binding in a
+nested scope, which is another variable, nor counted as a bare config once the
+test writes through it (``cfg.a = v``, ``cfg.a[i] = v``).
 All of these admit false NEGATIVES and none admits a false POSITIVE.  That is
 the trade a *committed* ratchet requires: a guard that occasionally misses a
 landmine is a nuisance, while one that occasionally invents one gets disabled.
@@ -137,10 +140,25 @@ def _is_config_root(root: ast.expr, names: frozenset[str]) -> bool:
     return _is_bare_config_call(root)
 
 
+#: Scopes whose bindings are other variables than the enclosing test's own.
+_NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _own_scope_nodes(func: _TestFunc) -> Iterator[ast.AST]:
+    """Every node below *func*, except those inside a scope nested in it."""
+    pending: list[ast.AST] = list(ast.iter_child_nodes(func))
+    while pending:
+        node = pending.pop()
+        yield node
+        if not isinstance(node, _NESTED_SCOPES):
+            pending.extend(ast.iter_child_nodes(node))
+
+
 def _plain_binding_values(func: _TestFunc) -> dict[ast.Name, ast.expr]:
-    """Map each ``name = value`` / ``name: T = value`` target to its value."""
+    """Map each ``name = value`` / ``name: T = value`` target in *func*'s own
+    scope to its value."""
     plain: dict[ast.Name, ast.expr] = {}
-    for node in ast.walk(func):
+    for node in _own_scope_nodes(func):
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name):
@@ -151,8 +169,21 @@ def _plain_binding_values(func: _TestFunc) -> dict[ast.Name, ast.expr]:
     return plain
 
 
+def _written_through_root(target: ast.Attribute | ast.Subscript) -> str | None:
+    """``'cfg'`` for ``cfg.a.b = v``, ``cfg.x[0] = v`` or ``del cfg.a``."""
+    node: ast.expr = target.value
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
 def _opaque_bound_names(node: ast.AST, func: _TestFunc) -> list[str]:
-    """Names *node* binds without an ``ast.Name`` target the scan could value."""
+    """Names *node* binds, or writes through, without an ``ast.Name`` target
+    the scan could value."""
+    if (isinstance(node, (ast.Attribute, ast.Subscript))
+            and isinstance(node.ctx, (ast.Store, ast.Del))):
+        root = _written_through_root(node)
+        return [root] if root is not None else []
     if isinstance(node, ast.arg):
         return [node.arg]
     if isinstance(node, ast.ExceptHandler) and node.name:
@@ -172,10 +203,12 @@ def _opaque_bound_names(node: ast.AST, func: _TestFunc) -> list[str]:
 def _local_bindings(func: _TestFunc) -> dict[str, list[ast.expr | None]]:
     """Every binding of every name in *func*, nested scopes included.
 
-    One entry per binding: the bound VALUE for a plain ``name = value``, and
-    ``None`` for any binding whose value the scan cannot see (parameters,
-    unpacking, loop and ``with`` targets, augmented assignment, ``del``...).
-    Counting nested scopes only adds bindings, which only ever disqualifies.
+    One entry per binding: the bound VALUE for a plain ``name = value`` in
+    *func*'s own scope, and ``None`` wherever the scan cannot see what the
+    name holds afterwards — parameters, unpacking, loop and ``with`` targets,
+    augmented assignment, ``del``, a write through the name (``name.a = v``),
+    and any binding in a nested scope, which is another variable of the same
+    name.  A ``None`` entry only ever disqualifies a name.
     """
     plain = _plain_binding_values(func)
     bindings: dict[str, list[ast.expr | None]] = {}
@@ -193,7 +226,8 @@ class _TestScope:
 
     ``bare_configs`` — names whose every binding is a bare
     ``OrchestratorConfig()``.  ``once_bound`` — names bound exactly once, by a
-    plain assignment, to that expression.  ``bound`` — every local name.
+    plain assignment, to that expression.  ``bound`` — every name the test
+    binds or writes through.
     """
 
     bare_configs: frozenset[str]
@@ -239,9 +273,11 @@ _ARITHMETIC: Mapping[type[ast.operator], Callable[[Any, Any], Any]] = MappingPro
 })
 
 
-#: A pathological RHS must not stall the whole-suite ratchet, whose 300s
+#: Arithmetic never runs on an int wider than this, nor raises one to a power
+#: that could yield one: far wider than any config default, yet narrow enough
+#: that no arithmetic step can stall the whole-suite ratchet, whose 300s
 #: timeout ``os._exit()``s an xdist worker.
-_MAX_EVALUATED_EXPONENT = 64
+_MAX_EVALUATED_INT_BITS = 256
 
 _IMMUTABLE_SCALARS = (bool, int, float, complex, str, bytes, type(None))
 
@@ -255,6 +291,17 @@ _COLLECTION_CONSTRUCTORS: Mapping[str, Callable[..., Any]] = MappingProxyType({
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _within_int_bound(value: Any) -> bool:
+    return not isinstance(value, int) or value.bit_length() <= _MAX_EVALUATED_INT_BITS
+
+
+def _power_within_int_bound(base: Any, exponent: Any) -> bool:
+    """``abs(base) ** n`` needs at most ``base.bit_length() * n`` bits."""
+    if not (isinstance(base, int) and isinstance(exponent, int)) or exponent <= 0:
+        return True
+    return base.bit_length() * exponent <= _MAX_EVALUATED_INT_BITS
 
 
 def _is_immutable(value: Any) -> bool:
@@ -321,12 +368,13 @@ def _evaluate_arithmetic(node: ast.BinOp, scope: _TestScope,
     right = _evaluate_under_defaults(node.right, scope, resolving)
     if left is None or right is None:
         return None
-    if not (_is_number(left.value) and _is_number(right.value)):
+    operands = (left.value, right.value)
+    if not all(_is_number(v) and _within_int_bound(v) for v in operands):
         return None
-    if isinstance(node.op, ast.Pow) and abs(right.value) > _MAX_EVALUATED_EXPONENT:
+    if isinstance(node.op, ast.Pow) and not _power_within_int_bound(*operands):
         return None
     try:
-        value = apply(left.value, right.value)
+        value = apply(*operands)
     except (ArithmeticError, ValueError):
         return None
     return _Valued(value, left.reads | right.reads)
