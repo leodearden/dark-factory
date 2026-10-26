@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 # cycle back to evals (it reaches only config/fm_retry/shared.*), so a
 # module-level import is safe.
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
+from orchestrator.shadow_types import ReferenceKind
 
 from .measurement import UnmeasuredRecord
 from .plan_predicates import is_scorable_plan
@@ -279,6 +280,16 @@ class EvalMetrics:
     # before task 4844, or a path with no live architect such as ``run_eval``.
     # The key is written unconditionally; see docs/eval-replay-frame.md.
     replay_frame: str | None = None
+
+    # Live shadow eval (plans/live-shadow-eval-prd.md C1/C4): the shadow_cells row
+    # is the record's home and this is its pointer. None on every non-shadow cell
+    # and on every result persisted before these fields existed.
+    shadow_cell_id: str | None = None
+    reference_kind: ReferenceKind | None = None
+
+    def __post_init__(self) -> None:
+        if self.reference_kind is not None:
+            self.reference_kind = ReferenceKind(self.reference_kind)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
