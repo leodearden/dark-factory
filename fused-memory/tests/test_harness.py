@@ -11881,12 +11881,17 @@ class _ManualDeadline:
         self._armed.reschedule(asyncio.get_running_loop().time())
 
 
+async def _expire_then_wait(deadline: _ManualDeadline) -> None:
+    """Expire *deadline*, then wait for the cancellation that expiry delivers."""
+    deadline.expire()
+    await asyncio.sleep(999)
+
+
 def _expiring_stage_run(deadline: _ManualDeadline):
     """A stage.run stand-in that expires *deadline* and then waits to be cancelled."""
 
     async def expiring_run(events, watermark, prior_reports, run_id, model=None):
-        deadline.expire()
-        await asyncio.sleep(999)
+        await _expire_then_wait(deadline)
 
     return expiring_run
 
@@ -13794,8 +13799,7 @@ async def test_project_loop_timeout_in_post_completion_tail_keeps_events_drained
     await event_buffer.push(_make_event())
 
     async def stalled_mark_judge_pending(run_id, project_id):
-        deadline.expire()
-        await asyncio.sleep(999)
+        await _expire_then_wait(deadline)
 
     journal.mark_judge_pending = stalled_mark_judge_pending
 
@@ -13832,8 +13836,7 @@ async def test_project_loop_timeout_landing_after_the_completion_commit_keeps_ev
         if status != 'completed':
             return await original_complete_run(run_id, status)
         await original_complete_run(run_id, status)
-        deadline.expire()
-        await asyncio.sleep(999)
+        await _expire_then_wait(deadline)
 
     journal.complete_run = complete_run_then_expire
 
