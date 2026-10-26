@@ -37,7 +37,7 @@ from orchestrator.main_checkout_defaults import cli_default
 from orchestrator.review_payload import Verdict, normalize_review
 
 if TYPE_CHECKING:
-    from .corpus import CorpusManifest
+    from .corpus import CorpusDiff, CorpusManifest
     from .scorer import ScoringResult
 
 _PKG_DIR = Path(__file__).parent
@@ -80,36 +80,8 @@ def _cell_text(score: ScoringResult) -> str:
     return f'UNMEASURED {why} ${score.total_cost_usd:.2f}'
 
 
-async def _load_or_run_panel(variant, diff, stagger_secs: float = 2.0):
-    """Load cached result or run panel and save.
-
-    Mirrors the caching logic in runner.py _run_and_save() so results
-    from one step are reused by later steps.
-    """
-    from .runner import PanelRunResult, run_panel
-
-    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    result_path = _RESULTS_DIR / f'{variant.name}__{diff.diff_id}.json'
-
-    if result_path.exists():
-        try:
-            data = json.loads(result_path.read_text())
-            click.echo(f'  [cached] {variant.name}__{diff.diff_id}')
-            return PanelRunResult(
-                variant_name=data['variant_name'],
-                diff_id=data['diff_id'],
-                reviews=data.get('reviews', {}),
-                total_cost_usd=data.get('total_cost_usd', 0.0),
-                wall_clock_ms=data.get('wall_clock_ms', 0),
-                errors=data.get('errors', []),
-            )
-        except (json.JSONDecodeError, KeyError):
-            pass
-
-    click.echo(f'  [running] {variant.name}__{diff.diff_id}')
-    result = await run_panel(variant, diff, stagger_secs=stagger_secs)
-    result_path.write_text(json.dumps(asdict(result), indent=2))
-    return result
+def _echo_cell(score: ScoringResult) -> None:
+    click.echo(f'  {score.variant_name:22s} x {score.diff_id:<28s} {_cell_text(score)}')
 
 
 def _load_corpus():
@@ -204,7 +176,7 @@ def smoke(diff_id: str, stagger: float) -> None:
     """Step 2: Smoke test -- run baseline panel on 1 diff."""
 
     async def _run() -> int:
-        from .runner import REVIEW_SCHEMA
+        from .runner import REVIEW_SCHEMA, run_panel_cached
         from .variants import VARIANT_BASELINE
 
         corpus = _load_corpus()
@@ -217,7 +189,7 @@ def smoke(diff_id: str, stagger: float) -> None:
         click.echo('=' * 50)
         click.echo()
 
-        result = await _load_or_run_panel(VARIANT_BASELINE, diff, stagger_secs=stagger)
+        result = await run_panel_cached(VARIANT_BASELINE, diff, stagger_secs=stagger)
         click.echo()
         payloads = {name: normalize_review(rev) for name, rev in result.reviews.items()}
 
@@ -291,6 +263,44 @@ def smoke(diff_id: str, stagger: float) -> None:
 # Step 3: Scorer calibration
 # ---------------------------------------------------------------------------
 
+def _echo_calibration(diff: CorpusDiff, score: ScoringResult) -> None:
+    """*score* beside *diff*'s ground truth: what matched, what was missed, what was spurious."""
+    click.echo(f'\n{"=" * 50}')
+    click.echo(click.style(f'Calibration: {diff.diff_id} ({diff.language}, {diff.source})', bold=True))
+    click.echo(f'{"=" * 50}')
+    if score.unmeasured is not None:
+        click.echo(f'  Scorer: {_cell_text(score)}')
+        return
+
+    click.echo(f'\n{click.style("Ground Truth", bold=True)} ({len(diff.ground_truth)} issues):')
+    for gt in diff.ground_truth:
+        sev_color = 'red' if gt.severity == 'blocking' else 'yellow'
+        click.echo(f'  [{gt.id}] {click.style(gt.severity.upper(), fg=sev_color)}  {gt.category}  {gt.location}')
+        click.echo(f'    {gt.description[:120]}')
+
+    click.echo(f'\n{click.style("Matched Issues", bold=True)} ({len(score.matches)}):')
+    if score.matches:
+        for m in score.matches:
+            ri = m.reviewer_issue
+            click.echo(f'  [{m.ground_truth_id}] <-> {ri.get("reviewer", "?")} (confidence: {m.match_confidence:.2f})')
+            click.echo(f'    Found: {ri.get("description", "?")[:100]}')
+            click.echo(f'    Reasoning: {m.match_reasoning[:100]}')
+    else:
+        click.echo('  (none)')
+
+    if score.unmatched_gt:
+        click.echo(f'\n{click.style("Unmatched Ground Truth", fg="red")} ({len(score.unmatched_gt)}):')
+        for gt_id in score.unmatched_gt:
+            click.echo(f'  - {gt_id}')
+
+    if score.false_positives:
+        click.echo(f'\n{click.style("False Positives", fg="yellow")} ({len(score.false_positives)}):')
+        for fp in score.false_positives:
+            click.echo(f'  - {fp.get("reviewer", "?")}: {fp.get("description", "?")[:80]} ({fp.get("severity", "?")})')
+
+    click.echo(f'\nMetrics: recall={score.recall:.3f}  precision={score.precision:.3f}  F1={score.f1:.3f}  blocking_recall={score.blocking_recall:.3f}')
+
+
 @cli.command()
 @click.option('--diff-ids', default='py_missing_await,rs_off_by_one,ts_shallow_mutate',
               help='Comma-separated diff IDs (1 per language)')
@@ -299,7 +309,8 @@ def calibrate(diff_ids: str, stagger: float) -> None:
     """Step 3: Scorer calibration -- run scorer on 3 diffs for human inspection."""
 
     async def _run() -> None:
-        from .scorer import score_panel_run
+        from .corpus import CorpusManifest
+        from .runner import run_and_score
         from .variants import VARIANT_BASELINE
 
         corpus = _load_corpus()
@@ -308,58 +319,25 @@ def calibrate(diff_ids: str, stagger: float) -> None:
         click.echo(click.style(f'Scorer Calibration: {len(ids)} diffs', bold=True))
         click.echo('=' * 50)
 
+        found = []
         for diff_id in ids:
             diff = corpus.get_diff(diff_id)
             if diff is None:
                 click.echo(f'\nDiff not found: {diff_id}', err=True)
-                continue
-
-            click.echo(f'\n{"=" * 50}')
-            click.echo(click.style(f'Calibration: {diff_id} ({diff.language}, {diff.source})', bold=True))
-            click.echo(f'{"=" * 50}')
-
-            # Run panel
-            result = await _load_or_run_panel(VARIANT_BASELINE, diff, stagger_secs=stagger)
-
-            # Score
-            click.echo('\n  Scoring with haiku...')
-            score = await score_panel_run(result, diff)
-            if score.unmeasured is not None:
-                click.echo(f'  Scorer: {_cell_text(score)}')
-                continue
-
-            # Display ground truth
-            click.echo(f'\n{click.style("Ground Truth", bold=True)} ({len(diff.ground_truth)} issues):')
-            for gt in diff.ground_truth:
-                sev_color = 'red' if gt.severity == 'blocking' else 'yellow'
-                click.echo(f'  [{gt.id}] {click.style(gt.severity.upper(), fg=sev_color)}  {gt.category}  {gt.location}')
-                click.echo(f'    {gt.description[:120]}')
-
-            # Display matches
-            click.echo(f'\n{click.style("Matched Issues", bold=True)} ({len(score.matches)}):')
-            if score.matches:
-                for m in score.matches:
-                    ri = m.reviewer_issue
-                    click.echo(f'  [{m.ground_truth_id}] <-> {ri.get("reviewer", "?")} (confidence: {m.match_confidence:.2f})')
-                    click.echo(f'    Found: {ri.get("description", "?")[:100]}')
-                    click.echo(f'    Reasoning: {m.match_reasoning[:100]}')
             else:
-                click.echo('  (none)')
+                found.append(diff)
 
-            # Display unmatched GT
-            if score.unmatched_gt:
-                click.echo(f'\n{click.style("Unmatched Ground Truth", fg="red")} ({len(score.unmatched_gt)}):')
-                for gt_id in score.unmatched_gt:
-                    click.echo(f'  - {gt_id}')
-
-            # Display false positives
-            if score.false_positives:
-                click.echo(f'\n{click.style("False Positives", fg="yellow")} ({len(score.false_positives)}):')
-                for fp in score.false_positives:
-                    click.echo(f'  - {fp.get("reviewer", "?")}: {fp.get("description", "?")[:80]} ({fp.get("severity", "?")})')
-
-            # Metrics
-            click.echo(f'\nMetrics: recall={score.recall:.3f}  precision={score.precision:.3f}  F1={score.f1:.3f}  blocking_recall={score.blocking_recall:.3f}')
+        click.echo('\nRunning panels and scoring with haiku...')
+        scores = await run_and_score(
+            [VARIANT_BASELINE], CorpusManifest(diffs=found), stagger_secs=stagger, on_scored=_echo_cell,
+        )
+        score_by_id = {score.diff_id: score for score in scores}
+        for diff in found:
+            score = score_by_id.get(diff.diff_id)
+            if score is None:
+                click.echo(f'\nNo score for {diff.diff_id}: its fixture was skipped (see the log)', err=True)
+            else:
+                _echo_calibration(diff, score)
 
         click.echo(f'\n{"=" * 50}')
         click.echo(click.style('ACTION: Review matches above. If accuracy < 0.85, scorer prompts need tuning.', fg='cyan', bold=True))
@@ -385,8 +363,7 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
 
     async def _run() -> int:
         from .report import build_trial_report, save_report
-        from .runner import run_trial
-        from .scorer import score_panel_run
+        from .runner import run_and_score
         from .variants import VARIANT_BASELINE
 
         corpus = _load_corpus()
@@ -395,22 +372,12 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
         click.echo('=' * 50)
         click.echo()
 
-        # Run baseline against all diffs
-        click.echo('Running panels...')
-        results = await run_trial([VARIANT_BASELINE], corpus, max_parallel_panels=max_parallel)
-        click.echo(f'  Completed {len(results)} panel runs.')
-
-        # Score all results
-        click.echo('\nScoring results...')
-        scores = []
-        for result in results:
-            diff = corpus.get_diff(result.diff_id)
-            if diff is None:
-                click.echo(f'  Warning: no corpus diff for {result.diff_id}', err=True)
-                continue
-            score = await score_panel_run(result, diff)
-            scores.append(score)
-            click.echo(f'  {result.diff_id}: {_cell_text(score)}')
+        click.echo('Running and scoring panels...')
+        scores = await run_and_score(
+            [VARIANT_BASELINE], corpus, max_parallel_panels=max_parallel, stagger_secs=stagger,
+            on_scored=_echo_cell,
+        )
+        click.echo(f'  Scored {len(scores)} panel runs.')
 
         # Build report
         report = build_trial_report(scores, [VARIANT_BASELINE], corpus)
@@ -958,8 +925,7 @@ def full_trial(max_parallel: int, stagger: float, report_dir: Path | None) -> No
 
     async def _run() -> int:
         from .report import build_trial_report, format_markdown, save_report
-        from .runner import run_trial
-        from .scorer import score_panel_run
+        from .runner import run_and_score
         from .variants import ALL_VARIANTS
 
         corpus = _load_corpus()
@@ -970,21 +936,11 @@ def full_trial(max_parallel: int, stagger: float, report_dir: Path | None) -> No
             click.echo(f'  {v.name:15s} {v.description} ({len(v.reviewers)} reviewers)')
         click.echo()
 
-        # Run all variants
-        click.echo('Running panels...')
-        results = await run_trial(ALL_VARIANTS, corpus, max_parallel_panels=max_parallel)
-        click.echo(f'  Completed {len(results)} panel runs.')
-
-        # Score all results
-        click.echo('\nScoring results...')
-        scores = []
-        for result in results:
-            diff = corpus.get_diff(result.diff_id)
-            if diff is None:
-                continue
-            score = await score_panel_run(result, diff)
-            scores.append(score)
-            click.echo(f'  {result.variant_name:15s} x {result.diff_id:<25s} {_cell_text(score)}')
+        click.echo('Running and scoring panels...')
+        scores = await run_and_score(
+            ALL_VARIANTS, corpus, max_parallel_panels=max_parallel, stagger_secs=stagger,
+            on_scored=_echo_cell,
+        )
 
         # Build and save report
         report = build_trial_report(scores, ALL_VARIANTS, corpus)
@@ -996,7 +952,7 @@ def full_trial(max_parallel: int, stagger: float, report_dir: Path | None) -> No
         click.echo(format_markdown(report))
         click.echo(f'\nReport saved to: {report_path}')
 
-        total_cost = sum(r.total_cost_usd for r in results)
+        total_cost = sum(s.cost_usd for s in scores)
         click.echo(f'Total panel cost: ${total_cost:.2f}')
         return 0
 
@@ -1019,8 +975,7 @@ def effort_sweep(max_parallel: int, stagger: float) -> None:
 
     async def _run() -> int:
         from .report import build_trial_report, format_markdown, save_report
-        from .runner import run_trial
-        from .scorer import score_panel_run
+        from .runner import run_and_score
         from .variants import EFFORT_SWEEP_VARIANTS
 
         corpus = _load_corpus()
@@ -1035,19 +990,11 @@ def effort_sweep(max_parallel: int, stagger: float) -> None:
             click.echo(f'  {v.name:18s} effort={effort:6s} {v.description}')
         click.echo()
 
-        click.echo('Running panels...')
-        results = await run_trial(EFFORT_SWEEP_VARIANTS, corpus, max_parallel_panels=max_parallel)
-        click.echo(f'  Completed {len(results)} panel runs.')
-
-        click.echo('\nScoring results...')
-        scores = []
-        for result in results:
-            diff = corpus.get_diff(result.diff_id)
-            if diff is None:
-                continue
-            score = await score_panel_run(result, diff)
-            scores.append(score)
-            click.echo(f'  {result.variant_name:18s} x {result.diff_id:<25s} {_cell_text(score)}')
+        click.echo('Running and scoring panels...')
+        scores = await run_and_score(
+            EFFORT_SWEEP_VARIANTS, corpus, max_parallel_panels=max_parallel, stagger_secs=stagger,
+            on_scored=_echo_cell,
+        )
 
         report = build_trial_report(scores, EFFORT_SWEEP_VARIANTS, corpus)
         report_path = save_report(report, _RESULTS_DIR / 'effort_sweep_report')
@@ -1056,7 +1003,7 @@ def effort_sweep(max_parallel: int, stagger: float) -> None:
         click.echo(format_markdown(report))
         click.echo(f'\nReport saved to: {report_path}')
 
-        total_cost = sum(r.total_cost_usd for r in results)
+        total_cost = sum(s.cost_usd for s in scores)
         click.echo(f'Total panel cost: ${total_cost:.2f}')
         return 0
 
@@ -1090,8 +1037,7 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
         from orchestrator.config import default_price_table
 
         from .report import build_trial_report, format_markdown, save_report
-        from .runner import run_trial
-        from .scorer import score_panel_run
+        from .runner import run_and_score
         from .variants import REVIEWER_REFRESH_VARIANTS
 
         corpus = _select_original_corpus(_load_corpus())
@@ -1106,21 +1052,11 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
             click.echo(f'  {v.name:20s} {v.description} ({len(v.reviewers)} reviewers)')
         click.echo()
 
-        click.echo('Running panels...')
-        results = await run_trial(
-            REVIEWER_REFRESH_VARIANTS, corpus, max_parallel_panels=max_parallel, prices=prices,
+        click.echo('Running and scoring panels...')
+        scores = await run_and_score(
+            REVIEWER_REFRESH_VARIANTS, corpus, max_parallel_panels=max_parallel, stagger_secs=stagger,
+            prices=prices, on_scored=_echo_cell,
         )
-        click.echo(f'  Completed {len(results)} panel runs.')
-
-        click.echo('\nScoring results...')
-        scores = []
-        for result in results:
-            diff = corpus.get_diff(result.diff_id)
-            if diff is None:
-                continue
-            score = await score_panel_run(result, diff)
-            scores.append(score)
-            click.echo(f'  {result.variant_name:20s} x {result.diff_id:<25s} {_cell_text(score)}')
 
         # Build and save report
         report = build_trial_report(scores, REVIEWER_REFRESH_VARIANTS, corpus)
@@ -1132,7 +1068,7 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
         click.echo(format_markdown(report))
         click.echo(f'\nReport saved to: {report_path}')
 
-        total_cost = sum(r.total_cost_usd for r in results)
+        total_cost = sum(s.cost_usd for s in scores)
         click.echo(f'Total panel cost: ${total_cost:.2f}')
         return 0
 
@@ -1216,8 +1152,7 @@ def campaign(
         from orchestrator.evals.eval_gate import campaign_usage_gate
 
         from . import campaign as reduce
-        from .runner import DIFF_CAP_CHARS, run_trial
-        from .scorer import score_panel_run
+        from .runner import DIFF_CAP_CHARS, run_and_score
         from .variants import FABLE_EVIDENCE_VARIANTS, campaign_arms
 
         manifest = _load_corpus()
@@ -1253,36 +1188,17 @@ def campaign(
             records: list[dict] = []
             for trial in range(1, trials + 1):
                 trial_dir = results_dir / f'trial-{trial}'
-                score_dir = trial_dir / 'scores'
-                score_dir.mkdir(parents=True, exist_ok=True)
                 click.echo(f'\n== trial {trial}/{trials}')
-                results = await run_trial(
-                    variants, corpus, max_parallel_panels=max_parallel, prices=prices,
-                    results_dir=trial_dir, usage_gate=usage_gate, diff_cap_chars=cap,
+                scores = await run_and_score(
+                    variants, corpus, results_dir=trial_dir, score_dir=trial_dir / 'scores',
+                    max_parallel_panels=max_parallel, prices=prices, usage_gate=usage_gate,
+                    diff_cap_chars=cap, on_scored=_echo_cell,
                 )
-                for result in results:
-                    diff = corpus.get_diff(result.diff_id)
-                    if diff is None:
-                        continue
-                    score_path = score_dir / f'{result.variant_name}__{result.diff_id}.json'
-                    if score_path.exists():
-                        rec = json.loads(score_path.read_text())
-                        cell = _metrics_text(
-                            rec['f1'], rec['blocking_recall'],
-                            rec['cost_usd'] + rec.get('match_cost_usd', 0.0),
-                        )
-                    else:
-                        score = await score_panel_run(result, diff, usage_gate=usage_gate)
-                        rec = asdict(score)
-                        if score.unmeasured is None:
-                            score_path.write_text(json.dumps(rec, indent=2))
-                        cell = _cell_text(score)
-                    rec['trial'] = trial
-                    records.append(rec)
-                    click.echo(f'  {result.variant_name:22s} x {result.diff_id:<28s} {cell}')
+                records.extend({**asdict(s), 'trial': trial} for s in scores)
 
             arms_out, decisions = reduce.summarize_campaign(records, incumbent, blocking_gt)
             md = reduce.format_markdown(arms_out, decisions)
+            results_dir.mkdir(parents=True, exist_ok=True)
             (results_dir / 'campaign_report.md').write_text(md + '\n')
             (results_dir / 'campaign_report.json').write_text(
                 json.dumps(reduce.to_json(arms_out, decisions), indent=2),
