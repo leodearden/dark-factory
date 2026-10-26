@@ -37,6 +37,7 @@ from shared.cli_invoke import (  # noqa: F401
 
 # Process-group termination helper for subprocess tree cleanup
 from shared.proc_group import terminate_process_group
+from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents.sandbox_git_config import sandbox_git_config_env
 
@@ -138,6 +139,7 @@ async def invoke_agent(
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
+    resume_prior_total_cost_usd: float | None = None,
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
@@ -150,6 +152,10 @@ async def invoke_agent(
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
     *resume_session_id*, when set, resumes an existing Claude session.
+    *resume_prior_total_cost_usd* (claude backend only) is the CLI's last
+    reported ``total_cost_usd`` for the session being resumed, so the resumed
+    process is charged only its own spend (see ``shared.process_cost``);
+    ignored without *resume_session_id*.
     *session_id*, when set and *resume_session_id* is not, pre-allocates the
     session UUID via ``--session-id``.
     *timeout_seconds*, when set, kills the subprocess after this many seconds.
@@ -186,6 +192,7 @@ async def invoke_agent(
             working_idle_secs=working_idle_secs,
             absolute_cap_secs=absolute_cap_secs,
             strict_mcp_config=strict_mcp_config,
+            resume_prior_total_cost_usd=resume_prior_total_cost_usd,
         )
     elif backend == 'codex':
         return await _invoke_codex(
@@ -284,6 +291,7 @@ async def _invoke_claude_with_sandbox(
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
+    resume_prior_total_cost_usd: float | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI with optional bwrap sandboxing.
 
@@ -364,7 +372,11 @@ async def _invoke_claude_with_sandbox(
                     working_idle_secs=working_idle_secs,
                     absolute_cap_secs=absolute_cap_secs,
                 )
-                return _parse_claude_output(result)
+                return _parse_claude_output(
+                    result,
+                    resumed=bool(resume_session_id),
+                    prior_total_cost_usd=resume_prior_total_cost_usd,
+                )
             finally:
                 for path in temp_files:
                     Path(path).unlink(missing_ok=True)
@@ -389,6 +401,7 @@ async def _invoke_claude_with_sandbox(
         working_idle_secs=working_idle_secs,
         absolute_cap_secs=absolute_cap_secs,
         strict_mcp_config=strict_mcp_config,
+        resume_prior_total_cost_usd=resume_prior_total_cost_usd,
     )
 
 
@@ -709,6 +722,7 @@ def _parse_codex_output(
         success=result.returncode == 0 and not is_error,
         output=output_text,
         cost_usd=cost,
+        cost_basis=ProcessCostBasis.USAGE_ESTIMATE,
         duration_ms=result.duration_ms,
         turns=num_turns,
         session_id=session_id,
@@ -809,6 +823,7 @@ def _parse_gemini_output(
         success=result.returncode == 0,
         output=output_text,
         cost_usd=cost,
+        cost_basis=ProcessCostBasis.USAGE_ESTIMATE,
         duration_ms=result.duration_ms,
         turns=stats.get('turns', 0),
         session_id=data.get('session_id', ''),
@@ -1006,6 +1021,7 @@ def _parse_pi_output(
     cost_usd = native_cost if native_cost else _estimate_cost(
         model, total_input_tokens, total_output_tokens, prices,
     )
+    cost_basis = ProcessCostBasis.REPORTED if native_cost else ProcessCostBasis.USAGE_ESTIMATE
 
     terminal = assistant_messages[-1] if assistant_messages else None
     if terminal is not None:
@@ -1035,6 +1051,7 @@ def _parse_pi_output(
             success=True,
             output=output_text,
             cost_usd=cost_usd,
+            cost_basis=cost_basis,
             duration_ms=result.duration_ms,
             turns=turns,
             session_id=session_id,
@@ -1049,6 +1066,7 @@ def _parse_pi_output(
         success=False,
         output=error_message or output_text or 'pi agent reported an error',
         cost_usd=cost_usd,
+        cost_basis=cost_basis,
         duration_ms=result.duration_ms,
         turns=turns,
         session_id=session_id,
