@@ -3518,17 +3518,31 @@ async def test_done_provenance_rejects_missing_when_required(
     taskmaster.set_task_status.assert_not_called()
 
 
+def _offered_examples(text: str) -> list[dict]:
+    """Every JSON object ``text`` offers for copy-paste, decoded."""
+    decoder = json.JSONDecoder()
+    examples = []
+    start = text.find('{')
+    while start != -1:
+        example, end = decoder.raw_decode(text, start)
+        examples.append(example)
+        start = text.find('{', end)
+    return examples
+
+
 def _assert_offers_every_caller_selectable_kind(text: str) -> None:
-    """``text`` names every kind a caller may supply by hand, the
-    operational-verified link field, and the canonical per-kind table. The
-    caller-selectable set is derived from the declared vocabulary, so a new
-    caller-selectable kind fails here until the guidance names it."""
+    """``text`` offers exactly one copy-pasteable example per kind a caller
+    may supply by hand, each a valid done write, and points at the canonical
+    per-kind table. The kind set and the per-kind rules both come from
+    shared's public DoneProvenance interface, so a new caller-selectable
+    kind, or a new required field on one, fails here until the guidance
+    follows."""
     declared = set(get_args(DoneProvenance.model_fields['kind'].annotation))
-    caller_selectable = declared - DETERMINISTIC_PROVENANCE_KINDS
-    assert caller_selectable
-    for kind in caller_selectable:
-        assert f'"{kind}"' in text, (kind, text)
-    assert 'escalation_id' in text, text
+    caller_selectable = sorted(declared - DETERMINISTIC_PROVENANCE_KINDS)
+    examples = _offered_examples(text)
+    assert sorted(example['kind'] for example in examples) == caller_selectable, text
+    for example in examples:
+        DoneProvenance.parse_for_write(example)
     assert 'docs/task-authoring.md' in text, text
 
 
