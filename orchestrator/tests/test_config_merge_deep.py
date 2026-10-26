@@ -24,7 +24,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
-from _orch_helpers import load_packaged_defaults
+from _packaged_defaults import load_packaged_defaults
 from pydantic import ValidationError
 
 from orchestrator.config import (

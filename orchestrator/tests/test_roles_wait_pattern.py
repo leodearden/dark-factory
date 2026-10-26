@@ -75,7 +75,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import pytest
-from _orch_helpers import load_packaged_defaults
+from _packaged_defaults import load_packaged_defaults
 from _role_splice_contract import (
     BASH_CAPABLE_UNPINNED_ROLES,
     SpliceContract,

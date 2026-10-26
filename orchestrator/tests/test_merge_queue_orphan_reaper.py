@@ -34,7 +34,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _merge_lane_fakes import FakeClock
-from _orch_helpers import load_packaged_defaults
+from _packaged_defaults import load_packaged_defaults
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps, _run

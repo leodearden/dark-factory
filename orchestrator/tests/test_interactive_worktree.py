@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from _orch_helpers import load_packaged_defaults
+from _packaged_defaults import load_packaged_defaults
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig

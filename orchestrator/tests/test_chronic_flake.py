@@ -26,7 +26,8 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
-from _orch_helpers import load_packaged_defaults, mcp_tool_envelope, pydantic_spec
+from _orch_helpers import mcp_tool_envelope, pydantic_spec
+from _packaged_defaults import load_packaged_defaults
 
 from orchestrator.config import OrchestratorConfig
 

@@ -17,11 +17,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import (
-    load_packaged_defaults,
     pydantic_spec,
     skip_role_config_layer,
     stamp_stock_routing_config,
 )
+from _packaged_defaults import load_packaged_defaults
 from shared.cli_invoke import AllAccountsCappedException
 from shared.config_dir import TaskConfigDir
 

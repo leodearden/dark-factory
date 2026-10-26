@@ -14,7 +14,7 @@ unresolved incident and auto-resolving when the loop breaks.
 from __future__ import annotations
 
 import pytest
-from _orch_helpers import load_packaged_defaults
+from _packaged_defaults import load_packaged_defaults
 
 from orchestrator.workflow import WorkflowOutcome
 

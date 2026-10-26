@@ -11,7 +11,6 @@ import asyncio
 import contextlib
 import functools
 import gc
-import importlib.resources
 import inspect
 import json
 import logging
@@ -27,7 +26,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 from unittest.mock import AsyncMock, AsyncMockMixin, MagicMock
 
 import pytest
-import yaml
 from pydantic import BaseModel
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.psi import PsiSample
@@ -45,22 +43,6 @@ _log = logging.getLogger(__name__)
 
 # task 3980: return-type variable for `wait_responsive` below.
 _WaitT = TypeVar('_WaitT')
-
-
-def packaged_defaults_path() -> Path:
-    """Filesystem path of the package-bundled ``defaults.yaml``.
-
-    Test-side only: the suite always runs against a filesystem/editable install,
-    so the resolved path cannot dangle. Production code must not copy this --
-    for a zip/wheel install ``importlib.resources.as_file`` extracts to a temp
-    file that is deleted on context exit.
-    """
-    return Path(str(importlib.resources.files('orchestrator').joinpath('defaults.yaml')))
-
-
-def load_packaged_defaults() -> dict:
-    """Parse the shipped ``defaults.yaml`` so tests stay in sync automatically."""
-    return yaml.safe_load(packaged_defaults_path().read_text())
 
 
 ADMISSION_TEST_CMD = 'pytest tests/'

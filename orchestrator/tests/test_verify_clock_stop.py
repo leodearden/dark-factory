@@ -17,7 +17,8 @@ import re
 from pathlib import Path
 
 import pytest
-from _orch_helpers import DELIBERATE_TIGHT_BOUND_CEILING, load_packaged_defaults
+from _orch_helpers import DELIBERATE_TIGHT_BOUND_CEILING
+from _packaged_defaults import load_packaged_defaults
 from pydantic import ValidationError
 
 from orchestrator.config import OrchestratorConfig
