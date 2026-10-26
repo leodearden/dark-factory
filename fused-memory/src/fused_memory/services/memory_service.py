@@ -108,13 +108,20 @@ from fused_memory.reconciliation.standing_decision_writer import (
 )
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
-from fused_memory.services import overreach_guard
+from fused_memory.services import mem0_write_retry, overreach_guard
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
 )
 from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
 from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
+from fused_memory.services.mem0_write_retry import (
+    DEFAULT_MEM0_RETRY_POLICY,
+    Mem0RetryPassSummary,
+    Mem0RetryPolicy,
+    classify_transient_provider_failure,
+    retry_reason,
+)
 from fused_memory.services.memory_metadata_census import (
     UnknownKeyStormDetector,
     emit_schema_warnings,
@@ -2329,8 +2336,14 @@ def _elapsed_ms_since(started: float) -> float:
 class MemoryService:
     """Central orchestration — fused read/write across Graphiti + Mem0."""
 
-    def __init__(self, config: FusedMemoryConfig):
+    def __init__(
+        self,
+        config: FusedMemoryConfig,
+        *,
+        mem0_retry_policy: Mem0RetryPolicy = DEFAULT_MEM0_RETRY_POLICY,
+    ):
         self.config = config
+        self._mem0_retry_policy = mem0_retry_policy
         self.graphiti = GraphitiBackend(config)
         self.mem0 = Mem0Backend(config)
         self.classifier = WriteClassifier(config)
@@ -6848,6 +6861,7 @@ class MemoryService:
 
         memory_ids: list[str] = []
         stores_written: list[SourceStore] = []
+        stores_pending_retry: list[SourceStore] = []
         meta['category'] = resolved_category.value
         _stamp_unverified_claim(meta, unverified_claim)
 
@@ -6907,6 +6921,7 @@ class MemoryService:
 
         _graphiti_error = None
         _mem0_error = None
+        _mem0_pending = None
 
         # Graphiti: enqueue via durable queue (async, but durably persisted)
         if write_graphiti:
@@ -7043,15 +7058,21 @@ class MemoryService:
                         },
                     )
             except Exception as e:
-                logger.error(f'Mem0 write failed: {e}')
-                _mem0_error = str(e)
-                # add() provably raised → mem0 did NOT persist. Stamp the
-                # intent 'failed' (the reconciler treats a failed-only
-                # backend_op as safe to re-issue).
-                if self._write_journal and intent_id:
-                    await self._write_journal.resolve_mem0_intent(
-                        intent_id, 'failed', reason=str(e)
-                    )
+                _mem0_pending = await self._defer_mem0_write_for_retry(
+                    e, intent_id=intent_id, write_op_id=write_op_id
+                )
+                if _mem0_pending is not None:
+                    stores_pending_retry.append(SourceStore.mem0)
+                else:
+                    logger.error(f'Mem0 write failed: {e}')
+                    _mem0_error = str(e)
+                    # add() provably raised → mem0 did NOT persist. Stamp the
+                    # intent 'failed' (the reconciler treats a failed-only
+                    # backend_op as safe to re-issue).
+                    if self._write_journal and intent_id:
+                        await self._write_journal.resolve_mem0_intent(
+                            intent_id, 'failed', reason=str(e)
+                        )
 
         # Layer 1 journal entry
         if self._write_journal:
@@ -7071,6 +7092,7 @@ class MemoryService:
                 result_summary={
                     'memory_ids': memory_ids,
                     'stores': [s.value for s in stores_written],
+                    'stores_pending': [s.value for s in stores_pending_retry],
                 },
                 success=not (_graphiti_error or _mem0_error),
                 error=_graphiti_error or _mem0_error,
@@ -7095,15 +7117,78 @@ class MemoryService:
             msg += f' [graphiti_error: {_graphiti_error}]'
         if _mem0_error:
             msg += f' [mem0_error: {_mem0_error}]'
+        if _mem0_pending:
+            msg += f' [mem0_pending_retry: {_mem0_pending}]'
         if classification_fallback is not None:
             msg += f' [classification_fallback: {classification_fallback.value}]'
 
         return AddMemoryResponse(
             memory_ids=memory_ids,
             stores_written=stores_written,
+            stores_pending_retry=stores_pending_retry,
             category=resolved_category,
             message=msg,
             classification_fallback=classification_fallback,
+        )
+
+    async def _defer_mem0_write_for_retry(
+        self, error: Exception, *, intent_id: str | None, write_op_id: str
+    ) -> str | None:
+        """Queue a transiently failed Mem0 leg for server-side retry; return why, or None.
+
+        ``None`` means the write was NOT deferred: the error is not transient,
+        or no durable ``retrying`` intent row could be made, so the caller
+        reports the leg failed.
+        """
+        failure = classify_transient_provider_failure(error)
+        if failure is None or self._write_journal is None or intent_id is None:
+            return None
+        reason = retry_reason(failure, error)
+        deferred = await self._write_journal.schedule_mem0_retry(
+            intent_id,
+            reason=reason,
+            retry_at=self._mem0_retry_policy.retry_at(attempts=1, now=datetime.now(UTC)),
+        )
+        if not deferred:
+            return None
+        logger.warning(
+            'Mem0 write deferred for server-side retry '
+            '(intent_id=%s, write_op_id=%s, failure=%s)',
+            intent_id,
+            write_op_id,
+            failure.value,
+        )
+        return reason
+
+    async def reissue_mem0_intent(self, intent: Mapping[str, Any]) -> Any:
+        """Re-issue a journaled Mem0 write intent under its original write_op_id."""
+        content = intent.get('content') or ''
+        scope = Scope(
+            project_id=intent.get('project_id') or 'main',
+            agent_id=intent.get('agent_id'),
+            session_id=intent.get('session_id'),
+        )
+        metadata = json.loads(intent.get('metadata') or '{}')
+        return await self._journaled_backend_call(
+            write_op_id=intent['write_op_id'],
+            causation_id=intent.get('causation_id'),
+            backend='mem0',
+            operation='add',
+            payload={'content': content[:200]},
+            coro=self.mem0.add(content=content, scope=scope, metadata=metadata),
+        )
+
+    async def retry_due_mem0_intents(
+        self, *, now: datetime | None = None
+    ) -> Mem0RetryPassSummary:
+        """Run one server-side retry pass over the Mem0 writes deferred for retry."""
+        if self._write_journal is None:
+            return Mem0RetryPassSummary()
+        return await mem0_write_retry.retry_due_mem0_intents(
+            self._write_journal,
+            self.reissue_mem0_intent,
+            policy=self._mem0_retry_policy,
+            now=now or datetime.now(UTC),
         )
 
     # ------------------------------------------------------------------
