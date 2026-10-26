@@ -1,12 +1,15 @@
 """The hot-reload step of a config-deploy script, shared by
 scripts/merge-deep-set-cap.sh and scripts/merge-pytest-n-ab-switch.sh.
 
-Each of those scripts commits an edit to an orchestrator's config, then runs a
-`python3 -` heredoc that fetches reload_config's report through this module
-and checks only its own knob's disposition in it. Everything before that check
-lives here once: importing the transport, calling reload_config through it,
-confirming the reload committed a re-read of the caller's own config file, and
-the operator-facing diagnostic for each way that can fail.
+Each of those scripts runs a `python3 -` heredoc that first LANDS its edit to
+an orchestrator's config through that project's own merge queue
+(scripts/_merge_queue_landing.py::land_file), never as a direct commit to its
+main, then fetches reload_config's report through this module and checks only
+its own knob's disposition in it. Everything between the landing and that
+check lives here once: importing the transport, calling reload_config through
+it, confirming the reload committed a re-read of the caller's own config file,
+and the operator-facing diagnostic for each way that can fail. The landing
+module shares this module's transport loader, its remedy and `die`.
 
 Two entry points, one fetch:
 
