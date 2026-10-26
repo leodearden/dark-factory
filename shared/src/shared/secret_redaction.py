@@ -4,8 +4,10 @@ Callers pass ``{var: value}``; which variables hold secrets is
 ``shared.secret_env``'s question, not this module's. A value is matched in the
 JSON-string-escaped form it takes inside a JSONL line, and is replaced by
 ``<redacted:VAR>`` right-padded with ``x`` to the same byte length, so a file
-keeps its size and line count. A rewrite that would turn a valid JSON line
-invalid is refused rather than applied. No message ever carries a value.
+keeps its size and line count. A line whose rewrite would turn it from valid
+JSON into invalid JSON is left as it was and reported in
+``FileRedaction.refused``; every other line is still redacted. No message ever
+carries a value.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ __all__ = [
     'Needle',
     'RedactionError',
     'RedactionWouldCorruptJson',
+    'RefusedLine',
     'copy_redacted',
     'file_stamp',
     'redact_in_place',
@@ -49,12 +52,24 @@ class Needle:
 
 
 @dataclass(frozen=True)
+class RefusedLine:
+    line_number: int
+    var: str
+
+
+@dataclass(frozen=True)
 class FileRedaction:
     counts: Mapping[str, int]
+    refused: tuple[RefusedLine, ...] = ()
 
     @property
     def redacted(self) -> bool:
         return any(self.counts.values())
+
+    def raise_if_refused(self, path: StrPath) -> None:
+        if self.refused:
+            first = self.refused[0]
+            raise RedactionWouldCorruptJson(Path(path), first.line_number, first.var)
 
 
 @dataclass(frozen=True)
@@ -72,7 +87,7 @@ class RedactionWouldCorruptJson(RedactionError):
     def __init__(self, path: Path, line_number: int, var: str) -> None:
         super().__init__(
             f'{path}: redacting {var} on line {line_number} would turn a valid JSON '
-            'line invalid; the file was left unredacted'
+            'line invalid; that line was left unredacted'
         )
         self.path = path
         self.line_number = line_number
@@ -102,14 +117,15 @@ def file_stamp(path: StrPath) -> FileStamp:
 
 def copy_redacted(src: StrPath, dest: StrPath, needles: Sequence[Needle]) -> FileRedaction:
     counts: Counter[str] = Counter()
+    refused: list[RefusedLine] = []
     try:
         with open(src, 'rb') as reader, open(dest, 'wb') as writer:
             for line_number, line in enumerate(reader, start=1):
-                writer.write(_redact_line(line, needles, counts, Path(src), line_number))
+                writer.write(_redact_line(line, needles, counts, refused, line_number))
     except BaseException:
         Path(dest).unlink(missing_ok=True)
         raise
-    return FileRedaction(MappingProxyType(dict(counts)))
+    return FileRedaction(MappingProxyType(dict(counts)), tuple(refused))
 
 
 def redact_in_place(
@@ -129,6 +145,8 @@ def redact_in_place(
     temp = Path(temp_name)
     try:
         result = copy_redacted(path, temp, needles)
+        if not result.redacted:
+            return result
         os.chmod(temp, stat.S_IMODE(original.st_mode))
         os.utime(temp, ns=(original.st_atime_ns, original.st_mtime_ns))
         if file_stamp(path) != stamp:
@@ -160,18 +178,23 @@ def _contains_any(path: Path, needles: Sequence[Needle]) -> bool:
 
 
 def _redact_line(
-    line: bytes, needles: Sequence[Needle], counts: Counter[str], path: Path, line_number: int,
+    line: bytes,
+    needles: Sequence[Needle],
+    counts: Counter[str],
+    refused: list[RefusedLine],
+    line_number: int,
 ) -> bytes:
     redacted = line
-    hit_vars: list[str] = []
+    line_counts: Counter[str] = Counter()
     for needle in needles:
         hits = redacted.count(needle.pattern)
         if hits:
-            counts[needle.var] += hits
-            hit_vars.append(needle.var)
+            line_counts[needle.var] += hits
             redacted = redacted.replace(needle.pattern, needle.placeholder)
-    if hit_vars and _is_json(line) and not _is_json(redacted):
-        raise RedactionWouldCorruptJson(path, line_number, hit_vars[0])
+    if line_counts and _is_json(line) and not _is_json(redacted):
+        refused.append(RefusedLine(line_number, next(iter(line_counts))))
+        return line
+    counts.update(line_counts)
     return redacted
 
 

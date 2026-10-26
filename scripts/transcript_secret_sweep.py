@@ -2,13 +2,14 @@
 
 Archive-time redaction (``shared.transcript_archive``) covers what is archived
 from now on; this sweep covers what is already on disk: each factory
-project's agent-transcript archive and ``~/.claude/projects``. It matches the
-values its OWN environment holds (the wrapper sources the repo ``.env``), and
-replaces them with ``shared.secret_redaction``'s same-length placeholders. It
-skips files modified within ``min_age_secs``, which a live session may still
-be appending to. A sweep that redacted or refused anything files one
-``risk_identified`` info escalation. Nothing it prints or files carries a
-value. Operator view: ``OPERATIONS.md`` §12.
+project's agent-transcript archive and ``~/.claude/projects``, including
+archive staging copies a hard kill stranded. It matches the values its OWN
+environment holds (the wrapper sources the repo ``.env``), and replaces them
+with ``shared.secret_redaction``'s same-length placeholders. It reads only
+regular files, and skips those modified within ``min_age_secs``, which a live
+session may still be appending to. A sweep that redacted or refused anything
+files one ``risk_identified`` info escalation. Nothing it prints or files
+carries a value. Operator view: ``OPERATIONS.md`` §12.
 """
 
 from __future__ import annotations
@@ -35,11 +36,12 @@ try:
     from shared.secret_env import secret_env_values
     from shared.secret_redaction import (
         FileChangedDuringRedaction,
+        FileRedaction,
         Needle,
-        RedactionWouldCorruptJson,
         redact_in_place,
         redaction_needles,
     )
+    from shared.transcript_archive import STAGING_SUFFIX
 except ImportError as exc:
     print(
         f'transcript_secret_sweep.py: {exc} -- run it as '
@@ -52,6 +54,7 @@ AGENT_ROLE = 'transcript-secret-sweep'
 DEFAULT_MIN_AGE_SECS = 900.0
 MAX_DETAIL_FILES = 200
 NO_SECRETS_CAUSE = 'no secret-bearing values in the environment'
+TRANSCRIPT_SUFFIXES = ('.jsonl', '.jsonl' + STAGING_SUFFIX)
 
 PostEscalation = Callable[[dict[str, object]], object]
 
@@ -70,7 +73,7 @@ class RedactedFile:
 
 
 @dataclass(frozen=True)
-class RefusedFile:
+class RefusedTranscriptLine:
     path: Path
     var: str
     line_number: int
@@ -88,7 +91,7 @@ class SweepResult:
     ok: bool
     cause: str | None = None
     redacted: tuple[RedactedFile, ...] = ()
-    refused: tuple[RefusedFile, ...] = ()
+    refused: tuple[RefusedTranscriptLine, ...] = ()
     deferred: tuple[Path, ...] = ()
     unreadable: tuple[Path, ...] = ()
     clean: int = 0
@@ -133,17 +136,17 @@ def run(
 def _scan(config: SweepConfig, needles: Sequence[Needle]) -> SweepResult:
     cutoff_ns = int((config.now.timestamp() - config.min_age_secs) * 1e9)
     redacted: list[RedactedFile] = []
-    refused: list[RefusedFile] = []
+    refused: list[RefusedTranscriptLine] = []
     deferred: list[Path] = []
     unreadable: list[Path] = []
     clean = 0
     for path in _transcripts(config.roots, unreadable):
         outcome = _sweep_file(path, needles, cutoff_ns)
         match outcome:
-            case RedactedFile():
-                redacted.append(outcome)
-            case RefusedFile():
-                refused.append(outcome)
+            case FileRedaction():
+                if outcome.redacted:
+                    redacted.append(RedactedFile(path, outcome.counts))
+                refused.extend(RefusedTranscriptLine(path, line.var, line.line_number) for line in outcome.refused)
             case _Verdict.CLEAN:
                 clean += 1
             case _Verdict.DEFERRED:
@@ -172,34 +175,35 @@ def _transcripts(roots: Iterable[Path], unreadable: list[Path]) -> Iterator[Path
         for directory, subdirs, files in os.walk(root, onerror=note_unlistable):
             subdirs.sort()
             for name in sorted(files):
-                if name.endswith('.jsonl'):
+                if name.endswith(TRANSCRIPT_SUFFIXES):
                     yield Path(directory) / name
 
 
-def _sweep_file(path: Path, needles: Sequence[Needle], cutoff_ns: int) -> RedactedFile | RefusedFile | _Verdict:
+def _sweep_file(path: Path, needles: Sequence[Needle], cutoff_ns: int) -> FileRedaction | _Verdict:
     try:
         st = os.lstat(path)
-        if not stat.S_ISREG(st.st_mode):
-            return _Verdict.NOT_A_FILE
-        if st.st_mtime_ns > cutoff_ns:
-            return _Verdict.DEFERRED
+    except OSError:
+        return _Verdict.UNREADABLE
+    if not stat.S_ISREG(st.st_mode):
+        return _Verdict.NOT_A_FILE
+    if st.st_mtime_ns > cutoff_ns:
+        return _Verdict.DEFERRED
+    try:
         redaction = redact_in_place(path, needles)
     except FileChangedDuringRedaction:
         return _Verdict.DEFERRED
-    except RedactionWouldCorruptJson as exc:
-        return RefusedFile(path, exc.var, exc.line_number)
     except OSError:
         return _Verdict.UNREADABLE
     finally:
         _drop_page_cache(path)
-    return RedactedFile(path, redaction.counts) if redaction.redacted else _Verdict.CLEAN
+    return redaction if redaction.redacted or redaction.refused else _Verdict.CLEAN
 
 
 def _drop_page_cache(path: Path) -> None:
     if not hasattr(os, 'posix_fadvise'):
         return
     with contextlib.suppress(OSError):
-        fd = os.open(path, os.O_RDONLY)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         try:
             os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
         finally:
@@ -219,9 +223,11 @@ def _bounded(lines: list[str]) -> list[str]:
 
 def _escalation_arguments(result: SweepResult, now: datetime.datetime) -> dict[str, object]:
     occurrences = sum(sum(f.counts.values()) for f in result.redacted)
+    refused_files = len({line.path for line in result.refused})
     summary = (
         f'Transcript secret sweep redacted live secret values in {len(result.redacted)} file(s) '
-        f'({occurrences} occurrence(s)); {len(result.refused)} file(s) refused and left un-redacted'
+        f'({occurrences} occurrence(s)); {len(result.refused)} line(s) in {refused_files} file(s) '
+        'refused and left un-redacted'
     )
     lines = [
         *(f'{f.path}: {_counts_label(f.counts)}' for f in result.redacted),
@@ -235,7 +241,7 @@ def _escalation_arguments(result: SweepResult, now: datetime.datetime) -> dict[s
         'detail': '\n'.join(_bounded(lines)),
         'suggested_action': (
             'These live credentials were on disk in agent transcripts: consider rotating them. '
-            'A refused file still holds its value and needs redacting by hand.'
+            'A refused line still holds its value and needs redacting by hand.'
         ),
         'evidence': [{'observation': summary, 'measured_at': now.isoformat(), 'ref': AGENT_ROLE}],
     }

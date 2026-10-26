@@ -3,8 +3,9 @@
 The archiving process's environment is the input: the values of its
 secret-bearing variables are replaced by same-length ``<redacted:VAR>``
 placeholders on the way into the archive, through both producers (the staged
-copy and the teardown move). A transcript whose redaction is refused is
-counted as an archival failure and never archived unredacted.
+copy and the teardown move). A transcript with a line whose redaction is
+refused is counted as an archival failure and never archived unredacted; the
+teardown move still redacts its other lines in place while holding it.
 """
 
 from __future__ import annotations
@@ -132,7 +133,10 @@ class TestRefusedRedaction:
     VALUE = '00e9' + 'X' * 44
 
     def _refusable_lines(self) -> list[str]:
-        return [json.dumps({'text': 'café' + 'X' * 44})]
+        return [
+            json.dumps({'text': f'plain {self.VALUE}'}),
+            json.dumps({'text': 'café' + 'X' * 44}),
+        ]
 
     def test_the_staged_copy_is_counted_and_nothing_is_archived(
         self, monkeypatch, failures, tmp_path,
@@ -141,24 +145,33 @@ class TestRefusedRedaction:
         config_dir = tmp_path / 'claude-config'
         root = tmp_path / 'archive'
         src = _write_transcript(config_dir, self._refusable_lines())
+        src_bytes = src.read_bytes()
 
         assert archive_task_transcripts(config_dir, TASK_ID, archive_root=root) == 0
 
+        assert src.read_bytes() == src_bytes
         assert transcript_archive_module._archival_failures() == 1
         assert [f['path'] for f in failures] == [str(src)]
         assert _archived_files(root) == []
 
-    def test_the_teardown_move_holds_the_transcript(self, monkeypatch, failures, tmp_path):
+    def test_the_teardown_move_holds_the_transcript_with_its_other_lines_redacted(
+        self, monkeypatch, failures, tmp_path,
+    ):
         monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', self.VALUE)
         config_dir = tmp_path / 'claude-config'
         root = tmp_path / 'archive'
         src = _write_transcript(config_dir, self._refusable_lines())
-        src_bytes = src.read_bytes()
+        safe_line, refused_line = src.read_bytes().splitlines()
 
         outcome = archive_before_delete(config_dir, TASK_ID, archive_root=root)
 
         assert outcome.held == (src,)
-        assert src.read_bytes() == src_bytes
+        held_safe_line, held_refused_line = src.read_bytes().splitlines()
+        assert held_refused_line == refused_line
+        assert self.VALUE.encode() not in held_safe_line
+        assert b'<redacted:CLAUDE_OAUTH_TOKEN_A>' in held_safe_line
+        assert len(held_safe_line) == len(safe_line)
+        assert src.stat().st_mtime_ns == OLD_MTIME_NS
         assert transcript_archive_module._archival_failures() == 1
         assert [f['path'] for f in failures] == [str(src)]
         assert _archived_files(root) == []

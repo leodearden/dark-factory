@@ -16,6 +16,7 @@ import pytest
 from shared.secret_redaction import (
     FileChangedDuringRedaction,
     RedactionWouldCorruptJson,
+    RefusedLine,
     copy_redacted,
     file_stamp,
     redact_in_place,
@@ -175,28 +176,81 @@ def test_copy_redacted_redacts_the_destination_and_leaves_the_source(tmp_path):
     _assert_every_line_is_json(dest)
 
 
-def test_a_rewrite_that_would_break_a_json_line_is_refused(tmp_path):
-    value = '00e9' + 'X' * 40
-    lines = [
-        json.dumps({'text': f'plain {value} occurrence'}),
-        json.dumps({'text': 'café' + 'X' * 40}),
-    ]
-    assert '\\u00e9' + 'X' * 40 in lines[1], 'the value must sit inside a \\u escape'
-    path = _write(tmp_path / 'held' / 's.jsonl', lines)
-    content = path.read_bytes()
+class TestRefusedLine:
+    VALUE = '00e9' + 'X' * 40
 
-    with pytest.raises(RedactionWouldCorruptJson) as excinfo:
-        redact_in_place(path, redaction_needles({VAR: value}))
+    def _lines(self) -> list[str]:
+        lines = [
+            json.dumps({'text': f'plain {self.VALUE} occurrence'}),
+            json.dumps({'text': 'café' + 'X' * 40}),
+            json.dumps({'text': f'another {self.VALUE}'}),
+        ]
+        assert '\\u00e9' + 'X' * 40 in lines[1], 'the value must sit inside a \\u escape'
+        return lines
 
-    error = excinfo.value
-    message = str(error)
-    assert (error.path, error.line_number, error.var) == (path, 2, VAR)
-    assert str(path) in message
-    assert 'line 2' in message
-    assert VAR in message
-    assert value not in message
-    assert path.read_bytes() == content
-    assert list(path.parent.iterdir()) == [path]
+    def _needles(self):
+        return redaction_needles({VAR: self.VALUE})
+
+    def test_only_the_line_whose_rewrite_would_break_json_keeps_its_value(self, tmp_path):
+        path = _write(tmp_path / 'held' / 's.jsonl', self._lines())
+        original = _lines(path)
+
+        result = redact_in_place(path, self._needles())
+
+        after = _lines(path)
+        assert result.refused == (RefusedLine(2, VAR),)
+        assert dict(result.counts) == {VAR: 2}
+        assert after[1] == original[1]
+        assert self.VALUE.encode() not in after[0] + after[2]
+        assert len(path.read_bytes()) == sum(len(line) + 1 for line in original)
+        _assert_every_line_is_json(path)
+        assert list(path.parent.iterdir()) == [path]
+
+    def test_a_file_whose_only_hit_is_refused_is_not_rewritten(self, tmp_path):
+        path = _write(tmp_path / 'held' / 's.jsonl', [self._lines()[1]])
+        before = path.stat()
+        content = path.read_bytes()
+
+        result = redact_in_place(path, self._needles())
+
+        after = path.stat()
+        assert result.refused == (RefusedLine(1, VAR),)
+        assert not result.redacted
+        assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+        assert path.read_bytes() == content
+        assert list(path.parent.iterdir()) == [path]
+
+    def test_copy_redacted_keeps_the_refused_line_and_redacts_the_rest(self, tmp_path):
+        src = _write(tmp_path / 'src.jsonl', self._lines())
+        dest = tmp_path / 'dest.jsonl'
+
+        result = copy_redacted(src, dest, self._needles())
+
+        assert result.refused == (RefusedLine(2, VAR),)
+        assert dict(result.counts) == {VAR: 2}
+        copied = _lines(dest)
+        assert copied[1] == _lines(src)[1]
+        assert self.VALUE.encode() not in copied[0] + copied[2]
+
+    def test_raise_if_refused_names_the_path_line_and_variable_but_never_the_value(self, tmp_path):
+        path = _write(tmp_path / 'held' / 's.jsonl', self._lines())
+        result = redact_in_place(path, self._needles())
+
+        with pytest.raises(RedactionWouldCorruptJson) as excinfo:
+            result.raise_if_refused(path)
+
+        error = excinfo.value
+        message = str(error)
+        assert (error.path, error.line_number, error.var) == (path, 2, VAR)
+        assert str(path) in message
+        assert 'line 2' in message
+        assert VAR in message
+        assert self.VALUE not in message
+
+    def test_raise_if_refused_is_silent_for_a_complete_redaction(self, tmp_path):
+        path = _write(tmp_path / 's.jsonl', _transcript_lines(VALUE))
+
+        redact_in_place(path, redaction_needles({VAR: VALUE})).raise_if_refused(path)
 
 
 def test_a_file_changed_since_the_stamp_is_left_untouched(tmp_path):

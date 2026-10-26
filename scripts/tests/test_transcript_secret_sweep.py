@@ -2,7 +2,9 @@
 
 Driven through the public ``run``: the environment, the clock, the escalation
 poster and every root are passed explicitly, so no real HOME, unit dir or HTTP
-is touched. The values are fakes; the placeholder shape is the 2026-10-11 one.
+is touched; ``main`` is driven with explicit roots, an empty unit dir and an
+escalation URL nothing listens on. The values are fakes; the placeholder shape
+is the 2026-10-11 one.
 """
 
 from __future__ import annotations
@@ -16,6 +18,9 @@ from pathlib import Path
 import pytest
 import transcript_secret_sweep as sweep
 from shared.project_layout import agent_transcripts_dir
+from shared.secret_env import is_secret_env_name
+from shared.secret_redaction import FileChangedDuringRedaction
+from shared.transcript_archive import STAGING_SUFFIX
 
 POOL_A = 'sk-ant-oat01-' + 'Lv' * 17 + 'A'
 OPENAI = 'sk-proj-' + 'Ok' * 20
@@ -46,6 +51,11 @@ class Recorder:
     def __call__(self, arguments: dict) -> dict:
         self.calls.append(arguments)
         return {'status': 'queued'}
+
+
+class FailingPoster:
+    def __call__(self, arguments: dict) -> dict:
+        raise ConnectionError('escalation server unreachable')
 
 
 class Tree:
@@ -146,7 +156,8 @@ def test_one_sweep_redacts_every_live_value_and_files_one_escalation(tree):
     assert f'{tree.pool_main}: CLAUDE_OAUTH_TOKEN_A×2' in arguments['detail']
     assert f'{tree.pool_subagent}: CLAUDE_OAUTH_TOKEN_A×1' in arguments['detail']
     assert f'{tree.openai}: OPENAI_API_KEY×1' in arguments['detail']
-    assert '3' in arguments['summary']
+    assert 'in 3 file(s) (4 occurrence(s))' in arguments['summary']
+    assert '0 line(s) in 0 file(s) refused' in arguments['summary']
     (evidence,) = arguments['evidence']
     assert set(evidence) == {'observation', 'measured_at', 'ref'}
     _no_value_in(json.dumps(arguments))
@@ -179,24 +190,154 @@ def test_an_environment_without_secrets_cannot_run(tree):
     assert {path: path.read_bytes() for path in tree.files()} == contents
 
 
-def test_a_refused_file_is_escalated_as_left_unredacted(tmp_path):
+def test_a_refused_line_is_escalated_and_the_rest_of_its_file_is_redacted(tmp_path):
     value = '00e9' + 'X' * 44
     project = tmp_path / 'proj'
-    refused = _write(
+    held = _write(
         agent_transcripts_dir(project) / '7000' / '-enc' / 'sid.jsonl',
-        [json.dumps({'text': 'café' + 'X' * 44})],
+        [json.dumps({'text': f'plain {value}'}), json.dumps({'text': 'café' + 'X' * 44})],
     )
-    content = refused.read_bytes()
+    safe_line, refused_line = held.read_bytes().splitlines()
     config = sweep.SweepConfig(roots=sweep.transcript_roots([project], tmp_path / 'no-claude'), now=NOW)
     poster = Recorder()
 
     result = sweep.run(config, environ={'CLAUDE_OAUTH_TOKEN_B': value}, post_escalation=poster)
 
-    assert [refusal.path for refusal in result.refused] == [refused]
-    assert result.redacted == ()
-    assert refused.read_bytes() == content
+    assert [(line.path, line.var, line.line_number) for line in result.refused] == [
+        (held, 'CLAUDE_OAUTH_TOKEN_B', 2),
+    ]
+    assert {hit.path: dict(hit.counts) for hit in result.redacted} == {held: {'CLAUDE_OAUTH_TOKEN_B': 1}}
+    held_safe_line, held_refused_line = held.read_bytes().splitlines()
+    assert held_refused_line == refused_line
+    assert value.encode() not in held_safe_line
+    assert len(held_safe_line) == len(safe_line)
     (arguments,) = poster.calls
-    assert str(refused) in arguments['detail']
-    assert 'un-redacted' in arguments['detail']
+    assert '1 line(s) in 1 file(s) refused' in arguments['summary']
+    assert f'{held}: refused (CLAUDE_OAUTH_TOKEN_B on line 2), left un-redacted' in arguments['detail']
+    assert f'{held}: CLAUDE_OAUTH_TOKEN_B×1' in arguments['detail']
     assert value not in json.dumps(arguments)
     assert value not in json.dumps(result.record())
+
+
+def test_archive_staging_debris_is_swept_and_other_names_are_not(tmp_path):
+    project = tmp_path / 'proj'
+    session_dir = agent_transcripts_dir(project) / '7001' / '-enc'
+    debris = _write(session_dir / f'sid.jsonl{STAGING_SUFFIX}', [_line_with(f'token {POOL_A}')])
+    other = _write(session_dir / 'notes.txt', [_line_with(f'token {POOL_A}')])
+    other_content = other.read_bytes()
+    before = debris.stat()
+    config = sweep.SweepConfig(roots=sweep.transcript_roots([project], tmp_path / 'no-claude'), now=NOW)
+
+    result = sweep.run(config, environ=ENVIRON, post_escalation=Recorder())
+
+    _assert_redacted(debris, 'CLAUDE_OAUTH_TOKEN_A', POOL_A, before, 1)
+    assert [hit.path for hit in result.redacted] == [debris]
+    assert other.read_bytes() == other_content
+
+
+@pytest.mark.timeout(60)
+def test_a_fifo_named_like_a_transcript_is_passed_over_without_being_opened(tmp_path):
+    project = tmp_path / 'proj'
+    session_dir = agent_transcripts_dir(project) / '7002' / '-enc'
+    leaked = _write(session_dir / 'sid.jsonl', [_line_with(f'token {POOL_A}')])
+    fifo = session_dir / 'pipe.jsonl'
+    os.mkfifo(fifo)
+    config = sweep.SweepConfig(roots=sweep.transcript_roots([project], tmp_path / 'no-claude'), now=NOW)
+
+    result = sweep.run(config, environ=ENVIRON, post_escalation=Recorder())
+
+    assert [hit.path for hit in result.redacted] == [leaked]
+    assert fifo not in (*result.deferred, *result.unreadable)
+    assert result.clean == 0
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root reads a mode-000 file')
+def test_an_unreadable_file_is_reported_and_its_siblings_are_still_swept(tree):
+    tree.openai.chmod(0)
+    try:
+        result = sweep.run(tree.config(), environ=ENVIRON, post_escalation=Recorder())
+    finally:
+        tree.openai.chmod(0o664)
+
+    assert result.unreadable == (tree.openai,)
+    assert {hit.path for hit in result.redacted} == {tree.pool_main, tree.pool_subagent}
+    assert OPENAI.encode() in tree.openai.read_bytes()
+
+
+def test_a_file_that_changes_while_it_is_redacted_is_deferred(tree, monkeypatch):
+    real_redact_in_place = sweep.redact_in_place
+
+    def appended_to_mid_redaction(path, needles, **kwargs):
+        if path == tree.pool_subagent:
+            raise FileChangedDuringRedaction(path)
+        return real_redact_in_place(path, needles, **kwargs)
+
+    monkeypatch.setattr(sweep, 'redact_in_place', appended_to_mid_redaction)
+
+    result = sweep.run(tree.config(), environ=ENVIRON, post_escalation=Recorder())
+
+    assert result.deferred == (tree.pool_subagent, tree.fresh)
+    assert {hit.path for hit in result.redacted} == {tree.pool_main, tree.openai}
+
+
+def test_a_failed_escalation_is_reported_and_the_redaction_still_stands(tree):
+    result = sweep.run(tree.config(), environ=ENVIRON, post_escalation=FailingPoster())
+
+    assert result.ok
+    assert result.escalation_error == 'ConnectionError: escalation server unreachable'
+    assert POOL_A.encode() not in tree.pool_main.read_bytes()
+    assert result.record()['escalation_error'] == result.escalation_error
+
+
+class TestMain:
+    @pytest.fixture
+    def secretless_environ(self, monkeypatch):
+        for name in list(os.environ):
+            if is_secret_env_name(name):
+                monkeypatch.delenv(name)
+
+    def _argv(self, tree: Tree, tmp_path: Path) -> list[str]:
+        return [
+            '--project-root', str(tree.project_a),
+            '--project-root', str(tree.project_b),
+            '--units-dir', str(tmp_path / 'no-units'),
+            '--claude-projects-dir', str(tree.claude_projects),
+            '--escalation-url', 'http://127.0.0.1:1/mcp',
+            '--min-age-secs', '0',
+        ]
+
+    def _record(self, capsys) -> dict:
+        (line,) = capsys.readouterr().out.splitlines()
+        return json.loads(line)
+
+    def test_a_sweep_with_nothing_to_redact_exits_0(self, secretless_environ, monkeypatch, tmp_path, capsys):
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', NON_LIVE + 'z' * 8)
+        tree = Tree(tmp_path)
+
+        assert sweep.main(self._argv(tree, tmp_path)) == 0
+
+        record = self._record(capsys)
+        assert record['ok'] is True
+        assert record['redacted'] == []
+        assert record['escalation_error'] is None
+
+    def test_an_environment_without_secrets_exits_2(self, secretless_environ, tmp_path, capsys):
+        tree = Tree(tmp_path)
+
+        assert sweep.main(self._argv(tree, tmp_path)) == 2
+
+        assert self._record(capsys)['ok'] is False
+
+    def test_an_escalation_that_cannot_be_filed_exits_2(self, secretless_environ, monkeypatch, tmp_path, capsys):
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', POOL_A)
+        tree = Tree(tmp_path)
+
+        assert sweep.main(self._argv(tree, tmp_path)) == 2
+
+        out, err = capsys.readouterr()
+        (line,) = out.splitlines()
+        record = json.loads(line)
+        assert record['ok'] is True
+        assert record['escalation_error']
+        assert 'the escalation was not filed' in err
+        assert POOL_A not in out + err

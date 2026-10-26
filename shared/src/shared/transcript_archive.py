@@ -86,7 +86,10 @@ _ARCHIVAL_FAILURES: int = 0
 # mirroring migrate_transcript_archive_gunzip.STAGING_SUFFIX: debris stranded by
 # a hard kill matches no reader's ``*.jsonl`` glob, so it is inert rather than a
 # transcript lookalike, and the next archival of the same session rewrites it.
-_STAGING_SUFFIX = '.archive-tmp'
+# The one reader that does match it is scripts/transcript_secret_sweep.py: a
+# staged copy is redacted only after it lands, so debris a hard kill strands
+# between the two may still hold a live secret value.
+STAGING_SUFFIX = '.archive-tmp'
 
 # The single notification seam onto the counter above. _record_failure is the
 # one funnel BOTH producers (archive_task_transcripts' copy, and
@@ -263,7 +266,7 @@ def _archive_one(
     if dest.exists() and int(dest.stat().st_mtime) == int(st.st_mtime):
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
-    staging = dest.with_name(dest.name + _STAGING_SUFFIX)
+    staging = dest.with_name(dest.name + STAGING_SUFFIX)
     try:
         # shutil.copyfile uses the platform fast-copy path (copy_file_range /
         # sendfile) and is exactly as memory-bounded as an explicit chunked
@@ -275,7 +278,7 @@ def _archive_one(
         # redaction. An OSError or RedactionError here is caught + counted by
         # the caller (best-effort).
         shutil.copyfile(src, staging)
-        redact_in_place(staging, needles)
+        redact_in_place(staging, needles).raise_if_refused(src)
         os.utime(staging, (st.st_atime, st.st_mtime))
         os.replace(staging, dest)
     except (OSError, RedactionError):
@@ -324,7 +327,9 @@ def _move_to_archive(
 
     The source is redacted IN PLACE before the rename, so the canonical
     archive path never holds an unredacted copy; ``redact_in_place`` keeps the
-    mtime, so the already-current skip below still holds.
+    mtime, so the already-current skip below still holds. A line whose
+    redaction is refused stays as it was while every other line is redacted,
+    and the source is then held rather than archived.
 
     Why a rename rather than :func:`_archive_one`'s staged copy:
 
@@ -360,7 +365,7 @@ def _move_to_archive(
     if dest.exists() and int(dest.stat().st_mtime) == int(st.st_mtime):
         src.unlink()
         return False
-    redact_in_place(src, needles)
+    redact_in_place(src, needles).raise_if_refused(src)
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.rename(src, dest)
@@ -882,7 +887,7 @@ def restore_archived_transcript(
         # session ID` exactly as a zero-byte one does (measured, CLI 2.1.236).
         # The mtime mirror goes onto the STAGING file so the published copy is
         # correctly stamped from the instant it appears.
-        staging = dest.with_name(dest.name + _STAGING_SUFFIX)
+        staging = dest.with_name(dest.name + STAGING_SUFFIX)
         try:
             if gzipped:
                 # STREAMED, not read()-then-write: agent-session JSONL runs to
