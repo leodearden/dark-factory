@@ -451,7 +451,7 @@ def _submit_pending(submitted: dict) -> bool:
     """Whether the submitted request must now be polled; False when the
     submit itself settled it as landed. Raises for any other settlement."""
     status = submitted.get("status")
-    if "error" in submitted or status not in SUBMIT_NON_TERMINAL | SUBMIT_TERMINAL:
+    if "error" in submitted or (status not in SUBMIT_NON_TERMINAL and status not in SUBMIT_TERMINAL):
         code = f" (code {submitted['code']})" if submitted.get("code") else ""
         raise LandingNotConfirmed(
             LandingFailure.SUBMIT_REJECTED,

@@ -597,8 +597,9 @@ def test_a_reload_that_never_reached_the_tool_after_a_landing_fails_closed(
         proc = _run(server, config, "8")
 
     _assert_failed_closed_on_the_transport(proc)
-    assert _verdict(proc)["commit"] == queue.merge_sha == head(repo)
-    assert queue.merge_sha in proc.stderr, f"stderr={proc.stderr}"
+    landed_as = head(repo)
+    assert _verdict(proc)["commit"] == queue.merge_sha == landed_as
+    assert landed_as in proc.stderr, f"stderr={proc.stderr}"
     _assert_left_nothing_behind(repo, scratch)
 
 

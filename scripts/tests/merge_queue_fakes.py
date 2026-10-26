@@ -46,7 +46,7 @@ class FakeMergeQueue:
 
     REQUEST_ID = "mr-deploy0001"
 
-    def __init__(self, repo, *, submit="queued", states=("done",), landing="merge",
+    def __init__(self, repo, *, submit: str | dict = "queued", states=("done",), landing="merge",
                  eta_seconds=0.01, cancel_reply=None, foreign_state="done",
                  request_id=REQUEST_ID):
         self.repo = repo

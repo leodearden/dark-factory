@@ -334,9 +334,10 @@ def test_a_reload_that_never_reached_the_tool_fails_closed(tmp_path, deploy_env,
         proc = _run(server, config, "6", env=deploy_env)
 
     assert proc.returncode != 0, f"a transport fault was read as success: {proc.stdout}"
-    assert queue.has_landed() and head(repo) == queue.merge_sha
+    landed_as = head(repo)
+    assert queue.has_landed() and landed_as == queue.merge_sha
     assert TRANSPORT_MARKER in proc.stderr, f"stderr={proc.stderr}"
-    assert queue.merge_sha in proc.stderr, f"stderr={proc.stderr}"
+    assert landed_as in proc.stderr, f"stderr={proc.stderr}"
     assert "lands at the next restart" in proc.stderr, f"stderr={proc.stderr}"
     assert "applied disposition missing" not in proc.stderr, (
         f"a request that never reached the tool was blamed on the disposition: {proc.stderr}"
