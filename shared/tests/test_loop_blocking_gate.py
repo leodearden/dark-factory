@@ -829,6 +829,9 @@ _PRIMITIVE_CASES = [
     ('os.path.isfile', 'return os.path.isfile(payload)', 'os.path.isfile'),
     ('os.path.isdir', 'return os.path.isdir(payload)', 'os.path.isdir'),
     ('glob.glob', 'return glob.glob(payload)', 'glob.glob'),
+    # -- task 6089: path normalisation, one lstat per component
+    ('Path.resolve', 'return payload.resolve()', 'resolve'),
+    ('os.path.realpath', 'return os.path.realpath(payload)', 'os.path.realpath'),
 ]
 
 _PRIMITIVE_CASE_IMPORTS = (
@@ -1125,6 +1128,10 @@ class TestPrimitiveTable:
                 async def c(apath):
                     async for child in apath.iterdir():
                         return child
+                """,
+            'anyio resolve': """
+                async def e(apath):
+                    return await apath.resolve()
                 """,
         }
         for shape, body in async_apis.items():
