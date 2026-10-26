@@ -5,8 +5,9 @@ Callers enqueue events via a non-blocking ``put_nowait`` and return to the
 MCP boundary immediately. A single background drainer task pulls events out
 of the queue and pushes them into the buffer, retrying transient SQLite
 failures (``aiosqlite.OperationalError``) with exponential backoff. Events
-that hit non-retriable errors or overflow the queue are appended to a
-dead-letter JSONL file for manual replay.
+that hit non-retriable errors or overflow the queue are handed to a dedicated
+dead-letter writer thread, which appends them to a JSONL file for manual
+replay.
 
 Design rationale: before WP-B, a locked ``reconciliation.db`` surfaced as
 an MCP error on ``submit_task`` / ``set_task_status`` / etc., even after the
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -29,17 +31,74 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
+from fused_memory.reconciliation.dead_letter_writer import DeadLetterWriter
 from fused_memory.reconciliation.event_journal import EventJournal
 
 if TYPE_CHECKING:
+    from concurrent.futures import Future
+
     from fused_memory.models.reconciliation import ReconciliationEvent
     from fused_memory.reconciliation.event_buffer import EventBuffer
 
 logger = logging.getLogger(__name__)
+
+
+def _dead_letter_record(
+    event: ReconciliationEvent, *, reason: str, attempts: int,
+) -> dict[str, Any]:
+    return {
+        'event': event.model_dump(mode='json'),
+        'reason': reason,
+        'attempts': attempts,
+        'failed_at': datetime.now(UTC).isoformat(),
+    }
+
+
+def _release_row_once_written(
+    loop: asyncio.AbstractEventLoop,
+    journal: EventJournal,
+    event_id: str,
+    written: Future[bool],
+) -> None:
+    """Done-callback of a journaled event's dead-letter write.
+
+    Runs on the writer thread, or inline if the write had already finished.
+    The journal's connection is loop-thread-only, so the release is
+    marshalled onto the loop. A failed write, or a loop that has already
+    closed, keeps the row for :meth:`EventQueue.recover` to redeliver.
+    """
+    if not written.result():
+        logger.warning(
+            'EventQueue: dead-letter record for event=%s was not written; its '
+            'journal row is kept for recover()',
+            event_id,
+        )
+        return
+    try:
+        loop.call_soon_threadsafe(_release_journal_row, journal, event_id)
+    except RuntimeError as exc:
+        logger.warning(
+            'EventQueue: event loop closed before the journal row of '
+            'dead-lettered event=%s could be released; recover() will '
+            'redeliver it: %s',
+            event_id, exc,
+        )
+
+
+def _release_journal_row(journal: EventJournal, event_id: str) -> None:
+    """Loop callback: the event's dead-letter record is on disk, so drop its journal row."""
+    try:
+        journal.mark_processed(event_id)
+    except Exception as exc:
+        logger.warning(
+            'EventQueue: could not release the journal row of dead-lettered '
+            'event=%s: %s',
+            event_id, exc,
+        )
 
 
 def _iter_lines_reversed(
@@ -128,6 +187,9 @@ class EventQueue:
     ):
         self._buffer = event_buffer
         self._dead_letter_path = Path(dead_letter_path)
+        self._dead_letter_writer = DeadLetterWriter(
+            self._dead_letter_path, max_bytes=max_bytes, keep_rotations=keep_rotations,
+        )
         # Durable-at-enqueue write-ahead log. None (the default) keeps every
         # existing journal_path-less caller/test byte-unchanged — critically the
         # timing test test_enqueue_returns_immediately, which would regress if a
@@ -140,8 +202,6 @@ class EventQueue:
         self._retry_max = retry_max_seconds
         self._shutdown_flush = shutdown_flush_seconds
         self._overflow_warn_interval = overflow_warn_interval_seconds
-        self._max_bytes = max_bytes
-        self._keep_rotations = keep_rotations
         self._drainer_task: asyncio.Task | None = None
         # Event-loop reference captured at start(). Used only by
         # replay_dead_letters to marshal enqueue() (which mutates the
@@ -152,7 +212,6 @@ class EventQueue:
         # Stats surface for WP-C watchdog / WP-D policy.
         self._last_commit_ts: float | None = None
         self._overflow_drops = 0
-        self._dead_letters = 0
         self._retry_in_flight = 0
         self._events_committed = 0
         self._last_overflow_warn_ts: float = 0.0
@@ -195,8 +254,8 @@ class EventQueue:
         exists). Redelivery is at-least-once, so the drainer may re-push an
         already-committed event; ``EventBuffer.push`` is idempotent (INSERT OR
         IGNORE) so that is a harmless no-op. On overflow the event is
-        dead-lettered (``recover_overflow``) and its journal row marked processed.
-        Returns the number of events recovered.
+        dead-lettered (``recover_overflow``) and its journal row released once
+        the record is written. Returns the number of events recovered.
         """
         if self._journal is None:
             return 0
@@ -208,8 +267,9 @@ class EventQueue:
                 recovered += 1
             except asyncio.QueueFull:
                 self._overflow_drops += 1
-                self._write_dead_letter(event, reason='recover_overflow', attempts=0)
-                self._journal.mark_processed(event.id)
+                await self._hand_off_to_dead_letter(
+                    event, reason='recover_overflow', attempts=0,
+                )
         if recovered:
             logger.info(
                 'EventQueue.recover: re-enqueued %d unprocessed event(s) from journal',
@@ -220,14 +280,16 @@ class EventQueue:
     async def close(self) -> None:
         """Flush the queue within ``shutdown_flush_seconds`` then stop the drainer.
 
-        Any events that cannot be flushed in time are dumped to the
-        dead-letter file with ``reason="shutdown_timeout"``.
+        Any events that cannot be flushed in time are handed to the
+        dead-letter writer with ``reason="shutdown_timeout"``. Returns once
+        every handed-off record is written and its journal row released.
         """
         if self._closed:
             return
         self._closed = True
 
         if self._drainer_task is None:
+            await self.flush_dead_letters()
             return
 
         # Bounded flush: let the drainer finish what it can.
@@ -248,8 +310,8 @@ class EventQueue:
             await self._drainer_task
         self._drainer_task = None
 
-        # Drain residue synchronously to the dead-letter file. Using
-        # get_nowait avoids awaiting after cancellation.
+        # Collect the residue for the dead-letter writer. Using get_nowait
+        # avoids awaiting after cancellation.
         residue: list[ReconciliationEvent] = []
         while True:
             try:
@@ -262,47 +324,59 @@ class EventQueue:
 
         if residue:
             for event in residue:
-                self._write_dead_letter(event, reason='shutdown_timeout', attempts=0)
-                # Durability handed off to the dead-letter file — drop the
-                # journal row so recover() doesn't redeliver it next startup.
-                if self._journal is not None:
-                    self._journal.mark_processed(event.id)
+                self._hand_off_to_dead_letter(event, reason='shutdown_timeout', attempts=0)
             logger.warning(
                 'EventQueue: dead-lettered %d events on shutdown', len(residue),
             )
 
         # Close the durable journal last: every surviving in-flight event has
         # now been either committed to the buffer (drainer marked it processed)
-        # or dead-lettered (marked processed just above).
+        # or handed to the dead-letter writer, and the flush waits until each
+        # written record's journal-row release has run.
+        await self.flush_dead_letters()
         if self._journal is not None:
             self._journal.close()
 
     # ── test helper ───────────────────────────────────────────────────
 
     async def _drain_for_test(self, *, timeout: float = 5.0) -> None:
-        """Wait until the internal queue is fully drained (all task_done calls made).
+        """Wait until the internal queue is fully drained and its dead letters written.
 
         This method exists so that rotation/integration tests do not reach into
         ``self._queue`` directly.  It is NOT part of the public contract of
         EventQueue — do not call it in production code.  If ``self._queue`` is
-        ever renamed or restructured, only this one line needs to change.
+        ever renamed or restructured, only this one method needs to change.
         """
-        await asyncio.wait_for(self._queue.join(), timeout=timeout)
+        async def _drained() -> None:
+            await self._queue.join()
+            await self.flush_dead_letters()
+
+        await asyncio.wait_for(_drained(), timeout=timeout)
+
+    async def flush_dead_letters(self) -> None:
+        """Return once every dead-letter record handed off before the call is written or has failed.
+
+        By then each written record's journal-row release has run on the
+        loop, which is why :meth:`close` calls it before closing the journal.
+        """
+        await asyncio.wrap_future(self._dead_letter_writer.flushed())
 
     # ── enqueue (sync, non-blocking) ───────────────────────────────────
 
     def enqueue(self, event: ReconciliationEvent) -> bool:
         """Try to enqueue an event. Returns True on accept, False on overflow.
 
-        On overflow the event is written to the dead-letter file immediately
-        and an overflow warning is logged (rate-limited to once per
+        On overflow the event is handed to the dead-letter writer and an
+        overflow warning is logged (rate-limited to once per
         ``overflow_warn_interval_seconds``).
         """
         if self._closed:
             # Shutting down — divert straight to dead-letter so nothing is lost.
             # The journal may already be closed here, so do NOT touch it; the
             # dead-letter file provides durability for post-close events.
-            self._write_dead_letter(event, reason='post_close', attempts=0)
+            self._dead_letter_writer.append(
+                _dead_letter_record(event, reason='post_close', attempts=0),
+            )
             return False
         # Durable-at-enqueue: persist the event synchronously BEFORE the
         # in-memory put, so a hard kill between here and the drainer's commit
@@ -315,11 +389,7 @@ class EventQueue:
             return True
         except asyncio.QueueFull:
             self._overflow_drops += 1
-            self._write_dead_letter(event, reason='overflow_drop', attempts=0)
-            # Durability just handed off to the dead-letter file — drop the
-            # journal row so it isn't redelivered on the next recover().
-            if self._journal is not None:
-                self._journal.mark_processed(event.id)
+            self._hand_off_to_dead_letter(event, reason='overflow_drop', attempts=0)
             now = time.monotonic()
             if (now - self._last_overflow_warn_ts) >= self._overflow_warn_interval:
                 self._last_overflow_warn_ts = now
@@ -340,7 +410,7 @@ class EventQueue:
             'last_commit_ts': self._last_commit_ts,
             'events_committed': self._events_committed,
             'overflow_drops': self._overflow_drops,
-            'dead_letters': self._dead_letters,
+            'dead_letters': self._dead_letter_writer.records_written,
             'retry_in_flight': self._retry_in_flight,
             'drainer_running': (
                 self._drainer_task is not None and not self._drainer_task.done()
@@ -434,11 +504,9 @@ class EventQueue:
                     'EventQueue.drain: non-retriable error for event=%s: %s',
                     event.id, exc, exc_info=True,
                 )
-                self._write_dead_letter(event, reason='non_retriable', attempts=attempts)
-                # Durability handed off to the dead-letter file — drop the
-                # journal row so recover() doesn't redeliver it next startup.
-                if self._journal is not None:
-                    self._journal.mark_processed(event.id)
+                await self._hand_off_to_dead_letter(
+                    event, reason='non_retriable', attempts=attempts,
+                )
                 if self._retry_in_flight > 0 and attempts > 1:
                     self._retry_in_flight = max(0, self._retry_in_flight - 1)
                 self._recent_ops.append(
@@ -448,145 +516,39 @@ class EventQueue:
 
     # ── dead-letter ────────────────────────────────────────────────────
 
-    def _write_dead_letter(
+    def _hand_off_to_dead_letter(
         self,
         event: ReconciliationEvent,
         *,
         reason: str,
         attempts: int,
-    ) -> None:
-        """Append an event to the dead-letter JSONL file.
+    ) -> asyncio.Future[bool]:
+        """Hand a journaled event to the dead-letter writer.
 
-        Best-effort. A failure here is logged but must not raise — we'd
-        rather lose a single event than crash the drainer or the caller.
+        Its journal row is released on the loop thread only once the record
+        is on disk, so a kill -9 while the append is pending leaves the event
+        in the journal rather than in neither store. The returned future
+        resolves ``True`` once the record is written, ``False`` if it failed.
         """
-        record = {
-            'event': event.model_dump(mode='json'),
-            'reason': reason,
-            'attempts': attempts,
-            'failed_at': datetime.now(UTC).isoformat(),
-        }
-        try:
-            self._dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
-            # Rotate before appending when the file has grown past the byte cap.
-            if (
-                self._max_bytes is not None
-                and self._dead_letter_path.exists()
-                and self._dead_letter_path.stat().st_size >= self._max_bytes
-            ):
-                self._rotate_dead_letter()
-            with self._dead_letter_path.open('a', encoding='utf-8') as fh:
-                fh.write(json.dumps(record) + '\n')
-            self._dead_letters += 1
-        except Exception as exc:
-            logger.error(
-                'EventQueue: failed to append dead-letter record for event=%s: %s',
-                event.id, exc,
+        loop = asyncio.get_running_loop()
+        written = self._dead_letter_writer.append(
+            _dead_letter_record(event, reason=reason, attempts=attempts),
+        )
+        if self._journal is not None:
+            written.add_done_callback(
+                functools.partial(_release_row_once_written, loop, self._journal, event.id),
             )
-
-    def _rotate_dead_letter(self) -> None:
-        """Cascade-rotate dead-letter files.
-
-        ``dead_letter.jsonl``   → ``dead_letter.jsonl.1``
-        ``dead_letter.jsonl.1`` → ``dead_letter.jsonl.2``
-        …
-        ``dead_letter.jsonl.{keep}`` → overwritten/dropped by the cascade
-
-        When ``keep_rotations == 0``, the current file is simply unlinked so
-        the byte cap is still honoured (nothing is archived).
-
-        After the cascade (or the zero-keep discard), :meth:`_purge_orphan_rotations`
-        runs unconditionally via a ``finally`` block.  This makes retention
-        self-repairing in all branches: if an operator lowers ``keep_rotations``
-        between runs (e.g. 5 → 0 or 5 → 2), previously-created ``.3``, ``.4``,
-        ``.5`` files are cleaned up the next time a rotation fires — regardless
-        of which branch executes or whether the cascade loop itself raises
-        mid-iteration.
-
-        **Safety note for the finally-on-exception case**: the cascade loop
-        only writes to indices ``1`` … ``keep_rotations`` (i.e. ``dl.1``,
-        ``dl.2``, …, ``dl.{keep}``), while :meth:`_purge_orphan_rotations`
-        only removes siblings with index ``> keep_rotations``.  These ranges
-        are disjoint, so invoking the purge in the ``finally`` block after a
-        mid-cascade failure cannot remove any file the partial cascade just
-        placed.  The only data that could be lost is the oldest rotation slot
-        (``dl.{keep}``) that the cascade would have overwritten anyway when it
-        ran successfully — that slot is subject to the best-effort contract.
-
-        Uses ``os.replace`` for atomicity — it already overwrites the
-        destination on POSIX and Windows, so no pre-unlink is needed.
-        Any error is caught and logged to preserve the best-effort contract.
-        """
-        try:
-            try:
-                if self._keep_rotations == 0:
-                    # No archival rotations: just discard the current file.
-                    # The finally clause below still runs, purging any orphan
-                    # siblings left over from a prior higher-keep_rotations run.
-                    self._dead_letter_path.unlink(missing_ok=True)
-                    return
-                # Work from oldest → newest so we never overwrite unsaved data.
-                # os.replace atomically overwrites the destination; the oldest
-                # file (index keep_rotations) is simply replaced/dropped by the
-                # cascade without a separate unlink step.
-                for i in range(self._keep_rotations, 0, -1):
-                    src = Path(f'{self._dead_letter_path}.{i - 1}') if i > 1 else self._dead_letter_path
-                    dst = Path(f'{self._dead_letter_path}.{i}')
-                    if src.exists():
-                        os.replace(src, dst)
-            finally:
-                # Remove any siblings whose numeric suffix exceeds the current
-                # keep_rotations bound.  Runs unconditionally — including the
-                # zero-keep branch above and when the cascade raises mid-loop.
-                self._purge_orphan_rotations()
-        except Exception as exc:
-            logger.error(
-                'EventQueue: dead-letter rotation failed: %s', exc,
-            )
-
-    def _purge_orphan_rotations(self) -> None:
-        """Remove rotation siblings whose index exceeds ``keep_rotations``.
-
-        Scans the parent directory for files whose name matches
-        ``{dead_letter_path.name}.{N}`` where N is an integer greater than
-        ``keep_rotations``, and unlinks them.  Non-numeric suffixes (e.g.
-        ``.bak``, ``.swp``) are left untouched.
-
-        This is a best-effort cleanup: any OSError on an individual sibling
-        (permission denied, race-deleted, etc.) is silently suppressed so
-        the rotation as a whole succeeds.  A missing or unreadable directory
-        is also silently ignored.
-        """
-        parent = self._dead_letter_path.parent
-        prefix = f'{self._dead_letter_path.name}.'
-        try:
-            siblings = list(parent.iterdir())
-        except (FileNotFoundError, OSError):
-            return
-        for sibling in siblings:
-            if not sibling.name.startswith(prefix):
-                continue
-            suffix = sibling.name[len(prefix):]
-            if not suffix.isdigit():
-                continue  # non-numeric suffix (or '-1', '+3', '01', …) — leave it alone
-            index = int(suffix)
-            if index > self._keep_rotations:
-                with contextlib.suppress(OSError):
-                    sibling.unlink(missing_ok=True)
+        return asyncio.wrap_future(written, loop=loop)
 
     # ── read dead-letters ──────────────────────────────────────────────
 
     def _dead_letter_paths(self) -> list[Path]:
         """Return the ordered list of dead-letter paths: current, then .1, .2 …
 
-        Both :meth:`read_dead_letters` and :meth:`count_dead_letters` enumerate
-        the same set of files; this helper ensures that enumeration stays
-        consistent if ``keep_rotations`` semantics or path conventions ever change.
+        The writer owns the rotation naming, so reading, counting and replay
+        enumerate exactly the files it rotates through.
         """
-        paths: list[Path] = [self._dead_letter_path]
-        for i in range(1, self._keep_rotations + 1):
-            paths.append(Path(f'{self._dead_letter_path}.{i}'))
-        return paths
+        return self._dead_letter_writer.paths()
 
     def read_dead_letters(
         self,
@@ -791,10 +753,10 @@ class EventQueue:
 
         For each existing dead-letter file (current + rotations) this atomically
         snapshots it to a ``.replaying`` temp via ``os.replace`` — race-safe
-        against concurrent :meth:`_write_dead_letter` appends and self-guarding
-        against re-replay (a second call finds nothing left to snapshot). The
-        ``.replaying`` suffix is non-numeric, so :meth:`_purge_orphan_rotations`
-        and :meth:`_dead_letter_paths` ignore it. Each record is read
+        against concurrent appends by the :class:`DeadLetterWriter` and
+        self-guarding against re-replay (a second call finds nothing left to
+        snapshot). The ``.replaying`` suffix is non-numeric, so the writer's
+        orphan-rotation purge and :meth:`_dead_letter_paths` ignore it. Each record is read
         oldest-first; when ``project_id`` is None or matches, its event is
         reconstructed and re-enqueued through the normal :meth:`enqueue` path (so
         it regains durable-at-enqueue semantics and overflow safety). Records
@@ -869,7 +831,7 @@ class EventQueue:
                     leftovers.append(line)
                     continue
                 # Normal enqueue path → re-journaled (durable-at-enqueue) and
-                # overflow-safe (an overflow re-dead-letters via _write_dead_letter).
+                # overflow-safe (an overflow goes back to the dead-letter writer).
                 # `enqueue` is the thread-appropriate callable (inline on the
                 # loop thread, marshalled onto the loop from a worker thread).
                 enqueue(event)
