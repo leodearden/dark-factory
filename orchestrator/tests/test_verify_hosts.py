@@ -100,6 +100,27 @@ def _lease(outcome: HostLease | Refusal) -> HostLease:
     return outcome
 
 
+def _held_by_a_merge_lease(allocator: HostAllocator, quarantine: set[str]) -> None:
+    assert allocator.acquire_remote() is not None
+
+
+def _benched(allocator: HostAllocator, quarantine: set[str]) -> None:
+    quarantine.add('laptop')
+
+
+_HOST_STATES = [
+    pytest.param(_held_by_a_merge_lease, 'host_busy', id='busy'),
+    pytest.param(_benched, 'host_quarantined', id='quarantined'),
+]
+
+
+async def _park_through_a_failed_cancel(pool: HostPool, allocator: HostAllocator, name: str) -> None:
+    lease = _lease(pool.acquire_for_task('42'))
+    assert lease.name == name
+    assert await pool.cancel_and_release(lease) is False
+    assert allocator.is_parked(name) is True
+
+
 class TestAcquireForTask:
     def test_free_remote_is_leased_and_held_for_the_task(self) -> None:
         pool, allocator = _pool([_FakeRemote('laptop')], _Hooks())
@@ -134,18 +155,41 @@ class TestAcquireForTask:
         assert _lease(pool.acquire_for_task('42')).name == 'laptop'
         assert hooks.demand_calls == 2
 
-    def test_remote_busy_with_a_merge_lease_refuses_no_host(self) -> None:
+    def test_remote_busy_with_a_merge_lease_refuses_host_busy(self) -> None:
         pool, allocator = _pool([_FakeRemote('laptop')], _Hooks())
         assert allocator.acquire_remote() is not None
 
-        assert pool.acquire_for_task('42') == Refusal('no_host')
+        assert pool.acquire_for_task('42') == Refusal('host_busy')
         assert pool.holders() == {}
 
-    def test_quarantined_remote_refuses_no_host(self) -> None:
+    def test_quarantined_remote_refuses_host_quarantined(self) -> None:
         pool, allocator = _pool([_FakeRemote('laptop')], _Hooks(), quarantine={'laptop'})
 
-        assert pool.acquire_for_task('42') == Refusal('no_host')
+        assert pool.acquire_for_task('42') == Refusal('host_quarantined')
         assert allocator.is_busy('laptop') is False
+
+    @pytest.mark.parametrize(('enter_state', 'reason'), _HOST_STATES)
+    def test_a_host_state_refusal_is_given_without_reading_merge_demand(
+        self, enter_state: Callable[[HostAllocator, set[str]], None], reason: str,
+    ) -> None:
+        hooks = _Hooks(demand=[True])
+        quarantine: set[str] = set()
+        pool, allocator = _pool([_FakeRemote('laptop')], hooks, quarantine=quarantine)
+        enter_state(allocator, quarantine)
+
+        assert pool.acquire_for_task('42') == Refusal(reason)
+        assert hooks.demand_calls == 0
+
+    def test_a_busy_remote_outranks_a_quarantined_one(self) -> None:
+        pool, allocator = _pool(
+            [_FakeRemote('A'), _FakeRemote('B')], _Hooks(), quarantine={'A'},
+        )
+        merge_lease = allocator.acquire_remote()
+        assert merge_lease is not None
+        assert merge_lease.name == 'B'
+
+        assert pool.acquire_for_task('42') == Refusal('host_busy')
+        assert pool.holders() == {}
 
     def test_allocator_is_the_one_passed_in(self) -> None:
         allocator = HostAllocator([_FakeRemote('laptop')])
@@ -177,7 +221,7 @@ class TestHoldersAndRefusal:
 
         pytest.raises(dataclasses.FrozenInstanceError, setattr, refusal, 'reason', 'merge_demand')
 
-    @pytest.mark.parametrize('reason', ['busy_elsewhere', 'NO_HOST', ''])
+    @pytest.mark.parametrize('reason', ['busy_elsewhere', 'NO_HOST', '', 'pressure_hold'])
     def test_refusal_rejects_a_reason_outside_the_vocabulary(self, reason) -> None:
         with pytest.raises(ValueError, match=f"'{reason}'"):
             Refusal(reason)
@@ -195,6 +239,27 @@ class TestReleaseAndCancel:
         assert allocator.is_parked('laptop') is True
         assert pool.holders() == {}
         assert pool.acquire_for_task('43') == Refusal('host_parked')
+
+    async def test_a_parked_refusal_is_given_without_reading_merge_demand(self) -> None:
+        hooks = _Hooks(demand=[False, True])
+        pool, allocator = _pool([_FakeRemote('laptop', cancel_rc=1, probe_clean=False)], hooks)
+        await _park_through_a_failed_cancel(pool, allocator, 'laptop')
+        demand_reads = hooks.demand_calls
+
+        assert pool.acquire_for_task('43') == Refusal('host_parked')
+        assert hooks.demand_calls == demand_reads
+
+    async def test_a_quarantined_remote_outranks_a_parked_one(self) -> None:
+        quarantine: set[str] = set()
+        pool, allocator = _pool(
+            [_FakeRemote('A', cancel_rc=1, probe_clean=False), _FakeRemote('B')], _Hooks(),
+            quarantine=quarantine,
+        )
+        await _park_through_a_failed_cancel(pool, allocator, 'A')
+        quarantine.add('B')
+
+        assert pool.acquire_for_task('43') == Refusal('host_quarantined')
+        assert pool.holders() == {}
 
     async def test_release_frees_the_slot_and_drops_the_hold(self) -> None:
         pool, allocator = _pool([_FakeRemote('laptop')], _Hooks())

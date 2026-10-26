@@ -148,7 +148,7 @@ class TestEligible:
 
 
 class TestDispatchDecision:
-    @pytest.mark.parametrize('reason', ['local', 'REMOTE', 'busy'])
+    @pytest.mark.parametrize('reason', ['local', 'REMOTE', 'busy', 'pressure_hold'])
     def test_reason_outside_the_vocabulary_is_refused(self, reason) -> None:
         with pytest.raises(ValueError, match=f"'{reason}'"):
             _decision(reason)
@@ -157,6 +157,8 @@ class TestDispatchDecision:
         ('remote', 'remote'),
         ('not_eligible', 'local'),
         ('merge_demand', 'local'),
+        ('host_busy', 'local'),
+        ('host_quarantined', 'local'),
         ('cross_check', 'local'),
         ('red_confirm', 'local'),
         ('dispatcher_error', 'local'),
@@ -431,6 +433,16 @@ def _harness(
 _ORCH_ONLY = TaskVerifyPolicy(host_policy='remote_modules', remote_modules=('orchestrator',))
 
 
+async def _held_by_a_merge_lease(allocator: HostAllocator) -> None:
+    assert allocator.acquire_remote() is not None
+
+
+async def _benched(allocator: HostAllocator) -> None:
+    lease = allocator.acquire_remote()
+    assert lease is not None
+    await allocator.quarantine_and_release(lease)
+
+
 # ---------------------------------------------------------------------------
 # Routing that never reaches a remote
 # ---------------------------------------------------------------------------
@@ -552,6 +564,25 @@ class TestLocalRoutes:
         assert h.only_sidecar()['reason'] == 'merge_demand'
         assert h.local.observed == [False]
         assert h.allocator.is_busy('laptop') is False
+        assert h.transport.log == []
+
+    @pytest.mark.parametrize(('enter_state', 'reason'), [
+        pytest.param(_held_by_a_merge_lease, 'host_busy', id='held-by-a-merge-lease'),
+        pytest.param(_benched, 'host_quarantined', id='benched'),
+    ])
+    async def test_an_unleasable_host_runs_locally_naming_its_state(
+        self, tmp_path: Path, enter_state: Callable[[HostAllocator], Awaitable[None]],
+        reason: str,
+    ) -> None:
+        h = _harness(tmp_path, _ORCH_ONLY, demand=True)
+        await enter_state(h.allocator)
+
+        result = await h.call()
+
+        assert result is h.local.result
+        assert h.local.calls == [h.expected_call()]
+        assert h.only_sidecar()['reason'] == reason
+        assert h.hooks.demand_calls == 0
         assert h.transport.log == []
 
     async def test_no_remote_host_runs_locally(self, tmp_path: Path) -> None:
