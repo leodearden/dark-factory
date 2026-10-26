@@ -13856,8 +13856,10 @@ async def test_project_loop_pre_completion_timeout_restores_only_the_timed_out_r
 ):
     """Task 6453: a cycle timeout re-buffers the timed-out run's events and
     leaves an earlier completed run's events drained."""
+    deadline = _ManualDeadline()
     harness, _ = _make_completing_harness(
         journal, event_buffer, mock_memory_service, tmp_path,
+        full_cycle_deadline=deadline.arm,
     )
     harness.config.resume_after_restart = resume_after_restart
     await event_buffer.push(_make_event())
@@ -13865,8 +13867,7 @@ async def test_project_loop_pre_completion_timeout_restores_only_the_timed_out_r
     run_a = await harness.run_full_cycle('test-project', 'seed')
     assert run_a.status == RunStatus.completed
 
-    harness.config.cycle_timeout_seconds = 1
-    harness.stages[0].run = _stalling_stage_run(asyncio.Event())
+    harness.stages[0].run = _expiring_stage_run(deadline)
     await event_buffer.push(_make_event())
     await event_buffer.push(_make_event())
 
@@ -13877,6 +13878,7 @@ async def test_project_loop_pre_completion_timeout_restores_only_the_timed_out_r
     timed_out_run, earlier_run = await journal.get_recent_runs('test-project')
     assert earlier_run.id == run_a.id
     assert timed_out_run.status != 'completed'
+    assert deadline.delays == [harness.config.cycle_timeout_seconds]
 
 
 @pytest.mark.asyncio
