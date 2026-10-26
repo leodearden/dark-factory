@@ -4023,9 +4023,10 @@ class TaskKnowledgeSync(BaseStage):
             )
 
         # Done-Task Completion-Memory Audit — enumerate EVERY task that
-        # transitioned to `done` since the prior successful cycle boundary
-        # (watermark.last_full_run_completed) via an updatedAt-window scan over
-        # the UNCAPPED filtered.all_done_tasks.  This supersedes reliance on the
+        # transitioned to `done` inside the task-change window, which starts when
+        # the previous full run STARTED (why not its completion:
+        # tests/reconciliation/test_recon_window_anchor.py), via an updatedAt scan
+        # over the UNCAPPED filtered.all_done_tasks.  This supersedes reliance on the
         # 5-item Proactive Task Sample for done-task completion-memory coverage,
         # which systematically missed done tasks as throughput grew (the sample
         # sorts done tasks last, so they rarely survive the top-5 cut).  Gated on
@@ -4033,7 +4034,7 @@ class TaskKnowledgeSync(BaseStage):
         # (remediation is a focused second pass, not general sync).
         done_audit_section = ''
         if not self.remediation_mode:
-            boundary = watermark.last_full_run_completed
+            boundary = watermark.last_task_change_timestamp
             audit_tasks = select_done_since_boundary(filtered.all_done_tasks, boundary)
             total_audit = len(audit_tasks)
             boundary_label = (
@@ -4060,7 +4061,7 @@ class TaskKnowledgeSync(BaseStage):
             done_audit_section = (
                 f'\n### Done-Task Completion-Memory Audit '
                 f'({total_audit} since last cycle)\n'
-                f'Boundary (last full-run completed): {boundary_label}\n'
+                f'Boundary (previous full run started): {boundary_label}\n'
                 f'{audit_body}'
             )
 

@@ -1331,7 +1331,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
     """assemble_payload renders a since-boundary Done-Task Completion-Memory Audit (step-5).
 
     The audit enumerates every done task updated at/after the watermark's
-    ``last_full_run_completed`` boundary (not a fixed 5-item sample), so
+    ``last_task_change_timestamp`` boundary (not a fixed 5-item sample), so
     completion-memory gaps outside the small Proactive Task Sample are no longer
     systematically missed as done-task throughput grows.
     """
@@ -1370,7 +1370,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
             ],
         }
 
-        wm = Watermark(project_id='p', last_full_run_completed=boundary)
+        wm = Watermark(project_id='p', last_task_change_timestamp=boundary)
         payload = await stage.assemble_payload([], wm, [])
 
         assert '### Done-Task Completion-Memory Audit' in payload, (
@@ -1457,7 +1457,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': tasks}
 
-        wm = Watermark(project_id='p', last_full_run_completed=boundary)
+        wm = Watermark(project_id='p', last_task_change_timestamp=boundary)
         payload = await stage.assemble_payload([], wm, [])
 
         section = _extract_section(payload, '### Done-Task Completion-Memory Audit')
@@ -1508,7 +1508,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
             ],
         }
 
-        wm = Watermark(project_id='p', last_full_run_completed=boundary)
+        wm = Watermark(project_id='p', last_task_change_timestamp=boundary)
         payload = await stage.assemble_payload([], wm, [])
 
         assert '### Done-Task Completion-Memory Audit' not in payload, (
