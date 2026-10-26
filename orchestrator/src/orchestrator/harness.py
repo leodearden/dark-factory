@@ -13301,12 +13301,39 @@ class Harness:
 
         self._file_stale_l0_strand_escalation(strands)
 
-    # Strand-sweep aggregate escalation (task 3172).  Constant (not per-task)
-    # dedup key — one open record at a time however many strands a restart
-    # sweeps — mirroring _LANE_RECORD_DRIFT_ROOT_CAUSE's bare-literal style.
+    # Strand-sweep aggregate escalation (task 3172).  One record per sweep that
+    # strands anything, however many strands it sweeps.  The rate is bounded by
+    # the strand threshold, not by a guard: each sweep dismisses every pending
+    # L0, so a strand at the next sweep was filed after this one and has aged
+    # past orphan_l0_timeout_secs since.  Task 4988 removed the earlier
+    # "one open record at a time" guard: it muted 8 of 12 reify sweeps, and an
+    # L2 promotion never re-armed it because promote_to_l2 leaves the member L1
+    # pending at level 1.
     _STALE_L0_STRAND_SENTINEL: str = '__stale_l0_strand_sweep__'
     _STALE_L0_STRAND_ROOT_CAUSE: str = 'stale_l0_strand_sweep'
     _STALE_L0_STRAND_ROLE: str = 'harness-stale-l0-strand-sweep'
+
+    @staticmethod
+    def _open_stale_l0_strand_records(
+        pending: list[Escalation],
+    ) -> list[tuple[str, str | None]]:
+        """Earlier strand L1s still pending, each paired with the pending L2 clustering it.
+
+        Sorted by id because ``EscalationQueue.get_pending`` reads in glob order.
+        """
+        clustered_by = {
+            member_id: l2.id
+            for l2 in pending if l2.level == 2
+            for member_id in l2.members
+        }
+        return sorted(
+            (
+                (e.id, clustered_by.get(e.id))
+                for e in pending
+                if e.level == 1 and e.root_cause == Harness._STALE_L0_STRAND_ROOT_CAUSE
+            ),
+            key=lambda record: record[0],
+        )
 
     def _file_stale_l0_strand_escalation(self, strands: list[dict[str, Any]]) -> None:
         """File ONE level-1 escalation for the strands this restart destroyed.
@@ -13321,17 +13348,17 @@ class Harness:
         sweep, and eleven separate escalations would be its own noise failure.
         Per-strand granularity is not lost — it lives in the
         ``stale_l0_strand_dismissed`` events and in this record's detail.
+
+        An earlier strand record that is still open never suppresses this one
+        (task 4988).  The new record names only this sweep's strands and cites
+        the open records, plus any pending L2 clustering them, so triage folds
+        it into the same decision instead of closing it as a duplicate.
         """
         queue = getattr(self, '_escalation_queue', None)
         if not queue or not strands:
             return
         try:
-            # find_pending_l2_by_root_cause is level-2 only by construction, so
-            # the L1 aggregate needs the level-appropriate equivalent of the
-            # same O(N) root_cause scan.
-            for existing in queue.get_pending():
-                if existing.level == 1 and existing.root_cause == self._STALE_L0_STRAND_ROOT_CAUSE:
-                    return  # dedup: one open strand record at a time
+            open_records = self._open_stale_l0_strand_records(queue.get_pending())
 
             from escalation.models import Escalation
 
@@ -13348,6 +13375,19 @@ class Harness:
                 f'agent_role={s["agent_role"]}'
                 for s in strands
             )
+            earlier = ''
+            if open_records:
+                cited = '\n'.join(
+                    f'  - {l1_id}' if l2_id is None
+                    else f'  - {l1_id} (clustered under pending L2 {l2_id})'
+                    for l1_id, l2_id in open_records
+                )
+                earlier = (
+                    f'Earlier stale-L0 strand records are still open:\n{cited}\n'
+                    f'Triage this sweep\'s strands alongside them (fold this record into '
+                    f'the same L2) rather than closing it as a duplicate: it names only '
+                    f'the strands this sweep dismissed, which no earlier record lists.\n\n'
+                )
             detail = (
                 f'The startup L0 sweep dismissed {len(strands)} escalation(s) that had '
                 f'already been pending longer than the '
@@ -13355,6 +13395,7 @@ class Harness:
                 f'NOT ordinary restart artifacts: each one had been waiting, unanswered, '
                 f'while the previous orchestrator run was alive.\n\n'
                 f'{lines}\n\n'
+                f'{earlier}'
                 f'A strand with workflow_blocked=True means a workflow slot was parked on '
                 f'that escalation (derived from severity != "info") and was killed by the '
                 f'restart without ever getting an answer.  The orphan-L0 reaper cannot see '
