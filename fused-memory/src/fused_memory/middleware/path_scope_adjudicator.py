@@ -55,6 +55,8 @@ from shared.neutral_cwd import neutral_cli_cwd
 from fused_memory.middleware.zero_output_breaker import ZeroOutputBreaker
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from shared.usage_gate import UsageGate
 
     from fused_memory.config.schema import PathScopeAdjudicatorConfig
@@ -218,8 +220,11 @@ class PathScopeAdjudicator:
         usage_gate: UsageGate | None = None,
         cwd: Path | None = None,
         scope_violation_escalator: ScopeViolationEscalator | None = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
+        self._clock = clock
         self._usage_gate = usage_gate
         self._cwd = cwd
         self._escalator = scope_violation_escalator
@@ -295,7 +300,7 @@ class PathScopeAdjudicator:
             suggested_project: The project the guard believes it belongs to.
             project_root: The filing project's root directory.
         """
-        now = time.monotonic()
+        now = self._clock()
 
         # --- Circuit-breaker gate ---
         if self._zero_output_breaker.is_open(now):
@@ -408,7 +413,7 @@ class PathScopeAdjudicator:
             # A fresh timestamp measures the cooldown from when the failure was
             # observed, not from before the (potentially 60s) hung LLM call started.
             if is_zero_output_timeout(agent_result) and self._zero_output_breaker.record_timeout(
-                time.monotonic()
+                self._clock()
             ):
                 logger.warning(
                     'path_scope_adjudicator: zero-output-breaker OPEN after %d consecutive ZOTs; '

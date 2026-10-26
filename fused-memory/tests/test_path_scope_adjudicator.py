@@ -8,8 +8,8 @@ Test layout (mirrors the plan):
 
 from __future__ import annotations
 
-import asyncio
 import logging
+import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -26,6 +26,7 @@ def _make_adjudicator(
     *,
     tmp_path=None,
     escalator=None,
+    clock=time.monotonic,
 ):
     """Construct a PathScopeAdjudicator with minimal wiring."""
     from fused_memory.middleware.path_scope_adjudicator import PathScopeAdjudicator
@@ -36,7 +37,21 @@ def _make_adjudicator(
         usage_gate=None,
         cwd=tmp_path,
         scope_violation_escalator=escalator,
+        clock=clock,
     )
+
+
+class _ManualClock:
+    """A monotonic clock that moves only when a test advances it."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def _agent_result(
@@ -83,7 +98,7 @@ async def _do_adjudicate(adj, **kwargs):
 
 _INVOKE_PATH = 'fused_memory.middleware.path_scope_adjudicator.invoke_with_cap_retry'
 _ADJUDICATOR_LOGGER = 'fused_memory.middleware.path_scope_adjudicator'
-_SHORT_COOLDOWN = 0.5
+_COOLDOWN = 60.0
 _ZOT = _agent_result(success=False, output='', timed_out=True, subtype='error')
 _OK = _agent_result(success=True, structured_output={'verdict': 'allow', 'reason': 'ok'})
 
@@ -341,9 +356,10 @@ class TestZeroOutputBreakerCircuit:
     ):
         cfg = PathScopeAdjudicatorConfig(
             zero_output_breaker_threshold=2,
-            zero_output_breaker_cooldown_seconds=_SHORT_COOLDOWN,
+            zero_output_breaker_cooldown_seconds=_COOLDOWN,
         )
-        adj = _make_adjudicator(config=cfg, tmp_path=tmp_path)
+        clock = _ManualClock()
+        adj = _make_adjudicator(config=cfg, tmp_path=tmp_path, clock=clock)
 
         with caplog.at_level(logging.WARNING, logger=_ADJUDICATOR_LOGGER):
             await _adjudicate_with(adj, _ZOT)
@@ -353,7 +369,7 @@ class TestZeroOutputBreakerCircuit:
             assert _breaker_open_lines(caplog) == 1
             assert [reached for _, reached in extra] == [False, False]
 
-            await asyncio.sleep(_SHORT_COOLDOWN + 0.1)
+            clock.advance(_COOLDOWN)
             good, reached = await _adjudicate_with(adj, _OK)
             assert reached and good.should_allow_creation is True
 
@@ -366,14 +382,15 @@ class TestZeroOutputBreakerCircuit:
     async def test_failed_probe_after_cooldown_reopens(self, tmp_path, caplog):
         cfg = PathScopeAdjudicatorConfig(
             zero_output_breaker_threshold=2,
-            zero_output_breaker_cooldown_seconds=_SHORT_COOLDOWN,
+            zero_output_breaker_cooldown_seconds=_COOLDOWN,
         )
-        adj = _make_adjudicator(config=cfg, tmp_path=tmp_path)
+        clock = _ManualClock()
+        adj = _make_adjudicator(config=cfg, tmp_path=tmp_path, clock=clock)
 
         with caplog.at_level(logging.WARNING, logger=_ADJUDICATOR_LOGGER):
             await _adjudicate_with(adj, _ZOT)
             await _adjudicate_with(adj, _ZOT)
-            await asyncio.sleep(_SHORT_COOLDOWN + 0.1)
+            clock.advance(_COOLDOWN)
 
             _, probe_reached = await _adjudicate_with(adj, _ZOT)
             blocked, reached = await _adjudicate_with(adj, _ZOT)
