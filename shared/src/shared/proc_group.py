@@ -398,7 +398,10 @@ async def terminate_process_group(
     4. If anything still runs, SIGKILL it: through :func:`sigkill_process_group`
        while the leader is unreaped, and once it is reaped only while a running
        survivor pins the pgid (:func:`_killable_survivors_of_reaped_leader`).  Then wait
-       another *grace_secs*.
+       another *grace_secs*.  Returning does not mean *proc* was reaped: this
+       SIGKILL leg is bounded by *grace_secs* as well, so ``proc.returncode``
+       may still be ``None``, and a caller that needs the exit status must
+       reap *proc* itself.
 
     No ``killpg`` failure propagates, because the group may vanish between our
     liveness check and the signal dispatch.
