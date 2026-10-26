@@ -809,3 +809,100 @@ class TestGateReverifyDoesNotParkTheLoop:
             assert outcome.status == 'done', outcome
             assert verifier.verified.count(GATED_HEAD) == 2, verifier.verified
             assert verifier.gate_entered.is_set(), verifier.verified
+
+    async def test_item_dispatched_to_free_host_while_head_gate_reverify_runs(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier()
+        async with _running_lane(git_ops, config, verifier=verifier) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            head, _drift = await _gate_head(lane, verifier)
+            assert _hosts_of(lane) == {'local': [GATED_HEAD]}, lane.observed()
+            progress = lane.worker.snapshot()['verify_in_progress']
+            assert (progress['task_id'], progress['phase']) == (
+                GATED_HEAD, 'gate_reverify',
+            ), progress
+
+            waiter = await lane.enqueue(GATE_WAITER)
+            await lane.settle(
+                lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
+                expected=f'{GATE_WAITER} dispatched to the free laptop',
+                why=(
+                    "the verifier loop is parked inside the head's gate "
+                    're-verify, so nothing dispatches to a free host until it ends.'
+                ),
+            )
+
+            assert lane.states()[GATED_HEAD] == 'gate_reverify', lane.observed()
+            assert not head.result.done(), lane.observed()
+            assert lane.worker.frozen_prefix() == (head.request_id, waiter.request_id)
+
+    async def test_finished_follower_waits_for_gated_head_and_lands_after_it(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier()
+        async with _running_lane(git_ops, config, verifier=verifier) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            head, drift = await _gate_head(lane, verifier)
+            waiter = await lane.enqueue(GATE_WAITER)
+            await lane.settle(
+                lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
+                expected=f'{GATE_WAITER} dispatched to the free laptop',
+                why="the verifier loop is parked inside the head's gate re-verify.",
+            )
+
+            lane.remote_gate.set()
+            for _ in range(10):
+                await asyncio.sleep(_FAST_POLL_SECS)
+                assert not waiter.result.done(), lane.observed()
+                assert await lane.git_ops.get_main_sha() == drift, lane.observed()
+
+            verifier.gate_release.set()
+            head_outcome = await wait_responsive(head.result, label=f'{GATED_HEAD} outcome')
+            waiter_outcome = await wait_responsive(
+                waiter.result, label=f'{GATE_WAITER} outcome',
+            )
+
+            assert head_outcome.status == 'done', head_outcome
+            assert waiter_outcome.status == 'done', waiter_outcome
+            assert await lane.git_ops.is_ancestor_checked(
+                head_outcome.merge_sha, waiter_outcome.merge_sha,
+            ) is True, (head_outcome, waiter_outcome)
+
+    async def test_red_gate_cascades_the_follower_dispatched_beside_it(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier(
+            gate_result=fails(category='test_failure', summary='gate re-verify red').result,
+        )
+        async with _running_lane(git_ops, config, verifier=verifier) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            head, _drift = await _gate_head(lane, verifier)
+            waiter = await lane.enqueue(GATE_WAITER)
+            await lane.settle(
+                lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
+                expected=f'{GATE_WAITER} dispatched to the free laptop',
+                why="the verifier loop is parked inside the head's gate re-verify.",
+            )
+
+            verifier.gate_release.set()
+            head_outcome = await wait_responsive(head.result, label=f'{GATED_HEAD} outcome')
+            assert head_outcome.status not in ('done', 'already_merged'), head_outcome
+
+            lane.remote_gate.set()
+            waiter_outcome = await wait_responsive(
+                waiter.result, label=f'{GATE_WAITER} outcome',
+            )
+            assert waiter_outcome.status == 'done', waiter_outcome
+            assert await _git_rc(
+                lane.git_ops.project_root, 'cat-file', '-e', 'main:gr_head.py',
+            ) != 0, "the red-gated head's file reached main"
+
+
+async def _git_rc(repo: Any, *args: str) -> int:
+    """Exit status of ``git *args`` run in *repo*."""
+    proc = await asyncio.create_subprocess_exec(
+        'git', *args, cwd=repo,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    return await proc.wait()
