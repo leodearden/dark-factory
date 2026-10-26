@@ -527,6 +527,30 @@ def _aggregate_escalations(harness: Harness) -> list:
     ]
 
 
+def _seed_l2_twin(queue: EscalationQueue, member_ids: list[str]) -> Escalation:
+    """Submit the pending L2 that ``promote_to_l2``'s create path leaves on disk.
+
+    Shaped like ``escalation/server.py::promote_to_l2``'s create path: a fresh
+    level-2 record whose ``members`` name the promoted L1s.  The promoted L1
+    itself stays pending at level 1, exactly as live specimen
+    esc-__stale_l0_strand_sweep__-8 left its member -7 while it sat under
+    human triage.
+    """
+    l2 = Escalation(
+        id=queue.make_id('__stale_l0_strand_sweep__'),
+        task_id='__stale_l0_strand_sweep__',
+        agent_role='escalation-watcher-auto',
+        severity='blocking',
+        category='risk_identified',
+        summary='stale-L0 strand records awaiting human triage',
+        level=2,
+        members=list(member_ids),
+        root_cause='startup sweep strands L0 escalations nobody answered',
+    )
+    queue.submit(l2)
+    return l2
+
+
 @pytest.mark.asyncio
 class TestStaleL0StrandEscalationSurvivesRestart:
     """The strand record must outlive the restart that destroyed the evidence.
@@ -594,15 +618,92 @@ class TestStaleL0StrandEscalationSurvivesRestart:
         assert abs(_pending_secs_for(detail, 'esc-5189-7', '5189') - STRAND_AGE_SECS) < 5
         assert abs(_pending_secs_for(detail, 'esc-5190-1', '5190') - (STRAND_AGE_SECS + 600)) < 5
 
-    async def test_second_sweep_with_open_aggregate_files_no_duplicate(
+    async def test_second_sweep_with_open_record_files_its_own_record(
         self, strand_harness: Harness
     ):
-        """Anti-storm dedup: one OPEN aggregate at a time, however many strands."""
+        """An open strand record never mutes the next sweep's strands (task 4988)."""
+        queue = _queue_of(strand_harness)
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        await strand_harness._dismiss_stale_escalations()
+        (first,) = _aggregate_escalations(strand_harness)
+
+        _seed_escalation(queue, 'esc-7777-1', '7777', age_secs=STRAND_AGE_SECS)
+        await strand_harness._dismiss_stale_escalations()
+
+        records = _aggregate_escalations(strand_harness)
+        assert len(records) == 2
+        (second,) = [e for e in records if e.id != first.id]
+        assert 'esc-7777-1' in second.detail
+        assert 'esc-5189-7' not in second.detail
+        assert second.level == 1
+
+        earlier = _get(queue, first.id)
+        assert earlier.status == 'pending'
+        assert 'esc-5189-7' in earlier.detail
+        assert 'esc-7777-1' not in earlier.detail
+
+        assert first.id in second.detail
+
+    async def test_open_record_under_l2_triage_does_not_mute_next_sweep(
+        self, strand_harness: Harness
+    ):
+        """A promoted strand record keeps its L1 pending; that must not mute us."""
+        queue = _queue_of(strand_harness)
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        await strand_harness._dismiss_stale_escalations()
+        (first,) = _aggregate_escalations(strand_harness)
+        l2 = _seed_l2_twin(queue, [first.id])
+
+        promoted = _get(queue, first.id)
+        assert (promoted.status, promoted.level) == ('pending', 1)
+
+        _seed_escalation(queue, 'esc-7777-1', '7777', age_secs=STRAND_AGE_SECS)
+        await strand_harness._dismiss_stale_escalations()
+
+        later = [
+            e for e in _aggregate_escalations(strand_harness)
+            if e.id != first.id and e.level == 1
+        ]
+        assert len(later) == 1
+        assert 'esc-7777-1' in later[0].detail
+        assert l2.id in later[0].detail
+
+    async def test_every_filing_sweep_logs_its_filing_line(
+        self, strand_harness: Harness, caplog
+    ):
+        """The sweep that files next to an open record says so in journald."""
+        queue = _queue_of(strand_harness)
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        await strand_harness._dismiss_stale_escalations()
+        (first,) = _aggregate_escalations(strand_harness)
+
+        _seed_escalation(queue, 'esc-7777-1', '7777', age_secs=STRAND_AGE_SECS)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            await strand_harness._dismiss_stale_escalations()
+
+        (second,) = [e for e in _aggregate_escalations(strand_harness) if e.id != first.id]
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'stale-l0-strand: filed L1' in m and second.id in m for m in warnings
+        ), warnings
+
+    async def test_back_to_back_restart_files_no_second_record(
+        self, strand_harness: Harness
+    ):
+        """The storm bound that replaced the open-record guard.
+
+        Each sweep dismisses every pending L0, so any strand a later sweep finds
+        was filed after this one and has aged past the strand threshold since.
+        Filings are therefore at most one per ``orphan_l0_timeout_secs``: a
+        restart right after a filing sweep finds only fresh L0s and files
+        nothing.  Green before and after task 4988 by design.
+        """
         queue = _queue_of(strand_harness)
         _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
         await strand_harness._dismiss_stale_escalations()
 
-        _seed_escalation(queue, 'esc-7777-1', '7777', age_secs=STRAND_AGE_SECS)
+        _seed_escalation(queue, 'esc-5685-1', '5685', age_secs=FRESH_AGE_SECS)
         await strand_harness._dismiss_stale_escalations()
 
         assert len(_aggregate_escalations(strand_harness)) == 1
