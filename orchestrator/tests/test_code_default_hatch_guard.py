@@ -180,6 +180,52 @@ def test_inline_default():
         )
         assert literal == 50, f'expected the asserted literal; got {literal!r}'
 
+    def test_flags_despite_a_non_autouse_isolating_fixture(self, tmp_path):
+        """An isolating fixture isolates only the tests that request it."""
+        src = _write(tmp_path, 'test_synth_unrequested_fixture.py', '''
+import pytest
+from orchestrator.config import OrchestratorConfig
+
+
+@pytest.fixture
+def isolated_config_env(monkeypatch):
+    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+
+def test_default():
+    cfg = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == 50
+''')
+        found = list(iter_default_asserting_tests(src))
+        assert _names(found) == {(None, 'test_default')}, (
+            'a non-autouse fixture the test does not request must not shield '
+            f'it; got {found!r}'
+        )
+
+    def test_flags_despite_an_autouse_fixture_in_a_sibling_class(self, tmp_path):
+        """A class-level autouse fixture isolates its own class only."""
+        src = _write(tmp_path, 'test_synth_sibling_autouse.py', '''
+import pytest
+from orchestrator.config import OrchestratorConfig
+
+
+class A:
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+
+class B:
+    def test_default(self):
+        cfg = OrchestratorConfig()
+        assert cfg.starvation_watchdog.skip_threshold == 50
+''')
+        found = list(iter_default_asserting_tests(src))
+        assert _names(found) == {('B', 'test_default')}, (
+            'an autouse fixture in a sibling class must not shield this '
+            f'class; got {found!r}'
+        )
+
 
 class TestDetectorFlagsComputedRightHandSides:
     """A right-hand side that EVALUATES to the default is as much a landmine as
@@ -410,6 +456,69 @@ def test_inline_explicit():
         assert list(iter_default_asserting_tests(src)) == [], (
             'an inline config constructed with explicit kwargs is not a '
             'bare-default landmine'
+        )
+
+    def test_class_level_autouse_fixture_repointing_the_config(self, tmp_path):
+        """An autouse fixture in the test's class isolates like the test body."""
+        src = _write(tmp_path, 'test_synth_class_autouse.py', '''
+import pytest
+from orchestrator.config import OrchestratorConfig
+
+
+class TestIsolated:
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch, tmp_path):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+    def test_default(self):
+        cfg = OrchestratorConfig()
+        assert cfg.starvation_watchdog.skip_threshold == 50
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            'a class-level autouse fixture re-pointing ORCH_CONFIG_PATH must '
+            'be honoured as isolation'
+        )
+
+    def test_module_level_autouse_fixture_repointing_the_config(self, tmp_path):
+        """An autouse fixture at module scope isolates every test in the file."""
+        src = _write(tmp_path, 'test_synth_module_autouse.py', '''
+import pytest
+from orchestrator.config import OrchestratorConfig
+
+
+@pytest.fixture(autouse=True)
+def _isolated_config_env(monkeypatch):
+    monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+
+
+def test_default():
+    cfg = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == 50
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            'a module-level autouse fixture re-pointing ORCH_CONFIG_PATH must '
+            'be honoured as isolation'
+        )
+
+    def test_autouse_fixture_requesting_the_hatch(self, tmp_path):
+        """The ``test_verify_load_stamp.py`` shape: autouse requests the hatch."""
+        src = _write(tmp_path, 'test_synth_autouse_hatch.py', '''
+import pytest
+from orchestrator.config import OrchestratorConfig
+
+
+class TestPinned:
+    @pytest.fixture(autouse=True)
+    def _pin(self, code_default_config):
+        pass
+
+    def test_default(self):
+        cfg = OrchestratorConfig()
+        assert cfg.starvation_watchdog.skip_threshold == 50
+''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            'an autouse fixture requesting code_default_config must be '
+            'honoured as isolation'
         )
 
 
