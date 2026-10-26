@@ -9,9 +9,12 @@ import pytest
 from escalation.models import Escalation
 
 from orchestrator.resume_resolution import (
+    MISMATCH_INSTRUCTION,
     NO_CARRIED_RESOLUTIONS,
+    STILL_PENDING_HEADING,
     CarriedResolution,
     render_carried_resolutions,
+    render_issue_context,
     select_carried_resolutions,
 )
 
@@ -154,3 +157,37 @@ class TestRenderCarriedResolutions:
     def test_no_resolutions_renders_an_explicit_statement(self):
         assert NO_CARRIED_RESOLUTIONS
         assert render_carried_resolutions([]) == NO_CARRIED_RESOLUTIONS
+
+
+class TestRenderIssueContext:
+    answered = _carried('esc-3713-4', 'RESUME with step 20', summary='step 19 verify red')
+
+    def test_names_answered_and_still_pending_escalations_apart(self):
+        still_open = _esc(
+            'esc-3713-5', status='pending', resolution=None, resolved_by=None,
+            resolution_action=None, summary='verify still red at step 20',
+            severity='blocking', level=0,
+        )
+
+        text = render_issue_context([still_open], (self.answered,))
+
+        heading = text.index(STILL_PENDING_HEADING)
+        assert text.index('esc-3713-4') < heading
+        assert text.index('step 19 verify red') < heading
+        pending_line = next(line for line in text.splitlines() if 'esc-3713-5' in line)
+        assert text.index(pending_line) > heading
+        assert 'severity=blocking' in pending_line
+        assert 'level=0' in pending_line
+        assert 'verify still red at step 20' in pending_line
+        assert MISMATCH_INSTRUCTION in text
+
+    def test_names_answered_escalations_when_nothing_is_pending(self):
+        text = render_issue_context([], (self.answered,))
+
+        assert 'esc-3713-4' in text
+        assert 'step 19 verify red' in text
+        assert STILL_PENDING_HEADING not in text
+        assert MISMATCH_INSTRUCTION not in text
+
+    def test_is_never_blank(self):
+        assert render_issue_context([], ()).strip()
