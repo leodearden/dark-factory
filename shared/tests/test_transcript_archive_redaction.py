@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -74,7 +75,7 @@ def archiving_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def failures() -> list[dict]:
+def failures() -> Iterator[list[dict]]:
     seen: list[dict] = []
     transcript_archive_module._reset_archival_failures()
     transcript_archive_module.set_archival_failure_hook(seen.append)
