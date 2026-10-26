@@ -1385,6 +1385,42 @@ class TestTaskKnowledgeSyncDoneAuditSection:
         assert '[8900]' not in section, 'an active task must never appear in the done-task audit'
 
     @pytest.mark.asyncio
+    async def test_audit_window_starts_at_task_change_timestamp_not_completion(
+        self, mock_deps, tmp_path
+    ):
+        """The audit starts at the previous run's start, so a task done mid-run is audited."""
+        previous_run_started = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
+        previous_run_completed = datetime(2026, 7, 14, 12, 30, 0, tzinfo=UTC)
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='p', project_root=str(tmp_path)
+        )
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                {'id': 8811, 'status': 'done', 'title': 'Done mid-previous-run',
+                 'updatedAt': '2026-07-14T12:10:00.000Z'},
+                {'id': 8812, 'status': 'done', 'title': 'Done before the previous run',
+                 'updatedAt': '2026-07-14T11:00:00.000Z'},
+                {'id': 8813, 'status': 'done', 'title': 'Done after the previous run',
+                 'updatedAt': '2026-07-14T13:00:00.000Z'},
+            ],
+        }
+
+        wm = Watermark(
+            project_id='p',
+            last_task_change_timestamp=previous_run_started,
+            last_full_run_completed=previous_run_completed,
+        )
+        payload = await stage.assemble_payload([], wm, [])
+
+        section = _extract_section(payload, '### Done-Task Completion-Memory Audit')
+        assert '[8811]' in section
+        assert '[8813]' in section
+        assert '[8812]' not in section
+        boundary_line = next(ln for ln in section.splitlines() if ln.startswith('Boundary'))
+        assert previous_run_started.isoformat() in boundary_line
+        assert previous_run_completed.isoformat() not in boundary_line
+
+    @pytest.mark.asyncio
     async def test_audit_section_render_cap_drops_oldest_with_overflow_note(
         self, mock_deps, tmp_path
     ):
