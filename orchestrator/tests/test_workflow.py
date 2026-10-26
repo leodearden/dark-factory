@@ -8,8 +8,10 @@ over-declared files that turned out not to be needed.
 
 These tests pin the bounded one-shot retry: the architect gets a single
 chance to ``update_plan_metadata(files=[narrowed list])``.  Lenient
-semantics — only forbid NEW files; the gate's re-check is the source of
-truth for pass/fail.
+semantics — only forbid NEW files and candidates with no lock-bearing file;
+the gate's re-check is the source of truth for pass/fail.  An accepted
+narrowing reconciles locks and metadata.files; a declined one leaves plan,
+plan.json and scope exactly as it found them (task 3580).
 """
 
 from __future__ import annotations
@@ -18,7 +20,10 @@ import asyncio
 import contextlib
 import os
 import subprocess
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -30,6 +35,8 @@ from _orch_helpers import (
     wait_responsive,
 )
 from _recording_event_store import _RecordingEventStore
+from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
+from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
 
 from orchestrator.agents.invoke import AgentResult
@@ -37,6 +44,8 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import WorktreeConflictError
 from orchestrator.merge_lane.gates import PlanFilesTouchedResult
+from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest
+from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import (
     StewardInterrupted,
@@ -112,6 +121,77 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:
     return wf
 
 
+def _wire_scope_backend(
+    wf: TaskWorkflow, files: list[str],
+    *, for_module: Callable[[str], object] | None = None,
+) -> FakeMetadataBackend:
+    """Make *wf*'s plan, plan.json, held modules, module configs and backend
+    ``metadata.files`` mutually consistent over *files*, as at production
+    dispatch.
+
+    *for_module*, when given, becomes ``config.for_module`` so the module
+    configs are observable. Rebinds the MagicMock scheduler's ``update_task`` /
+    ``handle_blast_radius_expansion`` / ``get_task`` onto a merge-faithful
+    backend so scope writes land in ``backend.blob``.
+    """
+    wf.plan = {'files': list(files)}
+    assert wf.artifacts is not None
+    wf.artifacts.write_plan({'files': list(files)})
+    wf.modules = derive_modules(files, wf.config.lock_depth)
+    if for_module is not None:
+        cast(MagicMock, wf.config).for_module.side_effect = for_module
+    wf._module_configs = wf._resolve_module_configs()
+    wf.task['metadata'] = {'files': sanitize_files_for_persist(files)}
+    backend = FakeMetadataBackend(lock_depth=wf.config.lock_depth)
+    wire_metadata_backend(
+        cast(MagicMock, wf.scheduler), backend,
+        seed=wf.task['metadata'], grants=True,
+    )
+    return backend
+
+
+def _stub_architect(
+    wf: TaskWorkflow, files: list[str], *, success: bool = True,
+    raises: BaseException | None = None,
+) -> list[object]:
+    """Stand in for the narrowing-pass architect: every invocation writes
+    ``{'files': files}`` to plan.json, then raises *raises* when given, else
+    reports *success*.
+
+    Returns the list each invocation's role is appended to.
+    """
+    invocations: list[object] = []
+
+    async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
+        invocations.append(role)
+        assert wf.artifacts is not None
+        wf.artifacts.write_plan({'files': list(files)})
+        if raises is not None:
+            raise raises
+        return AgentResult(success=success, output='', cost_usd=0.0, turns=1)
+
+    wf._invoke = fake_invoke  # type: ignore[method-assign]
+    wf.briefing.build_plan_tightening_prompt = AsyncMock(return_value='PROMPT')
+    return invocations
+
+
+async def _assert_declined_pass_left_scope_untouched(
+    wf: TaskWorkflow, backend: FakeMetadataBackend, pre: list[str],
+) -> None:
+    """A declined narrowing pass left plan, plan.json, locks and
+    metadata.files as it found them, and the merge-entry tripwire files no
+    divergence escalation."""
+    assert wf.plan['files'] == pre
+    assert wf.artifacts is not None
+    assert wf.artifacts.read_plan()['files'] == pre
+    assert backend.blast_radius_calls == []
+    assert backend.update_task_calls == []
+    assert backend.blob['files'] == sanitize_files_for_persist(pre)
+    assert wf.escalation_queue is not None
+    await wf._check_scope_invariant()
+    assert wf.escalation_queue.get_by_task(wf.task_id, status='pending') == []
+
+
 class _CheckSequence:
     """Helper: produce a sequence of PlanFilesTouchedResult on successive calls."""
 
@@ -166,6 +246,71 @@ def _merge_coalesced_count(store: _RecordingEventStore) -> int:
     return sum(1 for t, _ in store.events if 'merge_coalesced' in t)
 
 
+@dataclass(frozen=True)
+class _MergeSubmission:
+    """What one ``_drive_merge_submission`` call observed."""
+
+    outcome: WorkflowOutcome
+    gate_calls: int
+    merge_attempt_outcomes: list[str]
+    requests: list[MergeRequest]
+    mark_blocked: AsyncMock
+
+
+async def _drive_merge_submission(
+    wf: TaskWorkflow, monkeypatch: pytest.MonkeyPatch,
+    checks: list[PlanFilesTouchedResult],
+) -> _MergeSubmission:
+    """Submit *wf*'s branch while the plan-files gate answers *checks* in turn.
+
+    A REAL queue plus a stand-in merger, in place of a patched enqueue: the
+    request genuinely lands on the queue and is resolved 'done', so this
+    exercises the real register-and-enqueue path. The post-merge SHA pipeline
+    is stubbed to return DONE.
+    """
+    check_seq = _CheckSequence(checks)
+    monkeypatch.setattr(
+        'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
+        check_seq,
+    )
+
+    async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        return 0, 'fake_head_sha\n', ''
+    monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+
+    events = _RecordingEventStore()
+    wf.event_store = events  # type: ignore[assignment]
+
+    real_queue: asyncio.Queue = asyncio.Queue()
+    wf.merge_queue = real_queue
+    requests: list[MergeRequest] = []
+
+    async def _merger():
+        req = await real_queue.get()
+        requests.append(req)
+        req.result.set_result(MergeOutcome('done', merge_sha='deadbeef'))
+
+    merger_task = asyncio.create_task(_merger())
+
+    mark_blocked = AsyncMock()
+    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+    wf._finalise_merged_done = AsyncMock(  # type: ignore[method-assign]
+        return_value=WorkflowOutcome.DONE,
+    )
+
+    outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+    merger_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await merger_task
+    return _MergeSubmission(
+        outcome=outcome,
+        gate_calls=check_seq.calls,
+        merge_attempt_outcomes=_merge_attempt_outcomes(events),
+        requests=requests,
+        mark_blocked=mark_blocked,
+    )
+
+
 @pytest.mark.asyncio
 class TestSubmitToMergeQueuePlanTightening:
     """Architect plan-tightening retry inside ``_submit_to_merge_queue``."""
@@ -178,70 +323,159 @@ class TestSubmitToMergeQueuePlanTightening:
         and no L1 is submitted.
         """
         wf = _make_workflow(tmp_path=tmp_path)
+        _wire_scope_backend(wf, ['a.py', 'b.py', 'c.py'])
+        _stub_architect(wf, ['b.py', 'c.py'])
 
-        check_seq = _CheckSequence([
+        submission = await _drive_merge_submission(wf, monkeypatch, [
             PlanFilesTouchedResult(not_touched=['a.py']),  # first call
             PlanFilesTouchedResult(not_touched=[]),         # after narrowing
         ])
-        monkeypatch.setattr(
-            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
-            check_seq,
+
+        assert submission.outcome == WorkflowOutcome.DONE
+        assert submission.gate_calls == 2, (
+            f'gate must re-check after narrowing; got {submission.gate_calls} calls'
+        )
+        assert 'plan_files_narrowed' in submission.merge_attempt_outcomes
+        assert 'plan_files_not_touched' not in submission.merge_attempt_outcomes
+        submission.mark_blocked.assert_not_awaited()
+
+    async def test_accepted_narrowing_reconciles_metadata_files_and_locks(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """An accepted cross-module narrowing leaves metadata.files equal to
+        plan.files, derives locks from the narrowed list, and submits a
+        MergeRequest whose file and module views agree.
+        """
+        wf = _make_workflow(tmp_path=tmp_path)
+        pre = ['pkg_a/mod/x.py', 'pkg_b/mod/y.py']
+        narrowed = ['pkg_a/mod/x.py']
+        assert set(derive_modules(narrowed, 2)) < set(derive_modules(pre, 2))
+        backend = _wire_scope_backend(
+            wf, pre, for_module=lambda m: SimpleNamespace(prefix=m.split('/')[0]),
+        )
+        wf.escalation_queue = EscalationQueue(tmp_path / 'queue')
+        _stub_architect(wf, narrowed)
+
+        submission = await _drive_merge_submission(wf, monkeypatch, [
+            PlanFilesTouchedResult(not_touched=['pkg_b/mod/y.py']),
+            PlanFilesTouchedResult(not_touched=[]),
+        ])
+
+        assert submission.outcome == WorkflowOutcome.DONE
+        assert 'plan_files_narrowed' in submission.merge_attempt_outcomes
+        assert 'plan_files_not_touched' not in submission.merge_attempt_outcomes
+
+        assert backend.blob['files'] == wf.plan['files'] == narrowed
+        assert wf.modules == derive_modules(narrowed, 2)
+        assert backend.blast_radius_calls[-1][1] == derive_modules(narrowed, 2)
+
+        (req,) = submission.requests
+        assert req.task_files == narrowed
+        assert {mc.prefix for mc in req.module_configs} == {'pkg_a'}
+
+        await wf._check_scope_invariant()
+        assert wf.escalation_queue.get_by_task(wf.task_id, status='pending') == []
+
+    async def test_same_module_narrow_persists_metadata_files(
+        self, tmp_path: Path,
+    ):
+        """A narrowing that leaves the derived lock modules unchanged never
+        reaches the scheduler's blast-radius path, yet metadata.files still
+        follows plan.files.
+        """
+        wf = _make_workflow(tmp_path=tmp_path)
+        pre = ['a/b/c/d/e.py', 'a/b/c/d/f.py']
+        narrowed = ['a/b/c/d/e.py']
+        assert derive_modules(pre, 2) == derive_modules(narrowed, 2)
+        assert set(pre) != set(narrowed)
+        backend = _wire_scope_backend(wf, pre)
+
+        _stub_architect(wf, narrowed)
+
+        result = await wf._try_narrow_plan(['a/b/c/d/f.py'])
+
+        assert result is True
+        assert backend.blast_radius_calls == []
+        assert backend.blob['files'] == wf.plan['files'] == narrowed
+
+    @pytest.mark.parametrize(
+        ('rewrite', 'success'),
+        [
+            pytest.param(
+                ['pkg_a/mod/x.py', 'pkg_c/mod/z.py'], True, id='superset_rewrite',
+            ),
+            pytest.param(['pkg_a/mod/x.py'], False, id='failed_invocation'),
+        ],
+    )
+    async def test_declined_narrowing_leaves_plan_and_scope_untouched(
+        self, tmp_path: Path, rewrite: list[str], success: bool,
+    ):
+        """A declined narrowing pass leaves plan, plan.json, locks and
+        metadata.files exactly as it found them, and files no divergence
+        escalation.
+        """
+        wf = _make_workflow(tmp_path=tmp_path)
+        pre = ['pkg_a/mod/x.py', 'pkg_b/mod/y.py']
+        backend = _wire_scope_backend(wf, pre)
+        wf.escalation_queue = EscalationQueue(tmp_path / 'queue')
+
+        _stub_architect(wf, rewrite, success=success)
+
+        result = await wf._try_narrow_plan(['pkg_b/mod/y.py'])
+
+        assert result is False
+        await _assert_declined_pass_left_scope_untouched(wf, backend, pre)
+
+    async def test_narrowing_pass_that_raises_restores_plan_json(
+        self, tmp_path: Path,
+    ):
+        """An architect invocation that raises after rewriting plan.json (a
+        shutdown cancellation) propagates, yet leaves plan, plan.json and
+        scope exactly as the pass found them.
+        """
+        wf = _make_workflow(tmp_path=tmp_path)
+        pre = ['pkg_a/mod/x.py', 'pkg_b/mod/y.py']
+        backend = _wire_scope_backend(wf, pre)
+        wf.escalation_queue = EscalationQueue(tmp_path / 'queue')
+
+        _stub_architect(
+            wf, ['pkg_a/mod/x.py', 'pkg_c/mod/z.py'],
+            raises=asyncio.CancelledError(),
         )
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
-            return 0, 'fake_head_sha\n', ''
-        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        with pytest.raises(asyncio.CancelledError):
+            await wf._try_narrow_plan(['pkg_b/mod/y.py'])
 
-        events = _RecordingEventStore()
-        wf.event_store = events  # type: ignore[assignment]
+        await _assert_declined_pass_left_scope_untouched(wf, backend, pre)
 
-        # Stub architect: write a narrowed plan to disk so read_plan() returns it.
-        async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
-            assert wf.artifacts is not None
-            wf.artifacts.write_plan({'files': ['b.py', 'c.py']})
-            return AgentResult(
-                success=True, output='', cost_usd=0.0, turns=1,
-            )
-        wf._invoke = fake_invoke  # type: ignore[method-assign]
+    @pytest.mark.parametrize(
+        ('pre', 'candidate'),
+        [
+            pytest.param(['pkg_a/mod/x.py', 'pkg_b/mod/y.py'], [], id='empty'),
+            pytest.param(
+                ['pkg_a/mod', 'pkg_b/mod/y.py'], ['pkg_a/mod'], id='directory_only',
+            ),
+        ],
+    )
+    async def test_zero_lock_module_narrowing_is_rejected(
+        self, tmp_path: Path, pre: list[str], candidate: list[str],
+    ):
+        """A candidate deriving ZERO lock modules is rejected, never
+        reconciled: no lock release, no scope write, no divergence escalation.
+        """
+        assert set(candidate) <= set(pre)
+        assert derive_modules(candidate, 2) == []
+        assert derive_modules(pre, 2) != []
+        wf = _make_workflow(tmp_path=tmp_path)
+        backend = _wire_scope_backend(wf, pre)
+        wf.escalation_queue = EscalationQueue(tmp_path / 'queue')
 
-        # Stub briefing helper used by _try_narrow_plan.
-        wf.briefing.build_plan_tightening_prompt = AsyncMock(return_value='PROMPT')
+        _stub_architect(wf, candidate)
 
-        # A REAL queue plus a drain coroutine, in place of a patched enqueue:
-        # the request genuinely lands on the queue and a stand-in merger
-        # resolves it with a 'done' outcome, so this test exercises the real
-        # register-and-enqueue path.  We only assert the recorded events / no-L1,
-        # not the post-merge SHA pipeline.
-        from orchestrator.merge_lane.worker import MergeOutcome
+        result = await wf._try_narrow_plan(['pkg_b/mod/y.py'])
 
-        real_queue: asyncio.Queue = asyncio.Queue()
-        wf.merge_queue = real_queue
-
-        async def _merger():
-            req = await real_queue.get()
-            req.result.set_result(MergeOutcome('done', merge_sha='deadbeef'))
-
-        merger_task = asyncio.create_task(_merger())
-
-        mark_blocked = AsyncMock()
-        wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
-
-        # Stub _finalise_merged_done so success path returns DONE cleanly.
-        wf._finalise_merged_done = AsyncMock(  # type: ignore[method-assign]
-            return_value=WorkflowOutcome.DONE,
-        )
-
-        outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
-        await merger_task
-
-        assert outcome == WorkflowOutcome.DONE
-        assert check_seq.calls == 2, (
-            f'gate must re-check after narrowing; got {check_seq.calls} calls'
-        )
-        outcomes = _merge_attempt_outcomes(events)
-        assert 'plan_files_narrowed' in outcomes
-        assert 'plan_files_not_touched' not in outcomes
-        mark_blocked.assert_not_awaited()
+        assert result is False
+        await _assert_declined_pass_left_scope_untouched(wf, backend, pre)
 
     async def test_architect_refuses_to_narrow_falls_through_to_l1(
         self, tmp_path: Path, monkeypatch,
@@ -250,6 +484,7 @@ class TestSubmitToMergeQueuePlanTightening:
         same not_touched file; workflow escalates to L1.
         """
         wf = _make_workflow(tmp_path=tmp_path)
+        _wire_scope_backend(wf, ['a.py', 'b.py', 'c.py'])
 
         check_seq = _CheckSequence([
             PlanFilesTouchedResult(not_touched=['a.py']),
@@ -268,14 +503,7 @@ class TestSubmitToMergeQueuePlanTightening:
         wf.event_store = events  # type: ignore[assignment]
 
         # Architect leaves plan.json untouched.
-        async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
-            assert wf.artifacts is not None
-            wf.artifacts.write_plan({'files': ['a.py', 'b.py', 'c.py']})
-            return AgentResult(
-                success=True, output='', cost_usd=0.0, turns=1,
-            )
-        wf._invoke = fake_invoke  # type: ignore[method-assign]
-        wf.briefing.build_plan_tightening_prompt = AsyncMock(return_value='PROMPT')
+        _stub_architect(wf, ['a.py', 'b.py', 'c.py'])
 
         mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
         wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
@@ -299,6 +527,7 @@ class TestSubmitToMergeQueuePlanTightening:
         not_touched=[a.py].
         """
         wf = _make_workflow(tmp_path=tmp_path)
+        _wire_scope_backend(wf, ['a.py', 'b.py', 'c.py'])
 
         check_seq = _CheckSequence([
             PlanFilesTouchedResult(not_touched=['a.py']),
@@ -315,14 +544,7 @@ class TestSubmitToMergeQueuePlanTightening:
         events = _RecordingEventStore()
         wf.event_store = events  # type: ignore[assignment]
 
-        async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
-            assert wf.artifacts is not None
-            wf.artifacts.write_plan({'files': ['b.py', 'c.py', 'z.py']})
-            return AgentResult(
-                success=True, output='', cost_usd=0.0, turns=1,
-            )
-        wf._invoke = fake_invoke  # type: ignore[method-assign]
-        wf.briefing.build_plan_tightening_prompt = AsyncMock(return_value='PROMPT')
+        _stub_architect(wf, ['b.py', 'c.py', 'z.py'])
 
         mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
         wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
@@ -346,18 +568,9 @@ class TestSubmitToMergeQueuePlanTightening:
         the same TaskWorkflow instance.
         """
         wf = _make_workflow(tmp_path=tmp_path)
+        _wire_scope_backend(wf, ['a.py', 'b.py', 'c.py'])
 
-        invocations: list[int] = []
-
-        async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
-            invocations.append(1)
-            assert wf.artifacts is not None
-            wf.artifacts.write_plan({'files': ['b.py', 'c.py']})
-            return AgentResult(
-                success=True, output='', cost_usd=0.0, turns=1,
-            )
-        wf._invoke = fake_invoke  # type: ignore[method-assign]
-        wf.briefing.build_plan_tightening_prompt = AsyncMock(return_value='PROMPT')
+        invocations = _stub_architect(wf, ['b.py', 'c.py'])
 
         first = await wf._try_narrow_plan(['a.py'])
         second = await wf._try_narrow_plan(['a.py'])
@@ -1412,7 +1625,7 @@ class TestAttachedWaiterOutcomeMapping:
     async def _setup_attached_workflow(self, tmp_path, monkeypatch):
         import asyncio
 
-        from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry
 
         real_queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
