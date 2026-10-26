@@ -42,6 +42,7 @@ import orchestrator.merge_lane.worker as _mq
 
 if TYPE_CHECKING:
     from orchestrator.merge_lane.worker import (
+        InflightEntry,
         LocalRunner,
         RealMergeItem,
         SpeculativeMergeWorker,
@@ -103,4 +104,15 @@ async def drive_verify_and_advance(
         started_at=time.time(),
     )
 
-    return await worker._finalize_inflight(entry)
+    return await finalize_through_gate(worker, entry)
+
+
+async def finalize_through_gate(
+    worker: SpeculativeMergeWorker, entry: InflightEntry,
+) -> bool:
+    """``_finalize_inflight`` *entry*, resuming it while it parks on a gate
+    re-verify (task 6155).  Returns True iff main was advanced."""
+    while True:
+        advanced = await worker._finalize_inflight(entry)
+        if entry.gate is None:
+            return advanced
