@@ -97,6 +97,7 @@ from orchestrator.lane_lifecycle import (
     LaneLifecycle,
     LaneState,
 )
+from orchestrator.lane_task_dir import archive_root_for, evict_previous_occupant
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
 from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
 from orchestrator.tree_removal import remove_tree
@@ -8527,7 +8528,9 @@ class GitOps:
         in-worktree reset succeeds, the sibling ``.task-meta/<name>`` (which
         the reset above cannot touch) is cleared too (W11 ε1).
 
-        Added as a stub here (step-8); fully exercised by step-10 tests.
+        The previous occupant's ``.task/`` is evicted, transcripts archived
+        first, before the clean, by
+        orchestrator/src/orchestrator/lane_task_dir.py::evict_previous_occupant.
         """
         # -f (force) discards local modifications to tracked files before the
         # branch switch — required when the lane is being reused from a prior
@@ -8541,6 +8544,10 @@ class GitOps:
                 f'_reset_warm_lane: checkout -f -B {full_branch} {target_commit} '
                 f'failed for {lane_dir}: {err}'
             )
+        await evict_previous_occupant(
+            lane_dir / '.task', keep_task_id=None,
+            archive_root=archive_root_for(self.transcript_archive, self.project_root),
+        )
         ok, err = await self._clean_lane_retaining_artifacts(
             lane_dir, caller='_reset_warm_lane',
         )
