@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from escalation.models import Escalation
+from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig, VerifyRunnerConfig
@@ -292,6 +292,58 @@ class TestHarnessDeliveredCheckBlockWiring:
             summary=self._SUMMARY,
             detail='detail',
             category='dependency_capability',
+        )
+
+    @pytest.mark.asyncio
+    async def test_callback_records_and_renders_the_check_owner(self, tmp_path: Path) -> None:
+        """Called with the failed descriptor and the owner (sidecar None, so
+        no git read), the filed record carries the owner as data and the
+        owner block in its detail."""
+        harness = _make_harness(tmp_path)
+        mock_queue = _install_mock_escalation_queue(harness)
+        harness.scheduler.set_task_status = AsyncMock(return_value=True)
+        owner: DeliveredCheckOwner = {'task_id': '5', 'check_name': 'cap', 'sidecar': None}
+
+        assert harness.scheduler._callbacks.on_delivered_check_block is not None
+        await harness.scheduler._callbacks.on_delivered_check_block(
+            '42',
+            summary=self._SUMMARY,
+            detail='detail',
+            category='dependency_capability',
+            check={'name': 'cap', 'kind': 'path', 'expect': 'present', 'paths': ['x.py']},
+            owner=owner,
+        )
+
+        submitted: Escalation = mock_queue.submit.call_args.args[0]
+        assert submitted.delivered_check_owner == owner
+        assert 'Check owner: task 5' in submitted.detail
+        assert submitted.detail.splitlines()[-1].endswith(
+            'set task 42 back to pending once the check passes on main.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_call_keeps_the_re_pend_recipe_without_an_owner(
+        self, tmp_path: Path
+    ) -> None:
+        """A caller that predates the owner kwargs still gets Resolved-6's
+        manual re-pend recipe, and the record carries no owner."""
+        harness = _make_harness(tmp_path)
+        mock_queue = _install_mock_escalation_queue(harness)
+        harness.scheduler.set_task_status = AsyncMock(return_value=True)
+
+        assert harness.scheduler._callbacks.on_delivered_check_block is not None
+        await harness.scheduler._callbacks.on_delivered_check_block(
+            '42',
+            summary=self._SUMMARY,
+            detail='detail',
+            category='dependency_capability',
+        )
+
+        submitted: Escalation = mock_queue.submit.call_args.args[0]
+        assert submitted.delivered_check_owner is None
+        assert submitted.detail == (
+            'detail\nBlocked dependents are NOT auto-re-pended — set task 42 back to '
+            'pending once the check passes on main.'
         )
 
 

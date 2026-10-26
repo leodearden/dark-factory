@@ -14,6 +14,7 @@ from escalation.models import (
     RESOLUTION_CLASSES,
     SEVERITY_RANK,
     Amendment,
+    DeliveredCheckOwner,
     Escalation,
     EvidenceEntry,
     IndexHealthState,
@@ -483,6 +484,65 @@ class TestEscalationIndexHealthField:
         assert restored.index_health is None, (
             f'Expected index_health=None for legacy JSON, got {restored.index_health!r}'
         )
+
+
+class TestEscalationDeliveredCheckOwnerField:
+    """Escalation carries the failing delivered check's owner as data (task 7514).
+
+    A `dependency_capability` record's task is the blocked DEPENDENT; the
+    check belongs to the dependency named here. Same additive zero-migration
+    contract as `index_health`.
+    """
+
+    _OWNER: DeliveredCheckOwner = {
+        'task_id': '5405',
+        'check_name': 'pattern-module-substrate',
+        'sidecar': {
+            'path': 'docs/prds/v0_6/eradicate-silent-undef.capability-manifest.yaml',
+            'on_main': 'declares',
+        },
+    }
+    _OWNER_WITHOUT_SIDECAR: DeliveredCheckOwner = {
+        'task_id': '6371',
+        'check_name': 'x-cap',
+        'sidecar': None,
+    }
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base: dict[str, Any] = {
+            'id': 'esc-5542-0001',
+            'task_id': '5542',
+            'agent_role': 'orchestrator-scheduler',
+            'severity': 'critical',
+            'category': 'dependency_capability',
+            'summary': 'DEP_CAPABILITY_NOT_DELIVERED: task 5542 - dep 5405 done',
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    def test_default_is_none_and_surfaces_in_to_dict(self):
+        esc = self._make_base_esc()
+        assert esc.delivered_check_owner is None
+        assert esc.to_dict()['delivered_check_owner'] is None
+
+    @pytest.mark.parametrize('owner', [_OWNER, _OWNER_WITHOUT_SIDECAR])
+    def test_round_trip_via_to_dict_from_dict(self, owner):
+        esc = self._make_base_esc(delivered_check_owner=owner)
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.delivered_check_owner == owner
+
+    @pytest.mark.parametrize('owner', [_OWNER, _OWNER_WITHOUT_SIDECAR])
+    def test_round_trip_via_to_json_from_json(self, owner):
+        esc = self._make_base_esc(delivered_check_owner=owner)
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.delivered_check_owner == owner
+        assert restored.to_json() == esc.to_json()
+
+    def test_legacy_json_without_the_key_deserialises_to_none(self):
+        payload = self._make_base_esc().to_dict()
+        del payload['delivered_check_owner']
+        restored = Escalation.from_json(json.dumps(payload))
+        assert restored.delivered_check_owner is None
 
 
 class TestEscalationResolutionAction:
