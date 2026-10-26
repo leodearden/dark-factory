@@ -8,14 +8,26 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from orchestrator import verify_evidence
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.agents.invoke import AgentResult
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import GitOps
+from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult, run_scoped_verification, run_verification
-from orchestrator.verify_evidence import CacheMode, UnitOutcome, UnitTier, VerifyUnit
+from orchestrator.verify_admission_record import AdmissionLeg
+from orchestrator.verify_evidence import (
+    CacheMode,
+    UnitOutcome,
+    UnitTier,
+    VerifyUnit,
+    module_leg_unit,
+)
 from orchestrator.verify_plan import ScopeKind, VerifyPlan, derive_verify_plan
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_FAILED_CATEGORY,
@@ -25,6 +37,7 @@ from orchestrator.verify_runner import (
     result_from_dict,
     result_to_dict,
 )
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
 _ALPHA = ModuleConfig(
     prefix='alpha',
@@ -46,9 +59,9 @@ def _lint_run_scope(plan: VerifyPlan) -> ScopeKind:
     return next(run.scope_kind for run in plan.runs if run.reason.startswith('lint:'))
 
 
-def _result(*, passed: bool = True, **overrides: Any) -> VerifyResult:
+def _result(*, passed: bool = True, summary: str = '', **overrides: Any) -> VerifyResult:
     return VerifyResult(
-        passed=passed, test_output='', lint_output='', type_output='', summary='', **overrides,
+        passed=passed, test_output='', lint_output='', type_output='', summary=summary, **overrides,
     )
 
 
@@ -264,3 +277,126 @@ class TestMergeVerifyEventCarriesUnits:
             f'module:{module}:{leg}' for module in ('alpha', 'beta') for leg in ('test', 'lint', 'type')
         }
         assert {unit.outcome for unit in result.units} == {UnitOutcome.RAN_GREEN}
+
+
+# ---------------------------------------------------------------------------
+# A TaskWorkflow over a real git repo and a real EventStore, with its agent and
+# scheduler collaborators doubled (the test_rebase_verify_cost.py harness).
+
+_TASK_ID = '42'
+
+
+def _git(cwd: Path, *argv: str) -> str:
+    return subprocess.run(
+        ['git', '-c', 'user.email=t@t', '-c', 'user.name=t', *argv],
+        cwd=cwd, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _commit(cwd: Path, name: str) -> None:
+    (cwd / name).write_text(f'{name}\n')
+    _git(cwd, 'add', '-A')
+    _git(cwd, 'commit', '-q', '-m', name)
+
+
+@pytest.fixture
+def config(tmp_path: Path) -> OrchestratorConfig:
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _git(repo, 'init', '-q', '-b', 'main')
+    _commit(repo, 'lib.py')
+    return OrchestratorConfig(
+        project_root=repo,
+        max_concurrent_tasks=1,
+        max_verify_attempts=2,
+        escalate_preexisting_main_break=False,
+        git=GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin', worktree_dir='.worktrees',
+        ),
+    )
+
+
+@pytest.fixture
+def git_ops(config: OrchestratorConfig) -> GitOps:
+    return GitOps(config.git, config.project_root)
+
+
+async def _task_workflow(
+    config: OrchestratorConfig, git_ops: GitOps, store: EventStore, monkeypatch: pytest.MonkeyPatch,
+) -> TaskWorkflow:
+    worktree = await git_ops.create_worktree(_TASK_ID)
+    workflow = TaskWorkflow(
+        assignment=TaskAssignment(
+            task_id=_TASK_ID,
+            task={
+                'id': _TASK_ID, 'title': 'X', 'description': '', 'status': 'pending',
+                'metadata': {'files': ['lib']}, 'dependencies': [],
+            },
+            modules=['lib'],
+        ),
+        config=config, git_ops=git_ops,
+        scheduler=MagicMock(), briefing=MagicMock(), mcp=MagicMock(),
+        event_store=store,
+    )
+    workflow.worktree = worktree.path
+    workflow.artifacts = TaskArtifacts(worktree.path)
+    workflow.artifacts.init(_TASK_ID, 'X', 'desc', base_commit=worktree.base_commit)
+    workflow.plan = {'task_id': _TASK_ID, 'steps': []}
+    workflow.briefing.build_debugger_prompt = AsyncMock(return_value='debug')
+    monkeypatch.setattr(workflow, '_check_escalations', MagicMock(return_value=[]))
+    monkeypatch.setattr(workflow, '_invoke', AsyncMock(return_value=AgentResult(success=True, output='')))
+    return workflow
+
+
+def _admission_leg(*, waited_secs: float, flock_wait_secs: float) -> AdmissionLeg:
+    return AdmissionLeg(
+        plan_id='p', module='alpha', scope_kind='full_suite', order='arrival',
+        arrived_at='2026-10-26T00:00:00+00:00', granted_at='2026-10-26T00:00:03+00:00',
+        waited_secs=waited_secs, depth_at_arrival=1, slot_held=True,
+        flock_wait_secs=flock_wait_secs, held_secs=9.0, rc=0, timed_out=False,
+    )
+
+
+def _workflow_verify_rows(store: EventStore) -> list[dict[str, Any]]:
+    return [row['data'] for row in store.fetch_events_by_type(EventType.workflow_verify)]
+
+
+class TestImplementSiteWorkflowVerify:
+    @pytest.mark.asyncio
+    async def test_the_review_edge_row_carries_the_passing_verdict(
+        self, config, git_ops, tmp_path, monkeypatch,
+    ):
+        store = EventStore(tmp_path / 'events.db', run_id='r')
+        workflow = await _task_workflow(config, git_ops, store, monkeypatch)
+        plan = _alpha_plan().to_dict()
+        failing = _result(
+            passed=False, summary='tests failed', duration_secs=1.0,
+            units=(module_leg_unit('alpha', 'test', 1),),
+        )
+        passing = _result(
+            plan=plan, duration_secs=12.5,
+            units=(module_leg_unit('alpha', 'test', 0), module_leg_unit('alpha', 'lint', 0)),
+            admission_legs=(_admission_leg(waited_secs=3.0, flock_wait_secs=1.5),),
+        )
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', AsyncMock(side_effect=[failing, passing]),
+        )
+
+        assert await workflow._verify_debugfix_loop() == WorkflowOutcome.DONE
+        workflow._verify_green_tip_sha = 'cafef00d'
+        workflow._base_commit = 'deadbeef'
+        workflow.state = WorkflowState.VERIFY
+        workflow._enter_phase(WorkflowState.REVIEW)
+
+        assert _workflow_verify_rows(store) == [{
+            'passed': True,
+            'tip_sha': 'cafef00d',
+            'base_sha': 'deadbeef',
+            'branch': f'task/{_TASK_ID}',
+            'duration_ms': 12500,
+            'slot_wait_secs': 4.5,
+            'site': 'implement',
+            'plan_hash': verify_evidence.plan_hash(plan),
+            'cache_mode': 'off',
+            'units': [unit.to_dict() for unit in passing.units or ()],
+        }]
