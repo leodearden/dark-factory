@@ -19,6 +19,10 @@ from config_reload_script_fakes import git
 
 DEPLOY_BRANCH_PREFIX = "refs/heads/task/deploy-"
 
+# A merge_status step that answers no tool result at all: the transport
+# refuses the envelope, as it would a reply cut off by a server restart.
+TRANSPORT_FAULT = object()
+
 
 class FakeMergeQueue:
     """One deploy request's scripted journey through a target's merge queue.
@@ -29,9 +33,10 @@ class FakeMergeQueue:
 
     *states* is the merge_status sequence for this request's own id, one entry
     per poll with the last repeating; or a dict mapping each pollable handle to
-    its own sequence. An entry is a state, or a dict of reply fields carrying
-    `state`. A handle the script does not know answers *foreign_state*, as the
-    queue's other requests would, and never lands anything.
+    its own sequence. An entry is a state, a dict of reply fields carrying
+    `state`, or TRANSPORT_FAULT. A handle the script does not know answers
+    *foreign_state*, as the queue's other requests would, and never lands
+    anything.
 
     *landing* is what reaching 'done' does to the repo: 'merge' (a `--no-ff`
     merge in the main checkout, which syncs the working tree), 'cherry_pick'
@@ -112,6 +117,8 @@ class FakeMergeQueue:
         seen = self._polls.get(handle, 0)
         self._polls[handle] = seen + 1
         step = steps[min(seen, len(steps) - 1)]
+        if step is TRANSPORT_FAULT:
+            return None
         fields = step if isinstance(step, dict) else {"state": step}
         if fields["state"] == "done":
             self._land()
