@@ -1817,6 +1817,20 @@ of `scripts/sitting/preparation.py::to_json_payload`, where `item` is the `key` 
 - Put every escalation and task id you mention in `cites`, so the brief glosses it.
 - The item's briefing disposition decides whether it is recorded now, after investigation, or as a
   direct ask (see "Disposition before briefing (H1–H6)").
+- A `dependency_capability` record (`DEP_CAPABILITY_NOT_DELIVERED`) is about a check the blocked
+  task does NOT own. Read the owner from the record: `get_escalation` returns
+  `delivered_check_owner` (shape: `escalation/src/escalation/models.py::DeliveredCheckOwner`).
+  Its `task_id` is the dependency whose `metadata.delivered_checks` entry `check_name` failed, and
+  its `sidecar` is that dependency's capability manifest, with `on_main` saying whether the file
+  declares the check on `main`. An option that repaths, re-patterns or drops the check edits the
+  owner's sites only: `update_task` on the owner, re-sending its full `delivered_checks` list, plus
+  the sidecar when `on_main` is `declares` (and its `.capability-manifest.md` twin if that names the
+  old path). Settle `unverified` with `git show main:<path>` before writing the option. The record's
+  own task appears in an option only as the task to re-pend; never propose editing its
+  `delivered_checks` or its sidecar. A record without the field (filed before task 7514, or
+  rewritten by an older process) states the same owner in prose: the dependency in the summary's
+  `dep <id>` and the detail's `Dependency: task <id>`. `get_task` it and derive its sidecar from its
+  `metadata.prd_path` (`.md` becomes `.capability-manifest.yaml`).
 
 #### Gate facts are yours to supply
 
@@ -2006,6 +2020,24 @@ Agent found it depends on work that isn't done yet.
    )
    ```
 3. **If no matching task exists**: spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, dependency_discovered, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`). The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
+
+### `dependency_capability` (critical, born at L2)
+
+Filed by the scheduler (`agent_role='orchestrator-scheduler'`) when a dependency's
+`metadata.delivered_checks` entry has failed on `main` for `delivered_checks.grace_cycles` ticks.
+The record's task is the blocked DEPENDENT; the check belongs to the dependency named in
+`delivered_check_owner.task_id` (prose fallback and field meanings: the "Investigate before you
+`record`" bullet above). Two cases, with opposite responses (`docs/task-authoring.md` §3.3):
+
+1. **The capability is on main and the check is stale or mis-authored.** An `AUTHORING DIAGNOSIS`
+   block, or your own `git grep` at `main` finding the capability elsewhere, shows this. Editing a
+   gate descriptor is a human call: put it to Leo with the owner's sites as the apply target.
+2. **The capability is missing from main.** The gap is the owner's work. Put it to Leo with the
+   owner named; do not touch any descriptor.
+
+Once the check passes on main, resolve with `action='resume'` to re-pend the dependent. Other
+dependents of the same owner may hold their own records for the same check: one fix on the owner
+serves them all, so close each against the ruling.
 
 ### `design_concern` (info or blocking)
 

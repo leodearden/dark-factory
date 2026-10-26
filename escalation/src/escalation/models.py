@@ -126,7 +126,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +143,29 @@ class TrainState(TypedDict):
     order: int            # this task's position in the train (0-based)
     parked_members: list[str]  # sibling task_ids at merge-deferred, excluding self
     failing_member: str   # this task's id (the one that triggered BLOCKED)
+
+
+SidecarOnMain = Literal['declares', 'does_not_declare', 'unverified']
+
+
+class CheckSidecarSite(TypedDict):
+    """The owner's capability-manifest sidecar, as read at main when the escalation was filed."""
+
+    path: str  # shared.capability_manifest.sidecar_path(owner's metadata.prd_path), repo-relative
+    on_main: SidecarOnMain
+
+
+class DeliveredCheckOwner(TypedDict):
+    """Who declares a failing delivered check, and where (`dependency_capability`, task 7514).
+
+    `task_id` is the DEPENDENCY whose metadata.delivered_checks carries `check_name`;
+    the record's own task_id is the blocked dependent, which is only ever re-pended.
+    `sidecar` is None when the owner has no prd_path.
+    """
+
+    task_id: str
+    check_name: str
+    sidecar: CheckSidecarSite | None
 
 
 class IndexHealthState(TypedDict):
@@ -519,6 +542,12 @@ class Escalation:
     # _atomic_write / resolve / park / stamp_triage are field-agnostic
     # passthroughs that need no change.
     index_health: IndexHealthState | None = None
+    # Task 7514 — the dependency that declares the failing delivered check, for
+    # `dependency_capability` escalations filed by the harness.  None for every
+    # other escalation kind; legacy JSON (pre-field) deserialises to None via the
+    # from_dict __dataclass_fields__ filter — zero migration, same pattern as
+    # train_state / index_health above.
+    delivered_check_owner: DeliveredCheckOwner | None = None
     # C1 action chosen at resolve_issue time (resume/restart/park/abandon/close_only).
     # None for records resolved before α1 or for L2 cascade members (β derives theirs
     # from the parent via resolved_by='l2-cascade:<id>' attribution).

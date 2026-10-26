@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
 import errno
@@ -12,7 +11,6 @@ import itertools
 import json
 import logging
 import os
-import re
 import time
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -23,6 +21,7 @@ from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 
 from escalation.categories import EscalationCategory
 from escalation.classify import is_done_step_commit_orphan
+from escalation.models import DeliveredCheckOwner
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
 from shared.asyncio_tasks import abandon_task
@@ -57,8 +56,8 @@ from shared.transcript_archive import (
     set_archival_failure_hook,
 )
 
+from orchestrator import delivered_check_owner, recovery_pins, recut_ruling
 from orchestrator import digest as digest_mod
-from orchestrator import recovery_pins, recut_ruling
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -8405,58 +8404,8 @@ class Harness:
 
     # ── task 3500: authoring-defect diagnosis for a failed delivered check ──
 
-    #: Recovers the failed check's descriptor from the detail
-    #: ``scheduler._build_delivered_check_escalation`` renders. Parsing a
-    #: rendered string is not the shape anyone would choose — the descriptor
-    #: exists as a dict three frames up — but the ``on_delivered_check_block``
-    #: callback's signature is ``(task_id, *, summary, detail, category)`` and
-    #: widening it means editing ``scheduler.py``, which is outside task 3500's
-    #: lock scope. The coupling is filed as a follow-up; until then this is
-    #: deliberately total-or-nothing (any shape it does not recognise yields
-    #: None -> no diagnosis), and its only consumer is best-effort, so a format
-    #: drift costs the enhancement and never the escalation.
-    _DELIVERED_CHECK_DETAIL_RE = re.compile(
-        r"^Delivered check '(?P<name>[^']*)' \(kind=(?P<kind>[^)]*)\)", re.MULTILINE
-    )
-    _DELIVERED_CHECK_FIELD_RE = re.compile(
-        r'^(?P<key>pattern|paths|expect): (?P<value>.*)$', re.MULTILINE
-    )
-
-    @classmethod
-    def _parse_delivered_check_detail(cls, detail: str) -> dict | None:
-        """Recover ``{name, kind, pattern, expect, paths}`` from *detail*.
-
-        Returns None for anything it does not fully recognise — a grep check
-        without a pattern cannot be linted, and guessing at a half-parsed
-        descriptor would produce a diagnosis about a check nobody authored.
-        """
-        head = cls._DELIVERED_CHECK_DETAIL_RE.search(detail or '')
-        if head is None:
-            return None
-        fields = {
-            m.group('key'): m.group('value')
-            for m in cls._DELIVERED_CHECK_FIELD_RE.finditer(detail)
-        }
-        pattern = fields.get('pattern')
-        if not pattern or pattern == 'None':
-            return None
-        try:
-            # `paths` is rendered as a Python list repr by the escalation
-            # builder; literal_eval, never eval — this string reaches us from
-            # task metadata an agent authored.
-            paths = ast.literal_eval(fields.get('paths') or '[]')
-        except (ValueError, SyntaxError):
-            paths = []
-        return {
-            'name': head.group('name'),
-            'kind': head.group('kind'),
-            'pattern': pattern,
-            'expect': fields.get('expect'),
-            'paths': list(paths) if isinstance(paths, list) else [],
-        }
-
-    def _diagnose_delivered_check_authoring(self, detail: str) -> str | None:
-        """An ``AUTHORING DIAGNOSIS`` block for *detail*, or None if clean.
+    def _diagnose_delivered_check_authoring(self, check: Mapping[str, Any]) -> str | None:
+        """An ``AUTHORING DIAGNOSIS`` block for the failed *check*, or None if clean.
 
         THE POINT OF TASK 3500. ``DEP_CAPABILITY_NOT_DELIVERED`` reads
         identically whether the check is mis-authored or the capability
@@ -8466,7 +8415,8 @@ class Harness:
         actually reads the record.
 
         ONLY ``severity='reject'`` findings are surfaced, which in practice
-        means ``filename_shaped``. The exclusions are deliberate:
+        means ``filename_shaped``, ``removed_path`` and
+        ``shim_path``. The exclusions are deliberate:
 
         * The ``vacuous_*`` codes are unreachable on this path by
           construction — they fire on a check that PASSES, and we are here
@@ -8478,13 +8428,10 @@ class Harness:
           confident-sounding diagnosis built on data we do not have is worse
           than none, because the reader cannot tell it is unfounded.
         """
-        parsed = self._parse_delivered_check_detail(detail)
-        if parsed is None:
-            return None
         findings = [
             f
             for f in delivered_check_polarity.lint_delivered_checks(
-                [parsed],
+                [check],
                 files=None,
                 repo_root=self.config.project_root,
                 # The same tree the gate itself evaluated against, so the
@@ -8511,6 +8458,8 @@ class Harness:
         summary: str,
         detail: str,
         category: str,
+        check: Mapping[str, Any] | None = None,
+        owner: DeliveredCheckOwner | None = None,
     ) -> None:
         """Block a task and file a BORN-AT-L2 escalation for a delivered
         check that has FAILED for ``delivered_checks.grace_cycles``
@@ -8590,20 +8539,46 @@ class Harness:
         # nothing else. Runs AFTER the dedupe read so it can neither trigger a
         # second file nor change what the existing one matches on, and in a
         # worker thread because the lint shells out to git.
-        try:
-            diagnosis = await asyncio.to_thread(
-                self._diagnose_delivered_check_authoring, detail
+        diagnosis = None
+        if check is not None:
+            try:
+                diagnosis = await asyncio.to_thread(
+                    self._diagnose_delivered_check_authoring, check
+                )
+            except Exception:
+                logger.warning(
+                    'Delivered-check block for task %s — authoring diagnosis '
+                    'failed; filing the escalation undiagnosed',
+                    task_id,
+                    exc_info=True,
+                )
+
+        # Task 7514: resolve whether the owner's sidecar declares the check on
+        # main. Best-effort in the same way, and keeping the derived owner on
+        # failure so `task_id` is always present.
+        if owner is not None:
+            try:
+                owner = await asyncio.to_thread(
+                    delivered_check_owner.verify_check_owner,
+                    owner,
+                    project_root=self.config.project_root,
+                )
+            except Exception:
+                logger.warning(
+                    'Delivered-check block for task %s — owner sidecar '
+                    'verification failed; filing with the derived owner',
+                    task_id,
+                    exc_info=True,
+                )
+        detail = '\n'.join(
+            part
+            for part in (
+                detail,
+                diagnosis,
+                delivered_check_owner.render_check_owner(owner, dependent_id=task_id),
             )
-        except Exception:
-            logger.warning(
-                'Delivered-check block for task %s — authoring diagnosis '
-                'failed; filing the escalation undiagnosed',
-                task_id,
-                exc_info=True,
-            )
-            diagnosis = None
-        if diagnosis:
-            detail = f'{detail}\n{diagnosis}'
+            if part
+        )
 
         from escalation.models import Escalation
 
@@ -8615,12 +8590,13 @@ class Harness:
             category=category,
             # `summary` is deliberately UNTOUCHED: it is truncated to 200
             # chars and existing e2e tests assert its contents, so the
-            # diagnosis is additive to `detail` alone.
+            # diagnosis and the owner block are additive to `detail` alone.
             summary=summary[:200],
             detail=detail,
             suggested_action='manual_intervention',
             level=2,
             filing_claimant_run_id=self._filing_claimant_run_id,
+            delivered_check_owner=owner,
         )
         self._escalation_queue.submit(esc)
         logger.warning(
