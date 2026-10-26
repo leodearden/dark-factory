@@ -638,13 +638,14 @@ def mine(
         from .corpus import CorpusDiff
         from .mining import (
             FnCandidate,
-            assign_split,
             audit_corpus,
+            backfill_hand_authored,
             mine_escalation_refs,
             mine_fn_candidates,
             propose_labels_frontier,
             recover_diff,
             resolve_merge_sha_by_task_id,
+            save_corpus,
         )
 
         if not runs_db.is_file():
@@ -676,52 +677,9 @@ def mine(
         click.echo('=' * 60)
 
         def _resave() -> None:
-            """Persist manifest + adjudication log, re-deriving split + the
-            spot-check subset from the CURRENT full diff set. Synchronous (no
-            ``await`` inside) so it's safe to call from within a worker's
-            critical section -- called after every successfully-labeled
-            diff, so an interrupted run leaves a fully consistent, resumable
-            on-disk corpus as of the last save.
+            save_corpus(manifest, log, seed=seed, manifest_path=_CORPUS_PATH, log_path=_ADJUDICATION_LOG_PATH)
 
-            Spot-check subset membership is STICKY: a diff already flagged
-            ``in_spot_check_subset=True`` (or carrying a non-``'pending'``
-            ``spot_check_status`` -- i.e. a human has already acted on it) is
-            always kept, even though the deterministic even-spread sample
-            below runs over a larger ``mined_ids`` on every call as the
-            corpus grows. Only newly-sampled ids are added to grow the
-            subset toward the target fraction; prior human sign-off is never
-            silently dropped (see corpus/README.md's spot-check protocol)."""
-            log.grow_spot_check_subset(d.diff_id for d in manifest.diffs if d.source == 'mined')
-
-            assignment = assign_split([d.diff_id for d in manifest.diffs], seed=seed)
-            for d in manifest.diffs:
-                d.split = assignment.get(d.diff_id)
-            manifest.split_seed = seed
-
-            manifest.save(_CORPUS_PATH)
-            log.save(_ADJUDICATION_LOG_PATH)
-
-        # Backfill adjudication coverage for pre-existing hand-authored diffs
-        # (never fabricated as "frontier" -- logged with their own original
-        # ground truth, tagged with a frontier_model that names them as
-        # hand-authored so the provenance is honest).
-        logged_ids = {e.diff_id for e in log.entries}
-        backfilled = 0
-        for diff in manifest.diffs:
-            if diff.diff_id in logged_ids or diff.source == 'mined':
-                continue
-            log.append(
-                diff.diff_id,
-                frontier_proposal=diff.ground_truth,
-                in_spot_check_subset=False,
-                frontier_model='hand-authored',
-                notes=(
-                    'Pre-existing hand-authored ground truth from the original '
-                    '15-diff corpus (predates task 2495 FN mining); not frontier-proposed.'
-                ),
-            )
-            logged_ids.add(diff.diff_id)
-            backfilled += 1
+        backfilled = backfill_hand_authored(manifest, log)
         if backfilled:
             click.echo(f'  Backfilled {backfilled} adjudication entries for pre-existing hand-authored diffs.')
             _resave()

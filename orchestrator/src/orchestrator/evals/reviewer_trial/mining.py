@@ -285,6 +285,55 @@ def assign_split(
     return assignment
 
 
+def backfill_hand_authored(manifest: CorpusManifest, log: AdjudicationLog) -> int:
+    """Log every hand-authored diff that has no entry yet; return how many were added.
+
+    Each is logged with its own ground truth and ``frontier_model='hand-authored'``,
+    never presented as a frontier proposal.
+    """
+    logged_ids = {e.diff_id for e in log.entries}
+    added = 0
+    for diff in manifest.diffs:
+        if diff.diff_id in logged_ids or diff.source == 'mined':
+            continue
+        log.append(
+            diff.diff_id,
+            frontier_proposal=diff.ground_truth,
+            in_spot_check_subset=False,
+            frontier_model='hand-authored',
+            notes=(
+                'Pre-existing hand-authored ground truth from the original '
+                '15-diff corpus (predates task 2495 FN mining); not frontier-proposed.'
+            ),
+        )
+        logged_ids.add(diff.diff_id)
+        added += 1
+    return added
+
+
+def save_corpus(
+    manifest: CorpusManifest,
+    log: AdjudicationLog,
+    *,
+    seed: str,
+    manifest_path: Path,
+    log_path: Path,
+) -> None:
+    """Grow the spot-check subset over the mined diffs, re-split every diff under *seed*, and save both.
+
+    Synchronous, so it is safe inside a worker's critical section; ``mine``
+    calls it after every labelled diff so an interrupted run leaves a
+    resumable corpus.
+    """
+    log.grow_spot_check_subset(d.diff_id for d in manifest.diffs if d.source == 'mined')
+    assignment = assign_split([d.diff_id for d in manifest.diffs], seed=seed)
+    for diff in manifest.diffs:
+        diff.split = assignment.get(diff.diff_id)
+    manifest.split_seed = seed
+    manifest.save(manifest_path)
+    log.save(log_path)
+
+
 # Schema for the frontier label-proposal LLM output — mirrors scorer._MATCH_SCHEMA's
 # invoke_agent pattern but proposes NEW issues rather than matching existing ones.
 # Deliberately omits "id": ids are synthesized by propose_labels_frontier itself
