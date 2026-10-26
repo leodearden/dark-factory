@@ -49,7 +49,10 @@ from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
 )
-from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
+from fused_memory.memory_metadata import (
+    SUPERSEDED_BY_METADATA_KEY,
+    TRIAGE_CONTESTED_METADATA_KEY,
+)
 from fused_memory.middleware.deferral_gate import StatusWriteScope
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
@@ -199,6 +202,7 @@ from fused_memory.server.write_triage import (
     TriageFailOpenCounter,
     attach_write_landed,
     declares_attach_keys,
+    declares_supersession,
     emit_triage_fail_open_storm_escalation,
     resolve_write_triage_enabled,
     triage_write,
@@ -234,6 +238,7 @@ from fused_memory.services.read_telemetry import (
     summarize_search_query,
     summarize_search_results,
 )
+from fused_memory.services.supersession_mark import mark_superseded
 from fused_memory.utils.clip_disclosure import truncation_fields
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
@@ -3597,6 +3602,13 @@ def create_mcp_server(
         overwrite. No agent class is force-stored (task 3134).
         Your own classification of a record is not triage's to replace.
 
+        To correct a memory, write the correction as a new memory with
+        ``metadata={'supersedes': [<id>]}``: it is always stored standalone
+        (never attached under the record it replaces), and each superseded
+        record is marked with ``metadata.x_superseded_by=<the new id>``, which
+        ``search`` and ``get_memory_by_id`` return, briefings render as
+        ``superseded by <id>``, and the ack's ``supersession`` key reports.
+
         Optionally DECLARE what the memory is about with `entities`. A
         declaration outranks the referents scanned out of the content, so it is
         how you correct a body whose prose names a task ambiguously or not at
@@ -3825,6 +3837,7 @@ def create_mcp_server(
         # for why ANY `kind` counts (not just the child kinds) and what that
         # costs in coverage.
         caller_owns_attach_keys = declares_attach_keys(metadata)
+        caller_declares_supersession = declares_supersession(metadata)
         # Write triage (task 3127, PRD leaf beta) SUPERSEDES the two reject
         # guards below rather than layering on top of them (D2: redirect
         # supersedes reject). The two paths are mutually exclusive: when triage
@@ -3856,12 +3869,13 @@ def create_mcp_server(
                 # transport error, timeout and unparseable output, and that
                 # `except` arm counts it and returns `stored`.
                 judge=judge_write,
-                # Both predicates are already derived above, from the metadata
+                # The predicates are already derived above, from the metadata
                 # and agent_id this body holds. Passed IN rather than
                 # recomputed inside triage_write: a second derivation is a
                 # second place for the two to disagree about who is exempt.
                 allow_near_duplicate=allow_near_duplicate,
                 caller_owns_attach_keys=caller_owns_attach_keys,
+                caller_declares_supersession=caller_declares_supersession,
             )
         # DEFERRED, DELIBERATELY: the topic-cluster signal contributes nothing
         # to triage routing in this leaf. The PRD's band rule (§Bands) is
@@ -4027,6 +4041,8 @@ def create_mcp_server(
             # Only the contested attach below may write this, so no caller can
             # make a hand-declared contest look triage-written.
             cleaned_meta.pop(TRIAGE_CONTESTED_METADATA_KEY, None)
+            # Only services/supersession_mark.py::mark_superseded may write this.
+            cleaned_meta.pop(SUPERSEDED_BY_METADATA_KEY, None)
         # An ATTACH outcome reroutes this same write into a child of the memory
         # it restates: same content, same category, same agent, plus the parent
         # link. It does NOT touch the canonical — triage issues no
@@ -4214,7 +4230,21 @@ def create_mcp_server(
             )
             _triage_fail_open_counter.record(project=project_id)
             attached_to = None
+        # Marks each record this write supersedes, now that the new id exists.
+        # Not a triage event; see services/supersession_mark.py.
+        supersession = await mark_superseded(
+            memory_service,
+            metadata=metadata,
+            written=result,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            source=source,
+        )
         ack = result.model_dump()
+        if supersession is not None:
+            ack.update(supersession.to_ack())
         if unverified_flag is not None:
             ack[UNVERIFIED_CLAIM_TAG] = _report_unverified_claims(
                 unverified_flag, agent_id, project_id,
