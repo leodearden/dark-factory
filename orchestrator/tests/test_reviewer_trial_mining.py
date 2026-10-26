@@ -24,7 +24,6 @@ from shared.cli_invoke import AgentResult
 
 from orchestrator.evals.reviewer_trial.__main__ import (
     _infer_language,
-    _select_spot_check_subset,
     cli,
 )
 from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
@@ -513,61 +512,6 @@ class TestAuditCorpus:
 
         assert report.ok is False
         assert 'spot_check_subset_empty' in report.failures
-
-
-class TestSelectSpotCheckSubset:
-    """``__main__._select_spot_check_subset`` -- deterministic, evenly-spread
-    spot-check sampling with a floor and sticky (grow-only) membership.
-
-    Colocated here (rather than in test_reviewer_trial_main.py) because
-    these are CLI helpers that back the `mine` pipeline machinery this file
-    already tests end to end."""
-
-    def test_empty_input_returns_empty_set(self) -> None:
-        assert _select_spot_check_subset([]) == set()
-
-    def test_below_minimum_floor_selects_everything(self) -> None:
-        # n=3 < minimum=5 -> k is capped at n (not padded past the pool size).
-        diff_ids = ['a', 'b', 'c']
-        result = _select_spot_check_subset(diff_ids, minimum=5)
-        assert result == {'a', 'b', 'c'}
-
-    def test_fraction_rounds_to_target_size(self) -> None:
-        diff_ids = [f'd{i:03d}' for i in range(100)]
-        result = _select_spot_check_subset(diff_ids, fraction=0.1, minimum=5)
-        assert len(result) == 10
-
-    def test_deterministic_across_calls_and_input_order(self) -> None:
-        diff_ids = [f'd{i:03d}' for i in range(37)]
-        first = _select_spot_check_subset(diff_ids)
-        reordered = _select_spot_check_subset(list(reversed(diff_ids)))
-        again = _select_spot_check_subset(diff_ids)
-        assert first == reordered == again
-
-    def test_sticky_ids_survive_even_when_sampling_would_drop_them(self) -> None:
-        """A diff flagged in a smaller corpus must stay flagged after the
-        corpus grows, even though the deterministic even-spread sample over
-        the larger id set no longer lands on it -- this is the bug the
-        `sticky` param fixes: prior human sign-off silently disappearing on
-        a later `mine` resave."""
-        small = [f'd{i:02d}' for i in range(10)]
-        prior_subset = _select_spot_check_subset(small)
-        assert prior_subset == {'d00', 'd02', 'd04', 'd06', 'd08'}
-
-        grown = [f'd{i:02d}' for i in range(40)]
-        naive = _select_spot_check_subset(grown)  # no sticky: simulates the pre-fix bug
-        assert not prior_subset <= naive, 'test premise: naive resample must drop some prior ids'
-
-        result = _select_spot_check_subset(grown, sticky=prior_subset)
-        assert prior_subset <= result, 'sticky ids must never be dropped'
-        assert result - prior_subset, 'new ids should still be sampled to grow the subset'
-
-    def test_sticky_ids_no_longer_in_corpus_are_dropped(self) -> None:
-        """A sticky id that no longer exists in diff_ids (e.g. removed from
-        the corpus) must not leak into the result."""
-        diff_ids = ['a', 'b', 'c']
-        result = _select_spot_check_subset(diff_ids, sticky={'zzz-not-present'})
-        assert 'zzz-not-present' not in result
 
 
 class TestInferLanguage:
