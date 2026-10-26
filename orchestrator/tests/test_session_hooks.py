@@ -3828,7 +3828,7 @@ def test_refresh_path_reads_the_written_record_exactly_once(
         assert record.question is not None and record.question.text == 'may I proceed?'
 
 
-def test_hand_launched_refresh_reads_the_written_record_exactly_once(
+def test_hand_launched_refresh_writes_the_body_its_decision_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     hook_input = {'session_id': 'sess-hand', 'cwd': '/home/leo/src/dark-factory'}
@@ -3838,7 +3838,9 @@ def test_hand_launched_refresh_reads_the_written_record_exactly_once(
 
     sh.run_stop(hook_input, {}, root=tmp_path)
 
-    assert io.reads_of(slug) == 1
+    # Read 1 is the session-id pointer's vouch; read 2 is the one the decision and the write share.
+    assert io.reads_of(slug) == 2
+    assert [written.cwd for written in io.writes] == ['read-2']
     assert sr.read_record(slug, root=tmp_path).status is sr.Status.IDLE
 
 
@@ -4297,3 +4299,249 @@ def test_notification_takes_no_self_exit_decision(tmp_path: Path) -> None:
     assert record.status is sr.Status.AWAITING_INPUT
     assert record.exit_request is None
     assert marker.exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 7489: pointer keying -- a session with no CLAUDE_SPAWN_SESSION_ID (a
+# T3-hosted one) reaches its record through sessions-by-claude-id, then
+# sessions-by-pid, before the hand-launched keying.
+# ---------------------------------------------------------------------------
+
+_T3_CWD = '/home/leo/src/dark-factory'
+_T3_SLUG = 'session-dark-factory-7489001'
+_T3_OWNER = 7_489_101
+_NESTED = 7_489_202
+
+
+def _write_t3_record(
+    tmp_path: Path,
+    *,
+    session_id: str,
+    status: sr.Status = sr.Status.RUNNING,
+    owner_pid: int = _T3_OWNER,
+) -> None:
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=_T3_SLUG,
+            status=status,
+            title='t3 child',
+            cwd=_T3_CWD,
+            launcher_pid=7_489_900,
+            display=sr.Display(kind=sr.DisplayKind.T3.value, t3_thread_id='thread-7489'),
+            claude_session_id=session_id,
+            claude_launch_session_id=session_id,
+            claude_owner_pid=owner_pid,
+        ),
+        root=tmp_path,
+    )
+    sr.write_claude_session_pointer(session_id, _T3_SLUG, root=tmp_path)
+    sr.write_session_pointer(owner_pid, _T3_SLUG, root=tmp_path)
+
+
+def _reaped_pid() -> int:
+    child = subprocess.Popen(['true'])
+    child.wait()
+    return child.pid
+
+
+def _hand_slug(session_id: str, tmp_path: Path) -> str:
+    """The hand-launched keying's slug: what the hooks resolve against a registry with no pointers."""
+    return sh.hook_session_slug(
+        _t3_event(session_id),
+        {},
+        root=tmp_path / 'pointerless-fleet',
+        process_tree=claude_process_tree(None),
+    )
+
+
+def _session_slugs(tmp_path: Path) -> set[str]:
+    return {path.name for path in sr.sessions_dir(root=tmp_path).iterdir()}
+
+
+def _t3_event(session_id: str, **extra: str) -> dict[str, str]:
+    return {'session_id': session_id, 'cwd': _T3_CWD, **extra}
+
+
+@pytest.mark.parametrize(
+    ('handler', 'expected'),
+    [
+        (sh.run_session_start, sr.Status.RUNNING),
+        (sh.run_notification, sr.Status.AWAITING_INPUT),
+        (sh.run_stop, sr.Status.IDLE),
+    ],
+)
+def test_session_id_pointer_resolves_every_event_onto_the_t3_record(
+    tmp_path: Path,
+    handler: Callable[..., object],
+    expected: sr.Status,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3', status=sr.Status.LAUNCHING)
+
+    handler(_t3_event('sid-t3'), {}, root=tmp_path, process_tree=claude_process_tree(_T3_OWNER))
+
+    record = sr.read_record(_T3_SLUG, root=tmp_path)
+    assert record.status is expected
+    assert record.display is not None and record.display.kind == sr.DisplayKind.T3.value
+    assert _session_slugs(tmp_path) == {_T3_SLUG}
+
+
+def test_session_start_keeps_the_t3_display_over_an_inherited_tmux_env(tmp_path: Path) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3')
+
+    sh.run_session_start(
+        _t3_event('sid-t3'),
+        {'TMUX': '/tmp/tmux-1000/default,1,0', 'TMUX_PANE': '%3'},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_OWNER),
+    )
+
+    display = sr.read_record(_T3_SLUG, root=tmp_path).display
+    assert display is not None
+    assert (display.kind, display.t3_thread_id) == (sr.DisplayKind.T3.value, 'thread-7489')
+
+
+def test_a_session_id_pointer_the_record_no_longer_vouches_for_falls_through(
+    tmp_path: Path,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-current')
+    sr.write_claude_session_pointer('sid-stale', _T3_SLUG, root=tmp_path)
+
+    sh.run_notification(
+        _t3_event('sid-stale'), {}, root=tmp_path, process_tree=claude_process_tree(_T3_OWNER)
+    )
+
+    t3 = sr.read_record(_T3_SLUG, root=tmp_path)
+    assert (t3.status, t3.claude_session_id) == (sr.Status.RUNNING, 'sid-current')
+    assert _session_slugs(tmp_path) == {_T3_SLUG, _hand_slug('sid-stale', tmp_path)}
+
+
+@pytest.mark.parametrize('source', ['clear', 'compact'])
+def test_pid_pointer_rebinds_the_t3_record_on_a_remint(tmp_path: Path, source: str) -> None:
+    _write_t3_record(tmp_path, session_id='sid-before')
+
+    sh.run_session_start(
+        _t3_event('sid-after', source=source),
+        {},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_OWNER),
+    )
+
+    record = sr.read_record(_T3_SLUG, root=tmp_path)
+    assert record.claude_session_id == 'sid-after'
+    assert record.claude_launch_session_id == 'sid-before'
+    assert record.claude_owner_pid == _T3_OWNER
+    assert sr.resolve_session_slug_for_claude_session_id('sid-after', root=tmp_path) == _T3_SLUG
+    assert sr.resolve_session_slug_for_pid(_T3_OWNER, root=tmp_path) == _T3_SLUG
+    assert _session_slugs(tmp_path) == {_T3_SLUG}
+
+
+@pytest.mark.parametrize('source', ['startup', 'resume'])
+def test_pid_pointer_does_not_rebind_the_t3_record_on_a_plain_session_start(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-before')
+
+    sh.run_session_start(
+        _t3_event('sid-new', source=source),
+        {},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_OWNER),
+    )
+
+    assert sr.read_record(_T3_SLUG, root=tmp_path).claude_session_id == 'sid-before'
+    assert _session_slugs(tmp_path) == {_T3_SLUG, _hand_slug('sid-new', tmp_path)}
+
+
+def test_a_nested_claude_cannot_capture_the_t3_record(tmp_path: Path) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3')
+    nested = claude_process_tree(_NESTED, _T3_OWNER)
+
+    sh.run_session_start(_t3_event('sid-nested', source='resume'), {}, root=tmp_path, process_tree=nested)
+    sh.run_session_start(_t3_event('sid-nested-2', source='compact'), {}, root=tmp_path, process_tree=nested)
+    sh.run_stop(_t3_event('sid-nested-2'), {}, root=tmp_path, process_tree=nested)
+
+    t3 = sr.read_record(_T3_SLUG, root=tmp_path)
+    assert (t3.status, t3.claude_session_id, t3.claude_owner_pid) == (
+        sr.Status.RUNNING,
+        'sid-t3',
+        _T3_OWNER,
+    )
+    assert sr.resolve_session_slug_for_pid(_T3_OWNER, root=tmp_path) == _T3_SLUG
+    assert _session_slugs(tmp_path) == {_T3_SLUG, _hand_slug('sid-nested', tmp_path)}
+
+
+def test_an_env_slug_binding_writes_a_session_id_pointer(tmp_path: Path) -> None:
+    slug = 'session-cockpit-7489300'
+    sr.write_record(
+        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=7_489_300),
+        root=tmp_path,
+    )
+
+    sh.run_session_start(
+        _t3_event('sid-env'),
+        _owner_ppid_env(slug, 7_489_310),
+        root=tmp_path,
+        process_tree=claude_process_tree(7_489_311, 7_489_310),
+    )
+
+    assert sr.resolve_session_slug_for_claude_session_id('sid-env', root=tmp_path) == slug
+
+
+def test_a_hand_launched_record_carries_its_owner_pid_and_both_pointers(tmp_path: Path) -> None:
+    record = sh.run_session_start(
+        _t3_event('sid-hand'), {}, root=tmp_path, process_tree=claude_process_tree(7_489_401)
+    )
+
+    assert record.session_slug == _hand_slug('sid-hand', tmp_path)
+    assert record.claude_owner_pid == 7_489_401
+    assert sr.resolve_session_slug_for_pid(7_489_401, root=tmp_path) == record.session_slug
+    assert sr.resolve_session_slug_for_claude_session_id('sid-hand', root=tmp_path) == record.session_slug
+
+
+def test_a_hand_launched_clear_keeps_the_session_on_its_record(tmp_path: Path) -> None:
+    tree = claude_process_tree(7_489_501)
+    sh.run_session_start(_t3_event('sid-first'), {}, root=tmp_path, process_tree=tree)
+
+    sh.run_session_start(_t3_event('sid-second', source='clear'), {}, root=tmp_path, process_tree=tree)
+    sh.run_stop(_t3_event('sid-second'), {}, root=tmp_path, process_tree=tree)
+
+    record = sr.read_record(_hand_slug('sid-first', tmp_path), root=tmp_path)
+    assert (record.status, record.claude_session_id) == (sr.Status.IDLE, 'sid-second')
+    assert _session_slugs(tmp_path) == {_hand_slug('sid-first', tmp_path)}
+
+
+_T3_RESUMED = 7_489_102
+
+
+def test_a_resume_in_a_new_process_reclaims_a_dead_owner_then_rebinds_on_compact(
+    tmp_path: Path,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3', owner_pid=_reaped_pid())
+    resumed = claude_process_tree(_T3_RESUMED)
+
+    sh.run_session_start(_t3_event('sid-t3', source='resume'), {}, root=tmp_path, process_tree=resumed)
+
+    assert sr.read_record(_T3_SLUG, root=tmp_path).claude_owner_pid == _T3_RESUMED
+    assert sr.resolve_session_slug_for_pid(_T3_RESUMED, root=tmp_path) == _T3_SLUG
+
+    sh.run_session_start(_t3_event('sid-compacted', source='compact'), {}, root=tmp_path, process_tree=resumed)
+
+    assert sr.read_record(_T3_SLUG, root=tmp_path).claude_session_id == 'sid-compacted'
+    assert _session_slugs(tmp_path) == {_T3_SLUG}
+
+
+def test_a_same_session_id_from_a_new_process_leaves_a_live_owner_in_place(
+    tmp_path: Path,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3', owner_pid=os.getpid())
+
+    sh.run_session_start(
+        _t3_event('sid-t3', source='resume'),
+        {},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_RESUMED, os.getpid()),
+    )
+
+    assert sr.read_record(_T3_SLUG, root=tmp_path).claude_owner_pid == os.getpid()
+    assert sr.resolve_session_slug_for_pid(_T3_RESUMED, root=tmp_path) is None

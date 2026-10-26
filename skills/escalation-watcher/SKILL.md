@@ -24,15 +24,20 @@ Before starting, verify these are in place. If anything is missing, ask the user
 
 Terminal discovery for spawned `/unblock` sessions is handled lazily by the `/spawn` skill — no setup is required here.
 
-## Launching this watcher (default lane: tmux)
+## Launching this watcher
 
-This is a long-running loop session (PRD `plans/fleet-cockpit-prd.md` §3 fork 1) — launch it in
-the crash-survivable, reattachable **tmux lane** by default: spawn with `CLAUDE_SPAWN_BACKEND=tmux`
-(see `skills/spawn/spawn-claude.sh`'s header) so the session gets a `display.kind=tmux`
-session-registry record and a `tmux attach`-reattachable window whose record persists across a
-crash. Interactive one-off skills this watcher spawns (e.g. `/unblock` sessions) stay as ordinary
-WM terminal windows, unchanged. tmux stays the default; running in the foreground instead is a
-self-operation, decided without asking (see "Self-operations need no permission").
+This is a long-running loop session (PRD `plans/fleet-cockpit-prd.md` §3 fork 1). The operator runs
+it as a **T3 Code thread** — a hosted session, so no `CLAUDE_SPAWN_BACKEND` is needed. Launched from
+a plain terminal instead, use the crash-survivable, reattachable **tmux lane**: spawn with
+`CLAUDE_SPAWN_BACKEND=tmux` (see `skills/spawn/spawn-claude.sh`'s header) so the session gets a
+`display.kind=tmux` session-registry record and a `tmux attach`-reattachable window whose record
+persists across a crash. Interactive one-off skills this watcher spawns (e.g. `/unblock` sessions)
+follow the spawner's lane under `CLAUDE_SPAWN_BACKEND=auto`: from a T3-hosted watcher they appear as
+T3 threads in the project's sidebar, from a terminal-launched one as ordinary WM terminal windows.
+Joining a spawn is the same on either lane — read its `result.md` (see "Joining a completed
+spawn: read `result.md`, don't explore"); on the t3 lane the spawn script's background task ends on
+the result file or an archived thread, never on a process exit. Running in the foreground instead
+is a self-operation, decided without asking (see "Self-operations need no permission").
 
 ## Claiming the Watcher Lease (single-owner-per-role)
 
@@ -337,8 +342,8 @@ of the self-execute tier, so report them the way that tier says.
   timeout contract in "Starting the watcher".
 - Releasing the lease on an announced reboot, which is a stop (see "Stopping").
 - Writing and reading handovers.
-- Running in the tmux lane or in the foreground of the terminal you were started in (see
-  "Launching this watcher (default lane: tmux)").
+- Running as a T3 thread, in the tmux lane, or in the foreground of the terminal you were started in
+  (see "Launching this watcher").
 
 Still forbidden, and not a self-operation: forcing a lease takeover on a pid probe, whether by
 `--force` or by treating `holder_liveness=orphaned` as yours. "Claiming the Watcher Lease
@@ -807,7 +812,7 @@ ready to discuss.
   conversation un-interleaved and out of this session's context, which is reserved for system
   supervision. The category handlers' interactive `/unblock` spawns below are this case.
 - If it ends in a single report and a single ruling, use a sub-agent (the `Agent` tool) and deliver
-  its result into this session. That means fewer terminals; Leo has run more than 15 at once.
+  its result into this session. That means fewer interactive sessions; Leo has run more than 15 at once.
 
 Join a completed spawn per "Joining a completed spawn: read `result.md`, don't explore".
 
@@ -1185,8 +1190,8 @@ switches on and off. Three behavioural shifts:
    half-merged or destructive state. The Priority Hierarchy bar still holds: better to defer than to
    bake in a bad decision — when in real doubt, fall back to "leave pending + digest."
 
-2. **Don't spawn unattended terminals.** The interactive `/spawn` → `/unblock` path needs a human at
-   a terminal; while AFK those sit idle and the task stays blocked anyway. So in AFK mode:
+2. **Don't spawn unattended interactive sessions.** The interactive `/spawn` → `/unblock` path needs a human
+   in the session; while AFK those sit idle and the task stays blocked anyway. So in AFK mode:
    - **`task_failure` / `review_issues`:** run the **low-risk auto-unblock gate** first (see the
      [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) subsection for the full
      gate procedure and applicability rule). If the gate does not launch (abort / over-cap /
@@ -1194,7 +1199,7 @@ switches on and off. Three behavioural shifts:
      it to the digest — do NOT spawn an interactive `/unblock`.
    - **`wip_conflict` / `unmerged_state` / `stash_failed` / `dependency_discovered`-with-no-task / `design_concern` /
      `risk_identified` / `infra_issue` / `recon_*`:** leave pending + digest. These need a human;
-     a terminal nobody attends just clutters. Append `<esc-id>` to the wrapper-owned exclude-file
+     a session nobody attends just clutters. Append `<esc-id>` to the wrapper-owned exclude-file
      (see "Starting the watcher" above) for each item left pending so the initial scan does not
      busy-loop on it.
    - Either way, also **file a DecisionRecord via `write-decision`** (see "Filing Parked Decisions
@@ -1224,10 +1229,10 @@ wake, compare against that file, not against a time you remember: a compaction c
 context. A quiet queue still wakes you once per slice (the Bash-tool timeout contract in "Starting
 the watcher"), so the switch lags the 4-hour mark by at most one slice.
 
-**What changes.** The three shifts above: defer, don't wedge; no unattended interactive terminals;
+**What changes.** The three shifts above: defer, don't wedge; no unattended interactive sessions;
 a DecisionRecord and the brief instead of per-item pings. The 3b reminder cadence also stops.
 
-**What keeps running.** Pre-investigation sub-agents are not terminals. Keep launching the
+**What keeps running.** Pre-investigation sub-agents are not interactive sessions. Keep launching the
 ownership and in-flight checks of "Investigate before you `record`" and the H1–H3 and H6 seats of
 "Disposition before briefing (H1–H6)", so items are ready to brief on return. A `/spawn` for a
 multi-turn conversation with Leo (see "Sub-agent or `/spawn`") waits for his return; meanwhile a
