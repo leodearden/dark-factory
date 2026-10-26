@@ -3708,6 +3708,7 @@ def _trivial_pass(reason: str) -> 'VerifyResult':
         timed_out=False,
         cause_hint='',
         trivial=True,
+        units=(),
     )
 
 
@@ -3757,6 +3758,7 @@ def _merge_no_evidence_fail(reason: str) -> 'VerifyResult':
         cause_hint=f'{_MERGE_NO_EVIDENCE_CATEGORY}:{reason}',
         category=_MERGE_NO_EVIDENCE_CATEGORY,
         trivial=False,
+        units=(),
     )
 
 
@@ -4730,6 +4732,11 @@ class VerifyResult:
     # no gated leg ran. compare=False because the stamps are wall clock, as for
     # ``duration_secs``.
     admission_legs: tuple[AdmissionLeg, ...] | None = field(default=None, compare=False)
+    # Task 5651: one unit per leg that ran (verify_evidence.py::VerifyUnit). None =
+    # not recorded (an older remote, hand-built results, sentinels); () = nothing ran.
+    units: tuple[verify_evidence.VerifyUnit, ...] | None = None
+    # Task 5651: a plan-level fact like `plan`, stamped where `plan` is stamped.
+    cache_mode: verify_evidence.CacheMode = verify_evidence.CacheMode.OFF
 
     def __post_init__(self) -> None:
         mismatch = _module_attribution_mismatch(
@@ -4742,6 +4749,9 @@ class VerifyResult:
             )
         if self.admission_legs is not None:
             self.admission_legs = legs_from_wire(self.admission_legs)
+        if self.units is not None:
+            self.units = verify_evidence.units_from_wire(self.units)
+        self.cache_mode = verify_evidence.CacheMode(self.cache_mode)
 
     @property
     def plan_hash(self) -> str | None:
@@ -8002,6 +8012,10 @@ async def run_verification(
             if attempt.test.event_channel is not None else None
         ),
         admission_legs=tuple(run.admission for run in test_runs if run.admission is not None) or None,
+        units=tuple(
+            verify_evidence.module_leg_unit(module_prefix, check.label, check.rc)
+            for check in attempt.checks if check.cmd is not None
+        ),
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -8061,6 +8075,13 @@ def _aggregate_run_all_failed_members(results: list[VerifyResult]) -> list[str] 
     if not carried:
         return None
     return list(carried[0]) if len(carried) == 1 else []
+
+
+def _aggregate_units(results: list[VerifyResult]) -> tuple[verify_evidence.VerifyUnit, ...] | None:
+    # Fail closed: a partial list would read as a module whose legs never ran.
+    if any(r.units is None for r in results):
+        return None
+    return tuple(unit for r in results for unit in r.units or ())
 
 
 def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
@@ -8193,6 +8214,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         run_all_failed_members=_aggregate_run_all_failed_members(results),
         test_leg_failed=any(r.test_leg_failed for r in results),
         admission_legs=tuple(leg for r in results for leg in (r.admission_legs or ())) or None,
+        units=_aggregate_units(results),
     )
 
 
