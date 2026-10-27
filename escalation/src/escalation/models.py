@@ -740,7 +740,8 @@ class Escalation:
     # `fused_memory/reconciliation/orphaned_recon_escalation_sweep.py::escalation_project_id`.
     # Zero migration by the same from_dict __dataclass_fields__ filter as
     # every field above.  Deliberately NOT added to
-    # `_COMPACT_ESCALATION_FIELDS` (server.py) — its readers load full records.
+    # `_COMPACT_ESCALATION_FIELDS` (server.py) — its readers load full records;
+    # the reasoning (task 5776, won't-fix) is recorded beside that tuple.
     project_id: str | None = None
     # NOTE TO FILE (plans/plan-deviation-recording-prd.md D2) — a filer-declared
     # record that requests nothing: never pending (EscalationQueue.submit), and

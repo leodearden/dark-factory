@@ -725,6 +725,30 @@ _COMPACT_ESCALATION_FIELDS = (
     # and giving absence a second, different meaning on a neighbouring key would
     # be exactly the legibility trap that contract exists to prevent.
     'pin_declared_by',
+    # project_id (task 4951) is DELIBERATELY NOT PROJECTED — decided in task 5776
+    # (won't-fix), so do not re-file it as an oversight.
+    #
+    # THE GAP IS REAL BUT NARROW: the reconciliation queue is shared across
+    # projects, so a compact row there cannot name its subject project.  An
+    # orchestrator queue is per-project (each endpoint serves one project), so
+    # for those the answer is already the endpoint itself.
+    #
+    # WHY IT IS NOT WORTH A KEY ON EVERY ROW: (1) the in-repo consumers
+    # (orphaned_recon_escalation_sweep.py::escalation_project_id and
+    # derive_orphaned_recon_escalations.py) read FULL records, so nothing needs
+    # it; (2) `None` means UNSTAMPED, and `attach_dedupe_child` never backfills a
+    # folded parent, so a parent filed before 4951 never gains it — a compact
+    # reader would see `null`, could not tell "legacy" from "no project", and
+    # would STILL need a get_escalation round-trip for exactly the records it
+    # cares about; (3) it costs ~20 bytes (`"project_id":null`) on
+    # EVERY compact row, including the dashboard's fetch_pins_recovery poll that
+    # reads nothing but `pins_recovery`, for a value that is null on the
+    # overwhelming majority.
+    #
+    # IF A PROJECT-SCOPED COMPACT DRAIN EVER EXISTS: add a server-side
+    # `project_id` filter to get_pending_escalations (one filtered value per
+    # call, no per-row cost) rather than widening this tuple — and note that no
+    # such filter exists today.
 )
 
 # get_pending_escalations(compact=True) additionally keeps its computed
