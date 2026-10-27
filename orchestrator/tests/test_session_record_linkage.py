@@ -551,7 +551,72 @@ class TestRefreshEventsStampPointer:
         assert sr.resolve_session_slug_for_pid(spawner_pid, root=tmp_path) == spawner_slug
 
 
-_T0 = datetime(2026, 9, 25, 12, 0, 0, tzinfo=UTC)
+_T3_SESSION_ID = 'sess-t3'
+_T3_HOOK_INPUT = {'session_id': _T3_SESSION_ID, 'cwd': _CWD}
+
+
+def _pre_pointer_record(root: Path, *, owner: int = _DEAD_PID) -> str:
+    """Seed a hand-launched record bound to ``_T3_SESSION_ID`` by an earlier *owner*, with no pointers."""
+    slug = sh.hook_session_slug(
+        _T3_HOOK_INPUT, {}, root=root, process_tree=claude_process_tree(None)
+    )
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.IDLE,
+            cwd=_CWD,
+            claude_session_id=_T3_SESSION_ID,
+            claude_owner_pid=owner,
+        ),
+        root=root,
+    )
+    return slug
+
+
+class TestResumedHandLaunchedSessionIsRelinked:
+    _RESUMED = 7_614_102
+
+    @pytest.mark.parametrize(
+        ('handler', 'hook_input'),
+        [
+            (sh.run_session_start, {**_T3_HOOK_INPUT, 'source': 'resume'}),
+            (sh.run_notification, _T3_HOOK_INPUT),
+            (sh.run_stop, _T3_HOOK_INPUT),
+        ],
+        ids=['session-start', 'notification', 'stop'],
+    )
+    def test_the_resumed_process_reclaims_the_dead_owner_and_gets_both_pointers(
+        self,
+        tmp_path: Path,
+        handler: Callable[..., object],
+        hook_input: Mapping[str, object],
+    ) -> None:
+        slug = _pre_pointer_record(tmp_path)
+
+        handler(hook_input, {}, root=tmp_path, process_tree=claude_process_tree(self._RESUMED))
+
+        assert sr.read_record(slug, root=tmp_path).claude_owner_pid == self._RESUMED
+        assert sr.resolve_session_slug_for_pid(self._RESUMED, root=tmp_path) == slug
+        assert (
+            sr.resolve_session_slug_for_claude_session_id(_T3_SESSION_ID, root=tmp_path) == slug
+        )
+        assert [d.name for d in sr.sessions_dir(tmp_path).iterdir()] == [slug]
+
+    def test_a_live_recorded_owner_is_left_in_place(self, tmp_path: Path) -> None:
+        slug = _pre_pointer_record(tmp_path, owner=os.getpid())
+
+        sh.run_stop(
+            _T3_HOOK_INPUT,
+            {},
+            root=tmp_path,
+            process_tree=claude_process_tree(self._RESUMED, os.getpid()),
+        )
+
+        assert sr.read_record(slug, root=tmp_path).claude_owner_pid == os.getpid()
+        assert sr.resolve_session_slug_for_pid(self._RESUMED, root=tmp_path) is None
+
+
+_T0 =datetime(2026, 9, 25, 12, 0, 0, tzinfo=UTC)
 
 
 def _holder(*, pid: int = 0, record_slug: str = '', slug: str = 'watcher-df-1') -> sr.LeaseHolder:
@@ -1167,6 +1232,7 @@ def _set_claude_pid_with_an_unvouched_pointer(
 class TestWriteDecisionRecordSlug:
     _PID = 4_237_600
     _RESTARTED_PID = 4_237_700
+    _RESUMED = 7_614_700
     _ID = 'esc-4237-1'
     _FILED_ID = sr.qualify_decision_id('dark_factory', _ID)
 
@@ -1262,6 +1328,23 @@ class TestWriteDecisionRecordSlug:
 
         assert decision.linked_session_slug in sessions_by_slug
         assert decision.session_id not in sessions_by_slug
+
+    def test_a_resumed_hand_launched_watchers_decision_links_to_its_registry_record(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        slug = _pre_pointer_record(tmp_path)
+        sh.run_stop(
+            _T3_HOOK_INPUT, {}, root=tmp_path, process_tree=claude_process_tree(self._RESUMED)
+        )
+        monkeypatch.setenv('CLAUDE_PID', str(self._RESUMED))
+
+        _, decision = self._file(tmp_path, capsys, session_id=f'watcher-df-{self._RESUMED}')
+
+        assert decision.record_slug == slug
+        assert decision.linked_session_slug in _registry(tmp_path)
 
     def test_a_cross_queue_filing_fills_a_blank_record_slug(
         self,
