@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -46,9 +47,10 @@ class _SessionAwareHandler:
       cannot bound, and the one that used to wedge a cached session or park an
       aggregating loop before it reached the remaining urls.
 
-    ``tool_reply`` is the framing knob: the ``tools/call`` answer returned
-    verbatim (an SSE-framed or malformed reply) in place of the default
-    JSON-framed ``tool_response``.
+    ``make_raw_tool_response`` is the framing knob: a factory for a finished
+    ``httpx.Response`` (an SSE-framed or malformed reply), called afresh on
+    every ``tools/call`` and returned verbatim in place of wrapping the
+    ``tool_response`` dict in the default JSON envelope.
 
     ``__call__`` is ``async`` for the sake of that last knob:
     ``httpx.MockTransport.handle_async_request`` awaits a handler that returns
@@ -61,9 +63,9 @@ class _SessionAwareHandler:
                  error_on_tool: Exception | None = None, error_on_all: Exception | None = None,
                  fail_port: int | None = None,
                  hang_port: int | None = None, hang_always: bool = False,
-                 tool_reply: httpx.Response | None = None):
+                 make_raw_tool_response: Callable[[], httpx.Response] | None = None):
         self.tool_response = tool_response or {}
-        self.tool_reply = tool_reply
+        self.make_raw_tool_response = make_raw_tool_response
         self.error_status = error_status
         self.error_on_tool = error_on_tool
         self.error_on_all = error_on_all
@@ -123,8 +125,8 @@ class _SessionAwareHandler:
             # session cache-able — and therefore wedge-able.
             await self._never.wait()
             raise AssertionError('unreachable')  # pragma: no cover
-        if self.tool_reply is not None:
-            return self.tool_reply
+        if self.make_raw_tool_response is not None:
+            return self.make_raw_tool_response()
         return mcp_tool_response(self.tool_response, request_id)
 
 
@@ -690,7 +692,9 @@ class TestSseResponseParsing:
     async def test_sse_framed_tool_reply_is_decoded(self):
         from dashboard.data.memory import mcp_tool_call
 
-        handler = _SessionAwareHandler(tool_reply=mcp_sse_tool_response({'ok': True}))
+        handler = _SessionAwareHandler(
+            make_raw_tool_response=lambda: mcp_sse_tool_response({'ok': True}),
+        )
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             result = await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
 
@@ -699,7 +703,7 @@ class TestSseResponseParsing:
     async def test_sse_reply_without_a_data_line_raises_value_error(self):
         from dashboard.data.memory import mcp_tool_call
 
-        handler = _SessionAwareHandler(tool_reply=_sse_reply_without_a_data_line())
+        handler = _SessionAwareHandler(make_raw_tool_response=_sse_reply_without_a_data_line)
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             with pytest.raises(ValueError):
                 await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
@@ -708,7 +712,7 @@ class TestSseResponseParsing:
         """ValueError is a per-URL soft failure (``FANOUT_FAILURE_EXCEPTIONS``)."""
         from dashboard.data.memory import get_memory_status
 
-        handler = _SessionAwareHandler(tool_reply=_sse_reply_without_a_data_line())
+        handler = _SessionAwareHandler(make_raw_tool_response=_sse_reply_without_a_data_line)
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             result = await get_memory_status(client, dashboard_config)
 
