@@ -14,6 +14,7 @@ from typing import Any, Final, Literal
 from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
+from fused_memory.utils.clip_disclosure import elide_text
 
 
 class CuratorFailureError(RuntimeError):
@@ -405,24 +406,24 @@ def embedding_text(title: str, description: str, files_to_modify: list[str]) -> 
 
 
 def clip_for_prompt(text: str, cap: int) -> str:
-    """Clip *text* to *cap* characters, marking how much was elided.
+    """Clip *text* to *cap* characters for the curator prompt, marking how much was elided.
 
-    The single owner of truncate-and-mark for the curator prompt. Both sides
-    of that prompt route through it — the POOL side (:meth:`PoolEntry.render`)
-    and the CANDIDATE side (``task_curator.py::_render_candidate_section``,
-    which both the single and batch prompts use) — so the two cannot drift apart
-    (INV-5 ``no-lockstep-duplication``). They previously did: the pool side
-    appended a bare ``…`` while the candidate side clipped silently, so the
-    reading LLM could not tell a short description from a truncated one.
+    The counted marker is owned by ``utils/clip_disclosure.py::elide_text``;
+    this is the curator prompt's single route to it. Both sides of that prompt
+    route through here — the POOL side (:meth:`PoolEntry.render`) and the
+    CANDIDATE side (``task_curator.py::_render_candidate_section``, which both
+    the single and batch prompts use) — so the two cannot drift apart (INV-5
+    ``no-lockstep-duplication``). They previously did: the pool side appended a
+    bare ``…`` while the candidate side clipped silently, so the reading LLM
+    could not tell a short description from a truncated one. A clip at a
+    non-positive *cap* raises ``ValueError`` rather than rendering a marker.
 
     The elided COUNT is part of the marker because the size of the loss is
     what decides whether it mattered: "2 characters trimmed" and "1827
     characters of concrete file references gone" are not the same event, and
     1827 was the measured mean elision at the pre-2026-09-18 cap.
     """
-    if len(text) <= cap:
-        return text
-    return f'{text[:cap]}…[+{len(text) - cap} chars elided]'
+    return elide_text(text, cap, field='curator_prompt').text
 
 
 def is_combine_eligible_status(status: str) -> bool:
