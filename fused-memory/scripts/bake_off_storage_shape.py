@@ -2363,43 +2363,63 @@ def _protocol_fixture_paths(
     return [*base, DEFAULT_REGROWTH_INJECTION_PATH]
 
 
+def _git_stdout(args: list[str], cwd: Path) -> str | None:
+    """Stripped stdout of ``git <args>``, or ``None`` when git cannot answer.
+
+    ``None`` covers no git, no repo, a nonzero exit and an empty answer
+    alike.  Provenance that cannot be verified must not look verified, so a
+    stamp is either git's own answer or absent — never a guess.
+    """
+    import subprocess  # noqa: PLC0415
+
+    try:
+        completed = subprocess.run(
+            ['git', *args], cwd=str(cwd), capture_output=True, text=True,
+            timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
 def fixture_provenance(paths: list[str | Path]) -> list[dict[str, Any]]:
-    """Repo-relative path + last-touching commit for each fixture.
+    """Repo-relative path, content blob and last-touching commit per fixture.
 
     Git history IS the blind-authoring audit trail: the arm decomposition and
     query set were committed BEFORE any metric function existed in the tree,
-    and these SHAs are what lets a reader verify that rather than take it on
-    trust.
+    and these stamps are what lets a reader verify that rather than take it
+    on trust.
+
+    ``blob`` is the git object id of the bytes this run read (``git
+    hash-object``), so it is present for an untracked but readable file.  It
+    depends only on content, so a rebase cannot rewrite it, and ``git log
+    --find-object=<blob>`` names the commit(s) that introduced that content:
+    it is the verifiable identity.  ``commit`` is the commit that last touched
+    the path when the stamp was taken, kept for the audit trail; a rebase
+    rewrites it.
 
     Paths are reported repo-relative (``fused-memory/tests/fixtures/…``, never
     ``/home/<user>/src/dark-factory/…``) — an artifact naming somebody's
     absolute home-directory checkout is neither reproducible nor readable by
     anyone else, and it leaks the worktree the run happened in.
 
-    ``commit`` is ``None`` for a path git does not track.  Reporting None
-    rather than falling back to HEAD is the point: a wrong SHA in an audit
-    trail is worse than an absent one, because it looks checkable.
+    Either stamp is ``None`` when git cannot produce it — ``commit`` for a
+    path git does not track, ``blob`` for a file git cannot read.  Reporting
+    None rather than falling back to HEAD is the point: a wrong stamp in an
+    audit trail is worse than an absent one, because it looks checkable.
     """
-    import subprocess  # noqa: PLC0415
-
     repo_root = _PACKAGE_ROOT.parent
     provenance: list[dict[str, Any]] = []
     for raw in paths:
         path = Path(raw).resolve()
-        relative = _repo_relative(path)
-        commit: str | None = None
-        try:
-            completed = subprocess.run(
-                ['git', 'log', '-1', '--format=%H', '--', str(path)],
-                cwd=str(repo_root), capture_output=True, text=True, timeout=30,
-                check=False,
-            )
-            commit = completed.stdout.strip() or None
-        except (OSError, subprocess.SubprocessError):
-            # No git, or no repo: the report says so rather than inventing a
-            # SHA. Provenance that cannot be verified must not look verified.
-            commit = None
-        provenance.append({'path': relative, 'commit': commit})
+        provenance.append({
+            'path': _repo_relative(path),
+            'commit': _git_stdout(
+                ['log', '-1', '--format=%H', '--', str(path)], repo_root),
+            'blob': _git_stdout(['hash-object', '--', str(path)], repo_root),
+        })
     return provenance
 
 
@@ -4162,14 +4182,17 @@ def corpus_fingerprint(records: list[ArmRecord]) -> str:
 def fixture_digests(paths: list[str | Path]) -> list[dict[str, Any]]:
     """Repo-relative path + sha256 of each fixture's CONTENT.
 
-    Deliberately not folded into :func:`fixture_provenance`, which stamps the
-    last-touching COMMIT.  The two answer different questions and the cache
-    needs both: a commit sha is the blind-authoring audit trail, but it does
-    not move when a fixture is edited in the working tree — which is exactly
-    the drift that silently invalidates a dumped cache.
+    Deliberately not folded into :func:`fixture_provenance`, whose ``blob`` is
+    also a content hash.  The two answer different questions: the provenance
+    blob is a git object id — it needs git, and is addressable in history,
+    which is what the blind-authoring audit trail wants.  This sha256 needs
+    no git, so it is the git-free drift check that refuses a replay once a
+    fixture moves, and the committed fetch cache and
+    ``fused-memory/tests/test_bake_off_fetch_cache.py::ANCHOR_FIXTURE_SHA256``
+    pin it.
 
     Paths are reported repo-relative for the same reason
-    :func:`fixture_provenance` does it (:1852): an artifact naming somebody's
+    :func:`fixture_provenance` does it: an artifact naming somebody's
     absolute home-directory checkout is neither reproducible nor readable by
     anyone else.
     """

@@ -1419,8 +1419,9 @@ def run_selection(
 # of it was paid for: render BEFORE writing (:2316) so a render failure
 # leaves both files untouched rather than a stale .md beside a fresh .json;
 # `_atomic_write_text` (:2322); `_cell`/`_NO_MEASUREMENT` (:1955/:1824) so a
-# None cannot print as 0.00; `fixture_provenance` (:1844) for the commit
-# stamps.
+# None cannot print as 0.00;
+# `fused-memory/scripts/bake_off_storage_shape.py::fixture_provenance` for the
+# fixture stamps (commit + blob).
 
 from fused_memory.memory_metadata import (  # noqa: E402
     RESERVED_VOCABULARY_KEYS as _LIVE_RESERVED_KEYS,
