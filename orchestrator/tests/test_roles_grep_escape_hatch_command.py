@@ -1,0 +1,92 @@
+"""The look-around escape hatch's prescribed commands do what the prompt says.
+
+The prompt text is orchestrator/src/orchestrator/agents/roles.py::_GREP_PCRE_BASH_RECOURSE.
+Each command it prescribes is a named template constant spliced into that prose,
+so this module runs the templates in a real repo fixture and checks where they
+sit in the prompt. It asserts nothing about the surrounding wording.
+"""
+
+from __future__ import annotations
+
+import shlex
+import subprocess
+from pathlib import Path
+
+from _git_fixtures import RepoSeed, seed_repo
+from _orch_helpers import git_env_with_ceiling
+from df_pytest_isolation import git_redirect_env
+
+from orchestrator.agents.roles import GIT_GREP_PCRE_COMMAND_TEMPLATE, GREP_LOOKAROUND_GUIDANCE
+
+_LOOKAHEAD_PATTERN = r'config\.(?!git)[a-z_]+'
+
+_SEARCH_SEED = RepoSeed(
+    files=(
+        ('.gitignore', 'target/\n'),
+        ('src/mod.py', 'config.alpha = 1\nconfig.git = 2\n'),
+    ),
+    message='tracked source plus an ignored build tree',
+)
+
+
+def _render(template: str, pattern: str, path: str) -> list[str]:
+    argv = shlex.split(template)
+    for placeholder in ('<pattern>', '<path>'):
+        assert argv.count(placeholder) == 1, (
+            f'expected exactly one {placeholder!r} argv token in the template, got {argv!r}; '
+            'rename the placeholder here too if the roles.py template constant renamed it'
+        )
+    substitutions = {'<pattern>': pattern, '<path>': path}
+    return [substitutions.get(token, token) for token in argv]
+
+
+def _git_env(repo: Path) -> dict[str, str]:
+    env = git_env_with_ceiling(repo)
+    for key in git_redirect_env(env):
+        del env[key]
+    return env
+
+
+def _seed_search_fixture(tmp_path: Path) -> Path:
+    repo = seed_repo(tmp_path / 'repo', _SEARCH_SEED)
+    (repo / 'src' / 'new_mod.py').write_text('config.beta = 3\n')
+    gen = repo / 'target' / 'debug' / 'gen.py'
+    gen.parent.mkdir(parents=True)
+    gen.write_text('config.gamma = 4\n')
+    venv_lib = repo / '.venv' / 'lib'
+    venv_lib.mkdir(parents=True)
+    (repo / '.venv' / '.gitignore').write_text('*\n')
+    (venv_lib / 'site.py').write_text('config.delta = 5\n')
+    return repo
+
+
+def _run(argv: list[str], repo: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv, cwd=repo, env=_git_env(repo), capture_output=True, text=True, check=False,
+    )
+
+
+def _outcome(result: subprocess.CompletedProcess[str]) -> str:
+    return f'rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}'
+
+
+def test_git_grep_template_runs_lookaround_over_tracked_and_untracked_files_only(
+    tmp_path: Path,
+) -> None:
+    repo = _seed_search_fixture(tmp_path)
+
+    result = _run(_render(GIT_GREP_PCRE_COMMAND_TEMPLATE, _LOOKAHEAD_PATTERN, '.'), repo)
+
+    assert result.returncode == 0, _outcome(result)
+    matched_paths = {line.split(':', 1)[0] for line in result.stdout.splitlines() if line}
+    assert matched_paths == {'src/mod.py', 'src/new_mod.py'}, _outcome(result)
+    assert 'config.git' not in result.stdout, _outcome(result)
+
+
+def test_bash_recourse_cites_the_git_grep_template_as_its_own_line() -> None:
+    standalone_lines = {line.strip() for line in GREP_LOOKAROUND_GUIDANCE.splitlines()}
+    assert GIT_GREP_PCRE_COMMAND_TEMPLATE in standalone_lines, (
+        'GREP_LOOKAROUND_GUIDANCE must show GIT_GREP_PCRE_COMMAND_TEMPLATE as a '
+        'standalone, copyable line, not only inside a longer command'
+    )
+
