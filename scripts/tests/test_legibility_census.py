@@ -7206,9 +7206,7 @@ def test_run_census_completes_when_the_real_verifier_returns_cap_themed_verdicts
         "not re-mine this window and re-hit the same cluster forever"
     )
     assert len(fake_submit_fn.calls) == 1, "the verified cluster was filed"
-    assert not any(
-        c.get("category") == "infra_issue" for c in fake_escalate_fn.calls
-    ), "no false 'the account is capped' escalation"
+    assert fake_escalate_fn.calls == [], "no false 'the account is capped' escalation"
 
 
 # ---------------------------------------------------------------------------
