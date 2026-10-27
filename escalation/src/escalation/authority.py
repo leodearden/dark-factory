@@ -49,7 +49,9 @@ a wrapper holds nothing the detector has not itself stood down.
 
 Task 4541 adds ``PROMOTE_SENTINEL_BOUND_ROLES``, keyed on the agent_role of
 the records being PROMOTED rather than on the caller's identity, so unlike
-the tables above it binds header-less callers too.
+the tables above it binds header-less callers too. Tasks 6861 and 5880 bind
+the offline lane's records and the zero-progress requeue alarm by the same
+rule.
 """
 
 from __future__ import annotations
@@ -83,15 +85,17 @@ PROMOTE_ALLOWED: frozenset[str] = frozenset({_WATCHER_AUTO_IDENTITY})
 # under a caller-chosen REAL id, it becomes a record every veto predicate reads
 # on that task, so the alarm about a hold becomes part of the hold
 # (esc-5469-11).
-# Must equal orchestrator.recovery_emission.RECOVERY_VETO_STREAK_ROLE and
-# orchestrator.offline_lane_escalations.LANE_ESCALATION_ROLE; the full WHY is at
-# orchestrator/src/orchestrator/recovery_emission.py::
+# Must equal orchestrator.recovery_emission.RECOVERY_VETO_STREAK_ROLE,
+# orchestrator.offline_lane_escalations.LANE_ESCALATION_ROLE and
+# orchestrator.zero_progress_requeue.ZERO_PROGRESS_REQUEUE_ROLE; the full WHY is
+# at orchestrator/src/orchestrator/recovery_emission.py::
 # RECOVERY_VETO_STREAK_SENTINEL_PREFIX. Duplicated (not imported) to preserve
-# the escalation -> orchestrator layer direction; pinned in lockstep by
-# tests/test_authority.py.
+# the escalation -> orchestrator layer direction; each member is pinned in
+# lockstep by its own test in tests/test_authority.py.
 PROMOTE_SENTINEL_BOUND_ROLES: frozenset[str] = frozenset({
     'orchestrator-recovery-veto-streak',
     'orchestrator-offline-lane',
+    'orchestrator-zero-progress-requeue',
 })
 
 

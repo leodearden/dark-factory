@@ -88,7 +88,9 @@ logger = logging.getLogger(__name__)
 #: Sentinel task_id prefix for the alert.  A synthetic id is required because
 #: no per-task steward can be dispatched for this alarm — it is a monitor
 #: signal ABOUT a task, not work ON one.  Same shape as
-#: merge_liveness's ``_verify_host_unreachable_sentinel``.
+#: merge_liveness's ``_verify_host_unreachable_sentinel``.  An L2 wrapping
+#: these alarms must be minted under the sentinel too; the server enforces
+#: that through ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES``.
 ZERO_PROGRESS_SENTINEL_PREFIX = '__zero_progress_requeue__'
 
 #: Category used for both the filed escalation and the has_open_l1 signature
@@ -97,7 +99,13 @@ ZERO_PROGRESS_SENTINEL_PREFIX = '__zero_progress_requeue__'
 _CATEGORY = 'risk_identified'
 
 #: agent_role stamped on both the alarm and its resolution.
-_ROLE = 'orchestrator-zero-progress-requeue'
+#:
+#: A CROSS-LAYER contract: ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES``
+#: duplicates this string (lockstep-tested in
+#: ``escalation/tests/test_authority.py``) so ``promote_to_l2`` can refuse to
+#: mint a wrapper of these alarms under the real task id.  Rename both sides
+#: together.
+ZERO_PROGRESS_REQUEUE_ROLE = 'orchestrator-zero-progress-requeue'
 
 
 @dataclass
@@ -325,7 +333,7 @@ def emit_zero_progress_requeue_alert(
         esc = Escalation(
             id=escalation_queue.make_id(sentinel),
             task_id=sentinel,
-            agent_role=_ROLE,
+            agent_role=ZERO_PROGRESS_REQUEUE_ROLE,
             severity='blocking',
             level=1,
             category=_CATEGORY,
@@ -476,7 +484,7 @@ def resolve_zero_progress_requeue_alert(
                     'zero-progress requeue detector; it will re-file if the '
                     'loop recurs.'
                 ),
-                resolved_by=_ROLE,
+                resolved_by=ZERO_PROGRESS_REQUEUE_ROLE,
             )
             resolved += 1
     except Exception as exc:  # noqa: BLE001 — fail-open backstop
