@@ -153,6 +153,42 @@ def _run_script(repo: Path) -> subprocess.CompletedProcess[str]:
 _MAIN_ONLY_TIER_REACHED = 'uv stub: the main-only tier was reached'
 
 
+def _stub_bin(repo: Path) -> Path:
+    stub_bin = repo.parent / 'stub_bin'
+    stub_bin.mkdir(exist_ok=True)
+    return stub_bin
+
+
+def _install_stub(repo: Path, name: str, script: str) -> None:
+    stub = _stub_bin(repo) / name
+    stub.write_text(script)
+    stub.chmod(0o755)
+
+
+def _install_git_refusing_the_code_quality_listing(repo: Path) -> None:
+    """A ``git`` that fails any ``git diff`` naming the doc, and is real git otherwise.
+
+    The ratchet listing runs first and names no code-quality path, so it still
+    answers; only the render check's own listing meets the failure.
+    """
+    real_git = shutil.which('git', path=_bare_env(repo)['PATH'])
+    assert real_git is not None
+    _install_stub(
+        repo,
+        'git',
+        '#!/bin/sh\n'
+        'if [ "$1" = diff ]; then\n'
+        '    for arg in "$@"; do\n'
+        f'        if [ "$arg" = "{DOC}" ]; then\n'
+        '            echo "fatal: git stub: index file corrupt" >&2\n'
+        '            exit 128\n'
+        '        fi\n'
+        '    done\n'
+        'fi\n'
+        f'exec "{real_git}" "$@"\n',
+    )
+
+
 def _run_hook(repo: Path, branch: str) -> subprocess.CompletedProcess[str]:
     """Run the copied hook with *branch* passed as $2, never left to its default.
 
@@ -160,13 +196,9 @@ def _run_hook(repo: Path, branch: str) -> subprocess.CompletedProcess[str]:
     main-only tier's ruff can never pass for a refusal, and never runs a real
     ``uv`` against the throwaway repo.
     """
-    stub_bin = repo.parent / 'stub_bin'
-    stub_bin.mkdir(exist_ok=True)
-    stub_uv = stub_bin / 'uv'
-    stub_uv.write_text(f'#!/bin/sh\necho "{_MAIN_ONLY_TIER_REACHED}"\nexit 97\n')
-    stub_uv.chmod(0o755)
+    _install_stub(repo, 'uv', f'#!/bin/sh\necho "{_MAIN_ONLY_TIER_REACHED}"\nexit 97\n')
     env = _bare_env(repo)
-    env['PATH'] = f'{stub_bin}{os.pathsep}{env["PATH"]}'
+    env['PATH'] = f'{_stub_bin(repo)}{os.pathsep}{env["PATH"]}'
     return subprocess.run(
         [str(repo / _HOOK), str(repo), branch],
         cwd=repo,
@@ -326,3 +358,18 @@ class TestTheHookRunsTheRenderCheck:
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
         assert DOC in output
+
+    def test_a_failed_staged_listing_refuses_rather_than_skipping(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _make_repo(tmp_path)
+        _stage(repo, DOC, _valid_reach_edit(_doc_text(repo)))
+        _install_git_refusing_the_code_quality_listing(repo)
+
+        result = _run_hook(repo, 'task/6107')
+
+        output = result.stdout + result.stderr
+        assert result.returncode != 0, output
+        assert 'refusing the commit rather than skipping the render check' in result.stdout
+        assert 'code-quality render check (staged)' not in output
+        assert 'all checks passed' not in output
