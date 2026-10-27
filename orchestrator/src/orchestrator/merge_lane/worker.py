@@ -2540,7 +2540,9 @@ async def _run_post_merge_verify(
             this snapshot is taken are not protected by prunes triggered inside
             this call — they rely on the heartbeat mtime / grace-period
             mechanism to avoid premature removal in the residual window between
-            snapshot capture and prune execution.
+            snapshot capture and prune execution.  The gate re-verify passes
+            the live ledger instead (task 6155): dispatch continues while it
+            runs, so each prune reads the ledger as it stands at that moment.
         escalation_queue: Live escalation queue or ``None`` (default).  Used
             solely to file a born-at-L2 escalation (task 2307 β) when
             *verify* is the distinguished flock-worktree-contention outcome
@@ -15723,12 +15725,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     _ie.lease, _ie.verify_task, _ie_req.task_id,
                     shutdown_defensive=True,
                 )
-            # A next head the loop finalized during the awaits above can be
-            # parked on its own gate re-verify by now (task 6155).
-            await self._teardown_parked_gate(_ie)
-            if _ie.merge_wt is not None:
-                with contextlib.suppress(BaseException):
-                    await self._cleanup_owned_merge_worktree(_ie.merge_wt)
+            await self._release_drained_worktrees(_ie)
             if _ie.lease is not None and self._host_allocator is not None:
                 with contextlib.suppress(BaseException):
                     await self._cancel_and_release_tracked(_ie.lease)
@@ -17378,8 +17375,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._speculation_ledger.release(head.permit)
         self._drift_base.pop(head.item.request.request_id, None)
 
-    async def _teardown_parked_gate(self, entry: InflightEntry) -> None:
+    async def _teardown_parked_gate(self, entry: InflightEntry) -> Path | None:
         """Cancel and reap *entry*'s parked gate re-verify and return its worktree.
+
+        Returns that worktree, already released (warm or cold, as the
+        candidate says), so no caller disposes of it a second time; None when
+        *entry* has no parked gate.
 
         No lease is passed to the teardown: a remote gate is aborted on its
         host by its own reap in :func:`_run_verify_reaped` while it is live.
@@ -17388,13 +17389,44 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         gate = entry.gate
         if gate is None:
-            return
+            return None
         await self._teardown_verify_task(
             None, gate.task, entry.item.request.task_id, shutdown_defensive=True,
         )
         with contextlib.suppress(BaseException):
             await self._release_or_cleanup(
                 gate.candidate.merge_wt, spec_warm=gate.candidate.spec_warm,
+            )
+        return gate.candidate.merge_wt
+
+    async def _release_drained_worktrees(self, entry: InflightEntry) -> None:
+        """Return the worktrees of an entry stop() drains from ``_inflight``.
+
+        A next head the loop finalized during stop()'s awaits can be parked on
+        its own gate re-verify by then (task 6155): that gate's worktree goes
+        first, and the entry's own merge worktree is cold-removed only when it
+        is a different path, so a warm lane is never released and then removed.
+        """
+        gate_wt = await self._teardown_parked_gate(entry)
+        if entry.merge_wt is not None and entry.merge_wt != gate_wt:
+            with contextlib.suppress(BaseException):
+                await self._cleanup_owned_merge_worktree(entry.merge_wt)
+
+    async def _finalize_passthrough(self, entry: InflightEntry) -> None:
+        """``_finalize_inflight`` an entry with no verify to wait on, off the
+        head of line.
+
+        Such an entry returns before the CAS, so it never parks on a gate
+        re-verify (task 6155).  Nothing here would resume one that did, so the
+        gate is torn down and the park raised as a finalize error, for the
+        caller's handler to resolve and release the entry.
+        """
+        await self._finalize_inflight(entry)
+        if entry.gate is not None:
+            await self._teardown_parked_gate(entry)
+            raise RuntimeError(
+                f'task {entry.item.request.task_id}: a passthrough finalize '
+                'parked on a gate re-verify',
             )
 
     async def _verifier_loop(self) -> None:
@@ -17622,7 +17654,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # No consumer depends on strict cross-item Future-delivery ordering.
                 if entry.verify_task is None:
                     try:
-                        await self._finalize_inflight(entry)
+                        await self._finalize_passthrough(entry)
                     except (asyncio.CancelledError, KeyboardInterrupt):
                         raise
                     except BaseException as exc:
@@ -18060,7 +18092,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # on a verify task) then restart the outer loop.
                 if entry.verify_task is None:
                     try:
-                        await self._finalize_inflight(entry)
+                        await self._finalize_passthrough(entry)
                     except (asyncio.CancelledError, KeyboardInterrupt):
                         raise
                     except BaseException as exc:
@@ -22088,13 +22120,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Chain item #1 (this entry) is now on main; I2..Ik follow,
         # in order, on the SAME tip verdict's authority.  Placed
         # after the head's whole success block so the walk can
-        # never run against a head that did not actually land, and
-        # inside the `result == 'advanced'` arm so a CAS-failed
-        # head takes the retry loop untouched.
+        # never run against a head that did not actually land.
+        # Only `_advance_candidate`'s 'advanced' arm calls this
+        # method, so a CAS-failed head never reaches the walk.
         #
         # `entry.chain` is read HERE for the first time — γ wrote
-        # the field (merge_queue.py:20265) and left it write-only
-        # precisely for this consumer (merge_types.py:1458-1464).
+        # the field (in `_dispatch_item`) and left it write-only
+        # precisely for this consumer (`types.py::InflightEntry`).
         await self._land_chain_prefix(
             entry, advanced_sha or merge_commit,
         )
@@ -22143,7 +22175,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                     max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
                     merge_sha=rebased_sha,
-                    keep_worktrees=set(self._owned_merge_worktrees),
+                    # The live ledger, not a copy: dispatch keeps registering
+                    # worktrees while this gate runs, and a disk-pressure prune
+                    # must spare them.
+                    keep_worktrees=self._owned_merge_worktrees,
                     run_post_merge_verify=functools.partial(
                         self._gate_reverify_on_head_host, entry.lease,
                     ),
