@@ -526,3 +526,64 @@ class TestClaimsAreAgedAtTheTreeReadInstant:
             'the only row was dropped: its heartbeat was aged at render time, not at the tree read'
         )
         assert f'claimant={ClaimantLabel.LIVE}' in _line_for(_section_of(payload), 'task/6027')
+
+    @pytest.mark.asyncio
+    async def test_stage1_payload_ages_claims_at_the_injected_tree_read_instant(
+        self, repo: Path,
+    ) -> None:
+        from reconciliation.consolidator_fixtures import make_consolidator
+
+        _pending_with_worktree(repo, 6027, when=datetime.now(UTC) - timedelta(hours=48))
+        read_at = datetime.now(UTC) - timedelta(minutes=20)
+        stage = make_consolidator(project_root=str(repo))
+        stage.filtered_task_tree = _tree(
+            [_heartbeating(6027, heartbeat_at=read_at - timedelta(minutes=1))]
+        )
+        stage.filtered_task_tree_fetched_at = read_at
+
+        payload = await stage.assemble_payload(
+            events=[], watermark=Watermark(project_id='dark_factory'), prior_reports=[],
+        )
+
+        assert LIVE_WORKFLOW_SECTION_HEADER in payload, (
+            'the only row was dropped: its heartbeat was aged at render time, not at the tree read'
+        )
+        assert f'claimant={ClaimantLabel.LIVE}' in _line_for(_section_of(payload), 'task/6027')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('read_instant', 'reason'),
+        [(None, 'not_supplied'), (datetime(2026, 1, 1), 'naive_datetime')],
+        ids=['missing', 'naive'],
+    )
+    async def test_stage1_without_a_usable_read_instant_warns_and_ages_at_wall_clock(
+        self,
+        repo: Path,
+        caplog: pytest.LogCaptureFixture,
+        read_instant: datetime | None,
+        reason: str,
+    ) -> None:
+        from reconciliation.consolidator_fixtures import make_consolidator
+
+        _pending_with_worktree(repo, 6027, when=datetime.now(UTC) - timedelta(hours=48))
+        stage = make_consolidator(project_root=str(repo))
+        stage.filtered_task_tree = _tree(
+            [_heartbeating(6027, heartbeat_at=datetime.now(UTC) - timedelta(minutes=21))]
+        )
+        stage.filtered_task_tree_fetched_at = read_instant
+
+        with caplog.at_level(logging.WARNING):
+            payload = await stage.assemble_payload(
+                events=[], watermark=Watermark(project_id='dark_factory'), prior_reports=[],
+            )
+
+        assert 'task/6027' not in payload, (
+            'aged at wall clock the heartbeat is stale, so the uncorroborated in-progress row drops'
+        )
+        warnings = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+            and 'reconciliation.stage1_task_tree_read_instant_missing' in record.getMessage()
+        ]
+        assert [record.__dict__['reason'] for record in warnings] == [reason]
