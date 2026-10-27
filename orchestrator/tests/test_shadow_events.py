@@ -11,7 +11,12 @@ import pytest
 
 from orchestrator.event_store import EventStore, EventType, ShadowSkipReason
 
-_SHADOW_EVENT_NAMES = ('shadow_cell_opened', 'shadow_cell_skipped', 'shadow_cell_settled')
+_SHADOW_EVENT_NAMES = (
+    'shadow_cell_opened',
+    'shadow_cell_skipped',
+    'shadow_cell_settled',
+    'shadow_cell_ended',
+)
 
 _SKIP_REASON_VALUES = {
     'sampled_out',
@@ -24,6 +29,10 @@ _SKIP_REASON_VALUES = {
     'shape_disabled',
     'already_open',
     'paused',
+    # A configured candidate name the resolver cannot turn into an EvalConfig.
+    'unknown_candidate',
+    # The task record lacks metadata.branch_base_sha; PRD §Premise: skip, never guess HEAD.
+    'no_base_sha',
 }
 
 
@@ -66,3 +75,25 @@ def test_skip_reason_persists_as_bare_value(tmp_path: Path) -> None:
 
     assert rows == [('42', 'sampled_out')]
     assert ShadowSkipReason(rows[0][1]) is ShadowSkipReason.SAMPLED_OUT
+
+
+def test_ended_round_trips_its_state_and_reason(tmp_path: Path) -> None:
+    db_path = tmp_path / 'events.db'
+    EventStore(db_path, 'run-shadow').emit(
+        EventType.shadow_cell_ended,
+        task_id='42',
+        data={
+            'cell_id': '01JCELL',
+            'state': 'failed',
+            'reason': 'runner_raised:RuntimeError',
+        },
+    )
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        rows = conn.execute(
+            "SELECT task_id, json_extract(data, '$.state'), json_extract(data, '$.reason') "
+            'FROM events WHERE event_type = ?',
+            (EventType.shadow_cell_ended.value,),
+        ).fetchall()
+
+    assert rows == [('42', 'failed', 'runner_raised:RuntimeError')]
