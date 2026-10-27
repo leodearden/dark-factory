@@ -462,6 +462,43 @@ run fails writes `failed` before any settle can occur. Errors inside a cell neve
 to the production slot (the coordinator wraps the runner; a wrapped failure is a `failed`
 cell with the exception class in `reason`).
 
+> **As built (task 5387, 2026-10-27).** The contract above is the design; where the code
+> differs, the code below is authoritative.
+>
+> - **Constructor:** `ShadowCoordinator(config, deps: ShadowCoordinatorDeps, *, project_id,
+>   run_id, incumbents)`. `seed` has one home, `ShadowEvalConfig.seed`. The isolation probe
+>   in `deps` has no default.
+> - **`on_phase(task, phase: WorkflowState, entering)`** takes the task record, because the
+>   open decision needs the stratum and `branch_base_sha`.
+> - **`should_open` is async:** it gathers a store snapshot (`OpenInputs`). The pure part is
+>   `shadow_eval.py::decide_open`. Two skip reasons were added: `unknown_candidate` and
+>   `no_base_sha`.
+> - **A runner has two stages,** `ShadowRunner.prepare` then `run`, so `opened` and
+>   `running` are real states.
+> - **Failed and cap-excluded cells** emit `shadow_cell_ended`, not `shadow_cell_settled`.
+> - **Settling has three entries:**
+>   - `on_merge_finalized`, keyed on the payload's `task_id`;
+>   - `on_production_terminal(task_id, outcome)`, the non-landing settle that row 5 needs
+>     (`WorkflowOutcome.BLOCKED`/`CANCELLED` only);
+>   - a late-reference catch-up when a run completes after production's outcome is
+>     already recorded.
+> - **Who writes `settled_at`:** only a transition into `settled`/`expired`
+>   (`ShadowCellState.stamps_settled_at`, enforced in `run_store.py::RunStore.advance_shadow_cell`),
+>   whose only callers are the settle path and `expire`. This structural rule replaces the
+>   list of writer names in the ordering invariants above.
+> - **Only `done`/`done_wip_recovery` with a `merge_sha` is a landing.** `superseded` and the
+>   retryable merge states settle nothing.
+> - **`expire(now)` returns `ExpireSweep(expired, deferred)`,** capped at `EXPIRE_BATCH_LIMIT`.
+> - **The storm pause is durable:** it is the `shadow_storm` row in runs.db, and the open
+>   gate reads that row. `storm_state()` returns an advisory `StormState(paused, cause,
+>   detail)`. Only the call that creates the pause escalates. `resume()` restarts every
+>   storm window at `resumed_at`.
+> - **Both cost guards count only `metered` cells:** the USD budget, and the ratio, which
+>   compares a cell only against production's metered `cost_basis`.
+> - **Consequence leg 1 is an `architect`-shape cell.** Leg 2 opens from its completed run
+>   when `shadow_scoring.py::consequence_leg_warranted` holds, linked by `parent_cell_id`.
+> - **The C4 rules** live in `orchestrator/shadow_scoring.py`.
+
 ### C3 — live fixture builder (`evals/live_fixture.py`)
 
 ```python
