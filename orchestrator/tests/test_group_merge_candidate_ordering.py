@@ -1,4 +1,4 @@
-"""Real-git pins for the rc=0 group-merge candidate query (tasks 4926, 5539).
+"""Real-git pins for the rc=0 group-merge candidate query (tasks 4926, 5539, 5165).
 
 ``skills/_shared/deriving-landed-sha.md``'s step 4, rc=0 arm, finds the merge
 that brought a landed branch into main with::
@@ -24,24 +24,27 @@ pair is pinned here:
   rule 3).
 
 These are characterization pins, expected to pass on write: a failure means
-git's behaviour moved.  Prose greps of the runbook are deliberately absent;
+git's behaviour moved, except in the agreement assertions, where it means the
+runbook or production moved.  Prose greps of the runbook are deliberately absent;
 see ``orchestrator/tests/test_roles_ancestry_check.py``'s module docstring.
 Every fixture repo carries the esc-3072-3 isolation guards through
 ``_ladder_git.py::new_repo`` and ``_ladder_git.py::git_env``.
 
-DELIBERATE DIVERGENCE, do not "restore" the agreement assertion.
 ``orchestrator/src/orchestrator/git_ops.py::GitOps.landing_merge_for`` runs the
-same query without ``--topo-order`` (its ``--reverse`` only reverses the
-date-ordered list), so it carries the ordering defect.  Task 5165 owns that
-fix (GitOps.landing_merge_for); until it lands, this module must not assert
-that the runbook form and production agree.
+same query for ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::_no_op_question``
+(``--reverse`` with the first element is ``tail -1``), and every candidate here is
+asserted to agree with it, as ``test_citation_gate_positive_arm.py`` does for the citation walk.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from _ladder_git import commit, git, git_rc, new_repo
+
+from orchestrator.config import GitConfig
+from orchestrator.git_ops import GitOps
 
 TASK_ID = 'T'
 
@@ -62,6 +65,23 @@ def _candidate_topo(root: Path, tid: str) -> str:
         root, 'rev-list', '--topo-order', '--ancestry-path', '--merges', f'task/{tid}..main',
     )
     return out.split('\n')[-1] if out else ''
+
+
+def _production_landing_merge(root: Path, tid: str) -> str | None:
+    """The REAL ``GitOps.landing_merge_for``, called as ``_no_op_question`` calls it."""
+    tip = git(root, 'rev-parse', f'task/{tid}')
+    git_ops = GitOps(GitConfig(main_branch='main', branch_prefix='task/'), root)
+    return asyncio.run(git_ops.landing_merge_for(tip, 'main'))
+
+
+def _assert_runbook_agrees_with_production(root: Path, tid: str, candidate: str) -> None:
+    assert _production_landing_merge(root, tid) == candidate, (
+        "the runbook's rc=0 candidate query (skills/_shared/deriving-landed-sha.md step 4) "
+        'and GitOps.landing_merge_for must agree; a disagreement means one of them moved '
+        'and the other needs the same change.  Without --topo-order production returns a '
+        'date-ordered LATER merge, so _no_op_question measures {merge}^1..{merge} for an '
+        'unrelated merge'
+    )
 
 
 def _contained_before(root: Path, tid: str, rev: str) -> int:
@@ -141,9 +161,11 @@ def test_clock_skew_makes_the_date_ordered_candidate_query_pick_the_wrong_merge(
     )
 
     # (3) --topo-order returns exactly X, the bringing-in merge.
-    assert _candidate_topo(root, TASK_ID) == x, (
+    candidate = _candidate_topo(root, TASK_ID)
+    assert candidate == x, (
         '--topo-order is what makes `tail -1` genuinely the oldest DESCENDANT merge'
     )
+    _assert_runbook_agrees_with_production(root, TASK_ID, candidate)
 
     # (4) ...whose containment check takes the correct "stamp it" arm.
     assert _contained_before(root, TASK_ID, f'{x}^1') == 1, (
@@ -201,9 +223,11 @@ def test_same_second_commits_make_the_date_ordered_candidate_query_pick_the_wron
     assert _contained_before(root, TASK_ID, f'{mf1}^1') == 0, (
         'the wrong candidate takes the "do not stamp" exit, skipping the true group merge'
     )
-    assert _candidate_topo(root, TASK_ID) == x, (
+    candidate = _candidate_topo(root, TASK_ID)
+    assert candidate == x, (
         '--topo-order returns the merge that brought the branch in, ties or not'
     )
+    _assert_runbook_agrees_with_production(root, TASK_ID, candidate)
     assert _contained_before(root, TASK_ID, f'{x}^1') == 1
 
 
@@ -266,6 +290,7 @@ def test_a_branch_side_landing_is_the_same_history_as_a_fast_forward_then_an_unr
 
     candidate = _candidate_topo(a, TASK_ID)
     assert candidate == git(a, 'rev-parse', 'main')
+    _assert_runbook_agrees_with_production(a, TASK_ID, candidate)
     assert _contained_before(a, TASK_ID, f'{candidate}^1') == 0, (
         'the task tip is ^1, so the arm takes its "do not stamp" exit -- wrong for story '
         'A, right for story B'
@@ -305,6 +330,7 @@ def test_a_merge_created_on_main_puts_main_at_caret_1(tmp_path: Path) -> None:
 
     candidate = _candidate_topo(root, TASK_ID)
     assert candidate == merge
+    _assert_runbook_agrees_with_production(root, TASK_ID, candidate)
     assert _contained_before(root, TASK_ID, f'{candidate}^1') == 1, (
         'merged from main, the documented ^1 check renders the correct "this IS the '
         'merge that brought it in" verdict -- so the ambiguity above is about unknown '
@@ -344,9 +370,11 @@ def test_a_stacked_branch_that_merged_main_first_hides_the_landing_merge(
     git(root, 'merge', '--no-ff', 'task/S', '-m', 'Z')
     z = git(root, 'rev-parse', 'HEAD')
 
-    assert _candidate_topo(root, TASK_ID) == y, (
+    candidate = _candidate_topo(root, TASK_ID)
+    assert candidate == y, (
         'the oldest descendant merge is the stacked branch\'s sync merge, not the landing'
     )
+    _assert_runbook_agrees_with_production(root, TASK_ID, candidate)
     assert _contained_before(root, TASK_ID, f'{y}^1') == 0, (
         'Y\'s first parent already contains the branch, so the arm takes its do-not-stamp '
         'exit to the citation gate -- safe, no wrong stamp'
@@ -407,6 +435,7 @@ def test_an_already_landed_branch_yields_the_arms_legitimate_rc0_verdict(
         'the arm must reach its containment check with a REAL candidate here: rc=0 has '
         'to be decided by the check, not short-circuited by an empty $c'
     )
+    _assert_runbook_agrees_with_production(root, TASK_ID, candidate)
     assert _contained_before(root, TASK_ID, f'{candidate}^1') == 0, (
         "this is the arm's correct 'unrelated later merge, do not stamp' exit -- the "
         'branch was genuinely in main before $c, so no merge commit brought it in and '
@@ -496,10 +525,12 @@ def test_the_no_op_rebase_member_is_the_shape_that_reaches_the_rc0_arm(
         'with a no-op rebase the member\'s own commits are genuinely contained in the '
         'group merge, so ancestry exits 0 and the rc=0 arm IS reached'
     )
-    assert _candidate_topo(root, 'M') == tip_merge, (
+    candidate = _candidate_topo(root, 'M')
+    assert candidate == tip_merge, (
         "the rc=0 arm's candidate query must find the tip's merge commit -- the group "
         'merge that absorbed this member'
     )
+    _assert_runbook_agrees_with_production(root, 'M', candidate)
     assert _contained_before(root, 'M', f'{tip_merge}^1') == 1, (
         'the member was not in main before the tip merge, so that merge IS what brought '
         'it in: the stampable "absorbed into group merge" arm'
