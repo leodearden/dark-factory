@@ -33,6 +33,7 @@ from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
+from fused_memory.backends.exact_episode_window import ExactEpisodeWindowGraphiti
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
 from fused_memory.backends.falkor_fulltext import build_query
 from fused_memory.backends.falkor_indices import (
@@ -49,6 +50,7 @@ from fused_memory.backends.falkor_indices import (
     vector_drop_statement,
     vector_index_properties,
 )
+from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
 from fused_memory.backends.llm_clients import (
     ForceJsonObjectOpenAIGenericClient,
     TokenRecordingOpenAIGenericClient,
@@ -732,10 +734,14 @@ _EMBEDDED_EDGES_CENSUS = _EMBEDDED_EDGES_MATCH + 'RETURN count(*)'
 
 # Edges whose valid_at falls in a window (task 4869). `e.uuid` is total for the
 # directed-pattern reason given at _EMBEDDED_EDGES_MATCH. No vector here, so the
-# plain RETURN-then-ORDER shape suffices.
+# plain RETURN-then-ORDER shape suffices. The upper bound goes through
+# exact_string_upper_bound because FalkorDB's RANGE index over-returns on a
+# string `<=` (task 7543).
 _EDGES_IN_VALID_AT_WINDOW_MATCH = (
     'MATCH ()-[e:RELATES_TO]->() '
-    'WHERE e.valid_at >= $start AND e.valid_at <= $end '
+    'WHERE e.valid_at >= $start AND '
+    + exact_string_upper_bound('e.valid_at', 'end', inclusive=True)
+    + ' '
 )
 _EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE = (
     _EDGES_IN_VALID_AT_WINDOW_MATCH
@@ -747,10 +753,12 @@ _EDGES_IN_VALID_AT_WINDOW_CENSUS = _EDGES_IN_VALID_AT_WINDOW_MATCH + 'RETURN cou
 
 # Ids starting with a uuid prefix, for services/id_resolver.py (task 5323).
 # `$prefix`/`$upper` are bound, never interpolated. The half-open range
-# [$prefix, $upper) lets FalkorDB use the uuid RANGE index; STARTS WITH stays
-# as the exact predicate. No invalid_at filter: a superseded edge's uuid is
-# still an id a prefix can cite. The edge pattern is DIRECTED for the
-# one-row-per-edge reason given at _EMBEDDED_EDGES_MATCH.
+# [$prefix, $upper) lets FalkorDB use the uuid RANGE index; STARTS WITH is
+# load-bearing, because that index can over-return on a string `<` (see
+# plans/falkordb-resultset-cap-audit.md, section 'String < / <= on
+# RANGE-indexed properties (task 7543)'). No invalid_at filter: a superseded
+# edge's uuid is still an id a prefix can cite. The edge pattern is DIRECTED
+# for the one-row-per-edge reason given at _EMBEDDED_EDGES_MATCH.
 _ENTITY_UUID_PREFIX_MATCH = (
     'MATCH (n:Entity) '
     'WHERE n.uuid >= $prefix AND n.uuid < $upper AND n.uuid STARTS WITH $prefix '
@@ -1705,11 +1713,14 @@ class GraphitiBackend:
         ``graphiti_max_coroutines`` (each call's own internal fan-out) — by
         default 3 × 5 = 15 concurrent OpenAI calls at most, unchanged by
         this per-group cache.
+
+        Per-group clients are ``ExactEpisodeWindowGraphiti`` so add_episode's
+        previous-episode read is exact (task 7543).
         """
         cached = self._group_clients.get(group_id)
         if cached is not None:
             return cached
-        client = Graphiti(
+        client = ExactEpisodeWindowGraphiti(
             graph_driver=self._driver_for(group_id),
             llm_client=self._llm_client,
             embedder=self._embedder,
