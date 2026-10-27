@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from test_warm_lane_scripts_shipped import (  # noqa: E402
+from test_warm_lane_scripts_shipped import (
     _BASH,
     WARM_LANE_SCRIPT_DIR,
     _sanitized_env,
@@ -162,8 +162,8 @@ class TestAuditWarnsOnAnEmptyPool:
 class _AgeCase:
     """One lane: its two clocks, and what the audit must make of them.
 
-    ``record`` is minutes ago (an int), a literal ``updated_at`` (a str), or
-    ``None`` for a lane with no record at all.
+    ``record`` is minutes ago (an int, negative for a stamp ahead of now), a
+    literal ``updated_at`` (a str), or ``None`` for a lane with no record.
     """
 
     lane: str
@@ -181,6 +181,8 @@ _AGE_CASES = (
     _AgeCase('_lane-churn', 180, 0, 'record', 180, 'LEAKED'),
     # The record wins in BOTH directions, not max(record, dir).
     _AgeCase('_lane-fresh', 0, 90, 'record', 0, 'PRESERVED-OK'),
+    # A record written under a skewed clock reads age 0, never negative.
+    _AgeCase('_lane-future', -30, 90, 'record', 0, 'PRESERVED-OK'),
     _AgeCase('_lane-norec', None, 90, 'dir-mtime', 90, 'LEAKED'),
     # GNU `date -d ''` answers today's midnight; age_source discriminates.
     _AgeCase('_lane-unstamped', '', 90, 'dir-mtime', 90, 'LEAKED'),

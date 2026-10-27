@@ -699,9 +699,9 @@ _dirty_state() {
 }
 
 # ── age_min: whole minutes since the lane's last lifecycle transition ────────
-# _resolve_lane_age <dir> <record-updated-at>
-# Publishes LANE_AGE_MIN = floor((NOW_EPOCH - clock) / 60) and LANE_AGE_SOURCE,
-# the clock it used, so call it WITHOUT $(...).
+# _resolve_lane_age <dir> <record-updated-at> <now-epoch>
+# Publishes LANE_AGE_MIN = floor((now - clock) / 60), floored at 0, and
+# LANE_AGE_SOURCE, the clock it used, so call it WITHOUT $(...).
 #   record     the lane-state record's updated_at, via lane_state_epoch. It wins
 #              whenever it is judgeable: the dir mtime is churned by transient
 #              files inside the lane, so it can read ~0 for a lane dispatched
@@ -710,19 +710,23 @@ _dirty_state() {
 #              record-less resident and for an empty or unparseable updated_at.
 #              A dir whose mtime cannot be read either degrades to age 0 (never
 #              stale) rather than aborting.
+# A clock ahead of <now> (a record written under a skewed clock) reads age 0.
 LANE_AGE_MIN=0
 LANE_AGE_SOURCE='dir-mtime'
 _resolve_lane_age() {
-    local dir="$1" updated_at="$2" epoch
+    local dir="$1" updated_at="$2" now="$3" epoch
     if epoch="$(lane_state_epoch "$updated_at")"; then
         LANE_AGE_SOURCE='record'
     elif epoch="$(portable_mtime "$dir" 2>/dev/null)"; then
         LANE_AGE_SOURCE='dir-mtime'
     else
         LANE_AGE_SOURCE='dir-mtime'
-        epoch="$NOW_EPOCH"
+        epoch="$now"
     fi
-    LANE_AGE_MIN=$(( (NOW_EPOCH - epoch) / 60 ))
+    LANE_AGE_MIN=$(( (now - epoch) / 60 ))
+    if (( LANE_AGE_MIN < 0 )); then
+        LANE_AGE_MIN=0
+    fi
     return 0
 }
 
@@ -990,7 +994,7 @@ for entry in "$MOUNT"/*/; do
     dirty="$(_dirty_state "$entry")"
     divergent_bytes="$(_divergent_bytes "$entry")"
     divergent_gib=$(( divergent_bytes / 1073741824 ))
-    _resolve_lane_age "$entry" "$LANE_RECORD_UPDATED_AT"
+    _resolve_lane_age "$entry" "$LANE_RECORD_UPDATED_AT" "$NOW_EPOCH"
     DIVERGENT_TOTAL_BYTES=$((DIVERGENT_TOTAL_BYTES + divergent_bytes))
 
     classification="$(_classify "$live" "$assigned_state" "$status" "$recoverable" "$dirty" "$LANE_AGE_MIN")"
