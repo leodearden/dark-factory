@@ -1292,7 +1292,7 @@
     "orchestrator/tests/test_verify_cancel.py": {"patch_targets": [], "private_reads": 2},
     "orchestrator/tests/test_verify_categories.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_verify_env_transient.py": {"patch_targets": [], "private_reads": 36},
-    "orchestrator/tests/test_verify_events_units.py": {"patch_targets": [], "private_reads": 5},
+    "orchestrator/tests/test_verify_events_units.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/test_verify_host_skew_bench.py": {"patch_targets": [], "private_reads": 7},
     "orchestrator/tests/test_verify_main_tip_sweep.py": {"patch_targets": [], "private_reads": 35},
     "orchestrator/tests/test_verify_mu_fork_flake_gate.py": {"patch_targets": [], "private_reads": 0},

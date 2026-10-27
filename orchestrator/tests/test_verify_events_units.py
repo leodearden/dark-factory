@@ -14,7 +14,7 @@ import pytest
 
 from orchestrator import verify_evidence
 from orchestrator.agents.invoke import AgentResult
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
@@ -37,7 +37,7 @@ from orchestrator.verify_runner import (
     result_from_dict,
     result_to_dict,
 )
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 _ALPHA = ModuleConfig(
     prefix='alpha',
@@ -279,6 +279,37 @@ class TestMergeVerifyEventCarriesUnits:
         assert {unit.outcome for unit in result.units} == {UnitOutcome.RAN_GREEN}
 
 
+class TestAggregatedUnits:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('beta_units', 'expected'), [
+        pytest.param(None, None, id='one-unrecorded-module-leaves-the-aggregate-unrecorded'),
+        pytest.param((), (module_leg_unit('alpha', 'test', 0),), id='recorded-modules-concatenate'),
+    ])
+    async def test_a_module_verdict_without_units_fails_closed(
+        self, tmp_path, monkeypatch, beta_units, expected,
+    ):
+        repo = tmp_path / 'repo'
+        _two_module_repo(repo)
+        by_module = {
+            'alpha': _result(units=(module_leg_unit('alpha', 'test', 0),)),
+            'beta': _result(units=beta_units),
+        }
+
+        async def _module_verdict(
+            _worktree: Path, _config: OrchestratorConfig, module: ModuleConfig, **_kwargs: Any,
+        ) -> VerifyResult:
+            return by_module[module.prefix]
+
+        monkeypatch.setattr('orchestrator.verify.run_verification', _module_verdict)
+
+        result = await run_scoped_verification(
+            repo, OrchestratorConfig(), [_module('alpha'), _module('beta')],
+            task_files=['alpha/core.py', 'beta/core.py'], role='task',
+        )
+
+        assert result.units == expected
+
+
 # ---------------------------------------------------------------------------
 # A TaskWorkflow over a real git repo and a real EventStore, with its agent and
 # scheduler collaborators doubled (the test_rebase_verify_cost.py harness).
@@ -339,6 +370,7 @@ async def _task_workflow(
         event_store=store,
     )
     workflow.worktree = worktree.path
+    workflow._base_commit = worktree.base_commit
     workflow.artifacts = TaskArtifacts(worktree.path)
     workflow.artifacts.init(_TASK_ID, 'X', 'desc', base_commit=worktree.base_commit)
     workflow.plan = {'task_id': _TASK_ID, 'steps': []}
@@ -381,17 +413,17 @@ class TestImplementSiteWorkflowVerify:
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification', AsyncMock(side_effect=[failing, passing]),
         )
+        monkeypatch.setattr(workflow, '_review', AsyncMock(return_value=ReviewAggregation(
+            has_blocking_issues=False, blocking_issues=[], suggestions=[], reviews={'analyst': {}},
+        )))
 
-        assert await workflow._verify_debugfix_loop() == WorkflowOutcome.DONE
-        workflow._verify_green_tip_sha = 'cafef00d'
-        workflow._base_commit = 'deadbeef'
-        workflow.state = WorkflowState.VERIFY
-        workflow._enter_phase(WorkflowState.REVIEW)
+        assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
 
+        assert workflow.worktree is not None
         assert _workflow_verify_rows(store) == [{
             'passed': True,
-            'tip_sha': 'cafef00d',
-            'base_sha': 'deadbeef',
+            'tip_sha': _git(workflow.worktree, 'rev-parse', 'HEAD'),
+            'base_sha': _git(config.project_root, 'rev-parse', 'main'),
             'branch': f'task/{_TASK_ID}',
             'duration_ms': 12500,
             'slot_wait_secs': 4.5,
@@ -400,10 +432,6 @@ class TestImplementSiteWorkflowVerify:
             'cache_mode': 'off',
             'units': [unit.to_dict() for unit in passing.units or ()],
         }]
-
-
-async def _pre_merge_rebase(workflow: TaskWorkflow) -> bool:
-    return await workflow._rebase_before_enqueue()
 
 
 async def _forked_task_workflow(
@@ -435,7 +463,7 @@ class TestPreMergeSiteWorkflowVerify:
             'orchestrator.workflow.run_scoped_verification', AsyncMock(return_value=verdict),
         )
 
-        assert await _pre_merge_rebase(workflow) is passed
+        assert await workflow._rebase_before_enqueue() is passed
 
         assert workflow.worktree is not None
         tip = _git(workflow.worktree, 'rev-parse', 'HEAD')
@@ -467,7 +495,7 @@ class TestPreMergeSiteWorkflowVerify:
         verify = AsyncMock(return_value=_result())
         monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify)
 
-        assert await _pre_merge_rebase(workflow) is True
+        assert await workflow._rebase_before_enqueue() is True
 
         verify.assert_not_awaited()
         assert _workflow_verify_rows(store) == []
