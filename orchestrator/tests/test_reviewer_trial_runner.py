@@ -1086,6 +1086,7 @@ class TestPanelCache:
                 results_dir=tmp_path / 'results', stagger_secs=0,
             )
 
+        assert spy.await_args is not None
         assert spy.await_args.kwargs['stagger_secs'] == 0
 
 
@@ -1165,16 +1166,20 @@ class TestRunAndScore:
     @pytest.mark.asyncio
     async def test_a_score_dir_caches_measured_scores_only(self, source: _Source, tmp_path: Path) -> None:
         variant, corpus = _one_reviewer(), self._corpus(source)
-        dirs = {'results_dir': tmp_path / 'results', 'score_dir': tmp_path / 'scores'}
+        results_dir, score_dir = tmp_path / 'results', tmp_path / 'scores'
 
         with self._panels_and_matcher() as matched:
-            first = await run_and_score([variant], corpus, stagger_secs=0, **dirs)
+            first = await run_and_score(
+                [variant], corpus, results_dir=results_dir, score_dir=score_dir, stagger_secs=0,
+            )
             assert matched == ['OK_MARKER', 'REFUSED_MARKER']
-            second = await run_and_score([variant], corpus, stagger_secs=0, **dirs)
+            second = await run_and_score(
+                [variant], corpus, results_dir=results_dir, score_dir=score_dir, stagger_secs=0,
+            )
 
-        stored = json.loads((dirs['score_dir'] / f'{variant.name}__d_ok.json').read_text())
+        stored = json.loads((score_dir / f'{variant.name}__d_ok.json').read_text())
         assert ScoringResult.from_dict(stored) == first[0]
-        assert not (dirs['score_dir'] / f'{variant.name}__d_refused.json').exists()
+        assert not (score_dir / f'{variant.name}__d_refused.json').exists()
         assert matched == ['OK_MARKER', 'REFUSED_MARKER', 'REFUSED_MARKER']
         assert second[0] == first[0]
         assert second[1].unmeasured is not None
