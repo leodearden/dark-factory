@@ -195,36 +195,23 @@ do not "fix" it back into line with the others.
 
 WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO.  Ten conftests
 import from this module; the git ceiling and the deploy-clock guard are in
-all ten.  ``_df_no_leaked_drain_processes`` was, from task 3798 through task
-3931, wired only into the ROOT conftest (covering ``tests/``) and
-``scripts/tests/conftest.py`` — exactly the two rootdirs that spawn the drain
-script, and the two the incident came from.  Task 3932 wired it into the
-seven subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
-``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) that run as
-their own pytest sessions from their own venvs, so the root conftest's
-binding no longer needs to reach them — each stamps its own token.  Before
-task 3932, none of those seven carried the guard, so no token was stamped
-there and ``leaked_drain_processes`` failed CLOSED on an absent token: those
-sessions reported all-clear unconditionally rather than falsely, and a green
-run had to be read as "unmeasured", never as "no leak".  That reading no
-longer applies to those nine — a green run of any of them now means the guard
-actually checked.  It STILL applies to the tenth, ``client-feed``, whose
-conftest landed after task 3932 was planned and does not bind the guard.
-``orchestrator`` was the one to watch during the gap, since
-``orchestrator/src/orchestrator/service_restart.py`` is the PRODUCTION caller
-of the drain script and its tests historically only asserted on config
-strings; it is covered now like the rest.
+all ten.  ``_df_no_leaked_drain_processes`` is bound in nine: the ROOT
+conftest (covering ``tests/``) and ``scripts/tests/conftest.py`` — the two
+rootdirs that spawn the drain script — plus the seven subproject rootdirs
+(``cockpit``, ``dashboard``, ``escalation``, ``fused-memory``,
+``orchestrator``, ``sampler``, ``shared``), each of which runs as its own
+pytest session and so stamps its own token.  In those nine a green run means
+the teardown sweep ran; see ``_df_no_leaked_drain_processes`` for its
+detection window.  The tenth, ``client-feed``, does not bind the guard, so no
+sweep runs there and a green ``client-feed`` run is unmeasured.
 
 Task 3799's ``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
-pair is a SEPARATE defence and unaffected by task 3932's wiring above.  It
-started on the same two original rootdirs (root ``tests/`` and
-``scripts/tests/``) and gained a THIRD in task 3951: ``orchestrator/tests/conftest.py``,
-which is the fleet heartbeat's PRODUCER rootdir rather than a drain-script
-spawner (see the next two paragraphs).  Of the seven subproject rootdirs
-above, ``orchestrator`` therefore carries the fleet-dir pair and the
-remaining six carry neither; that gap (unlike the drain-process one) is still
-open and is out of this module's scope to close, since none of those six
-subprojects drives the fleet heartbeat producer path.
+pair is a SEPARATE defence, bound in three rootdirs: root ``tests/``,
+``scripts/tests/`` and ``orchestrator/tests/``.  The last is the fleet
+heartbeat's PRODUCER rootdir rather than a drain-script spawner (see the next
+two paragraphs).  The other six subproject rootdirs above carry neither; that
+gap is still open and is out of this module's scope to close, since none of
+those six subprojects drives the fleet heartbeat producer path.
 
 THE WRITE-SIDE GAP IN THAT RATIONALE, stated explicitly rather than left to be
 rediscovered.  "The rootdirs that spawn the drain script" is the right criterion
