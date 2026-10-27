@@ -14,6 +14,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from _filer_first_layout import FILER_PROJECT, TASK_27_FILES, stale_snapshot_registry
+
 from fused_memory.middleware.curator_types import CandidateTask
 from fused_memory.middleware.path_scope_guard import (
     _RIGHT_CONTEXT,
@@ -1481,53 +1483,33 @@ class TestIsRoutingOverride:
 
 
 class TestFilerFirstAttribution:
-    TASK_27_FILES = [
-        'crates/touch-session/src/plan.rs',
-        'crates/touch-session/tests/plan.rs',
-        'sessions/plans/lp-starter-v1.toml',
-    ]
     PROSE = 'Record into sessions/recorded/x/session.toml and corpus/fixtures/a.trace.toml'
 
-    @staticmethod
-    def _stale_snapshot_registry(tmp_path: Path) -> ProjectPrefixRegistry:
-        filer = _mkproj(tmp_path, 'stream-touch', ['crates', 'research'])
-        roots = [
-            filer,
-            _mkproj(tmp_path, 'reify', ['crates']),
-            _mkproj(tmp_path, 'mission-control', ['sessions']),
-            _mkproj(tmp_path, 'know-live', ['corpus', 'research']),
-            _mkproj(tmp_path, 'dark-factory', ['orchestrator']),
-        ]
-        registry = ProjectPrefixRegistry.from_roots([str(r) for r in roots])
-        (filer / 'sessions').mkdir()
-        (filer / 'corpus').mkdir()
-        return registry
-
     def test_task_27_files_pass_the_certain_check(self, tmp_path):
-        reg = self._stale_snapshot_registry(tmp_path)
-        assert check_files_for_scope(self.TASK_27_FILES, 'stream_touch', reg).outcome == 'ok'
+        reg = stale_snapshot_registry(tmp_path)
+        assert check_files_for_scope(TASK_27_FILES, FILER_PROJECT, reg).outcome == 'ok'
 
     def test_task_27_files_are_not_a_cross_repo_deliverable(self, tmp_path):
-        reg = self._stale_snapshot_registry(tmp_path)
-        assert all_files_foreign_owner(self.TASK_27_FILES, 'stream_touch', reg) is None
+        reg = stale_snapshot_registry(tmp_path)
+        assert all_files_foreign_owner(TASK_27_FILES, FILER_PROJECT, reg) is None
 
     def test_task_27_files_attest_local_work(self, tmp_path):
-        reg = self._stale_snapshot_registry(tmp_path)
+        reg = stale_snapshot_registry(tmp_path)
         assert local_attesting_signals(
-            self.TASK_27_FILES, 'stream_touch', reg) == self.TASK_27_FILES
+            TASK_27_FILES, FILER_PROJECT, reg) == TASK_27_FILES
 
     def test_prose_citing_own_dirs_is_not_a_mismatch(self, tmp_path):
-        reg = self._stale_snapshot_registry(tmp_path)
+        reg = stale_snapshot_registry(tmp_path)
         assert find_paths(self.PROSE, reg.all_prefixes()) == ['sessions/', 'corpus/']
-        assert check_text_for_scope(self.PROSE, 'stream_touch', reg).is_rejection is False
+        assert check_text_for_scope(self.PROSE, FILER_PROJECT, reg).is_rejection is False
         verdict = check_candidate_for_scope(
-            _candidate(description=self.PROSE), 'stream_touch', reg)
+            _candidate(description=self.PROSE), FILER_PROJECT, reg)
         assert verdict.is_rejection is False
 
     def test_dir_only_another_project_has_stays_foreign(self, tmp_path):
-        reg = self._stale_snapshot_registry(tmp_path)
+        reg = stale_snapshot_registry(tmp_path)
         assert all_files_foreign_owner(
-            ['orchestrator/src/x.py'], 'stream_touch', reg) == 'dark_factory'
-        verdict = check_text_for_scope('see orchestrator/src/x.py', 'stream_touch', reg)
+            ['orchestrator/src/x.py'], FILER_PROJECT, reg) == 'dark_factory'
+        verdict = check_text_for_scope('see orchestrator/src/x.py', FILER_PROJECT, reg)
         assert verdict.is_rejection
         assert verdict.suggested_project == 'dark_factory'
