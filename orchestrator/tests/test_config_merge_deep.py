@@ -86,15 +86,14 @@ class TestMergeDeepKnobInProjectYaml:
     on main) writes: ``merge_deep:\\n  chain_cap: <cap>`` in the project YAML.
     """
 
-    def test_project_yaml_override_loads_through(self, monkeypatch, tmp_path):
+    def test_project_yaml_override_loads_through(self, tmp_path):
         """Project layer beats package defaults (test_config.py:982 precedent)."""
         project_cfg = tmp_path / 'orchestrator.yaml'
         project_cfg.write_text(yaml.dump({'merge_deep': {'chain_cap': 6}}))
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         cfg = load_config(project_cfg)
         assert cfg.merge_deep.chain_cap == 6
 
-    def test_knob_is_a_known_census_key(self, monkeypatch, tmp_path):
+    def test_knob_is_a_known_census_key(self, tmp_path):
         """Registering the submodel makes ``merge_deep.chain_cap`` a KNOWN key,
         so the deploy script's edit is neither silently dropped by pydantic
         ``extra='ignore'`` nor censused as a phantom key (which would file a
@@ -102,16 +101,14 @@ class TestMergeDeepKnobInProjectYaml:
         """
         project_cfg = tmp_path / 'orchestrator.yaml'
         project_cfg.write_text(yaml.dump({'merge_deep': {'chain_cap': 6}}))
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         assert census_config_keys(project_cfg).unknown == []
 
-    def test_typo_under_the_knob_still_censuses(self, monkeypatch, tmp_path):
+    def test_typo_under_the_knob_still_censuses(self, tmp_path):
         """Negative control: the census must still descend INTO merge_deep, so a
         typo'd leaf is reported rather than swallowed by the new known parent.
         """
         project_cfg = tmp_path / 'orchestrator.yaml'
         project_cfg.write_text(yaml.dump({'merge_deep': {'chain_capp': 6}}))
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         paths = [uk.path for uk in census_config_keys(project_cfg).unknown]
         assert 'merge_deep.chain_capp' in paths, (
             f'expected the typo to be censused under the known merge_deep parent; got {paths!r}'
