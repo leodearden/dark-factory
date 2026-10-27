@@ -1095,10 +1095,6 @@ def _filed_escalations(root) -> list[dict]:
     ]
 
 
-@pytest.mark.skipif(
-    importlib.util.find_spec('escalation') is None,
-    reason='the escalation package is not installed in this environment',
-)
 class _UncountableJournal(WriteJournal):
     async def count_mem0_intents_by_status(self, *, since: datetime) -> dict[str, int]:
         raise RuntimeError('database is locked')
@@ -1121,6 +1117,10 @@ async def _seed_mem0_intent(journal: WriteJournal, status: str) -> str:
     return intent_id
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec('escalation') is None,
+    reason='the escalation package is not installed in this environment',
+)
 class TestTheFailOpenStormReachesAnOperator:
     """The alarm END TO END: counter → drain → per-project filing → ack echo.
 
