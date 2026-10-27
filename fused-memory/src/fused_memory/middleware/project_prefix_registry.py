@@ -277,7 +277,12 @@ class ProjectPrefixRegistry:
         return tuple(sorted(self.prefix_to_project))
 
     def project_for_prefix(self, prefix: str) -> str | None:
-        """Return the owning project_id for *prefix*, or None if unknown."""
+        """Return the build-time table's owner for *prefix*, or None if unknown.
+
+        A filer-agnostic table probe for tests and diagnostics only. It skips
+        the filer-first rule, so attribution goes through
+        :meth:`attributed_owner` instead.
+        """
         return self.prefix_to_project.get(prefix)
 
     def project_for_path(self, file_path: str | None) -> str | None:
@@ -352,7 +357,10 @@ class ProjectPrefixRegistry:
         Both spellings of the same logical file classify identically (task
         3109).
         """
-        path = _normalise_candidate(file_path)
+        return self._owner_for_normalised(_normalise_candidate(file_path))
+
+    def _owner_for_normalised(self, path: str) -> str | None:
+        """:meth:`project_for_path` for a path already put through `_normalise_candidate`."""
         if not path:
             return None
 
@@ -395,7 +403,7 @@ class ProjectPrefixRegistry:
             leading = path.split('/', 1)[0]
             if _is_source_dir(Path(filer_root), leading):
                 return filing_project
-        return self.project_for_path(file_path)
+        return self._owner_for_normalised(path)
 
     @cached_property
     def _roots_longest_first(self) -> tuple[tuple[str, str], ...]:
