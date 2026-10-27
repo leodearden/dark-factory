@@ -8,6 +8,7 @@ import enum
 import logging
 import os
 import sys
+import traceback
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -144,3 +145,25 @@ def raise_alarm(
         )
         return False
     return True
+
+
+@contextlib.contextmanager
+def fail_loud_boundary(
+    source: AlarmSource, project: AlarmProject, *, poster: Poster | None = None,
+) -> Iterator[None]:
+    """Raise one ERROR alarm for an exception escaping the block, then re-raise it.
+
+    The exit code stays the caller's to choose.
+    """
+    try:
+        yield
+    except Exception as exc:
+        raise_alarm(
+            project,
+            source,
+            f"legibility {source} run failed ({project.project_id}): {type(exc).__name__}: {exc}",
+            "".join(traceback.format_exception(exc)),
+            level=logging.ERROR,
+            poster=poster,
+        )
+        raise
