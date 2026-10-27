@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     'CREDIT_WINDOW',
+    'EXPIRE_BATCH_LIMIT',
     'NOT_LANDED_TERMINALS',
     'PRODUCTION_COST_BASIS',
     'SHAPE_TRIGGERS',
@@ -57,6 +58,7 @@ __all__ = [
     'CellRunOutcome',
     'CostPair',
     'CostRatioVerdict',
+    'ExpireSweep',
     'HostVerdict',
     'MergeFinalized',
     'OpenDecision',
@@ -561,6 +563,19 @@ class MergeFinalized:
         return None
 
 
+# Awaiting cells accumulate for up to settle_deadline_hours, so one sweep's
+# writes are capped here rather than by anything upstream (INV-8).
+EXPIRE_BATCH_LIMIT = 50
+
+
+@dataclass(frozen=True)
+class ExpireSweep:
+    """One bounded expiry sweep: what it expired, and what it left for the next (INV-11)."""
+
+    expired: tuple[str, ...]
+    deferred: tuple[str, ...]
+
+
 # --------------------------------------------------------------------------- #
 # The coordinator                                                              #
 # --------------------------------------------------------------------------- #
@@ -898,33 +913,38 @@ class ShadowCoordinator:
                 self._deps.store.find_shadow_cells,
                 self._query(task_id=task_id, states=frozenset({ShadowCellState.AWAITING_REFERENCE})),
             )
-            return [cell.cell_id for cell in awaiting if await self._settle(cell, reference)]
+            settled: list[str] = []
+            for cell in awaiting:
+                if await self._settle(cell, reference):
+                    settled.append(cell.cell_id)
+            return settled
         except Exception:
             logger.exception('shadow coordinator: settling task %s failed', task_id)
             return []
 
     async def _settle(self, cell: ShadowCell, reference: ShadowReference) -> bool:
-        """Settle one awaiting cell; False when another settle already won it."""
+        """Settle one awaiting cell against *reference*."""
         change = CellChange(
             ShadowCellState.SETTLED,
             self._deps.clock(),
             reference_kind=reference.kind,
             reference_sha=reference.sha,
         )
-        settled = await asyncio.to_thread(
+        return await self._close_awaiting(
+            cell, change, reference_kind=reference.kind.value, reference_sha=reference.sha,
+        )
+
+    async def _close_awaiting(self, cell: ShadowCell, change: CellChange, **event: Any) -> bool:
+        """Move an awaiting cell to its ``settled_at``-stamping end; False if another won it."""
+        closed = await asyncio.to_thread(
             self._deps.store.advance_shadow_cell,
             cell.cell_id,
             expected=ShadowCellState.AWAITING_REFERENCE,
             change=change,
         )
-        if settled is None:
+        if closed is None:
             return False
-        await self._emit(
-            EventType.shadow_cell_settled,
-            settled,
-            reference_kind=reference.kind.value,
-            reference_sha=reference.sha,
-        )
+        await self._emit(EventType.shadow_cell_settled, closed, **event)
         return True
 
     async def _catch_up(self, cell: ShadowCell) -> None:
@@ -956,6 +976,58 @@ class ShadowCoordinator:
         ):
             return ShadowReference.none()
         return None
+
+    # -- expiry and restart -------------------------------------------------
+
+    async def expire(self, now: datetime) -> ExpireSweep:
+        """Expire the oldest awaiting cells past their deadline, at most EXPIRE_BATCH_LIMIT."""
+        overdue = await asyncio.to_thread(
+            self._deps.store.find_shadow_cells,
+            self._query(states=frozenset({ShadowCellState.AWAITING_REFERENCE}), deadline_before=now),
+        )
+        batch, rest = overdue[:EXPIRE_BATCH_LIMIT], overdue[EXPIRE_BATCH_LIMIT:]
+        reason = CellEndReason.SETTLE_DEADLINE.value
+        change = CellChange(ShadowCellState.EXPIRED, now, reason=reason)
+        expired: list[str] = []
+        for cell in batch:
+            if await self._close_awaiting(
+                cell, change, state=ShadowCellState.EXPIRED.value, reason=reason,
+            ):
+                expired.append(cell.cell_id)
+        if rest:
+            logger.warning(
+                'shadow expire: %d overdue awaiting cell(s) deferred past the batch limit of %d',
+                len(rest), EXPIRE_BATCH_LIMIT,
+            )
+        return ExpireSweep(expired=tuple(expired), deferred=tuple(cell.cell_id for cell in rest))
+
+    async def reconcile_on_start(self) -> list[str]:
+        """Fail every held cell whose run is not this one: its run died with its process.
+
+        Uncapped, because every orphan must get its successor (INV-6); each
+        start reconciles the previous run, which held at most max_concurrent.
+        An awaiting cell is left alone: settle or expire owns it, not its run.
+        """
+        orphans = await asyncio.to_thread(self._fail_orphans)
+        for cell in orphans:
+            await self._emit_ended(cell)
+        return [cell.cell_id for cell in orphans]
+
+    def _fail_orphans(self) -> list[ShadowCell]:
+        store = self._deps.store
+        change = CellChange(
+            ShadowCellState.FAILED,
+            self._deps.clock(),
+            reason=CellEndReason.ORPHANED_BY_RESTART.value,
+        )
+        failed: list[ShadowCell] = []
+        for cell in store.find_shadow_cells(self._query(states=_HELD_STATES)):
+            if cell.run_id == self.run_id:
+                continue
+            orphan = store.advance_shadow_cell(cell.cell_id, expected=cell.state, change=change)
+            if orphan is not None:
+                failed.append(orphan)
+        return failed
 
     async def join(self) -> None:
         """Wait for every live drive, including any a finishing drive spawned."""
