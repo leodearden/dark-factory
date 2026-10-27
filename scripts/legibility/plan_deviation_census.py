@@ -20,7 +20,7 @@ from escalation.categories import EscalationCategory
 from escalation.disposition import ObservationConsumed
 from escalation.models import NOTE_TO_FILE_CLASS, Escalation, normalised_severity
 from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
-from legibility import state_docs, trickle_state
+from legibility import alarm, state_docs, trickle_state
 from legibility.config import LegibilityConfig, PlanDeviationCensus
 from shared.mcp_session import SyncMcpSession
 from shared.plan_deviation import DEVIATION_KINDS
@@ -550,11 +550,12 @@ def _failure(exc: BaseException) -> str:
 
 
 def _default_call_tool(cfg: LegibilityConfig) -> CallTool:
+    base_url = f'http://localhost:{cfg.escalation_port}'
+
     def call_tool(tool_name: str, arguments: dict) -> dict:
+        alarm.refuse_real_post_under_test(base_url, tool_name)
         with SyncMcpSession(
-            f'http://localhost:{cfg.escalation_port}',
-            client_name='legibility-plan-deviation-census',
-            timeout=_MCP_TIMEOUT_SECS,
+            base_url, client_name='legibility-plan-deviation-census', timeout=_MCP_TIMEOUT_SECS,
         ) as session:
             return session.call_tool(tool_name, arguments)
 

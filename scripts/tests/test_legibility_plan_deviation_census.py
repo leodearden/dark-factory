@@ -24,8 +24,8 @@ import pytest
 import yaml
 from escalation.disposition import ObservationConsumed
 from escalation.models import NOTE_TO_FILE_CLASS, Escalation
+from legibility import alarm, nightly, state_docs, trickle_state
 from legibility import config as config_mod
-from legibility import nightly, state_docs, trickle_state
 from legibility import plan_deviation_census as mod
 from shared.plan_deviation import DEVIATION_KINDS, DeviationRecord
 from shared.testing_mcp_stub import StubMcpServer
@@ -785,7 +785,8 @@ def test_run_files_through_the_escalation_server_on_the_configured_port(tmp_path
     with StubMcpServer(stateful=True, tools=lambda name, arguments: answers[name]) as server:
         port = int(server.url.rsplit(':', 1)[1])
         cfg = _load_cfg(tmp_path).model_copy(update={'escalation_port': port})
-        line = mod.run(cfg, now=NOW)
+        with alarm.own_endpoint():
+            line = mod.run(cfg, now=NOW)
 
     calls = [
         (request.body['params']['name'], request.body['params']['arguments'])
@@ -796,6 +797,24 @@ def test_run_files_through_the_escalation_server_on_the_configured_port(tmp_path
     assert calls[1][1]['task_id'] == SYNTHETIC_TASK_ID
     assert line.startswith(_FIRE_PREFIX)
     assert MINTED_ID in line
+
+
+def test_run_under_pytest_reaches_no_escalation_server_it_did_not_declare_its_own(tmp_path):
+    """No call_tool injected and no own_endpoint() declared: the default
+    call_tool refuses inside pytest, so a FIRE files nothing anywhere."""
+    _write_positive_control(tmp_path)
+
+    with StubMcpServer(stateful=True) as server:
+        port = int(server.url.rsplit(':', 1)[1])
+        cfg = _load_cfg(tmp_path).model_copy(update={'escalation_port': port})
+        line = mod.run(cfg, now=NOW)
+        requests = server.requests
+
+    assert requests == ()
+    assert line.startswith(_FIRE_PREFIX)
+    assert 'RealPostRefusedUnderTest' in line
+    assert 'not filed' in line
+    assert not mod.default_state_path(PROJECT_ID).exists()
 
 
 def test_run_negative_control_files_nothing(tmp_path, caplog):
