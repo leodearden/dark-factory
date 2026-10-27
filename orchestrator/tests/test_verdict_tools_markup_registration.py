@@ -961,11 +961,11 @@ class TestTheWidenedRepairVocabularyStaysContained:
     """
 
     @staticmethod
-    async def _submit(artifacts: TaskArtifacts):
+    async def _submit(artifacts: TaskArtifacts, reviewer: str = REVIEWER_ROLE):
         server = create_server(artifacts, REVIEWER_ROLE)
         async with Client(server) as client:
             return await client.call_tool('submit_review_verdict', {
-                'reviewer': REVIEWER_ROLE,
+                'reviewer': reviewer,
                 'verdict': 'PASS',
                 'issues': [],
                 'summary': METADATA_TAIL_SUMMARY,
@@ -1061,6 +1061,23 @@ class TestTheWidenedRepairVocabularyStaysContained:
         assert verdict_tools._MARKUP_SINK_SPEC.refusal_consequence not in residue.detail
         assert 'FORWARDED' in residue.detail
         assert 'swallowed tail' in residue.detail
+
+    @pytest.mark.asyncio
+    async def test_the_dropped_slice_record_claims_no_landing_it_cannot_see(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """The slice is filed BEFORE the call is forwarded, so the sink cannot
+        know whether the call then succeeds. Here it does not: the tool rejects
+        the mismatched reviewer and writes nothing, after the record was filed,
+        so the record must not say the call landed."""
+        steer_project_root(monkeypatch, tmp_path)
+
+        result = await self._submit(artifacts, reviewer=f'not_{REVIEWER_ROLE}')
+
+        assert result.data['status'] == 'error'
+        assert artifacts.read_verdict(REVIEWER_ROLE) is None
+        (residue,) = queued_residue(tmp_path)
+        assert 'landed' not in residue.detail.lower()
 
     @pytest.mark.asyncio
     async def test_an_unreachable_queue_drops_nothing_into_the_worktree(
