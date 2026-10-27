@@ -14332,16 +14332,18 @@ class TestAssemblePayloadRequiredSections:
     def watermark(self):
         return Watermark(project_id='dark_factory')
 
-    def _install_stub_registry(self, stage, monkeypatch) -> dict[str, FilteredTaskTree]:
-        """Swap in STUB_REGISTRY; return the tree each stub renderer received, by stub."""
-        received: dict[str, FilteredTaskTree] = {}
+    def _install_stub_registry(
+        self, stage, monkeypatch
+    ) -> dict[str, tuple[FilteredTaskTree, datetime]]:
+        """Swap in STUB_REGISTRY; return the (tree, read instant) each stub received, by stub."""
+        received: dict[str, tuple[FilteredTaskTree, datetime]] = {}
 
         async def stub_alpha(filtered: FilteredTaskTree, tree_read_at: datetime) -> str:
-            received['alpha'] = filtered
+            received['alpha'] = (filtered, tree_read_at)
             return '\n### Alpha\nfirst\n'
 
         async def stub_beta(filtered: FilteredTaskTree, tree_read_at: datetime) -> str:
-            received['beta'] = filtered
+            received['beta'] = (filtered, tree_read_at)
             return '\n### Beta\nsecond\n'
 
         monkeypatch.setattr(stage, 'stub_alpha', stub_alpha, raising=False)
@@ -14370,8 +14372,8 @@ class TestAssemblePayloadRequiredSections:
             'concatenated in REGISTRY ORDER, with no separator and no '
             f'post-processing; expected {self.EXPECTED_SECTIONS!r} in:\n{payload!r}'
         )
-        assert received.get('alpha') is stage.filtered_task_tree
-        assert received.get('beta') is stage.filtered_task_tree
+        assert received['alpha'][0] is stage.filtered_task_tree
+        assert received['beta'][0] is stage.filtered_task_tree
 
     @pytest.mark.asyncio
     async def test_self_fetched_tree_reaches_every_registry_renderer(
@@ -14380,25 +14382,37 @@ class TestAssemblePayloadRequiredSections:
         """With no harness-injected tree, renderers get the tree assemble_payload fetched.
 
         Pins Stage 2's contract over Stage 1's zero-arg aggregator: a renderer
-        reading self.filtered_task_tree would see None on this path.
+        reading self.filtered_task_tree would see None on this path.  The tree
+        travels with the instant it was read, stamped once the fetch returned.
         """
-        mock_deps['taskmaster'].get_tasks.return_value = {
-            'tasks': [{'id': 7, 'title': 'Fetched task', 'status': 'pending'}]
-        }
+        fetch_returned_by: list[datetime] = []
+
+        async def get_tasks(**_kwargs):
+            fetch_returned_by.append(datetime.now(UTC))
+            return {'tasks': [{'id': 7, 'title': 'Fetched task', 'status': 'pending'}]}
+
+        mock_deps['taskmaster'].get_tasks.side_effect = get_tasks
         stage = make_configured_task_knowledge_sync_stage(
             mock_deps, project_id='dark_factory', project_root='/project'
         )
         received = self._install_stub_registry(stage, monkeypatch)
 
         payload = await stage.assemble_payload([], watermark, [])
+        assembled_by = datetime.now(UTC)
 
         assert self.EXPECTED_SECTIONS in payload
         assert stage.filtered_task_tree is None
-        assert received['alpha'] is received['beta'], (
+        tree, tree_read_at = received['alpha']
+        assert received['beta'][0] is tree and received['beta'][1] == tree_read_at, (
             'Every Stage-2 registry renderer must receive the SAME resolved '
-            f'FilteredTaskTree; received {received!r}'
+            f'FilteredTaskTree and read instant; received {received!r}'
         )
-        assert [task['id'] for task in received['alpha'].active_tasks] == [7]
+        assert [task['id'] for task in tree.active_tasks] == [7]
+        assert tree_read_at.tzinfo is not None
+        assert fetch_returned_by[0] <= tree_read_at <= assembled_by, (
+            'A self-fetched tree is read when the fetch returns; got '
+            f'{tree_read_at!r}, fetch returned by {fetch_returned_by[0]!r}'
+        )
 
 
 class TestRenderLiveWorkflowSectionEmptyTasksNoOp:
