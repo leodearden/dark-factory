@@ -46,7 +46,7 @@ from pathlib import Path
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import trickle_state  # noqa: E402
+from legibility import alarm, trickle_state  # noqa: E402
 
 logger = logging.getLogger('legibility.check_trickle_health')
 
@@ -354,62 +354,15 @@ def run_health_check(
 
 
 # ---------------------------------------------------------------------------
-# Escalation — a best-effort mirror, copied by CONVENTION not by import
+# Escalation
 # ---------------------------------------------------------------------------
-#
-# The shape comes from
-# `scripts/legibility/check_transcript_persistence.py`, which is itself a
-# by-convention mirror of `scripts/legibility/nightly.py::post_escalation`.
-# `nightly` is deliberately NOT imported: it pulls the whole trickle
-# pipeline -- census, codebook, coder, digest -- at module load, which a
-# probe that runs every night at 04:30 has no business paying for.
-#
-# `census_trigger.post_mcp_envelope` IS imported rather than re-derived, so
-# the 400 -> `initialize` -> `notifications/initialized` handshake retry
-# stays single-sourced. Task 3644 added it after every legibility
-# escalation was being silently dropped by a stateful streamable-HTTP
-# server that rejects a session-less `tools/call` at the transport layer.
 
-_ESCALATION_TOOL_NAME = 'escalate_info'
-_ESCALATION_AGENT_ROLE = 'legibility-trickle-health'
-_ESCALATION_CATEGORY = 'infra_issue'
-_ESCALATION_SEVERITY = 'info'
-
-
-def _default_poster(url: str, envelope: dict) -> None:
-    """Post *envelope* to *url* over the MCP streamable-HTTP transport."""
-    from legibility import census_trigger  # lazy: keeps the probe path light
-
-    census_trigger.post_mcp_envelope(url, envelope, timeout=10.0)
-
-
-def _build_escalation_arguments(
+def _finding_message(
     project_id: str, result: HealthResult, rerun, *, note: str | None = None,
-) -> dict:
-    """Build the ``escalate_info`` arguments for ONE invocation.
+) -> tuple[str, str]:
+    """The ``(summary, detail)`` of ONE invocation's finding.
 
-    *project_id* is the RESOLVED one — the id both probes were actually
-    run with — and never ``cfg.project_id``. The two differ whenever
-    ``--project-id`` and ``--config`` name different projects, and
-    ``run_health_check``'s resolution rule says the flag wins. Measured
-    before this parameter existed: ``--project-id dark_factory --config
-    <reify yaml>`` probed dark_factory and filed
-    ``task_id=legibility-trickle-health-reify``, an alarm misattributed to
-    a project that was never probed. That is the identity-divergence class
-    GAP 3 closed at the path layer, one layer up — the id that NAMES a
-    finding must be the id that PRODUCED it. Taking the id as a parameter
-    rather than reading it back off the config is also what makes the
-    config unnecessary here at all: this function needs no
-    :class:`LegibilityConfig`, only the port-holder above it does.
-
-    The ``task_id`` is synthetic (``legibility-trickle-health-<project_id>``)
-    because this is a timer-driven probe, not a Taskmaster task — the same
-    reasoning ``nightly.py`` and ``check_transcript_persistence.py`` already
-    record. It is deliberately DISTINCT from nightly's
-    ``legibility-trickle-<project_id>`` so the two escalation histories stay
-    separately readable.
-
-    ONE envelope for the whole invocation, never one per probe: every
+    ONE finding for the whole invocation, never one per probe: every
     probe's captured output goes into a single detail, because which probe
     failed is rarely the interesting question — the set is.
 
@@ -427,66 +380,43 @@ def _build_escalation_arguments(
     ]
     rerun_lines = '\n'.join(f'  {" ".join(argv)}' for argv in rerun)
     note_block = '' if note is None else f'{note}\n\n'
-    return {
-        'task_id': f'legibility-trickle-health-{project_id}',
-        'agent_role': _ESCALATION_AGENT_ROLE,
-        'category': _ESCALATION_CATEGORY,
-        'severity': _ESCALATION_SEVERITY,
-        'summary': (
-            f'legibility trickle health: {" and ".join(failed)} probe(s) '
-            f'FAILED for project {project_id}'
-        ),
-        'detail': (
-            f'{result.reason}\n\n'
-            f'{note_block}'
-            f'--- check_trickle_progress.py output ---\n'
-            f'{result.progress_output.strip() or "(no output)"}\n\n'
-            f'--- check_trickle_liveness.sh output ---\n'
-            f'{result.liveness_output.strip() or "(no output)"}\n\n'
-            f'--- check_census_progress.py output ---\n'
-            f'{result.census_output.strip() or "(no output)"}\n\n'
-            f'Re-run by hand (the exact commands this probe ran):\n'
-            f'{rerun_lines}'
-        ),
-    }
+    summary = (
+        f'legibility trickle health: {" and ".join(failed)} probe(s) '
+        f'FAILED for project {project_id}'
+    )
+    detail = (
+        f'{result.reason}\n\n'
+        f'{note_block}'
+        f'--- check_trickle_progress.py output ---\n'
+        f'{result.progress_output.strip() or "(no output)"}\n\n'
+        f'--- check_trickle_liveness.sh output ---\n'
+        f'{result.liveness_output.strip() or "(no output)"}\n\n'
+        f'--- check_census_progress.py output ---\n'
+        f'{result.census_output.strip() or "(no output)"}\n\n'
+        f'Re-run by hand (the exact commands this probe ran):\n'
+        f'{rerun_lines}'
+    )
+    return summary, detail
 
 
 def post_health_finding(
-    cfg, result: HealthResult, rerun, *, project_id: str, poster=None,
-    note: str | None = None,
+    cfg, result: HealthResult, rerun, *, project_id: str,
+    poster: alarm.Poster | None = None, note: str | None = None,
 ) -> bool:
-    """Best-effort ``escalate_info`` POST. NEVER raises.
+    """Raise the finding as an ERROR alarm; True iff it landed. Never raises.
 
-    *cfg* is consulted for ONE thing, the escalation port. The finding's
-    identity comes from *project_id* — see
-    :func:`_build_escalation_arguments` for why the two must not be
-    conflated.
-
-    Any failure is logged as ONE warning and swallowed, returning
-    ``False``: a down escalation server must not mask the finding, because
-    :attr:`HealthResult.exit_code` is the authoritative loud signal
-    whether or not this POST landed."""
-    poster_fn = poster if poster is not None else _default_poster
-    try:
-        envelope = {
-            'jsonrpc': '2.0',
-            'id': 1,
-            'method': 'tools/call',
-            'params': {
-                'name': _ESCALATION_TOOL_NAME,
-                'arguments': _build_escalation_arguments(
-                    project_id, result, rerun, note=note,
-                ),
-            },
-        }
-        poster_fn(f'http://localhost:{cfg.escalation_port}/mcp', envelope)
-        return True
-    except Exception as exc:  # noqa: BLE001 — best-effort, never propagate
-        logger.warning(
-            'legibility trickle health: escalation post failed (best-effort, '
-            'the run still exits non-zero): %s', exc,
-        )
-        return False
+    *project_id* is the RESOLVED one, the id the probes ran with, and names
+    the finding; *cfg* supplies only the escalation port. The two differ
+    when ``--project-id`` and ``--config`` name different projects."""
+    summary, detail = _finding_message(project_id, result, rerun, note=note)
+    return alarm.raise_alarm(
+        alarm.AlarmProject(project_id=project_id, escalation_port=cfg.escalation_port),
+        alarm.AlarmSource.TRICKLE_HEALTH,
+        summary,
+        detail,
+        level=logging.ERROR,
+        poster=poster,
+    )
 
 
 def _load_config(*, config_path, project_id):
