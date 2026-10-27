@@ -30,7 +30,7 @@ from typing import Any
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
-from mcp.types import Implementation
+from mcp.types import CallToolResult, Implementation
 from shared.cli_boundary import LoudArgumentParser, run_cli
 
 from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
@@ -132,6 +132,27 @@ def replay_arguments(intent: Mapping[str, Any]) -> dict[str, Any]:
     return arguments
 
 
+def ack_from_tool_result(result: CallToolResult) -> Mapping[str, Any]:
+    """The add_memory ack an MCP tool result carries, in the shape :func:`classify_ack` reads."""
+    if result.isError:
+        return {'error': _text_of(result), 'error_type': 'mcp_tool_error'}
+    payload = result.structuredContent
+    if not payload:
+        return {
+            'message': (
+                'add_memory returned no structured ack, so whether it landed is '
+                f'unknown; check Mem0 before re-running this id. Text: {_text_of(result)!r}'
+            )
+        }
+    if set(payload) == {'result'} and isinstance(payload['result'], Mapping):
+        return payload['result']
+    return payload
+
+
+def _text_of(result: CallToolResult) -> str:
+    return ' '.join(getattr(block, 'text', repr(block)) for block in result.content)
+
+
 def classify_ack(ack: Mapping[str, Any]) -> tuple[ReplayResult, str]:
     if 'error' in ack:
         return ReplayResult.REJECTED, f'{ack.get("error_type")}: {ack["error"]}'
@@ -221,16 +242,11 @@ async def open_mcp_add_memory(url: str) -> AsyncIterator[AddMemoryFn]:
         await session.initialize()
 
         async def add_memory(arguments: dict[str, Any]) -> Mapping[str, Any]:
-            result = await session.call_tool(
-                'add_memory', arguments, read_timeout_seconds=ADD_MEMORY_TIMEOUT
+            return ack_from_tool_result(
+                await session.call_tool(
+                    'add_memory', arguments, read_timeout_seconds=ADD_MEMORY_TIMEOUT
+                )
             )
-            if result.isError:
-                text = ' '.join(getattr(block, 'text', repr(block)) for block in result.content)
-                return {'error': text, 'error_type': 'mcp_tool_error'}
-            payload = result.structuredContent or {}
-            if set(payload) == {'result'} and isinstance(payload['result'], Mapping):
-                payload = payload['result']
-            return payload
 
         try:
             yield add_memory

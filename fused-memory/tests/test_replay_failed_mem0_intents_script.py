@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-import uuid
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,8 +18,10 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from _fm_helpers import load_script_module
+from _mem0_intent_fixtures import mem0_intent_row, seed_mem0_intent
+from mcp.types import CallToolResult, TextContent
 
-from fused_memory.services.write_journal import WriteJournal
+from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'replay_failed_mem0_intents.py'
 
@@ -54,43 +55,26 @@ async def journal(tmp_path):
 async def _seed(
     journal: WriteJournal,
     *,
-    status: str = 'failed',
+    status: Mem0IntentStatus = Mem0IntentStatus.FAILED,
     content: str = 'always pin dependencies exactly',
     agent_id: str | None = 'agent-a',
     session_id: str | None = None,
     metadata: dict | None = None,
     created_at: datetime | None = None,
 ) -> str:
-    intent_id = str(uuid.uuid4())
-    await journal.log_mem0_intent(
-        intent_id=intent_id,
-        write_op_id=str(uuid.uuid4()),
+    return await seed_mem0_intent(
+        journal,
+        status=status,
+        reason="Error code: 429 - {'error': 'no credits'}",
+        retry_at=_T,
+        created_at=created_at,
+        content=content,
+        metadata=metadata if metadata is not None else {'category': 'procedural_knowledge'},
         project_id='dark_factory',
         agent_id=agent_id,
         session_id=session_id,
         category='procedural_knowledge',
-        content=content,
-        metadata=metadata if metadata is not None else {'category': 'procedural_knowledge'},
-        payload_digest='d',
     )
-    if status == 'retrying':
-        await journal.schedule_mem0_retry(intent_id, reason='rate_limited', retry_at=_T)
-    elif status != 'pending':
-        await journal.resolve_mem0_intent(
-            intent_id, status, reason="Error code: 429 - {'error': 'no credits'}"
-        )
-    if created_at is not None:
-        with closing(sqlite3.connect(journal.db_path)) as conn, conn:
-            conn.execute(
-                'UPDATE mem0_intents SET created_at = ? WHERE id = ?',
-                (created_at.isoformat(), intent_id),
-            )
-    return intent_id
-
-
-async def _intent(journal: WriteJournal, intent_id: str) -> dict:
-    (row,) = [r for r in await journal.get_mem0_intents() if r['id'] == intent_id]
-    return row
 
 
 class _AddMemory:
@@ -123,7 +107,7 @@ class TestSelection:
     async def test_listed_ids_select_only_failed_rows(self, journal):
         failed = await _seed(journal)
         other_failed = await _seed(journal)
-        completed = await _seed(journal, status='completed')
+        completed = await _seed(journal, status=Mem0IntentStatus.COMPLETED)
 
         selected = await _script.select_intents(
             journal, Selection(intent_ids=(failed, completed))
@@ -145,8 +129,8 @@ class TestSelection:
         before = await _seed(journal, created_at=_T - timedelta(minutes=1))
         at_start = await _seed(journal, created_at=_T)
         inside = await _seed(journal, created_at=_T + timedelta(minutes=10))
-        await _seed(journal, status='completed', created_at=_T + timedelta(minutes=10))
-        await _seed(journal, status='retrying', created_at=_T + timedelta(minutes=10))
+        await _seed(journal, status=Mem0IntentStatus.COMPLETED, created_at=_T + timedelta(minutes=10))
+        await _seed(journal, status=Mem0IntentStatus.RETRYING, created_at=_T + timedelta(minutes=10))
         at_end = await _seed(journal, created_at=_T + timedelta(minutes=30))
 
         selected = await _script.select_intents(
@@ -219,7 +203,7 @@ class TestReplay:
         )
 
         assert outcome.outcome is ReplayResult.LANDED
-        row = await _intent(journal, intent_id)
+        row = await mem0_intent_row(journal, intent_id)
         assert row['status'] == 'completed'
         assert 'replayed' in row['reason']
         assert 'new-1' in row['reason']
@@ -236,7 +220,7 @@ class TestReplay:
         )
 
         assert outcome.outcome is ReplayResult.PENDING_RETRY
-        row = await _intent(journal, intent_id)
+        row = await mem0_intent_row(journal, intent_id)
         assert row['status'] == 'completed'
         assert 'replayed' in row['reason']
         assert 'pending server' in row['reason']
@@ -280,7 +264,7 @@ class TestReplay:
 
         assert outcome.outcome is ReplayResult[expected]
         assert detail_fragment in outcome.detail
-        assert (await _intent(journal, intent_id))['status'] == 'failed'
+        assert (await mem0_intent_row(journal, intent_id))['status'] == 'failed'
 
     @pytest.mark.asyncio
     async def test_a_raising_call_is_reported_and_the_next_row_still_runs(self, journal):
@@ -297,7 +281,7 @@ class TestReplay:
         assert _by_id(outcomes)[first].outcome is ReplayResult.ERROR
         assert 'ConnectionError' in _by_id(outcomes)[first].detail
         assert _by_id(outcomes)[second].outcome is ReplayResult.LANDED
-        assert (await _intent(journal, first))['status'] == 'failed'
+        assert (await mem0_intent_row(journal, first))['status'] == 'failed'
 
     @pytest.mark.asyncio
     async def test_a_second_run_replays_nothing(self, journal):
@@ -316,7 +300,7 @@ class TestReplay:
     @pytest.mark.asyncio
     async def test_a_dry_run_calls_nothing_and_changes_nothing(self, journal):
         intent_id = await _seed(journal)
-        before = await _intent(journal, intent_id)
+        before = await mem0_intent_row(journal, intent_id)
         add_memory = _AddMemory()
 
         (outcome,) = await _script.replay(
@@ -325,7 +309,48 @@ class TestReplay:
 
         assert outcome.outcome is ReplayResult.DRY_RUN
         assert add_memory.calls == []
-        assert await _intent(journal, intent_id) == before
+        assert await mem0_intent_row(journal, intent_id) == before
+
+
+def _tool_result(
+    structured: dict[str, Any] | None, *, text: str = '', is_error: bool = False
+) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type='text', text=text)],
+        structuredContent=structured,
+        isError=is_error,
+    )
+
+
+class TestAckFromToolResult:
+    def test_a_structured_ack_is_returned_as_is(self):
+        assert _script.ack_from_tool_result(_tool_result(_LANDED_ACK)) == _LANDED_ACK
+
+    def test_the_result_envelope_is_unwrapped(self):
+        ack = _script.ack_from_tool_result(_tool_result({'result': _PENDING_ACK}))
+
+        assert ack == _PENDING_ACK
+        assert _script.classify_ack(ack)[0] is ReplayResult.PENDING_RETRY
+
+    def test_a_tool_error_is_a_rejection_carrying_its_text(self):
+        ack = _script.ack_from_tool_result(
+            _tool_result(None, text='Error executing tool add_memory: boom', is_error=True)
+        )
+
+        result, detail = _script.classify_ack(ack)
+        assert result is ReplayResult.REJECTED
+        assert 'mcp_tool_error' in detail
+        assert 'boom' in detail
+
+    @pytest.mark.parametrize('structured', [None, {}], ids=['none', 'empty'])
+    def test_a_missing_structured_ack_says_the_outcome_is_unknown(self, structured):
+        ack = _script.ack_from_tool_result(_tool_result(structured, text='queued?'))
+
+        result, detail = _script.classify_ack(ack)
+        assert result is ReplayResult.NOT_LANDED
+        assert 'no structured ack' in detail
+        assert 'unknown' in detail
+        assert 'queued?' in detail
 
 
 def _seed_journal_dir(data_dir: Path, count: int) -> list[str]:
