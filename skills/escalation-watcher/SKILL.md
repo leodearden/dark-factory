@@ -87,12 +87,6 @@ stand-down, and once its heartbeat is past the TTL the reaper reclaims it. The p
 `lease-heartbeat` is the **only** liveness signal a hosted holder has
 (`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
 
-**One-time rollout note (task 6916).** A lease a hosted session claimed *before* this change carries
-the bare `<--name>-$CLAUDE_PID` slug, so that session's re-derived heartbeat and release get
-`result=refused` (naming the holder's pid `alive`) — nothing is damaged. The lease becomes
-reclaimable once its heartbeat is past the 2h TTL; to skip the wait, release it with its original
-`--slug` (`lease-show` prints it as `holder_slug`) and claim again.
-
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** with a
 message naming both, rather than silently drifting to a slug your own later heartbeat would fail to
 match. The CLI deliberately will not invent one: a synthesized token would be identical for every
@@ -152,10 +146,7 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
   Do **not** force-release it on this evidence alone — `holder_liveness` is a single-signal
   diagnostic, and a dead-*looking* holder that is merely quiet is the duplicate-spawn incident. A
   `holder_record=exited` or `absent` beside it is corroboration, not a licence: **never
-  auto-steal**. (Task 3994 withdrew an earlier record cross-check because a lease slug is a
-  claimant-chosen ownership token, not a record key; `holder_record=` instead reads the separate
-  `record_slug` the lease body now carries.) Reclaiming is the human's call, or the reaper's once
-  the TTL expires.
+  auto-steal**. Reclaiming is the human's call, or the reaper's once the TTL expires.
 
 **Reading the contention message.** It reports two INDEPENDENT axes — whether the holder's *pid* is
 running, and how fresh its *heartbeat* is — and then states the decision they imply:
@@ -392,7 +383,7 @@ drops the heavy free-text/cluster fields (`detail`, `options`, `train_state`, �
 docstring carries the authoritative list — read it there rather than trusting a copy in this
 file, which is how this paragraph went stale before.
 
-**`root_cause` and `member_ids` ARE returned** (task 3997) — they were dropped until then.
+**`root_cause` and `member_ids` ARE returned.**
 Operationally that is what makes a drain self-sufficient: you can rebuild the already-promoted
 set as {`root_cause` of the pending L2s} ∪ {their `member_ids`} from the drain ALONE, so a
 rotation that inherits no session memory does not re-promote a cluster its predecessor already
@@ -495,12 +486,8 @@ substring rather than anchoring at the start of the line.
 **Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds per slice before
 returning, and **every** call — background *and* foreground — must carry an explicit Bash-tool
 `timeout` parameter sized to at least `(--timeout + 60s) × 1000` ms — e.g. `timeout: 3660000` for
-`--timeout 3600`. `run_in_background: true` does **not** exempt a call from the harness timeout:
-measured 2026-08-10, background arms launched with no `timeout` parameter were killed after ~116s
-(≈ the 120000ms Bash default) against a configured `--timeout 540` slice, so the slice length was
-never the constraint; re-arming the identical command with `timeout: 3660000` survived 6m32s and
-exited cleanly with `WATCHER_REARM_OUTCOME: FIRED exit=0`. With that parameter passed, use the long
-canonical slice: `--timeout 3600` yields at most one heartbeat wake per hour (`CEILING`) while a
+`--timeout 3600`. `run_in_background: true` does **not** exempt a call from the harness timeout.
+With that parameter passed, use the long canonical slice: `--timeout 3600` yields at most one heartbeat wake per hour (`CEILING`) while a
 real L2 escalation still fires instantly via inotify. A short slice buys no protection — the old
 `--timeout 540` merely forced a wake-notify-rearm turn every 9 minutes. A slice that long requires
 `BASH_MAX_TIMEOUT_MS` ≥ that value in the settings env (dark-factory onboarding provisions it —
@@ -590,11 +577,9 @@ Every decision must respect this order:
 - If the MCP is down, ask the human for help. MCP task mutations trigger reconciliation that maintains memory quality; bypassing it silently degrades the system.
 
 **tasks.db corruption detection:**
-Task state lives in fused-memory's SQLite at `<project_root>/.taskmaster/tasks/tasks.db` (the older on-disk
-`tasks.json` was superseded by SQLite and later deleted, so a doc naming it is stale). **Do not use the
-file's size as the signal** — it was a usable proxy for the JSON and is not one for SQLite: the file does
-not shrink when rows are deleted (freed pages go on the freelist), so mass task loss can show *no* size
-change at all, while a routine `VACUUM` or WAL checkpoint changes the size with nothing wrong. Use these
+Task state lives in fused-memory's SQLite at `<project_root>/.taskmaster/tasks/tasks.db`. **Do not use
+the file's size as the signal** — the file does not shrink when rows are deleted (freed pages go on the
+freelist), so mass task loss can show *no* size change at all, while a routine `VACUUM` or WAL checkpoint changes the size with nothing wrong. Use these
 two instead:
 
 - **Task count, cycle over cycle.** `mcp__fused-memory__get_statuses(project_root=<project_root>, page_size=1)`
@@ -605,8 +590,7 @@ two instead:
   contend with the live orchestrator, per the hard constraint above:
   `sqlite3.connect('file:<project_root>/.taskmaster/tasks/tasks.db?mode=ro', uri=True)`. Anything other
   than a single `ok` row is corruption. `SELECT COUNT(*) FROM tasks` on that same connection is the
-  fallback count when the MCP is down — measured 2026-08-30 against the live df store, it agrees exactly
-  with `pagination['total']` (both 4907), and the whole check runs in ~0.2s.
+  fallback count when the MCP is down.
 
 If the count drops with no cause you can name (a `remove_task` you ran, an operator prune), if
 `integrity_check` returns anything but `ok`, or if task IDs are mismatched/duplicated or tasks have
