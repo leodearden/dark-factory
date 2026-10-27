@@ -937,7 +937,10 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   its lease-token shape is not a session-registry key. The cockpit's Enter-to-focus follows
   `record_slug`, your session record's key, which `write-decision` stamps itself from `$CLAUDE_PID`;
   there is no shell token to add. If it cannot be resolved the decision is still filed, just
-  unlinked.
+  unlinked, and the verb says so with a `WARNING` on stderr naming `$CLAUDE_PID` and your `--id`:
+  the id still comes back on stdout because the filing DID land, and the row is only unfocusable in
+  the cockpit. Re-filing from the same session resolves the same way, so it does not repair the
+  link and is not called for.
 - **`--severity`**: pass through the parked escalation's own severity (`esc.severity` —
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried
