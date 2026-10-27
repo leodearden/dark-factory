@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT =(Path(__file__).parent.parent
+SCRIPT = (Path(__file__).parent.parent
           / 'install-memory-metadata-coverage-census-timer.sh')
 TEMPLATES_DIR = Path(__file__).parent.parent
 REPO_ROOT = TEMPLATES_DIR.parent
@@ -805,9 +805,14 @@ def _halves(calls):
     return [(c['who'], c['argv'][:5]) for c in calls]
 
 
+def _uv_run_prefix(tmp_path):
+    """The args the fake `uv` receives ahead of the script it is asked to run."""
+    return ['run', '--frozen', '--project',
+            f'{tmp_path / "fake-repo"}/fused-memory', 'python']
+
+
 def _both_halves_under_uv(tmp_path):
-    prefix = ['run', '--frozen', '--project',
-              f'{tmp_path / "fake-repo"}/fused-memory', 'python']
+    prefix = _uv_run_prefix(tmp_path)
     return [('UV', prefix), ('UV', prefix)]
 
 
@@ -901,6 +906,31 @@ def test_wrapper_needs_no_uv_when_both_seams_are_set(tmp_path):
     assert result.returncode == 0, _diag(result)
     assert [c['who'] for c in calls] == ['CENSUS', 'STAMP'], _diag(result)
     assert 'ERROR:' not in result.stderr, _diag(result)
+
+
+@pytest.mark.parametrize('seam, shim, expected_whos', [
+    ('COVERAGE_CENSUS_CMD', 'fake-census', ['CENSUS', 'UV']),
+    ('RETRO_STAMP_CMD', 'fake-stamp', ['UV', 'STAMP']),
+])
+def test_wrapper_resolves_uv_only_for_the_half_without_a_seam(
+        tmp_path, seam, shim, expected_whos):
+    """The mixed case, in both directions: resolving uv for the unset half
+    must leave the set seam driving its own half, unprefixed."""
+    bin_dir = _wrapper_bin_dir(tmp_path)
+    scripts = tmp_path / 'fake-repo' / 'fused-memory' / 'scripts'
+
+    result, calls = _run_wrapper_on_an_empty_path(
+        tmp_path, default_prefix=True,
+        extra_env={seam: str(bin_dir / shim), 'UV_BIN': str(bin_dir / 'uv')})
+
+    assert result.returncode == 0, _diag(result)
+    assert [c['who'] for c in calls] == expected_whos, _diag(result)
+    expected_scripts = (f'{scripts}/census_memory_metadata.py',
+                        f'{scripts}/retro_stamp_topics.py')
+    for call, script in zip(calls, expected_scripts, strict=True):
+        uv_args = _uv_run_prefix(tmp_path) if call['who'] == 'UV' else []
+        expected_head = [*uv_args, script]
+        assert call['argv'][:len(expected_head)] == expected_head, call
 
 
 # ── the wrapper commits what it regenerates (esc-4006-5) ────────────────────
