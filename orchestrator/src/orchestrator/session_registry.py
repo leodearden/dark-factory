@@ -4808,6 +4808,30 @@ def _locked_filing_target(
         yield qualified, _read_decision_or_none(qualified)
 
 
+def _resolve_filing_record_slug(local_id: str, project: str) -> str:
+    """Return the record_slug a write-decision filing of *local_id* stamps.
+
+    That is resolve_own_record_slug's slug, else '' after a WARNING, because a
+    blank one leaves that cockpit row unable to focus its filer's session for
+    the record's life (task 7527).
+    """
+    slug = resolve_own_record_slug()
+    if slug is not None:
+        return slug
+    logger.warning(
+        'write-decision --id %s --project %s: $%s=%r resolves to no vouched session record '
+        '(unset, unusable or a shared `claude agents` host pid; or no sessions-by-pid/<pid> '
+        'pointer whose record still names that pid as its owner), so this decision gets a '
+        'BLANK record_slug and its cockpit row cannot focus the filing session (Enter-to-focus) '
+        'for the life of the record. The decision is still filed.',
+        local_id,
+        project,
+        SESSION_PID_ENV,
+        os.environ.get(SESSION_PID_ENV),
+    )
+    return ''
+
+
 def _run_write_decision(
     local_id: str,
     project: str,
@@ -4838,7 +4862,9 @@ def _run_write_decision(
     ``record_slug`` is best-effort enrichment derived from ``$CLAUDE_PID``'s
     pid pointer (resolve_own_record_slug), never typed by the caller and
     never a reason to refuse or delay a filing: an unresolvable one is filed
-    as '' and is visible downstream as an unresolved link.
+    as '', is announced by a WARNING at dispatch
+    (_resolve_filing_record_slug), and is visible downstream as an
+    unresolved link.
 
     ``project`` is stored NORMALIZED (see shared.project_id.fold_project_token,
     task 3807), so ``df``, ``dark-factory`` and ``Dark_Factory`` all persist as
@@ -5825,7 +5851,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.session_id,
                 args.severity,
                 args.escalations_dir,
-                record_slug=resolve_own_record_slug() or '',
+                record_slug=_resolve_filing_record_slug(args.id, args.project),
             )
         elif args.verb == 'reap-decisions':
             _run_reap_decisions(
