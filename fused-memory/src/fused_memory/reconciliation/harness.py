@@ -3960,7 +3960,7 @@ class ReconciliationHarness:
                     # tests/reconciliation/test_recon_window_anchor.py
                     'last_episode_timestamp': run.started_at,
                     'last_memory_timestamp': run.started_at,
-                    'last_task_change_timestamp': completed_at,
+                    'last_task_change_timestamp': run.started_at,
                 })
                 await self.journal.update_watermark(watermark)
 
