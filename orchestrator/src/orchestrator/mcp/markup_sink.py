@@ -600,11 +600,14 @@ def file_storm(
             # burst is invisible — the failure the attribution work exists to
             # end, reintroduced by the dedup.
             #
-            # This line inherits the same reachability limit the record's own
-            # prose states about the guard's other lines (task 4744 owns that
-            # channel), so it is a floor and not the fix: the FIX an operator
-            # has is in the message — resolving the open record lets the next
-            # burst file under its own subject.
+            # On a per-agent stdio site (plan-tools and verdict-tools today)
+            # this line goes to the subprocess's stderr, which the spawning
+            # CLI keeps nowhere durable: neither journald nor the CLI's own
+            # MCP log cache holds tool-time stderr. The fold is a sink event,
+            # not a middleware fact, so the site's markup journal never
+            # records it either. On such a site the line is a floor and not
+            # the fix: the FIX an operator has is in the message — resolving
+            # the open record lets the next burst file under its own subject.
             logger.error(
                 'markup guard: markup_guard_storm SUPPRESSED — %s is already '
                 'open naming subject_task_id=%r, so this burst from '
@@ -636,10 +639,10 @@ def file_storm(
         detail=storm_detail(record, subject_task_id, spec),
         # Leads with the attribution the record now CARRIES. It used to lead
         # with "identify the leaking caller from the guard's log lines", an
-        # instruction that on this server cannot be followed at all — a
-        # per-agent stdio subprocess's stderr is consumed by the spawning CLI
-        # and never reaches journald — and that anywhere else expires inside
-        # this host's ~72h `journald --user` window, while the measured
+        # instruction that cannot be followed at all on a per-agent stdio
+        # site — whose stderr the spawning CLI consumes and never forwards to
+        # journald — and that on any other site expires inside this host's
+        # ~72h `journald --user` window, while the measured
         # esc-plan-tools-markup-storm-* records were read at 6-7 days old.
         suggested_action=(
             f'the record names its caller: subject_task_id={subject_task_id!r}, '
@@ -693,7 +696,7 @@ def make_escalation_sink(
     nothing was filed (the queue could not take it, or the record came from the
     eval lane — see below).
 
-    AN EVAL-LANE RECORD IS NOT FILED AT ALL, of either kind (task 6479).
+    AN EVAL-LANE RECORD IS NOT FILED AT ALL, of any kind (task 6479).
     plan-tools is injected into every eval cell, an eval worktree is a linked
     worktree of the main checkout, and both filers reach the queue through a
     direct ``submit`` that bypasses the eval-lane gate in
@@ -719,11 +722,11 @@ def make_escalation_sink(
     plan-tools ``create_plan`` refused before any plan exists is the case. So
     it is evaluated per record, on the worker thread, never at wiring time.
 
-    It serves BOTH record kinds, not residue alone. A burst alarm whose only
-    route to the caller was a grep of the guard's log lines was undischargeable
-    on this server — a per-agent stdio subprocess's stderr is consumed by the
-    spawning CLI and never reaches journald — so the storm branch reads the
-    same thunk, and this is the axis that resolves for it.
+    It serves every record kind, the burst alarm included, not residue alone.
+    A burst alarm whose only route to the caller was a grep of the guard's log
+    lines was undischargeable on a per-agent stdio site — whose stderr the
+    spawning CLI consumes and never forwards to journald — so the storm branch
+    reads the same thunk, and this is the axis that resolves for it.
 
     ASYNC, with every blocking step on a worker thread. The middleware calls
     this from inside the server's event loop, and one record can run a
