@@ -174,6 +174,19 @@ async def test_terminal_exit_refusal_reports_the_row_already_terminal(
 
 
 @pytest.mark.asyncio
+async def test_generic_refusal_from_a_terminal_row_reports_the_row_already_terminal(
+    scheduler: Scheduler, store: _ServerGatedRowStore, forbid_live_mcp,
+) -> None:
+    store.refusal = _illegal_transition('done', 'pending')
+
+    with pytest.raises(SetTaskStatusRejected) as info:
+        await scheduler.set_task_status(TID, 'pending')
+
+    assert type(info.value) is SetTaskStatusRejected
+    assert info.value.row_already_terminal is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('refusal', [
     {'success': False, 'error': 'done_gate_missing_files', 'missing_files': ['gone.py']},
     {'success': False, 'error': 'done_provenance_invalid'},
@@ -264,12 +277,17 @@ async def test_row_going_terminal_before_the_revert_write_gets_no_write(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('server_refusal', [
+    None,
+    _illegal_transition('done', 'pending'),
+], ids=['terminal_exit_gate', 'illegal_transition'])
 async def test_row_going_terminal_after_the_live_reread_is_a_lost_race_not_an_escalation(
     revert_harness: Harness, store: _ServerGatedRowStore, queue: EscalationQueue,
-    forbid_live_mcp,
+    server_refusal: dict | None, forbid_live_mcp,
 ) -> None:
     def _land() -> None:
         store.row['status'] = 'done'
+        store.refusal = server_refusal
 
     store.on_claimant_clear = _land
 
