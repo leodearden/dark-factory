@@ -3177,7 +3177,6 @@ class SqliteTaskBackend:
                 f'{sorted(s.value for s in _VALID_STATUSES)}.',
             )
 
-        # The first non-empty prompt line, clipped at a word with the counted marker, is the title; the full prompt is the description.
         if not title and prompt:
             for line in prompt.splitlines():
                 stripped = line.strip()

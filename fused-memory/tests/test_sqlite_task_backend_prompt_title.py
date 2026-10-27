@@ -20,8 +20,8 @@ async def backend(tmp_path):
     await b.close()
 
 
-@pytest_asyncio.fixture
-async def project_root(tmp_path):
+@pytest.fixture
+def project_root(tmp_path):
     return str(tmp_path / 'proj')
 
 
