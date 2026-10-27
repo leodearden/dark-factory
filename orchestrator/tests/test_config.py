@@ -2525,7 +2525,6 @@ class TestPinReservationConfig:
         assert live.pin_reservations_enabled is False
 
 
-@pytest.mark.usefixtures("code_default_config")
 class TestTransientRequeueBackoffConfig:
     """The two jittered-backoff knobs (task 3317 / PRD contract C3).
 
@@ -2534,17 +2533,21 @@ class TestTransientRequeueBackoffConfig:
     requeues.  Genuine requeues keep the flat ``requeue_cooldown_secs``.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_backoff_base_default_is_thirty_seconds(self):
         assert OrchestratorConfig().transient_requeue_backoff_base_secs == 30.0
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_backoff_cap_default_is_fifteen_minutes(self):
         assert OrchestratorConfig().transient_requeue_backoff_cap_secs == 900.0
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_both_knobs_are_floats(self):
         config = OrchestratorConfig()
         assert isinstance(config.transient_requeue_backoff_base_secs, float)
         assert isinstance(config.transient_requeue_backoff_cap_secs, float)
 
+    @pytest.mark.usefixtures("code_default_config")
     @pytest.mark.parametrize('field', [
         'transient_requeue_backoff_base_secs',
         'transient_requeue_backoff_cap_secs',
@@ -2561,6 +2564,7 @@ class TestTransientRequeueBackoffConfig:
         with pytest.raises(ValidationError):
             OrchestratorConfig(**{field: bad})
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults_yaml_carries_both_keys(self):
         """The packaged defaults.yaml agrees with the pydantic defaults.
 
@@ -2583,6 +2587,7 @@ class TestTransientRequeueBackoffConfig:
             == 900.0
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_flat_genuine_requeue_cooldown_is_untouched(self):
         """The genuine-requeue lane keeps its flat 30s cooldown.
 
@@ -2607,6 +2612,7 @@ class TestTransientRequeueBackoffConfig:
             'in the # Scheduler tuning slice alongside fairness.skip_threshold)'
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_apply_reload_mutates_backoff_knobs_in_place(self):
         """apply_reload applies both leaves to the LIVE config object.
 
@@ -2631,6 +2637,7 @@ class TestTransientRequeueBackoffConfig:
         assert live.transient_requeue_backoff_base_secs == 5.0
         assert live.transient_requeue_backoff_cap_secs == 20.0
 
+    @pytest.mark.usefixtures("code_default_config")
     @pytest.mark.parametrize('leaf', [
         'transient_requeue_backoff_base_secs',
         'transient_requeue_backoff_cap_secs',
@@ -2808,7 +2815,6 @@ class TestWarmLaneGcConfig:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.usefixtures("code_default_config")
 class TestConfigReload:
     """RELOADABLE_FIELDS: code-owned allowlist of dotted leaf paths safe to
     apply via hot-reload without a process restart.
@@ -2823,6 +2829,7 @@ class TestConfigReload:
             f'{sorted({type(p).__name__ for p in RELOADABLE_FIELDS})}'
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_every_path_resolves_on_default_config(self):
         """Every dotted path in RELOADABLE_FIELDS must resolve via getattr-walk
         on a default OrchestratorConfig — catches typos in the allowlist that
@@ -2917,7 +2924,6 @@ class TestConfigReload:
         )
 
 
-@pytest.mark.usefixtures("code_default_config")
 class TestSimpleTaskRoleConfigAddressability:
     """Routing alpha (plans/adaptive-model-routing-prd.md): simple_task is a
     full peer of every other AgentRole in the six per-role routing
@@ -2942,6 +2948,7 @@ class TestSimpleTaskRoleConfigAddressability:
         assert TimeoutsConfig().simple_task == 7200.0
         assert BackendsConfig().simple_task == 'claude'
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults_yaml_agrees_with_submodel_defaults(self):
         """A config materialized from the packaged defaults.yaml (Layer 1, no
         project override) resolves the same six simple_task values as the
@@ -3387,7 +3394,6 @@ class TestApplyReloadHybridRollback:
         assert live.timeouts.steward == 1800.0
 
 
-@pytest.mark.usefixtures("code_default_config")
 class TestProgressExtensionConfig:
     """Working-regime progress-extended deadline config (task 2360, step-1).
 
@@ -3401,6 +3407,7 @@ class TestProgressExtensionConfig:
     OrchestratorConfig.max_progress_resume_iterations churn bound.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_working_idle_secs_default_is_1800(self):
         """TimeoutsConfig.working_idle_secs defaults to 1800.0.
 
@@ -3427,6 +3434,7 @@ class TestProgressExtensionConfig:
         field_info = OrchestratorConfig.model_fields['invocation_timeout']
         assert field_info.default == 7200.0
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_unblock_auto_timeout_seconds_default_is_1200(self):
         """UnblockAutoConfig.timeout_seconds default is raised 600.0 -> 1200.0.
 
@@ -3437,6 +3445,7 @@ class TestProgressExtensionConfig:
         config = OrchestratorConfig()
         assert config.unblock_auto.timeout_seconds == 1200.0
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_max_progress_resume_iterations_default_is_20(self):
         """OrchestratorConfig.max_progress_resume_iterations defaults to 20.
 
@@ -3447,6 +3456,7 @@ class TestProgressExtensionConfig:
         config = OrchestratorConfig()
         assert config.max_progress_resume_iterations == 20
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults_yaml_round_trips_progress_extension_fields(self):
         """defaults.yaml carries the shipped values for all four fields, and a
         bare OrchestratorConfig() (which loads package defaults.yaml via
@@ -3491,7 +3501,6 @@ class TestPriceEntry:
             PriceEntry(input_per_1m=1, output_per_1m=1, cached_input_per_1m=-0.5)
 
 
-@pytest.mark.usefixtures("code_default_config")
 class TestOrchestratorConfigPrices:
     """OrchestratorConfig.prices is seeded from the packaged defaults.yaml
     `prices:` block (task 2459; migrated off invoke.py's former hardcoded
@@ -3503,6 +3512,7 @@ class TestOrchestratorConfigPrices:
         'gemini-3.1-pro-preview', 'gemini-3-flash',
     }
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_prices_seeded_with_expected_rates(self):
         config = OrchestratorConfig()
         assert set(config.prices) == self._SEED_KEYS
@@ -3526,10 +3536,12 @@ class TestOrchestratorConfigPrices:
         assert set(table) == self._SEED_KEYS
         assert table['o4-mini'] == {'input_per_1m': 1.10, 'output_per_1m': 4.40}
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_astra_seeds_a_cached_input_rate(self):
         assert default_price_table()['gpt-6-astra']['cached_input_per_1m'] == 1.00
         assert OrchestratorConfig().prices['gpt-6-astra'].cached_input_per_1m == 1.00
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_sol_and_terra_have_no_cached_input_rate(self):
         prices = OrchestratorConfig().prices
         assert prices['gpt-5.6-sol'].cached_input_per_1m is None
@@ -3544,7 +3556,6 @@ class TestOrchestratorConfigPrices:
         assert default_price_table() == _load_package_defaults()['prices']
 
 
-@pytest.mark.usefixtures("code_default_config")
 class TestPricesReloadDisposition:
     """`prices` is a green-tier hot-reloadable dict-valued top-level leaf,
     mirroring the existing `verify_env` precedent in RELOADABLE_FIELDS.
@@ -3553,6 +3564,7 @@ class TestPricesReloadDisposition:
     def test_prices_is_reloadable(self):
         assert 'prices' in RELOADABLE_FIELDS
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_price_edit_lands_in_applied_candidates_not_restart_required(self):
         live = OrchestratorConfig(
             prices={'o4-mini': PriceEntry(input_per_1m=1.10, output_per_1m=4.40)}
@@ -3564,6 +3576,7 @@ class TestPricesReloadDisposition:
         assert 'prices' in diff.applied_candidates
         assert 'prices' not in diff.restart_required
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_apply_reload_applies_in_place(self):
         live = OrchestratorConfig(
             prices={'o4-mini': PriceEntry(input_per_1m=1.10, output_per_1m=4.40)}
