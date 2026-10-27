@@ -437,7 +437,14 @@ async def build_live_workflow_snapshot(
             claimant label age heartbeats against it, because a heartbeat
             frozen in a snapshot read minutes ago would otherwise go stale at
             render time whatever the truth (task 6027).  Defaults to *now*.
+            Must be timezone-aware: a naive instant raises ``ValueError``
+            rather than being silently read as UTC.
     """
+    if claims_read_at is not None and claims_read_at.tzinfo is None:
+        raise ValueError(
+            f'claims_read_at must be timezone-aware, got naive {claims_read_at!r}; '
+            'resolve it with tree_read_instant.resolve_tree_read_instant'
+        )
     total_active = len(tasks)
     if not tasks:
         return LiveWorkflowSnapshot(rows=(), project_orchestrator_live=None)

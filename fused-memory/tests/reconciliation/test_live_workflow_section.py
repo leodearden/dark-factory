@@ -490,6 +490,14 @@ class TestClaimsAreAgedAtTheTreeReadInstant:
         assert f'claimant={ClaimantLabel.LIVE}' in _line_for(snapshot.render(), 'task/6027')
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('tasks', [[], [_heartbeating(6027, heartbeat_at=READ_AT)]], ids=['empty', 'one'])
+    async def test_a_naive_read_instant_is_refused(self, repo: Path, tasks: list[dict]) -> None:
+        with pytest.raises(ValueError, match='claims_read_at must be timezone-aware'):
+            await build_live_workflow_snapshot(
+                tasks, ProjectRoot(str(repo)), now=NOW, claims_read_at=READ_AT.replace(tzinfo=None),
+            )
+
+    @pytest.mark.asyncio
     async def test_recent_commit_window_stays_on_now(self, repo: Path) -> None:
         _pending_with_worktree(repo, 6028, when=NOW - timedelta(hours=7))
         read_at = NOW - timedelta(hours=2)
