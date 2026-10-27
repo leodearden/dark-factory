@@ -227,6 +227,25 @@ def _record_killpg(monkeypatch: pytest.MonkeyPatch) -> list[_KillpgCall]:
     return calls
 
 
+def _assert_sigterm_then_sigkill(
+    dispatched: tuple[_KillpgCall, ...], pgid: int, grace_secs: float
+) -> tuple[_KillpgCall, _KillpgCall]:
+    """Assert *dispatched* is one SIGTERM of group *pgid*, then one SIGKILL at least *grace_secs* later.
+
+    Returns the ``(sigterm, sigkill)`` calls so a caller can bound the legs further.
+    """
+    assert [(c.target, c.sig) for c in dispatched] == [
+        (pgid, signal.SIGTERM),
+        (pgid, signal.SIGKILL),
+    ], f'expected one SIGTERM then one SIGKILL of group {pgid}; killpg calls: {dispatched}'
+    sigterm, sigkill = dispatched
+    assert sigkill.at - sigterm.at >= grace_secs, (
+        f'the SIGTERM leg was cut short: SIGKILL came '
+        f'{sigkill.at - sigterm.at:.2f}s after SIGTERM, for grace {grace_secs}s'
+    )
+    return sigterm, sigkill
+
+
 @pytest.fixture
 def unreaped_zombie_pgid():
     """Yield the pgid of a one-member group whose only member is an unreaped zombie.
@@ -690,12 +709,14 @@ class TestTerminateProcessGroup:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(30)
-    async def test_terminate_process_group_escalates_to_sigkill(self):
-        """When the child ignores SIGTERM, SIGKILL fires after grace_secs.
+    async def test_terminate_process_group_escalates_to_sigkill(self, monkeypatch):
+        """A group that ignores SIGTERM is SIGKILLed once the grace is spent.
 
-        bash traps SIGTERM (ignores it) so the SIGTERM leg times out, then
-        SIGKILL should kill the group. proc.returncode == -9 (SIGKILL).
+        The leader dies of that SIGKILL. Its reap is awaited rather than read
+        at return, because terminate_process_group bounds its SIGKILL leg by
+        grace_secs too.
         """
+        grace_secs = 0.5
         proc = await asyncio.create_subprocess_shell(
             "trap '' TERM; echo ready; sleep 30",
             stdout=asyncio.subprocess.PIPE,
@@ -703,21 +724,22 @@ class TestTerminateProcessGroup:
             start_new_session=True,
         )
         pgid = proc.pid
+        try:
+            # The "ready" line is a happens-before edge proving SIGTERM is
+            # already SIG_IGN before we signal (task 3337 de-flake).
+            await _await_shell_ready(proc, what='SIGTERM trap installed')
+            calls = _record_killpg(monkeypatch)
 
-        # The "ready" line is a happens-before edge proving `trap '' TERM`
-        # has already returned — i.e. SIGTERM's disposition is SIG_IGN
-        # before we signal — rather than a wall-clock assumption that a
-        # fixed sleep was long enough (task 3337 de-flake).
-        await _await_shell_ready(proc, what='SIGTERM trap installed')
+            await terminate_process_group(proc, pgid, grace_secs=grace_secs)
 
-        await terminate_process_group(proc, pgid, grace_secs=0.5)
-
-        assert proc.returncode is not None, (
-            'Process was not killed even after SIGKILL escalation'
-        )
-        assert proc.returncode == -signal.SIGKILL, (
-            f'Expected returncode -9 (SIGKILL), got {proc.returncode}'
-        )
+            _assert_sigterm_then_sigkill(tuple(calls), pgid, grace_secs)
+            await proc.wait()
+            assert proc.returncode == -signal.SIGKILL, (
+                f'the leader must die of the SIGKILL, got {proc.returncode}'
+            )
+        finally:
+            _sigkill_running_members(pgid)
+            await proc.wait()
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(60)
@@ -814,16 +836,7 @@ class TestTerminateProcessGroup:
             await terminate_process_group(proc, pgid, grace_secs=grace_secs)
 
             returned_at = time.monotonic()
-            dispatched = tuple(calls)
-            assert [(c.target, c.sig) for c in dispatched] == [
-                (pgid, signal.SIGTERM),
-                (pgid, signal.SIGKILL),
-            ], f'expected one SIGTERM then one SIGKILL of group {pgid}; killpg calls: {dispatched}'
-            sigterm, sigkill = dispatched
-            assert sigkill.at - sigterm.at >= grace_secs, (
-                f'the SIGTERM leg was cut short: SIGKILL came '
-                f'{sigkill.at - sigterm.at:.2f}s after SIGTERM, for grace {grace_secs}s'
-            )
+            _, sigkill = _assert_sigterm_then_sigkill(tuple(calls), pgid, grace_secs)
             assert returned_at - sigkill.at < grace_secs, (
                 f'the SIGKILL leg spent its own grace instead of ending once the group was '
                 f'dead: {returned_at - sigkill.at:.2f}s after SIGKILL, for grace {grace_secs}s'
