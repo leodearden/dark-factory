@@ -36,7 +36,10 @@ from pathlib import Path
 from typing import Any
 
 from shared.eval_lane import eval_lane_provenance
-from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    MARKUP_RESIDUE_ERROR_TYPES,
+)
 from shared.project_layout import escalation_queue_dir
 
 logger = logging.getLogger(__name__)
@@ -45,9 +48,11 @@ logger = logging.getLogger(__name__)
 #: worktree has no name either. Never a guess — an explicit "nobody knows".
 MARKUP_UNATTRIBUTED_SUBJECT = 'unattributed'
 
-#: The two record kinds the middleware emits through this one channel. Matched
-#: by name rather than by shape: a record kind that grew a key later must not
-#: silently start taking the other branch.
+#: The REFUSAL residue kind and the burst kind. Matched by name rather than by
+#: shape: a record kind that grew a key later must not silently start taking
+#: the other branch. Residue is dispatched on the middleware's own
+#: ``MARKUP_RESIDUE_ERROR_TYPES`` set, which also holds FORWARD_REPAIR's
+#: dropped-slice kind.
 MARKUP_RESIDUE_ERROR_TYPE = 'mcp_markup_unrepairable'
 MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 
@@ -747,7 +752,7 @@ def make_escalation_sink(
                 return file_storm(
                     escalation_cls, queue, worktree, subject, record, spec,
                 )
-            if error_type != MARKUP_RESIDUE_ERROR_TYPE:
+            if error_type not in MARKUP_RESIDUE_ERROR_TYPES:
                 # A kind the middleware grew later. FILE IT rather than
                 # dropping it: silently discarding a record kind is the
                 # fail-soft this PRD exists to end, and an unfamiliar record in
@@ -755,7 +760,8 @@ def make_escalation_sink(
                 logger.warning(
                     'markup guard: filing an unrecognised record kind %r as '
                     'residue — the middleware emits something this sink does '
-                    'not know about', error_type,
+                    'not know about (known: %s)', error_type,
+                    sorted(MARKUP_RESIDUE_ERROR_TYPES | {MARKUP_STORM_ERROR_TYPE}),
                 )
             return file_residue(
                 escalation_cls, queue, worktree, subject, record, spec,
