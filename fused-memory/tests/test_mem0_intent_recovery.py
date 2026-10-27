@@ -20,10 +20,9 @@ import uuid
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
-import openai
 import pytest
 import pytest_asyncio
+from _mem0_intent_fixtures import rate_limit_error
 
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.scope import Scope
@@ -214,17 +213,6 @@ class TestAddMemoryIntentBracketing:
 # ---------------------------------------------------------------------------
 
 
-def _rate_limit_error() -> openai.RateLimitError:
-    return openai.RateLimitError(
-        'Error code: 429 - You exceeded your current quota',
-        response=httpx.Response(
-            429,
-            request=httpx.Request('POST', 'https://api.openai.com/v1/embeddings'),
-        ),
-        body=None,
-    )
-
-
 class _IntentDroppingJournal(WriteJournal):
     """A journal whose write-ahead intent silently does not land."""
 
@@ -241,7 +229,7 @@ class TestAddMemoryTransientDeferral:
         self, recovery_service, recovery_journal
     ):
         svc = recovery_service
-        svc.mem0.add = AsyncMock(side_effect=_rate_limit_error())
+        svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
 
         result = await svc.add_memory(
             content=_DEFERRED_CONTENT,
@@ -300,7 +288,7 @@ class TestAddMemoryTransientDeferral:
             journal = _IntentDroppingJournal(tmp_path / 'dropping-wj')
             await journal.initialize()
             svc.set_write_journal(journal)
-        svc.mem0.add = AsyncMock(side_effect=_rate_limit_error())
+        svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
         try:
             result = await svc.add_memory(
                 content='always run black before commit',
@@ -319,7 +307,7 @@ class TestAddMemoryTransientDeferral:
         self, recovery_service
     ):
         svc = recovery_service
-        svc.mem0.add = AsyncMock(side_effect=_rate_limit_error())
+        svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
 
         result = await svc.add_memory(
             content='we chose sqlite for the journal because it is local',
@@ -336,7 +324,7 @@ class TestAddMemoryTransientDeferral:
         self, recovery_service, recovery_journal
     ):
         svc = recovery_service
-        failing_add = AsyncMock(side_effect=_rate_limit_error())
+        failing_add = AsyncMock(side_effect=rate_limit_error())
         svc.mem0.add = failing_add
         await svc.add_memory(
             content=_DEFERRED_CONTENT,
@@ -379,7 +367,7 @@ class TestAddMemoryTransientDeferral:
     @pytest.mark.asyncio
     async def test_the_tool_payload_carries_the_pending_store(self, recovery_service):
         svc = recovery_service
-        svc.mem0.add = AsyncMock(side_effect=_rate_limit_error())
+        svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
 
         result = await svc.add_memory(
             content='always run black before commit',
@@ -597,7 +585,7 @@ class TestRecoverMem0Intents:
             success=False,
             error='RateLimitError: 429',
         )
-        svc.mem0.add = AsyncMock(side_effect=_rate_limit_error())
+        svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
 
         summary = await svc.recover_mem0_intents()
 

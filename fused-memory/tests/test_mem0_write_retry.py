@@ -9,10 +9,16 @@ import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
-import httpx
 import openai
 import pytest
 import pytest_asyncio
+from _mem0_intent_fixtures import (
+    EMBEDDINGS_REQUEST,
+    mem0_intent_row,
+    openai_status_error,
+    rate_limit_error,
+    seed_mem0_intent,
+)
 
 from fused_memory.services.mem0_write_retry import (
     DEFAULT_MEM0_RETRY_POLICY,
@@ -24,23 +30,7 @@ from fused_memory.services.mem0_write_retry import (
     retry_reason,
     run_periodic_mem0_retry,
 )
-from fused_memory.services.write_journal import WriteJournal
-
-_EMBEDDINGS_REQUEST = httpx.Request('POST', 'https://api.openai.com/v1/embeddings')
-
-
-def _status_error(cls: type[openai.APIStatusError], status: int) -> openai.APIStatusError:
-    return cls(
-        f'Error code: {status} - no credits',
-        response=httpx.Response(status, request=_EMBEDDINGS_REQUEST),
-        body=None,
-    )
-
-
-def rate_limit_error() -> openai.RateLimitError:
-    error = _status_error(openai.RateLimitError, 429)
-    assert isinstance(error, openai.RateLimitError)
-    return error
+from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
 
 
 class TestClassifyTransientProviderFailure:
@@ -49,19 +39,19 @@ class TestClassifyTransientProviderFailure:
         [
             (rate_limit_error(), TransientProviderFailure.RATE_LIMITED),
             (
-                _status_error(openai.InternalServerError, 500),
+                openai_status_error(openai.InternalServerError, 500),
                 TransientProviderFailure.SERVER_ERROR,
             ),
             (
-                _status_error(openai.APIStatusError, 503),
+                openai_status_error(openai.APIStatusError, 503),
                 TransientProviderFailure.SERVER_ERROR,
             ),
             (
-                openai.APIConnectionError(request=_EMBEDDINGS_REQUEST),
+                openai.APIConnectionError(request=EMBEDDINGS_REQUEST),
                 TransientProviderFailure.CONNECTION,
             ),
             (
-                openai.APITimeoutError(request=_EMBEDDINGS_REQUEST),
+                openai.APITimeoutError(request=EMBEDDINGS_REQUEST),
                 TransientProviderFailure.CONNECTION,
             ),
         ],
@@ -74,8 +64,8 @@ class TestClassifyTransientProviderFailure:
         'error',
         [
             TimeoutError('Mem0 add timed out after 30.0s'),
-            _status_error(openai.AuthenticationError, 401),
-            _status_error(openai.BadRequestError, 400),
+            openai_status_error(openai.AuthenticationError, 401),
+            openai_status_error(openai.BadRequestError, 400),
             RuntimeError(
                 "Error code: 429 - {'error': {'message': 'You have no credits remaining'}}"
             ),
@@ -157,27 +147,21 @@ async def _seed_retrying(
     content: str = 'Never run git stash in a dark-factory checkout. ' * 8,
     metadata: dict | None = None,
 ) -> tuple[str, str]:
-    intent_id, write_op_id = str(uuid.uuid4()), str(uuid.uuid4())
-    await journal.log_mem0_intent(
-        intent_id=intent_id,
+    write_op_id = str(uuid.uuid4())
+    intent_id = await seed_mem0_intent(
+        journal,
+        status=Mem0IntentStatus.RETRYING,
+        reason='rate_limited: RateLimitError: 429',
+        retry_at=retry_at,
         write_op_id=write_op_id,
+        content=content,
+        metadata=metadata if metadata is not None else {'category': 'procedural_knowledge'},
         project_id='dark_factory',
         agent_id='agent-a',
         session_id='sess-1',
         category='procedural_knowledge',
-        content=content,
-        metadata=metadata if metadata is not None else {'category': 'procedural_knowledge'},
-        payload_digest='d',
-    )
-    assert await journal.schedule_mem0_retry(
-        intent_id, reason='rate_limited: RateLimitError: 429', retry_at=retry_at
     )
     return intent_id, write_op_id
-
-
-async def _intent(journal: WriteJournal, intent_id: str) -> dict:
-    (row,) = [r for r in await journal.get_mem0_intents() if r['id'] == intent_id]
-    return row
 
 
 class _Reissue:
@@ -190,6 +174,20 @@ class _Reissue:
         if self._error is not None:
             raise self._error
         return {'results': [{'id': 'mem0-late'}]}
+
+
+class _StampedElsewhere(_Reissue):
+    """A re-issue during which another writer stamps the intent out of ``retrying``."""
+
+    def __init__(self, journal: WriteJournal, error: BaseException | None = None) -> None:
+        super().__init__(error)
+        self._journal = journal
+
+    async def __call__(self, intent: dict) -> object:
+        await self._journal.resolve_mem0_intent(
+            intent['id'], Mem0IntentStatus.FAILED, reason='stamped elsewhere'
+        )
+        return await super().__call__(intent)
 
 
 async def _run_pass(journal: WriteJournal, reissue: _Reissue) -> Mem0RetryPassSummary:
@@ -210,7 +208,7 @@ class TestRetryDueMem0Intents:
         assert call['id'] == intent_id
         assert call['content'] == content
         assert json.loads(call['metadata']) == metadata
-        row = await _intent(journal, intent_id)
+        row = await mem0_intent_row(journal, intent_id)
         assert row['status'] == 'completed'
         assert 'attempt 2' in row['reason']
         assert summary == Mem0RetryPassSummary(due=1, landed=1)
@@ -223,7 +221,7 @@ class TestRetryDueMem0Intents:
         summary = await _run_pass(journal, reissue)
 
         assert reissue.calls == []
-        assert (await _intent(journal, intent_id))['status'] == 'retrying'
+        assert (await mem0_intent_row(journal, intent_id))['status'] == 'retrying'
         assert summary == Mem0RetryPassSummary()
 
     @pytest.mark.asyncio
@@ -232,7 +230,7 @@ class TestRetryDueMem0Intents:
 
         summary = await _run_pass(journal, _Reissue(rate_limit_error()))
 
-        row = await _intent(journal, intent_id)
+        row = await mem0_intent_row(journal, intent_id)
         assert row['status'] == 'retrying'
         assert row['attempts'] == 2
         assert row['next_attempt_at'] == _PASS_POLICY.retry_at(
@@ -254,7 +252,7 @@ class TestRetryDueMem0Intents:
         with caplog.at_level(logging.ERROR):
             summary = await _run_pass(journal, _Reissue(error))
 
-        row = await _intent(journal, intent_id)
+        row = await mem0_intent_row(journal, intent_id)
         assert row['status'] == 'dead'
         assert type(error).__name__ in row['reason']
         assert 'attempt 2' in row['reason']
@@ -275,7 +273,7 @@ class TestRetryDueMem0Intents:
         summary = await _run_pass(journal, reissue)
 
         assert reissue.calls == []
-        assert (await _intent(journal, intent_id))['status'] == 'completed'
+        assert (await mem0_intent_row(journal, intent_id))['status'] == 'completed'
         assert summary == Mem0RetryPassSummary(due=1, reconciled=1)
 
     @pytest.mark.asyncio
@@ -314,7 +312,35 @@ class TestRetryDueMem0Intents:
         with pytest.raises(asyncio.CancelledError):
             await _run_pass(journal, _Reissue(asyncio.CancelledError()))
 
-        assert (await _intent(journal, intent_id))['status'] == 'retrying'
+        assert (await mem0_intent_row(journal, intent_id))['status'] == 'retrying'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('error', 'target_status'),
+        [
+            (None, Mem0IntentStatus.COMPLETED),
+            (rate_limit_error(), Mem0IntentStatus.RETRYING),
+            (RuntimeError('qdrant schema mismatch'), Mem0IntentStatus.DEAD),
+        ],
+        ids=['landed', 'rescheduled', 'dead-lettered'],
+    )
+    async def test_a_stamp_that_misses_is_counted_unstamped_and_warned(
+        self, journal, caplog, error, target_status
+    ):
+        intent_id, write_op_id = await _seed_retrying(journal)
+
+        with caplog.at_level(logging.WARNING):
+            summary = await _run_pass(journal, _StampedElsewhere(journal, error))
+
+        assert (await mem0_intent_row(journal, intent_id))['status'] == 'failed'
+        assert summary == Mem0RetryPassSummary(due=1, unstamped=1)
+        assert any(
+            r.levelno == logging.WARNING
+            and intent_id in r.getMessage()
+            and repr(target_status.value) in r.getMessage()
+            and write_op_id in r.getMessage()
+            for r in caplog.records
+        )
 
 
 @pytest.mark.asyncio

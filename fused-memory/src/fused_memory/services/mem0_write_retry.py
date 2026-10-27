@@ -100,11 +100,14 @@ DEFAULT_MEM0_RETRY_POLICY = Mem0RetryPolicy(
 
 @dataclass(frozen=True)
 class Mem0RetryPassSummary:
+    """One pass's intents by outcome; ``unstamped`` ones are counted under no other outcome."""
+
     due: int = 0
     landed: int = 0
     reconciled: int = 0
     rescheduled: int = 0
     dead_lettered: int = 0
+    unstamped: int = 0
 
 
 class _RetryOutcome(StrEnum):
@@ -112,6 +115,7 @@ class _RetryOutcome(StrEnum):
     RECONCILED = 'reconciled'
     RESCHEDULED = 'rescheduled'
     DEAD_LETTERED = 'dead_lettered'
+    UNSTAMPED = 'unstamped'
 
 
 def mem0_write_op_landed(backend_ops: Sequence[Mapping]) -> bool:
@@ -137,6 +141,7 @@ async def retry_due_mem0_intents(
         reconciled=outcomes[_RetryOutcome.RECONCILED],
         rescheduled=outcomes[_RetryOutcome.RESCHEDULED],
         dead_lettered=outcomes[_RetryOutcome.DEAD_LETTERED],
+        unstamped=outcomes[_RetryOutcome.UNSTAMPED],
     )
 
 
@@ -150,32 +155,32 @@ async def _retry_one(
 ) -> _RetryOutcome:
     attempt = intent['attempts'] + 1
     if mem0_write_op_landed(await journal.get_backend_ops_for_write_op(intent['write_op_id'])):
-        await journal.resolve_mem0_intent(
-            intent['id'],
+        return await _stamp_retrying_intent(
+            journal,
+            intent,
             Mem0IntentStatus.COMPLETED,
             reason='reconciled: a success mem0 backend_op shows an earlier retry landed',
-            expected_status=Mem0IntentStatus.RETRYING,
+            outcome=_RetryOutcome.RECONCILED,
         )
-        return _RetryOutcome.RECONCILED
     try:
         await reissue(intent)
     except Exception as exc:
         return await _record_failed_attempt(
             journal, intent, exc, attempt=attempt, policy=policy, now=now
         )
-    await journal.resolve_mem0_intent(
-        intent['id'],
-        Mem0IntentStatus.COMPLETED,
-        reason=f'landed on retry attempt {attempt}',
-        expected_status=Mem0IntentStatus.RETRYING,
-    )
     logger.info(
-        'Mem0 retry landed intent %s on attempt %d (write_op_id=%s)',
+        'Mem0 retry re-issue of intent %s landed on attempt %d (write_op_id=%s)',
         intent['id'],
         attempt,
         intent['write_op_id'],
     )
-    return _RetryOutcome.LANDED
+    return await _stamp_retrying_intent(
+        journal,
+        intent,
+        Mem0IntentStatus.COMPLETED,
+        reason=f'landed on retry attempt {attempt}',
+        outcome=_RetryOutcome.LANDED,
+    )
 
 
 async def _record_failed_attempt(
@@ -190,9 +195,10 @@ async def _record_failed_attempt(
     failure = classify_transient_provider_failure(exc)
     if failure is not None:
         retry_at = policy.retry_at(attempts=attempt, now=now)
-        await journal.schedule_mem0_retry(
+        if not await journal.schedule_mem0_retry(
             intent['id'], reason=retry_reason(failure, exc), retry_at=retry_at
-        )
+        ):
+            return _warn_unstamped(intent, Mem0IntentStatus.RETRYING, _RetryOutcome.RESCHEDULED)
         logger.warning(
             'Mem0 retry attempt %d of intent %s failed transiently (%s); next at %s '
             '(write_op_id=%s)',
@@ -207,14 +213,44 @@ async def _record_failed_attempt(
         f'retry attempt {attempt} raised a non-transient {type(exc).__name__}: {exc} '
         f'(write_op_id={intent["write_op_id"]})'
     )
-    await journal.resolve_mem0_intent(
-        intent['id'],
+    logger.error('Mem0 retry dead-letters intent %s: %s', intent['id'], reason)
+    return await _stamp_retrying_intent(
+        journal,
+        intent,
         Mem0IntentStatus.DEAD,
         reason=reason,
-        expected_status=Mem0IntentStatus.RETRYING,
+        outcome=_RetryOutcome.DEAD_LETTERED,
     )
-    logger.error('Mem0 retry dead-lettered intent %s: %s', intent['id'], reason)
-    return _RetryOutcome.DEAD_LETTERED
+
+
+async def _stamp_retrying_intent(
+    journal: WriteJournal,
+    intent: dict,
+    status: Mem0IntentStatus,
+    *,
+    reason: str,
+    outcome: _RetryOutcome,
+) -> _RetryOutcome:
+    """Stamp a still-``retrying`` intent ``status``; return ``outcome``, or UNSTAMPED if it missed."""
+    if await journal.resolve_mem0_intent(
+        intent['id'], status, reason=reason, expected_status=Mem0IntentStatus.RETRYING
+    ):
+        return outcome
+    return _warn_unstamped(intent, status, outcome)
+
+
+def _warn_unstamped(
+    intent: dict, status: Mem0IntentStatus, outcome: _RetryOutcome
+) -> _RetryOutcome:
+    logger.warning(
+        'Mem0 retry could not stamp intent %s %r after outcome %r: the row was no '
+        'longer retrying, or the journal write failed (write_op_id=%s)',
+        intent['id'],
+        status.value,
+        outcome.value,
+        intent['write_op_id'],
+    )
+    return _RetryOutcome.UNSTAMPED
 
 
 async def run_periodic_mem0_retry(

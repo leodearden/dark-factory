@@ -11,6 +11,11 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from _mem0_intent_fixtures import (
+    mem0_intent_row,
+    seed_mem0_intent,
+    set_mem0_intent_created_at,
+)
 
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
 from fused_memory.services.write_journal import (
@@ -860,32 +865,6 @@ CREATE INDEX IF NOT EXISTS idx_mi_write_op ON mem0_intents(write_op_id);
 """
 
 
-async def _seed_mem0_intent(journal: WriteJournal, content: str = 'c') -> str:
-    intent_id = str(uuid.uuid4())
-    await journal.log_mem0_intent(
-        intent_id=intent_id,
-        write_op_id=str(uuid.uuid4()),
-        content=content,
-        metadata={'k': 'v'},
-        payload_digest='d',
-    )
-    return intent_id
-
-
-def _set_mem0_intent_column(
-    journal: WriteJournal, intent_id: str, column: str, value: str
-) -> None:
-    with closing(sqlite3.connect(journal.db_path)) as conn, conn:
-        conn.execute(
-            f'UPDATE mem0_intents SET {column} = ? WHERE id = ?', (value, intent_id)
-        )
-
-
-async def _mem0_intent(journal: WriteJournal, intent_id: str) -> dict:
-    (row,) = [r for r in await journal.get_mem0_intents() if r['id'] == intent_id]
-    return row
-
-
 class TestMem0IntentRetrySchedule:
     """The journal surface for Mem0 writes deferred for server-side retry (task 7397)."""
 
@@ -900,7 +879,7 @@ class TestMem0IntentRetrySchedule:
 
     @pytest.mark.asyncio
     async def test_fresh_intent_has_no_attempts_and_no_schedule(self, journal):
-        row = await _mem0_intent(journal, await _seed_mem0_intent(journal))
+        row = await mem0_intent_row(journal, await seed_mem0_intent(journal))
         assert row['attempts'] == 0
         assert row['next_attempt_at'] is None
 
@@ -918,7 +897,7 @@ class TestMem0IntentRetrySchedule:
         j = WriteJournal(data_dir)
         await j.initialize()
         try:
-            row = await _mem0_intent(j, 'old-1')
+            row = await mem0_intent_row(j, 'old-1')
             assert row['attempts'] == 0
             assert row['next_attempt_at'] is None
             assert await j.schedule_mem0_retry(
@@ -929,13 +908,13 @@ class TestMem0IntentRetrySchedule:
 
     @pytest.mark.asyncio
     async def test_schedule_moves_pending_to_retrying_and_counts_attempts(self, journal):
-        intent_id = await _seed_mem0_intent(journal)
+        intent_id = await seed_mem0_intent(journal)
         first_at = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
         reason = 'rate_limited: RateLimitError: 429'
 
         assert await journal.schedule_mem0_retry(intent_id, reason=reason, retry_at=first_at)
 
-        row = await _mem0_intent(journal, intent_id)
+        row = await mem0_intent_row(journal, intent_id)
         assert row['status'] == 'retrying'
         assert row['attempts'] == 1
         assert row['next_attempt_at'] == first_at.isoformat(timespec='microseconds')
@@ -946,21 +925,21 @@ class TestMem0IntentRetrySchedule:
         assert await journal.schedule_mem0_retry(
             intent_id, reason=reason, retry_at=second_at
         )
-        row = await _mem0_intent(journal, intent_id)
+        row = await mem0_intent_row(journal, intent_id)
         assert row['attempts'] == 2
         assert row['next_attempt_at'] == second_at.isoformat(timespec='microseconds')
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('terminal', ['completed', 'failed', 'dead'])
     async def test_schedule_refuses_terminal_rows(self, journal, terminal):
-        intent_id = await _seed_mem0_intent(journal)
+        intent_id = await seed_mem0_intent(journal)
         await journal.resolve_mem0_intent(intent_id, terminal, reason='terminal')
-        before = await _mem0_intent(journal, intent_id)
+        before = await mem0_intent_row(journal, intent_id)
 
         assert not await journal.schedule_mem0_retry(
             intent_id, reason='late', retry_at=datetime.now(UTC)
         )
-        assert await _mem0_intent(journal, intent_id) == before
+        assert await mem0_intent_row(journal, intent_id) == before
 
     @pytest.mark.asyncio
     async def test_schedule_refuses_unknown_id(self, journal):
@@ -972,11 +951,11 @@ class TestMem0IntentRetrySchedule:
     @pytest.mark.asyncio
     async def test_due_retries_are_the_retrying_rows_scheduled_by_now(self, journal):
         now = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
-        due_later_first = await _seed_mem0_intent(journal)
-        due_earlier_second = await _seed_mem0_intent(journal)
-        due_third = await _seed_mem0_intent(journal)
-        not_yet_due = await _seed_mem0_intent(journal)
-        await _seed_mem0_intent(journal)  # stays pending
+        due_later_first = await seed_mem0_intent(journal)
+        due_earlier_second = await seed_mem0_intent(journal)
+        due_third = await seed_mem0_intent(journal)
+        not_yet_due = await seed_mem0_intent(journal)
+        await seed_mem0_intent(journal)  # stays pending
         schedule = {
             due_later_first: now - timedelta(seconds=10),
             due_earlier_second: now - timedelta(seconds=20),
@@ -996,7 +975,7 @@ class TestMem0IntentRetrySchedule:
 
     @pytest.mark.asyncio
     async def test_resolve_reports_whether_it_updated(self, journal):
-        intent_id = await _seed_mem0_intent(journal)
+        intent_id = await seed_mem0_intent(journal)
         assert await journal.resolve_mem0_intent(intent_id, Mem0IntentStatus.COMPLETED)
         assert not await journal.resolve_mem0_intent(
             'no-such-intent', Mem0IntentStatus.COMPLETED
@@ -1004,11 +983,11 @@ class TestMem0IntentRetrySchedule:
 
     @pytest.mark.asyncio
     async def test_resolve_with_expected_status_is_a_compare_and_set(self, journal):
-        completed_id = await _seed_mem0_intent(journal)
+        completed_id = await seed_mem0_intent(journal)
         await journal.resolve_mem0_intent(completed_id, 'completed', reason='landed')
-        failed_id = await _seed_mem0_intent(journal)
+        failed_id = await seed_mem0_intent(journal)
         await journal.resolve_mem0_intent(failed_id, 'failed', reason='429')
-        completed_before = await _mem0_intent(journal, completed_id)
+        completed_before = await mem0_intent_row(journal, completed_id)
 
         assert not await journal.resolve_mem0_intent(
             completed_id,
@@ -1016,7 +995,7 @@ class TestMem0IntentRetrySchedule:
             reason='replayed',
             expected_status=Mem0IntentStatus.FAILED,
         )
-        assert await _mem0_intent(journal, completed_id) == completed_before
+        assert await mem0_intent_row(journal, completed_id) == completed_before
 
         assert await journal.resolve_mem0_intent(
             failed_id,
@@ -1024,25 +1003,25 @@ class TestMem0IntentRetrySchedule:
             reason='replayed',
             expected_status=Mem0IntentStatus.FAILED,
         )
-        failed_after = await _mem0_intent(journal, failed_id)
+        failed_after = await mem0_intent_row(journal, failed_id)
         assert failed_after['status'] == 'completed'
         assert failed_after['reason'] == 'replayed'
 
     @pytest.mark.asyncio
     async def test_count_by_status_covers_only_the_window(self, journal):
         since = datetime.now(UTC) - timedelta(minutes=5)
-        for status in ['completed', 'completed', 'failed']:
-            await journal.resolve_mem0_intent(await _seed_mem0_intent(journal), status)
-        retrying_id = await _seed_mem0_intent(journal)
-        await journal.schedule_mem0_retry(retrying_id, reason='r', retry_at=since)
-        await _seed_mem0_intent(journal)  # pending
-        old_id = await _seed_mem0_intent(journal)
-        await journal.resolve_mem0_intent(old_id, 'dead')
-        _set_mem0_intent_column(
+        for status in [
+            Mem0IntentStatus.COMPLETED,
+            Mem0IntentStatus.COMPLETED,
+            Mem0IntentStatus.FAILED,
+            Mem0IntentStatus.RETRYING,
+            Mem0IntentStatus.PENDING,
+        ]:
+            await seed_mem0_intent(journal, status=status, retry_at=since)
+        await seed_mem0_intent(
             journal,
-            old_id,
-            'created_at',
-            (since - timedelta(hours=2)).isoformat(),
+            status=Mem0IntentStatus.DEAD,
+            created_at=since - timedelta(hours=2),
         )
 
         counts = await journal.count_mem0_intents_by_status(since=since)
@@ -1052,19 +1031,17 @@ class TestMem0IntentRetrySchedule:
 
     @pytest.mark.asyncio
     async def test_retrying_rows_are_never_pruned(self, journal):
-        intent_id = await _seed_mem0_intent(journal)
+        intent_id = await seed_mem0_intent(journal)
         await journal.schedule_mem0_retry(
             intent_id, reason='r', retry_at=datetime.now(UTC)
         )
-        _set_mem0_intent_column(
-            journal, intent_id, 'created_at', '2000-01-01T00:00:00+00:00'
-        )
+        set_mem0_intent_created_at(journal, intent_id, datetime(2000, 1, 1, tzinfo=UTC))
 
         assert await journal.prune_mem0_intents(older_than_days=0) == 0
         assert await journal.prune_mem0_intents(
             older_than_days=0, statuses=('completed', 'failed', 'retrying')
         ) == 0
-        row = await _mem0_intent(journal, intent_id)
+        row = await mem0_intent_row(journal, intent_id)
         assert row['status'] == 'retrying'
         assert row['resolved_at'] is None
 
