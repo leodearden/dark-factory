@@ -41,7 +41,7 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.models.memory import AddMemoryResponse
-from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation.known_projects_section import render_known_projects_section
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.server.recon_report import ReconReportState
 
@@ -58,11 +58,6 @@ _STUB_ADD_MEMORY_RESPONSE = AddMemoryResponse(memory_ids=['stub-id'])
 # ---------------------------------------------------------------------------
 # Local helpers (self-contained; do not import from test_flag_dedup.py)
 # ---------------------------------------------------------------------------
-
-
-def _scope(project_id: str, project_root: str) -> ProjectScope:
-    """Build a ProjectScope from raw strings — DRYs the many test call sites."""
-    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
 @pytest_asyncio.fixture
@@ -518,7 +513,7 @@ class TestUnknownProjectBranchHasNoAnchor:
 
     server/main.py builds ONE known_projects map and feeds it to BOTH
     state.known_projects (gating cite_task) AND the payload's Known Projects section
-    (rendered by _format_known_projects_section). So:
+    (rendered by render_known_projects_section). So:
 
         'appears in Known Projects' ↔ 'in known_projects' ↔ 'cite_task succeeds'
 
@@ -575,7 +570,7 @@ class TestUnknownProjectBranchHasNoAnchor:
         state._task_interceptor.get_task.assert_not_awaited()
 
     def test_known_projects_section_lists_project_iff_registered(self):
-        """_format_known_projects_section renders 'reify' only when it is in known_projects.
+        """render_known_projects_section renders 'reify' only when it is in known_projects.
 
         Together with test_cross_project_finding_carries_cited_tasks (step-1, where
         'reify' IS registered and cite_task succeeds), this locks in the full invariant:
@@ -587,26 +582,20 @@ class TestUnknownProjectBranchHasNoAnchor:
         The corrected step-6 prompt must key the cite_task directive on EXACTLY this
         condition — it must appear in the KNOWN-project branch, not the unknown-project one.
         """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            TaskKnowledgeSync,
-        )
-
         # Two-project case: 'reify' registered → section renders and contains 'reify'
-        stage = TaskKnowledgeSync.__new__(TaskKnowledgeSync)
-        stage.scope = _scope('dark_factory', '/a')
-        stage.known_projects = {'dark_factory': '/a', 'reify': '/b'}
-        section = stage._format_known_projects_section()
+        section = render_known_projects_section(
+            {'dark_factory': '/a', 'reify': '/b'}, current_project_id='dark_factory'
+        )
         assert 'reify' in section, (
             f"'reify' must appear in Known Projects section when registered; got:\n{section!r}"
         )
 
-        # Single-project case: < 2 projects guard (L1927) → empty string
+        # Single-project case: < 2 projects guard → empty string
         # 'reify' is absent from the payload — the LLM's Known Projects section
         # does NOT list it, consistent with cite_task failing for an unregistered project
-        stage_solo = TaskKnowledgeSync.__new__(TaskKnowledgeSync)
-        stage_solo.scope = _scope('dark_factory', '/a')
-        stage_solo.known_projects = {'dark_factory': '/a'}
-        section_solo = stage_solo._format_known_projects_section()
+        section_solo = render_known_projects_section(
+            {'dark_factory': '/a'}, current_project_id='dark_factory'
+        )
         assert section_solo == '', (
             f'Section must be empty when fewer than 2 projects known; got:\n{section_solo!r}'
         )
