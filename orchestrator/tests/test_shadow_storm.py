@@ -168,8 +168,12 @@ class TestEvaluateStorm:
         everything = dataclasses.replace(_CALM, **_OVER_BUDGET, **_STREAK, **_RATIO)
         streak_and_ratio = dataclasses.replace(_CALM, **_STREAK, **_RATIO)
 
-        assert evaluate_storm(everything).cause is ShadowStormCause.DAILY_BUDGET
-        assert evaluate_storm(streak_and_ratio).cause is ShadowStormCause.FAILURE_STREAK
+        causes = [evaluate_storm(facts) for facts in (everything, streak_and_ratio)]
+
+        assert [trip and trip.cause for trip in causes] == [
+            ShadowStormCause.DAILY_BUDGET,
+            ShadowStormCause.FAILURE_STREAK,
+        ]
 
 
 def _inputs_with_budget(spent: float, cap: float) -> OpenInputs:
@@ -212,7 +216,7 @@ _NOW = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)
 
 class TestStormWindow:
     def test_the_window_is_the_trailing_day(self):
-        assert TRAILING_WINDOW == timedelta(hours=24)
+        assert timedelta(hours=24) == TRAILING_WINDOW
         assert storm_window_start(_NOW, None) == _NOW - TRAILING_WINDOW
 
     def test_a_recent_resume_restarts_the_window(self):
