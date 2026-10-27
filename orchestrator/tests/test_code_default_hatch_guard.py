@@ -532,22 +532,16 @@ def test_hatched(code_default_config):
             'a direct `code_default_config` fixture argument must be honoured'
         )
 
-    @pytest.mark.parametrize('test_def', [
-        '''
-def test_repointed(monkeypatch, tmp_path):
-    monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'project.yaml'))
-    cfg = OrchestratorConfig()
-    assert cfg.starvation_watchdog.skip_threshold == 50
-''',
-        '''
-def test_repointed(tmp_path):
-    p = tmp_path / 'project.yaml'
-    with patch.dict(os.environ, {'ORCH_CONFIG_PATH': str(p)}):
-        cfg = OrchestratorConfig()
-        assert cfg.starvation_watchdog.skip_threshold == 50
-''',
-    ], ids=['setenv-path', 'patch-dict-path'])
-    def test_explicit_repoint_of_the_config(self, tmp_path, test_def):
+    @pytest.mark.parametrize('repoint', [
+        "monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))",
+        "monkeypatch.setenv(name='ORCH_CONFIG_PATH', value=str(p))",
+        "os.environ['ORCH_CONFIG_PATH'] = str(p)",
+        "patch.dict(os.environ, {'ORCH_CONFIG_PATH': str(p)}).start()",
+        "patch.dict(os.environ, ORCH_CONFIG_PATH=str(p)).start()",
+        "patch.dict('os.environ', {'ORCH_CONFIG_PATH': str(p)}, clear=True).start()",
+    ], ids=['setenv', 'setenv-keywords', 'environ-subscript', 'patch-dict',
+            'patch-dict-keyword', 'patch-dict-string-target-clearing'])
+    def test_explicit_repoint_of_the_config(self, tmp_path, repoint):
         """A test reading its own project file is not reading the operational one."""
         src = _write(tmp_path, 'test_synth_repoint.py', f'''
 import os
@@ -555,7 +549,13 @@ from unittest.mock import patch
 
 from orchestrator.config import OrchestratorConfig
 
-{test_def}''')
+
+def test_repointed(monkeypatch, tmp_path):
+    p = tmp_path / 'project.yaml'
+    {repoint}
+    cfg = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == 50
+''')
         assert list(iter_default_asserting_tests(src)) == [], (
             'an explicit re-point of ORCH_CONFIG_PATH must be honoured as '
             'isolation'
@@ -1003,14 +1003,55 @@ class TestBlankingSiteDetector:
             f'expected one (qualname, line, kind) per blanking site; got {found!r}'
         )
 
+    @pytest.mark.parametrize('stmt, kind', [
+        ("monkeypatch.setenv(name='ORCH_CONFIG_PATH', value='')",
+         ConfigPathWrite.BLANK),
+        ("os.environ['ORCH_CONFIG_PATH'] = ''", ConfigPathWrite.BLANK),
+        ("with patch.dict(os.environ, ORCH_CONFIG_PATH=''):\n        pass",
+         ConfigPathWrite.BLANK),
+        ("monkeypatch.delenv(name='ORCH_CONFIG_PATH')", ConfigPathWrite.DELETE),
+        ("os.environ.pop('ORCH_CONFIG_PATH', None)", ConfigPathWrite.DELETE),
+        ("del os.environ['ORCH_CONFIG_PATH']", ConfigPathWrite.DELETE),
+        ("with patch.dict(os.environ, clear=True):\n        pass",
+         ConfigPathWrite.DELETE),
+        ("with patch.dict('os.environ', {'PATH': '/bin'}, clear=True):\n        pass",
+         ConfigPathWrite.DELETE),
+    ], ids=['setenv-keywords', 'environ-subscript', 'patch-dict-keyword',
+            'delenv-keyword', 'environ-pop', 'environ-del', 'patch-dict-clear',
+            'patch-dict-clear-other-keys'])
+    def test_classifies_each_spelling_of_a_blank_or_delete(
+        self, tmp_path, stmt, kind,
+    ):
+        src = _write(tmp_path, 'test_synth_spellings.py', f'''
+import os
+from unittest.mock import patch
+
+
+def test_z(monkeypatch):
+    {stmt}
+''')
+        found = [found_kind for _q, _l, found_kind in iter_config_path_blanking_sites(src)]
+        assert found == [kind], (
+            f'`{stmt}` writes ORCH_CONFIG_PATH as {kind.name}; got {found!r}'
+        )
+
     @pytest.mark.parametrize('stmt', [
         "monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))",
         "with patch.dict(os.environ, {'ORCH_CONFIG_PATH': str(p)}):\n        pass",
+        "os.environ['ORCH_CONFIG_PATH'] = str(p)",
         "fake_environ = {'ORCH_CONFIG_PATH': ''}\n"
         "    monkeypatch.setattr(verify.os, 'environ', fake_environ)",
+        "with patch.dict(fake_environ, {'ORCH_CONFIG_PATH': ''}, clear=True):\n"
+        "        pass",
+        "with patch.dict(os.environ, env, clear=True):\n        pass",
+        "with patch.dict(os.environ, {**env}, clear=True):\n        pass",
+        "os.environ.pop('TZ', None)",
         "assert 'ORCH_CONFIG_PATH' not in os.environ",
         "assert os.environ.get('ORCH_CONFIG_PATH', '') == ''",
-    ], ids=['setenv-path', 'patch-dict-path', 'subprocess-env-dict',
+    ], ids=['setenv-path', 'patch-dict-path', 'environ-subscript-path',
+            'subprocess-env-dict', 'patch-dict-other-mapping',
+            'patch-dict-clear-unreadable-values',
+            'patch-dict-clear-unpacked-values', 'environ-pop-other-key',
             'membership-read', 'get-read'])
     def test_yields_nothing_for_a_non_blanking_mention(self, tmp_path, stmt):
         src = _write(tmp_path, 'test_synth_non_sites.py', f'''
@@ -1020,7 +1061,7 @@ from unittest.mock import patch
 from orchestrator import verify
 
 
-def test_z(monkeypatch, tmp_path):
+def test_z(monkeypatch, tmp_path, env, fake_environ):
     p = tmp_path / 'project.yaml'
     {stmt}
 ''')

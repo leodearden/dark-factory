@@ -26,15 +26,16 @@ WHAT COUNTS AS ISOLATED.
   in the class body or the module (each detected by substring over the
   unparsed mark, so any quote spelling works); or a ``code_default_config``
   parameter, requesting the fixture directly.
-* An explicit re-point anywhere in the function:
-  ``<obj>.setenv('ORCH_CONFIG_PATH', <non-empty>)`` or
-  ``patch.dict(<env>, {'ORCH_CONFIG_PATH': <non-empty>})``.
+* An explicit re-point anywhere in the function: a write that sets
+  ``ORCH_CONFIG_PATH`` to anything but ``''``, in one of the spellings
+  :func:`_config_path_write` lists (``setenv``, an ``os.environ[...]``
+  assignment, ``patch.dict`` on the environment).
 
 An ``autouse=True`` fixture defined directly in the test's class or module
 counts too, when the fixture itself meets one of those rules.
 
-Blanking the variable (``setenv`` or ``patch.dict`` with ``''``) or deleting it
-does NOT count: ``orchestrator/src/orchestrator/config.py::OrchestratorConfig.settings_customise_sources``
+Blanking the variable (setting it to ``''``) or deleting it does NOT count:
+``orchestrator/src/orchestrator/config.py::OrchestratorConfig.settings_customise_sources``
 reads ``os.environ.get('ORCH_CONFIG_PATH', '') or 'config.yaml'``.  Both
 therefore fall back to a ``config.yaml`` relative to the process cwd, and
 isolate only while no such file happens to sit there.
@@ -59,6 +60,11 @@ test writes through it (``cfg.a = v``, ``cfg.a[i] = v``).
 All of these admit false NEGATIVES and none admits a false POSITIVE.  That is
 the trade a *committed* ratchet requires: a guard that occasionally misses a
 landmine is a nuisance, while one that occasionally invents one gets disabled.
+The one exception is isolation the scan cannot read: a re-point in a spelling
+:func:`_config_path_write` does not list (the variable's name held in a
+constant, a mapping built elsewhere), or one made by a non-autouse fixture
+the test requests by name.  A default assertion behind such a re-point is
+reported.  The remedy is the hatch, which says what the test means anyway.
 
 NOT DETECTED HERE.  Tests that exercise default-only *behaviour* without
 asserting any config literal are invisible to a static scan (e.g. a section's
@@ -420,34 +426,112 @@ class ConfigPathWrite(enum.Enum):
     DELETE = enum.auto()
 
 
+_CONFIG_PATH_VAR = 'ORCH_CONFIG_PATH'
+
+
 def _names_config_path(node: ast.expr | None) -> bool:
-    return isinstance(node, ast.Constant) and node.value == 'ORCH_CONFIG_PATH'
+    return isinstance(node, ast.Constant) and node.value == _CONFIG_PATH_VAR
 
 
-def _set_to(value: ast.expr) -> ConfigPathWrite:
+def _is_environ(node: ast.expr | None) -> bool:
+    """``os.environ`` reached through any module path, a bare ``environ``, or
+    the ``'os.environ'`` string ``patch.dict`` also accepts as its target."""
+    if isinstance(node, ast.Attribute):
+        return node.attr == 'environ'
+    if isinstance(node, ast.Name):
+        return node.id == 'environ'
+    return isinstance(node, ast.Constant) and node.value == 'os.environ'
+
+
+def _is_config_path_item(target: ast.expr) -> bool:
+    """True for ``<environ>['ORCH_CONFIG_PATH']``."""
+    return (
+        isinstance(target, ast.Subscript)
+        and _is_environ(target.value)
+        and _names_config_path(target.slice)
+    )
+
+
+def _argument(call: ast.Call, position: int, keyword: str) -> ast.expr | None:
+    """What *call* passes at *position* or as *keyword*, or ``None``."""
+    if position < len(call.args):
+        return call.args[position]
+    return next((kw.value for kw in call.keywords if kw.arg == keyword), None)
+
+
+def _set_to(value: ast.expr | None) -> ConfigPathWrite | None:
+    if value is None:
+        return None
     if isinstance(value, ast.Constant) and value.value == '':
         return ConfigPathWrite.BLANK
     return ConfigPathWrite.REPOINT
 
 
-def _config_path_write(call: ast.Call) -> ConfigPathWrite | None:
-    """How *call* writes ``ORCH_CONFIG_PATH``, or ``None`` if it does not.
+def _literal_key(key: ast.expr | None) -> str | None:
+    """The string a dict-literal key spells, or ``None`` (a ``**`` unpacking
+    or anything but a string constant)."""
+    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+        return key.value
+    return None
 
-    Recognises ``<obj>.setenv(VAR, v)``, ``<obj>.delenv(VAR, ...)`` and
-    ``<...>.dict(<env>, {VAR: v, ...})`` — the ``patch.dict`` shape.
+
+def _environ_patch_write(call: ast.Call) -> ConfigPathWrite | None:
+    """How ``patch.dict(<environ>, {VAR: v}, VAR=v, clear=...)`` writes VAR.
+
+    Clearing removes every key the patch does not itself set, so it deletes
+    VAR, unless some entry the scan cannot read — a ``values`` mapping that is
+    not a literal, a computed key, a ``**`` unpacking — might set it.
     """
-    func = call.func
-    if not isinstance(func, ast.Attribute) or not call.args:
+    if not _is_environ(_argument(call, 0, 'in_dict')):
         return None
-    first, rest = call.args[0], call.args[1:]
-    if func.attr == 'setenv' and _names_config_path(first) and rest:
-        return _set_to(rest[0])
-    if func.attr == 'delenv' and _names_config_path(first):
+    values = _argument(call, 1, 'values')
+    entries = [(kw.arg, kw.value) for kw in call.keywords]
+    if isinstance(values, ast.Dict):
+        entries += [(_literal_key(key), value)
+                    for key, value in zip(values.keys, values.values, strict=True)]
+    for name, value in entries:
+        if name == _CONFIG_PATH_VAR:
+            return _set_to(value)
+    readable = (values is None or isinstance(values, ast.Dict)) and all(
+        name is not None for name, _value in entries
+    )
+    clears = _argument(call, 2, 'clear')
+    if readable and isinstance(clears, ast.Constant) and clears.value is True:
         return ConfigPathWrite.DELETE
-    if func.attr == 'dict' and rest and isinstance(rest[0], ast.Dict):
-        for key, value in zip(rest[0].keys, rest[0].values, strict=True):
-            if _names_config_path(key):
-                return _set_to(value)
+    return None
+
+
+def _call_write(call: ast.Call) -> ConfigPathWrite | None:
+    func = call.func
+    if not isinstance(func, ast.Attribute):
+        return None
+    if func.attr == 'setenv' and _names_config_path(_argument(call, 0, 'name')):
+        return _set_to(_argument(call, 1, 'value'))
+    if func.attr == 'delenv' and _names_config_path(_argument(call, 0, 'name')):
+        return ConfigPathWrite.DELETE
+    if (func.attr == 'pop' and _is_environ(func.value)
+            and _names_config_path(_argument(call, 0, 'key'))):
+        return ConfigPathWrite.DELETE
+    if func.attr == 'dict':
+        return _environ_patch_write(call)
+    return None
+
+
+def _config_path_write(node: ast.AST) -> ConfigPathWrite | None:
+    """How *node* writes ``ORCH_CONFIG_PATH``, or ``None`` if it does not.
+
+    Recognises ``<obj>.setenv(VAR, v)`` and ``<obj>.delenv(VAR)``, positional
+    or by keyword; ``<environ>[VAR] = v``, ``del <environ>[VAR]`` and
+    ``<environ>.pop(VAR)``; and ``patch.dict`` on the environment, by mapping,
+    by keyword or by ``clear=True``.  Any other write — the name held in a
+    variable, a mapping built elsewhere, another method — is not seen.
+    """
+    if isinstance(node, ast.Call):
+        return _call_write(node)
+    if isinstance(node, ast.Assign) and any(map(_is_config_path_item, node.targets)):
+        return _set_to(node.value)
+    if isinstance(node, ast.Delete) and any(map(_is_config_path_item, node.targets)):
+        return ConfigPathWrite.DELETE
     return None
 
 
@@ -458,10 +542,9 @@ def _blanking_sites(
         if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             yield from _blanking_sites(child, (*scope, child.name))
             continue
-        if isinstance(child, ast.Call):
-            kind = _config_path_write(child)
-            if kind in (ConfigPathWrite.BLANK, ConfigPathWrite.DELETE):
-                yield '.'.join(scope) or '<module>', child.lineno, kind
+        kind = _config_path_write(child)
+        if kind in (ConfigPathWrite.BLANK, ConfigPathWrite.DELETE):
+            yield '.'.join(scope) or '<module>', child.lineno, kind
         yield from _blanking_sites(child, scope)
 
 
@@ -470,8 +553,9 @@ def iter_config_path_blanking_sites(
 ) -> Iterator[tuple[str, int, ConfigPathWrite]]:
     """Yield ``(qualname, lineno, kind)`` for each BLANK or DELETE write of
     ``ORCH_CONFIG_PATH`` anywhere in *path*: tests, fixtures, helpers and
-    nested defs alike.  ``qualname`` joins the enclosing class and function
-    names with dots, or is ``'<module>'`` at module level."""
+    nested defs alike, in any spelling :func:`_config_path_write` lists.
+    ``qualname`` joins the enclosing class and function names with dots, or
+    is ``'<module>'`` at module level."""
     tree = ast.parse(Path(path).read_text(), filename=str(path))
     yield from _blanking_sites(tree, ())
 
@@ -493,8 +577,7 @@ def _function_isolates(func: _TestFunc) -> bool:
     if any(a.arg == 'code_default_config' for a in params):
         return True
     return any(
-        isinstance(node, ast.Call)
-        and _config_path_write(node) is ConfigPathWrite.REPOINT
+        _config_path_write(node) is ConfigPathWrite.REPOINT
         for node in ast.walk(func)
     )
 
