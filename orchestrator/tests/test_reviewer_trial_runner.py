@@ -921,8 +921,8 @@ class TestTrialFixtureReadiness:
 
         assert [(r.variant_name, r.diff_id) for r in results] == [(diff_only.name, 'fx_nobase')]
         assert mock_invoke.await_count == 1
-        assert sorted(p.name for p in results_dir.glob('*.json')) == [
-            f'{diff_only.name}__fx_nobase.json',
+        assert [(p.variant_name, p.diff_id) for p in _stored_panels(results_dir)] == [
+            (diff_only.name, 'fx_nobase'),
         ]
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any(reason in message and d2.name in message for message in warnings), warnings
@@ -956,12 +956,34 @@ def _full_style() -> dict:
     return {'prices': default_price_table(), 'usage_gate': _GATE, 'diff_cap_chars': 0}
 
 
+def _stored_panels(results_dir: Path) -> list[PanelRunResult]:
+    return [PanelRunResult.from_dict(json.loads(p.read_text())) for p in sorted(results_dir.glob('*.json'))]
+
+
+def _stored_scores(score_dir: Path) -> list[ScoringResult]:
+    return [ScoringResult.from_dict(json.loads(p.read_text())) for p in sorted(score_dir.glob('*.json'))]
+
+
+def _only_entry(directory: Path) -> Path:
+    [entry] = directory.glob('*.json')
+    return entry
+
+
+_SMOKE_KEY = PanelRunKey.of(prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS)
+
+
+def _write_legacy_panel(results_dir: Path, legacy: PanelRunResult) -> Path:
+    """Store *legacy* as a panel written before task 6741: no run_key, at the bare cell name."""
+    results_dir.mkdir(parents=True, exist_ok=True)
+    record = asdict(legacy)
+    del record['run_key']
+    entry = results_dir / f'{legacy.variant_name}__{legacy.diff_id}.json'
+    entry.write_text(json.dumps(record))
+    return entry
+
+
 class TestPanelCache:
     """run_panel_cached reuses a stored panel only when it was produced under the same key."""
-
-    @staticmethod
-    def _entry(results_dir: Path, variant: VariantConfig, diff: CorpusDiff) -> Path:
-        return results_dir / f'{variant.name}__{diff.diff_id}.json'
 
     @pytest.mark.asyncio
     async def test_a_full_style_run_never_reuses_a_smoke_entry(self, source: _Source, tmp_path: Path) -> None:
@@ -972,8 +994,18 @@ class TestPanelCache:
             await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **_full_style())
 
         assert dispatched == ['ungated', 'gated']
-        stored = PanelRunResult.from_dict(json.loads(self._entry(results_dir, variant, diff).read_text()))
-        assert stored.run_key == PanelRunKey.of(**_full_style())
+        assert {p.run_key for p in _stored_panels(results_dir)} == {_SMOKE_KEY, PanelRunKey.of(**_full_style())}
+
+    @pytest.mark.asyncio
+    async def test_each_key_keeps_its_own_slot(self, source: _Source, tmp_path: Path) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+
+        with _counted_reviewers() as dispatched:
+            for _ in range(2):
+                await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+                await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **_full_style())
+
+        assert dispatched == ['ungated', 'gated']
 
     @pytest.mark.asyncio
     async def test_an_identical_call_is_served_from_the_cache(self, source: _Source, tmp_path: Path) -> None:
@@ -1002,44 +1034,51 @@ class TestPanelCache:
         assert len(dispatched) == 2
 
     @pytest.mark.asyncio
-    async def test_a_keyless_legacy_entry_is_honoured_with_a_warning(
+    async def test_a_keyless_legacy_entry_is_honoured_and_named_quietly(
         self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
         variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
-        results_dir.mkdir()
         legacy = PanelRunResult(
             variant_name=variant.name, diff_id=diff.diff_id,
             reviews={'r1': _make_review('r1')}, total_cost_usd=0.75, wall_clock_ms=10,
         )
-        record = asdict(legacy)
-        del record['run_key']
-        entry = self._entry(results_dir, variant, diff)
-        entry.write_text(json.dumps(record))
+        entry = _write_legacy_panel(results_dir, legacy)
 
         with (
-            caplog.at_level(logging.WARNING, logger='orchestrator.evals.reviewer_trial.runner'),
+            caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
             _counted_reviewers() as dispatched,
         ):
             result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0, **_full_style())
 
         assert dispatched == []
         assert result == legacy
-        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any(str(entry) in message for message in warnings), warnings
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert any(str(entry) in message for message in infos), infos
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.asyncio
+    async def test_a_corrupt_legacy_entry_is_rerun(self, source: _Source, tmp_path: Path) -> None:
+        variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
+        results_dir.mkdir()
+        (results_dir / f'{variant.name}__{diff.diff_id}.json').write_text('{not json')
+
+        with _counted_reviewers() as dispatched:
+            result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+
+        assert dispatched == ['ungated']
+        assert result.run_key == _SMOKE_KEY
 
     @pytest.mark.parametrize('stored', [
         pytest.param(lambda variant, diff: '{not json', id='corrupt'),
         pytest.param(
             lambda variant, diff: json.dumps(asdict(PanelRunResult(
-                variant_name='another_variant', diff_id=diff.diff_id,
-                run_key=PanelRunKey.of(prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS),
+                variant_name='another_variant', diff_id=diff.diff_id, run_key=_SMOKE_KEY,
             ))),
             id='foreign-variant',
         ),
         pytest.param(
             lambda variant, diff: json.dumps(asdict(PanelRunResult(
-                variant_name=variant.name, diff_id='another_diff',
-                run_key=PanelRunKey.of(prices=None, usage_gate=None, diff_cap_chars=DIFF_CAP_CHARS),
+                variant_name=variant.name, diff_id='another_diff', run_key=_SMOKE_KEY,
             ))),
             id='foreign-diff',
         ),
@@ -1049,14 +1088,14 @@ class TestPanelCache:
         self, source: _Source, tmp_path: Path, stored,
     ) -> None:
         variant, diff, results_dir = _one_reviewer(), _diff_in(source), tmp_path / 'results'
-        results_dir.mkdir()
-        entry = self._entry(results_dir, variant, diff)
-        entry.write_text(stored(variant, diff))
 
         with _counted_reviewers() as dispatched:
+            await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
+            entry = _only_entry(results_dir)
+            entry.write_text(stored(variant, diff))
             result = await run_panel_cached(variant, diff, results_dir=results_dir, stagger_secs=0)
 
-        assert dispatched == ['ungated']
+        assert dispatched == ['ungated', 'ungated']
         assert PanelRunResult.from_dict(json.loads(entry.read_text())) == result
         assert (result.variant_name, result.diff_id) == (variant.name, diff.diff_id)
 
@@ -1074,6 +1113,25 @@ class TestPanelCache:
             await run_trial([variant], corpus, results_dir=results_dir, **_full_style())
 
         assert dispatched == ['ungated', 'gated']
+
+    @pytest.mark.asyncio
+    async def test_run_trial_summarises_its_legacy_hits_in_one_warning(
+        self, source: _Source, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        variant, results_dir = _one_reviewer(), tmp_path / 'results'
+        diffs = [_diff_in(source, diff_id='d1'), _diff_in(source, diff_id='d2')]
+        for diff in diffs:
+            _write_legacy_panel(results_dir, PanelRunResult(variant_name=variant.name, diff_id=diff.diff_id))
+
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.evals.reviewer_trial.runner'),
+            _counted_reviewers() as dispatched,
+        ):
+            await run_trial([variant], CorpusManifest(diffs=diffs), results_dir=results_dir, stagger_secs=0)
+
+        assert dispatched == []
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert 'Reused 2 legacy panel' in warning and str(results_dir) in warning, warning
 
     @pytest.mark.asyncio
     async def test_run_trial_threads_its_stagger_to_each_panel(self, source: _Source, tmp_path: Path) -> None:
@@ -1177,12 +1235,58 @@ class TestRunAndScore:
                 [variant], corpus, results_dir=results_dir, score_dir=score_dir, stagger_secs=0,
             )
 
-        stored = json.loads((score_dir / f'{variant.name}__d_ok.json').read_text())
-        assert ScoringResult.from_dict(stored) == first[0]
-        assert not (score_dir / f'{variant.name}__d_refused.json').exists()
+        assert _stored_scores(score_dir) == [first[0]]
         assert matched == ['OK_MARKER', 'REFUSED_MARKER', 'REFUSED_MARKER']
         assert second[0] == first[0]
         assert second[1].unmeasured is not None
+
+    @pytest.mark.asyncio
+    async def test_a_corrupt_stored_score_is_rescored_and_overwritten(self, source: _Source, tmp_path: Path) -> None:
+        variant, corpus = _one_reviewer(), self._corpus(source)
+        results_dir, score_dir = tmp_path / 'results', tmp_path / 'scores'
+
+        with self._panels_and_matcher() as matched:
+            await run_and_score([variant], corpus, results_dir=results_dir, score_dir=score_dir, stagger_secs=0)
+            _only_entry(score_dir).write_text('{"variant_name": "r1_pa')
+            second = await run_and_score(
+                [variant], corpus, results_dir=results_dir, score_dir=score_dir, stagger_secs=0,
+            )
+
+        assert matched == ['OK_MARKER', 'REFUSED_MARKER', 'OK_MARKER', 'REFUSED_MARKER']
+        assert second[0].unmeasured is None
+        assert _stored_scores(score_dir) == [second[0]]
+
+    @pytest.mark.asyncio
+    async def test_a_panel_rerun_under_a_new_key_is_rescored(self, source: _Source, tmp_path: Path) -> None:
+        variant, corpus = _one_reviewer(), CorpusManifest(diffs=[_scored_diff(source, 'd_ok', 'OK_MARKER')])
+        dirs = {'results_dir': tmp_path / 'results', 'score_dir': tmp_path / 'scores', 'stagger_secs': 0}
+
+        with self._panels_and_matcher() as matched:
+            await run_and_score([variant], corpus, **dirs)
+            await run_and_score([variant], corpus, diff_cap_chars=0, **dirs)
+            assert matched == ['OK_MARKER', 'OK_MARKER']
+            await run_and_score([variant], corpus, **dirs)
+            await run_and_score([variant], corpus, diff_cap_chars=0, **dirs)
+
+        assert matched == ['OK_MARKER', 'OK_MARKER']
+        assert len(_stored_scores(dirs['score_dir'])) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_legacy_panel_reuses_its_legacy_score(self, source: _Source, tmp_path: Path) -> None:
+        variant, results_dir, score_dir = _one_reviewer(), tmp_path / 'results', tmp_path / 'scores'
+        _write_legacy_panel(results_dir, PanelRunResult(variant_name=variant.name, diff_id='d_ok'))
+        score_dir.mkdir()
+        legacy_score = ScoringResult(variant_name=variant.name, diff_id='d_ok', f1=0.25, cost_usd=1.5)
+        (score_dir / f'{variant.name}__d_ok.json').write_text(json.dumps(asdict(legacy_score)))
+
+        with self._panels_and_matcher() as matched, _counted_reviewers() as dispatched:
+            scores = await run_and_score(
+                [variant], CorpusManifest(diffs=[_scored_diff(source, 'd_ok', 'OK_MARKER')]),
+                results_dir=results_dir, score_dir=score_dir, stagger_secs=0,
+            )
+
+        assert (dispatched, matched) == ([], [])
+        assert scores == [legacy_score]
 
     @pytest.mark.asyncio
     async def test_without_a_score_dir_every_run_rescores(self, source: _Source, tmp_path: Path) -> None:
