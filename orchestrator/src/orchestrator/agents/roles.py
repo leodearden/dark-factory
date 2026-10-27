@@ -1363,26 +1363,48 @@ cannot express them, and a second pass over the matches can.
 """
 
 
+# Spliced into _GREP_PCRE_BASH_RECOURSE by `+`; executed in a real repo fixture
+# by orchestrator/tests/test_roles_grep_escape_hatch_command.py.
+GIT_GREP_PCRE_COMMAND_TEMPLATE = "git grep --untracked -nP '<pattern>' -- <path>"
+
+
 # Recourse for the roles holding unqualified `Bash`. Concatenated onto
 # _GREP_ENGINE_LIMITS below -- never used alone.
 _GREP_PCRE_BASH_RECOURSE = """
 When look-around or a backreference is genuinely required, the escape hatch
-is `Bash`:
+is `git grep`, through `Bash`:
+
+    """ + GIT_GREP_PCRE_COMMAND_TEMPLATE + """
+
+`-P` is real PCRE, so the rejected pattern runs unchanged. It reads only the
+files git knows about: the tracked ones, plus the untracked ones
+`--untracked` adds, minus anything an ignore file excludes. That is the same
+filter `Grep` applies, with no per-project exclude list to get right:
+`.venv`, `node_modules`, a build-output tree such as `target/` and a main
+checkout's task-worktree copies are all skipped, whatever a project calls
+them. So running it from the checkout root, or leaving out `-- <path>`, is
+safe. From such a root a recursive grep was still reading when its timeout
+killed it; git grep answered in well under a second. Narrow by file type with
+a pathspec glob after `--`, as in `-- '*.py'`: git's `*` crosses directory
+boundaries, so it matches at every depth.
+
+Its blind spot is the other side of that filter. A file git ignores, or a
+directory outside any repository, is invisible to it, and git grep reports
+that as exit 1 with no output, not as an error. So exit 1 over a virtualenv's
+site-packages or a build artifact is NOT evidence of absence. Exit 128 means
+git refused the command: read its `fatal:` line. A malformed pattern is fixed
+in the pattern. `not a git repository`, or a git built without
+Perl-compatible regex support, means fall back to real grep.
+
+The fallback, for exactly what git cannot see:
 
     command grep -rP --include='*.py' --exclude-dir=.venv --exclude-dir=node_modules --exclude-dir=.git '<pattern>' <path>
 
-`-P` is real PCRE, so the rejected pattern runs unchanged, and `--include=`
-is the glob filter `Grep` would have applied.
-
-The `--exclude-dir=` flags are not boilerplate: they stand in for a SECOND
-filter `Grep` applied for you and real grep does not. `Grep` reads ignore
-files — `.gitignore` at each level, including the catch-all one a virtualenv
-writes inside itself — while GNU grep reads none of them and walks straight
-into a vendored tree. Measured in this worktree, `--include='*.py'` ALONE
-still matched hundreds of third-party site-packages files under `.venv` for a
-pattern as ordinary as `config\\.[a-z_]+`, not one of which `Grep` would have
-returned. So point `<path>` at a source directory rather than the repo root,
-and if the rejected `Grep` call omitted `path`, do not simply substitute `.`.
+`--include=` is its glob filter. It reads no ignore files at all, and its
+`--exclude-dir=` flags name only the commonest vendored trees, never a
+project's own build output. So point `<path>` at a source directory, or at
+the one ignored tree you need to search, never at the repo root; and if the
+rejected `Grep` call omitted `path`, do not simply substitute `.`.
 
 The `command` prefix is load-bearing, not decoration. The harness shell
 snapshot shadows some search commands with shell functions, and WHICH ones is
@@ -1399,7 +1421,8 @@ PROCESS: a `bash -c` or `sh -c`, or a standalone script file you write and
 then run. It DOES survive a pipeline, a `$(...)` substitution and an explicit
 `( ... )` subshell in the top-level `Bash` call — those stay in the shell that
 defines it. `which rg` finds nothing either way, so do not use that to decide.
-Reach for `command grep -rP` when a nested shell process is involved.
+When a nested shell process is involved, use `git grep` or `command grep -rP`
+instead: both run real binaries on `PATH`.
 """
 
 
