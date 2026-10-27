@@ -228,3 +228,49 @@ def test_outside_pytest_the_guard_stands_aside(monkeypatch):
     monkeypatch.delenv("PYTEST_CURRENT_TEST")
 
     assert alarm.refuse_real_post_under_test("http://localhost:8103", "escalate_info") is None
+
+
+def test_a_failing_run_raises_one_error_alarm_and_reraises_the_same_exception(caplog):
+    recorder = _Recorder()
+    boom = RuntimeError("boom-6747")
+
+    with caplog.at_level(logging.DEBUG, logger=_ALARM_LOGGER), pytest.raises(RuntimeError) as excinfo:
+        with alarm.fail_loud_boundary(alarm.AlarmSource.CENSUS, _project(), poster=recorder):
+            raise boom
+
+    assert excinfo.value is boom
+    [(_, arguments)] = recorder.calls
+    assert arguments["summary"] == "legibility census run failed (p1): RuntimeError: boom-6747"
+    assert "Traceback" in arguments["detail"]
+    assert "boom-6747" in arguments["detail"]
+    journal = f"{arguments['summary']} -- {arguments['detail']}"
+    assert (logging.ERROR, journal) in [(r.levelno, r.getMessage()) for r in caplog.records]
+
+
+def test_a_clean_run_raises_no_alarm():
+    recorder = _Recorder()
+
+    with alarm.fail_loud_boundary(alarm.AlarmSource.TRICKLE, _project(), poster=recorder):
+        pass
+
+    assert recorder.calls == []
+
+
+def test_a_raising_poster_does_not_replace_the_runs_exception():
+    boom = RuntimeError("boom-6747")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        with alarm.fail_loud_boundary(alarm.AlarmSource.TRICKLE, _project(), poster=_raising_poster):
+            raise boom
+
+    assert excinfo.value is boom
+
+
+def test_a_keyboard_interrupt_passes_through_without_an_alarm():
+    recorder = _Recorder()
+
+    with pytest.raises(KeyboardInterrupt):
+        with alarm.fail_loud_boundary(alarm.AlarmSource.CENSUS, _project(), poster=recorder):
+            raise KeyboardInterrupt
+
+    assert recorder.calls == []
