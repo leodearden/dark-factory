@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from _orch_helpers import wait_responsive
 from _shadow_coordinator_doubles import (
     INCUMBENTS,
     PROJECT_ID,
@@ -339,7 +340,7 @@ async def test_shutdown_fails_a_running_cell_before_releasing_it(tmp_path, costs
     rig.runner.script(ShadowShape.IMPLEMENTER, 'claude-sonnet-max', block=asyncio.Event())
 
     await _plan_exit(rig, make_task('5387'))
-    await asyncio.wait_for(rig.runner.run_started.wait(), timeout=5)
+    await wait_responsive(rig.runner.run_started.wait(), label='the shadow implementer run starts')
     assert _only_cell(rig).state is _S.RUNNING
 
     await asyncio.wait_for(rig.coordinator.aclose(), timeout=5)

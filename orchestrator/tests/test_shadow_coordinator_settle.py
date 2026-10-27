@@ -12,6 +12,7 @@ from datetime import timedelta
 
 import pytest
 import pytest_asyncio
+from _orch_helpers import wait_responsive
 from _shadow_coordinator_doubles import (
     PROJECT_ID,
     RUN_ID,
@@ -205,7 +206,7 @@ async def test_a_running_cell_is_never_settled(rig):
     release = asyncio.Event()
     rig.runner.script(ShadowShape.IMPLEMENTER, _CANDIDATE, block=release)
     [cell_id] = await rig.coordinator.on_phase(make_task('5387'), WorkflowState.PLAN, entering=False)
-    await asyncio.wait_for(rig.runner.run_started.wait(), timeout=5)
+    await wait_responsive(rig.runner.run_started.wait(), label='the shadow implementer run starts')
 
     assert await rig.coordinator.on_production_terminal('5387', WorkflowOutcome.CANCELLED) == []
     row = rig.store.get_shadow_cell(cell_id)
