@@ -543,7 +543,8 @@ def _blanking_sites(
             yield from _blanking_sites(child, (*scope, child.name))
             continue
         kind = _config_path_write(child)
-        if kind in (ConfigPathWrite.BLANK, ConfigPathWrite.DELETE):
+        if (kind in (ConfigPathWrite.BLANK, ConfigPathWrite.DELETE)
+                and isinstance(child, (ast.expr, ast.stmt))):
             yield '.'.join(scope) or '<module>', child.lineno, kind
         yield from _blanking_sites(child, scope)
 
