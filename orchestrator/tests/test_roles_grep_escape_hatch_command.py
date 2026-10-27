@@ -12,9 +12,7 @@ import shlex
 import subprocess
 from pathlib import Path
 
-from _git_fixtures import RepoSeed, seed_repo
-from _orch_helpers import git_env_with_ceiling
-from df_pytest_isolation import git_redirect_env
+from _git_fixtures import RepoSeed, _git_env, seed_repo
 
 from orchestrator.agents.roles import (
     GIT_GREP_PCRE_COMMAND_TEMPLATE,
@@ -45,13 +43,6 @@ def _render(template: str, pattern: str, path: str) -> list[str]:
     return [substitutions.get(token, token) for token in argv]
 
 
-def _git_env(repo: Path) -> dict[str, str]:
-    env = git_env_with_ceiling(repo)
-    for key in git_redirect_env(env):
-        del env[key]
-    return env
-
-
 def _seed_search_fixture(tmp_path: Path) -> Path:
     repo = seed_repo(tmp_path / 'repo', _SEARCH_SEED)
     (repo / 'src' / 'new_mod.py').write_text('config.beta = 3\n')
@@ -65,9 +56,9 @@ def _seed_search_fixture(tmp_path: Path) -> Path:
     return repo
 
 
-def _run(argv: list[str], repo: Path) -> subprocess.CompletedProcess[str]:
+def _run(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        argv, cwd=repo, env=_git_env(repo), capture_output=True, text=True, check=False,
+        argv, cwd=cwd, env=_git_env(cwd), capture_output=True, text=True, check=False,
     )
 
 
@@ -98,6 +89,18 @@ def test_bash_recourse_cites_the_git_grep_template_as_its_own_line() -> None:
         'standalone, copyable line, not only inside a longer command'
     )
 
+
+def test_git_grep_template_refuses_a_directory_outside_any_repo_with_exit_128(
+    tmp_path: Path,
+) -> None:
+    plain = tmp_path / 'plain'
+    plain.mkdir()
+    (plain / 'mod.py').write_text('config.alpha = 1\n')
+
+    result = _run(_render(GIT_GREP_PCRE_COMMAND_TEMPLATE, _LOOKAHEAD_PATTERN, '.'), plain)
+
+    assert result.returncode == 128, _outcome(result)
+    assert 'not a git repository' in result.stderr, _outcome(result)
 
 
 def test_fallback_template_reaches_an_ignored_tree_git_grep_reports_as_no_match(
