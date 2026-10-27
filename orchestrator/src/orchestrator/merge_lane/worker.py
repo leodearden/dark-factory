@@ -12372,11 +12372,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Definition (§5.3):
           frozen = (self._finalizing_head_entry() if its phase is a verify/finalize phase)
                    + [e for e in self._occupying_inflight_entries()
-                      if e.verify_task is not None]
+                      if e.in_verify_frontier]
 
         Passthroughs (verify_task=None: conflict/already_merged/skip) are NOT
         frozen — they carry no merge_commit and are not part of the verify
-        frontier.
+        frontier.  A head parked on its gate re-verify is, even one adopted
+        on tip authority, whose verify_task is None (task 6155).
 
         Pure/synchronous — mirrors _pop_next_pickable.
 
@@ -12393,7 +12394,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ):
             entries.append(_fh_entry)
         for e in self._occupying_inflight_entries():
-            if e.verify_task is not None:
+            if e.in_verify_frontier:
                 entries.append(e)
         return entries
 
@@ -22407,7 +22408,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # and stays valid at its use below: the only intervening mutation is the
         # dead-base _remerge, which sets _dead_base_remerged=True and thereby
         # short-circuits the Mechanism-2 gate regardless of this value.
-        _has_inflight_verify = any(e.verify_task is not None for e in self._inflight)
+        _has_inflight_verify = any(e.in_verify_frontier for e in self._inflight)
         _needs_main_sha = bool(self._dead_base_commits) or (
             not _has_inflight_verify
             and not item.speculative

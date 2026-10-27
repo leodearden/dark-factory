@@ -1871,6 +1871,15 @@ class InflightEntry:
         return self.gate.task if self.gate is not None else self.verify_task
 
     @property
+    def in_verify_frontier(self) -> bool:
+        """True while finalize has a verify or a gate re-verify to wait on.
+
+        A head adopted on tip authority has no verify task, yet stays in the
+        frontier while its gate runs (task 6155).  A passthrough has neither.
+        """
+        return self.pending_task is not None
+
+    @property
     def vacated(self) -> bool:
         """True once the verify dropped or requeued this entry's request and
         released its lease; only the head-of-line finalize remains."""

@@ -64,7 +64,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from pathlib import Path
 
 import pytest
@@ -2478,20 +2478,27 @@ async def _adopted_warm_head_scene(
     return s
 
 
-async def _adopt_head_only(s: dict, *, timeout: float = DEEP_LANDING_ADOPT_WAIT_SECS) -> dict:
+async def _adopt_head_only(
+    s: dict,
+    *,
+    timeout: float = DEEP_LANDING_ADOPT_WAIT_SECS,
+    on_park: Callable[[], object] = lambda: None,
+) -> dict:
     """Run the adopting exit, then finalize ONLY the head.
 
     :func:`_adopt_and_land` also finalizes the speculative entry, whose
     ``expected_main`` is the head's ORIGINAL merge commit — correct in the
     clean scene, but not after the head has had to rebase.  A test about the
-    head's retry loop therefore stops here.
+    head's retry loop therefore stops here.  *on_park* runs each time the
+    rebased head parks on its gate re-verify.
     """
     worker = s['worker']
     s['verify_result'] = await worker._run_inflight_verify(
         s['spec_item'], _local_lease(), chain=s['chain'],
     )
     s['head_advanced'] = await asyncio.wait_for(
-        finalize_through_gate(worker, s['head_entry']), timeout=timeout,
+        finalize_through_gate(worker, s['head_entry'], on_park=on_park),
+        timeout=timeout,
     )
     await asyncio.sleep(0)
     return s
@@ -2625,6 +2632,32 @@ class TestAdoptedHeadLandsWithThePostVerifyWorktree:
             f'the adopted head must survive a lost CAS race by rebasing in '
             f'its live lane; got {outcome.status} / {outcome.reason!r}'
         )
+
+    async def test_a_gated_adopted_head_still_heads_the_frozen_prefix(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """An adopted head has no verify task, and while it waits on its gate
+        re-verify it must still head the frozen prefix (task 6155).
+
+        Read off the verify task alone, the prefix drops it there: a follower
+        then reads as the head, and dispatch reads no verify in flight.
+        """
+        s = await _adopted_warm_head_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-warm-gated-prefix.db',
+        )
+        await _create_branch_editing(git_repo, 'task/199', 'z.txt', 'edit-199\n')
+        await _merge_commit_off_main(git_repo, 'task/199', '199')
+        await _run(['git', 'merge', '--ff-only', 'task/199'], cwd=git_repo)
+        prefixes: list[tuple[str, ...]] = []
+
+        await _adopt_head_only(
+            s, on_park=lambda: prefixes.append(s['worker'].frozen_prefix()),
+        )
+
+        head_id = s['reqs']['100'].request_id
+        assert prefixes, 'staging: main moved, so the adopted head must park on its gate'
+        assert [p[:1] for p in prefixes] == [(head_id,)] * len(prefixes), prefixes
+        assert s['reqs']['100'].result.result().status == 'done'
 
     async def test_a_warm_spec_lane_head_goes_back_to_the_pool(
         self, git_repo: Path, tmp_path: Path, monkeypatch,

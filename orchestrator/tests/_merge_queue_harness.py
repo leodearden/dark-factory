@@ -41,6 +41,8 @@ from typing import TYPE_CHECKING
 import orchestrator.merge_lane.worker as _mq
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from orchestrator.merge_lane.worker import (
         InflightEntry,
         LocalRunner,
@@ -108,11 +110,18 @@ async def drive_verify_and_advance(
 
 
 async def finalize_through_gate(
-    worker: SpeculativeMergeWorker, entry: InflightEntry,
+    worker: SpeculativeMergeWorker,
+    entry: InflightEntry,
+    *,
+    on_park: Callable[[], object] = lambda: None,
 ) -> bool:
     """``_finalize_inflight`` *entry*, resuming it while it parks on a gate
-    re-verify (task 6155).  Returns True iff main was advanced."""
+    re-verify (task 6155).  Returns True iff main was advanced.
+
+    *on_park* runs each time the entry parks, before its gate has started.
+    """
     while True:
         advanced = await worker._finalize_inflight(entry)
         if entry.gate is None:
             return advanced
+        on_park()
