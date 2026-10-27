@@ -5335,6 +5335,7 @@ def test_main_write_decision_already_canonical_project_logs_nothing(
     do -- must not emit a warning on every park, or the signal is noise.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _file_from_a_linked_session(monkeypatch, tmp_path)
 
     with caplog.at_level(logging.WARNING):
         rc = sr.main(
@@ -5414,6 +5415,7 @@ def test_main_write_decision_recommended_solar_token_warns_nothing(
     signal.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _file_from_a_linked_session(monkeypatch, tmp_path)
 
     with caplog.at_level(logging.WARNING):
         rc = sr.main(
@@ -7769,6 +7771,22 @@ def _file_decision(**kwargs: str) -> int:
     return sr.main(argv)
 
 
+def _file_from_a_linked_session(
+    monkeypatch: pytest.MonkeyPatch, root: Path, pid: int = 7_527_001
+) -> None:
+    """Make the next write-decision file from a session linked to its own registry record.
+
+    write-decision WARNs when it cannot link a filing to its filer's session
+    record (task 7527), so a test pinning an otherwise-quiet filing path files
+    from a linked session, as a spawned watcher does.
+    """
+    sr.write_record(
+        _make_record(session_slug='linked-watcher-record', claude_owner_pid=pid), root=root
+    )
+    sr.write_session_pointer(pid, 'linked-watcher-record', root=root)
+    monkeypatch.setenv('CLAUDE_PID', str(pid))
+
+
 def test_main_write_decision_mode2_second_queue_enriches_and_never_downgrades(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -8049,6 +8067,7 @@ def test_main_write_decision_warns_when_a_same_queue_refile_is_held_closed(
     break a contract agents already rely on. The divergence goes to the log.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _file_from_a_linked_session(monkeypatch, tmp_path)
     orch, _recon = _two_queues(tmp_path)
 
     _file_decision(
@@ -8099,6 +8118,7 @@ def test_main_write_decision_same_queue_refile_of_an_open_record_is_quiet(
     is how the genuinely-actionable one above gets tuned out.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _file_from_a_linked_session(monkeypatch, tmp_path)
     orch, _recon = _two_queues(tmp_path)
 
     _file_decision(
@@ -10970,6 +10990,7 @@ class TestReopenDecision:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        _file_from_a_linked_session(monkeypatch, tmp_path)
         queue = str(tmp_path / 'data' / 'escalations')
         filing = {
             'id': 'esc-5914-1', 'project': 'dark_factory', 'text': 'Adopt the reify plan?', 'escalations_dir': queue,
