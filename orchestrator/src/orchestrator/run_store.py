@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -20,6 +20,7 @@ from orchestrator.shadow_types import (
     ReferenceKind,
     ShadowCellState,
     ShadowShape,
+    ShadowStormCause,
 )
 from orchestrator.workflow_types import WorkflowOutcome
 
@@ -36,6 +37,13 @@ _SHADOW_CELL_DEFAULT_OWNER = 'shadow_coordinator'
 
 def _is_blank(text: str | None) -> bool:
     return text is None or not text.strip(_BLANK_CHARS)
+
+
+def _utc_iso(moment: datetime) -> str:
+    """The one stored text form of an instant, so stored times compare as text."""
+    if moment.utcoffset() is None:
+        raise ValueError(f'a stored instant must be timezone-aware (got naive {moment!r})')
+    return moment.astimezone(UTC).isoformat()
 
 
 @dataclass(frozen=True)
@@ -159,6 +167,21 @@ CREATE TABLE IF NOT EXISTS shadow_cells (
     CHECK (trim(owner, {_SQL_BLANK_CHARS}) <> ''),
     CHECK (parent_cell_id IS NULL OR parent_cell_id <> cell_id)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_cells_one_per_triple
+    ON shadow_cells(project_id, task_id, shape, candidate);
+
+CREATE INDEX IF NOT EXISTS idx_shadow_cells_project_state
+    ON shadow_cells(project_id, state);
+
+CREATE TABLE IF NOT EXISTS shadow_storm (
+    project_id  TEXT PRIMARY KEY,
+    cause       TEXT,
+    detail      TEXT,
+    paused_at   TEXT,
+    resumed_at  TEXT,
+    CHECK ((cause IS NULL) = (paused_at IS NULL))
+);
 """
 
 _SHADOW_CELL_COLUMNS = tuple(field.name for field in fields(ShadowCell))
@@ -179,7 +202,7 @@ def _shadow_cell_to_row(cell: ShadowCell) -> dict[str, Any]:
     for name in _SHADOW_CELL_ENUM_COLUMNS:
         row[name] = None if row[name] is None else row[name].value
     for name in _SHADOW_CELL_TIME_COLUMNS:
-        row[name] = None if row[name] is None else row[name].astimezone(UTC).isoformat()
+        row[name] = None if row[name] is None else _utc_iso(row[name])
     for name in _SHADOW_CELL_PATH_COLUMNS:
         row[name] = None if row[name] is None else str(row[name])
     row['stratum'] = _STRATUM_SEPARATOR.join(cell.stratum)
@@ -235,6 +258,176 @@ def _require_valid_parent(conn: sqlite3.Connection, cell: ShadowCell) -> None:
                 f'{column}={getattr(cell, column)!r}; a child cell shares its '
                 f"parent's project, task and base"
             )
+
+
+@dataclass(frozen=True)
+class ShadowCellQuery:
+    """A ``find_shadow_cells`` filter: every unset field matches every cell of the project."""
+
+    project_id: str
+    states: frozenset[ShadowCellState] | None = None
+    task_id: str | None = None
+    shape: ShadowShape | None = None
+    candidate: str | None = None
+    run_id: str | None = None
+    opened_since: datetime | None = None
+    deadline_before: datetime | None = None
+    newest_first: bool = False
+    limit: int | None = None
+
+    def __post_init__(self) -> None:
+        if _is_blank(self.project_id):
+            raise ValueError(f'ShadowCellQuery: project_id must be non-blank (got {self.project_id!r})')
+        if self.states is not None and not self.states:
+            raise ValueError('ShadowCellQuery: states must be None (any state) or non-empty')
+        if self.limit is not None and self.limit < 1:
+            raise ValueError(f'ShadowCellQuery: limit must be None or >= 1 (got {self.limit!r})')
+
+
+# (query field, SQL condition) — opened_since is inclusive, deadline_before strict.
+_SHADOW_CELL_QUERY_FILTERS = (
+    ('task_id', 'task_id = ?'),
+    ('shape', 'shape = ?'),
+    ('candidate', 'candidate = ?'),
+    ('run_id', 'run_id = ?'),
+    ('opened_since', 'opened_at >= ?'),
+    ('deadline_before', 'settle_deadline < ?'),
+)
+
+
+def _query_param(value: str | datetime) -> str:
+    return _utc_iso(value) if isinstance(value, datetime) else str(value)
+
+
+def _find_shadow_cells_sql(query: ShadowCellQuery) -> tuple[str, list[Any]]:
+    conditions = ['project_id = ?']
+    params: list[Any] = [query.project_id]
+    if query.states is not None:
+        values = sorted(state.value for state in query.states)
+        conditions.append(f'state IN ({", ".join("?" for _ in values)})')
+        params.extend(values)
+    for field_name, condition in _SHADOW_CELL_QUERY_FILTERS:
+        value = getattr(query, field_name)
+        if value is not None:
+            conditions.append(condition)
+            params.append(_query_param(value))
+    direction = 'DESC' if query.newest_first else 'ASC'
+    sql = (
+        f'SELECT * FROM shadow_cells WHERE {" AND ".join(conditions)} '
+        f'ORDER BY opened_at {direction}, cell_id {direction}'
+    )
+    if query.limit is not None:
+        sql += ' LIMIT ?'
+        params.append(query.limit)
+    return sql, params
+
+
+@dataclass(frozen=True)
+class CellChange:
+    """One requested transition of a stored cell; an unset field keeps the stored value.
+
+    Only a ``settled`` change carries a reference, and it must be coherent: a
+    ``landed`` reference names its sha, a ``none`` reference names none.
+    """
+
+    state: ShadowCellState
+    at: datetime
+    worktree_path: Path | None = None
+    result_path: Path | None = None
+    cost_usd: float | None = None
+    cost_credits: float | None = None
+    reason: str | None = None
+    reference_kind: ReferenceKind | None = None
+    reference_sha: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.state is ShadowCellState.SETTLED:
+            self._check_reference()
+        elif self.reference_kind is not None or self.reference_sha is not None:
+            self._refuse(
+                f'reference fields belong only to a {ShadowCellState.SETTLED.value!r} change '
+                f'(got reference_kind={self.reference_kind!r}, reference_sha={self.reference_sha!r})'
+            )
+
+    def _check_reference(self) -> None:
+        if self.reference_kind is None:
+            self._refuse('a settled change requires a reference_kind')
+        if self.reference_kind is ReferenceKind.LANDED and _is_blank(self.reference_sha):
+            self._refuse(f'a landed reference requires a non-blank reference_sha (got {self.reference_sha!r})')
+        if self.reference_kind is ReferenceKind.NONE and self.reference_sha is not None:
+            self._refuse(f'a none reference carries no reference_sha (got {self.reference_sha!r})')
+
+    def _refuse(self, invariant: str) -> None:
+        raise ValueError(f'CellChange to {self.state.value!r}: {invariant}')
+
+
+_CELL_CHANGE_CARRIED_FIELDS = tuple(
+    field.name for field in fields(CellChange) if field.name not in ('state', 'at')
+)
+
+
+def _successor_cell(cell: ShadowCell, change: CellChange) -> ShadowCell:
+    """The cell after *change*; ``replace`` re-runs every ``ShadowCell`` invariant."""
+    carried: dict[str, Any] = {
+        name: getattr(change, name)
+        for name in _CELL_CHANGE_CARRIED_FIELDS
+        if getattr(change, name) is not None
+    }
+    if change.state is ShadowCellState.RUNNING:
+        carried['running_at'] = change.at
+    if change.state.stamps_settled_at:
+        carried['settled_at'] = change.at
+    return replace(cell, state=change.state, **carried)
+
+
+_ADVANCE_SHADOW_CELL_SQL = (
+    'UPDATE shadow_cells SET '
+    + ', '.join(f'{name} = :{name}' for name in _SHADOW_CELL_COLUMNS if name != 'cell_id')
+    + ' WHERE cell_id = :cell_id AND state = :expected_state'
+)
+
+
+@dataclass(frozen=True)
+class ShadowStormRecord:
+    """A project's ``shadow_storm`` row: shadow evaluation is paused while ``cause`` is set."""
+
+    project_id: str
+    cause: ShadowStormCause | None
+    detail: str | None
+    paused_at: datetime | None
+    resumed_at: datetime | None
+
+    def __post_init__(self) -> None:
+        if (self.cause is None) != (self.paused_at is None):
+            raise ValueError(
+                f'ShadowStormRecord {self.project_id!r}: cause and paused_at are set together '
+                f'(got cause={self.cause!r}, paused_at={self.paused_at!r})'
+            )
+
+    @property
+    def paused(self) -> bool:
+        return self.cause is not None
+
+
+def _optional_instant(raw: str | None) -> datetime | None:
+    return None if raw is None else datetime.fromisoformat(raw)
+
+
+def _read_shadow_storm(conn: sqlite3.Connection, project_id: str) -> ShadowStormRecord:
+    row = conn.execute(
+        'SELECT cause, detail, paused_at, resumed_at FROM shadow_storm WHERE project_id = ?',
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return ShadowStormRecord(project_id, None, None, None, None)
+    cause, detail, paused_at, resumed_at = row
+    return ShadowStormRecord(
+        project_id=project_id,
+        cause=None if cause is None else ShadowStormCause(cause),
+        detail=detail,
+        paused_at=_optional_instant(paused_at),
+        resumed_at=_optional_instant(resumed_at),
+    )
 
 
 @dataclass(frozen=True)
@@ -892,3 +1085,107 @@ class RunStore:
         finally:
             conn.close()
         return None if row is None else _shadow_cell_from_row(row)
+
+    def find_shadow_cells(self, query: ShadowCellQuery) -> list[ShadowCell]:
+        """This project's cells matching *query*, by ``opened_at`` (oldest first unless asked)."""
+        sql, params = _find_shadow_cells_sql(query)
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+        return [_shadow_cell_from_row(row) for row in rows]
+
+    def advance_shadow_cell(
+        self, cell_id: str, *, expected: ShadowCellState, change: CellChange,
+    ) -> ShadowCell | None:
+        """Move a cell from *expected* to ``change.state``: the one transition choke point.
+
+        Returns the stored successor, or ``None`` with nothing written when the
+        stored state is no longer *expected* (a lost compare-and-set). An
+        unknown cell raises ``KeyError``; a transition the successor table
+        forbids, or a successor breaking a row invariant, raises ``ValueError``.
+        Entering ``running`` stamps ``running_at``; entering a state that
+        ``stamps_settled_at`` stamps ``settled_at``, and nothing else does.
+        """
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            with conn:
+                conn.execute('BEGIN IMMEDIATE')
+                row = conn.execute(
+                    'SELECT * FROM shadow_cells WHERE cell_id = ?', (cell_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f'shadow cell {cell_id!r} is not stored')
+                if not expected.may_become(change.state):
+                    raise ValueError(
+                        f'shadow cell {cell_id!r}: {expected.value!r} may not become '
+                        f'{change.state.value!r}'
+                    )
+                stored = _shadow_cell_from_row(row)
+                if stored.state is not expected:
+                    return None
+                successor = _successor_cell(stored, change)
+                conn.execute(
+                    _ADVANCE_SHADOW_CELL_SQL,
+                    {**_shadow_cell_to_row(successor), 'expected_state': expected.value},
+                )
+        finally:
+            conn.close()
+        return successor
+
+    # ------------------------------------------------------------------ #
+    # Shadow-eval storm pause (plans/live-shadow-eval-prd.md C2, task 5387) #
+    # ------------------------------------------------------------------ #
+
+    def get_shadow_storm(self, project_id: str) -> ShadowStormRecord:
+        """*project_id*'s storm record; a never-paused project reads an all-``None`` record."""
+        conn = self._connect()
+        try:
+            return _read_shadow_storm(conn, project_id)
+        finally:
+            conn.close()
+
+    def pause_shadow_storm(
+        self, project_id: str, cause: ShadowStormCause, detail: str, at: datetime,
+    ) -> bool:
+        """Pause *project_id*; True only for the call that created the pause.
+
+        While a pause stands a further call changes nothing, so the first
+        cause is kept and only its creator files the escalation.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute('BEGIN IMMEDIATE')
+                if _read_shadow_storm(conn, project_id).paused:
+                    return False
+                conn.execute(
+                    'INSERT INTO shadow_storm (project_id, cause, detail, paused_at) '
+                    'VALUES (?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET '
+                    'cause = excluded.cause, detail = excluded.detail, '
+                    'paused_at = excluded.paused_at',
+                    (project_id, cause.value, detail, _utc_iso(at)),
+                )
+        finally:
+            conn.close()
+        return True
+
+    def resume_shadow_storm(self, project_id: str, at: datetime) -> bool:
+        """Lift *project_id*'s pause and record *at* as ``resumed_at``; True if one stood."""
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute('BEGIN IMMEDIATE')
+                if not _read_shadow_storm(conn, project_id).paused:
+                    return False
+                conn.execute(
+                    'UPDATE shadow_storm SET cause = NULL, detail = NULL, paused_at = NULL, '
+                    'resumed_at = ? WHERE project_id = ?',
+                    (_utc_iso(at), project_id),
+                )
+        finally:
+            conn.close()
+        return True

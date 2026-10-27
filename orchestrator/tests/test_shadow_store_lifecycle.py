@@ -339,7 +339,7 @@ class TestFindShadowCells:
     )
     def test_equality_filters(self, store, field, value, query_value):
         _seed(store, 2)
-        store.insert_shadow_cell(_cell(cell_id='01JMATCH', task_id='m', **{field: value}))
+        store.insert_shadow_cell(_cell(**{'cell_id': '01JMATCH', 'task_id': 'm', field: value}))
 
         found = store.find_shadow_cells(
             ShadowCellQuery(project_id='dark_factory', **{field: query_value}),
