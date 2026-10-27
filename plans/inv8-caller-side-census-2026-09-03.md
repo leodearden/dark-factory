@@ -315,18 +315,26 @@ consequence is worth knowing. `resolve_main_checkout` calls
 lookup, so a warm call pays it too (~19–33 µs). That cost is cheap. It is not
 part of the cold-miss fork+exec that the 23-row ticket owns.
 
-**Per-call cost**, measured for the accepted rows (CPython 3.13.9, min of
+**Per-call cost**, measured for the rows task 7572 owns (CPython 3.13.9, min of
 5 × 20000-call timeit, host load average ~160–180): `Path.resolve` 19–33 µs
 for a 4–9 component path; `os.path.realpath` 25–43 µs; `exists` 3–5 µs. An
 unpinned `PromptArtifactStore.resolve` costs 16–21 µs. The live main checkout
 has no `data/prompt_artifacts`, so nothing is pinned there.
 
+**Owner of the nine cheap rows.** Under the INV-12 day-one ruling (esc-5603-1,
+`docs/legibility/inv12-day-one-rulings.md`), `accepted` is no longer a resting
+state in this ledger: an accepted row borrows task 5270's default, whose scope
+lists 28 specific rows. So the nine measured-cheap rows cite their own
+follow-up, task 7572 (created from ticket `tkt_0RW94QBGG9RSRP47XQXGGV1KFK`),
+which offloads each site or seeks a per-row Policy ruling, and
+`LOOP_BLOCKING_LEDGER`'s `default_covers` stays 28.
+
 | root cause | rows | disposition | owner / reason |
 |---|---|---|---|
-| one `resolve()` of a root or DB path before an awaited `aiosqlite` / `connect_daemon` open | 3 | accepted | one lstat per component, ahead of far costlier awaited work |
-| verifier LLM-tool containment guard (`read_file`, `grep_search`) | 2 | accepted | once per tool call, each after an LLM turn; `read_file`'s `read_text` stays 5270's |
-| `run_server` startup `resolve()` | 3 | accepted | once per process, before `server.serve()` binds |
-| `PromptArtifactStore.resolve` per curator LLM call | 1 | accepted | once per LLM round-trip of seconds |
+| one `resolve()` of a root or DB path before an awaited `aiosqlite` / `connect_daemon` open | 3 | filed | task 7572; one lstat per component, ahead of far costlier awaited work |
+| verifier LLM-tool containment guard (`read_file`, `grep_search`) | 2 | filed | task 7572; once per tool call, each after an LLM turn; `read_file`'s `read_text` stays 5270's |
+| `run_server` startup `resolve()` | 3 | filed | task 7572; once per process, before `server.serve()` binds, though it may stall already-started background loops once |
+| `PromptArtifactStore.resolve` per curator LLM call | 1 | filed | task 7572; once per LLM round-trip of seconds |
 | `EscalationQueue.resolve` in `on_judge_unhalt` | 1 | filed | task 6086, whose offload moves the whole closing loop into one `asyncio.to_thread` hop |
 
 **Sibling gate.** `shared/tests/test_orchestrator_rmtree_gate.py` filters the
