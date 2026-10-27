@@ -1,7 +1,7 @@
 """warm-lane-audit.sh refuses a missing mount, and ages a lane by its record.
 
 Drives the SHIPPED script by subprocess against synthetic mounts. The defects
-this pins, and why DF's copy is patched directly: README.md "Delta 13" in
+this pins, and why DF's copy is patched directly: README.md "Delta 16" in
 orchestrator/scripts/warm-lane/.
 """
 from __future__ import annotations

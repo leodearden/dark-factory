@@ -343,7 +343,7 @@ if ! [[ "$SAFETY" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v s="$SAFETY" 'BEGIN{exit 
 fi
 
 # No usable mount is a usage error, not an empty pool: a `resident=0` report for
-# it would read as "nothing is resident" to every consumer (README.md "Delta 13").
+# it would read as "nothing is resident" to every consumer (README.md "Delta 16").
 if [ -z "$MOUNT" ]; then
     err "No mount given: pass --mount DIR or set REIFY_WARM_LANE_MOUNT."
     err "Run '$(basename "$0") --help' for usage."
@@ -705,7 +705,7 @@ _dirty_state() {
 #   record     the lane-state record's updated_at, via lane_state_epoch. It wins
 #              whenever it is judgeable: the dir mtime is churned by transient
 #              files inside the lane, so it can read ~0 for a lane dispatched
-#              hours ago (README.md "Delta 13").
+#              hours ago (README.md "Delta 16").
 #   dir-mtime  the lane dir's mtime, via portable_mtime: the fallback for a
 #              record-less resident and for an empty or unparseable updated_at.
 #              A dir whose mtime cannot be read either degrades to age 0 (never

@@ -19,7 +19,7 @@
 #    RECLAIMABLE-via-terminal, recoverable LANDED/PUSHED/ORPHAN,
 #    residue-only-dirty, LEAKED + stale, measured disk figures, --format
 #    json, the combined B1 fixture + A3 degradation, and B2 read-only.)
-#   Mount refusal and the record age clock (README.md "Delta 13") are pinned
+#   Mount refusal and the record age clock (README.md "Delta 16") are pinned
 #   in orchestrator/tests/test_warm_lane_audit_mount_and_age.py instead.
 #
 # Driven by orchestrator/tests/test_warm_lane_bash_suite.py (PORTED_TESTS).
@@ -1325,7 +1325,7 @@ printf '9101 pending\n9102 pending\n9103 done\n9104 pending\n9105 pending\n9106 
 # + ahead-of-main with no origin => ORPHAN + aged past the default 60-minute
 # knob). Aged on BOTH clocks: the lane dir is backdated and so is its record's
 # updated_at, because the audit ages a lane by its record when it has one
-# (README.md "Delta 13") and make_lane_state otherwise stamps it now, which would
+# (README.md "Delta 16") and make_lane_state otherwise stamps it now, which would
 # read the LEAKED control as fresh. Three lanes here are byte-for-byte identical
 # in that respect and differ ONLY in their assignment record's state -- pinned /
 # quarantined / leaked -- which is what makes "the reserved one reports PINNED,
