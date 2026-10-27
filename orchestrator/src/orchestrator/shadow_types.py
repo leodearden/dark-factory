@@ -15,6 +15,7 @@ __all__ = [
     'ReferenceKind',
     'ShadowCellState',
     'ShadowShape',
+    'ShadowStormCause',
 ]
 
 
@@ -81,6 +82,24 @@ class ShadowCellState(StrEnum):
         """A cell that ended without settling must say why (C1)."""
         return self.is_terminal and self is not ShadowCellState.SETTLED
 
+    def may_become(self, target: ShadowCellState) -> bool:
+        """Whether a cell in this state may transition to *target*.
+
+        The table only moves forward through the declaration order, so a cell
+        can never revisit a state, and a terminal state has no successor.
+        """
+        return target in _SUCCESSORS[self]
+
+    @property
+    def held_by_run(self) -> bool:
+        """The states a live coordinator run owns, so its exit writes the successor."""
+        return self in _HELD_BY_RUN_STATES
+
+    @property
+    def stamps_settled_at(self) -> bool:
+        """The states whose entry writes ``settled_at``: the cell is closed for scoring."""
+        return self in _SETTLED_AT_STATES
+
 
 _TERMINAL_STATES = frozenset({
     ShadowCellState.SETTLED,
@@ -88,6 +107,29 @@ _TERMINAL_STATES = frozenset({
     ShadowCellState.EXPIRED,
     ShadowCellState.FAILED,
 })
+
+_SUCCESSORS: dict[ShadowCellState, frozenset[ShadowCellState]] = {
+    ShadowCellState.SAMPLED: frozenset({ShadowCellState.OPENED, ShadowCellState.FAILED}),
+    ShadowCellState.OPENED: frozenset({ShadowCellState.RUNNING, ShadowCellState.FAILED}),
+    ShadowCellState.RUNNING: frozenset({
+        ShadowCellState.AWAITING_REFERENCE,
+        ShadowCellState.CAP_EXCLUDED,
+        ShadowCellState.FAILED,
+    }),
+    ShadowCellState.AWAITING_REFERENCE: frozenset({
+        ShadowCellState.SETTLED,
+        ShadowCellState.EXPIRED,
+    }),
+    **{state: frozenset() for state in _TERMINAL_STATES},
+}
+
+_HELD_BY_RUN_STATES = frozenset({
+    ShadowCellState.SAMPLED,
+    ShadowCellState.OPENED,
+    ShadowCellState.RUNNING,
+})
+
+_SETTLED_AT_STATES = frozenset({ShadowCellState.SETTLED, ShadowCellState.EXPIRED})
 
 
 class ReferenceKind(StrEnum):
@@ -102,3 +144,11 @@ class PlanSource(StrEnum):
 
     PRODUCTION = 'production'
     CANDIDATE = 'candidate'
+
+
+class ShadowStormCause(StrEnum):
+    """Which storm guard paused shadow evaluation (C2 storm escape, ``shadow_storm.cause``)."""
+
+    DAILY_BUDGET = 'daily_budget'
+    FAILURE_STREAK = 'failure_streak'
+    COST_RATIO = 'cost_ratio'
