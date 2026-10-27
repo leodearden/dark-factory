@@ -44,9 +44,8 @@ from orchestrator.scheduler import Scheduler
 class TestUnblockAutoConfigDefaults:
     """Pins UnblockAutoConfig field names and default values."""
 
-    def test_unblock_auto_config_defaults(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_unblock_auto_config_defaults(self):
         cfg = OrchestratorConfig()
 
         ua = cfg.unblock_auto

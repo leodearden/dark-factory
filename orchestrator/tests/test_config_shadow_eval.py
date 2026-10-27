@@ -136,12 +136,8 @@ class TestCensusAndCli:
         assert 'shadow_eval.enabeld' in result.output
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestApplyReload:
-    @pytest.fixture(autouse=True)
-    def _no_config_file(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-
     def test_a_retune_applies_in_place_and_the_report_serialises(self):
         live = OrchestratorConfig()
         held = live.shadow_eval
