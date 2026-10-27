@@ -3682,9 +3682,11 @@ def create_mcp_server(
         If the embedding provider fails transiently (429, 5xx, connection), the
         Mem0 leg is NOT dropped: the ack carries stores_pending_retry=['mem0'],
         memory_ids is empty, the message says mem0_pending_retry, and the
-        server retries until the write lands. Do NOT re-submit the same content
-        (that would duplicate it); only a mem0_error means the write did not
-        land.
+        server retries the write for as long as its failures stay transient. A
+        later non-transient failure dead-letters it (status 'dead' in the
+        write journal's mem0_intents, logged at ERROR). Do NOT re-submit the
+        same content (that would duplicate it). The Mem0 leg has landed only
+        when the ack lists mem0 in stores_written and memory_ids is non-empty.
 
         Args:
             content: The memory itself (a fact, preference, procedure, etc.)
