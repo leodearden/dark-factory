@@ -198,12 +198,15 @@ travels with the orchestrator, never with the operated repo;
 Consequences for an editor of this file:
 
 - Editing a rendered section changes dispatched prompt content, even in a
-  docs-only commit. Send every edit to this file through the merge queue,
-  never as a direct commit to main. The shape test in
-  `orchestrator/tests/test_code_quality.py` runs only at the merge gate, and
-  pre-commit runs no render check for a `.md`. A malformed rendered section
-  committed directly to main is not caught before it lands, and every
-  orchestrator then raises at import on its next restart.
+  docs-only commit. On every branch, pre-commit renders a staged edit to this
+  file or to `code_quality.py` with
+  `scripts/check_staged_code_quality_render.py`, wired in
+  `hooks/project-checks`, and refuses a commit that would make `roles.py`
+  raise at import. The fuller shape test in
+  `orchestrator/tests/test_code_quality.py` (heuristic numbering, bullet-list
+  shape, tokens the prompt scanners forbid) runs only at the merge gate. A
+  direct commit to main is checked for import safety, not for shape, so send
+  structural edits through the merge queue.
 - Rendered sections must read correctly in any operated repo, and stay
   brace-free, because the block reaches a `str.format()` template.
 - Keep the rendered headings. A renamed or removed one raises at orchestrator
