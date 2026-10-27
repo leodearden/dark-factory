@@ -97,6 +97,7 @@ from orchestrator.lane_lifecycle import (
     LaneLifecycle,
     LaneState,
 )
+from orchestrator.lane_task_dir import archive_root_for, evict_previous_occupant
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
 from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
 from orchestrator.tree_removal import remove_tree
@@ -8128,15 +8129,11 @@ class GitOps:
                             f'Inspect the branch and, once wanted work is preserved, '
                             f'remove the other worktree and retry.'
                         )
-                    # Reaching this guard means .task/ (if present) belongs to
-                    # the lane's PREVIOUS occupant — the same-task case already
-                    # returned via the disk-backstop reuse above.  checkout -f
-                    # replaces tracked files but leaves untracked .task/ intact,
-                    # and _reuse_warm_lane deliberately preserves .task/ (its
-                    # same-task contract) — clear it here or the incoming task
-                    # inherits a foreign plan.json/iterations.jsonl/reviews/
-                    # (reify esc-4920-163: _lane-26 4949→4920 contamination).
-                    await remove_tree(lane / '.task', ignore_errors=True)
+                    # See orchestrator/src/orchestrator/lane_task_dir.py::evict_previous_occupant.
+                    await evict_previous_occupant(
+                        lane / '.task', keep_task_id=branch_name,
+                        archive_root=archive_root_for(self.transcript_archive, self.project_root),
+                    )
                     # The sibling .task-meta/<name> (W11 ε1) belongs to the same
                     # previous occupant but, unlike .task/, lives OUTSIDE the
                     # worktree — checkout -f cannot touch it, so it must be
@@ -8405,14 +8402,15 @@ class GitOps:
         return True
 
     async def _clean_lane_retaining_artifacts(
-        self, cwd: Path, *, caller: str = 'git_ops',
+        self, cwd: Path, *, caller: str = 'git_ops', also_retain: tuple[str, ...] = (),
     ) -> tuple[bool, str]:
         """Run a single ``git clean -xfd`` preserving artifact dirs and reseed-trash siblings.
 
         Builds one invocation excluding ALL configured artifact dirs (via
         ``self.config.reap_build_artifact_dirs``) and their
         ``<dir>.reseed-trash.*`` siblings — single-pass so >1 artifact dir all
-        survive (per-dir-loop step-19 regression).  A benign ENOENT race (R3:
+        survive (per-dir-loop step-19 regression) — plus the caller's own
+        *also_retain* exclude patterns.  A benign ENOENT race (R3:
         concurrent detached ``rm -rf`` already removed the path before git clean
         reached it) is treated as success and logged at WARNING level.
 
@@ -8426,7 +8424,10 @@ class GitOps:
             ``(True, err)`` if the failure was a benign ENOENT race (logged at WARNING).
             ``(False, err)`` on a genuine clean failure.
         """
-        clean_cmd = ['git', 'clean', '-xfd']
+        clean_cmd = [
+            'git', 'clean', '-xfd',
+            *(arg for pattern in also_retain for arg in ('-e', pattern)),
+        ]
         for artifact_dir in self.config.reap_build_artifact_dirs:
             clean_cmd += ['-e', artifact_dir, '-e', f'{artifact_dir}.reseed-trash.*']
         rc, _, err = await _run(clean_cmd, cwd=cwd)
@@ -8527,7 +8528,12 @@ class GitOps:
         in-worktree reset succeeds, the sibling ``.task-meta/<name>`` (which
         the reset above cannot touch) is cleared too (W11 ε1).
 
-        Added as a stub here (step-8); fully exercised by step-10 tests.
+        The previous occupant's ``.task/`` is evicted, transcripts archived
+        first, by orchestrator/src/orchestrator/lane_task_dir.py::evict_previous_occupant,
+        and the clean then skips ``.task/``: the eviction owns it, and a
+        transcript the archive refused is held there for the next boot's
+        orchestrator/src/orchestrator/harness.py::Harness._sweep_orphaned_transcripts
+        rather than deleted unarchived.
         """
         # -f (force) discards local modifications to tracked files before the
         # branch switch — required when the lane is being reused from a prior
@@ -8541,8 +8547,13 @@ class GitOps:
                 f'_reset_warm_lane: checkout -f -B {full_branch} {target_commit} '
                 f'failed for {lane_dir}: {err}'
             )
+        task_dir = lane_dir / '.task'
+        await evict_previous_occupant(
+            task_dir, keep_task_id=None,
+            archive_root=archive_root_for(self.transcript_archive, self.project_root),
+        )
         ok, err = await self._clean_lane_retaining_artifacts(
-            lane_dir, caller='_reset_warm_lane',
+            lane_dir, caller='_reset_warm_lane', also_retain=(f'/{task_dir.name}/',),
         )
         if not ok:
             raise RuntimeError(
