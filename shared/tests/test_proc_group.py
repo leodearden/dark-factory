@@ -227,6 +227,25 @@ def _record_killpg(monkeypatch: pytest.MonkeyPatch) -> list[_KillpgCall]:
     return calls
 
 
+def _assert_sigterm_then_sigkill(
+    dispatched: tuple[_KillpgCall, ...], pgid: int, grace_secs: float
+) -> tuple[_KillpgCall, _KillpgCall]:
+    """Assert *dispatched* is one SIGTERM of group *pgid*, then one SIGKILL at least *grace_secs* later.
+
+    Returns the ``(sigterm, sigkill)`` calls so a caller can bound the legs further.
+    """
+    assert [(c.target, c.sig) for c in dispatched] == [
+        (pgid, signal.SIGTERM),
+        (pgid, signal.SIGKILL),
+    ], f'expected one SIGTERM then one SIGKILL of group {pgid}; killpg calls: {dispatched}'
+    sigterm, sigkill = dispatched
+    assert sigkill.at - sigterm.at >= grace_secs, (
+        f'the SIGTERM leg was cut short: SIGKILL came '
+        f'{sigkill.at - sigterm.at:.2f}s after SIGTERM, for grace {grace_secs}s'
+    )
+    return sigterm, sigkill
+
+
 @pytest.fixture
 def unreaped_zombie_pgid():
     """Yield the pgid of a one-member group whose only member is an unreaped zombie.
@@ -713,16 +732,7 @@ class TestTerminateProcessGroup:
 
             await terminate_process_group(proc, pgid, grace_secs=grace_secs)
 
-            dispatched = tuple(calls)
-            assert [(c.target, c.sig) for c in dispatched] == [
-                (pgid, signal.SIGTERM),
-                (pgid, signal.SIGKILL),
-            ], f'expected one SIGTERM then one SIGKILL of group {pgid}; killpg calls: {dispatched}'
-            sigterm, sigkill = dispatched
-            assert sigkill.at - sigterm.at >= grace_secs, (
-                f'the SIGTERM leg was cut short: SIGKILL came '
-                f'{sigkill.at - sigterm.at:.2f}s after SIGTERM, for grace {grace_secs}s'
-            )
+            _assert_sigterm_then_sigkill(tuple(calls), pgid, grace_secs)
             await proc.wait()
             assert proc.returncode == -signal.SIGKILL, (
                 f'the leader must die of the SIGKILL, got {proc.returncode}'
@@ -826,16 +836,7 @@ class TestTerminateProcessGroup:
             await terminate_process_group(proc, pgid, grace_secs=grace_secs)
 
             returned_at = time.monotonic()
-            dispatched = tuple(calls)
-            assert [(c.target, c.sig) for c in dispatched] == [
-                (pgid, signal.SIGTERM),
-                (pgid, signal.SIGKILL),
-            ], f'expected one SIGTERM then one SIGKILL of group {pgid}; killpg calls: {dispatched}'
-            sigterm, sigkill = dispatched
-            assert sigkill.at - sigterm.at >= grace_secs, (
-                f'the SIGTERM leg was cut short: SIGKILL came '
-                f'{sigkill.at - sigterm.at:.2f}s after SIGTERM, for grace {grace_secs}s'
-            )
+            _, sigkill = _assert_sigterm_then_sigkill(tuple(calls), pgid, grace_secs)
             assert returned_at - sigkill.at < grace_secs, (
                 f'the SIGKILL leg spent its own grace instead of ending once the group was '
                 f'dead: {returned_at - sigkill.at:.2f}s after SIGKILL, for grace {grace_secs}s'
