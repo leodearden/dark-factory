@@ -101,12 +101,12 @@ class TestConfigKnob:
         assert variant is ImplementerBriefVariant.WHOLE_PLAN
 
     def test_the_stored_value_parses_to_the_member(self, isolated_config_env):
-        config = OrchestratorConfig(implementer_brief_variant='one-step')
+        config = OrchestratorConfig.model_validate({'implementer_brief_variant': 'one-step'})
         assert config.implementer_brief_variant is ImplementerBriefVariant.ONE_STEP
 
     def test_a_non_member_is_rejected_naming_the_field(self, isolated_config_env):
         with pytest.raises(ValidationError) as excinfo:
-            OrchestratorConfig(implementer_brief_variant='one_step')
+            OrchestratorConfig.model_validate({'implementer_brief_variant': 'one_step'})
         assert 'implementer_brief_variant' in str(excinfo.value)
 
 
@@ -117,14 +117,16 @@ class TestGreenTier:
     def test_edit_lands_in_applied_candidates_not_restart_required(self, isolated_config_env):
         diff = diff_config(
             OrchestratorConfig(),
-            OrchestratorConfig(implementer_brief_variant='one-step'),
+            OrchestratorConfig(implementer_brief_variant=ImplementerBriefVariant.ONE_STEP),
         )
         assert 'implementer_brief_variant' in diff.applied_candidates
         assert 'implementer_brief_variant' not in diff.restart_required
 
     def test_apply_reload_flips_the_live_object_in_place(self, isolated_config_env):
         live = OrchestratorConfig()
-        report = apply_reload(live, OrchestratorConfig(implementer_brief_variant='one-step'))
+        report = apply_reload(
+            live, OrchestratorConfig(implementer_brief_variant=ImplementerBriefVariant.ONE_STEP),
+        )
         assert report['reloaded'] is True
         assert report['applied'] == {
             'implementer_brief_variant': {'old': 'whole-plan', 'new': 'one-step'},

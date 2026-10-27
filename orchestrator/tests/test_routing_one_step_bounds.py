@@ -11,6 +11,7 @@ import pytest
 
 from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, SIMPLE_TASK, AgentRole
 from orchestrator.config import OrchestratorConfig, RoutingRule
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.routing import RoleDefaults, RouteInputs, RoutingDecision, resolve_route
 
 pytestmark = pytest.mark.usefixtures('code_default_config')
@@ -44,8 +45,9 @@ def test_whole_plan_implementer_route_is_the_configured_bounds():
 def test_one_step_divides_the_implementer_bounds_and_keeps_model_and_effort():
     bounds = {'budgets': {'implementer': 20.0}, 'max_turns': {'implementer': 160}}
     whole_decision = _route(IMPLEMENTER, OrchestratorConfig(**bounds))
+    one_step = ImplementerBriefVariant.ONE_STEP
     one_decision = _route(
-        IMPLEMENTER, OrchestratorConfig(implementer_brief_variant='one-step', **bounds),
+        IMPLEMENTER, OrchestratorConfig(implementer_brief_variant=one_step, **bounds),
     )
 
     assert one_decision.budget_usd == 20.0 / 3
@@ -60,7 +62,7 @@ def test_one_step_scales_the_final_route_after_a_policy_rule():
         'match': {'role': ['implementer']},
         'set': {'max_turns': 90, 'budget_usd': 9.0},
     })
-    config = OrchestratorConfig(implementer_brief_variant='one-step')
+    config = OrchestratorConfig(implementer_brief_variant=ImplementerBriefVariant.ONE_STEP)
     config.routing.rules = [rule]
 
     decision = _route(IMPLEMENTER, config)
@@ -72,5 +74,5 @@ def test_one_step_scales_the_final_route_after_a_policy_rule():
 
 @pytest.mark.parametrize('role', [DEBUGGER, ARCHITECT, SIMPLE_TASK], ids=lambda r: r.name)
 def test_one_step_leaves_other_roles_routes_alone(role):
-    one_step = OrchestratorConfig(implementer_brief_variant='one-step')
+    one_step = OrchestratorConfig(implementer_brief_variant=ImplementerBriefVariant.ONE_STEP)
     assert _route(role, one_step) == _route(role, OrchestratorConfig())

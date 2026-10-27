@@ -31,12 +31,12 @@ class TestEvalConfigField:
         assert config.harness_variant is ImplementerBriefVariant.WHOLE_PLAN
 
     def test_the_stored_value_is_coerced_to_the_member(self):
-        config = EvalConfig('x', 'claude', 'sonnet', 'max', harness_variant='one-step')
+        config = EvalConfig('x', 'claude', 'sonnet', 'max', harness_variant='one-step')  # pyright: ignore[reportArgumentType]
         assert config.harness_variant is ImplementerBriefVariant.ONE_STEP
 
     def test_a_non_member_is_refused(self):
         with pytest.raises(ValueError):
-            EvalConfig('x', 'claude', 'sonnet', 'max', harness_variant='bogus')
+            EvalConfig('x', 'claude', 'sonnet', 'max', harness_variant='bogus')  # pyright: ignore[reportArgumentType]
 
 
 def _first_endpoint_only_candidate() -> str:
@@ -112,6 +112,8 @@ class TestBuildEvalOrchConfig:
         assert orch.implementer_brief_variant is ImplementerBriefVariant.ONE_STEP
 
     def test_the_candidate_governs_the_cell_not_the_base(self, tmp_path):
-        base = OrchestratorConfig(project_root=tmp_path, implementer_brief_variant='one-step')
+        base = OrchestratorConfig(
+            project_root=tmp_path, implementer_brief_variant=ImplementerBriefVariant.ONE_STEP,
+        )
         orch = build_eval_orch_config(named_eval_config(BASE), {}, base_config=base)
         assert orch.implementer_brief_variant is ImplementerBriefVariant.WHOLE_PLAN
