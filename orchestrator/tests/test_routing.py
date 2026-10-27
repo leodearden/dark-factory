@@ -41,46 +41,36 @@ from orchestrator.routing import (
 )
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestRoutingConfigDefaults:
     """RoutingConfig is attached to OrchestratorConfig with the routing.py
     allowlist default (mirrors the ModelsConfig/PsiAdmissionConfig submodel
     pattern, config.py:141/473)."""
 
-    def test_default_allowed_models_attached_on_orchestrator_config(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_default_allowed_models_attached_on_orchestrator_config(self):
         cfg = OrchestratorConfig()
         assert isinstance(cfg.routing, RoutingConfig)
         assert cfg.routing.allowed_models == list(DEFAULT_ALLOWED_MODELS)
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestAllowlistFailFastValidation:
     """A configured model string outside routing.allowed_models must raise a
     structured, field-named pydantic.ValidationError at load (mirrors
     _validate_steward_timeout_invariant, config.py:2633)."""
 
-    def test_model_outside_allowlist_raises_naming_field_and_value(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_model_outside_allowlist_raises_naming_field_and_value(self):
         with pytest.raises(ValidationError) as exc_info:
             OrchestratorConfig(models=ModelsConfig(architect='sonnett'))
         message = str(exc_info.value)
         assert 'architect' in message
         assert 'sonnett' in message
 
-    def test_all_in_allowlist_config_constructs_ok(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_all_in_allowlist_config_constructs_ok(self):
         cfg = OrchestratorConfig(models=ModelsConfig(architect='haiku'))
         assert cfg.models.architect == 'haiku'
 
-    def test_unblock_auto_model_outside_allowlist_raises(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_unblock_auto_model_outside_allowlist_raises(self):
         with pytest.raises(ValidationError) as exc_info:
             OrchestratorConfig(unblock_auto=UnblockAutoConfig(model='bogus-model-9'))
         message = str(exc_info.value)
@@ -88,16 +78,13 @@ class TestAllowlistFailFastValidation:
         assert 'bogus-model-9' in message
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestNonClaudeBackendScopeBoundary:
     """The allowlist validator is SCOPED to claude-backend roles: a role
     running on a non-claude backend (the harness-backend axis) must never be
     rejected against the claude-centric allowlist."""
 
-    def test_non_claude_backend_model_is_not_checked_against_allowlist(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_non_claude_backend_model_is_not_checked_against_allowlist(self):
         cfg = OrchestratorConfig(
             backends=BackendsConfig(reviewer='gemini'),
             models=ModelsConfig(reviewer='gemini-2.5-pro'),
@@ -118,12 +105,11 @@ class TestRoutingAllowlistReloadDisposition:
             f'missing from RELOADABLE_FIELDS'
         )
 
-    def test_widening_allowlist_applies(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_widening_allowlist_applies(self):
         """A reload that WIDENS routing.allowed_models (adds back a model
         already in use) applies cleanly: reloaded=True, the leaf lands in
         applied, live is updated in place."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         # module_tagger defaults to 'haiku' (task 2540 flip); pin it to an
         # already-allowed model in `live` so this config -- whose allowlist
         # deliberately omits 'haiku' before the widening reload -- is valid.
@@ -143,9 +129,8 @@ class TestRoutingAllowlistReloadDisposition:
         }
         assert live.routing.allowed_models == ['haiku', 'sonnet', 'opus']
 
-    def test_tightening_allowlist_below_in_use_model_rolls_back(
-        self, monkeypatch, tmp_path
-    ):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_tightening_allowlist_below_in_use_model_rolls_back(self):
         """I5 hybrid-invariant rollback for the NEW cross-field invariant
         (_validate_models_in_allowlist), mirroring
         TestApplyReloadHybridRollback in test_config.py.
@@ -159,8 +144,6 @@ class TestRoutingAllowlistReloadDisposition:
         unit level via the injectable `allowlist` param, exactly like the
         steward-timeout precedent.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         # live is valid on its own: architect='opus' is in ['haiku','sonnet','opus'].
         live = OrchestratorConfig(
             models=ModelsConfig(architect='opus'),
@@ -194,9 +177,8 @@ class TestRoutingAllowlistReloadDisposition:
         assert live.routing.allowed_models == ['haiku', 'sonnet', 'opus']
         assert live.models.architect == 'opus'
 
-    def test_typo_in_fresh_config_fails_closed_before_apply_reload_is_reached(
-        self, monkeypatch, tmp_path
-    ):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_typo_in_fresh_config_fails_closed_before_apply_reload_is_reached(self):
         """The 'typo'd model reload returns a structured error naming the
         field' user-observable signal (PRD boundary-test-11 shape).
 
@@ -213,8 +195,6 @@ class TestRoutingAllowlistReloadDisposition:
         the {reloaded: False, error: ...} shape via a bare try/except; that
         wrapping is exercised by that module's own tests, not re-tested here.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError) as exc_info:
             OrchestratorConfig(models=ModelsConfig(architect='sonnett'))
         assert 'architect' in str(exc_info.value)
@@ -620,14 +600,10 @@ class TestRenderProbeArtifact:
 # ---------------------------------------------------------------------------
 
 
-def _fake_probe_cli_config(monkeypatch, tmp_path) -> OrchestratorConfig:
-    """A real, hermetically-constructed OrchestratorConfig for the CLI
-    tests below -- ORCH_CONFIG_PATH/cwd are neutralised first (mirrors
-    every other direct-construction test in this module) so this
-    OrchestratorConfig() call can never pick up a stray real config.yaml
-    from the actual environment."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+def _fake_probe_cli_config(tmp_path) -> OrchestratorConfig:
+    """A real OrchestratorConfig for the CLI tests below, each of which
+    requests code_default_config so this construction reads only the
+    package defaults."""
     # Default RoutingConfig() (haiku/sonnet/opus) -- ModelsConfig's own
     # defaults (e.g. architect='opus') must stay inside routing.allowed_models
     # or OrchestratorConfig's fail-fast allowlist validator (step-2) rejects
@@ -655,7 +631,7 @@ def _invoke_probe_models_cli(monkeypatch, tmp_path, report: ProbeReport,
     WRITTEN reads the returned path. The recorded list staying EMPTY is itself
     the assertion for a parse-time rejection.
     """
-    fake_config = _fake_probe_cli_config(monkeypatch, tmp_path)
+    fake_config = _fake_probe_cli_config(tmp_path)
     monkeypatch.setattr('orchestrator.cli.load_config', lambda _path: fake_config)
 
     calls: list[dict] = []
@@ -682,6 +658,7 @@ def _invoke_probe_models_cli(monkeypatch, tmp_path, report: ProbeReport,
     return result, calls, out_path
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestProbeModelsCliBudgetOption:
     """`probe-models --budget-usd` is the operator control the probe was
     missing: the CLI forwarded nothing, so every run silently took
@@ -725,6 +702,7 @@ class TestProbeModelsCliBudgetOption:
         assert probe_calls == [], 'a rejected ceiling must never reach probe_models'
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestProbeModelsCliBudgetAbortWarning:
     """The half of the defect a parse-time check cannot catch: a POSITIVE but
     mis-sized ceiling. `--budget-usd 0.05` -- the exact value that caused this
@@ -798,6 +776,7 @@ class TestProbeModelsCliBudgetAbortWarning:
         assert parsed['accounts']['max-x'][FABLE_CANDIDATE_MODEL] == 'budget_too_low'
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestProbeModelsCli:
     def test_writes_artifact_with_fable_row_and_exits_zero(self, monkeypatch, tmp_path):
         result, probe_calls, output_file = _invoke_probe_models_cli(
