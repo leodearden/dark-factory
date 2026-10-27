@@ -34,6 +34,7 @@ from orchestrator.evals.metrics import EvalMetrics
 from orchestrator.evals.task_sampler import repo_of_project
 from orchestrator.event_store import EventStore, EventType, ShadowSkipReason
 from orchestrator.run_store import CellChange, RunStore, ShadowCell, ShadowCellQuery
+from orchestrator.shadow_scoring import ShadowReference
 from orchestrator.shadow_types import (
     CostBasis,
     PlanSource,
@@ -41,12 +42,13 @@ from orchestrator.shadow_types import (
     ShadowShape,
     ShadowStormCause,
 )
-from orchestrator.workflow_types import WorkflowState
+from orchestrator.workflow_types import WorkflowOutcome, WorkflowState
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     'CREDIT_WINDOW',
+    'NOT_LANDED_TERMINALS',
     'PRODUCTION_COST_BASIS',
     'SHAPE_TRIGGERS',
     'TRAILING_WINDOW',
@@ -56,6 +58,7 @@ __all__ = [
     'CostPair',
     'CostRatioVerdict',
     'HostVerdict',
+    'MergeFinalized',
     'OpenDecision',
     'OpenInputs',
     'RatioSkip',
@@ -516,6 +519,49 @@ def run_end_change(outcome: CellRunOutcome, at: datetime) -> CellChange:
 
 
 # --------------------------------------------------------------------------- #
+# Production's outcome, as a settle reads it                                   #
+# --------------------------------------------------------------------------- #
+
+# Only these advance main with a merge_sha. 'superseded' is replaced by a later
+# request and 'conflict'/'blocked' may be retried, so none of them is final.
+_LANDING_STATES = frozenset({'done', 'done_wip_recovery'})
+
+# The production terminals that mean the task will not land.
+NOT_LANDED_TERMINALS = frozenset({WorkflowOutcome.BLOCKED, WorkflowOutcome.CANCELLED})
+
+
+def _required_text(payload: Mapping[str, Any], name: str) -> str:
+    value = payload.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f'merge_finalized payload: {name} must be a non-blank str (got {value!r})')
+    return value
+
+
+@dataclass(frozen=True)
+class MergeFinalized:
+    """The fields of a ``merge_finalized`` payload that a settle reads, parsed once."""
+
+    task_id: str
+    state: str
+    merge_sha: str | None
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> MergeFinalized:
+        sha = payload.get('merge_sha')
+        return cls(
+            task_id=_required_text(payload, 'task_id'),
+            state=_required_text(payload, 'state'),
+            merge_sha=sha if isinstance(sha, str) and sha.strip() else None,
+        )
+
+    def reference(self) -> ShadowReference | None:
+        """The landed reference, or ``None`` when this outcome landed nothing."""
+        if self.state in _LANDING_STATES and self.merge_sha is not None:
+            return ShadowReference.landed(self.merge_sha)
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # The coordinator                                                              #
 # --------------------------------------------------------------------------- #
 
@@ -788,8 +834,12 @@ class ShadowCoordinator:
         ended = await self._advance(
             cell_id, ShadowCellState.RUNNING, run_end_change(outcome, self._deps.clock()),
         )
-        if ended is not None and ended.state is ShadowCellState.CAP_EXCLUDED:
+        if ended is None:
+            return
+        if ended.state is ShadowCellState.CAP_EXCLUDED:
             await self._emit_ended(ended)
+            return
+        await self._catch_up(ended)
 
     async def _advance(
         self, cell_id: str, expected: ShadowCellState, change: CellChange,
@@ -820,6 +870,92 @@ class ShadowCoordinator:
             expected=cell.state,
             change=CellChange(ShadowCellState.FAILED, self._deps.clock(), reason=reason),
         )
+
+    # -- settle -------------------------------------------------------------
+
+    async def on_merge_finalized(self, payload: Mapping[str, Any]) -> list[str]:
+        """Settle the task's awaiting cells against a landing; the cell ids settled."""
+        try:
+            finalized = MergeFinalized.from_payload(payload)
+        except ValueError:
+            logger.warning('shadow coordinator: unreadable merge_finalized payload %r', payload)
+            return []
+        reference = finalized.reference()
+        if reference is None:
+            return []
+        return await self._settle_task(finalized.task_id, reference)
+
+    async def on_production_terminal(self, task_id: str, outcome: WorkflowOutcome) -> list[str]:
+        """Settle the task's awaiting cells unreferenced when production will not land."""
+        if outcome not in NOT_LANDED_TERMINALS:
+            return []
+        return await self._settle_task(task_id, ShadowReference.none())
+
+    async def _settle_task(self, task_id: str, reference: ShadowReference) -> list[str]:
+        """The one settle path of both entry points; like on_phase, it never raises."""
+        try:
+            awaiting = await asyncio.to_thread(
+                self._deps.store.find_shadow_cells,
+                self._query(task_id=task_id, states=frozenset({ShadowCellState.AWAITING_REFERENCE})),
+            )
+            return [cell.cell_id for cell in awaiting if await self._settle(cell, reference)]
+        except Exception:
+            logger.exception('shadow coordinator: settling task %s failed', task_id)
+            return []
+
+    async def _settle(self, cell: ShadowCell, reference: ShadowReference) -> bool:
+        """Settle one awaiting cell; False when another settle already won it."""
+        change = CellChange(
+            ShadowCellState.SETTLED,
+            self._deps.clock(),
+            reference_kind=reference.kind,
+            reference_sha=reference.sha,
+        )
+        settled = await asyncio.to_thread(
+            self._deps.store.advance_shadow_cell,
+            cell.cell_id,
+            expected=ShadowCellState.AWAITING_REFERENCE,
+            change=change,
+        )
+        if settled is None:
+            return False
+        await self._emit(
+            EventType.shadow_cell_settled,
+            settled,
+            reference_kind=reference.kind.value,
+            reference_sha=reference.sha,
+        )
+        return True
+
+    async def _catch_up(self, cell: ShadowCell) -> None:
+        """Settle a just-completed cell whose production outcome is already recorded."""
+        try:
+            reference = await asyncio.to_thread(self._recorded_reference, cell)
+            if reference is not None:
+                await self._settle(cell, reference)
+        except Exception:
+            logger.warning(
+                'shadow cell %s: late-reference catch-up failed; settle or expire still owns it',
+                cell.cell_id, exc_info=True,
+            )
+
+    def _recorded_reference(self, cell: ShadowCell) -> ShadowReference | None:
+        """Production's outcome for the cell's task, if recorded since the cell opened."""
+        finalized = self._deps.events.latest_merge_finalized(task_id=cell.task_id, cross_run=True)
+        if finalized is not None:
+            reference = MergeFinalized.from_payload(finalized).reference()
+            finished_at = datetime.fromisoformat(finalized['finished_at'])
+            if reference is not None and finished_at >= cell.opened_at:
+                return reference
+        recorded = self._deps.store.get_task_outcome(self.project_id, cell.task_id)
+        if (
+            recorded is not None
+            and recorded.outcome in NOT_LANDED_TERMINALS
+            and recorded.completed_at is not None
+            and recorded.completed_at >= cell.opened_at
+        ):
+            return ShadowReference.none()
+        return None
 
     async def join(self) -> None:
         """Wait for every live drive, including any a finishing drive spawned."""
