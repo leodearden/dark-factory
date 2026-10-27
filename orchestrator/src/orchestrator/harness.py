@@ -13305,10 +13305,7 @@ class Harness:
     # strands anything, however many strands it sweeps.  The rate is bounded by
     # the strand threshold, not by a guard: each sweep dismisses every pending
     # L0, so a strand at the next sweep was filed after this one and has aged
-    # past orphan_l0_timeout_secs since.  Task 4988 removed the earlier
-    # "one open record at a time" guard: it muted 8 of 12 reify sweeps, and an
-    # L2 promotion never re-armed it because promote_to_l2 leaves the member L1
-    # pending at level 1.
+    # past orphan_l0_timeout_secs since (task 4988).
     _STALE_L0_STRAND_SENTINEL: str = '__stale_l0_strand_sweep__'
     _STALE_L0_STRAND_ROOT_CAUSE: str = 'stale_l0_strand_sweep'
     _STALE_L0_STRAND_ROLE: str = 'harness-stale-l0-strand-sweep'
@@ -13359,8 +13356,6 @@ class Harness:
             return
         try:
             open_records = self._open_stale_l0_strand_records(queue.get_pending())
-
-            from escalation.models import Escalation
 
             max_age = max(s['pending_secs'] for s in strands)
             blocked = sum(1 for s in strands if s['workflow_blocked'])
