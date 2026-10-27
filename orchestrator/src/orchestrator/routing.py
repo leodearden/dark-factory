@@ -12,7 +12,8 @@ Task epsilon adds ``resolve_route`` -- the single layered authority for
 ``orchestrator.workflow.TaskWorkflow._invoke``. See ``resolve_route``'s own
 docstring for the layer precedence.
 
-Kept import-light at module top (stdlib only) so ``config.py`` can
+Kept import-light at module top (stdlib, plus the stdlib-only
+``orchestrator.implementer_brief_variant``) so ``config.py`` can
 ``from orchestrator.routing import DEFAULT_ALLOWED_MODELS`` with no circular
 import; heavier imports (e.g. ``shared.cli_invoke.invoke_claude_agent``) are
 deferred to inside the functions that need them. ``OrchestratorConfig`` is
