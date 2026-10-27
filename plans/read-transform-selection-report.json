@@ -215,8 +215,8 @@
       "path": "fused-memory/tests/fixtures/production_query_sample.jsonl"
     },
     {
-      "blob": "2dddb2ffa9e999fb06d075786f03a3cb8e602590",
-      "commit": "91e577e210b0d406e62918a800cf357166b52582",
+      "blob": "6912b2d9a249076823cd22e572c93450821171e2",
+      "commit": "87f362f7f9fd111c7ce6bcaf13bcaa1debfc6e96",
       "path": "fused-memory/tests/fixtures/e2_fetch_cache.json"
     }
   ],
