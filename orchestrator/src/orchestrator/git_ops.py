@@ -10856,11 +10856,11 @@ class GitOps:
         anything relative to main as it stood immediately before it?" — which
         is well-defined after the fact and answers the same question.
 
-        ``--ancestry-path`` (not a plain ``--merges`` walk) is what makes the
-        result *this branch's* landing rather than merely the oldest merge in
-        the range: it restricts the walk to commits that are simultaneously
-        descendants of *head* and ancestors of *upstream*, so an unrelated
-        merge that happened to land in the same window is excluded.
+        ``--ancestry-path`` keeps only descendants of *head* that are ancestors
+        of *upstream*, excluding an unrelated merge landed in the same window.
+        ``--topo-order`` makes "oldest" TOPOLOGICAL: rev-list's default order
+        is COMMIT DATE, which ``--reverse`` merely flips, so a skewed or tied
+        date can put a later merge first (``orchestrator/tests/test_group_merge_candidate_ordering.py``).
 
         Returns ``None`` when there is no such merge — a fast-forward or
         rebase landing leaves none — and also on any git failure.  The two are
@@ -10870,8 +10870,8 @@ class GitOps:
         a refusal is ``not_landed`` or ``git_error``.
         """
         rc, out, _ = await _run(
-            ['git', 'rev-list', '--ancestry-path', '--merges', '--reverse',
-             f'{head}..{upstream}'],
+            ['git', 'rev-list', '--topo-order', '--ancestry-path', '--merges',
+             '--reverse', f'{head}..{upstream}'],
             cwd=self.project_root,
         )
         if rc != 0 or not out.strip():
