@@ -29,7 +29,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-SCRIPT = (Path(__file__).parent.parent
+import pytest
+
+SCRIPT =(Path(__file__).parent.parent
           / 'install-memory-metadata-coverage-census-timer.sh')
 TEMPLATES_DIR = Path(__file__).parent.parent
 REPO_ROOT = TEMPLATES_DIR.parent
@@ -43,6 +45,10 @@ PRODUCTION_ROOT = '/home/leo/src/dark-factory'
 SERVICE_NAME = 'memory-metadata-coverage-census.service'
 TIMER_NAME = 'memory-metadata-coverage-census.timer'
 WRAPPER = TEMPLATES_DIR / 'memory-metadata-coverage-census.sh'
+
+# Resolved in the PARENT: subprocess looks argv[0] up on the CHILD's PATH, and
+# the uv rows below hand the wrapper an empty one.
+BASH = shutil.which('bash') or '/bin/bash'
 
 
 _FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
@@ -492,6 +498,25 @@ def _git_argv_path(tmp_path):
     return tmp_path / 'git_argv.jsonl'
 
 
+def _wrapper_bin_dir(tmp_path):
+    """Where _wrapper_harness writes its shims and the recorder they exec."""
+    return tmp_path / 'wbin'
+
+
+def _write_recorder_shim(path, who, recorder):
+    """An executable that records its argv under `who` via `recorder`.
+
+    Both the shebang and the interpreter are ABSOLUTE, so the shim runs under
+    an empty PATH and a PATH-resolved shim can never re-enter itself.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f'#!{BASH}\n'
+        f'FAKE_WHO={who} exec {sys.executable} {recorder} "$@"\n'
+    )
+    path.chmod(0o755)
+
+
 def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
                      default_prefix=False, record_git=False,
                      pad_commit_output=0):
@@ -511,26 +536,18 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
     pipefail misread (see the retry-predicate tests below) from a ~0.6% race
     at git's natural output size into a deterministic reproduction.
     """
-    bin_dir = tmp_path / 'wbin'
+    bin_dir = _wrapper_bin_dir(tmp_path)
     bin_dir.mkdir(exist_ok=True)
     state_path = tmp_path / 'wrapper_state.json'
     state_path.write_text('[]')
 
-    # The interpreter is spelled ABSOLUTELY (sys.executable), never `python3`,
-    # so a PATH-resolved shim can never re-enter itself.
     shims = {'fake-census': 'CENSUS', 'fake-stamp': 'STAMP'}
     if default_prefix:
         # ONE fake `uv` serves BOTH halves, so it cannot key on FAKE_WHO: every
         # call lands under the same `who`, and the census's is simply the first.
         shims['uv'] = 'UV'
     for name, who in shims.items():
-        shim = bin_dir / name
-        shim.write_text(
-            '#!/usr/bin/env bash\n'
-            f'FAKE_WHO={who} exec {sys.executable} '
-            f'{bin_dir / "recorder.py"} "$@"\n'
-        )
-        shim.chmod(0o755)
+        _write_recorder_shim(bin_dir / name, who, bin_dir / 'recorder.py')
     (bin_dir / 'recorder.py').write_text(_FAKE_RECORDER_SRC)
 
     if record_git:
@@ -589,14 +606,16 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
     env['REPO'] = str(repo)
     for key in _SERVICE_ENV_KEYS:
         env.pop(key, None)
+    # An ambient operator pin would steer the default prefix to a REAL uv.
+    env.pop('UV_BIN', None)
     if default_prefix:
         for key in ('COVERAGE_CENSUS_CMD', 'RETRO_STAMP_CMD'):
             env.pop(key, None)
         # Keeps the commit half out of the prefix assertion.
         env['CENSUS_COMMIT'] = '0'
     else:
-        env['COVERAGE_CENSUS_CMD'] = 'fake-census'
-        env['RETRO_STAMP_CMD'] = 'fake-stamp'
+        env['COVERAGE_CENSUS_CMD'] = str(bin_dir / 'fake-census')
+        env['RETRO_STAMP_CMD'] = str(bin_dir / 'fake-stamp')
     env['FAKE_STATE'] = str(state_path)
     env['FAKE_EXIT_CENSUS'] = str(census_exit)
     env['FAKE_EXIT_STAMP'] = str(stamp_exit)
@@ -608,7 +627,7 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
 def _run_wrapper(tmp_path, **kwargs):
     env, state_path = _wrapper_harness(tmp_path, **kwargs)
     result = subprocess.run(
-        ['bash', str(WRAPPER)],
+        [BASH, str(WRAPPER)],
         env=env, capture_output=True, text=True, timeout=60,
     )
     return result, json.loads(state_path.read_text())
@@ -733,6 +752,141 @@ def test_wrapper_runs_both_halves_under_uv_so_fused_memory_imports_resolve(
         assert argv[:len(prefix)] == prefix, argv
         # The script is the prefix's first argument, never a bare argv[0].
         assert argv[len(prefix)] == script, argv
+
+
+# ── uv is resolved to an absolute path, not trusted to be on PATH ───────────
+#
+# A Persistent=true boot catch-up run gets the user manager's minimal PATH, so
+# a bare `uv` is not found; the wrapper used to narrate census=127 stamp=127
+# and exit 0, losing the night's row silently. These rows hand the wrapper an
+# EMPTY PATH and HOME, so the only uv it can reach is the one a row plants.
+
+_NO_LAST_RESORT_UV = pytest.mark.skipif(
+    os.path.exists('/usr/local/bin/uv'),
+    reason=(
+        '/usr/local/bin/uv exists on this host, so the ladder\'s last-resort '
+        'fallback resolves and the unresolvable-uv path cannot be exercised'
+    ),
+)
+
+
+def _empty_dir(tmp_path, name):
+    directory = tmp_path / name
+    directory.mkdir(exist_ok=True)
+    return directory
+
+
+def _run_wrapper_on_an_empty_path(tmp_path, *, extra_env=None, **kwargs):
+    """_run_wrapper with PATH and HOME each an empty dir; `extra_env` wins."""
+    env = {
+        'PATH': str(_empty_dir(tmp_path, 'empty-path')),
+        'HOME': str(_empty_dir(tmp_path, 'empty-home')),
+        **(extra_env or {}),
+    }
+    return _run_wrapper(tmp_path, extra_env=env, **kwargs)
+
+
+def _halves(calls):
+    """Each recorded call as (who, the five args a uv-run prefix occupies)."""
+    return [(c['who'], c['argv'][:5]) for c in calls]
+
+
+def _both_halves_under_uv(tmp_path):
+    prefix = ['run', '--frozen', '--project',
+              f'{tmp_path / "fake-repo"}/fused-memory', 'python']
+    return [('UV', prefix), ('UV', prefix)]
+
+
+def _diag(result):
+    return (f'rc={result.returncode} stdout={result.stdout!r} '
+            f'stderr={result.stderr!r}')
+
+
+def test_wrapper_resolves_uv_via_uv_bin_under_an_empty_path(tmp_path):
+    fake_uv = _wrapper_bin_dir(tmp_path) / 'uv'
+
+    result, calls = _run_wrapper_on_an_empty_path(
+        tmp_path, default_prefix=True, extra_env={'UV_BIN': str(fake_uv)})
+
+    assert result.returncode == 0, _diag(result)
+    assert _halves(calls) == _both_halves_under_uv(tmp_path), _diag(result)
+
+
+def test_wrapper_falls_back_to_home_local_bin_uv_under_an_empty_path(tmp_path):
+    """The boot-catch-up branch: no UV_BIN, no uv on PATH, uv installed at
+    $HOME/.local/bin/uv."""
+    home = tmp_path / 'uv-home'
+    _write_recorder_shim(home / '.local' / 'bin' / 'uv', 'UV',
+                         _wrapper_bin_dir(tmp_path) / 'recorder.py')
+
+    result, calls = _run_wrapper_on_an_empty_path(
+        tmp_path, default_prefix=True, extra_env={'HOME': str(home)})
+
+    assert result.returncode == 0, _diag(result)
+    assert _halves(calls) == _both_halves_under_uv(tmp_path), _diag(result)
+
+
+@_NO_LAST_RESORT_UV
+def test_wrapper_refuses_to_run_either_half_when_uv_cannot_be_resolved(
+        tmp_path):
+    """The one exception to always-exit-0: a configuration fault that would
+    fail every night identically refuses to START, loudly, instead of
+    narrating two 127s and exiting 0."""
+    result, calls = _run_wrapper_on_an_empty_path(tmp_path, default_prefix=True)
+
+    assert result.returncode == 127, _diag(result)
+    assert 'memory-metadata-coverage-census.sh: ERROR:' in result.stderr, (
+        _diag(result))
+    assert 'uv' in result.stderr, _diag(result)
+    assert calls == [], _diag(result)
+    assert 'done (' not in result.stdout, _diag(result)
+
+
+def test_wrapper_refuses_a_non_executable_uv_bin_even_with_uv_on_path(
+        tmp_path):
+    """Falling through to the uv on PATH would run a DIFFERENT uv than the
+    one pinned."""
+    bad_uv = tmp_path / 'bad-uv'
+    bad_uv.write_text('#!/bin/sh\nexit 0\n')
+    bad_uv.chmod(0o644)
+    path = f'{_wrapper_bin_dir(tmp_path)}{os.pathsep}' + str(
+        _empty_dir(tmp_path, 'empty-path'))
+
+    result, calls = _run_wrapper_on_an_empty_path(
+        tmp_path, default_prefix=True,
+        extra_env={'PATH': path, 'UV_BIN': str(bad_uv)})
+
+    assert result.returncode == 127, _diag(result)
+    assert str(bad_uv) in result.stderr, _diag(result)
+    assert calls == [], _diag(result)
+
+
+@_NO_LAST_RESORT_UV
+def test_wrapper_resolves_uv_after_sourcing_dotenv(tmp_path):
+    """UV_BIN reaches the wrapper ONLY through $REPO/.env, the remedy an
+    operator reaches for after a boot-PATH 127. Resolving before the source
+    would find nothing and refuse with 127."""
+    fake_uv = _wrapper_bin_dir(tmp_path) / 'uv'
+    repo = tmp_path / 'fake-repo'
+    repo.mkdir(exist_ok=True)
+    (repo / '.env').write_text(f'UV_BIN={fake_uv}\n')
+
+    result, calls = _run_wrapper_on_an_empty_path(tmp_path, default_prefix=True)
+
+    assert result.returncode == 0, _diag(result)
+    assert _halves(calls) == _both_halves_under_uv(tmp_path), _diag(result)
+
+
+@_NO_LAST_RESORT_UV
+def test_wrapper_needs_no_uv_when_both_seams_are_set(tmp_path):
+    """Resolution is conditional on a half actually needing the default
+    prefix: with both seams set, a host with no uv at all still runs both."""
+    result, calls = _run_wrapper_on_an_empty_path(
+        tmp_path, extra_env={'CENSUS_COMMIT': '0'})
+
+    assert result.returncode == 0, _diag(result)
+    assert [c['who'] for c in calls] == ['CENSUS', 'STAMP'], _diag(result)
+    assert 'ERROR:' not in result.stderr, _diag(result)
 
 
 # ── the wrapper commits what it regenerates (esc-4006-5) ────────────────────
