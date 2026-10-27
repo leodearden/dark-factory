@@ -599,8 +599,9 @@ def code_digests(
 
     WARNING rather than ERROR, deliberately: one failed digest does not by
     itself fail the run. Only the storm does, and that branch's ERROR is
-    emitted by ``nightly.post_escalation``. The reason is logged unbounded;
-    ``session_runner`` already tail-bounds the output streams it embeds.
+    the trickle's alarm, journaled by ``alarm.raise_alarm``. The reason is
+    logged unbounded; ``session_runner`` already tail-bounds the output
+    streams it embeds.
 
     TWO CONSUMERS, VERY DIFFERENT VOLUMES — and everything above is the
     TRICKLE's argument. ``nightly.run_nightly`` codes exactly ONE small
