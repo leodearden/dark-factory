@@ -518,7 +518,8 @@ _IDLE_POLL_LOG_SECS: float = 180.0
 # Allowed and disallowed tools for the escalation-watcher-auto rotation.
 # Scoped to what escalation triage actually needs: file reads, foreground
 # escalation.watcher subprocess, safe git reads, and the MCP tools for
-# autonomous dispatch (update_task, add_dependency, resolve_issue).
+# autonomous dispatch (update_task, add_dependency, resolve_issue), plus the
+# submit_task/resolve_ticket filing pair.
 # Defence-in-depth mirrors the unblock-auto precedent (dry_run_unblock.py).
 #
 # NOTE — this allowlist is ADVISORY, not the durable enforcement boundary.
@@ -566,12 +567,16 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     # pending L1/L2 it assessed (task 2555) so future rotations can skip
     # re-deriving the same disposition every rotation.
     'mcp__escalation__stamp_triage',
-    # Fused-memory MCP: read + autonomous dispatch (scope_violation/dependency/cleanup)
+    # Fused-memory MCP: read + autonomous dispatch (scope_violation/dependency/cleanup) + filing
     'mcp__fused-memory__get_task',
     'mcp__fused-memory__get_tasks',
     'mcp__fused-memory__search',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__add_dependency',
+    # Convert-to-tracked-work filing (task 3726): submit_task files the
+    # candidate; resolve_ticket waits for the task id the resolution cites.
+    'mcp__fused-memory__submit_task',
+    'mcp__fused-memory__resolve_ticket',
 ]
 # Connection-capability headers for the escalation-watcher-auto rotation's
 # escalation MCP connection (plans/escalation-connection-capability-guard-prd.md

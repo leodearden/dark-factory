@@ -1,6 +1,6 @@
 ---
 name: escalation-watcher-auto
-description: "Autonomous level-1 escalation watcher. Acts as the L1 consumer and triage funnel to the human (L2): handles admin-class escalations directly (scope_violation, dependency_discovered, cleanup_needed), performs shallow root-cause analysis to detect causal clusters, and promotes judgement-class items — single or clustered — to L2 via promote_to_l2 so the human receives a pre-formed hypothesis with evidence and concrete options. When promote_to_l2 is unavailable (graceful degradation), falls back to the legacy leave-pending + digest mode. Runs until ROTATION_ESCALATIONS or ROTATION_HOURS is reached, then exits cleanly. This is a fully autonomous, no-terminal skill — do NOT use it for interactive unblocking."
+description: "Autonomous level-1 escalation watcher. Acts as the L1 consumer and triage funnel to the human (L2): handles admin-class escalations directly (scope_violation, dependency_discovered, cleanup_needed), performs shallow root-cause analysis to detect causal clusters, and promotes judgement-class items — single or clustered — to L2 via promote_to_l2 so the human receives a pre-formed hypothesis with evidence and concrete options. Files work-shaped findings as tracked tasks (submit_task → resolve_ticket) and closes them citing the task id; every L1 it assesses ends resolved, filed or promoted, never parked. Runs until ROTATION_ESCALATIONS or ROTATION_HOURS is reached, then exits cleanly. This is a fully autonomous, no-terminal skill — do NOT use it for interactive unblocking."
 ---
 
 # Escalation Watcher (Autonomous)
@@ -15,14 +15,14 @@ You are running an autonomous, fully non-interactive level-1 escalation handler.
 
 - **NO terminal spawning.** Do not use `gnome-terminal`, `kitty`, `tmux`, `Bash(run_in_background)`, the `/spawn` skill, or any other form of background subprocess.
 - **NO interactive `/unblock` sessions.** Do not spawn Claude Code sessions or any interactive tool.
-- **Tier-1 admin actions ONLY.** You may call `mcp__fused-memory__update_task`, `mcp__fused-memory__add_dependency`, `mcp__escalation__resolve_issue`, `mcp__escalation__promote_to_l2`, and `mcp__escalation__stamp_triage` (an ungated triage-ack **annotation**, not a state transition — see [Triage-ack freshness contract](#triage-ack-freshness-contract)). Nothing else mutates state.
+- **Tier-1 admin actions ONLY.** You may call `mcp__fused-memory__update_task`, `mcp__fused-memory__add_dependency`, `mcp__escalation__resolve_issue`, `mcp__escalation__promote_to_l2`, `mcp__escalation__stamp_triage` (an ungated triage-ack **annotation**, not a state transition — see [Triage-ack freshness contract](#triage-ack-freshness-contract)), and the filing pair `mcp__fused-memory__submit_task` / `mcp__fused-memory__resolve_ticket` (file a finding as a task and wait for its task id — see [Convert to tracked work](#convert-to-tracked-work-file-and-resolve)). Nothing else mutates state.
 - **No code edits.** Do not use `Edit`, `Write`, or any tool that modifies source files.
 - **No merge-queue interaction.** Do not call merge-queue or git-merge tools. This skill never submits to the merge queue — no `merge_request` call exists anywhere in this flow and none may be added; if merge interaction is ever introduced, it must use the bounded submit→poll protocol (explicit `wait_secs`, `merge_status` polling — see `skills/escalation-watcher/SKILL.md` §"Merge Submissions — Bounded Submit, Then Poll").
 - **No infra commands.** Do not issue infrastructure commands (docker, systemctl, kill, etc.).
 - **No recovery ref-moves.** NEVER perform red-on-main recovery ref-moves — no `git reset`, `git update-ref refs/heads/main`, or any other direct ref mutation. When main is RED and a recovery ref-move is required, PROMOTE to L2 so the human-driven escalation-watcher can execute the enforce-safe recovery procedure (`skills/escalation-watcher/SKILL.md §"Red-on-main recovery"`). This invariant applies even if a recovery SHA is known — the auto-watcher is read-only and has no sanctioned path to move the main ref.
 - **`resolve_issue` on level ≥ 2 is forbidden, with one narrow, evidence-gated exception.** This was always the contract, and the escalation server **enforces** it structurally (`plans/escalation-connection-capability-guard-prd.md`, narrowed by task 2630's carve-out — `escalation.authority.l2_auto_close_class`): this watcher's supervised MCP connection carries `X-Escalation-Levels: 0,1`, so `resume` / `restart` / `park` / `abandon` against a level-2 escalation are **always** rejected server-side with `{'error': ..., 'code': 'level_forbidden'}` and make **no** state change — that part of the contract is unchanged and cannot succeed. The one exception: `resolve_issue(action='close_only')` on an L2 record now **succeeds** when (a) the record matches one of three allowlisted classes AND (b) your `resolution` text quotes that class's required evidence verbatim — see [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) below for the classes, evidence, and the NEVER-allowed set (`design_concern` / `milestone_gate` categories, and any record filed by `orchestrator-deterministic` — the born-at-L2 human-gate sentinel role covering deterministic `always_escalates` / operator / acceptance / milestone-predicate gates — are **never** auto-closable, checked before the allowlist). Every other action at L2, and any L2 record outside the three classes or missing its evidence, still returns `level_forbidden` exactly as before. Resolve L0/L1 admin-class items directly; promote judgement-class and L2-bound items via `promote_to_l2` (which is exempt from the level gate); leave every other L2 pending for the human. The same connection carries `X-Escalation-Identity: orchestrator-escalation-watcher-auto`, which the server stamps onto the archived record's `resolved_by` for every permitted `resolve`/`park`/auto-close — server-attributed and non-spoofable, regardless of the `resolved_by="escalation-watcher-auto"` tool argument used in the call-shape examples throughout this skill.
 
-When in doubt, **promote the escalation to L2** (see [Promote to L2](#promote-to-l2)). Leaving items pending at L1 indefinitely is not acceptable; if the tool is unavailable fall back to the legacy digest (see [Graceful Degradation](#graceful-degradation)).
+When in doubt, **promote the escalation to L2** (see [Promote to L2](#promote-to-l2)). Every L1 you assess ends resolved, filed-and-resolved or promoted — never parked (see [Terminal dispositions](#terminal-dispositions--never-park)).
 
 ## Rotation Limits
 
@@ -98,6 +98,8 @@ The auto-watcher's allowed tools strictly limit what you can access. Use these f
 | `mcp__fused-memory__get_task` | Full task record including metadata and recent history |
 | `mcp__fused-memory__get_tasks` | Task tree — useful for finding sibling tasks of the same parent |
 | `mcp__fused-memory__search` | Semantic search for prior decisions, related tasks, conventions |
+
+The filing pair `mcp__fused-memory__submit_task` / `mcp__fused-memory__resolve_ticket` is not an investigation read: it is a mutating Tier-1 action ([Hard Constraints](#hard-constraints--never-violate)).
 
 **MCP tool names are per-server.** The `mcp__<server>__` prefix names the server that owns a tool.
 
@@ -295,7 +297,23 @@ Nothing is mutated on a refusal: the head and every member stay pending and un-a
 - **A compact drain surfaces `pin_declared_by` on every row.** Check it *before* designating a cluster for a bulk close. `pin_declared_reason` is not projected — a non-empty `pin_declared_by` is your signal to re-read the record without `compact`, as **Reading one full escalation record** under [Read-only investigation toolset](#read-only-investigation-toolset) describes. The pending read is sufficient because a declared-pin refusal mutates nothing — the head and every member stay pending.
 - **`acknowledge_declared_pins` is NOT a way to make the error go away.** It requires naming *every* blocked id (a partial acknowledgement still refuses, reporting only the remainder), and there is no un-declare verb. The correct response to this refusal is to go **read what `pin_declared_by` names and consult it** — a deviation notice, an operator gate — not to silence it. Acknowledge only when that thing has told you the pin may be spent.
 - **An UNMARKED record is not proof that nothing relies on it.** The marker is opt-in; its absence means "not declared", not "safe".
-- **You cannot declare a pin yourself — REPORT one.** `mcp__escalation__declare_pin` is not in this rotation's allowed tools (`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` grants `stamp_triage`, not this); declaring is operator/steward-only for now. When a record looks load-bearing but carries no `pin_declared_by`, do NOT close it and do NOT invent a marker: leave it pending, `stamp_triage` it with what you found, and say in your report that it is a *candidate pin* naming what appears to rely on it. A human runs `declare_pin` to make it machine-readable.
+- **You cannot declare a pin yourself — PROMOTE a candidate.** `mcp__escalation__declare_pin` is not in this rotation's allowed tools (`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` grants `stamp_triage`, not this); declaring is operator/steward-only for now. When a record looks load-bearing but carries no `pin_declared_by`, do NOT close it and do NOT invent a marker: promote it as a 1-member *candidate pin*. A human runs `declare_pin` to make it machine-readable, and this promotion is how the human learns of it.
+  ```python
+  mcp__escalation__promote_to_l2(
+      task_id=esc["task_id"],
+      agent_role="escalation-watcher-auto",
+      member_ids=[esc["id"]],
+      root_cause="candidate-pin:<esc_id>",
+      evidence="<what appears to rely on this record staying open, and why>",
+      options=[
+          "A: declare_pin <esc_id> naming the dependent, then PARK this L2 — resolving or dismissing it cascades to its member and spends the pin (the esc-3371-2 loss below)",
+          "B: confirm nothing relies on it, then resolve",
+          "C: something else",
+      ],
+      summary="Candidate pin: " + esc["summary"],
+      category=esc["category"],
+  )
+  ```
 
 Why this exists: on 2026-08-08 an L2 cascade close of the homogeneous 11-member cluster esc-3237-5 dismissed esc-3371-2 — the only pin preserving mu-gate validation specimen task 3371, which is permanently gone. Every member was indistinguishable by id, level, category, severity, agent_role and summary, and the sole marker lived in prose nothing linked from. The surviving sibling pin is **esc-3105-3** (a 15-member L2 head — exactly the shape a rotation bulk-closes).
 
@@ -338,9 +356,11 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
 
 ```
 1. Record start time; compute deadline = start + ROTATION_HOURS × 3600 s
-2. Feature-detect: is mcp__escalation__promote_to_l2 in my available toolset?
-   If YES → use L2 promotion paths throughout (steps 4 and 5)
-   If NO  → fall back to LEGACY mode (see Graceful Degradation)
+2. Feature-detect, by inspecting the toolset (never a trial call — see Graceful Degradation):
+   are mcp__escalation__promote_to_l2 AND the filing pair
+   mcp__fused-memory__submit_task / mcp__fused-memory__resolve_ticket available?
+   All present → full mode
+   Any missing → DEGRADED (see Graceful Degradation)
 3. Drain and deduplicate pending L1 escalations (exact call shapes: Draining pending escalations):
    a. get_pending_escalations(level=1) → candidate_l1s
       (FULL shape: the handlers read agent_role and detail)
@@ -354,8 +374,12 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
    (Member L1s stay pending at L1 after promotion; without this filter every cycle re-scans
     and re-promotes the same items, inflating the counter and re-spending RCA budget)
 4. Apply shallow RCA across work_batch — detect causal clusters (see Shallow-by-default RCA)
-5. For each escalation in work_batch: autonomous dispatch (path-guard scope_violation closes / dependency / cleanup)
-   OR promote to L2 / legacy-leave-pending (judgement classes — see routing table below)
+5. For each escalation in work_batch, apply exactly one terminal disposition (see Terminal dispositions):
+   resolve it (autonomous dispatch: path-guard scope_violation closes / dependency / stranded),
+   file-and-resolve it (Convert to tracked work, including cleanup_needed and review_suggestions), or
+   promote it to L2 (judgement classes and anything you cannot address — see routing table below)
+5b. Check that every work_batch member was resolved, filed-and-resolved or promoted;
+    an item in none of those states is a triage bug — promote it
 6. Increment escalations_handled by len(work_batch) — already-promoted items filtered in step 3
    do NOT count toward the rotation limit
 7. Check rotation limits:
@@ -374,7 +398,7 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
       identical-retry cap in Waiting for the next L1 — never loop on the identical call
 ```
 
-The digest is emitted on rotation-limit exit regardless of mode (promotion or legacy).
+The digest is emitted on rotation-limit exit in either mode (full or DEGRADED).
 
 ### Draining pending escalations
 
@@ -517,12 +541,117 @@ The `<min(3600, remaining)>` clamp sizes the final wait exactly to the remaining
 
 ## Per-Category Routing Table
 
+### Terminal dispositions — never park
+
+Every L1 in `work_batch` leaves the rotation in exactly one of three states:
+
+- **Resolve it** (`resolve_issue`) — you made the state change, or confirmed the record stale or benign.
+- **File-and-resolve it** (`submit_task` → `resolve_ticket` → `resolve_issue`) — see [Convert to tracked work](#convert-to-tracked-work-file-and-resolve).
+- **Promote it** (`promote_to_l2`) — anything you cannot yourself address: anything needing authority above `{0,1}`, a code edit, merge-queue, infra or a ref-move, a human ruling, and anything you are unsure about.
+
+There is NO fourth branch. An assessment that ends without one of the three ends in a promotion.
+
+- **"Hold for an Nth occurrence" is retired.** It cannot release itself: one drain samples one moment, nothing counts occurrences across tasks or rotations, and nothing re-examines the criterion. A recurrence question worth asking is a filed task whose description asks it; one that needs a human is a promotion.
+- **A `stamp_triage` stamp is not a disposition.** It changes neither status nor level, so a stamped-only L1 is still parked.
+- **A parked record costs every later rotation.** `orchestrator/src/orchestrator/harness.py::Harness._watcher_has_actionable_l1` counts every pending L1 outside a pending L2's members, so a parked record re-arms rotations indefinitely.
+- **Pending L2s are the human's queue**, not records you parked; the L2 guards above stand.
+- The one non-terminal state is the `promote_to_l2`-absent defect in [Graceful Degradation](#graceful-degradation). It is not a disposition.
+
+### Convert to tracked work (file-and-resolve)
+
+An escalation is not durable storage: `escalation/src/escalation/archive.py::prune_archive` hard-deletes archived records after `DEFAULT_RETENTION_DAYS` (30), so a finding closed with a bare `resolve_issue` is gone within a month. When a record carries work but its subject task needs nothing from you now, file the work as a task and close the record citing that task's id.
+
+**Applies to** a pending L1 in `work_batch` that meets BOTH:
+- (a) no immediate state change is needed on its subject task — the task is terminal, or is not waiting on this record;
+- (b) it carries durable, work-shaped content — a concrete file path or symbol, a measured observation, a residual work item, a post-merge check.
+
+Typical sources: `harness-orphan-reaper` L0→L1 promotions of completion-time notes (`orchestrator/src/orchestrator/harness.py::Harness._reap_orphan_l0_escalations`), and carry-overs recorded only in the escalation.
+
+**Does NOT apply — [promote](#promote-to-l2) instead:**
+- **Judgement-shaped content.** `design_concern` / `risk_identified` / `missing_premise` content you cannot resolve at L1 needs a human ruling. Never file a task that amounts to "have an agent resolve this design concern" (operator ruling 2026-08-12). Unsure whether it is work or judgement → promote.
+- **Curator-origin records** — `agent_role` is `fused-memory/task-curator` or `fused-memory/ticket-janitor`. The curator is the failing component, so a re-file feeds a watcher→curator→watcher loop. Handle them under [Curator-origin records](#curator-origin-records--promote-never-re-file); never call `submit_task` for them.
+- **A record that already reports a curator `refused` outcome.** A refusal is a deterministic guard; a re-file re-hits it.
+
+**Clusters.** Several L1s carrying ONE finding become ONE filing, with every member id in the description; resolve each member citing the same task id. A re-drain of the cluster must reproduce both R4 keys exactly, so pick them by rule, not by whichever member you read first: `escalation_id` is the earliest-filed member's id (smallest `timestamp`, ties broken by the smallest id), which a member joining later cannot displace; `suggestion_hash` is derived from the finding itself, never from a member id.
+
+**1. File.** The `description` must stand alone WITHOUT this rotation's context: name the escalation id(s), the subject task id, the concrete file paths, and the measured evidence copied VERBATIM from `summary`/`detail`. `escalation_id` and `suggestion_hash` are the R4 idempotency keys, so a re-drain dedupes instead of double-filing.
+
+```python
+ticket = mcp__fused-memory__submit_task(
+    title="<one-line work item>",
+    description="<standalone: escalation id(s), subject task id, file paths, evidence verbatim>",
+    priority="low",
+    metadata={
+        "source": "watcher-l1-convert",
+        "spawn_context": "watcher_l1_convert",
+        "spawned_from": "<subject task id, or 'N/A' for a synthetic anchor>",
+        "files": ["path/to/file-or-dir", ...],
+        "escalation_id": esc["id"],  # a cluster: its earliest-filed member's id
+        "suggestion_hash": "<stable hash of the finding>",
+    },
+    project_root=<project_root>,
+)
+# {"ticket": "tkt_..."}, or {"error": ..., "error_type": ...} with NO "ticket" key:
+# nothing was filed → step 4.
+```
+
+**2. Wait for the task id.** `submit_task` yields only a ticket, and a close citing a ticket is not tracked work.
+
+```python
+result = mcp__fused-memory__resolve_ticket(ticket=ticket["ticket"], project_root=<project_root>)
+# "created" | "combined" → cite result["task_id"]; combined = folded into an existing task, not lost.
+# "refused"  → terminal and a SUCCESS: NO task exists and there is NO "task_id" key.
+#              Never retry, never cite an id → step 4, carrying result["reason"].
+# "failed" with reason "timeout" → call resolve_ticket ONCE more on the SAME ticket
+#              (a wait, not a re-file); still not created/combined → step 4.
+# "awaiting_curation" → NOT terminal: the ticket is parked durably and has no task_id yet.
+#              Never re-submit; call resolve_ticket ONCE more as for a timeout,
+#              then step 4, carrying the ticket id.
+# "failed" with any other reason → step 4, carrying result["reason"] and the ticket id.
+```
+
+Never call `submit_task` twice for one record in a rotation.
+
+**3. Close.** `close_only`, because nothing waits on this record; `converted`, because a curator-created task now carries the work.
+
+```python
+mcp__escalation__resolve_issue(
+    escalation_id=esc["id"],
+    resolution="Converted to tracked work: task <task_id> (<created|combined>) — <one-line finding>",
+    action="close_only",
+    resolved_by="escalation-watcher-auto",
+    resolution_class="converted",
+)
+```
+
+A `declared_pin_refused` close means the record is load-bearing ([Declared pins](#declared-pins-a-close-can-be-refused-declared_pin_refused)): promote it with the filed task id in `evidence`; never leave it pending.
+
+**4. Promote** every record you could not file or close:
+
+```python
+mcp__escalation__promote_to_l2(
+    task_id=esc["task_id"],
+    agent_role="escalation-watcher-auto",
+    member_ids=[esc["id"]],
+    root_cause="unfiled-finding:<task_id>:<slug>",
+    evidence=(esc["detail"] or esc["summary"]) + " | filing outcome: <status, reason, ticket id, filed task id>",
+    options=["A: file it by hand", "B: the finding is moot — resolve", "C: something else"],
+    summary=esc["summary"],
+    category=esc["category"],
+)
+```
+
+**Over-filing.** No per-rotation cap is enforced (`_WATCHER_ALLOWED_TOOLS` is advisory under `bypassPermissions`); the real safety is the R4 keys and the curator's admission gate. File one task per finding, never one per cluster member.
+
+Add to digest: `FILED: <category> — <subject task_id> — tracked as task <new_task_id> (<created|combined>) — <summary> [converted]`
+
 ### Classify the resolution (`resolution_class`)
 
-Every `resolve_issue` you call — an autonomous-dispatch `resume` **or** a `close_only` — MUST carry a `resolution_class`, so the archived record's provenance is **stamped, not inferred** by the origin analytics panel's benign-rate metric. Classification is triage output, not an afterthought; decide it as you decide the disposition. Two values:
+Every `resolve_issue` you call — an autonomous-dispatch `resume` **or** a `close_only` — MUST carry a `resolution_class`, so the archived record's provenance is **stamped, not inferred** by the origin analytics panel's benign-rate metric. Classification is triage output, not an afterthought; decide it as you decide the disposition. Three values:
 
 - **`actionable`** — a real action or decision accompanied the close: a `resume`/re-pend (scope expanded, dependency added, agent continued, strand re-dispatched), a requeue/restart, a dependency added, or a fix filed. The escalation led to a state change.
 - **`benign`** — a confirmed **no-action** close: the stated condition was stale, superseded, already-cleared, or a duplicate, and nothing real changed beyond closing the record. This covers the [L2 rubber-stamp carve-out](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) closes and the [`stranded_blocked`](#stranded_blocked) predicate-stale close.
+- **`converted`** — the close cites a task you filed via [Convert to tracked work](#convert-to-tracked-work-file-and-resolve): a curator-created task now carries the work. Stamp it when the filed task carries the closed record's own work. A close that cites a task filed about something else, such as the [eval-lane](#eval-lane-records-any-category--close-never-promote) bypass report, keeps its own class. It is neither `benign` nor `actionable` (`escalation/src/escalation/models.py::RESOLUTION_CLASSES`).
 
 The class describes the **escalation's usefulness**, not your effort — a `resume` you performed in one call is still `actionable`; a stale record you spent effort verifying is still `benign`. `promote_to_l2` takes **no** `resolution_class` (promotion does not resolve — member L1s stay pending; the class is stamped only when the resulting L2 is finally resolved). When genuinely unsure, prefer `actionable` (it never suppresses a record from the human-review benign-rate metric).
 
@@ -552,7 +681,7 @@ mcp__escalation__resolve_issue(
 
 Close it; do not `stamp_triage` it. A stamp leaves the record pending, and a pending L1 keeps `_watcher_has_actionable_l1` (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) respawning rotations.
 
-**Report, don't just close.** The live queue held no eval-lane records on 2026-10-01, when containment was built, so a pending eval-lane record with a later `timestamp` most likely reached the queue without passing `escalation/src/escalation/server.py::_chokepoint_or_submit`. This rotation holds no escalation-filing tool, so the digest is the report: append `— BYPASS? filed <timestamp>` to that record's digest line.
+**Report, don't just close.** The live queue held no eval-lane records on 2026-10-01, when containment was built, so a pending eval-lane record with a later `timestamp` most likely reached the queue without passing `escalation/src/escalation/server.py::_chokepoint_or_submit`. File the suspected bypass with steps 1–2 of [Convert to tracked work](#convert-to-tracked-work-file-and-resolve): one filing per rotation however many such records it meets, `files=["escalation/src/escalation/server.py"]`, and a description naming each record's id, `timestamp` and `agent_role`. Its R4 keys follow the Convert section's **Clusters** rule: `escalation_id` is the earliest-filed such record's id, and `suggestion_hash` is derived from the bypass finding. Then close each record `benign` as above, ending its `resolution` with the filed task id — or, if the filing yielded none, its `status` and `reason`. The close stays `benign`, not `converted`: the filed task carries the bypass, and the record itself carries no work. Never promote it instead: `promote_to_l2` refuses eval-lane members. Appending `— BYPASS? filed <timestamp>` to the record's digest line remains a convenience, not the report.
 
 **Digest — one line per record, mandatory:**
 
@@ -724,17 +853,30 @@ Agent found it depends on work that isn't done yet.
 
 Technical debt or cleanup discovered during development.
 
-1. Resolve with action='resume' (the dispatch agent is parked on the L0 live wait; resume injects the ack and continues):
-   ```
+1. File the cleanup with steps 1–2 of [Convert to tracked work](#convert-to-tracked-work-file-and-resolve): `submit_task`, then `resolve_ticket`, then branch on its `status`.
+2. **On `created` / `combined`:** resolve with `action='resume'` instead of that section's `close_only`. A blocked subject may be parked on this record, and resume re-pends it; on a done or cancelled subject resume is a no-op (`orchestrator/src/orchestrator/harness.py::Harness._cascade_unblock_member` skips terminal statuses).
+   ```python
    mcp__escalation__resolve_issue(
      escalation_id="...",
-     resolution="Cleanup queued. Agent may continue — cleanup tracked in digest for follow-up.",
+     resolution="Cleanup filed as task <task_id> (<created|combined>) — <summary>; agent may continue.",
      action='resume',
      resolved_by="escalation-watcher-auto",
-     resolution_class="actionable"
+     resolution_class="converted"
    )
    ```
-2. Add to digest: `DISPATCHED: cleanup_needed — <task_id> — <summary>`
+   Add to digest: `FILED: cleanup_needed — <task_id> — tracked as task <new_task_id> (<created|combined>) — <summary> [converted]`
+3. **On `refused` / `failed` / a submit error:** follow that section's step 4 (promote). Never resolve with a cleanup claim when no task exists.
+
+#### `review_suggestions`
+
+A `review_suggestions` record exists only when `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._route_review_suggestions_to_curator` had no curator transport and fell back to `_escalate_suggestions`, so the curator never received these suggestions. At L1 it is a `harness-orphan-reaper` re-file: the steward that owned it at L0 is gone. A bare close loses the suggestions; skipping it parks the record.
+
+File and close it with steps 1–4 of [Convert to tracked work](#convert-to-tracked-work-file-and-resolve), unchanged: `close_only` + `converted`, and a promotion on any refused or failed outcome.
+- One filing per record; its `description` carries `detail` verbatim.
+- When `detail` opens with `#hash:<hex16>#` (`orchestrator/src/orchestrator/review_suggestions/dedup.py::hash_marker`), that `<hex16>` is a ready, stable `suggestion_hash`.
+- `combined` is a success: a later run already routed these suggestions to the curator.
+
+These records are severity `info` and nothing waits on them, so never `resume`.
 
 #### `stranded_blocked`
 
@@ -990,7 +1132,7 @@ Add to digest: `PROMOTED (L2 <id>): workflow_exit_contract — <task_id> — <ch
 
 **Meaning.** Nothing is jammed any more: the slot and locks are free and the task row was already terminal. What remains is a coroutine somewhere that ignores cancellation, which will wedge the next workflow that reaches it. The first line of `detail` is `Culprit: <task name> at <file>:<line> in <function>`: the innermost await outside asyncio of the task holding the slot. That is a terminal-cleanup entry (`workflow-<id>/<entry>`) or the workflow body (`workflow-<id>/body`) when one is alive, else the slot task. The rest of `detail` lists every task of the slot with its await chain.
 
-**Disposition.** Always promote; never close: the cause is a code defect. Quote the Culprit line in the evidence, and `search_tasks` for a task already owning that await before promoting.
+**Disposition.** Always [promote](#promote-to-l2); never close: the cause is a code defect. Quote the Culprit line in the evidence, and `search_tasks` for a task already owning that await before promoting.
 
 **Cluster.** Every pending `workflow_slot_wedged` L1 whose Culprit line names the same `<file>` and `<function>` shares one cause, whichever task it is on.
 
@@ -1112,11 +1254,34 @@ mcp__escalation__promote_to_l2(
 
 Add to digest: `PROMOTED (L2 <id>): <category> — <task_id> — <summary>`
 
-#### `curator_failure` / `recon_failure` / `recon_backlog_overflow` / `recon_stale_run` / `recon_integrity_issue`
+#### Curator-origin records — promote, never re-file
 
-Fused-memory reconciliation or curator problems — may indicate systematic issues. These often cluster under one infra-level root cause.
+**Discriminator: `agent_role`**, not a category list — curator categories already outnumber any list:
+- `fused-memory/task-curator` — every curator L1, filed by `fused-memory/src/fused_memory/middleware/curator_escalator.py::_curator_escalation` under task_id `task-curator`;
+- `fused-memory/ticket-janitor` — `ticket_failure` L1s from `fused-memory/src/fused_memory/middleware/ticket_janitor.py`.
 
-Root_cause: `"recon-issue:<category-slug>"` (e.g. `"recon-issue:curator_failure"`, `"recon-issue:backlog-overflow"`)
+Never apply [Convert to tracked work](#convert-to-tracked-work-file-and-resolve) to these, and never call `submit_task` while handling them: the curator is the failing component, and a re-file loops watcher→curator→watcher. Promote them; the `root_cause` keeps the `recon-issue:` prefix (e.g. `"recon-issue:curator_failure"`) so pending L2s under that key still fold:
+
+```python
+mcp__escalation__promote_to_l2(
+  task_id=esc["task_id"],
+  agent_role="escalation-watcher-auto",
+  member_ids=[<esc_id>, ...],
+  root_cause="recon-issue:<category-slug>",
+  evidence=esc["summary"] + " | " + esc["detail"],
+  options=["A: restart fused-memory service", "B: investigate and fix the curator root cause", "C: something else"],
+  summary=esc["category"] + ": " + esc["summary"],
+  category=esc["category"],
+)
+```
+
+Add to digest: `PROMOTED (L2 <id>): <category> — <task_id> — <summary>`
+
+#### `recon_failure` / `recon_backlog_overflow` / `recon_stale_run` / `recon_integrity_issue`
+
+Fused-memory reconciliation problems — may indicate systematic issues. These often cluster under one infra-level root cause.
+
+Root_cause: `"recon-issue:<category-slug>"` (e.g. `"recon-issue:backlog-overflow"`)
 
 ```python
 mcp__escalation__promote_to_l2(
@@ -1135,36 +1300,27 @@ Add to digest: `PROMOTED (L2 <id>): <category> — <task_id or N/A> — <summary
 
 ---
 
-### Skip silently
-
-#### `review_suggestions`
-
-The task curator owns review suggestions. Do NOT handle them.
-- Do NOT call `resolve_issue`
-- Do NOT create tasks
-- Do NOT add to digest
-Skip entirely and move to the next escalation.
-
----
-
 ## Graceful Degradation
 
-Feature-detect `mcp__escalation__promote_to_l2` **once at startup** (step 2 in the Main Loop) by checking whether it appears in your available toolset. Do NOT make a trial call — a trial call would mutate the queue.
+Feature-detect **once at startup** (step 2 in the Main Loop) by checking whether each tool appears in your available toolset: `mcp__escalation__promote_to_l2`, and the filing pair `mcp__fused-memory__submit_task` / `mcp__fused-memory__resolve_ticket`. Never make a trial call — it would mutate the queue or file a task.
 
 | Condition | Behaviour |
 |-----------|-----------|
-| Tool **present** | Use L2 promotion paths for all judgement-class items (steps 4 and 5 of the routing table). Emit PROMOTED lines in the digest. |
-| Tool **absent** | Fall back to **legacy mode**: leave judgement-class items pending at L1 and emit PENDING lines in the digest (the pre-tiering behaviour). Autonomous dispatch is unchanged in both modes. Note this now covers **real-task `scope_violation`** as well: leave it pending rather than resuming it, since a resume delivers nothing and re-escalates. |
+| All present | Full mode: every L1 ends resolved, filed-and-resolved or promoted ([Terminal dispositions](#terminal-dispositions--never-park)). |
+| Filing pair **absent** | Promote every item you would have filed, with its content verbatim in `evidence`. The tree stays total. |
+| `promote_to_l2` **absent** | A misconfiguration: a defect state, not a mode to run in. Autonomous dispatch and file-and-resolve continue. Items whose only disposition is promotion — real-task `scope_violation` included, since a resume delivers nothing and re-escalates — cannot be dispositioned: leave them pending and UNSTAMPED, so the first rotation with `promote_to_l2` back reassesses them at once. |
 
-This makes the skill safe to land **before** the orchestrators are restarted onto the new escalation server — the skill degrades gracefully until `promote_to_l2` becomes available at runtime.
+Nothing durable records the items the `promote_to_l2`-absent state leaves pending. The digest is this rotation's final chat message and no component reads it, so it is not a fallback. What an operator sees is the symptom: `orchestrator/src/orchestrator/harness.py::Harness._watcher_has_actionable_l1` keeps re-arming rotations on them.
 
-Log one line at startup so the rotation digest reflects which mode was active:
+This keeps the skill safe to load before the orchestrators restart onto an allowlist that grants these tools.
+
+Log one line at startup naming the state:
 ```
-Mode: L2-promotion (promote_to_l2 available)
+Mode: full (promote_to_l2 + filing pair available)
 ```
 or
 ```
-Mode: LEGACY (promote_to_l2 not available — will leave pending + digest)
+Mode: DEGRADED (missing: <tools>)
 ```
 
 ---
@@ -1186,13 +1342,17 @@ Emit this as your **final message** when the rotation limit is reached:
 ## Escalation Watcher Digest
 Rotation: <escalations_handled> escalations in <elapsed_hours:.1f>h
 Exit reason: <"escalation limit reached" | "time limit reached" | "re-arm stopped: <WATCHER_REARM_OUTCOME or rejected call>">
-Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not available)">
+Mode: <"full (promote_to_l2 + filing pair available)" | "DEGRADED (missing: <tools>)">
 
 ### Dispatched (autonomous)
-- DISPATCHED: cleanup_needed — task-99 — dead code in scheduler.py flagged for follow-up [actionable]
 - DISPATCHED: dependency_discovered — task-77 → depends on task-55 [actionable]
 
-### Promoted to L2 (L2-promotion mode only)
+### Filed as tracked work
+- FILED: cleanup_needed — task-99 — tracked as task 6121 (created) — dead code in scheduler.py [converted]
+- FILED: infra_issue — task-61 — tracked as task 6120 (created) — residual: scripts/watcher-rearm.sh still reads the pre-6118 queue path [converted]
+- FILED: review_suggestions — task-71 — tracked as task 6122 (created) — 4 review suggestion(s) the curator never received [converted]
+
+### Promoted to L2
 - PROMOTED (L2 esc-42-7): task_failure — task-12 — verify exhausted after 3 attempts
     Proposal: fix import in tests/test_foo.py line 42 [risk: low]
 - PROMOTED (L2 esc-42-11): scope_violation — task-42 — widening needs a re-plan; requested files [orchestrator/src/orchestrator/harness.py]
@@ -1219,17 +1379,14 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 - AUTO-CLOSED (L2 esc-main-sweep-abc123def456-1): superseded_main_sweep — main-sweep-abc123def456 — newer sweep esc-main-sweep-9f8e7d6c5b4a; swept SHA abc123def456 is-ancestor of clean tip [benign]
 - AUTO-CLOSED (L2 esc-77-3): self_cleared_infra — task-77 — live probe: curator paused=false [benign]
 
-### Pending (human review required — LEGACY mode only)
-- PENDING (human): task_failure — task-12 — verify exhausted after 3 attempts
+### Left pending (promote_to_l2 unavailable — defect state)
+- PENDING: task_failure — task-12 — verify exhausted after 3 attempts
     Proposal: Blocked because import error in test. To unblock: fix import in tests/test_foo.py line 42. Confidence: high. [risk: low]
-- PENDING (human): design_concern — task-88 — architectural question about X
-- PENDING (human/urgent): infra_issue — N/A — Neo4j connection refused
-- PENDING (human): dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
-
-### Skipped
-- review_suggestions: 3 escalations skipped (curator owned)
+- PENDING: design_concern — task-88 — architectural question about X
+- PENDING (urgent): infra_issue — N/A — Neo4j connection refused
+- PENDING: dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
 ```
 
-The trailing `[actionable]` / `[benign]` tag on each `DISPATCHED` and `AUTO-CLOSED` line is the `resolution_class` you stamped on that resolve/close — recorded on **every** `resolve_issue` you make (see [Classify the resolution](#classify-the-resolution-resolution_class)). `PROMOTED` lines carry no class (promotion does not resolve).
+The trailing `[actionable]` / `[benign]` / `[converted]` tag on each `DISPATCHED`, `FILED` and `AUTO-CLOSED` line is the `resolution_class` you stamped on that resolve/close — recorded on **every** `resolve_issue` you make (see [Classify the resolution](#classify-the-resolution-resolution_class)). `PROMOTED` lines carry no class (promotion does not resolve).
 
 Maintain a running in-context summary as you handle each escalation. Emit the final digest only once, as your last output before returning.
