@@ -16,7 +16,12 @@ from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import git_env_with_ceiling
 from df_pytest_isolation import git_redirect_env
 
-from orchestrator.agents.roles import GIT_GREP_PCRE_COMMAND_TEMPLATE, GREP_LOOKAROUND_GUIDANCE
+from orchestrator.agents.roles import (
+    GIT_GREP_PCRE_COMMAND_TEMPLATE,
+    GREP_LOOKAROUND_GUIDANCE,
+    GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
+    GREP_PCRE_FALLBACK_COMMAND_TEMPLATE,
+)
 
 _LOOKAHEAD_PATTERN = r'config\.(?!git)[a-z_]+'
 
@@ -66,6 +71,10 @@ def _run(argv: list[str], repo: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _standalone_lines(text: str) -> set[str]:
+    return {line.strip() for line in text.splitlines()}
+
+
 def _outcome(result: subprocess.CompletedProcess[str]) -> str:
     return f'rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}'
 
@@ -84,9 +93,44 @@ def test_git_grep_template_runs_lookaround_over_tracked_and_untracked_files_only
 
 
 def test_bash_recourse_cites_the_git_grep_template_as_its_own_line() -> None:
-    standalone_lines = {line.strip() for line in GREP_LOOKAROUND_GUIDANCE.splitlines()}
-    assert GIT_GREP_PCRE_COMMAND_TEMPLATE in standalone_lines, (
+    assert GIT_GREP_PCRE_COMMAND_TEMPLATE in _standalone_lines(GREP_LOOKAROUND_GUIDANCE), (
         'GREP_LOOKAROUND_GUIDANCE must show GIT_GREP_PCRE_COMMAND_TEMPLATE as a '
         'standalone, copyable line, not only inside a longer command'
     )
 
+
+
+def test_fallback_template_reaches_an_ignored_tree_git_grep_reports_as_no_match(
+    tmp_path: Path,
+) -> None:
+    repo = _seed_search_fixture(tmp_path)
+
+    git_grep = _run(_render(GIT_GREP_PCRE_COMMAND_TEMPLATE, _LOOKAHEAD_PATTERN, 'target'), repo)
+    assert git_grep.returncode == 1, _outcome(git_grep)
+    assert git_grep.stdout == '', _outcome(git_grep)
+
+    fallback_argv = _render(GREP_PCRE_FALLBACK_COMMAND_TEMPLATE, _LOOKAHEAD_PATTERN, 'target')
+    fallback = _run(['bash', '-c', shlex.join(fallback_argv)], repo)
+    assert fallback.returncode == 0, _outcome(fallback)
+    assert 'target/debug/gen.py' in fallback.stdout, _outcome(fallback)
+
+
+def test_bash_recourse_leads_with_git_grep_before_the_grep_fallback() -> None:
+    standalone_lines = _standalone_lines(GREP_LOOKAROUND_GUIDANCE)
+    for name, template in (
+        ('GIT_GREP_PCRE_COMMAND_TEMPLATE', GIT_GREP_PCRE_COMMAND_TEMPLATE),
+        ('GREP_PCRE_FALLBACK_COMMAND_TEMPLATE', GREP_PCRE_FALLBACK_COMMAND_TEMPLATE),
+    ):
+        assert template in standalone_lines, (
+            f'GREP_LOOKAROUND_GUIDANCE must show {name} as a standalone, copyable line'
+        )
+    assert GREP_LOOKAROUND_GUIDANCE.index(GIT_GREP_PCRE_COMMAND_TEMPLATE) < (
+        GREP_LOOKAROUND_GUIDANCE.index(GREP_PCRE_FALLBACK_COMMAND_TEMPLATE)
+    ), 'GREP_LOOKAROUND_GUIDANCE must offer git grep before the command grep -rP fallback'
+
+
+def test_judge_variant_never_names_the_grep_fallback() -> None:
+    assert GREP_PCRE_FALLBACK_COMMAND_TEMPLATE not in GREP_LOOKAROUND_GUIDANCE_READ_ONLY, (
+        "GREP_LOOKAROUND_GUIDANCE_READ_ONLY reaches judge, whose Bash(git:*) grant "
+        'would refuse GREP_PCRE_FALLBACK_COMMAND_TEMPLATE with a permission denial'
+    )
