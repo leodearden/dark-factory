@@ -34,7 +34,7 @@ from orchestrator.evals.metrics import EvalMetrics
 from orchestrator.evals.task_sampler import repo_of_project
 from orchestrator.event_store import EventStore, EventType, ShadowSkipReason
 from orchestrator.run_store import CellChange, RunStore, ShadowCell, ShadowCellQuery
-from orchestrator.shadow_scoring import ShadowReference
+from orchestrator.shadow_scoring import ShadowReference, consequence_leg_warranted
 from orchestrator.shadow_types import (
     CostBasis,
     PlanSource,
@@ -855,6 +855,25 @@ class ShadowCoordinator:
             await self._emit_ended(ended)
             return
         await self._catch_up(ended)
+        if ended.shape is ShadowShape.ARCHITECT:
+            await self._maybe_open_leg_two(request, outcome)
+
+    async def _maybe_open_leg_two(self, leg_one: CellRequest, outcome: CellRunOutcome) -> None:
+        """Open consequence leg 2 on the candidate's plan when leg 1 produced one to run."""
+        if ShadowShape.ARCHITECT_CONSEQUENCE not in self._config.shapes:
+            return
+        if outcome.metrics is None or not consequence_leg_warranted(outcome.metrics):
+            return
+        try:
+            await self._open_cell(
+                leg_one.task,
+                ShadowShape.ARCHITECT_CONSEQUENCE,
+                leg_one.candidate,
+                parent_cell_id=leg_one.cell.cell_id,
+                plan=outcome.plan,
+            )
+        except Exception:
+            logger.exception('shadow cell %s: opening consequence leg 2 failed', leg_one.cell.cell_id)
 
     async def _advance(
         self, cell_id: str, expected: ShadowCellState, change: CellChange,
