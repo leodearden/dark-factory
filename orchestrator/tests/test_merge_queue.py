@@ -8798,7 +8798,8 @@ class TestEnospcTransientInfraRetry:
 
 @pytest.mark.asyncio
 class TestSpeculativeMergeWorkerLedgerAwarePrune:
-    """SpeculativeMergeWorker passes a ledger snapshot as keep_worktrees and the
+    """SpeculativeMergeWorker passes its ledger as keep_worktrees (a snapshot to
+    the in-flight verify, the live set to the gate re-verify) and the
     end-to-end prune removes only the orphan."""
 
     async def test_worker_passes_ledger_snapshot_to_post_merge_verify(
@@ -8928,15 +8929,15 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
         req = _make_request(branch_name, branch_name, branch_wt, config)
         return branch_wt, req
 
-    async def test_gate_reverify_passes_ledger_snapshot(
+    async def test_gate_reverify_keeps_the_live_ledger(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """Worker passes keep_worktrees=set(self._owned_merge_worktrees) to
-        _reverify_rebased_tree; snapshot is a distinct object.
+        """The gate re-verify's keep_worktrees follows the ledger, so a worktree
+        registered after the gate launched is kept too (task 6155).
 
-        RED: 'keep_worktrees' not in captured kwargs (call site doesn't pass it).
-        GREEN after step-10 adds keep_worktrees=set(self._owned_merge_worktrees)
-        to the _reverify_rebased_tree call at the gate_reverify site.
+        Dispatch goes on while the gate runs, so a snapshot taken at launch
+        would leave every worktree dispatched since then to a disk-pressure
+        prune, which removes every ``_merge-*`` worktree outside its keep set.
         """
         branch = 'gate-ledger-snap'
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -8993,9 +8994,10 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
         kw = captured_kw['keep_worktrees']
         assert p1 in kw, f'p1 not in keep_worktrees: {kw!r}'
         assert p2 in kw, f'p2 not in keep_worktrees: {kw!r}'
-        # Must be a snapshot copy, not the live ledger reference.
-        assert kw is not worker._owned_merge_worktrees, (
-            'keep_worktrees must be a snapshot copy, not the live ledger set'
+        registered_later = git_ops.worktree_base / '_merge-fake-gate-p3'
+        worker._register_owned_merge_worktree(registered_later)
+        assert registered_later in kw, (
+            f'a worktree registered after the gate launched is unprotected: {kw!r}'
         )
 
 

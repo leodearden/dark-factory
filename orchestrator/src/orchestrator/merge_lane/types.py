@@ -27,6 +27,7 @@ from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_n
 from orchestrator.branch_stack import PreStackTip
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
@@ -1719,6 +1720,46 @@ class VerifyBaseFacts:
     merge_base_sha: str | None
 
 
+@dataclass(frozen=True)
+class LandingCandidate:
+    """A verified tree the finalize CAS loop is landing on main (task 6155).
+
+    ``item.base_sha`` is the main the CAS expects, ``sha`` the tree it moves
+    main onto, and ``verified_commit`` the merge commit whose verify passed.
+    ``merge_wt`` and ``spec_warm`` travel together, as ``_release_or_cleanup``
+    needs both.
+    """
+
+    item: RealMergeItem
+    sha: str
+    merge_wt: Path
+    spec_warm: bool
+    warm_results: Mapping[str, str]
+    verified_commit: str
+
+    def reanchored(self, item: RealMergeItem, sha: str) -> LandingCandidate:
+        """The same verified tree, landing *sha* as the rebuilt *item*."""
+        return LandingCandidate(
+            item=item, sha=sha, merge_wt=self.merge_wt, spec_warm=self.spec_warm,
+            warm_results=self.warm_results, verified_commit=self.verified_commit,
+        )
+
+
+@dataclass(frozen=True)
+class PendingGate:
+    """A head's gate re-verify of its rebased tree, running while the head
+    stays parked at the front of ``_inflight`` (task 6155).
+
+    ``candidate`` is what the CAS was landing when it rebased; ``rebased_sha``
+    onto ``rebased_onto`` is what the gate is re-verifying.
+    """
+
+    task: asyncio.Task[MergeOutcome | GateClearance]
+    candidate: LandingCandidate
+    rebased_sha: str
+    rebased_onto: str
+
+
 @dataclass
 class InflightEntry:
     """An in-flight verify entry held in SpeculativeMergeWorker._inflight deque.
@@ -1801,6 +1842,10 @@ class InflightEntry:
                      to classification, published by the verify itself
                      through :class:`InflightEntrySlot` (task 5447).  ``None``
                      until resolved, and always ``None`` for passthroughs.
+    gate           : the :class:`PendingGate` this head is parked on while its
+                     rebased tree re-verifies, or ``None`` (task 6155).  While
+                     it is set the entry keeps its lease and permit, and the
+                     next ``_finalize_inflight`` call resumes the CAS from it.
     """
 
     item: SpeculativeItem
@@ -1818,6 +1863,21 @@ class InflightEntry:
     verify_wt: VerifyWorktreeHandle | None = None  # δ (task 3186): the verify's POST-swap worktree
     spec_warm: bool = False                 # δ (task 3186): warmth of an ADOPTED head's published merge_wt
     verify_base: VerifyBaseFacts | None = None
+    gate: PendingGate | None = None
+
+    @property
+    def pending_task(self) -> asyncio.Task[object] | None:
+        """The task finalize waits for: the parked gate's, else the verify's."""
+        return self.gate.task if self.gate is not None else self.verify_task
+
+    @property
+    def in_verify_frontier(self) -> bool:
+        """True while finalize has a verify or a gate re-verify to wait on.
+
+        A head adopted on tip authority has no verify task, yet stays in the
+        frontier while its gate runs (task 6155).  A passthrough has neither.
+        """
+        return self.pending_task is not None
 
     @property
     def vacated(self) -> bool:
