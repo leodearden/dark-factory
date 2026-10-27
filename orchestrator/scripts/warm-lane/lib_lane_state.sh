@@ -101,14 +101,14 @@ _lane_state_record() {
 #                          unreformatted; '' when the record is absent,
 #                          unparseable, or carries no such key. That EMPTY
 #                          reading means "this record's age is unjudgeable" —
-#                          it is not a claim that the lane is new. The consumer
-#                          is warm-lane-gc.sh's Pass-1 record gate, whose
-#                          staleness bound preserves (fails SAFE) on it: a
-#                          readable `assigned` state is a trustworthy claim
-#                          about STATE, so an unreadable timestamp leaves only
-#                          the AGE unknown, and reclaiming on that would let a
-#                          malformed field delete a genuinely live lane's
-#                          build.
+#                          it is not a claim that the lane is new. Both
+#                          consumers turn it into an age via lane_state_epoch
+#                          and handle an unjudgeable stamp in opposite ways.
+#                          warm-lane-gc.sh's Pass-1 record gate fails SAFE: it
+#                          preserves the lane and warns, because it deletes.
+#                          warm-lane-audit.sh falls back to the lane dir mtime
+#                          and labels the row `age_source=dir-mtime`, because
+#                          it only reports.
 #   stdout                 '<raw>' or '<raw> <task_id>'
 #
 # stdout carries only the headline pair, NOT the timestamp: warm-lane-audit.sh
@@ -199,6 +199,25 @@ lane_state_read() {
     else
         printf '%s\n' "$LANE_STATE_RAW"
     fi
+    return 0
+}
+
+# lane_state_epoch <updated-at>
+# THE ONE parse of a record's `updated_at` into epoch seconds. Prints the epoch
+# and returns 0, or prints NOTHING and returns 1 when the stamp is unjudgeable:
+# empty, or anything `date -d` cannot turn into an integer (including on a
+# non-GNU date that cannot parse ISO-8601). Call it in an `if` condition so a
+# `set -euo pipefail` caller never aborts on it.
+#
+# The empty case is tested FIRST, before `date` runs, because GNU `date -d ''`
+# does not fail: it exits 0 and answers today's midnight, which would read an
+# unstamped record as stamped today.
+lane_state_epoch() {
+    local stamp="${1:-}" epoch
+    [ -n "$stamp" ] || return 1
+    epoch="$(date -d "$stamp" +%s 2>/dev/null)" || return 1
+    [[ "$epoch" =~ ^-?[0-9]+$ ]] || return 1
+    printf '%s\n' "$epoch"
     return 0
 }
 
