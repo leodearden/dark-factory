@@ -212,10 +212,10 @@ At the end, write a survey summary to fused-memory:
 
 ```
 add_memory(
-  content="Bug-hotspot survey <run_id> (<mode>, as_of <sha>, since <sha|none>): <N> agents, <tokens>; mined <corpora>; <K> clusters reviewed of <C>; <X> confirmed / <Y> weakened / <Z> refuted / <U> unverified new findings; carried <c> still open, <f> fixed; fix signal <chosen> (raw <raw>). Report: <md path>, findings: <json path>.",
+  content="Bug-hotspot survey <run_id> (<mode>, as_of <sha>, since <sha|none>): <N> agents, <tokens>; mined <corpora>; <K> clusters reviewed of <C>; <X> confirmed / <Y> weakened / <Z> refuted / <U> unverified new findings; carried <c> still open, <f> fixed; fix signal <chosen> (raw <raw>). Report: <md path>, findings: <json path>. Next survey gated by task 3127.",
   category="observations_and_summaries",
   project_id=<overlay>, agent_id="claude-interactive",
-  entities=[]   # a task or run this summary is about, e.g. [{'kind': 'task', 'id': <the chain's human gate id>}]
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the human gate of the trigger chain Hand-off step 4 filed, here and in content; [] if it filed none, as under --findings-only
 )
 ```
 
