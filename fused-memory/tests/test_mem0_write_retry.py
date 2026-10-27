@@ -328,7 +328,8 @@ async def test_periodic_loop_survives_a_failing_pass_and_ends_on_cancel(caplog):
 
     with caplog.at_level(logging.ERROR):
         task = asyncio.create_task(run_periodic_mem0_retry(pass_fn, interval_seconds=0.01))
-        await asyncio.wait_for(third_call.wait(), timeout=5)
+        # A genuine hang is bounded by the suite's per-test timeout.
+        await third_call.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
