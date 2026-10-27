@@ -267,9 +267,9 @@ class EventQueue:
                 recovered += 1
             except asyncio.QueueFull:
                 self._overflow_drops += 1
-                await self._hand_off_to_dead_letter(
+                await asyncio.wrap_future(self._hand_off_to_dead_letter(
                     event, reason='recover_overflow', attempts=0,
-                )
+                ))
         if recovered:
             logger.info(
                 'EventQueue.recover: re-enqueued %d unprocessed event(s) from journal',
@@ -288,10 +288,20 @@ class EventQueue:
             return
         self._closed = True
 
-        if self._drainer_task is None:
-            await self.flush_dead_letters()
-            return
+        if self._drainer_task is not None:
+            await self._stop_drainer(self._drainer_task)
+            self._drainer_task = None
 
+        # Close the durable journal last: every surviving in-flight event has
+        # now been either committed to the buffer (drainer marked it processed)
+        # or handed to the dead-letter writer, and the flush waits until each
+        # written record's journal-row release has run.
+        await self.flush_dead_letters()
+        if self._journal is not None:
+            self._journal.close()
+
+    async def _stop_drainer(self, drainer: asyncio.Task) -> None:
+        """Give ``drainer`` the bounded flush window, cancel it, and dead-letter the residue."""
         # Bounded flush: let the drainer finish what it can.
         try:
             await asyncio.wait_for(
@@ -305,10 +315,9 @@ class EventQueue:
             )
 
         # Cancel drainer — remaining events go to dead-letter below.
-        self._drainer_task.cancel()
+        drainer.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await self._drainer_task
-        self._drainer_task = None
+            await drainer
 
         # Collect the residue for the dead-letter writer. Using get_nowait
         # avoids awaiting after cancellation.
@@ -328,14 +337,6 @@ class EventQueue:
             logger.warning(
                 'EventQueue: dead-lettered %d events on shutdown', len(residue),
             )
-
-        # Close the durable journal last: every surviving in-flight event has
-        # now been either committed to the buffer (drainer marked it processed)
-        # or handed to the dead-letter writer, and the flush waits until each
-        # written record's journal-row release has run.
-        await self.flush_dead_letters()
-        if self._journal is not None:
-            self._journal.close()
 
     # ── test helper ───────────────────────────────────────────────────
 
@@ -361,7 +362,7 @@ class EventQueue:
         """
         await asyncio.wrap_future(self._dead_letter_writer.flushed())
 
-    # ── enqueue (sync, non-blocking) ───────────────────────────────────
+    # ── enqueue (sync, non-blocking, event-loop thread only) ───────────
 
     def enqueue(self, event: ReconciliationEvent) -> bool:
         """Try to enqueue an event. Returns True on accept, False on overflow.
@@ -369,6 +370,10 @@ class EventQueue:
         On overflow the event is handed to the dead-letter writer and an
         overflow warning is logged (rate-limited to once per
         ``overflow_warn_interval_seconds``).
+
+        Call it on the thread running the queue's event loop: the in-memory
+        queue and the journal connection are both loop-thread-only, and a
+        journaled overflow schedules its row release on the running loop.
         """
         if self._closed:
             # Shutting down — divert straight to dead-letter so nothing is lost.
@@ -411,6 +416,7 @@ class EventQueue:
             'events_committed': self._events_committed,
             'overflow_drops': self._overflow_drops,
             'dead_letters': self._dead_letter_writer.records_written,
+            'dead_letters_pending': self._dead_letter_writer.records_pending,
             'retry_in_flight': self._retry_in_flight,
             'drainer_running': (
                 self._drainer_task is not None and not self._drainer_task.done()
@@ -504,9 +510,9 @@ class EventQueue:
                     'EventQueue.drain: non-retriable error for event=%s: %s',
                     event.id, exc, exc_info=True,
                 )
-                await self._hand_off_to_dead_letter(
+                await asyncio.wrap_future(self._hand_off_to_dead_letter(
                     event, reason='non_retriable', attempts=attempts,
-                )
+                ))
                 if self._retry_in_flight > 0 and attempts > 1:
                     self._retry_in_flight = max(0, self._retry_in_flight - 1)
                 self._recent_ops.append(
@@ -522,23 +528,24 @@ class EventQueue:
         *,
         reason: str,
         attempts: int,
-    ) -> asyncio.Future[bool]:
+    ) -> Future[bool]:
         """Hand a journaled event to the dead-letter writer.
 
-        Its journal row is released on the loop thread only once the record
+        Its journal row is released on the running loop only once the record
         is on disk, so a kill -9 while the append is pending leaves the event
         in the journal rather than in neither store. The returned future
-        resolves ``True`` once the record is written, ``False`` if it failed.
+        resolves ``True`` once the record is written, ``False`` if it failed;
+        a coroutine that awaits it resumes only after that release has run.
         """
-        loop = asyncio.get_running_loop()
         written = self._dead_letter_writer.append(
             _dead_letter_record(event, reason=reason, attempts=attempts),
         )
         if self._journal is not None:
-            written.add_done_callback(
-                functools.partial(_release_row_once_written, loop, self._journal, event.id),
-            )
-        return asyncio.wrap_future(written, loop=loop)
+            written.add_done_callback(functools.partial(
+                _release_row_once_written,
+                asyncio.get_running_loop(), self._journal, event.id,
+            ))
+        return written
 
     # ── read dead-letters ──────────────────────────────────────────────
 

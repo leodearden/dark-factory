@@ -4,56 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import threading
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+from _dead_letter_helpers import hold_fifo
 
 from fused_memory.reconciliation.dead_letter_writer import DeadLetterWriter
 
 _WRITER_LOGGER = 'fused_memory.reconciliation.dead_letter_writer'
-
-
-@dataclass
-class _HeldFifo:
-    """A FIFO whose only reader stays away until ``release`` is set.
-
-    ``open('a')`` on a FIFO blocks until a reader opens it, so an append to
-    ``path`` cannot finish while the FIFO is held. The reader also gives up
-    waiting after 5s, so a blocking ``append`` fails its assertions instead
-    of hanging the test.
-    """
-
-    path: Path
-    release: threading.Event = field(default_factory=threading.Event)
-    reader_opened: threading.Event = field(default_factory=threading.Event)
-    received: bytearray = field(default_factory=bytearray)
-    reader: threading.Thread | None = None
-
-    def start(self) -> _HeldFifo:
-        os.mkfifo(self.path)
-        self.reader = threading.Thread(target=self._read, daemon=True)
-        self.reader.start()
-        return self
-
-    def _read(self) -> None:
-        self.release.wait(timeout=5.0)
-        self.reader_opened.set()
-        with self.path.open('rb') as fh:
-            self.received.extend(fh.read())
-
-    def release_and_read(self) -> bytes:
-        self.release.set()
-        assert self.reader is not None
-        self.reader.join(timeout=5.0)
-        assert not self.reader.is_alive(), 'FIFO reader never saw EOF'
-        return bytes(self.received)
-
-
-def _hold_fifo(path: Path) -> _HeldFifo:
-    return _HeldFifo(path).start()
 
 
 def _read_records(path: Path) -> list[dict]:
@@ -74,7 +32,7 @@ def test_appends_land_in_submission_order_and_flush_waits_for_them(tmp_path: Pat
 
 
 def test_append_returns_before_the_write_lands(tmp_path: Path):
-    held = _hold_fifo(tmp_path / 'dl.jsonl')
+    held = hold_fifo(tmp_path / 'dl.jsonl')
     writer = DeadLetterWriter(held.path)
     record = {'event': {'id': 'e1'}, 'reason': 'overflow_drop'}
 
@@ -85,9 +43,11 @@ def test_append_returns_before_the_write_lands(tmp_path: Path):
         'append() only returned after the FIFO reader opened: the write ran '
         'on the caller thread'
     )
-    received = held.release_and_read()
+    assert writer.records_pending == 1
+    held.release.set()
+    assert held.records() == [record]
     assert written.result(timeout=5) is True
-    assert [json.loads(line) for line in received.decode('utf-8').splitlines()] == [record]
+    assert writer.records_pending == 0
 
 
 def test_a_failed_write_is_logged_and_resolves_false(
@@ -101,6 +61,7 @@ def test_a_failed_write_is_logged_and_resolves_false(
         assert written.result(timeout=5) is False
 
     assert writer.records_written == 0
+    assert writer.records_pending == 0
     assert any(
         rec.name == _WRITER_LOGGER and rec.levelno == logging.ERROR
         for rec in caplog.records
@@ -108,16 +69,16 @@ def test_a_failed_write_is_logged_and_resolves_false(
 
 
 def test_an_accepted_append_cannot_be_cancelled(tmp_path: Path):
-    held = _hold_fifo(tmp_path / 'dl.jsonl')
+    held = hold_fifo(tmp_path / 'dl.jsonl')
     writer = DeadLetterWriter(held.path)
     record = {'event': {'id': 'e1'}, 'reason': 'shutdown_timeout'}
 
     written = writer.append(record)
 
     assert written.cancel() is False
-    received = held.release_and_read()
+    held.release.set()
+    assert held.records() == [record]
     assert written.result(timeout=5) is True
-    assert json.loads(received.decode('utf-8')) == record
 
 
 def test_an_unused_writer_is_already_flushed(tmp_path: Path):

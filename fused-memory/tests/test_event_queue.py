@@ -5,18 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import pathlib
-import threading
 import time
 import uuid
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import aiosqlite
 import pytest
 import pytest_asyncio
+from _dead_letter_helpers import hold_fifo, seed_dead_letters
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -116,59 +114,6 @@ def _make_event(
         timestamp=datetime.now(UTC),
         payload={'test': True},
     )
-
-
-def _seed_dead_letters(path: pathlib.Path, events: list[ReconciliationEvent]) -> None:
-    """Append ``events`` to ``path`` in the dead-letter record format that read, count and replay consume."""
-    with path.open('a', encoding='utf-8') as fh:
-        for event in events:
-            record = {
-                'event': event.model_dump(mode='json'),
-                'reason': 'non_retriable',
-                'attempts': 1,
-                'failed_at': datetime.now(UTC).isoformat(),
-            }
-            fh.write(json.dumps(record) + '\n')
-
-
-@dataclass
-class _HeldFifo:
-    """A FIFO dead-letter path whose only reader stays away until ``release`` is set.
-
-    ``open('a')`` on a FIFO blocks until a reader opens it, so a dead-letter
-    append to ``path`` cannot finish while the FIFO is held. The reader also
-    gives up waiting after 5s, so an append that blocks its caller fails the
-    ``reader_opened`` assertion instead of hanging the test.
-    """
-
-    path: pathlib.Path
-    release: threading.Event = field(default_factory=threading.Event)
-    reader_opened: threading.Event = field(default_factory=threading.Event)
-    received: bytearray = field(default_factory=bytearray)
-    reader: threading.Thread | None = None
-
-    def start(self) -> _HeldFifo:
-        os.mkfifo(self.path)
-        self.reader = threading.Thread(target=self._read, daemon=True)
-        self.reader.start()
-        return self
-
-    def _read(self) -> None:
-        self.release.wait(timeout=5.0)
-        self.reader_opened.set()
-        with self.path.open('rb') as fh:
-            self.received.extend(fh.read())
-
-    def records(self) -> list[dict]:
-        """Wait for the reader to reach EOF, then parse every line it received."""
-        assert self.reader is not None
-        self.reader.join(timeout=5.0)
-        assert not self.reader.is_alive(), 'FIFO reader never saw EOF'
-        return [json.loads(line) for line in self.received.decode('utf-8').splitlines()]
-
-
-def _hold_fifo(path: pathlib.Path) -> _HeldFifo:
-    return _HeldFifo(path).start()
 
 
 def _journaled_ids(journal_path: pathlib.Path) -> set[str]:
@@ -626,6 +571,7 @@ async def test_stats_surface_has_expected_keys(queue):
         'events_committed',
         'overflow_drops',
         'dead_letters',
+        'dead_letters_pending',
         'retry_in_flight',
         'drainer_running',
     }
@@ -1767,7 +1713,7 @@ async def test_replay_dead_letters_reenqueues_and_clears(real_buffer, tmp_path):
     )
     await q.start()
     try:
-        _seed_dead_letters(dl, [_make_event() for _ in range(3)])
+        seed_dead_letters(dl, [_make_event() for _ in range(3)])
         assert len(dl.read_text().strip().splitlines()) == 3
 
         counts = q.replay_dead_letters()
@@ -1799,8 +1745,8 @@ async def test_replay_dead_letters_filters_by_project_id(real_buffer, tmp_path):
     )
     await q.start()
     try:
-        _seed_dead_letters(dl, [_make_event(project_id='proj-a') for _ in range(2)])
-        _seed_dead_letters(dl, [_make_event(project_id='proj-b') for _ in range(3)])
+        seed_dead_letters(dl, [_make_event(project_id='proj-a') for _ in range(2)])
+        seed_dead_letters(dl, [_make_event(project_id='proj-b') for _ in range(3)])
 
         counts = q.replay_dead_letters(project_id='proj-a')
         assert counts == {'replayed': 2, 'failed': 0}
@@ -1830,7 +1776,7 @@ async def test_replay_dead_letters_preserves_unparseable(real_buffer, tmp_path):
     )
     await q.start()
     try:
-        _seed_dead_letters(dl, [_make_event()])
+        seed_dead_letters(dl, [_make_event()])
         with dl.open('a', encoding='utf-8') as fh:
             fh.write('{not valid json\n')
 
@@ -1852,7 +1798,7 @@ async def test_enqueue_overflow_returns_before_dead_letter_append_lands(tmp_path
     """An overflowing enqueue hands its record to the writer thread and returns
     while the append is still held open, so the loop never waits on that I/O.
     """
-    held = _hold_fifo(tmp_path / 'dl.jsonl')
+    held = hold_fifo(tmp_path / 'dl.jsonl')
     q = EventQueue(AsyncMock(), dead_letter_path=held.path, maxsize=1)
     try:
         e1, e2 = _make_event(), _make_event()
@@ -1862,6 +1808,7 @@ async def test_enqueue_overflow_returns_before_dead_letter_append_lands(tmp_path
             'enqueue() only returned after the FIFO reader opened: the '
             'dead-letter append ran on the event-loop thread'
         )
+        assert q.stats()['dead_letters_pending'] == 1
 
         held.release.set()
         await q.flush_dead_letters()
@@ -1869,6 +1816,7 @@ async def test_enqueue_overflow_returns_before_dead_letter_append_lands(tmp_path
         records = held.records()
         assert [(r['reason'], r['event']['id']) for r in records] == [('overflow_drop', e2.id)]
         assert q.stats()['dead_letters'] == 1
+        assert q.stats()['dead_letters_pending'] == 0
     finally:
         await q.close()
 
@@ -1877,7 +1825,7 @@ async def test_enqueue_overflow_returns_before_dead_letter_append_lands(tmp_path
 async def test_overflow_journal_row_survives_until_its_dead_letter_is_written(tmp_path):
     """The overflowed event's journal row is released only once its record is
     on disk, so a kill -9 while the append is pending cannot lose it."""
-    held = _hold_fifo(tmp_path / 'dl.jsonl')
+    held = hold_fifo(tmp_path / 'dl.jsonl')
     ej = tmp_path / 'ej.db'
     q = EventQueue(AsyncMock(), dead_letter_path=held.path, journal_path=ej, maxsize=1)
     try:
@@ -1895,8 +1843,23 @@ async def test_overflow_journal_row_survives_until_its_dead_letter_is_written(tm
         assert e2.id not in journaled
     finally:
         await q.close()
-        if q._journal is not None:
-            q._journal.close()
+
+
+@pytest.mark.asyncio
+async def test_close_of_a_never_started_queue_closes_its_journal(tmp_path):
+    """close() releases the journal's connection even if start() never ran.
+
+    SQLite deletes a WAL database's ``-wal`` file when its last connection
+    closes, so a surviving ``-wal`` file means the queue still holds one.
+    """
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(AsyncMock(), dead_letter_path=tmp_path / 'dl.jsonl', journal_path=ej)
+    assert q.enqueue(_make_event()) is True
+    assert (tmp_path / 'ej.db-wal').exists()
+
+    await q.close()
+
+    assert not (tmp_path / 'ej.db-wal').exists()
 
 
 @pytest.mark.asyncio
@@ -1921,8 +1884,6 @@ async def test_failed_dead_letter_write_keeps_the_journal_row(tmp_path):
         assert q.stats()['dead_letters'] == 0
     finally:
         await q.close()
-        if q._journal is not None:
-            q._journal.close()
 
 
 @pytest.mark.asyncio

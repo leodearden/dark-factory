@@ -51,9 +51,15 @@ class DeadLetterWriter:
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix='event-dead-letter-writer',
         )
-        self._submit_lock = threading.Lock()
+        self._pending_lock = threading.Lock()
         self._last: Future[bool] | None = None
+        self._records_pending = 0
         self._records_written = 0
+
+    @property
+    def records_pending(self) -> int:
+        """Records accepted by :meth:`append` whose write has not finished yet."""
+        return self._records_pending
 
     @property
     def records_written(self) -> int:
@@ -72,9 +78,10 @@ class DeadLetterWriter:
         written: Future[bool] = _running_future()
         try:
             line = json.dumps(record) + '\n'
-            with self._submit_lock:
+            with self._pending_lock:
                 self._executor.submit(self._write, line, written)
                 self._last = written
+                self._records_pending += 1
         except Exception as exc:
             logger.error(
                 'DeadLetterWriter: cannot hand a dead-letter record for %s to '
@@ -87,7 +94,7 @@ class DeadLetterWriter:
     def flushed(self) -> Future[None]:
         """Resolve once every append submitted before this call has finished."""
         flushed: Future[None] = _running_future()
-        with self._submit_lock:
+        with self._pending_lock:
             last = self._last
         if last is None:
             flushed.set_result(None)
@@ -109,6 +116,8 @@ class DeadLetterWriter:
                 self._path, exc,
             )
         finally:
+            with self._pending_lock:
+                self._records_pending -= 1
             written.set_result(ok)
 
     def _append_line(self, line: str) -> None:
