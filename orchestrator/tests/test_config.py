@@ -98,11 +98,9 @@ def _load_config_with_nested_module(
 class TestDefaults:
     """Tests for OrchestratorConfig defaults — isolated from real config files."""
 
-    def test_default_values(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_default_values(self):
         """Package defaults.yaml is loaded via settings_customise_sources."""
-        monkeypatch.chdir(tmp_path)
-        # Ensure no external config is loaded - must unset env before instantiation
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         defaults = _load_package_defaults()
         # Values from package defaults.yaml (not Pydantic field defaults)
@@ -392,7 +390,8 @@ class TestDefaults:
         config = OrchestratorConfig(project_root=Path('.'))
         assert config.project_root.is_absolute() is True
 
-    def test_steward_timeout_default_is_1800(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_steward_timeout_default_is_1800(self):
         """timeouts.steward default is 1800s and satisfies the steward_completion_timeout invariant.
 
         Documents the decoupling invariant: per-invocation wall-clock must be
@@ -400,28 +399,24 @@ class TestDefaults:
         invocation is never silently cut short inside the drain window.
         Equality is permitted; the validator on OrchestratorConfig enforces >=.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.timeouts.steward == 1800.0
         assert config.timeouts.steward >= config.steward_completion_timeout
 
-    def test_startup_grace_secs_default_is_120(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_startup_grace_secs_default_is_120(self):
         """TimeoutsConfig.startup_grace_secs defaults to 120.0 (pre-turn-1 startup grace window).
 
         Documents the two-regime liveness watchdog: 120s is ~20x the observed ~6s
         turn-1 latency, so genuine startups never trip it while a true pre-turn-1
         wedge is killed fast (vs. burning the full 1200s per-role ceiling).
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.timeouts.startup_grace_secs == 120.0
 
-    def test_verify_cold_command_timeout_secs_from_defaults_yaml(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_verify_cold_command_timeout_secs_from_defaults_yaml(self):
         """verify_cold_command_timeout_secs is loaded from defaults.yaml (expected 5400)."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         defaults = _load_package_defaults()
         assert config.verify_cold_command_timeout_secs == defaults['verify_cold_command_timeout_secs']
@@ -441,28 +436,26 @@ class TestDefaults:
         field_info = OrchestratorConfig.model_fields['merge_verify_cold_command_timeout_secs']
         assert field_info.default is None
 
-    def test_merge_verify_cold_command_timeout_secs_from_defaults_yaml(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_merge_verify_cold_command_timeout_secs_from_defaults_yaml(self):
         """merge_verify_cold_command_timeout_secs is loaded from defaults.yaml (expected 7200).
 
         7200s (2×5400, 4×1800) gives headroom for a cold full-workspace compile
         + frontend install on a cold merge-verify worktree, where 1602's fail-closed
         gate makes a timeout a queue-stalling block.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         defaults = _load_package_defaults()
         assert config.merge_verify_cold_command_timeout_secs == defaults['merge_verify_cold_command_timeout_secs']
         assert config.merge_verify_cold_command_timeout_secs == 7200
 
-    def test_terminal_status_hard_cancel_polls_default(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_terminal_status_hard_cancel_polls_default(self):
         """terminal_status_hard_cancel_polls defaults to 3 (ITEM 2 config, step-3 RED).
 
         At the 30 s default poll interval, threshold=3 means ~90 s of soft-cancel
         grace before the watcher escalates to a hard asyncio.Task.cancel().
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.terminal_status_hard_cancel_polls == 3
 
@@ -475,14 +468,11 @@ class TestDefaults:
         with pytest.raises(ValidationError):
             OrchestratorConfig(terminal_status_hard_cancel_polls=0)
 
-    def test_wedged_slot_backstop_defaults_leave_room_for_the_bounded_cleanup(
-        self, monkeypatch, tmp_path,
-    ):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_wedged_slot_backstop_defaults_leave_room_for_the_bounded_cleanup(self):
         """Task 6660: one abandoned cleanup entry takes at most 3 grace windows
         (its grace plus cancel_bounded's two), so the force-release backstop,
         counted in watcher polls past the hard-cancel, must wait longer."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.terminal_cleanup_cancel_grace_secs == 120.0
         assert config.terminal_status_force_release_polls == 15
@@ -515,7 +505,8 @@ class TestDefaults:
             terminal_cleanup_cancel_grace_secs=40.0,
         )
 
-    def test_run_forever_idle_defaults(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_run_forever_idle_defaults(self):
         """Run-forever idle + full-review rate-limit fields carry their defaults.
 
         These three fields are absent from defaults.yaml, so OrchestratorConfig()
@@ -524,14 +515,13 @@ class TestDefaults:
         cadence is 15s (separate from _PAUSED_IDLE_POLL_SECS so operators can tune
         the run-forever poll independently).
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.review.full_review_min_interval_secs == 86400.0
         assert config.review.full_review_min_tasks == 20
         assert config.idle_poll_secs == 15.0
 
-    def test_max_failure_signature_repeat_default(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_max_failure_signature_repeat_default(self):
         """max_failure_signature_repeat is loaded from defaults.yaml (expected 3).
 
         The shipped default must equal the defaults.yaml value so the loop-guard
@@ -539,8 +529,6 @@ class TestDefaults:
         Sibling thrash thresholds max_consecutive_infra_resumes and
         max_consecutive_merge_thrash follow the same pattern.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         defaults = _load_package_defaults()
         assert config.max_failure_signature_repeat == defaults['max_failure_signature_repeat']
@@ -1070,13 +1058,12 @@ class TestPathResolution:
         assert config.overrides_db_path == tmp_path / 'data' / 'orchestrator' / 'scheduler_overrides.db'
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestStewardTimeoutInvariant:
     """OrchestratorConfig must reject configs where timeouts.steward < steward_completion_timeout."""
 
-    def test_direct_init_violation_raises_validation_error(self, monkeypatch, tmp_path):
+    def test_direct_init_violation_raises_validation_error(self):
         """Directly instantiating OrchestratorConfig with a violating config raises ValidationError."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError, match='steward'):
             OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=600.0))
 
@@ -1090,60 +1077,49 @@ class TestStewardTimeoutInvariant:
         with pytest.raises(ValidationError, match='steward'):
             load_config(bad_yaml)
 
-    def test_equal_values_allowed(self, monkeypatch, tmp_path):
+    def test_equal_values_allowed(self):
         """timeouts.steward == steward_completion_timeout is valid (invariant is >=, not strict >)."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=900.0))
         assert config.timeouts.steward == config.steward_completion_timeout
 
-    def test_greater_value_allowed(self, monkeypatch, tmp_path):
+    def test_greater_value_allowed(self):
         """timeouts.steward > steward_completion_timeout is valid."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=1800.0))
         assert config.timeouts.steward > config.steward_completion_timeout
 
-    def test_error_message_contains_remediation_hint(self, monkeypatch, tmp_path):
+    def test_error_message_contains_remediation_hint(self):
         """ValidationError message must include operator-actionable remediation hint.
 
         Guards against future refactors silently dropping the guidance text.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError, match=r'(?i)raise.*timeouts\.steward.*or lower.*steward_completion_timeout'):
             OrchestratorConfig(steward_completion_timeout=900.0, timeouts=TimeoutsConfig(steward=600.0))
 
-    def test_env_var_override_triggers_invariant(self, monkeypatch, tmp_path):
+    def test_env_var_override_triggers_invariant(self, monkeypatch):
         """ORCH_TIMEOUTS__STEWARD env-var override is caught by the mode='after' validator.
 
         Regression guard: pins that pydantic-settings env-sourced overrides
         are merged into the model before mode='after' validators run.
         A future pydantic-settings source-ordering regression would cause this test to fail.
         """
-        monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_TIMEOUTS__STEWARD', '300')
         monkeypatch.setenv('ORCH_STEWARD_COMPLETION_TIMEOUT', '900')
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         # Both sides are test-pinned: timeouts.steward=300, steward_completion_timeout=900
         # env override: timeouts.steward=300 → 300 < 900 → validator must fire
         with pytest.raises(ValidationError, match='steward'):
             OrchestratorConfig()
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestValidateAssignment:
     """validate_assignment=True must re-run model validators on top-level field mutations."""
 
-    def test_validate_assignment_rejects_steward_completion_timeout_mutation(
-        self, monkeypatch, tmp_path
-    ):
+    def test_validate_assignment_rejects_steward_completion_timeout_mutation(self):
         """Setting steward_completion_timeout above timeouts.steward must raise ValidationError.
 
         With validate_assignment=True, this assignment fires _validate_steward_timeout_invariant
         and raises ValidationError.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         # Construct a valid config: defaults give timeouts.steward=1800, sct=900
         cfg = OrchestratorConfig()
         assert cfg.timeouts.steward == 1800.0
@@ -1153,16 +1129,12 @@ class TestValidateAssignment:
         with pytest.raises(ValidationError, match='steward'):
             cfg.steward_completion_timeout = 2000.0
 
-    def test_validate_assignment_rejects_timeouts_replacement(
-        self, monkeypatch, tmp_path
-    ):
+    def test_validate_assignment_rejects_timeouts_replacement(self):
         """Replacing cfg.timeouts with a TimeoutsConfig that violates the invariant must raise.
 
         With validate_assignment=True, assigning cfg.timeouts fires _validate_steward_timeout_invariant
         and raises ValidationError.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         # steward_completion_timeout=900 is valid against default timeouts.steward=1800
         cfg = OrchestratorConfig(steward_completion_timeout=900.0)
         assert cfg.steward_completion_timeout == 900.0
@@ -1171,14 +1143,12 @@ class TestValidateAssignment:
         with pytest.raises(ValidationError, match='steward'):
             cfg.timeouts = TimeoutsConfig(steward=300.0)
 
-    def test_validate_assignment_allows_valid_mutation(self, monkeypatch, tmp_path):
+    def test_validate_assignment_allows_valid_mutation(self):
         """A valid mutation of steward_completion_timeout must succeed without errors.
 
         Regression guard: confirms that validate_assignment does not block
         mutations that satisfy the invariant. Passes before and after step-4.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         cfg = OrchestratorConfig()
         # default timeouts.steward=1800, steward_completion_timeout=900
         # Setting sct=500 is valid (500 <= 1800).
@@ -1193,15 +1163,12 @@ class TestValidateAssignment:
         This test fails when model_post_init is used (which only fires at construction).
         """
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         cfg = OrchestratorConfig()
         # Assign a relative path post-construction; the field validator must resolve it
         cfg.project_root = Path('relative/subdir')
         assert cfg.project_root.is_absolute() is True
 
-    def test_project_root_field_validator_does_not_double_trigger_model_validator(
-        self, monkeypatch, tmp_path
-    ):
+    def test_project_root_field_validator_does_not_double_trigger_model_validator(self):
         """@field_validator must not cause model validators to fire twice during construction.
 
         With the old model_post_init: assigning self.project_root under validate_assignment=True
@@ -1214,8 +1181,6 @@ class TestValidateAssignment:
         """
         from pydantic import model_validator as _mv
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         call_count: list[int] = []
 
         class TrackingConfig(OrchestratorConfig):
@@ -1343,7 +1308,7 @@ class TestMergeVerifyBreadthConfig:
             'and must NOT be in RELOADABLE_FIELDS'
         )
 
-    def test_defaults_yaml_carries_scoped(self, monkeypatch, tmp_path):
+    def test_defaults_yaml_carries_scoped(self, tmp_path):
         """The shipped defaults.yaml explicitly carries merge_verify_breadth:
         scoped (same guard pattern as test_defaults_yaml_has_park_stop_block
         above), and that value flows through both a bare OrchestratorConfig()
@@ -1355,8 +1320,6 @@ class TestMergeVerifyBreadthConfig:
         )
         assert defaults['merge_verify_breadth'] == 'scoped'
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.merge_verify_breadth == 'scoped'
 
@@ -2562,6 +2525,7 @@ class TestPinReservationConfig:
         assert live.pin_reservations_enabled is False
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestTransientRequeueBackoffConfig:
     """The two jittered-backoff knobs (task 3317 / PRD contract C3).
 
@@ -2570,19 +2534,13 @@ class TestTransientRequeueBackoffConfig:
     requeues.  Genuine requeues keep the flat ``requeue_cooldown_secs``.
     """
 
-    def test_backoff_base_default_is_thirty_seconds(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_backoff_base_default_is_thirty_seconds(self):
         assert OrchestratorConfig().transient_requeue_backoff_base_secs == 30.0
 
-    def test_backoff_cap_default_is_fifteen_minutes(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_backoff_cap_default_is_fifteen_minutes(self):
         assert OrchestratorConfig().transient_requeue_backoff_cap_secs == 900.0
 
-    def test_both_knobs_are_floats(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_both_knobs_are_floats(self):
         config = OrchestratorConfig()
         assert isinstance(config.transient_requeue_backoff_base_secs, float)
         assert isinstance(config.transient_requeue_backoff_cap_secs, float)
@@ -2592,7 +2550,7 @@ class TestTransientRequeueBackoffConfig:
         'transient_requeue_backoff_cap_secs',
     ])
     @pytest.mark.parametrize('bad', [0.0, -1.0])
-    def test_non_positive_values_rejected(self, field, bad, monkeypatch, tmp_path):
+    def test_non_positive_values_rejected(self, field, bad):
         """A zero/negative cooldown would reinstate the tight-loop pathology.
 
         This task exists precisely to remove a hot retry loop (2026-07-29
@@ -2600,20 +2558,16 @@ class TestTransientRequeueBackoffConfig:
         could arm a zero-length cooldown must fail loudly at load rather than
         silently restore it.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError):
             OrchestratorConfig(**{field: bad})
 
-    def test_defaults_yaml_carries_both_keys(self, monkeypatch, tmp_path):
+    def test_defaults_yaml_carries_both_keys(self):
         """The packaged defaults.yaml agrees with the pydantic defaults.
 
         Loaded through the same entry point the sibling defaults.yaml-parity
         tests use, so the layering (packaged defaults.yaml -> project yaml ->
         Field default) is not re-implemented here.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         defaults = _load_package_defaults()
         assert 'transient_requeue_backoff_base_secs' in defaults
@@ -2629,14 +2583,12 @@ class TestTransientRequeueBackoffConfig:
             == 900.0
         )
 
-    def test_flat_genuine_requeue_cooldown_is_untouched(self, monkeypatch, tmp_path):
+    def test_flat_genuine_requeue_cooldown_is_untouched(self):
         """The genuine-requeue lane keeps its flat 30s cooldown.
 
         The backoff is a transient-only carve-out; a genuine requeue must
         still arm exactly ``requeue_cooldown_secs``.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         assert OrchestratorConfig().requeue_cooldown_secs == 30.0
 
     @pytest.mark.parametrize('leaf', [
@@ -2655,7 +2607,7 @@ class TestTransientRequeueBackoffConfig:
             'in the # Scheduler tuning slice alongside fairness.skip_threshold)'
         )
 
-    def test_apply_reload_mutates_backoff_knobs_in_place(self, monkeypatch, tmp_path):
+    def test_apply_reload_mutates_backoff_knobs_in_place(self):
         """apply_reload applies both leaves to the LIVE config object.
 
         In-place mutation is what makes the green tier work without a reload
@@ -2663,8 +2615,6 @@ class TestTransientRequeueBackoffConfig:
         time, and the Scheduler holds this same object, so the next arming
         sees the new value.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig()
         fresh = OrchestratorConfig(
             transient_requeue_backoff_base_secs=5.0,
@@ -2685,38 +2635,33 @@ class TestTransientRequeueBackoffConfig:
         'transient_requeue_backoff_base_secs',
         'transient_requeue_backoff_cap_secs',
     ])
-    def test_reloadable_names_resolve_on_a_default_config(self, leaf, monkeypatch, tmp_path):
+    def test_reloadable_names_resolve_on_a_default_config(self, leaf):
         """Typo gate: each RELOADABLE_FIELDS literal must be a real attribute.
 
         Mirrors ``test_every_path_resolves_on_default_config`` — a misspelled
         entry would silently no-op inside diff_config/apply_reload.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         assert getattr(OrchestratorConfig(), leaf) > 0.0
 
 
 class TestVerifyInfraRetryConfig:
     """Tests for verify_infra_retry_* config fields (step-5)."""
 
-    def test_verify_infra_retry_max_attempts_default(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_verify_infra_retry_max_attempts_default(self):
         """verify_infra_retry_max_attempts defaults to 5."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.verify_infra_retry_max_attempts == 5
 
-    def test_verify_infra_retry_backoff_secs_default(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_verify_infra_retry_backoff_secs_default(self):
         """verify_infra_retry_backoff_secs defaults to 2.0."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.verify_infra_retry_backoff_secs == 2.0
 
-    def test_verify_infra_retry_max_backoff_secs_default(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_verify_infra_retry_max_backoff_secs_default(self):
         """verify_infra_retry_max_backoff_secs defaults to 60.0."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.verify_infra_retry_max_backoff_secs == 60.0
 
@@ -2863,6 +2808,7 @@ class TestWarmLaneGcConfig:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestConfigReload:
     """RELOADABLE_FIELDS: code-owned allowlist of dotted leaf paths safe to
     apply via hot-reload without a process restart.
@@ -2877,13 +2823,11 @@ class TestConfigReload:
             f'{sorted({type(p).__name__ for p in RELOADABLE_FIELDS})}'
         )
 
-    def test_every_path_resolves_on_default_config(self, monkeypatch, tmp_path):
+    def test_every_path_resolves_on_default_config(self):
         """Every dotted path in RELOADABLE_FIELDS must resolve via getattr-walk
         on a default OrchestratorConfig — catches typos in the allowlist that
         would otherwise silently no-op inside diff_config/apply_reload.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         cfg = OrchestratorConfig()
         for path in RELOADABLE_FIELDS:
             obj = cfg
@@ -2973,6 +2917,7 @@ class TestConfigReload:
         )
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestSimpleTaskRoleConfigAddressability:
     """Routing alpha (plans/adaptive-model-routing-prd.md): simple_task is a
     full peer of every other AgentRole in the six per-role routing
@@ -2997,13 +2942,11 @@ class TestSimpleTaskRoleConfigAddressability:
         assert TimeoutsConfig().simple_task == 7200.0
         assert BackendsConfig().simple_task == 'claude'
 
-    def test_defaults_yaml_agrees_with_submodel_defaults(self, monkeypatch, tmp_path):
+    def test_defaults_yaml_agrees_with_submodel_defaults(self):
         """A config materialized from the packaged defaults.yaml (Layer 1, no
         project override) resolves the same six simple_task values as the
         bare submodel Field defaults -- keeps config.py and defaults.yaml in
         lockstep."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         defaults = _load_package_defaults()
         assert config.models.simple_task == defaults['models']['simple_task'] == 'sonnet'
@@ -3026,6 +2969,7 @@ class TestSimpleTaskRoleConfigAddressability:
         } <= RELOADABLE_FIELDS
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestSimpleTaskDeprecatedScalarHonoring:
     """simple_task_budget_usd / simple_task_max_turns (config.py's dead
     scalars, never read by _invoke) must be formally HONORED -- not left
@@ -3041,11 +2985,8 @@ class TestSimpleTaskDeprecatedScalarHonoring:
     """
 
     def test_non_default_scalars_migrate_into_submodel_fields_with_warning(
-        self, monkeypatch, tmp_path, caplog: pytest.LogCaptureFixture,
+        self, caplog: pytest.LogCaptureFixture,
     ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-
         with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
             config = OrchestratorConfig(
                 simple_task_budget_usd=3.33,
@@ -3079,12 +3020,10 @@ class TestSimpleTaskDeprecatedScalarHonoring:
             f'{[r.getMessage() for r in warning_records]}'
         )
 
-    def test_explicit_submodel_value_wins_over_deprecated_scalar(self, monkeypatch, tmp_path):
+    def test_explicit_submodel_value_wins_over_deprecated_scalar(self):
         """An explicitly-set budgets.simple_task takes precedence -- the
         deprecated scalar is ignored (no migration) when the submodel field
         is no longer at its default."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
 
         config = OrchestratorConfig(
             simple_task_budget_usd=3.33,
@@ -3096,7 +3035,7 @@ class TestSimpleTaskDeprecatedScalarHonoring:
             'deprecated simple_task_budget_usd scalar.'
         )
 
-    def test_no_deprecation_warning_on_construction_or_diff(self, monkeypatch, tmp_path):
+    def test_no_deprecation_warning_on_construction_or_diff(self):
         """Locks the __dict__-vs-getattr choice in
         _honor_deprecated_simple_task_scalars and _iter_leaves: a future
         refactor back to plain getattr on either path would fire pydantic's
@@ -3124,8 +3063,6 @@ class TestSimpleTaskDeprecatedScalarHonoring:
         ``logging``, orthogonal to the ``warnings`` module, so they never
         appear in the captured list regardless.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always')
@@ -3149,17 +3086,13 @@ class TestSimpleTaskDeprecatedScalarHonoring:
             f'or diff_config; got: {[str(w.message) for w in deprecated_field_access_warnings]}'
         )
 
-    def test_default_scalars_neither_migrate_nor_warn(
-        self, monkeypatch, tmp_path, caplog: pytest.LogCaptureFixture,
-    ):
+    def test_default_scalars_neither_migrate_nor_warn(self, caplog: pytest.LogCaptureFixture):
         """Inverse of test_non_default_scalars_migrate_into_submodel_fields_with_warning:
         when both deprecated scalars are left at their Field defaults, the
         guard (raw != default AND submodel == default) must not fire -- no
         migration, no WARNING. This keeps the deprecated scalars silent
         unless an operator actually overrides them.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
             config = OrchestratorConfig()
@@ -3179,13 +3112,11 @@ class TestSimpleTaskDeprecatedScalarHonoring:
             f'OrchestratorConfig(); got: {[r.getMessage() for r in warning_records]}'
         )
 
-    def test_explicit_max_turns_submodel_wins_over_deprecated_scalar(self, monkeypatch, tmp_path):
+    def test_explicit_max_turns_submodel_wins_over_deprecated_scalar(self):
         """Symmetric with test_explicit_submodel_value_wins_over_deprecated_scalar
         (the budgets variant): an explicitly-set max_turns.simple_task takes
         precedence -- the deprecated scalar is ignored (no migration) when
         the submodel field is no longer at its default."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
 
         config = OrchestratorConfig(
             simple_task_max_turns=7,
@@ -3198,6 +3129,7 @@ class TestSimpleTaskDeprecatedScalarHonoring:
         )
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestDiffConfig:
     """diff_config(live, fresh, allowlist) categorizes every differing leaf
     into applied_candidates (allowlisted) or restart_required (not), and
@@ -3205,18 +3137,14 @@ class TestDiffConfig:
     constructor kwargs so assertions are robust to defaults.yaml drift.
     """
 
-    def test_no_op_diff_has_no_candidates(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_no_op_diff_has_no_candidates(self):
         cfg = OrchestratorConfig()
         diff = diff_config(cfg, cfg)
         assert diff.applied_candidates == {}
         assert diff.restart_required == {}
         assert diff.unchanged > 0
 
-    def test_allowlisted_change_lands_in_applied_candidates(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_allowlisted_change_lands_in_applied_candidates(self):
         live = OrchestratorConfig(models=ModelsConfig(architect='opus'))
         fresh = OrchestratorConfig(models=ModelsConfig(architect='sonnet'))
         diff = diff_config(live, fresh)
@@ -3225,12 +3153,10 @@ class TestDiffConfig:
         }
         assert diff.restart_required == {}
 
-    def test_merge_fanout_cap_change_is_green_tier(self, monkeypatch, tmp_path):
+    def test_merge_fanout_cap_change_is_green_tier(self):
         """merge_verify_max_concurrent_modules (task 2393, T5) is green-tier:
         a change lands in applied_candidates, not restart_required.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(merge_verify_max_concurrent_modules=4)
         fresh = OrchestratorConfig(merge_verify_max_concurrent_modules=2)
         diff = diff_config(live, fresh)
@@ -3239,9 +3165,7 @@ class TestDiffConfig:
         }
         assert diff.restart_required == {}
 
-    def test_restart_required_change_lands_in_restart_required(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_restart_required_change_lands_in_restart_required(self):
         live = OrchestratorConfig(max_concurrent_tasks=3)
         fresh = OrchestratorConfig(max_concurrent_tasks=5)
         diff = diff_config(live, fresh)
@@ -3250,9 +3174,7 @@ class TestDiffConfig:
         }
         assert diff.applied_candidates == {}
 
-    def test_mixed_change_each_path_in_exactly_one_bucket(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_mixed_change_each_path_in_exactly_one_bucket(self):
         live = OrchestratorConfig(models=ModelsConfig(architect='opus'), max_concurrent_tasks=3)
         fresh = OrchestratorConfig(models=ModelsConfig(architect='sonnet'), max_concurrent_tasks=5)
         diff = diff_config(live, fresh)
@@ -3268,9 +3190,7 @@ class TestDiffConfig:
         assert not (applied_paths & restart_paths)
         assert len(applied_paths | restart_paths) == 2
 
-    def test_verify_env_is_a_single_atomic_leaf(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_verify_env_is_a_single_atomic_leaf(self):
         live = OrchestratorConfig(verify_env={})
         fresh = OrchestratorConfig(verify_env={'RUSTC_WRAPPER': 'sccache'})
         diff = diff_config(live, fresh)
@@ -3282,9 +3202,7 @@ class TestDiffConfig:
             f'verify_env must be a single atomic leaf, not per-key paths; got {all_paths}'
         )
 
-    def test_private_module_configs_excluded_from_diff(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_private_module_configs_excluded_from_diff(self):
         live = OrchestratorConfig()
         fresh = OrchestratorConfig()
         live._module_configs = {'foo': ModuleConfig(prefix='foo')}
@@ -3323,6 +3241,7 @@ class TestLaneCommandOutageProbe:
         assert command.outage_probe_timeout_secs == 60
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestApplyReload:
     """apply_reload(live, fresh, allowlist) mutates *live* in place for every
     allowlisted differing leaf, reports restart_required leaves WITHOUT
@@ -3331,11 +3250,9 @@ class TestApplyReload:
     TestApplyReloadHybridRollback.
     """
 
-    def test_allowlisted_apply_mutates_live_and_reports(self, monkeypatch, tmp_path):
+    def test_allowlisted_apply_mutates_live_and_reports(self):
         from orchestrator.config import GitConfig
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         # Both sides pin `models`/`git` explicitly (not just `fresh`): a bare
         # OrchestratorConfig() sources unset submodel leaves from the packaged
         # defaults.yaml via YamlSettingsSource, which diverges from the
@@ -3360,14 +3277,12 @@ class TestApplyReload:
         assert live.models.architect == 'sonnet'
         assert live.git.offline_lane_test_threads == 8
 
-    def test_submodel_identity_preserved(self, monkeypatch, tmp_path):
+    def test_submodel_identity_preserved(self):
         """I3: allowlisted leaves are mutated in place on the existing
         submodel objects — models/git objects are never replaced, so any
         other holder of a reference (e.g. GitOps) observes the update."""
         from orchestrator.config import GitConfig
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig()
         fresh = OrchestratorConfig(
             models=ModelsConfig(architect='sonnet'),
@@ -3379,10 +3294,8 @@ class TestApplyReload:
         assert id(live.models) == models_id_before
         assert id(live.git) == git_id_before
 
-    def test_restart_required_change_not_mutated_on_live(self, monkeypatch, tmp_path):
+    def test_restart_required_change_not_mutated_on_live(self):
         """I2: a restart_required leaf is reported but live is left untouched."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(max_concurrent_tasks=3)
         fresh = OrchestratorConfig(max_concurrent_tasks=5)
         report = apply_reload(live, fresh)
@@ -3392,9 +3305,7 @@ class TestApplyReload:
         }
         assert live.max_concurrent_tasks == 3
 
-    def test_mixed_change_only_allowlisted_leaf_mutated(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_mixed_change_only_allowlisted_leaf_mutated(self):
         live = OrchestratorConfig(models=ModelsConfig(architect='opus'), max_concurrent_tasks=3)
         fresh = OrchestratorConfig(models=ModelsConfig(architect='sonnet'), max_concurrent_tasks=5)
         report = apply_reload(live, fresh)
@@ -3409,9 +3320,7 @@ class TestApplyReload:
         # I6: each differing path reported exactly once, in exactly one bucket.
         assert not (set(report['applied']) & set(report['restart_required']))
 
-    def test_no_op_apply_reports_success_with_nothing_to_do(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_no_op_apply_reports_success_with_nothing_to_do(self):
         cfg = OrchestratorConfig()
         report = apply_reload(cfg, cfg)
         assert report['reloaded'] is True
@@ -3419,13 +3328,11 @@ class TestApplyReload:
         assert report['restart_required'] == {}
         assert report['unchanged'] > 0
 
-    def test_verify_env_replaced_wholesale(self, monkeypatch, tmp_path):
+    def test_verify_env_replaced_wholesale(self):
         """verify_env is a single atomic top-level leaf (I3): applying it
         replaces the whole dict on live in one shot, as load_config's
         sccache fold (config.verify_env = config.effective_verify_env)
         would produce on *fresh*."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(verify_env={})
         fresh = OrchestratorConfig(verify_env={
             'RUSTC_WRAPPER': 'sccache',
@@ -3439,6 +3346,7 @@ class TestApplyReload:
         }
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestApplyReloadHybridRollback:
     """I5: a partial apply that leaves *live* in a hybrid-invalid state (only
     one side of a cross-field invariant updated) must be synchronously
@@ -3453,9 +3361,7 @@ class TestApplyReloadHybridRollback:
     at the unit level via the injectable `allowlist` param.
     """
 
-    def test_hybrid_invariant_violation_rolls_back_synchronously(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_hybrid_invariant_violation_rolls_back_synchronously(self):
         # live is valid on its own: 1800 >= 900.
         live = OrchestratorConfig(
             timeouts=TimeoutsConfig(steward=1800.0),
@@ -3481,6 +3387,7 @@ class TestApplyReloadHybridRollback:
         assert live.timeouts.steward == 1800.0
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestProgressExtensionConfig:
     """Working-regime progress-extended deadline config (task 2360, step-1).
 
@@ -3494,15 +3401,13 @@ class TestProgressExtensionConfig:
     OrchestratorConfig.max_progress_resume_iterations churn bound.
     """
 
-    def test_working_idle_secs_default_is_1800(self, monkeypatch, tmp_path):
+    def test_working_idle_secs_default_is_1800(self):
         """TimeoutsConfig.working_idle_secs defaults to 1800.0.
 
         The working-regime watchdog kills only after the transcript shows no
         NEW assistant turn for max(working_idle_secs, per-role ceiling); this
         pins the idle-bound half of that pair.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.timeouts.working_idle_secs == 1800.0
 
@@ -3522,36 +3427,30 @@ class TestProgressExtensionConfig:
         field_info = OrchestratorConfig.model_fields['invocation_timeout']
         assert field_info.default == 7200.0
 
-    def test_unblock_auto_timeout_seconds_default_is_1200(self, monkeypatch, tmp_path):
+    def test_unblock_auto_timeout_seconds_default_is_1200(self):
         """UnblockAutoConfig.timeout_seconds default is raised 600.0 -> 1200.0.
 
         Raised to >= the implementer's per-role ceiling (timeouts.implementer
         == 1200.0) so unblock_auto's dry-run investigator no longer reproduces
         the exact ceiling-kill failure it is diagnosing.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.unblock_auto.timeout_seconds == 1200.0
 
-    def test_max_progress_resume_iterations_default_is_20(self, monkeypatch, tmp_path):
+    def test_max_progress_resume_iterations_default_is_20(self):
         """OrchestratorConfig.max_progress_resume_iterations defaults to 20.
 
         Independent churn bound on progress-timeout+resume pairs, separate
         from max_execute_iterations (which progress-resumes no longer consume
         toward — see workflow._execute_iterations).
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.max_progress_resume_iterations == 20
 
-    def test_defaults_yaml_round_trips_progress_extension_fields(self, monkeypatch, tmp_path):
+    def test_defaults_yaml_round_trips_progress_extension_fields(self):
         """defaults.yaml carries the shipped values for all four fields, and a
         bare OrchestratorConfig() (which loads package defaults.yaml via
         settings_customise_sources) picks them up byte-for-byte."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         defaults = _load_package_defaults()
 
@@ -3592,6 +3491,7 @@ class TestPriceEntry:
             PriceEntry(input_per_1m=1, output_per_1m=1, cached_input_per_1m=-0.5)
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestOrchestratorConfigPrices:
     """OrchestratorConfig.prices is seeded from the packaged defaults.yaml
     `prices:` block (task 2459; migrated off invoke.py's former hardcoded
@@ -3603,9 +3503,7 @@ class TestOrchestratorConfigPrices:
         'gemini-3.1-pro-preview', 'gemini-3-flash',
     }
 
-    def test_prices_seeded_with_expected_rates(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_prices_seeded_with_expected_rates(self):
         config = OrchestratorConfig()
         assert set(config.prices) == self._SEED_KEYS
         assert config.prices['gpt-5.4'].input_per_1m == 2.50
@@ -3628,15 +3526,11 @@ class TestOrchestratorConfigPrices:
         assert set(table) == self._SEED_KEYS
         assert table['o4-mini'] == {'input_per_1m': 1.10, 'output_per_1m': 4.40}
 
-    def test_astra_seeds_a_cached_input_rate(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_astra_seeds_a_cached_input_rate(self):
         assert default_price_table()['gpt-6-astra']['cached_input_per_1m'] == 1.00
         assert OrchestratorConfig().prices['gpt-6-astra'].cached_input_per_1m == 1.00
 
-    def test_sol_and_terra_have_no_cached_input_rate(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_sol_and_terra_have_no_cached_input_rate(self):
         prices = OrchestratorConfig().prices
         assert prices['gpt-5.6-sol'].cached_input_per_1m is None
         assert prices['gpt-5.6-terra'].cached_input_per_1m is None
@@ -3650,6 +3544,7 @@ class TestOrchestratorConfigPrices:
         assert default_price_table() == _load_package_defaults()['prices']
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestPricesReloadDisposition:
     """`prices` is a green-tier hot-reloadable dict-valued top-level leaf,
     mirroring the existing `verify_env` precedent in RELOADABLE_FIELDS.
@@ -3658,11 +3553,7 @@ class TestPricesReloadDisposition:
     def test_prices_is_reloadable(self):
         assert 'prices' in RELOADABLE_FIELDS
 
-    def test_price_edit_lands_in_applied_candidates_not_restart_required(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_price_edit_lands_in_applied_candidates_not_restart_required(self):
         live = OrchestratorConfig(
             prices={'o4-mini': PriceEntry(input_per_1m=1.10, output_per_1m=4.40)}
         )
@@ -3673,9 +3564,7 @@ class TestPricesReloadDisposition:
         assert 'prices' in diff.applied_candidates
         assert 'prices' not in diff.restart_required
 
-    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_apply_reload_applies_in_place(self):
         live = OrchestratorConfig(
             prices={'o4-mini': PriceEntry(input_per_1m=1.10, output_per_1m=4.40)}
         )
@@ -3703,9 +3592,8 @@ class TestRoleEnvOverridesConfig:
     Defaults to {} so an absent role (e.g. judge) gets no endpoint env.
     """
 
-    def test_defaults_to_empty(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_defaults_to_empty(self):
         config = OrchestratorConfig()
         assert config.role_env_overrides == {}
 
@@ -4603,6 +4491,7 @@ class TestMergeParkLockGraceSeconds:
         )
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestInfoL0RouterConfig:
     """The four info-L0 disposition router knobs
     (plans/info-l0-disposition-router-prd.md D5/D9/D12, §Contract)."""
@@ -4614,12 +4503,6 @@ class TestInfoL0RouterConfig:
         'info_l0_note_detail_chars',
     )
 
-    @pytest.fixture(autouse=True)
-    def _isolated(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-
-    @pytest.mark.usefixtures("code_default_config")
     def test_defaults(self):
         config = OrchestratorConfig()
         assert config.info_l0_router_enabled is True
