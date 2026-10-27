@@ -355,7 +355,11 @@ def applier_harness(tmp_path, mock_orch_config):
     import shutil
     from unittest.mock import AsyncMock, MagicMock, patch
 
-    from _orch_helpers import wire_clear_claim_then_set_status, wire_scheduler_liveness_mock
+    from _orch_helpers import (
+        wire_clear_claim_then_set_status,
+        wire_live_status_from_get_task,
+        wire_scheduler_liveness_mock,
+    )
     from escalation.queue import EscalationQueue
 
     from orchestrator.config import RecoveryEmissionConfig
@@ -370,6 +374,7 @@ def applier_harness(tmp_path, mock_orch_config):
     h.scheduler = MagicMock()
     wire_scheduler_liveness_mock(h.scheduler)
     wire_clear_claim_then_set_status(h.scheduler)
+    wire_live_status_from_get_task(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(
         return_value=({_TID: str(TaskStatus.IN_PROGRESS)}, None),

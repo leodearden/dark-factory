@@ -164,6 +164,20 @@ def wire_clear_claim_then_set_status(scheduler_mock: MagicMock) -> None:
     )
 
 
+def wire_live_status_from_get_task(scheduler_mock: MagicMock) -> None:
+    """Answer ``get_status`` on a MagicMock Scheduler from its own ``get_task`` row.
+
+    Mirrors the real Scheduler, where both read the same fused-memory row;
+    ``get_task`` is looked up per call, so a test that reassigns it later flows through.
+    """
+
+    async def _live_status(tid: str) -> str | None:
+        row = await scheduler_mock.get_task(tid)
+        return (row or {}).get('status')
+
+    scheduler_mock.get_status = AsyncMock(side_effect=_live_status)
+
+
 # task 3492/4215: the pyproject-configured default per-test timeout ceiling
 # that every heavy test in this suite must clear.  MIRROR of
 # `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml -- see

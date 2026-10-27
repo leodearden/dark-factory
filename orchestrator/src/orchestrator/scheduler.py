@@ -257,14 +257,34 @@ class SetTaskStatusRejected(Exception):
     the silent-WARNING-and-return behaviour must now wrap the call.
     """
 
-    def __init__(self, task_id: str, error_code: str, raw: str, message: str | None = None):
+    def __init__(
+        self,
+        task_id: str,
+        error_code: str,
+        raw: str,
+        message: str | None = None,
+        *,
+        old_status: str | None = None,
+        target_status: str | None = None,
+    ):
         self.task_id = task_id
         self.error_code = error_code
         self.raw = raw
+        self.old_status = old_status
+        self.target_status = target_status
         super().__init__(
             message
             or f'set_task_status({task_id!r}) rejected: {error_code} — {raw}'
         )
+
+    @property
+    def attempted_transition(self) -> str:
+        return f"{self.old_status or 'unknown'} -> {self.target_status or 'unknown'}"
+
+    @property
+    def row_already_terminal(self) -> bool:
+        """The refusal reports the row already terminal: the write lost a race, not a stuck row."""
+        return self.old_status in TERMINAL_STATUSES
 
 
 class TerminalExitRejection(SetTaskStatusRejected):
@@ -280,8 +300,6 @@ class TerminalExitRejection(SetTaskStatusRejected):
     """
 
     def __init__(self, task_id: str, old_status: str, target_status: str, raw: str):
-        self.old_status = old_status
-        self.target_status = target_status
         super().__init__(
             task_id=task_id,
             error_code='terminal_exit_rejected',
@@ -290,6 +308,8 @@ class TerminalExitRejection(SetTaskStatusRejected):
                 f'set_task_status({task_id!r}, {target_status!r}) refused: '
                 f'task is currently {old_status!r} (terminal-exit gate)'
             ),
+            old_status=old_status,
+            target_status=target_status,
         )
 
 
@@ -312,6 +332,7 @@ class DoneGateRejection(SetTaskStatusRejected):
                 f'set_task_status({task_id!r}, "done") refused: '
                 f'phantom-done gate — missing files: {missing_files!r}'
             ),
+            target_status='done',
         )
 
 
@@ -332,6 +353,7 @@ class ProvenanceValidationRejection(SetTaskStatusRejected):
                 f'set_task_status({task_id!r}, "done") refused: '
                 f'{error_code} — {raw}'
             ),
+            target_status='done',
         )
 
 
@@ -375,6 +397,7 @@ class StaleEvidenceRejection(SetTaskStatusRejected):
                 f'done_evidence_stale — evidence {evidence_commit!r} '
                 f'({evidence_committed_at}) predates reopen_at {reopen_at!r}'
             ),
+            target_status='done',
         )
 
 
@@ -3400,6 +3423,11 @@ class Scheduler:
                     if isinstance(structured, dict)
                     else ''
                 )
+                from_status = (
+                    str(structured['from_status'])
+                    if isinstance(structured, dict) and structured.get('from_status')
+                    else None
+                )
                 if error_code == 'terminal_exit_rejected':
                     # Terminal classification reuses the shared TERMINAL_STATUSES
                     # set (imported above) rather than a separate local copy.
@@ -3411,8 +3439,7 @@ class Scheduler:
                         return
                     raise TerminalExitRejection(
                         task_id=task_id,
-                        old_status=str(structured.get('from_status', ''))
-                        if isinstance(structured, dict) else '',
+                        old_status=from_status or '',
                         target_status=status,
                         raw=rejection,
                     )
@@ -3465,6 +3492,8 @@ class Scheduler:
                     task_id=task_id,
                     error_code=error_code or 'unknown',
                     raw=rejection,
+                    old_status=from_status,
+                    target_status=status,
                 )
             logger.info(
                 'set_task_status(%s, %s) transient rejection '

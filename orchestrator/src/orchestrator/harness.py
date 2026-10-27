@@ -161,7 +161,6 @@ from orchestrator.scheduler import (
     SchedulerCallbacks,
     SetTaskStatusRejected,
     StaleEvidenceRejection,
-    TerminalExitRejection,
 )
 from orchestrator.service_restart import (
     FLEET_DEPLOY_CLOCK_RELPATH,
@@ -5761,19 +5760,16 @@ class Harness:
                     tid, status, mid_run=mid_run, tally=tally,
                 )
             except SetTaskStatusRejected as exc:
-                # Persistence layer refused our write — escalate directly
-                # (task 2243, W10-θ2 step-14: the per-tid strike counter and
-                # its MAX_RECONCILE_FAILURES threshold gate are retired; a
-                # persistent rejection is now surfaced loudly on the sweep
-                # it occurs, not tallied toward a threshold first).  Honest
-                # log so future operators can see *why* the task is still
-                # stranded instead of the old "marked done" misnomer.
-                # Other (unexpected) exception types intentionally propagate
-                # so bugs in the sweep surface rather than being silently
-                # skipped.
+                # Persistence layer refused a recovery write (mark-done or the
+                # pending revert) — escalate directly (task 2243, W10-θ2
+                # step-14: the per-tid strike counter is retired).  The log
+                # names the transition the refused write attempted.  Other
+                # (unexpected) exception types intentionally propagate so bugs
+                # in the sweep surface rather than being silently skipped.
                 logger.error(
-                    '%s: failed to mark task %s done — %s: %s',
-                    log_prefix, tid, exc.error_code, exc.raw,
+                    '%s: reconcile write refused for task %s (%s) — %s: %s',
+                    log_prefix, tid, exc.attempted_transition,
+                    exc.error_code, exc.raw,
                 )
                 if self._escalation_queue:
                     self._escalate_reconcile_failure(tid, exc)
@@ -7087,10 +7083,9 @@ class Harness:
         """Revert a stranded in-progress task to pending (REVERT_TO_PENDING applier).
 
         Returns ``'reverted'`` (status flipped to pending) or ``None`` (left
-        intact — the sole remaining early-return is the infra-held
-        non-degenerate branch guard below; task 2763 removed the
-        unreadable-lock fail-closed early-return along with the worktree
-        plan.lock read that produced it).
+        intact: the infra-held non-degenerate branch guard below, or the row
+        was already terminal at the live status re-read just before the write,
+        or by the time the write reached the server).
 
         Callers only reach this on the REVERT_TO_PENDING action:
         ``TaskGroundTruth.recovery_for``'s ``live_claimant`` resolution has
@@ -7246,7 +7241,25 @@ class Harness:
         # exist; the suppress + missing_ok keep it a harmless no-op then.
         with contextlib.suppress(OSError):
             lock_path.unlink(missing_ok=True)
-        await self.scheduler.clear_claim_then_set_status(tid, 'pending')
+        live_status = await self.scheduler.get_status(tid)
+        if live_status in TERMINAL_STATUSES:
+            logger.info(
+                'Reconcile: task %s is already %s — skipping the stale pending '
+                'revert (status snapshot predates it)',
+                tid, live_status,
+            )
+            return None
+        try:
+            await self.scheduler.clear_claim_then_set_status(tid, 'pending')
+        except SetTaskStatusRejected as exc:
+            if not exc.row_already_terminal:
+                raise
+            logger.info(
+                'Reconcile: task %s went terminal between the live re-read and '
+                'the write — pending revert refused (%s); nothing to recover',
+                tid, exc.attempted_transition,
+            )
+            return None
         logger.info(
             'Reconcile: reverted task %s to pending', tid
         )
@@ -7409,12 +7422,13 @@ class Harness:
     ) -> None:
         """Submit an L1 escalation for a persistent reconcile failure.
 
-        Fired directly on every ``mark_done`` rejection the reconcile sweep
-        observes for *tid* (task 2243, W10-θ2 step-14 — the per-tid strike
-        counter and its ``MAX_RECONCILE_FAILURES`` threshold gate are
-        retired): the persistence layer contradicts a branch-on-main
-        observation, which is L1-worthy on its own without waiting for a
-        run of consecutive sweeps to confirm it.
+        Fired directly on every recovery-write rejection the reconcile sweep
+        observes for *tid* — a mark-done on landing evidence or the pending
+        revert of a stranded task (task 2243, W10-θ2 step-14 — the per-tid
+        strike counter and its ``MAX_RECONCILE_FAILURES`` threshold gate are
+        retired): the persistence layer refusing the sweep's recovery is
+        L1-worthy on its own without waiting for a run of consecutive sweeps
+        to confirm it.
         """
         if not self._escalation_queue:
             return
@@ -7426,17 +7440,20 @@ class Harness:
             agent_role='harness-reconcile',
             severity='blocking',
             category='reconcile_persistent_rejection',
-            summary=f'Reconcile sweep failed to mark task {tid} done'[:200],
+            summary=(
+                f'Reconcile sweep write refused for task {tid}: '
+                f'{exc.attempted_transition}'
+            )[:200],
             detail=(
-                f'set_task_status(done) rejected by fused-memory for task '
-                f'{tid}.\n\n'
+                f'Reconcile sweep write for task {tid} was refused by '
+                f'fused-memory.\n\n'
+                f'attempted transition: {exc.attempted_transition}\n'
                 f'error_code: {exc.error_code}\n'
                 f'raw: {exc.raw}\n\n'
-                f'The branch was observed on main (or a merge marker was '
-                f'found) but the persistence layer refuses the transition. '
-                f'Manual investigation required — the row may carry stale '
-                f'metadata.files or the done_provenance ancestor check may '
-                f'be failing.'
+                f"The sweep's recovery write (mark-done on landing evidence, "
+                f'or revert-to-pending of a stranded task) was refused by the '
+                f'persistence layer; the error_code and raw rejection above '
+                f'name the gate that refused it. Manual investigation required.'
             ),
             suggested_action='investigate_persistence_layer_rejection',
             filing_claimant_run_id=self._filing_claimant_run_id,
@@ -7470,8 +7487,8 @@ class Harness:
         NON-transient rejections, so an exception reaching this caller is by
         construction post-retry and a caller-level re-retry would be dead code.
 
-        Carve-out: a :class:`TerminalExitRejection` whose ``old_status`` is
-        terminal is a legitimately-finished row, not a hold.  Nothing is stuck
+        Carve-out: a rejection whose ``row_already_terminal`` holds is a
+        legitimately-finished row, not a hold.  Nothing is stuck
         and nobody needs to investigate, so it is logged at INFO and NOT filed —
         filing there would be pure noise on a common, benign race.
 
@@ -7489,7 +7506,7 @@ class Harness:
         fire-and-forget, so an exception escaping here would surface only as an
         unretrieved-task-exception at GC time — i.e. be lost.
         """
-        if isinstance(exc, TerminalExitRejection) and exc.old_status in TERMINAL_STATUSES:
+        if isinstance(exc, SetTaskStatusRejected) and exc.row_already_terminal:
             logger.info(
                 'cascade-unblock: resume of task %s to %r refused because the row '
                 'is already %s — legitimately finished out of band, not a hold; '
