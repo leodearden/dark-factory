@@ -58,22 +58,21 @@ FIXTURES_DIR = Path(__file__).parent / 'fixtures'
 #: or hand-edited into the report artifacts: every measured cell comes from a
 #: real run, or renders as the no-measurement em dash.
 #:
-#: sha256 of the five committed E2 fixtures at the anchor commit.  These are
-#: the inputs `materialize_arm` is deterministic over, so a fetch cache dumped
-#: against them is replayable exactly as long as they hash to these values.
+#: sha256 of the byte-pinned E2 fixtures (`digest_pinned_fixtures`) at the
+#: anchor commit, so a fetch cache dumped against them is replayable exactly
+#: as long as they hash to these values.  The topic registry is not here: it
+#: is anchored by the per-shape corpus fingerprint instead, in
+#: `TestMeasurementAnchor::test_the_committed_fixtures_still_materialize_the_cached_corpus`.
 #: Asserted here rather than only inside the cache so a fixture edit that
 #: silently invalidates the committed cache fails a PURE test in the merge
 #: lane, not a live run nobody reruns.
 ANCHOR_COMMIT = 'ff303320c7c3d90b093076965992dac246db062a'
 
+COMMITTED_FETCH_CACHE = FIXTURES_DIR / 'e2_fetch_cache.json'
+
 ANCHOR_FIXTURE_SHA256: dict[str, str] = {
     'write_triage_calibration.jsonl':
         'fa5958f3634ace98b846ac398cdfe28f2e105a746f0348fe48fb5ed08cd03fe3',
-    # Re-pinned by task 4856 (E1-only briefing re-key) without a re-dump: E2
-    # reads only the curator_gate subset (`load_registry_topics`), which
-    # compares equal before and after that edit.
-    'memory_eval_topic_registry.json':
-        'ca17d33fd91708d4124d5c0cec1b30d5d6636c7a874fcf562f47f0574d717bb4',
     'e2_arm_claims.jsonl':
         '0b09c7de1c30c38570543f1705f01c5b4ac5970618f64545facb486e6991c257',
     'e2_query_set.jsonl':
@@ -145,16 +144,17 @@ class TestTheScriptIsLoadedOnceNotReExecuted:
 class TestMeasurementAnchor:
     """The committed fetch cache is only replayable against THESE fixtures.
 
-    `materialize_arm` is deterministic over the five committed fixtures, and
-    the fetch cache stores `(shape, query_id) -> [(record_id, score)]` keyed
-    on the uuid5 `record_id` those fixtures derive.  Edit a fixture and the
-    cache still LOADS — it just describes a corpus that no longer exists, and
-    the replayed report would publish a stale ranking as a fresh measurement.
+    The fetch cache stores `(shape, query_id) -> [(record_id, score)]` keyed
+    on the uuid5 `record_id` the committed fixtures derive.  Edit a fixture
+    and the cache still LOADS — it just describes a corpus or a query set
+    that no longer exists, and the replayed report would publish a stale
+    ranking as a fresh measurement.
 
     This is the cheap, pure, merge-lane half of that guard: it fails the
     moment a fixture moves, in a test that actually runs, instead of only
-    inside a live run nobody reruns.  The expensive half — the per-shape
-    corpus fingerprint carried in the dump — is step-3.
+    inside a live run nobody reruns.  `ANCHOR_FIXTURE_SHA256` pins the
+    byte-pinned fixtures; the topic registry is pinned by recomputing every
+    shape's corpus fingerprint against the one the committed cache carries.
     """
 
     @pytest.mark.parametrize('name', sorted(ANCHOR_FIXTURE_SHA256))
@@ -173,16 +173,66 @@ class TestMeasurementAnchor:
         )
 
     def test_anchor_covers_every_fixture_the_bake_off_defaults_to(self) -> None:
-        """No fixture may drift out of the anchor's coverage unnoticed."""
+        """No fixture may drift out of the anchor's coverage unnoticed.
+
+        The registry is the one default fixture the corpus-fingerprint anchor
+        covers instead, so excluding a second one is a visible decision.
+        """
         mod = _mod()
-        defaults = [
-            mod.DEFAULT_ALPHA_FIXTURE_PATH,
-            mod.DEFAULT_REGISTRY_PATH,
-            mod.DEFAULT_ARM_CLAIMS_PATH,
-            mod.DEFAULT_QUERY_SET_PATH,
-            mod.DEFAULT_DISTRACTOR_SLAB_PATH,
-        ]
-        assert {Path(p).name for p in defaults} == set(ANCHOR_FIXTURE_SHA256)
+        pinned = {Path(p).name for p in mod.digest_pinned_fixtures()}
+        defaults = {
+            Path(p).name for p in (
+                mod.DEFAULT_ALPHA_FIXTURE_PATH,
+                mod.DEFAULT_REGISTRY_PATH,
+                mod.DEFAULT_ARM_CLAIMS_PATH,
+                mod.DEFAULT_QUERY_SET_PATH,
+                mod.DEFAULT_DISTRACTOR_SLAB_PATH,
+            )
+        }
+        assert pinned == set(ANCHOR_FIXTURE_SHA256)
+        assert defaults - pinned == {mod.DEFAULT_REGISTRY_PATH.name}
+
+    def test_the_committed_fixtures_still_materialize_the_cached_corpus(
+        self,
+    ) -> None:
+        mod = _mod()
+        corpus = _committed_corpus_inputs()
+        mod.cross_validate_fixtures(
+            clusters=corpus.clusters, topics=corpus.topics,
+            claims=corpus.claims, queries=mod.load_query_set(),
+        )
+        cached = json.loads(COMMITTED_FETCH_CACHE.read_text(encoding='utf-8'))[
+            'provenance']['corpus_fingerprints']
+
+        drifted = []
+        for shape in mod.ARM_SHAPES:
+            local = mod.corpus_fingerprint(mod.materialize_arm(
+                shape, corpus.clusters, corpus.claims, corpus.topics,
+                corpus.distractors,
+            ))
+            if local != cached[shape]:
+                drifted.append(
+                    f'{shape}: cached {cached[shape][:16]}, local {local[:16]}',
+                )
+        assert not drifted, (
+            f'the committed fixtures no longer materialize the corpus '
+            f'{COMMITTED_FETCH_CACHE.name} was dumped against '
+            f'({"; ".join(drifted)}). Re-run the seeding pass with '
+            f'--dump-fetches — do NOT edit the cached fingerprint.'
+        )
+
+    def test_the_committed_cache_pins_exactly_the_digest_pinned_fixtures(
+        self,
+    ) -> None:
+        mod = _mod()
+        committed = json.loads(COMMITTED_FETCH_CACHE.read_text(encoding='utf-8'))
+        assert {
+            row['path']: row['sha256']
+            for row in committed['provenance']['fixtures']
+        } == {
+            row['path']: row['sha256']
+            for row in mod.fixture_digests(mod.digest_pinned_fixtures())
+        }
 
 
 # ===========================================================================
@@ -644,7 +694,7 @@ class TestFetchCacheProvenance:
         # not say WHICH arm drifted.
         assert prints['c_peers'] != prints['status_quo']
 
-    def test_carries_the_five_fixture_sha256s(self, tmp_path):
+    def test_carries_a_sha256_for_each_given_fixture(self, tmp_path):
         """`fixture_provenance` stamps the last-touching COMMIT, which does not
         change when a fixture is edited in the working tree. The cache needs a
         content hash, so it carries both semantics rather than conflating them."""
@@ -658,7 +708,7 @@ class TestFetchCacheProvenance:
 
         doc = json.loads(path.read_text(encoding='utf-8'))
         digests = {row['path']: row['sha256'] for row in doc['provenance']['fixtures']}
-        assert len(digests) == 5
+        assert len(digests) == len(ANCHOR_FIXTURE_SHA256)
         for name, expected in ANCHOR_FIXTURE_SHA256.items():
             key = next(p for p in digests if p.endswith(name))
             assert digests[key] == expected
