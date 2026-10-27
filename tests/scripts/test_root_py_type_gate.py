@@ -139,6 +139,9 @@ def test_repo_root_py_is_pyright_clean() -> None:
     This is the invariant the task exists to establish, and it is RED on
     arrival — see the MEASURED RED paragraph in the module docstring.
 
+    It asserts on the parsed diagnostic SET rather than pyright's exit code,
+    which is what makes a failure name the rule, the file and the line.
+
     Findings here are FIXED, never carved back out with an ``exclude`` or a
     ``# pyright: ignore`` (task 3350's fix-don't-weaken precedent; the
     no-carve-out half is enforced by the config test below). An ignore comment
@@ -155,8 +158,6 @@ def test_repo_root_py_is_pyright_clean() -> None:
         "almost certainly wrong"
     )
 
-    # Asserting on the parsed diagnostic SET rather than the exit code is what
-    # makes a failure name the rule, the file and the line (task 3960).
     payload = pyright_json_report(files)
 
     # NON-VACUITY, side two: pyright silently analysing fewer files than were
