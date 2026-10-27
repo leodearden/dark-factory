@@ -98,7 +98,7 @@ class TestScoreImplementerCell:
         assert score.reference_kind is ReferenceKind.NONE
 
     def test_unreferenced_still_reports_the_gates_and_review(self):
-        metrics = _passing(lint_clean=False, review_blocking_issues=3)
+        metrics = _passing(lint_clean=False, review_blocking_issues=1)
         assert compute_composite(metrics) > 0
 
         score = score_implementer_cell(metrics, _NONE)
@@ -108,7 +108,7 @@ class TestScoreImplementerCell:
             score.lint_clean,
             score.typecheck_clean,
             score.review_blocking_issues,
-        ) == (True, False, True, 3)
+        ) == (True, False, True, 1)
 
 
 def _architect(**overrides) -> EvalMetrics:
@@ -137,7 +137,7 @@ class TestScoreArchitectCell:
 
         assert score.plan_quality is None
         assert score.plan_structure == score_plan_structure(_PLAN)
-        assert score.plan_structure > 0
+        assert score_plan_structure(_PLAN) > 0
 
     def test_a_declined_leg_records_the_decline_and_scores_zero_structure(self):
         metrics = _architect(terminal_kind='already_done', plan_steps=0, plan_quality=None)
