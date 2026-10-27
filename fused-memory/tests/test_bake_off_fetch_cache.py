@@ -1070,6 +1070,77 @@ class TestTheFixtureDigestsAreVerifiedNotMerelyRecorded:
         assert mod.load_fetches(path, {'c_peers': seeded})
 
 
+REGISTRY_NAME = 'memory_eval_topic_registry.json'
+
+
+@functools.cache
+def _committed_corpus_inputs() -> types.SimpleNamespace:
+    """The committed default fixtures `materialize_arm` reads, loaded once.
+
+    Through the public loaders, so a corpus anchored here is exactly the one
+    a default run materializes.  Read-only by contract: the result is cached.
+    """
+    mod = _mod()
+    return types.SimpleNamespace(
+        clusters=mod.load_calibration_clusters(),
+        topics=mod.load_registry_topics(),
+        claims=mod.load_arm_claims(),
+        distractors=mod.load_distractor_slab(),
+    )
+
+
+def _write_registry(path: Path, registry: dict) -> None:
+    """Write *registry* back in the committed file's own format, so the bytes
+    move only where an edit moved them."""
+    path.write_text(
+        json.dumps(registry, indent=2, sort_keys=True, ensure_ascii=False) + '\n',
+        encoding='utf-8',
+    )
+
+
+class TestTheRegistryIsPinnedByTheCorpusNotItsBytes:
+    """The topic registry leaves the byte-pinned set, so prove that is not a
+    hole: a curator_gate edit E2 actually reads still refuses replay."""
+
+    def test_a_curator_gate_topic_edit_still_refuses_replay(self, tmp_path):
+        mod = _mod()
+        corpus = _committed_corpus_inputs()
+        records = mod.materialize_arm(
+            'c_peers', corpus.clusters, corpus.claims, corpus.topics,
+            corpus.distractors,
+        )
+        path = tmp_path / 'cache.json'
+        mod.dump_fetches(
+            path,
+            {'c_peers': _fetched(
+                {'q1': [(records[0], 0.9), (records[1], 0.4)]}, {},
+            )},
+            provenance=_provenance(mod, {'c_peers': records}),
+        )
+
+        registry = _fixture_copy(tmp_path, REGISTRY_NAME)
+        doc = json.loads(registry.read_text(encoding='utf-8'))
+        claimed_clusters = {claim.cluster_id for claim in corpus.claims}
+        entry = next(
+            e for e in doc['entries']
+            if e.get('derived_from') == 'curator_gate'
+            and e['provenance']['cluster_id'] in claimed_clusters
+        )
+        entry['topic'] = f'{entry["topic"]}-renamed'
+        _write_registry(registry, doc)
+        edited = mod.materialize_arm(
+            'c_peers', corpus.clusters, corpus.claims,
+            mod.load_registry_topics(registry), corpus.distractors,
+        )
+
+        # The premise: no record id moved, so the cached rankings still join
+        # and the corpus fingerprint is the only thing standing.
+        assert {r.record_id for r in edited} == {r.record_id for r in records}
+        with pytest.raises(mod.FetchCacheError) as excinfo:
+            mod.load_fetches(path, {'c_peers': _seeded('c_peers', edited)})
+        assert 'c_peers' in str(excinfo.value)
+
+
 # ===========================================================================
 # step-5 — the CLI wiring, exercised WITHOUT a network
 # ===========================================================================
@@ -1292,6 +1363,28 @@ class TestDumpFetchesFlag:
         assert isinstance(doc['provenance']['guard_threshold'], float)
 
 
+def _reword_an_e1_only_entry(registry: dict) -> None:
+    """The task-4856 shape of edit: an entry E2 never loads."""
+    entry = next(
+        e for e in registry['entries'] if e.get('derived_from') != 'curator_gate'
+    )
+    entry['phrasings'][0]['text'] += ' (reworded)'
+
+
+def _rekey_a_curator_gate_canonical(registry: dict) -> None:
+    """The task-6094 shape of edit: a curator_gate entry's canonical moves,
+    its topic and cluster id do not."""
+    entry = next(
+        e for e in registry['entries'] if e.get('derived_from') == 'curator_gate'
+    )
+    new_hash = '0123456789abcdef'
+    assert entry['canonical']['content_hash'] != new_hash
+    entry['canonical']['content_hash'] = new_hash
+    entry['canonical']['last_known_id'] = '00000000-0000-4000-8000-000000006092'
+    for pair in entry['supersedes_pairs']:
+        pair['successor_hash'] = new_hash
+
+
 # Each test runs the bake-off twice (dump, then replay); this overrides verify's
 # --timeout=300. Sized per plans/pytest-per-test-timeout-measurement-2026-09-17.md:
 # 8x the worst measured wall clock, never below the pyproject default.
@@ -1430,6 +1523,52 @@ class TestReplayFetchesFlag:
             tmp_path, 'replay', '--replay-fetches', str(cache),
         )) != 0
         assert not (tmp_path / 'replay.json').exists()
+
+    @pytest.mark.parametrize(
+        'edit', [_reword_an_e1_only_entry, _rekey_a_curator_gate_canonical],
+        ids=lambda edit: edit.__name__,
+    )
+    def test_a_replay_survives_a_registry_edit_e2_does_not_read(
+        self, tmp_path, monkeypatch, edit,
+    ):
+        """E1 owns the registry, so its edits must not invalidate E2's cache
+        unless they move what E2 materializes (pinned by the converse in
+        `TestTheRegistryIsPinnedByTheCorpusNotItsBytes`)."""
+        mod = _mod()
+        cache = tmp_path / 'cache.json'
+        registry = _fixture_copy(tmp_path, REGISTRY_NAME)
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(
+            tmp_path, 'live', '--registry', str(registry),
+            '--dump-fetches', str(cache),
+        )) == 0
+        live = json.loads((tmp_path / 'live.json').read_text(encoding='utf-8'))
+        dumped = json.loads(cache.read_text(encoding='utf-8'))
+        assert [
+            row for row in dumped['provenance']['fixtures']
+            if row['path'].endswith(REGISTRY_NAME)
+        ] == []
+
+        sha_before = hashlib.sha256(registry.read_bytes()).hexdigest()
+        topics_before = {
+            cid: t.topic for cid, t in mod.load_registry_topics(registry).items()
+        }
+        doc = json.loads(registry.read_text(encoding='utf-8'))
+        edit(doc)
+        _write_registry(registry, doc)
+        # The premise: the bytes moved, the slugs E2 reads did not.
+        assert hashlib.sha256(registry.read_bytes()).hexdigest() != sha_before
+        assert {
+            cid: t.topic for cid, t in mod.load_registry_topics(registry).items()
+        } == topics_before
+
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(
+            tmp_path, 'replay', '--registry', str(registry),
+            '--replay-fetches', str(cache),
+        )) == 0
+        replayed = json.loads((tmp_path / 'replay.json').read_text(encoding='utf-8'))
+        assert replayed['arms'] == live['arms']
 
     @staticmethod
     def _delete_probe_cluster(cache, shape_keys) -> str:

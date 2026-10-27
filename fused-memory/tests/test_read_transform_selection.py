@@ -3473,6 +3473,25 @@ class TestTheGuardIsWiredNotMerelyAvailable:
 
         assert 'e2_query_set.jsonl' in str(excinfo.value)
 
+    def test_score_from_cache_scores_a_cache_with_no_registry_digest(
+        self, tmp_path,
+    ):
+        """The topic registry is pinned by the corpus fingerprint, not its
+        bytes, so a cache that never digested it must still score."""
+        mod = _mod()
+        doc = json.loads(COMMITTED_FETCH_CACHE.read_text(encoding='utf-8'))
+        doc['provenance']['fixtures'] = [
+            row for row in doc['provenance']['fixtures']
+            if not row['path'].endswith('memory_eval_topic_registry.json')
+        ]
+        target = tmp_path / 'e2_fetch_cache.json'
+        target.write_text(json.dumps(doc, indent=2, sort_keys=True) + '\n',
+                          encoding='utf-8')
+
+        scored = mod.score_from_cache(fetch_cache=target)
+
+        assert set(scored['e2']) == set(mod.ARM_KEYS)
+
     def test_main_reports_the_refusal_without_a_traceback(
         self, tmp_path, capsys,
     ):
