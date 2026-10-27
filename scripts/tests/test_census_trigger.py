@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -20,6 +21,7 @@ import pytest
 import yaml
 from legibility import census_trigger as ct
 from legibility.config import Census as LegibilityCensus
+from shared.testing_mcp_stub import StubAnswer, StubMcpServer
 
 NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
 
@@ -1210,270 +1212,122 @@ def test_bounded_keys_survives_mixed_type_keys():
     assert "None" in result
 
 
+# ---------------------------------------------------------------------------
+# default_status_fetcher against a real-socket stand-in for fused-memory,
+# reached through FUSED_MEMORY_MCP_URL.
+# ---------------------------------------------------------------------------
+
+def _done_statuses(count):
+    return {str(i): "done" for i in range(count)}
+
+
+def _fetch_from(server, monkeypatch, project_root):
+    monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+    return ct.default_status_fetcher(project_root)()
+
+
+def _get_statuses_arguments(server):
+    """The arguments of the one tools/call *server* received, which must be
+    get_statuses."""
+    [call] = [
+        r.body for r in server.requests
+        if isinstance(r.body, dict) and r.body.get("method") == "tools/call"
+    ]
+    assert call["params"]["name"] == "get_statuses"
+    return call["params"]["arguments"]
+
+
+def test_default_status_fetcher_returns_the_unwrapped_get_statuses_reply(tmp_path, monkeypatch):
+    with StubMcpServer(stateful=False, payload={"statuses": {"1": "done"}}) as server:
+        reply = _fetch_from(server, monkeypatch, tmp_path)
+
+    assert reply == {"statuses": {"1": "done"}}
+
+
 def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(
-    tmp_path, install_fake_httpx
+    tmp_path, monkeypatch,
 ):
-    """An unreachable endpoint must surface as StatusFetchUnavailable, never
-    as a raw transport exception.
-
-    The transport failure is INJECTED rather than relied upon. This test
-    originally passed on two ambient premises, both of which are now false:
-    that httpx was not importable here (so the lazy-import ImportError branch
-    fired), and that nothing listened on the default FUSED_MEMORY_MCP_URL
-    (http://localhost:8002). httpx is installed today, and a real fused-memory
-    MCP server listens on :8002 on any machine running the stack -- so the
-    test flapped pass/fail with that live server's connection state instead of
-    testing this module. Injecting a failing `httpx` module (via the shared
-    `install_fake_httpx` fixture, as
-    test_default_status_fetcher_sends_streamable_http_accept_headers below
-    also does) makes the "unreachable" premise true by construction.
-    """
-    def _fake_post(url, **kwargs):
-        raise OSError("[Errno 111] Connection refused")
-
-    install_fake_httpx(_fake_post)
-
-    fetcher = ct.default_status_fetcher(tmp_path)
-
-    # match + __cause__ pin the network-failure branch specifically --
-    # StatusFetchUnavailable also wraps an absent httpx (ImportError), a
-    # non-2xx response, and an _extract_tool_result parse failure, so
-    # asserting only the exception type would still pass if the fake ever
-    # stopped exercising the network path. The fake above raises OSError
-    # (not the narrower ConnectionError -- OSError is what a real errno-111
-    # connection refusal actually is), so pin __cause__ to that.
-    with pytest.raises(ct.StatusFetchUnavailable, match="unreachable at") as excinfo:
-        fetcher()
-    assert isinstance(excinfo.value.__cause__, OSError)
-
-
-class _FakeHttpxResponse:
-    """A 200/`application/json` `httpx.Response` stand-in for the
-    `default_status_fetcher` tests.
-
-    `status_code` and `headers` were added in the task-3644 amendment pass:
-    `default_status_fetcher._fetch` no longer hand-rolls its own POST, it
-    routes through `post_mcp_tool_call` like the other three legibility MCP
-    consumers -- which reads `status_code` (to detect a stateful server's 400
-    "Missing session ID") and `headers` (to pick the JSON vs SSE decoder).
-    The values pin the STATELESS fused-memory shape this fetcher actually
-    talks to, so these tests keep exercising the single-POST fast path.
-    """
-
-    def __init__(self, payload):
-        self.status_code = 200
-        self.headers = {"content-type": "application/json"}
-        self.text = ""
-        self._payload = payload
-
-    def raise_for_status(self):
+    """A refused connection surfaces as StatusFetchUnavailable naming the
+    URL, never as a raw transport exception."""
+    with StubMcpServer(stateful=False) as server:
         pass
-
-    def json(self):
-        return self._payload
-
-
-def test_default_status_fetcher_sends_streamable_http_accept_headers(
-    tmp_path, install_fake_httpx
-):
-    """Task 2953: the streamable-HTTP MCP transport 406s
-    ("Not Acceptable: Client must accept application/json") any tools/call
-    POST whose Accept header doesn't include both application/json and
-    text/event-stream -- verified live against a local MCP /mcp endpoint.
-    default_status_fetcher's httpx import is lazy, but httpx is genuinely
-    available here: a DIRECT dependency of `shared` (shared/pyproject.toml,
-    `httpx>=0.27`, task 2965), not a transitive one. So the real POST would
-    actually go out; the shared `install_fake_httpx` fixture substitutes a
-    stub to capture the outbound call without a network, and without
-    depending on whatever is listening on localhost:8002."""
-    captured_kwargs = {}
-    rpc_response = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {"structuredContent": {"statuses": {"1": "done"}}},
-    }
-
-    def _fake_post(url, **kwargs):
-        captured_kwargs.update(kwargs)
-        return _FakeHttpxResponse(rpc_response)
-
-    install_fake_httpx(_fake_post)
-
+    monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
     fetcher = ct.default_status_fetcher(tmp_path)
-    result = fetcher()
 
-    assert result == {"statuses": {"1": "done"}}
-    headers = captured_kwargs.get("headers") or {}
-    assert "application/json" in headers.get("Accept", "")
-    assert "text/event-stream" in headers.get("Accept", "")
-    # Content-Type is part of the same transport contract -- pin it too so a
-    # future edit dropping it can't pass on the Accept assertions alone.
-    assert headers.get("Content-Type") == "application/json"
-    # The JSON-RPC tools/call body must still ride along on the same call.
-    envelope = captured_kwargs.get("json") or {}
-    assert envelope.get("method") == "tools/call"
-    assert envelope.get("params", {}).get("name") == "get_statuses"
+    with pytest.raises(ct.StatusFetchUnavailable, match=re.escape(f"unreachable at {server.url}")):
+        fetcher()
 
 
-def _capture_get_statuses_project_root(install_fake_httpx, project_root):
-    """Drive `default_status_fetcher(project_root)` against a fake httpx and
-    return the `project_root` argument it actually put on the wire. Reuses
-    the `_FakeHttpxResponse` + shared `install_fake_httpx` harness above (the
-    `import httpx` inside `_fetch` is lazy precisely so this works).
-
-    Takes the fixture as a parameter rather than requesting it: this is a
-    plain helper, not a test, so pytest will not inject fixtures into it."""
-    captured_kwargs = {}
-
-    def _fake_post(url, **kwargs):
-        captured_kwargs.update(kwargs)
-        return _FakeHttpxResponse(
-            {"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"statuses": {}}}}
-        )
-
-    install_fake_httpx(_fake_post)
-
-    ct.default_status_fetcher(project_root)()
-    return captured_kwargs["json"]["params"]["arguments"]["project_root"]
-
-
-def test_default_status_fetcher_sends_absolute_project_root_for_dot(
-    tmp_path, monkeypatch, install_fake_httpx
+def test_default_status_fetcher_raises_status_fetch_unavailable_on_a_tool_error(
+    tmp_path, monkeypatch,
 ):
-    """Task 3291 root cause. fused-memory's `_normalize_project_root` hard-
-    rejects ANY relative path -- verified live against localhost:8002, which
-    answered `{"project_root": "."}` with
-    `{"error": "project_root must be a non-empty absolute path, got: '.'",
-      "error_type": "ValidationError"}`.
+    """An isError reply is a failed fetch, not a done-count of 0."""
+    with (
+        StubMcpServer(stateful=False, answer=StubAnswer.IS_ERROR) as server,
+        pytest.raises(ct.StatusFetchUnavailable) as excinfo,
+    ):
+        _fetch_from(server, monkeypatch, tmp_path)
 
-    census.py resolves its own, now required, `--project-root` (task 3269);
-    the `evaluate` CLI's `"."` default still reaches this resolve. The MCP
-    argument is resolved by the SERVER's cwd, not the client's, so a relative
-    path is meaningless over the wire."""
+    assert server.url in str(excinfo.value)
+
+
+def test_default_status_fetcher_sends_absolute_project_root_for_dot(tmp_path, monkeypatch):
+    """fused-memory's `_normalize_project_root` rejects any relative path: the
+    MCP argument is resolved by the SERVER's cwd, not the client's. The
+    `evaluate` CLI's "." default reaches this resolve."""
     monkeypatch.chdir(tmp_path)
 
-    sent = _capture_get_statuses_project_root(install_fake_httpx, ".")
+    with StubMcpServer(stateful=False, payload={"statuses": {}}) as server:
+        _fetch_from(server, monkeypatch, ".")
+        sent = _get_statuses_arguments(server)["project_root"]
 
     assert sent == str(tmp_path.resolve())
     assert Path(sent).is_absolute()
 
 
 def test_default_status_fetcher_sends_absolute_project_root_for_relative_subdir(
-    tmp_path, monkeypatch, install_fake_httpx
+    tmp_path, monkeypatch,
 ):
-    """Second case so the fix cannot pass by special-casing `"."` alone."""
+    """Second case so the fix cannot pass by special-casing "." alone."""
     (tmp_path / "sub" / "dir").mkdir(parents=True)
     monkeypatch.chdir(tmp_path)
 
-    sent = _capture_get_statuses_project_root(install_fake_httpx, "sub/dir")
+    with StubMcpServer(stateful=False, payload={"statuses": {}}) as server:
+        _fetch_from(server, monkeypatch, "sub/dir")
+        sent = _get_statuses_arguments(server)["project_root"]
 
     assert sent == str((tmp_path / "sub" / "dir").resolve())
     assert Path(sent).is_absolute()
 
 
-def test_default_status_fetcher_leaves_absolute_project_root_unchanged(
-    tmp_path, monkeypatch, install_fake_httpx
-):
-    """The other half of the contract: an ALREADY-absolute root must cross the
-    wire byte-for-byte unchanged. Both tests above start from a relative path,
-    so on their own they would not notice a "fix" that mangles absolute inputs.
-
-    This matters concretely because fused-memory keys its `_MAIN_CHECKOUT_CACHE`
-    on the path it is handed: if `resolve()` were ever to rewrite an operator's
-    configured root (a symlinked home, say `/home/leo` -> elsewhere), the cache
-    key would silently stop matching the configured one. Pinning pass-through
-    for the already-absolute case is what keeps this fix a normalisation of
-    relative paths rather than a rewrite of every path."""
+def test_default_status_fetcher_leaves_absolute_project_root_unchanged(tmp_path, monkeypatch):
+    """An already-absolute root crosses the wire unchanged. fused-memory keys
+    its `_MAIN_CHECKOUT_CACHE` on the path it is handed, so the resolve must
+    normalise relative paths and rewrite nothing else."""
     monkeypatch.chdir(tmp_path)
     absolute_root = str(tmp_path)
 
-    sent = _capture_get_statuses_project_root(install_fake_httpx, absolute_root)
+    with StubMcpServer(stateful=False, payload={"statuses": {}}) as server:
+        _fetch_from(server, monkeypatch, absolute_root)
+        sent = _get_statuses_arguments(server)["project_root"]
 
     assert sent == absolute_root
 
 
-# ---------------------------------------------------------------------------
-# amendment pass (review findings #1/#2): _extract_tool_result() unwraps the
-# real MCP tools/call JSON-RPC envelope. default_status_fetcher's HTTP
-# round-trip is never driven against a real endpoint here -- the tests above
-# inject a fake `httpx` module instead, since anything else makes them depend
-# on whether a live fused-memory MCP server happens to be listening on the
-# default URL; these tests instead exercise the envelope parser
-# directly against realistic tools/call response shapes, and then bridge its
-# output into compute_tasks_landed to pin the exact contract between them.
-# ---------------------------------------------------------------------------
-
-def _done_statuses_envelope(count):
-    return {str(i): "done" for i in range(count)}
-
-
-def test_extract_tool_result_prefers_structured_content():
-    # structuredContent and content disagree on purpose, so a returned value
-    # equal to structuredContent's (not content's) proves precedence.
-    rpc_response = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {
-            "content": [{"type": "text", "text": json.dumps({"statuses": {"decoy": "done"}})}],
-            "structuredContent": {"statuses": {"1": "done"}},
-            "isError": False,
-        },
-    }
-    assert ct._extract_tool_result(rpc_response) == {"statuses": {"1": "done"}}
-
-
-def test_extract_tool_result_falls_back_to_content_text_when_no_structured_content():
-    rpc_response = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {
-            "content": [{"type": "text", "text": json.dumps({"statuses": {"1": "done"}})}],
-            "isError": False,
-        },
-    }
-    assert ct._extract_tool_result(rpc_response) == {"statuses": {"1": "done"}}
-
-
-def test_extract_tool_result_raises_when_no_result_key():
-    # e.g. a JSON-RPC error response, which carries "error" instead of "result".
-    rpc_response = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "boom"}}
-    with pytest.raises(ct.StatusFetchUnavailable):
-        ct._extract_tool_result(rpc_response)
-
-
-def test_extract_tool_result_raises_when_content_text_unparseable():
-    rpc_response = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {"content": [{"type": "text", "text": "not json"}]},
-    }
-    with pytest.raises(ct.StatusFetchUnavailable):
-        ct._extract_tool_result(rpc_response)
-
-
-def test_extract_tool_result_feeds_compute_tasks_landed_correct_delta():
-    """Pins the exact shape contract between a realistic MCP tools/call
-    envelope (as get_statuses actually returns it) and
-    compute_tasks_landed -- closing the gap where only the hand-rolled
-    _wrapped_fetcher test double (which bypasses envelope parsing entirely)
-    was ever exercised. Before the fix, this delta silently came out
-    negative (0 - 500) instead of 130."""
-    statuses = _done_statuses_envelope(630)
+def test_default_status_fetcher_feeds_compute_tasks_landed_the_correct_delta(
+    tmp_path, monkeypatch,
+):
+    """The fetcher's reply is exactly the shape compute_tasks_landed reads:
+    630 done of 645 against a 500 baseline is a delta of 130."""
+    statuses = _done_statuses(630)
     statuses.update({str(i): "pending" for i in range(630, 645)})
-    rpc_response = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {
-            "content": [{"type": "text", "text": json.dumps({"statuses": statuses})}],
-            "structuredContent": {"statuses": statuses},
-            "isError": False,
-        },
-    }
-    state = {"last_census_done_count": 500}
 
-    result = ct.compute_tasks_landed(
-        state=state, status_fetcher=lambda: ct._extract_tool_result(rpc_response)
-    )
+    with StubMcpServer(stateful=False, payload={"statuses": statuses}) as server:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+        result = ct.compute_tasks_landed(
+            state={"last_census_done_count": 500},
+            status_fetcher=ct.default_status_fetcher(tmp_path),
+        )
 
     assert result == 130
 

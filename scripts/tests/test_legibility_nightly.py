@@ -50,6 +50,7 @@ from legibility.config import TrickleCensusCaps, load_config
 from pydantic import ValidationError
 from quality_doc_texts import definition_body, heuristic_headlines
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
+from shared.testing_mcp_stub import StubMcpServer
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures
@@ -1332,9 +1333,8 @@ def test_run_nightly_launches_the_census_once_through_the_injected_launcher(
     )]
 
 
-def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
-    tmp_path, monkeypatch, install_fake_httpx,
-):
+@pytest.mark.usefixtures('unreached_fused_memory')
+def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(tmp_path, monkeypatch):
     """End to end: a max-interval FIRE through run_nightly and the REAL default
     launcher carries the project's census.trickle_caps into census.py's argv,
     and no env: census.py opens its own pooled runner (task 6042), so a pinned
@@ -1345,7 +1345,6 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
     is the global module -- so no census really starts. Non-default caps
     (7/9) make a silent fall-back to the schema default fail.
     """
-    install_fake_httpx(_no_outbound_post)
     root = tmp_path / 'proj_a'
     config_path = _write_config(
         root, project_id='proj_a',
@@ -1654,12 +1653,11 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
 
     @pytest.fixture
     def night(
-        self, tmp_path, monkeypatch, install_fake_httpx, fake_claude_cli,
+        self, tmp_path, monkeypatch, unreached_fused_memory, fake_claude_cli,
         pool_roster, sentinel_login,
     ):
         """A two-account pool behind the fake CLI and the operator's login a
         sentinel no call may read."""
-        install_fake_httpx(_no_outbound_post)
         accounts_file, env_file = pool_roster(_P, _Q)
         opened = _pool_the_night_on(monkeypatch, accounts_file, env_file)
         return fake_claude_cli, pool_roster, sentinel_login, opened
@@ -1853,11 +1851,11 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         assert result.coder_status == 'ok'
         assert [record['closed'] for record in opened] == [1]
 
-    def test_an_injected_invoke_opens_no_runner(self, tmp_path, monkeypatch, install_fake_httpx):
+    @pytest.mark.usefixtures('unreached_fused_memory')
+    def test_an_injected_invoke_opens_no_runner(self, tmp_path, monkeypatch):
         """Every other run_nightly test here injects an invoke stub and
         depends on the default never clobbering it -- nor opening a pool,
         which would read the operator's own .env."""
-        install_fake_httpx(_no_outbound_post)
         monkeypatch.setattr(
             session_runner, 'open_pooled_runner',
             lambda *a, **k: pytest.fail('no runner may be opened on the injected path'),
@@ -1910,12 +1908,15 @@ _HAND_DIGEST_FOR_IDENTITY = (
 )
 
 
-def _no_outbound_post(url, **kwargs):
-    """An httpx.post stub that fails LOUDLY rather than returning a plausible
-    reply. Every seam in these runs is injected, so a POST reaching the wire
-    means a seam silently resolved to its live implementation -- exactly the
-    fault this class exists to pin, and it must not pass quietly."""
-    pytest.fail(f'unexpected outbound POST to {url!r} -- every seam is injected')
+@pytest.fixture
+def unreached_fused_memory(monkeypatch):
+    """A live fused-memory stand-in behind FUSED_MEMORY_MCP_URL that the test
+    must never reach. Every seam in these runs is injected, so a request
+    arriving here means a seam silently resolved to its live implementation."""
+    with StubMcpServer(stateful=False) as server:
+        monkeypatch.setenv('FUSED_MEMORY_MCP_URL', server.url)
+        yield server
+    assert server.requests == (), f'unexpected fused-memory requests: {server.requests}'
 
 
 # ---------------------------------------------------------------------------
@@ -4634,8 +4635,8 @@ class TestEveryPassEndsWithOneJournalLine:
         assert lines == [result.journal_line() for result in results]
         assert ['pass=scheduled' in lines[0], 'pass=retry' in lines[1]] == [True, True]
 
-    def test_the_systemd_entry_journals_it(self, tmp_path, monkeypatch, caplog, install_fake_httpx):
-        install_fake_httpx(_no_outbound_post)
+    @pytest.mark.usefixtures('unreached_fused_memory')
+    def test_the_systemd_entry_journals_it(self, tmp_path, monkeypatch, caplog):
         _spy_census_subprocess_and_stub_pool(monkeypatch)
         config_path = _write_config(tmp_path, project_id='proj_a')
         projects_root = tmp_path / 'projects'
@@ -5913,28 +5914,6 @@ def test_an_injected_selector_s_suppressed_sample_is_a_budget_suppressed_night(t
     assert skip_sessions == frozenset()
 
 
-class _FakeStatefulResponse:
-    """An `httpx.Response` stand-in for the stateful-server handshake."""
-
-    def __init__(self, *, status_code=200, headers=None, payload=None, text=''):
-        self.status_code = status_code
-        self.headers = headers or {}
-        self.text = text
-        self._payload = payload
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            # A plain RuntimeError, not httpx.HTTPStatusError: the shared
-            # install_fake_httpx stub exposes only `post` and pytest.fails on
-            # any other attribute (task 3376).
-            raise RuntimeError(f'HTTP {self.status_code}')
-
-    def json(self):
-        if self._payload is None:
-            raise ValueError('response has no JSON body')
-        return self._payload
-
-
 # ---------------------------------------------------------------------------
 # task 4148: the tasks-landed condition, end to end through the PRODUCTION
 # entrypoint.
@@ -5948,8 +5927,9 @@ class _FakeStatefulResponse:
 # "tasks-landed: no status_fetcher configured -- condition (b) fails safe".
 #
 # main() injects nothing, so these two reach the REAL status fetcher and the
-# REAL census launcher: they fake httpx (conftest's `install_fake_httpx`) and
-# spy the census.py subprocess (`_spy_census_subprocess_and_stub_pool`).
+# REAL census launcher: they serve fused-memory from a StubMcpServer behind
+# FUSED_MEMORY_MCP_URL and spy the census.py subprocess
+# (`_spy_census_subprocess_and_stub_pool`).
 # ---------------------------------------------------------------------------
 
 class _UnusedRunner:
@@ -5991,9 +5971,7 @@ def _spy_census_subprocess_and_stub_pool(monkeypatch):
     return census_argvs
 
 
-def test_main_run_fires_the_tasks_landed_condition_end_to_end(
-    tmp_path, monkeypatch, caplog, install_fake_httpx,
-):
+def test_main_run_fires_the_tasks_landed_condition_end_to_end(tmp_path, monkeypatch, caplog):
     """Drive `nightly.main(['run', '--config', ...])` -- the systemd-invoked
     CLI -- against a project whose census baseline is 8 days and 130 done
     tasks stale, and assert condition (b) fires, that the absolute
@@ -6028,24 +6006,7 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
     )
 
     # 1130 done - 1000 baseline = 130 landed, over the 120 threshold.
-    recorded = []
-
-    def _fake_post(url, **kwargs):
-        recorded.append((url, kwargs))
-        return _FakeStatefulResponse(
-            headers={'content-type': 'application/json'},
-            payload={
-                'jsonrpc': '2.0',
-                'id': 1,
-                'result': {
-                    'structuredContent': {
-                        'statuses': {f't{i}': 'done' for i in range(1130)},
-                    },
-                },
-            },
-        )
-
-    install_fake_httpx(_fake_post)
+    done = {'statuses': {f't{i}': 'done' for i in range(1130)}}
 
     census_argvs = _spy_census_subprocess_and_stub_pool(monkeypatch)
 
@@ -6060,7 +6021,11 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
     # `configure_logging` goes through `logging.basicConfig`, a documented
     # no-op while root has handlers, so main()'s call cannot leak root state
     # for as long as caplog's handler is installed.
-    with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+    with (
+        StubMcpServer(stateful=False, payload=done) as fused_memory,
+        caplog.at_level(logging.INFO, logger='legibility.nightly'),
+    ):
+        monkeypatch.setenv('FUSED_MEMORY_MCP_URL', fused_memory.url)
         exit_code = nightly.main([
             'run', '--config', str(config_path),
             '--projects-root', str(projects_root),
@@ -6082,11 +6047,11 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
     # fused-memory's _normalize_project_root hard-rejects a relative path.
     cfg = load_config(config_path)
     get_statuses_calls = [
-        kwargs for _url, kwargs in recorded
-        if (kwargs.get('json') or {}).get('params', {}).get('name') == 'get_statuses'
+        r.body['params']['arguments'] for r in fused_memory.requests
+        if isinstance(r.body, dict) and r.body.get('params', {}).get('name') == 'get_statuses'
     ]
-    assert len(get_statuses_calls) == 1, recorded
-    sent_root = get_statuses_calls[0]['json']['params']['arguments']['project_root']
+    assert len(get_statuses_calls) == 1, fused_memory.requests
+    sent_root = get_statuses_calls[0]['project_root']
     assert sent_root == str(cfg.project_root)
     assert Path(sent_root).is_absolute()
 
@@ -6109,7 +6074,7 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
 
 
 def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memory(
-    tmp_path, monkeypatch, caplog, install_fake_httpx,
+    tmp_path, monkeypatch, caplog,
 ):
     """The twin of the test above, on the FAILURE path (task 4148 amendment).
 
@@ -6144,17 +6109,10 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
         legibility_dir / 'confusion-codebook.yaml',
     )
 
-    # fused-memory down. `post_mcp_envelope` touches only `httpx.post` and
-    # `httpx.delete` (task 3376) and lets transport exceptions escape
-    # verbatim, so this reaches `default_status_fetcher`'s wrapper and comes
-    # out as StatusFetchUnavailable -- the real production shape.
-    posts = []
-
-    def _refusing_post(url, **kwargs):
-        posts.append((url, kwargs))
-        raise ConnectionError('[Errno 111] Connection refused')
-
-    install_fake_httpx(_refusing_post)
+    # fused-memory down: FUSED_MEMORY_MCP_URL names a port nothing listens on.
+    with StubMcpServer(stateful=False) as fused_memory:
+        pass
+    monkeypatch.setenv('FUSED_MEMORY_MCP_URL', fused_memory.url)
 
     census_argvs = _spy_census_subprocess_and_stub_pool(monkeypatch)
 
@@ -6174,16 +6132,10 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
     assert exit_code == 0
     assert census_argvs == [], messages
 
-    # ...but the fetch really was attempted through the DEFAULTED seam, so
-    # this test cannot go green on a fetcher that was never built.
-    get_statuses_calls = [
-        kwargs for _url, kwargs in posts
-        if (kwargs.get('json') or {}).get('params', {}).get('name') == 'get_statuses'
-    ]
-    assert len(get_statuses_calls) == 1, posts
-
-    # The failure is legible on both channels an operator has: the specific
-    # WARNING naming the fetch, and the one-line NO-FIRE decision.
+    # ...but the fetch really was attempted through the DEFAULTED seam: a
+    # refused connection leaves no request to count, so the WARNING naming
+    # the failed fetch is that proof, and the one-line NO-FIRE decision is
+    # the other channel an operator has.
     assert any('tasks-landed: status_fetcher failed' in m for m in messages), messages
     assert any(
         m.startswith('legibility trickle: census trigger: NO-FIRE')
