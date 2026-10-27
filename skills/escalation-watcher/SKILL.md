@@ -813,8 +813,8 @@ human — Priority 3b, an AFK-mode deferral, a B3 gate abort/drift-pending outco
 ADDITION to** (not instead of) the in-session note and the `afk-digest.md` line. The registry is
 what makes the cockpit decision queue (C5b) a return-triage surface, and the 05:30 return brief,
 `data/return-brief.md`, reads it too: that brief is the primary pull-on-return surface and
-supersedes `afk-digest.md`. The digest is **retained** (demoted to a generated history view, not
-removed in this batch), so nothing that already reads it breaks.
+supersedes `afk-digest.md`. The digest is **retained** (demoted to a generated history view),
+so nothing that already reads it breaks.
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
@@ -1984,9 +1984,9 @@ mcp__escalation__resolve_issue(
 - **No plan, no widen.** A task that never reached the architect (no `plan.json` in either `.task-meta/<worktree>/` or the legacy `<worktree>/.task/`) has no scope to widen; the fold logs a DEBUG and skips, and the re-pend still happens.
 - **The re-block guard outranks the grant.** If the guard withholds the flip, nothing is re-pended, so nothing is widened.
 
-Module **locks** follow `plan.files` and are re-derived at the next plan boundary by `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._reconcile_scope_locks`, which persists `metadata.files = plan_files`.
+Module **locks** follow `plan.files`, but the fold does not touch them directly: `orchestrator/src/orchestrator/scheduler.py::Scheduler._get_modules` is cache-first, and the task's narrow `_module_cache` entry from its prior dispatch outlives the escalation, so the old lock can stand until the next plan boundary. There `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._reconcile_scope_locks` re-derives the locks and persists `metadata.files = plan_files`.
 
-Do **not** hand-write `metadata.files` yourself to simulate the fold. Beyond being redundant now, a metadata-only write is self-reverting for exactly that reason, and it is not consulted for lock derivation while the module cache is warm.
+Do **not** hand-write `metadata.files` yourself to simulate the fold. Beyond being redundant now, a metadata-only write is self-reverting for exactly that reason, and it is not consulted for lock derivation while that `_module_cache` entry stands.
 
 Do **not** try to widen scope by writing `modules` into task metadata. Lock derivation (`Scheduler._get_modules`) reads `metadata.files` and has never read that key, so such a write is a silent no-op that reports success. A lock conflict on the grant is handled orchestrator-side — the task requeues rather than resuming under another task's lock.
 
@@ -2497,8 +2497,8 @@ writing capped headers into `.mcp.json`.
 
 ## Red-on-main recovery (enforce-safe, break-glass)
 
-A bad merge has turned `main` RED and the ref must move back to a known-good SHA — typically the
-`bad-merge-to-main:*` `infra_issue` L2 the auto-watcher promotes with option A. Follow
+When a bad merge has turned `main` RED and the ref must move back to a known-good SHA (typically
+the `bad-merge-to-main:*` `infra_issue` L2 the auto-watcher promotes with option A), follow
 `$DARK_FACTORY_ROOT/skills/escalation-watcher/references/red-on-main-recovery.md`: one atomic
 `recover_main` move, then the fix re-lands through the merge queue.
 
