@@ -134,10 +134,9 @@ RECON_RUN_REVIEW_HEADINGS: tuple[str, ...] = (
     '## reconciliation run review', '### run metadata', '### stage reports',
 )
 """Injected reconciliation run-review PROMPT heading literals
-(fused_memory/reconciliation/judge.py:411 ``ReconciliationJudge.
-_build_review_prompt`` emits '## Reconciliation Run Review', '### Run
-Metadata', '### Stage Reports', '### MCP Actions (N total)' and '###
-Journal Entries (N total)' as a single f-string). The three
+(``fused_memory/reconciliation/judge.py::Judge._build_review_prompt``
+emits '## Reconciliation Run Review', '### Run Metadata', '### Stage
+Reports' and '### MCP Actions (N total)' as a single f-string). The three
 parenthesis-free headings are used so the marker is an exact line match;
 all must co-occur as line-anchored headings (all(), not any() -- the same
 false-positive guard as HARNESS_BRIEFING_HEADINGS).
