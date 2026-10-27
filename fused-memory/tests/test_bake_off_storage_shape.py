@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import functools
 import re
+import subprocess
 import types
 from collections.abc import Container
 from pathlib import Path
@@ -4151,9 +4152,6 @@ class TestTheTwoArtifactsAreWrittenAsAPair:
         assert md_path.read_text(encoding='utf-8') == mod.render_markdown(
             json.loads(json_path.read_text(encoding='utf-8'))
         )
-
-
-import subprocess  # noqa: E402
 
 
 class TestFixtureProvenance:

@@ -276,12 +276,8 @@ class TestABlobHeadDoesNotHoldIsReported:
         _git(tmp_path, 'checkout', '-q', 'task')
         _git(tmp_path, 'rebase', '-q', 'main')
 
-        rewritten = subprocess.run(
-            ['git', '-C', str(tmp_path), 'merge-base', '--is-ancestor',
-             stamp['commit'], 'HEAD'],
-            capture_output=True, text=True, check=False,
-        )
-        assert rewritten.returncode == 1
+        assert _git(tmp_path, 'rev-parse', 'HEAD^') == _git(tmp_path, 'rev-parse', 'main')
+        assert _git(tmp_path, 'rev-parse', 'HEAD') != stamp['commit']
         assert _blobs_head_does_not_hold([stamp], repo=tmp_path) == []
 
 
