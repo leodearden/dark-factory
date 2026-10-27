@@ -1138,7 +1138,7 @@ def _call_tool(base_url: str, tool: str, arguments: dict[str, object], *, timeou
 
 def _server_base(endpoint_url: str) -> str:
     """The server base of an MCP endpoint URL, the form the dashboard config and --escalation-url speak."""
-    return endpoint_url.removesuffix('/mcp')
+    return endpoint_url.rstrip('/').removesuffix('/mcp')
 
 
 def build_ports(project_root: Path, *, fused_memory_url: str | None, escalation_mcp_url: str | None) -> Ports:

@@ -1233,15 +1233,18 @@ def _served_tool_calls(server: StubMcpServer) -> list[tuple[str, object]]:
     ]
 
 
-def test_build_ports_reach_fused_memory_at_its_base_and_escalation_at_its_endpoint(tmp_path: Path):
+@pytest.mark.parametrize('endpoint_suffix', ['/mcp', '/mcp/'])
+def test_build_ports_reach_fused_memory_at_its_base_and_escalation_at_its_endpoint(
+    tmp_path: Path, endpoint_suffix: str
+):
     """The fused-memory URL is a server base; the escalation URL is the
-    endpoint form escalation_url() returns."""
+    endpoint form escalation_url() returns, with or without a trailing slash."""
     with (
         StubMcpServer(stateful=False, payload={'tasks': []}) as fused_memory,
         StubMcpServer(stateful=True, payload={'result': []}) as escalation,
     ):
         ports = build_ports(
-            tmp_path, fused_memory_url=fused_memory.url, escalation_mcp_url=f'{escalation.url}/mcp'
+            tmp_path, fused_memory_url=fused_memory.url, escalation_mcp_url=f'{escalation.url}{endpoint_suffix}'
         )
 
         assert ports.fused_memory('get_tasks', {'project_root': '/r'}) == {'tasks': []}
