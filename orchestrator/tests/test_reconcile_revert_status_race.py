@@ -10,6 +10,7 @@ the real rejection payload shapes.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -294,3 +295,31 @@ async def test_unreadable_live_status_fails_open_and_reverts(
     assert ('set_task_status', 'pending') in [
         (name, row['status']) for name, row in store.writes
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_revert_is_escalated_under_the_transition_it_attempted(
+    revert_harness: Harness, store: _ServerGatedRowStore, queue: EscalationQueue,
+    caplog: pytest.LogCaptureFixture, forbid_live_mcp,
+) -> None:
+    store.refusal = _illegal_transition('in-progress', 'pending')
+
+    with caplog.at_level(logging.ERROR, logger='orchestrator.harness'):
+        await _sweep(revert_harness)
+
+    filed = [
+        esc for esc in queue.get_by_task(TID, status='pending')
+        if esc.category == 'reconcile_persistent_rejection'
+    ]
+    assert len(filed) == 1
+    esc = filed[0]
+    assert esc.summary == f'Reconcile sweep write refused for task {TID}: in-progress -> pending'
+    assert 'attempted transition: in-progress -> pending\n' in esc.detail
+    assert 'error_code: illegal_transition\n' in esc.detail
+    assert 'set_task_status(done)' not in esc.detail
+    assert 'mark task' not in esc.summary
+    assert [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR
+        and f'reconcile write refused for task {TID} (in-progress -> pending)' in r.getMessage()
+    ] != []

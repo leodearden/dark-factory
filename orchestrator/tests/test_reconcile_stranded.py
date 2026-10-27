@@ -2711,7 +2711,7 @@ async def test_one_task_rejection_does_not_kill_sweep(harness: Harness, caplog):
     assert not hasattr(harness, '_reconcile_failure_counts')
     # Honest log mentions the error_code, not "marked done".
     assert any(
-        'failed to mark task 100 done' in r.getMessage()
+        'reconcile write refused for task 100 (unknown -> done)' in r.getMessage()
         and 'done_gate_missing_files' in r.getMessage()
         for r in caplog.records
     )
