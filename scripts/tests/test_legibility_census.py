@@ -6166,7 +6166,7 @@ def test_main_cost_control_flags_thread_into_run_census(tmp_path, monkeypatch):
     )
 
 
-def test_main_requires_project_root(tmp_path, monkeypatch, capsys, install_fake_httpx):
+def test_main_requires_project_root(tmp_path, monkeypatch, capsys):
     """The census must REFUSE to guess its target from the process cwd.
 
     An implicit-cwd default on a money-spending entrypoint is the root enabler
@@ -6178,7 +6178,6 @@ def test_main_requires_project_root(tmp_path, monkeypatch, capsys, install_fake_
     # An EMPTY cwd: were the flag silently defaulted, "." must not resolve to
     # a tree holding a real legibility.yaml (the worktree root does).
     monkeypatch.chdir(tmp_path)
-    install_fake_httpx(lambda *a, **k: pytest.fail("no network on this path"))
     monkeypatch.setattr(mod, "run_census", _poison("run_census"))
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
@@ -6190,7 +6189,7 @@ def test_main_requires_project_root(tmp_path, monkeypatch, capsys, install_fake_
 
 
 def test_main_rejects_a_project_root_that_disagrees_with_the_config(
-    tmp_path, monkeypatch, capsys, install_fake_httpx,
+    tmp_path, monkeypatch, capsys,
 ):
     """Two sources for "which project is this?" must agree, or the run stops.
 
@@ -6203,18 +6202,23 @@ def test_main_rejects_a_project_root_that_disagrees_with_the_config(
     project_a = tmp_path / "project_a"
     project_b = tmp_path / "project_b"
     project_a.mkdir()
-    config_b = _write_legibility_yaml(project_b, project_id="project_b")
-    install_fake_httpx(lambda *a, **k: pytest.fail("no network on this path"))
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
-    exit_code = mod.main([
-        "--project-root", str(project_a), "--config", str(config_b), "--force",
-    ])
+    with StubMcpServer(stateful=True) as server:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+        config_b = _write_legibility_yaml(
+            project_b, project_id="project_b", escalation_port=int(server.url.rsplit(":", 1)[1]),
+        )
+        exit_code = mod.main([
+            "--project-root", str(project_a), "--config", str(config_b), "--force",
+        ])
+        requests = server.requests
 
     assert exit_code == 1
     assert fake_run_census.calls == [], "a mixed-project run must stop before any billable work"
+    assert requests == (), f"a pytest run must reach no real MCP endpoint: {requests}"
     err = capsys.readouterr().err
     # BOTH sides must be named, or the operator cannot tell which one is wrong.
     assert str(project_a) in err
@@ -10226,26 +10230,6 @@ def _main_task_store(tmp_path, monkeypatch, *, outcome=None):
     return kwargs["task_store"]
 
 
-def test_main_hands_run_census_a_task_store_on_the_fused_memory_endpoint(tmp_path, monkeypatch):
-    monkeypatch.setenv("FUSED_MEMORY_MCP_URL", "http://fused-memory.test:9999")
-    posts = []
-
-    def rec(url, tool_name, arguments, *, timeout=None):
-        posts.append((url, tool_name, arguments))
-        return _EMPTY_FIND_PAGE
-
-    monkeypatch.setattr(mod, "_post_mcp_tool_call", rec)
-    store = _main_task_store(tmp_path, monkeypatch)
-
-    assert store.find_tasks_by_metadata("/abs/root", key="x_finding_key", value="fk-000000000000") == ()
-
-    [(url, tool_name, arguments)] = posts
-    assert (url, tool_name) == ("http://fused-memory.test:9999", "find_tasks_by_metadata")
-    assert {key: arguments[key] for key in ("project_root", "key", "value")} == {
-        "project_root": "/abs/root", "key": "x_finding_key", "value": "fk-000000000000",
-    }
-
-
 def _tool_calls(server):
     return [
         (request.body["params"]["name"], request.body["params"]["arguments"])
@@ -10254,13 +10238,15 @@ def _tool_calls(server):
     ]
 
 
-def test_the_fused_memory_poster_serves_a_task_store_over_a_real_socket():
+def test_main_hands_run_census_a_task_store_on_the_fused_memory_base_url(tmp_path, monkeypatch):
     with StubMcpServer(stateful=False, payload=_EMPTY_FIND_PAGE) as server:
-        store = task_store.McpTaskStore(url=server.url, post=mod._post_mcp_tool_call)
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+        store = _main_task_store(tmp_path, monkeypatch)
         with alarm.own_endpoint():
             hits = store.find_tasks_by_metadata("/abs/root", key="x_finding_key", value="fk-000000000000")
 
     assert hits == ()
+    assert {request.path for request in server.requests} == {"/mcp"}
     [(tool_name, arguments)] = _tool_calls(server)
     assert tool_name == "find_tasks_by_metadata"
     assert {key: arguments[key] for key in ("project_root", "key", "value", "offset")} == {
