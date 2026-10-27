@@ -390,6 +390,15 @@ another project's files. A submission from an **unregistered** filer, or one
 that **mixes** local and foreign files, is **not** tagged and stays a hard
 path-scope reject (the task-2206 anti-bypass guard is preserved).
 
+Ownership of a **relative** `metadata.files` entry is resolved against the
+filing project's own root first: an entry whose leading directory exists in
+the filing project is that project's, even when another registered project
+has a same-named top-level directory (a stream_touch `sessions/…` entry is
+never credited to mission_control). Only an entry whose leading directory
+exists solely in another project makes the task cross-repo; generic names
+such as `docs/` or `src/` count for neither side. The rule has one home:
+`fused-memory/src/fused_memory/middleware/project_prefix_registry.py::ProjectPrefixRegistry.attributed_owner`.
+
 When the marker is present, the orchestrator pre-merge narrowing gate treats
 the task as a cross-repo deliverable: instead of flagging "files not
 touched" and forcing a dishonest plan-narrowing pass, it routes the merge
