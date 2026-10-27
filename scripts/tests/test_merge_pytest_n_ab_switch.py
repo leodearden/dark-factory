@@ -198,9 +198,8 @@ def test_converged_resume_over_the_real_stateful_transport(tmp_path):
     a 400 before any tool runs -- so exiting 0 here cannot be luck.
 
     The sequence is asserted as "some tools/call AFTER the initialize", not
-    as a fixed list: `post_mcp_envelope` is deliberately ADAPTIVE, sending
-    the envelope session-less first and handshaking only on the 400, so the
-    real wire also carries a rejected tools/call ahead of the handshake.
+    as a fixed list: what this script depends on is a handshake before the
+    tool, not the client's full message sequence.
 
     The session it opened is asserted CLOSED for the same reason it is
     asserted opened: both are wire facts this script depends on and cannot

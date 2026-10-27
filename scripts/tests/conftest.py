@@ -299,9 +299,8 @@ def install_fake_httpx(monkeypatch):
     httpx IS installed here — a direct dependency of ``shared``
     (``shared/pyproject.toml``, ``httpx>=0.27``, added for task 2965) — so the
     lazy, function-local ``import httpx`` in the modules under test resolves to
-    the real library and its POST genuinely goes out to
-    ``$FUSED_MEMORY_MCP_URL`` (default ``localhost:8002``).  On any box running
-    the fused-memory stack that POST SUCCEEDS, so a test leaning on ambient
+    the real library and its request genuinely goes out.  On any box where the
+    target is listening that request SUCCEEDS, so a test leaning on ambient
     unreachability flaps with the host's listener state — the exact defect
     tasks 3237/3291 fixed by injecting a fake.  Injecting makes both the
     request shape assertable and the failure path deterministic regardless of
@@ -312,19 +311,17 @@ def install_fake_httpx(monkeypatch):
 
     The stub exposes ``post``, and ``get``/``delete`` when a caller supplies
     one (task 3713: readiness polling hits GET ``/health`` and GET
-    ``/v1/models``, which a POST-only stub cannot express; task 3644:
-    ``census_trigger.post_mcp_envelope`` DELETEs the ``/mcp`` endpoint to
-    terminate the MCP session it opened, so the server does not leak one
-    session dict entry + one live anyio task per legibility escalation).
+    ``/v1/models``, which a POST-only stub cannot express).
     Both stay OPT-IN rather than no-arg defaults, so a module that starts
     issuing a verb without its test saying so still lands in the loud-miss
     path below instead of silently receiving a stub response nobody wrote.
 
     Any OTHER attribute is a loud ``pytest.fail`` rather than an
-    ``AttributeError``, because ``default_status_fetcher`` funnels every
-    ``Exception`` into ``StatusFetchUnavailable``: a future production change
-    reaching for e.g. ``httpx.Timeout`` or ``except httpx.HTTPError`` would
-    otherwise keep its test green off the stub's own miss.  ``pytest.fail``
+    ``AttributeError``, because a module under test whose error boundary is
+    ``except Exception`` would turn the miss into its own failure: a future
+    production change reaching for e.g. ``httpx.Timeout`` or
+    ``except httpx.HTTPError`` would otherwise keep its test green off the
+    stub's own miss.  ``pytest.fail``
     raises a ``BaseException``, which such a handler cannot swallow.  Dunders
     stay ordinary ``AttributeError``s so import machinery and introspection can
     still probe the module.
