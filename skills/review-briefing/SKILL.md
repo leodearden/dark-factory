@@ -188,11 +188,11 @@ Write anything you learned about the project's intent, priorities, or review con
 
 ```
 add_memory(
-  content="Review briefing created/updated. Key context: {notable discoveries about project intent, user priorities, or conventions}",
+  content="Review briefing created/updated. Key context: {notable discoveries about project intent, user priorities, or conventions}. New known gap accepted by task 3127.",
   category="observations_and_summaries",
   project_id="<project_id>",
   agent_id="claude-review-briefing",
-  entities=[]
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the acceptance task a new known_gaps entry points at as accepted_by, filed per "Every known gap needs an owning task", here and in content; [] if none was filed
 )
 ```
 
