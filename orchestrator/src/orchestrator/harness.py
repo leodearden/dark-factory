@@ -161,7 +161,6 @@ from orchestrator.scheduler import (
     SchedulerCallbacks,
     SetTaskStatusRejected,
     StaleEvidenceRejection,
-    TerminalExitRejection,
 )
 from orchestrator.service_restart import (
     FLEET_DEPLOY_CLOCK_RELPATH,
@@ -7087,10 +7086,9 @@ class Harness:
         """Revert a stranded in-progress task to pending (REVERT_TO_PENDING applier).
 
         Returns ``'reverted'`` (status flipped to pending) or ``None`` (left
-        intact — the sole remaining early-return is the infra-held
-        non-degenerate branch guard below; task 2763 removed the
-        unreadable-lock fail-closed early-return along with the worktree
-        plan.lock read that produced it).
+        intact: the infra-held non-degenerate branch guard below, or the row
+        was already terminal at the live status re-read just before the write,
+        or by the time the write reached the server).
 
         Callers only reach this on the REVERT_TO_PENDING action:
         ``TaskGroundTruth.recovery_for``'s ``live_claimant`` resolution has
@@ -7246,7 +7244,25 @@ class Harness:
         # exist; the suppress + missing_ok keep it a harmless no-op then.
         with contextlib.suppress(OSError):
             lock_path.unlink(missing_ok=True)
-        await self.scheduler.clear_claim_then_set_status(tid, 'pending')
+        live_status = await self.scheduler.get_status(tid)
+        if live_status in TERMINAL_STATUSES:
+            logger.info(
+                'Reconcile: task %s is already %s — skipping the stale pending '
+                'revert (status snapshot predates it)',
+                tid, live_status,
+            )
+            return None
+        try:
+            await self.scheduler.clear_claim_then_set_status(tid, 'pending')
+        except SetTaskStatusRejected as exc:
+            if not exc.row_already_terminal:
+                raise
+            logger.info(
+                'Reconcile: task %s went terminal between the live re-read and '
+                'the write — pending revert refused (%s); nothing to recover',
+                tid, exc.attempted_transition,
+            )
+            return None
         logger.info(
             'Reconcile: reverted task %s to pending', tid
         )
@@ -7470,8 +7486,8 @@ class Harness:
         NON-transient rejections, so an exception reaching this caller is by
         construction post-retry and a caller-level re-retry would be dead code.
 
-        Carve-out: a :class:`TerminalExitRejection` whose ``old_status`` is
-        terminal is a legitimately-finished row, not a hold.  Nothing is stuck
+        Carve-out: a rejection whose ``row_already_terminal`` holds is a
+        legitimately-finished row, not a hold.  Nothing is stuck
         and nobody needs to investigate, so it is logged at INFO and NOT filed —
         filing there would be pure noise on a common, benign race.
 
@@ -7489,7 +7505,7 @@ class Harness:
         fire-and-forget, so an exception escaping here would surface only as an
         unretrieved-task-exception at GC time — i.e. be lost.
         """
-        if isinstance(exc, TerminalExitRejection) and exc.old_status in TERMINAL_STATUSES:
+        if isinstance(exc, SetTaskStatusRejected) and exc.row_already_terminal:
             logger.info(
                 'cascade-unblock: resume of task %s to %r refused because the row '
                 'is already %s — legitimately finished out of band, not a hold; '
