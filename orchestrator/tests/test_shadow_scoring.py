@@ -13,9 +13,8 @@ from orchestrator.shadow_scoring import (
     consequence_leg_warranted,
     score_architect_cell,
     score_implementer_cell,
-    scoring_rule_for,
 )
-from orchestrator.shadow_types import ReferenceKind, ShadowShape
+from orchestrator.shadow_types import ReferenceKind
 
 _LANDED = ShadowReference.landed('b' * 40)
 _NONE = ShadowReference.none()
@@ -56,18 +55,6 @@ class TestShadowReference:
     def test_a_none_reference_with_a_sha_is_refused(self):
         with pytest.raises(ValueError, match='sha'):
             ShadowReference(ReferenceKind.NONE, 'b' * 40)
-
-
-class TestScoringRuleFor:
-    def test_architect_takes_the_architect_rule(self):
-        assert scoring_rule_for(ShadowShape.ARCHITECT) is score_architect_cell
-
-    @pytest.mark.parametrize(
-        'shape',
-        [ShadowShape.IMPLEMENTER, ShadowShape.ARCHITECT_CONSEQUENCE, ShadowShape.END_TO_END],
-    )
-    def test_every_implementing_shape_takes_the_implementer_rule(self, shape):
-        assert scoring_rule_for(shape) is score_implementer_cell
 
 
 class TestScoreImplementerCell:

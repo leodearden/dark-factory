@@ -4,7 +4,8 @@ One purpose: given a cell's persisted ``EvalMetrics`` and the reference its row
 settled against, say what the cell scores. The coordinator consumes it for the
 consequence leg-2 gate, and theta1's report applies the same rules to the
 persisted metrics and the row's reference, so a score is always derived and
-never stored as a copy (INV-9).
+never stored as a copy (INV-9). A caller picks the rule by the cell's shape:
+only an architect cell is scored as a plan, and only its rule reads one.
 
 ``EvalMetrics.composite_score`` as ``collect_metrics`` computed it is NOT the
 shadow score of a ``reference_kind=none`` cell: C4 leaves that cell's composite
@@ -13,12 +14,11 @@ shadow score of a ``reference_kind=none`` cell: C4 leaves that cell's composite
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from orchestrator.evals.judge import score_plan_structure
-from orchestrator.evals.metrics import DECLINE_KINDS, EvalMetrics, compute_composite
-from orchestrator.shadow_types import ReferenceKind, ShadowShape
+from orchestrator.evals.metrics import EvalMetrics, compute_composite
+from orchestrator.shadow_types import ReferenceKind
 
 __all__ = [
     'ArchitectScore',
@@ -27,7 +27,6 @@ __all__ = [
     'consequence_leg_warranted',
     'score_architect_cell',
     'score_implementer_cell',
-    'scoring_rule_for',
 ]
 
 _PLANNED = 'planned'
@@ -78,6 +77,7 @@ class ArchitectScore:
 
 
 def score_implementer_cell(metrics: EvalMetrics, reference: ShadowReference) -> ImplementerScore:
+    """Score an ``implementer``, ``end-to-end`` or consequence leg-2 cell."""
     landed = reference.kind is ReferenceKind.LANDED
     return ImplementerScore(
         reference_kind=reference.kind,
@@ -92,20 +92,11 @@ def score_implementer_cell(metrics: EvalMetrics, reference: ShadowReference) -> 
 def score_architect_cell(
     metrics: EvalMetrics, reference: ShadowReference, plan: dict | None,
 ) -> ArchitectScore:
-    """Score an architect cell; *plan* is the plan it produced, ``None`` for a decline."""
+    """Score an ``architect`` cell; *plan* is the plan it produced, ``None`` for a decline."""
     if reference.kind is ReferenceKind.LANDED:
         judged = None if metrics.judged_without_reference else metrics.plan_quality
         return ArchitectScore(reference.kind, metrics.terminal_kind, judged, None)
     return ArchitectScore(reference.kind, metrics.terminal_kind, None, score_plan_structure(plan))
-
-
-def scoring_rule_for(
-    shape: ShadowShape,
-) -> Callable[..., ImplementerScore | ArchitectScore]:
-    """C4's row for *shape*: only the architect leg is scored as a plan."""
-    if shape is ShadowShape.ARCHITECT:
-        return score_architect_cell
-    return score_implementer_cell
 
 
 def consequence_leg_warranted(metrics: EvalMetrics) -> bool:
@@ -113,6 +104,4 @@ def consequence_leg_warranted(metrics: EvalMetrics) -> bool:
 
     The last terminal call wins, so a plan followed by a decline is a decline.
     """
-    if metrics.terminal_kind in DECLINE_KINDS:
-        return False
     return metrics.terminal_kind == _PLANNED and metrics.plan_steps > 0
