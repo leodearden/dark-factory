@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -29,6 +30,7 @@ from shared.cost_store import CostStore
 from orchestrator.event_store import EventType, ShadowSkipReason
 from orchestrator.run_store import ShadowCell, ShadowCellQuery
 from orchestrator.shadow_eval import (
+    COST_UNREADABLE_PAUSE,
     PRODUCTION_COST_BASIS,
     TRAILING_WINDOW,
     CostPair,
@@ -150,6 +152,7 @@ _CALM = StormFacts(
     run_ends_newest_first=(_ended('c1', _S.SETTLED),),
     failure_streak_pause=3,
     ratios={'glm-5.3-endpoint': cost_ratio_verdict([_pair(1.0, _SUB, 1.0)], ceiling=3.0)},
+    cost_unreadable_streak=0,
 )
 _OVER_BUDGET = {'spent_usd': 1.2}
 _STREAK = {
@@ -189,6 +192,32 @@ class TestEvaluateStorm:
         assert 'minimax-m3-endpoint' in trip.detail
         assert '4.50' in trip.detail
         assert '3.00' in trip.detail
+
+    def test_a_cost_read_failing_too_often_trips_naming_the_count(self):
+        trip = evaluate_storm(
+            dataclasses.replace(_CALM, ratios={}, cost_unreadable_streak=COST_UNREADABLE_PAUSE),
+        )
+
+        assert trip is not None
+        assert trip.cause is ShadowStormCause.COST_UNREADABLE
+        assert str(COST_UNREADABLE_PAUSE) in trip.detail
+
+    def test_fewer_failed_cost_reads_trip_nothing(self):
+        facts = dataclasses.replace(
+            _CALM, ratios={}, cost_unreadable_streak=COST_UNREADABLE_PAUSE - 1,
+        )
+
+        assert evaluate_storm(facts) is None
+
+    def test_the_streak_outranks_an_unreadable_cost_store(self):
+        facts = dataclasses.replace(
+            _CALM, **_STREAK, ratios={}, cost_unreadable_streak=COST_UNREADABLE_PAUSE,
+        )
+
+        trip = evaluate_storm(facts)
+
+        assert trip is not None
+        assert trip.cause is ShadowStormCause.FAILURE_STREAK
 
     def test_budget_outranks_streak_outranks_ratio(self):
         everything = dataclasses.replace(_CALM, **_OVER_BUDGET, **_STREAK, **_RATIO)
@@ -317,7 +346,9 @@ async def _tripped_streak(tmp_path, costs) -> CoordinatorRig:
     return rig
 
 
-def _seed(rig: CoordinatorRig, state: ShadowCellState, *, task_id: str) -> ShadowCell:
+def _seed(
+    rig: CoordinatorRig, state: ShadowCellState, *, task_id: str, cost_usd: float = 0.0,
+) -> ShadowCell:
     """Store a cell already in *state*, opened now; the clock then moves on a minute."""
     now = rig.clock.now()
     cell = ShadowCell(
@@ -334,6 +365,7 @@ def _seed(rig: CoordinatorRig, state: ShadowCellState, *, task_id: str) -> Shado
         plan_source=PlanSource.PRODUCTION,
         reason=_SEEDED_REASONS.get(state),
         reference_kind=ReferenceKind.NONE if state is _S.SETTLED else None,
+        cost_usd=cost_usd,
         run_id=RUN_ID,
         opened_at=now,
         settle_deadline=now + timedelta(hours=168),
@@ -497,6 +529,89 @@ class TestCostGuardsEscape:
         assert {cell.state for cell in _cells(rig)} == {_S.SETTLED}
         assert _causes(rig) == expected
         assert rig.coordinator.storm_state().paused is bool(expected)
+
+
+async def _unreadable_cost(project_id: str, task_ids, **_: object) -> float:
+    raise sqlite3.OperationalError('database is locked')
+
+
+class TestUnreadableCostStore:
+    """INV-4: an unreadable cost store skips the ratio, keeps the other guards, and is bounded."""
+
+    @pytest.mark.asyncio
+    async def test_the_ratio_is_skipped_and_the_streak_still_trips(
+        self, tmp_path, costs, monkeypatch,
+    ):
+        streak = COST_UNREADABLE_PAUSE - 1
+        rig = _storm_rig(
+            tmp_path, costs,
+            failure_streak_pause=streak, cost_ratio_ceiling=3.0, daily_budget_usd=100.0,
+        )
+        await _seed_production_cost(costs, 'pricey', 1.0)
+        _seed(rig, _S.SETTLED, task_id='pricey', cost_usd=9.0)
+        monkeypatch.setattr(costs, 'tasks_invocation_cost', _unreadable_cost)
+        _fail_every_run(rig)
+
+        await _open_and_finish(rig, _STREAK_TASKS[0])
+
+        assert rig.escalator.trips == []
+
+        await _open_and_finish(rig, *_STREAK_TASKS[1:streak])
+
+        assert _causes(rig) == [ShadowStormCause.FAILURE_STREAK]
+
+    @pytest.mark.asyncio
+    async def test_a_store_unreadable_for_long_enough_pauses_once(
+        self, tmp_path, costs, monkeypatch,
+    ):
+        rig = _storm_rig(tmp_path, costs)
+        _seed(rig, _S.SETTLED, task_id='settled')
+        monkeypatch.setattr(costs, 'tasks_invocation_cost', _unreadable_cost)
+
+        for _ in range(COST_UNREADABLE_PAUSE - 1):
+            await rig.coordinator.expire(rig.clock.now())
+        assert rig.escalator.trips == []
+
+        await rig.coordinator.expire(rig.clock.now())
+        await rig.coordinator.expire(rig.clock.now())
+
+        assert _causes(rig) == [ShadowStormCause.COST_UNREADABLE]
+        assert rig.store.get_shadow_storm(PROJECT_ID).cause is ShadowStormCause.COST_UNREADABLE
+
+    @pytest.mark.asyncio
+    async def test_a_resume_restarts_the_count(self, tmp_path, costs, monkeypatch):
+        rig = _storm_rig(tmp_path, costs)
+        _seed(rig, _S.SETTLED, task_id='settled')
+        monkeypatch.setattr(costs, 'tasks_invocation_cost', _unreadable_cost)
+        for _ in range(COST_UNREADABLE_PAUSE):
+            await rig.coordinator.expire(rig.clock.now())
+
+        assert await rig.coordinator.resume() is True
+        rig.clock.advance(timedelta(minutes=1))
+        _seed(rig, _S.SETTLED, task_id='settled-after-resume')
+        await rig.coordinator.expire(rig.clock.now())
+
+        assert rig.coordinator.storm_state().paused is False
+        assert len(rig.escalator.trips) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_successful_read_restarts_the_count(self, tmp_path, costs, monkeypatch):
+        rig = _storm_rig(tmp_path, costs)
+        _seed(rig, _S.SETTLED, task_id='settled')
+        readable = [False] * (COST_UNREADABLE_PAUSE - 1) + [True] + [False] * (COST_UNREADABLE_PAUSE - 1)
+
+        async def sometimes_unreadable(project_id: str, task_ids, **_: object) -> float:
+            if not readable.pop(0):
+                raise sqlite3.OperationalError('database is locked')
+            return 1.0
+
+        monkeypatch.setattr(costs, 'tasks_invocation_cost', sometimes_unreadable)
+
+        for _ in range(2 * COST_UNREADABLE_PAUSE - 1):
+            await rig.coordinator.expire(rig.clock.now())
+
+        assert readable == []
+        assert rig.escalator.trips == []
 
 
 @pytest.mark.asyncio

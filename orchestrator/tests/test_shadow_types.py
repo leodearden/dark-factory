@@ -168,6 +168,7 @@ def test_storm_cause_values():
         'daily_budget',
         'failure_streak',
         'cost_ratio',
+        'cost_unreadable',
     }
 
 

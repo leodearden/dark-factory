@@ -164,3 +164,4 @@ class ShadowStormCause(StrEnum):
     DAILY_BUDGET = 'daily_budget'
     FAILURE_STREAK = 'failure_streak'
     COST_RATIO = 'cost_ratio'
+    COST_UNREADABLE = 'cost_unreadable'

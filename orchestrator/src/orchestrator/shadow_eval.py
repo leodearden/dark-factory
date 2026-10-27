@@ -53,6 +53,7 @@ from orchestrator.workflow_types import WorkflowOutcome, WorkflowState
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'COST_UNREADABLE_PAUSE',
     'CREDIT_WINDOW',
     'EXPIRE_BATCH_LIMIT',
     'NOT_LANDED_TERMINALS',
@@ -291,6 +292,10 @@ PRODUCTION_COST_BASIS = CostBasis.METERED
 
 _STREAK_STATES = frozenset({ShadowCellState.FAILED, ShadowCellState.EXPIRED})
 
+# Consecutive failed production-cost reads after which the cost-ratio guard
+# counts as disarmed, and the storm pauses rather than spend on unmeasured.
+COST_UNREADABLE_PAUSE = 3
+
 
 def storm_window_start(now: datetime, resumed_at: datetime | None) -> datetime:
     """A resume restarts every storm window, so old failures cannot re-trip at once."""
@@ -373,6 +378,7 @@ class StormFacts:
     run_ends_newest_first: tuple[RunEndedCell, ...]
     failure_streak_pause: int
     ratios: Mapping[str, CostRatioVerdict]
+    cost_unreadable_streak: int
 
 
 @dataclass(frozen=True)
@@ -436,10 +442,20 @@ def _ratio_trip(facts: StormFacts) -> str | None:
     )
 
 
+def _cost_unreadable_trip(facts: StormFacts) -> str | None:
+    if facts.cost_unreadable_streak < COST_UNREADABLE_PAUSE:
+        return None
+    return (
+        f'production cost unreadable on {facts.cost_unreadable_streak} consecutive storm '
+        f'evaluations, so no cost ratio can be measured'
+    )
+
+
 _STORM_GUARDS: tuple[tuple[ShadowStormCause, Callable[[StormFacts], str | None]], ...] = (
     (ShadowStormCause.DAILY_BUDGET, _budget_trip),
     (ShadowStormCause.FAILURE_STREAK, _streak_trip),
     (ShadowStormCause.COST_RATIO, _ratio_trip),
+    (ShadowStormCause.COST_UNREADABLE, _cost_unreadable_trip),
 )
 
 
@@ -708,6 +724,7 @@ class ShadowCoordinator:
         self._drives: set[asyncio.Task[None]] = set()
         self._open_lock = asyncio.Lock()
         self._storm = _UNPAUSED
+        self._cost_unreadable_streak = 0
 
     # -- open ---------------------------------------------------------------
 
@@ -1170,6 +1187,7 @@ class ShadowCoordinator:
             self._deps.store.resume_shadow_storm, self.project_id, self._deps.clock(),
         )
         self._storm = _UNPAUSED
+        self._cost_unreadable_streak = 0
         return resumed
 
     async def _evaluate_storm(self) -> None:
@@ -1186,6 +1204,7 @@ class ShadowCoordinator:
             self._storm = StormState.of(snapshot.storm)
             return
         settled = [cell for cell in snapshot.window if cell.state is ShadowCellState.SETTLED]
+        ratios = await self._measured_ratios(settled)
         facts = StormFacts(
             spent_usd=metered_spend(snapshot.window),
             daily_budget_usd=self._config.daily_budget_usd,
@@ -1193,7 +1212,8 @@ class ShadowCoordinator:
                 RunEndedCell(cell.cell_id, cell.state) for cell in snapshot.run_ends_newest_first
             ),
             failure_streak_pause=threshold,
-            ratios=await self._measured_ratios(settled),
+            ratios=ratios,
+            cost_unreadable_streak=self._cost_unreadable_streak,
         )
         trip = evaluate_storm(facts)
         if trip is None:
@@ -1221,16 +1241,25 @@ class ShadowCoordinator:
     async def _measured_ratios(self, settled: Sequence[ShadowCell]) -> dict[str, CostRatioVerdict]:
         """The cost ratios, or none this round when production's cost is unreadable.
 
-        An unreadable cost store must not disarm the budget and streak guards too.
+        An unreadable cost store must not disarm the budget and streak guards
+        too. Each failed read extends the count the cost_unreadable guard
+        reads, and a read that succeeds restarts it. The count is
+        process-local, so a restart re-arms it from zero.
         """
+        if not settled:
+            return {}
         try:
-            return await self._cost_ratios(settled)
+            ratios = await self._cost_ratios(settled)
         except Exception:
+            self._cost_unreadable_streak += 1
             logger.warning(
-                'shadow storm: production cost unreadable; no cost ratio is measured this round',
-                exc_info=True,
+                'shadow storm: production cost unreadable (%d consecutive); '
+                'no cost ratio is measured this round',
+                self._cost_unreadable_streak, exc_info=True,
             )
             return {}
+        self._cost_unreadable_streak = 0
+        return ratios
 
     async def _cost_ratios(self, settled: Sequence[ShadowCell]) -> dict[str, CostRatioVerdict]:
         """Each candidate's settled cost beside production's: one cost read per candidate and basis."""
