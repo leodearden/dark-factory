@@ -15,13 +15,14 @@ import contextlib
 import uuid
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 from _fm_helpers import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
 from falkordb.asyncio import FalkorDB
 from graphiti_core.cross_encoder.client import CrossEncoderClient
+from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.llm_client import LLMClient
 from graphiti_core.nodes import EpisodeType
@@ -189,7 +190,7 @@ class TestQueryEdgesByTimeRangeLiveFalkorDB:
 
 
 def _backend_over(mock_config, driver: _MultiTenantFalkorDriver) -> GraphitiBackend:
-    backend = GraphitiBackend(mock_config)
+    backend = GraphitiBackend(mock_config, registered_graph_ids=())
     backend._driver = driver
     backend._llm_client = MagicMock(spec=LLMClient)
     backend._embedder = MagicMock(spec=EmbedderClient)
@@ -264,6 +265,34 @@ class TestPerGroupClientPreviousEpisodeRead:
             )
 
         execute_query.assert_not_awaited()
+
+
+class _PreviousEpisodeReadIssued(Exception):
+    """Stops add_episode at its first query, the previous-episode read, before any LLM call."""
+
+
+class TestAddEpisodePreviousEpisodeRead:
+    @pytest.mark.asyncio
+    async def test_add_episode_reads_its_context_through_the_exact_upper_bound(self, mock_config):
+        backend = _backend_over(
+            mock_config, _MultiTenantFalkorDriver(falkor_db=MagicMock(), database='__base__'),
+        )
+        execute_query = AsyncMock(side_effect=_PreviousEpisodeReadIssued)
+        reference_time = datetime(2026, 9, 12, tzinfo=UTC)
+
+        with (
+            patch.object(FalkorDriver, 'execute_query', execute_query),
+            pytest.raises(_PreviousEpisodeReadIssued),
+        ):
+            await backend.add_episode('ep', 'body', group_id='g', reference_time=reference_time)
+
+        execute_query.assert_awaited_once()
+        await_args = execute_query.await_args
+        assert await_args is not None
+        cypher = await_args.args[0]
+        assert exact_string_upper_bound('e.valid_at', 'reference_time', inclusive=True) in cypher
+        assert await_args.kwargs['reference_time'] == reference_time
+        assert await_args.kwargs['group_ids'] == ['g']
 
 
 async def _seed_episodes(live: LiveGraph) -> None:

@@ -48,6 +48,12 @@ class CleanupManager:
     async def find_stale_edges(self, start: str, end: str) -> list[dict]:
         """Return edges whose valid_at falls within [start, end].
 
+        The query and the window check below both compare the bounds with
+        each stored valid_at as STRINGS, not as instants. So give the bounds
+        in the stored UTC form, e.g. '2026-03-22T17:50:00+00:00'. A 'Z' or
+        non-UTC suffix changes which edges the window selects, and nothing
+        raises.
+
         Args:
             start: ISO 8601 lower bound (inclusive).
             end: ISO 8601 upper bound (inclusive).
