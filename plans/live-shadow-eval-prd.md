@@ -472,9 +472,19 @@ cell with the exception class in `reason`).
 >   open decision needs the stratum and `branch_base_sha`.
 > - **`should_open` is async:** it gathers a store snapshot (`OpenInputs`). The pure part is
 >   `shadow_eval.py::decide_open`. Two skip reasons were added: `unknown_candidate` and
->   `no_base_sha`.
-> - **A runner has two stages,** `ShadowRunner.prepare` then `run`, so `opened` and
->   `running` are real states.
+>   `no_base_sha`. A resolver that raises is still `unknown_candidate`, logged at ERROR, and
+>   its skip carries `resolver_error`.
+> - **The open snapshot and the insert share one lock** per coordinator, so `max_concurrent`
+>   is a hard limit. The daily cap counts dollars already spent, so runs in flight can
+>   overshoot it by their own cost before the budget storm guard pauses.
+> - **A runner has three stages:** `ShadowRunner.prepare`, `run`, `release`. So `opened` and
+>   `running` are real states. `release` is called exactly once for every worktree that
+>   `prepare` returned, on every exit.
+> - **C1 gains `run_ended_at`,** stamped when a cell leaves a held state
+>   (`ShadowCellState.stamps_run_ended_at`). The `credits_exhausted` hold reads it over
+>   `CREDIT_WINDOW`, so the hold runs from when the allowance ran out.
+> - **`aclose()` leaves no held cell:** it cancels every drive, then fails whatever this run
+>   still holds with `cancelled_at_shutdown`.
 > - **Failed and cap-excluded cells** emit `shadow_cell_ended`, not `shadow_cell_settled`.
 > - **Settling has three entries:**
 >   - `on_merge_finalized`, keyed on the payload's `task_id`;
@@ -495,9 +505,14 @@ cell with the exception class in `reason`).
 >   storm window at `resumed_at`.
 > - **Both cost guards count only `metered` cells:** the USD budget, and the ratio, which
 >   compares a cell only against production's metered `cost_basis`.
+> - **An unreadable production cost store** skips the ratio, but only for a bounded time:
+>   after `COST_UNREADABLE_PAUSE` consecutive failed reads, it pauses with cause
+>   `cost_unreadable`. The count is process-local.
 > - **Consequence leg 1 is an `architect`-shape cell.** Leg 2 opens from its completed run
 >   when `shadow_scoring.py::consequence_leg_warranted` holds, linked by `parent_cell_id`.
-> - **The C4 rules** live in `orchestrator/shadow_scoring.py`.
+> - **The C4 rules** live in `orchestrator/shadow_scoring.py`. `score_architect_cell` scores an
+>   `architect` cell and `score_implementer_cell` scores every other shape. The caller picks the
+>   rule by shape.
 
 ### C3 — live fixture builder (`evals/live_fixture.py`)
 
