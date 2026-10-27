@@ -1468,6 +1468,12 @@ takes no arguments: it always re-reads that process's own
   with no task-role verify: the merge gate verifies every landing (task 1724),
   so that verdict had no reader. `true` restores the advisory post-rebase
   re-verify — a rollback switch only, read at each merge attempt.
+- `implementer_brief_variant` (default `whole-plan`; task 5385). `one-step`
+  makes each EXECUTE iteration's implementer complete exactly one plan step:
+  the iteration cap becomes the plan's item count + 3, and the implementer's
+  `max_turns`/`budget_usd` are a third of its resolved route. An eval axis
+  (`<candidate>@one-step`, `plans/live-shadow-eval-prd.md` decision 14); no
+  production config sets it. Read at each brief, cap check and route.
 
 **Red tier (restart-only — the edit is accepted into the file but has no
 effect until a full restart):**
