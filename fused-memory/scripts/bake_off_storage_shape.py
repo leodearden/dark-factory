@@ -4214,6 +4214,27 @@ def fixture_digests(paths: list[str | Path]) -> list[dict[str, Any]]:
     return rows
 
 
+def digest_pinned_fixtures(
+    *,
+    alpha_fixture: str | Path = DEFAULT_ALPHA_FIXTURE_PATH,
+    arm_claims: str | Path = DEFAULT_ARM_CLAIMS_PATH,
+    query_set: str | Path = DEFAULT_QUERY_SET_PATH,
+    distractor_slab: str | Path = DEFAULT_DISTRACTOR_SLAB_PATH,
+) -> list[str | Path]:
+    """The fixtures a fetch cache pins by whole-file sha256.
+
+    These are the inputs :func:`corpus_fingerprint` cannot see:
+    :func:`materialize_arm` takes no queries, and guard probes are drawn from
+    the alpha fixture.
+
+    The topic registry is absent on purpose.  E2 reads from it only each
+    curator_gate cluster's topic slug, which lands in record metadata and so
+    is pinned by :func:`corpus_fingerprint`; see the registry section of
+    ``fused-memory/tests/fixtures/README.md``.
+    """
+    return [alpha_fixture, arm_claims, query_set, distractor_slab]
+
+
 def fetch_cache_provenance(
     *,
     records_by_shape: dict[str, list[ArmRecord]],
@@ -5776,11 +5797,11 @@ async def run_bake_off(
                 # run.  Additive: `load_fetches` compares fixtures as a
                 # path -> sha MAPPING over the CALLER's list, so a wider cache
                 # still satisfies `read_transform_selection`'s narrower
-                # five-fixture check.
-                fixtures=_protocol_fixture_paths([
-                    alpha_fixture, registry, arm_claims, query_set,
-                    distractor_slab,
-                ], regrowth=regrowth_block),
+                # check over `digest_pinned_fixtures()` alone.
+                fixtures=_protocol_fixture_paths(digest_pinned_fixtures(
+                    alpha_fixture=alpha_fixture, arm_claims=arm_claims,
+                    query_set=query_set, distractor_slab=distractor_slab,
+                ), regrowth=regrowth_block),
                 search_limit=limit,
                 guard_threshold=guard_threshold,
                 embedder_model=config.embedder.model,
@@ -5913,11 +5934,10 @@ async def _replay_bake_off(
         expect_query_ids=[query.query_id for query in queries],
         expect_probe_ids=expect_probe_ids,
         expect_limit=limit,
-        # The same five paths, in the same order, that the protocol block
-        # stamps below (:4197-4199) and that the live dump records.
-        expect_fixtures=[
-            alpha_fixture, registry, arm_claims, query_set, distractor_slab,
-        ],
+        expect_fixtures=digest_pinned_fixtures(
+            alpha_fixture=alpha_fixture, arm_claims=arm_claims,
+            query_set=query_set, distractor_slab=distractor_slab,
+        ),
     )
 
     guard_threshold = float(provenance['guard_threshold'])
@@ -5950,8 +5970,8 @@ async def _replay_bake_off(
             for mode in REGROWTH_MODES
         }
         # A SECOND `load_fetches`, with the injection slab as its own
-        # expectation, rather than folding a sixth path into the call above.
-        # The five originals must keep verifying on their own: a cache dumped
+        # expectation, rather than folding another path into the call above.
+        # The originals must keep verifying on their own: a cache dumped
         # before this probe existed (4004's committed `e2_fetch_cache.json`,
         # which `read_transform_selection` reads) carries no injection digest,
         # and a merged list would make it unloadable for the E2 arms.
