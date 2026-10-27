@@ -273,9 +273,18 @@ _DEAD_LETTER_APPEND_WHY = (
     'population is larger. Filed by task 5099 as TASK 6085.'
 )
 
+#: Task 6089: who owns the measured-cheap ``resolve`` rows its widening added.
+_CHEAP_RESOLVE_OWNER_WHY = (
+    ' OWNED BY TASK 7572, created from task 6089\'s follow-up ticket '
+    'tkt_0RW94QBGG9RSRP47XQXGGV1KFK. Under the INV-12 day-one ruling '
+    '(esc-5603-1) a measured-cheap site is no longer a resting state in this '
+    'ledger, so 7572 offloads it (asyncio.to_thread, or anyio.Path.resolve '
+    'for a Path) and deletes the row, or obtains a per-row Policy ruling.'
+)
+
 #: Task 6089: one canonicalising resolve() in front of an awaited open.
 _PATH_RESOLVE_GUARD_WHY = (
-    'ACCEPTED, measured cheap (one cause): one Path.resolve() per '
+    'ROOT CAUSE (one debt, measured cheap): one Path.resolve() per '
     'invocation of a single root or database path -- never a walk over what '
     'a directory holds -- canonicalising it immediately before awaited work '
     'that costs far more (an aiosqlite or connect_daemon open). Its cost is '
@@ -283,24 +292,25 @@ _PATH_RESOLVE_GUARD_WHY = (
     'measured for a 4-9 component path (task 6089: 20000-call timeit, '
     'CPython 3.13.9). The component count is set by the path the code, '
     'configuration or caller supplies, not by what is on disk.'
+    + _CHEAP_RESOLVE_OWNER_WHY
 )
 
 #: Task 6089: the verifier LLM tools' path-containment guard.
 _VERIFIER_TOOL_PATH_GUARD_WHY = (
-    'ACCEPTED, measured cheap (one cause): CodebaseVerifier.verify\'s '
+    'ROOT CAUSE (one debt, measured cheap): CodebaseVerifier.verify\'s '
     'read_file and grep_search tools each resolve() the model-chosen path '
     'once, as an is_relative_to(codebase_root) containment guard -- 19-33us '
     'per tool call (task 6089: 20000-call timeit, CPython 3.13.9), and each '
-    'tool call follows an LLM turn of seconds. The guard is not the defect: '
-    'read_file\'s read_text after it is TASK 5270\'s row in the same '
-    'coroutine, and grep_search\'s grep is already an awaited subprocess. If '
-    '5270 offloads read_file\'s whole body, delete the read_file resolve row '
-    'with it.'
+    'tool call follows an LLM turn of seconds. read_file\'s read_text after '
+    'the guard is TASK 5270\'s row in the same coroutine, and grep_search\'s '
+    'grep is already an awaited subprocess. If 5270 offloads read_file\'s '
+    'whole body, delete the read_file resolve row with it.'
+    + _CHEAP_RESOLVE_OWNER_WHY
 )
 
 #: Task 6089: run_server canonicalising configured paths before it serves.
 _STARTUP_PATH_RESOLVE_WHY = (
-    'ACCEPTED, startup only (one cause): run_server canonicalises a '
+    'ROOT CAUSE (one debt, startup only): run_server canonicalises a '
     'configured path with Path.resolve() once per process, while it builds '
     'the server and before server.serve() binds, so no request is in flight '
     'to be delayed. A background loop run_server has already started (the '
@@ -308,6 +318,7 @@ _STARTUP_PATH_RESOLVE_WHY = (
     'resolve, 19-33us (task 6089: 20000-call timeit, CPython 3.13.9), once '
     'per process lifetime. If it ever moves onto a request or reload path, '
     'its content_hash changes and the gate re-asks.'
+    + _CHEAP_RESOLVE_OWNER_WHY
 )
 
 #: The shared justification of both ``gc_run_config_dir`` rows in harness.py.
@@ -388,7 +399,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/mcp_tools/scheduler_state.py',
         'read_scheduler_events',
         '14947dd93734',
-        'accepted',
+        'filed',
         _PATH_RESOLVE_GUARD_WHY,
     ),
 
@@ -420,8 +431,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/middleware/task_curator.py',
         'TaskCurator._invoke_curator',
         '2be781b317a0',
-        'accepted',
-        'ACCEPTED, bounded by an LLM call: _invoke_curator reaches '
+        'filed',
+        'ROOT CAUSE (one debt, bounded by an LLM call): _invoke_curator reaches '
         '_resolve_curator_prompt -> self._prompt_store.resolve(...). The '
         'scanner matches the method name resolve, but the receiver is '
         'shared.prompt_artifact.PromptArtifactStore.resolve, not '
@@ -433,7 +444,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'PromptArtifactStore.resolve\'s own docstring states this I/O and '
         'the once-per-invocation granularity it expects. It runs once per '
         'curator LLM round-trip, immediately before the awaited self._invoke '
-        'of seconds -- the same bound the COMBINE audit append rests on.',
+        'of seconds -- the same bound the COMBINE audit append rests on.'
+        + _CHEAP_RESOLVE_OWNER_WHY,
     ),
 
     # ---- middleware/ticket_store.py ----
@@ -795,14 +807,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/reconciliation/verify.py',
         'CodebaseVerifier.verify.read_file',
         '8ad4f6cd803f',
-        'accepted',
+        'filed',
         _VERIFIER_TOOL_PATH_GUARD_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/verify.py',
         'CodebaseVerifier.verify.grep_search',
         'd96696388685',
-        'accepted',
+        'filed',
         _VERIFIER_TOOL_PATH_GUARD_WHY,
     ),
 
@@ -839,7 +851,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/services/overreach_shadow.py',
         'OverreachShadowStore.open_read_only',
         'fa698adde643',
-        'accepted',
+        'filed',
         _PATH_RESOLVE_GUARD_WHY,
     ),
 
@@ -895,21 +907,21 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/server/main.py',
         'run_server',
         '8a884f86a26c',
-        'accepted',
+        'filed',
         _STARTUP_PATH_RESOLVE_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/main.py',
         'run_server',
         'beb5b61c6b9a',
-        'accepted',
+        'filed',
         _STARTUP_PATH_RESOLVE_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/main.py',
         'run_server',
         '43c97372205c',
-        'accepted',
+        'filed',
         _STARTUP_PATH_RESOLVE_WHY,
     ),
 
@@ -1349,7 +1361,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/server/tools.py',
         'create_mcp_server.request_park_eviction',
         'a0b1b5c60eed',
-        'accepted',
+        'filed',
         _PATH_RESOLVE_GUARD_WHY,
     ),
     (
