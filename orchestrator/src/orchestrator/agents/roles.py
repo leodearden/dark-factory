@@ -1239,12 +1239,16 @@ that replacing all of them is what you wanted.
 #
 # TWO VARIANTS, because two orthogonal capability dimensions decide who
 # needs what. All 9 roles hold `Grep`, so every role can hit the rejection
-# and needs the LIMITATION; but the `grep -P` escape hatch is gated on the
-# `Bash` grant, and `judge` holds only `Bash(git:*)`, so prescribing it
-# there would walk that role into a permission denial -- the same "agent
-# follows its own instructions into a denial" defect that
+# and needs the LIMITATION; but the escape hatch's `command grep -rP`
+# fallback and `rg` are gated on the `Bash` grant, and `judge` holds only
+# `Bash(git:*)`, so prescribing them there would walk that role into a
+# permission denial -- the same "agent follows its own instructions into a
+# denial" defect that
 # orchestrator/tests/test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names
-# guards against for MCP tools, and which does NOT cover builtins. Composed
+# guards against for MCP tools, and which does NOT cover builtins. The
+# escape hatch's `git grep` lead IS a git command, but judge is not offered
+# it either: no one has measured whether judge's `Bash(git:*)` grant admits
+# it in judge's own permission context (tkt_0RW9EGFYDMSM8YD4R96D56AETW). Composed
 # the way _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE compose
 # SCOPE_BOUNDARY_GUIDANCE below: the shared facts stated once so the two
 # variants cannot drift, each half self-contained with its own
@@ -1363,9 +1367,13 @@ cannot express them, and a second pass over the matches can.
 """
 
 
-# Spliced into _GREP_PCRE_BASH_RECOURSE by `+`; executed in a real repo fixture
-# by orchestrator/tests/test_roles_grep_escape_hatch_command.py.
+# Both spliced into _GREP_PCRE_BASH_RECOURSE by `+`; executed in a real repo
+# fixture by orchestrator/tests/test_roles_grep_escape_hatch_command.py.
 GIT_GREP_PCRE_COMMAND_TEMPLATE = "git grep --untracked -nP '<pattern>' -- <path>"
+GREP_PCRE_FALLBACK_COMMAND_TEMPLATE = (
+    "command grep -rP --include='*.py' --exclude-dir=.venv"
+    " --exclude-dir=node_modules --exclude-dir=.git '<pattern>' <path>"
+)
 
 
 # Recourse for the roles holding unqualified `Bash`. Concatenated onto
@@ -1383,8 +1391,8 @@ filter `Grep` applies, with no per-project exclude list to get right:
 `.venv`, `node_modules`, a build-output tree such as `target/` and a main
 checkout's task-worktree copies are all skipped, whatever a project calls
 them. So running it from the checkout root, or leaving out `-- <path>`, is
-safe. From such a root a recursive grep was still reading when its timeout
-killed it; git grep answered in well under a second. Narrow by file type with
+safe. From a main checkout's root a recursive grep was still reading when its
+timeout killed it; git grep answered in well under a second. Narrow by file type with
 a pathspec glob after `--`, as in `-- '*.py'`: git's `*` crosses directory
 boundaries, so it matches at every depth.
 
@@ -1398,7 +1406,7 @@ Perl-compatible regex support, means fall back to real grep.
 
 The fallback, for exactly what git cannot see:
 
-    command grep -rP --include='*.py' --exclude-dir=.venv --exclude-dir=node_modules --exclude-dir=.git '<pattern>' <path>
+    """ + GREP_PCRE_FALLBACK_COMMAND_TEMPLATE + """
 
 `--include=` is its glob filter. It reads no ignore files at all, and its
 `--exclude-dir=` flags name only the commonest vendored trees, never a
@@ -1426,9 +1434,12 @@ instead: both run real binaries on `PATH`.
 """
 
 
-# JUDGE's recourse. Its `Bash` grant is `Bash(git:*)`, so the escape hatch
-# above would land it a permission denial rather than a result -- naming a
-# command the role cannot run is the failure this variant exists to avoid.
+# JUDGE's recourse. Its `Bash` grant is `Bash(git:*)`, so the escape hatch's
+# `command grep -rP` fallback and `rg` would land it a permission denial rather
+# than a result -- naming a command the role cannot run is the failure this
+# variant exists to avoid. The `git grep` lead is a git command, but whether
+# that grant admits it in judge's own permission context is unmeasured, so it
+# is not offered here either.
 # Concatenated onto _GREP_ENGINE_LIMITS below -- never used alone.
 _GREP_PCRE_READ_ONLY_RECOURSE = """
 Shelling out is NOT available to you here: your `Bash` grant is restricted to
