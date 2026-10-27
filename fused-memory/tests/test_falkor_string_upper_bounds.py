@@ -198,11 +198,12 @@ def _backend_over(mock_config, driver: _MultiTenantFalkorDriver) -> GraphitiBack
 
 
 def _per_group_client(mock_config, records: list[dict]):
-    """add_episode's client for group 'g', its driver answering every query with *records*."""
+    """add_episode's client for group 'g', and the query double answering it with *records*."""
     driver = _MultiTenantFalkorDriver(falkor_db=MagicMock(), database='__base__')
     client = _backend_over(mock_config, driver)._client_for('g')
-    client.driver.execute_query = AsyncMock(return_value=(records, [], None))
-    return client
+    execute_query = AsyncMock(return_value=(records, [], None))
+    client.driver.execute_query = execute_query
+    return client, execute_query
 
 
 def _episode_record(name: str, valid_at: str) -> dict:
@@ -222,14 +223,15 @@ def _episode_record(name: str, valid_at: str) -> dict:
 class TestPerGroupClientPreviousEpisodeRead:
     @pytest.mark.asyncio
     async def test_valid_at_upper_bound_cannot_be_index_served(self, mock_config):
-        client = _per_group_client(mock_config, [])
+        client, execute_query = _per_group_client(mock_config, [])
         reference_time = datetime(2026, 9, 12, tzinfo=UTC)
 
         await client.retrieve_episodes(
             reference_time, last_n=3, group_ids=['g'], source=EpisodeType.text,
         )
 
-        await_args = client.driver.execute_query.await_args
+        await_args = execute_query.await_args
+        assert await_args is not None
         cypher = await_args.args[0]
         assert exact_string_upper_bound('e.valid_at', 'reference_time', inclusive=True) in cypher
         assert 'e.valid_at <= $reference_time' not in cypher
@@ -240,7 +242,7 @@ class TestPerGroupClientPreviousEpisodeRead:
 
     @pytest.mark.asyncio
     async def test_returns_episodes_oldest_first(self, mock_config):
-        client = _per_group_client(mock_config, [
+        client, _ = _per_group_client(mock_config, [
             _episode_record('sep-10', '2026-09-10T12:00:00+00:00'),
             _episode_record('sep-05', '2026-09-05T12:00:00+00:00'),
             _episode_record('sep-01', '2026-09-01T12:00:00+00:00'),
@@ -254,14 +256,14 @@ class TestPerGroupClientPreviousEpisodeRead:
 
     @pytest.mark.asyncio
     async def test_saga_is_refused_without_querying(self, mock_config):
-        client = _per_group_client(mock_config, [])
+        client, execute_query = _per_group_client(mock_config, [])
 
         with pytest.raises(NotImplementedError, match='saga'):
             await client.retrieve_episodes(
                 datetime(2026, 9, 12, tzinfo=UTC), last_n=3, group_ids=['g'], saga='s',
             )
 
-        client.driver.execute_query.assert_not_awaited()
+        execute_query.assert_not_awaited()
 
 
 async def _seed_episodes(live: LiveGraph) -> None:
