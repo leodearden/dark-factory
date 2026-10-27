@@ -9,6 +9,7 @@ unworkable task.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -17,10 +18,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import pydantic_spec
 from escalation.queue import EscalationQueue
+from shared.task_transitions import outcome_allows_status
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredCheckResult, DeliveredChecksBlock
+from orchestrator.scheduler import SetTaskStatusRejected
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
 
@@ -697,6 +700,32 @@ class TestHandleAlreadyDoneReportAttribution:
         assert kwargs['note'].startswith('architect-reported task already on main')
         assert queue.get_by_task('50') == []
 
+    async def test_stamp_keeps_the_declared_files(self, tmp_path: Path):
+        """The architect stamp runs with no ``_merge_sha``, so the merge diff is
+        uncomputable: the declared scope must survive the stamp rather than be
+        blanked to ``[]`` (task 3113)."""
+        declared = ['helpers/foo.py', 'helpers/bar.py']
+        f = _make(
+            worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+            declared_files=tuple(declared), commit_files=tuple(declared),
+        )
+        update_task = AsyncMock(return_value=True)
+        f.wf.scheduler.update_task = update_task
+        f.wf.scheduler.get_task = AsyncMock(
+            return_value={'id': '50', 'metadata': {'files': list(declared)}},
+        )
+        queue = _arm_queue(f, tmp_path)
+        self._report(f)
+
+        outcome = await f.wf._handle_already_done_report()
+
+        assert outcome == WorkflowOutcome.DONE
+        cast(AsyncMock, f.wf.scheduler.mark_done).assert_awaited_once()
+        assert update_task.await_args is not None
+        assert update_task.await_args.args[1]['files'] == declared
+        assert f.wf.task['metadata']['files'] == declared
+        assert queue.get_by_task('50') == []
+
     async def test_no_queue_still_holds_and_never_stamps(self, tmp_path: Path):
         """Nothing to file into: the existing non-escalating block still runs,
         so the task is held visibly rather than stamped or dropped."""
@@ -796,3 +825,143 @@ class TestHandleAlreadyDoneReportAttribution:
         filed = queue.get_by_task('50')
         assert {e.category for e in filed} == {'task_failure'}
         assert any(e.level == 0 for e in filed), 'the steward-facing L0 is the retry route'
+
+
+@pytest.mark.asyncio
+async def test_rejected_mark_done_blocks_the_row_and_files_an_l1(tmp_path: Path):
+    """A corroborated report whose done write the store refuses must block the
+    row behind one L1, never report DONE over the row it could not write."""
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    f.artifacts.write_already_done(
+        commit='abcdef1234567890', evidence='helpers.foo on main at task 42',
+    )
+    f.wf.scheduler.mark_done = AsyncMock(side_effect=SetTaskStatusRejected(
+        task_id='50', error_code='pre_done_hook_rejected',
+        raw='pre-done hook exited rc 125',
+    ))
+    queue = _arm_queue(f, tmp_path)
+
+    outcome = await f.wf._handle_already_done_report()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    assert f.wf.state == WorkflowState.BLOCKED
+    assert _status_writes(f)[-1] == ('50', 'blocked')
+    assert len(queue.get_by_task('50', status='pending', level=1)) == 1
+    assert outcome_allows_status(outcome, 'blocked')
+
+
+# ---------------------------------------------------------------------------
+# merge_phase forwarding (task 4614): the merge-gate narrowing pass routes the
+# architect's already_done report here with merge_phase=True, and a refusal that
+# dropped the flag would park the row while the caller believes it is retrying.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Refusal:
+    arm: Callable[[Path, pytest.MonkeyPatch], _Fixture]
+    reason_fragment: str
+    handle: Callable[[TaskWorkflow], Awaitable[WorkflowOutcome]] = (
+        lambda wf: wf._handle_already_done_report(merge_phase=True)
+    )
+
+
+def _refusal_malformed_report(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fixture:
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    (f.artifacts.root / 'already_done.json').write_text('{"evidence": "no commit"}\n')
+    return f
+
+
+def _refusal_malformed_unactionable_task(
+    tmp_path: Path, _mp: pytest.MonkeyPatch,
+) -> _Fixture:
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    (f.artifacts.root / 'unactionable_task.json').write_text('{"evidence": "no reason"}\n')
+    return f
+
+
+def _refusal_malformed_false_premise(
+    tmp_path: Path, _mp: pytest.MonkeyPatch,
+) -> _Fixture:
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    (f.artifacts.root / 'false_premise.json').write_text('{"evidence": "no premise"}\n')
+    return f
+
+
+def _refusal_unreachable_commit(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fixture:
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        commit_on_main=False,
+    )
+    f.artifacts.write_already_done(commit=_AD_COMMIT, evidence='e')
+    return f
+
+
+def _refusal_unattributed_hold(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fixture:
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    f.wf.task['metadata'] = {'files': [], 'delivered_checks': []}
+    f.artifacts.write_already_done(commit=_AD_COMMIT, evidence='e')
+    return f
+
+
+def _refusal_delivered_checks_block(
+    tmp_path: Path, mp: pytest.MonkeyPatch,
+) -> _Fixture:
+    f = _arm_already_done_fixture(tmp_path)
+    block = DeliveredChecksBlock(
+        reason='failed', main_sha=_AD_MAIN_SHA, failed_check=_AD_DC_CHECK,
+    )
+    mp.setattr(
+        'orchestrator.workflow.gate_mark_done_on_delivered_checks',
+        AsyncMock(return_value=block),
+    )
+    return f
+
+
+def _refusal_rejected_mark_done(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fixture:
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    f.artifacts.write_already_done(commit=_AD_COMMIT, evidence='e')
+    f.wf.scheduler.mark_done = AsyncMock(side_effect=SetTaskStatusRejected(
+        task_id='50', error_code='pre_done_hook_rejected', raw='rc 125',
+    ))
+    return f
+
+
+_REFUSAL_ARMS = {
+    'malformed_report': _Refusal(_refusal_malformed_report, 'malformed'),
+    'unreachable_commit': _Refusal(_refusal_unreachable_commit, 'not reachable'),
+    'unattributed_hold': _Refusal(_refusal_unattributed_hold, 'could not be attributed'),
+    'delivered_checks_block': _Refusal(
+        _refusal_delivered_checks_block, 'delivered_checks are not present',
+    ),
+    'rejected_mark_done': _Refusal(_refusal_rejected_mark_done, 'already_done rejected'),
+    'malformed_unactionable_task': _Refusal(
+        _refusal_malformed_unactionable_task, 'malformed',
+        lambda wf: wf._handle_unactionable_task_report(merge_phase=True),
+    ),
+    'malformed_false_premise': _Refusal(
+        _refusal_malformed_false_premise, 'malformed',
+        lambda wf: wf._handle_false_premise_report(merge_phase=True),
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'refusal', _REFUSAL_ARMS.values(), ids=_REFUSAL_ARMS.keys(),
+)
+async def test_merge_phase_is_forwarded_by_every_refusal_arm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: _Refusal,
+):
+    f = refusal.arm(tmp_path, monkeypatch)
+    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    monkeypatch.setattr(f.wf, '_mark_blocked', mark_blocked)
+
+    outcome = await refusal.handle(f.wf)
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    mark_blocked.assert_awaited_once()
+    assert mark_blocked.await_args is not None
+    args, kwargs = mark_blocked.await_args
+    assert refusal.reason_fragment in args[0]
+    assert kwargs['merge_phase'] is True

@@ -93,7 +93,6 @@ hand-built ``PlanShape``.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -158,7 +157,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -1205,7 +1204,7 @@ class TestSaturationStampRoutesNextDispatchFullPath:
         # simple_saturated=True through a genuine scheduler merge write AND
         # the in-memory task dict.
         outcome_1 = await workflow._run_simple_task()
-        assert outcome_1 == WorkflowOutcome.REQUEUED
+        assert outcome_1 is None
         assert backend.blob['routing']['simple_saturated'] is True
         assert workflow.task['metadata']['routing']['simple_saturated'] is True
 
@@ -1245,7 +1244,7 @@ class TestSaturationStampRoutesNextDispatchFullPath:
         # regressed to one write -- 0 == 1 - 1 is a false positive for the
         # same regression the round-1 checks above already guard against.
         outcome_2 = await workflow._run_simple_task()
-        assert outcome_2 == WorkflowOutcome.REQUEUED
+        assert outcome_2 is None
         assert backend.blob['routing']['simple_saturated'] is True
         assert workflow.task['metadata']['routing']['simple_saturated'] is True
         new_calls_in_round_2 = backend.update_task_calls[2:]

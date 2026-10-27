@@ -798,10 +798,10 @@ class TestReconEscalationDedup:
         cfg = DedupeConfig(
             infra_dedupe_enabled=True,
             infra_dedupe_window_secs=float('inf'),
-            infra_dedupe_categories=('test_sev_category',),
+            infra_dedupe_categories=('recon_integrity_issue',),
             key_fn=content_fingerprint_key,
         )
-        fp = compute_content_fingerprint('test_sev_category', 'stale_k', ['t1'], '')
+        fp = compute_content_fingerprint('recon_integrity_issue', 'stale_k', ['t1'], '')
 
         # First submission: 'info' severity → becomes the parent.
         esc1 = Escalation(
@@ -809,7 +809,7 @@ class TestReconEscalationDedup:
             task_id='sev-parent',
             agent_role='test',
             severity='info',
-            category='test_sev_category',
+            category='recon_integrity_issue',
             summary='stale_k for t1',
             dedupe_fingerprint=fp,
         )
@@ -821,7 +821,7 @@ class TestReconEscalationDedup:
             task_id='sev-child',
             agent_role='test',
             severity='blocking',
-            category='test_sev_category',
+            category='recon_integrity_issue',
             summary='stale_k for t1',
             dedupe_fingerprint=fp,
         )
@@ -3968,17 +3968,17 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
         Mirrors tests/test_flag_dedup.py::_seed_marker: dedup identity is
         (project_id, 'stage1_flag_marker', task_id, flag_type, run_id='') —
         the originating run_id rides in payload_json, not the PK.  The
-        identity's task component is the flag's SIGNATURE component, not its
-        top-level task_id: compute_flag_signature unions the top-level id with
-        every cited_tasks id, so this flag keys on '3839,598'.  Derived from
-        compute_flag_signature rather than hardcoded so a future change to the
-        union rule cannot silently turn this seed into a MISS (which would
-        make the whole test pass vacuously — the gate is HIT-only).
+        identity's task component is the flag's MARKER signature, not its
+        top-level task_id: compute_marker_signature unions the top-level id
+        with every cited_tasks id, project-qualifying the foreign fix task.
+        Derived rather than hardcoded so a future change to the union rule
+        cannot silently turn this seed into a MISS (which would make the whole
+        test pass vacuously — the gate is HIT-only).
         """
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.flag_dedup import compute_marker_signature
         from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 
-        signature = compute_flag_signature(self._suppressed_flag())
+        signature = compute_marker_signature(self._suppressed_flag(), project_id=self.PROJECT_ID)
         assert signature is not None, 'the suppressed flag must have a signature'
         sig_task_id, sig_flag_type = signature
 
@@ -4090,7 +4090,10 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
 
     @pytest.mark.asyncio
     async def test_cross_project_drop_is_excluded_from_acknowledge(self, ledger_store):
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            compute_marker_signature,
+        )
 
         await self._seed_prior_marker(ledger_store)
 
@@ -4126,9 +4129,12 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
 
         # Ledger-level restatement: the marker row itself survives the cycle,
         # re-upserted active by dedup_flags BEFORE the gate ran.
-        assert suppressed_sig is not None
+        marker_sig = compute_marker_signature(
+            self._suppressed_flag(), project_id=self.PROJECT_ID,
+        )
+        assert marker_sig is not None
         marker = await ledger_store.get_by_identity(
-            self.PROJECT_ID, 'stage1_flag_marker', suppressed_sig[0], suppressed_sig[1], '',
+            self.PROJECT_ID, 'stage1_flag_marker', marker_sig[0], marker_sig[1], '',
         )
         assert marker is not None and marker.state == 'active', (
             'the suppressed flag\'s marker must survive un-reclaimed; '
@@ -5826,8 +5832,9 @@ class TestGateOwnedActionPhrasingWiring:
 
 class TestStage1LiveStateFreshnessSection:
     """The Stage-1 live-state freshness section (task 5271) renders its benign
-    deleter list from recon_self_model.MEM0_TOMBSTONE_DELETERS, the tuple the
-    code-side sweep_deletion_guard reads, so the two cannot drift apart."""
+    deleter list as the shared recon_self_model.format_mem0_tombstone_deleters()
+    list, built from the tuple the code-side sweep_deletion_guard reads, so the
+    two cannot drift apart."""
 
     def _section(self) -> str:
         from fused_memory.reconciliation.prompts.stage1 import (
@@ -5847,13 +5854,12 @@ class TestStage1LiveStateFreshnessSection:
 
         assert STAGE1_SYSTEM_PROMPT.count(LIVE_STATE_FRESHNESS_HEADING) == 1
 
-    def test_every_documented_deleter_is_rendered_in_the_section(self):
-        from fused_memory.reconciliation.recon_self_model import MEM0_TOMBSTONE_DELETERS
+    def test_section_renders_the_shared_deleter_list(self):
+        from fused_memory.reconciliation.recon_self_model import format_mem0_tombstone_deleters
 
-        section = self._section()
-        missing = [d for d in MEM0_TOMBSTONE_DELETERS if d not in section]
-        assert not missing, (
-            f'the section must name every documented sweep deleter; missing {missing!r}'
+        deleters = format_mem0_tombstone_deleters()
+        assert deleters in self._section(), (
+            f'the section must render the shared deleter list {deleters!r}'
         )
 
 

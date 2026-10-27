@@ -48,6 +48,7 @@ from orchestrator.verify import VerifyResult
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 def test_config_defaults_escalation_revalidation() -> None:
     """OrchestratorConfig exposes escalation_revalidation_enabled (True) —
     the single operator kill-switch for both new auto-closure paths."""
@@ -55,6 +56,7 @@ def test_config_defaults_escalation_revalidation() -> None:
     assert config.escalation_revalidation_enabled is True
 
 
+@pytest.mark.usefixtures("code_default_config")
 def test_config_defaults_escalation_revalidation_allowlist() -> None:
     """OrchestratorConfig exposes escalation_revalidation_allowlist (task 2724),
     a frozenset defaulting to the two categories where a terminal subject task
@@ -98,7 +100,9 @@ def _make_harness() -> Harness:
     """Build a minimal bare Harness for escalation-revalidation-sweep tests."""
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)
-    h.config = OrchestratorConfig()
+    # pin: these tests are about the sweep, not the flag's default; the
+    # kill-switch tests flip it back off
+    h.config = OrchestratorConfig(escalation_revalidation_enabled=True)
     h.scheduler = MagicMock()
     h._escalation_queue = MagicMock()
     h._escalation_queue.make_id = MagicMock(return_value='esc-revalidation-1')
@@ -710,6 +714,7 @@ def _make_main_tip_harness(*, main_sha: str) -> Harness:
     h._last_swept_main_sha = 'stale-' + main_sha[:6]
     h._run_store = None
     h._main_sweep_cold_control = None
+    h.event_store = None
     return h
 
 

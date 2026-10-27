@@ -4,7 +4,8 @@ Each orchestrator runs its own escalation MCP, and that MCP owns the
 merge-queue halt state for its orchestrator. To surface halt status on
 the dashboard we fan out ``get_merge_halt_status`` calls across every
 known escalation URL concurrently and aggregate the results into a
-``{project_label: {wired, halted, owner_esc_id, offline}}`` dict.
+``{project_label: {wired, halted, owner_esc_id, offline}}`` dict, keyed by
+project label (``dashboard/project_labels.py::ProjectLabels``).
 
 The default ``mcp_tool_call`` timeout is 10s — too slow for a 3s polling
 loop. The probe budget is bounded at **two complementary layers**, both
@@ -77,8 +78,9 @@ async def get_merge_halt_status(
     """Probe every escalation URL concurrently; return ``{label: status}``.
 
     Per-project labels match the keys used by ``shape_merge_queue`` (project
-    basename). Failures are reported as ``{wired, halted: False, offline: True}``
-    so the UI can render an Offline pill rather than a blank panel.
+    label — ``dashboard/project_labels.py::ProjectLabels``). Failures are
+    reported as ``{wired, halted: False, offline: True}`` so the UI can render
+    an Offline pill rather than a blank panel.
     """
     if not escalation_urls:
         return {}

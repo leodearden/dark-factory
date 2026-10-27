@@ -1,0 +1,10 @@
+prd: plans/verify-scope-inversion-prd.md
+schema_version: 1
+tasks:
+- label: xi
+  task_id: 2592
+  title: 'verify-scope ξ: B+H boundary suite — the inversion end-to-end (rows 1-10)'
+  note: 'Minimal sidecar written by task 6591 (plans/dashboard-prd-lanes-prd.md §9 ε): this PRD has no decompose-time YAML sidecar, so only its signal leaf is declared, hand-bound to the task whose prd_task_label is xi.'
+  capabilities: []
+signal_leaves:
+- xi

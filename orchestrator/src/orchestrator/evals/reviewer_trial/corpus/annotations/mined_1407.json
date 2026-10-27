@@ -24,6 +24,70 @@
       "severity": "suggestion",
       "description": "TestMakeGateFactory pins account_count/active_account_name/soonest_resets_at/override passthrough but does not assert that the mock-driven branches (e.g. detect_cap_hit / cap-hit path) behave as the callers expect, so the contract test would not catch the missing detect_cap_hit default that changed runtime-error test behavior.",
       "mutation_type": "test_gap"
+    },
+    {
+      "id": "mined_1407_pool_01",
+      "location": "orchestrator/tests/test_invoke.py:85",
+      "category": "spot_violation_task_requirement",
+      "severity": "blocking",
+      "description": "The task asked for one shared gate factory so attribute defaults like soonest_resets_at=None are set in one place. The change instead adds two byte-identical `_make_gate` copies (test_invoke.py:85 and test_steward.py:195), alongside the already-existing canonical `shared.testing.make_gate_mock` (which sets the same defaults plus detect_cap_hit, uses spec=UsageGate, and is already used by shared/tests) and shared/tests `_mock_gate`. A new UsageGate attribute still needs edits in multiple places, and the copies' docstrings falsely claim it 'only needs to be updated here'. orchestrator/tests/_orch_helpers.py already exists as the home for shared non-fixture orchestrator test helpers (it holds build_usage_gate).",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1407_pool_02",
+      "location": "orchestrator/tests/test_invoke.py:85",
+      "category": "name_collision",
+      "severity": "suggestion",
+      "description": "The new MagicMock factory is named `_make_gate`, the same name as orchestrator/tests/test_usage_gate.py:22's `_make_gate`, which builds a REAL UsageGate; helpers with the same name and opposite meaning coexist in the same test package.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1407_pool_03",
+      "location": "orchestrator/tests/test_invoke.py:489",
+      "category": "redundant_override",
+      "severity": "suggestion",
+      "description": "All eight converted call sites (test_invoke.py:489,504,518,532; test_steward.py:1668,1688,1707,1728) pass `before_invoke=AsyncMock(return_value='tok-a')`, identical to the factory default, restating the default at every site and implying the value is site-specific.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1407_pool_04",
+      "location": "orchestrator/tests/test_invoke.py:95",
+      "category": "unspecced_mock",
+      "severity": "suggestion",
+      "description": "The factory builds a bare `MagicMock()` with a `**overrides` setattr passthrough, so it does not enforce its stated invariant: attributes it forgets, attributes renamed or removed on UsageGate, and typo'd override names all silently auto-create truthy mocks (the passthrough of `custom_attr` is even tested as supported). The existing shared.testing.make_gate_mock uses `MagicMock(spec=UsageGate)` for exactly this drift.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1407_pool_05",
+      "location": "orchestrator/tests/test_invoke.py:574",
+      "category": "unrelated_whitespace_change",
+      "severity": "suggestion",
+      "description": "The diff deletes an unrelated blank line before `assert captured_kwargs.get('start_new_session') is True` in TestRunSubprocessLocalProcessGroup, outside the refactor's scope.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1407_pool_06",
+      "location": "orchestrator/tests/test_steward.py:2505",
+      "category": "weak_meta_tests",
+      "severity": "suggestion",
+      "description": "The TestMakeGateFactory class is duplicated in both test files and mostly tests test scaffolding with assertions that cannot fail meaningfully: `isinstance(gate, MagicMock)` is trivially true, and `test_make_gate_yielding_routes_through_factory` only checks `soonest_resets_at is None`, which the pre-change inline code also satisfied, so it cannot detect whether routing happens. The steward copy's `test_pre_triage_gate_*` tests call `TestPreTriageUsageGateCleanup._gate`, a private static helper of another test class. (The separate gap that these contract tests would not catch a missing default such as detect_cap_hit is frontier_3.)",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1407_pool_07",
+      "location": "orchestrator/tests/test_steward.py:237",
+      "category": "inconsistent_default",
+      "severity": "suggestion",
+      "description": "The steward `_make_gate_yielding` now inherits the factory's `account_count=1` regardless of how many slots it yields, while the test_invoke version passes `account_count=len(slots)`. No current steward test depends on it, but steward's pre-triage path calls invoke_with_cap_retry, which reads `max(usage_gate.account_count, 1)`, so a multi-slot steward gate would model one account.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1407_pool_08",
+      "location": "orchestrator/tests/test_invoke.py:85-94",
+      "category": "inaccurate_docstrings",
+      "severity": "suggestion",
+      "description": "The new docstrings carry incident history ('122-error cascade (tasks 1313/1339)') in both TestMakeGateFactory classes and make claims the code contradicts: the factory docstring says a new attribute 'only needs to be updated here' though two copies exist, and 'Mirrors the _mock_gate helper' though `_mock_gate` defaults detect_cap_hit and uses different values ('tok'/'acct').",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

@@ -51,6 +51,20 @@ inventory this closes):
     ``run_eval(..., memory_endpoint=...)`` (runner.py), which layers over this
     null-sentinel default so the real writes are recorded and the production
     write-count delta stays 0.
+  - ``strict_mcp_config`` (task 4757): production defaults False. The
+    ``fused_memory.url`` sentinel above covers only the HARNESS's own
+    fused-memory client; this leaf covers the AGENT's ambient MCP. Every eval
+    worktree carries the target repo's tracked ``.mcp.json``, which declares
+    the live escalation and fused-memory servers, and the CLI merges it unless
+    ``--strict-mcp-config`` is passed. True here makes
+    ``workflow.py::TaskWorkflow._invoke`` scope every role to the
+    orchestrator-built config alone, so EVERY ambient server is dropped, not
+    only the live ones: ``playwright`` too. A role that adopts an ambient-only
+    server reaches it in production and not under eval; give it an
+    orchestrator-built config instead. The eval-only spawn sites outside the
+    workflow (``evals/architect_eval.py::architect_eval_mcp_scope``, the judges in
+    ``evals/judge.py``, the assessors in ``evals/compare.py``) scope
+    themselves directly.
 """
 
 from __future__ import annotations
@@ -71,6 +85,7 @@ EVAL_PROFILE: dict[str, bool | str] = {
     'auto_eval_enabled': False,        # eval never re-triggers itself
     'simple_task_enabled': False,      # fixtures route through the full path deterministically
     'fused_memory.url': FM_NULL_SENTINEL_URL,  # D8 — non-routable null sentinel; single-sourced from fm_retry so the McpSession transport fails fast on it
+    'strict_mcp_config': True,         # task 4757 — eval agents never ambient-merge the live .mcp.json
 }
 
 

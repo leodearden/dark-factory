@@ -5,22 +5,21 @@ Hermetic: the census filter runs against a synthetic sqlite db built inline
 ladder runs against temp git repos built per-test. No live data / no network.
 
 ``scripts/`` is not an importable package, so the driver is loaded by path via
-``importlib.util.spec_from_file_location`` off the module-local ``REPO_ROOT``.
+``_mint_driver_loader.load_mint_driver``.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import sqlite3
 import subprocess
-import sys
 from collections.abc import Mapping
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 import pytest
+from _mint_driver_loader import load_mint_driver
+from shared.project_layout import runs_db, tasks_db
 
 # Matches the parents[2] convention used by conftest.py and the sibling
 # evals tests (test_eval_bootstrap_smoke.py). Defined locally rather than
@@ -29,18 +28,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _load_driver() -> ModuleType:
-    """Import ``scripts/mint_hard_v2_fixtures.py`` by path (not a package)."""
-    path = REPO_ROOT / 'scripts' / 'mint_hard_v2_fixtures.py'
-    spec = importlib.util.spec_from_file_location('mint_hard_v2_fixtures', path)
-    assert spec is not None and spec.loader is not None, f'no import spec for {path}'
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-driver = _load_driver()
+driver = load_mint_driver()
 
 
 def _git(args: list[str], cwd: Path) -> str:
@@ -224,6 +212,33 @@ class TestCensusFilter:
         db = _make_runs_db(tmp_path, _CENSUS_ROWS)
         durations = driver.census_durations_ms(db)
         assert sorted(durations) == [600_000, 900_000, 1_200_000]
+
+
+class TestCollectCandidatesReadsTheLayoutStores:
+    def test_reads_runs_db_and_tasks_db_where_the_shared_layout_puts_them(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path / 'checkout'
+        census_db = _make_runs_db(tmp_path, [
+            {'task_id': '100', 'data': '{"subtype": "error_max_turns", "turns": 121}'},
+        ])
+        runs_db(root).parent.mkdir(parents=True)
+        census_db.rename(runs_db(root))
+        tasks_db(root).parent.mkdir(parents=True)
+        conn = sqlite3.connect(tasks_db(root))
+        conn.execute(
+            'CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, '
+            'description TEXT, status TEXT, metadata TEXT)'
+        )
+        conn.execute(
+            "INSERT INTO tasks VALUES ('100', 'the seeded title', NULL, 'done', NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        (cand,) = driver.collect_candidates('reify', root)
+
+        assert (cand.task_id, cand.title) == ('100', 'the seeded title')
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +556,27 @@ class TestFindMergeSha:
         # cannot pass by matching nothing at all.
         _git(['merge', '--ff-only', 'integration'], repo)
         assert driver.find_merge_sha(repo, '804') == side_merge
+
+    def test_a_revert_or_a_longer_target_branch_is_not_a_landing_merge(
+        self, tmp_path: Path,
+    ) -> None:
+        # The landing spelling is anchored at both ends: a Revert subject
+        # quoting it and a merge into 'mainline' are decoys. Either one would
+        # also turn the real merge below into a spurious second match.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _commit(repo, 'b.txt', 'undo\n', 'Revert "Merge task/805 into main"')
+        _git(['checkout', '-q', '-b', 'task/805-decoy'], repo)
+        _commit(repo, 'c.txt', 'decoy\n', 'decoy')
+        _git(['checkout', '-q', 'main'], repo)
+        _merge(repo, 'task/805-decoy', 'Merge task/805 into mainline')
+        assert driver.find_merge_sha(repo, '805') is None
+
+        _git(['checkout', '-q', '-b', 'task/805'], repo)
+        _commit(repo, 'd.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'main'], repo)
+        landing = _merge(repo, 'task/805', 'Merge task/805: subject')
+        assert driver.find_merge_sha(repo, '805') == landing
 
 
 # ---------------------------------------------------------------------------
@@ -886,7 +922,7 @@ _SPLIT_MAJORITY_CLAIM = 'SPLIT / direct-landed candidates are a MAJORITY'
 _REFERENCED_MAJORITY_CLAIM = 'Candidates that CAN carry a reference are a MAJORITY'
 
 # The two accepted landing-merge spellings, as a reader of CURATION.md sees
-# them (`_merge_subject_patterns` carries the machine form).
+# them (`shared.merge_subject.merge_subject_pattern` carries the machine form).
 _SPELLING_INTO_MAIN = '`Merge task/<id> into main`'
 _SPELLING_COLON = '`Merge task/<id>: <subject>`'
 
@@ -1429,7 +1465,7 @@ class TestCeilingsEvidenceGuard:
 # ---------------------------------------------------------------------------
 
 class TestEnrichFromTaskDb:
-    # `Any`, not `object`: the driver is loaded by path (see _load_driver), so
+    # `Any`, not `object`: the driver is loaded by path (see load_mint_driver), so
     # `driver.Candidate` is only ever `Any` to a type checker. Narrowing the
     # return to `object` throws that away and makes every field read below a
     # reportAttributeAccessIssue.

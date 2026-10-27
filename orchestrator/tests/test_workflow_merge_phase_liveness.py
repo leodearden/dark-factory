@@ -763,7 +763,7 @@ class TestEnqueueClearWiring:
         """RED on main: ``_submit_to_merge_queue`` never clears the durable stamp."""
         import asyncio
 
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+        from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome
 
         class _RecordingQueue(asyncio.Queue):
             """The real merge queue, keeping a cumulative record of every put.

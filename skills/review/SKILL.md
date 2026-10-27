@@ -200,7 +200,7 @@ After the last phase run, write both files under `<project_root>/review/reports/
 |---------|-----------|
 | Review briefing | Warn, suggest `/review-briefing`, skip smoke and path tracing |
 | Prior committed report | `mode: full`, `since: none` |
-| Task store unreachable (MCP and read-only sqlite) | Report only; file nothing, say so (§8) |
+| Task store unreachable (`find_tasks_by_metadata` errors or is unreachable) | Report only; file nothing, say so (§8) |
 | fused-memory MCP down | No memory context, no filing; report says so |
 | Test suite / lint / typecheck config | Skip that command, note it in `phase1` |
 | `$QUALITY_DOC` (no `docs/code-quality.md` and no `guidance()` render) | Stop Phase 2: judging without the definition is not this skill |

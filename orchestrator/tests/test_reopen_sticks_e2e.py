@@ -52,6 +52,7 @@ import pytest
 import pytest_asyncio
 
 pytest.importorskip('fused_memory')
+pytest.importorskip('graphiti_core')
 
 from escalation.queue import EscalationQueue
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend

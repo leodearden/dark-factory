@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import importlib.util
 import json
 import sys
 import tempfile
@@ -56,30 +55,13 @@ from fused_memory.server.write_triage_judge import (
     resolve_judge_reasoning_effort,
     resolve_judge_timeout,
 )
+from fused_memory.utils.script_loader import load_script
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPTS = _PACKAGE_ROOT / 'scripts'
 
 
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_calibrate = _load_script(_SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
+_calibrate = load_script(_SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
 
 #: The slate widths measured: the shipped ``judge_candidate_count`` and the
 #: wider slates the flip-readiness arms run.

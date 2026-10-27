@@ -14,6 +14,7 @@ const { inQueueOver } = window.DF_MERGE_QUEUE;
 const { writeQueue } = window.DF_MEMORY_READINGS;
 const { todaySpend, spendText } = window.DF_SPEND_READINGS;
 const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow, pendingWindow } = window.DF_WINDOW_CHIP;
+const { tabRenderFailureNotice } = window.DF_TAB_RENDER_FAILURE;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -60,6 +61,30 @@ function noticeBannerStyle(edgeColor) {
     fontFamily: 'var(--mono)',
     fontSize: 11,
   };
+}
+
+// A render throw would otherwise unmount the whole root. The keyed .body
+// remounts this boundary per tab, so switching tabs retries.
+class TabErrorBoundary extends React.Component {
+  state = { failed: false, thrown: undefined };
+
+  static getDerivedStateFromError(thrown) {
+    return { failed: true, thrown };
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children;
+    const notice = tabRenderFailureNotice(this.props.tabLabel, this.state.thrown);
+    return (
+      <div className="col-span-12"
+           data-testid="tab-render-failure-banner"
+           role="alert"
+           style={noticeBannerStyle('var(--bad)')}>
+        <div>{notice.text}</div>
+        <div>{notice.detail}</div>
+      </div>
+    );
+  }
 }
 
 function App() {
@@ -271,7 +296,8 @@ function App() {
         <div className="body" key={tab}>
           {/* ADDITIVE, never a replacement: renderTab() below stays
               unconditional so the last-good payload refreshOne deliberately
-              preserved stays on screen — marked as old, not blanked. */}
+              preserved stays on screen — marked as old, not blanked. Only the
+              boundary replaces it, when the tab's own render throws. */}
           {staleNotices.map(notice => (
             <div key={notice.path} className="col-span-12"
                  data-testid="endpoint-stale-banner"
@@ -286,7 +312,7 @@ function App() {
               {loadingNotice.text}
             </div>
           )}
-          {renderTab()}
+          <TabErrorBoundary tabLabel={tabLabel}>{renderTab()}</TabErrorBoundary>
         </div>
       </div>
 

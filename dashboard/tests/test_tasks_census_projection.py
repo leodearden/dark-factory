@@ -378,10 +378,10 @@ class TestCensusProjectionEndpoint:
 # ---------------------------------------------------------------------------
 
 # The REAL client, in index.html's order and with no `document`, so data.js
-# loads inert (data_poll.test.mjs::loadDataJs records why). `url` prints the
-# /tasks url pollSetFor polls on the Scheduler tab; `apply` runs a served body
-# through the real refreshOne under endpointsFor's /tasks key specs and prints
-# what the rail reads back: censusOver(DF_DATA, null).
+# loads inert (dashboard/tests/js/_data_loader.mjs::loadDataJs records why).
+# `url` prints the /tasks url pollSetFor polls on the Scheduler tab; `apply`
+# runs a served body through the real refreshOne under endpointsFor's /tasks
+# key specs and prints what the rail reads back: censusOver(DF_DATA, null).
 _CENSUS_CLIENT = r"""
 const fs = require('fs');
 const path = require('path');
@@ -414,7 +414,7 @@ def _census_client(mode: str, url: str = '', body: dict | None = None):
     import subprocess
     from pathlib import Path
 
-    from _lock_chip_matrix import node_path
+    from _dashboard_helpers import node_path
 
     redux = Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
     result = subprocess.run(

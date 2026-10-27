@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
-"""Measure the merge-lane cluster, and ratchet every measure against a committed baseline.
+"""Measure the merge-lane cluster, and ratchet its structure against a committed baseline.
 
 PRD ``plans/merge-lane-quality-prd.md`` task alpha. The measures are the ones
 the PRD's Background table quotes -- file lines and prose lines, per-function
 cognitive complexity, function-local (reach-back) imports, re-export shim names,
 distinct test patch targets into lane internals, and private-attribute reads
-from tests -- plus, from PRD task zeta2, ``external_importers``: for each of the
-fourteen old module paths that ``ALIAS_MODULES`` names, the number of distinct
-tracked repo files outside ``merge_lane/`` that still import it or name a path
-into it in a string (a patch target), which is the target PRD task eta drives to
-zero. The committed baseline lives at
-``orchestrator/tests/merge_lane_ratchet_baseline.json`` and the gate that
-enforces it is ``orchestrator/tests/test_merge_lane_ratchet.py``.
+from tests. The two size measures are measured and reported but never
+ratcheted (``REPORTED_ONLY_MEASURES``); every other one is. The committed
+baseline lives at ``orchestrator/tests/merge_lane_ratchet_baseline.json`` and
+the gate that enforces it is ``orchestrator/tests/test_merge_lane_ratchet.py``.
 
 Ratchet contract, and it has two sides. An UNAUTHORIZED raise is refused: by
 ``--check``, and decisively by ``--write-baseline`` itself, so a raise cannot be
 absorbed by regenerating the file that would have caught it. An AUTHORIZED one
 is permitted and recorded -- ``--authorize-raise <task-id> --reason <text>``
-appends the exact per-measure delta to ``LEDGER_RELPATH``, so net-additive work
-lands as a reviewed diff rather than as a number nobody saw move. Lowering needs
+writes the exact per-measure delta as one new file under ``LEDGER_DIR_RELPATH``,
+so net-additive work lands as a reviewed diff rather than as a number nobody saw
+move. Lowering needs
 no ceremony and equality is permitted -- this is a ratchet, not a day-one gate.
 The two ceilings (``FILE_LINE_CEILING``, ``NEW_FUNCTION_COGNITIVE_CEILING``)
 apply only to paths and qualnames ABSENT from the baseline, so the
@@ -45,12 +43,7 @@ fixed, named cluster where a path it cannot read IS the finding. Concretely:
 * the whole-of-``orchestrator/tests`` sweep keeps the siblings' per-file
   fail-soft polarity, but records every skipped file in
   ``Enumeration.unreadable`` and marks the enumeration incomplete, and
-  ``check_against_baseline`` REFUSES to compare an incomplete enumeration;
-* the importer sweep over every tracked ``.py`` follows that same record-and-
-  refuse rule for a file it cannot read or parse, and is HARD where its input
-  is missing: ``git`` absent, failing, or pointed at a root that is not the
-  top of a work tree is a ``MetricsError`` naming the cause, because an empty
-  file list would read as zero importers -- an improvement.
+  ``check_against_baseline`` REFUSES to compare an incomplete enumeration.
 
 That last clause is what makes "a partial enumeration is distinguishable from a
 complete one in the RESULT, not only in a log line" true rather than aspirational.
@@ -87,12 +80,13 @@ from __future__ import annotations
 import argparse
 import ast
 import dataclasses
+import hashlib
 import json
+import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
-from types import MappingProxyType
-from typing import Any
+from typing import Any, TypeGuard
 
 import _checkout as _checkout
 import source_measures
@@ -113,7 +107,8 @@ class RatchetError(source_measures.MetricsError):
 
 
 class AppendOnlyViolation(RatchetError):
-    """The ledger's recorded history was REWRITTEN -- a verdict, not a fault.
+    """The ledger's recorded history was REWRITTEN, or the one commit that splits
+    the retired array into files broke its rule -- a verdict, not a fault.
 
     A ``RatchetError`` subclass, so nothing that already catches one changes
     behaviour; a DISTINCT type, because the two are read differently at a
@@ -133,29 +128,15 @@ class AppendOnlyViolation(RatchetError):
 #: regeneration, because ``check_against_baseline`` compares the baseline's
 #: recorded ``params.cluster_paths`` against it and raises on a mismatch.
 CLUSTER_PATHS: tuple[str, ...] = (
-    'orchestrator/src/orchestrator/merge_queue.py',
-    'orchestrator/src/orchestrator/merge_gates.py',
-    'orchestrator/src/orchestrator/merge_types.py',
-    'orchestrator/src/orchestrator/merge_shadow.py',
-    'orchestrator/src/orchestrator/merge_liveness.py',
-    'orchestrator/src/orchestrator/merge_disposition.py',
-    'orchestrator/src/orchestrator/merge_queue_store.py',
-    'orchestrator/src/orchestrator/merge_completion.py',
-    'orchestrator/src/orchestrator/merge_drift.py',
-    'orchestrator/src/orchestrator/merge_speculation_controller.py',
-    'orchestrator/src/orchestrator/merge_request_ledger.py',
-    'orchestrator/src/orchestrator/merge_skew_tripwire.py',
     'orchestrator/src/orchestrator/lane_lifecycle.py',
     'orchestrator/src/orchestrator/offline_lane.py',
     'orchestrator/src/orchestrator/warm_lane_pool.py',
-    'orchestrator/src/orchestrator/landing_evidence.py',
-    'orchestrator/src/orchestrator/landed_outbox.py',
     'orchestrator/src/orchestrator/recover_main.py',
     # Measured (lines, cognitive) but exempt from the file-size ceiling -- see
     # SIZE_CEILING_EXEMPT.
     'orchestrator/src/orchestrator/git_ops.py',
-    # Empty until PRD task zeta1 creates the package. A glob matching nothing is
-    # NOT a failure; a literal matching nothing is.
+    # The package, holding the fourteen modules PRD task zeta2 moved into it. A
+    # glob matching nothing is NOT a failure; a literal matching nothing is.
     'orchestrator/src/orchestrator/merge_lane/**/*.py',
     'orchestrator/tests/_merge_queue_harness.py',
     'orchestrator/tests/conftest.py',
@@ -165,7 +146,7 @@ CLUSTER_PATHS: tuple[str, ...] = (
 #: PRD decision 9: ``git_ops.py`` is the git engine for warm lanes, the
 #: scheduler and recovery -- not only the merge lane -- and its split is a
 #: follow-up PRD. The exemption is scoped to the CEILING alone: git_ops.py's
-#: 14,721 lines are still frozen by the ratchet, so they cannot grow unwatched.
+#: structural measures are still ratcheted, so they cannot grow unwatched.
 SIZE_CEILING_EXEMPT: frozenset[str] = frozenset(
     {'orchestrator/src/orchestrator/git_ops.py'}
 )
@@ -176,45 +157,13 @@ FILE_LINE_CEILING = 1500
 #: A function ABSENT from the baseline may not exceed this cognitive complexity.
 NEW_FUNCTION_COGNITIVE_CEILING = 15
 
-#: THE ONE COPY of the PRD task zeta2 move, as old dotted name -> new dotted
-#: name. Each old module stays importable as an alias of its new home until PRD
-#: task eta migrates its importers and deletes it. The OLD names are what
-#: ``external_importers`` counts, and each is also a ``CLUSTER_PATHS`` literal
-#: (``orchestrator/src/<dotted path>.py``), so the per-file measures keep
-#: measuring the old paths after the move; the NEW names are the migration target
-#: ``--report`` prints beside each count and the mapping task eta rewrites by.
-ALIAS_MODULES: Mapping[str, str] = MappingProxyType(
-    {
-        'orchestrator.merge_queue': 'orchestrator.merge_lane.worker',
-        'orchestrator.merge_gates': 'orchestrator.merge_lane.gates',
-        'orchestrator.merge_types': 'orchestrator.merge_lane.types',
-        'orchestrator.merge_shadow': 'orchestrator.merge_lane.shadow',
-        'orchestrator.merge_liveness': 'orchestrator.merge_lane.liveness',
-        'orchestrator.merge_disposition': 'orchestrator.merge_lane.disposition',
-        'orchestrator.merge_queue_store': 'orchestrator.merge_lane.queue_store',
-        'orchestrator.merge_completion': 'orchestrator.merge_lane.completion',
-        'orchestrator.merge_drift': 'orchestrator.merge_lane.drift',
-        'orchestrator.merge_speculation_controller': (
-            'orchestrator.merge_lane.speculation_controller'
-        ),
-        'orchestrator.merge_request_ledger': 'orchestrator.merge_lane.request_ledger',
-        'orchestrator.merge_skew_tripwire': 'orchestrator.merge_lane.skew_tripwire',
-        'orchestrator.landing_evidence': 'orchestrator.merge_lane.landing_evidence',
-        'orchestrator.landed_outbox': 'orchestrator.merge_lane.landed_outbox',
-    }
+#: The measures a breach of those two ceilings is reported under. A breach is
+#: not a rise over a recorded value, so ``unrecorded_raises`` covers it by name.
+NEW_FILE_OVER_CEILING = 'new_file_over_ceiling'
+NEW_FUNCTION_OVER_CEILING = 'new_function_over_ceiling'
+CEILING_BREACH_MEASURES: frozenset[str] = frozenset(
+    {NEW_FILE_OVER_CEILING, NEW_FUNCTION_OVER_CEILING}
 )
-
-#: Repo-relative directory of the package the aliases forward to. Its own files
-#: are the new home, not importers of the old one.
-MERGE_LANE_PACKAGE_DIR = 'orchestrator/src/orchestrator/merge_lane/'
-
-#: Path segments that mark another tree's files: virtualenvs, vendored
-#: ``node_modules`` and nested worktrees. Never this repo's own importers.
-_FOREIGN_TREE_SEGMENTS = frozenset(
-    {'.venv', 'venv', 'site-packages', 'node_modules', '.worktrees'}
-)
-_NESTED_CLAUDE_WORKTREES = '.claude/worktrees/'
-
 
 # ---------------------------------------------------------------------------
 # Enumeration -- completeness carried in the RESULT, per INV-11.
@@ -312,13 +261,9 @@ def resolve_cluster_paths(root: Path) -> Enumeration:
 # reachback guard's allowlist as a COUNT, which is what lets PRD task delta
 # delete the guard once the count reaches zero.
 
-#: Dotted module paths whose attributes count as lane internals when patched.
-#: `merge_lane` is here from day one, before the package exists, precisely so
-#: PRD task zeta2's `git mv` cannot make the count read 0 by relocation.
-LANE_PATCH_MODULES: tuple[str, ...] = (
-    'orchestrator.merge_queue',
-    'orchestrator.merge_lane',
-)
+#: Dotted module paths whose attributes count as lane internals when patched:
+#: the package, and through it every submodule (a leaf reads ``<sub>.<attr>``).
+LANE_PATCH_MODULES: tuple[str, ...] = ('orchestrator.merge_lane',)
 
 
 # ---------------------------------------------------------------------------
@@ -399,158 +344,6 @@ def test_file_measures_in_tree(tree: ast.Module) -> dict[str, object] | None:
 
 
 # ---------------------------------------------------------------------------
-# External importers of the alias modules (PRD task zeta2).
-#
-# WHAT IS COUNTED. For each old module of ``ALIAS_MODULES``, the number of
-# DISTINCT files that depend on it. Every import form counts -- ``import X``,
-# ``import X as Y``, ``from X import ...`` and ``from <package> import <leaf>``
-# -- at module level or inside a function, and under ``if TYPE_CHECKING:``: a
-# type-only import still breaks the day the alias is deleted. So does a string
-# constant that continues past the module name (``'orchestrator.X.attr'``, a
-# patch target): that file never imports X and breaks all the same. A bare
-# ``'orchestrator.X'`` is a logger name and does not. Detection is AST-based and
-# on FULL dotted names, so a docstring quoting a name never counts, and neither
-# does an unrelated module that merely shares a leaf
-# (``dashboard/data/merge_queue.py``). Relative imports are out of scope: the
-# only files that use them for these modules sit inside ``merge_lane/``, which
-# is excluded, and the rest of the tree imports by absolute name.
-#
-# WHAT IS NOT. The alias file itself, everything under ``merge_lane/`` (the new
-# home), and other trees' files -- virtualenvs, ``node_modules``, nested
-# worktrees. Another alias file DOES count as an importer: on the pre-move tree
-# the old modules import each other, and those edges are real fan-in until the
-# move turns each of them into a forwarding stub.
-#
-# DOMAIN, and why it is ``git ls-files`` and not a filesystem walk. The measured
-# domain is the repo's TRACKED ``.py`` files, because that is the one set that is
-# the same in every checkout. A walk of the main checkout also reaches the
-# gitignored run data (``data/``, plugin caches) and untracked scratch -- about
-# three times as many files as are tracked, and many seconds slower than the same
-# walk of a clean worktree -- so its numbers would differ from every worktree's.
-# The price is that a new file is not counted until it is added to the index; the
-# commit that adds it is what the ratchet judges. This is the instrument's one
-# git dependency, and a read-only one -- the history-comparing git work stays in
-# ``scripts/check_staged_ratchet_raise.py``.
-#
-# A cheap text prefilter (the file mentions a leaf name at all) runs before the
-# AST parse. It cannot hide a dependent, since an import or a dotted string must
-# spell the leaf, so a file that is both unparseable and silent about every leaf
-# depends on no alias and is not recorded as unreadable.
-
-_ALIAS_LEAVES = frozenset(name.rsplit('.', 1)[-1] for name in ALIAS_MODULES)
-
-
-#: ``'<old dotted name>.'`` for each alias. The trailing dot is the point: a string
-#: that CONTINUES past the module is a path into it (``patch(...)``,
-#: ``monkeypatch.setattr(...)``, ``importlib`` of a submodule) and breaks when the
-#: alias is deleted, where a bare ``'orchestrator.merge_queue'`` is a logger name
-#: and survives it.
-_ALIAS_STRING_PREFIXES = {name + '.': name for name in ALIAS_MODULES}
-_ALIAS_STRING_PREFIX_TUPLE = tuple(_ALIAS_STRING_PREFIXES)
-
-
-def _aliases_imported_by_statement(node: ast.Import | ast.ImportFrom) -> set[str]:
-    if isinstance(node, ast.Import):
-        imported = [alias.name for alias in node.names]
-    elif node.module and not node.level:
-        imported = [node.module] + [f'{node.module}.{alias.name}' for alias in node.names]
-    else:
-        return set()
-    return {name for name in imported if name in ALIAS_MODULES}
-
-
-def _aliases_named_by_string(value: str) -> set[str]:
-    if not value.startswith(_ALIAS_STRING_PREFIX_TUPLE):
-        return set()
-    return {
-        name for prefix, name in _ALIAS_STRING_PREFIXES.items() if value.startswith(prefix)
-    }
-
-
-def referenced_alias_modules(source: str, *, path: str = '<source>') -> frozenset[str]:
-    """The old dotted names of ``ALIAS_MODULES`` that *source* depends on.
-
-    Raises ``MetricsError`` naming *path* when the source cannot be parsed.
-    """
-    return referenced_alias_modules_in_tree(source_measures.parse_source(source, path=path))
-
-
-def referenced_alias_modules_in_tree(tree: ast.Module) -> frozenset[str]:
-    """``referenced_alias_modules`` over an already-parsed tree.
-
-    A module is depended on in two ways. It is IMPORTED: ``from P import m`` binds
-    the module ``P.m`` whenever that is a module, so each name in the statement
-    is also tried joined to ``P`` -- which is how ``from orchestrator import
-    merge_queue`` is read without this function knowing the word
-    ``orchestrator``. Or it is NAMED BY PATH in a string constant that continues
-    past the module, ``'orchestrator.landing_evidence._helper'``: a file that
-    patches an alias's attribute never imports it, and counting only imports
-    would let task eta read zero, delete the alias, and break that file. Neither a
-    docstring nor a bare module-name string (a logger name) counts.
-    """
-    found: set[str] = set()
-    docstring_values: set[int] = set()
-    # One walk, parents before children, so a holder has named its docstring's
-    # constant before the walk reaches it.
-    for node in ast.walk(tree):
-        if (docstring := source_measures.docstring_of(node)) is not None:
-            docstring_values.add(id(docstring.value))
-        if isinstance(node, ast.Import | ast.ImportFrom):
-            found |= _aliases_imported_by_statement(node)
-        elif (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and id(node) not in docstring_values
-        ):
-            found |= _aliases_named_by_string(node.value)
-    return frozenset(found)
-
-
-def is_external_importer_source(relpath: str) -> bool:
-    """False for the files an importer count must not read: the new package's
-    own files, and other trees' (virtualenv, ``node_modules``, nested worktree)."""
-    return not (
-        relpath.startswith((MERGE_LANE_PACKAGE_DIR, _NESTED_CLAUDE_WORKTREES))
-        or _FOREIGN_TREE_SEGMENTS.intersection(relpath.split('/'))
-    )
-
-
-def _mentions_an_alias_leaf(source: str) -> bool:
-    return any(leaf in source for leaf in _ALIAS_LEAVES)
-
-
-def _external_aliases_referenced_by(tree: ast.Module, relpath: str) -> frozenset[str]:
-    own_name = source_measures.src_module_name(relpath)
-    return frozenset(
-        name for name in referenced_alias_modules_in_tree(tree) if name != own_name
-    )
-
-
-def alias_importer_measure(relpath: str, counts: Mapping[str, int]) -> dict[str, int]:
-    """The ``external_importers`` entry for cluster path *relpath*; empty unless
-    *relpath* is one of the alias modules."""
-    name = source_measures.src_module_name(relpath)
-    if name is None or name not in counts:
-        return {}
-    return {'external_importers': counts[name]}
-
-
-def _require_aliases_in_cluster() -> None:
-    """Every ``ALIAS_MODULES`` key must be a ``CLUSTER_PATHS`` literal's name.
-
-    A count with no ``files`` entry to land on would be measured and dropped,
-    which reads as a measure that is fine.
-    """
-    missing = sorted(set(ALIAS_MODULES) - lane_module_names())
-    if missing:
-        raise RatchetError(
-            f'ALIAS_MODULES names {missing}, which no CLUSTER_PATHS literal '
-            'carries -- each old module must stay in the cluster so its '
-            'external_importers has a files entry to be recorded on'
-        )
-
-
-# ---------------------------------------------------------------------------
 # Report assembly, and DERIVED totals.
 
 SCHEMA_VERSION = 1
@@ -580,7 +373,6 @@ def build_report(root: Path) -> dict[str, object]:
     # numbers would be wrong anyway.
     version = source_measures.require_complexipy()
     enumeration = resolve_cluster_paths(root)
-    _require_aliases_in_cluster()
     sweep = sweep_repo(root)
 
     files: dict[str, object] = {}
@@ -597,7 +389,6 @@ def build_report(root: Path) -> dict[str, object]:
             'cognitive': cognitive.total,
             'function_local_imports': source_measures.function_local_imports_in_tree(tree),
             'reexport_names': len(source_measures.reexport_names_in_tree(tree)),
-            **alias_importer_measure(relpath, sweep.alias_importers),
         }
         for qualname, score in cognitive.per_function.items():
             functions[f'{relpath}::{qualname}'] = score
@@ -621,71 +412,30 @@ def build_report(root: Path) -> dict[str, object]:
 
 @dataclasses.dataclass(frozen=True)
 class RepoSweep:
-    """What the ONE pass over the repo's Python files found.
+    """What the ONE pass over the ``.py`` files under ``orchestrator/tests`` found.
 
-    ``tests`` is every lane-importing file under ``orchestrator/tests`` with its
-    two measures; ``alias_importers`` is the importer count of EVERY alias
-    module, zeros included (an alias reaching zero is the state task eta is
-    after and must stay recorded as zero, not vanish); ``unreadable`` names the
-    paths either measure had to skip, verbatim; ``test_tree`` is how broad the
-    test-tree half was, as counts. The swept paths themselves are deliberately not
-    accumulated: the caller has no use for a 568-entry manifest of other
+    ``tests`` is every lane-importing file there with its two measures;
+    ``unreadable`` names the paths the sweep had to skip, verbatim; ``test_tree``
+    is how broad it was, as counts. The swept paths themselves are deliberately
+    not accumulated: the caller has no use for a 568-entry manifest of other
     people's test files, and building one is how it ended up frozen in the
     committed baseline (esc-5021-7).
     """
 
     tests: dict[str, object]
-    alias_importers: Mapping[str, int]
     unreadable: tuple[str, ...]
     test_tree: TestTreeCoverage
 
 
-@dataclasses.dataclass(frozen=True)
-class _FileFindings:
-    test_measures: dict[str, object] | None
-    imported_aliases: frozenset[str]
-
-
-def _test_tree_files(root: Path) -> frozenset[str]:
-    return frozenset(
+def _test_tree_files(root: Path) -> list[str]:
+    return sorted(
         path.relative_to(root).as_posix() for path in (root / TESTS_ROOT).rglob('*.py')
     )
 
 
-def _measure_file(
-    root: Path, relpath: str, *, in_test_tree: bool, is_importer_source: bool
-) -> _FileFindings:
-    """Read *relpath* once, parse it at most once, and take every measure it is
-    in the domain of from that one tree.
-
-    A file that is not in the test tree and names no alias leaf is not parsed at
-    all: a reference to an alias must spell the leaf.
-    """
-    source = (root / relpath).read_text(encoding='utf-8')
-    is_importer = is_importer_source and _mentions_an_alias_leaf(source)
-    if not (in_test_tree or is_importer):
-        return _FileFindings(test_measures=None, imported_aliases=frozenset())
-    tree = source_measures.parse_source(source, path=relpath)
-    return _FileFindings(
-        test_measures=test_file_measures_in_tree(tree) if in_test_tree else None,
-        imported_aliases=(
-            _external_aliases_referenced_by(tree, relpath)
-            if is_importer
-            else frozenset()
-        ),
-    )
-
-
 def sweep_repo(root: Path) -> RepoSweep:
-    """Take the two open-sweep measures in ONE pass over the repo's Python files.
-
-    The two measures have different domains and keep them: the test-suite
-    measures cover every ``.py`` under ``orchestrator/tests`` on disk, as they
-    always have, and the importer count covers the tracked files outside
-    ``merge_lane/`` (see ``source_measures.tracked_python_files``). The pass walks their union
-    once, so a lane-importing test file -- which is both, and is among the
-    largest files in the repo -- is read once and parsed once rather than once
-    per measure.
+    """Take the two test-suite measures in ONE pass over every ``.py`` on disk
+    under ``orchestrator/tests``, reading and parsing each file once.
 
     THIS sweep keeps the sibling guards' per-file fail-SOFT polarity -- an
     unrelated mid-edit file must not redden the ratchet, which is the
@@ -693,39 +443,22 @@ def sweep_repo(root: Path) -> RepoSweep:
     the record: each skipped file lands in ``Enumeration.unreadable``, the
     enumeration goes incomplete, and ``check_against_baseline`` then refuses to
     compare at all. That split is the INV-11 seam between "this cluster file is
-    unmeasurable, which IS the finding" and "some unrelated file is mid-edit". A
-    failure to list the tracked files is not per-file and is not soft -- see
-    ``source_measures.tracked_python_files``.
+    unmeasurable, which IS the finding" and "some unrelated file is mid-edit".
     """
-    tracked = frozenset(source_measures.tracked_python_files(root))
     test_tree = _test_tree_files(root)
-    alias_importers = dict.fromkeys(ALIAS_MODULES, 0)
     tests: dict[str, object] = {}
     unreadable: list[str] = []
-    for relpath in sorted(tracked | test_tree):
-        in_test_tree = relpath in test_tree
-        is_importer_source = relpath in tracked and is_external_importer_source(
-            relpath
-        )
-        if not (in_test_tree or is_importer_source):
-            continue
+    for relpath in test_tree:
         try:
-            found = _measure_file(
-                root,
-                relpath,
-                in_test_tree=in_test_tree,
-                is_importer_source=is_importer_source,
-            )
+            source = (root / relpath).read_text(encoding='utf-8')
+            measures = test_file_measures(source, path=relpath)
         except (OSError, UnicodeDecodeError, source_measures.MetricsError):
             unreadable.append(relpath)
             continue
-        if found.test_measures is not None:
-            tests[relpath] = found.test_measures
-        for name in found.imported_aliases:
-            alias_importers[name] += 1
+        if measures is not None:
+            tests[relpath] = measures
     return RepoSweep(
         tests=tests,
-        alias_importers=MappingProxyType(alias_importers),
         unreadable=tuple(unreadable),
         test_tree=TestTreeCoverage(requested=len(test_tree), resolved=len(tests)),
     )
@@ -738,8 +471,7 @@ def _report_enumeration(
 ) -> dict[str, object]:
     """The report's enumeration block: cluster paths, test-tree counts, INV-11.
 
-    *swept_unreadable* is every path either open sweep (the test tree and the
-    alias-importer sweep) had to skip.
+    *swept_unreadable* is every path the test-tree sweep had to skip.
 
     The two halves stay APART rather than being flattened into one pair of
     lists. Flattening cost information as well as bytes: the three CLUSTER_PATHS
@@ -769,7 +501,16 @@ _SUMMED_FILE_MEASURES = (
     'cognitive',
     'function_local_imports',
     'reexport_names',
-    'external_importers',
+)
+
+#: Measured, stored and printed by --report, never ratcheted: raw size steers
+#: toward deleting prose instead of rehoming it (docs/code-quality.md "Do not
+#: steer by"; PRD plans/review-all-s25-scripts-instruments-prd.md D10). `lines`
+#: stays stored because the new-file ceiling reads it.
+REPORTED_ONLY_MEASURES: frozenset[str] = frozenset({'lines', 'prose_lines'})
+
+_RATCHETED_FILE_MEASURES = tuple(
+    measure for measure in _SUMMED_FILE_MEASURES if measure not in REPORTED_ONLY_MEASURES
 )
 
 
@@ -780,10 +521,10 @@ def derive_totals(report: dict) -> dict[str, int]:
 
     Deriving rather than storing is what makes the ten parallel gamma branches
     rebase cleanly, AND it preserves the anti-rename-gaming property exactly. A
-    total computed by summing stored per-path baselines is unchanged when 500
-    lines move from ``merge_queue.py`` to a brand-new path, so the ratchet still
-    catches the move -- which a per-path-only comparison would not, since the
-    new path is simply absent from the baseline.
+    total computed by summing stored per-path baselines is unchanged when code
+    carrying 500 cognitive moves from ``merge_queue.py`` to a brand-new path, so
+    the ratchet still catches the move -- which a per-path-only comparison would
+    not, since the new path is simply absent from the baseline.
 
     ``patch_targets`` is the size of the UNION across files, matching the PRD's
     "distinct names" measure rather than a sum of per-file counts.
@@ -817,12 +558,18 @@ def derive_totals(report: dict) -> dict[str, int]:
 # ``TestRenderBaseline::test_every_per_path_entry_occupies_exactly_one_line``.
 
 # The ratchet's two COMMITTED ARTIFACTS, relative to the repo root. The
-# baseline holds the frozen measures; its sidecar ledger holds the provenance of
-# every raise that was ever authorized against them. Both paths are named here,
-# above the README that cites them, because the remedy text an agent reads when
-# the gate goes red is composed from them.
+# baseline holds the frozen measures; its sidecar ledger -- a DIRECTORY holding
+# one file per authorization -- holds the provenance of every raise that was
+# ever authorized against them. Both paths are named here, above the README that
+# cites them, because the remedy text an agent reads when the gate goes red is
+# composed from them.
 BASELINE_RELPATH = 'orchestrator/tests/merge_lane_ratchet_baseline.json'
-LEDGER_RELPATH = 'orchestrator/tests/merge_lane_ratchet_authorized_raises.json'
+LEDGER_DIR_RELPATH = 'orchestrator/tests/merge_lane_ratchet_raises'
+
+#: The RETIRED single-array ledger, which every two authorizing branches
+#: conflicted on at its tail. Read only by ``retire_legacy_ledger``, the rule for
+#: the one commit that splits it into ``LEDGER_DIR_RELPATH`` (task 7298).
+LEGACY_LEDGER_RELPATH = 'orchestrator/tests/merge_lane_ratchet_authorized_raises.json'
 
 #: The commit-time auditor the remedy tells a blocked agent about, named here
 #: rather than spelled into the prose. It is a REAL PATH a reader is sent to
@@ -848,9 +595,12 @@ RAISE_REMEDY = (
     f'  python scripts/merge_lane_metrics.py --write-baseline {BASELINE_RELPATH} '
     '--authorize-raise <task-id> '
     '--reason "<why this is net-additive work, not a refactor that failed>"\n'
-    f'That appends the exact per-measure delta to {LEDGER_RELPATH}, naming the '
-    'task and the reason, so the raise lands as a diff a reviewer reads rather '
-    'than as a number nobody saw move. Without those flags --write-baseline '
+    'That writes the exact per-measure delta as ONE NEW FILE under '
+    f'{LEDGER_DIR_RELPATH}/, naming the task and the reason, so the raise lands '
+    'as a diff a reviewer reads rather than as a number nobody saw move. A '
+    "commit's raises are covered by the entry files THAT COMMIT adds: per "
+    'measure and key, the rise may not exceed the sum of their deltas. Without '
+    'those flags --write-baseline '
     'REFUSES to absorb a raise over an EXISTING baseline, so regenerating in '
     'place cannot widen the ratchet. Nor can going around it: '
     f'{COMMIT_GATE_RELPATH} runs in pre-commit on EVERY branch '
@@ -859,7 +609,7 @@ RAISE_REMEDY = (
     'hold -- so a baseline deleted first, written elsewhere and copied over, '
     'or hand-edited is refused on the same terms as a regeneration -- and so '
     'is a commit that '
-    'drops or rewrites a recorded entry in the ledger. The one thing it lets '
+    'modifies, deletes or renames a recorded entry file. The one thing it lets '
     'through deliberately is UNDOING THE LAST CHANGE to the baseline: staging '
     'the value this path held one commit ago, and nothing further back. That '
     'is the state the tree was just running with, so putting it back re-raises '
@@ -868,9 +618,10 @@ RAISE_REMEDY = (
     'every image in between is a value the ratchet moved through and returning '
     'behind them re-absorbs every measure they lowered.\n'
     'RESIDUAL, so you do not trust more than is true: `git rebase` and a CLEAN '
-    'merge do not run pre-commit at all, and the merge worker advances main '
-    'with `git update-ref`, which runs no hooks. A raise introduced before this '
-    'guard existed and replayed across its introduction still reaches main '
+    'merge -- including one the ratchet-baseline merge driver resolved -- do '
+    'not run pre-commit at all, and the merge worker advances main with `git '
+    'update-ref`, which runs no hooks. A raise introduced before this guard '
+    'existed and replayed across its introduction still reaches main '
     'unexamined. Closing that needs a merge-lane or reference-transaction gate, '
     'not this one. --authorize-raise is the way past.'
 )
@@ -879,23 +630,16 @@ RAISE_REMEDY = (
 #: is about to "fix" rather than only in a docstring they will not open.
 BASELINE_README = (
     'This is a committed RATCHET BASELINE for the merge-lane cluster '
-    '(PRD plans/merge-lane-quality-prd.md, task alpha). Every measure here is '
-    'frozen at its value on the commit that recorded it: the gate '
-    'orchestrator/tests/test_merge_lane_ratchet.py FAILS on any measure that '
-    'RISES above these numbers. Equality is fine, lowering is the point. The '
-    'enumeration block below is the CLUSTER half only: the instrument also '
-    'sweeps every .py under '
+    '(PRD plans/merge-lane-quality-prd.md, task alpha). Every measure here '
+    f'except {" and ".join(sorted(REPORTED_ONLY_MEASURES))}, which are reported '
+    'but never ratcheted, is frozen at its value on the commit that recorded it: '
+    'the gate orchestrator/tests/test_merge_lane_ratchet.py FAILS on any such '
+    'measure that RISES above these numbers. Equality is fine, lowering is the '
+    'point. The enumeration block below is the CLUSTER half only: the '
+    'instrument also sweeps every .py under '
     'orchestrator/tests for the measures in the tests section, and that sweep '
     'is sized by --report rather than ratcheted here, so an unrelated test file '
-    'arriving never touches these bytes. The files entry of each of the fourteen '
-    'old merge-lane modules also carries external_importers: how many tracked '
-    'repo files outside orchestrator/src/orchestrator/merge_lane/ still import '
-    'that module by its old name, or name a path into it in a string such as a '
-    "patch target ('orchestrator.<old name>.<attr>'; a bare module-name string, "
-    'which is a logger name, does not count) (PRD task zeta2). It is ratcheted '
-    'like every '
-    'other measure, per module and in the derived total, and PRD task eta drives '
-    'it to 0.\n'
+    'arriving never touches these bytes.\n'
     # Composed, never paraphrased: this is the one string in the instrument that
     # changes what a blocked agent does next, and the copy that mattered was
     # always the one in THIS file.
@@ -903,7 +647,7 @@ BASELINE_README = (
 )
 
 #: The three per-path maps whose entries get one line each.
-_PER_PATH_SECTIONS: tuple[str, ...] = ('files', 'functions', 'tests')
+PER_PATH_SECTIONS: tuple[str, ...] = ('files', 'functions', 'tests')
 
 
 def _stored_enumeration(enumeration: dict) -> dict:
@@ -964,20 +708,24 @@ def _render_section(name: str, mapping: dict) -> str:
     return f'  {json.dumps(name)}: {{\n{rows}\n  }}'
 
 
-def render_baseline(report: dict) -> str:
+def render_baseline(report: dict, *, readme: str = BASELINE_README) -> str:
     """Serialize *report* as the committed baseline's exact bytes.
 
     Idempotent: ``render_baseline(json.loads(render_baseline(r)))`` reproduces
     the same text, so regenerating a baseline from a baseline is a no-op rather
     than a churned file full of manufactured conflicts. The ``_README`` key is
-    emitted from ``BASELINE_README`` and any inbound one is dropped, which is
-    what makes that hold across a round trip.
+    emitted from *readme* -- ``BASELINE_README`` for every measurement -- and
+    any inbound one is dropped, which is what makes that hold across a round
+    trip. The one caller passing another is the merge driver
+    (``scripts/merge_lane_ratchet_merge.py``): it may run a different checkout's
+    copy of this module than the tree it merges, so it carries the merged
+    images' own README through rather than substituting its own.
     """
-    entries = [f'  "_README": {json.dumps(BASELINE_README)}']
+    entries = [f'  "_README": {json.dumps(readme)}']
     for key, value in report.items():
         if key == '_README':
             continue
-        if key in _PER_PATH_SECTIONS and isinstance(value, dict):
+        if key in PER_PATH_SECTIONS and isinstance(value, dict):
             entries.append(_render_section(key, value))
         else:
             # Top-level scalars and the small params/enumeration blocks are
@@ -1074,9 +822,10 @@ def write_baseline(
     reviewer the INSTRUMENT moved rather than the code, which is why
     ``_require_matching_params`` asks for the version in it.
 
-    With an *authorization*, the raises are recorded in the append-only ledger
-    at *ledger* (default ``repo_root() / LEDGER_RELPATH``) and the write goes
-    ahead. WRITE ORDER PICKS THE SURVIVABLE FAILURE: the ledger lands FIRST, so
+    With an *authorization*, the raises are recorded as one new entry file in
+    the append-only ledger directory *ledger* (default ``repo_root() /
+    LEDGER_DIR_RELPATH``) and the write goes ahead. WRITE ORDER PICKS THE
+    SURVIVABLE FAILURE: the ledger entry lands FIRST, so
     a crash between the two writes leaves a recorded authorization over an
     unchanged baseline -- the gate stays red, nothing was widened, and the
     orphaned record is visible -- rather than an unrecorded raise sitting in the
@@ -1097,8 +846,7 @@ def write_baseline(
 
     THAT HOLE IS NOW CLOSED ELSEWHERE, and deliberately elsewhere. Closing it
     means comparing against the copy in git HEAD, which is a dependency on git
-    HISTORY this instrument still does not have (its one git call is the
-    read-only listing of tracked files, ``source_measures.tracked_python_files``):
+    this instrument does not have:
     ``scripts/check_staged_ratchet_raise.py`` holds every git invocation that
     reads history or the index, runs in pre-commit on every branch, and calls
     ``compare_baseline_files`` here for the comparison itself, so there is one
@@ -1123,7 +871,7 @@ def write_baseline(
             raise UnauthorizedRaise(raises)
         record = authorization_record(authorization, raises)
         append_authorization(
-            Path(ledger) if ledger is not None else repo_root() / LEDGER_RELPATH,
+            Path(ledger) if ledger is not None else repo_root() / LEDGER_DIR_RELPATH,
             record,
         )
     safe_io.atomic_write_text(target, text, mkdir=True)
@@ -1215,24 +963,39 @@ class RaiseAuthorization:
         _require_non_blank(self, 'reason')
 
 
-#: Bumped only if an entry's SHAPE changes; the file is append-only otherwise.
+#: Bumped only if an entry's SHAPE changes; entries are never rewritten otherwise.
 LEDGER_SCHEMA_VERSION = 1
 
-#: Emitted as the ledger's leading key, for the same reason BASELINE_README is:
-#: the rule belongs in the file a reader has open.
+#: The one file in ``LEDGER_DIR_RELPATH`` that records no authorization.
+LEDGER_README_NAME = '_README.json'
+
+#: Emitted as ``LEDGER_README_NAME``'s leading key, for the same reason
+#: BASELINE_README is: the rule belongs where a reader has the entries open.
 LEDGER_README = (
-    'This is the APPEND-ONLY provenance of every raise ever authorized against '
-    'the merge-lane ratchet baseline '
-    '(orchestrator/tests/merge_lane_ratchet_baseline.json). It is NOT a '
-    'permission list: nothing in this file grants a future raise, and no entry '
-    'here will ever let --write-baseline absorb one. Authorization is an act, '
-    'not a standing entry -- rerun --authorize-raise for each raise, and it '
-    'appends one more record. Each entry\'s "measures" block is DERIVED from the '
-    'measured raises the write gate computed, never hand-written, so it is '
-    'mechanically incapable of disagreeing with the baseline diff it '
-    'accompanies. There is no timestamp: git already carries the date, and a '
-    'clock would churn this file on every rewrite. Written by '
-    'scripts/merge_lane_metrics.py --write-baseline '
+    'This directory is the APPEND-ONLY provenance of every raise ever '
+    'authorized against the merge-lane ratchet baseline '
+    '(orchestrator/tests/merge_lane_ratchet_baseline.json): ONE FILE PER '
+    'AUTHORIZATION, named <task-id>-<first 12 hex of the sha256 of the entry '
+    'as sorted-key compact JSON>.json, so two branches authorizing at once add '
+    'two different files and never conflict. A recorded entry is never '
+    'modified, deleted or renamed. It is NOT a permission list: no entry here '
+    'grants a future raise. A commit\'s raises are covered only by the entry '
+    'files THAT COMMIT adds -- per measure and key, the rise may not exceed the '
+    f'sum of their (current - baseline); a {NEW_FILE_OVER_CEILING} or '
+    f'{NEW_FUNCTION_OVER_CEILING} row is covered when an added entry names it. '
+    'An added entry must be ATTRIBUTED: its task_id is the task the branch '
+    'works on -- the id in task/<id> or carry/<id>, or ending the branch name '
+    'as -<id> -- or one an earlier commit on the branch since main cites, as '
+    'its scope (fix(<id>): ...) or as "task <id>", which is how a carrier '
+    'records the task it lands; and its reason is not blank. Pre-commit '
+    '(scripts/check_staged_ratchet_raise.py) refuses any other, without '
+    'reading the task store. '
+    'Each entry\'s "measures" block is DERIVED from the measured raises the '
+    'write gate computed, never hand-written, so it describes the BRANCH COMMIT '
+    'it accompanied, not a state of main: when the ratchet-baseline merge '
+    'driver composes two branches\' moves of one row, main holds ours + theirs '
+    '- base, a value no single entry names. There is no timestamp: git carries '
+    'the date. Written by scripts/merge_lane_metrics.py --write-baseline '
     'orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise '
     '<task-id> --reason "<why>".'
 )
@@ -1265,250 +1028,271 @@ def authorization_record(
     }
 
 
+def entry_filename(record: dict) -> str:
+    """The file name *record* is recorded under: its task id, then its content digest.
 
-def _record_measures(record: dict) -> list[dict]:
-    measures = record.get('measures')
-    if not isinstance(measures, list):
-        return []
-    return [measure for measure in measures if isinstance(measure, dict)]
-
-
-def unrecorded_raises(
-    raises: Sequence[Violation], records: Sequence[dict]
-) -> list[Violation]:
-    """The raises in *raises* that no entry in *records* names. Pure.
-
-    The inverse of ``authorization_record``, and placed beside it so the writer
-    and the auditor read a raise out of one field vocabulary (SPOT) rather than
-    two that can drift. Coverage is the triple ``(measure, key, current)``.
-
-    ``current`` is in the triple because it is the discriminator that actually
-    catches a stale or hand-written entry: such an entry names the right measure
-    and the right key while the baseline it accompanies landed somewhere else,
-    so a ``(measure, key)`` check would wave it through. ``baseline`` is
-    deliberately OUT of it: an agent who runs ``--write-baseline
-    --authorize-raise`` twice in one commit records ``b -> m`` and ``m -> f``,
-    while the HEAD-to-staged delta reads ``b -> f``, so requiring it to match
-    would refuse a correctly authorized commit.
-
-    A record whose ``measures`` is missing or not a list simply covers nothing:
-    a badly hand-edited ledger must REFUSE the commit, not crash the gate.
+    DERIVED FROM THE CONTENT, so a name can never hold two different entries:
+    two branches adding the same name added the same bytes, which git merges
+    clean, and an entry edited after it was written stops matching its own
+    name -- which ``parse_entry`` refuses. The task id leads so an entry is
+    findable by eye; it is reduced to filename-safe characters, because it is
+    free text and the digest already carries uniqueness.
     """
-    covered = {
-        (measure.get('measure'), measure.get('key'), measure.get('current'))
-        for record in records
-        for measure in _record_measures(record)
-    }
-    return [
-        violation
-        for violation in raises
-        if (violation.measure, violation.key, violation.current) not in covered
-    ]
+    canonical = json.dumps(record, sort_keys=True, separators=(',', ':'))
+    digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:12]
+    task = re.sub(r'[^A-Za-z0-9_-]', '_', str(record.get('task_id')))[:40]
+    return f'{task}-{digest}.json'
 
 
-
-def empty_ledger() -> dict:
-    """A ledger that has authorized nothing -- the day-one and fail-closed state."""
-    return {
-        '_README': LEDGER_README,
-        'schema_version': LEDGER_SCHEMA_VERSION,
-        'raises': [],
-    }
+def render_entry(record: dict) -> str:
+    """One entry file's exact bytes."""
+    return json.dumps(record, indent=2) + '\n'
 
 
-def render_ledger(ledger: dict) -> str:
-    """Serialize *ledger* as the committed file's exact bytes.
+def render_ledger_readme() -> str:
+    """``LEDGER_README_NAME``'s exact bytes."""
+    readme = {'_README': LEDGER_README, 'schema_version': LEDGER_SCHEMA_VERSION}
+    return json.dumps(readme, indent=2) + '\n'
 
-    Idempotent, like ``render_baseline``: the ``_README`` is re-emitted from
-    ``LEDGER_README`` and any inbound one dropped, so a round trip is a no-op
-    rather than a churned file.
 
-    Plain ``json.dumps(indent=2)``: the baseline's one-line-per-entry writer
-    would buy nothing here. It makes edits at DIFFERENT positions disjoint
-    hunks, but two concurrent authorizations both append at the tail of
-    ``raises``, which conflicts under any line layout. The conflict is loud;
-    a merge commit's resolution of it is audited in pre-commit by
-    ``ledger_merged_entries``, and a rebase's is the residual ``RAISE_REMEDY``
-    names.
+def parse_entry(name: str, text: str) -> dict:
+    """The authorization recorded in the entry file *name* holding *text*.
+
+    MALFORMED IS FATAL, as for every ratchet artifact: an entry that cannot be
+    read is one whose provenance cannot be audited, and reading it as absent
+    would hide history. So is an entry whose name is not ``entry_filename`` of
+    its content -- it was edited after it was written, or written by hand under
+    a guessed name, and either way the name no longer says what the file holds.
     """
-    body = {key: value for key, value in ledger.items() if key != '_README'}
-    return json.dumps({'_README': LEDGER_README, **body}, indent=2) + '\n'
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RatchetError(
+            f'authorized-raise entry {name} is not valid JSON: {exc}'
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise RatchetError(
+            f'authorized-raise entry {name} holds a {type(loaded).__name__} at '
+            'top level, expected a JSON object'
+        )
+    expected = entry_filename(loaded)
+    if name != expected:
+        raise RatchetError(
+            f'authorized-raise entry {name} is not named for its content '
+            f'(its content is named {expected}). Entries are written by '
+            '--authorize-raise and never edited afterwards; record a new one '
+            'instead of changing a recorded one.'
+        )
+    return loaded
 
 
-def load_ledger(path: Path) -> dict:
-    """Load the authorized-raise ledger. ABSENT is empty; MALFORMED is fatal.
+def load_ledger(directory: Path) -> list[dict]:
+    """Every authorization recorded under *directory*. ABSENT is empty; MALFORMED is fatal.
 
     THE POLARITY IS THE OPPOSITE OF ``load_baseline``'s on absence, deliberately,
     because absence means opposite things. An absent BASELINE would compare clean
     against every measure -- a silent disarming, so it must fail hard (INV-11).
     An absent LEDGER means no raise was ever authorized, which is the fail-CLOSED
-    state: nothing is permitted by it, and hard-failing would only break the
-    day-one and fresh-tmp-path cases for no safety gain.
-
-    Corruption is different in kind. A ledger that cannot be parsed is one whose
-    entries cannot be audited, and reading it as empty would hide history, so
-    every malformed shape fails hard and names the file. Do not "fix" the split
-    by copying the neighbour -- this module already carries one deliberate
-    fail-soft/fail-hard seam that neighbours were tempted to flatten.
+    state: nothing is permitted by it. Corruption is different in kind, and
+    every file but ``LEDGER_README_NAME`` must parse as an entry
+    (``parse_entry``). Ordered by file name, since git -- not the file -- carries
+    the chronology.
     """
-    target = Path(path)
-    try:
-        text = target.read_text(encoding='utf-8')
-    except FileNotFoundError:
-        return empty_ledger()
-    except (OSError, UnicodeDecodeError) as exc:
+    target = Path(directory)
+    if not target.exists():
+        return []
+    if not target.is_dir():
         raise RatchetError(
-            f'authorized-raise ledger {target} could not be read: '
-            f'{exc.__class__.__name__}: {exc}'
-        ) from exc
+            f'authorized-raise ledger {target} is not a directory -- the ledger '
+            'holds one file per authorization'
+        )
+    entries = []
+    for path in sorted(target.iterdir()):
+        if path.name == LEDGER_README_NAME:
+            continue
+        try:
+            text = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RatchetError(
+                f'authorized-raise entry {path} could not be read: '
+                f'{exc.__class__.__name__}: {exc}'
+            ) from exc
+        entries.append(parse_entry(path.name, text))
+    return entries
+
+
+def append_authorization(directory: Path, record: dict) -> Path:
+    """Record *record* as a NEW file under *directory*; no existing file is touched.
+
+    Append-only by construction: an authorization is a file of its own, so
+    recording one cannot rewrite another, and the README is written only where
+    it is absent. Writing the same record twice writes the same bytes to the
+    same name. The promise still has to be CHECKED, because the directory is
+    also edited by rebases, merges and hands -- ``own_entry_names`` is the
+    reader that refuses a commit dropping or rewriting a recorded entry.
+    """
+    target = Path(directory)
+    readme = target / LEDGER_README_NAME
+    if not readme.exists():
+        safe_io.atomic_write_text(readme, render_ledger_readme(), mkdir=True)
+    entry = target / entry_filename(record)
+    safe_io.atomic_write_text(entry, render_entry(record), mkdir=True)
+    return entry
+
+
+def own_entry_names(
+    parents: Sequence[Mapping[str, str]], staged: Mapping[str, str]
+) -> list[str]:
+    """The entry files a commit adds, refusing any recorded one it drops or rewrites.
+
+    Each mapping is entry file name -> content identity (a blob id, at the git
+    boundary) for one parent's ledger and for the staged one. A commit's OWN
+    entries are the staged files NO parent holds: for a merge, a file either
+    parent recorded is HISTORY, never the merge's own, so it can cover nothing
+    the merge raises (LEDGER_README: no entry grants a future raise).
+
+    Append-only is a set comparison, not an ordering one: every file any parent
+    holds must be staged unchanged. A drop, an edit and a rename (a drop plus an
+    add) are each refused with an ``AppendOnlyViolation``. Pure; the caller
+    decides where the listings came from.
+    """
+    for parent in parents:
+        lost = sorted(name for name, identity in parent.items() if staged.get(name) != identity)
+        if lost:
+            raise AppendOnlyViolation(
+                'the authorized-raise ledger is append-only, and this change '
+                f'modifies, deletes or renames {len(lost)} of the '
+                f'{len(parent)} recorded entr(ies) a parent holds: '
+                f'{", ".join(lost[:5])}{" ..." if len(lost) > 5 else ""}. A '
+                'recorded entry is never touched -- record a new one with '
+                '--authorize-raise instead.'
+            )
+    return sorted(name for name in staged if not any(name in parent for parent in parents))
+
+
+def legacy_ledger_entries(text: str) -> list[dict]:
+    """The entries of the retired single-array ledger *text*. MALFORMED is fatal."""
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError as exc:
         raise RatchetError(
-            f'authorized-raise ledger {target} is not valid JSON: {exc}'
+            f'retired ledger {LEGACY_LEDGER_RELPATH} is not valid JSON: {exc}'
         ) from exc
-    if not isinstance(loaded, dict):
+    raises = loaded.get('raises') if isinstance(loaded, dict) else None
+    if not isinstance(raises, list) or not all(isinstance(entry, dict) for entry in raises):
         raise RatchetError(
-            f'authorized-raise ledger {target} holds a '
-            f'{type(loaded).__name__} at top level, expected a JSON object'
+            f'retired ledger {LEGACY_LEDGER_RELPATH} has no "raises" list of '
+            'entries, so the history it carries cannot be checked into files'
         )
-    if not isinstance(loaded.get('raises'), list):
-        raise RatchetError(
-            f'authorized-raise ledger {target} has no "raises" list -- a ledger '
-            'whose entries cannot be read is one whose history cannot be '
-            'audited, which must never read as "nothing was authorized"'
-        )
-    return loaded
+    return raises
 
 
-def append_authorization(path: Path, record: dict) -> Path:
-    """Append one record to the ledger at *path*, preserving every prior entry.
+def retire_legacy_ledger(
+    retired: Sequence[dict], staged_names: Collection[str], own: Sequence[dict]
+) -> list[dict]:
+    """The ONE-COMMIT RULE for retiring ``LEGACY_LEDGER_RELPATH``: what may cover a raise.
 
-    Append-only: history is never rewritten, so a reviewer reading the file
-    reads every raise this baseline has ever absorbed. That promise is about
-    every writer of the file, not only about this function, so it is CHECKED
-    rather than merely asserted -- ``ledger_appended_entries`` below is what
-    reads a staged ledger against its committed predecessor and refuses a
-    commit that dropped, rewrote or reordered any of it.
-    """
-    target = Path(path)
-    ledger = load_ledger(target)
-    ledger['schema_version'] = LEDGER_SCHEMA_VERSION
-    ledger['raises'] = [*ledger['raises'], record]
-    safe_io.atomic_write_text(target, render_ledger(ledger), mkdir=True)
-    return target
-
-
-def _common_prefix_length(previous: list, current: list) -> int:
-    """How many leading entries the two lists still agree on."""
-    return next(
-        (
-            index
-            # strict=False deliberately: the recorded history and the staged
-            # list may differ in length.
-            for index, (was, now) in enumerate(
-                zip(previous, current, strict=False)
-            )
-            if was != now
-        ),
-        min(len(previous), len(current)),
-    )
-
-
-def ledger_appended_entries(previous: dict, current: dict) -> list[dict]:
-    """The entries *current* adds to *previous*, refusing any rewrite of history.
-
-    The reader half of ``append_authorization``'s append-only promise, and the
-    only thing that makes that promise checkable: the writer can only keep it
-    for its own writes, while the file is edited by rebases, merges and hands.
-    *previous* must be a PREFIX of *current* -- length equality is not prefix
-    equality, so an entry rewritten in place is refused exactly like a dropped
-    one, and a reorder like both. The refusal is an ``AppendOnlyViolation``
-    rather than a bare ``RatchetError`` so a caller can tell this VERDICT apart
-    from an instrument failure at its own exit boundary.
-
-    Pure: two loaded dicts in, the suffix out. The caller decides where the two
-    images came from, which is what keeps every git invocation in
-    ``scripts/check_staged_ratchet_raise.py`` and none of it here.
-    """
-    previous_raises = list(previous.get('raises', ()))
-    current_raises = list(current.get('raises', ()))
-    if current_raises[: len(previous_raises)] != previous_raises:
-        kept = _common_prefix_length(previous_raises, current_raises)
-        raise AppendOnlyViolation(
-            'the authorized-raise ledger is append-only, and this change '
-            f'rewrites its history: {len(previous_raises) - kept} of its '
-            f'{len(previous_raises)} recorded entr(ies) are no longer where '
-            f'they were recorded (the staged file holds {len(current_raises)}). '
-            'Dropping, editing or reordering a recorded raise is what makes the '
-            'ledger stop reading as the provenance of every raise this baseline '
-            'has ever absorbed. Append a new entry with --authorize-raise '
-            'instead of touching a recorded one.'
-        )
-    return current_raises[len(previous_raises) :]
-
-
-def _merged_history_length(ours: list, theirs: list, current: list) -> int | None:
-    """How many leading entries of *current* hold both parents' histories.
-
-    One read position per parent. An entry advances every parent whose next
-    unread entry it equals -- both at once for shared history, or for an
-    identical addition git's text merge coalesced into one copy. An entry that
-    is neither parent's next is a drop, a rewrite, a reorder or a foreign
-    insertion, and so is running out before both parents are read: None.
-    """
-    read_ours = read_theirs = position = 0
-    while read_ours < len(ours) or read_theirs < len(theirs):
-        if position == len(current):
-            return None
-        entry = current[position]
-        advances_ours = read_ours < len(ours) and ours[read_ours] == entry
-        advances_theirs = read_theirs < len(theirs) and theirs[read_theirs] == entry
-        if not (advances_ours or advances_theirs):
-            return None
-        read_ours += advances_ours
-        read_theirs += advances_theirs
-        position += 1
-    return position
-
-
-def ledger_merged_entries(ours: dict, theirs: dict, current: dict) -> list[dict]:
-    """The entries a MERGE commit adds beyond BOTH parents' histories.
-
-    The reader half of ``append_authorization``'s promise for a merge commit,
-    as ``ledger_appended_entries`` is for an ordinary one. Every entry each
-    parent recorded must survive unchanged and in that parent's own order. The
-    two histories may interleave, as git's merge of the text interleaves them,
-    but nothing else may sit among them; anything else is the same
+    *retired* is every entry of the array a parent held and this commit no
+    longer stages; *staged_names* is every staged entry file; *own* is this
+    commit's own entries (``own_entry_names``). Nothing retired -> *own*,
+    unchanged. Otherwise the commit is the split, and it is SET-EQUAL: every
+    retired entry must be staged as its ``entry_filename``, and every own entry
+    must be a retired one -- so the split drops nothing, rewrites nothing, and
+    authorizes nothing of its own. It returns no entry at all, because a
+    retired entry is history and covers no raise. Any breach is an
     ``AppendOnlyViolation``.
 
-    No merge base is taken: every base entry a parent still carries must
-    survive already, so the base would add a constraint only for an entry BOTH
-    parents dropped -- and demanding that one back would refuse a merge for
-    something neither parent holds.
-
-    A parent's entries are HISTORY, never this merge's own: LEDGER_README
-    promises that nothing in the file grants a future raise, so only entries
-    after both histories that equal no parent's entry may cover a raise the
-    merge makes.
+    Uniform across a merge that retires the array (a branch still carrying it
+    merging a main that already split it): the entries main already holds as
+    files are staged as history, the branch's own become own files here, and
+    the same two conditions hold.
     """
-    ours_raises = list(ours.get('raises', ()))
-    theirs_raises = list(theirs.get('raises', ()))
-    current_raises = list(current.get('raises', ()))
-    history_length = _merged_history_length(ours_raises, theirs_raises, current_raises)
-    if history_length is None:
+    if not retired:
+        return list(own)
+    retired_names = {entry_filename(entry) for entry in retired}
+    dropped = sorted(retired_names - set(staged_names))
+    fresh = sorted({entry_filename(entry) for entry in own} - retired_names)
+    if dropped or fresh:
         raise AppendOnlyViolation(
-            'the authorized-raise ledger is append-only, and this merge rewrites '
-            'its history: every entry each parent recorded must stay unchanged '
-            "and in that parent's order. The two histories may interleave, as "
-            "git's merge of the text interleaves them, but nothing else may sit "
-            "among them, and the merge's own entries go after both. Ours "
-            f'records {len(ours_raises)} entr(ies), theirs {len(theirs_raises)}, '
-            f'and the staged file holds {len(current_raises)}. Append a new '
-            'entry with --authorize-raise instead of touching a recorded one.'
+            f'this commit retires {LEGACY_LEDGER_RELPATH}, so it must split '
+            f'its {len(retired_names)} entr(ies) into {LEDGER_DIR_RELPATH}/ '
+            'exactly: one file per entry, no entry dropped or rewritten, and no '
+            f'authorization of its own. Missing: {len(dropped)} '
+            f'({", ".join(dropped[:5])}); not from the retired array: '
+            f'{len(fresh)} ({", ".join(fresh[:5])}). Re-run '
+            'scripts/split_merge_lane_ratchet_ledger.py, and authorize any '
+            'raise in a commit of its own.'
         )
-    recorded = [*ours_raises, *theirs_raises]
-    return [entry for entry in current_raises[history_length:] if entry not in recorded]
+    return []
+
+
+def is_count(value: object) -> TypeGuard[int]:
+    """A measured count: an int, and not a bool, which JSON would also load as one."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _authorized_amounts(records: Sequence[dict]) -> tuple[dict[tuple, int], set[tuple]]:
+    """Per (measure, key): the summed (current - baseline) *records* authorize, and every pair named.
+
+    A row whose numbers are not both ints adds nothing but is still NAMED; a
+    record whose ``measures`` is missing or not a list names nothing. A badly
+    hand-edited entry must REFUSE the commit, not crash the gate.
+    """
+    amounts: dict[tuple, int] = {}
+    named: set[tuple] = set()
+    for record in records:
+        measures = record.get('measures')
+        for row in measures if isinstance(measures, list) else ():
+            if not isinstance(row, dict):
+                continue
+            pair = (row.get('measure'), row.get('key'))
+            named.add(pair)
+            baseline, current = row.get('baseline'), row.get('current')
+            if is_count(baseline) and is_count(current):
+                amounts[pair] = amounts.get(pair, 0) + current - baseline
+    return amounts, named
+
+
+def unrecorded_raises(
+    raises: Sequence[Violation], records: Sequence[dict]
+) -> list[Violation]:
+    """The raises in *raises* that *records* -- a commit's OWN entries -- do not cover. Pure.
+
+    THE COVERAGE RULE, one rule at every enforcement point (heuristic 10): per
+    ``(measure, key)``, a raise is covered when its rise (``current -
+    baseline``) is at most the SUM of ``current - baseline`` over every row of
+    *records* naming that pair. A ceiling breach (``CEILING_BREACH_MEASURES``)
+    is not a rise over a recorded value, so it is covered when a record names
+    its measure and key.
+
+    A SUM, because a commit -- and a branch -- carries several entries for one
+    key: an agent running ``--authorize-raise`` twice records ``b -> m`` and
+    ``m -> f`` while the commit's delta reads ``b -> f``, and two raises of one
+    key composed by a merge add up the same way. Matching any one entry's
+    absolute ``current`` refused 9 of 27 legitimately authorized landings when
+    task 7298's design replayed the json-touching landings of 2026-10-06..20; the
+    sum refused none, and still refuses an unrecorded rise, because only the
+    commit's own entries are summed and a stale entry claims less than the rise.
+
+    THE SLACK THE SUM ADMITS, stated so nobody trusts more than is true: two
+    entries for ONE raise (``--authorize-raise`` rerun after ``git checkout --
+    <baseline>``, with a different reason, so a different file) both count, and
+    double that key's allowance in that commit. The write gate still refuses
+    every rise it measures, so the slack is reachable only by a baseline staged
+    past it by hand.
+
+    The inverse of ``authorization_record``, and placed beside it so the writer
+    and the auditor read a raise out of one field vocabulary (SPOT).
+    """
+    amounts, named = _authorized_amounts(records)
+
+    def covered(violation: Violation) -> bool:
+        pair = (violation.measure, violation.key)
+        if violation.measure in CEILING_BREACH_MEASURES:
+            return pair in named
+        return violation.current - violation.baseline <= amounts.get(pair, 0)
+
+    return [violation for violation in raises if not covered(violation)]
 
 
 # ---------------------------------------------------------------------------
@@ -1632,7 +1416,7 @@ def _require_matching_params(current: dict, baseline: dict) -> None:
             '-- which is a RE-MEASUREMENT, not code growth, and the write gate '
             'cannot tell the difference: every number the new version reads '
             'higher is a raise it will refuse. Pass --authorize-raise with a '
-            f'--reason naming the version change, so the {LEDGER_RELPATH} entry '
+            f'--reason naming the version change, so the {LEDGER_DIR_RELPATH} entry '
             'reads as a change of instrument rather than as a task that grew '
             'the cluster.'
         )
@@ -1661,7 +1445,7 @@ def _check_files(current: dict, baseline: dict) -> list[Violation]:
             # Not a per-path violation -- lowering is the point -- and the
             # derived totals are what catch a move that only relocated the mass.
             continue
-        for measure in _SUMMED_FILE_MEASURES:
+        for measure in _RATCHETED_FILE_MEASURES:
             was, now = int(base_entry.get(measure, 0)), int(entry.get(measure, 0))
             if now > was:
                 violations.append(Violation.rose(measure, path, was, now))
@@ -1705,7 +1489,7 @@ def _check_totals(current: dict, baseline: dict) -> list[Violation]:
     return [
         _total_violation(measure, was, current_totals[measure])
         for measure, was in sorted(baseline_totals.items())
-        if current_totals.get(measure, 0) > was
+        if measure not in REPORTED_ONLY_MEASURES and current_totals.get(measure, 0) > was
     ]
 
 
@@ -1726,12 +1510,12 @@ def _check_ceilings(current: dict, baseline: dict) -> list[Violation]:
         if lines > FILE_LINE_CEILING:
             violations.append(
                 Violation(
-                    measure='new_file_over_ceiling',
+                    measure=NEW_FILE_OVER_CEILING,
                     key=path,
                     baseline=FILE_LINE_CEILING,
                     current=lines,
                     message=(
-                        f'new_file_over_ceiling: {path} is {lines} lines, above '
+                        f'{NEW_FILE_OVER_CEILING}: {path} is {lines} lines, above '
                         f'the {FILE_LINE_CEILING}-line ceiling that applies to '
                         'paths absent from the baseline'
                     ),
@@ -1746,12 +1530,12 @@ def _check_ceilings(current: dict, baseline: dict) -> list[Violation]:
         if score > NEW_FUNCTION_COGNITIVE_CEILING:
             violations.append(
                 Violation(
-                    measure='new_function_over_ceiling',
+                    measure=NEW_FUNCTION_OVER_CEILING,
                     key=key,
                     baseline=NEW_FUNCTION_COGNITIVE_CEILING,
                     current=score,
                     message=(
-                        f'new_function_over_ceiling: {key} has cognitive '
+                        f'{NEW_FUNCTION_OVER_CEILING}: {key} has cognitive '
                         f'complexity {score}, above the '
                         f'{NEW_FUNCTION_COGNITIVE_CEILING} ceiling that applies '
                         'to functions absent from the baseline'
@@ -1839,7 +1623,7 @@ def _merged_value(base: Any, ours: Any, theirs: Any) -> Any:
 
     Each side's own move stands, up or down, and a deletion stands unless the
     other side moved the entry (a modify/delete keeps the modification). Where
-    both sides moved one measure, the higher side bounds it.
+    both sides moved one measure, :func:`_both_moved_bound` bounds it.
     """
     if ours == base:
         return theirs
@@ -1849,7 +1633,25 @@ def _merged_value(base: Any, ours: Any, theirs: Any) -> Any:
         return theirs if ours is None else ours
     if isinstance(ours, dict) and isinstance(theirs, dict):
         return _merged_mapping(base if isinstance(base, dict) else {}, ours, theirs)
-    return max(ours, theirs, key=_magnitude)
+    return _both_moved_bound(base, ours, theirs)
+
+
+def _both_moved_bound(base: Any, ours: Any, theirs: Any) -> Any:
+    """The most a measure both sides moved can honestly hold.
+
+    That is the higher side, or both sides' moves composed over *base* where
+    that is higher: ``ours + theirs - base``, or for a name list the 3-way set
+    merge, whose absent *base* is the empty list. A count with no *base* has
+    nothing to compose over.
+    """
+    if isinstance(ours, list):
+        before, mine, other = set(base or ()), set(ours), set(theirs)
+        composed = sorted((mine & other) | (mine - before) | (other - before))
+    elif base is None:
+        return max(ours, theirs, key=_magnitude)
+    else:
+        composed = ours + theirs - base
+    return max(ours, theirs, composed, key=_magnitude)
 
 
 def _merged_mapping(base: dict, ours: dict, theirs: dict) -> dict:
@@ -1867,7 +1669,7 @@ def _merge_bound(base: dict, ours: dict, theirs: dict) -> dict:
         name: _merged_mapping(
             _section(base, name), _section(ours, name), _section(theirs, name)
         )
-        for name in _PER_PATH_SECTIONS
+        for name in PER_PATH_SECTIONS
     }
 
 
@@ -1878,9 +1680,9 @@ def compare_merged_baseline_files(
 
     The bound is what git does to the file text, applied per measure against the
     merge *base*: a measure only one side moved stands at that side's value, up
-    or down, and one both sides moved is bounded by the higher side. An absent
-    *base* is the empty image git merges unrelated histories against, and an
-    absent parent moved nothing, so it stands in as the base.
+    or down, and one both sides moved is bounded by :func:`_both_moved_bound`.
+    An absent *base* is the empty image git merges unrelated histories against,
+    and an absent parent moved nothing, so it stands in as the base.
 
     NOT "clean against either parent": that admits keeping one side's stale
     value over the other side's lowering, which is an unrecorded widening on
@@ -1908,22 +1710,6 @@ def compare_merged_baseline_files(
 def repo_root() -> Path:
     """The repo root, derived from this file's location (``<root>/scripts/``)."""
     return Path(__file__).resolve().parents[1]
-
-
-def _alias_importer_rows(files: dict) -> list[str]:
-    """One row per alias module: its old name, the new name to migrate to, and
-    how many files still import the old one -- the number PRD task eta drives to 0."""
-    rows: dict[str, int] = {}
-    for path, entry in files.items():
-        name = source_measures.src_module_name(path)
-        if name is not None and name in ALIAS_MODULES and 'external_importers' in entry:
-            rows[name] = entry['external_importers']
-    old_width = max(map(len, rows), default=0)
-    new_width = max((len(ALIAS_MODULES[name]) for name in rows), default=0)
-    return [
-        f'  {name:<{old_width}} -> {ALIAS_MODULES[name]:<{new_width}}  {rows[name]:>7}'
-        for name in sorted(rows)
-    ]
 
 
 def _render_table(report: dict, root: Path) -> str:
@@ -1961,8 +1747,6 @@ def _render_table(report: dict, root: Path) -> str:
             '',
             f'function_local_imports  {totals["function_local_imports"]:>7}',
             f'reexport_names          {totals["reexport_names"]:>7}',
-            f'external_importers      {totals["external_importers"]:>7}',
-            *_alias_importer_rows(files),
             '',
             f'test suite -- {len(report.get("tests", {}))} lane-importing files '
             f'under {TESTS_ROOT}',
@@ -2004,8 +1788,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             'Measure the merge-lane cluster (PRD plans/merge-lane-quality-prd.md '
-            'task alpha) and ratchet every measure against the committed '
-            'baseline. READ-ONLY except under --write-baseline.'
+            'task alpha) and ratchet its structural measures against the '
+            'committed baseline. READ-ONLY except under --write-baseline.'
         ),
         epilog=(
             'Exit codes: 0 clean; 1 ratchet violations (a measure rose above '
@@ -2058,10 +1842,11 @@ def _build_parser() -> argparse.ArgumentParser:
         'failed. Requires --authorize-raise; recorded verbatim in the ledger.',
     )
     parser.add_argument(
-        '--ledger', default=str(repo_root() / LEDGER_RELPATH),
-        help='Authorized-raise ledger appended by --authorize-raise (default: '
-        '%(default)s). Pair it with --write-baseline when writing outside this '
-        'checkout; on its own it would append to THIS checkout\'s ledger.',
+        '--ledger', default=str(repo_root() / LEDGER_DIR_RELPATH),
+        help='Authorized-raise ledger DIRECTORY --authorize-raise records one new '
+        'entry file in (default: %(default)s). Pair it with --write-baseline when '
+        'writing outside this checkout; on its own it would record in THIS '
+        'checkout\'s ledger.',
     )
     return parser
 

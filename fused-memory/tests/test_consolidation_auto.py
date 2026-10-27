@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.memory_metadata import SUPERSEDED_BY_METADATA_KEY
 from fused_memory.reconciliation.consolidation_auto import (
     CORRECTION_METADATA_KEYS,
     UNREADABLE,
@@ -798,6 +799,20 @@ class TestMemberHazards:
         reasons = _reasons_for(verdict, AutoReasonCode.member_carries_correction_metadata)
         assert [r.ids for r in reasons] == [('m2',)]
         assert key in reasons[0].detail
+
+    def test_a_member_marked_superseded_fails(self):
+        """Folding a marked record would delete the mark and re-promote its claim."""
+        marked: dict[str, Any] = {
+            SUPERSEDED_BY_METADATA_KEY: 'ce8590f1-cc05-48da-9428-1cf1f54f3fff',
+        }
+        members = _members(_member('m1'), _member('m2', **marked))
+
+        verdict = _judge(members)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.member_carries_correction_metadata)
+        assert [r.ids for r in reasons] == [('m2',)]
+        assert SUPERSEDED_BY_METADATA_KEY in reasons[0].detail
 
     @pytest.mark.parametrize(
         'body',

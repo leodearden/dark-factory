@@ -1,0 +1,18 @@
+{
+  "task_id": "6160",
+  "reason": "train verify threads the worker's injected VerifyPort (step-2)",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22124,
+      "current": 22126
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57578,
+      "current": 57580
+    }
+  ]
+}

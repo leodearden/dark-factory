@@ -276,6 +276,14 @@ tasks:
     delivered_check:
       kind: manual
       reason: a declared port, exercised by δ1's own fakes
+  - name: one-reader-of-a-done-tasks-fix-commit
+    binding: δ1 makes flake_ledger.py::_resolving_commit public and puts D10's done-task containment question
+      in one function in flake_ledger.py beside it, taking the ancestry read as an argument; the engine
+      calls it for D10 and ε0's debt drain for a done de-flake owner (2026-10-13).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a rename and a shared helper; exercised by D10's table tests and scenario 40
 - label: δ2
   task_id: 6861
   title: 'Offline-lane red path δ2 (HUB carry): the cutover — the engine replaces the fingerprint red
@@ -480,6 +488,80 @@ tasks:
     delivered_check:
       kind: manual
       reason: the live half cannot be exercised by this task's own gate
+- label: ε0
+  task_id: 6934
+  title: 'Offline-lane red path ε0 (HUB carry): flake-debt filing leaves the observation path — a durable
+    due list in the ledger, drained by a background service; the per-observation filing cap and budget
+    retire'
+  note: 'Added 2026-10-13 on Leo''s ruling (PRD §14 item 24): de-flake filing leaves the observation path.
+    Hub hand-carry (harness.py). Retires the per-observation filing cap and budget; supersedes the result
+    type §14 item 19 first gave the recorder.'
+  capabilities:
+  - name: debt-drain-module
+    binding: 'capability→producer — ε0 creates orchestrator/src/orchestrator/flake_debt_drain.py: one
+      pass reads due items oldest first (50 per pass), calls orchestrator/src/orchestrator/flake_ledger.py::open_debt
+      (exists) with the wall-clock stamp, deletes an item once the debt is closed or has an owner that
+      reads live and not deferred, backs off exponentially otherwise, bounds each pass (50 items, the
+      first transport failure, 5 minutes), runs its sqlite calls off the loop thread, and keeps one stale-item
+      escalation. Its pass reads the harness escalation queue when it runs, because the registry is built
+      before the queue exists. Registered as a orchestrator/src/orchestrator/background_service.py::BackgroundService
+      in orchestrator/src/orchestrator/harness.py (the lifecycle registry pattern exists, eleven services
+      use it).'
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/src/orchestrator/flake_debt_drain.py
+      expect: present
+  - name: durable-due-list
+    binding: capability→producer — ε0 adds flake_debt_due to orchestrator/src/orchestrator/flake_ledger.py::_SCHEMA
+      (additive CREATE TABLE IF NOT EXISTS, the schema's own idiom), keyed like flake_occurrence on (test_id,
+      observed_at, call_site), written in the occurrence rows' transaction.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: CREATE TABLE IF NOT EXISTS flake_debt_due
+      paths:
+      - orchestrator/src/orchestrator/flake_ledger.py
+      expect: present
+  - name: filing-cap-retired
+    binding: removal — orchestrator/src/orchestrator/flake_recorder.py::_DEBT_FILINGS_PER_OBSERVATION_CAP,
+      ::_DEBT_FILING_BUDGET_SECS and ::_unowned_first (present on main; task 4974 via 5304) and the recorder's
+      task_client. The merge worker stops threading a client to the recorder (orchestrator/src/orchestrator/merge_lane/worker.py::_record_flake_observation;
+      ratcheted, shrinks).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _DEBT_FILINGS_PER_OBSERVATION_CAP =
+      paths:
+      - orchestrator/src/orchestrator/flake_recorder.py
+      expect: absent
+  - name: stale-head-rule-in-the-drain
+    binding: 'capability→producer — open_debt gains one optional check: when the lazy close reads the
+      owner done and the due item''s head does not contain that owner''s fix commit, the cycle closes
+      without a re-entry or a regression report. The check is δ1''s containment function in orchestrator/src/orchestrator/flake_ledger.py
+      (upstream) over δ2''s GitOps.is_ancestor_checked (upstream). Leo 2026-10-13 (PRD §14 items 23 and
+      24); applies to every call site.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour asserted by scenario 40 in its merge-gate and drain-timing forms
+  - name: retry-files-no-second-task
+    binding: substrate — orchestrator/src/orchestrator/flake_ledger.py::open_debt writes the owner pointer
+      before commit_planning and treats a live owner as a repeat (::_ensure_owner_task), so retrying an
+      item cut off mid-filing files no second task. ε0 pins it.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour asserted by the drain tests
+  - name: owner-invariant-meaning-kept
+    binding: the flake-ledger PRD §5.9 owner invariant is still enforced inside open_debt; only the time
+      open_debt runs moves. The report renders an unowned row with a due item as filing pending, not the
+      breach.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a semantic property; asserted by the merge-gate before/after test and the report test
 - label: ε1
   task_id: 6864
   title: 'Offline-lane red path ε1: one flake recorder body for every call site — debt_eligible, debt
@@ -531,15 +613,15 @@ tasks:
       paths:
       - orchestrator/src/orchestrator/flake_report.py
       expect: present
-  - name: debt-filing-result
-    binding: capability→producer — record_call_site_observations returns which debt-eligible tests had
-      debt opened and owned, opened without an owner, or were not reached by the cap or the budget (today
-      a test the cap leaves out gets no debt row and no trace). Regression escalations carry the call
-      site as a structured evidence entry (escalation/src/escalation/models.py::Escalation.evidence exists).
+  - name: enqueues-instead-of-filing
+    binding: capability→producer — record_call_site_observations puts every debt_eligible test, with its
+      DebtContext, on ε0's due list in the rows' transaction; it has no cap, no budget and no task client
+      (ε0, upstream). Regression escalations, raised from ε0's drain module, carry the call site as a
+      structured evidence entry (escalation/src/escalation/models.py::Escalation.evidence exists).
     verdict: PASS
     delivered_check:
       kind: manual
-      reason: asserted by ε1's recorder tests; consumed by ε2 and ζ0
+      reason: asserted by ε1's recorder tests and scenario 32 after a drain pass
   - name: evidence-on-the-wire
     binding: substrate — the `detail` column exists (orchestrator/src/orchestrator/flake_ledger.py::_SCHEMA)
       and ::flake_suppression_from_wire projects onto declared fields, so an added optional field is safe
@@ -556,7 +638,8 @@ tasks:
       kind: manual
       reason: an existing test is the check
   - name: typed-outcome-and-shared-classifier
-    binding: producer:γ and producer:δ1 — both upstream; ε1 is written against the tree after them.
+    binding: producer:γ, producer:δ1 and producer:ε0 — all upstream; ε1 is written against the tree after
+      them.
     verdict: PASS
     delivered_check:
       kind: manual
@@ -564,14 +647,15 @@ tasks:
 - label: ε2
   task_id: 6865
   title: 'Offline-lane red path ε2: lane clears and recoveries reach the flake recorder — per-pass rows,
-    the one-head recovery rule, debt_due, the debt-eligible list, the de-flake owner in the fix digest'
+    the one-head recovery rule, each due item''s evidence head, the debt-eligible list, the de-flake owner
+    in the fix digest'
   note: 'Rests on all three D6 calls (author''s calls, unreviewed). G7 waiver storm-escape-required (D6
     call 1): nothing escalates on the lane''s clear rate until task 3792 lands. G7 resolution: one home
-    for the host-pressure mapping in shared/psi.py. Records what became of every debt it offered in the
-    pass record''s effect block.'
+    for the host-pressure mapping in shared/psi.py. Records the tests it put on the ledger''s due list
+    in the pass record''s effect block; no lane-side due list (ε0).'
   capabilities:
   - name: lane-calls-the-shared-recorder
-    binding: capability→producer — ε2 adds the recorder calls and the debt_due retry to orchestrator/src/orchestrator/offline_lane_episodes.py::LaneEngine.observe
+    binding: capability→producer — ε2 adds the recorder calls to orchestrator/src/orchestrator/offline_lane_episodes.py::LaneEngine.observe
       and ::tick. Absent on main (the module does not exist).
     verdict: PASS
     delivered_check:
@@ -581,14 +665,14 @@ tasks:
       - orchestrator/src/orchestrator/offline_lane_episodes.py
       expect: present
   - name: recorder-context-and-evidence
-    binding: producer:ε1 — upstream.
+    binding: producer:ε1 and producer:ε0 (the due list and its drain) — upstream.
     verdict: PASS
     delivered_check:
       kind: manual
       reason: consumed
   - name: engine-pipeline-and-outage-mark
-    binding: producer:δ1 (the engine, reproduced_heads, last_green_head, debt_due), producer:δ2 (the worker
-      calls it), producer:π (had_outage_pass) — all upstream.
+    binding: producer:δ1 (the engine, reproduced_heads, last_green_head), producer:δ2 (the worker calls
+      it), producer:π (had_outage_pass) — all upstream.
     verdict: PASS
     delivered_check:
       kind: manual
@@ -606,6 +690,15 @@ tasks:
     delivered_check:
       kind: manual
       reason: consumed
+  - name: stale-head-for-a-done-de-flake-owner
+    binding: Leo 2026-10-13. Decided by ε0's debt drain (upstream) against each due item's head, because
+      the owner can go done between the observation and the drain; ε2's part is to give each item the
+      head of its evidence (the pass's head for a clear, the head where it failed and passed for a recovery).
+      Scenario 40.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour asserted by scenario 40 at engine level (ε2) and against the real worker (ι)
 - label: ι
   task_id: 6866
   title: 'Offline-lane red path ι (integration gate): PRD §6 scenarios 1–23 and 25–38 against the real
@@ -655,11 +748,11 @@ tasks:
   - name: soak-report-script
     binding: 'capability→producer — ζ0 creates scripts/offline_lane_soak_report.py. Every fact it reads
       has an upstream producer: pass headers and the record read API (α); the outcome block (β''s form,
-      written by δ2); the effect block (δ1''s, written by δ2, with ε2 adding the debt results from ε1''s
-      DebtFilingResult); occurrence and debt rows at the lane''s call site (ε1, ε2); the stuck-write and
-      outage records (δ1, π); the structured call site on regression escalations (ε1); tasks through get_task.
-      As first drafted this row was producer-extent-short — no leaf persisted a pass''s outcome or an
-      ended episode — and was resolved by the two blocks.'
+      written by δ2); the effect block (δ1''s, written by δ2, with ε2 adding the tests it put on the due
+      list); the due list itself (ε0); occurrence and debt rows at the lane''s call site (ε1, ε2); the
+      stuck-write and outage records (δ1, π); the structured call site on regression escalations (ε1);
+      tasks through get_task. As first drafted this row was producer-extent-short — no leaf persisted
+      a pass''s outcome or an ended episode — and was resolved by the two blocks.'
     verdict: PASS
     delivered_check:
       kind: path

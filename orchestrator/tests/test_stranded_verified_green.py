@@ -27,8 +27,8 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.recovery_emission import RecoverySweepTally
 from orchestrator.stranded_verified_green import (
     VerifiedGreenMatch,
@@ -773,14 +773,23 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
         # Still left blocked for the merge to land — never re-pended.
         _asserted_no_repend(harness, tid)
 
-    async def test_d2_human_concern_esc_still_vetoes(
-        self, harness: Harness, tmp_path: Path,
+    @pytest.mark.parametrize(
+        'category', ['design_concern', 'preexisting_main_break'],
+        ids=['human-concern', 'preexisting-main-break-off-main'],
+    )
+    async def test_d2_non_remediable_off_main_esc_still_vetoes(
+        self, harness: Harness, tmp_path: Path, category: str,
     ) -> None:
-        """A design_concern is NOT merge-remediable → LEAVE, unchanged."""
+        """A design_concern is NOT merge-remediable → LEAVE, unchanged.
+
+        Neither is a `preexisting_main_break` off main (task 4645): its ask is
+        the hotfix that lets the branch merge, and nothing has met it yet.  The
+        ON-MAIN clause alone relaxes that category.
+        """
         tid = _TID
         queue = _arm_escalation_queue(harness, tmp_path, 'd2')
         _wire_exists_off_main(harness, tid)
-        seeded = _seed_pending(queue, tid, 'design_concern')
+        seeded = _seed_pending(queue, tid, category)
 
         with patch(
             'orchestrator.harness.detect_verified_green',
@@ -794,7 +803,7 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
         _asserted_no_repend(harness, tid)
         pending = queue.get_by_task(tid, status='pending')
         assert [e.id for e in pending] == [seeded]
-        assert pending[0].category == 'design_concern'
+        assert pending[0].category == category
 
     async def test_non_match_with_open_remediable_esc_files_no_duplicate(
         self, harness: Harness, tmp_path: Path,
@@ -878,13 +887,20 @@ class TestVerifiedGreenVetoRelaxOnMain:
     vetoes, unchanged.
     """
 
+    @pytest.mark.parametrize(
+        'category', ['stranded_blocked', 'preexisting_main_break'],
+        ids=['stranded-blocked', 'preexisting-main-break-B7'],
+    )
     async def test_case_a_merge_remediable_esc_no_longer_vetoes_mark_done(
-        self, harness: Harness, tmp_path: Path,
+        self, harness: Harness, tmp_path: Path, category: str,
     ) -> None:
+        """`preexisting_main_break` is boundary row B7 (task 4645): the escalation
+        that asked for the landing must not veto the self-heal once the branch is
+        on main."""
         tid = _TID
         queue = _arm_escalation_queue(harness, tmp_path, 'ma')
         _wire_on_main_mark_done(harness, tid, tmp_path)
-        _seed_pending(queue, tid, 'stranded_blocked')
+        _seed_pending(queue, tid, category)
 
         with patch(
             'orchestrator.harness.detect_verified_green',
@@ -897,14 +913,25 @@ class TestVerifiedGreenVetoRelaxOnMain:
         assert prov is not None, 'landed branch must self-heal to done'
         assert prov['kind'] == 'found_on_main'
 
+    @pytest.mark.parametrize(
+        'companions', [(), ('preexisting_main_break',)],
+        ids=['alone', 'beside-preexisting-main-break'],
+    )
     async def test_case_b_human_concern_esc_still_vetoes_mark_done(
-        self, harness: Harness, tmp_path: Path,
+        self, harness: Harness, tmp_path: Path, companions: tuple[str, ...],
     ) -> None:
-        """A design_concern is NOT merge-remediable → the task stays blocked."""
+        """A design_concern is NOT merge-remediable → the task stays blocked.
+
+        Also beside a `preexisting_main_break` record (boundary row B8, task
+        4645): ONE human-concern record still holds the task.
+        """
         tid = _TID
         queue = _arm_escalation_queue(harness, tmp_path, 'mb')
         _wire_on_main_mark_done(harness, tid, tmp_path)
-        seeded = _seed_pending(queue, tid, 'design_concern')
+        seeded = [
+            _seed_pending(queue, tid, category)
+            for category in (*companions, 'design_concern')
+        ]
 
         with patch(
             'orchestrator.harness.detect_verified_green',
@@ -917,7 +944,7 @@ class TestVerifiedGreenVetoRelaxOnMain:
             'a human-concern escalation must still hold the task'
         )
         pending = queue.get_by_task(tid, status='pending')
-        assert [e.id for e in pending] == [seeded]
+        assert sorted(e.id for e in pending) == sorted(seeded)
 
 
 def _marker(*, tip: str = _TIP, request_id: str = 'mr-prev1234', age_s: float = 0.0) -> dict:
@@ -1103,7 +1130,7 @@ def test_status_sets_exhaust_merge_outcome_vocabulary() -> None:
     """
     from typing import get_args, get_type_hints
 
-    from orchestrator.merge_types import MergeOutcome
+    from orchestrator.merge_lane.types import MergeOutcome
 
     vocabulary = set(get_args(get_type_hints(MergeOutcome)['status']))
     assert vocabulary, 'MergeOutcome.status is not a Literal — cannot derive vocabulary'
@@ -1206,7 +1233,7 @@ class TestStrandedMergeFailedL2:
     async def test_durable_failure_files_born_at_l2(
         self, harness: Harness, tmp_path: Path, status: str,
     ) -> None:
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         queue = EscalationQueue(tmp_path / 'esc')
         req = await self._submit_and_get_req(harness, tmp_path, queue)
@@ -1230,7 +1257,7 @@ class TestStrandedMergeFailedL2:
     async def test_success_transient_files_no_l2(
         self, harness: Harness, tmp_path: Path, status: str,
     ) -> None:
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         queue = EscalationQueue(tmp_path / 'esc')
         req = await self._submit_and_get_req(harness, tmp_path, queue)
@@ -1245,7 +1272,7 @@ class TestStrandedMergeFailedL2:
     async def test_second_durable_failure_no_duplicate_l2(
         self, harness: Harness, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         queue = EscalationQueue(tmp_path / 'esc')
         req1 = await self._submit_and_get_req(harness, tmp_path, queue)
@@ -1275,7 +1302,7 @@ class TestStrandedMergeFailedL2:
         """
         import logging
 
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         queue = EscalationQueue(tmp_path / 'esc')
         req = await self._submit_and_get_req(harness, tmp_path, queue)
@@ -1482,7 +1509,7 @@ class TestSubmitVerifiedGreenMergeRequest:
         merge_queue: asyncio.Queue | None = None,
         config: Any = None,
     ):
-        from orchestrator.merge_types import QueuedBranch
+        from orchestrator.merge_lane.types import QueuedBranch
 
         queue = merge_queue if merge_queue is not None else asyncio.Queue()
         cfg = config
@@ -1523,7 +1550,7 @@ class TestSubmitVerifiedGreenMergeRequest:
     async def test_registers_done_callback_on_the_future(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_types import MergeOutcome
+        from orchestrator.merge_lane.types import MergeOutcome
 
         seen: list[Any] = []
         req, _queue = await self._submit(

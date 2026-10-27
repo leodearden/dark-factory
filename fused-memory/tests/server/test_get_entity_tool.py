@@ -16,6 +16,7 @@ through the MCP tool boundary rather than assumed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -101,3 +102,42 @@ class TestGetEntityToolDegradedSurfacing:
         )
         assert len(parsed['nodes']) == 1
         assert len(parsed['edges']) == 1
+
+
+async def _hang(*args, **kwargs):
+    await asyncio.Event().wait()
+
+
+class TestGetEntityToolFuzzyReadTimeout:
+    """A Graphiti read timeout in get_entity's fuzzy fallback is a hard error, not a miss.
+
+    get_entity degrades only on a classified rate-limit/quota error; a timeout
+    propagates.  `GraphitiBackend.search_nodes` used to swallow its own timeout
+    into `[]`, which made the fuzzy branch answer a clean
+    `{'nodes': [], 'edges': []}`, so the real backend must be in the path
+    (task 5699).
+    """
+
+    @pytest.mark.asyncio
+    async def test_search_nodes_timeout_returns_an_error_naming_it(
+        self, mock_config, make_backend,
+    ):
+        mock_config.queue.backend_read_timeout_seconds = 0.05
+        backend = make_backend(mock_config)
+        backend.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        backend.client.search_ = AsyncMock(side_effect=_hang)
+        backend.client.search = AsyncMock(return_value=[])
+        service = MemoryService(mock_config)
+        service.graphiti = backend
+
+        result = await create_mcp_server(service)._tool_manager.call_tool(
+            'get_entity',
+            {'name': 'X', 'project_id': _PROJECT_ID},
+        )
+        parsed = _parse_tool_result(result)
+
+        assert parsed.get('error_type') == 'TimeoutError', (
+            f'a search_nodes timeout must surface as an error, not a clean miss; got {parsed!r}'
+        )
+        assert 'search_nodes' in parsed.get('error', ''), f'got {parsed!r}'
+        assert 'nodes' not in parsed, f'got {parsed!r}'

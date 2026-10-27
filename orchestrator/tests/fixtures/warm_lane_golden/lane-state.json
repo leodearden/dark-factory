@@ -1,0 +1,8 @@
+{
+  "state": "assigned",
+  "task_id": "4242",
+  "title": "Golden fixture task 4242",
+  "branch": "task/4242",
+  "seeded_from_sha": "0123456789abcdef0123456789abcdef01234567",
+  "updated_at": "2026-10-12T08:15:30.123456+00:00"
+}

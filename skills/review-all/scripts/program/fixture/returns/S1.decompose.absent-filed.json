@@ -1,0 +1,90 @@
+{
+  "schema": "review-all-prd-return/1",
+  "run_id": "review-all-fixture-20261019",
+  "stream": "S1",
+  "pass": "decompose",
+  "session": {
+    "kind": "agent",
+    "title": "S1 decompose seat"
+  },
+  "prd_path": "plans/review-all-fixture-s1-prd.md",
+  "manifest_path": "plans/review-all-fixture-s1-prd.capability-manifest.md",
+  "sidecar_path": "plans/review-all-fixture-s1-prd.capability-manifest.yaml",
+  "commits": [],
+  "open_questions": [],
+  "xrefs": [],
+  "lead_actions": [
+    {
+      "op": "note",
+      "task": 102,
+      "target": null,
+      "text": "Route callers only after 101 lands.",
+      "needs_human": false
+    },
+    {
+      "op": "edge",
+      "task": 102,
+      "target": 106,
+      "text": "102 consumes C2 from S2 α.",
+      "needs_human": false
+    }
+  ],
+  "notes": "Filed α and β; γ is held on S2 C1.",
+  "filed": [
+    {
+      "label": "α",
+      "task_id": 999,
+      "priority": "high",
+      "keys": [
+        "fk-0000000000a1"
+      ],
+      "gate_dep": true,
+      "adopted": false
+    },
+    {
+      "label": "β",
+      "task_id": 102,
+      "priority": "medium",
+      "keys": [
+        "fk-0000000000a2"
+      ],
+      "gate_dep": false,
+      "adopted": false
+    }
+  ],
+  "held": [
+    {
+      "label": "γ",
+      "task_id": 103,
+      "waits_on": "S2",
+      "contract": "C1",
+      "release_owner": "S2"
+    }
+  ],
+  "released": [],
+  "commit_planning": {
+    "committed": [
+      101,
+      102
+    ],
+    "excluded": [
+      103
+    ],
+    "stamping_errors": []
+  },
+  "other_filed": [],
+  "moves": [
+    {
+      "from": "src/fixture/old_name.py",
+      "to": "src/fixture/new_name.py",
+      "symbols": [
+        "OldThing"
+      ]
+    },
+    {
+      "from": "src/fixture/removed.py",
+      "to": null,
+      "symbols": []
+    }
+  ]
+}

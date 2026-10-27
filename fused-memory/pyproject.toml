@@ -28,7 +28,10 @@ dark-factory-shared = { workspace = true }
 escalation = { workspace = true }
 
 [tool.pytest.ini_options]
-markers = ["integration: live tests requiring real external services/credentials (e.g. OpenAI API / network egress); deselect: -m 'not integration'"]
+markers = [
+    "integration: live tests requiring real external services/credentials (e.g. OpenAI API / network egress); deselect: -m 'not integration'",
+    "reads_git_history: the test reads the checkout's git history (log, merge-base, rev-list, describe), so a byte-identical tree under a new parent can verify differently; re-run alone on the merge gate's same-tree path by merge_gate_history_test_command. Not deselected by default.",
+]
 pythonpath = ["src", "../orchestrator/src"]
 asyncio_mode = "strict"
 # --max-worker-restart=0 (task 5114) is required of every thread-method config
@@ -41,12 +44,11 @@ addopts = "-n auto --dist loadgroup --max-worker-restart=0 -m 'not integration'"
 # is large rather than the original 60: the cap is WALL-CLOCK, so a healthy test
 # starved of CPU on a loaded 32-core host trips it and — under thread mode
 # plus --max-worker-restart=0 — reds a SHIFTING VICTIM rather than itself).
-# 540 is DERIVED FROM MEASUREMENT (task 5442) — worst unmarked per-test wall
-# clock under real fleet load x the 8x headroom factor — and no longer
-# judgement-picked. THE TWO SLOWEST UNMARKED TESTS IN THE WHOLE CORPUS ARE IN
-# THIS SUITE: tests/test_check_bare_magicmock_config.py's whole-tree scans, at
-# 61.52s and 54.52s. They carry no @pytest.mark.timeout, so this default is what
-# governs them, and they are what the value is derived from. See
+# 420 is DERIVED FROM MEASUREMENT — worst unmarked per-test wall clock under
+# real fleet load x the 8x headroom factor — and no longer judgement-picked.
+# This suite's repo-wide scans in tests/test_check_bare_magicmock_config.py
+# carry their own mark at their measured ceiling, so they do not govern this
+# default. The measurement and the value's history are in
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # Slow tests opt out with @pytest.mark.timeout(N).
 # In-band markers (60 < N < verify --timeout) are rejected by
@@ -64,9 +66,9 @@ addopts = "-n auto --dist loadgroup --max-worker-restart=0 -m 'not integration'"
 # @pytest.mark.timeout(N) to opt up rather than cost the run its tally. Fix the
 # mock (shared.testing.make_gate_mock) rather than leaning on this cap to
 # recover from hangs.
-# thread method is UNCHANGED by the 60→300 and 300→540 raises, deliberately:
+# thread method is UNCHANGED by every change of the value, deliberately:
 # a raise attacks the trigger, not the two safety mechanisms.
-timeout = 540
+timeout = 420
 timeout_method = "thread"
 
 [tool.pyright]

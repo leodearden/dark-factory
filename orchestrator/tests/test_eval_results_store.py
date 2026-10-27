@@ -18,7 +18,8 @@ import pytest
 from _campaign_gate_helpers import eval_base_config
 
 import orchestrator.evals.results as results_module
-from orchestrator.evals import runner, snapshots
+from orchestrator.evals import runner
+from orchestrator.evals.architect_eval import ArchitectEvalDeps
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.results import (
     CellName,
@@ -443,15 +444,21 @@ async def test_an_unaddressable_cell_fails_before_the_run_spends_anything(
     store = ResultStore(tmp_path / 'results')
     config_builder = MagicMock(spec=runner.build_eval_orch_config)
     monkeypatch.setattr(runner, 'create_eval_worktree', _fake_create_wt)
-    monkeypatch.setattr(snapshots, 'create_eval_worktree', _fake_create_wt)
     monkeypatch.setattr(runner, 'load_task', lambda _p: _executor_task(tmp_path))
     monkeypatch.setattr(runner, 'build_eval_orch_config', config_builder)
+    architect_deps = ArchitectEvalDeps(
+        store=store,
+        create_worktree=_fake_create_wt,
+        cleanup_worktree=AsyncMock(),
+        invoke=AsyncMock(),
+        read_reference_diff=AsyncMock(return_value=''),
+    )
     runs = {
         'run_eval': lambda: runner.run_eval(
             _TASK_PATH, _UNADDRESSABLE, usage_gate=None, store=store,
         ),
         'run_architect_eval': lambda: runner.run_architect_eval(
-            _TASK_PATH, _UNADDRESSABLE, usage_gate=None, store=store,
+            _TASK_PATH, _UNADDRESSABLE, usage_gate=None, deps=architect_deps,
         ),
         'run_end_to_end': lambda: runner.run_end_to_end(
             _TASK_PATH, _UNADDRESSABLE, _ADDRESSABLE, usage_gate=None, store=store,

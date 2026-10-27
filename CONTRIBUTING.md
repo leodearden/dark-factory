@@ -76,7 +76,7 @@ emergency hotfix) it's fine to edit directly:
 This is a `uv` workspace (`pyproject.toml`); the current members are:
 
 ```
-cockpit, dashboard, escalation, fused-memory, orchestrator, sampler, shared
+client-feed, cockpit, dashboard, escalation, fused-memory, orchestrator, sampler, shared
 ```
 
 **`<pkg>/src/<pkg>/` double-nesting.** Every package follows this
@@ -229,7 +229,7 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   ```
   `dark-factory-orchestrator.yaml`'s `test_command` fans this out across
   every subproject in its own venv (`shared`, `escalation`, `orchestrator`,
-  `fused-memory`, `dashboard`, `sampler`, optionally `cockpit`) — a bare
+  `fused-memory`, `dashboard`, `sampler`, `client-feed`, optionally `cockpit`) — a bare
   repo-root `pytest` instead collects everything into one process against
   only the root `pyproject.toml`, which is slower and less isolated. Mirror
   the fan-out when running the full suite yourself.
@@ -238,11 +238,11 @@ Reversing this decision means updating this section, `CLAUDE.md` and
      the repo declares at the same value. Pinned by
      tests/scripts/test_pytest_per_test_timeout_policy.py — change the configs
      and this paragraph goes red until it is updated to match. -->
-  Every pytest config caps a single test at `540` seconds of WALL CLOCK (not CPU
+  Every pytest config caps a single test at `420` seconds of WALL CLOCK (not CPU
   time), a value DERIVED FROM MEASUREMENT rather than picked — see
   `plans/pytest-per-test-timeout-measurement-2026-09-17.md` for the corpus and
   the arithmetic, and `shared/pyproject.toml` for why the cap exists at all.
-  All eight configs carry it, the repo root included, so a bare root-bound
+  All nine configs carry it, the repo root included, so a bare root-bound
   `pytest` is no longer uncapped: pytest reads exactly ONE inifile — the
   rootdir's — and never merges across `pyproject.toml` files, so a member's
   setting does nothing for a run rooted elsewhere. Opt a slow test up with
@@ -254,9 +254,9 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   verify leg passes `--timeout=300` on its CLI, and a CLI `--timeout` overrides
   the ini. So verify currently runs TIGHTER than a bare local or agent `pytest`
   — an unmarked test taking 310 seconds passes locally and reds the gate, and
-  the two tests the measurement above derived its value from still run at the
-  4.9x headroom that measurement calls insufficient. Aligning that yaml knob is
-  outside the scope that set these configs and is filed as residue 2 of
+  the test the value is now derived from (45.48s) runs at only ~6.6x headroom
+  under verify's 300, short of the 8x the measurement demands. Aligning that
+  yaml knob is outside the scope that set these configs and is filed as residue 2 of
   `plans/pytest-per-test-timeout-measurement-2026-09-17.md`.
 <!-- pytest-timeout-mirror:end -->
 <!-- lint-command-mirror:begin
@@ -264,7 +264,7 @@ Reversing this decision means updating this section, `CLAUDE.md` and
      dark-factory-orchestrator.yaml. Pinned by
      tests/scripts/test_contributing_lint_command_drift.py — widen the yaml
      head and this line goes red until it is updated to match. -->
-- **Lint**: `uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills`
+- **Lint**: `uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit client-feed conftest.py df_pytest_isolation.py skills`
 <!-- lint-command-mirror:end -->
   That bullet mirrors the `ruff check` leg only; `lint_command` chains one
   more leg the merge gate also runs —
@@ -333,7 +333,7 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   Reversing this decision means updating this section, `CLAUDE.md` and
   `tests/scripts/test_ruff_format_policy.py` together.
 - **Type-check** (pyright, run from each configured package directory so it
-  picks up that package's `[tool.pyright]` block) — the same seven workspace
+  picks up that package's `[tool.pyright]` block) — the same eight workspace
   members the merge gate checks:
   <!-- type-check-command-mirror:begin
        Mirrors the package DIRECTORIES walked by `type_check_command` in
@@ -344,10 +344,10 @@ Reversing this decision means updating this section, `CLAUDE.md` and
        the yaml chain and this block goes red until it is updated to
        match. -->
   ```bash
-  cd fused-memory && uv run pyright && cd ../orchestrator && uv run pyright && cd ../dashboard && uv run pyright && cd ../shared && uv run pyright && cd ../escalation && uv run pyright && cd ../sampler && uv run pyright && cd ../cockpit && uv run pyright
+  cd fused-memory && uv run pyright && cd ../orchestrator && uv run pyright && cd ../dashboard && uv run pyright && cd ../shared && uv run pyright && cd ../escalation && uv run pyright && cd ../sampler && uv run pyright && cd ../cockpit && uv run pyright && cd ../client-feed && uv run pyright
   ```
   <!-- type-check-command-mirror:end -->
-  `dark-factory-orchestrator.yaml`'s `type_check_command` runs the same seven
+  `dark-factory-orchestrator.yaml`'s `type_check_command` runs the same eight
   workspace members via `npx pyright` (needs Node 22+) — either invocation
   works, and both resolve the SAME pyright version: `uv run pyright` resolves
   the pyright-python wheel `uv.lock` pins, `npx pyright` resolves the repo-root
@@ -370,7 +370,7 @@ branch, before any merge submission:
    should trigger a broader run).
 2. `uv run ruff check <touched packages>`.
 3. `uv run pyright` in each touched, pyright-configured package — any of the
-   seven workspace members the §3 **Type-check** command walks.
+   eight workspace members the §3 **Type-check** command walks.
 
 The inline-suppression ratchet guard,
 `scripts/tests/test_inline_suppression_ratchet.py`, runs with the suite. A
@@ -381,6 +381,22 @@ operator has seeded `scripts/inline_suppression_baseline.json` (step κ1 of
 skips and its skip reason says so, so a green suite does not yet mean your
 suppressions were checked.
 
+The merge-lane quality ratchet, `orchestrator/tests/test_merge_lane_ratchet.py`,
+also runs with the suite. Lowering a merge-lane measure is the point; it
+regenerates `orchestrator/tests/merge_lane_ratchet_baseline.json` in the same
+commit (`python scripts/merge_lane_metrics.py --write-baseline <that path>`).
+A raise is never silent: add `--authorize-raise <task-id> --reason "<why>"`,
+which records it as ONE NEW FILE under
+`orchestrator/tests/merge_lane_ratchet_raises/`. The pre-commit auditor
+`scripts/check_staged_ratchet_raise.py` refuses a commit whose raises its own new
+entry files do not cover, and one that modifies, deletes or renames a recorded
+entry. A new entry's task id must be one the branch works on -- the id in its
+name (`task/<id>`, `carry/<id>`, or a name ending `-<id>`) or one an earlier commit
+on the branch cites (`fix(<id>): ...` or `task <id>`) -- and its reason may not
+be blank; the commit being made cannot cite itself. The baseline itself merges through a structured 3-way driver (installed
+by `scripts/setup-host.sh` step 9), so two branches moving different code no
+longer conflict on it.
+
 Do this **before** `merge_request`/`/merge-queue`, not after — a red
 post-merge verify blocks or reverts the merge, which is more expensive than
 catching it locally.
@@ -389,8 +405,8 @@ catching it locally.
 (installed via `hooks/setup.sh`, which points `core.hooksPath` at `hooks/`):
 it strips any staged `.task/` files (see §8), then on `main` runs `ruff
 check`, the asyncmock/bare-MagicMock style checks on staged test files, and
-**pyright up to 7×** (once per touched package under `PYRIGHT_PACKAGES` —
-the same seven members the merge gate type-checks — or across all of them if
+**pyright up to 8×** (once per touched package under `PYRIGHT_PACKAGES` —
+the same eight members the merge gate type-checks — or across all of them if
 the change touches a shared dependency like `shared` or `escalation`). That stage is path-filtered since task 2551: a commit
 staging no `.py` files skips pyright entirely and finishes in seconds
 (`pre-commit: pyright skipped (no Python changes)`), and a staged `.py`

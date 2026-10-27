@@ -458,7 +458,7 @@ async def test_lifespan_shutdown_leaves_no_aiosqlite_worker_threads(
     """Cancelling ``_metrics_loop`` mid-``DbPool.get()`` must not leak a thread.
 
     End-to-end reduction of the reported cross-file pytest ERROR (task 3466).
-    ``lifespan()`` cancels ``metrics_task`` at shutdown; when that task is
+    ``lifespan()`` cancels the metrics sampler task at shutdown; when that task is
     suspended awaiting a ``DbPool`` connect, the ``Connection`` is never
     returned to ``DbPool.get()``, so it never lands in ``_conns`` and
     ``close_all()`` cannot see it.

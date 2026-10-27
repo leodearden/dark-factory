@@ -19,7 +19,8 @@ from typing import Any
 
 import pytest
 from legibility import codebook as mod
-from legibility import coder, invariants
+from legibility import coder, disposition, invariants, verdict
+from legibility_task_store_fake import FakeTaskStore
 from shared.finding_key import finding_key
 
 # ---------------------------------------------------------------------------
@@ -1087,6 +1088,131 @@ def test_merge_invalid_correction_is_skipped_whole(build_record):
 
 
 # ---------------------------------------------------------------------------
+# task 7448: a correction that names the task whose whole outcome for the
+# entry it is (`outcome_of_task`). The merger records that task on the
+# entry's `corrected_by`, which disposition reads, so the task's done is never
+# taken for a fix of the entry's defect.
+# ---------------------------------------------------------------------------
+
+_T7448_UNIT_TASK_REF = {"project_root": "/r", "task_id": 5687}
+
+
+def _outcome_correction_record(
+    session="sess-outcome", task_ref: dict | None = None
+) -> dict:
+    """A note-only §7.3 correction naming *task_ref* (default task 5687 of
+    root "/r") in `outcome_of_task`: no title, cause or status."""
+    return {
+        "session": session,
+        "date": "2026-10-24",
+        "project": "dark_factory",
+        "agent_class": "task-agent",
+        "corrections": [
+            {
+                "entry_id": "entry-a",
+                "note": "The task's whole outcome was this record's correction.",
+                "outcome_of_task": dict(task_ref or _T7448_UNIT_TASK_REF),
+            }
+        ],
+    }
+
+
+def test_validate_coding_record_accepts_a_correction_naming_its_outcome_task():
+    assert mod.validate_coding_record(_outcome_correction_record()) == []
+
+
+@pytest.mark.parametrize(
+    "task_ref",
+    [
+        {"project_root": "/r", "task_id": "5687"},
+        {"project_root": "/r", "task_id": True},
+        {"task_id": 5687},
+        {"project_root": "", "task_id": 5687},
+        {"project_root": "/r"},
+    ],
+    ids=["str-task-id", "bool-task-id", "no-project-root", "empty-project-root", "no-task-id"],
+)
+def test_validate_coding_record_rejects_a_malformed_outcome_task(task_ref):
+    record = _outcome_correction_record()
+    record["corrections"][0]["outcome_of_task"] = task_ref
+
+    errors = mod.validate_coding_record(record)
+
+    assert errors and all("outcome_of_task" in error for error in errors)
+
+
+def test_merge_outcome_correction_records_the_task_on_the_entry_only():
+    codebook = _codebook_with_entry_a()
+    before = copy.deepcopy(codebook["entries"][0])
+
+    merge = _merge_one(codebook, _outcome_correction_record())
+
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
+    for field in ("title", "status"):
+        assert entry[field] == before[field]
+    assert "cause" not in entry
+    assert [s["session"] for s in entry["sightings"]] == ["sess-outcome"]
+    assert "outcome_of_task" not in entry["sightings"][0]
+    assert entry["sightings"][0]["note"]
+    assert entry["corrected_by"] == [{"project_root": "/r", "task_id": 5687}]
+    assert _report(merge) == _clean_report(corrections_applied=1)
+    assert mod.validate(merge.codebook) == []
+
+
+def test_merge_outcome_correction_re_apply_is_a_no_op():
+    record = _outcome_correction_record()
+    once = _merge_one(_codebook_with_entry_a(), record).codebook
+
+    twice = _merge_one(once, record)
+
+    assert twice.codebook == once
+    assert _report(twice) == _clean_report()
+    assert not twice.mutated
+
+
+def test_merge_outcome_corrections_dedupe_the_task_and_append_new_ones_in_order():
+    first = _merge_one(_codebook_with_entry_a(), _outcome_correction_record("sess-1")).codebook
+    same_task = _merge_one(first, _outcome_correction_record("sess-2")).codebook
+    entry = next(e for e in same_task["entries"] if e["id"] == "entry-a")
+    assert entry["corrected_by"] == [{"project_root": "/r", "task_id": 5687}]
+
+    other_task = _merge_one(
+        same_task,
+        _outcome_correction_record("sess-3", {"project_root": "/r", "task_id": 5688}),
+    ).codebook
+
+    entry = next(e for e in other_task["entries"] if e["id"] == "entry-a")
+    assert entry["corrected_by"] == [
+        {"project_root": "/r", "task_id": 5687},
+        {"project_root": "/r", "task_id": 5688},
+    ]
+    assert [s["session"] for s in entry["sightings"]] == ["sess-1", "sess-2", "sess-3"]
+
+
+def test_merge_correction_without_an_outcome_task_writes_no_corrected_by():
+    merge = _merge_one(_codebook_with_entry_a(), _correction_record())
+
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
+    assert "corrected_by" not in entry
+
+
+def test_validate_accepts_a_well_formed_corrected_by():
+    codebook = _codebook_with_entry_a()
+    codebook["entries"][0]["corrected_by"] = [{"project_root": "/r", "task_id": 5687}]
+
+    assert mod.validate(codebook) == []
+
+
+def test_validate_rejects_a_corrected_by_item_with_a_string_task_id():
+    codebook = _codebook_with_entry_a()
+    codebook["entries"][0]["corrected_by"] = [{"project_root": "/r", "task_id": "5687"}]
+
+    errors = mod.validate(codebook)
+
+    assert errors and all("corrected_by" in error for error in errors)
+
+
+# ---------------------------------------------------------------------------
 # step-13: RED (§8.3 never-delete) — NeverDeleteError + assert_no_deletion
 # ---------------------------------------------------------------------------
 
@@ -2039,7 +2165,8 @@ def test_live_codebook_has_no_pending_twin_of_an_adjudicated_candidate():
 
 
 # ---------------------------------------------------------------------------
-# Shared machinery for the live-file guards below (tasks 4892, 5198, 5687).
+# Shared machinery for the live-file guards below (tasks 4892, 5198, 5687,
+# 5729).
 # Each asserts that a committed §7.3 coding record and the merger-owned
 # registry still agree; the comparison itself is single-sourced here, so each
 # guard states only what is distinctive about its own correction and a fix to
@@ -2057,9 +2184,68 @@ _SIGHTING_PAYLOAD_FIELDS = (
     "evidence_quote",
 )
 
+# What apply_coding_records copies from the record's header into every
+# sighting it appends (the session is how a sighting is found, so it is the
+# lookup key rather than a compared field).
+_SIGHTING_HEADER_FIELDS = ("date", "project")
+
 
 def _sightings_for(holder: dict, session: str) -> list[dict]:
     return [s for s in holder.get("sightings") or [] if s.get("session") == session]
+
+
+def _session_record(record_path: Path, session: str) -> dict:
+    """The one §7.3 coding record in JSONL *record_path* that carries
+    *session*, asserted valid."""
+    records = [
+        json.loads(line)
+        for line in record_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    mine = [r for r in records if r.get("session") == session]
+    assert len(mine) == 1, (
+        f"expected exactly one {session!r} record in {record_path}, found "
+        f"{len(mine)}; sessions present: "
+        f"{sorted({r.get('session') for r in records})}"
+    )
+    assert mod.validate_coding_record(mine[0]) == [], (
+        f"invalid §7.3 coding record for session {session!r}"
+    )
+    return mine[0]
+
+
+def _live_entry(codebook: dict, entry_id: str) -> dict:
+    entries = [e for e in codebook.get("entries") or [] if e.get("id") == entry_id]
+    assert len(entries) == 1, (
+        f"expected exactly one {entry_id!r} entry, found {len(entries)}"
+    )
+    return entries[0]
+
+
+def _assert_sighting_carries(record: dict, payload: dict, holder: dict) -> None:
+    """Assert *holder* carries exactly one sighting for *record*'s session,
+    and that it is what the sole writer appends for *payload*: the record's
+    header fields and the payload's fields, verbatim. This is the
+    in-place-rewrite detector for a committed sighting."""
+    session = record["session"]
+    carried = _sightings_for(holder, session)
+    assert len(carried) == 1, (
+        f"expected exactly one {session!r} sighting on {holder.get('id')!r}, "
+        f"found {len(carried)}"
+    )
+    expected = {field: record[field] for field in _SIGHTING_HEADER_FIELDS} | {
+        field: payload[field] for field in _SIGHTING_PAYLOAD_FIELDS if payload.get(field)
+    }
+    drift = {
+        field: (want, carried[0].get(field))
+        for field, want in expected.items()
+        if carried[0].get(field) != want
+    }
+    assert drift == {}, (
+        f"the {session!r} sighting on {holder.get('id')!r} no longer matches the "
+        "committed record — a committed sighting was rewritten in place "
+        f"{{field: (record, codebook)}}: {drift}"
+    )
 
 
 def _assert_correction_absorbed(
@@ -2091,7 +2277,7 @@ def _assert_correction_absorbed(
         session would be counted in `correction_skipped` with its field
         writes lost.
     (1) AGREEMENT — the entry's title/cause/status equal the record's, and one
-        sighting carries the record's payload field for field. This is the
+        sighting carries the record field for field. This is the
         in-place-rewrite detector for the merger-owned YAML, and it is what
         proves the correction's full text is carried verbatim — which is why
         no caller needs to pin cause or note prose.
@@ -2116,21 +2302,7 @@ def _assert_correction_absorbed(
     stays owned by `test_live_codebook_is_v2_and_validates_green`.
     """
     # (0) WELL-FORMED.
-    records = [
-        json.loads(line)
-        for line in record_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    mine = [r for r in records if r.get("session") == session]
-    assert len(mine) == 1, (
-        f"expected exactly one {session!r} record in {record_path}, found "
-        f"{len(mine)}; sessions present: "
-        f"{sorted({r.get('session') for r in records})}"
-    )
-    record = mine[0]
-    assert mod.validate_coding_record(record) == [], (
-        f"invalid §7.3 coding record for session {session!r}"
-    )
+    record = _session_record(record_path, session)
     corrections = record.get("corrections") or []
     assert len(corrections) == 1, (
         f"expected exactly one correction in the {session!r} record, got "
@@ -2142,9 +2314,7 @@ def _assert_correction_absorbed(
     assert correction.get("entry_id") == entry_id
 
     codebook = mod.load(_LIVE_CODEBOOK_PATH)
-    entries = [e for e in codebook.get("entries") or [] if e.get("id") == entry_id]
-    assert len(entries) == 1, f"expected exactly one {entry_id!r} entry"
-    entry = entries[0]
+    entry = _live_entry(codebook, entry_id)
 
     # (1) AGREEMENT — entry fields, then the provenance sighting.
     field_drift = {
@@ -2157,21 +2327,7 @@ def _assert_correction_absorbed(
         f"merger-owned field was rewritten by hand {{field: (record, codebook)}}: "
         f"{field_drift}"
     )
-
-    carried = _sightings_for(entry, session)
-    assert len(carried) == 1, (
-        f"expected exactly one {session!r} sighting on {entry_id!r}, found "
-        f"{len(carried)}"
-    )
-    sighting_drift = {
-        field: (correction[field], carried[0].get(field))
-        for field in _SIGHTING_PAYLOAD_FIELDS
-        if correction.get(field) and correction[field] != carried[0].get(field)
-    }
-    assert sighting_drift == {}, (
-        f"the {session!r} sighting no longer matches the committed record "
-        f"{{field: (record, codebook)}}: {sighting_drift}"
-    )
+    _assert_sighting_carries(record, correction, entry)
 
     # (2) WITHDRAWN — the refuted framing is gone from the one field
     #     build_codebook_index renders unconditionally.
@@ -2531,6 +2687,192 @@ def test_live_codebook_withdraws_the_refuted_em_dash_framing():
 
 
 # ---------------------------------------------------------------------------
+# task 5729 (live-file guard) — the ef7f6a5c census-verifier sighting misfiled
+# on entry-cand-20260919-2 is annotated there and re-routed to
+# entry-cand-20260722-18, through the sole writer.
+# ---------------------------------------------------------------------------
+
+_T5729_RECORD_PATH = (
+    _REPO_ROOT / "docs" / "legibility" / "coding-records" / "task-5729-corrections.jsonl"
+)
+_T5729_ANNOTATION_SESSION = "task-5729-ef7f6a5c-reroute"
+_T5729_MISFILED_SESSION = "ef7f6a5c-3ea0-43b3-b0ee-73fe34d67ccf"
+_T5729_MISFILED_DATE = "2026-09-20"
+_T5729_HOME_ENTRY_ID = "entry-cand-20260722-18"
+_T5729_MISFILED_NOTE = (
+    "The periodic-census verifier encountered the em-dash issue itself while "
+    "verifying the cluster. Turns 42, 46, 54, 83, 97 show repeated "
+    "ansi_c_string encoding rejections when constructing heredocs with "
+    "embedded em-dashes. Error neighborhoods confirm SyntaxError with U+2014 "
+    "character and multiple failed Bash commands attempting to work with the "
+    "problematic em-dash pattern."
+)
+
+
+def test_live_codebook_reroutes_the_misfiled_census_verifier_sighting():
+    """The misfiled sighting is annotated where it was filed and re-routed to
+    the entry whose mechanism it shows, both through the sole writer.
+
+    (1) ANNOTATION — a note-only correction on the misfiled entry, absorbed as
+        `_assert_correction_absorbed` defines it, the entry still open.
+    (2) REPLACES NO EXPLANATION — the annotation supplies no title, cause or
+        status.
+    (3) ANNOTATED, NOT RETRACTED — the misfiled sighting keeps its own note.
+    (4) LINK — the annotation names the session it annotates and its new home.
+    (5) ROUTE — one match op, under the real session and date, on the home
+        entry, naming where it was misfiled; carried once, field for field.
+    (6) ROUTE NO-OP — re-applying the route changes nothing.
+    """
+    _, correction, entry = _assert_correction_absorbed(
+        _T5729_RECORD_PATH,
+        _T5729_ANNOTATION_SESSION,
+        _T5687_ENTRY_ID,
+        refuted_tokens=_T5687_REFUTED_TOKENS,
+        expected_status="open",
+        original_sightings={_T5729_MISFILED_SESSION: _T5729_MISFILED_DATE},
+    )
+
+    # (2) REPLACES NO EXPLANATION.
+    rewritten = {"title", "cause", "status"} & correction.keys()
+    assert rewritten == set(), (
+        f"the {_T5729_ANNOTATION_SESSION!r} correction writes {sorted(rewritten)} "
+        f"of {_T5687_ENTRY_ID!r} — that entry's framing is owned by task 5687's "
+        "record; this one only annotates a sighting"
+    )
+
+    # (3) ANNOTATED, NOT RETRACTED.
+    notes = [s.get("note") for s in _sightings_for(entry, _T5729_MISFILED_SESSION)]
+    assert notes == [_T5729_MISFILED_NOTE], (
+        f"the {_T5729_MISFILED_SESSION!r} sighting of {_T5687_ENTRY_ID!r} now "
+        f"carries {notes!r} — a dated observation is immutable: it is corrected "
+        "by the sibling annotation sighting, never rewritten"
+    )
+
+    # (4) LINK.
+    unnamed = [
+        ident
+        for ident in (_T5729_MISFILED_SESSION, _T5729_HOME_ENTRY_ID)
+        if ident not in correction["note"]
+    ]
+    assert unnamed == [], (
+        f"the annotation note does not name {unnamed} — naming them is the only "
+        "link from an annotation to the sighting it annotates and its new home"
+    )
+
+    # (5) ROUTE.
+    route = _session_record(_T5729_RECORD_PATH, _T5729_MISFILED_SESSION)
+    assert route.get("date") == _T5729_MISFILED_DATE, (
+        f"the route must keep the observation's own date, not {route.get('date')!r}"
+    )
+    assert not route.get("corrections") and not route.get("candidates"), (
+        "the route only adds a sighting; it rewrites no entry and files nothing new"
+    )
+    matches = route.get("matches") or []
+    assert len(matches) == 1, f"expected exactly one match op, got {len(matches)}"
+    match = matches[0]
+    assert match.get("entry_id") == _T5729_HOME_ENTRY_ID
+    assert _T5687_ENTRY_ID in match.get("note", ""), (
+        f"the route note does not name {_T5687_ENTRY_ID!r}, where the sighting "
+        "was misfiled and still stands"
+    )
+
+    codebook = mod.load(_LIVE_CODEBOOK_PATH)
+    _assert_sighting_carries(route, match, _live_entry(codebook, _T5729_HOME_ENTRY_ID))
+
+    # (6) ROUTE NO-OP.
+    merge = _merge_one(codebook, route)
+    assert _report(merge) == _clean_report(), (
+        f"re-applying the route changed something — the committed codebook has "
+        f"not fully absorbed it: {merge.summary()}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 7448 (live-file guard) — task 5687's whole outcome for
+# entry-cand-20260919-2 was its correction, so its done is never read as a fix.
+# The 2026-10-24 census read it as one and set the entry fixed (0f443e6c0e).
+# ---------------------------------------------------------------------------
+
+_T7448_RECORD_PATH = (
+    _REPO_ROOT / "docs" / "legibility" / "coding-records" / "task-7448-corrections.jsonl"
+)
+_T7448_SESSION = "task-7448-5687-outcome-is-a-correction"
+_T7448_CORRECTION_TASK = 5687
+
+
+def _t7448_refuting_verdict(project_root: str) -> verdict.Verdict:
+    return verdict.parse_verdict(
+        {
+            "verified": False,
+            "reason": "re-verified at as_of_sha: the finding is not observed",
+            "anchor": "slug:embedded-triple-quote-in-heredoc",
+            "tags": ["h13", verdict.KIND_TAG],
+            "severity": "medium",
+            "severity_reason": "r",
+            "route": "mechanical",
+        },
+        title="a confusion",
+        project_root=project_root,
+    )
+
+
+def test_live_codebook_records_task_5687_as_a_correction_and_never_projects_it_fixed():
+    """(a) The note-only correction naming task 5687 in `outcome_of_task` is
+    absorbed, and the entry stays open. (b) A done 5687 queues no re-verify.
+    (c) Even a GONE re-verify against 5687 projects no fix: this reproduces the
+    2026-10-24 re-flip over the committed codebook."""
+    # (a)
+    _, correction, entry = _assert_correction_absorbed(
+        _T7448_RECORD_PATH,
+        _T7448_SESSION,
+        _T5687_ENTRY_ID,
+        refuted_tokens=_T5687_REFUTED_TOKENS,
+        expected_status="open",
+        original_sightings=_T5687_ORIGINAL_SIGHTING,
+    )
+    rewritten = {"title", "cause", "status"} & correction.keys()
+    assert rewritten == set(), (
+        f"the {_T7448_SESSION!r} correction writes {sorted(rewritten)}; it only "
+        "records what task 5687's outcome was"
+    )
+    (root,) = {
+        row["project_root"]
+        for row in entry.get("filed_tickets") or []
+        if row.get("task_id") == _T7448_CORRECTION_TASK
+    }
+    assert correction.get("outcome_of_task") == {
+        "project_root": root, "task_id": _T7448_CORRECTION_TASK,
+    }
+
+    # (b)
+    live = mod.load(_LIVE_CODEBOOK_PATH)
+    statuses = {
+        str(row["task_id"]): "done"
+        for listed in live.get("entries") or []
+        for row in listed.get("filed_tickets") or []
+        if row.get("task_id") is not None
+    }
+    outcomes = disposition.read_outcomes(
+        live, statuses=statuses, statuses_error=None, observed_root=root, store=FakeTaskStore(),
+    )
+    assert _T5687_ENTRY_ID not in {due.entry_id for due in outcomes.due}
+
+    # (c)
+    gone = disposition.Reverification(
+        _T5687_ENTRY_ID,
+        disposition.TaskRef(root, _T7448_CORRECTION_TASK),
+        disposition.ReverifyResult.GONE,
+        found=_t7448_refuting_verdict(root),
+    )
+    projected, changes = disposition.project(
+        live, outcomes, {_T5687_ENTRY_ID: gone}, as_of_sha="c" * 40,
+    )
+    after = _live_entry(projected, _T5687_ENTRY_ID)
+    assert (after["status"], after.get("fixed_at_sha")) == ("open", None)
+    assert _T5687_ENTRY_ID not in {change.entry_id for change in changes}
+
+
+# ---------------------------------------------------------------------------
 # task 6402 (census PRD leaf L3, C1): finding identity, run history and ticket
 # fields on entries and candidates. Every field is optional; each rejection
 # names the field path and carries the offending value (INV-2).
@@ -2663,6 +3005,50 @@ def test_validate_rejects_a_filed_ticket_row_missing_its_step():
     assert _c1_errors_naming(codebook, "entries/0/filed_tickets/0", "step")
 
 
+def test_a_back_link_filed_before_finding_keys_existed_validates():
+    codebook = _c1_codebook(entry=_c1_entry(filed_tickets=[_c1_ticket(finding_key=None)]))
+    assert mod.validate(codebook) == []
+
+
+def test_a_malformed_finding_key_on_a_filed_ticket_row_is_still_rejected():
+    codebook = _c1_codebook(entry=_c1_entry(filed_tickets=[_c1_ticket(finding_key="fk-ZZZ")]))
+    assert _c1_errors_naming(codebook, "entries/0/filed_tickets/0", "fk-ZZZ")
+
+
+def test_a_historical_backfill_marker_validates():
+    codebook = _c1_codebook()
+    codebook[mod.HISTORICAL_BACKFILL] = {"run_id": _C1_RUN, "unmatched_task_ids": [5330]}
+    assert mod.validate(codebook) == []
+
+
+@pytest.mark.parametrize(
+    "marker, path, offending",
+    [
+        ({"run_id": "", "unmatched_task_ids": []}, "run_id", ""),
+        ({"run_id": _C1_RUN, "unmatched_task_ids": ["5330"]}, "unmatched_task_ids/0", "5330"),
+        ({"unmatched_task_ids": []}, "", "run_id"),
+    ],
+    ids=["empty-run", "string-task-id", "no-run"],
+)
+def test_validate_rejects_a_malformed_historical_backfill_marker(marker, path, offending):
+    codebook = _c1_codebook()
+    codebook[mod.HISTORICAL_BACKFILL] = marker
+    assert _c1_errors_naming(codebook, f"{mod.HISTORICAL_BACKFILL}/{path}".rstrip("/"), offending)
+
+
+def test_filed_ticket_errors_accepts_a_well_formed_row_keyed_or_not():
+    assert mod.filed_ticket_errors(_c1_ticket()) == []
+    assert mod.filed_ticket_errors(_c1_ticket(finding_key=None)) == []
+
+
+def test_filed_ticket_errors_names_the_offending_field_or_value():
+    unresolved = _c1_ticket()
+    del unresolved["resolution"]
+
+    assert any("guess" in error for error in mod.filed_ticket_errors(_c1_ticket(step="guess")))
+    assert any("resolution" in error for error in mod.filed_ticket_errors(unresolved))
+
+
 def test_validate_rejects_an_accepted_entry_without_accepted_by():
     entry = _c1_entry()
     del entry["accepted_by"]
@@ -2740,3 +3126,119 @@ def test_validate_rejects_a_partial_finding_identity(codebook, path):
 def test_validate_holds_the_identity_to_the_contract_anchor_and_tag_vocabulary(field, value):
     codebook = _c1_codebook(entry=_c1_entry(**{field: value}))
     assert _c1_errors_naming(codebook, f"entries/0/{field}", value)
+
+
+# ---------------------------------------------------------------------------
+# task 6405 (census PRD leaf L6): every attach sets attached_by. The merger
+# copies a payload's attached_by onto the sighting it lands, wherever its
+# existing routing lands it; validate() and validate_coding_record() hold the
+# one attached_by shape, and validate() the sighting's verifier_tags.
+# ---------------------------------------------------------------------------
+
+_L6_RUN = "census-dark_factory-20260714"
+_L6_TITLE_ATTACH = {"method": "title", "run_id": _L6_RUN}
+
+
+def _attached(record: dict, op: str) -> dict:
+    record[op][0]["attached_by"] = dict(_L6_TITLE_ATTACH)
+    return record
+
+
+def _recurrence_of_novel_shape() -> dict:
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+    return _attached(record, "candidates")
+
+
+def test_a_title_attach_on_a_rejected_candidate_lands_its_attached_by():
+    merge = _merge_one(_codebook_with_adjudicated_candidate("rejected"), _recurrence_of_novel_shape())
+
+    candidate = merge.codebook["candidates"][0]
+    assert _sighting_on(candidate, "sess-new")["attached_by"] == _L6_TITLE_ATTACH
+    assert mod.validate(merge.codebook) == []
+
+
+def test_a_title_attach_on_a_promoted_candidate_lands_its_attached_by_on_the_entry():
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    codebook["candidates"][0]["promoted_to"] = "entry-a"
+
+    merge = _merge_one(codebook, _recurrence_of_novel_shape())
+
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
+    assert _sighting_on(entry, "sess-new")["attached_by"] == _L6_TITLE_ATTACH
+    assert mod.validate(merge.codebook) == []
+
+
+def test_a_match_carrying_attached_by_lands_it_on_the_entry():
+    merge = _merge_one(_codebook_with_entry_a(), _attached(_match_record(), "matches"))
+
+    entry = merge.codebook["entries"][0]
+    assert _sighting_on(entry, "sess-1")["attached_by"] == _L6_TITLE_ATTACH
+    assert mod.validate(merge.codebook) == []
+
+
+def test_a_payload_without_attached_by_lands_a_sighting_without_the_key():
+    merge = _merge_one(
+        _codebook_with_adjudicated_candidate("rejected"),
+        _candidate_record(title="novel shape", session="sess-new", date="2026-07-24"),
+    )
+
+    assert "attached_by" not in _sighting_on(merge.codebook["candidates"][0], "sess-new")
+
+
+def _codebook_with_a_sighting(**fields: Any) -> dict:
+    codebook = _codebook_with_entry_a()
+    sighting = {
+        "date": "2026-07-14",
+        "project": "dark_factory",
+        "session": "sess-1",
+        "origin_phase": "implement",
+        "manifested_phase": "merge",
+    }
+    sighting.update(fields)
+    codebook["entries"][0]["sightings"] = [sighting]
+    return codebook
+
+
+def test_validate_accepts_a_sighting_carrying_attached_by_and_verifier_tags():
+    codebook = _codebook_with_a_sighting(
+        attached_by={"method": "key", "run_id": _L6_RUN},
+        verifier_tags=["h11", "kind:confusion"],
+    )
+    assert mod.validate(codebook) == []
+
+
+@pytest.mark.parametrize(
+    "fields, path, offending",
+    [
+        ({"attached_by": {"method": "vibes", "run_id": _L6_RUN}}, "attached_by/method", "vibes"),
+        ({"attached_by": {"method": "title"}}, "attached_by", "run_id"),
+        ({"verifier_tags": []}, "verifier_tags", []),
+        ({"verifier_tags": "h11"}, "verifier_tags", "h11"),
+        ({"verifier_tags": ["h11", 7]}, "verifier_tags/1", 7),
+    ],
+    ids=["unknown-method", "no-run-id", "empty-tags", "string-tags", "non-string-tag"],
+)
+def test_validate_rejects_a_malformed_sighting_attach(fields, path, offending):
+    codebook = _codebook_with_a_sighting(**fields)
+    assert _c1_errors_naming(codebook, f"entries/0/sightings/0/{path}", offending)
+
+
+@pytest.mark.parametrize("op", ["matches", "candidates"])
+@pytest.mark.parametrize(
+    "attached_by, offending",
+    [({"method": "vibes", "run_id": _L6_RUN}, "vibes"), ({"method": "title"}, "run_id")],
+    ids=["unknown-method", "no-run-id"],
+)
+def test_validate_coding_record_rejects_a_malformed_payload_attach(op, attached_by, offending):
+    record = _match_record() if op == "matches" else _candidate_record()
+    record[op][0]["attached_by"] = attached_by
+
+    errors = mod.validate_coding_record(record)
+
+    assert [error for error in errors if f"{op}/0/attached_by" in error and repr(offending) in error]
+
+
+@pytest.mark.parametrize("op", ["matches", "candidates"])
+def test_validate_coding_record_accepts_a_well_formed_payload_attach(op):
+    record = _match_record() if op == "matches" else _candidate_record()
+    assert mod.validate_coding_record(_attached(record, op)) == []

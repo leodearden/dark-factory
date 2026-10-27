@@ -4088,6 +4088,66 @@ class TestResolveBranchSha:
 
 
 @pytest.mark.asyncio
+class TestListLocalBranches:
+    async def test_fresh_repo_lists_main(self, git_ops: GitOps):
+        branches = await git_ops.list_local_branches()
+
+        assert isinstance(branches, frozenset)
+        assert 'main' in branches
+
+    async def test_lists_a_created_task_branch_by_its_full_name(
+        self, git_ops: GitOps,
+    ):
+        await git_ops.create_worktree('lb-1')
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        assert 'task/lb-1' in branches
+
+    async def test_a_deleted_branch_is_no_longer_listed(self, git_ops: GitOps):
+        wt_info = await git_ops.create_worktree('lb-1')
+        assert wt_info is not None
+        await git_ops.cleanup_worktree(wt_info.path, 'lb-1')
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        assert 'task/lb-1' not in branches
+
+    async def test_agrees_with_resolve_branch_sha(self, git_ops: GitOps):
+        await git_ops.create_worktree('lb-2')
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        for name in branches:
+            assert await git_ops.resolve_branch_sha(name) is not None, name
+        assert 'task/lb-absent' not in branches
+        assert await git_ops.resolve_branch_sha('task/lb-absent') is None
+
+    async def test_returns_none_outside_a_git_repository(
+        self, git_config: GitConfig, tmp_path: Path,
+    ):
+        not_a_repo = tmp_path / 'not-a-repo'
+        not_a_repo.mkdir()
+
+        assert await GitOps(git_config, not_a_repo).list_local_branches() is None
+
+    async def test_a_branch_sharing_its_name_with_a_tag_keeps_its_exact_name(
+        self, git_ops: GitOps,
+    ):
+        for cmd in (['git', 'tag', 'dup'], ['git', 'branch', 'dup']):
+            rc, _, stderr = await _run(cmd, cwd=git_ops.project_root)
+            assert rc == 0, stderr
+
+        branches = await git_ops.list_local_branches()
+
+        assert branches is not None
+        assert 'dup' in branches
+
+
+@pytest.mark.asyncio
 class TestFindMergeMarker:
     """Real-git tests for GitOps.find_merge_marker.
 
@@ -10699,12 +10759,20 @@ class TestCreateWorktreeRequeueAndRecycledId:
         await git_ops.cleanup_worktree(lane, 'A')
         assert plan_file.exists(), 'prereq: plan.json must still exist after cleanup'
 
+        # Seed the lane→task routing key so the disk backstop MATCHES and the
+        # identity guard this test exists to prove is genuinely reached.
+        meta_root = TaskArtifacts.meta_root_for(lane.parent, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(
+            '{"task_id": "A", "title": "Old Task"}'
+        )
+
         # NEW task with recycled id 'A' but DIFFERENT title — should NOT inherit plan
         info2 = await git_ops.create_worktree('A', expected_title='New Task')
         assert info2.path == lane  # same pool lane
 
-        # TODAY: disk backstop reuses (task_id 'A' == 'A') → plan.json inherited → FAIL
-        # AFTER step-26: identity mismatch ('Old Task' != 'New Task') → fresh reset → plan gone
+        # Without the guard: disk backstop reuses (task_id 'A' == 'A') → plan inherited
+        # With it: identity mismatch ('Old Task' != 'New Task') → fresh reset → plan gone
         assert not plan_file.exists(), (
             'Recycled-id task MUST NOT inherit the prior task\'s plan.json '
             '(identity guard should route to fresh reset)'
@@ -12181,7 +12249,7 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
         task/D must be RETAINED by α (not deleted as 0-beyond-main).
 
         Sequence:
-        1. Acquire lane on 'D', write .task/plan.json, commit WIP commit
+        1. Acquire lane on 'D', seed the meta root's metadata.json, commit WIP
         2. Advance main
         3. release_warm_lane('D') → detach + retain task/D (WIP > 0) + FREE
         4. acquire_warm_lane('D', main_HEAD) → disk-backstop route (route 2)
@@ -12198,15 +12266,16 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
 
         git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
 
-        # Step 1: Acquire lane on 'D', write plan.json, commit WIP
+        # Step 1: Acquire lane on 'D', seed metadata.json, commit WIP
         info = await git_ops.acquire_warm_lane('D', start_ref)
         assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
         lane = info.path
 
-        # Write .task/plan.json with task_id='D' (forces disk-backstop route on re-acquire)
-        task_dir = lane / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text(_json.dumps({'task_id': 'D'}))
+        # metadata.json with task_id='D' is the lane→task routing key that
+        # forces the disk-backstop route on re-acquire.
+        meta_root = TaskArtifacts.meta_root_for(lane.parent, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(_json.dumps({'task_id': 'D'}))
 
         # Commit WIP so task/D has commits beyond main
         (lane / 'wip_d.txt').write_text('work for task D\n')
@@ -12224,7 +12293,7 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
         # Step 3: release_warm_lane → detach + retain + FREE
         await git_ops.release_warm_lane(lane, 'D')
 
-        # Verify: detached, task/D retained, plan.json intact
+        # Verify: detached, task/D retained, metadata.json intact
         _, abbrev_raw, _ = await _run(
             ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
         )
@@ -12235,12 +12304,13 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
             ['git', 'rev-parse', '--verify', 'task/D'], cwd=git_repo,
         )
         assert rc_verify == 0, 'task/D must be RETAINED after first release (α)'
-        assert (task_dir / 'plan.json').exists(), (
-            'plan.json must survive release_warm_lane (used by disk-backstop re-acquire)'
+        assert (meta_root / 'metadata.json').exists(), (
+            'metadata.json must survive release_warm_lane '
+            '(it is the disk-backstop re-acquire routing key)'
         )
 
         # Step 4: re-acquire via disk-backstop route
-        # (pool sees lane as FREE+registered with plan.json task_id=='D' → route 2)
+        # (pool sees lane as FREE+registered, metadata.json task_id=='D' → route 2)
         info2 = await git_ops.acquire_warm_lane('D', main_head)
 
         # Step 5: assertions on re-acquire result
@@ -15183,3 +15253,39 @@ class TestAdvanceMainIndexLockStandoff:
             'a wait spanning several warn intervals must re-announce itself; '
             f'got {[r.message for r in caplog.records]!r}'
         )
+
+
+@pytest.mark.asyncio
+class TestIsAncestorChecked:
+    """The ancestry read tells a git error (None) from a plain no (False)."""
+
+    @staticmethod
+    async def _first_and_diverged(repo: Path) -> tuple[str, str, str]:
+        (repo / 'first.txt').write_text('first\n')
+        first = await _commit_all(repo, 'first')
+        (repo / 'second.txt').write_text('second\n')
+        second = await _commit_all(repo, 'second')
+        rc, _, err = await _run(['git', 'checkout', '-b', 'side', first], cwd=repo)
+        assert rc == 0, err
+        (repo / 'side.txt').write_text('side\n')
+        side = await _commit_all(repo, 'side')
+        return first, second, side
+
+    async def test_an_ancestor_is_true(self, git_ops: GitOps, git_repo: Path):
+        first, second, _ = await self._first_and_diverged(git_repo)
+        assert await git_ops.is_ancestor_checked(first, second) is True
+        assert await git_ops.is_ancestor(first, second) is True
+
+    async def test_a_non_ancestor_is_false(self, git_ops: GitOps, git_repo: Path):
+        _, second, side = await self._first_and_diverged(git_repo)
+        assert await git_ops.is_ancestor_checked(side, second) is False
+        assert await git_ops.is_ancestor(side, second) is False
+
+    async def test_an_unknown_sha_is_none_and_not_an_ancestor(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        first, _, _ = await self._first_and_diverged(git_repo)
+        unknown = '0123456789abcdef0123456789abcdef01234567'
+        assert await git_ops.is_ancestor_checked(unknown, first) is None
+        assert await git_ops.is_ancestor_checked(first, unknown) is None
+        assert await git_ops.is_ancestor(unknown, first) is False

@@ -141,7 +141,8 @@ fixture_branch_own_commit() {
 # U5 — --task with no value                    -> exit 2
 # U6 — --task N and --audit together           -> exit 2 (mutually exclusive)
 # U7 — --task with a non-numeric id            -> exit 2
-# All error cases (U1, U4-U7): empty stdout.
+# U8 — --task multi-line, first line numeric   -> exit 2, validator message
+# All error cases (U1, U4-U8): empty stdout.
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "--- step-1: arg-parsing / usage taxonomy ---"
@@ -183,6 +184,12 @@ run_helper --task abc
 assert "U7: --task with non-numeric id exits 2" test "$RC" -eq 2
 assert "U7: stderr is non-empty" bash -c '[ -n "$1" ]' _ "$ERR_OUT"
 assert "U7: stdout is empty" bash -c '[ -z "$1" ]' _ "$OUT"
+
+run_helper --task $'5\nx'
+assert "U8: --task with multi-line id exits 2" test "$RC" -eq 2
+assert "U8: stderr carries the --task validator message" \
+    bash -c 'grep -qF -- "--task must be a positive integer" <<<"$1"' _ "$ERR_OUT"
+assert "U8: stdout is empty" bash -c '[ -z "$1" ]' _ "$OUT"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # step-3 — structural-error taxonomy (exit 3)

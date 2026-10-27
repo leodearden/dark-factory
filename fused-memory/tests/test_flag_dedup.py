@@ -2637,197 +2637,6 @@ class TestConfirmTaskAbsent:
 
 
 # ---------------------------------------------------------------------------
-# task-2525 step-1: confirm_task_present (RED tests)
-# ---------------------------------------------------------------------------
-
-
-class TestConfirmTaskPresent:
-    """RED tests for confirm_task_present(get_task_result) (task-2525 step-1).
-
-    confirm_task_present is the positive-present inverse of confirm_task_absent:
-    returns True ONLY when the result positively confirms the task DOES exist
-    (a plain task-record dict, no error keys, carrying at least one
-    task-identity key). Any not-found, inconclusive, or non-dict result
-    returns False (fail-safe: uncertain presence must never be treated as
-    corroboration).
-
-    RED until step-2 adds confirm_task_present to flag_dedup.py.
-    """
-
-    def test_true_for_valid_task_record(self):
-        """Returns True for a valid task record dict carrying several identity keys."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        task_record = {
-            'id': '42',
-            'title': 'Some real task',
-            'status': 'in-progress',
-            'dependencies': [],
-        }
-        assert confirm_task_present(task_record) is True, (
-            'confirm_task_present must return True for a valid task record'
-        )
-
-    def test_true_for_dict_with_only_task_id_key(self):
-        """Returns True when the only identity key present is 'task_id'."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        minimal_record = {'task_id': '42'}
-        assert confirm_task_present(minimal_record) is True, (
-            "confirm_task_present must return True when 'task_id' is the only identity key"
-        )
-
-    def test_false_for_not_found_error_dict(self):
-        """Returns False for the canonical not-found error dict (task is absent, not present)."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        not_found = {
-            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 42',
-            'error_type': 'TaskmasterError',
-        }
-        assert confirm_task_present(not_found) is False, (
-            'confirm_task_present must return False for a not-found error dict'
-        )
-
-    def test_false_for_generic_inconclusive_error_dict(self):
-        """Returns False for a generic/inconclusive error dict (e.g. timeout)."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        timeout_error = {
-            'error': 'Connection timeout reaching Taskmaster backend',
-            'error_type': 'TimeoutError',
-        }
-        assert confirm_task_present(timeout_error) is False, (
-            'confirm_task_present must return False for inconclusive errors (fail-safe)'
-        )
-
-    def test_false_for_none(self):
-        """Returns False for None input (fail-safe)."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        assert confirm_task_present(None) is False, (
-            'confirm_task_present must return False for None (fail-safe)'
-        )
-
-    def test_false_for_empty_dict(self):
-        """Returns False for an empty dict (no identity keys => not confirmed present)."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        assert confirm_task_present({}) is False, (
-            'confirm_task_present must return False for an empty dict (fail-safe)'
-        )
-
-    def test_false_for_non_dict_inputs(self):
-        """Returns False for non-dict inputs (str, int, list, bool) — fail-safe."""
-        from fused_memory.reconciliation.flag_dedup import confirm_task_present
-
-        for bad in ['a task exists', 42, [], True]:
-            assert confirm_task_present(bad) is False, (
-                f'confirm_task_present must return False for non-dict {bad!r} (fail-safe)'
-            )
-
-
-# ---------------------------------------------------------------------------
-# task-3051 step-1: safe_get_task (RED tests)
-# ---------------------------------------------------------------------------
-
-
-class TestSafeGetTask:
-    """RED tests for the module-level ``safe_get_task`` (task 3051 step-1).
-
-    ``safe_get_task(taskmaster, task_id, project_root)`` is the single shared
-    one-task fetch every cross-project corroboration path routes through: it
-    returns the raw ``taskmaster.get_task`` result untouched on success and
-    normalises ANY exception to ``{'error': str(exc), 'error_type':
-    type(exc).__name__}``, so ``confirm_task_present`` / ``confirm_task_absent``
-    classify the raised-exception path exactly as they classify the MCP
-    wrapper's own error-dict path. That normalisation is also what lets every
-    caller keep using a PLAIN ``asyncio.gather``.
-
-    It is PUBLIC (no leading underscore) because task 3051 adds a call site
-    outside this module — ``task_knowledge_sync._corroborate_record_keys`` —
-    and one more private copy is exactly what this helper exists to prevent.
-    """
-
-    @pytest.mark.asyncio
-    async def test_returns_task_record_unchanged(self):
-        """A successful task-record result passes through byte-identical."""
-        from fused_memory.reconciliation.flag_dedup import safe_get_task
-
-        record = {'id': '3045', 'title': 'A real task', 'status': 'pending'}
-        taskmaster = AsyncMock()
-        taskmaster.get_task = AsyncMock(return_value=record)
-
-        result = await safe_get_task(taskmaster, '3045', '/repo/df')
-
-        assert result is record
-        assert flag_dedup.confirm_task_present(result) is True
-
-    @pytest.mark.asyncio
-    async def test_returns_error_dict_unchanged(self):
-        """A RETURNED error dict is passed through untouched, not re-wrapped."""
-        from fused_memory.reconciliation.flag_dedup import safe_get_task
-
-        error_dict = {
-            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 9999',
-            'error_type': 'TaskmasterError',
-        }
-        taskmaster = AsyncMock()
-        taskmaster.get_task = AsyncMock(return_value=error_dict)
-
-        result = await safe_get_task(taskmaster, '9999', '/repo/df')
-
-        assert result is error_dict
-        assert flag_dedup.confirm_task_absent(result) is True
-
-    @pytest.mark.asyncio
-    async def test_forwards_task_id_and_project_root_positionally(self):
-        """task_id and project_root are forwarded POSITIONALLY, in that order."""
-        from fused_memory.reconciliation.flag_dedup import safe_get_task
-
-        taskmaster = AsyncMock()
-        taskmaster.get_task = AsyncMock(return_value={'id': '7'})
-
-        await safe_get_task(taskmaster, 7, '/repo/other')
-
-        taskmaster.get_task.assert_awaited_once_with(7, '/repo/other')
-
-    @pytest.mark.asyncio
-    async def test_normalises_not_found_exception_to_absent_error_dict(self):
-        """A RAISED TaskmasterError carrying the canonical not-found phrase
-        normalises to a dict that ``confirm_task_absent`` classifies exactly as
-        it classifies the returned error-dict path."""
-        from fused_memory.reconciliation.flag_dedup import safe_get_task
-
-        exc = TaskmasterError('TASKMASTER_TOOL_ERROR', 'No tasks found for ID(s): 9999')
-        taskmaster = AsyncMock()
-        taskmaster.get_task = AsyncMock(side_effect=exc)
-
-        result = await safe_get_task(taskmaster, '9999', '/repo/df')
-
-        assert result == {'error': str(exc), 'error_type': 'TaskmasterError'}
-        assert flag_dedup.confirm_task_absent(result) is True
-        assert flag_dedup.confirm_task_present(result) is False
-
-    @pytest.mark.asyncio
-    async def test_normalises_generic_exception_to_inconclusive_error_dict(self):
-        """A generic exception normalises to the same shape and is INCONCLUSIVE:
-        neither classifier fires, so it can neither corroborate presence nor
-        confirm absence."""
-        from fused_memory.reconciliation.flag_dedup import safe_get_task
-
-        exc = RuntimeError('backend down')
-        taskmaster = AsyncMock()
-        taskmaster.get_task = AsyncMock(side_effect=exc)
-
-        result = await safe_get_task(taskmaster, '3045', '/repo/df')
-
-        assert result == {'error': 'backend down', 'error_type': 'RuntimeError'}
-        assert flag_dedup.confirm_task_present(result) is False
-        assert flag_dedup.confirm_task_absent(result) is False
-
-
-# ---------------------------------------------------------------------------
 # Step 9: filter_false_absence_flags (RED tests)
 # ---------------------------------------------------------------------------
 
@@ -3411,6 +3220,48 @@ class TestFilterFalsePhantomTaskCreationFlags:
             "Drop log must not report the finding's null top-level task_id; got: "
             f'{[r.message for r in caplog.records]}'
         )
+
+    @pytest.mark.asyncio
+    async def test_phantom_filter_drops_when_any_cite_corroborates_and_keeps_otherwise(self):
+        """Across several flags, one corroborated cite among several drops its
+        flag; a flag with none corroborated is kept (task 4873 corroboration fold)."""
+
+        async def get_task(task_id, project_root):
+            if (str(task_id), project_root) == ('42', '/repo/reify'):
+                return {'id': '42', 'title': 'Foreign task', 'status': 'pending'}
+            return {
+                'error': f'No tasks found for ID(s): {task_id}',
+                'error_type': 'TaskmasterError',
+            }
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=get_task)
+
+        def phantom(*cited: dict) -> dict:
+            return {
+                'task_id': None,
+                'flag_type': 'phantom_tasks_created',
+                'description': 'Stage 2 reported tasks_created=1 with no task found',
+                'cited_tasks': list(cited),
+            }
+
+        corroborated = phantom(
+            {'project_id': 'dark_factory', 'task_id': '41', 'title': 'Ghost'},
+            {'project_id': 'reify', 'task_id': '42', 'title': 'Foreign task'},
+        )
+        uncorroborated = phantom(
+            {'project_id': 'dark_factory', 'task_id': '43', 'title': 'Ghost'},
+            {'project_id': 'reify', 'task_id': '42', 'title': 'Different title'},
+        )
+        benign = {'task_id': '5', 'flag_type': 'other', 'description': 'unrelated'}
+
+        kept = await flag_dedup.filter_false_phantom_task_creation_flags(
+            taskmaster,
+            {'dark_factory': '/repo/df', 'reify': '/repo/reify'},
+            [corroborated, benign, uncorroborated],
+        )
+
+        assert kept == [benign, uncorroborated]
 
 
 # ---------------------------------------------------------------------------
@@ -4630,6 +4481,7 @@ class TestMarkerPayloadKeyInvariant:
         — a ``compute_flag_signature`` input — in its marker payload."""
         from fused_memory.reconciliation.flag_dedup import (
             compute_flag_signature,
+            compute_marker_signature,
             dedup_flags,
         )
 
@@ -4643,7 +4495,9 @@ class TestMarkerPayloadKeyInvariant:
         assert sig == ('3839,598', self.FLAG_TYPE), (
             f'pre-1 measured signature must still hold; got {sig!r}'
         )
-        tid, ftype = sig
+        marker_sig = compute_marker_signature(flag, project_id='know_live')
+        assert marker_sig is not None, 'a well-formed flag must yield a marker identity'
+        tid, ftype = marker_sig
 
         await dedup_flags(
             memory_service=ledger_memory_service,
@@ -4766,7 +4620,7 @@ class TestMarkerPayloadKeyInvariant:
         never write.
         """
         from fused_memory.reconciliation.flag_dedup import (
-            compute_flag_signature,
+            compute_marker_signature,
             dedup_flags,
         )
 
@@ -4806,10 +4660,10 @@ class TestMarkerPayloadKeyInvariant:
             f'cycle did, so it must be a MISS; got {r2[0]!r}'
         )
 
-        # (c) both rows exist, at compute_flag_signature of each cycle's own
+        # (c) both rows exist, at compute_marker_signature of each cycle's own
         # flag, and those two signatures DIFFER.
-        citing_sig = compute_flag_signature(citing_flag)
-        citation_less_sig = compute_flag_signature(citation_less_flag)
+        citing_sig = compute_marker_signature(citing_flag, project_id=self.PROJECT)
+        citation_less_sig = compute_marker_signature(citation_less_flag, project_id=self.PROJECT)
         assert citing_sig is not None, 'a well-formed citing flag must yield a signature'
         assert citation_less_sig is not None, (
             'a well-formed citation-less flag must yield a signature'
@@ -4963,9 +4817,11 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
 
     @staticmethod
     def _signature(flag):
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.flag_dedup import compute_marker_signature
 
-        sig = compute_flag_signature(flag)
+        sig = compute_marker_signature(
+            flag, project_id=TestDedupFlagsCrossProjectFixTaskSuppression.PROJECT
+        )
         assert sig is not None
         return sig
 
@@ -5579,7 +5435,7 @@ class TestDedupFlagsCrossProjectDiscovery:
     Everything the task-4381 gate does stays exactly as ruled — this only
     supplies the citation the gate could never get.  The anti-relocation
     assertion below is the load-bearing one: ``cited_tasks`` is a
-    ``compute_flag_signature`` INPUT read at the TOP of the per-flag loop, so
+    ``compute_marker_signature`` INPUT read at the TOP of the per-flag loop, so
     a discovered citation that reached the flag dict would move the marker to
     a different row.  Since the gate is HIT-only, the first enriched cycle
     would become a MISS; and because discovery matches a live backlog that
@@ -5596,9 +5452,8 @@ class TestDedupFlagsCrossProjectDiscovery:
     #: The signature a citation-less flag keys to — the identity that must
     #: SURVIVE a discovery-driven suppression untouched.
     CITATION_FREE_TID = '598'
-    #: What the row would relocate to if a discovered citation ever reached
-    #: the flag dict before compute_flag_signature read it.
-    RELOCATED_TID = '3839,598'
+    #: The foreign fix task discovery finds for this class's flag.
+    DISCOVERED_CITE = {'project_id': 'dark_factory', 'task_id': '3839'}
 
     @classmethod
     def _flag(cls, task_id: int = 598, description: str | None = None,
@@ -5682,6 +5537,7 @@ class TestDedupFlagsCrossProjectDiscovery:
         """
         from fused_memory.reconciliation.flag_dedup import (
             compute_flag_signature,
+            compute_marker_signature,
             dedup_flags,
         )
 
@@ -5689,6 +5545,10 @@ class TestDedupFlagsCrossProjectDiscovery:
         assert compute_flag_signature(flag) == (
             self.CITATION_FREE_TID, self.FLAG_TYPE,
         ), 'fixture must key to the citation-less signature'
+        relocated_sig = compute_marker_signature(
+            self._flag(cited_tasks=[self.DISCOVERED_CITE]), project_id=self.PROJECT,
+        )
+        assert relocated_sig is not None and relocated_sig[0] != self.CITATION_FREE_TID
         await _seed_marker(
             ledger_memory_service.recon_ledger, self.PROJECT,
             self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
@@ -5714,12 +5574,10 @@ class TestDedupFlagsCrossProjectDiscovery:
         )
         assert row.task_id == self.CITATION_FREE_TID
 
-        relocated = await _get_marker(
-            ledger, self.PROJECT, self.RELOCATED_TID, self.FLAG_TYPE,
-        )
+        relocated = await _get_marker(ledger, self.PROJECT, *relocated_sig)
         assert relocated is None, (
-            'a discovered citation must never reach compute_flag_signature: a '
-            f'row at {self.RELOCATED_TID!r} means the marker RELOCATED, which '
+            'a discovered citation must never reach compute_marker_signature: a '
+            f'row at {relocated_sig[0]!r} means the marker RELOCATED, which '
             'would make every enriched cycle a MISS under a HIT-only gate'
         )
 
@@ -5772,7 +5630,7 @@ class TestDedupFlagsCrossProjectDiscovery:
         task, discovery must not run at all — it is the fallback for findings
         that cite nothing usable, not a second sweep on every cycle."""
         from fused_memory.reconciliation.flag_dedup import (
-            compute_flag_signature,
+            compute_marker_signature,
             dedup_flags,
         )
 
@@ -5782,7 +5640,7 @@ class TestDedupFlagsCrossProjectDiscovery:
             'title': TestDiscoverForeignFixTaskCitations.LIVE_TITLE,
         }
         flag = self._flag(cited_tasks=[cite])
-        sig = compute_flag_signature(flag)
+        sig = compute_marker_signature(flag, project_id=self.PROJECT)
         assert sig is not None
         await _seed_marker(
             ledger_memory_service.recon_ledger, self.PROJECT, sig[0], sig[1],
@@ -5999,13 +5857,13 @@ class TestDedupFlagsCrossProjectDiscovery:
         backend cannot confirm.  The near-miss must not short-circuit the
         fallback."""
         from fused_memory.reconciliation.flag_dedup import (
-            compute_flag_signature,
+            compute_marker_signature,
             dedup_flags,
         )
 
         stale = {'project_id': 'dark_factory', 'task_id': '404', 'title': 'Gone'}
         flag = self._flag(cited_tasks=[stale])
-        sig = compute_flag_signature(flag)
+        sig = compute_marker_signature(flag, project_id=self.PROJECT)
         assert sig is not None, f'the flag must have a signature; got {flag!r}'
         tid, ftype = sig
         await _seed_marker(
@@ -7268,6 +7126,51 @@ class TestFilterTerminalMetadataFlags:
             'task_metadata_stale alias must also be dropped for cancelled tasks'
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag_type',
+        ['Stale-Metadata', 'metadata_stale', 'Task Metadata Stale', 'STALE_TASK_METADATA'],
+    )
+    async def test_canonical_variant_spellings_are_dropped_for_a_terminal_task(self, flag_type):
+        """A case/separator/word-order respelling of a known spelling is checked and dropped.
+
+        This widening (task 6005) is intentional: the filter matches through
+        STALE_METADATA_FAMILY, and the drop still requires a live terminal status.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'cancelled'})
+
+        flag = {'task_id': '1703', 'flag_type': flag_type}
+        result = await filter_terminal_metadata_flags(taskmaster, '/proj', [flag])
+
+        assert result == []
+        taskmaster.get_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_possible_drift_log_keeps_its_event_name_and_names_the_family(self, caplog):
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        flags = [
+            {'task_id': None, 'flag_type': 'stale_task_reference'},
+            {'task_id': None, 'flag_type': 'Stale_Metadata'},
+            {'task_id': None, 'flag_type': 'orphaned_knowledge'},
+        ]
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            await filter_terminal_metadata_flags(AsyncMock(), '/proj', flags)
+
+        drift = [
+            r.getMessage()
+            for r in caplog.records
+            if 'terminal_metadata_filter_possible_drift' in r.getMessage()
+        ]
+        assert len(drift) == 1, drift
+        assert drift[0].startswith('reconciliation.terminal_metadata_filter_possible_drift ')
+        assert 'family=stale_metadata' in drift[0]
+        assert "unmatched_flag_types=['stale_task_reference']" in drift[0]
+
 
 # ---------------------------------------------------------------------------
 # task-3007 step-1 — filter_stale_bulk_get_statuses_flags
@@ -7563,6 +7466,32 @@ class TestFilterStaleBulkGetStatusesFlags:
             'scoped reads must be issued only for the two task-bearing matching '
             'flags (100, 200) — never for the non-matching (999) or no-task-id flag'
         )
+
+    @pytest.mark.asyncio
+    async def test_possible_drift_log_keeps_its_event_name_and_names_the_family(self, caplog):
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        flags = [
+            {'task_id': None, 'flag_type': 'get_statuses_latency_regression'},
+            {'task_id': None, 'flag_type': 'Bulk-Get-Statuses-Stale'},
+        ]
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            await filter_stale_bulk_get_statuses_flags(taskmaster, '/proj', flags)
+
+        drift = [
+            r.getMessage()
+            for r in caplog.records
+            if 'stale_bulk_get_statuses_filter_possible_drift' in r.getMessage()
+        ]
+        assert len(drift) == 1, drift
+        assert drift[0].startswith(
+            'reconciliation.stale_bulk_get_statuses_filter_possible_drift '
+        )
+        assert 'family=stale_bulk_get_statuses' in drift[0]
+        assert "unmatched_flag_types=['get_statuses_latency_regression']" in drift[0]
+        taskmaster.get_statuses.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -8401,6 +8330,103 @@ class TestFilterContaminationCeilingFindings:
 # which point these classes fold into TestAcknowledgeFlagMarkerDelete/Tag/
 # ResolvedFlags below (replacing their Mem0 search+delete/tag bodies).
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# filter_snapshot_stat_edge_findings — task 3487 code-side backstop
+# ---------------------------------------------------------------------------
+
+
+class TestFilterSnapshotStatEdgeFindings:
+    """Drops a Stage-3 finding that pairs a ``task_count_snapshot*`` stat with
+    a missing Graphiti temporal_facts edge, for EVERY project: snapshot stats
+    are Mem0-only, so no such edge is ever written (Snapshot Discipline)."""
+
+    @staticmethod
+    def _flag(description, suggested_action='Investigate', **extra):
+        flag = {
+            'task_id': None,
+            'flag_type': 'stats_mismatch',
+            'category': 'memory_stale',
+            'description': description,
+            'suggested_action': suggested_action,
+        }
+        flag.update(extra)
+        return flag
+
+    @pytest.mark.parametrize(
+        'description',
+        [
+            'Stage 2 reported task_count_snapshot_mem0_written=1 but no Graphiti '
+            'temporal_facts edge exists',
+            'TASK_COUNT_SNAPSHOT_MEM0_PRUNED=2 yet no temporal fact was found',
+            'task_count_snapshot_mem0_written=1 with no matching Graphiti edge',
+            'task_count_snapshot_mem0_written=1 has no graphiti temporal record',
+        ],
+        ids=['temporal_fact', 'temporal-fact-uppercase-stat', 'graphiti-edge', 'graphiti-temporal'],
+    )
+    def test_drops_a_stat_plus_edge_finding(self, description):
+        assert flag_dedup.filter_snapshot_stat_edge_findings([self._flag(description)]) == []
+
+    def test_signals_may_be_split_across_description_and_suggested_action(self):
+        flag = self._flag(
+            'Stage 2 reported task_count_snapshot_mem0_written=1',
+            suggested_action='Write the missing Graphiti temporal_facts edge',
+        )
+
+        assert flag_dedup.filter_snapshot_stat_edge_findings([flag]) == []
+
+    @pytest.mark.parametrize(
+        'flag',
+        [
+            {'description': 'task_count_snapshot_mem0_written=1 looks low',
+             'suggested_action': 'Check Mem0'},
+            {'description': 'Graphiti temporal_facts edge for task 12 is stale',
+             'suggested_action': 'Refresh it'},
+            {'description': None, 'suggested_action': None},
+            {},
+            {'description': 'task 42 has no design doc', 'suggested_action': 'Add one'},
+        ],
+        ids=['stat-only', 'edge-only', 'none-fields', 'empty', 'unrelated'],
+    )
+    def test_keeps_anything_short_of_both_signals(self, flag):
+        assert flag_dedup.filter_snapshot_stat_edge_findings([flag]) == [flag]
+
+    def test_is_project_agnostic(self):
+        import inspect
+
+        params = inspect.signature(flag_dedup.filter_snapshot_stat_edge_findings).parameters
+        assert list(params) == ['flags']
+
+    def test_preserves_order_and_returns_a_new_list(self):
+        keep_a = self._flag('task 1 has no design doc')
+        drop = self._flag(
+            'task_count_snapshot_mem0_written=1 but no Graphiti temporal_facts edge',
+        )
+        keep_b = self._flag('task 2 has no tests')
+        flags = [keep_a, drop, keep_b]
+
+        kept = flag_dedup.filter_snapshot_stat_edge_findings(flags)
+
+        assert kept == [keep_a, keep_b]
+        assert kept is not flags
+        assert flags == [keep_a, drop, keep_b]
+
+    def test_logs_one_debug_line_per_drop(self, caplog):
+        caplog.set_level(logging.DEBUG, logger='fused_memory.reconciliation.flag_dedup')
+        drops = [
+            self._flag('task_count_snapshot_mem0_written=1 but no temporal fact', task_id=str(i))
+            for i in range(2)
+        ]
+
+        flag_dedup.filter_snapshot_stat_edge_findings([*drops, self._flag('unrelated')])
+
+        lines = [
+            r for r in caplog.records
+            if r.levelno == logging.DEBUG
+            and 'filter_snapshot_stat_edge_findings' in r.getMessage()
+        ]
+        assert len(lines) == 2
 
 
 class TestAcknowledgeFlagMarkerLedger:
@@ -11283,11 +11309,11 @@ class TestCrossProjectGateAmendments:
             flag['cited_tasks'] = cited
         return flag
 
-    @staticmethod
-    def _sig(flag):
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+    @classmethod
+    def _sig(cls, flag):
+        from fused_memory.reconciliation.flag_dedup import compute_marker_signature
 
-        sig = compute_flag_signature(flag)
+        sig = compute_marker_signature(flag, project_id=cls.PROJECT)
         assert sig is not None, f'the flag must have a signature; got {flag!r}'
         return sig
 
@@ -11302,7 +11328,7 @@ class TestCrossProjectGateAmendments:
     async def _seed(self, ledger, flag, **extra_payload):
         """Seed the prior-cycle marker for *flag* (the gate is HIT-only).
 
-        The identity is DERIVED from compute_flag_signature, which unions the
+        The identity is DERIVED from compute_marker_signature, which unions the
         top-level task_id with every cited_tasks id — hardcoding the top-level
         id would seed a row the gate never reads, and the test would pass
         vacuously.
@@ -11990,7 +12016,7 @@ class TestFilterStyleOnlyAuthorshipFlags:
 
     @pytest.mark.asyncio
     async def test_non_candidate_flag_type_passes_through_without_lookup(self):
-        """(SCOPE) Only AUTHORSHIP_SUSPICION_FLAG_TYPES are checked."""
+        """(SCOPE) Only flag_types AUTHORSHIP_SUSPICION_FAMILY matches are checked."""
         from fused_memory.reconciliation.flag_dedup import (
             filter_style_only_authorship_flags,
         )
@@ -12140,6 +12166,69 @@ class TestFilterStyleOnlyAuthorshipFlags:
             'the input list itself must never be mutated'
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag_type',
+        ['Prompt-Injection', 'injection_possible', 'Foreign Authorship', 'CONTENT_FABRICATED'],
+    )
+    async def test_canonical_variant_spellings_are_candidates_and_dropped_when_house_authored(
+        self, flag_type,
+    ):
+        """A case/separator/word-order respelling of a known spelling is a candidate.
+
+        This widening (task 6005) is intentional and safe: the filter matches
+        through AUTHORSHIP_SUSPICION_FAMILY, and dropping still requires
+        wholly-house-authored provenance.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag(flag_type=flag_type)
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            return_value=self._record('recon-stage-memory_consolidator'),
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == []
+        memory_service.get_memory_by_id.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_possible_drift_log_keeps_its_event_name_and_names_the_family(self, caplog):
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flags = [
+            {'flag_type': 'injection_risk_detected'},
+            {'flag_type': 'fabrication_suspected'},
+            {'flag_type': 'foreign_key_violation'},
+            {'flag_type': 'Possible-Injection'},
+            {'flag_type': 'stale_metadata'},
+        ]
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            await filter_style_only_authorship_flags(AsyncMock(), 'dark_factory', flags)
+
+        drift = [
+            r.getMessage()
+            for r in caplog.records
+            if 'style_only_authorship_filter_possible_drift' in r.getMessage()
+        ]
+        assert len(drift) == 1, drift
+        assert drift[0].startswith(
+            'reconciliation.style_only_authorship_filter_possible_drift '
+        )
+        assert 'family=authorship_suspicion' in drift[0]
+        assert (
+            "unmatched_flag_types=['injection_risk_detected', 'fabrication_suspected', "
+            "'foreign_key_violation']"
+        ) in drift[0]
+
 
 # ---------------------------------------------------------------------------
 # ---- task 3476 step-1 ----
@@ -12257,7 +12346,7 @@ class TestFlagTypeFamily:
     _FAMILY = flag_dedup.FlagTypeFamily(
         name='widget_anomaly',
         spellings=frozenset({'widget_anomaly_detected'}),
-        drift_token='widget',
+        drift_tokens=frozenset({'widget'}),
     )
 
     def test_without_unseen_tokens_only_canonical_variants_match(self):
@@ -12290,6 +12379,38 @@ class TestFlagTypeFamily:
             )
 
         assert caplog.records == []
+
+    def test_log_drift_logs_a_flag_type_carrying_any_drift_token(self, caplog):
+        family = flag_dedup.FlagTypeFamily(
+            name='authorship_like',
+            spellings=frozenset({'possible_injection'}),
+            drift_tokens=frozenset({'inject', 'fabricat'}),
+        )
+        flags = [
+            {'flag_type': 'injection_risk'},
+            {'flag_type': 'Fabrication_Suspected'},
+            {'flag_type': 'Possible-Injection'},
+            {'flag_type': 'stale_metadata'},
+        ]
+
+        with caplog.at_level(logging.INFO):
+            family.log_drift(flags, log_event='reconciliation.x_filter_possible_drift')
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert len(messages) == 1, messages
+        assert messages[0].startswith('reconciliation.x_filter_possible_drift ')
+        assert "unmatched_flag_types=['injection_risk', 'Fabrication_Suspected']" in messages[0]
+
+    @pytest.mark.parametrize(
+        'drift_tokens',
+        [frozenset(), frozenset({''}), frozenset({'Widget'}), 'widget', {'widget'}],
+        ids=['empty_set', 'empty_token', 'not_casefolded', 'bare_str', 'mutable_set'],
+    )
+    def test_construction_rejects_malformed_drift_tokens(self, drift_tokens):
+        with pytest.raises(ValueError, match='drift_tokens'):
+            flag_dedup.FlagTypeFamily(
+                name='w', spellings=frozenset({'w_x'}), drift_tokens=drift_tokens,
+            )
 
 
 # ---------------------------------------------------------------------------

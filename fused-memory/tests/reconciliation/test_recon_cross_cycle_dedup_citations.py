@@ -209,8 +209,9 @@ class TestSignaturePathCrossCycleDedup:
 
     compute_flag_signature's cited_tasks fallback (introduced by task-1573)
     derives a deterministic (task_id, flag_type) tuple from cited_tasks when
-    the top-level task_id is None.  dedup_flags uses this signature to key
-    the stage1_flag_marker row in the recon_ledger (task 2227), so cycle 2
+    the top-level task_id is None.  dedup_flags keys the stage1_flag_marker
+    row in the recon_ledger (task 2227) on compute_marker_signature, the same
+    union with each foreign cited id project-qualified (task 5614), so cycle 2
     finds the prior row and annotates the flag with persisted_from_run
     instead of re-escalating.
 
@@ -280,8 +281,9 @@ class TestSignaturePathCrossCycleDedup:
         self, ledger_memory_service
     ):
         """Cycle 1 (no prior ledger row): flag not annotated; a stage1_flag_marker
-        ledger row is upserted keyed by the cited-tasks-derived signature
-        (task_id='3803', flag_type='cross_project')."""
+        ledger row is upserted keyed by the cited-tasks-derived marker signature
+        (task_id='reify:3803', flag_type='cross_project') — 'reify' is foreign
+        to the running project 'p'."""
         from fused_memory.reconciliation.flag_dedup import dedup_flags
 
         flag = {
@@ -304,21 +306,22 @@ class TestSignaturePathCrossCycleDedup:
             f'Fresh flag must not have persisted_from_run; got {result[0]}'
         )
 
-        # A stage1_flag_marker ledger row was upserted, keyed by the
-        # cited-tasks-derived signature (task_id='3803', flag_type='cross_project').
+        # A stage1_flag_marker ledger row was upserted, keyed by the cited-tasks-
+        # derived marker signature (task_id='reify:3803', flag_type='cross_project').
         row = await ledger_memory_service.recon_ledger.get_by_identity(
-            'p', 'stage1_flag_marker', '3803', 'cross_project', ''
+            'p', 'stage1_flag_marker', 'reify:3803', 'cross_project', ''
         )
         assert row is not None, (
-            'Expected a stage1_flag_marker ledger row for (task_id=3803, '
+            'Expected a stage1_flag_marker ledger row for (task_id=reify:3803, '
             'flag_type=cross_project)'
         )
         payload = json.loads(row.payload_json)
         assert payload.get('source') == 'stage1_flag_marker', (
             f'Marker source must be "stage1_flag_marker"; got {payload.get("source")!r}'
         )
-        assert payload.get('task_id') == '3803', (
-            f'Marker task_id must be "3803" (cited-tasks signature); got {payload.get("task_id")!r}'
+        assert payload.get('task_id') == 'reify:3803', (
+            'Marker task_id must be "reify:3803" (cited-tasks marker signature); '
+            f'got {payload.get("task_id")!r}'
         )
         assert payload.get('flag_type') == 'cross_project', (
             f'Marker flag_type must be "cross_project"; got {payload.get("flag_type")!r}'
@@ -342,14 +345,14 @@ class TestSignaturePathCrossCycleDedup:
             payload_json=json.dumps({
                 'source': 'stage1_flag_marker',
                 'kind': 'stage1_flag_marker',
-                'task_id': '3803',
+                'task_id': 'reify:3803',
                 'flag_type': 'cross_project',
                 'run_id': 'r0',
                 'last_seen_run_id': 'r0',
             }),
             state='active',
             created_at='2026-01-01T00:00:00+00:00',
-            task_id='3803',
+            task_id='reify:3803',
             flag_type='cross_project',
             run_id='',
             expires_at='2099-01-01T00:00:00+00:00',

@@ -38,8 +38,8 @@ class TestStormEscalationEnabled:
     def test_constructs_zero_arg(self):
         """Constructed unconditionally inside MemoryService.__init__ — no deps to hand it.
 
-        The map is delivered later by a setter, exactly because MemoryService is
-        built before ``build_known_projects_map`` runs at server startup.
+        The map is delivered by a setter: MemoryService hands it the env seed at
+        construction, and server startup replaces that with the full snapshot.
         """
         esc = Mem0UpdateStormEscalator()
         assert esc._queues == {}
@@ -191,6 +191,27 @@ class TestStormEscalationEnabled:
         assert second is not None
         assert second != first
         assert len(_read_escalations(tmp_path)) == 2
+
+    def test_summary_names_the_project_the_count_is_scoped_to(self, tmp_path):
+        """The compact L1 view projects summary and drops detail.
+
+        So the scope of the count must be readable from the summary alone
+        (escalation/src/escalation/server.py::_COMPACT_ESCALATION_FIELDS).
+        """
+        esc = Mem0UpdateStormEscalator()
+        esc.set_known_projects({'dark_factory': str(tmp_path)})
+
+        esc.report_storm(
+            project_id='dark_factory',
+            agent_id='recon-stage-memory_consolidator',
+            count=20,
+            threshold=20,
+            window_seconds=3600.0,
+        )
+
+        summary = _read_escalations(tmp_path)[0]['summary']
+        assert 'dark_factory' in summary
+        assert 'recon-stage-memory_consolidator' in summary
 
     def test_caches_one_queue_per_project_root(self, tmp_path):
         esc = Mem0UpdateStormEscalator()

@@ -24,13 +24,13 @@ from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
 from orchestrator.merge_lane.gates import PostMergePyrightResult
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     MergeOutcome,
     MergeRequest,
     _check_post_merge_pyright,
     _run_unscoped_typechecks,
 )
-from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures — shared real-git setup (mirrors TestCheckPostMergeEquivalence)

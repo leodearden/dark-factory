@@ -16,7 +16,7 @@ from _orch_helpers import pydantic_spec, stamp_stock_routing_config
 from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
+from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewOutcome, ReviewReport
 from orchestrator.verify import VerifyResult
 
 _PHASE1 = VerifyResult(
@@ -94,6 +94,7 @@ class TestRunFullRecordsTrackers:
         cp._run_review = AsyncMock(  # type: ignore[method-assign]
             return_value=ReviewReport(
                 review_id='x', mode='full', changed_modules=[], phase1=_PHASE1,
+                outcome=ReviewOutcome.RAN, briefing_missing=False,
             )
         )
 

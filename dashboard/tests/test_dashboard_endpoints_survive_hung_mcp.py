@@ -72,7 +72,7 @@ and cannot be opted out of; it must still answer 200 while the seam hangs.
 def _dashboard_get_paths() -> list[str]:
     """Every LITERAL GET route under /api/v2/dashboard/, read off the live app.
 
-    Templated routes (``/api/v2/dashboard/task/{project}/T-{task_id}``) are excluded: this
+    Templated routes (``/api/v2/dashboard/task/{project:path}/T-{task_id}``) are excluded: this
     sweep requests each path verbatim, so a templated one would be fetched as
     the literal string ``.../{task_id}`` and answer 404/422 — a false failure
     about path construction, reported under a message about hung dependencies,
@@ -300,7 +300,7 @@ def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp, 
 def test_task_prose_route_survives_a_hung_fetch_task_prose(client, monkeypatch):
     """The templated prose route, probed with REAL parameter values.
 
-    The sweep above cannot request ``/task/{project}/T-{task_id}`` verbatim, so
+    The sweep above cannot request ``/task/{project:path}/T-{task_id}`` verbatim, so
     this binds the configured root's own label and a real id, hangs the route
     module's ``fetch_task_prose`` binding, and requires a bounded answer.
     """
@@ -344,7 +344,7 @@ def test_templated_dashboard_routes_are_not_silently_unswept():
     """
     templated = sorted(p for p in _all_dashboard_get_paths() if '{' in p)
 
-    assert templated == ['/api/v2/dashboard/task/{project}/T-{task_id}'], (
+    assert templated == ['/api/v2/dashboard/task/{project:path}/T-{task_id}'], (
         f'templated GET route(s) {templated} exist under /api/v2/dashboard/; '
         'the only one with a dedicated hung-dependency probe is the task-prose '
         'route (test_task_prose_route_survives_a_hung_fetch_task_prose). The '

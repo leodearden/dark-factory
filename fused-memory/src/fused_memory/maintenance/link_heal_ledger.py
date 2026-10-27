@@ -26,6 +26,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from shared.sqlite_column_migration import add_column_if_missing_sync
+
 from fused_memory.maintenance.link_heal import (
     BasisSource,
     HealAction,
@@ -43,6 +45,8 @@ UNDO_ACTION = 'undo'
 class RunSource(StrEnum):
     CORPUS = 'corpus'
     ADJUDICATOR = 'adjudicator'
+    #: A plan whose heals rest on the deterministic rows alone.
+    DETERMINISTIC = 'deterministic'
     UNDO = 'undo'
 
 
@@ -135,13 +139,6 @@ _ACTION_COLUMNS = (
 )
 _HEALS_ONLY = f"basis_source != '{BasisSource.UNDO}'"
 _RUN_PREFIX = re.compile(r'[0-9a-f]{8,32}')
-
-
-def _add_missing_columns(conn: sqlite3.Connection) -> None:
-    """Bring a ledger written before ``runs.plan_path`` existed up to ``_SCHEMA``."""
-    columns = {row['name'] for row in conn.execute('PRAGMA table_info(runs)')}
-    if 'plan_path' not in columns:
-        conn.execute('ALTER TABLE runs ADD COLUMN plan_path TEXT')
 
 
 def new_run_id() -> str:
@@ -280,7 +277,8 @@ class LinkHealLedger:
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
-        _add_missing_columns(self._conn)
+        # A ledger written before runs.plan_path existed.
+        add_column_if_missing_sync(self._conn, 'runs', 'plan_path', 'TEXT')
         self._conn.commit()
 
     def close(self) -> None:
@@ -432,7 +430,8 @@ class LinkHealLedger:
         return matches[0] if matches else None
 
     def is_undo_suppressed(self, planned: PlannedAction) -> bool:
-        """An undo took this heal back for this pair at these text hashes."""
+        """An undo took this heal back for this pair at these text hashes, whatever basis
+        planned either: an undo takes back an action on a pair, not a basis."""
         rows = self._same_heal(planned, states=[ActionState.UNDONE.value])
         return any(
             row.planned.pre_image.parent_id == planned.pre_image.parent_id for row in rows

@@ -3392,15 +3392,14 @@ class TestADegradedLookupIsDistinguishableFromAnAbsentNode:
     `new_endpoint_uuid=None` on purpose — leaf eta's `ensure_entity_node`
     resolves-or-mints and handles both identically. A transient backend error
     degrades to the same `None`, which is where the collapse stops being
-    deliberate: eta reads that field at exactly one site,
-    `minted=finding.new_endpoint_uuid is None`, so a FalkorDB blip books as
-    minted=True telemetry — a made-up node reported where an unavailable lookup
-    happened.
+    deliberate: read as "absent", it would mint, and book minted=True for a
+    node nobody showed was missing.
 
-    Zeta's job is to PRODUCE the discriminator; acting on it is eta's, and is
-    filed separately. Detection stays the primary result either way: the flag
-    EXTENDS `test_a_lookup_failure_never_loses_the_finding` rather than
-    replacing it, so the evidence still survives a backend that will not answer.
+    Zeta's job is to PRODUCE the discriminator; acting on it is eta's, pinned in
+    `tests/test_referent_repair.py::TestADegradedTargetLookupDefersTheRepair`.
+    Detection stays the primary result either way: the flag EXTENDS
+    `test_a_lookup_failure_never_loses_the_finding` rather than replacing it, so
+    the evidence still survives a backend that will not answer.
     """
 
     @pytest.mark.asyncio

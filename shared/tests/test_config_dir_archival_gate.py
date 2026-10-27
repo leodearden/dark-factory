@@ -345,13 +345,16 @@ class TestDispositionsMatchTheCode:
         ARCHIVED direction self-guards — it fails loudly on an empty scan — but
         the UNARCHIVED direction does not, so it needs this.)
         """
-        assert len(archival_ref_sites) >= 5, (
+        assert len(archival_ref_sites) >= 8, (
             f'Only {len(archival_ref_sites)} archival reference site(s) found: '
-            f'{sorted(archival_ref_sites)}. Five are known — '
+            f'{sorted(archival_ref_sites)}. Eight are known — '
             f'TaskWorkflow._invoke and run_dry_run_unblock (producer hooks), '
             f'GitOps.cleanup_worktree and '
             f'TaskWorkflow._archive_then_cleanup_config_dir (teardown, task '
-            f'3619), and Harness._sweep_orphaned_transcripts (the boot-time '
-            f'SIGKILL-tail sweeper, task 3619) — is repo_root correct? '
-            f'({_REPO_ROOT})'
+            f'3619), Harness._sweep_orphaned_transcripts (the boot-time '
+            f'SIGKILL-tail sweeper, task 3619), and in fused-memory '
+            f'BaseStage._archive_stage_transcripts (producer hook), '
+            f'cli_stage_runner.gc_run_config_dir (teardown, both task 3972) and '
+            f"TaskCurator's _archive_curator_config_dir (sweep + shutdown, task "
+            f'6008) — is repo_root correct? ({_REPO_ROOT})'
         )

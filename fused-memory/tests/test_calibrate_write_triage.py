@@ -22,12 +22,9 @@ from pathlib import Path
 import pytest
 from _fm_helpers import load_script_module
 from _jsonl_fixture import parse_jsonl_fixture
+from _write_triage_calibration_fixtures import CALIBRATION_FIXTURES, REIFY_FIXTURE_PATH
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
-FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
-DARK_FACTORY_FIXTURE_PATH = (
-    Path(__file__).parent / 'fixtures' / 'write_triage_calibration_dark_factory.jsonl'
-)
 
 UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 
@@ -61,16 +58,16 @@ def _mod() -> types.ModuleType:
 @pytest.fixture(scope='module')
 def records() -> list[dict]:
     """The reify fixture — the one the reify-specific rulings and counts pin."""
-    return parse_jsonl_fixture(FIXTURE_PATH)
+    return parse_jsonl_fixture(REIFY_FIXTURE_PATH)
 
 
 @pytest.fixture(
     scope='module',
-    params=[FIXTURE_PATH, DARK_FACTORY_FIXTURE_PATH],
-    ids=['reify', 'dark_factory'],
+    params=list(CALIBRATION_FIXTURES.values()),
+    ids=list(CALIBRATION_FIXTURES),
 )
 def fixture_records(request: pytest.FixtureRequest) -> list[dict]:
-    """Every committed curator fixture — the shape contract both must keep."""
+    """Every committed curator fixture — the shape contract each must keep."""
     return parse_jsonl_fixture(request.param)
 
 
@@ -2958,7 +2955,7 @@ def _retrieval_with_parents(
 class TestComputeRecallAtKAliasesAndPopulation:
     """Production parity (task's retrieval-recall leaf): rotated-canonical
     resolution and the child-hoist rule mirroring
-    write_triage.py::_canonical_id_of."""
+    write_triage.py::canonical_id_of."""
 
     def test_default_behaviour_is_byte_identical_to_the_legacy_call(self) -> None:
         """No aliases, no count_absent_as_miss kwarg: must match the original
@@ -3026,7 +3023,7 @@ class TestComputeRecallAtKAliasesAndPopulation:
         self, aliases, count_absent_as_miss,
     ) -> None:
         """Production files a sighting/amendment winner against its parent
-        (write_triage.py::_canonical_id_of), and the judge eval's
+        (write_triage.py::canonical_id_of), and the judge eval's
         canonical_in_slate counts it the same way. So the hoist is not an
         alias feature: it holds under every alias map and every population."""
         retrievals = [

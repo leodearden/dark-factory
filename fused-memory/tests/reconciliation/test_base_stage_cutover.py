@@ -1072,6 +1072,156 @@ class TestSessionCaptureLifecycle:
             runner.assert_not_awaited()
 
 
+class TestStageTranscriptArchival:
+    """BaseStage.run COPIES each stage transcript into the archive on every exit,
+    leaving the source for the task-σ resume seam (task 3972).
+
+    Every stage gets an explicit tmp ``explore_codebase_root``: the schema
+    default '.' would make archival write into the test cwd."""
+
+    ENC = '-home-leo-src-dark-factory'
+    TRANSCRIPT = b'{"type":"user","message":"stage payload"}\n'
+
+    def _make_archiving_stage(self, tmp_path, **config_overrides):
+        stage = _make_stage(recon_report_state=None)
+        journal = MagicMock()
+        journal.data_dir = tmp_path / 'data'
+        journal.record_run_session = AsyncMock()
+        journal.clear_run_session = AsyncMock()
+        stage.journal = journal
+        stage.config = ReconciliationConfig(
+            explore_codebase_root=str(tmp_path / 'proj'), **config_overrides,
+        )
+        return stage, journal
+
+    def _transcript_writing_runner(self, captured: dict, raises=None):
+        """Plant the transcript where the CLI writes it, in the forwarded config dir."""
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        async def _runner(**kwargs):
+            captured.update(kwargs)
+            session_dir = kwargs['config_dir'].path / 'projects' / self.ENC
+            session_dir.mkdir(parents=True, exist_ok=True)
+            source = session_dir / f"{kwargs['session_id']}.jsonl"
+            source.write_bytes(self.TRANSCRIPT)
+            captured['source'] = source
+            if raises is not None:
+                raise raises
+            return StageResult(report={}, success=True)
+
+        return AsyncMock(side_effect=_runner)
+
+    def _archived(self, tmp_path, run_id, session_id):
+        return (
+            tmp_path / 'proj' / 'data' / 'orchestrator' / 'agent-transcripts'
+            / f'recon-{run_id}' / self.ENC / f'{session_id}.jsonl'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stage_transcript_is_copied_to_the_archive(self, tmp_path):
+        stage, _ = self._make_archiving_stage(tmp_path)
+        captured: dict = {}
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=self._transcript_writing_runner(captured),
+        ):
+            await stage.run([], Watermark(project_id='test_project'), [], run_id='run-a1')
+
+        archived = self._archived(tmp_path, 'run-a1', captured['session_id'])
+        assert archived.read_bytes() == self.TRANSCRIPT
+
+    @pytest.mark.asyncio
+    async def test_source_transcript_survives_the_archival(self, tmp_path):
+        """The producer COPIES: the resume seam reads this same per-run dir."""
+        stage, _ = self._make_archiving_stage(tmp_path)
+        captured: dict = {}
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=self._transcript_writing_runner(captured),
+        ):
+            await stage.run([], Watermark(project_id='test_project'), [], run_id='run-a2')
+
+        assert self._archived(tmp_path, 'run-a2', captured['session_id']).exists()
+        assert captured['source'].read_bytes() == self.TRANSCRIPT
+
+    @pytest.mark.asyncio
+    async def test_archival_runs_even_when_the_stage_is_cancelled(self, tmp_path):
+        """Interrupted runs skip the harness gc, so here the producer hook is the
+        ONLY archival; the cancel-preserves-snapshot contract is untouched."""
+        stage, journal = self._make_archiving_stage(tmp_path)
+        captured: dict = {}
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=self._transcript_writing_runner(
+                captured, raises=asyncio.CancelledError(),
+            ),
+        ), pytest.raises(asyncio.CancelledError):
+            await stage.run([], Watermark(project_id='test_project'), [], run_id='run-a3')
+
+        archived = self._archived(tmp_path, 'run-a3', captured['session_id'])
+        assert archived.read_bytes() == self.TRANSCRIPT
+        journal.clear_run_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_archival_runs_when_clear_run_session_fails(self, tmp_path):
+        """A failing session-snapshot clear does not cost the run its archive."""
+        stage, journal = self._make_archiving_stage(tmp_path)
+        journal.clear_run_session = AsyncMock(side_effect=RuntimeError('journal down'))
+        captured: dict = {}
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=self._transcript_writing_runner(captured),
+        ):
+            await stage.run([], Watermark(project_id='test_project'), [], run_id='run-a4')
+
+        archived = self._archived(tmp_path, 'run-a4', captured['session_id'])
+        assert archived.read_bytes() == self.TRANSCRIPT
+
+    @pytest.mark.asyncio
+    async def test_disabled_config_archives_nothing(self, tmp_path):
+        stage, _ = self._make_archiving_stage(
+            tmp_path, transcript_archive_enabled=False,
+        )
+        captured: dict = {}
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=self._transcript_writing_runner(captured),
+        ):
+            report = await stage.run(
+                [], Watermark(project_id='test_project'), [], run_id='run-a5',
+            )
+
+        assert report is not None
+        assert not (tmp_path / 'proj' / 'data' / 'orchestrator').exists()
+
+    @pytest.mark.asyncio
+    async def test_a_broken_archive_root_does_not_fail_the_stage(self, tmp_path):
+        """The archive root's parent is a regular FILE, so its mkdir raises
+        (binding even under root, unlike chmod); the hook is total."""
+        (tmp_path / 'proj').mkdir()
+        (tmp_path / 'proj' / 'blocker').write_text('not a directory')
+        stage, _ = self._make_archiving_stage(
+            tmp_path, transcript_archive_root='blocker/archive',
+        )
+        captured: dict = {}
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=self._transcript_writing_runner(captured),
+        ):
+            report = await stage.run(
+                [], Watermark(project_id='test_project'), [], run_id='run-a6',
+            )
+
+        assert report is not None
+        assert captured['source'].read_bytes() == self.TRANSCRIPT
+
+
 class TestBaseStageResumeSession:
     """BaseStage.run(resume_session_id=...) — the task σ resume seam.
 

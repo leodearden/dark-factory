@@ -149,7 +149,13 @@ result = mcp__escalation__promote_to_l2(
 #          'severity': <what was actually filed>}
 #   or, for an eval-lane task_id or any eval-lane member, the refusal
 #          {'error': ..., 'code': 'eval_lane_contained'}  (nothing minted)
+#   or, with severity omitted over a cluster whose members are ALL info, the refusal
+#          {'status': 'refused', 'code': 'info_only_cluster', 'members': [...],
+#           'unusable': [...], 'derived_severity': 'info'}
+#          (nothing minted, nothing folded into an existing L2)
 ```
+
+An `info_only_cluster` refusal is handled by the [info-only cluster rung](#info-only-cluster-info_only_cluster) below. This holds for **every** `promote_to_l2` call in this skill that omits `severity`, including the per-category recipes further down: a `PROMOTED` digest line is written only for a `created`/`updated` result, never for a refusal.
 
 An `eval_lane_contained` refusal is final for the eval-lane records it names: close them instead, per [Eval-lane records](#eval-lane-records-any-category--close-never-promote), and re-promote any production members without them.
 
@@ -157,9 +163,13 @@ An `eval_lane_contained` refusal is final for the eval-lane records it names: cl
 
 1. **Omit `severity` and the L2 inherits the highest severity among its
    members.** This is what you want in the overwhelming majority of cases —
-   an L2 clustering purely-informational L1s is itself informational, and
-   filing it as `blocking` puts a human in the loop for something no member
-   claimed was blocking.
+   filing a cluster as `blocking` when no member claimed it was blocking puts
+   a human in the loop for nothing. One exception, server-enforced (PRD
+   `plans/info-l0-disposition-router-prd.md` D4): omitting `severity` over a
+   cluster whose members are ALL `info` is **refused** with
+   `code: 'info_only_cluster'` — nothing is minted, and nothing is folded into
+   an already-pending L2 under the same `root_cause` either. See the
+   [info-only cluster rung](#info-only-cluster-info_only_cluster).
 
 2. **Pass it EXPLICITLY and UPWARD when your RCA concluded the cluster is
    collectively worse than any individual member** — a set of individually
@@ -176,6 +186,40 @@ An `eval_lane_contained` refusal is final for the eval-lane records it names: cl
 4. **The response carries `severity`** — report the value actually filed in the
    rotation digest, not the one you asked for. On an `'updated'` result it is
    the post-floor value, which may be higher than your argument.
+
+### Info-only cluster (`info_only_cluster`)
+
+A refusal with `code: 'info_only_cluster'` means every member the server could
+read is informational, so the cluster does not belong in the human queue. Its
+`members` lists exactly those info records; `unusable` lists the ids you named
+that contributed nothing — a phantom id, or a record with an out-of-vocabulary
+severity. Never close an `unusable` id under this rung: a phantom has no record,
+and an out-of-vocabulary record is triaged on its own merits. Take exactly one
+of two paths:
+
+1. **Close the members at L1 with a digest** — the default. For each id in
+   `members`:
+
+   ```
+   mcp__escalation__resolve_issue(
+     escalation_id="<member esc_id>",
+     resolution="info-only cluster: <member summary, quoted> — informational, no human decision needed. Closed at L1.",
+     action='close_only',
+     resolved_by="escalation-watcher-auto",
+     resolution_class="benign"
+   )
+   ```
+
+   and one digest line per member under
+   `### Auto-closed L1 (info-only cluster)`:
+   `AUTO-CLOSED (L1 <esc_id>): info-only-cluster — <task_id> — <member summary> [benign]`
+
+2. **Re-issue the promote with an explicit severity** (`'blocking'` or
+   higher) if your RCA judges the cluster collectively blocking — the escape
+   hatch in item 2 above — and say why in `evidence`.
+
+**Never re-issue with an explicit `severity='info'` to get past the refusal**:
+that mints exactly the info L2 the refusal keeps out of the human queue.
 
 ### Case A — single judgement-class item (1-member L2)
 
@@ -194,7 +238,7 @@ result = mcp__escalation__promote_to_l2(
 )
 ```
 
-Add to digest: `PROMOTED (L2 <result['id']>): <category> — <task_id> — <summary>`
+If `result['status'] == 'refused'` (`info_only_cluster`), nothing was filed: follow the [info-only cluster rung](#info-only-cluster-info_only_cluster) instead. Otherwise add to digest: `PROMOTED (L2 <result['id']>): <category> — <task_id> — <summary>`
 
 ### Case B — causal cluster (multiple members)
 
@@ -224,13 +268,14 @@ result = mcp__escalation__promote_to_l2(
 
 Clusters are **causal, not superficial** — members need not share category or error signature; the common factor is the hypothesized underlying cause.
 
-Add to digest: `PROMOTED cluster (L2 <result['id']>): <root_cause> — <N> members: [<ids>]`
+If `result['status'] == 'refused'` (`info_only_cluster`), nothing was filed: follow the [info-only cluster rung](#info-only-cluster-info_only_cluster) instead. Otherwise add to digest: `PROMOTED cluster (L2 <result['id']>): <root_cause> — <N> members: [<ids>]`
 
 ### One-evolving-L2-per-root-cause (dedup)
 
 Pass the same `root_cause` string for escalations that share a hypothesis. The server deduplicates:
 - `status: 'created'` — new L2 was filed
 - `status: 'updated'` — an existing pending L2 with the same `root_cause` was updated (new members appended)
+- `status: 'refused'` (`info_only_cluster`) — nothing was filed or folded; follow the [info-only cluster rung](#info-only-cluster-info_only_cluster)
 
 **Member L1s stay pending at L1.** They are referenced by the L2 but not promoted. When the human resolves (or dismisses) the L2, the resolution cascades automatically to all member L1s — you do NOT resolve member L1s directly. The one exception is a member the best-effort cascade MISSED: the drain closes it (see [Draining pending escalations](#draining-pending-escalations)).
 
@@ -341,12 +386,16 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
    If escalations_handled >= ROTATION_ESCALATIONS OR now >= deadline:
      → emit digest as final message and exit cleanly (return normally — do NOT raise)
 8. Compute remaining = deadline − now (seconds)
-9. Arm a bounded foreground wait (see [Waiting for the next L1](#waiting-for-the-next-l1)):
-   a. On exit 0: parse the printed escalation JSON from stdout; go to 3
+9. Arm a bounded foreground wait (see [Waiting for the next L1](#waiting-for-the-next-l1))
+   and branch on the WATCHER_REARM_OUTCOME marker it prints to stderr:
+   a. FIRED (exit 0, non-empty stdout): parse the printed escalation JSON; go to 3
       (drain ALL pending L1s — the drain is authoritative, not the single watcher event)
-   b. On exit 124 (timeout expired, empty stdout): re-check deadline:
+   b. CEILING (exit 124, empty stdout): re-check deadline:
       - remaining > 0 → go to 8 (re-arm with updated remaining)
       - remaining ≤ 0 → emit digest as final message and exit cleanly
+   c. KILLED (exit 137/143/144), ERROR (any other exit; exit 2 prints no marker),
+      FIRED with empty stdout, or a rejected call: follow the exit-code table and the
+      identical-retry cap in Waiting for the next L1 — never loop on the identical call
 ```
 
 The digest is emitted on rotation-limit exit in either mode (full or DEGRADED).
@@ -473,9 +522,18 @@ The `<min(3600, remaining)>` clamp sizes the final wait exactly to the remaining
 
 **Bash-tool timeout contract:** this is a bounded **foreground** call — always pass the calling Bash tool's `timeout` parameter, sized to **(`--timeout` + 60s margin) × 1000 ms** (e.g. `--timeout 3600` → Bash `timeout: 3660000`). Values above the harness's usual 600000ms ceiling are always legal inside a rotation: the watcher supervisor injects `BASH_MAX_TIMEOUT_MS` at the full rotation length into every auto-watcher rotation, so any `min(3600, remaining)` slice fits. OMITTING the Bash `timeout` parameter gets the harness's 2-minute default kill instead — the 07-09 exit-143 failure mode this wrapper exists to prevent.
 
-**Exit-code contract (preserved verbatim by `scripts/watcher-rearm.sh` from `escalation.watcher`, plus a `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` marker the wrapper emits to stderr on every run):**
-- **exit 0** (`WATCHER_REARM_OUTCOME: FIRED` on stderr) — one matching L1 escalation was printed as JSON to stdout. Parse it, then go to step 3 and drain ALL pending L1s. The watcher event is a wake signal only; the drain is the authoritative source of work. Do not pipe `2>&1` — the stderr outcome line must not land in the stdout JSON you parse.
-- **exit 124** (`WATCHER_REARM_OUTCOME: CEILING` on stderr) — timeout expired, stdout is empty. Re-check the deadline: if `remaining > 0`, go to step 8 and re-arm; if `remaining ≤ 0`, emit the digest and exit cleanly.
+**Exit-code contract.** `scripts/watcher-rearm.sh` preserves `escalation.watcher`'s exit code and prints a `WATCHER_REARM_OUTCOME: <OUTCOME> exit=<rc>` marker to **stderr** on every watcher run. Branch on it. Do not pipe `2>&1`, or the marker lands in the stdout JSON you parse.
+
+| Marker | Exit | Next |
+|---|---|---|
+| `WATCHER_REARM_OUTCOME: FIRED` | 0 | Parse the escalation JSON on stdout, then go to step 3 and drain ALL pending L1s: the watcher event is a wake signal only, and the drain is the authoritative source of work. Exit 0 with EMPTY stdout is a caught SIGTERM (`scripts/watcher-rearm.sh` header), a wake and not a fire, and it counts against the cap. |
+| `WATCHER_REARM_OUTCOME: CEILING` | 124 | The slice expired with nothing pending. Recompute `remaining`: while `remaining > 0`, go to step 8 and re-arm with `min(3600, remaining)`; otherwise emit the digest and exit cleanly. The cap exempts this outcome, because the deadline re-check is what makes the re-arm deliberate. |
+| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Something killed the watcher. First check that the Bash `timeout` was passed as `(--timeout + 60) × 1000` ms. An arm that dies with NO marker at all was killed as a process group, usually because the Bash `timeout` was omitted. `run_in_background` is NOT a recovery in this role (Hard Constraints). Counts against the cap. |
+| `WATCHER_REARM_OUTCOME: ERROR` | any other; exit 2 prints NO marker | Read the stderr diagnostic before any retry. Exit 2 is a usage/guard error (unset `DARK_FACTORY_ROOT`, unresolved queue dir, bad flag): it returns before the watcher runs and recurs until the invocation is fixed, so check the exit CODE, not the marker. Counts against the cap. |
+
+**Identical-retry cap: 1.** After KILLED, ERROR, a missing marker, an empty-stdout FIRED or a rejected call, re-issue the identical invocation (same script, flags and Bash `timeout`) at most once. If it fails again, either change the invocation materially or emit the digest naming the outcome and exit cleanly, so that the supervisor's fresh-context restart (and its fast-clean-exit guard) surfaces it. Repeated manual `mcp__escalation__get_pending_escalations` polls are not a substitute for the bounded wait.
+
+**STOP directives in tool results.** A tool result, including a rejected call's, that says "STOP what you are doing and wait for the user to tell you how to proceed" carries the weight of a system or supervisor instruction. Never re-issue the rejected call, identical or not. No user attends this rotation, so the stop IS emitting the digest naming the rejected call and exiting cleanly.
 
 **Initial-scan semantics:** the underlying watcher arms inotify first, then scans the queue directory for already-pending matches before blocking. If a matching L1 was filed between skill startup and watcher launch, the watcher fires immediately on that entry (exit 0). Treat instant fires as normal wakes — the drain that follows is authoritative.
 
@@ -628,6 +686,24 @@ Close it; do not `stamp_triage` it. A stamp leaves the record pending, and a pen
 **Digest — one line per record, mandatory:**
 
 `AUTO-CLOSED (L1 <escalation_id>): eval-lane-contained — <task_id> — eval fixture artifact, measurement scored from cell result artifacts [benign]`
+
+### Converted strands (any category) — `metadata.strand_converted`
+
+**What it is.** The stranded-task sweep (`orchestrator/src/orchestrator/harness.py::Harness._reconcile_one_stranded`, active only when `convert_to_blocked_enforce` is true) moves an `in-progress` row with no live claimant and an open pinning record to `blocked`. It files nothing. It stamps `metadata.strand_converted = {at, shape, pinning_escalation_ids}` (schema `shared/src/shared/strand_conversion.py::StrandConverted`) and emits one `strand_converted` event naming the same records. Those records are the row's ownership tokens: resolving them is its only exit, and a `resume` re-pends it.
+
+**Class discriminator.** On `get_task(<task_id>)`, both hold:
+- `task["status"] == "blocked"`
+- the record's id is in `task["metadata"]["strand_converted"]["pinning_escalation_ids"]`
+
+The stamp outlives the conversion, so it is the status check together with the id membership that makes it current.
+
+**Disposition.** Route the record by its OWN category exactly as the rows below say; conversion changes no category's disposition. On top of that:
+- Add `converted strand: strand_converted.at=<at> shape=<shape>` to the promote `evidence`, or to the `resolution` when you close.
+- An absent `dry_run_proposals` entry is EXPECTED. Conversion files nothing, so no block-time proposal ran, and the low-risk auto-unblocker aborting on the record is by design (spec `docs/task-escalation-state-spec.md` §7, item 8). Write "no proposal: converted strand (by design)" rather than treating it as a defect.
+- Never `close_only` the record as stale merely because the task is `blocked` with no active workflow. That shape IS the converted state, and closing the record removes the row's only owner.
+- Never set the task's status or re-pend it by hand, and never file a new record for it.
+
+**Digest.** Append ` [converted strand <at>]` to the category's normal digest line.
 
 ### Autonomous dispatch categories (handle and resolve)
 
@@ -1011,6 +1087,59 @@ category. If `disposition == "integration_skew"`:
    ```
 4. Add to digest: `PROMOTED (L2 <id>): task_failure — <task_id> — <summary>` (include proposal snippet if present)
 
+#### `workflow_exit_contract`
+
+**Producer.** `orchestrator/src/orchestrator/exit_contract.py::record_exit_verdict` files ONE L1 per task (deduped on an open L1 of this category), with `agent_role="orchestrator"`, `severity="blocking"` and `suggested_action="investigate_exit_contract"`, and only when `workflow_exit_contract_enforce` is true. With it false (the shipped default) the contract runs in log mode: events only, no records. A `verdict='store_unavailable'` never files a record.
+
+**Meaning.** A workflow's `run()` exited with an (outcome, status) pair outside the proven `shared/src/shared/task_transitions.py::_OUTCOME_ALLOWED` table (`check='outcome_status'`), or with a report phase that disagrees with the state machine (`check='phase'`). It is a CONTRACT violation, not a task failure: the task's own work may be fine, and its status row was left exactly as found.
+
+**Extraction.** The first line of `detail` is the rendered verdict, `verdict='violation' mode='enforce' check=... outcome=... status=... report_phase=... machine_state=... failed_write=... escalation_id=...` (values repr-quoted). Read `check`, `outcome`, `status`, `report_phase` and `machine_state` from it, and quote the line.
+
+**Pin warning.** An open blocking L1 on the real task id is a queue-handoff pin (`escalation/src/escalation/pins.py::classify_pins`, link 3), so while it is open the recovery sweeps hold the task. Do not `close_only` it to unstick the task.
+
+**Disposition.** Always promote: the call is a judgement between two causes.
+- (a) THE PAIR IS LEGITIMATE AND THE TABLE IS TOO TIGHT. A designed producer reaches this pair, and `_OUTCOME_ALLOWED[<outcome>]` simply does not list `<status>`. The fix is to widen the table, a code change filed against the exit-contract table.
+- (b) THE WORKFLOW GENUINELY EXITED WRONGLY. The defect is in the exiting path (the producer that wrote, or failed to write, the status), and the task row may need human repair.
+
+`check='phase'` is always (b): the table is not involved. Before promoting, Grep `_OUTCOME_ALLOWED` for the `<outcome>` row and quote it in the evidence, and re-read the task's status with `get_task`.
+
+**Cluster.** Every pending `workflow_exit_contract` L1 with the same `(check, outcome, status)` shares one cause, whichever task it is on; cluster them.
+
+```python
+mcp__escalation__promote_to_l2(
+  task_id=<task_id>,
+  agent_role="escalation-watcher-auto",
+  member_ids=[<esc_id>, ...],
+  root_cause="workflow-exit-contract:<check>:<outcome>-><status>",
+  evidence=<detail line + quoted _OUTCOME_ALLOWED row + current status>,
+  options=[
+    "A: the pair is legitimate — widen _OUTCOME_ALLOWED[<outcome>] to admit <status>",
+    "B: the workflow exited wrongly — fix the exiting path; repair the task row if it is stuck",
+    "C: an existing task already owns this pair — link it and keep the record open until it lands",
+    "D: something else",
+  ],
+  summary=<escalation summary>,
+  category="workflow_exit_contract",
+  # severity omitted — inherited from the members.
+)
+```
+
+Add to digest: `PROMOTED (L2 <id>): workflow_exit_contract — <task_id> — <check> <outcome>-><status>`
+
+#### `workflow_slot_wedged`
+
+**Producer.** `orchestrator/src/orchestrator/harness.py::Harness._force_release_wedged_slot` files ONE L1 per task (deduped on an open L1 of this category), `agent_role="orchestrator"`, `severity="blocking"`, `suggested_action="investigate_wedged_workflow"`. The terminal-status watcher saw the task `done`/`cancelled`, hard-cancelled its workflow, and the workflow still had not ended `terminal_status_force_release_polls` polls later, so the harness released its slot and module locks itself (task 6660). A `workflow_slot_force_released` event goes with it.
+
+**Meaning.** Nothing is jammed any more: the slot and locks are free and the task row was already terminal. What remains is a coroutine somewhere that ignores cancellation, which will wedge the next workflow that reaches it. The first line of `detail` is `Culprit: <task name> at <file>:<line> in <function>`: the innermost await outside asyncio of the task holding the slot. That is a terminal-cleanup entry (`workflow-<id>/<entry>`) or the workflow body (`workflow-<id>/body`) when one is alive, else the slot task. The rest of `detail` lists every task of the slot with its await chain.
+
+**Disposition.** Always [promote](#promote-to-l2); never close: the cause is a code defect. Quote the Culprit line in the evidence, and `search_tasks` for a task already owning that await before promoting.
+
+**Cluster.** Every pending `workflow_slot_wedged` L1 whose Culprit line names the same `<file>` and `<function>` shares one cause, whichever task it is on.
+
+`root_cause="workflow-slot-wedged:<file>:<function of the Culprit line>"`; options: `A: file a fix for that await (bound it, e.g. shared/src/shared/asyncio_tasks.py::cancel_bounded)`, `B: an existing task already owns it — link it and keep the record open until it lands`, `C: something else`.
+
+Add to digest: `PROMOTED (L2 <id>): workflow_slot_wedged — <task_id> — <Culprit line>`
+
 #### `infra_issue`
 
 Infrastructure problem. Do NOT attempt automated fixes.
@@ -1027,7 +1156,7 @@ mcp__escalation__promote_to_l2(
   options=["A: restart the affected service", "B: investigate logs/connectivity", "C: pause orchestration until resolved", "D: something else"],
   summary="Infrastructure issue: " + <summary>,
   category="infra_issue",
-  # severity omitted — inherited from the clustered members.
+  # severity omitted — inherited from the clustered members (an all-info cluster is refused — see the info-only rung).
 )
 ```
 
@@ -1086,7 +1215,7 @@ mcp__escalation__promote_to_l2(
   ],
   summary=<escalation summary>,
   category="risk_identified",
-  # severity omitted — inherited from the members, as in `infra_issue` above.
+  # severity omitted — inherited from the members, as in `infra_issue` above (an all-info cluster is refused — see the info-only rung).
 )
 ```
 
@@ -1103,6 +1232,8 @@ Add to digest: `PROMOTED (L2 <id>): risk_identified — <sentinel_task_id> — <
 #### `design_concern` / `risk_identified` / `missing_premise`
 
 These require human judgment. Apply shallow RCA: sibling tasks of the same PRD parent often cluster here.
+
+**Note-to-file records never arrive here.** `mcp__escalation__escalate_info(note_to_file=True)` files them already resolved (`resolution_class: note-to-file`, `resolution_action: close_only`) and archives them at filing, so no pending L0/L1 carries one and there is nothing to route, close or promote. An info `design_concern` that does arrive is an ordinary note, and an all-info cluster of those is handled by the [info-only cluster rung](#info-only-cluster-info_only_cluster).
 
 Root_cause hint:
 - `design_concern` / `missing_premise`: `"design-concern:<module-or-parent-task-slug>"`
@@ -1210,7 +1341,7 @@ Emit this as your **final message** when the rotation limit is reached:
 ```
 ## Escalation Watcher Digest
 Rotation: <escalations_handled> escalations in <elapsed_hours:.1f>h
-Exit reason: <"escalation limit reached" | "time limit reached">
+Exit reason: <"escalation limit reached" | "time limit reached" | "re-arm stopped: <WATCHER_REARM_OUTCOME or rejected call>">
 Mode: <"full (promote_to_l2 + filing pair available)" | "DEGRADED (missing: <tools>)">
 
 ### Dispatched (autonomous)
@@ -1240,6 +1371,9 @@ Mode: <"full (promote_to_l2 + filing pair available)" | "DEGRADED (missing: <too
 
 ### Auto-closed L1 (eval-lane contained)
 - AUTO-CLOSED (L1 esc-df_task_2430_adv_plan-7): eval-lane-contained — df_task_2430_adv_plan — eval fixture artifact, measurement scored from cell result artifacts [benign]
+
+### Auto-closed L1 (info-only cluster)
+- AUTO-CLOSED (L1 esc-…): info-only-cluster — <task_id> — <member summary> [benign]
 
 ### Auto-closed L2 (narrow carve-out)
 - AUTO-CLOSED (L2 esc-main-sweep-abc123def456-1): superseded_main_sweep — main-sweep-abc123def456 — newer sweep esc-main-sweep-9f8e7d6c5b4a; swept SHA abc123def456 is-ancestor of clean tip [benign]

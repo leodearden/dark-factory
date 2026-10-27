@@ -2402,7 +2402,9 @@ class TestReadSideSeesMeasuredRowsOnly:
         """Wire compatibility with ``redux_api.shape_burndown`` (task 5592 owns it):
         a gap row contributes nothing — not zeros — to either block."""
         from dashboard.data.redux_api import shape_burndown
+        from dashboard.project_labels import ProjectLabels
 
+        no_configured_roots = ProjectLabels.of_roots(())
         with_gap, without_gap = tmp_path / 'with_gap.db', tmp_path / 'without_gap.db'
         for path in (with_gap, without_gap):
             _migrated_pre_delta1_db(path)
@@ -2415,8 +2417,8 @@ class TestReadSideSeesMeasuredRowsOnly:
             conn.commit()
             conn.close()
 
-        shaped = shape_burndown({'/p/proj': await _series_of(with_gap)})
-        expected = shape_burndown({'/p/proj': await _series_of(without_gap)})
+        shaped = shape_burndown({'/p/proj': await _series_of(with_gap)}, labels=no_configured_roots)
+        expected = shape_burndown({'/p/proj': await _series_of(without_gap)}, labels=no_configured_roots)
 
         assert shaped['BURNDOWN_BY_PROJECT'] == expected['BURNDOWN_BY_PROJECT']
         assert shaped['BURNDOWN'] == expected['BURNDOWN']
@@ -3042,11 +3044,9 @@ class TestCollectSnapshotPerRootBudget:
         pre-empts a unit still inside its own bounds. Ceiling: half one
         collector cycle, so cycle N is done before cycle N+1 starts even when a
         root spends its whole budget."""
-        import dashboard.loops as loops_module
-
         budget = burndown_module._SNAPSHOT_PER_ROOT_BUDGET
         floor = burndown_module._SNAPSHOT_UNIT_WORST_CASE_SECONDS
-        ceiling = loops_module._SAMPLE_INTERVAL_SECONDS / 2
+        ceiling = burndown_module.SAMPLE_INTERVAL_SECONDS / 2
 
         assert budget >= floor, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the snapshot unit\'s own '
@@ -3055,8 +3055,8 @@ class TestCollectSnapshotPerRootBudget:
         )
         assert budget <= ceiling, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is above HALF one collector '
-            f'cycle ({ceiling} s = _SAMPLE_INTERVAL_SECONDS / 2 = '
-            f'{loops_module._SAMPLE_INTERVAL_SECONDS} / 2).'
+            f'cycle ({ceiling} s = SAMPLE_INTERVAL_SECONDS / 2 = '
+            f'{burndown_module.SAMPLE_INTERVAL_SECONDS} / 2).'
         )
 
 

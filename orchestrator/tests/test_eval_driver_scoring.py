@@ -17,9 +17,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.evals import scoring
+from orchestrator.evals.metrics import EvalMetrics, compute_composite
 from orchestrator.evals.results import EvalResult
 from orchestrator.mcp import verdict_tools as _verdict_tools
+from orchestrator.review_payload import ReviewPayloadError, normalize_review
 
 _REVIEWER = 'reviewer_comprehensive'
 
@@ -122,6 +127,25 @@ class TestScoreResultFromArtifacts:
             == compare.score_result_from_artifacts(_result(legacy_error_wt))
         )
 
+    def test_an_error_reviewer_contributes_nothing_beside_a_counted_one(self, tmp_path: Path):
+        from orchestrator.evals import compare
+
+        wt = tmp_path / 'wt_two'
+        art = TaskArtifacts(wt)
+        art.init('df_task', 'T', 'd')
+        error_payload = {
+            'reviewer': 'reviewer_errored',
+            'verdict': 'ERROR',
+            'issues': [{'severity': 'blocking', 'description': 'stale', 'location': 'm/y.py:1'}],
+            'summary': 'reviewer crashed',
+        }
+        art.write_review('reviewer_errored', error_payload)
+        art.write_review(_REVIEWER, _payload())
+
+        assert compare.score_result_from_artifacts(_result(wt)) == scoring.quality_from_reviews(
+            [normalize_review(_payload())], plan_steps=5,
+        )
+
     def test_plan_steps_falls_back_to_result_metrics_and_kwarg_overrides(self, tmp_path: Path):
         # plan_steps is sourced from result.metrics when the kwarg is omitted; an
         # explicit kwarg overrides it.
@@ -135,3 +159,46 @@ class TestScoreResultFromArtifacts:
 
         override = compare.score_result_from_artifacts(result, plan_steps=3)
         assert override == scoring.quality_from_review_artifact(_payload(), plan_steps=3)
+
+
+class TestQualityFromReviews:
+    def test_sums_every_payloads_counts_into_one_composite(self):
+        p1 = normalize_review({
+            'reviewer': 'r1',
+            'verdict': 'ISSUES_FOUND',
+            'issues': [
+                {'severity': 'blocking', 'description': 'b'},
+                {'severity': 'suggestion', 'description': 's'},
+            ],
+        })
+        p2 = normalize_review({
+            'reviewer': 'r2',
+            'verdict': 'PASS',
+            'issues': [
+                {'severity': 'suggestion', 'description': 's1'},
+                {'severity': 'suggestion', 'description': 's2'},
+            ],
+        })
+        errored = normalize_review({'reviewer': 'r3', 'verdict': 'ERROR', 'issues': []})
+        expected = compute_composite(EvalMetrics(
+            tests_pass=True,
+            plan_steps=5,
+            review_blocking_issues=1,
+            review_suggestions=3,
+            debug_cycles=1,
+        ))
+
+        assert scoring.quality_from_reviews([p1, p2], plan_steps=5, debug_cycles=1) == expected
+        assert scoring.quality_from_reviews(
+            [p1, p2, errored], plan_steps=5, debug_cycles=1,
+        ) == expected
+
+    def test_an_off_contract_verdict_is_rejected(self):
+        with pytest.raises(ReviewPayloadError, match='NEEDS_CHANGES'):
+            scoring.quality_from_review_artifact(_payload('NEEDS_CHANGES'), plan_steps=5)
+
+    def test_an_envelope_wrapping_a_non_dict_payload_is_rejected(self):
+        envelope = {'role': _REVIEWER, 'schema_version': 1, 'verdict': 'PASS'}
+
+        with pytest.raises(ReviewPayloadError):
+            scoring.quality_from_review_artifact(envelope, plan_steps=5)

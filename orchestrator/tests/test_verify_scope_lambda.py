@@ -57,7 +57,13 @@ from test_verify_scope_kappa import _executed_module_configs, _run_verification_
 from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import run_scoped_verification
-from orchestrator.verify_plan import ScopeKind, derive_verify_plan, parse_config_command
+from orchestrator.verify_cmd import render
+from orchestrator.verify_plan import (
+    ScopeKind,
+    derive_verify_plan,
+    parse_config_command,
+    scope_prefix_to_keyword,
+)
 from orchestrator.verify_runner import (
     MergeVerifySpec,
     build_merge_verify_spec,
@@ -443,54 +449,72 @@ def _write_3033_diff(tmp_path: Path) -> None:
     (tests / 'test_new_thing.py').write_text('def test_new_thing(): pass\n')
 
 
-class TestTaskRoleMixedDiffFullSuiteExecution:
-    """Task 3294: the mixed-diff widening, against the real orchestrator config.
+_TOUCHED_TEST_PATH = 'orchestrator/tests/test_new_thing.py'
+_TREE_GUARD_PATH = 'orchestrator/tests/test_tree_guard.py'
 
-    WHY THIS CLASS EXISTS. Task 3033's attempt-1 diff touched
-    ``workflow.py`` plus a co-committed test file. Pre-3294 the plan took the
-    collectable-tests branch and narrowed the TEST leg to that one file — 36
-    items instead of the module's ~13188 — so a regression in a DIFFERENT
-    consumer of ``workflow.py`` was structurally invisible and reached a
-    debugger. The fix is a decision-layer reorder; this class pins that the
-    fix is real all the way out to what runs.
+# A whole-tree guard module as the census guard demands it be spelled, so
+# is_whole_tree_guard_module admits it into the owning module's guard family.
+_TREE_GUARD_CONTENT: str = (
+    'import pytest\n'
+    'from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT\n'
+    'pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n\n\n'
+    'def test_tree():\n'
+    '    pass\n'
+)
 
-    Two things are pinned here, and they are deliberately different kinds of
-    assertion:
 
-    - (a)/(b) THE BRIDGE. ``test_verify_plan.py``'s
-      ``TestDeriveVerifyPlanTaskRoleFloorMixedDiff`` pins the decision at the
-      pure ``derive_verify_plan`` layer; task κ made the ``VerifyPlan``
-      authoritative, but ``_executed_module_configs_from_plan`` is what
-      actually renders it into the ``ModuleConfig``(s) handed to
-      ``run_verification``. So these drive the REAL
-      ``run_scoped_verification`` with the task-3033-shaped diff and pin what
-      EXECUTES, plus that ``result.plan`` records the same thing an operator
-      reads (PRD A1).
-    - (c) GRANULARITY. The widened plan reproduces the owning module's own
-      ``test_command`` UNNARROWED and targets its whole test PACKAGE (PRD
-      Resolved decision 3) — derived from the plan and asserted path-free (no
-      target is a file), so the claim does not rest on any individual test
-      module's filename.
+def _write_guard_module(tmp_path: Path) -> None:
+    """Materialise one guard-family member and one unmarked bystander test.
+
+    Files are only written here, never globbed: the census guard would read a
+    glob in this module as a whole-tree scan and demand the 1200s mark.
+    """
+    tests = tmp_path / 'orchestrator' / 'tests'
+    tests.mkdir(parents=True, exist_ok=True)
+    (tests / 'test_tree_guard.py').write_text(_TREE_GUARD_CONTENT)
+    (tests / 'test_bystander.py').write_text('def test_bystander(): pass\n')
+
+
+class TestTaskRoleMixedDiffNarrowedExecution:
+    """Task 7253 (gate-5702 ruling): the task-3033-shaped mixed diff, against
+    the real orchestrator config, runs the touched test plus the owning
+    module's whole-tree guard family at role='task' — not the full suite.
+
+    WHY THIS CLASS EXISTS. Task 3033's attempt-1 diff touched ``workflow.py``
+    plus a co-committed test file and narrowed to that one test, so a
+    regression in a DIFFERENT consumer of ``workflow.py`` was invisible. Task
+    3294 answered with the owning module's full suite at task role; the
+    gate-5702 ruling narrowed that to the touched tests plus the guard family,
+    because the merge gate re-runs the full suite and the only measured
+    out-of-scope catch at task role was a guard test.
+
+    - (a)/(b) THE BRIDGE. ``test_verify_plan.py`` pins the decision at the pure
+      ``derive_verify_plan`` layer; these drive the REAL
+      ``run_scoped_verification`` and pin that it WIRES the guard-family
+      enumeration through to what EXECUTES, and that ``result.plan`` records
+      the same thing (PRD A1).
+    - (c) GRANULARITY. The narrowed run names FILES, derived from the plan and
+      the live yaml.
+    - (d) THE FALLBACK. With no guard module in the tree, the same diff still
+      runs the owning module's full suite.
 
     Every case runs against the LIVE ``orchestrator/orchestrator.yaml``
-    commands (``_orchestrator_module_config``), so the provenance the
-    task-3033 story needs — the widening exercised against the config the
-    incident actually ran under — holds by construction rather than by a
-    hand-copied literal and a drift pin.
+    commands (``_orchestrator_module_config``).
     """
 
     @pytest.mark.asyncio
-    async def test_task_3033_shaped_mixed_diff_executes_owning_module_full_suite(
+    async def test_task_3033_shaped_mixed_diff_executes_touched_test_plus_guard_family(
         self, tmp_path: Path,
     ):
-        """(a) The EXECUTED ModuleConfig carries the module's verbatim
-        full-suite test_command — not a narrowed one — and the command never
-        names the co-committed test file."""
+        """(a) The EXECUTED test_command is narrowed: it names the touched test
+        and the guard module, never the unmarked bystander, and is not the
+        module's full suite."""
         mc, config = _orchestrator_registry(tmp_path)
         # Precondition for the STRUCTURAL half of the story: content is read,
         # so workflow.py can classify STRUCTURAL, exactly when this is set.
         assert mc.type_check_command
         _write_3033_diff(tmp_path)
+        _write_guard_module(tmp_path)
 
         mock_run_verification = _run_verification_spy()
         with patch.object(verify, 'run_verification', new=mock_run_verification):
@@ -503,23 +527,24 @@ class TestTaskRoleMixedDiffFullSuiteExecution:
         assert len(executed) == 1
         executed_mc = executed[0]
         assert executed_mc.prefix == 'orchestrator'
-        # The module's OWN command, byte-for-byte — a FULL_SUITE slot is
-        # rendered by _executed_module_configs_from_plan as getattr(mc, attr),
-        # where a FILE_SCOPED one would have narrowed it to the touched test.
-        assert executed_mc.test_command == mc.test_command
         assert executed_mc.test_command is not None
-        assert 'test_new_thing.py' not in executed_mc.test_command
+        assert executed_mc.test_command != mc.test_command
+        assert 'test_new_thing.py' in executed_mc.test_command
+        assert 'test_tree_guard.py' in executed_mc.test_command
+        assert 'test_bystander.py' not in executed_mc.test_command
 
     @pytest.mark.asyncio
-    async def test_result_plan_records_full_suite_for_the_mixed_diff(
+    async def test_result_plan_records_the_narrowed_run_that_executed(
         self, tmp_path: Path,
     ):
-        """(b) PRD A1: the record an operator reads matches what ran. The
-        plan's orchestrator pytest run is 'full_suite' with no
-        scoped_targets, and its reason explains that the co-committed test
-        did not narrow it."""
+        """(b) PRD A1: the record an operator reads matches what ran. The plan's
+        orchestrator pytest run is 'file_scoped' over the touched test and the
+        guard module, its reason names the guard family, and the executed
+        command is that plan run's command rendered."""
         mc, config = _orchestrator_registry(tmp_path)
+        assert mc.test_command is not None
         _write_3033_diff(tmp_path)
+        _write_guard_module(tmp_path)
 
         mock_run_verification = _run_verification_spy()
         with patch.object(verify, 'run_verification', new=mock_run_verification):
@@ -534,36 +559,43 @@ class TestTaskRoleMixedDiffFullSuiteExecution:
         ]
         assert len(pytest_runs) == 1
         pytest_run = pytest_runs[0]
-        assert pytest_run['scope_kind'] == 'full_suite'
-        assert pytest_run['scoped_targets'] == []
-        assert 'narrow' in pytest_run['reason'].lower()
+        assert pytest_run['scope_kind'] == 'file_scoped'
+        assert pytest_run['scoped_targets'] == [_TOUCHED_TEST_PATH, _TREE_GUARD_PATH]
+        assert 'guard family' in pytest_run['reason']
 
-    def test_widened_plan_targets_the_owning_modules_whole_test_package(self):
-        """(c) The widened run reproduces the owning module's OWN command,
-        unnarrowed, and targets its whole test PACKAGE.
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert executed[0].test_command == render(
+            scope_prefix_to_keyword(mc.test_command, 'pytest', pytest_run['scoped_targets']),
+        )
 
-        Derived from the plan and from the live yaml, never from a local
-        literal, so these assertions track the real config. Pure — the
-        ``worktree_reader`` seam makes it a straight ``derive_verify_plan``
-        call with no tmp_path, no subprocess, no mocking.
+    def test_narrowed_plan_targets_files_not_the_package(self):
+        """(c) The narrowed run is the owning module's OWN command scoped to the
+        touched test plus the guard module, and every target is a FILE.
 
-        Anti-tautology: pre-3294 this same diff took the collectable-tests
-        branch and the cmd was scoped to ``orchestrator/tests/test_new_thing.py``,
-        so ``cmd == parse_config_command(<live test_command>)`` genuinely
-        discriminates. Package granularity (PRD Resolved decision 3) is
-        asserted path-free — no target is a FILE — so the claim survives any
-        legitimate rename in the targeted package, and does not pin the
-        config's cosmetic choice of a trailing slash.
+        Pure — fake ``worktree_reader``/``list_pkg_tests`` seams, no tmp_path,
+        no subprocess, no mocking.
+
+        Anti-tautology: before task 7253 this same diff took the task-3294
+        floor and the cmd was ``parse_config_command(<live test_command>)``,
+        targeting the whole test PACKAGE; the inequality below discriminates.
         """
         mc = _orchestrator_module_config()
         assert mc.test_command is not None
+        contents = {
+            'orchestrator/src/orchestrator/workflow.py': _STRUCTURAL_WORKFLOW_CONTENT,
+            _TREE_GUARD_PATH: _TREE_GUARD_CONTENT,
+        }
 
-        def reader(path: str) -> str | None:
-            if path == 'orchestrator/src/orchestrator/workflow.py':
-                return _STRUCTURAL_WORKFLOW_CONTENT
-            return None
+        def list_pkg_tests(prefix: str) -> list[str]:
+            if prefix != 'orchestrator':
+                return []
+            return [_TOUCHED_TEST_PATH, _TREE_GUARD_PATH, 'orchestrator/tests/test_bystander.py']
 
-        plan = derive_verify_plan(_MIXED_3033_DIFF, [mc], None, reader, role='task')
+        plan = derive_verify_plan(
+            _MIXED_3033_DIFF, [mc], None, contents.get, role='task',
+            list_pkg_tests=list_pkg_tests,
+        )
         run = next(
             (
                 r for r in plan.runs
@@ -572,27 +604,39 @@ class TestTaskRoleMixedDiffFullSuiteExecution:
             None,
         )
         assert run is not None
-        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
         assert run.cmd is not None
-        # parse_config_command, never render() — render normalises --directory
-        # into a leading `cd`, so a render-based comparison would fail against
-        # a --directory-form input even when the behaviour is correct.
-        assert run.cmd == parse_config_command(mc.test_command), (
-            f"the widened slot must reproduce the owning module's own "
-            f'test_command UNNARROWED; got {run.cmd!r}'
+        assert run.cmd != parse_config_command(mc.test_command)
+        assert run.cmd == scope_prefix_to_keyword(
+            mc.test_command, 'pytest', [_TOUCHED_TEST_PATH, _TREE_GUARD_PATH],
         )
-        assert run.cmd.targets, 'a FULL_SUITE pytest run must still name its package'
+        assert run.cmd.targets, 'a narrowed pytest run must name its files'
         for target in run.cmd.targets:
-            # Package, not file. Asserted as "has no file extension" rather
-            # than "ends with /": `pytest tests` and `pytest tests/` are the
-            # same selection to pytest, and the trailing slash is a cosmetic
-            # property of how the config happens to be spelled.
-            assert '.' not in PurePosixPath(target.rstrip('/')).name, (
-                f'{target!r} names a FILE — the widened run must select the '
-                f'whole test PACKAGE (PRD Resolved decision 3)'
+            assert PurePosixPath(target).suffix == '.py', (
+                f'{target!r} is not a FILE — the narrowed run must select the '
+                'touched test and the guard module, not a package'
             )
-        assert not any('test_new_thing.py' in t for t in run.cmd.targets)
-        assert run.scoped_targets == ()
+        assert run.scoped_targets == (_TOUCHED_TEST_PATH, _TREE_GUARD_PATH)
+
+    @pytest.mark.asyncio
+    async def test_without_a_guard_module_the_mixed_diff_executes_the_full_suite(
+        self, tmp_path: Path,
+    ):
+        """(d) The fallback leg end to end: no guard module in the tree, so the
+        floor is not narrowed and the module's own command runs verbatim."""
+        mc, config = _orchestrator_registry(tmp_path)
+        _write_3033_diff(tmp_path)
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [mc], task_files=_MIXED_3033_DIFF, role='task',
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert executed[0].test_command == mc.test_command
 
 
 # ---------------------------------------------------------------------------

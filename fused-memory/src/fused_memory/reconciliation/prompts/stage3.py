@@ -1,6 +1,9 @@
 """System prompt for Stage 3: Cross-System Integrity Check."""
 
 from fused_memory.models.reconciliation import FindingSeverity
+from fused_memory.reconciliation.dangling_citation import (
+    DANGLING_CROSS_RUN_CITATION_FLAG_TYPE,
+)
 from fused_memory.reconciliation.graphiti_degradation_probe import (
     render_graphiti_degradation_probe_section,
 )
@@ -18,6 +21,34 @@ from fused_memory.reconciliation.prompts import (
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_PRUNED_STAT_KEY,
     SNAPSHOT_WRITTEN_STAT_KEY,
+)
+
+# Rendered separately so the flag type is interpolated from the leaf that emits
+# the finding. Must not name the repair tool: Stage 3 is denied it, pinned by
+# test_recon_report_stage_gated_tool_advertisement.py.
+DANGLING_CITATION_HANDOFF_SECTION = (
+    """\
+## Dangling Cross-Run Citations — Detected For You
+
+**The defect.** A finding of a PRIOR, settled run (completed or failed) cites a Mem0 memory \
+that no longer resolves, typically because a later consolidation or supersession deleted it.
+
+"""
+    f"""**The detection.** After your turn, the integrity-check stage's own code scans \
+recently settled runs in the reconciliation journal, confirms each cited Mem0 memory with a \
+point read, and appends one finding per confirmed-absent citation, with \
+`flag_type='{DANGLING_CROSS_RUN_CITATION_FLAG_TYPE}'`.
+
+"""
+    """\
+**The handoff.** Stage 1 receives those findings, in a remediation pass and as the next \
+cycle's prior Stage 3 findings, and repairs the owning run's journal record. You are \
+read-only and hold no tool for it.
+
+**Your action: none.** You cannot read a closed run's findings, so do not file your own \
+finding for this defect. A dangling citation in THIS run's Stage 1/2 findings is already \
+handled by citation verification at report assembly.
+"""
 )
 
 STAGE3_SYSTEM_PROMPT = f"""\
@@ -155,12 +186,9 @@ Never recommend adding a project to the `ReconSnapshotWriteRejected` guard \
 exception list on this evidence. That contradicts Snapshot Discipline and is the \
 wrong fix.
 
-Unlike the task-1840 exception above, this guidance is deliberately \
-**prompt-only for now** — there is no `flag_dedup.py` gate dropping a finding \
-whose sole evidence is a `task_count_snapshot` stat with no Graphiti edge. The \
-code-side backstop is tracked as a follow-up (ticket \
-`tkt_0RRZ5N78VHHYKR48WXMYEKJEH2`, filed from task 3045); until it lands, this \
-section is the only thing standing between the renamed stat and a recurrence.
+A code-side gate (`filter_snapshot_stat_edge_findings` in `flag_dedup.py`) drops \
+these findings after the run, for every project, as a defense-in-depth backstop \
+— but avoiding them at the source keeps Stage 2 load clean.
 
 ## Contamination-Ceiling Retirement Exception (task 2818/2826)
 
@@ -398,6 +426,13 @@ routing (`submit_task` called with another project's `project_root`). An origin-
 check cannot see that. Real incident: run 709de018 — the task genuinely existed in \
 another project, and the false phantom conclusion drove a wasteful duplicate re-file.
 
+Two Stage 2 stats settle most of these questions before any lookup. \
+`task_created_records_journaled` counts creations the framework journaled code-side \
+as the curator decided them — cross-project filings included — so it corroborates a \
+`tasks_created` count by itself; never flag a count it covers as phantom. \
+`tasks_combined` counts candidates the curator folded into an EXISTING task: they \
+mint no new task id, so never read a `tasks_combined` count as phantom creations.
+
 Before flagging a self-reported `tasks_created` count phantom:
 1. Look for any signal identifying a candidate OTHER project + task_id for the created \
 task — e.g. a `cross_project_routing` finding from this or a prior cycle, or a task \
@@ -418,6 +453,7 @@ the finding on positive corroboration. It is the authoritative backstop, but it 
 re-check what you cite, so cite every candidate you considered rather than only the ones \
 you managed to confirm yourself.
 
+{DANGLING_CITATION_HANDOFF_SECTION}
 ## Report Channel — recon_report MCP Tools (PRD γ §9)
 {get_recon_report_tool_guidance()}
 {DUPLICATE_FINDING_SALVAGE_GUIDANCE}

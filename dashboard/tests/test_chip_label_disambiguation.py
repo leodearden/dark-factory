@@ -17,12 +17,10 @@ RED→GREEN coverage via the node-vm sandbox below.
 from __future__ import annotations
 
 import json
-import os
 import pathlib
-import shutil
 import subprocess
 
-import pytest
+from _dashboard_helpers import node_path
 
 SCHED_UTILS_PATH = str(
     pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux/scheduler_utils.jsx'
@@ -56,19 +54,10 @@ process.stdout.write(JSON.stringify(sandbox.__result) + '\n');
 """
 
 
-def _node():
-    path = shutil.which('node')
-    if not path:
-        if os.environ.get('CI'):
-            pytest.fail('node is required in CI but not found on PATH')
-        pytest.skip('node not available')
-    return path
-
-
 def _eval_sched_utils_fn(fn_name, *args):
     """Call fn_name(*args) in a node vm sandbox and return the decoded result."""
     result = subprocess.run(
-        [_node(), '-e', _DRIVER, SCHED_UTILS_PATH, fn_name, json.dumps(list(args))],
+        [node_path(), '-e', _DRIVER, SCHED_UTILS_PATH, fn_name, json.dumps(list(args))],
         capture_output=True,
         text=True,
         check=True,

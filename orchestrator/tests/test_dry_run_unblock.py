@@ -23,8 +23,15 @@ from _orch_helpers import (
     skip_role_config_layer,
     stamp_stock_routing_config,
 )
-from shared.cli_invoke import AllAccountsCappedException
+from shared.cli_invoke import (
+    AgentFailureKind,
+    AgentResult,
+    AllAccountsCappedException,
+    classify_agent_failure,
+)
 from shared.config_dir import TaskConfigDir
+from shared.process_cost import ProcessCostBasis
+from shared.testing import make_gate_mock
 
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.dry_run_unblock import _TASK_EMPTY_STATE, _TASK_UNAVAILABLE_STATE
@@ -298,6 +305,40 @@ class TestHappyPath:
         assert 'mcp__fused-memory__update_task' in disallowed
 
 
+class TestDryRunSkillDenied:
+    @pytest.mark.asyncio
+    async def test_dry_run_invocation_denies_skill_tool(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        agent_result = _make_agent_result(structured_output={
+            'proposal_text': 'x', 'risk_label': 'low', 'files_referenced': [],
+        })
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=AsyncMock(return_value=agent_result),
+        ) as mock_invoke:
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        invoke_kwargs = mock_invoke.call_args.kwargs
+        assert 'Skill' in invoke_kwargs['disallowed_tools']
+        granted = [
+            t for t in invoke_kwargs['allowed_tools']
+            if t == 'Skill' or t.startswith('Skill(')
+        ]
+        assert granted == []
+
+
 # ---------------------------------------------------------------------------
 # step-9: missing risk_label defaults to human-review-required
 # ---------------------------------------------------------------------------
@@ -429,6 +470,7 @@ class TestBudgetExhaustedFallback:
             output='',
             structured_output=None,
         )
+        assert classify_agent_failure(agent_result).kind is AgentFailureKind.BUDGET
 
         scheduler = MagicMock()
         scheduler.update_task = AsyncMock(return_value=True)
@@ -518,6 +560,46 @@ class TestEventTagging:
         data = emit_call.kwargs.get('data', {})
         assert data.get('dry_run') is True
         assert 'risk_label' in data
+
+    @pytest.mark.asyncio
+    async def test_event_records_how_the_cost_was_derived(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+        from orchestrator.event_store import EventType
+
+        agent_result = AgentResult(
+            success=True,
+            output='',
+            cost_usd=0.5,
+            structured_output={
+                'proposal_text': 'Rebase on main',
+                'risk_label': 'medium',
+                'files_referenced': [],
+            },
+            cost_basis=ProcessCostBasis.SESSION_DELTA,
+        )
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+        event_store = MagicMock()
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='55',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+                event_store=event_store,
+            )
+
+        [data] = [
+            c.kwargs['data'] for c in event_store.emit.call_args_list
+            if c.args and c.args[0] == EventType.invocation_end
+        ]
+        assert data['cost_basis'] == 'session_delta'
+        assert data['cost_delta_clamped'] is False
 
 
 # ---------------------------------------------------------------------------
@@ -748,7 +830,7 @@ class TestBlockClassStamping:
         on an ordinary success entry.
         """
         from orchestrator.dry_run_unblock import run_dry_run_unblock
-        from orchestrator.merge_gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane.gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
 
         reason = POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX + ': type-check failed for orchestrator'
         structured = {
@@ -1877,7 +1959,7 @@ class _ForcedCapUsageGate:
     active_account_name = 'forced-cap-account'
     soonest_resets_at = None
 
-    def invoke_slot(self, scope=None, *, park=True):
+    def invoke_slot(self, scope=None, *, park=True, max_wait_secs=None):
         return _ForcedCapSlot()
 
 
@@ -1935,6 +2017,136 @@ class TestDryRunCapExhaustionRealLoop:
         assert 'capped' in entry['proposal_text'].lower()
 
 
+class TestFrozenPoolInvestigationIsBounded:
+    """A pool frozen BEFORE the investigation starts used to park it in the
+    gate until a reset, out of reach of ``_DRY_RUN_CAP_WAIT_SANITY_SECS``."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('freezing_outcome', 'named', 'unnamed'), [
+        pytest.param('cap', 'capped: only', 'auth-failed: only', id='capped'),
+        pytest.param('auth', 'auth-failed: only', 'all accounts capped', id='auth_failed'),
+    ])
+    async def test_a_pool_frozen_at_spawn_writes_infra_failure_within_the_bound(
+        self, tmp_path, monkeypatch, freezing_outcome, named, unnamed,
+    ):
+        from datetime import UTC, datetime, timedelta
+
+        from _orch_helpers import build_usage_gate
+        from shared.config_models import AccountConfig
+        from shared.invocation_outcome import AuthFailed, CapHit
+
+        from orchestrator import dry_run_unblock
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        outcome = {
+            'cap': CapHit(resets_at=datetime.now(UTC) + timedelta(hours=5), reason='test cap'),
+            'auth': AuthFailed(status=401),
+        }[freezing_outcome]
+        gate = build_usage_gate(
+            [AccountConfig(name='only', oauth_token_env='TEST_TOKEN_ONLY')], ['tok-only'],
+        )
+        async with gate.invoke_slot() as slot:
+            slot.report(outcome)
+        assert gate.is_paused, 'fixture must freeze the pool before the investigation starts'
+        monkeypatch.setattr(dry_run_unblock, '_DRY_RUN_CAP_WAIT_SANITY_SECS', 0.2)
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+        mock_invoke = AsyncMock(return_value=_make_agent_result())
+
+        try:
+            with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
+                await asyncio.wait_for(
+                    run_dry_run_unblock(
+                        task_id='4002',
+                        worktree=str(tmp_path),
+                        reason='verify exhausted',
+                        detail='',
+                        scheduler=scheduler,
+                        mcp=MagicMock(),
+                        config=_make_config(),
+                        usage_gate=gate,
+                    ),
+                    5.0,
+                )
+        finally:
+            await gate.shutdown()
+
+        mock_invoke.assert_not_awaited()
+        _assert_one_proposal_persist(scheduler)
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure', entry
+        assert entry['risk_label'] == 'human-review-required', entry
+        assert named in entry['proposal_text'], entry
+        assert unnamed not in entry['proposal_text'].lower(), entry
+
+
+class TestCapHitRetriesFresh:
+    """A capped investigation retries FRESH through the real cap-retry loop,
+    even when its transcript records progress the default would resume."""
+
+    @pytest.mark.asyncio
+    async def test_capped_investigation_retries_fresh_not_resumed(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        scheduler = MagicMock(
+            update_task=AsyncMock(return_value=True),
+            get_task=AsyncMock(return_value=None),
+        )
+        calls: list[dict] = []
+
+        async def _invoke(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                slug_dir = Path(kwargs['config_dir']) / 'projects' / 'p'
+                slug_dir.mkdir(parents=True, exist_ok=True)
+                records = [
+                    {'type': 'user', 'content': 'hi'},
+                    {'type': 'assistant', 'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/tmp/x.py'}},
+                    ]}},
+                ]
+                (slug_dir / f"{kwargs['session_id']}.jsonl").write_text(
+                    '\n'.join(_json.dumps(r) for r in records) + '\n',
+                )
+                return AgentResult(
+                    success=False, output='usage limit', cost_usd=0.5,
+                    session_id=kwargs['session_id'],
+                )
+            return AgentResult(
+                success=True, output='{}', cost_usd=0.5, turns=3, duration_ms=9000,
+                structured_output={
+                    'proposal_text': 'p', 'risk_label': 'low', 'files_referenced': [],
+                },
+            )
+
+        with (
+            patch('orchestrator.dry_run_unblock.invoke_agent', new=AsyncMock(side_effect=_invoke)),
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+                usage_gate=gate,
+            )
+
+        assert len(calls) == 2
+        first, retry = calls
+        assert 'resume_session_id' not in retry
+        assert retry['prompt'] == first['prompt']
+        assert retry['session_id'] != first['session_id']
+
+
 # ---------------------------------------------------------------------------
 # task 2633 step-3: merge-completion risk clamp (RED — clamp not yet implemented)
 # ---------------------------------------------------------------------------
@@ -1978,7 +2190,7 @@ class TestMergeCompletionRiskClamp:
     for a MERGE_VERIFY_RED proposal when
     ``merge_completion_eligible(event_store, task_id)`` is False (task 2633,
     the (b)+(c) generation-time enforcement point — see
-    ``orchestrator.merge_completion``).
+    ``orchestrator.merge_lane.completion``).
 
     RED today (step-3): the clamp does not exist yet in ``run_dry_run_unblock``,
     so ``test_low_risk_clamped_when_eligibility_evidence_missing`` fails — the
@@ -2983,4 +3195,193 @@ class TestSkillPromptExplainsEveryTaskBlockState:
         assert not unexplained, (
             f'the user prompt carries {unexplained} but the unblock-auto '
             f'system prompt never explains them'
+        )
+
+
+_MUTATING_GIT_SUBCOMMANDS = frozenset({
+    'branch', 'tag', 'checkout', 'switch', 'reset', 'commit', 'merge',
+    'rebase', 'stash', 'worktree', 'push', 'pull', 'fetch', 'clean',
+    'restore', 'add', 'rm', 'mv', 'apply', 'am', 'cherry-pick', 'revert',
+    'update-ref', 'config',
+})
+
+
+_FILE_WRITING_GIT_FLAGS: dict[str, tuple[str, ...]] = {
+    'diff': ('--output',),
+    'log': ('--output',),
+    'show': ('--output',),
+}
+
+
+def _rendered_argv(kwargs: dict) -> list[str]:
+    """The CLI argv the captured investigation call becomes."""
+    from shared.cli_invoke import build_claude_argv
+
+    argv, temp_files = build_claude_argv(
+        model=kwargs['model'],
+        max_budget_usd=kwargs['max_budget_usd'],
+        system_prompt=kwargs['system_prompt'],
+        max_turns=kwargs['max_turns'],
+        permission_mode=kwargs['permission_mode'],
+        allowed_tools=kwargs['allowed_tools'],
+        disallowed_tools=kwargs['disallowed_tools'],
+        mcp_config=None,
+        output_schema=kwargs['output_schema'],
+        effort=kwargs['effort'],
+        resume_session_id=None,
+        session_id=kwargs['session_id'],
+    )
+    for path in temp_files:
+        Path(path).unlink(missing_ok=True)
+    return argv
+
+
+def _bash_rule_matches(rule: str, command: str) -> bool:
+    """Whether the ``Bash(...)`` permission *rule* matches *command*: a trailing
+    ``:*`` makes a prefix rule, and any other ``*`` is a wildcard."""
+    match = re.fullmatch(r'Bash\((.+)\)', rule)
+    if match is None:
+        return False
+    content = match.group(1)
+    if content.endswith(':*') and '*' not in content[:-2]:
+        prefix = content[:-2]
+        return command == prefix or command.startswith(f'{prefix} ')
+    pattern = '.*'.join(re.escape(part) for part in content.split('*'))
+    return re.fullmatch(pattern, command) is not None
+
+
+def _allowed_git_subcommands(allowed_tools: list[str]) -> set[str]:
+    return {
+        match.group(1)
+        for entry in allowed_tools
+        if (match := re.fullmatch(r'Bash\(git (\S+):\*\)', entry))
+    }
+
+
+def _flag_values(argv: list[str], flag: str) -> list[str]:
+    """Every token after *flag* up to the next ``--`` flag."""
+    start = argv.index(flag) + 1
+    values = []
+    for token in argv[start:]:
+        if token.startswith('--'):
+            break
+        values.append(token)
+    return values
+
+
+class TestInvestigationPermissionEnvelope:
+    """The dry run's read-only promise must be enforced by the CLI, not advised.
+
+    Under the inherited ``bypassPermissions`` the allowlist binds nothing and
+    only deny rules hold, so ``git -C <wt> commit`` slipped past
+    ``Bash(git commit:*)`` and ``NotebookEdit`` was never denied at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_investigation_runs_under_dont_ask_not_bypass(self, tmp_path):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        assert kwargs.get('permission_mode') == 'dontAsk', kwargs.get('permission_mode')
+        argv = _rendered_argv(kwargs)
+        assert argv[argv.index('--permission-mode') + 1] == 'dontAsk', argv
+
+    @pytest.mark.asyncio
+    async def test_every_builtin_file_writing_tool_is_denied(self, tmp_path):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        denied = set(_flag_values(_rendered_argv(kwargs), '--disallowed-tools'))
+        missing = sorted({'Edit', 'Write', 'NotebookEdit'} - denied)
+        assert not missing, f'file-writing tools not denied: {missing}'
+
+    @pytest.mark.asyncio
+    async def test_no_git_subcommand_the_envelope_allows_can_mutate(self, tmp_path):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        allowed_subs = _allowed_git_subcommands(kwargs['allowed_tools'])
+        assert allowed_subs, kwargs['allowed_tools']
+        mutating = sorted(allowed_subs & _MUTATING_GIT_SUBCOMMANDS)
+        assert not mutating, f'the envelope grants mutation-capable git subcommands: {mutating}'
+
+    @pytest.mark.asyncio
+    async def test_a_file_writing_flag_of_an_allowed_git_subcommand_is_denied_anywhere(
+        self, tmp_path,
+    ):
+        """A read-only subcommand still writes any reachable path through
+        ``--output``, and a prefix allow rule admits the flag in any position."""
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        writes = [
+            f'git {sub} --stat {flag}=out.txt'
+            for sub in sorted(_allowed_git_subcommands(kwargs['allowed_tools']))
+            for flag in _FILE_WRITING_GIT_FLAGS.get(sub, ())
+        ]
+        assert writes, 'the envelope grants no subcommand with a known file-writing flag'
+        undenied = [
+            command for command in writes
+            if not any(_bash_rule_matches(rule, command) for rule in kwargs['disallowed_tools'])
+        ]
+        assert not undenied, f'file-writing git forms the envelope does not deny: {undenied}'
+
+
+_FENCE = re.compile(r'^```(\w*)\n(.*?)^```', re.MULTILINE | re.DOTALL)
+_DATA_FENCE_LANGUAGES = frozenset({'json', 'yaml', 'yml', 'toml'})
+_SHELL_COMMENT = re.compile(r'(^|\s)#.*$')
+_INLINE_SPAN = re.compile(r'`([^`\n]+)`')
+_LEADING_NAME = re.compile(r'[A-Za-z][\w-]*')
+_PLACEHOLDER = re.compile(r'<[^<>\s]+>')
+_SHELL_COMPOSITION = re.compile(r'\$\(|`|&&|\|\||[;|<>]')
+
+
+def _instructed_calls(skill: str) -> list[str]:
+    """Every tool call and shell command *skill* tells the investigator to run.
+
+    Every fence is read whatever its language tag, except one tagged with a
+    data format, which shows output rather than instructing a call.
+    """
+    calls = [
+        _SHELL_COMMENT.sub('', line).strip()
+        for lang, body in _FENCE.findall(skill) if lang not in _DATA_FENCE_LANGUAGES
+        for line in body.splitlines()
+    ]
+    prose = _FENCE.sub('', skill)
+    calls += [span for span in _INLINE_SPAN.findall(prose) if span.startswith('git ')]
+    return [call for call in calls if call]
+
+
+def _admitted(call: str, kwargs: dict) -> bool:
+    """Whether the envelope admits *call*: a tool call by its tool's name, a
+    shell command by an allow rule that no deny rule overrides.
+
+    A ``Bash`` rule never admits a composed command as a whole, so
+    substitution, operators and redirection leave it unadmitted.  A
+    ``<placeholder>`` is the skill's notation for a value, not a redirection.
+    """
+    name = _LEADING_NAME.match(call)
+    if name is not None and name.group() in kwargs['allowed_tools']:
+        return True
+    command = _PLACEHOLDER.sub('VALUE', call)
+    if _SHELL_COMPOSITION.search(command):
+        return False
+    return any(
+        _bash_rule_matches(rule, command) for rule in kwargs['allowed_tools']
+    ) and not any(_bash_rule_matches(rule, command) for rule in kwargs['disallowed_tools'])
+
+
+class TestSkillCommandsFitTheEnvelope:
+    """Under dontAsk a skill command outside the allowlist is denied without a
+    prompt, which silently degrades the investigation rather than failing it."""
+
+    @pytest.mark.asyncio
+    async def test_every_call_the_skill_instructs_is_admitted_by_the_envelope(
+        self, tmp_path,
+    ):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+
+        calls = _instructed_calls(kwargs['system_prompt'])
+        assert any(call.startswith('git ') for call in calls), (
+            f'no git command extracted from the unblock-auto skill: {calls}'
+        )
+        unadmitted = [call for call in calls if not _admitted(call, kwargs)]
+        assert not unadmitted, (
+            f'the unblock-auto skill instructs calls its envelope denies: {unadmitted}'
         )
