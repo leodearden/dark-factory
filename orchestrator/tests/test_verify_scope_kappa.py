@@ -1430,8 +1430,7 @@ class TestExecutedModulesMatchExecutedModulePrefixes:
             )
 
         plan = verify_plan.derive_verify_plan(
-            [f for f in task_files if (tmp_path / f).exists()], module_configs, config,
-            _real_worktree_reader(tmp_path), role='task',
+            task_files, module_configs, config, _real_worktree_reader(tmp_path), role='task',
         )
         executed = {mc.prefix for mc in _executed_module_configs(mock_run_verification)}
         assert executed == verify_plan.executed_module_prefixes(plan) == expected

@@ -116,7 +116,10 @@ class _CancelThenUnwind:
 
 
 def _blocker(allocator: HostAllocator, name: str) -> RefusalReason | None:
-    """Why remote *name* cannot be leased now, or None when it is free."""
+    """Why remote *name* cannot be leased now, or None when it is free.
+
+    Parked is checked first because ``is_busy`` is also true for a PARKED slot.
+    """
     if allocator.is_parked(name):
         return 'host_parked'
     if allocator.is_quarantined(name):
