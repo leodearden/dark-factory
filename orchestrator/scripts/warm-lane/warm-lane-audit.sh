@@ -47,10 +47,12 @@
 # and how to read a PINNED-heavy pool: docs/notes/warm-lane-audit-runbook.md.
 #
 # Options (env defaults shown):
-#   --mount DIR           Warm-lane worktrees dir (env: REIFY_WARM_LANE_MOUNT;
-#                         shared with warm-lane-preflight.sh / warm-lane-gc.sh).
-#                         A nonexistent/empty mount reports resident=0 (not
-#                         an error — this script is advisory-only).
+#   --mount DIR           Warm-lane worktrees dir: the directory that HOLDS
+#                         the lanes, not the mount point above it (env:
+#                         REIFY_WARM_LANE_MOUNT; shared with
+#                         warm-lane-preflight.sh / warm-lane-gc.sh). Required:
+#                         an unset/empty or non-directory mount is exit 2, and
+#                         a mount with no residents warns.
 #   --format table|json  Output format (default: table).
 #   --status-cmd CMD     Backing-task status oracle: invoked as `<cmd> <id>`,
 #                         expected to print a status (e.g. done/cancelled/
@@ -89,10 +91,11 @@
 # Exit codes:
 #   0  — Always, on every valid invocation (advisory/observability — this
 #        script must never gate anything; PRD §9.5 inv.12). A status-lookup
-#        failure, a df/du measurement failure, or a nonexistent/empty mount
-#        all degrade gracefully rather than aborting.
+#        failure or a df/du measurement failure degrades gracefully rather
+#        than aborting.
 #   2  — Usage/WIRING error: unknown flag, missing flag value, invalid
-#        --format/--stale-age-min/--safety, or a missing sibling library
+#        --format/--stale-age-min/--safety, an unset/empty or non-directory
+#        mount, or a missing sibling library
 #        (scripts/lib_portable.sh, scripts/lib_lane_state.sh). The library
 #        case is a wiring error, not a runtime one: nothing about the
 #        invocation could have avoided it and no retry will fix it — the
@@ -245,7 +248,8 @@ Usage: $(basename "$0") [--mount DIR] [--format table|json] [--status-cmd CMD]
               zeros included.
 
   Options:
-    --mount DIR           Warm-lane worktrees dir (default: \$REIFY_WARM_LANE_MOUNT).
+    --mount DIR           Warm-lane worktrees dir holding the lanes (default:
+                          \$REIFY_WARM_LANE_MOUNT). Required; must be a directory.
     --format table|json   Output format (default: table).
     --status-cmd CMD      Backing-task status oracle (default:
                           \$REIFY_LANE_LEAK_STATUS_CMD).
@@ -259,8 +263,8 @@ Usage: $(basename "$0") [--mount DIR] [--format table|json] [--status-cmd CMD]
 
   Exit codes:
     0  — Always, on every valid invocation (advisory-only; never gates).
-    2  — Usage/wiring error (incl. a missing sibling scripts/lib_portable.sh
-         or scripts/lib_lane_state.sh).
+    2  — Usage/wiring error (incl. an unset/empty or non-directory mount, and
+         a missing sibling scripts/lib_portable.sh or scripts/lib_lane_state.sh).
 EOF
 }
 
@@ -331,12 +335,23 @@ if ! [[ "$SAFETY" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v s="$SAFETY" 'BEGIN{exit 
     exit 2
 fi
 
+# No usable mount is a usage error, not an empty pool: a `resident=0` report for
+# it would read as "nothing is resident" to every consumer (README.md "Delta 13").
+if [ -z "$MOUNT" ]; then
+    err "No mount given: pass --mount DIR or set REIFY_WARM_LANE_MOUNT."
+    err "Run '$(basename "$0") --help' for usage."
+    exit 2
+fi
+if ! [ -d "$MOUNT" ]; then
+    err "--mount (or REIFY_WARM_LANE_MOUNT) is not a directory: '$MOUNT'."
+    err "Run '$(basename "$0") --help' for usage."
+    exit 2
+fi
+
 # The state dir defaults to <mount>/.lane-state, so it can only be resolved
 # once --mount is final. An explicit REIFY_WARM_LANE_AUDIT_STATE_DIR wins and
 # may point anywhere, including outside the mount.
-if [ -z "$STATE_DIR" ] && [ -n "$MOUNT" ]; then
-    STATE_DIR="$MOUNT/.lane-state"
-fi
+[ -n "$STATE_DIR" ] || STATE_DIR="$MOUNT/.lane-state"
 
 info "warm-lane-audit.sh: mount=$MOUNT format=$FORMAT stale_age_min=$STALE_AGE_MIN main_ref=$MAIN_REF safety=$SAFETY state_dir=$STATE_DIR"
 
@@ -459,10 +474,10 @@ LANE_UNKNOWN_CAUSE=''
 LANE_RECORD_TASK_ID=''
 _read_lane_assignment() {
     # Preserves _lane_record's `[ -n "$STATE_DIR" ]` guard. Unreachable today
-    # (an empty STATE_DIR implies an empty --mount, which skips the resident
-    # walk entirely), but kept explicit: without it an empty STATE_DIR would
-    # fall through to lane_state_read's derived default, which for the bare
-    # lane NAME passed here resolves CWD-relative to ./.lane-state.
+    # (a validated mount always yields a non-empty STATE_DIR), but kept
+    # explicit: without it an empty STATE_DIR would fall through to
+    # lane_state_read's derived default, which for the bare lane NAME passed
+    # here resolves CWD-relative to ./.lane-state.
     if [ -z "$STATE_DIR" ]; then
         LANE_ASSIGNED_STATE='UNKNOWN'
         LANE_UNKNOWN_CAUSE='no-readable-record'
@@ -839,147 +854,149 @@ JSON_LANE_OBJS=()
 # dir that IS there. state_unknown accounting is untouched -- still per lane.
 #
 # The single warning is emitted LAZILY, on the first lane that would have warned
-# rather than here, so a mount with no lanes at all (resident=0, nothing to say
-# anything about) stays silent.
+# rather than here, so a mount with no lanes at all (resident=0) warns only about
+# that, after the walk.
 STATE_DIR_PRESENT=0
 if [ -n "$STATE_DIR" ] && [ -d "$STATE_DIR" ]; then
     STATE_DIR_PRESENT=1
 fi
 STATE_DIR_ABSENT_WARNED=0
 
-# A nonexistent/empty --mount is NOT an error (advisory-only script): the walk
-# below simply visits nothing and resident stays 0.
-if [ -n "$MOUNT" ] && [ -d "$MOUNT" ]; then
-    for entry in "$MOUNT"/*/; do
-        entry="${entry%/}"
-        [ -d "$entry" ] || continue
-        name="${entry##*/}"
-        _is_git_worktree "$entry" || continue
+for entry in "$MOUNT"/*/; do
+    entry="${entry%/}"
+    [ -d "$entry" ] || continue
+    name="${entry##*/}"
+    _is_git_worktree "$entry" || continue
 
-        RESIDENT=$((RESIDENT + 1))
-        role="$(_lane_role "$name")"
+    RESIDENT=$((RESIDENT + 1))
+    role="$(_lane_role "$name")"
 
-        live="$(_probe_live "$MOUNT/$name.lock")"
+    live="$(_probe_live "$MOUNT/$name.lock")"
 
-        # Independent of `live`: the pool's own reservation truth (A5). ONE read
-        # publishes the state, its UNKNOWN cause, and the record's task_id, so
-        # all three describe the same instant of the same record.
-        _read_lane_assignment "$name"
-        assigned_state="$LANE_ASSIGNED_STATE"
+    # Independent of `live`: the pool's own reservation truth (A5). ONE read
+    # publishes the state, its UNKNOWN cause, and the record's task_id, so
+    # all three describe the same instant of the same record.
+    _read_lane_assignment "$name"
+    assigned_state="$LANE_ASSIGNED_STATE"
 
-        # The four-way partition (see the counter block above). The if/elif
-        # chain IS the exclusivity proof -- exactly one bucket is incremented
-        # per resident, so the identity cannot drift out of true.
+    # The four-way partition (see the counter block above). The if/elif
+    # chain IS the exclusivity proof -- exactly one bucket is incremented
+    # per resident, so the identity cannot drift out of true.
+    if [ "$live" = "LIVE" ]; then
+        LIVE_COUNT=$((LIVE_COUNT + 1))
+    elif [ "$assigned_state" = "ASSIGNED" ]; then
+        PINNED_COUNT=$((PINNED_COUNT + 1))
+    elif [ "$assigned_state" = "QUARANTINED" ]; then
+        QUARANTINED_COUNT=$((QUARANTINED_COUNT + 1))
+    else
+        FREE_COUNT=$((FREE_COUNT + 1))
+    fi
+
+    # Cross-cuts (may overlap the partition; never part of the identity).
+    if [ "$assigned_state" = "ASSIGNED" ]; then
+        ASSIGNED_COUNT=$((ASSIGNED_COUNT + 1))
+    fi
+    if [ "$assigned_state" = "UNKNOWN" ]; then
+        STATE_UNKNOWN_COUNT=$((STATE_UNKNOWN_COUNT + 1))
+        # A5 observability, mirroring A3's leak_unknown warning: the lane is
+        # named here so "no pins" stays distinguishable from "pins could not
+        # be evaluated". Two things are REPORTED rather than assumed. The
+        # CAUSE, because naming a single one would send triage after a
+        # missing file that is often sitting right there (see
+        # _read_lane_assignment). And the bucket the lane was actually
+        # counted in, read off the partition above rather than asserted: an
+        # UNKNOWN lane that is LIVE lands in `live`, so a fixed "counted
+        # free" would contradict the very HEADROOM line it points at.
         if [ "$live" = "LIVE" ]; then
-            LIVE_COUNT=$((LIVE_COUNT + 1))
-        elif [ "$assigned_state" = "ASSIGNED" ]; then
-            PINNED_COUNT=$((PINNED_COUNT + 1))
-        elif [ "$assigned_state" = "QUARANTINED" ]; then
-            QUARANTINED_COUNT=$((QUARANTINED_COUNT + 1))
+            unknown_accounting='counted live'
         else
-            FREE_COUNT=$((FREE_COUNT + 1))
+            unknown_accounting='counted free (conservative)'
         fi
-
-        # Cross-cuts (may overlap the partition; never part of the identity).
-        if [ "$assigned_state" = "ASSIGNED" ]; then
-            ASSIGNED_COUNT=$((ASSIGNED_COUNT + 1))
+        if [ "$STATE_DIR_PRESENT" -eq 1 ]; then
+            warn "lane=$name: assignment state unknown ($LANE_UNKNOWN_CAUSE) at ${STATE_DIR:-<unset>}/$name.json; ${unknown_accounting}. See HEADROOM state_unknown."
+        elif [ "$STATE_DIR_ABSENT_WARNED" -eq 0 ]; then
+            # Whole-directory absence: ONE warning for the dir, not one per
+            # lane. No accounting clause -- it differs per lane, and the
+            # claim that holds for all of them is the one made here.
+            STATE_DIR_ABSENT_WARNED=1
+            warn "state dir ${STATE_DIR:-<unset>} does not exist: every lane reports assignment state unknown (no-readable-record) and none is counted pinned, quarantined or assigned. See HEADROOM state_unknown."
         fi
-        if [ "$assigned_state" = "UNKNOWN" ]; then
-            STATE_UNKNOWN_COUNT=$((STATE_UNKNOWN_COUNT + 1))
-            # A5 observability, mirroring A3's leak_unknown warning: the lane is
-            # named here so "no pins" stays distinguishable from "pins could not
-            # be evaluated". Two things are REPORTED rather than assumed. The
-            # CAUSE, because naming a single one would send triage after a
-            # missing file that is often sitting right there (see
-            # _read_lane_assignment). And the bucket the lane was actually
-            # counted in, read off the partition above rather than asserted: an
-            # UNKNOWN lane that is LIVE lands in `live`, so a fixed "counted
-            # free" would contradict the very HEADROOM line it points at.
-            if [ "$live" = "LIVE" ]; then
-                unknown_accounting='counted live'
-            else
-                unknown_accounting='counted free (conservative)'
-            fi
-            if [ "$STATE_DIR_PRESENT" -eq 1 ]; then
-                warn "lane=$name: assignment state unknown ($LANE_UNKNOWN_CAUSE) at ${STATE_DIR:-<unset>}/$name.json; ${unknown_accounting}. See HEADROOM state_unknown."
-            elif [ "$STATE_DIR_ABSENT_WARNED" -eq 0 ]; then
-                # Whole-directory absence: ONE warning for the dir, not one per
-                # lane. No accounting clause -- it differs per lane, and the
-                # claim that holds for all of them is the one made here.
-                STATE_DIR_ABSENT_WARNED=1
-                warn "state dir ${STATE_DIR:-<unset>} does not exist: every lane reports assignment state unknown (no-readable-record) and none is counted pinned, quarantined or assigned. See HEADROOM state_unknown."
-            fi
+    fi
+
+    raw_branch="$(_lane_branch_raw "$entry")"
+    branch="${raw_branch:-(detached)}"
+
+    # Resolve the backing task's raw status ONCE, then bucket it. The raw
+    # value is kept because the `pin` column needs full fidelity while
+    # `status` needs only the terminal/non-terminal/unknown bucket.
+    backing_id="$(_backing_task_id "$entry")"
+    backing_raw="$(_task_status_raw "$backing_id")"
+    status="$(_status_bucket "$backing_raw")"
+
+    # pin: WHO holds a reserved-but-idle lane, and in what state. Only a
+    # lane that is both ASSIGNED and not LIVE is pinned -- a live lane is
+    # in use, and a released lane is not reserved at all.
+    pin='-'
+    if [ "$assigned_state" = "ASSIGNED" ] && [ "$live" != "LIVE" ]; then
+        # WHO holds the reservation. The record's task_id is authoritative
+        # when present -- a lane's branch name can be stale (or absent, on a
+        # detached HEAD), whereas the reservation record is written by
+        # whoever made the reservation. Falls back to the branch-derived id
+        # when the record carries no usable id, notably `"task_id": null`,
+        # which lib_lane_state.sh's scalar reader reports as empty because it
+        # requires a quoted value. Both halves come from reads already done
+        # above, so nothing
+        # here re-opens the record or re-walks the refs.
+        pin_id="${LANE_RECORD_TASK_ID:-$backing_id}"
+        if [ "$pin_id" = "$backing_id" ]; then
+            pin_raw="$backing_raw"   # same task -- don't ask the oracle twice
+        else
+            pin_raw="$(_task_status_raw "$pin_id")"
         fi
+        pin="${pin_raw:-unknown}"
+    fi
 
-        raw_branch="$(_lane_branch_raw "$entry")"
-        branch="${raw_branch:-(detached)}"
+    recoverable="$(_recoverable "$entry" "$raw_branch")"
+    dirty="$(_dirty_state "$entry")"
+    divergent_bytes="$(_divergent_bytes "$entry")"
+    divergent_gib=$(( divergent_bytes / 1073741824 ))
+    age_min="$(_age_min "$entry")"
+    DIVERGENT_TOTAL_BYTES=$((DIVERGENT_TOTAL_BYTES + divergent_bytes))
 
-        # Resolve the backing task's raw status ONCE, then bucket it. The raw
-        # value is kept because the `pin` column needs full fidelity while
-        # `status` needs only the terminal/non-terminal/unknown bucket.
-        backing_id="$(_backing_task_id "$entry")"
-        backing_raw="$(_task_status_raw "$backing_id")"
-        status="$(_status_bucket "$backing_raw")"
+    classification="$(_classify "$live" "$assigned_state" "$status" "$recoverable" "$dirty" "$age_min")"
+    case "$classification" in
+        RECLAIMABLE) RECLAIMABLE_COUNT=$((RECLAIMABLE_COUNT + 1)) ;;
+        LEAKED) LEAKED_COUNT=$((LEAKED_COUNT + 1)) ;;
+        PINNED)
+            # Keyed off the CLASSIFICATION, not the raw predicate, so the
+            # breakdown can never drift out of sync with PINNED_COUNT.
+            case "$(_pin_bucket "$pin")" in
+                pending)    PIN_PENDING_COUNT=$((PIN_PENDING_COUNT + 1)) ;;
+                infra-hold) PIN_INFRA_HOLD_COUNT=$((PIN_INFRA_HOLD_COUNT + 1)) ;;
+                blocked)    PIN_BLOCKED_COUNT=$((PIN_BLOCKED_COUNT + 1)) ;;
+                terminal)   PIN_TERMINAL_COUNT=$((PIN_TERMINAL_COUNT + 1)) ;;
+                unknown)    PIN_UNKNOWN_COUNT=$((PIN_UNKNOWN_COUNT + 1)) ;;
+                *)          PIN_OTHER_COUNT=$((PIN_OTHER_COUNT + 1)) ;;
+            esac
+            ;;
+    esac
 
-        # pin: WHO holds a reserved-but-idle lane, and in what state. Only a
-        # lane that is both ASSIGNED and not LIVE is pinned -- a live lane is
-        # in use, and a released lane is not reserved at all.
-        pin='-'
-        if [ "$assigned_state" = "ASSIGNED" ] && [ "$live" != "LIVE" ]; then
-            # WHO holds the reservation. The record's task_id is authoritative
-            # when present -- a lane's branch name can be stale (or absent, on a
-            # detached HEAD), whereas the reservation record is written by
-            # whoever made the reservation. Falls back to the branch-derived id
-            # when the record carries no usable id, notably `"task_id": null`,
-            # which lib_lane_state.sh's scalar reader reports as empty because it
-            # requires a quoted value. Both halves come from reads already done
-            # above, so nothing
-            # here re-opens the record or re-walks the refs.
-            pin_id="${LANE_RECORD_TASK_ID:-$backing_id}"
-            if [ "$pin_id" = "$backing_id" ]; then
-                pin_raw="$backing_raw"   # same task -- don't ask the oracle twice
-            else
-                pin_raw="$(_task_status_raw "$pin_id")"
-            fi
-            pin="${pin_raw:-unknown}"
-        fi
+    # A3 observability: surface (never reclassify) a lane whose LEAKED
+    # verdict is suppressed solely because its status is unknown.
+    if [ "$classification" = "PRESERVED-OK" ] && _is_leak_unknown_suspect "$status" "$recoverable" "$age_min"; then
+        LEAK_UNKNOWN_COUNT=$((LEAK_UNKNOWN_COUNT + 1))
+        warn "lane=$name: backing-task status unknown -- cannot confirm LEAKED (would classify LEAKED if status resolved non-terminal); reported PRESERVED-OK. See HEADROOM leak_unknown."
+    fi
 
-        recoverable="$(_recoverable "$entry" "$raw_branch")"
-        dirty="$(_dirty_state "$entry")"
-        divergent_bytes="$(_divergent_bytes "$entry")"
-        divergent_gib=$(( divergent_bytes / 1073741824 ))
-        age_min="$(_age_min "$entry")"
-        DIVERGENT_TOTAL_BYTES=$((DIVERGENT_TOTAL_BYTES + divergent_bytes))
-
-        classification="$(_classify "$live" "$assigned_state" "$status" "$recoverable" "$dirty" "$age_min")"
-        case "$classification" in
-            RECLAIMABLE) RECLAIMABLE_COUNT=$((RECLAIMABLE_COUNT + 1)) ;;
-            LEAKED) LEAKED_COUNT=$((LEAKED_COUNT + 1)) ;;
-            PINNED)
-                # Keyed off the CLASSIFICATION, not the raw predicate, so the
-                # breakdown can never drift out of sync with PINNED_COUNT.
-                case "$(_pin_bucket "$pin")" in
-                    pending)    PIN_PENDING_COUNT=$((PIN_PENDING_COUNT + 1)) ;;
-                    infra-hold) PIN_INFRA_HOLD_COUNT=$((PIN_INFRA_HOLD_COUNT + 1)) ;;
-                    blocked)    PIN_BLOCKED_COUNT=$((PIN_BLOCKED_COUNT + 1)) ;;
-                    terminal)   PIN_TERMINAL_COUNT=$((PIN_TERMINAL_COUNT + 1)) ;;
-                    unknown)    PIN_UNKNOWN_COUNT=$((PIN_UNKNOWN_COUNT + 1)) ;;
-                    *)          PIN_OTHER_COUNT=$((PIN_OTHER_COUNT + 1)) ;;
-                esac
-                ;;
-        esac
-
-        # A3 observability: surface (never reclassify) a lane whose LEAKED
-        # verdict is suppressed solely because its status is unknown.
-        if [ "$classification" = "PRESERVED-OK" ] && _is_leak_unknown_suspect "$status" "$recoverable" "$age_min"; then
-            LEAK_UNKNOWN_COUNT=$((LEAK_UNKNOWN_COUNT + 1))
-            warn "lane=$name: backing-task status unknown -- cannot confirm LEAKED (would classify LEAKED if status resolved non-terminal); reported PRESERVED-OK. See HEADROOM leak_unknown."
-        fi
-
-        TABLE_OUT="${TABLE_OUT}lane=${name} role=${role} live=${live} assigned=${assigned_state} pin=${pin} branch=${branch} status=${status} recoverable=${recoverable} dirty=${dirty} divergent_gib=${divergent_gib} age_min=${age_min} classification=${classification}
+    TABLE_OUT="${TABLE_OUT}lane=${name} role=${role} live=${live} assigned=${assigned_state} pin=${pin} branch=${branch} status=${status} recoverable=${recoverable} dirty=${dirty} divergent_gib=${divergent_gib} age_min=${age_min} classification=${classification}
 "
-        JSON_LANE_OBJS+=("{\"lane\":\"$(_json_escape "$name")\",\"role\":\"${role}\",\"live\":\"${live}\",\"assigned\":\"${assigned_state}\",\"pin\":\"$(_json_escape "$pin")\",\"branch\":\"$(_json_escape "$branch")\",\"status\":\"${status}\",\"recoverable\":\"${recoverable}\",\"dirty\":\"${dirty}\",\"divergent_gib\":${divergent_gib},\"age_min\":${age_min},\"classification\":\"${classification}\"}")
-    done
+    JSON_LANE_OBJS+=("{\"lane\":\"$(_json_escape "$name")\",\"role\":\"${role}\",\"live\":\"${live}\",\"assigned\":\"${assigned_state}\",\"pin\":\"$(_json_escape "$pin")\",\"branch\":\"$(_json_escape "$branch")\",\"status\":\"${status}\",\"recoverable\":\"${recoverable}\",\"dirty\":\"${dirty}\",\"divergent_gib\":${divergent_gib},\"age_min\":${age_min},\"classification\":\"${classification}\"}")
+done
+
+# A real mount with nothing resident is almost always the wrong level: the mount
+# point above the worktrees dir rather than the dir that holds the lanes.
+if [ "$RESIDENT" -eq 0 ]; then
+    warn "mount '$MOUNT' holds no resident worktrees (resident=0): --mount must be the worktrees dir that holds the lanes, not the mount point above it."
 fi
 
 # Floor the pool-wide divergent total ONCE from the raw summed bytes
@@ -989,20 +1006,16 @@ DIVERGENT_TOTAL_GIB=$((DIVERGENT_TOTAL_BYTES / 1073741824))
 
 # ── free_gib / budget_gib: measured via the stubbable df seam (DD3/G6/D8) ────
 # A df failure or unparseable output degrades both figures to 0 with a stderr
-# note (fail-open -- this script must never abort; PRD §9.5 inv.12). Skipped
-# (stays 0) for a nonexistent/empty --mount, mirroring the resident walk's
-# own guard.
+# note (fail-open -- this script must never abort; PRD §9.5 inv.12).
 FREE_GIB=0
 BUDGET_GIB=0
-if [ -n "$MOUNT" ] && [ -d "$MOUNT" ]; then
-    df_out="$("$DF" -B1 --output=avail -- "$MOUNT" 2>/dev/null)" || df_out=""
-    avail_bytes="$(printf '%s\n' "$df_out" | tail -n +2 | head -n 1 | awk '{print $1}')"
-    if [[ "$avail_bytes" =~ ^[0-9]+$ ]]; then
-        FREE_GIB=$((avail_bytes / 1073741824))
-        BUDGET_GIB="$(awk -v f="$FREE_GIB" -v s="$SAFETY" 'BEGIN{printf "%d", (f/s)}')"
-    else
-        warn "df ($DF) failed or returned unparseable avail bytes for mount '$MOUNT'; free_gib/budget_gib degraded to 0."
-    fi
+df_out="$("$DF" -B1 --output=avail -- "$MOUNT" 2>/dev/null)" || df_out=""
+avail_bytes="$(printf '%s\n' "$df_out" | tail -n +2 | head -n 1 | awk '{print $1}')"
+if [[ "$avail_bytes" =~ ^[0-9]+$ ]]; then
+    FREE_GIB=$((avail_bytes / 1073741824))
+    BUDGET_GIB="$(awk -v f="$FREE_GIB" -v s="$SAFETY" 'BEGIN{printf "%d", (f/s)}')"
+else
+    warn "df ($DF) failed or returned unparseable avail bytes for mount '$MOUNT'; free_gib/budget_gib degraded to 0."
 fi
 
 # ── emit: table (default) or json ─────────────────────────────────────────────
