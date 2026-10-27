@@ -311,11 +311,12 @@ def _residue_outcome(record: Mapping[str, Any], spec: MarkupSinkSpec) -> str:
     if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
         return (
             f'The {spec.server_label} MCP boundary guard FORWARDED this tool '
-            'call WITHOUT the field named above, and the call LANDED. The '
-            'value below was recovered from leaked tool-call envelope markup '
-            "but could not be typed against that parameter's declared schema, "
-            'so it was dropped rather than passed through untyped. Whatever '
-            'the call wrote is missing it.'
+            'call WITHOUT the field named above. The value below was recovered '
+            'from leaked tool-call envelope markup but could not be typed '
+            "against that parameter's declared schema, so it was dropped rather "
+            'than passed through untyped. This record was filed before the call '
+            'ran, so whether it then succeeded is not known here; if it did, '
+            'whatever it wrote is missing this value.'
         )
     return (
         f'This sink does not recognise the record kind {error_type!r}, so it '
@@ -332,7 +333,7 @@ def residue_detail(
 
     The raw value is rendered last, unquoted and unescaped, because it is the
     ONLY surviving copy of data the caller may never be able to resend: a
-    refused call wrote none of it, and a forwarded call landed without it.
+    refused call wrote none of it, and a forwarded call ran without it.
     The outcome paragraph between them is the record kind's own
     (:func:`_residue_outcome`). Everything above it is diagnostic and is
     written with ``!r`` so an empty or ``None`` field reads as itself rather
