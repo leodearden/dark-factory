@@ -3,7 +3,7 @@
 import asyncio
 import json
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -60,10 +60,7 @@ def _make_memory_result(
 
 
 def _make_watermark() -> Watermark:
-    return Watermark(
-        project_id='test-project',
-        last_full_run_completed=datetime.now(UTC) - timedelta(hours=1),
-    )
+    return Watermark(project_id='test-project')
 
 
 def _make_config(**overrides: int) -> ReconciliationConfig:

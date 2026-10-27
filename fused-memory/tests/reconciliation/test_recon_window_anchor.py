@@ -257,6 +257,11 @@ async def test_resumed_run_anchors_data_windows_at_original_start(
 async def test_task_done_mid_cycle_is_inside_next_cycles_task_change_window(
     harness, journal, taskmaster,
 ):
+    """The harness half of the done-audit invariant: the persisted window contains task 7001.
+
+    The Stage 2 half, that the audit windows by ``last_task_change_timestamp``, is
+    tests/test_stages.py::TestTaskKnowledgeSyncDoneAuditSection::test_audit_window_starts_at_task_change_timestamp_not_completion.
+    """
     before_cycle = '2026-01-01T00:00:00.000Z'
     tasks = [
         {'id': 7001, 'title': 'done mid-cycle', 'status': 'in-progress', 'updatedAt': before_cycle},

@@ -1388,7 +1388,12 @@ class TestTaskKnowledgeSyncDoneAuditSection:
     async def test_audit_window_starts_at_task_change_timestamp_not_completion(
         self, mock_deps, tmp_path
     ):
-        """The audit starts at the previous run's start, so a task done mid-run is audited."""
+        """The audit starts at the previous run's start, so a task done mid-run is audited.
+
+        This is the Stage 2 half of the done-audit invariant. The harness half, that
+        the persisted ``last_task_change_timestamp`` is the run's start, is
+        tests/reconciliation/test_recon_window_anchor.py::test_task_done_mid_cycle_is_inside_next_cycles_task_change_window.
+        """
         previous_run_started = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
         previous_run_completed = datetime(2026, 7, 14, 12, 30, 0, tzinfo=UTC)
         stage = make_configured_task_knowledge_sync_stage(
