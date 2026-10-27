@@ -818,8 +818,8 @@ def test_compute_tasks_landed_missing_baseline_returns_none_with_one_warning(cap
 # fused-memory's `_normalize_project_root` hard-rejects a relative path with
 # exactly this payload. Verified live against localhost:8002 with
 # `{"project_root": "."}` -- and critically, the JSON-RPC envelope carries
-# `isError: false`, so `_extract_tool_result` unwraps this dict as though it
-# were a genuine tool result and hands it straight to the caller.
+# `isError: false`, so the MCP client unwraps this dict as though it were a
+# genuine tool result and hands it straight to the caller.
 _TOOL_ERROR_ENVELOPE = {
     "error": "project_root must be a non-empty absolute path, got: '.'",
     "error_type": "ValidationError",
@@ -841,8 +841,8 @@ def test_extract_done_count_empty_statuses_is_a_valid_zero():
 
 def test_extract_done_count_raises_on_fused_memory_tool_error_envelope():
     """The regression that poisoned the live baseline. `@mcp_tool_errors`
-    returns this dict with `isError: false` at the JSON-RPC layer, so
-    `_extract_tool_result` unwraps it happily; the old
+    returns this dict with `isError: false` at the JSON-RPC layer, so the
+    MCP client unwraps it happily; the old
     `(payload.get("statuses") or {})` idiom then read it as a done-count of
     0 -- silently, with no warning and no exception."""
     with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
@@ -1216,10 +1216,6 @@ def test_bounded_keys_survives_mixed_type_keys():
 # default_status_fetcher against a real-socket stand-in for fused-memory,
 # reached through FUSED_MEMORY_MCP_URL.
 # ---------------------------------------------------------------------------
-
-def _done_statuses(count):
-    return {str(i): "done" for i in range(count)}
-
 
 def _fetch_from(server, monkeypatch, project_root):
     monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
