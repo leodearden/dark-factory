@@ -218,6 +218,7 @@ _GUARDED_DOCS = (
     'skills/review/SKILL.md',
     'skills/review/references/phase3-triage.md',
     'skills/hotspot-survey/SKILL.md',
+    'skills/review-briefing/SKILL.md',
 )
 
 _GUARDED_SITES = (
