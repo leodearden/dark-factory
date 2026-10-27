@@ -22,6 +22,7 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard, TypeVar
 from shared.cost_store import CapReason
 from shared.proc_group import snapshot_process_group, terminate_process_group
 from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
+from shared.secret_env import agent_subprocess_env
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
@@ -3811,8 +3812,8 @@ async def _invoke_claude(
     # (task 3147 — see _materialize_stdin).
     stdin_data = prompt.encode()
 
-    # Strip ANTHROPIC_API_KEY so `claude` falls back to OAuth
-    env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+    # Which inherited variables the child may see: shared.secret_env.
+    env = agent_subprocess_env(os.environ)
     # Merge caller-supplied overrides (e.g. ANTHROPIC_BASE_URL for vLLM)
     if env_overrides:
         env.update(env_overrides)

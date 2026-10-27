@@ -14,6 +14,7 @@ __all__ = [
     'KNOWN_PROJECT_ROOTS_ENV',
     'CheckoutRootError',
     'StrPath',
+    'agent_transcripts_dir',
     'default_project_root',
     'escalation_queue_dir',
     'known_project_roots',
@@ -38,6 +39,10 @@ def escalation_queue_dir(root: StrPath) -> Path:
 
 def orchestrator_data_dir(root: StrPath) -> Path:
     return Path(root) / 'data' / 'orchestrator'
+
+
+def agent_transcripts_dir(root: StrPath) -> Path:
+    return orchestrator_data_dir(root) / 'agent-transcripts'
 
 
 def runs_db(root: StrPath) -> Path:
