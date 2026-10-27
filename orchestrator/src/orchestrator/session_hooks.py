@@ -297,15 +297,19 @@ class _HookSlugResolution:
 
     INVARIANT: ``snapshot is None or snapshot.slug == slug``.
 
-    ``session_id_pointed`` -- adopted through its session-id pointer, so sid
-    equality proved ownership and a dead ``claude_owner_pid`` may be reclaimed.
+    ``session_id_keyed`` -- the slug was reached by this event's own session
+    id, either through its session-id pointer or through the hand-launched
+    keying that embeds it. A record bound to that id is therefore proven this
+    session's, and a dead ``claude_owner_pid`` may be reclaimed;
+    ``_bind_claude_session_id`` still requires the binding to equal the
+    event's id.
     """
 
     slug: str
     rejected_env_slug: str | None
     may_bind: bool
     snapshot: _RecordSnapshot | None
-    session_id_pointed: bool = False
+    session_id_keyed: bool = False
 
 
 def _adopt_pointer_slug(
@@ -315,7 +319,7 @@ def _adopt_pointer_slug(
     *,
     allow_remint: bool,
     probes: EventProbes,
-    session_id_pointed: bool,
+    session_id_keyed: bool,
 ) -> _HookSlugResolution | None:
     """Adopt pointer-resolved *slug* iff ``_env_slug_ownership`` owns it and its record reads."""
     if slug is None:
@@ -325,7 +329,7 @@ def _adopt_pointer_slug(
     )
     if not owned or snapshot is None or snapshot.record is None:
         return None
-    return _HookSlugResolution(slug, None, may_bind, snapshot, session_id_pointed)
+    return _HookSlugResolution(slug, None, may_bind, snapshot, session_id_keyed)
 
 
 def _pointer_resolution(
@@ -351,7 +355,7 @@ def _pointer_resolution(
         root,
         allow_remint=allow_remint,
         probes=probes,
-        session_id_pointed=True,
+        session_id_keyed=True,
     )
     if by_session_id is not None:
         return by_session_id
@@ -364,7 +368,7 @@ def _pointer_resolution(
         root,
         allow_remint=allow_remint,
         probes=probes,
-        session_id_pointed=False,
+        session_id_keyed=False,
     )
 
 
@@ -390,7 +394,8 @@ def _resolve_hook_slug(
       branch it would describe the spawner's record, not the one returned.
 
     With no ``CLAUDE_SPAWN_SESSION_ID``, ``_pointer_resolution`` is tried
-    before the hand-launched keying.
+    before the hand-launched keying, which is session-id keyed: its slug
+    embeds the stdin ``session_id``.
 
     *allow_remint* (SessionStart only) and *probes* are forwarded to
     ``_env_slug_ownership``. See ``docs/session-hook-ownership.md``
@@ -434,7 +439,7 @@ def _resolve_hook_slug(
     )
     # This slug embeds session_id itself, so binding it is tautological.
     # No snapshot: any read above was of a DIFFERENT record than this slug.
-    return _HookSlugResolution(slug, rejected, True, None)
+    return _HookSlugResolution(slug, rejected, True, None, session_id_keyed=True)
 
 
 def hook_session_slug(
@@ -902,7 +907,7 @@ def run_session_start(
         record,
         hook_input,
         allow_rebind=_is_owner_only_session_start(hook_input),
-        reclaim_dead_owner=resolution.session_id_pointed,
+        reclaim_dead_owner=resolution.session_id_keyed,
         probes=probes,
     )
     session_registry.write_record(record, root=root)
@@ -1051,7 +1056,7 @@ def _run_status_refresh_and_retitle(
     # one (may_bind False).
     owner_event = not in_launch_window and may_bind
     newly_bound = owner_event and _bind_claude_session_id(
-        record, hook_input, reclaim_dead_owner=resolution.session_id_pointed, probes=probes
+        record, hook_input, reclaim_dead_owner=resolution.session_id_keyed, probes=probes
     )
     if question is not None and not in_launch_window:
         record.question = question
