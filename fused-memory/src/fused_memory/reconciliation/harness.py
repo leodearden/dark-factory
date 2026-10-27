@@ -1314,6 +1314,7 @@ class ReconciliationHarness:
         assembled_payload: AssembledPayload | None = None,
         remediation_findings: list[dict] | None = None,
         filtered_task_tree: FilteredTaskTree | None = None,
+        filtered_task_tree_fetched_at: datetime | None = None,
         task_count_verification: dict | None = None,
         graphiti_queue_health: dict | None = None,
         index_health: dict | None = None,
@@ -1325,10 +1326,14 @@ class ReconciliationHarness:
         Shared between run_full_cycle and _run_remediation_pass to prevent
         attribute-configuration divergence.
 
-        Note: filtered_task_tree here applies only to Stage 1 (MemoryConsolidator).
-        Stage 2 (TaskKnowledgeSync) wiring is handled by the symmetric
-        _configure_task_sync helper.
+        Note: filtered_task_tree and filtered_task_tree_fetched_at here apply
+        only to Stage 1 (MemoryConsolidator). Stage 2 (TaskKnowledgeSync)
+        wiring is handled by the symmetric _configure_task_sync helper.
 
+        filtered_task_tree_fetched_at: the instant filtered_task_tree was read,
+            against which Stage 1's Live-Workflow section ages claimant
+            heartbeats (task 6027). Set unconditionally with the tree, so a
+            call without one never leaves a previous tree's instant behind.
         task_count_verification: cross_verify_task_counts record (available only
             in full-cycle passes; None in remediation passes).
         graphiti_queue_health: summarize_graphiti_queue_health record (available only
@@ -1348,6 +1353,7 @@ class ReconciliationHarness:
         stage.assembled_payload = assembled_payload
         stage.remediation_findings = remediation_findings
         stage.filtered_task_tree = filtered_task_tree
+        stage.filtered_task_tree_fetched_at = filtered_task_tree_fetched_at
         stage.task_count_verification = task_count_verification
         stage.graphiti_queue_health = graphiti_queue_health
         stage.index_health = index_health
@@ -1366,9 +1372,9 @@ class ReconciliationHarness:
 
         Mirrors _configure_consolidator for Stage 1 — both full-cycle and
         remediation paths use this helper to keep attribute wiring symmetric
-        and discoverable. Stage-2-specific attributes (filtered_task_tree,
-        filtered_task_tree_fetched_at, remediation_mode) are set here; Stage-1
-        wiring is handled by _configure_consolidator.
+        and discoverable. Stage 2's attributes (filtered_task_tree,
+        filtered_task_tree_fetched_at, remediation_mode) are set here; Stage 1's,
+        including its own tree and read instant, by _configure_consolidator.
         """
         stage.filtered_task_tree = filtered_task_tree
         stage.filtered_task_tree_fetched_at = filtered_task_tree_fetched_at
@@ -3772,8 +3778,9 @@ class ReconciliationHarness:
         # e.g. at the _maybe_remediate call below — because the S1->S3 stage
         # loop that follows is minutes of LLM work and the claimant heartbeat
         # TTL is only 10 minutes (task 2964). Threaded to Stage 2's
-        # hint-attention selector (task 5093) and through _maybe_remediate ->
-        # _run_remediation_pass to the live-workflow gate, so both age a task's
+        # hint-attention selector (task 5093), to both stages' Live-Workflow
+        # Signals sections (task 6027), and through _maybe_remediate ->
+        # _run_remediation_pass to the live-workflow gate, so each ages a task's
         # heartbeat against the actual read, not a fresh clock taken well after it.
         filtered_task_tree_fetched_at = datetime.now(UTC)
 
@@ -3907,6 +3914,7 @@ class ReconciliationHarness:
                             cycle_fence_time=cycle_start_time,
                             assembled_payload=assembled_payload,
                             filtered_task_tree=filtered_task_tree,
+                            filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
                             task_count_verification=task_count_verification,
                             graphiti_queue_health=graphiti_queue_health,
                             index_health=index_health,
@@ -5943,6 +5951,7 @@ class ReconciliationHarness:
                 stage1, tier,
                 remediation_findings=findings,
                 filtered_task_tree=remediation_tree,
+                filtered_task_tree_fetched_at=_tasks_snapshot_at,
             )
             self._configure_task_sync(
                 stage2,
