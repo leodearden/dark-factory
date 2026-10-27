@@ -245,6 +245,7 @@ def build_coordinator(
     store: RunStore | None = None,
     run_id: str = RUN_ID,
     psi_config: PsiAdmissionConfig | None = None,
+    isolation_probe: Callable[[], bool] | None = None,
 ) -> CoordinatorRig:
     db_path = tmp_path / 'runs.db'
     config = config or shadow_config()
@@ -263,7 +264,7 @@ def build_coordinator(
         runner=runner,
         escalate=escalator,
         clock=clock.now,
-        isolation=lambda: isolation[0],
+        isolation=isolation_probe or (lambda: isolation[0]),
         read_host_sample=lambda: host[0],
         psi_config=psi_config or PsiAdmissionConfig(),
         resolve_candidate=resolve_candidate or candidates.get,

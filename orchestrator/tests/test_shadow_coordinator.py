@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import threading
 from datetime import timedelta
 from pathlib import Path
 
@@ -371,6 +372,50 @@ async def test_shutdown_fails_a_running_cell_before_releasing_it(tmp_path, costs
     assert cell.state is _S.FAILED
     assert cell.reason == 'cancelled_at_shutdown'
     assert len(_ended_events(rig)) == 1
+
+
+class _OverlappingSnapshots:
+    """An isolation probe whose first call waits up to a second for a concurrent second call.
+
+    The probe runs inside the open snapshot, so two openers that are not
+    serialised both take their snapshot before either inserts its cell.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._calls = 0
+        self._second_arrived = threading.Event()
+
+    def __call__(self) -> bool:
+        with self._lock:
+            self._calls += 1
+            first = self._calls == 1
+        if first:
+            self._second_arrived.wait(timeout=1.0)
+        else:
+            self._second_arrived.set()
+        return True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_triggers_never_open_past_max_concurrent(tmp_path, costs):
+    rig = build_coordinator(
+        tmp_path, costs,
+        config=shadow_config(max_concurrent=1),
+        isolation_probe=_OverlappingSnapshots(),
+    )
+    release_runs = asyncio.Event()
+    rig.runner.script(ShadowShape.IMPLEMENTER, 'claude-sonnet-max', block=release_runs)
+
+    opened = await asyncio.gather(
+        _plan_exit(rig, make_task('5387')), _plan_exit(rig, make_task('5388')),
+    )
+    release_runs.set()
+    await rig.coordinator.join()
+
+    assert sorted(len(ids) for ids in opened) == [0, 1]
+    assert len(_cells(rig)) == 1
+    assert _skip_reasons(rig) == ['concurrency_full']
 
 
 @pytest.mark.asyncio

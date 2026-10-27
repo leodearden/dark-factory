@@ -699,6 +699,7 @@ class ShadowCoordinator:
         self.run_id = run_id
         self._incumbents = MappingProxyType(dict(incumbents))
         self._drives: set[asyncio.Task[None]] = set()
+        self._open_lock = asyncio.Lock()
         self._storm = _UNPAUSED
 
     # -- open ---------------------------------------------------------------
@@ -781,18 +782,27 @@ class ShadowCoordinator:
         parent_cell_id: str | None = None,
         plan: dict | None = None,
     ) -> str | None:
-        """Decide, then insert, announce and drive the cell; the one open path."""
-        inputs = await asyncio.to_thread(self._open_inputs, task, shape, candidate)
-        decision = decide_open(inputs)
-        if decision.reason is not None:
-            await self._emit_skip(inputs.task_id, shape, candidate.name, decision.reason)
-            return None
-        cell = self._sampled_cell(inputs, candidate, parent_cell_id)
-        try:
-            await asyncio.to_thread(self._deps.store.insert_shadow_cell, cell)
-        except sqlite3.IntegrityError:
-            await self._emit_skip(inputs.task_id, shape, candidate.name, ShadowSkipReason.ALREADY_OPEN)
-            return None
+        """Decide, then insert, announce and drive the cell; the one open path.
+
+        The snapshot and the insert share one lock, so a concurrent opener
+        counts this cell and ``max_concurrent`` is a hard limit. The daily cap
+        counts dollars already spent, so the runs in flight can overshoot it
+        by their own cost; the budget storm guard then pauses.
+        """
+        async with self._open_lock:
+            inputs = await asyncio.to_thread(self._open_inputs, task, shape, candidate)
+            decision = decide_open(inputs)
+            if decision.reason is not None:
+                await self._emit_skip(inputs.task_id, shape, candidate.name, decision.reason)
+                return None
+            cell = self._sampled_cell(inputs, candidate, parent_cell_id)
+            try:
+                await asyncio.to_thread(self._deps.store.insert_shadow_cell, cell)
+            except sqlite3.IntegrityError:
+                await self._emit_skip(
+                    inputs.task_id, shape, candidate.name, ShadowSkipReason.ALREADY_OPEN,
+                )
+                return None
         await self._emit(EventType.shadow_cell_opened, cell, host=decision.host.value)
         self._spawn(CellRequest(cell=cell, task=task, candidate=candidate, plan=plan))
         return cell.cell_id
