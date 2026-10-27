@@ -154,6 +154,13 @@ class TestShadowCellLifecycleRules:
             _S.EXPIRED,
         }
 
+    def test_stamps_run_ended_at_is_every_state_a_held_state_leaves_into(self):
+        assert {s for s in ShadowCellState if s.stamps_run_ended_at} == {
+            _S.AWAITING_REFERENCE,
+            _S.CAP_EXCLUDED,
+            _S.FAILED,
+        }
+
 
 def test_storm_cause_values():
     assert issubclass(ShadowStormCause, StrEnum)

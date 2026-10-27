@@ -100,6 +100,11 @@ class ShadowCellState(StrEnum):
         """The states whose entry writes ``settled_at``: the cell is closed for scoring."""
         return self in _SETTLED_AT_STATES
 
+    @property
+    def stamps_run_ended_at(self) -> bool:
+        """The states whose entry writes ``run_ended_at``: a held state leaves into them."""
+        return self in _RUN_ENDED_AT_STATES
+
 
 _TERMINAL_STATES = frozenset({
     ShadowCellState.SETTLED,
@@ -130,6 +135,13 @@ _HELD_BY_RUN_STATES = frozenset({
 })
 
 _SETTLED_AT_STATES = frozenset({ShadowCellState.SETTLED, ShadowCellState.EXPIRED})
+
+_RUN_ENDED_AT_STATES = frozenset(
+    target
+    for held in _HELD_BY_RUN_STATES
+    for target in _SUCCESSORS[held]
+    if target not in _HELD_BY_RUN_STATES
+)
 
 
 class ReferenceKind(StrEnum):

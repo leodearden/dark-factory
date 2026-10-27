@@ -843,11 +843,11 @@ class ShadowCoordinator:
         return ShadowCellQuery(project_id=self.project_id, **filters)
 
     def _credits_exhausted_since(self, candidate: str, since: datetime) -> bool:
-        """Whether a cell of *candidate* opened since *since* ended with the allowance spent."""
+        """Whether a run of *candidate* has run out of its allowance since *since*."""
         capped = self._deps.store.find_shadow_cells(self._query(
             states=frozenset({ShadowCellState.CAP_EXCLUDED}),
             candidate=candidate,
-            opened_since=since,
+            run_ended_since=since,
         ))
         return any(cell.reason == CellEndReason.CREDITS_EXHAUSTED.value for cell in capped)
 

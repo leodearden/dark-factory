@@ -161,6 +161,51 @@ class TestAdvanceShadowCell:
         assert updated is not None
         assert updated.settled_at is None
 
+    @pytest.mark.parametrize(
+        'stored,change',
+        [
+            (_S.SAMPLED, CellChange(state=_S.FAILED, at=_AT, reason='runner_raised:OSError')),
+            (_S.OPENED, CellChange(state=_S.FAILED, at=_AT, reason='cancelled_at_shutdown')),
+            (_S.RUNNING, CellChange(state=_S.AWAITING_REFERENCE, at=_AT)),
+            (_S.RUNNING, CellChange(state=_S.CAP_EXCLUDED, at=_AT, reason='credits_exhausted')),
+        ],
+        ids=lambda v: v.value if isinstance(v, ShadowCellState) else v.state.value,
+    )
+    def test_leaving_a_held_state_stamps_run_ended_at(self, store, stored, change):
+        store.insert_shadow_cell(_cell(state=stored))
+
+        updated = store.advance_shadow_cell(_CELL_ID, expected=stored, change=change)
+
+        assert updated is not None
+        assert updated.run_ended_at == _AT
+        assert store.get_shadow_cell(_CELL_ID) == updated
+
+    @pytest.mark.parametrize(
+        'stored,change',
+        [
+            (_S.SAMPLED, CellChange(state=_S.OPENED, at=_AT, worktree_path=Path('/tmp/w'))),
+            (_S.OPENED, CellChange(state=_S.RUNNING, at=_AT)),
+        ],
+        ids=lambda v: v.value if isinstance(v, ShadowCellState) else v.state.value,
+    )
+    def test_a_still_held_successor_leaves_run_ended_at_unset(self, store, stored, change):
+        store.insert_shadow_cell(_cell(state=stored))
+
+        updated = store.advance_shadow_cell(_CELL_ID, expected=stored, change=change)
+
+        assert updated is not None
+        assert updated.run_ended_at is None
+
+    def test_settling_keeps_the_run_end_it_already_has(self, store):
+        ended = _AT - timedelta(minutes=3)
+        store.insert_shadow_cell(_cell(state=_S.AWAITING_REFERENCE, run_ended_at=ended))
+        change = CellChange(state=_S.SETTLED, at=_AT, reference_kind=ReferenceKind.NONE)
+
+        updated = store.advance_shadow_cell(_CELL_ID, expected=_S.AWAITING_REFERENCE, change=change)
+
+        assert updated is not None
+        assert (updated.run_ended_at, updated.settled_at) == (ended, _AT)
+
     def test_opened_carries_the_worktree_path(self, store):
         store.insert_shadow_cell(_cell(state=_S.SAMPLED))
         change = CellChange(state=_S.OPENED, at=_AT, worktree_path=Path('/tmp/eval/shadow_5387'))
@@ -356,6 +401,23 @@ class TestFindShadowCells:
 
         assert _ids(found) == _ids(cells[2:])
 
+    def test_run_ended_since_is_inclusive_and_skips_unended_cells(self, store):
+        for i in range(3):
+            store.insert_shadow_cell(_cell(
+                cell_id=f'01JENDED{i}',
+                task_id=f'e{i}',
+                state=_S.CAP_EXCLUDED,
+                reason='credits_exhausted',
+                run_ended_at=_OPENED_AT + timedelta(minutes=i + 1),
+            ))
+        store.insert_shadow_cell(_cell(cell_id='01JUNENDED', task_id='u', state=_S.RUNNING))
+
+        found = store.find_shadow_cells(ShadowCellQuery(
+            project_id='dark_factory', run_ended_since=_OPENED_AT + timedelta(minutes=2),
+        ))
+
+        assert _ids(found) == ['01JENDED1', '01JENDED2']
+
     def test_deadline_before_is_strict(self, store):
         cells = _seed(store, 4)
 
@@ -378,6 +440,34 @@ class TestFindShadowCells:
     def test_an_empty_states_filter_is_refused(self):
         with pytest.raises(ValueError, match='states'):
             ShadowCellQuery(project_id='dark_factory', states=frozenset())
+
+
+class TestRunEndedAt:
+    """``run_ended_at``: when the cell's run ended, added to an already-deployed table."""
+
+    def test_a_naive_run_end_is_refused(self):
+        with pytest.raises(ValueError, match='run_ended_at'):
+            _cell(run_ended_at=datetime(2026, 10, 19, 12, 5))
+
+    def test_a_table_without_the_column_gains_it_and_old_rows_read_none(self, store, db_path):
+        store.insert_shadow_cell(_cell(state=_S.RUNNING))
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute('ALTER TABLE shadow_cells DROP COLUMN run_ended_at')
+            conn.commit()
+        finally:
+            conn.close()
+
+        reopened = RunStore(db_path)
+
+        stored = reopened.get_shadow_cell(_CELL_ID)
+        assert stored is not None
+        assert stored.run_ended_at is None
+        ended = reopened.advance_shadow_cell(
+            _CELL_ID, expected=_S.RUNNING, change=CellChange(state=_S.AWAITING_REFERENCE, at=_AT),
+        )
+        assert ended is not None
+        assert ended.run_ended_at == _AT
 
 
 class TestTripleUniqueness:

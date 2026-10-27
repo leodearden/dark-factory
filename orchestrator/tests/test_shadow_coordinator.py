@@ -318,6 +318,26 @@ async def test_credits_exhaustion_holds_the_candidate_for_the_credit_window(tmp_
 
 
 @pytest.mark.asyncio
+async def test_the_credit_hold_runs_from_when_the_allowance_ran_out_not_from_the_open(
+    tmp_path, costs,
+):
+    rig = build_coordinator(tmp_path, costs, config=shadow_config(candidates=['glm-5.3-endpoint']))
+    rig.runner.script(
+        ShadowShape.IMPLEMENTER, 'glm-5.3-endpoint',
+        outcome=CellRunOutcome(end=RunEnd.CREDITS_EXHAUSTED),
+        before_return=lambda _request: rig.clock.advance(CREDIT_WINDOW + timedelta(hours=1)),
+    )
+    await _plan_exit(rig, make_task('5387'))
+    await rig.coordinator.join()
+    rig.runner.scripts.clear()
+
+    rig.clock.advance(timedelta(minutes=1))
+
+    assert await _plan_exit(rig, make_task('5388')) == []
+    assert _skip_reasons(rig) == ['credits_exhausted']
+
+
+@pytest.mark.asyncio
 async def test_a_raising_resolver_is_an_unknown_candidate_skip_naming_the_error(
     tmp_path, costs, caplog,
 ):

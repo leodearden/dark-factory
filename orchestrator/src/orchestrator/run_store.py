@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 _BLANK_CHARS = ' \t\n\r'
 _STRATUM_SEPARATOR = '×'
 _SHADOW_CELL_DEFAULT_OWNER = 'shadow_coordinator'
+_SHADOW_CELL_TIME_COLUMNS = (
+    'opened_at', 'settle_deadline', 'running_at', 'run_ended_at', 'settled_at',
+)
 
 
 def _is_blank(text: str | None) -> bool:
@@ -73,6 +76,7 @@ class ShadowCell:
     cost_credits: float = 0.0
     run_id: str | None = None
     running_at: datetime | None = None
+    run_ended_at: datetime | None = None
     settled_at: datetime | None = None
     owner: str = _SHADOW_CELL_DEFAULT_OWNER
 
@@ -96,7 +100,7 @@ class ShadowCell:
             self._refuse(f'parent_cell_id must differ from cell_id (got {self.parent_cell_id!r})')
 
     def _check_timestamps(self) -> None:
-        for name in ('opened_at', 'settle_deadline', 'running_at', 'settled_at'):
+        for name in _SHADOW_CELL_TIME_COLUMNS:
             value = getattr(self, name)
             if value is not None and value.utcoffset() is None:
                 self._refuse(f'{name} must be timezone-aware (got naive {value!r})')
@@ -157,6 +161,7 @@ CREATE TABLE IF NOT EXISTS shadow_cells (
     run_id          TEXT,
     opened_at       TEXT NOT NULL,
     running_at      TEXT,
+    run_ended_at    TEXT,
     settled_at      TEXT,
     settle_deadline TEXT NOT NULL,
     owner           TEXT NOT NULL DEFAULT '{_SHADOW_CELL_DEFAULT_OWNER}',
@@ -192,7 +197,6 @@ _SHADOW_CELL_ENUM_COLUMNS: dict[str, type[StrEnum]] = {
     'plan_source': PlanSource,
     'reference_kind': ReferenceKind,
 }
-_SHADOW_CELL_TIME_COLUMNS = ('opened_at', 'settle_deadline', 'running_at', 'settled_at')
 _SHADOW_CELL_PATH_COLUMNS = ('worktree_path', 'result_path')
 _PARENT_SHARED_COLUMNS = ('project_id', 'task_id', 'base_sha')
 
@@ -271,6 +275,7 @@ class ShadowCellQuery:
     candidate: str | None = None
     run_id: str | None = None
     opened_since: datetime | None = None
+    run_ended_since: datetime | None = None
     deadline_before: datetime | None = None
     newest_first: bool = False
     limit: int | None = None
@@ -284,13 +289,14 @@ class ShadowCellQuery:
             raise ValueError(f'ShadowCellQuery: limit must be None or >= 1 (got {self.limit!r})')
 
 
-# (query field, SQL condition) — opened_since is inclusive, deadline_before strict.
+# (query field, SQL condition) — each *_since is inclusive, deadline_before strict.
 _SHADOW_CELL_QUERY_FILTERS = (
     ('task_id', 'task_id = ?'),
     ('shape', 'shape = ?'),
     ('candidate', 'candidate = ?'),
     ('run_id', 'run_id = ?'),
     ('opened_since', 'opened_at >= ?'),
+    ('run_ended_since', 'run_ended_at >= ?'),
     ('deadline_before', 'settle_deadline < ?'),
 )
 
@@ -375,6 +381,8 @@ def _successor_cell(cell: ShadowCell, change: CellChange) -> ShadowCell:
     }
     if change.state is ShadowCellState.RUNNING:
         carried['running_at'] = change.at
+    if change.state.stamps_run_ended_at:
+        carried['run_ended_at'] = change.at
     if change.state.stamps_settled_at:
         carried['settled_at'] = change.at
     return replace(cell, state=change.state, **carried)
@@ -595,6 +603,7 @@ class RunStore:
             self._migrate_task_results_block_context(conn)
             self._migrate_scheduler_state_ewa_value(conn)
             self._migrate_runs_code_sha(conn)
+            self._migrate_shadow_cells_run_ended_at(conn)
         finally:
             conn.close()
 
@@ -667,6 +676,16 @@ class RunStore:
         if add_column_if_missing_sync(conn, 'runs', 'code_sha', 'TEXT'):
             conn.commit()
             logger.info('RunStore: migrated runs — added code_sha')
+
+    def _migrate_shadow_cells_run_ended_at(self, conn: sqlite3.Connection) -> None:
+        """Add ``run_ended_at`` to a pre-5387 ``shadow_cells``.
+
+        Same shape as :meth:`_migrate_runs_code_sha`. An existing row reads
+        NULL, meaning "the run had not ended, or ended before task 5387".
+        """
+        if add_column_if_missing_sync(conn, 'shadow_cells', 'run_ended_at', 'TEXT'):
+            conn.commit()
+            logger.info('RunStore: migrated shadow_cells — added run_ended_at')
 
     def start_run(
         self,
@@ -1107,6 +1126,7 @@ class RunStore:
         unknown cell raises ``KeyError``; a transition the successor table
         forbids, or a successor breaking a row invariant, raises ``ValueError``.
         Entering ``running`` stamps ``running_at``; entering a state that
+        ``stamps_run_ended_at`` stamps ``run_ended_at``; entering a state that
         ``stamps_settled_at`` stamps ``settled_at``, and nothing else does.
         """
         conn = self._connect()
