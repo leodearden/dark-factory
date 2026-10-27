@@ -504,3 +504,25 @@ class TestClaimsAreAgedAtTheTreeReadInstant:
         assert LiveSignal.RECENT_COMMIT not in row.signals, (
             'the commit is 7h old at `now`; only a leaked read instant would make it 5h old'
         )
+
+    @pytest.mark.asyncio
+    async def test_stage2_payload_ages_claims_at_the_injected_tree_read_instant(
+        self, repo: Path,
+    ) -> None:
+        from test_stages import _mock_stage_deps, make_configured_task_knowledge_sync_stage
+
+        _pending_with_worktree(repo, 6027, when=datetime.now(UTC) - timedelta(hours=48))
+        read_at = datetime.now(UTC) - timedelta(minutes=20)
+        task = _heartbeating(6027, heartbeat_at=read_at - timedelta(minutes=1))
+        stage = make_configured_task_knowledge_sync_stage(
+            _mock_stage_deps(), project_id='dark_factory', project_root=str(repo),
+        )
+        stage.filtered_task_tree = _tree([task])
+        stage.filtered_task_tree_fetched_at = read_at
+
+        payload = await stage.assemble_payload([], Watermark(project_id='dark_factory'), [])
+
+        assert LIVE_WORKFLOW_SECTION_HEADER in payload, (
+            'the only row was dropped: its heartbeat was aged at render time, not at the tree read'
+        )
+        assert f'claimant={ClaimantLabel.LIVE}' in _line_for(_section_of(payload), 'task/6027')
