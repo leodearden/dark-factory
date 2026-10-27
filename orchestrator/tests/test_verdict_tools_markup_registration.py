@@ -586,6 +586,20 @@ class TestUnrepairableResidueIsPreserved:
         assert "field='summary'" in filed.detail
 
     @pytest.mark.asyncio
+    async def test_the_refused_record_states_its_refusal(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """The guard row for the kind dispatch: a REFUSED call's record keeps
+        saying what the refusal cost, and never that the call was forwarded."""
+        steer_project_root(monkeypatch, tmp_path)
+
+        await self._refuse(artifacts)
+
+        (filed,) = queued_residue(tmp_path)
+        assert verdict_tools._MARKUP_SINK_SPEC.refusal_consequence in filed.detail
+        assert 'FORWARDED' not in filed.detail
+
+    @pytest.mark.asyncio
     async def test_the_hint_makes_the_preservation_claim(
         self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
     ):
@@ -1033,6 +1047,22 @@ class TestTheWidenedRepairVocabularyStaysContained:
         )
 
     @pytest.mark.asyncio
+    async def test_the_dropped_slice_record_does_not_claim_a_refusal(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """This call was FORWARDED and its verdict landed
+        (``test_the_call_still_lands``), so the record must not say the call
+        was refused or that no verdict was written."""
+        steer_project_root(monkeypatch, tmp_path)
+
+        await self._submit(artifacts)
+
+        (residue,) = queued_residue(tmp_path)
+        assert verdict_tools._MARKUP_SINK_SPEC.refusal_consequence not in residue.detail
+        assert 'FORWARDED' in residue.detail
+        assert 'swallowed tail' in residue.detail
+
+    @pytest.mark.asyncio
     async def test_an_unreachable_queue_drops_nothing_into_the_worktree(
         self, monkeypatch, artifacts: TaskArtifacts
     ):
@@ -1079,6 +1109,32 @@ class _RecordingQueue:
     def submit(self, esc: Any) -> str:
         self.submitted.append(esc)
         return esc.id
+
+
+#: A record kind today's middleware does not emit. There is, by construction,
+#: no way to make today's middleware emit tomorrow's record, so rows using it
+#: drive the sink directly.
+UNKNOWN_KIND = 'mcp_markup_some_future_kind'
+
+
+async def file_an_unknown_kind(root: Path) -> _RecordingQueue:
+    """Send one ``UNKNOWN_KIND`` record straight at a verdict-tools sink and
+    return the queue it filed into."""
+    queue = _RecordingQueue()
+    sink = markup_sink.make_escalation_sink(
+        worktree=root,
+        spec=verdict_tools._MARKUP_SINK_SPEC,
+        subject_task_id=lambda: '6083',
+        resolve_root=lambda worktree: root,
+        open_channel=lambda project_root: (Escalation, queue),
+    )
+    await sink({
+        'error_type': UNKNOWN_KIND,
+        'tool': 'submit_review_verdict',
+        'field': 'issues',
+        'raw_value': 'THE ONLY SURVIVING COPY',
+    })
+    return queue
 
 
 class TestVerdictToolsResidueChannelIsShared:
@@ -1210,22 +1266,8 @@ class TestVerdictToolsResidueChannelIsShared:
         """The anti-vacuity partner of the dropped-slice no-warning row: the
         warning still exists for the case it is meant for, and names both the
         offending kind and the kinds the sink does accept."""
-        queue = _RecordingQueue()
-        sink = markup_sink.make_escalation_sink(
-            worktree=tmp_path,
-            spec=verdict_tools._MARKUP_SINK_SPEC,
-            subject_task_id=lambda: '6083',
-            resolve_root=lambda worktree: tmp_path,
-            open_channel=lambda root: (Escalation, queue),
-        )
-
         with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.markup_sink'):
-            await sink({
-                'error_type': 'mcp_markup_some_future_kind',
-                'tool': 'submit_review_verdict',
-                'field': 'issues',
-                'raw_value': 'THE ONLY SURVIVING COPY',
-            })
+            queue = await file_an_unknown_kind(tmp_path)
 
         assert len(queue.submitted) == 1
         assert 'THE ONLY SURVIVING COPY' in queue.submitted[0].detail
@@ -1234,10 +1276,21 @@ class TestVerdictToolsResidueChannelIsShared:
             if record.name == 'orchestrator.mcp.markup_sink'
             and record.levelno >= logging.WARNING
         ]
-        assert 'mcp_markup_some_future_kind' in warning
+        assert UNKNOWN_KIND in warning
         assert MARKUP_UNRECOVERED_PARAM_ERROR_TYPE in warning, (
             f'the warning does not name the kinds this sink knows: {warning!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_unknown_kind_claims_no_outcome(self, tmp_path):
+        """The sink cannot know what happened to a call whose kind it does not
+        know, so the body names the kind and claims no refusal."""
+        queue = await file_an_unknown_kind(tmp_path)
+
+        (filed,) = queue.submitted
+        assert verdict_tools._MARKUP_SINK_SPEC.refusal_consequence not in filed.detail
+        assert UNKNOWN_KIND in filed.detail
+        assert 'THE ONLY SURVIVING COPY' in filed.detail
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
