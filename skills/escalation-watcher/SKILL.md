@@ -1095,8 +1095,7 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
    The six worker-internal outcomes (`wip_halted`, `done_wip_recovery`,
    `wip_recovery_no_advance`, `unmerged_state`, `stash_failed`, `error`) are rare;
    `merge_status` collapses all of them except `done_wip_recovery` to `blocked` when
-   observed by polling — handle them as `blocked`. (`failed`, which this list named
-   until task 4829, is not a value the server ever returns; the real one is `error`.)
+   observed by polling — handle them as `blocked`.
    <!-- merge-state-vocab:begin partition=SUBMIT_NON_TERMINAL
         Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
         scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
@@ -1121,8 +1120,8 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
         and this list goes red until it matches. -->
    `done | conflict | blocked | abandoned | superseded`.
    <!-- merge-state-vocab:end -->
-   (`already_merged`, which this list named until task 4829, is a *submit* status the
-   server collapses to `done` when observed by polling — see step 1 and
+   (`already_merged` is a *submit* status the server collapses to `done` when observed by
+   polling — see step 1 and
    `escalation/src/escalation/server.py::_map_terminal_state`.)
    After an orchestrator restart,
    `{state: 'unknown', hint: 'check git log main'}` → fall back to `git log main` (PRD I3).
@@ -1410,10 +1409,8 @@ config `UnblockAutoConfig.attended_b3_enabled` (`<project_root>/dark-factory-orc
 session via a session override. A session override wins in either direction — a human may turn it on
 even if config is false, or off even if config is true.
 
-**Digest line format** (written into `<project_root>/data/escalations/afk-digest.md` — the single
-shared B3 outcome ledger for both AFK and attended modes; the "afk" prefix reflects the file's
-original AFK-only scope, but it is now the unified record for all B3 outcomes regardless of session
-mode; AFK shift 3 manages it):
+**Digest line format** (written into `<project_root>/data/escalations/afk-digest.md`, the one B3
+outcome ledger for AFK and attended modes alike; AFK shift 3 manages it):
 - **Merged**: `B3 <task_id> — merged: <one-line summary> (sha: <merge_sha>)`
 - **Aborted**: `B3 <task_id> — aborted: <reason>`
 - **Drift-reinvestigated, second drift**: `B3 <task_id> — drift re-investigated; re-gate: drift-again → pending`
@@ -1421,13 +1418,10 @@ mode; AFK shift 3 manages it):
 - **Handed off**: `B3 <task_id> — handed off: <request_id> still <state> at the polling ceiling → resume launched`
 - **Resume backstop**: `B3 <task_id> — resume backstop: <request_id> still <state> → pending (not cancelled)`
 
-`afk-digest.md` is **retained** (Fleet Cockpit C8) — it is not removed in this batch, but it is
-demoted to a generated history view: `data/return-brief.md`, the 05:30 return brief, is the
-primary pull-on-return surface that supersedes it, and it reads the cockpit decision queue (C5b),
-fed by `write-decision` (see "Filing Parked Decisions to the Cockpit Registry" above), for any of
-the above that left a decision open (i.e. every outcome except "Merged", a first "Handed off",
-whose resume is still running, and a resume-mode "Aborted" on an escalation someone else already
-took).
+Every outcome above that left a decision open reaches the return brief through its DecisionRecord
+— that is every outcome except "Merged", a first "Handed off" (its resume is still running) and a
+resume-mode "Aborted" on an escalation someone else already took; why the digest is kept beside the
+return brief is stated in "Filing Parked Decisions to the Cockpit Registry (C8)" above.
 
 **When a line is derived from a triage ack.** If a digest line above, or a `write-decision --text`
 registry entry (see "Filing Parked Decisions to the Cockpit Registry" above), draws on an existing
@@ -1587,8 +1581,7 @@ normative statement of the rule:
 A pending L2 is a **cluster**, and `escalation-watcher-auto` re-promotes the same cluster every
 time it finds more L1s matching that root cause. Each of those folds carries its own
 `root_cause`/`evidence`/`options`/`summary` — the promoting rotation's current read of the problem,
-which is often sharper than the first one. Until task 3997 all of it was discarded on the floor
-(measured: 336,875 characters). It is now kept.
+which is often sharper than the first one.
 
 **When you pull the full record with `get_escalation(id)`, read `amendments` alongside the record's
 own framing.** The two are different things and the distinction is the whole point:
@@ -1942,7 +1935,7 @@ If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B
 
 ### `wip_conflict` / `unmerged_state` / `stash_failed` (blocking, halt-owner)
 
-These escalations mean the **merge queue is globally halted** — no other task can merge until exactly one of them (the "halt owner") is resolved. The orchestrator records which escalation owns the halt on the merge worker (`_halt_owner_esc_id`); resolving that specific escalation via MCP un-halts the queue. Resolving any other escalation — even another `wip_conflict` — will NOT release the halt (fixed 2026-04-19; prior code relied on a category heuristic that caused phantom-L1 bugs like esc-1888-57).
+These escalations mean the **merge queue is globally halted** — no other task can merge until exactly one of them (the "halt owner") is resolved. The orchestrator records which escalation owns the halt on the merge worker (`_halt_owner_esc_id`); resolving that specific escalation via MCP un-halts the queue. Resolving any other escalation — even another `wip_conflict` — will NOT release the halt.
 
 Three flavours:
 - **`wip_conflict`** — the merge queue tripped on uncommitted work in `project_root`. Three sub-variants distinguishable from the `detail`:
@@ -1966,7 +1959,7 @@ resolution, and is never a flake.
 
 **Spawn an interactive `/unblock` session** via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, <wip_conflict|unmerged_state|stash_failed>, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`) so the human can see the recovery branch, inspect `project_root`, and resolve the escalation when finished. The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
 
-**Phantom-halt check:** if the orchestrator log shows "Merge queue un-halted: halt owner &lt;esc.id&gt; resolved" but the escalation file still has `status: pending`, that is a bug — report to the human; do **not** silently dismiss. (Historical context: pre-fix, this was a common symptom of the category-match un-halt bug.)
+**Phantom-halt check:** if the orchestrator log shows "Merge queue un-halted: halt owner &lt;esc.id&gt; resolved" but the escalation file still has `status: pending`, that is a bug — report to the human; do **not** silently dismiss.
 
 ### `scope_violation` (info or blocking)
 
@@ -1983,12 +1976,7 @@ mcp__escalation__resolve_issue(
 )
 ```
 
-**`granted_files` is now delivered on the re-pend path, not just to a live workflow.** It is persisted durably on the escalation record either way, and there are two consumers:
-
-- **Live workflow (per-task steward's path).** `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._collect_granted_files` → `_set_task_scope`, from a single call site in `workflow.py::TaskWorkflow._drive`, reached only after `_wait_for_resolution()` returns for a still-alive workflow process. That is why the same wording is correct in `orchestrator/src/orchestrator/agents/roles.py::STEWARD`.
-- **No live workflow (this queue's normal case).** The `scope_violation` items reaching an L2 queue are usually on a `blocked` — or stranded `in-progress` — task whose workflow slot is gone. Resolution takes the orphan/cascade branch (`orchestrator/src/orchestrator/harness.py::Harness._on_escalation_resolved`) into `harness.py::Harness._cascade_unblock_member`, which since **task 3540** calls `harness.py::Harness._fold_granted_files_on_repend` between the re-block guard and the status write. That helper unions `granted_files` across **every resolved** escalation for the task (the whole history, order-preserving — the same union `_collect_granted_files` computes) and writes it to **both** `plan.json`'s `files` and `metadata.files`, before the row goes re-pendable.
-
-So `resume` + `granted_files` on a blocked or stranded task with no live claimant now widens the scope the redispatched agent actually works to. `plans/task-escalation-state-graph-prd.md` **D8** and `docs/task-escalation-state-spec.md` **E9** list this as semantics to be built; 3540 built it.
+**`granted_files` is delivered on the re-pend path, not just to a live workflow.** It is persisted durably on the escalation record either way. On a `blocked` — or stranded `in-progress` — task with no live workflow, which is this queue's normal case, the resolve folds the union of every resolved escalation's `granted_files` into both `plan.json`'s `files` and `metadata.files` before the re-pend (`orchestrator/src/orchestrator/harness.py::Harness._fold_granted_files_on_repend`). A live workflow takes `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._collect_granted_files` instead.
 
 **Three caveats that survive, so state them accurately rather than promising more than the fold delivers:**
 
@@ -1996,7 +1984,7 @@ So `resume` + `granted_files` on a blocked or stranded task with no live claiman
 - **No plan, no widen.** A task that never reached the architect (no `plan.json` in either `.task-meta/<worktree>/` or the legacy `<worktree>/.task/`) has no scope to widen; the fold logs a DEBUG and skips, and the re-pend still happens.
 - **The re-block guard outranks the grant.** If the guard withholds the flip, nothing is re-pended, so nothing is widened.
 
-Module **locks** are a separate question from working scope, and the fold does not touch them directly: `orchestrator/src/orchestrator/scheduler.py::Scheduler._get_modules` is cache-first (its own docstring: "deterministic short-circuit > in-memory cache > metadata.files > fallback"), and the narrow `_module_cache` entry from the task's prior dispatch survives an escalation — `blocked` is in `orchestrator/src/orchestrator/task_status.py::ACTIVE_TASK_STATUSES`, so `scheduler.py::Scheduler._phase_stale_sweep` does not evict it. Lock widening is re-established branch-side instead, by `workflow.py::TaskWorkflow._reconcile_scope_locks` — the choke point every path that (re)establishes `plan.files` runs through (`_plan()`, `_apply_revalidation_skip()`, `_run_simple_task()`, `_set_task_scope()`). That is also why writing **`plan.json`** is the load-bearing half of the fold: `_reconcile_scope_locks` persists `metadata.files = plan_files` on every successful refinement, so a metadata-only widen would be narrowed straight back down on the next dispatch, while a plan-level widen propagates the other way.
+Module **locks** follow `plan.files` and are re-derived at the next plan boundary by `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._reconcile_scope_locks`, which persists `metadata.files = plan_files`.
 
 Do **not** hand-write `metadata.files` yourself to simulate the fold. Beyond being redundant now, a metadata-only write is self-reverting for exactly that reason, and it is not consulted for lock derivation while the module cache is warm.
 
@@ -2498,18 +2486,12 @@ be possible under the enforced guard, and is the actual anomaly worth reporting 
 (possible guard regression, bypassed connection headers, or a stale pre-guard orchestrator/server
 pair that hasn't been restarted onto the fix yet).
 
-**Capped identity leaking into an interactive session (task 2796):** the supervised auto rotation
-now attaches its capped `escalation` connection with `--strict-mcp-config`, scoping the rotation to
-only its own MCP config and no longer merging the ambient project `.mcp.json`. Because the capped
-block shares the identical server name (`escalation`) and URL (port `8102`) as an interactive
-session's header-less block, that non-strict ambient merge was the path by which a capped
-`X-Escalation-Identity: orchestrator-escalation-watcher-auto` / `X-Escalation-Levels: 0,1` identity
-could bleed into a concurrent header-less **interactive** watcher session — making that session's own
-L2 `resolve_issue`/`park` fail `level_forbidden` as if it were the capped auto-watcher. With the
-strict isolation now in place, a capped identity should no longer leak into an interactive session.
-**If it recurs anyway**, the supervised rotation is no longer the likely culprit — suspect a
+**Capped identity leaking into an interactive session:** if this session's own L2
+`resolve_issue`/`park` fails `level_forbidden`, the capped identity
+(`X-Escalation-Identity: orchestrator-escalation-watcher-auto`, `X-Escalation-Levels: 0,1`) has
+reached its connection. The supervised rotation attaches under `--strict-mcp-config`, so suspect a
 hand-injected `--mcp-config` (e.g. a `CLAUDE_SPAWN_CLAUDE_ARGS` passthrough) or a config generator
-writing capped headers directly into `.mcp.json`.
+writing capped headers into `.mcp.json`.
 
 **If MCP is unreachable:** ask the human for help. Don't try to resolve escalations by writing directly to the queue files — this bypasses callbacks and can leave the orchestrator in an inconsistent state.
 
