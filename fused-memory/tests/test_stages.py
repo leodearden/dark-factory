@@ -14336,11 +14336,11 @@ class TestAssemblePayloadRequiredSections:
         """Swap in STUB_REGISTRY; return the tree each stub renderer received, by stub."""
         received: dict[str, FilteredTaskTree] = {}
 
-        async def stub_alpha(filtered: FilteredTaskTree) -> str:
+        async def stub_alpha(filtered: FilteredTaskTree, tree_read_at: datetime) -> str:
             received['alpha'] = filtered
             return '\n### Alpha\nfirst\n'
 
-        async def stub_beta(filtered: FilteredTaskTree) -> str:
+        async def stub_beta(filtered: FilteredTaskTree, tree_read_at: datetime) -> str:
             received['beta'] = filtered
             return '\n### Beta\nsecond\n'
 
