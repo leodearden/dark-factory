@@ -535,7 +535,8 @@ class EventQueue:
         is on disk, so a kill -9 while the append is pending leaves the event
         in the journal rather than in neither store. The returned future
         resolves ``True`` once the record is written, ``False`` if it failed;
-        a coroutine that awaits it resumes only after that release has run.
+        a coroutine awaiting it through ``asyncio.wrap_future`` resumes only
+        after that release has run.
         """
         written = self._dead_letter_writer.append(
             _dead_letter_record(event, reason=reason, attempts=attempts),
