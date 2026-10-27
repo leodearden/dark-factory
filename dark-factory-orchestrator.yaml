@@ -1786,3 +1786,15 @@ psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (
 # Runbook: plans/d2-context-complete-reviewer-gate.md (watch section 3, kill rule section 4).
 review:
   reviewer_briefing: d2
+
+# Task 5057 (deep-chain canary; plans/deep-merge-ahead-prd.md), Leo's ruling B of
+# 2026-10-20: carry the flip (carrier 7619) one week after reify's canary 3189.
+# Reify's week was neutral: 122 merge verifies, 95 landings (66 the week before),
+# 2 deep verifies, 1 chain landing, 0 chain-attributed red.
+# STOP RULE: back to 0 if gates per landed item exceed 1.0, or on any
+# chain-attributed red main or rebase-conflict cluster. Green tier: reload_config
+# applies a change without a restart; this carry issues none, so 6 goes live at
+# the next restart. The coalesce test this flip once redded pins chain_cap=0
+# since task 7279 (merge 58a69de6a5).
+merge_deep:
+  chain_cap: 6
