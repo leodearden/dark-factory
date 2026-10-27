@@ -555,10 +555,10 @@ _T3_SESSION_ID = 'sess-t3'
 _T3_HOOK_INPUT = {'session_id': _T3_SESSION_ID, 'cwd': _CWD}
 
 
-def _pre_pointer_record(root: Path, *, owner: int = _DEAD_PID) -> str:
-    """Seed a hand-launched record bound to ``_T3_SESSION_ID`` by an earlier *owner*, with no pointers."""
+def _pre_pointer_record(root: Path, env: Mapping[str, str], *, owner: int = _DEAD_PID) -> str:
+    """Seed *env*'s record bound to ``_T3_SESSION_ID`` by an earlier *owner*, with no pointers."""
     slug = sh.hook_session_slug(
-        _T3_HOOK_INPUT, {}, root=root, process_tree=claude_process_tree(None)
+        _T3_HOOK_INPUT, env, root=root, process_tree=claude_process_tree(None)
     )
     sr.write_record(
         sr.SessionRecord(
@@ -573,9 +573,34 @@ def _pre_pointer_record(root: Path, *, owner: int = _DEAD_PID) -> str:
     return slug
 
 
-class TestResumedHandLaunchedSessionIsRelinked:
+_DISOWNED_SPAWNER = 'session-cockpit-7614001'
+
+
+def _hand_launched_env(root: Path) -> dict[str, str]:
+    return {}
+
+
+def _forked_inheritor_env(root: Path) -> dict[str, str]:
+    """Seed a spawner bound to another session, so the inherited ``CLAUDE_SPAWN_SESSION_ID`` is disowned."""
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=_DISOWNED_SPAWNER,
+            status=sr.Status.RUNNING,
+            claude_session_id='uuid-spawner',
+        ),
+        root=root,
+    )
+    return {'CLAUDE_SPAWN_SESSION_ID': _DISOWNED_SPAWNER, 'CLAUDE_SPAWN_ROLE': 'watcher'}
+
+
+class TestResumedSessionIdKeyedRecordIsRelinked:
     _RESUMED = 7_614_102
 
+    @pytest.mark.parametrize(
+        'lane_env',
+        [_hand_launched_env, _forked_inheritor_env],
+        ids=['hand-launched', 'forked-inheritor'],
+    )
     @pytest.mark.parametrize(
         ('handler', 'hook_input'),
         [
@@ -590,20 +615,23 @@ class TestResumedHandLaunchedSessionIsRelinked:
         tmp_path: Path,
         handler: Callable[..., object],
         hook_input: Mapping[str, object],
+        lane_env: Callable[[Path], Mapping[str, str]],
     ) -> None:
-        slug = _pre_pointer_record(tmp_path)
+        env = lane_env(tmp_path)
+        slug = _pre_pointer_record(tmp_path, env)
+        records_before = sorted(sr.sessions_dir(tmp_path).iterdir())
 
-        handler(hook_input, {}, root=tmp_path, process_tree=claude_process_tree(self._RESUMED))
+        handler(hook_input, env, root=tmp_path, process_tree=claude_process_tree(self._RESUMED))
 
         assert sr.read_record(slug, root=tmp_path).claude_owner_pid == self._RESUMED
         assert sr.resolve_session_slug_for_pid(self._RESUMED, root=tmp_path) == slug
         assert (
             sr.resolve_session_slug_for_claude_session_id(_T3_SESSION_ID, root=tmp_path) == slug
         )
-        assert [d.name for d in sr.sessions_dir(tmp_path).iterdir()] == [slug]
+        assert sorted(sr.sessions_dir(tmp_path).iterdir()) == records_before
 
     def test_a_live_recorded_owner_is_left_in_place(self, tmp_path: Path) -> None:
-        slug = _pre_pointer_record(tmp_path, owner=os.getpid())
+        slug = _pre_pointer_record(tmp_path, {}, owner=os.getpid())
 
         sh.run_stop(
             _T3_HOOK_INPUT,
@@ -616,7 +644,7 @@ class TestResumedHandLaunchedSessionIsRelinked:
         assert sr.resolve_session_slug_for_pid(self._RESUMED, root=tmp_path) is None
 
 
-_T0 =datetime(2026, 9, 25, 12, 0, 0, tzinfo=UTC)
+_T0 = datetime(2026, 9, 25, 12, 0, 0, tzinfo=UTC)
 
 
 def _holder(*, pid: int = 0, record_slug: str = '', slug: str = 'watcher-df-1') -> sr.LeaseHolder:
@@ -1335,7 +1363,7 @@ class TestWriteDecisionRecordSlug:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        slug = _pre_pointer_record(tmp_path)
+        slug = _pre_pointer_record(tmp_path, {})
         sh.run_stop(
             _T3_HOOK_INPUT, {}, root=tmp_path, process_tree=claude_process_tree(self._RESUMED)
         )

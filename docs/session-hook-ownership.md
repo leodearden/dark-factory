@@ -118,7 +118,9 @@ applies on two lanes:
 
 - an event reached through its session-id pointer;
 - an event reached through the hand-launched keying, whose slug embeds that
-  same session id, so a record bound to it is proven the session's own.
+  same session id, so a record bound to it is proven the session's own. A
+  forked inheritor's record is keyed the same way (see §Forked-inheritor
+  identity), so it shares this lane.
 
 An event that adopts its `CLAUDE_SPAWN_SESSION_ID` does not reclaim: there a
 reclaim would also satisfy the self-exit owner-pid precondition in the same
