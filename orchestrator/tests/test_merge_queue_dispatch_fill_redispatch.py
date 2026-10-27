@@ -42,10 +42,10 @@ the follower alone in flight and the second item stranded at
 from __future__ import annotations
 
 import asyncio
-import collections
 import contextlib
 import dataclasses
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -72,11 +72,11 @@ from test_merge_queue_concurrent_verify import (
     git_ops,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_repo,  # noqa: F401 — pytest fixture re-exported from γ harness
 )
-from test_merge_queue_rebased_landing_dead_base import _land_foreign_commit
+from test_merge_queue_rebased_landing_dead_base import _git_until_it_takes, _land_foreign_commit
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_lane import MERGE_WORKER_SHUTDOWN_REASON, MergeLane
+from orchestrator.merge_lane import MERGE_WORKER_SHUTDOWN_REASON, MergeLane, MergeRequest
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
@@ -137,16 +137,26 @@ class _Lane:
     requests: dict[str, Any] = dataclasses.field(default_factory=dict)
     run_task: asyncio.Task | None = None  # type: ignore[type-arg]
 
-    async def enqueue(self, task_id: str) -> Any:
+    @staticmethod
+    def branch_file(task_id: str) -> str:
+        """The one file :meth:`enqueue` commits on *task_id*'s branch."""
+        return f'{task_id.replace("-", "_")}.py'
+
+    async def enqueue(self, task_id: str) -> MergeRequest:
         """Commit a one-file branch for *task_id* and submit it on the public queue."""
         worktree = await _make_branch_with_file(
-            self.git_ops, f'task/{task_id}', f'{task_id.replace("-", "_")}.py',
-            f'# {task_id}\n',
+            self.git_ops, f'task/{task_id}', self.branch_file(task_id), f'# {task_id}\n',
         )
         request = _make_request(task_id, f'task/{task_id}', worktree, self.config)
         self.requests[task_id] = request
         await self.queue.put(request)
         return request
+
+    async def on_main(self, task_id: str) -> bool:
+        """Whether *task_id*'s branch file is on main."""
+        return await _git_rc(
+            self.git_ops.project_root, 'cat-file', '-e', f'main:{self.branch_file(task_id)}',
+        ) == 0
 
     def inflight_ids(self) -> set[str]:
         """Task ids holding a host lease right now, from the public snapshot."""
@@ -712,12 +722,14 @@ GATE_WAITER = 'gr-waiter'
 
 
 class _GateVerifier(FakeVerifier):
-    """Holds GATED_HEAD's own verify and then its gate re-verify on events.
+    """Holds GATED_HEAD's own verify and then its gate re-verifies on events.
 
     GATED_HEAD's first call is its verify, gated on ``head_entered`` /
     ``head_release``; its second is the gate, gated on ``gate_entered`` /
-    ``gate_release`` and returning *gate_result*.  Every other call passes.
-    ``cancelled`` lists the task id of every call torn down mid-run.
+    ``gate_release`` and returning *gate_result*; a third, the gate after a
+    second rebase, is gated on ``regate_entered`` / ``regate_release`` and
+    passes.  Every other call passes.  ``cancelled`` lists the task id of
+    every call torn down mid-run.
     """
 
     def __init__(self, *, gate_result: VerifyResult | None = None) -> None:
@@ -726,27 +738,32 @@ class _GateVerifier(FakeVerifier):
         self.head_release = asyncio.Event()
         self.gate_entered = asyncio.Event()
         self.gate_release = asyncio.Event()
+        self.regate_entered = asyncio.Event()
+        self.regate_release = asyncio.Event()
         self.cancelled: list[str | None] = []
         self.gate_result = gate_result or passes().result
-        self.calls: collections.Counter[str | None] = collections.Counter()
 
     def next_script(self, task_id: str | None) -> VerifyScript:
-        self.calls[task_id] += 1
         if task_id != GATED_HEAD:
             return self.default
-        if self.calls[task_id] == 1:
+        call = self.verified.count(task_id)
+        if call == 1:
             return VerifyScript(
                 result=passes().result, release=self.head_release, entered=self.head_entered,
             )
-        if self.calls[task_id] == 2:
+        if call == 2:
             return VerifyScript(
                 result=self.gate_result, release=self.gate_release, entered=self.gate_entered,
+            )
+        if call == 3:
+            return VerifyScript(
+                result=passes().result, release=self.regate_release, entered=self.regate_entered,
             )
         return self.default
 
     async def run_scoped(
         self,
-        worktree: Any,
+        worktree: Path,
         config: Any,
         module_configs: list[Any],
         task_files: list[str] | None = None,
@@ -761,7 +778,7 @@ class _GateVerifier(FakeVerifier):
             raise
 
 
-async def _gate_head(lane: _Lane, verifier: _GateVerifier) -> tuple[Any, str]:
+async def _gate_head(lane: _Lane, verifier: _GateVerifier) -> tuple[MergeRequest, str]:
     """Drive GATED_HEAD into its gate re-verify on local and hold it there.
 
     Main moves by a direct commit while the head verifies, so its CAS rebases.
@@ -894,9 +911,8 @@ class TestGateReverifyDoesNotParkTheLoop:
                 waiter.result, label=f'{GATE_WAITER} outcome',
             )
             assert waiter_outcome.status == 'done', waiter_outcome
-            assert await _git_rc(
-                lane.git_ops.project_root, 'cat-file', '-e', 'main:gr_head.py',
-            ) != 0, "the red-gated head's file reached main"
+            assert await lane.on_main(GATE_WAITER), "the waiter's file never reached main"
+            assert not await lane.on_main(GATED_HEAD), "the red-gated head's file reached main"
 
     async def test_gate_completion_wakes_the_fill_ahead_race(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -929,6 +945,45 @@ class TestGateReverifyDoesNotParkTheLoop:
             assert GATE_WAITER in lane.inflight_ids(), lane.observed()
             assert not waiter.result.done(), lane.observed()
 
+    async def test_a_second_rebase_parks_the_head_on_a_second_gate(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        verifier = _GateVerifier()
+        async with _running_lane(git_ops, config, verifier=verifier) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            head, _drift = await _gate_head(lane, verifier)
+            await _land_another_foreign_commit(lane.git_ops.project_root)
+            second_drift = await lane.git_ops.get_main_sha()
+
+            verifier.gate_release.set()
+            await wait_responsive(
+                verifier.regate_entered.wait(),
+                label=f'{GATED_HEAD} gate re-verify after main moved again',
+            )
+            waiter = await lane.enqueue(GATE_WAITER)
+            await lane.settle(
+                lambda: _hosts_of(lane).get(lane.remote.name) == [GATE_WAITER],
+                expected=f'{GATE_WAITER} dispatched to the free laptop',
+                why="the verifier loop is parked inside the head's second gate re-verify.",
+            )
+            assert lane.states()[GATED_HEAD] == 'gate_reverify', lane.observed()
+
+            verifier.regate_release.set()
+            lane.remote_gate.set()
+            head_outcome = await wait_responsive(head.result, label=f'{GATED_HEAD} outcome')
+            waiter_outcome = await wait_responsive(
+                waiter.result, label=f'{GATE_WAITER} outcome',
+            )
+
+            assert head_outcome.status == 'done', head_outcome
+            assert waiter_outcome.status == 'done', waiter_outcome
+            assert await lane.git_ops.is_ancestor_checked(
+                second_drift, head_outcome.merge_sha,
+            ) is True, head_outcome
+            assert await lane.git_ops.is_ancestor_checked(
+                head_outcome.merge_sha, waiter_outcome.merge_sha,
+            ) is True, (head_outcome, waiter_outcome)
+
     async def test_stop_preempts_a_parked_gate_reverify(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
@@ -957,7 +1012,14 @@ class TestGateReverifyDoesNotParkTheLoop:
             assert await lane.git_ops.get_main_sha() == drift, lane.observed()
 
 
-async def _git_rc(repo: Any, *args: str) -> int:
+async def _land_another_foreign_commit(repo: Path) -> None:
+    """Move main again, as :func:`_land_foreign_commit` does, on a file of its own."""
+    (repo / 'foreign_again.txt').write_text('landed elsewhere again\n')
+    await _git_until_it_takes(repo, 'add', 'foreign_again.txt')
+    await _git_until_it_takes(repo, 'commit', '-m', 'Second foreign landing')
+
+
+async def _git_rc(repo: Path, *args: str) -> int:
     """Exit status of ``git *args`` run in *repo*."""
     proc = await asyncio.create_subprocess_exec(
         'git', *args, cwd=repo,
