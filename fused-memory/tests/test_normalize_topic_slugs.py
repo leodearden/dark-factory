@@ -3564,6 +3564,30 @@ class TestTopicSelection:
         assert resolve_exit(report) == 1
 
     @pytest.mark.asyncio
+    async def test_only_a_selected_values_id_less_record_is_filed(self):
+        """A refusal that is not a collision is narrowed by its legacy value too.
+
+        The selected value's id-less record cannot be written, so it is both
+        refused and left behind as residue; the unselected one is not this run's.
+        """
+        service, corpus = _run_service({'dark_factory': [
+            _crec('m1', 'legacy_a'),
+            _crec('', 'legacy_a'),
+            _crec('m2', 'legacy_b') | {'id': None},
+        ]})
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True,
+                                 topics=frozenset({'legacy_a'}))
+
+        assert [(entry['memory_id'], entry['topic'])
+                for entry in report['skips']['record_without_id']] == [('', 'legacy_a')]
+        assert corpus.topic_of('dark_factory', 'm1') == 'legacy-a'
+        assert [entry['legacy_topic'] for entry in report['skips']['legacy_slug_residue']] == [
+            'legacy_a',
+        ]
+        assert resolve_exit(report) == 1
+
+    @pytest.mark.asyncio
     async def test_an_unselected_spelling_still_contests_a_selected_one(self):
         """The collision index is corpus-wide: the selection filters the plan, not its input."""
         service, corpus = _run_service({
