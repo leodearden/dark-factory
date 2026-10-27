@@ -36,6 +36,7 @@ from legibility import (
     digest,
     invariants,
     nightly,
+    plan_deviation_census,
     session_ledger,
     session_runner,
     state_docs,
@@ -691,7 +692,7 @@ def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path):
         now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=lambda prompt, model: '{"proposals": []}',
         status_fetcher=None,
-        poster=lambda url, envelope: None,
+        poster=lambda url, arguments: None,
         selector=spy_select,
         digest_builder=spy_build,
         pass_kind=nightly.PassKind.MANUAL,
@@ -755,203 +756,6 @@ def test_git_status_changed_detects_dirty_codebook(tmp_path):
     )
 
     assert nightly._git_status_changed(repo, _CODEBOOK_RELPATH) is True
-
-
-# ---------------------------------------------------------------------------
-# step-9/10: escalation (_build_escalation_arguments, post_escalation)
-# ---------------------------------------------------------------------------
-
-def test_build_escalation_arguments_shape(tmp_path):
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
-
-    arguments = nightly._build_escalation_arguments(cfg, 'summary text', 'detail text')
-
-    assert arguments == {
-        'task_id': 'legibility-trickle-proj_a',
-        'agent_role': 'legibility-trickle',
-        'category': 'infra_issue',
-        'severity': 'info',
-        'summary': 'summary text',
-        'detail': 'detail text',
-    }
-
-
-def test_post_escalation_calls_poster_with_mcp_envelope(tmp_path):
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a', escalation_port=8199))
-    calls = []
-
-    def fake_poster(url, envelope):
-        calls.append((url, envelope))
-
-    ok = nightly.post_escalation(cfg, 'summary text', 'detail text', poster=fake_poster)
-
-    assert ok is True
-    assert len(calls) == 1
-    url, envelope = calls[0]
-    assert url == 'http://localhost:8199/mcp'
-    assert envelope['method'] == 'tools/call'
-    assert envelope['params']['name'] == 'escalate_info'
-    assert envelope['params']['arguments'] == {
-        'task_id': 'legibility-trickle-proj_a',
-        'agent_role': 'legibility-trickle',
-        'category': 'infra_issue',
-        'severity': 'info',
-        'summary': 'summary text',
-        'detail': 'detail text',
-    }
-
-
-def test_post_escalation_is_best_effort_on_poster_failure(tmp_path):
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
-
-    def raising_poster(url, envelope):
-        raise RuntimeError('escalation server unreachable')
-
-    ok = nightly.post_escalation(cfg, 'summary text', 'detail text', poster=raising_poster)
-
-    assert ok is False
-# ---------------------------------------------------------------------------
-# task 4511 step-1/2: post_escalation journals the summary/detail pair ITSELF,
-# before the POST.
-#
-# The 2026-08-18 incident (esc-legibility-trickle-reify-3): the only copy of
-# 'coder storm: 6/6 digests failed ... [Errno 2] No such file or directory:
-# claude' lived inside the archived escalation JSON, and
-# `journalctl --user -u legibility-trickle@reify.service` showed nothing but
-# an unexplained benign 400 and `status=1/FAILURE`. Logging from inside
-# `post_escalation` -- the only path to the POST -- makes the reason survive
-# both a future branch that forgets to log and an escalation server that is
-# down.
-# ---------------------------------------------------------------------------
-
-def test_post_escalation_journals_the_pair_before_the_post(tmp_path, caplog):
-    """The escalation reason reaches the journal from `post_escalation`
-    itself, at ERROR, carrying BOTH halves.
-
-    The "before the POST" half is asserted from INSIDE the injected poster
-    rather than after the call returns, because that is the property that
-    actually survives an unreachable escalation server: a write ordered
-    after a successful POST would still be missing in exactly the case an
-    operator needs it.
-    """
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
-    seen_inside_poster = []
-
-    def _recording_poster(url, envelope):
-        seen_inside_poster.extend(_nightly_warnings(caplog))
-
-    with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
-        ok = nightly.post_escalation(
-            cfg, 'summary text', 'detail text', poster=_recording_poster,
-        )
-
-    assert ok is True
-
-    loud = _nightly_warnings(caplog)
-    assert len(loud) == 1, (
-        f'expected exactly one record; got {[r.getMessage() for r in loud]}'
-    )
-    assert loud[0].levelno == logging.ERROR, (
-        'a fail-loud escalation IS the reason for the non-zero exit, so it '
-        'belongs in `journalctl -p err`'
-    )
-    message = loud[0].getMessage()
-    assert 'summary text' in message
-    assert 'detail text' in message, (
-        'the DETAIL is the diagnosis; a summary-only journal line is exactly '
-        f'what the 2026-08-18 incident already had. got {message!r}'
-    )
-
-    assert len(seen_inside_poster) == 1, (
-        'the journal write must already have happened when the poster is '
-        f'entered; saw {seen_inside_poster!r}'
-    )
-
-
-def test_post_escalation_journals_the_pair_even_when_the_poster_raises(
-    tmp_path, caplog,
-):
-    """The escalation-server-down case, which loses the diagnosis entirely
-    today. The pre-existing best-effort contract is unchanged and re-pinned
-    here so the new write cannot be mistaken for a behaviour change."""
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
-
-    def _raising_poster(url, envelope):
-        raise RuntimeError('escalation server unreachable')
-
-    with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
-        ok = nightly.post_escalation(
-            cfg, 'summary text', 'detail text', poster=_raising_poster,
-        )
-
-    # Unchanged best-effort behaviour: never raises, reports False, and
-    # still emits its own post-failure WARNING.
-    assert ok is False
-    loud = _nightly_warnings(caplog)
-    warned = [r.getMessage() for r in loud if r.levelno == logging.WARNING]
-    assert any('escalation post failed' in m for m in warned), warned
-
-    errors = [r for r in loud if r.levelno == logging.ERROR]
-    assert len(errors) == 1, (
-        f'expected exactly one ERROR; got {[r.getMessage() for r in errors]}'
-    )
-    message = errors[0].getMessage()
-    assert 'summary text' in message
-    assert 'detail text' in message, (
-        'a down escalation server must not cost the diagnosis -- that is the '
-        f'whole point of journaling before the POST. got {message!r}'
-    )
-
-
-class _FakeHttpxResponse:
-    """A 200 `application/json` reply with an empty JSON-RPC body.
-
-    `status_code`, `headers` and `json()` were added for task 3644:
-    `_default_poster` now delegates to `census_trigger.post_mcp_envelope`,
-    which reads `status_code` (to detect the stateful escalation server's 400
-    "Missing session ID") and `content-type` (to detect an SSE-framed body)
-    before decoding. Without them this fake would die on an AttributeError
-    and stop exercising the real code path -- so the task-2953 header
-    contract below keeps being asserted against the transport that actually
-    ships, not against a fake the implementation has outgrown."""
-
-    status_code = 200
-    headers = {'content-type': 'application/json'}
-
-    def raise_for_status(self):
-        pass
-
-    def json(self):
-        return {}
-
-
-def test_default_poster_sends_streamable_http_accept_headers(install_fake_httpx):
-    """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
-    lacking an Accept header covering both application/json and
-    text/event-stream (verified live against a local MCP /mcp endpoint).
-    `_default_poster`'s httpx import is lazy, but httpx IS importable here --
-    a direct dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`,
-    task 2965) -- so an un-faked call would really hit the network. The
-    shared `install_fake_httpx` fixture substitutes a stub so the outbound
-    request shape is assertable independent of any live listener."""
-    captured_kwargs = {}
-
-    def _fake_post(url, **kwargs):
-        captured_kwargs.update(kwargs)
-        return _FakeHttpxResponse()
-
-    install_fake_httpx(_fake_post)
-
-    nightly._default_poster('http://localhost:8199/mcp', {'jsonrpc': '2.0'})
-
-    headers = captured_kwargs.get('headers') or {}
-    assert 'application/json' in headers.get('Accept', '')
-    assert 'text/event-stream' in headers.get('Accept', '')
-    # Content-Type is part of the same transport contract -- pin it too so a
-    # future edit dropping it can't pass on the Accept assertions alone.
-    assert headers.get('Content-Type') == 'application/json'
-    # The envelope must still ride along unchanged on the same POST.
-    assert captured_kwargs.get('json') == {'jsonrpc': '2.0'}
 
 
 # ---------------------------------------------------------------------------
@@ -1489,7 +1293,7 @@ def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
         now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
         invoke=lambda prompt, model: '{"proposals": []}',
         status_fetcher=lambda: {'statuses': {}},
-        poster=lambda url, envelope: None,
+        poster=lambda url, arguments: None,
         census_launcher=launcher,
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -1577,7 +1381,7 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
         now=now,
         invoke=lambda prompt, model: '{"matches": [], "candidates": []}',
         status_fetcher=lambda: {'statuses': {}},
-        poster=lambda url, envelope: None,
+        poster=lambda url, arguments: None,
         pass_kind=nightly.PassKind.MANUAL,
     )
 
@@ -1606,7 +1410,7 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
 # a delta: condition (b) could not fire AT ALL. Every OTHER seam in
 # run_nightly already resolves None to its real implementation (committer ->
 # unlanded.commit_only, recorder -> trickle_state.write_night, poster ->
-# _default_poster); status_fetcher alone resolved to nothing, which is how
+# the alarm's default poster); status_fetcher alone resolved to nothing, which is how
 # three prior repairs of this exact code (2953, 3291, 4085) each left the
 # wiring loop open.
 # ---------------------------------------------------------------------------
@@ -1660,7 +1464,7 @@ class TestRunNightlyDefaultsTheCensusStatusFetcher:
             target_date=date(2026, 7, 13),
             now=self._NOW,
             invoke=lambda prompt, model: '{"proposals": []}',
-            poster=lambda url, envelope: None,
+            poster=lambda url, arguments: None,
             census_launcher=_no_census_launch,
             pass_kind=nightly.PassKind.MANUAL,
             **kwargs,
@@ -1781,19 +1585,19 @@ def _pool_the_night_on(monkeypatch, accounts_file, env_file):
 
 
 def _capture_poster():
-    """A ``poster=`` seam that keeps every envelope. Returns (fn, envelopes)."""
-    envelopes = []
+    """A ``poster=`` seam that keeps every escalation's arguments. Returns (fn, posted)."""
+    posted = []
 
-    def _post(url, envelope):
-        envelopes.append(envelope)
+    def _post(url, arguments):
+        posted.append(arguments)
 
-    return _post, envelopes
+    return _post, posted
 
 
-def _one_escalation(envelopes):
-    """The ``escalate_info`` arguments of the one envelope posted."""
-    assert len(envelopes) == 1, f'expected exactly ONE escalation, got {envelopes}'
-    return envelopes[0]['params']['arguments']
+def _one_escalation(posted):
+    """The ``escalate_info`` arguments of the one escalation posted."""
+    assert len(posted) == 1, f'expected exactly ONE escalation, got {posted}'
+    return posted[0]
 
 
 def _no_census_launch(project_root, **kwargs):
@@ -2239,7 +2043,7 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
         now=fixed_now,
         invoke=_fake_invoke_known_cause,
         status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
 
@@ -2279,7 +2083,7 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
         now=fixed_now,
         invoke=_fake_invoke_known_cause,
         status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
 
@@ -2337,7 +2141,7 @@ def test_run_nightly_logs_the_sampler_summary_on_a_healthy_night(tmp_path, caplo
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
-            poster=lambda url, envelope: None,
+            poster=lambda url, arguments: None,
             pass_kind=nightly.PassKind.MANUAL,
         )
 
@@ -2373,7 +2177,7 @@ def test_run_nightly_logs_the_sampler_summary_when_there_are_no_sessions(tmp_pat
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
-            poster=lambda url, envelope: None,
+            poster=lambda url, arguments: None,
             pass_kind=nightly.PassKind.MANUAL,
         )
 
@@ -2388,8 +2192,13 @@ def test_run_nightly_logs_the_sampler_summary_when_there_are_no_sessions(tmp_pat
     assert '2026-07-13' in line
 
 
+_TRICKLE_LOGGERS = frozenset({'legibility.nightly', 'legibility.alarm'})
+"""The trickle's own logger and the alarm's, which journals every alarm the
+trickle raises."""
+
+
 def _nightly_warnings(caplog):
-    """Records at >= WARNING on this module's OWN logger.
+    """Records at >= WARNING on the trickle's OWN loggers.
 
     Filtered by logger name deliberately: ``legibility.census_trigger`` emits
     its own fail-safe WARNING on a fixture with no census baseline, which says
@@ -2397,7 +2206,7 @@ def _nightly_warnings(caplog):
     """
     return [
         r for r in caplog.records
-        if r.levelno >= logging.WARNING and r.name == 'legibility.nightly'
+        if r.levelno >= logging.WARNING and r.name in _TRICKLE_LOGGERS
     ]
 
 
@@ -2450,7 +2259,7 @@ def test_run_nightly_reports_a_totally_budget_suppressed_night(tmp_path, caplog)
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
-            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+            poster=lambda url, arguments: escalation_calls.append((url, arguments)),
             pass_kind=nightly.PassKind.MANUAL,
         )
 
@@ -2462,11 +2271,9 @@ def test_run_nightly_reports_a_totally_budget_suppressed_night(tmp_path, caplog)
     assert result.budget_suppressed is True
     assert result.escalated is True
 
-    # Structured facts, not log-scraping: ONE durable escalation, on the
-    # existing decision-8 envelope, unchanged.
+    # Structured facts, not log-scraping: ONE durable escalation.
     assert len(escalation_calls) == 1
-    _url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    _url, arguments = escalation_calls[0]
     assert arguments['category'] == 'infra_issue'
     assert arguments['severity'] == 'info'
     summary = arguments['summary'].lower()
@@ -2532,7 +2339,7 @@ def test_run_nightly_quiet_night_is_not_reported_as_suppressed(tmp_path, caplog)
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
-            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+            poster=lambda url, arguments: escalation_calls.append((url, arguments)),
             pass_kind=nightly.PassKind.MANUAL,
         )
 
@@ -2590,8 +2397,8 @@ def test_run_nightly_defers_an_all_capped_night(tmp_path, caplog):
     """
     codebook_path_holder = {}
 
-    def _poster(url, envelope):
-        escalation_calls.append((url, envelope))
+    def _poster(url, arguments):
+        escalation_calls.append((url, arguments))
 
     escalation_calls = []
     with caplog.at_level(logging.DEBUG):
@@ -2619,8 +2426,7 @@ def test_run_nightly_defers_an_all_capped_night(tmp_path, caplog):
     # (d) Exactly ONE escalation, naming the deferral rather than a storm, and
     # carrying the cap text so the journal names the cause on first read.
     assert len(escalation_calls) == 1
-    _url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    _url, arguments = escalation_calls[0]
     summary = arguments['summary'].lower()
     assert 'storm' not in summary, (
         f"a deferral must not be announced as a storm; got {summary!r}"
@@ -2631,17 +2437,17 @@ def test_run_nightly_defers_an_all_capped_night(tmp_path, caplog):
         f"reads a deferral with no stated cause; got {arguments['detail']!r}"
     )
 
-    # (e) WARNING, not ERROR: post_escalation's own level rule is ERROR iff
-    # this escalation is itself the fail-loud trigger returning exit_code=1.
+    # (e) WARNING, not ERROR: AlarmKind.level is ERROR iff this alarm is
+    # itself the fail-loud trigger returning exit_code=1.
     errors = [r for r in caplog.records
-              if r.name == 'legibility.nightly' and r.levelno >= logging.ERROR]
+              if r.name in _TRICKLE_LOGGERS and r.levelno >= logging.ERROR]
     assert not errors, (
         f"a deferred night must not journal at ERROR -- exit_code is 0, so "
         f"this escalation is not a fail-loud trigger; got "
         f"{[r.getMessage() for r in errors]!r}"
     )
     warnings = [r.getMessage() for r in caplog.records
-                if r.name == 'legibility.nightly' and r.levelno == logging.WARNING]
+                if r.name in _TRICKLE_LOGGERS and r.levelno == logging.WARNING]
     assert any('weekly limit' in w.lower() for w in warnings), (
         f"the aggregate journal line must carry the cap text; got {warnings!r}"
     )
@@ -2671,7 +2477,7 @@ def test_run_nightly_capped_leaves_the_codebook_byte_identical(tmp_path):
         now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=_fake_invoke_capped,
         status_fetcher=None,
-        poster=lambda url, envelope: None,
+        poster=lambda url, arguments: None,
         pass_kind=nightly.PassKind.MANUAL,
     )
 
@@ -2740,7 +2546,7 @@ def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
         now=fixed_now,
         invoke=_fake_invoke_unparseable,
         status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
 
@@ -2750,8 +2556,7 @@ def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
     assert result.escalated is True
 
     assert len(escalation_calls) == 1
-    url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    url, arguments = escalation_calls[0]
     assert arguments['category'] == 'infra_issue'
     assert 'storm' in arguments['summary'].lower()
     assert '1/1' in arguments['summary']
@@ -2806,7 +2611,7 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
         now=fixed_now,
         invoke=_fake_invoke_known_cause,
         status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         committer=_failing_committer,
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -2817,8 +2622,7 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
     assert result.applied == 1  # the merge/dump DID happen before the commit attempt
 
     assert len(escalation_calls) == 1
-    url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    url, arguments = escalation_calls[0]
     assert arguments['category'] == 'infra_issue'
     assert 'commit' in arguments['summary'].lower()
 
@@ -2948,7 +2752,7 @@ def test_run_nightly_commit_refused_by_pre_commit_hook_restores_the_checkout(tmp
             now=fixed_now,
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
-            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+            poster=lambda url, arguments: escalation_calls.append((url, arguments)),
             pass_kind=nightly.PassKind.MANUAL,
         )
 
@@ -2961,7 +2765,7 @@ def test_run_nightly_commit_refused_by_pre_commit_hook_restores_the_checkout(tmp
     assert after_log == before_log
     quarantine_dir = _assert_refused_dump_rolled_back(repo, head_bytes, result)
     assert len(escalation_calls) == 1
-    detail = escalation_calls[0][1]['params']['arguments']['detail']
+    detail = escalation_calls[0][1]['detail']
     assert 'cited-test-path gate' in detail
     assert str(quarantine_dir) in detail
 
@@ -3031,7 +2835,7 @@ def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path, 
         now=fixed_now,
         invoke=_fake_invoke_deletion_directive,
         status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
 
@@ -3042,8 +2846,8 @@ def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path, 
     assert {'deletion_directive=1', 'matched=0'} <= set(merge_line.split())
 
     assert len(escalation_calls) == 1
-    _url, envelope = escalation_calls[0]
-    assert 'deletion directive' in envelope['params']['arguments']['summary'].lower()
+    _url, arguments = escalation_calls[0]
+    assert 'deletion directive' in arguments['summary'].lower()
 
     # Nothing applied -> the existing no-change-night path holds.
     assert codebook_path.read_bytes() == before_bytes
@@ -3110,7 +2914,7 @@ def test_run_nightly_deletion_directive_does_not_cost_the_rest_of_the_batch(tmp_
         now=fixed_now,
         invoke=_fake_invoke_deletion_then_match,
         status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
 
@@ -3134,8 +2938,7 @@ def test_run_nightly_deletion_directive_does_not_cost_the_rest_of_the_batch(tmp_
 
     # ...and the BAD one was still surfaced, naming the OTHER session.
     assert len(escalation_calls) == 1
-    _url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    _url, arguments = escalation_calls[0]
     assert 'deletion directive' in arguments['summary'].lower()
     assert f'session={sighted}' not in arguments['detail']
     assert result.reason is not None
@@ -3174,7 +2977,7 @@ def test_run_nightly_aggregates_deletion_directive_escalations(tmp_path):
         now=fixed_now,
         invoke=_fake_invoke_deletion_directive,
         status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
 
@@ -3184,8 +2987,7 @@ def test_run_nightly_aggregates_deletion_directive_escalations(tmp_path):
     assert result.escalated is True
 
     assert len(escalation_calls) == 1, 'one aggregated POST, never one per record'
-    _url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    _url, arguments = escalation_calls[0]
     assert '2 coding record(s)' in arguments['summary']
     assert 'deletion directive' in arguments['summary'].lower()
     # Both skipped sessions are named, so the aggregate loses no detail.
@@ -3195,7 +2997,7 @@ def test_run_nightly_aggregates_deletion_directive_escalations(tmp_path):
 
 
 def test_run_nightly_records_a_reason_when_the_escalation_post_fails(tmp_path):
-    """With the escalation server down, `post_escalation` returns False --
+    """With the escalation server down, the alarm reports not landed --
     so `escalated` is False and `exit_code` is 0, leaving the returned
     result structurally identical to a clean night. `reason` is what keeps
     a never-delete contract violation from surviving as nothing but a
@@ -3210,7 +3012,7 @@ def test_run_nightly_records_a_reason_when_the_escalation_post_fails(tmp_path):
         session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
     )
 
-    def _dead_poster(url, envelope):
+    def _dead_poster(url, arguments):
         raise OSError('connection refused')
 
     result = nightly.run_nightly(
@@ -3313,7 +3115,7 @@ def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
         now=fixed_now,
         invoke=_fake_invoke_rejected_candidate,
         status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
 
@@ -3345,7 +3147,7 @@ def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
         now=fixed_now,
         invoke=_fake_invoke_rejected_candidate,
         status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         pass_kind=nightly.PassKind.MANUAL,
     )
 
@@ -3397,7 +3199,7 @@ def test_run_nightly_persists_a_corrections_only_night(tmp_path, monkeypatch):
         now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=_fake_invoke_empty,
         status_fetcher=None,
-        poster=lambda url, envelope: None,
+        poster=lambda url, arguments: None,
         pass_kind=nightly.PassKind.MANUAL,
     )
 
@@ -3449,7 +3251,7 @@ def test_run_nightly_no_change_night_commits_nothing(tmp_path, caplog):
             now=fixed_now,
             invoke=_fake_invoke_empty,
             status_fetcher=None,
-            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+            poster=lambda url, arguments: escalation_calls.append((url, arguments)),
             pass_kind=nightly.PassKind.MANUAL,
         )
 
@@ -3521,7 +3323,7 @@ def test_run_nightly_fail_loud_on_extractor_crash(tmp_path):
         now=fixed_now,
         invoke=_unexpected_invoke,
         status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         digest_builder=_crashing_build_digests,
         pass_kind=nightly.PassKind.MANUAL,
     )
@@ -3531,8 +3333,7 @@ def test_run_nightly_fail_loud_on_extractor_crash(tmp_path):
     assert coder_calls == []  # the coder must never be reached after a crash
 
     assert len(escalation_calls) == 1
-    url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    url, arguments = escalation_calls[0]
     assert arguments['category'] == 'infra_issue'
     assert 'extractor' in arguments['summary'].lower()
     assert '1' in arguments['summary']
@@ -3960,7 +3761,7 @@ def _run_e2e_nightly(tmp_path, *, branch=None, recorder=None, budget_bytes=None,
         now=now,
         invoke=invoke,
         status_fetcher=None,
-        poster=poster if poster is not None else (lambda url, envelope: None),
+        poster=poster if poster is not None else (lambda url, arguments: None),
         census_launcher=census_launcher,
         pass_kind=pass_kind,
     )
@@ -4134,10 +3935,10 @@ class TestRunNightlyRecordsTrickleState:
         recorder, calls = _recorder_spy()
         posted = []
 
-        def _server_gone_after_the_first_post(url, envelope):
+        def _server_gone_after_the_first_post(url, arguments):
             if posted:
                 raise ConnectionError('escalation server went away')
-            posted.append(envelope)
+            posted.append(arguments)
 
         result, _repo = _run_e2e_nightly(
             tmp_path, branch='crash', recorder=recorder, budget_bytes=10,
@@ -4293,7 +4094,7 @@ class TestRunNightlyRecordsTrickleState:
 
     def test_a_raising_recorder_never_breaks_the_run(self, tmp_path, caplog):
         """Observability must never become a new failure mode — mirroring
-        post_escalation's established best-effort contract."""
+        the alarm's best-effort contract."""
         def _raising_recorder(night, *, barren_escalated):
             raise OSError('synthetic state-write failure')
 
@@ -4569,7 +4370,7 @@ def _alarm(kind, *, landed=True):
     return nightly.Alarm(kind=kind, summary=f'legibility trickle {kind}', landed=landed)
 
 
-def _refusing_poster(url, envelope):
+def _refusing_poster(url, arguments):
     raise ConnectionError('escalation server is down')
 
 
@@ -4742,7 +4543,7 @@ class TestEveryBranchIsOneOutcomeAndOneAlarmList:
         recorder, calls = _recorder_spy()
         runner = _NightRunner(
             tmp_path, recorder=recorder,
-            on_post=None if lands else (lambda envelope: _refusing_poster('', envelope)),
+            on_post=None if lands else (lambda arguments: _refusing_poster('', arguments)),
         )
         for day in (13, 14):
             runner.night(day, 'barren')
@@ -4768,10 +4569,10 @@ def test_a_crash_keeps_every_alarm_posted_before_it(tmp_path):
     even though the crash's own post did not."""
     posted = []
 
-    def _server_gone_after_the_first_post(url, envelope):
+    def _server_gone_after_the_first_post(url, arguments):
         if posted:
             raise ConnectionError('escalation server went away')
-        posted.append(envelope)
+        posted.append(arguments)
 
     result, _repo = _run_e2e_nightly(
         tmp_path, branch='crash', budget_bytes=10, poster=_server_gone_after_the_first_post,
@@ -4856,11 +4657,11 @@ class TestEveryPassEndsWithOneJournalLine:
 # task 3340 step-11/12: edge-triggered barren-streak escalation
 # ---------------------------------------------------------------------------
 
-def _is_streak_escalation(envelope) -> bool:
-    """Whether *envelope* was posted by the STREAK trigger, as distinct from
+def _is_streak_escalation(arguments) -> bool:
+    """Whether *arguments* was posted by the STREAK trigger, as distinct from
     _report_sample_outcome's per-night suppression notice (a different
-    predicate, window and remedy prompt, posted on the same envelope)."""
-    return 'consecutive' in envelope['params']['arguments']['summary'].lower()
+    predicate, window and remedy prompt, posted through the same alarm)."""
+    return 'consecutive' in arguments['summary'].lower()
 
 
 def _streak_escalations(calls):
@@ -4926,10 +4727,10 @@ class _NightRunner:
         self.on_post = on_post
         self.census_launcher = census_launcher
 
-    def _post(self, url, envelope):
-        self.escalations.append((url, envelope))
+    def _post(self, url, arguments):
+        self.escalations.append((url, arguments))
         if self.on_post is not None:
-            self.on_post(envelope)
+            self.on_post(arguments)
 
     def night(self, day, kind, *, invoke=None):
         """Run one night. *kind* is 'barren' (real signal, squeezed budget),
@@ -5111,13 +4912,10 @@ class TestBarrenStreakEscalation:
         streak = _streak_escalations(runner.escalations)
         assert len(streak) == 1, (
             f'expected exactly ONE streak escalation; got '
-            f'{[e["params"]["arguments"]["summary"] for _u, e in streak]}'
+            f'{[e["summary"] for _u, e in streak]}'
         )
-        arguments = streak[0][1]['params']['arguments']
+        arguments = streak[0][1]
 
-        # The decision-8 envelope, reused unchanged, so it never gates
-        # anything.
-        assert streak[0][1]['params']['name'] == 'escalate_info'
         assert arguments['category'] == 'infra_issue'
         assert arguments['severity'] == 'info'
 
@@ -5225,8 +5023,8 @@ class TestBarrenStreakEscalation:
     def test_the_streak_is_posted_before_the_night_is_recorded(self, tmp_path):
         seen_at_post = []
 
-        def _read_the_record_at_post_time(envelope):
-            if _is_streak_escalation(envelope):
+        def _read_the_record_at_post_time(arguments):
+            if _is_streak_escalation(arguments):
                 seen_at_post.append(_testproj_state())
 
         runner = _NightRunner(tmp_path, on_post=_read_the_record_at_post_time)
@@ -5241,8 +5039,8 @@ class TestBarrenStreakEscalation:
     def test_the_night_written_is_the_one_the_escalation_decided_on(self, tmp_path):
         """The record is lost between the decision and the write: the night
         written still carries the streak the escalation was posted for."""
-        def _lose_the_record_mid_post(envelope):
-            if _is_streak_escalation(envelope):
+        def _lose_the_record_mid_post(arguments):
+            if _is_streak_escalation(arguments):
                 trickle_state.trickle_state_path('testproj').unlink()
 
         runner = _NightRunner(tmp_path, on_post=_lose_the_record_mid_post)
@@ -5257,8 +5055,8 @@ class TestBarrenStreakEscalation:
         assert doc['barren_escalated'] is True
 
     def test_a_streak_post_that_fails_records_not_escalated(self, tmp_path):
-        def _server_down_for_the_streak(envelope):
-            if _is_streak_escalation(envelope):
+        def _server_down_for_the_streak(arguments):
+            if _is_streak_escalation(arguments):
                 raise ConnectionError('escalation server is down')
 
         runner = _NightRunner(tmp_path, on_post=_server_down_for_the_streak)
@@ -5296,8 +5094,7 @@ class TestBarrenStreakEscalation:
         assert [night.barren_escalated for night in nights] == [
             False, False, False, False, True,
         ]
-        [(_url, envelope)] = _streak_escalations(runner.escalations)
-        arguments = envelope['params']['arguments']
+        [(_url, arguments)] = _streak_escalations(runner.escalations)
         assert 'for 5 consecutive runs' in arguments['summary']
         assert 'consecutive_barren_runs=5' in arguments['detail']
         assert 'check_trickle_progress.py testproj 5' in arguments['detail']
@@ -5318,7 +5115,7 @@ class TestANonDefaultThresholdEndToEnd:
             max_age_hours=_fixture_clock_window_hours(),
             liveness_runner=lambda project_id, **kwargs: (0, 'OK: ran'),
             census_runner=lambda project_id, **kwargs: (0, 'OK: no fire'),
-            poster=lambda url, envelope: posted.append(envelope),
+            poster=lambda url, arguments: posted.append(arguments),
         )
         return posted
 
@@ -5957,9 +5754,18 @@ def _sample(*, selected=(), zero_signal_dropped=0, dedupe_collapsed=0,
 
 def _run_sampled_night(tmp_path, sample, **seams):
     """Run one MANUAL night whose injected selector returns *sample*; its
-    digest builder renders nothing. Returns ``(result, posted envelopes)``."""
+    digest builder renders nothing. Returns ``(result, posted arguments)``."""
     poster, posted = _capture_poster()
-    result = nightly.run_nightly(
+    result = _run_manual_night(
+        tmp_path, selector=lambda *args, **kwargs: sample, poster=poster, **seams,
+    )
+    return result, posted
+
+
+def _run_manual_night(tmp_path, *, selector, poster, **seams):
+    """Run one MANUAL night of project 'testproj' drawing its sample from
+    *selector*; its digest builder renders nothing."""
+    return nightly.run_nightly(
         config_path=_write_config(tmp_path, project_id='testproj'),
         projects_root=tmp_path / 'projects',
         target_date=date(2026, 7, 13),
@@ -5967,13 +5773,12 @@ def _run_sampled_night(tmp_path, sample, **seams):
         invoke=lambda prompt, model: pytest.fail('no digest may reach the coder'),
         status_fetcher=lambda: {'statuses': {}},
         poster=poster,
-        selector=lambda *args, **kwargs: sample,
+        selector=selector,
         digest_builder=lambda selected, **kwargs: ([], []),
         census_launcher=_no_census_launch,
         pass_kind=nightly.PassKind.MANUAL,
         **seams,
     )
-    return result, posted
 
 
 def test_report_sample_outcome_warns_on_a_sampling_cut_only_night(tmp_path, caplog):
@@ -6038,6 +5843,35 @@ def test_report_sample_outcome_stays_quiet_on_a_quiet_night(tmp_path, caplog):
     assert _nightly_warnings(caplog) == []
 
 
+def test_a_crashed_night_alarms_as_its_projects_trickle(tmp_path):
+    def _crash(*args, **kwargs):
+        raise RuntimeError('selector-boom')
+
+    poster, posted = _capture_poster()
+    result = _run_manual_night(tmp_path, selector=_crash, poster=poster)
+
+    assert result.exit_code == 1
+    arguments = _one_escalation(posted)
+    assert arguments['task_id'] == 'legibility-trickle-testproj'
+    assert arguments['agent_role'] == 'legibility-trickle'
+    assert 'selector-boom' in arguments['summary']
+
+
+def test_a_raise_after_the_stages_is_alarmed_once_and_reraised(tmp_path, monkeypatch):
+    def _boom(cfg, *, now=None):
+        raise RuntimeError('pdc-boom')
+
+    monkeypatch.setattr(plan_deviation_census, 'run', _boom)
+    poster, posted = _capture_poster()
+
+    with pytest.raises(RuntimeError, match='pdc-boom'):
+        _run_manual_night(tmp_path, selector=lambda *args, **kwargs: _sample(), poster=poster)
+
+    prefix = 'legibility trickle run failed (testproj): RuntimeError: pdc-boom'
+    failed = [arguments for arguments in posted if arguments['summary'].startswith(prefix)]
+    assert len(failed) == 1, posted
+
+
 def test_report_sample_outcome_partial_truncation_stays_at_info(tmp_path, caplog):
     """Selected something AND skipped some on budget: the budget working as
     designed, never an absence."""
@@ -6079,19 +5913,6 @@ def test_an_injected_selector_s_suppressed_sample_is_a_budget_suppressed_night(t
     assert skip_sessions == frozenset()
 
 
-# ---------------------------------------------------------------------------
-# task 3644: the trickle's fail-loud escalation must survive a STATEFUL server
-# ---------------------------------------------------------------------------
-#
-# `_default_poster` bare-POSTed `tools/call`, which the escalation server
-# (:8103) rejects at the transport layer before the tool ever runs, with
-# `400 Bad Request` / "Missing session ID" (captured live 2026-08-05).
-# `post_escalation` swallows that best-effort and returns False, so EVERY
-# trickle fail-loud escalation -- extractor crash, coder storm, commit
-# failure -- was silently dropped. Identical root cause and identical fix as
-# census.py's poster; the transport lives single-sourced in census_trigger.
-
-
 class _FakeStatefulResponse:
     """An `httpx.Response` stand-in for the stateful-server handshake."""
 
@@ -6112,107 +5933,6 @@ class _FakeStatefulResponse:
         if self._payload is None:
             raise ValueError('response has no JSON body')
         return self._payload
-
-
-def _stateful_escalation_post(recorded, *, session_id='sid-nightly'):
-    """A fake `httpx.post` behaving like the STATEFUL escalation server:
-    session-less `tools/call` -> 400; `initialize` -> 200 + the assigned id
-    as a response header; `notifications/initialized` -> 202; `tools/call`
-    WITH that header -> 200."""
-    def _post(url, **kwargs):
-        recorded.append((url, kwargs))
-        envelope = kwargs.get('json') or {}
-        method = envelope.get('method')
-        if method == 'initialize':
-            return _FakeStatefulResponse(
-                headers={'mcp-session-id': session_id,
-                         'content-type': 'application/json'},
-                payload={'jsonrpc': '2.0', 'id': 1, 'result': {}},
-            )
-        if method == 'notifications/initialized':
-            return _FakeStatefulResponse(status_code=202)
-        if (kwargs.get('headers') or {}).get('mcp-session-id') != session_id:
-            return _FakeStatefulResponse(
-                status_code=400,
-                headers={'content-type': 'application/json'},
-                payload={'jsonrpc': '2.0', 'id': 'server-error',
-                         'error': {'code': -32600,
-                                   'message': 'Bad Request: Missing session ID'}},
-            )
-        return _FakeStatefulResponse(
-            headers={'content-type': 'application/json'},
-            payload={'jsonrpc': '2.0', 'id': 1,
-                     'result': {'structuredContent': {'id': 'esc-9', 'status': 'queued'}}},
-        )
-
-    return _post
-
-
-def _recording_delete(deleted):
-    """A fake `httpx.delete` recording the MCP session-termination call the
-    transport makes after a handshake, so the long-lived escalation server does
-    not leak a session per trickle escalation."""
-    def _delete(url, **kwargs):
-        deleted.append((url, kwargs))
-        return _FakeStatefulResponse(status_code=200)
-
-    return _delete
-
-
-def test_post_escalation_lands_against_a_stateful_server(tmp_path, install_fake_httpx):
-    """The DEFAULT poster (no `poster=` injection) must handshake and land."""
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
-    recorded = []
-    deleted = []
-    install_fake_httpx(
-        _stateful_escalation_post(recorded), delete=_recording_delete(deleted),
-    )
-
-    assert nightly.post_escalation(cfg, 'summary text', 'detail text') is True
-
-    methods = [(kwargs.get('json') or {}).get('method') for _url, kwargs in recorded]
-    assert methods == [
-        'tools/call', 'initialize', 'notifications/initialized', 'tools/call',
-    ]
-    # The retried call carries the server-assigned session id...
-    assert (recorded[-1][1].get('headers') or {}).get('mcp-session-id') == 'sid-nightly'
-    # ...and is still the escalate_info the trickle meant to file.
-    params = (recorded[-1][1].get('json') or {})['params']
-    assert params['name'] == 'escalate_info'
-    assert params['arguments']['summary'] == 'summary text'
-    # ...and the session opened to file it is released again.
-    assert [(kw.get('headers') or {}).get('mcp-session-id') for _u, kw in deleted] == [
-        'sid-nightly'
-    ]
-
-
-def test_post_escalation_reports_false_on_a_tool_error_envelope(
-    tmp_path, install_fake_httpx, caplog
-):
-    """HTTP 200 is not success. `post_escalation` discards the response body
-    and reports True on "no exception", so a tool-level failure
-    (`result.isError: true`) would otherwise read as a landed escalation --
-    the same green-on-paper/nothing-filed failure task 3644 exists to close,
-    one layer up from the transport."""
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
-
-    def _post(url, **kwargs):
-        return _FakeStatefulResponse(
-            headers={'content-type': 'application/json'},
-            payload={'jsonrpc': '2.0', 'id': 1, 'result': {
-                'isError': True,
-                'content': [{'type': 'text', 'text': "unknown category 'nope'"}],
-            }},
-        )
-
-    install_fake_httpx(_post)
-
-    with caplog.at_level(logging.WARNING):
-        assert nightly.post_escalation(cfg, 'summary text', 'detail text') is False
-
-    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert any('escalation post failed' in m for m in warned), warned
-    assert any('isError' in m or 'reported an error' in m for m in warned), warned
 
 
 # ---------------------------------------------------------------------------
@@ -6483,9 +6203,6 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
 # inherits the guarantee for free -- it cannot reach `escalated=...` without
 # passing through the one log site.
 #
-# Nothing here asserts on the escalation payload: `_build_escalation_arguments`
-# and the envelope are deliberately untouched by this task.
-#
 # Driven through the SHARED `_run_e2e_nightly` helper, which is also what the
 # trickle-state recorder suite runs on -- one e2e fixture and one copy of the
 # branch dispatch, so "the four branches" cannot come to mean different things
@@ -6504,7 +6221,7 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
 def test_every_fail_loud_branch_journals_its_reason_with_the_server_down(
     tmp_path, caplog, branch, summary_marker, detail_marker,
 ):
-    def _raising_poster(url, envelope):
+    def _raising_poster(url, arguments):
         raise RuntimeError('escalation server unreachable')
 
     with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
@@ -6532,7 +6249,7 @@ def test_every_fail_loud_branch_journals_its_reason_with_the_server_down(
 # task 4511 step-3/4: the three EXIT-0 escalation sites stay at WARNING, and
 # are logged exactly ONCE.
 #
-# `post_escalation` now journals every escalation itself, so the two call
+# The alarm journals every escalation itself, so the two call
 # sites that already logged the pair would double-log, and all three exit-0
 # sites would be promoted to ERROR. Neither is acceptable: the budget door,
 # the barren streak and the deletion-directive aggregate all deliberately
@@ -6551,7 +6268,7 @@ def test_every_fail_loud_branch_journals_its_reason_with_the_server_down(
 def test_budget_suppression_door_journals_once_at_warning(tmp_path, caplog):
     """The budget-suppression door escalates AND exits 0, so its journal
     line stays a WARNING -- and there is exactly one of it, not a call-site
-    WARNING plus a post_escalation ERROR."""
+    WARNING plus an alarm ERROR."""
     with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
         result, posted = _run_sampled_night(tmp_path, _sample(budget_skipped=4))
 
