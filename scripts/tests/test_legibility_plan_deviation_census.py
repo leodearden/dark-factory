@@ -28,6 +28,7 @@ from legibility import config as config_mod
 from legibility import nightly, state_docs, trickle_state
 from legibility import plan_deviation_census as mod
 from shared.plan_deviation import DEVIATION_KINDS, DeviationRecord
+from shared.testing_mcp_stub import StubMcpServer
 
 _LOGGER = 'legibility.plan_deviation_census'
 
@@ -770,6 +771,31 @@ def test_run_positive_control_files_one_blocking_escalation(tmp_path, caplog):
     records = _census_records(caplog)
     assert [record.getMessage() for record in records] == [line]
     assert records[0].levelno == logging.INFO
+
+
+def test_run_files_through_the_escalation_server_on_the_configured_port(tmp_path):
+    """No call_tool injected: the default one reaches the escalation server
+    named by cfg.escalation_port and files exactly one escalate_info."""
+    _write_positive_control(tmp_path)
+    answers = {
+        'get_pending_escalations': {'result': []},
+        'escalate_info': {'id': MINTED_ID, 'status': 'queued', 'level': 0},
+    }
+
+    with StubMcpServer(stateful=True, tools=lambda name, arguments: answers[name]) as server:
+        port = int(server.url.rsplit(':', 1)[1])
+        cfg = _load_cfg(tmp_path).model_copy(update={'escalation_port': port})
+        line = mod.run(cfg, now=NOW)
+
+    calls = [
+        (request.body['params']['name'], request.body['params']['arguments'])
+        for request in server.requests
+        if request.http_method == 'POST' and request.body.get('method') == 'tools/call'
+    ]
+    assert [name for name, _ in calls] == ['get_pending_escalations', 'escalate_info']
+    assert calls[1][1]['task_id'] == SYNTHETIC_TASK_ID
+    assert line.startswith(_FIRE_PREFIX)
+    assert MINTED_ID in line
 
 
 def test_run_negative_control_files_nothing(tmp_path, caplog):

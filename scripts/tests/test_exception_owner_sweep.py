@@ -49,6 +49,7 @@ from exception_owner_sweep import (
     SweepResult,
     Tally,
     act,
+    build_ports,
     escalation_url,
     parse_register,
     read_register,
@@ -65,6 +66,7 @@ from shared.governed_exceptions import (
     disposition_record,
     owner_record,
 )
+from shared.testing_mcp_stub import StubMcpServer
 
 TICKET = TicketRef('tkt_0A')
 
@@ -1221,6 +1223,33 @@ def test_a_project_with_no_escalation_config_is_a_config_failure(tmp_path: Path)
         escalation_url(tmp_path)
 
     assert excinfo.value.stage is FailureStage.CONFIG
+
+
+def _served_tool_calls(server: StubMcpServer) -> list[tuple[str, object]]:
+    return [
+        (request.body['params']['name'], request.body['params']['arguments'])
+        for request in server.requests
+        if request.http_method == 'POST' and request.body.get('method') == 'tools/call'
+    ]
+
+
+def test_build_ports_reach_fused_memory_at_its_base_and_escalation_at_its_endpoint(tmp_path: Path):
+    """The fused-memory URL is a server base; the escalation URL is the
+    endpoint form escalation_url() returns."""
+    with (
+        StubMcpServer(stateful=False, payload={'tasks': []}) as fused_memory,
+        StubMcpServer(stateful=True, payload={'result': []}) as escalation,
+    ):
+        ports = build_ports(
+            tmp_path, fused_memory_url=fused_memory.url, escalation_mcp_url=f'{escalation.url}/mcp'
+        )
+
+        assert ports.fused_memory('get_tasks', {'project_root': '/r'}) == {'tasks': []}
+        assert ports.escalation('get_pending_escalations', {'compact': True}) == {'result': []}
+
+    assert _served_tool_calls(fused_memory) == [('get_tasks', {'project_root': '/r'})]
+    assert _served_tool_calls(escalation) == [('get_pending_escalations', {'compact': True})]
+    assert {request.path for request in (*fused_memory.requests, *escalation.requests)} == {'/mcp'}
 
 
 SWEEP_SCRIPT = Path(__file__).resolve().parents[1] / 'exception_owner_sweep.py'
