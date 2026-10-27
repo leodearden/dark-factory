@@ -1063,6 +1063,9 @@ def test_no_unhatched_code_default_assertions(source):
         f'Each of these passes only because the repo does not currently '
         f'declare that key. Declaring it — an ordinary ops edit — turns the '
         f'test red for a reason that has nothing to do with the change.\n'
+        f"Blanking ORCH_CONFIG_PATH with setenv('') or removing it with delenv "
+        f'does not count as isolation: both fall back to a cwd-relative '
+        f'config.yaml.\n'
         f'Remedy: add @pytest.mark.usefixtures("code_default_config") to the '
         f'test (or to its class, if every test in the class is defaults-only), '
         f'so the assertion means what the test name already claims.'

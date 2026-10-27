@@ -19,22 +19,34 @@ in ``dark-factory-orchestrator.yaml``; the autouse ``_isolate_orch_config``
 fixture pins that file for every test.  An operator declaring the key turns the
 test red without touching any code the test is about (task 3886's incident).
 
-WHAT COUNTS AS ISOLATED.  Three idioms, all honoured:
+WHAT COUNTS AS ISOLATED.
 
-* ``@pytest.mark.usefixtures("code_default_config")`` on the function or on its
-  enclosing class (the sanctioned hatch — detected by substring over the
-  unparsed decorator, so any quote spelling works);
-* a ``code_default_config`` parameter (requesting the fixture directly);
-* the substring ``ORCH_CONFIG_PATH`` anywhere in the unparsed function body,
-  which covers the two ad-hoc idioms already widespread in the suite —
-  ``monkeypatch.setenv('ORCH_CONFIG_PATH', '')`` (154 uses) and
-  ``monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)`` (29 uses).
+* The sanctioned hatch, ``code_default_config``: a ``usefixtures`` mark naming
+  it on the function or on its enclosing class, or a ``pytestmark`` naming it
+  in the class body or the module (each detected by substring over the
+  unparsed mark, so any quote spelling works); or a ``code_default_config``
+  parameter, requesting the fixture directly.
+* An explicit re-point anywhere in the function:
+  ``<obj>.setenv('ORCH_CONFIG_PATH', <non-empty>)`` or
+  ``patch.dict(<env>, {'ORCH_CONFIG_PATH': <non-empty>})``.
 
 An ``autouse=True`` fixture defined directly in the test's class or module
 counts too, when the fixture itself meets one of those rules.
 
-DELIBERATE ASYMMETRY.  That last rule is a substring test, so it also silences a
-test that merely *mentions* the variable — and the ``type()`` match below
+Blanking the variable (``setenv`` or ``patch.dict`` with ``''``) or deleting it
+does NOT count: ``orchestrator/src/orchestrator/config.py::OrchestratorConfig.settings_customise_sources``
+reads ``os.environ.get('ORCH_CONFIG_PATH', '') or 'config.yaml'``.  Both
+therefore fall back to a ``config.yaml`` relative to the process cwd, and
+isolate only while no such file happens to sit there.
+
+A second scan, :func:`iter_config_path_blanking_sites`, reports every such
+blank or delete wherever it sits — test, fixture or helper — and feeds the
+blanking ratchet in :mod:`test_code_default_hatch_guard`.  It exists because
+most tests that leaned on one depend on code defaults through behaviour, which
+the literal scan above cannot see.
+
+DELIBERATE ASYMMETRY.  A re-point is credited regardless of its order relative
+to the construction and of its target — and the ``type()`` match below
 silences ``== 1800`` against a ``1800.0`` default.  The evaluator refuses, in
 the same direction: a right-hand side reading the asserted path (or a prefix or
 extension of it), since both sides track a declaration of that key; a value
@@ -57,6 +69,7 @@ key; see the task-4481 commit log for that measurement.
 from __future__ import annotations
 
 import ast
+import enum
 import operator
 import os
 from collections.abc import Callable, Iterator, Mapping
@@ -399,6 +412,70 @@ def _evaluate_constructor(node: ast.Call, scope: _TestScope,
         return None
 
 
+class ConfigPathWrite(enum.Enum):
+    """The three ways a test can write ``ORCH_CONFIG_PATH``."""
+
+    REPOINT = enum.auto()
+    BLANK = enum.auto()
+    DELETE = enum.auto()
+
+
+def _names_config_path(node: ast.expr | None) -> bool:
+    return isinstance(node, ast.Constant) and node.value == 'ORCH_CONFIG_PATH'
+
+
+def _set_to(value: ast.expr) -> ConfigPathWrite:
+    if isinstance(value, ast.Constant) and value.value == '':
+        return ConfigPathWrite.BLANK
+    return ConfigPathWrite.REPOINT
+
+
+def _config_path_write(call: ast.Call) -> ConfigPathWrite | None:
+    """How *call* writes ``ORCH_CONFIG_PATH``, or ``None`` if it does not.
+
+    Recognises ``<obj>.setenv(VAR, v)``, ``<obj>.delenv(VAR, ...)`` and
+    ``<...>.dict(<env>, {VAR: v, ...})`` — the ``patch.dict`` shape.
+    """
+    func = call.func
+    if not isinstance(func, ast.Attribute) or not call.args:
+        return None
+    first, rest = call.args[0], call.args[1:]
+    if func.attr == 'setenv' and _names_config_path(first) and rest:
+        return _set_to(rest[0])
+    if func.attr == 'delenv' and _names_config_path(first):
+        return ConfigPathWrite.DELETE
+    if func.attr == 'dict' and rest and isinstance(rest[0], ast.Dict):
+        for key, value in zip(rest[0].keys, rest[0].values, strict=True):
+            if _names_config_path(key):
+                return _set_to(value)
+    return None
+
+
+def _blanking_sites(
+    node: ast.AST, scope: tuple[str, ...],
+) -> Iterator[tuple[str, int, ConfigPathWrite]]:
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield from _blanking_sites(child, (*scope, child.name))
+            continue
+        if isinstance(child, ast.Call):
+            kind = _config_path_write(child)
+            if kind in (ConfigPathWrite.BLANK, ConfigPathWrite.DELETE):
+                yield '.'.join(scope) or '<module>', child.lineno, kind
+        yield from _blanking_sites(child, scope)
+
+
+def iter_config_path_blanking_sites(
+    path: str | Path,
+) -> Iterator[tuple[str, int, ConfigPathWrite]]:
+    """Yield ``(qualname, lineno, kind)`` for each BLANK or DELETE write of
+    ``ORCH_CONFIG_PATH`` anywhere in *path*: tests, fixtures, helpers and
+    nested defs alike.  ``qualname`` joins the enclosing class and function
+    names with dots, or is ``'<module>'`` at module level."""
+    tree = ast.parse(Path(path).read_text(), filename=str(path))
+    yield from _blanking_sites(tree, ())
+
+
 def _decorated_with_hatch(node: ast.AST) -> bool:
     """True if any decorator on *node* names ``code_default_config``."""
     return any(
@@ -416,7 +493,9 @@ def _function_isolates(func: _TestFunc) -> bool:
     if any(a.arg == 'code_default_config' for a in params):
         return True
     return any(
-        'ORCH_CONFIG_PATH' in ast.unparse(stmt) for stmt in func.body
+        isinstance(node, ast.Call)
+        and _config_path_write(node) is ConfigPathWrite.REPOINT
+        for node in ast.walk(func)
     )
 
 
@@ -428,9 +507,21 @@ def _is_autouse_fixture(func: _TestFunc) -> bool:
     return False
 
 
+def _is_hatch_pytestmark(stmt: ast.stmt) -> bool:
+    """True for a ``pytestmark = ...`` assignment whose value names the hatch."""
+    return (
+        isinstance(stmt, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == 'pytestmark'
+                for t in stmt.targets)
+        and 'code_default_config' in ast.unparse(stmt.value)
+    )
+
+
 def _scope_isolates(node: ast.Module | ast.ClassDef) -> bool:
     """True if every test directly inside *node* is insulated by *node* itself."""
     if _decorated_with_hatch(node):
+        return True
+    if any(_is_hatch_pytestmark(stmt) for stmt in node.body):
         return True
     return any(
         isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
