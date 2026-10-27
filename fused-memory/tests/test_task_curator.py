@@ -275,6 +275,9 @@ class TestClipForPrompt:
         with pytest.raises(ValueError, match='cap'):
             clip_for_prompt('abc', cap)
 
+    def test_empty_text_fits_a_zero_cap_unchanged(self):
+        assert clip_for_prompt('', 0) == ''
+
 
 class TestEmbeddingText:
     """`embedding_text` is the single owner of the curator corpus embedding text."""

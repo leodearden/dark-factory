@@ -415,8 +415,8 @@ def clip_for_prompt(text: str, cap: int) -> str:
     the single and batch prompts use) — so the two cannot drift apart (INV-5
     ``no-lockstep-duplication``). They previously did: the pool side appended a
     bare ``…`` while the candidate side clipped silently, so the reading LLM
-    could not tell a short description from a truncated one. A clip at a
-    non-positive *cap* raises ``ValueError`` rather than rendering a marker.
+    could not tell a short description from a truncated one. Text longer than
+    a non-positive *cap* raises ``ValueError`` rather than rendering a marker.
 
     The elided COUNT is part of the marker because the size of the loss is
     what decides whether it mattered: "2 characters trimmed" and "1827
