@@ -535,7 +535,13 @@ def resolve_zero_progress_requeue_alert(
 def _resolve_own_alarms(
     escalation_queue: Any, pending: Iterable[Any], sentinel: str, resolution: str,
 ) -> int:
-    """Resolve this task's L1 alarms in *pending*; wrappers are left to their membership pass."""
+    """Resolve this task's L1 alarms in *pending*; wrappers are left to their membership pass.
+
+    "Own" must cover the emitter's ``has_open_l1(sentinel, category=_CATEGORY)``
+    dedup set, which ignores ``agent_role``, so this ignores it too: an L1 that
+    suppresses the next filing but survives the recovery would silence the
+    detector for this task until someone closes it by hand.
+    """
     resolved = 0
     for esc in pending:
         if esc.task_id != sentinel or esc.level >= 2 or esc.category != _CATEGORY:

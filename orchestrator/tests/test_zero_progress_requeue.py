@@ -704,8 +704,8 @@ class TestResolveZeroProgressWrappers:
 
         assert _recover(queue) is True
 
-        assert _status(queue, alarm.id) != 'pending'
-        assert _status(queue, wrapper.id) != 'pending'
+        assert _status(queue, alarm.id) == 'resolved'
+        assert _status(queue, wrapper.id) == 'resolved'
 
     def test_a_real_id_wrapper_is_discharged_with_its_alarm(self, tmp_path):
         """(b) The pre-guard esc-5469-11 shape: the L2 minted under the REAL task id."""
@@ -717,8 +717,8 @@ class TestResolveZeroProgressWrappers:
 
         assert _recover(queue) is True
 
-        assert _status(queue, alarm.id) != 'pending'
-        assert _status(queue, wrapper.id) != 'pending'
+        assert _status(queue, alarm.id) == 'resolved'
+        assert _status(queue, wrapper.id) == 'resolved'
 
     def test_the_own_alarm_is_resolved_before_its_wrapper(self, tmp_path):
         """(c) Attribution stays the detector's, not ``l2-cascade:<id>``."""
@@ -730,10 +730,11 @@ class TestResolveZeroProgressWrappers:
 
         _recover(queue)
 
-        assert _status(queue, wrapper.id) != 'pending'
-        resolved_alarm = queue.get(alarm.id)
-        assert resolved_alarm is not None
-        assert resolved_alarm.resolved_by == _role()
+        for record_id in (alarm.id, wrapper.id):
+            record = queue.get(record_id)
+            assert record is not None
+            assert record.status == 'resolved'
+            assert record.resolved_by == _role(), f'{record_id} lost the detector attribution'
 
     def test_a_wrapper_outliving_its_operator_resolved_member_is_discharged(
         self, tmp_path,
@@ -749,7 +750,7 @@ class TestResolveZeroProgressWrappers:
 
         assert _recover(queue) is True
 
-        assert _status(queue, wrapper.id) != 'pending'
+        assert _status(queue, wrapper.id) == 'resolved'
 
     def test_a_cross_task_wrapper_waits_for_its_last_member_task(self, tmp_path):
         """(e) NEGATIVE then POSITIVE: never close a wrapper holding a live alarm."""
@@ -770,7 +771,7 @@ class TestResolveZeroProgressWrappers:
 
         assert _recover(queue, '7000') is True
 
-        assert _status(queue, wrapper.id) != 'pending'
+        assert _status(queue, wrapper.id) == 'resolved'
 
     def test_a_wrapper_mixing_in_ordinary_work_stays_pending(self, tmp_path):
         """(f) NEGATIVE: an ordinary member means a human is still deciding something."""
@@ -841,7 +842,7 @@ class TestResolveZeroProgressWrappers:
 
         assert _recover(_MemberReadsFail(queue)) is True
 
-        assert _status(queue, alarm.id) != 'pending'
+        assert _status(queue, alarm.id) == 'resolved'
         assert _status(queue, wrapper.id) == 'pending'
 
     def test_a_wrapper_mixing_sentinel_classes_stays_pending(self, tmp_path):
