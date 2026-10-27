@@ -6,14 +6,19 @@ tests pin them against a real EventStore.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.merge_lane.completion import merge_completion_eligible
-from orchestrator.merge_lane.disposition import _branch_pre_merge_verify_green
+from orchestrator.merge_lane.disposition import (
+    MergeFailureDisposition,
+    classify_merge_failure_disposition,
+)
 from orchestrator.stranded_verified_green import last_verified_green_tip
+from orchestrator.verify import VerifyResult
 from orchestrator.verify_checkpoint import green_checkpoint_at_tip
 from orchestrator.verify_evidence import VerifySite
 
@@ -51,13 +56,45 @@ def _store_with(tmp_path: Path, rows: list[Row]) -> EventStore:
     return store
 
 
+_FAILURE_IN_X = VerifyResult(
+    passed=False, test_output='FAILED src/x.py::test_bar - AssertionError', lint_output='',
+    type_output='', summary='1 failed', cause_hint='src/x.py::test_bar', category='test_failure',
+)
+
+
+def _commit_x(repo: Path, content: str) -> str:
+    (repo / 'src').mkdir(exist_ok=True)
+    (repo / 'src' / 'x.py').write_text(content)
+    for argv in (['add', '-A'], ['commit', '-q', '-m', content]):
+        subprocess.run(['git', '-c', 'user.email=t@t', '-c', 'user.name=t', *argv], cwd=repo, check=True)
+    return subprocess.run(
+        ['git', 'rev-parse', 'HEAD'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(('rows', 'expected'), [
-    pytest.param([PRE_MERGE_RED_T2], None, id='pre-merge-red-alone-is-no-branch-evidence'),
-    pytest.param([PRE_MERGE_GREEN_T2], True, id='pre-merge-green-counts'),
-    pytest.param([IMPLEMENT_GREEN_T1, PRE_MERGE_RED_T2], True, id='implement-green-survives-pre-merge-red'),
+    pytest.param([PRE_MERGE_RED_T2], MergeFailureDisposition.INDETERMINATE, id='pre-merge-red-alone-is-no-green'),
+    pytest.param([PRE_MERGE_GREEN_T2], MergeFailureDisposition.INTEGRATION_SKEW, id='pre-merge-green-counts'),
+    pytest.param(
+        [IMPLEMENT_GREEN_T1, PRE_MERGE_RED_T2], MergeFailureDisposition.INTEGRATION_SKEW,
+        id='implement-green-survives-pre-merge-red',
+    ),
 ])
-def test_i5_branch_verdict_ignores_pre_merge_reds(tmp_path, rows, expected):
-    assert _branch_pre_merge_verify_green(_store_with(tmp_path, rows), _TASK_ID) is expected
+async def test_i5_skew_needs_a_green_that_pre_merge_reds_cannot_erase(tmp_path, rows, expected):
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    subprocess.run(['git', 'init', '-q', '-b', 'main'], cwd=repo, check=True)
+    merge_base_sha = _commit_x(repo, 'v1')
+    main_sha = _commit_x(repo, 'v2')
+
+    classification = await classify_merge_failure_disposition(
+        verify_result=_FAILURE_IN_X, branch=f'task/{_TASK_ID}',
+        merge_base_sha=merge_base_sha, main_sha=main_sha, preexisting=False,
+        task_id=_TASK_ID, repo_root=repo, event_store=_store_with(tmp_path, rows),
+    )
+
+    assert classification.disposition is expected
 
 
 @pytest.mark.parametrize(('rows', 'expected'), [

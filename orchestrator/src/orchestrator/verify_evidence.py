@@ -42,7 +42,8 @@ class VerifySite(StrEnum):
 
     Pinned by orchestrator/tests/test_workflow_verify_site_readers.py:
 
-    - merge_lane/disposition.py::_branch_pre_merge_verify_green (I5) ignores pre-merge reds.
+    - merge_lane/disposition.py::classify_merge_failure_disposition (I5) ignores pre-merge
+      reds: one never erases a branch green, and alone it confirms none.
     - merge_lane/completion.py::merge_completion_eligible: a current-run pre-merge green
       satisfies its passed-row half.
     - stranded_verified_green.py::last_verified_green_tip: a pre-merge green at the
