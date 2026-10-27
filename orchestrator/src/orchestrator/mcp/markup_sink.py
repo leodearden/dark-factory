@@ -39,6 +39,7 @@ from shared.eval_lane import eval_lane_provenance
 from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
     MARKUP_RESIDUE_ERROR_TYPES,
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
 )
 from shared.project_layout import escalation_queue_dir
 
@@ -141,10 +142,11 @@ class MarkupSinkSpec:
     #: the two indistinguishable to a reader.
     storm_anchor_task_id: str
 
-    #: What the refusal COST, in one sentence, rendered into the residue
-    #: record's body. Server-specific because the loss is: a refused plan-tools
-    #: call writes nothing to plan.json, while a refused verdict-tools call
-    #: strands a review gate and destroys a reviewer's findings list.
+    #: What the refusal COST, in one sentence, rendered only into a REFUSED
+    #: residue record's body. Server-specific because the loss is: a refused
+    #: plan-tools call writes nothing to plan.json, while a refused
+    #: verdict-tools call strands a review gate and destroys a reviewer's
+    #: findings list.
     refusal_consequence: str
 
     #: What an ACTIVE burst threatens if the guard is disabled, in one
@@ -294,16 +296,47 @@ def open_escalation_channel(project_root: Path) -> tuple[Any, Any] | None:
         return None
 
 
+def _residue_outcome(record: Mapping[str, Any], spec: MarkupSinkSpec) -> str:
+    """What happened to the call, in the record kind's OWN terms."""
+    error_type = record.get('error_type')
+    if error_type == MARKUP_RESIDUE_ERROR_TYPE:
+        return (
+            f'The {spec.server_label} MCP boundary guard refused this tool call: '
+            'the value below carries raw tool-call envelope markup whose own '
+            'boundary cannot be determined, so no repair was attempted. '
+            + spec.refusal_consequence +
+            ' Guessing would have silently dropped whatever arguments hide in '
+            'the residue.'
+        )
+    if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
+        return (
+            f'The {spec.server_label} MCP boundary guard FORWARDED this tool '
+            'call WITHOUT the field named above, and the call LANDED. The '
+            'value below was recovered from leaked tool-call envelope markup '
+            "but could not be typed against that parameter's declared schema, "
+            'so it was dropped rather than passed through untyped. Whatever '
+            'the call wrote is missing it.'
+        )
+    return (
+        f'This sink does not recognise the record kind {error_type!r}, so it '
+        "states no outcome for the call. The record's summary and suggested "
+        "action, where the middleware supplied them, are the middleware's own "
+        'account of what happened.'
+    )
+
+
 def residue_detail(
     record: Mapping[str, Any], subject_task_id: str, spec: MarkupSinkSpec
 ) -> str:
     """The residue record's body — flat fields, then the payload VERBATIM.
 
     The raw value is rendered last, unquoted and unescaped, because it is the
-    ONLY surviving copy of data the caller may never be able to resend: the
-    call was refused, so none of it reached the server's store. Everything
-    above it is diagnostic and is written with ``!r`` so an empty or ``None``
-    field reads as itself rather than as a blank line.
+    ONLY surviving copy of data the caller may never be able to resend: a
+    refused call wrote none of it, and a forwarded call landed without it.
+    The outcome paragraph between them is the record kind's own
+    (:func:`_residue_outcome`). Everything above it is diagnostic and is
+    written with ``!r`` so an empty or ``None`` field reads as itself rather
+    than as a blank line.
 
     ``subject_task_id`` is rendered here BECAUSE the record's own ``task_id``
     field is the non-gating anchor — this is the only place a reader learns
@@ -322,12 +355,7 @@ def residue_detail(
         f'agent_id={record.get("agent_id")!r}',
         f'project={record.get("project")!r}',
         '',
-        f'The {spec.server_label} MCP boundary guard refused this tool call: '
-        'the value below carries raw tool-call envelope markup whose own '
-        'boundary cannot be determined, so no repair was attempted. '
-        + spec.refusal_consequence +
-        ' Guessing would have silently dropped whatever arguments hide in the '
-        'residue.',
+        _residue_outcome(record, spec),
         '',
         'Recover the payload below for the caller if it is still needed, then '
         'chase the harness serialization leak that produced it and '
