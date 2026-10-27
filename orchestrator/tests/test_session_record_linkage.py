@@ -1238,7 +1238,8 @@ class TestWriteDecisionRecordSlug:
         [warning] = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert warning.name == sr.logger.name
         message = warning.getMessage()
-        assert self._ID in message
+        assert message.startswith(f'write-decision --id {self._ID} ')
+        assert 'BLANK record_slug' in message
         assert sr.SESSION_PID_ENV in message
         assert str(self._PID) in message or not names_the_pid
 

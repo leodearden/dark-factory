@@ -4823,7 +4823,8 @@ def _resolve_filing_record_slug(local_id: str, project: str) -> str:
         '(unset, unusable or a shared `claude agents` host pid; or no sessions-by-pid/<pid> '
         'pointer whose record still names that pid as its owner), so this decision gets a '
         'BLANK record_slug and its cockpit row cannot focus the filing session (Enter-to-focus) '
-        'for the life of the record. The decision is still filed.',
+        'for the life of the record. This alone does not refuse the filing; an id on stdout is '
+        'what says it landed.',
         local_id,
         project,
         SESSION_PID_ENV,
