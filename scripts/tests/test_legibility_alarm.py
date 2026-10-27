@@ -50,8 +50,12 @@ def _raising_poster(base_url, arguments):
     raise ConnectionError("escalation server gone")
 
 
-def _warnings(caplog) -> list[logging.LogRecord]:
-    return [r for r in caplog.records if r.name == _ALARM_LOGGER and r.levelno == logging.WARNING]
+def _delivery_warnings(caplog) -> list[logging.LogRecord]:
+    """The alarm's WARNINGs about its post, leaving out a WARNING-level journal line."""
+    return [
+        r for r in caplog.records
+        if r.name == _ALARM_LOGGER and r.levelno == logging.WARNING and r.getMessage() != "S -- D"
+    ]
 
 
 def _tool_calls(server: StubMcpServer) -> list[dict]:
@@ -124,7 +128,7 @@ def test_a_raising_poster_is_one_warning_and_false(caplog):
         )
 
     assert landed is False
-    [warning] = _warnings(caplog)
+    [warning] = _delivery_warnings(caplog)
     assert "ConnectionError" in warning.getMessage()
     assert "escalation server gone" in warning.getMessage()
 
@@ -138,7 +142,7 @@ def test_an_error_reply_is_not_landed(caplog):
         )
 
     assert landed is False
-    [warning] = _warnings(caplog)
+    [warning] = _delivery_warnings(caplog)
     assert "invalid severity" in warning.getMessage()
 
 
@@ -161,7 +165,7 @@ def test_a_down_escalation_server_is_one_warning_and_false(caplog):
         )
 
     assert landed is False
-    [warning] = _warnings(caplog)
+    [warning] = _delivery_warnings(caplog)
     assert "McpCallError" in warning.getMessage()
 
 
@@ -176,7 +180,7 @@ def test_under_pytest_the_default_poster_refuses_a_real_post(caplog, source):
 
     assert landed is False
     assert requests == ()
-    [warning] = _warnings(caplog)
+    [warning] = _delivery_warnings(caplog)
     assert "RealPostRefusedUnderTest" in warning.getMessage()
     assert "own_endpoint" in warning.getMessage()
 
