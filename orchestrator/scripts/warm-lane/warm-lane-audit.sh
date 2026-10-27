@@ -18,8 +18,10 @@
 # lane is not pinned) · branch ·
 # backing-task-status (terminal|non-terminal|unknown) · recoverable
 # (LANDED|PUSHED|ORPHAN) · dirty (clean|residue-only|wip) · divergent_gib ·
-# age_min · classification (LIVE|PINNED|QUARANTINED|RECLAIMABLE|LEAKED|
-# PRESERVED-OK, ranked in that order).
+# age_min (whole minutes since the lane-state record's updated_at, else since
+# the lane dir's mtime) · classification (LIVE|PINNED|QUARANTINED|RECLAIMABLE|
+# LEAKED|PRESERVED-OK, ranked in that order) · age_source (record|dir-mtime:
+# which clock age_min was read off).
 #
 # `live`, `assigned` and `pin` answer THREE independent questions, and are
 # three columns for that reason: is a consumer PROCESS holding this lane's
@@ -161,9 +163,9 @@ esac
 SCRIPT_DIR="$(cd "$_dir" && pwd)"
 unset _src _dir
 
-# reify's portable shims (portable_mtime et al.), called unconditionally on
-# every lane -- see _age_min below. Fail LOUDLY if the lib is missing: an absent
-# sibling is an incomplete DEPLOYMENT, never a data problem -- exit 2
+# reify's portable shims (portable_mtime et al.); portable_mtime is the fallback
+# age clock -- see _resolve_lane_age below. Fail LOUDLY if the lib is missing:
+# an absent sibling is an incomplete DEPLOYMENT, never a data problem -- exit 2
 # (usage/WIRING), not the 1 bash's own bare `source` failure produces under
 # `set -e`.
 #
@@ -232,6 +234,11 @@ Usage: $(basename "$0") [--mount DIR] [--format table|json] [--status-cmd CMD]
               running): the RAW backing status of the task holding it, e.g.
               pending / infra-hold / in-progress / done. \`unknown\` when it
               cannot be resolved; \`-\` when the lane is not pinned.
+    age_min   Whole minutes since the lane's last lifecycle transition: its
+              record's updated_at, else (no record, or an empty/unparseable
+              stamp) the lane dir's mtime.
+    age_source
+              record|dir-mtime — which of those two clocks age_min used.
 
   Classification, ranked: LIVE > PINNED > QUARANTINED >
   RECLAIMABLE|LEAKED|PRESERVED-OK -- the HEADROOM partition's order exactly.
@@ -419,11 +426,13 @@ _probe_live() {
 # _read_lane_assignment <lane>
 # Resolves EVERYTHING this script needs from <lane>'s assignment record --
 # <STATE_DIR>/<lane>.json, the pool's RESERVATION truth, wholly independent of
-# the liveness probe -- from a SINGLE read, and publishes it in three globals:
+# the liveness probe -- from a SINGLE read, and publishes it in four globals:
 #
-#   LANE_ASSIGNED_STATE  ASSIGNED|RELEASED|QUARANTINED|UNKNOWN
-#   LANE_UNKNOWN_CAUSE   why the state is UNKNOWN; EMPTY when it is not
-#   LANE_RECORD_TASK_ID  the record's task_id ('' when absent, null, or unread)
+#   LANE_ASSIGNED_STATE     ASSIGNED|RELEASED|QUARANTINED|UNKNOWN
+#   LANE_UNKNOWN_CAUSE      why the state is UNKNOWN; EMPTY when it is not
+#   LANE_RECORD_TASK_ID     the record's task_id ('' when absent, null, or unread)
+#   LANE_RECORD_UPDATED_AT  the record's updated_at, verbatim ('' when absent or
+#                           unread); the age_min clock, see _resolve_lane_age
 #
 # A THIN ADAPTER over lib_lane_state.sh since dark-factory task 3074 (PRD
 # warm-lane-infra-repatriation-prd.md §8, "extract and unify"). What MOVED into
@@ -437,16 +446,15 @@ _probe_live() {
 # What stayed HERE is only this script's published vocabulary, unchanged at the
 # caller boundary; every downstream consumer below is untouched.
 #
-# Globals, and one slurp, because the three values must describe ONE observation
+# Globals, and one slurp, because the four values must describe ONE observation
 # of ONE record. The orchestrator rewrites these records on every acquire and
 # release, so a second read is a DIFFERENT INSTANT: re-deriving the cause would
 # let a record that was absent during the first read and valid during the second
 # report `assigned=UNKNOWN` paired with `unrecognized-state:<raw>` -- a cause the
 # runbook tells operators to read as dark-factory LaneState schema drift, aiming
 # triage at a schema problem that does not exist. lane_state_read publishes all
-# three of ITS values from one in-memory snapshot, and the three republished
-# below are derived from those alone, so the triple is still self-consistent by
-# construction.
+# of ITS values from one in-memory snapshot, and the four republished below are
+# derived from those alone, so they are still self-consistent by construction.
 #
 # A5 folds three DISTINCT causes into the one UNKNOWN column value, and they
 # send an operator to three different places, so the stderr warning names which
@@ -472,6 +480,7 @@ _probe_live() {
 LANE_ASSIGNED_STATE='UNKNOWN'
 LANE_UNKNOWN_CAUSE=''
 LANE_RECORD_TASK_ID=''
+LANE_RECORD_UPDATED_AT=''
 _read_lane_assignment() {
     # Preserves _lane_record's `[ -n "$STATE_DIR" ]` guard. Unreachable today
     # (a validated mount always yields a non-empty STATE_DIR), but kept
@@ -482,14 +491,16 @@ _read_lane_assignment() {
         LANE_ASSIGNED_STATE='UNKNOWN'
         LANE_UNKNOWN_CAUSE='no-readable-record'
         LANE_RECORD_TASK_ID=''
+        LANE_RECORD_UPDATED_AT=''
         return 0
     fi
 
-    # ONE read. lane_state_read resets its own three globals at entry, so a lane
-    # whose record cannot be read never inherits its predecessor's values.
+    # ONE read. lane_state_read resets its own globals at entry, so a lane whose
+    # record cannot be read never inherits its predecessor's values.
     lane_state_read "$1" "$STATE_DIR" >/dev/null
 
     LANE_RECORD_TASK_ID="$LANE_STATE_TASK_ID"
+    LANE_RECORD_UPDATED_AT="$LANE_STATE_UPDATED_AT"
     LANE_ASSIGNED_STATE="$(lane_state_class "$LANE_STATE_RAW")"
     LANE_UNKNOWN_CAUSE=''
     if [ "$LANE_ASSIGNED_STATE" = 'UNKNOWN' ]; then
@@ -687,16 +698,32 @@ _dirty_state() {
     return 0
 }
 
-# ── age_min: whole minutes since <dir>'s mtime ────────────────────────────────
-# _age_min <dir>
-# floor((now - mtime(dir)) / 60), via lib_portable.sh's portable_mtime. A
-# missing/unreadable dir degrades to 0 (never stale) rather than aborting.
-_age_min() {
-    local dir="$1"
-    local mtime now
-    mtime="$(portable_mtime "$dir" 2>/dev/null)" || { printf '0'; return 0; }
-    now="$(date +%s)"
-    printf '%d' $(( (now - mtime) / 60 ))
+# ── age_min: whole minutes since the lane's last lifecycle transition ────────
+# _resolve_lane_age <dir> <record-updated-at>
+# Publishes LANE_AGE_MIN = floor((NOW_EPOCH - clock) / 60) and LANE_AGE_SOURCE,
+# the clock it used, so call it WITHOUT $(...).
+#   record     the lane-state record's updated_at, via lane_state_epoch. It wins
+#              whenever it is judgeable: the dir mtime is churned by transient
+#              files inside the lane, so it can read ~0 for a lane dispatched
+#              hours ago (README.md "Delta 13").
+#   dir-mtime  the lane dir's mtime, via portable_mtime: the fallback for a
+#              record-less resident and for an empty or unparseable updated_at.
+#              A dir whose mtime cannot be read either degrades to age 0 (never
+#              stale) rather than aborting.
+LANE_AGE_MIN=0
+LANE_AGE_SOURCE='dir-mtime'
+_resolve_lane_age() {
+    local dir="$1" updated_at="$2" epoch
+    if epoch="$(lane_state_epoch "$updated_at")"; then
+        LANE_AGE_SOURCE='record'
+    elif epoch="$(portable_mtime "$dir" 2>/dev/null)"; then
+        LANE_AGE_SOURCE='dir-mtime'
+    else
+        LANE_AGE_SOURCE='dir-mtime'
+        epoch="$NOW_EPOCH"
+    fi
+    LANE_AGE_MIN=$(( (NOW_EPOCH - epoch) / 60 ))
+    return 0
 }
 
 # ── divergent_bytes: measured (real du), never a frozen constant (DD3/G6/D8) ─
@@ -862,6 +889,9 @@ if [ -n "$STATE_DIR" ] && [ -d "$STATE_DIR" ]; then
 fi
 STATE_DIR_ABSENT_WARNED=0
 
+# The clock is read ONCE, so every row's age_min is judged against one instant.
+NOW_EPOCH="$(date +%s)"
+
 for entry in "$MOUNT"/*/; do
     entry="${entry%/}"
     [ -d "$entry" ] || continue
@@ -960,10 +990,10 @@ for entry in "$MOUNT"/*/; do
     dirty="$(_dirty_state "$entry")"
     divergent_bytes="$(_divergent_bytes "$entry")"
     divergent_gib=$(( divergent_bytes / 1073741824 ))
-    age_min="$(_age_min "$entry")"
+    _resolve_lane_age "$entry" "$LANE_RECORD_UPDATED_AT"
     DIVERGENT_TOTAL_BYTES=$((DIVERGENT_TOTAL_BYTES + divergent_bytes))
 
-    classification="$(_classify "$live" "$assigned_state" "$status" "$recoverable" "$dirty" "$age_min")"
+    classification="$(_classify "$live" "$assigned_state" "$status" "$recoverable" "$dirty" "$LANE_AGE_MIN")"
     case "$classification" in
         RECLAIMABLE) RECLAIMABLE_COUNT=$((RECLAIMABLE_COUNT + 1)) ;;
         LEAKED) LEAKED_COUNT=$((LEAKED_COUNT + 1)) ;;
@@ -983,14 +1013,14 @@ for entry in "$MOUNT"/*/; do
 
     # A3 observability: surface (never reclassify) a lane whose LEAKED
     # verdict is suppressed solely because its status is unknown.
-    if [ "$classification" = "PRESERVED-OK" ] && _is_leak_unknown_suspect "$status" "$recoverable" "$age_min"; then
+    if [ "$classification" = "PRESERVED-OK" ] && _is_leak_unknown_suspect "$status" "$recoverable" "$LANE_AGE_MIN"; then
         LEAK_UNKNOWN_COUNT=$((LEAK_UNKNOWN_COUNT + 1))
         warn "lane=$name: backing-task status unknown -- cannot confirm LEAKED (would classify LEAKED if status resolved non-terminal); reported PRESERVED-OK. See HEADROOM leak_unknown."
     fi
 
-    TABLE_OUT="${TABLE_OUT}lane=${name} role=${role} live=${live} assigned=${assigned_state} pin=${pin} branch=${branch} status=${status} recoverable=${recoverable} dirty=${dirty} divergent_gib=${divergent_gib} age_min=${age_min} classification=${classification}
+    TABLE_OUT="${TABLE_OUT}lane=${name} role=${role} live=${live} assigned=${assigned_state} pin=${pin} branch=${branch} status=${status} recoverable=${recoverable} dirty=${dirty} divergent_gib=${divergent_gib} age_min=${LANE_AGE_MIN} classification=${classification} age_source=${LANE_AGE_SOURCE}
 "
-    JSON_LANE_OBJS+=("{\"lane\":\"$(_json_escape "$name")\",\"role\":\"${role}\",\"live\":\"${live}\",\"assigned\":\"${assigned_state}\",\"pin\":\"$(_json_escape "$pin")\",\"branch\":\"$(_json_escape "$branch")\",\"status\":\"${status}\",\"recoverable\":\"${recoverable}\",\"dirty\":\"${dirty}\",\"divergent_gib\":${divergent_gib},\"age_min\":${age_min},\"classification\":\"${classification}\"}")
+    JSON_LANE_OBJS+=("{\"lane\":\"$(_json_escape "$name")\",\"role\":\"${role}\",\"live\":\"${live}\",\"assigned\":\"${assigned_state}\",\"pin\":\"$(_json_escape "$pin")\",\"branch\":\"$(_json_escape "$branch")\",\"status\":\"${status}\",\"recoverable\":\"${recoverable}\",\"dirty\":\"${dirty}\",\"divergent_gib\":${divergent_gib},\"age_min\":${LANE_AGE_MIN},\"classification\":\"${classification}\",\"age_source\":\"${LANE_AGE_SOURCE}\"}")
 done
 
 # A real mount with nothing resident is almost always the wrong level: the mount

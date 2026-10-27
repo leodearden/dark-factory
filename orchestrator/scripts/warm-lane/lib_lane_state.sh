@@ -184,7 +184,7 @@ lane_state_read() {
     # read, no second parser. `updated_at` is a flat top-level quoted string,
     # the exact shape _lane_state_scalar documents itself as handling, and its
     # miss behaviour (absent key or non-string value yields empty) is already
-    # the unjudgeable-age reading the gc consumer wants.
+    # the unjudgeable-age reading both consumers want.
     LANE_STATE_UPDATED_AT="$(_lane_state_scalar "$text" updated_at)"
     local raw
     raw="$(_lane_state_scalar "$text" state)"

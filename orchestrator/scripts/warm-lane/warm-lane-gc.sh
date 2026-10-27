@@ -756,7 +756,7 @@ fi
 # The resulting drift is the pass duration against a days-scale bound, so it
 # cannot flip a verdict at any plausible margin, and it drifts CONSERVATIVE:
 # lanes visited later in the pass are judged against an older cutoff, so they
-# are preserved rather than reclaimed. The idiom is warm-lane-audit.sh::_age_min's.
+# are preserved rather than reclaimed. The idiom is warm-lane-audit.sh::NOW_EPOCH's.
 NOW_EPOCH="$(date +%s)"
 
 # ── helper: name matches a glob pattern ───────────────────────────────────────
