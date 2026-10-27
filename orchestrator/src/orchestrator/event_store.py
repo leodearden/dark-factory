@@ -1092,9 +1092,12 @@ class EventType(StrEnum):
     # Shadow eval (plans/live-shadow-eval-prd.md C2). task_id is the PRODUCTION
     # task the cell shadows; shadow_cell_skipped's data.reason is a
     # ShadowSkipReason value. The payloads are owned by the coordinator (ε1).
+    # shadow_cell_settled marks a cell whose settled_at was written (settled |
+    # expired); shadow_cell_ended marks one that ended without it (failed | cap_excluded).
     shadow_cell_opened = 'shadow_cell_opened'
     shadow_cell_skipped = 'shadow_cell_skipped'
     shadow_cell_settled = 'shadow_cell_settled'
+    shadow_cell_ended = 'shadow_cell_ended'
 
 
 @unique
@@ -1115,6 +1118,8 @@ class ShadowSkipReason(StrEnum):
     SHAPE_DISABLED = 'shape_disabled'
     ALREADY_OPEN = 'already_open'
     PAUSED = 'paused'
+    UNKNOWN_CANDIDATE = 'unknown_candidate'
+    NO_BASE_SHA = 'no_base_sha'
 
 
 _MERGE_FINALIZED_ROWS = f"event_type = '{EventType.merge_finalized.value}'"
