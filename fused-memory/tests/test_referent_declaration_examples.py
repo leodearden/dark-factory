@@ -215,6 +215,8 @@ _GUARDED_DOCS = (
     '.claude/commands/memory.md',
     'skills/reflect/SKILL.md',
     'skills/orchestrate/SKILL.md',
+    'skills/review/SKILL.md',
+    'skills/review/references/phase3-triage.md',
 )
 
 _GUARDED_SITES = (
