@@ -10,33 +10,60 @@ their consequences. Design: plans/live-shadow-eval-prd.md C2.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
-from collections.abc import Callable, Mapping, Sequence
+import logging
+import sqlite3
+import uuid
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from pathlib import Path
 from types import MappingProxyType
+from typing import Any, Protocol
 
+from shared.cost_store import CostStore
 from shared.psi import PsiSample
 
-from orchestrator.config import PsiAdmissionConfig
-from orchestrator.evals.configs import CANDIDATE_ENDPOINT_PRICES, EvalConfig
-from orchestrator.event_store import ShadowSkipReason
-from orchestrator.shadow_types import CostBasis, ShadowCellState, ShadowShape, ShadowStormCause
+from orchestrator.config import PsiAdmissionConfig, ShadowEvalConfig
+from orchestrator.evals.configs import CANDIDATE_ENDPOINT_PRICES, EvalConfig, get_config_by_name
+from orchestrator.evals.live_fixture import live_stratum
+from orchestrator.evals.metrics import EvalMetrics
+from orchestrator.evals.task_sampler import repo_of_project
+from orchestrator.event_store import EventStore, EventType, ShadowSkipReason
+from orchestrator.run_store import CellChange, RunStore, ShadowCell, ShadowCellQuery
+from orchestrator.shadow_types import (
+    CostBasis,
+    PlanSource,
+    ShadowCellState,
+    ShadowShape,
+    ShadowStormCause,
+)
 from orchestrator.workflow_types import WorkflowState
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
+    'CREDIT_WINDOW',
     'PRODUCTION_COST_BASIS',
     'SHAPE_TRIGGERS',
     'TRAILING_WINDOW',
+    'CellEndReason',
+    'CellRequest',
+    'CellRunOutcome',
     'CostPair',
     'CostRatioVerdict',
     'HostVerdict',
     'OpenDecision',
     'OpenInputs',
     'RatioSkip',
+    'RunEnd',
     'RunEndedCell',
+    'ShadowCoordinator',
+    'ShadowCoordinatorDeps',
+    'ShadowRunner',
     'StormFacts',
     'StormTrip',
     'budget_exhausted',
@@ -47,6 +74,8 @@ __all__ = [
     'evaluate_storm',
     'failure_streak_tripped',
     'host_verdict',
+    'run_end_change',
+    'runner_raised_reason',
     'sample_point',
     'sampled_in',
     'shape_enabled',
@@ -385,3 +414,449 @@ def evaluate_storm(facts: StormFacts) -> StormTrip | None:
         if detail is not None:
             return StormTrip(cause, detail)
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Typed boundary values of a cell's run                                        #
+# --------------------------------------------------------------------------- #
+
+# The Coding Plan's rolling allowance window (PRD decision 16).
+CREDIT_WINDOW = timedelta(hours=5)
+
+
+class RunEnd(StrEnum):
+    """How a cell's run ended, as its runner reports it."""
+
+    COMPLETED = 'completed'
+    USAGE_CAP = 'usage_cap'
+    CREDITS_EXHAUSTED = 'credits_exhausted'
+
+
+class CellEndReason(StrEnum):
+    """The ``shadow_cells.reason`` of a cell that ended without settling (C1)."""
+
+    SETTLE_DEADLINE = 'settle_deadline'
+    ORPHANED_BY_RESTART = 'orphaned_by_restart'
+    USAGE_CAP = 'usage_cap'
+    CREDITS_EXHAUSTED = ShadowSkipReason.CREDITS_EXHAUSTED.value
+    RUNNER_RAISED = 'runner_raised'
+    CANCELLED_AT_SHUTDOWN = 'cancelled_at_shutdown'
+
+
+def runner_raised_reason(exc: BaseException) -> str:
+    """The one builder of a failed cell's exception-class reason."""
+    return f'{CellEndReason.RUNNER_RAISED.value}:{type(exc).__name__}'
+
+
+@dataclass(frozen=True)
+class CellRunOutcome:
+    """What a runner reports when a cell's run ends; a completed run has its result."""
+
+    end: RunEnd
+    metrics: EvalMetrics | None = None
+    result_path: Path | None = None
+    cost_usd: float = 0.0
+    cost_credits: float = 0.0
+    plan: dict | None = None
+
+    def __post_init__(self) -> None:
+        if self.end is RunEnd.COMPLETED and (self.metrics is None or self.result_path is None):
+            raise ValueError(
+                f'CellRunOutcome: a completed run carries its metrics and result_path '
+                f'(got metrics={self.metrics!r}, result_path={self.result_path!r})'
+            )
+
+
+@dataclass(frozen=True)
+class CellRequest:
+    """Everything a runner needs for one cell.
+
+    ``task`` is the production task record the cell shadows. ``plan`` is the
+    candidate plan a consequence leg 2 executes and ``None`` for every other
+    shape; an implementer cell's runner reads production's own plan.
+    """
+
+    cell: ShadowCell
+    task: dict
+    candidate: EvalConfig
+    plan: dict | None = None
+
+
+class ShadowRunner(Protocol):
+    """Two stages, so every C1 state is real: a prepared worktree, then a run in it."""
+
+    async def prepare(self, request: CellRequest) -> Path: ...
+
+    async def run(self, request: CellRequest, worktree: Path) -> CellRunOutcome: ...
+
+
+_CAP_REASONS: Mapping[RunEnd, CellEndReason] = MappingProxyType({
+    RunEnd.USAGE_CAP: CellEndReason.USAGE_CAP,
+    RunEnd.CREDITS_EXHAUSTED: CellEndReason.CREDITS_EXHAUSTED,
+})
+
+
+def run_end_change(outcome: CellRunOutcome, at: datetime) -> CellChange:
+    """The one mapping from a run's outcome to the running cell's successor."""
+    if outcome.end is RunEnd.COMPLETED:
+        return CellChange(
+            ShadowCellState.AWAITING_REFERENCE,
+            at,
+            result_path=outcome.result_path,
+            cost_usd=outcome.cost_usd,
+            cost_credits=outcome.cost_credits,
+        )
+    return CellChange(
+        ShadowCellState.CAP_EXCLUDED,
+        at,
+        reason=_CAP_REASONS[outcome.end].value,
+        cost_usd=outcome.cost_usd,
+        cost_credits=outcome.cost_credits,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The coordinator                                                              #
+# --------------------------------------------------------------------------- #
+
+_HELD_STATES = frozenset(state for state in ShadowCellState if state.held_by_run)
+
+_PLAN_SOURCE_BY_SHAPE: Mapping[ShadowShape, PlanSource] = MappingProxyType({
+    ShadowShape.IMPLEMENTER: PlanSource.PRODUCTION,
+    ShadowShape.ARCHITECT_CONSEQUENCE: PlanSource.CANDIDATE,
+})
+
+
+def metered_spend(cells: Sequence[ShadowCell]) -> float:
+    """Real dollars only: a subscription arm's imputed ``cost_usd`` is not spend."""
+    return sum(cell.cost_usd for cell in cells if cell.cost_basis is CostBasis.METERED)
+
+
+def _task_id_of(task: Mapping[str, Any]) -> str:
+    task_id = str(task['id']).strip()
+    if not task_id:
+        raise ValueError(f'shadow coordinator: task record has a blank id ({task!r})')
+    return task_id
+
+
+def _base_sha_of(task: Mapping[str, Any]) -> str | None:
+    sha = (task.get('metadata') or {}).get('branch_base_sha')
+    return sha.strip() if isinstance(sha, str) and sha.strip() else None
+
+
+@dataclass(frozen=True)
+class ShadowCoordinatorDeps:
+    """Every effect boundary of the coordinator.
+
+    ``isolation`` has no default: until the isolation probe lands, a default
+    would claim an isolation nobody checked.
+    """
+
+    store: RunStore
+    events: EventStore
+    costs: CostStore
+    runner: ShadowRunner
+    escalate: Callable[[StormTrip], Awaitable[None]]
+    clock: Callable[[], datetime]
+    isolation: Callable[[], bool]
+    read_host_sample: Callable[[], PsiSample]
+    psi_config: PsiAdmissionConfig
+    resolve_candidate: Callable[[str], EvalConfig | None] = get_config_by_name
+
+
+class ShadowCoordinator:
+    """Opens, drives, settles and pauses one project's shadow cells.
+
+    Holds no cell state in memory: every question is asked of the store, and
+    each cell's run is a background task the coordinator owns until it ends.
+    """
+
+    def __init__(
+        self,
+        config: ShadowEvalConfig,
+        deps: ShadowCoordinatorDeps,
+        *,
+        project_id: str,
+        run_id: str,
+        incumbents: Mapping[ShadowShape, str],
+    ) -> None:
+        missing = [shape.value for shape in ShadowShape if shape not in incumbents]
+        if missing:
+            raise ValueError(f'ShadowCoordinator: no incumbent named for shape(s) {missing}')
+        repo_of_project(project_id)
+        self._config = config
+        self._deps = deps
+        self.project_id = project_id
+        self.run_id = run_id
+        self._incumbents = MappingProxyType(dict(incumbents))
+        self._drives: set[asyncio.Task[None]] = set()
+
+    # -- open ---------------------------------------------------------------
+
+    async def should_open(
+        self, task: dict, shape: ShadowShape, candidate: EvalConfig,
+    ) -> OpenDecision:
+        """Whether a cell for this triple would open now; writes nothing."""
+        return decide_open(await asyncio.to_thread(self._open_inputs, task, shape, candidate))
+
+    async def on_phase(self, task: dict, phase: WorkflowState, entering: bool) -> list[str]:
+        """The harness hook for every phase enter/exit: the cell ids it opened. Never raises."""
+        if not self._config.enabled:
+            return []
+        try:
+            return await self._open_triggered(task, phase, entering)
+        except Exception:
+            logger.exception('shadow coordinator: on_phase failed for task %r', task.get('id'))
+            return []
+
+    async def _open_triggered(
+        self, task: dict, phase: WorkflowState, entering: bool,
+    ) -> list[str]:
+        task_id = _task_id_of(task)
+        enabled = frozenset(self._config.shapes)
+        opened: list[str] = []
+        for shape in ShadowShape:
+            if shape in shapes_triggered_by(phase, entering) and shape_enabled(shape, enabled):
+                for name in self._candidates_for(shape):
+                    cell_id = await self._try_open(task, task_id, shape, name)
+                    if cell_id is not None:
+                        opened.append(cell_id)
+        return opened
+
+    def _candidates_for(self, shape: ShadowShape) -> list[str]:
+        if shape is ShadowShape.END_TO_END:
+            return list(self._config.end_to_end_candidates)
+        return list(self._config.candidates)
+
+    async def _try_open(
+        self, task: dict, task_id: str, shape: ShadowShape, name: str,
+    ) -> str | None:
+        """One (shape, candidate) attempt; a failure here never stops the others."""
+        try:
+            candidate = self._resolve(name)
+            if candidate is None:
+                await self._emit_skip(task_id, shape, name, ShadowSkipReason.UNKNOWN_CANDIDATE)
+                return None
+            return await self._open_cell(task, shape, candidate)
+        except Exception:
+            logger.exception(
+                'shadow coordinator: opening %s/%s for task %s failed', shape.value, name, task_id,
+            )
+            return None
+
+    def _resolve(self, name: str) -> EvalConfig | None:
+        try:
+            return self._deps.resolve_candidate(name)
+        except Exception:
+            logger.warning('shadow coordinator: candidate %r did not resolve', name, exc_info=True)
+            return None
+
+    async def _open_cell(
+        self,
+        task: dict,
+        shape: ShadowShape,
+        candidate: EvalConfig,
+        *,
+        parent_cell_id: str | None = None,
+        plan: dict | None = None,
+    ) -> str | None:
+        """Decide, then insert, announce and drive the cell; the one open path."""
+        inputs = await asyncio.to_thread(self._open_inputs, task, shape, candidate)
+        decision = decide_open(inputs)
+        if decision.reason is not None:
+            await self._emit_skip(inputs.task_id, shape, candidate.name, decision.reason)
+            return None
+        cell = self._sampled_cell(inputs, candidate, parent_cell_id)
+        try:
+            await asyncio.to_thread(self._deps.store.insert_shadow_cell, cell)
+        except sqlite3.IntegrityError:
+            await self._emit_skip(inputs.task_id, shape, candidate.name, ShadowSkipReason.ALREADY_OPEN)
+            return None
+        await self._emit(EventType.shadow_cell_opened, cell, host=decision.host.value)
+        self._spawn(CellRequest(cell=cell, task=task, candidate=candidate, plan=plan))
+        return cell.cell_id
+
+    def _open_inputs(self, task: dict, shape: ShadowShape, candidate: EvalConfig) -> OpenInputs:
+        config, store, now = self._config, self._deps.store, self._deps.clock()
+        task_id = _task_id_of(task)
+        storm = store.get_shadow_storm(self.project_id)
+        since = storm_window_start(now, storm.resumed_at)
+        return OpenInputs(
+            task_id=task_id,
+            shape=shape,
+            candidate=candidate.name,
+            stratum=live_stratum(task, project=self.project_id),
+            base_sha=_base_sha_of(task),
+            seed=config.seed,
+            sample_rate=config.sample_rate_for(candidate.name),
+            enabled=config.enabled,
+            enabled_shapes=frozenset(config.shapes),
+            end_to_end_candidates=frozenset(config.end_to_end_candidates),
+            paused=storm.paused,
+            already_open=bool(store.find_shadow_cells(
+                self._query(task_id=task_id, shape=shape, candidate=candidate.name, limit=1),
+            )),
+            has_credentials=candidate_has_credentials(candidate),
+            isolation_available=self._deps.isolation(),
+            credits_exhausted_recently=self._credits_exhausted_since(
+                candidate.name, now - CREDIT_WINDOW,
+            ),
+            spent_usd=metered_spend(store.find_shadow_cells(self._query(opened_since=since))),
+            daily_budget_usd=config.daily_budget_usd,
+            held_cells=len(store.find_shadow_cells(self._query(states=_HELD_STATES))),
+            max_concurrent=config.max_concurrent,
+            host=self._host(),
+        )
+
+    def _query(self, **filters: Any) -> ShadowCellQuery:
+        return ShadowCellQuery(project_id=self.project_id, **filters)
+
+    def _credits_exhausted_since(self, candidate: str, since: datetime) -> bool:
+        """Whether a cell of *candidate* opened since *since* ended with the allowance spent."""
+        capped = self._deps.store.find_shadow_cells(self._query(
+            states=frozenset({ShadowCellState.CAP_EXCLUDED}),
+            candidate=candidate,
+            opened_since=since,
+        ))
+        return any(cell.reason == CellEndReason.CREDITS_EXHAUSTED.value for cell in capped)
+
+    def _host(self) -> HostVerdict:
+        cfg = self._deps.psi_config
+        if not cfg.enabled:
+            return HostVerdict.CLEAR
+        return host_verdict(self._deps.read_host_sample(), cfg)
+
+    def _sampled_cell(
+        self, inputs: OpenInputs, candidate: EvalConfig, parent_cell_id: str | None,
+    ) -> ShadowCell:
+        now = self._deps.clock()
+        assert inputs.base_sha is not None  # decide_open opened only with a base sha
+        return ShadowCell(
+            cell_id=uuid.uuid4().hex,
+            parent_cell_id=parent_cell_id,
+            project_id=self.project_id,
+            task_id=inputs.task_id,
+            shape=inputs.shape,
+            candidate=candidate.name,
+            incumbent=self._incumbents[inputs.shape],
+            stratum=inputs.stratum,
+            base_sha=inputs.base_sha,
+            plan_source=_PLAN_SOURCE_BY_SHAPE.get(inputs.shape),
+            state=ShadowCellState.SAMPLED,
+            cost_basis=cost_basis_of(candidate),
+            run_id=self.run_id,
+            opened_at=now,
+            settle_deadline=now + timedelta(hours=self._config.settle_deadline_hours),
+        )
+
+    # -- drive --------------------------------------------------------------
+
+    def _spawn(self, request: CellRequest) -> None:
+        drive = asyncio.create_task(
+            self._drive(request), name=f'shadow-cell-{request.cell.cell_id}',
+        )
+        self._drives.add(drive)
+        drive.add_done_callback(self._drives.discard)
+
+    async def _drive(self, request: CellRequest) -> None:
+        """Run one cell through its lifecycle; every exit writes the cell's successor."""
+        cell_id = request.cell.cell_id
+        try:
+            await self._run_cell(request)
+        except asyncio.CancelledError:
+            await self._fail_held(cell_id, CellEndReason.CANCELLED_AT_SHUTDOWN.value)
+            raise
+        except Exception as exc:
+            logger.warning('shadow cell %s: runner raised', cell_id, exc_info=True)
+            await self._fail_held(cell_id, runner_raised_reason(exc))
+
+    async def _run_cell(self, request: CellRequest) -> None:
+        runner, cell_id = self._deps.runner, request.cell.cell_id
+        worktree = await runner.prepare(request)
+        opened = await self._advance(
+            cell_id, ShadowCellState.SAMPLED,
+            CellChange(ShadowCellState.OPENED, self._deps.clock(), worktree_path=worktree),
+        )
+        if opened is None:
+            return
+        running = await self._advance(
+            cell_id, ShadowCellState.OPENED, CellChange(ShadowCellState.RUNNING, self._deps.clock()),
+        )
+        if running is None:
+            return
+        outcome = await runner.run(request, worktree)
+        ended = await self._advance(
+            cell_id, ShadowCellState.RUNNING, run_end_change(outcome, self._deps.clock()),
+        )
+        if ended is not None and ended.state is ShadowCellState.CAP_EXCLUDED:
+            await self._emit_ended(ended)
+
+    async def _advance(
+        self, cell_id: str, expected: ShadowCellState, change: CellChange,
+    ) -> ShadowCell | None:
+        cell = await asyncio.to_thread(
+            self._deps.store.advance_shadow_cell, cell_id, expected=expected, change=change,
+        )
+        if cell is None:
+            logger.warning(
+                'shadow cell %s: no longer %r, so this run stops driving it',
+                cell_id, expected.value,
+            )
+        return cell
+
+    async def _fail_held(self, cell_id: str, reason: str) -> None:
+        """Fail a cell this run still holds, from whatever held state it reached."""
+        failed = await asyncio.to_thread(self._fail_held_sync, cell_id, reason)
+        if failed is not None:
+            await self._emit_ended(failed)
+
+    def _fail_held_sync(self, cell_id: str, reason: str) -> ShadowCell | None:
+        store = self._deps.store
+        cell = store.get_shadow_cell(cell_id)
+        if cell is None or not cell.state.held_by_run:
+            return None
+        return store.advance_shadow_cell(
+            cell_id,
+            expected=cell.state,
+            change=CellChange(ShadowCellState.FAILED, self._deps.clock(), reason=reason),
+        )
+
+    async def join(self) -> None:
+        """Wait for every live drive, including any a finishing drive spawned."""
+        while self._drives:
+            await asyncio.gather(*list(self._drives), return_exceptions=True)
+
+    async def aclose(self) -> None:
+        """Cancel every live drive; each writes its cell's successor before it ends."""
+        for drive in list(self._drives):
+            drive.cancel()
+        await self.join()
+
+    # -- events -------------------------------------------------------------
+
+    async def _emit(self, event_type: EventType, cell: ShadowCell, **data: Any) -> None:
+        payload = {
+            'cell_id': cell.cell_id,
+            'shape': cell.shape.value,
+            'candidate': cell.candidate,
+            **data,
+        }
+        await asyncio.to_thread(
+            self._deps.events.emit, event_type, task_id=cell.task_id, data=payload,
+        )
+
+    async def _emit_ended(self, cell: ShadowCell) -> None:
+        await self._emit(
+            EventType.shadow_cell_ended, cell, state=cell.state.value, reason=cell.reason,
+        )
+
+    async def _emit_skip(
+        self, task_id: str, shape: ShadowShape, candidate: str, reason: ShadowSkipReason,
+    ) -> None:
+        await asyncio.to_thread(
+            self._deps.events.emit,
+            EventType.shadow_cell_skipped,
+            task_id=task_id,
+            data={'reason': reason.value, 'shape': shape.value, 'candidate': candidate},
+        )
+
