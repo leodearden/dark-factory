@@ -110,6 +110,7 @@ from fused_memory.reconciliation.task_filter import (
     format_filtered_task_tree,
     strip_snapshot_lines,
 )
+from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
 from fused_memory.utils.clip_disclosure import clip_note, elide_text, fetch_cap_note
 
@@ -223,6 +224,8 @@ class MemoryConsolidator(BaseStage):
 
     # Active task tree — set by harness before run() (task 455)
     filtered_task_tree: FilteredTaskTree | None = None
+    # Set with filtered_task_tree: the instant that tree, and every heartbeat_at in it, was read.
+    filtered_task_tree_fetched_at: datetime | None = None
 
     # Authoritative task-count cross-verification record — set by harness (task 1785).
     # None when the status map was unavailable (e.g. taskmaster down) or in remediation passes.
@@ -1905,13 +1908,21 @@ Review the above data and perform memory consolidation:
         snapshot is retained for :meth:`run`'s citation guard.  A tree with no
         active task yields a real, empty snapshot, because an absent section
         tells this stage that no task is live; only an unset tree leaves it
-        None, and the guard inert.
+        None, and the guard inert.  Claimant heartbeats are aged at
+        ``filtered_task_tree_fetched_at``, the instant the tree was read, not
+        at render time (task 6027).
         """
         if self.filtered_task_tree is None:
             return ''
+        claims_read_at = resolve_tree_read_instant(
+            self.filtered_task_tree_fetched_at,
+            event='reconciliation.stage1_task_tree_read_instant_missing',
+            extra={'project_id': self.project_id},
+        )
         self._live_workflow_snapshot = await build_live_workflow_snapshot(
             self.filtered_task_tree.active_tasks,
             self.scope.project_root,
+            claims_read_at=claims_read_at,
         )
         section = self._live_workflow_snapshot.render()
         return '\n' + section if section else ''
