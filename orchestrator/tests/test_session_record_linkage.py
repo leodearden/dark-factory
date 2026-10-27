@@ -1148,6 +1148,22 @@ def _registry(root: Path) -> dict[str, sr.SessionRecord]:
     return {record.session_slug: record for record in records}
 
 
+def _leave_claude_pid_unset(monkeypatch: pytest.MonkeyPatch, root: Path, pid: int) -> None:
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+
+def _set_claude_pid_without_a_pointer(monkeypatch: pytest.MonkeyPatch, root: Path, pid: int) -> None:
+    monkeypatch.setenv('CLAUDE_PID', str(pid))
+
+
+def _set_claude_pid_with_an_unvouched_pointer(
+    monkeypatch: pytest.MonkeyPatch, root: Path, pid: int
+) -> None:
+    monkeypatch.setenv('CLAUDE_PID', str(pid))
+    sr.write_record(_record('another-sessions-record', owner_pid=pid + 1), root=root)
+    sr.write_session_pointer(pid, 'another-sessions-record', root=root)
+
+
 class TestWriteDecisionRecordSlug:
     _PID = 4_237_600
     _RESTARTED_PID = 4_237_700
@@ -1182,35 +1198,49 @@ class TestWriteDecisionRecordSlug:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         _link_pid(self._PID, 'watcher-own-record', tmp_path)
         monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+        caplog.set_level(logging.DEBUG)
 
         _, decision = self._file(tmp_path, capsys)
 
         assert decision.record_slug == 'watcher-own-record'
         assert decision.session_id == f'watcher-df-{self._PID}'
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
-    @pytest.mark.parametrize('claude_pid', [None, str(_PID)], ids=['unset', 'no-pointer'])
-    def test_an_unresolvable_record_slug_still_files_blank_and_quiet(
+    @pytest.mark.parametrize(
+        ('arrange', 'names_the_pid'),
+        [
+            (_leave_claude_pid_unset, False),
+            (_set_claude_pid_without_a_pointer, True),
+            (_set_claude_pid_with_an_unvouched_pointer, True),
+        ],
+        ids=['unset', 'no-pointer', 'unvouched-pointer'],
+    )
+    def test_an_unresolvable_record_slug_still_files_blank_and_warns(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
         caplog: pytest.LogCaptureFixture,
-        claude_pid: str | None,
+        arrange: Callable[[pytest.MonkeyPatch, Path, int], None],
+        names_the_pid: bool,
     ) -> None:
-        if claude_pid is None:
-            monkeypatch.delenv('CLAUDE_PID', raising=False)
-        else:
-            monkeypatch.setenv('CLAUDE_PID', claude_pid)
+        arrange(monkeypatch, tmp_path, self._PID)
         caplog.set_level(logging.DEBUG)
 
         out, decision = self._file(tmp_path, capsys)
 
         assert out == f'{self._FILED_ID}\n'
         assert decision.record_slug == ''
-        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        [warning] = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning.name == sr.logger.name
+        message = warning.getMessage()
+        assert self._ID in message
+        assert sr.SESSION_PID_ENV in message
+        assert str(self._PID) in message or not names_the_pid
 
     def test_a_hand_launched_watchers_decision_links_to_its_registry_record(
         self,
