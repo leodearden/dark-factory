@@ -136,7 +136,8 @@ def render_live_workflow_authority_rules() -> str:
         f'`worktree, orchestrator` for 3+ cycles while `get_task` read pending with a '
         f'null claimant and a null heartbeat, and a suppressed write stalled a '
         f'decision task.\n\n'
-        f'The `{CLAIMANT_FIELD}` field is that same test precomputed at render time. '
+        f'The `{CLAIMANT_FIELD}` field is that same test, applied to the task record '
+        f'as of when the task tree was read. '
         f'{claimant[ClaimantLabel.NONE]} (no claimant) and '
         f'{claimant[ClaimantLabel.STALE]} (a claimant whose heartbeat is old, missing '
         f'or unreadable) are grounds to proceed; {claimant[ClaimantLabel.LIVE]} is '
@@ -289,9 +290,12 @@ async def render_live_workflow_section(
     project_root: ProjectRoot,
     *,
     now: datetime | None = None,
+    claims_read_at: datetime | None = None,
 ) -> str:
     """Render the section for *tasks*: :func:`build_live_workflow_snapshot`, rendered."""
-    snapshot = await build_live_workflow_snapshot(tasks, project_root, now=now)
+    snapshot = await build_live_workflow_snapshot(
+        tasks, project_root, now=now, claims_read_at=claims_read_at,
+    )
     return snapshot.render()
 
 
@@ -300,6 +304,7 @@ async def build_live_workflow_snapshot(
     project_root: ProjectRoot,
     *,
     now: datetime | None = None,
+    claims_read_at: datetime | None = None,
 ) -> LiveWorkflowSnapshot:
     """Probe *tasks* and return the '### Live-Workflow Signals' snapshot.
 
@@ -425,9 +430,13 @@ async def build_live_workflow_snapshot(
             detector and the landing probe, and used to read the orchestrator
             lock + scheduler-state snapshot for the in-progress corroboration
             gate.
-        now: Injectable reference time for deterministic tests.  Also the
-            reference used for the claimant-heartbeat freshness check in the
-            in-progress corroboration gate.
+        now: The reference for the recent-commit window over LIVE git state,
+            forwarded to the detector; wall clock when None.
+        claims_read_at: The instant *tasks*, and so every ``heartbeat_at`` in
+            them, were read.  Both the in-progress corroboration gate and the
+            claimant label age heartbeats against it, because a heartbeat
+            frozen in a snapshot read minutes ago would otherwise go stale at
+            render time whatever the truth (task 6027).  Defaults to *now*.
     """
     total_active = len(tasks)
     if not tasks:
@@ -435,16 +444,16 @@ async def build_live_workflow_snapshot(
     probed = [
         (str(task['id']), task) for task in _clip_to_cap(tasks) if task.get('id') is not None
     ]
-    now_eff = now or datetime.now(UTC)
+    claims_reference = claims_read_at or now or datetime.now(UTC)
     (project_orchestrator_live, livenesses), landings = await asyncio.gather(
-        _detect_liveness(probed, project_root, now, now_eff),
+        _detect_liveness(probed, project_root, now, claims_reference),
         _landing_verdicts(project_root, probed),
     )
     rows = (
         _row(
             task_id, liveness,
             landing=landings.get(task_id, LandingVerdict.unknown()),
-            claimant=claimant_label(task, now=now_eff),
+            claimant=claimant_label(task, now=claims_reference),
         )
         for (task_id, task), liveness in zip(probed, livenesses, strict=True)
     )
@@ -512,7 +521,7 @@ async def _detect_liveness(
     probed: Sequence[tuple[str, dict]],
     project_root: ProjectRoot,
     now: datetime | None,
-    now_eff: datetime,
+    claims_read_at: datetime,
 ) -> tuple[bool | None, list[WorkflowLiveness | None]]:
     """The hoisted project-wide lock check, and each probed task's liveness (None on error)."""
     project_orch_live, scheduler_state, orch_started = await asyncio.to_thread(
@@ -527,7 +536,9 @@ async def _detect_liveness(
 
     livenesses: list[WorkflowLiveness | None] = []
     for task_id, task in probed:
-        corroborated = _corroboration(task, task_id, now_eff, scheduler_state, orch_started)
+        corroborated = _corroboration(
+            task, task_id, claims_read_at, scheduler_state, orch_started,
+        )
         livenesses.append(await _detect_one(task_id, task, project_root, corroborated, kwargs))
     return project_orch_live, livenesses
 
@@ -535,7 +546,7 @@ async def _detect_liveness(
 def _corroboration(
     task: dict,
     task_id: str,
-    now: datetime,
+    claims_read_at: datetime,
     scheduler_state: SchedulerStateSnapshot | None,
     orchestrator_started: datetime | None,
 ) -> bool | None:
@@ -547,7 +558,7 @@ def _corroboration(
         return None
     try:
         return corroboration_for_task(
-            task, task_id, now=now,
+            task, task_id, now=claims_read_at,
             scheduler_state=scheduler_state,
             orchestrator_started_at=orchestrator_started,
         )
