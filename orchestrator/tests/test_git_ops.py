@@ -10992,6 +10992,44 @@ class TestGetFilesTouchedInBranchWarning:
         ), f'Expected WARNING to mention get_files_touched_in_branch; got: {warning_texts}'
 
 
+@pytest.mark.asyncio
+class TestGetChangedFilesWarning:
+    """Task 3493: get_changed_files keeps its fail-open ``[]`` on a git diff
+    error but no longer swallows the failure silently: it WARNs.
+    """
+
+    async def test_nonexistent_sha_returns_empty_and_warns(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        unresolvable = 'deadbeef' * 5
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.get_changed_files(unresolvable, 'HEAD')
+
+        assert result == [], f'Expected [] on git error; got {result!r}'
+        warning_texts = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any('get_changed_files' in t for t in warning_texts), (
+            f'Expected a WARNING naming get_changed_files; got: {warning_texts}'
+        )
+
+    async def test_success_lists_changed_files_without_warning(
+        self, git_ops: GitOps, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        (git_repo / 'base.py').write_text('# base\n')
+        base_sha = await _commit_all(git_repo, 'base')
+        (git_repo / 'alpha.py').write_text('# alpha\n')
+        (git_repo / 'beta.py').write_text('# beta\n')
+        head_sha = await _commit_all(git_repo, 'add alpha and beta')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            files = await git_ops.get_changed_files(base_sha, head_sha)
+
+        assert sorted(files) == ['alpha.py', 'beta.py']
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 # ---------------------------------------------------------------------------
 # TestMergeTreeConflicts — tests for merge_tree_conflicts() (PRD §5.2, task β)
 # ---------------------------------------------------------------------------

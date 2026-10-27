@@ -12128,11 +12128,24 @@ class GitOps:
             return None
 
     async def get_changed_files(self, from_sha: str, to_sha: str) -> list[str]:
-        """Return list of files changed between two commits."""
-        _, output, _ = await _run(
+        """Return list of files changed between two commits.
+
+        Fails open: a git error (e.g. an unresolvable SHA) returns ``[]`` and
+        is logged at WARNING rather than raised.  An empty list is therefore
+        ambiguous between "no changes" and "git failed"; a caller that must
+        tell them apart uses :meth:`get_merge_diff_files`' ``(files, error)``
+        contract instead.
+        """
+        rc, output, stderr = await _run(
             ['git', 'diff', '--name-only', from_sha, to_sha],
             cwd=self.project_root,
         )
+        if rc != 0:
+            logger.warning(
+                'get_changed_files: git diff %s..%s failed (rc=%s): %s',
+                from_sha, to_sha, rc, (stderr or '').strip()[:200],
+            )
+            return []
         return [f for f in output.strip().splitlines() if f.strip()]
 
     async def get_commit_changed_files(self, sha: str) -> list[str]:
