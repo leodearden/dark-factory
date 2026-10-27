@@ -14,6 +14,7 @@ from typing import cast
 
 import pytest
 import yaml
+from _code_default_hatch import require_code_default_config
 from click.testing import CliRunner
 from pydantic import ValidationError
 from shared.cli_invoke import AgentResult
@@ -601,9 +602,9 @@ class TestRenderProbeArtifact:
 
 
 def _fake_probe_cli_config(tmp_path) -> OrchestratorConfig:
-    """A real OrchestratorConfig for the CLI tests below, each of which
-    requests code_default_config so this construction reads only the
-    package defaults."""
+    """A real OrchestratorConfig for the CLI tests below, built from package
+    defaults only."""
+    require_code_default_config()
     # Default RoutingConfig() (haiku/sonnet/opus) -- ModelsConfig's own
     # defaults (e.g. architect='opus') must stay inside routing.allowed_models
     # or OrchestratorConfig's fail-fast allowlist validator (step-2) rejects

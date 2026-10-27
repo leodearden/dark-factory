@@ -46,6 +46,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _code_default_hatch import require_code_default_config
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler, fixed_prompt
 from shared.cli_invoke import transcript_exists
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
@@ -709,6 +710,7 @@ async def _drive_resumed_invoke(
     driving the arm site's third scoping arm: with no concrete directory there
     is nowhere correct to glob, so the corroboration must NOT veto.
     """
+    require_code_default_config()
     caplog.set_level(logging.INFO)
     sid = (recovered_session or {}).get('session_id', 'x')
     repo = tmp_path / f'resume-repo-{slug or sid}'

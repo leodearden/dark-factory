@@ -28,8 +28,9 @@ This module holds three things:
   ``ORCH_CONFIG_PATH``, which isolates only by accident of cwd, except for the
   tests in ``_ABSENT_CONFIG_PATH_IS_THE_PRECONDITION``, whose every entry is
   itself checked to still name a live site;
-* two contract guards pinning the premise every repair rests on (the hatch
-  really does yield package defaults, and it is NOT autouse).
+* contract guards pinning the premises every repair rests on: the hatch
+  really does yield package defaults, it is NOT autouse, and
+  ``require_code_default_config``, which helpers call, admits only its state.
 """
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ import os
 from pathlib import Path
 
 import pytest
+from _code_default_hatch import require_code_default_config
 from _config_default_scan import (
     DEFAULT_CONFIG,
     ConfigPathWrite,
@@ -1123,6 +1125,8 @@ _ABSENT_CONFIG_PATH_IS_THE_PRECONDITION = frozenset({
      'TestFlakeLedgerCommand.test_no_config_and_no_env_exits_one_with_an_error'),
     ('test_eval_task_sampler.py',
      'TestEvalListFixturesCLI.test_needs_no_orchestrator_config'),
+    ('test_code_default_hatch_guard.py',
+     'TestRequireCodeDefaultConfig.test_fails_when_the_variable_is_unset'),
 })
 
 
@@ -1176,8 +1180,8 @@ def test_every_exemption_still_names_a_blanking_site(file_name, qualname):
 # ---------------------------------------------------------------------------
 # CONTRACT GUARDS
 #
-# The two premises every repair in this sweep rests on.  Both are ratchets:
-# green on arrival, red only if a future change breaks the contract.  Both are
+# The premises every repair in this sweep rests on.  All are ratchets: green
+# on arrival, red only if a future change breaks the contract.  All are
 # behavioural — nothing here asserts on docstring wording, comments or prose.
 # ---------------------------------------------------------------------------
 
@@ -1284,3 +1288,27 @@ class TestHatchIsNotAutouse:
             f'an un-hatched test must read the operational config; '
             f'ORCH_CONFIG_PATH is {in_effect}'
         )
+
+
+class TestRequireCodeDefaultConfig:
+    """The helper-side guard admits the hatch's state and refuses every other.
+
+    Helpers that build a defaults-only config call it, so a caller that
+    forgets the hatch fails instead of silently reading the operational yaml.
+    """
+
+    def test_passes_under_the_hatch(self, code_default_config):
+        require_code_default_config()
+
+    def test_fails_on_the_operational_config(self):
+        with pytest.raises(pytest.fail.Exception):
+            require_code_default_config()
+
+    def test_fails_on_a_repoint_to_an_existing_file(self, declared_probe_config):
+        with pytest.raises(pytest.fail.Exception):
+            require_code_default_config()
+
+    def test_fails_when_the_variable_is_unset(self, monkeypatch):
+        monkeypatch.delenv('ORCH_CONFIG_PATH')
+        with pytest.raises(pytest.fail.Exception):
+            require_code_default_config()

@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import pytest
 import yaml
+from _code_default_hatch import require_code_default_config
 from _orch_helpers import _init_harness_state_for_test
 from escalation.categories import EscalationCategory
 from escalation.models import BORN_AT_L2_SEVERITIES
@@ -35,6 +36,7 @@ from orchestrator.harness import Harness
 def _make_harness(tmp_path, census, queue):
     """Bare Harness (Harness.__new__ + _init_harness_state_for_test) with a real
     config whose unknown_key_census is set directly and the given queue."""
+    require_code_default_config()
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)
     config = OrchestratorConfig(project_root=tmp_path)
