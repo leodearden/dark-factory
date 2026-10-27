@@ -1,16 +1,33 @@
 """The shadow coordinator's storm escape (plans/live-shadow-eval-prd.md decision 10, INV-4).
 
-Part 1 covers the pure storm policy; the coordinator escape follows in part 2.
+Part 1 covers the pure storm policy. Part 2 drives the coordinator's escape
+(row 11) on real stores: a tripped guard pauses durably, files exactly one
+escalation, survives a restart, and a resume restarts every window.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
+import pytest_asyncio
+from _shadow_coordinator_doubles import (
+    INCUMBENTS,
+    PROJECT_ID,
+    RUN_ID,
+    START,
+    CoordinatorRig,
+    build_coordinator,
+    completed,
+    make_task,
+    shadow_config,
+)
+from shared.cost_store import CostStore
 
-from orchestrator.event_store import ShadowSkipReason
+from orchestrator.event_store import EventType, ShadowSkipReason
+from orchestrator.run_store import ShadowCell, ShadowCellQuery
 from orchestrator.shadow_eval import (
     PRODUCTION_COST_BASIS,
     TRAILING_WINDOW,
@@ -21,6 +38,7 @@ from orchestrator.shadow_eval import (
     RatioSkip,
     RunEndedCell,
     StormFacts,
+    StormState,
     StormTrip,
     budget_exhausted,
     cost_ratio_verdict,
@@ -29,7 +47,15 @@ from orchestrator.shadow_eval import (
     failure_streak_tripped,
     storm_window_start,
 )
-from orchestrator.shadow_types import CostBasis, ShadowCellState, ShadowShape, ShadowStormCause
+from orchestrator.shadow_types import (
+    CostBasis,
+    PlanSource,
+    ReferenceKind,
+    ShadowCellState,
+    ShadowShape,
+    ShadowStormCause,
+)
+from orchestrator.workflow_types import WorkflowState
 
 _S = ShadowCellState
 _M = CostBasis.METERED
@@ -225,3 +251,275 @@ class TestStormWindow:
 
     def test_an_old_resume_leaves_the_trailing_day(self):
         assert storm_window_start(_NOW, _NOW - timedelta(days=3)) == _NOW - TRAILING_WINDOW
+
+
+# --------------------------------------------------------------------------- #
+# Part 2: the coordinator's storm escape (row 11)                              #
+# --------------------------------------------------------------------------- #
+
+_METERED_CANDIDATE = 'claude-sonnet-max'
+_SUBSCRIPTION_CANDIDATE = 'glm-5.3-endpoint'
+_STREAK = 5
+_STREAK_TASKS = tuple(f'streak-{i}' for i in range(_STREAK))
+_SEEDED_REASONS = {_S.FAILED: 'runner_raised:RuntimeError', _S.EXPIRED: 'settle_deadline'}
+
+
+@pytest_asyncio.fixture
+async def costs(tmp_path):
+    async with CostStore(tmp_path / 'runs.db') as store:
+        yield store
+
+
+def _storm_rig(tmp_path, costs, **config) -> CoordinatorRig:
+    return build_coordinator(tmp_path, costs, config=shadow_config(**config))
+
+
+def _restarted(tmp_path, costs, rig: CoordinatorRig) -> CoordinatorRig:
+    """A fresh coordinator on the same runs.db, as after the fleet redeploy."""
+    return build_coordinator(
+        tmp_path, costs, config=rig.config, clock=rig.clock, run_id='run-after-restart',
+    )
+
+
+def _cells(rig: CoordinatorRig) -> list[ShadowCell]:
+    return rig.store.find_shadow_cells(ShadowCellQuery(project_id=PROJECT_ID))
+
+
+def _skip_reasons(rig: CoordinatorRig) -> list[str]:
+    return [row['data']['reason'] for row in rig.events_of(EventType.shadow_cell_skipped)]
+
+
+def _causes(rig: CoordinatorRig) -> list[ShadowStormCause]:
+    return [trip.cause for trip in rig.escalator.trips]
+
+
+def _fail_every_run(rig: CoordinatorRig) -> None:
+    rig.runner.script(
+        ShadowShape.IMPLEMENTER, _METERED_CANDIDATE, run_raises=RuntimeError('runner broke'),
+    )
+
+
+async def _open_and_finish(rig: CoordinatorRig, *task_ids: str) -> list[str]:
+    opened: list[str] = []
+    for task_id in task_ids:
+        opened += await rig.coordinator.on_phase(
+            make_task(task_id), WorkflowState.PLAN, entering=False,
+        )
+    await rig.coordinator.join()
+    return opened
+
+
+async def _tripped_streak(tmp_path, costs) -> CoordinatorRig:
+    rig = _storm_rig(tmp_path, costs, failure_streak_pause=_STREAK)
+    _fail_every_run(rig)
+    opened = await _open_and_finish(rig, *_STREAK_TASKS)
+    assert len(opened) == _STREAK
+    return rig
+
+
+def _seed(rig: CoordinatorRig, state: ShadowCellState, *, task_id: str) -> ShadowCell:
+    """Store a cell already in *state*, opened now; the clock then moves on a minute."""
+    now = rig.clock.now()
+    cell = ShadowCell(
+        cell_id=f'seed-{task_id}',
+        project_id=PROJECT_ID,
+        task_id=task_id,
+        shape=ShadowShape.IMPLEMENTER,
+        candidate=_METERED_CANDIDATE,
+        incumbent=INCUMBENTS[ShadowShape.IMPLEMENTER],
+        stratum=('df', 'feature', 'full'),
+        base_sha='a' * 40,
+        state=state,
+        cost_basis=CostBasis.METERED,
+        plan_source=PlanSource.PRODUCTION,
+        reason=_SEEDED_REASONS.get(state),
+        reference_kind=ReferenceKind.NONE if state is _S.SETTLED else None,
+        run_id=RUN_ID,
+        opened_at=now,
+        settle_deadline=now + timedelta(hours=168),
+        settled_at=now if state.stamps_settled_at else None,
+    )
+    rig.store.insert_shadow_cell(cell)
+    rig.clock.advance(timedelta(minutes=1))
+    return cell
+
+
+async def _seed_production_cost(costs: CostStore, task_id: str, cost_usd: float) -> None:
+    await costs.save_invocation(
+        run_id='run-production', task_id=task_id, project_id=PROJECT_ID,
+        account_name='max-a', model='opus', role='implementer',
+        cost_usd=cost_usd, input_tokens=None, output_tokens=None,
+        cache_read_tokens=None, cache_create_tokens=None, duration_ms=100, capped=False,
+        started_at=START.isoformat(), completed_at=START.isoformat(),
+    )
+
+
+class TestFailureStreakEscape:
+    @pytest.mark.asyncio
+    async def test_a_streak_pauses_once_and_holds_every_later_open(self, tmp_path, costs):
+        rig = await _tripped_streak(tmp_path, costs)
+
+        assert {cell.state for cell in _cells(rig)} == {_S.FAILED}
+        state = rig.coordinator.storm_state()
+        assert (state.paused, state.cause) == (True, ShadowStormCause.FAILURE_STREAK)
+        assert _causes(rig) == [ShadowStormCause.FAILURE_STREAK]
+        assert state.detail == rig.escalator.trips[0].detail
+        assert all(cell.cell_id in state.detail for cell in _cells(rig))
+
+        later = await rig.coordinator.on_phase(
+            make_task('after-the-storm'), WorkflowState.PLAN, entering=False,
+        )
+
+        assert later == []
+        assert _skip_reasons(rig) == ['paused']
+        assert len(_cells(rig)) == _STREAK
+
+    @pytest.mark.asyncio
+    async def test_a_further_failure_while_paused_files_no_second_escalation(self, tmp_path, costs):
+        rig = await _tripped_streak(tmp_path, costs)
+        _seed(rig, _S.FAILED, task_id='sixth-failure')
+
+        await rig.coordinator.expire(rig.clock.now())
+
+        assert rig.coordinator.storm_state().paused is True
+        assert len(rig.escalator.trips) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_pause_survives_a_restart_without_a_second_escalation(self, tmp_path, costs):
+        rig = await _tripped_streak(tmp_path, costs)
+        restarted = _restarted(tmp_path, costs, rig)
+
+        await restarted.coordinator.reconcile_on_start()
+
+        state = restarted.coordinator.storm_state()
+        assert (state.paused, state.cause) == (True, ShadowStormCause.FAILURE_STREAK)
+        assert restarted.escalator.trips == []
+        assert len(rig.escalator.trips) == 1
+        assert await restarted.coordinator.on_phase(
+            make_task('after-restart'), WorkflowState.PLAN, entering=False,
+        ) == []
+
+    @pytest.mark.asyncio
+    async def test_resume_lifts_the_pause_and_restarts_the_streak(self, tmp_path, costs):
+        rig = await _tripped_streak(tmp_path, costs)
+        rig.clock.advance(timedelta(minutes=5))
+
+        assert await rig.coordinator.resume() is True
+
+        assert rig.coordinator.storm_state() == StormState(paused=False, cause=None, detail=None)
+        assert rig.store.get_shadow_storm(PROJECT_ID).paused is False
+
+        opened = await _open_and_finish(rig, 'after-resume')
+        await rig.coordinator.expire(rig.clock.now())
+
+        assert len(opened) == 1
+        assert rig.store.get_shadow_cell(opened[0]).state is _S.FAILED
+        assert rig.coordinator.storm_state().paused is False
+        assert rig.store.get_shadow_storm(PROJECT_ID).paused is False
+        assert len(rig.escalator.trips) == 1
+
+    @pytest.mark.asyncio
+    async def test_resume_without_a_pause_changes_nothing(self, tmp_path, costs):
+        rig = _storm_rig(tmp_path, costs)
+
+        assert await rig.coordinator.resume() is False
+        assert rig.store.get_shadow_storm(PROJECT_ID).resumed_at is None
+
+    @pytest.mark.parametrize(
+        'breaker,expected',
+        [
+            (_S.AWAITING_REFERENCE, []),
+            (_S.SETTLED, []),
+            (_S.FAILED, [ShadowStormCause.FAILURE_STREAK]),
+        ],
+        ids=['awaiting', 'settled', 'control-failed'],
+    )
+    @pytest.mark.asyncio
+    async def test_a_completed_run_breaks_the_streak(self, tmp_path, costs, breaker, expected):
+        rig = _storm_rig(tmp_path, costs, failure_streak_pause=_STREAK)
+        _seed(rig, breaker, task_id='breaker')
+        for i in range(_STREAK - 1):
+            _seed(rig, _S.FAILED, task_id=f'failed-{i}')
+
+        await rig.coordinator.expire(rig.clock.now())
+
+        assert _causes(rig) == expected
+        assert rig.coordinator.storm_state().paused is bool(expected)
+
+
+class TestCostGuardsEscape:
+    @pytest.mark.parametrize(
+        'candidate,basis,expected',
+        [
+            (_METERED_CANDIDATE, CostBasis.METERED, [ShadowStormCause.DAILY_BUDGET]),
+            (_SUBSCRIPTION_CANDIDATE, CostBasis.SUBSCRIPTION, []),
+        ],
+        ids=['metered', 'subscription'],
+    )
+    @pytest.mark.asyncio
+    async def test_the_daily_budget_counts_only_metered_dollars(
+        self, tmp_path, costs, candidate, basis, expected,
+    ):
+        rig = _storm_rig(tmp_path, costs, candidates=[candidate], daily_budget_usd=1.0)
+        rig.runner.default = completed(cost_usd=0.6)
+
+        opened = await _open_and_finish(rig, 'budget-a', 'budget-b')
+
+        assert len(opened) == 2
+        assert [(cell.cost_usd, cell.cost_basis) for cell in _cells(rig)] == [(0.6, basis)] * 2
+        assert _causes(rig) == expected
+        assert rig.coordinator.storm_state().paused is bool(expected)
+
+    @pytest.mark.parametrize(
+        'candidate,expected',
+        [
+            (_METERED_CANDIDATE, [ShadowStormCause.COST_RATIO]),
+            (_SUBSCRIPTION_CANDIDATE, []),
+        ],
+        ids=['metered', 'subscription'],
+    )
+    @pytest.mark.asyncio
+    async def test_the_cost_ratio_trips_only_on_a_production_basis_arm(
+        self, tmp_path, costs, candidate, expected,
+    ):
+        rig = _storm_rig(tmp_path, costs, candidates=[candidate], cost_ratio_ceiling=3.0)
+        rig.runner.default = completed(cost_usd=4.0)
+        tasks = ('ratio-a', 'ratio-b')
+        for task_id in tasks:
+            await _seed_production_cost(costs, task_id, 1.0)
+        await _open_and_finish(rig, *tasks)
+
+        for task_id in tasks:
+            await rig.coordinator.on_merge_finalized(
+                {'task_id': task_id, 'state': 'done', 'merge_sha': 'f' * 40},
+            )
+
+        assert {cell.state for cell in _cells(rig)} == {_S.SETTLED}
+        assert _causes(rig) == expected
+        assert rig.coordinator.storm_state().paused is bool(expected)
+
+
+@pytest.mark.asyncio
+async def test_a_failing_escalation_leaves_the_pause_standing(tmp_path, costs, caplog):
+    rig = _storm_rig(tmp_path, costs, failure_streak_pause=_STREAK)
+    rig.escalator.raises = RuntimeError('escalation server down')
+    _fail_every_run(rig)
+
+    with caplog.at_level(logging.ERROR, logger='orchestrator.shadow_eval'):
+        await _open_and_finish(rig, *_STREAK_TASKS)
+
+    assert len(rig.escalator.trips) == 1
+    assert rig.coordinator.storm_state().paused is True
+    assert rig.store.get_shadow_storm(PROJECT_ID).cause is ShadowStormCause.FAILURE_STREAK
+    assert any(
+        record.levelno == logging.ERROR
+        and record.exc_info is not None
+        and record.exc_info[1] is rig.escalator.raises
+        for record in caplog.records
+    )
+
+    restarted = _restarted(tmp_path, costs, rig)
+    await restarted.coordinator.reconcile_on_start()
+
+    assert restarted.escalator.trips == []
+    assert restarted.coordinator.storm_state().paused is True
