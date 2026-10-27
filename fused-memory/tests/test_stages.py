@@ -24,6 +24,7 @@ from _fused_memory_tool_surface import (
     registered_fused_memory_tools,
 )
 from _tool_surface_classification import assert_tool_surface_classified
+from reconciliation.harness_fixtures import make_harness
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
@@ -13079,21 +13080,14 @@ class TestBaseStageEscalationQueueAttribute:
 def minimal_harness():
     """Construct a minimal ReconciliationHarness with all deps mocked."""
     from fused_memory.config.schema import FusedMemoryConfig
-    from fused_memory.reconciliation.harness import ReconciliationHarness
 
-    config = FusedMemoryConfig()
-    memory_service = AsyncMock()
-    taskmaster = AsyncMock()
-    journal = AsyncMock()
-    event_buffer = AsyncMock()
-    harness = ReconciliationHarness(
-        memory_service=memory_service,
-        taskmaster=taskmaster,
-        journal=journal,
-        event_buffer=event_buffer,
-        config=config,
+    return make_harness(
+        journal=AsyncMock(),
+        event_buffer=AsyncMock(),
+        memory_service=AsyncMock(),
+        taskmaster=AsyncMock(),
+        config=FusedMemoryConfig(),
     )
-    return harness
 
 
 class TestHarnessWiresEscalationQueueOntoStages:
