@@ -5760,19 +5760,16 @@ class Harness:
                     tid, status, mid_run=mid_run, tally=tally,
                 )
             except SetTaskStatusRejected as exc:
-                # Persistence layer refused our write — escalate directly
-                # (task 2243, W10-θ2 step-14: the per-tid strike counter and
-                # its MAX_RECONCILE_FAILURES threshold gate are retired; a
-                # persistent rejection is now surfaced loudly on the sweep
-                # it occurs, not tallied toward a threshold first).  Honest
-                # log so future operators can see *why* the task is still
-                # stranded instead of the old "marked done" misnomer.
-                # Other (unexpected) exception types intentionally propagate
-                # so bugs in the sweep surface rather than being silently
-                # skipped.
+                # Persistence layer refused a recovery write (mark-done or the
+                # pending revert) — escalate directly (task 2243, W10-θ2
+                # step-14: the per-tid strike counter is retired).  The log
+                # names the transition the refused write attempted.  Other
+                # (unexpected) exception types intentionally propagate so bugs
+                # in the sweep surface rather than being silently skipped.
                 logger.error(
-                    '%s: failed to mark task %s done — %s: %s',
-                    log_prefix, tid, exc.error_code, exc.raw,
+                    '%s: reconcile write refused for task %s (%s) — %s: %s',
+                    log_prefix, tid, exc.attempted_transition,
+                    exc.error_code, exc.raw,
                 )
                 if self._escalation_queue:
                     self._escalate_reconcile_failure(tid, exc)
@@ -7425,12 +7422,13 @@ class Harness:
     ) -> None:
         """Submit an L1 escalation for a persistent reconcile failure.
 
-        Fired directly on every ``mark_done`` rejection the reconcile sweep
-        observes for *tid* (task 2243, W10-θ2 step-14 — the per-tid strike
-        counter and its ``MAX_RECONCILE_FAILURES`` threshold gate are
-        retired): the persistence layer contradicts a branch-on-main
-        observation, which is L1-worthy on its own without waiting for a
-        run of consecutive sweeps to confirm it.
+        Fired directly on every recovery-write rejection the reconcile sweep
+        observes for *tid* — a mark-done on landing evidence or the pending
+        revert of a stranded task (task 2243, W10-θ2 step-14 — the per-tid
+        strike counter and its ``MAX_RECONCILE_FAILURES`` threshold gate are
+        retired): the persistence layer refusing the sweep's recovery is
+        L1-worthy on its own without waiting for a run of consecutive sweeps
+        to confirm it.
         """
         if not self._escalation_queue:
             return
@@ -7442,17 +7440,20 @@ class Harness:
             agent_role='harness-reconcile',
             severity='blocking',
             category='reconcile_persistent_rejection',
-            summary=f'Reconcile sweep failed to mark task {tid} done'[:200],
+            summary=(
+                f'Reconcile sweep write refused for task {tid}: '
+                f'{exc.attempted_transition}'
+            )[:200],
             detail=(
-                f'set_task_status(done) rejected by fused-memory for task '
-                f'{tid}.\n\n'
+                f'Reconcile sweep write for task {tid} was refused by '
+                f'fused-memory.\n\n'
+                f'attempted transition: {exc.attempted_transition}\n'
                 f'error_code: {exc.error_code}\n'
                 f'raw: {exc.raw}\n\n'
-                f'The branch was observed on main (or a merge marker was '
-                f'found) but the persistence layer refuses the transition. '
-                f'Manual investigation required — the row may carry stale '
-                f'metadata.files or the done_provenance ancestor check may '
-                f'be failing.'
+                f"The sweep's recovery write (mark-done on landing evidence, "
+                f'or revert-to-pending of a stranded task) was refused by the '
+                f'persistence layer; the error_code and raw rejection above '
+                f'name the gate that refused it. Manual investigation required.'
             ),
             suggested_action='investigate_persistence_layer_rejection',
             filing_claimant_run_id=self._filing_claimant_run_id,

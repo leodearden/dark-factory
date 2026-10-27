@@ -32,8 +32,8 @@ STALE_HEARTBEAT = '2026-08-19T21:57:20+00:00'
 class _ServerGatedRowStore(HermeticMcpSession):
     """One task row whose ``set_task_status`` gates like fused-memory's interceptor.
 
-    ``refusal`` (a payload dict) answers the next status writes verbatim;
-    otherwise a non-terminal write onto a terminal row without
+    While set, ``refusal`` (a payload dict) answers every status write
+    verbatim; otherwise a non-terminal write onto a terminal row without
     ``reopen_reason`` gets the real terminal-exit payload. ``writes`` records
     each applied write with a snapshot of the row after it. With
     ``status_unreadable`` set, ``get_task`` answers the row without its status.
