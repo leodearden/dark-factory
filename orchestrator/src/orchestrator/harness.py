@@ -32,6 +32,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
+from shared.elision import elide_at_word
 from shared.eval_lane import eval_lane_provenance
 from shared.loop_stall import LoopStallMonitor
 from shared.mcp_envelope import resolver_failed
@@ -411,6 +412,8 @@ _AUTO_EVAL_SUPERSEDE_SAFE_STATUSES: frozenset[str] = frozenset({'pending'})
 _AUTO_EVAL_EXCLUDED_BLOCK_CATEGORIES: frozenset[str] = frozenset(
     {'wip_conflict', 'infra_issue', 'branch_reset'},
 )
+
+_REDO_TITLE_MAX = 200
 
 # Grace period added to the watcher rotation timeout on top of
 # watcher_rotation_hours*3600.  Gives the agent time to emit its digest and
@@ -11243,14 +11246,14 @@ class Harness:
             'files': sanitize_files_for_persist(task_metadata.get('files') or []),
         }
 
-        title = (
-            f'[auto-eval redo] {assignment.task.get("title", "")}'
-        )[:200]
+        original_title = str(assignment.task.get('title') or '')
+        title = elide_at_word(f'[auto-eval redo] {original_title}', _REDO_TITLE_MAX)
         description = (
             f'Automated full-architect redo of task {original_id} '
             f'(blocked at phase={report.block_phase} via optimistic path '
             f'{optimistic_path!r}). Original branch+worktree are renamed to '
             f'{new_branch} for forensic comparison once this redo is released.'
+            f'\n\nOriginal title: {original_title}'
         )
 
         outcome = await self.scheduler.submit_task({
