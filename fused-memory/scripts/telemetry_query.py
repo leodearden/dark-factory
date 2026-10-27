@@ -21,12 +21,20 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from shared.cli_boundary import LoudArgumentParser, run_cli
+
 from fused_memory.services.write_journal import OPERATOR_TELEMETRY_QUERY
 
 DEFAULT_JOURNAL = Path('/home/leo/src/dark-factory/data/reconciliation/write_journal.db')
 DEFAULT_WINDOW = timedelta(days=1)
 DEFAULT_LIMIT = 50
 CONNECT_TIMEOUT_SECONDS = 5.0
+
+EXIT_RUN_FAILED = 1
+"""The journal could not be read, or stdout failed.
+
+Agrees with ``shared.cli_boundary.EXIT_STDOUT_FAILED``.
+"""
 
 
 def journal_timestamp(text: str) -> str:
@@ -56,8 +64,8 @@ def read_telemetry(journal: Path, since: str, limit: int) -> list[dict[str, Any]
         con.close()
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+def build_parser() -> LoudArgumentParser:
+    parser = LoudArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument('--journal', type=Path, default=DEFAULT_JOURNAL)
@@ -77,11 +85,11 @@ def main(argv: list[str] | None = None) -> int:
         rows = read_telemetry(args.journal, args.since, args.limit)
     except sqlite3.Error as exc:
         print(f'cannot read {args.journal}: {exc}', file=sys.stderr)
-        return 1
+        return EXIT_RUN_FAILED
     for row in rows:
         print(json.dumps(row))
     return 0
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))

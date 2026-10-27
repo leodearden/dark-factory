@@ -5,7 +5,8 @@
 # Project-specific checks are REACHED on every branch too, and the
 # project decides which of them apply to which branch -- hooks/project-checks
 # receives the branch as $2 and applies its own per-check policy (today:
-# the merge-lane ratchet audit universal, ruff/pyright main-only).
+# the merge-lane ratchet audit and the code-quality render check universal,
+# ruff/pyright main-only).
 #
 # WHY THE BRANCH IS PASSED DOWN RATHER THAN DECIDED HERE.  This hook used
 # to `exit 0` on every branch that is not main, so a project check could

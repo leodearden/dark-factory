@@ -7,9 +7,13 @@ choices, and the ``EventProbes`` per-event memo.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
-from collections.abc import Callable
+import subprocess
+import sys
+from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
 from _process_tree_fakes import claude_process_tree, counting_walks, fake_process_tree
@@ -48,6 +52,78 @@ def test_default_process_tree_reads_this_process_name() -> None:
 
 def test_default_process_tree_session_leader_is_this_process_session() -> None:
     assert ProcessTree().session_leader_pid() == os.getsid(0)
+
+
+# comm is arbitrary process-settable bytes; this child names itself b'\xff\xfe'
+# and stays alive until its stdin closes.
+_UNDECODABLE_NAME_CHILD = (
+    'import ctypes, sys\n'
+    "ctypes.CDLL(None).prctl(15, b'\\xff\\xfe', 0, 0, 0)\n"
+    "print('ready', flush=True)\n"
+    'sys.stdin.read()\n'
+)
+
+
+# Names itself 'claude', runs argv[1:] as its own child on the shared stdin, and
+# reports that child's pid once the child is ready.
+_CLAUDE_NAMED_PARENT = (
+    'import ctypes, subprocess, sys\n'
+    "ctypes.CDLL(None).prctl(15, b'claude', 0, 0, 0)\n"
+    'child = subprocess.Popen(sys.argv[1:], stdout=subprocess.PIPE)\n'
+    'child.stdout.readline()\n'
+    'print(child.pid, flush=True)\n'
+    'child.wait()\n'
+)
+
+
+@contextlib.contextmanager
+def _undecodably_named_process(*, under_a_claude: bool = False) -> Iterator[list[int]]:
+    """Yields the pids it launched, outermost first; the last is live and named b'\\xff\\xfe'.
+
+    *under_a_claude* launches that process as the child of a live 'claude'-named
+    one. Each blocks on this test's stdin pipe, so closing it on exit releases them all.
+    """
+    undecodable = [sys.executable, '-c', _UNDECODABLE_NAME_CHILD]
+    launched = subprocess.Popen(
+        [sys.executable, '-c', _CLAUDE_NAMED_PARENT, *undecodable] if under_a_claude else undecodable,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert launched.stdout is not None
+        handshake = launched.stdout.readline().strip()
+        if under_a_claude:
+            names = {launched.pid: b'claude\n', int(handshake): b'\xff\xfe\n'}
+        else:
+            assert handshake == b'ready'
+            names = {launched.pid: b'\xff\xfe\n'}
+        assert {pid: Path(f'/proc/{pid}/comm').read_bytes() for pid in names} == names, (
+            'harness failure: a staged process did not rename itself'
+        )
+        yield list(names)
+    finally:
+        assert launched.stdin is not None
+        launched.stdin.close()
+        try:
+            launched.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            launched.kill()
+            launched.wait()
+
+
+@pytest.mark.timeout(15)
+def test_default_process_tree_reads_an_undecodable_name_as_replacement_characters() -> None:
+    with _undecodably_named_process() as [pid]:
+        assert ProcessTree().comm_of(pid) == '��'
+
+
+@pytest.mark.timeout(15)
+def test_default_process_tree_reads_the_parent_of_a_process_with_an_undecodable_name() -> None:
+    # /proc/<pid>/status opens with `Name:` and the raw comm bytes, so a
+    # strict decode of the whole body would hide a plain-ASCII PPid line.
+    with _undecodably_named_process() as [pid]:
+        assert ProcessTree().parent_pid_of(pid) == os.getpid()
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +171,16 @@ def test_owning_claude_pid_walk_is_bounded() -> None:
     chain = [(1000 - i, 'bash') for i in range(MAX_CLAUDE_ANCESTOR_HOPS)]
     chain.append((1000 - MAX_CLAUDE_ANCESTOR_HOPS, 'claude'))
     assert EventProbes({}, fake_process_tree(chain)).owning_claude_pid() is None
+
+
+@pytest.mark.timeout(15)
+def test_owning_claude_pid_walks_past_an_ancestor_with_an_undecodable_name() -> None:
+    # A live chain read through the real /proc readers: the hook's parent is
+    # named b'\xff\xfe' and its own parent is the claude. Neither the name
+    # read nor the parent read may end the walk at the undecodable level.
+    with _undecodably_named_process(under_a_claude=True) as [claude_pid, undecodable_pid]:
+        tree = dataclasses.replace(ProcessTree(), hook_parent_pid=lambda: undecodable_pid)
+        assert EventProbes({}, tree).owning_claude_pid() == claude_pid
 
 
 # ---------------------------------------------------------------------------

@@ -25,6 +25,7 @@ import logging
 import math
 import re
 import subprocess
+import sys
 from collections.abc import Callable
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
@@ -45,6 +46,7 @@ from legibility import (
     filing_policy,
     finding_area,
     invariants,
+    landing_gate,
     prescreen,
     session_ledger,
     session_runner,
@@ -259,6 +261,12 @@ def _poison(name):
     return _fn
 
 
+def _passing_gate():
+    """The `gate() -> landing_gate.GateVerdict` seam of a project whose
+    landing gate passes."""
+    return landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0)
+
+
 # ---------------------------------------------------------------------------
 # step-1: RED — is_duplicate() / batch_dup_rate()
 # ---------------------------------------------------------------------------
@@ -427,21 +435,25 @@ def test_mine_to_saturation_storm_batch_never_counts_as_saturated():
     assert len(result.batch_stats) == 4
 
     assert result.batch_stats[0].saturated is True
-    assert result.batch_stats[0].status == "ok"
+    assert isinstance(result.batch_stats[0].status, coder.CodingStatus)
+    assert result.batch_stats[0].status == coder.CodingStatus.OK
 
     storm = result.batch_stats[1]
     assert storm.total == 10
     assert storm.succeeded == 4
     assert storm.failed == 6
-    assert storm.status == "failure", "RunResult.status must be surfaced on BatchStats"
+    assert isinstance(storm.status, coder.CodingStatus)
+    assert storm.status == coder.CodingStatus.FAILURE, (
+        "RunResult.status must be surfaced on BatchStats"
+    )
     assert storm.dup_rate == pytest.approx(1.0), "dup_rate is still recorded for visibility"
     assert storm.saturated is False, "a storm batch must never satisfy saturation"
 
     # post-storm-reset: TWO fresh consecutive real-saturated batches are needed to stop
     assert result.batch_stats[2].saturated is True
-    assert result.batch_stats[2].status == "ok"
+    assert result.batch_stats[2].status == coder.CodingStatus.OK
     assert result.batch_stats[3].saturated is True
-    assert result.batch_stats[3].status == "ok"
+    assert result.batch_stats[3].status == coder.CodingStatus.OK
 
 
 # ---------------------------------------------------------------------------
@@ -1683,16 +1695,39 @@ def _storm_capped_mining_result():
         batch_stats=[
             mod.BatchStats(
                 index=0, total=10, succeeded=10, failed=0, dup_rate=0.1,
-                saturated=False, status="ok",
+                saturated=False, status=coder.CodingStatus.OK,
             ),
             mod.BatchStats(
                 index=1, total=10, succeeded=4, failed=6, dup_rate=1.0,
-                saturated=False, status="failure",
+                saturated=False, status=coder.CodingStatus.FAILURE,
             ),
         ],
         stop_reason="capped",
         max_batches=2,
     )
+
+
+def test_batch_status_reads_back_from_a_census_record_as_a_coding_status():
+    """run_census renders the report from the record's JSON text, which
+    stores the status as its string; BatchStats.from_record reads it back
+    as the enum, and the report renders the same either way."""
+    record = _census_record(mining_result=_storm_capped_mining_result())
+    restored = json.loads(json.dumps(record))
+
+    batches = [mod.BatchStats.from_record(stats) for stats in restored["mining"]["batch_stats"]]
+
+    assert batches == _storm_capped_mining_result().batch_stats
+    assert all(isinstance(batch.status, coder.CodingStatus) for batch in batches)
+    assert mod.census_report_sections(restored) == mod.census_report_sections(record)
+
+
+def test_a_census_record_batch_status_outside_coding_status_is_rejected():
+    record = _census_record(mining_result=_storm_capped_mining_result())
+    restored = json.loads(json.dumps(record))
+    restored["mining"]["batch_stats"][1]["status"] = "stormy"
+
+    with pytest.raises(ValueError, match="stormy"):
+        mod.census_report_sections(restored)
 
 
 def _section(sections, key):
@@ -2820,6 +2855,7 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
         task_store=FakeTaskStore(),
         escalate_fn=_make_fake_escalate_fn(),
         status_fetcher=_make_fake_status_fetcher(0),
+        gate=_passing_gate,
         commit=_poison("commit"),
         roll_back=_poison("roll_back"),
         codebook_dict=_minimal_v2_codebook(),
@@ -3486,6 +3522,135 @@ def test_run_census_lands_through_a_transient_index_lock(tmp_path):
     head_state = json.loads(_git(repo, "show", "HEAD:docs/legibility/census-state.json"))
     assert head_state["last_census_at"] == "2026-07-14"
     assert _git(repo, "ls-files", "--", "plans/confusion-census-2026-07-14.md") != b""
+
+
+def test_run_census_commit_refusal_keeps_its_summary_and_detail_and_records_the_passed_gate(tmp_path):
+    rollback = unlanded.Rollback(quarantine_dir=tmp_path / "q" / "census-2026-07-14-x", paths=("a",))
+    kwargs = _unlanded_kwargs(tmp_path, roll_back=_make_fake_roll_back(rollback))
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "unlanded"
+    assert outcome.gate == _passing_gate()
+    (call,) = kwargs["escalate_fn"].calls
+    assert call["summary"] == (
+        "legibility census commit did not land (dark_factory): outputs rolled back, "
+        "census-state NOT advanced"
+    )
+    assert call["detail"].startswith(
+        f"git commit did not land after 1 attempt(s): {_REFUSAL}\n\n{rollback.describe()}\n\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 7448: a census lands only once the project's landing gate passes over
+# the outputs it wrote; a refusal takes the same unlanded shape as a refused
+# commit, and the commit is never attempted.
+# ---------------------------------------------------------------------------
+
+_GATE_ARGV = ("uv", "run", "pytest", "scripts/tests/test_codebook.py")
+_GATE_TAIL = "1 failed: test_live_codebook_withdraws_the_refuted_em_dash_framing"
+
+
+def _refusing_gate_verdict(status: landing_gate.GateStatus) -> landing_gate.GateVerdict:
+    if status is landing_gate.GateStatus.FAILED:
+        return landing_gate.GateVerdict(status, _GATE_ARGV, 1, _GATE_TAIL)
+    return landing_gate.GateVerdict(status, _GATE_ARGV, None, _GATE_TAIL, "timed out after 900s")
+
+
+def _make_fake_gate(verdict, *, on_call=None):
+    """Fake `gate() -> landing_gate.GateVerdict` seam returning *verdict*,
+    running *on_call* first when given. Counts its calls in `.calls`."""
+    calls = []
+
+    def fake_gate():
+        calls.append(None)
+        if on_call is not None:
+            on_call()
+        return verdict
+
+    fake_gate.calls = calls
+    return fake_gate
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["filed", "dry-run"])
+@pytest.mark.parametrize(
+    "status", [landing_gate.GateStatus.FAILED, landing_gate.GateStatus.DID_NOT_RUN],
+)
+def test_run_census_refused_by_its_landing_gate_rolls_back_unlanded_and_never_commits(
+    tmp_path, status, dry_run,
+):
+    refusal = _refusing_gate_verdict(status)
+    gate = _make_fake_gate(refusal)
+    rollback = unlanded.Rollback(quarantine_dir=tmp_path / "q" / "census-2026-07-14-x", paths=("a",))
+    fake_roll_back = _make_fake_roll_back(rollback)
+    payloads_path = tmp_path / "confusion-census-2026-07-14-payloads.json" if dry_run else None
+    kwargs = _mined_run_kwargs(
+        tmp_path, gate=gate, commit=_poison("commit"), roll_back=fake_roll_back,
+        dry_run_payloads_path=payloads_path,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "unlanded"
+    assert outcome.gate is refusal
+    assert outcome.rollback is rollback
+    assert (outcome.report_path, outcome.record_path) == (None, None)
+    assert len(gate.calls) == 1
+    report_path = kwargs["report_path"]
+    written = [
+        str(report_path), str(report_path.with_suffix(".json")),
+        str(kwargs["codebook_path"]), str(kwargs["census_state_path"]),
+    ]
+    if payloads_path is not None:
+        written.append(str(payloads_path))
+    assert fake_roll_back.calls == [{"paths": written}]
+
+    (call,) = kwargs["escalate_fn"].calls
+    assert call["severity"] == "info"
+    assert "landing gate" in call["summary"]
+    assert "dark_factory" in call["summary"]
+    assert "census-state NOT advanced" in call["summary"]
+    assert call["detail"].startswith(refusal.describe())
+    assert _GATE_TAIL in call["detail"]
+    assert str(rollback.quarantine_dir) in call["detail"]
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, _GATE_ARGV, 0, "2 passed"),
+        landing_gate.GateVerdict(landing_gate.GateStatus.UNGATED),
+    ],
+    ids=["passed", "ungated"],
+)
+def test_run_census_runs_its_gate_over_the_written_outputs_then_commits(tmp_path, verdict):
+    order = []
+    seen = {}
+    kwargs: dict[str, Any] = {}
+
+    def read_written_outputs():
+        order.append("gate")
+        seen["codebook"] = codebook.load(kwargs["codebook_path"])
+        seen["state"] = json.loads(kwargs["census_state_path"].read_text())
+
+    fake_commit = _make_fake_commit()
+
+    def commit(**commit_kwargs):
+        order.append("commit")
+        return fake_commit(**commit_kwargs)
+
+    gate = _make_fake_gate(verdict, on_call=read_written_outputs)
+    kwargs.update(_mined_run_kwargs(tmp_path, gate=gate, commit=commit))
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert outcome.gate is verdict
+    assert order == ["gate", "commit"]
+    assert seen["codebook"] == codebook.load(kwargs["codebook_path"])
+    assert seen["codebook"] != kwargs["codebook_dict"]
+    assert seen["state"]["last_census_at"] == "2026-07-14"
 
 
 # ---------------------------------------------------------------------------
@@ -5798,6 +5963,42 @@ def test_main_exits_nonzero_and_names_the_quarantine_when_the_census_did_not_lan
 
     assert exit_code == 1
     assert str(quarantine_dir) in capsys.readouterr().err
+
+
+def test_main_hands_run_census_the_projects_landing_gate_run_in_its_root(tmp_path, monkeypatch):
+    config_path = _write_legibility_yaml(tmp_path)
+    argv = [sys.executable, "-c", "import os; print(os.getcwd())"]
+    with config_path.open("a", encoding="utf-8") as fh:
+        fh.write(f"census: {{landing_gate: {{argv: {json.dumps(argv)}}}}}\n")
+    _commit_all(tmp_path)
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+
+    assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
+
+    verdict = fake_run_census.calls[0]["gate"]()
+    assert verdict.status is landing_gate.GateStatus.PASSED
+    assert verdict.output_tail.strip() == str(tmp_path.resolve())
+
+
+def test_main_names_the_landing_gate_when_it_refused_the_census(tmp_path, monkeypatch, capsys):
+    _census_project(tmp_path)
+    refusal = _refusing_gate_verdict(landing_gate.GateStatus.FAILED)
+    monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(outcome=mod.CensusOutcome(
+        status="unlanded",
+        rollback=unlanded.Rollback(
+            quarantine_dir=tmp_path / "q" / "census-2026-07-14-x",
+            paths=("docs/legibility/census-state.json",),
+        ),
+        gate=refusal,
+    )))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "landing gate refused the census" in err
+    assert refusal.describe() in err
 
 
 @pytest.mark.parametrize("ledger_error", [None, "/state/coded-sessions.sqlite: disk I/O error"])

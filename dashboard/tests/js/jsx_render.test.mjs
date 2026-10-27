@@ -12,6 +12,7 @@ import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
   escalationAnalytics,
+  mergeQueueBlock,
   openEscalationItem,
   orchestratorRow,
   projectRow,
@@ -361,5 +362,27 @@ for (const { pinned, pins } of PINNING_TILE_FIXTURES) {
       hint.endsWith(` ${pinnedTaskCount} ${noun}`),
       `the hint "${hint}" must count pinningSummary().pinnedTaskCount = ${pinnedTaskCount} ${noun}`,
     );
+  });
+}
+
+// ── Decision 5: the depth chart's bucket width (merge_queue.js::depthBucketCaption) ──
+// The panel names the width the server counted the series at; a series that
+// names none names no width.
+
+for (const bucketMinutes of [60, null]) {
+  test(`tabs.jsx::MergeTab titles its depth panel with depthBucketCaption for bucket_minutes ${bucketMinutes}`, t => {
+    const harness = openWindow(t);
+    const block = mergeQueueBlock({ bucketMinutes });
+    seedDashboardData(harness.window, {
+      MERGE_QUEUE: { [PROJECT]: block },
+      __receipt: receiptsFor(harness.window.DF_DATA_LOADER, ['MERGE_QUEUE']),
+    });
+    const { container } = harness.mount(harness.window.DF_TABS.MergeTab, { projectFilter: [] });
+
+    const titles = [...container.querySelectorAll('.panel-head > .title')]
+      .map(title => title.textContent)
+      .filter(text => text.startsWith('Merge attempts'));
+    const caption = harness.window.DF_MERGE_QUEUE.depthBucketCaption(block.depth);
+    assert.deepEqual(titles, [`Merge attempts · ${caption}`]);
   });
 }

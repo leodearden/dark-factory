@@ -1,11 +1,12 @@
-"""Unit tests of the five pure faces the commit-time ratchet gate calls.
+"""Unit tests of the pure faces the commit-time ratchet gate calls.
 
 ``scripts/check_staged_ratchet_raise.py`` asks what a commit's STAGED baseline
 and ledger change against HEAD -- or, finishing a conflicted merge, against both
 parents. ``compare_baseline_files`` and ``compare_merged_baseline_files`` give
-what the staged image raises; ``ledger_appended_entries`` and
-``ledger_merged_entries`` give what the staged ledger adds; ``unrecorded_raises``
-gives which raises those additions leave uncovered. The gate's git plumbing is
+what the staged image raises; ``own_entry_names`` gives which entry files the
+commit adds, and ``retire_legacy_ledger`` holds the one commit that splits the
+retired array; ``unrecorded_raises`` gives which raises those additions leave
+uncovered. The gate's git plumbing is
 pinned end to end in ``test_merge_lane_ratchet_commit_gate.py``. Every image and
 ledger here is built from the shared seed in ``_merge_lane_ratchet_fixtures.py``,
 and no live measurement is taken.
@@ -13,6 +14,8 @@ and no live measurement is taken.
 from __future__ import annotations
 
 import copy
+import dataclasses
+import json
 from pathlib import Path
 
 import pytest
@@ -69,7 +72,7 @@ class TestCompareBaselineFiles:
         self, tmp_path: Path
     ) -> None:
         previous, current = self._pair(
-            tmp_path, lambda report: report['files']['a.py'].__setitem__('lines', 1005)
+            tmp_path, lambda report: report['files']['a.py'].__setitem__('cognitive', 125)
         )
 
         raises = metrics.compare_baseline_files(previous, current)
@@ -79,13 +82,13 @@ class TestCompareBaselineFiles:
         # the same raise. The total comes along because it is DERIVED -- moving
         # the mass to a new path is the shape that check exists for.
         assert [_violation_fields(v) for v in raises] == [
-            _violation_fields(metrics.Violation.rose('lines', 'a.py', 1000, 1005)),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205),
+            _violation_fields(metrics.Violation.rose('cognitive', 'a.py', 120, 125)),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 150, 155),
         ]
 
     def test_a_fall_is_clean(self, tmp_path: Path) -> None:
         previous, current = self._pair(
-            tmp_path, lambda report: report['files']['a.py'].__setitem__('lines', 995)
+            tmp_path, lambda report: report['files']['a.py'].__setitem__('cognitive', 115)
         )
 
         # Lowering is the point of a ratchet, so it must never need authorizing.
@@ -105,11 +108,39 @@ class TestCompareBaselineFiles:
         # (previous, current), so a crossed call is a live hazard -- and a
         # crossed call reads CLEAN, which is the failure a gate must never have.
         previous, current = self._pair(
-            tmp_path, lambda report: report['files']['a.py'].__setitem__('lines', 1005)
+            tmp_path, lambda report: report['files']['a.py'].__setitem__('cognitive', 125)
         )
 
         assert metrics.compare_baseline_files(previous, current)
         assert metrics.compare_baseline_files(current, previous) == []
+
+    @pytest.mark.parametrize(
+        'mutate',
+        [
+            pytest.param(
+                lambda report: report['files']['a.py'].__setitem__('lines', 1005),
+                id='lines',
+            ),
+            pytest.param(
+                lambda report: report['files']['a.py'].__setitem__('prose_lines', 460),
+                id='prose_lines',
+            ),
+            pytest.param(
+                lambda report: report['files'].__setitem__(
+                    'new.py', blank_file_entry(lines=1500, prose_lines=700)
+                ),
+                id='new-path-at-the-ceiling',
+            ),
+        ],
+    )
+    def test_a_size_only_move_between_images_raises_nothing(
+        self, tmp_path: Path, mutate
+    ) -> None:
+        # PRD plans/review-all-s25-scripts-instruments-prd.md D10: size is
+        # measured and stored, never ratcheted, per path or in the total.
+        previous, current = self._pair(tmp_path, mutate)
+
+        assert metrics.compare_baseline_files(previous, current) == []
 
     def test_a_new_oversized_path_breaches_the_ceiling(self, tmp_path: Path) -> None:
         # Proves ``_check_ceilings`` is reached, not just the four rise arms: a
@@ -164,10 +195,10 @@ class TestCompareMergedBaselineFiles:
     MERGE_HEAD moved is a raise; read against either parent, keeping one side's
     stale value re-absorbs the other side's lowering. The bound is what git does
     to the file text, applied per measure against the merge base: a measure one
-    side moved stands at that side's value, up or down, and where both moved,
-    the higher side bounds it.
+    side moved stands at that side's value, up or down, and one both sides moved
+    is bounded by scripts/merge_lane_metrics.py::_both_moved_bound.
 
-    The seed's numbers: a.py lines 1000, b.py lines 200, total:lines 1200.
+    The seed's numbers: a.py cognitive 120, b.py cognitive 30, total:cognitive 150.
     """
 
     @staticmethod
@@ -205,18 +236,18 @@ class TestCompareMergedBaselineFiles:
     ) -> None:
         # THE INCIDENT'S SHAPE: ours never touched the baseline, so the bound IS
         # theirs' image -- and the reported baseline is the bound, not HEAD's.
-        seed, theirs = synthetic_report(), self._moved(('a.py', 'lines', 1005))
+        seed, theirs = synthetic_report(), self._moved(('a.py', 'cognitive', 125))
 
         assert self._bounded(tmp_path, theirs, base=seed, ours=seed, theirs=theirs) == []
         assert self._bounded(
             tmp_path,
-            self._moved(('a.py', 'lines', 1006)),
+            self._moved(('a.py', 'cognitive', 126)),
             base=seed,
             ours=seed,
             theirs=theirs,
         ) == [
-            ('lines', 'a.py', 1005, 1006),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1206),
+            ('cognitive', 'a.py', 125, 126),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 155, 156),
         ]
 
     @pytest.mark.parametrize('lowered_by', ['ours', 'theirs'])
@@ -224,9 +255,9 @@ class TestCompareMergedBaselineFiles:
         self, tmp_path: Path, lowered_by: str
     ) -> None:
         # THE CASE EVERY EITHER-PARENT RULE ADMITS. Keeping the unmoved side's
-        # 1000 is clean against that side, and in a conflicted merge on main it
+        # 120 is clean against that side, and in a conflicted merge on main it
         # would land an unrecorded widening.
-        seed, lowered = synthetic_report(), self._moved(('a.py', 'lines', 995))
+        seed, lowered = synthetic_report(), self._moved(('a.py', 'cognitive', 115))
 
         assert self._bounded(
             tmp_path,
@@ -235,51 +266,98 @@ class TestCompareMergedBaselineFiles:
             ours=lowered if lowered_by == 'ours' else seed,
             theirs=lowered if lowered_by == 'theirs' else seed,
         ) == [
-            ('lines', 'a.py', 995, 1000),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1195, 1200),
+            ('cognitive', 'a.py', 115, 120),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 145, 150),
         ]
 
     def test_own_moves_stand_per_measure_not_per_path(self, tmp_path: Path) -> None:
         # Both sides moved a.py, but different MEASURES of it: taking theirs'
-        # whole entry keeps theirs' cognitive lowering and undoes ours' lines one.
-        ours = self._moved(('a.py', 'lines', 995))
+        # whole entry keeps theirs' cognitive lowering and undoes ours'
+        # function_local_imports one.
+        ours = self._moved(('a.py', 'function_local_imports', 2))
         theirs = self._moved(('a.py', 'cognitive', 110))
 
         assert self._bounded(
             tmp_path, theirs, base=synthetic_report(), ours=ours, theirs=theirs
         ) == [
-            ('lines', 'a.py', 995, 1000),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1195, 1200),
+            ('function_local_imports', 'a.py', 2, 3),
+            ('total:function_local_imports', metrics.CLUSTER_TOTAL_KEY, 3, 4),
         ]
 
-    def test_where_both_sides_moved_a_measure_the_higher_bounds_it(
-        self, tmp_path: Path
+    @pytest.mark.parametrize('raised_by', ['ours', 'theirs'])
+    def test_where_the_sides_moved_a_measure_oppositely_the_higher_side_bounds_it(
+        self, tmp_path: Path, raised_by: str
     ) -> None:
         seed = synthetic_report()
-        ours = self._moved(('a.py', 'lines', 990))
-        theirs = self._moved(('a.py', 'lines', 1005))
+        raised = self._moved(('a.py', 'cognitive', 125))
+        lowered = self._moved(('a.py', 'cognitive', 110))
+        ours, theirs = (raised, lowered) if raised_by == 'ours' else (lowered, raised)
 
-        assert self._bounded(tmp_path, theirs, base=seed, ours=ours, theirs=theirs) == []
+        assert self._bounded(tmp_path, raised, base=seed, ours=ours, theirs=theirs) == []
         assert self._bounded(
             tmp_path,
-            self._moved(('a.py', 'lines', 1006)),
+            self._moved(('a.py', 'cognitive', 126)),
             base=seed,
             ours=ours,
             theirs=theirs,
         ) == [
-            ('lines', 'a.py', 1005, 1006),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1206),
+            ('cognitive', 'a.py', 125, 126),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 155, 156),
+        ]
+
+    def test_where_both_sides_raised_a_measure_the_raises_compose(
+        self, tmp_path: Path
+    ) -> None:
+        seed = synthetic_report()
+        ours = self._moved(('a.py', 'cognitive', 125))
+        theirs = self._moved(('a.py', 'cognitive', 123))
+
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'cognitive', 128)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == []
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'cognitive', 129)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == [
+            ('cognitive', 'a.py', 128, 129),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 158, 159),
+        ]
+
+    def test_where_both_sides_lowered_a_measure_the_higher_still_bounds_it(
+        self, tmp_path: Path
+    ) -> None:
+        seed = synthetic_report()
+        ours = self._moved(('a.py', 'cognitive', 115))
+        theirs = self._moved(('a.py', 'cognitive', 110))
+
+        assert self._bounded(tmp_path, theirs, base=seed, ours=ours, theirs=theirs) == []
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'cognitive', 116)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == [
+            ('cognitive', 'a.py', 115, 116),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 145, 146),
         ]
 
     def test_moves_on_different_paths_add_up_in_the_derived_total(
         self, tmp_path: Path
     ) -> None:
         # ONE side moved each path, so each move stands, and the total is
-        # DERIVED from the bound: 1215. A per-measure max of the parents' own
-        # totals would read 1210 and refuse the merge.
-        ours = self._moved(('a.py', 'lines', 1005))
-        theirs = self._moved(('b.py', 'lines', 210))
-        merged = self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 210))
+        # DERIVED from the bound: 165. A per-measure max of the parents' own
+        # totals would read 160 and refuse the merge.
+        ours = self._moved(('a.py', 'cognitive', 125))
+        theirs = self._moved(('b.py', 'cognitive', 40))
+        merged = self._moved(('a.py', 'cognitive', 125), ('b.py', 'cognitive', 40))
 
         assert self._bounded(
             tmp_path, merged, base=synthetic_report(), ours=ours, theirs=theirs
@@ -289,7 +367,7 @@ class TestCompareMergedBaselineFiles:
         seed, ours = synthetic_report(), synthetic_report()
         del ours['files']['b.py']
 
-        assert ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1000, 1200) in self._bounded(
+        assert ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 120, 150) in self._bounded(
             tmp_path, seed, base=seed, ours=ours, theirs=seed
         )
 
@@ -299,30 +377,30 @@ class TestCompareMergedBaselineFiles:
         # git's modify/delete conflict: the modification stands.
         ours = synthetic_report()
         del ours['files']['b.py']
-        theirs = self._moved(('b.py', 'lines', 190))
+        theirs = self._moved(('b.py', 'cognitive', 20))
 
         assert self._bounded(
             tmp_path, theirs, base=synthetic_report(), ours=ours, theirs=theirs
         ) == []
 
-    def test_an_absent_base_bounds_each_measure_by_the_higher_parent(
+    def test_an_absent_base_bounds_each_count_by_the_higher_parent(
         self, tmp_path: Path
     ) -> None:
         # No common ancestor, or no baseline at it: git merges such histories
         # against the empty tree, so each side moved every measure it holds.
         ours = synthetic_report()
-        theirs = self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 190))
+        theirs = self._moved(('a.py', 'cognitive', 125), ('b.py', 'cognitive', 20))
 
         assert self._bounded(
             tmp_path,
-            self._moved(('a.py', 'lines', 1005)),
+            self._moved(('a.py', 'cognitive', 125)),
             base=None,
             ours=ours,
             theirs=theirs,
         ) == []
-        assert ('lines', 'b.py', 200, 201) in self._bounded(
+        assert ('cognitive', 'b.py', 30, 31) in self._bounded(
             tmp_path,
-            self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 201)),
+            self._moved(('a.py', 'cognitive', 125), ('b.py', 'cognitive', 31)),
             base=None,
             ours=ours,
             theirs=theirs,
@@ -331,16 +409,29 @@ class TestCompareMergedBaselineFiles:
     def test_an_absent_parent_image_moved_nothing(self, tmp_path: Path) -> None:
         # A parent without a baseline must not read as having lowered every
         # measure to nothing, which would refuse a resolver who keeps theirs.
-        seed, theirs = synthetic_report(), self._moved(('a.py', 'lines', 1005))
+        seed, theirs = synthetic_report(), self._moved(('a.py', 'cognitive', 125))
 
         assert self._bounded(tmp_path, theirs, base=seed, ours=None, theirs=theirs) == []
-        assert ('lines', 'a.py', 1005, 1006) in self._bounded(
+        assert ('cognitive', 'a.py', 125, 126) in self._bounded(
             tmp_path,
-            self._moved(('a.py', 'lines', 1006)),
+            self._moved(('a.py', 'cognitive', 126)),
             base=seed,
             ours=None,
             theirs=theirs,
         )
+
+    def test_a_size_only_excess_over_the_bound_raises_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        seed, theirs = synthetic_report(), self._moved(('a.py', 'lines', 1005))
+
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'lines', 1100)),
+            base=seed,
+            ours=seed,
+            theirs=theirs,
+        ) == []
 
     def test_a_name_set_both_sides_moved_is_bounded_by_the_side_naming_more(
         self, tmp_path: Path
@@ -357,6 +448,40 @@ class TestCompareMergedBaselineFiles:
             tmp_path, widened, base=seed, ours=ours, theirs=theirs
         )
 
+    def test_a_name_set_both_sides_widened_is_bounded_by_their_set_merge(
+        self, tmp_path: Path
+    ) -> None:
+        # 'qux', added by both sides, counts once, so name lists carry no
+        # overlap slack.
+        seed, ours, theirs = synthetic_report(), synthetic_report(), synthetic_report()
+        ours['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux', 'zap']
+        theirs['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux', 'wib']
+        merged = copy.deepcopy(ours)
+        merged['tests']['t1.py']['patch_targets'].append('wib')
+        widened = copy.deepcopy(merged)
+        widened['tests']['t1.py']['patch_targets'].append('extra')
+
+        assert self._bounded(tmp_path, merged, base=seed, ours=ours, theirs=theirs) == []
+        assert ('patch_targets', 't1.py', 5, 6) in self._bounded(
+            tmp_path, widened, base=seed, ours=ours, theirs=theirs
+        )
+
+    def test_an_absent_base_bounds_a_name_set_by_both_sides_names(
+        self, tmp_path: Path
+    ) -> None:
+        ours, theirs = synthetic_report(), synthetic_report()
+        ours['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux']
+        theirs['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'zap']
+        merged = copy.deepcopy(ours)
+        merged['tests']['t1.py']['patch_targets'].append('zap')
+        widened = copy.deepcopy(merged)
+        widened['tests']['t1.py']['patch_targets'].append('extra')
+
+        assert self._bounded(tmp_path, merged, base=None, ours=ours, theirs=theirs) == []
+        assert ('patch_targets', 't1.py', 4, 5) in self._bounded(
+            tmp_path, widened, base=None, ours=ours, theirs=theirs
+        )
+
 
 def _ledger_record(task_id: str, reason: str = 'net-additive work') -> dict:
     """One ledger entry, built by the real writer rather than hand-written."""
@@ -366,268 +491,172 @@ def _ledger_record(task_id: str, reason: str = 'net-additive work') -> dict:
     )
 
 
-def _ledger(*records: dict) -> dict:
-    return {**metrics.empty_ledger(), 'raises': list(records)}
+def _listing(*records: dict) -> dict[str, str]:
+    """Entry file name -> content identity, as the gate lists a tree or the index."""
+    return {metrics.entry_filename(record): metrics.render_entry(record) for record in records}
 
 
-class TestLedgerAppendedEntries:
-    """The ledger delta, and what makes append_authorization's promise checkable.
+class TestOwnEntryNames:
+    """The ledger delta, and what makes the append-only promise checkable.
 
-    ``append_authorization``'s docstring promises that "a reviewer reading the
-    file reads every raise this baseline has ever absorbed". That is a claim
-    about every FUTURE writer of the file, not just about that function, and
-    nothing enforced it: a commit could quietly drop or rewrite a historical
-    entry and the promise would stay standing and false. These pin the reader
-    that checks it.
+    The ledger is a directory of one file per authorization, so a commit's own
+    entries are the files no parent holds, and append-only is a comparison of
+    listings: every file a parent holds must be staged unchanged.
     """
 
-    def test_an_unchanged_ledger_appended_nothing(self) -> None:
-        ledger = _ledger(_ledger_record('5485'))
+    def test_an_unchanged_ledger_adds_nothing(self) -> None:
+        listing = _listing(_ledger_record('5485'))
 
-        assert metrics.ledger_appended_entries(ledger, copy.deepcopy(ledger)) == []
+        assert metrics.own_entry_names([listing], dict(listing)) == []
 
-    def test_the_appended_suffix_is_returned_in_order(self) -> None:
+    def test_the_added_files_are_returned_sorted(self) -> None:
         history = _ledger_record('5485')
-        first, second = _ledger_record('5722'), _ledger_record('5723')
+        first, second = _ledger_record('5723'), _ledger_record('5722')
 
-        appended = metrics.ledger_appended_entries(
-            _ledger(history), _ledger(history, first, second)
+        added = metrics.own_entry_names(
+            [_listing(history)], _listing(history, first, second)
         )
 
-        assert appended == [first, second]
+        assert added == sorted(
+            [metrics.entry_filename(first), metrics.entry_filename(second)]
+        )
 
-    def test_the_day_one_shape_is_the_whole_list(self) -> None:
-        # Previous is the fail-CLOSED empty ledger -- the state a commit that
-        # authorizes the very first raise starts from.
+    def test_with_no_recorded_entries_every_staged_file_is_own(self) -> None:
         record = _ledger_record('5722')
 
-        assert metrics.ledger_appended_entries(
-            metrics.empty_ledger(), _ledger(record)
-        ) == [record]
+        assert metrics.own_entry_names([{}], _listing(record)) == [
+            metrics.entry_filename(record)
+        ]
 
-    def test_dropping_a_historical_entry_is_refused_by_name(self) -> None:
-        history = [_ledger_record('5485'), _ledger_record('5675')]
+    def test_dropping_a_recorded_entry_is_refused_by_name(self) -> None:
+        kept, dropped = _ledger_record('5485'), _ledger_record('5675')
 
-        with pytest.raises(metrics.RatchetError) as excinfo:
-            metrics.ledger_appended_entries(_ledger(*history), _ledger(history[0]))
+        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
+            metrics.own_entry_names([_listing(kept, dropped)], _listing(kept))
 
-        message = str(excinfo.value)
-        assert 'append-only' in message
-        # HOW MANY went missing, not merely that something did: the number is
-        # what tells a reviewer whether this was one bad rebase or a wipe.
-        assert '1' in message
+        assert 'append-only' in str(excinfo.value)
+        assert metrics.entry_filename(dropped) in str(excinfo.value)
 
-    def test_rewriting_an_entry_in_place_is_refused(self) -> None:
-        # LENGTH EQUALITY IS NOT PREFIX EQUALITY. A rewrite keeps the count
-        # identical, so any check that compared lengths would pass it -- and a
-        # rewritten `reason` is exactly how a raise stops reading as what it was.
+    def test_rewriting_a_recorded_entry_under_its_name_is_refused(self) -> None:
+        # Same NAME, different content: a count of files would pass this.
         history = _ledger_record('5485')
-        forged = _ledger_record('5485', reason='actually it was a refactor')
+        staged = {metrics.entry_filename(history): 'a different blob'}
 
-        with pytest.raises(metrics.RatchetError):
-            metrics.ledger_appended_entries(_ledger(history), _ledger(forged))
+        with pytest.raises(metrics.AppendOnlyViolation):
+            metrics.own_entry_names([_listing(history)], staged)
 
-    def test_reordering_history_is_refused(self) -> None:
-        first, second = _ledger_record('5485'), _ledger_record('5675')
+    def test_a_merge_takes_either_parents_files_as_history(self) -> None:
+        history = _ledger_record('5485')
+        ours_own, theirs_own = _ledger_record('5722'), _ledger_record('3620')
+        merge_own = _ledger_record('5792')
 
-        with pytest.raises(metrics.RatchetError):
-            metrics.ledger_appended_entries(
-                _ledger(first, second), _ledger(second, first)
-            )
+        added = metrics.own_entry_names(
+            [_listing(history, ours_own), _listing(history, theirs_own)],
+            _listing(history, ours_own, theirs_own, merge_own),
+        )
+
+        # A file either parent recorded is HISTORY: counting it as the merge's
+        # own would be the standing permission LEDGER_README forbids.
+        assert added == [metrics.entry_filename(merge_own)]
+
+    def test_a_merge_dropping_the_other_parents_entry_is_refused(self) -> None:
+        theirs_own = _ledger_record('3620')
+
+        with pytest.raises(metrics.AppendOnlyViolation):
+            metrics.own_entry_names([{}, _listing(theirs_own)], {})
 
 
-class TestLedgerMergedEntries:
-    """The ledger delta of a MERGE commit, read against BOTH parents' histories.
-
-    A conflicted merge finished with `git commit` runs pre-commit with
-    MERGE_HEAD set (esc-3620-11), so its staged ledger descends from two
-    recorded histories, not one. Each parent's entries must survive whole AND
-    in that parent's own order; the two histories may interleave, the way git's
-    merge of the text interleaves them, but nothing foreign may sit among them.
-    Only what follows both histories and belongs to NEITHER parent is the
-    merge's OWN -- the one thing that may cover a raise the merge makes.
-    """
+class TestRetireLegacyLedger:
+    """The one-commit, set-equal rule for splitting the retired array into files."""
 
     @staticmethod
     def _entries() -> tuple[dict, dict, dict]:
-        """History both parents share, then one entry only ours / only theirs added."""
-        return _ledger_record('5485'), _ledger_record('5722'), _ledger_record('3620')
+        return _ledger_record('5485'), _ledger_record('5675'), _ledger_record('5722')
 
-    def test_a_parent_without_a_ledger_constrains_nothing(self) -> None:
-        # THE INCIDENT'S SHAPE: the task branch predates the ledger, so HEAD
-        # reads as the fail-closed empty one and main's entries are history.
-        _history, _ours_own, theirs_own = self._entries()
+    def test_with_nothing_retired_own_entries_pass_through(self) -> None:
+        first, second, _third = self._entries()
 
-        assert metrics.ledger_merged_entries(
-            metrics.empty_ledger(), _ledger(theirs_own), _ledger(theirs_own)
+        assert metrics.retire_legacy_ledger([], _listing(first, second), [first, second]) == [
+            first,
+            second,
+        ]
+
+    def test_an_exact_split_passes_and_covers_nothing(self) -> None:
+        entries = list(self._entries())
+
+        # Split entries are HISTORY: the commit that moves them authorizes nothing.
+        assert metrics.retire_legacy_ledger(entries, _listing(*entries), entries) == []
+
+    def test_dropping_an_entry_in_the_split_is_refused(self) -> None:
+        first, second, third = self._entries()
+
+        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
+            metrics.retire_legacy_ledger(
+                [first, second, third], _listing(first, second), [first, second]
+            )
+
+        assert metrics.entry_filename(third) in str(excinfo.value)
+
+    def test_rewriting_an_entry_in_the_split_is_refused(self) -> None:
+        first, second, third = self._entries()
+        rewritten = {**third, 'reason': 'actually it was a refactor'}
+        staged = [first, second, rewritten]
+
+        with pytest.raises(metrics.AppendOnlyViolation):
+            metrics.retire_legacy_ledger([first, second, third], _listing(*staged), staged)
+
+    def test_an_authorization_of_its_own_in_the_split_is_refused(self) -> None:
+        first, second, fresh = self._entries()
+        staged = [first, second, fresh]
+
+        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
+            metrics.retire_legacy_ledger([first, second], _listing(*staged), staged)
+
+        assert metrics.entry_filename(fresh) in str(excinfo.value)
+
+    def test_a_merge_may_find_the_retired_entries_already_split_by_its_other_parent(
+        self,
+    ) -> None:
+        # A branch still carrying the array merges a main that split it: main's
+        # files are staged as history, only the branch's own entry is new here.
+        shared_history, branch_own, _other = self._entries()
+
+        assert metrics.retire_legacy_ledger(
+            [shared_history, branch_own], _listing(shared_history, branch_own), [branch_own]
         ) == []
 
-    def test_one_sides_additions_are_history_not_the_merges_own(self) -> None:
-        history, _ours_own, theirs_own = self._entries()
 
-        assert metrics.ledger_merged_entries(
-            _ledger(history),
-            _ledger(history, theirs_own),
-            _ledger(history, theirs_own),
-        ) == []
-
+class TestLegacyLedgerEntries:
     @pytest.mark.parametrize(
-        'theirs_first', [True, False], ids=['theirs-then-ours', 'ours-then-theirs']
+        'text',
+        ['{"raises": ', '[]', '{"raises": {}}', '{}', '{"raises": [7]}'],
+        ids=['truncated', 'array', 'raises-not-list', 'raises-missing', 'entry-not-object'],
     )
-    def test_both_sides_additions_are_accepted_in_either_block_order(
-        self, theirs_first: bool
-    ) -> None:
-        # A resolver facing a both-sides-appended conflict keeps both entries in
-        # whichever order the conflict shows them; either interleaving keeps
-        # each parent's entries unchanged and in that parent's own order.
-        history, ours_own, theirs_own = self._entries()
-        blocks = [theirs_own, ours_own] if theirs_first else [ours_own, theirs_own]
+    def test_a_malformed_retired_array_is_a_named_hard_failure(self, text: str) -> None:
+        # Its entries are history being moved: one that cannot be read cannot be
+        # checked into a file, and must never read as "nothing to move".
+        with pytest.raises(metrics.RatchetError) as excinfo:
+            metrics.legacy_ledger_entries(text)
 
-        assert metrics.ledger_merged_entries(
-            _ledger(history, ours_own),
-            _ledger(history, theirs_own),
-            _ledger(history, *blocks),
-        ) == []
+        assert metrics.LEGACY_LEDGER_RELPATH in str(excinfo.value)
 
-    def test_the_merges_own_additions_are_returned_in_order(self) -> None:
-        history, ours_own, theirs_own = self._entries()
-        first, second = _ledger_record('5792'), _ledger_record('5793')
+    def test_the_entries_are_returned_in_order(self) -> None:
+        first, second = _ledger_record('5485'), _ledger_record('5722')
+        text = json.dumps({'_README': 'x', 'schema_version': 1, 'raises': [first, second]})
 
-        appended = metrics.ledger_merged_entries(
-            _ledger(history, ours_own),
-            _ledger(history, theirs_own),
-            _ledger(history, theirs_own, ours_own, first, second),
-        )
-
-        assert appended == [first, second]
-
-    @pytest.mark.parametrize('dropped', ['ours', 'theirs'])
-    def test_dropping_an_entry_either_side_recorded_is_refused(
-        self, dropped: str
-    ) -> None:
-        # BOTH histories, not either: a merge resolved on main that kept only
-        # the task's entries would silently drop main's recorded ones.
-        history, ours_own, theirs_own = self._entries()
-        kept = theirs_own if dropped == 'ours' else ours_own
-
-        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
-            metrics.ledger_merged_entries(
-                _ledger(history, ours_own),
-                _ledger(history, theirs_own),
-                _ledger(history, kept),
-            )
-
-        assert 'append-only' in str(excinfo.value)
-
-    def test_rewriting_an_entry_one_side_recorded_is_refused(self) -> None:
-        # Same count, changed `reason`: length equality is not prefix equality
-        # here either.
-        history, ours_own, theirs_own = self._entries()
-        forged = _ledger_record('3620', reason='actually it was a refactor')
-
-        with pytest.raises(metrics.AppendOnlyViolation):
-            metrics.ledger_merged_entries(
-                _ledger(history, ours_own),
-                _ledger(history, theirs_own),
-                _ledger(history, forged, ours_own),
-            )
-
-    @staticmethod
-    def _merged_before() -> tuple[dict, dict, dict, dict]:
-        """Shared history, ours' own, theirs' own, and theirs' next addition.
-
-        The shape of a branch that merged main once, kept ours-then-theirs, and
-        now merges main again after main appended one more entry.
-        """
-        return (
-            _ledger_record('5485'),
-            _ledger_record('5792'),
-            _ledger_record('3620'),
-            _ledger_record('3790'),
-        )
-
-    def test_a_branch_that_kept_ours_then_theirs_can_merge_again(self) -> None:
-        # The reviewer's case, measured: git merges [h,o,t] and [h,t,t2] over
-        # base [h,t] cleanly to [h,o,t,t2]. No block order reproduces that.
-        history, ours_own, theirs_own, theirs_next = self._merged_before()
-
-        assert metrics.ledger_merged_entries(
-            _ledger(history, ours_own, theirs_own),
-            _ledger(history, theirs_own, theirs_next),
-            _ledger(history, ours_own, theirs_own, theirs_next),
-        ) == []
-
-    def test_a_branch_merging_after_another_landed_interleaves(self) -> None:
-        # Main now carries another branch's ours-then-theirs order, and this
-        # branch appended past the entry the two share.
-        history, other_own, shared, _theirs_next = self._merged_before()
-        ours_next = _ledger_record('5801')
-
-        assert metrics.ledger_merged_entries(
-            _ledger(history, shared, ours_next),
-            _ledger(history, other_own, shared),
-            _ledger(history, other_own, shared, ours_next),
-        ) == []
-
-    def test_the_merges_own_entries_follow_an_interleaved_history(self) -> None:
-        history, ours_own, theirs_own, theirs_next = self._merged_before()
-        own = _ledger_record('5900')
-
-        assert metrics.ledger_merged_entries(
-            _ledger(history, ours_own, theirs_own),
-            _ledger(history, theirs_own, theirs_next),
-            _ledger(history, ours_own, theirs_own, theirs_next, own),
-        ) == [own]
-
-    def test_reordering_one_parents_own_entries_is_refused(self) -> None:
-        # Ours recorded its own entry BEFORE the shared one; moving it after
-        # theirs' history rewrites the order ours recorded.
-        history, ours_own, theirs_own, theirs_next = self._merged_before()
-
-        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
-            metrics.ledger_merged_entries(
-                _ledger(history, ours_own, theirs_own),
-                _ledger(history, theirs_own, theirs_next),
-                _ledger(history, theirs_own, theirs_next, ours_own),
-            )
-
-        assert 'append-only' in str(excinfo.value)
-
-    def test_a_foreign_entry_inside_the_histories_is_refused(self) -> None:
-        history, ours_own, theirs_own, theirs_next = self._merged_before()
-        foreign = _ledger_record('5900')
-
-        with pytest.raises(metrics.AppendOnlyViolation):
-            metrics.ledger_merged_entries(
-                _ledger(history, ours_own, theirs_own),
-                _ledger(history, theirs_own, theirs_next),
-                _ledger(history, foreign, ours_own, theirs_own, theirs_next),
-            )
-
-    @pytest.mark.parametrize('with_own', [False, True], ids=['copy-only', 'copy-then-own'])
-    def test_a_copied_parent_entry_is_not_the_merges_own(self, with_own: bool) -> None:
-        # A duplicate of a recorded entry after both histories is still
-        # HISTORY: counting it as coverage is the standing permission
-        # LEDGER_README forbids.
-        history, ours_own, theirs_own, _theirs_next = self._merged_before()
-        own = [_ledger_record('5900')] if with_own else []
-
-        assert metrics.ledger_merged_entries(
-            _ledger(history, ours_own),
-            _ledger(history, theirs_own),
-            _ledger(history, ours_own, theirs_own, theirs_own, *own),
-        ) == own
+        assert metrics.legacy_ledger_entries(text) == [first, second]
 
 
 class TestUnrecordedRaises:
-    """Which measured raises THIS commit's ledger entries do not name.
+    """Which measured raises THIS commit's own ledger entries do not cover.
 
     The inverse of ``authorization_record``: the writer projects Violations into
-    a record, this asks whether a record covers a Violation. Records here are
+    a record, this asks whether records cover a Violation. Records here are
     built by calling ``authorization_record`` for real rather than hand-written,
-    so what is pinned is the round trip against the actual producer -- a
-    hand-written dict would pin this module's idea of the vocabulary instead of
-    the writer's, which is the drift the shared field names exist to prevent.
+    so what is pinned is the round trip against the actual producer.
+
+    THE RULE: per ``(measure, key)``, the rise may not exceed the SUM of the
+    covering rows' ``current - baseline``; a ceiling breach is covered by name.
     """
 
     @staticmethod
@@ -654,17 +683,13 @@ class TestUnrecordedRaises:
         raises = [self._lines_raise(), self._cognitive_raise()]
 
         # The common refusal: a commit that staged a raising baseline and never
-        # touched the ledger. Order is the input's, so the refusal message is
+        # recorded an entry. Order is the input's, so the refusal message is
         # diffable run to run.
         assert metrics.unrecorded_raises(raises, []) == raises
 
-    def test_a_stale_record_naming_a_different_landing_value_covers_nothing(
-        self,
-    ) -> None:
-        # THE CASE THIS FUNCTION EXISTS FOR. A hand-written or stale entry names
-        # the right measure and the right key, so any (measure, key) check would
-        # wave it through -- while the baseline it accompanies landed somewhere
-        # else entirely. `current` is the discriminator.
+    def test_a_record_authorizing_less_than_the_rise_covers_nothing(self) -> None:
+        # A stale or hand-written entry names the right measure and key but a
+        # smaller rise than the one this commit makes.
         stale = self._record([metrics.Violation.rose('lines', 'a.py', 1000, 1002)])
         raises = [self._lines_raise()]
 
@@ -677,24 +702,83 @@ class TestUnrecordedRaises:
 
         assert metrics.unrecorded_raises(raises, [unrelated]) == raises
 
-    def test_two_records_union_rather_than_the_last_one_winning(self) -> None:
+    def test_records_of_different_measures_union(self) -> None:
         lines, cognitive = self._lines_raise(), self._cognitive_raise()
-
-        # Two authorized writes in one commit append two records; coverage is
-        # the union of both, not whichever landed last.
         records = [self._record([lines]), self._record([cognitive], task_id='5723')]
 
         assert metrics.unrecorded_raises([lines, cognitive], records) == []
 
-    def test_a_differing_baseline_still_covers_when_current_matches(self) -> None:
-        # DELIBERATE: the triple is (measure, key, current), not the full
-        # four-tuple. An agent who runs --write-baseline --authorize-raise TWICE
-        # in one commit records b->m and m->f, while the HEAD-to-staged delta
-        # reads b->f. Requiring `baseline` to match would refuse that correctly
-        # authorized commit.
+    def test_records_of_one_key_sum(self) -> None:
+        # An agent who runs --write-baseline --authorize-raise TWICE in one
+        # commit records b->m and m->f, while the commit's delta reads b->f;
+        # a branch landing several authorizing commits sums the same way.
+        records = [
+            self._record([metrics.Violation.rose('lines', 'a.py', 1000, 1002)]),
+            self._record([metrics.Violation.rose('lines', 'a.py', 1002, 1005)], '5723'),
+        ]
+
+        assert metrics.unrecorded_raises([self._lines_raise()], records) == []
+
+    def test_three_partial_records_cover_exactly_their_sum(self) -> None:
+        # No single record reaches the rise; only their SUM does. One count
+        # short of it, the same records refuse.
+        records = [
+            self._record([metrics.Violation.rose('lines', 'a.py', 1000, 1001)]),
+            self._record([metrics.Violation.rose('lines', 'a.py', 1001, 1002)], '5723'),
+            self._record([metrics.Violation.rose('lines', 'a.py', 1002, 1005)], '5724'),
+        ]
+
+        assert metrics.unrecorded_raises([self._lines_raise()], records) == []
+        assert metrics.unrecorded_raises(
+            [metrics.Violation.rose('lines', 'a.py', 1000, 1006)], records
+        ) != []
+
+    def test_derived_total_rows_sum_across_records_too(self) -> None:
+        total = metrics.CLUSTER_TOTAL_KEY
+        records = [
+            self._record([metrics.Violation.rose('total:lines', total, 1200, 1202)]),
+            self._record([metrics.Violation.rose('total:lines', total, 1300, 1303)], '5723'),
+        ]
+
+        landed = metrics.Violation.rose('total:lines', total, 1400, 1405)
+        assert metrics.unrecorded_raises([landed], records) == []
+
+    def test_one_record_of_part_of_the_rise_does_not_cover_it(self) -> None:
+        # The other half of the sum: the midpoint record alone authorized 3, and
+        # the commit raised 5. (Under the retired absolute rule its matching
+        # `current` covered the whole rise.)
         midpoint = self._record([metrics.Violation.rose('lines', 'a.py', 1002, 1005)])
 
-        assert metrics.unrecorded_raises([self._lines_raise()], [midpoint]) == []
+        assert metrics.unrecorded_raises([self._lines_raise()], [midpoint]) == [
+            self._lines_raise()
+        ]
+
+    def test_a_record_measured_from_another_base_covers_the_same_rise(self) -> None:
+        # A derived total authorized against base X covers the same raise
+        # landing on X + a sibling's lines -- the case the absolute rule refused.
+        landed = metrics.Violation.rose('total:lines', metrics.CLUSTER_TOTAL_KEY, 1300, 1305)
+        authored = self._record(
+            [metrics.Violation.rose('total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205)]
+        )
+
+        assert metrics.unrecorded_raises([landed], [authored]) == []
+
+    def test_a_ceiling_breach_is_covered_by_naming_it(self) -> None:
+        breach = metrics.Violation(
+            measure=metrics.NEW_FUNCTION_OVER_CEILING,
+            key='a.py::new',
+            baseline=metrics.NEW_FUNCTION_COGNITIVE_CEILING,
+            current=40,
+            message='breach',
+        )
+        named = self._record(
+            [dataclasses.replace(breach, current=19)]
+        )
+
+        assert metrics.unrecorded_raises([breach], [named]) == []
+        assert metrics.unrecorded_raises([breach], [self._record([self._lines_raise()])]) == [
+            breach
+        ]
 
     @pytest.mark.parametrize(
         'measures', [None, 'lines', 7], ids=['missing', 'string', 'int']
@@ -704,8 +788,7 @@ class TestUnrecordedRaises:
     ) -> None:
         # Hand-mutated on purpose -- authorization_record cannot produce these.
         # A ledger a human edited badly must REFUSE the commit, not raise a
-        # TypeError out of the gate: a crash reads as a broken instrument and
-        # sends the reader hunting the wrong thing.
+        # TypeError out of the gate: a crash reads as a broken instrument.
         record = self._record([self._lines_raise()])
         if measures is None:
             del record['measures']
@@ -714,3 +797,14 @@ class TestUnrecordedRaises:
         raises = [self._lines_raise()]
 
         assert metrics.unrecorded_raises(raises, [record]) == raises
+
+    @pytest.mark.parametrize('current', ['1005', None, True], ids=['string', 'null', 'bool'])
+    def test_a_row_whose_numbers_are_not_counts_authorizes_nothing(
+        self, current: object
+    ) -> None:
+        record = self._record([self._lines_raise()])
+        record['measures'][0]['current'] = current
+
+        assert metrics.unrecorded_raises([self._lines_raise()], [record]) == [
+            self._lines_raise()
+        ]

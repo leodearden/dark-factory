@@ -410,7 +410,7 @@ class TestCampaignUnmeasured:
         panel_results = [
             PanelRunResult(
                 variant_name=_ARM, diff_id=diff_id, total_cost_usd=cost, wall_clock_ms=100,
-                reviews={'r1': {'verdict': 'NEEDS_CHANGES', 'issues': [_ISSUE]}},
+                reviews={'r1': {'verdict': 'ISSUES_FOUND', 'issues': [_ISSUE]}},
             )
             for diff_id, cost in (('d_ok', 1.0), ('d_refused', 2.0))
         ]
@@ -478,11 +478,11 @@ class TestCampaignBriefing:
             CorpusDiff(diff_id='d1', language='python', source='synthetic',
                        diff_text='d', description='d1', ground_truth=[_gt('g1')]),
         ])
-        run_trial = AsyncMock(return_value=[
-            PanelRunResult(variant_name='variant_a', diff_id='d1', total_cost_usd=1.0),
+        run_trial = AsyncMock(side_effect=lambda variants, corpus, **_kw: [
+            PanelRunResult(variant_name=v.name, diff_id='d1', total_cost_usd=1.0) for v in variants
         ])
-        score = AsyncMock(return_value=ScoringResult(
-            variant_name='variant_a', diff_id='d1', cost_usd=1.0,
+        score = AsyncMock(side_effect=lambda result, diff, **_kw: ScoringResult(
+            variant_name=result.variant_name, diff_id=result.diff_id, cost_usd=1.0,
             recall=1.0, precision=1.0, f1=1.0, blocking_recall=1.0,
         ))
         with (
@@ -508,6 +508,38 @@ class TestCampaignBriefing:
             ReviewBriefing.DIFF_ONLY, ReviewBriefing.CONTEXT_COMPLETE,
         ]
 
+    def test_d2_alone_runs_only_each_arms_context_complete_arm(self, tmp_path: Path) -> None:
+        result, run_trial = self._invoke(
+            tmp_path, '--arms', 'variant_a,variant_fable51_solo,variant_a_xhigh', '--briefing', 'd2',
+        )
+
+        assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
+        arms = run_trial.call_args.args[0]
+        assert [arm.name for arm in arms] == [
+            'variant_a_d2', 'variant_fable51_solo_d2', 'variant_a_xhigh_d2',
+        ]
+        assert {arm.briefing for arm in arms} == {ReviewBriefing.CONTEXT_COMPLETE}
+
+    @pytest.mark.parametrize(('briefings', 'incumbent', 'candidates'), [
+        ('diff-only', 'variant_a', {'variant_a_xhigh'}),
+        ('diff-only,d2', 'variant_a', {'variant_a_d2', 'variant_a_xhigh', 'variant_a_xhigh_d2'}),
+        ('d2', 'variant_a_d2', {'variant_a_xhigh_d2'}),
+    ])
+    def test_the_report_pairs_every_arm_against_the_first_arms_first_generation(
+        self, tmp_path: Path, briefings: str, incumbent: str, candidates: set[str],
+    ) -> None:
+        result, _ = self._invoke(
+            tmp_path, '--arms', 'variant_a,variant_a_xhigh', '--briefing', briefings,
+        )
+
+        assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
+        report = json.loads((tmp_path / 'camp' / 'campaign_report.json').read_text())
+        assert report['decisions']['incumbent'] == incumbent
+        assert report['arms'][0]['name'] == incumbent
+        assert set(report['decisions']['strict_f1_improvement']) == candidates
+        md = (tmp_path / 'camp' / 'campaign_report.md').read_text()
+        assert f'Incumbent: `{incumbent}`' in md
+
     def test_without_briefing_only_diff_only_arms_run(self, tmp_path: Path) -> None:
         result, run_trial = self._invoke(tmp_path, '--arms', 'variant_a,variant_a_xhigh')
 
@@ -528,7 +560,7 @@ class TestCampaignBriefing:
         assert 'diff-only' in result.output and 'd2' in result.output
         run_trial.assert_not_called()
 
-    @pytest.mark.parametrize('briefings', ['diff-only,d2,d2', 'diff-only,diff-only'])
+    @pytest.mark.parametrize('briefings', ['diff-only,d2,d2', 'diff-only,diff-only', 'd2,d2'])
     def test_a_repeated_briefing_is_a_usage_error_naming_it(
         self, tmp_path: Path, briefings: str,
     ) -> None:
@@ -539,11 +571,8 @@ class TestCampaignBriefing:
         assert f'repeated: {repeated}' in result.output
         run_trial.assert_not_called()
 
-    @pytest.mark.parametrize('briefings', ['d2', 'd2,diff-only'])
-    def test_d2_without_the_diff_only_incumbent_first_is_a_usage_error(
-        self, tmp_path: Path, briefings: str,
-    ) -> None:
-        result, run_trial = self._invoke(tmp_path, '--arms', 'variant_a', '--briefing', briefings)
+    def test_d2_before_diff_only_is_a_usage_error(self, tmp_path: Path) -> None:
+        result, run_trial = self._invoke(tmp_path, '--arms', 'variant_a', '--briefing', 'd2,diff-only')
 
         assert result.exit_code == 2, f'{result.output}\n{result.exception!r}'
         assert 'diff-only' in result.output and 'first' in result.output
@@ -659,3 +688,37 @@ class TestRefreshUnmeasured:
         columns = [c.strip() for c in header.strip('|').split('|')]
         cells = [c.strip() for c in row.strip('|').split('|')]
         assert cells[columns.index('Unmeasured')] == '1'
+
+
+class TestSmokeCounts:
+    """smoke counts an ERROR review's issues as production does: not at all."""
+
+    def test_an_error_reviews_issues_are_not_found_blockers(self) -> None:
+        blocking = {'location': 'a.py:1', 'category': 'bug', 'severity': 'blocking', 'description': 'b'}
+        suggestion = {'location': 'b.py:2', 'category': 'style', 'severity': 'suggestion', 'description': 's'}
+        manifest = CorpusManifest(diffs=[
+            CorpusDiff(diff_id='d1', language='python', source='synthetic',
+                       diff_text='', description='d', ground_truth=[]),
+        ])
+        panel = PanelRunResult(
+            variant_name='baseline', diff_id='d1', total_cost_usd=1.0, wall_clock_ms=100,
+            reviews={
+                'r1': {'reviewer': 'r1', 'verdict': 'ERROR', 'issues': [blocking], 'summary': 'x'},
+                'r2': {
+                    'reviewer': 'r2', 'verdict': 'ISSUES_FOUND',
+                    'issues': [blocking, suggestion], 'summary': 'y',
+                },
+            },
+        )
+
+        with (
+            patch('orchestrator.evals.reviewer_trial.__main__._load_corpus', return_value=manifest),
+            patch('orchestrator.evals.reviewer_trial.__main__._load_or_run_panel',
+                  new_callable=AsyncMock, return_value=panel),
+        ):
+            result = CliRunner().invoke(cli, ['smoke', '--diff-id', 'd1'])
+
+        assert '1 ERROR verdicts' in result.output, result.output
+        assert '(1 total)' in result.output, result.output
+        r1_line = next(line for line in result.output.splitlines() if line.startswith('  r1 '))
+        assert '0 issues, 0 blocking' in r1_line, r1_line

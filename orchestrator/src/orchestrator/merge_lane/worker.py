@@ -81,10 +81,7 @@ from orchestrator.merge_lane.disposition import (
     SkewEvidence,
     classify_merge_failure_disposition,
 )
-from orchestrator.merge_lane.drift import (
-    _build_remote_runners,
-    _maybe_run_drift_check,
-)
+from orchestrator.merge_lane.drift import _maybe_run_drift_check
 from orchestrator.merge_lane.gates import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
@@ -100,6 +97,7 @@ from orchestrator.merge_lane.gates import (
     _reverify_rebased_tree,
     _run_unscoped_typechecks,
 )
+from orchestrator.merge_lane.history_leg import HistoryLegRunner
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import patch_content_contained
 from orchestrator.merge_lane.liveness import (
@@ -133,7 +131,7 @@ from orchestrator.merge_lane.ports import (
 )
 from orchestrator.merge_lane.request_ledger import (
     RequestLedger,
-    _alarm_merge_request_stuck,
+    report_stuck_requests,
 )
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.merge_lane.shadow import (
@@ -144,9 +142,9 @@ from orchestrator.merge_lane.shadow import (
     build_warm_shadow_results,
     did_not_pass_subset,
     nextest_filter_ids,
-    parse_failed_run_all_members,
     parse_nextest_list_planned,
     parse_per_test_results,
+    select_failed_run_all_members,
 )
 from orchestrator.merge_lane.speculation_controller import (
     PermitLedger,
@@ -170,14 +168,18 @@ from orchestrator.merge_lane.types import (
     ItemLifecycleState,
     MainHealthAutoHealRegistry,
     MergeBounceRegistry,
+    MergeCancelRefusal,
+    MergeCancelVerdict,
     MergeDispatchResult,
     MergedOk,
     MergeOutcome,
     MergeReadyPredicate,
     MergeRequest,
+    OperatorMergeCancel,
     OutcomeKind,
     QueuedBranch,
     RealMergeItem,
+    RelaneOutcome,
     SoloVerifyResult,
     SpeculativeItem,
     TerminalOutcomeRecord,
@@ -221,6 +223,7 @@ from orchestrator.verify_categories import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
 )
 from orchestrator.verify_classify import reports_disk_full
+from orchestrator.verify_hosts import build_remote_runners as _build_remote_runners
 from orchestrator.verify_plan import effective_merge_module_configs
 from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
@@ -342,6 +345,16 @@ single module-bool branch at each call site."""
 def _normalize_lane(lane: str) -> str:
     """Map an unrecognised lane value to 'normal' (defensive; prevents starvation)."""
     return lane if lane in MERGE_LANES else 'normal'
+
+
+def _answers_to(req: MergeRequest, request_id: str | None, task_id: str | None) -> bool:
+    """Whether *req* is the queue entry an operator named: by its own request id,
+    or by a task id it carries — its own, or a coalesced member's (task 5246)."""
+    if request_id is not None:
+        return req.request_id == request_id
+    return req.task_id == task_id or (
+        isinstance(req, GroupMergeRequest) and task_id in req.member_task_ids
+    )
 
 
 def _aging_key(req: MergeRequest) -> tuple[float, str]:
@@ -497,7 +510,7 @@ confirmed task faults in both modes — see
 # Conservative allowlist of verify.py category strings that are mechanical
 # (small diff, deterministic cause) and therefore safe to auto-spawn a fix
 # task for.  The category strings are those emitted by
-# ``verify_classify.classify_failure``; compile_error covers the tsc/type/lint class.
+# ``verify_classify.classify_failure``; compile_error covers the rustc/tsc class.
 #
 # Deliberately EXCLUDED — not eligible for auto-heal:
 #   test_failure:         multi-file; needs human judgement on test expectations
@@ -512,9 +525,9 @@ def is_auto_heal_eligible(
 ) -> bool:
     """Return True when the failure class is safe for automated fix spawning.
 
-    The allowlist is intentionally conservative — start with compile_error
-    (the tsc/type/lint class, typically a small bounded diff) and expand
-    only after production evidence of clean auto-heals for each new class.
+    The allowlist is intentionally conservative — compile_error (the rustc/tsc
+    class, a small bounded diff; lint_error/type_error are excluded) — and
+    expands only after production evidence of clean auto-heals per class.
 
     ``cause_hint`` is accepted for future per-hint filtering but is not
     currently used; the gate is purely category-based.
@@ -1082,9 +1095,10 @@ class _DryRunInvestigationHandles:
     itself (the harness owns all of them); this bundles them into one
     optional, default-``None`` param so ``_run_post_merge_verify`` stays a
     pure git engine (mirrors the ``train_callback_factory`` opaque-injection
-    pattern — the worker never imports the scheduler).  Only the production
-    ``SpeculativeMergeWorker._run_inflight_verify`` call site passes a live
-    instance; the solo-reverify and train module-level callers pass nothing,
+    pattern — the worker never imports the scheduler).  Only
+    ``SpeculativeMergeWorker._lane_post_merge_verify`` (the in-flight verify
+    and the single-branch gate re-verify) passes a live instance; the
+    solo-reverify and train module-level callers pass nothing,
     so their spawns automatically no-op.
 
     ``background_tasks`` is the SAME ``set`` instance the worker stores at
@@ -1211,12 +1225,12 @@ class _MainHealthProbeHandles:
     and is drained by the worker's existing shutdown drain
     (``SpeculativeMergeWorker.stop``).
 
-    Only the production ``SpeculativeMergeWorker._run_inflight_verify`` call
-    site passes a live instance (task 2564 step-16).  The solo-reverify,
-    train, and merge_gates module-level callers — and any bare test
-    caller — pass ``None`` (the default), so ``_run_post_merge_verify`` keeps
-    running the main-health probe SYNCHRONOUSLY exactly as it did before
-    this task.
+    Only ``SpeculativeMergeWorker._lane_post_merge_verify``, which serves the
+    in-flight verify and the single-branch gate re-verify, passes a live
+    instance (task 2564 step-16, task 6278).  The solo-reverify and train
+    callers — and any bare test caller — pass ``None`` (the default), so
+    ``_run_post_merge_verify`` keeps running the main-health probe
+    SYNCHRONOUSLY exactly as it did before task 2564.
 
     ``auto_heal`` (task 2564 step-22) is an optional callback threaded
     through to :func:`_run_deferred_main_health_probe`: when a confirmed,
@@ -1475,7 +1489,7 @@ def _spawn_main_health_probe(
     None-safe: no-ops when *handles* is ``None`` (mirrors
     :func:`_spawn_merge_verify_dry_run`'s ``handles is None`` guard) — every
     call site invokes this unconditionally and relies on this internal check,
-    so the solo-reverify, train, and merge_gates module-level
+    so the solo-reverify and train (its gate re-verify included)
     ``_run_post_merge_verify`` callers (which pass no handles) are guaranteed
     no-ops.
 
@@ -2190,8 +2204,8 @@ async def _build_attempt0_payload(
 
     Sources, all DF-owned except the two pins:
 
-    * ``verify.test_output`` → per-test verdicts (:func:`parse_per_test_results`)
-      and the {failed} run_all members (:func:`parse_failed_run_all_members`);
+    * ``verify.test_output`` → per-test verdicts (:func:`parse_per_test_results`);
+      the {failed} run_all members → :func:`select_failed_run_all_members`;
     * a ``cargo nextest list`` probe → the authoritative planned set;
     * reify's sidecar → ONLY ``tree_oid`` (the INV-3 pin) and ``profiles``.
 
@@ -2286,7 +2300,7 @@ async def _build_attempt0_payload(
         debug_verdicts=per_profile['debug'][1],
         release_planned=per_profile['release'][0],
         release_verdicts=per_profile['release'][1],
-        run_all_members=parse_failed_run_all_members(verify.test_output),
+        run_all_members=select_failed_run_all_members(verify.test_output, verify.run_all_failed_members),
         # Deliberately empty (task 3059): no real reify gui failure log was
         # available to pin a fixture to, and authoring one from prose is the
         # drift class this leaf corrects.  verify.sh:2127-2158 treats an empty
@@ -2356,6 +2370,42 @@ def _placeholder_local_runner(
         run_scoped=verifier.run_scoped,
         run_unscoped=verifier.run_unscoped_typechecks,
         task_id=req.task_id,
+    )
+
+
+def _local_merge_verify_runner(
+    merge_wt: Path,
+    req: MergeRequest,
+    effective_module_configs: list[ModuleConfig],
+    task_files_tuple: tuple[str, ...] | None,
+    *,
+    verifier: VerifyPort,
+    event_store: EventStore | None,
+    history_leg_command: str | None,
+) -> VerifyRunner:
+    """The runner a local merge verify dispatches to.
+
+    The full gate's scoped + unscoped bundle, or only the project's declared
+    history leg when *history_leg_command* is set (task 7248).
+    """
+    archive_root = req.config.project_root / 'data' / 'verify-logs'
+    if history_leg_command is not None:
+        return HistoryLegRunner(
+            merge_wt, req.config, history_leg_command,
+            task_id=req.task_id, archive_root=archive_root,
+        )
+    # INV-1 (task 2883): the dispatching store lets run_scoped's merge gate
+    # emit trivial_pass_escalated. The merge-flake gate's side-effects are NOT
+    # threaded here: task ε moved them to the dispatcher
+    # (_run_post_merge_verify), driven off the FlakeSuppression the returned
+    # VerifyResult carries.
+    return LocalRunner(
+        merge_wt, req.config, effective_module_configs, task_files_tuple,
+        run_scoped=verifier.run_scoped,
+        run_unscoped=verifier.run_unscoped_typechecks,
+        task_id=req.task_id,
+        archive_root=archive_root,
+        event_store=event_store,
     )
 
 
@@ -2431,6 +2481,7 @@ async def _run_post_merge_verify(
     merge_base_sha: str | None = None,
     main_sha: str | None = None,
     verifier: VerifyPort = PRODUCTION_VERIFIER,
+    history_leg_command: str | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -2506,7 +2557,8 @@ async def _run_post_merge_verify(
             quarantined, but the queue is NOT halted and the escalation is L1
             blocking rather than born-at-L2 (task 2886 amendment — bound the
             halt blast radius; DriftDetector Invariant 5).  Only the
-            production ``SpeculativeMergeWorker._run_inflight_verify`` and
+            production ``SpeculativeMergeWorker._lane_post_merge_verify``
+            (the in-flight verify and the single-branch gate re-verify) and
             ``_leased_train_verify`` call sites pass the worker's
             ``operator_halt``; every other (module-level or test) caller
             omits it (default ``None`` → no halt), keeping them
@@ -2518,18 +2570,19 @@ async def _run_post_merge_verify(
         dry_run_handles: Opaque bundle of scheduler/mcp/usage_gate/cost_store
             (task η, AFK coverage gap).  ``None`` (default) keeps the
             solo-reverify and train module-level callers byte-identical (no
-            spawn).  Only the production ``SpeculativeMergeWorker`` call site
-            passes a live bundle, at which point a MERGE_VERIFY_RED outcome
+            spawn).  Only ``SpeculativeMergeWorker._lane_post_merge_verify``,
+            which serves the in-flight verify and the single-branch gate
+            re-verify, passes a live bundle, at which point a MERGE_VERIFY_RED outcome
             (generic task-fault or unscoped-typecheck-FAILED) fires a
             fire-and-forget dry-run investigation via
             :func:`_spawn_merge_verify_dry_run`.
         main_health_probe_handles: Opaque bundle carrying the worker's
             ``background_tasks`` set (task 2564, reify 5067 merge-slot-stall
-            fix).  ``None`` (default) keeps the solo-reverify, train,
-            merge_gates module-level callers, and any other caller running
-            the main-health probe SYNCHRONOUSLY exactly as before this task.
-            Only the production
-            ``SpeculativeMergeWorker._run_inflight_verify`` call site passes
+            fix).  ``None`` (default) keeps the solo-reverify and train
+            callers, and any other caller, running the main-health probe
+            SYNCHRONOUSLY exactly as before task 2564.  Only
+            ``SpeculativeMergeWorker._lane_post_merge_verify``, which serves
+            the in-flight verify and the single-branch gate re-verify, passes
             a live bundle, at which point a main-health-eligible failure
             SKIPS the synchronous ``_classify_main_health_red`` probe,
             returns the provisional task-fault outcome immediately, and
@@ -2582,6 +2635,12 @@ async def _run_post_merge_verify(
         main_sha: Dispatch-time main SHA (``item.base_sha``) paired with
             *merge_base_sha*; see above.  Both must be non-``None`` for
             classification to run.
+        history_leg_command: The project's declared same-tree history leg
+            (task 7248), passed only by ``gates.py::_reverify_rebased_tree``.
+            When set, the LOCAL pool runs only this command, through
+            ``history_leg.py::HistoryLegRunner``, instead of the full gate;
+            every step around the dispatch is unchanged.  ``None`` (default)
+            runs the full gate.
     """
     # Normalize the narrowed-budget counter dict once up front (task 2835):
     # None (the default for every unmigrated caller) becomes a fresh,
@@ -2722,9 +2781,12 @@ async def _run_post_merge_verify(
 
     # γ decision 4: additive runner= param selects the verify host.
     # runner=None (default) → LOCAL-ONLY pool, byte-identical to β for every
-    # legacy caller (_do_merge, _reverify_rebased_tree, reverify_member_solo,
-    # _run_cold_shadow_verify — recovery paths stay on the trust anchor and
-    # out of slot accounting).
+    # legacy caller (_do_merge, reverify_member_solo, _run_cold_shadow_verify —
+    # recovery paths stay on the trust anchor and out of slot accounting).
+    # The gate re-verify is not one of them: the single-branch gate runs on
+    # the head's held lease host (SpeculativeMergeWorker.
+    # _gate_reverify_on_head_host), and the train's on its leased host
+    # (_leased_train_verify).
     # runner=<RemoteRunner> → pool=[runner] (no LocalRunner); warm-swap is skipped
     # (per-host persistent worktree — handled by γ's _run_inflight_verify caller).
     # The caller-owned `quarantine` set is the divergence-quarantine sink for
@@ -2754,18 +2816,10 @@ async def _run_post_merge_verify(
         # controls that intentionally leave archive_root=None — they are never
         # constructed here and are auto-excluded by LocalRunner's default.
         pool = VerifyRunnerPool(
-            [LocalRunner(
-                merge_wt, req.config, effective_module_configs, task_files_tuple,
-                run_scoped=verifier.run_scoped,
-                run_unscoped=verifier.run_unscoped_typechecks,
-                task_id=req.task_id,
-                archive_root=req.config.project_root / 'data' / 'verify-logs',
-                # INV-1 (task 2883): thread the dispatching store so run_scoped's
-                # merge gate emits trivial_pass_escalated.  The merge-flake gate's
-                # own side-effects are NOT threaded here — task ε moved them to the
-                # dispatcher (_run_post_merge_verify), driven off the
-                # FlakeSuppression the returned VerifyResult carries.
-                event_store=event_store,
+            [_local_merge_verify_runner(
+                merge_wt, req, effective_module_configs, task_files_tuple,
+                verifier=verifier, event_store=event_store,
+                history_leg_command=history_leg_command,
             )],
             event_store=event_store,
             task_id=req.task_id,
@@ -3457,8 +3511,9 @@ async def _run_post_merge_verify(
         # merge_wt is already cleaned up; the probe builds its own _mainprobe-
         # worktree and always cleans it in a finally block.
         #
-        # DEFERRED mode (main_health_probe_handles is not None — only the
-        # production SpeculativeMergeWorker._run_inflight_verify call site):
+        # DEFERRED mode (main_health_probe_handles is not None — only
+        # SpeculativeMergeWorker._lane_post_merge_verify, which serves the
+        # in-flight verify and the single-branch gate re-verify):
         # SKIP the synchronous probe entirely.  It can run for minutes
         # (bounded only by the cold verify timeout) and would otherwise hold
         # the caller's verify_task — hence the merge slot / host lease — for
@@ -3468,8 +3523,9 @@ async def _run_post_merge_verify(
         # pre-existing break is escalated separately, off the critical path,
         # by _run_deferred_main_health_probe once it completes.
         #
-        # SYNCHRONOUS mode (handles is None — solo-reverify, train, merge_gates,
-        # and any other caller that does not pass a probe-handles bundle):
+        # SYNCHRONOUS mode (handles is None — solo-reverify, train (its gate
+        # re-verify included), and any other caller that does not pass a
+        # probe-handles bundle):
         # unchanged behaviour from before this task.
         if main_health_probe_handles is None:
             main_health_outcome = await _classify_main_health_red(
@@ -4556,6 +4612,31 @@ async def enqueue_merge_request(
     _emit_merge_queued(event_store, req, queue_depth=queue.qsize(), source=source)
 
 
+_FINALIZE_WINDOW_STATES = frozenset({ItemLifecycleState.FINALIZING})
+"""The states in which ``SpeculativeMergeWorker._finalize_inflight`` may be mid-CAS.
+Its CAS loop consults the cancel only on a halt result, so a cancel there could
+abandon a merge that still lands.  GATE_REVERIFY is not among them: main has not
+moved, and the loop checks the cancel before it CASes again."""
+
+
+def _train_cancel_refusal(
+    req: MergeRequest, coalescing_ids: frozenset[str],
+) -> MergeCancelRefusal | None:
+    """TRAIN SEAM: every train is refused, on Leo's 2026-10-21 ruling on task 5248.
+
+    Neither a whole-train cancel nor a member eject is safe yet:
+    ``_do_train_merge`` has no abandonment checkpoint, and a train dropped
+    before its merge never reaches ``SpeculativeMergeWorker._unwind_coalesce_train``,
+    so its members would stay merge-deferred on their stacked tips.  A single
+    the coalescing pass is stacking right now (*coalescing_ids*) is refused too:
+    the pass would absorb it into a train whatever its future says.  Task 7309,
+    which makes both safe, replaces this function and nothing else.
+    """
+    if isinstance(req, GroupMergeRequest) or req.request_id in coalescing_ids:
+        return MergeCancelRefusal.TRAIN_CANCEL_UNSUPPORTED
+    return None
+
+
 _MERGE_CANCEL_RETIRE_REASON = 'merge_cancel_retire'
 """Reason string for the C1 worktree removal driven by ``merge_cancel``
 retirement (task ε) — distinguishes a cancel-retirement reap from the C3
@@ -4590,6 +4671,7 @@ async def retire_cancelled_merge_request(
     git_ops: _RetireWorktreeP | None,
     event_store: EventStore | None,
     yields: int = 3,
+    reap_worktree: bool = True,
 ) -> str | None:
     """Fully retire a just-cancelled live merge entry before ``merge_cancel`` returns.
 
@@ -4612,7 +4694,9 @@ async def retire_cancelled_merge_request(
        ``remove_merge_worktree_guarded(reason='merge_cancel_retire')`` and a
        ``worktree_reaped`` event is emitted — mirroring the C3 REPLACE arm.  A
        live-leased tree is SKIPPED (never yanked); the reaper collects true
-       leaks later (PRD D4).
+       leaks later (PRD D4).  *reap_worktree* False skips this step for a
+       request whose lane still works in its tree and disposes of it itself
+       (``MergeCancelVerdict.lane_disposes_worktree``).
 
     3. **Sticky result cleared (yield-then-forget).**  The loop is YIELDED
        (bounded ``await asyncio.sleep(0)`` loop; the worktree await also
@@ -4654,7 +4738,7 @@ async def retire_cancelled_merge_request(
         # cancel itself succeeded.  Log loudly (loud-over-silent) and fall
         # through so step (3) always clears the sticky result; the reaper
         # collects any worktree left behind by the failed reap later (PRD D4).
-        if git_ops is not None:
+        if git_ops is not None and reap_worktree:
             try:
                 wt = await git_ops.find_inflight_merge_worktree(branch)
                 if wt is not None:
@@ -7028,6 +7112,28 @@ async def _advance_train(
 _TRAIN_REMOTE_VERIFY_MAX_MEMBERS = 2
 
 
+async def _run_verify_reaped(
+    verify: Coroutine[Any, Any, MergeOutcome | None],
+    *,
+    reap: Callable[[asyncio.Task[MergeOutcome | None]], Awaitable[None]],
+) -> MergeOutcome | None:
+    """Run *verify* as its own task, for a merger that awaits it inline.
+
+    Interrupted, the still-live task is handed to *reap*, the caller's
+    teardown through ``SpeculativeMergeWorker._teardown_verify_task``, so a
+    remote verify is aborted on its host before the local task unwinds; then
+    the interruption propagates.  The verify's own outcome or exception is
+    returned or raised as is.
+    """
+    task = asyncio.create_task(verify)
+    try:
+        await asyncio.wait({task})
+    except BaseException:
+        await reap(task)
+        raise
+    return task.result()
+
+
 class _TrainVerifyHost:
     """The host a train's verifies run on: the slot it leased, or unleased local."""
 
@@ -7092,15 +7198,10 @@ class _TrainVerifyHost:
         Interrupted, the verify is aborted on its host and reaped through the
         worker's teardown chokepoint while it is still live.
         """
-        verify_task = asyncio.create_task(verify)
-        try:
-            await asyncio.wait({verify_task})
-        except BaseException:
-            await self._worker._teardown_verify_task(
-                self._lease, verify_task, self._task_id, shutdown_defensive=True,
-            )
-            raise
-        return verify_task.result()
+        return await _run_verify_reaped(verify, reap=functools.partial(
+            self._worker._teardown_verify_task,
+            self._lease, task_id=self._task_id, shutdown_defensive=True,
+        ))
 
     async def release(self, *, aborted: bool) -> None:
         """Give the slot back.
@@ -9520,8 +9621,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # merge-verify dry-run investigation spawn.  The worker holds none of
         # these itself in any other capacity — they exist solely to be
         # bundled into self._dry_run_handles below and threaded opaquely into
-        # _run_post_merge_verify at the production _run_inflight_verify call
-        # site (mirrors the train_callback_factory opaque-injection pattern
+        # _run_post_merge_verify by _lane_post_merge_verify
+        # (mirrors the train_callback_factory opaque-injection pattern
         # above: the worker never imports the scheduler).  All four default
         # to None so every existing bare git_ops+queue test constructor stays
         # byte-identical.
@@ -10054,6 +10155,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # the last _maybe_coalesce_waiting_singles attempt (incl. no-viable-train
         # attempts).  Short-circuits when the waiting set is unchanged.
         self._last_coalesce_signature: frozenset[str] | None = None
+        # The candidates the coalescing pass is stacking across its awaits;
+        # cancel_request refuses them (see _train_cancel_refusal).
+        self._coalescing_ids: frozenset[str] = frozenset()
+        # The chain link _land_chain_prefix is landing across its awaits; still
+        # LANE_BUFFERED to the registry, so cancel_request refuses it by id.
+        self._landing_link_ids: frozenset[str] = frozenset()
         # The most recent request whose merge commit was handed to the verifier
         # and has NOT yet been finalized (verified + CAS-advanced).  Read ONLY by
         # _await_unadvanced_predecessor, which parks a train behind it — see that
@@ -12032,6 +12139,127 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return  # sentinel consumed — all prior items already buffered
             self._buffer_owned_request(item)
 
+    def _queued_arrivals(self) -> list[MergeRequest]:
+        """Requests still on the external ``_queue``, not yet drained into a lane buffer."""
+        return [
+            _q_req
+            for _q_req in self._queue._queue  # type: ignore[attr-defined]
+            if _q_req is not None
+        ]
+
+    def relane(
+        self,
+        lane: Literal['normal', 'high'],
+        *,
+        request_id: str | None = None,
+        task_id: str | None = None,
+    ) -> RelaneOutcome:
+        """Move a request still waiting for the merger into *lane* (task 5246).
+
+        The operator's lever on an ALREADY-ENQUEUED request.
+        ``metadata.merge_lane`` is read once, at enqueue, so editing it later
+        moves nothing.  Address the request by *request_id*, or by *task_id*:
+        a coalesced member is reachable only by task id, because coalescing
+        retired its own request id, and it moves its whole train
+        (``via_train``).  Moving to ``'normal'`` demotes.
+
+        Only ``req.lane`` changes here, plus a solo request's journal record
+        so a restart keeps it (a train is never journaled; the durable lane is
+        the caller's ``metadata.merge_lane`` write, see
+        :class:`RelaneOutcome`).  The lane buffers belong to ``_merger_task``, and the
+        coalescing pass holds a view of them across awaits, so the move
+        itself is the owner's: :meth:`_rebucket_relaned_requests` runs at the
+        top of :meth:`_pop_next_pickable`, and the merger is woken to reach
+        it.  A request the merger has already taken is refused, since no lane
+        orders it any more and the frozen prefix is never reordered.  No
+        await: lookup and write are one atomic step on the loop.
+        """
+        if lane not in MERGE_LANES:
+            raise ValueError(f'unknown merge lane {lane!r}; expected one of {list(MERGE_LANES)}')
+        if (request_id is None) == (task_id is None):
+            raise ValueError('relane needs exactly one of request_id or task_id')
+        waiting = [
+            *(req for ln in MERGE_LANES for req in self._lane_buffers[ln]),
+            *self._queued_arrivals(),
+        ]
+        target = next(
+            (req for req in waiting
+             if not req.result.done() and _answers_to(req, request_id, task_id)),
+            None,
+        )
+        if target is None:
+            return self._relane_refusal(lane, request_id, task_id)
+        from_lane = target.lane
+        target.lane = lane
+        if self._merge_store is not None and target.request_id in self._journaled_request_ids:
+            try:
+                self._merge_store.record(target)
+            except Exception:
+                logger.warning(
+                    'merge_queue: relane: store.record failed for %s',
+                    target.request_id, exc_info=True,
+                )
+        is_train = isinstance(target, GroupMergeRequest)
+        via_train = target.train_id if is_train else None
+        task_ids = tuple(target.member_task_ids) if is_train else (target.task_id,)
+        logger.info(
+            'merge_queue: relane: %s (task %s, train %s) %s -> %s',
+            target.request_id, target.task_id, via_train, from_lane, lane,
+        )
+        self._signal_resume()
+        return RelaneOutcome(
+            relaned=True, lane=lane, request_id=target.request_id,
+            from_lane=from_lane, via_train=via_train, task_ids=task_ids,
+        )
+
+    def _relane_refusal(
+        self,
+        lane: Literal['normal', 'high'],
+        request_id: str | None,
+        task_id: str | None,
+    ) -> RelaneOutcome:
+        """Why :meth:`relane` found nothing waiting under that id: picked, or absent."""
+        waiting_states = (ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED)
+        for rid, state in self._lifecycle.non_terminal_items().items():
+            live = self._live_items.get(rid)
+            if (
+                state not in waiting_states
+                and live is not None
+                and _answers_to(_request_of(live), request_id, task_id)
+            ):
+                return RelaneOutcome(
+                    relaned=False, lane=lane, request_id=rid,
+                    refusal='already_picked', state=str(state),
+                )
+        return RelaneOutcome(relaned=False, lane=lane, refusal='not_found')
+
+    def _rebucket_relaned_requests(self) -> None:
+        """Move each buffered request whose ``lane`` was changed by :meth:`relane`
+        into that lane's buffer, at its aging position (task 5246).
+
+        Runs on ``_merger_task``, the buffers' owner, so it never lands inside
+        an await that holds a view of them (the coalescing pass does).  The
+        aging position, not the tail, because a moved request has no arrival
+        slot in its new lane: placing it by first submission (the key
+        :meth:`_pop_next_pickable` orders conflicting requests by) means a
+        promoted old fix is not queued behind younger high-lane work.
+        """
+        for lane in MERGE_LANES:
+            buf = self._lane_buffers[lane]
+            strays = [req for req in buf if _normalize_lane(req.lane) != lane]
+            if not strays:
+                continue
+            self._assert_single_writer(self._merger_task, '_lane_buffers')
+            for req in strays:
+                buf.remove(req)
+                target = self._lane_buffers[_normalize_lane(req.lane)]
+                key = _aging_key(req)
+                idx = next(
+                    (i for i, queued in enumerate(target) if _aging_key(queued) > key),
+                    len(target),
+                )
+                target.insert(idx, req)
+
     def _pop_next_pickable(self) -> MergeRequest | None:
         """Return the next pickable request using clique-scoped aging (ζ=1891).
 
@@ -12069,6 +12297,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         if self.is_admission_halted:
             return None
+        self._rebucket_relaned_requests()
         graph = self._suffix_conflict_graph
         for lane in MERGE_LANES:  # high → normal
             if self.is_lane_halted(lane):
@@ -12296,8 +12525,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         speculative item whose ``base_sha`` points at it has a BROKEN chain
         (see :meth:`_chain_dead_link`).  Called at every invalidation site
         (head-failure cascade, dispatch chain-invalidation discard,
-        RUNNER_UNAVAILABLE re-merge) so a built-awaiting-host straggler that the
-        cascade missed is still caught at its next dispatch.
+        RUNNER_UNAVAILABLE re-merge, rebased landing) so a built-awaiting-host
+        straggler that the cascade missed is still caught at its next dispatch.
 
         Bounded FIFO (cap ``self._dead_base_commits_cap``): past the cap the
         oldest recorded commit is evicted from BOTH the membership set and the
@@ -13926,6 +14155,51 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ))
         return found
 
+    def cancel_request(self, request_id: str) -> MergeCancelVerdict:
+        """Cancel the live request *request_id* for an operator, whoever awaits it.
+
+        Cancels the request's result future with an :class:`OperatorMergeCancel`
+        message; every phase's ``_request_abandoned`` checkpoint then drops the
+        request and reaps what it holds, including a running verify.  Refuses a
+        request in its finalize window or a train (:func:`_train_cancel_refusal`).
+        Synchronous, so the merger and verifier cannot move the request between
+        the lookup and the cancel.
+        """
+        found = self._live_request(request_id)
+        if found is None:
+            return MergeCancelVerdict(request_id, MergeCancelRefusal.NOT_LIVE)
+        req, state = found
+        refusal = _train_cancel_refusal(req, self._coalescing_ids)
+        if refusal is None and (
+            state in _FINALIZE_WINDOW_STATES or request_id in self._landing_link_ids
+        ):
+            refusal = MergeCancelRefusal.FINALIZE_WINDOW
+        if refusal is None:
+            req.result.cancel(OperatorMergeCancel(request_id))
+        return MergeCancelVerdict(
+            request_id, refusal, task_id=req.task_id, branch=req.branch.bare_id,
+            state=_REGISTRY_STATE_TO_WIRE[state],
+            awaited_by_workflow=req.awaited_by_workflow,
+            lane_disposes_worktree=state is ItemLifecycleState.GATE_REVERIFY,
+        )
+
+    def _live_request(
+        self, request_id: str,
+    ) -> tuple[MergeRequest, ItemLifecycleState] | None:
+        """The undecided request this lane holds under *request_id*, and its state."""
+        live = self._live_items.get(request_id)
+        state = self._lifecycle.current(request_id)
+        if live is not None and state is not None:
+            req = _request_of(live)
+        else:
+            req = next(
+                (r for r in self._queued_arrivals() if r.request_id == request_id), None,
+            )
+            state = ItemLifecycleState.QUEUED
+        if req is None or req.result.done():
+            return None
+        return req, state
+
     def _decided_predispatch_ids(self, arrivals: Sequence[MergeRequest]) -> frozenset[str]:
         """Ids of the requests waiting for the merger whose outcome is already decided.
 
@@ -14037,7 +14311,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             state: str,
             worktree_path=None,
             position: int = 0,
-            lane: str | None = None,
         ) -> dict:
             return {
                 'task_id': req.task_id,
@@ -14050,7 +14323,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'worktree': str(worktree_path) if worktree_path is not None else None,
                 'pre_rebased': req.pre_rebased,
                 'request_id': req.request_id,
-                'lane': lane if lane is not None else req.lane,
+                'lane': req.lane,
                 # Uniform schema: present on all entries; non-None only on _inflight entries.
                 'host': None,
                 'verify_started_at': None,
@@ -14106,11 +14379,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             for _lane in MERGE_LANES
             for _lb_req in self._lane_buffers[_lane]
         }
-        _arrivals: list[MergeRequest] = [
-            _q_req
-            for _q_req in self._queue._queue  # type: ignore[attr-defined]
-            if _q_req is not None
-        ]
+        _arrivals = self._queued_arrivals()
         _container_ids |= {_q_req.request_id for _q_req in _arrivals}
         _decided = self._decided_predispatch_ids(_arrivals)
 
@@ -14225,21 +14494,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         # 4. Queued (waiting for the merger; the incident blind spot)
         # Items may be in the external _queue OR already drained into _lane_buffers.
-        # Enumerate _lane_buffers first (priority-ordered; items here are already
-        # waiting), then _queue for any not-yet-drained arrivals, which carry
-        # their own lane.
-        _waiting = [
-            (lane, req)
-            for lane, req in (
-                *((_ln, _r) for _ln in MERGE_LANES for _r in self._lane_buffers[_ln]),
-                *((None, _r) for _r in _arrivals),
-            )
-            if req.request_id not in _decided
-        ]
-        for lane, req in _waiting:
+        # Enumerate _lane_buffers first (items here are already waiting), then
+        # _queue for any not-yet-drained arrivals, and list them in the order
+        # the merger will pick: by each request's OWN lane, high first, which
+        # a relane (task 5246) changes before the merger re-buckets it.
+        _waiting = sorted(
+            (
+                req
+                for req in (
+                    *(_r for _ln in MERGE_LANES for _r in self._lane_buffers[_ln]),
+                    *_arrivals,
+                )
+                if req.request_id not in _decided
+            ),
+            key=lambda req: MERGE_LANES.index(_normalize_lane(req.lane)),
+        )
+        for req in _waiting:
             entries.append(_entry(
-                req, 'queued', worktree_path=None,
-                position=len(entries), lane=lane,
+                req, 'queued', worktree_path=None, position=len(entries),
             ))
 
         entries, _duplicate_rids = _first_copy_per_request(entries)
@@ -14445,7 +14717,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         }
 
     def _check_request_liveness(self, now: float, *, threshold_s: float | None = None) -> None:
-        """Sweep the request-liveness ledger and alarm on any entry stuck past threshold.
+        """Sweep the request-liveness ledger and raise any due stuck-request alarm.
 
         Synchronous and clock-injectable (``now``/``threshold_s``) — mirrors
         :meth:`_maybe_log_queue_heartbeat`'s clock-injection convention so
@@ -14454,11 +14726,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         MQ-invariants eta (task 1992): OBSERVATION + ESCALATION ONLY (PRD
         design decision 4) — never resolves a Future, never mutates
-        ``_queue``/``_inflight``, never halts the pipeline.  See
-        ``merge_request_ledger.py``'s module docstring for the ledger
-        lifecycle this sweeps, and
-        :func:`orchestrator.merge_lane.request_ledger._alarm_merge_request_stuck`
-        for the dedup'd-escalation contract.
+        ``_queue``/``_inflight``, never halts the pipeline. The per-dequeue-
+        episode alarm contract lives in
+        ``orchestrator/src/orchestrator/merge_lane/request_ledger.py::report_stuck_requests``.
 
         ``threshold_s`` defaults to ``None``, resolved in-body to 1.5 ×
         :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS` (~4.5h — comfortably
@@ -14467,40 +14737,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         test's string-path monkeypatch of
         ``orchestrator.merge_lane.worker.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS``
         stays effective.
-
-        The WARNING log line is dedup'd exactly like the escalation: at most
-        once per open episode per request_id (``stuck.already_warned``,
-        cleared via ``self._request_ledger.mark_warned``) — otherwise a
-        genuinely leaked/wedged request would log an identical WARNING on
-        every ``_HEARTBEAT_POLL_S`` poll indefinitely. The escalation call
-        below still runs on every sweep regardless of ``already_warned``; it
-        has its own independent ``has_open_l1`` dedup so a resubmission after
-        an operator resolves the L1 is unaffected by the log-dedup state.
         """
         if threshold_s is None:
             threshold_s = 1.5 * INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
 
-        stuck_list = self._request_ledger.stuck_entries(now, threshold_s)
-        if not stuck_list:
-            return
-
-        phase_by_request_id = {
-            entry['request_id']: entry['state'] for entry in self.snapshot()['entries']
-        }
-
-        for stuck in stuck_list:
-            phase = phase_by_request_id.get(stuck.request_id, 'unowned')
-            stuck = dataclasses.replace(stuck, phase=phase)
-            if not stuck.already_warned:
-                logger.warning(
-                    'merge request stuck: request_id=%s task=%s branch=%s age=%.0fs '
-                    'phase=%s — dequeued but never resolved (silent-hang failure mode)',
-                    stuck.request_id, stuck.task_id, stuck.branch, stuck.age_secs, stuck.phase,
-                )
-                self._request_ledger.mark_warned(stuck.request_id)
-            _alarm_merge_request_stuck(
-                self._escalation_queue, stuck, event_store=self._event_store,
-            )
+        report_stuck_requests(
+            self._request_ledger,
+            now=now,
+            threshold_s=threshold_s,
+            pipeline_phases=lambda: {
+                entry['request_id']: entry['state'] for entry in self.snapshot()['entries']
+            },
+            escalation_queue=self._escalation_queue,
+            event_store=self._event_store,
+        )
 
     def _resource_audit_escalation_age_secs(self) -> float:
         """Age past which a leaked worktree is genuinely escalation-worthy (task 3622).
@@ -16018,6 +16268,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         candidates = [
             req for req in self._lane_buffers['normal']
             if not isinstance(req, GroupMergeRequest)
+            and req.lane == 'normal'
             and not req.result.done()
             and not req.result.cancelled()
         ]
@@ -16085,6 +16336,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
             return False
 
+        self._coalescing_ids = frozenset(c.request_id for c in candidates)
+        try:
+            return await self._stack_coalesce_train(candidates, exclusions, orch_config)
+        finally:
+            self._coalescing_ids = frozenset()
+
+    async def _stack_coalesce_train(
+        self,
+        candidates: list[MergeRequest],
+        exclusions: list[dict[str, str]],
+        orch_config: OrchestratorConfig,
+    ) -> bool:
+        """The await-bearing half of :meth:`_maybe_coalesce_waiting_singles`.
+
+        Stacks the eligible *candidates* into one GroupMergeRequest; runs while
+        ``_coalescing_ids`` names them, so no operator cancel lands mid-stack.
+        """
         # ── Step-6: core pass body ─────────────────────────────────────────────
         # SELECTION: fan out line-range fetches concurrently (one git subprocess
         # per candidate), then delegate to the greedy mutually-stackable selector.
@@ -16177,6 +16445,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             mark_member_done=callbacks.mark_member_done,
             redrive_member=callbacks.redrive_member,
             member_pre_stack_tips=stack_result.pre_stack_tips,
+            lane='high' if any(r.lane == 'high' for r in survivor_reqs) else 'normal',
         )
         # MQ-reliability kappa (task 2169): group_req is a brand-new
         # request_id (GroupMergeRequest.request_id auto-generated at
@@ -18273,8 +18542,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         (sole-waiter abandon, operator halt, dead-verify no-progress),
         ``_run_inflight_verify``'s ``finally`` orphan guard (task 3043), which
         reaps the inner verify task on any exit route the three abort triggers
-        do not cover (in practice: external cancellation), and a train's
-        verify interrupted mid-run (``_TrainVerifyHost.run_verify``, task 6160).
+        do not cover (in practice: external cancellation), and the reap of a
+        verify interrupted mid-run in :func:`_run_verify_reaped`, serving a
+        train's verify (``_TrainVerifyHost.run_verify``, task 6160) and a
+        remote gate re-verify (``_gate_reverify_on_head_host``, task 6278).
 
         ORDER IS LOAD-BEARING, and sole-callership is what now guarantees it.
         The remote cancel must fire while ``_inflight_request_id`` is still
@@ -18598,6 +18869,80 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._contended_lease_requeues.pop(task_id, None)
         self._contended_lease_first_defer_at.pop(task_id, None)
         self._contended_lease_last_defer_at.pop(task_id, None)
+
+    def _lane_post_merge_verify(
+        self, git_ops: GitOps, req: MergeRequest, merge_wt: Path, **per_call: Any,
+    ) -> Coroutine[Any, Any, MergeOutcome | None]:
+        """The single place that decides which lane handles a single-branch merge verify inherits."""
+        return _run_post_merge_verify(
+            git_ops, req, merge_wt,
+            max_narrowed=self.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
+            narrowed_retries=self._post_merge_verify_narrowed_retries,
+            event_store=self._event_store,
+            quarantine=self._runner_quarantine,
+            escalation_queue=self._escalation_queue,
+            # task 2886 fix 3 (PRD §3.4 / decision 4): thread the synchronous
+            # all-lane halt so a CONCLUDED cross-check divergence stops the
+            # queue the instant it is detected — BEFORE any further adoption —
+            # instead of trailing it via the async escalation gate (incident
+            # 83336a32 halted +3s too late).  Cross-check stays a trailing
+            # detector; the halt is synchronous only to precede further lands.
+            halt_hook=self.operator_halt,
+            dry_run_handles=self._dry_run_handles,
+            main_health_probe_handles=_MainHealthProbeHandles(
+                background_tasks=self._background_tasks,
+                auto_heal=self._auto_heal_main_health_deferred,
+            ),
+            verifier=self._verifier,
+            **per_call,
+        )
+
+    async def _gate_reverify_on_head_host(
+        self,
+        lease: HostLease | None,
+        git_ops: GitOps,
+        req: MergeRequest,
+        merge_wt: Path,
+        *,
+        history_leg_command: str | None = None,
+        **gate_kwargs: Any,
+    ) -> MergeOutcome | None:
+        """Run a head's gate re-verify on the host the head ALREADY holds.
+
+        A remote *lease* runs it there; a local lease, a chain-adopted head
+        (whose lease adoption already released) and a lease-less passthrough
+        run it locally.  No slot is ever acquired for it: re-acquiring would
+        wait on a slot held by the next in-order entry, which finalizes only
+        after this head.  The history leg's runner is local-only, so a
+        declared *history_leg_command* runs on local whatever the head holds.
+
+        A remote that turns out unreachable is benched through the
+        ``on_unavailable`` chokepoint and the gate re-runs on local, leaseless,
+        never blocking the item; its restart-drain deadline restarts with it.
+        An interrupted remote attempt is aborted on its host while still live.
+        """
+        if lease is not None and not lease.is_local and history_leg_command is None:
+            try:
+                return await _run_verify_reaped(
+                    self._lane_post_merge_verify(
+                        git_ops, req, merge_wt, runner=lease.runner, **gate_kwargs,
+                    ),
+                    reap=functools.partial(
+                        self._teardown_verify_task,
+                        lease, task_id=req.task_id, shutdown_defensive=True,
+                    ),
+                )
+            except RunnerUnavailable as exc:
+                logger.warning(
+                    'Task %s: verify host %s unavailable (%s: %s); re-running '
+                    'the gate re-verify on local',
+                    req.task_id, lease.name, exc.kind, exc,
+                )
+                self.bench_unavailable_runner(lease.name, exc)
+                self._note_verify_started(req.request_id)
+        return await self._lane_post_merge_verify(
+            git_ops, req, merge_wt, history_leg_command=history_leg_command, **gate_kwargs,
+        )
 
     async def _run_inflight_verify(
         self,
@@ -18990,40 +19335,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if entry_slot is not None:
                 entry_slot.publish_verify_base(verify_base)
 
-            verify_task = asyncio.ensure_future(_run_post_merge_verify(
+            verify_task = asyncio.ensure_future(self._lane_post_merge_verify(
                 self._git_ops, req, merge_wt,
                 timeouts=self._post_merge_verify_timeouts,
                 enospc_retries=self._post_merge_verify_enospc_retries,
                 max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                 max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
-                max_narrowed=self.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
-                narrowed_retries=self._post_merge_verify_narrowed_retries,
-                event_store=self._event_store,
                 merge_sha=merge_commit,
                 on_result=_warm_capture.append if _is_warm_path else None,
                 shadow_baseline_sink=_attempt0_shadow if _is_warm_path else None,
-                quarantine=self._runner_quarantine,
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
-                escalation_queue=self._escalation_queue,
-                # task 2886 fix 3 (PRD §3.4 / decision 4): thread the synchronous
-                # all-lane halt so a CONCLUDED cross-check divergence stops the
-                # queue the instant it is detected — BEFORE any further adoption —
-                # instead of trailing it via the async escalation gate (incident
-                # 83336a32 halted +3s too late).  Cross-check stays a trailing
-                # detector; the halt is synchronous only to precede further lands.
-                halt_hook=self.operator_halt,
-                dry_run_handles=self._dry_run_handles,
-                main_health_probe_handles=_MainHealthProbeHandles(
-                    background_tasks=self._background_tasks,
-                    auto_heal=self._auto_heal_main_health_deferred,
-                ),
                 depth=depth,
                 speculative=item.speculative,
                 chain_items=chain_items,
                 chain_build_ms=chain_build_ms,
                 merge_base_sha=verify_base.merge_base_sha,
-                main_sha=verify_base.main_sha, verifier=self._verifier,
+                main_sha=verify_base.main_sha,
             ))
             # task 2420 (DEFECT 1, split from 2357; extends #1728), revised by
             # task 4579: no-progress budget seed.  Content-mtime is sampled
@@ -20494,12 +20822,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 break
             _lane, _idx, link_req = taken
+            if self._request_abandoned(link_req):
+                # Cancelled while the head verified: it must not land, and
+                # every later link's tree contains it, so the walk ends here.
+                self._restore_chain_link_request(_lane, _idx, link_req)
+                break
             # Set the instant the link's future is resolved, which is the point
             # of no return: past it the link is TERMINAL and putting it back in
             # a lane buffer would re-merge an item that already landed.  Every
             # abort arm below therefore restores ONLY while this is False.
             link_resolved = False
 
+            self._landing_link_ids = frozenset({link_req.request_id})
             try:
                 # `merge_commit^2` is the branch tip build_chain's `--no-ff` merge
                 # incorporated — the same derivation _finalize_advanced_merge
@@ -20685,6 +21019,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if not link_resolved:
                     self._restore_chain_link_request(_lane, _idx, link_req)
                 break
+            finally:
+                self._landing_link_ids = frozenset()
 
         logger.info(
             'deep chain walk: landed %d of %d chained link(s) on top of %s',
@@ -20810,7 +21146,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Lease release and speculation-slot release happen in the single finally:
           · _cancel_release=True  → cancel_and_release  (DROPPED/REQUEUED,
-                                    unless vacated: lease is None)
+                                    unless vacated: lease is None; and a gate
+                                    re-verify interrupted mid-run, as an
+                                    aborted train's lease is)
           · _cancel_release=False → release              (FAIL/PASS)
           · _skip_release=True    → no allocator call    (PASSTHROUGH: lease is None)
         _n_failed is carried in _n_failed_val (None → defer to 'not advanced').
@@ -21501,6 +21839,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                         advanced = True
                         return True
+                    # INV-3 (task 6273): the rebase superseded current_sha; it will never be on main.
+                    self._record_dead_base(current_sha)
                     # ι=1894: count this as a merge retry — main advanced under the
                     # request, so a fresh re-verify is required.  Both cas_failed and
                     # rebased_pending_reverify are included in retries_per_landing (see
@@ -21511,6 +21851,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         req.request_id, ItemLifecycleState.FINALIZING,
                         ItemLifecycleState.GATE_REVERIFY, live_obj=entry,
                     )
+                    _cancel_release = True
                     gate = await _reverify_rebased_tree(
                         self._git_ops, req, merge_wt,
                         verified_merge_sha=current_sha,
@@ -21522,9 +21863,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
                         merge_sha=rebased_sha,
                         keep_worktrees=set(self._owned_merge_worktrees),
-                        run_post_merge_verify=_run_post_merge_verify,
+                        run_post_merge_verify=functools.partial(
+                            self._gate_reverify_on_head_host, entry.lease,
+                        ),
                         event_store=self._event_store,
                     )
+                    _cancel_release = False
                     if isinstance(gate, MergeOutcome):
                         # task 2604: route through the unified terminal
                         # chokepoint so _retire_item fires (mirrors the three
@@ -21536,6 +21880,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # request failed its post-rebase reverify gate. The
                         # chokepoint already performs the not-done guard.
                         self._resolve_or_drop_abandoned(req, gate)
+                        return False
+                    if self._request_abandoned(req):
+                        # Cancelled during the re-verify: main has not moved and
+                        # no CAS is in flight, so it leaves as a failed gate does.
+                        self._gate_retries.pop(req.task_id, None)
+                        await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
+                        self._retire_item(req.request_id)
                         return False
 
                     current_sha = rebased_sha

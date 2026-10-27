@@ -92,6 +92,7 @@ __all__ = [
     'declared_gate_topic',
     'evaluate_closure',
     'handrolled_member_enumeration',
+    'observed_members',
     'render_consolidation_gate_section',
     'render_end_state_brief',
     'resolve_unstamped_live_ids',
@@ -270,7 +271,7 @@ def _scroll_ids(members: Sequence[Any]) -> set[str]:
     return {_payload_id(p).lower() for p in members if _payload_id(p)}
 
 
-def _observed_members(gate_block: Any) -> Sequence[Any]:
+def observed_members(gate_block: Any) -> Sequence[Any]:
     """The gate block's inert ``provenance.observed_members``, defensively.
 
     A non-Mapping block, a missing/non-Mapping ``provenance``, and an
@@ -428,7 +429,7 @@ def unstamped_candidates(
     closure claim in favour of inert provenance.
 
     Defensive on every shape: an unusable block or provenance contributes no
-    observed members (see :func:`_observed_members`) rather than raising —
+    observed members (see :func:`observed_members`) rather than raising —
     this predicate's job is to REPORT malformedness, and one that dies on bad
     input blocks the very gates it exists to adjudicate (the same reasoning
     as :func:`_payload_meta`).  The claim is read regardless.
@@ -442,7 +443,7 @@ def unstamped_candidates(
     live_ids = _scroll_ids(members)
     candidates: list[str] = []
     seen: set[str] = set()
-    for raw in (*_sole_canonical_claim(members), *_observed_members(gate_block)):
+    for raw in (*_sole_canonical_claim(members), *observed_members(gate_block)):
         if not is_full_uuid(raw):
             continue
         folded = str(raw).lower()

@@ -453,10 +453,27 @@ escalation-watcher-auto. `--level 2` restricts the inotify watcher to L2 escalat
 watcher exits after the first matching L2 escalation, printing its JSON to stdout. If a matching L2
 escalation is already pending when the watcher starts, it may fire immediately at launch — this is
 expected, not an error, and is consistent with drain-after-up ordering (the subsequent drain
-re-finds it). The wrapper preserves the underlying watcher's exit code (`0`=fired, `124`=timeout)
-and emits a `WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` line to **stderr** on
-every run — do NOT pipe `2>&1` when you parse stdout as the escalation JSON, or you'll corrupt the
-parse.
+re-finds it). The wrapper preserves the underlying watcher's exit code and emits a
+`WATCHER_REARM_OUTCOME: <OUTCOME> exit=<rc>` line to **stderr** on every watcher run — do NOT pipe
+`2>&1` when you parse stdout as the escalation JSON, or you'll corrupt the parse. Branch on it:
+
+| Marker | Exit | Next |
+|---|---|---|
+| `WATCHER_REARM_OUTCOME: FIRED` | 0 | A wake: loop back to re-arm, then drain (Main Loop). Exit 0 with EMPTY stdout is a caught SIGTERM (`scripts/watcher-rearm.sh` header), not a fire, and it counts against the cap. |
+| `WATCHER_REARM_OUTCOME: CEILING` | 124 | The hourly heartbeat: re-arm in the background as normal. The cap exempts it, because this lane's AFK loop runs on CEILING ticks for up to 48h. |
+| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Never re-issue a killed FOREGROUND arm in the foreground: move to the `run_in_background` pattern. A BACKGROUND arm that died with no marker at ~2 min had no Bash `timeout` ("Diagnostic — watcher dies at ~2 minutes" below), and re-arming WITH it is a material change. Re-touch the `watcher-<project>` lease before assuming a second watcher is needed. Counts against the cap. |
+| `WATCHER_REARM_OUTCOME: ERROR` | any other; exit 2 prints NO marker | Diagnose from stderr before any retry. Exit 2 is a usage/guard error (unset `DARK_FACTORY_ROOT`, unresolved queue dir, bad flag): it returns before the watcher runs and recurs until fixed. Counts against the cap. |
+
+**Identical-retry cap: 1.** After KILLED, ERROR, a missing marker, an empty-stdout FIRED or a
+rejected call, re-issue the identical invocation (same script, flags and Bash `timeout`) at most
+once. If it fails again, change the invocation materially, or stop looping and report the outcome
+to the user.
+
+**STOP directives in tool results.** A tool result, including a rejected call's, that says
+"STOP what you are doing and wait for the user to tell you how to proceed" carries the weight of a
+system instruction from the user. Never re-issue the rejected call, identical or not: stop the loop
+and wait for the user's next turn. This is a pause and not one of "Stopping"'s triggers, so do not
+release the lease.
 
 **Second stderr marker — `WATCHER_NTFY_OUTCOME: FAILED esc=<id> url=<url>: <error>`:** the phone
 push for that escalation was dropped. The queue item itself is **unaffected** — it was still
@@ -679,6 +696,10 @@ carries the brief. Check "Always ask — keyed on record content" below first: i
    lease operation that stays forbidden.
 9. Launching a retain-and-tag, zero-deletion `/curate-fused-memories` sitting for consolidation
    gates (ratified 2026-09-25).
+10. Closing a `__stale_l0_strand_sweep__` record with `close_only` once each stranded note it
+    names has been recovered from `data/escalations/archive/<date>/` and routed: appended to a
+    `pending` owner task (line 5), or filed to the owner task of its class. The resolution names
+    where each note went (Leo, 2026-10-22, on scoping_intake's esc-__stale_l0_strand_sweep__-6).
 
 #### Always ask — keyed on record content
 
@@ -707,7 +728,32 @@ it, and the gate slug where one corresponds:
 - A record whose `pin_declared_by` field is set, that is under a Leo HOLD, or that names Leo's
   other session or his personal backlog.
 - Priority, pin-queue placement, cross-cluster dependency sequencing.
-- Scope changes: acceptance criteria, cancel-and-refile or re-scope.
+- Scope changes: acceptance criteria, cancel-and-refile or re-scope. **Except** cancelling a task
+  that a PRD decision Leo ruled has superseded (Leo, 2026-10-22; ratified 2026-10-26), which is
+  allowed and reported under **Done**. All four must hold, each checked by you, never taken from
+  the record:
+  1. **The PRD decision is one Leo ruled.** The PRD says so, the program doc records it
+     `ruled_by: human`, or a task's `x_ruling` carries it. A lead ruling, an architect's reading
+     or a `triage_note` does not qualify.
+  2. **The superseding task exists**, in any status except `cancelled`.
+  3. **The superseded task's full scope is covered.** Each of its items is done on main, rendered
+     moot by the decision, or included in the superseding task's description or plan. One
+     uncovered item fails this check: that item goes to Leo, or into the superseding task's
+     `details` while that task is `pending` (self-execute item 5).
+  4. **The superseded task's branch has no commits**: `git rev-list --count main..task/<id>` is 0.
+
+  Then, in order:
+  1. Repoint every task that depends on the superseded task onto the superseding task
+     (`remove_dependency`, then `add_dependency`), and confirm no dependents remain, so the cancel
+     never trips the irreversible-deletion class above.
+  2. Stamp `x_superseded_by: [<id>]` and an `x_ruling` naming the decision with its file:line,
+     using `metadata_mode='merge'`.
+  3. Cancel the task. When an L2 holds it, cancel it with `resolve_issue(action='abandon')`.
+  4. Close its streak alarm.
+
+  Exemplars: 603 (S7 decision 4), 856 (lane-harness decision 9) and 858 (D-S20-8), each ruled
+  cancel by Leo, 2026-10-20..22. A deliverable that landed under another task's commit is not this
+  case: it is marked done `found_on_main` with `delivered_checks` (683, 1058).
 
 Choosing Fable for an H3 investigation seat is your call. The "fable run" key matches a record that
 asks to launch one.
@@ -866,7 +912,7 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   `dark_factory`/`df`/`dark-factory`, each invisible to a reap scoped to either of the others).
   - **Caveat — check your project's existing rows before trusting the declared token.** Folding
     merges spellings that differ only by case or separator; only an entry in
-    `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
+    `shared.project_id.PROJECT_ID_ALIASES` can bridge a project whose filed decisions fold to something *other*
     than its declared `memory.project_id`, and today `df → dark_factory` is the only such entry.
     **solar-challenge is the known standing case**: its config declares `my_solar_challenge`, but
     its decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but
@@ -1113,8 +1159,8 @@ switches on and off. Three behavioural shifts:
    - Hold the task, choosing by the record's **severity**:
      - **Not `info`:** `resolve_issue(..., action='park')`. The task lands `blocked`, held under
        the open L2, because a pinning escalation vetoes the stranded-blocked sweep.
-     - **`info`:** never park. An info record never pins
-       (`escalation/src/escalation/pins.py::classify_pins`; intended, Leo 2026-10-09). The sweep
+     - **`info`:** never park; `resolve_issue` refuses it (`park_on_info`). An info record never
+       pins (`escalation/src/escalation/pins.py::classify_pins`; intended, Leo 2026-10-09). The sweep
        re-pends a parked task within a tick, as with esc-5708-3, reify esc-7881-5 and
        esc-4681-3 (16 s). Leave the escalation pending and **defer** the task:
        1. `set_task_status(id, status='deferred', deferral={'kind': 'until_condition',
@@ -1771,6 +1817,25 @@ of `scripts/sitting/preparation.py::to_json_payload`, where `item` is the `key` 
 - Put every escalation and task id you mention in `cites`, so the brief glosses it.
 - The item's briefing disposition decides whether it is recorded now, after investigation, or as a
   direct ask (see "Disposition before briefing (H1–H6)").
+- A `dependency_capability` record (`DEP_CAPABILITY_NOT_DELIVERED`) is about a check the blocked
+  task does NOT own. Read the owner from the record JSON in the item's own queue: the `brief --json`
+  row's `queue_dir` and `escalation_id` name `<queue_dir>/<escalation_id>.json`, else
+  `<queue_dir>/archive/*/<escalation_id>.json`. `mcp__escalation__get_escalation` reaches only
+  dark-factory's own queue, and without `project_root` it answers a foreign id from a same-numbered
+  local record; use it only for a dark-factory item, and pass `project_root` so a foreign id is
+  refused. The record's `delivered_check_owner`
+  (shape: `escalation/src/escalation/models.py::DeliveredCheckOwner`) has a `task_id`, which is the
+  dependency whose `metadata.delivered_checks` entry `check_name` failed, and a `sidecar`, which is
+  that dependency's capability manifest, with `on_main` saying whether the file declares the check on
+  `main`. An option that repaths, re-patterns or drops the check edits the owner's sites only:
+  `update_task` on the owner, re-sending its full `delivered_checks` list, plus the sidecar when
+  `on_main` is `declares` (and its `.capability-manifest.md` twin if that names the old path). Settle
+  `unverified` with `git show main:<path>` before writing the option. The record's own task appears
+  in an option only as the task to re-pend; never propose editing its `delivered_checks` or its
+  sidecar. A record without the field (filed before task 7514, or rewritten by an older process)
+  states the same owner in prose: the dependency in the summary's `dep <id>` and the detail's
+  `Dependency: task <id>`. `get_task` it and derive its sidecar from its
+  `metadata.prd_path` with `shared/src/shared/capability_manifest.py::sidecar_path`.
 
 #### Gate facts are yours to supply
 
@@ -1809,8 +1874,10 @@ enter through `resolve-answers`, with `--source docket` or `--source terminal`.
    Mem0 category, because the Graphiti route keeps the conclusion and distills the reasoning away.
 
 The order is deliberate. The markers go on while the record is still pending, and `resolve_issue`
-runs before `close-decision`, so a server refusal such as `declared_pin_refused` stops the apply
-before the registry records an answer.
+runs before `close-decision`, so a server refusal such as `declared_pin_refused` or `park_on_info`
+stops the apply before the registry records an answer. On `park_on_info` the record is
+info-severity: do not retry the park; hold the task with a deferral (AFK shift 1) and report it to
+Leo.
 
 An L2 with no DecisionRecord is filed, then closed, under
 `scripts/sitting/payloads.py::sitting_decision_id`: `<project>-<esc id>`, or `<project>-recon-<esc
@@ -1959,6 +2026,25 @@ Agent found it depends on work that isn't done yet.
    ```
 3. **If no matching task exists**: spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, dependency_discovered, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`). The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
 
+### `dependency_capability` (critical, born at L2)
+
+Filed by the scheduler (`agent_role='orchestrator-scheduler'`) when a dependency's
+`metadata.delivered_checks` entry has failed on `main` for `delivered_checks.grace_cycles` ticks.
+The record's task is the blocked DEPENDENT; the check belongs to the dependency named in
+`delivered_check_owner.task_id`. Read it from the record JSON in the item's own queue; the prose
+fallback, the field meanings and why not `get_escalation` are in the "Investigate before you
+`record`" bullet above. Two cases, with opposite responses (`docs/task-authoring.md` §3.3):
+
+1. **The capability is on main and the check is stale or mis-authored.** An `AUTHORING DIAGNOSIS`
+   block, or your own `git grep` at `main` finding the capability elsewhere, shows this. Editing a
+   gate descriptor is a human call: put it to Leo with the owner's sites as the apply target.
+2. **The capability is missing from main.** The gap is the owner's work. Put it to Leo with the
+   owner named; do not touch any descriptor.
+
+Once the check passes on main, resolve with `action='resume'` to re-pend the dependent. Other
+dependents of the same owner may hold their own records for the same check: one fix on the owner
+serves them all, so close each against the ruling.
+
 ### `design_concern` (info or blocking)
 
 Architectural or design questions. These already failed steward auto-resolution — they're genuinely ambiguous.
@@ -2040,7 +2126,10 @@ is anything but accept, use the normal park procedure above.
 **Limits.** A second such escalation on the same task goes to the human as a pattern instead: a
 stream of deviations on one task suggests its planning is off. There is no daily cap: Leo discarded
 it on 2026-09-26 ("Discard the cap. You can ratify these without limit."). The human can revoke
-this rule at any time.
+this rule at any time. Whether deviations are rising or clustering across tasks is owned by the
+nightly plan-deviation census (`scripts/legibility/plan_deviation_census.py`), which escalates a
+rate rise or pattern itself as a `blocking` `design_concern` on task id
+`plan-deviation-census-<project_id>`. It is blocking, so this standing rule never closes it.
 
 **Worked examples (2026-09-17).**
 - **Accepted: esc-4876-8.** A planner measured that of three suggested graphiti levers only
@@ -2312,11 +2401,14 @@ Instead, **read the session's result file** for the structured outcome:
 1. Locate the session-registry record for the spawn (the slug you launched it under, or the
    matching record under `~/.claude/fleet/sessions/` for the task/title you spawned).
 2. Read `record.result_file` — equivalently `~/.claude/fleet/sessions/<slug>/result.md` — for the
-   `outcome` (`done|blocked|abandoned|handed-off`), `changed` (commits/branches/task ids touched),
+   `outcome: done|blocked|abandoned|handed-off|in-progress`, `changed` (commits/branches/task ids touched),
    and `action_needed` fields the spawned session wrote before ending.
 3. Use that structured outcome to decide your next step (resolve the escalation, follow up, escalate
    further) — `result.md` is the authoritative outcome source, so this replaces exploring the
    task/worktree yourself to reconstruct what happened.
+4. An `in-progress` outcome on a finished spawn (the background task has completed, so the record
+   is terminal) means the session **ended at checkpoint**, before its final write. Treat it like an
+   absent file and fall back to exploring the task/escalation state.
 
 **Fail-soft:** the write is best-effort — if `result.md` is absent, empty, or unparsable (the
 spawned session ended without writing it, or the registry write itself faulted so the record never
@@ -2348,7 +2440,7 @@ its values may be passed to `resolve_issue`.
 |---|---|---|---|---|
 | `resume` (default) | `resolved` | resumes; resolution text injected (L0 live path) | `blocked` → `pending` (any task-attached level ≥ 1, incl. memberless born-at-L2) | "Here's the answer — continue." |
 | `restart` | `resolved` | killed (soft-cancel → grace → hard) | → `pending` (from `in-progress` or `blocked`) | "This run is off-course — re-run fresh." |
-| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." **Never on an `info` record:** info never pins, so the sweep re-pends the task within a tick. Defer the task instead (AFK shift 1). `resolve_issue` will refuse it once task 6578 lands. |
+| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." **Never on an `info` record:** info never pins, so the sweep re-pends the task within a tick. Defer the task instead (AFK shift 1). `resolve_issue` refuses it with code `park_on_info` and changes nothing; the response's `hint` and `task_id` give the deferral to use instead. An info park that is accepted means that orchestrator's escalation server predates task 6578: defer the task anyway. |
 | `abandon` | `dismissed` | killed | → `cancelled` | "Never run again." |
 | `close_only` | `dismissed` | untouched | none | "Record is noise/duplicate — change nothing." |
 
@@ -2510,6 +2602,8 @@ The gate itself honors a project-specific break-glass bypass; the two config com
 These are gate-side controls read by the watched project's reference-transaction hook — they are not dark-factory settings. Consult the watched project's gate documentation for the exact knob. To recover manually: **(1)** engage the bypass (set the knob), **(2)** run a raw CAS `git update-ref refs/heads/main <good-sha> <current-main>` in the watched repo (which the guard now allows through), **(3)** **clear the bypass immediately after** — on both success and failure, since the bypass is durable and would otherwise leak into every later ref move. Once the bypass commands are configured, `recover_main` does steps 1–3 for you; wire them up so the next recovery is one command.
 
 ## Failure Modes
+
+**A re-arm that does not return FIRED or CEILING**: branch on its `WATCHER_REARM_OUTCOME` row and the identical-retry cap in "Starting the watcher"; never loop on the identical call.
 
 **"Too many open files" (historical — no longer expected)**: Early sessions could exhaust the background-task fd pool after ~35 watcher restart cycles. This is no longer observed in practice — 100+ cycle sessions are routine. The watcher exits promptly via `sys.exit(0)`, so its inotify fd is reclaimed by the kernel and the background task is reaped shortly after. If you ever do hit it, start a fresh Claude Code session.
 

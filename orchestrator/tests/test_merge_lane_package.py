@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any, assert_type
 
 import pytest
 from _merge_lane_fakes import (
@@ -288,6 +289,7 @@ class TestProductionClockWaitsForAny:
         task = asyncio.create_task(asyncio.sleep(0.01))
         try:
             done = await PRODUCTION_CLOCK.wait_for_any({task}, timeout=5.0)
+            assert_type(done, set[asyncio.Future[Any]])
             assert isinstance(done, set)
             assert done == {task}
         finally:
@@ -335,6 +337,7 @@ class TestFakeClockWaitsForAny:
         task = asyncio.create_task(asyncio.sleep(0.05))
         try:
             done = await clock.wait_for_any({task}, timeout=600.0)
+            assert_type(done, set[asyncio.Future[Any]])
             polls = 1
             while not done and polls < self.POLL_BUDGET:
                 done = await clock.wait_for_any({task}, timeout=600.0)

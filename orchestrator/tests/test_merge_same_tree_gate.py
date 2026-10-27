@@ -111,7 +111,9 @@ class _Scene:
     config: OrchestratorConfig
 
 
-def _scene(tmp_path: Path, *, history_pure: bool = True) -> _Scene:
+def _scene(
+    tmp_path: Path, *, history_pure: bool = True, history_leg: str | None = None,
+) -> _Scene:
     repo = seed_repo(tmp_path / 'repo', _SEED)
     git = GitConfig(
         main_branch='main', branch_prefix='task/', worktree_dir='.worktrees',
@@ -121,8 +123,13 @@ def _scene(tmp_path: Path, *, history_pure: bool = True) -> _Scene:
         repo=repo, git_ops=GitOps(git, repo),
         config=lane_scene_config(
             repo, git, merge_verify_breadth='full', merge_gate_history_pure=history_pure,
+            merge_gate_history_test_command=history_leg,
         ),
     )
+
+
+def _leg_writing_head_to(marker: Path) -> str:
+    return f'git rev-parse HEAD > {marker}'
 
 
 async def _stacked_follower(scene: _Scene) -> tuple[Path, str]:
@@ -210,6 +217,68 @@ async def test_train_whose_member_patch_lands_upstream_skips_the_reverify(
     tmp_path: Path,
 ) -> None:
     scene = _scene(tmp_path)
+    outcome, verify, store = await _run_train_whose_member_patch_lands_upstream(scene)
+
+    assert outcome.status == 'done', outcome
+    assert len(verify.calls) == 1
+    assert _tree(scene.repo, 'main') == verify.calls[0].tree
+    [row] = _gate_retries(store)
+    assert row['gate_clearance'] == 'same_tree'
+    assert row['train_id'] == 'train-6647'
+
+
+async def test_rebase_that_drops_an_upstream_patch_runs_only_the_history_leg(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / 'leg-head'
+    scene = _scene(tmp_path, history_leg=_leg_writing_head_to(marker))
+    follower_wt, head_commit = await _stacked_follower(scene)
+    verify = _MovingVerify(scene.repo, _lands_patch_of(head_commit))
+    store = _RecordingEventStore()
+
+    outcome = await _run(scene, _request(scene, 'follower', follower_wt), verify, store)
+
+    assert outcome.status == 'done', outcome
+    assert len(verify.calls) == 1
+    assert [row['gate_clearance'] for row in _gate_retries(store)] == ['history_leg']
+    assert marker.read_text().strip() == _git(scene.repo, 'rev-parse', 'main')
+
+
+async def test_train_whose_member_patch_lands_upstream_runs_only_the_history_leg(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / 'leg-head'
+    scene = _scene(tmp_path, history_leg=_leg_writing_head_to(marker))
+    outcome, verify, store = await _run_train_whose_member_patch_lands_upstream(scene)
+
+    assert outcome.status == 'done', outcome
+    assert len(verify.calls) == 1
+    [row] = _gate_retries(store)
+    assert row['gate_clearance'] == 'history_leg'
+    assert row['train_id'] == 'train-6647'
+    assert marker.read_text().strip() == _git(scene.repo, 'rev-parse', 'main')
+
+
+async def test_rebase_onto_an_unrelated_drift_does_not_run_the_history_leg(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / 'leg-head'
+    scene = _scene(tmp_path, history_leg=_leg_writing_head_to(marker))
+    follower_wt, _ = await _stacked_follower(scene)
+    verify = _MovingVerify(scene.repo, _unrelated_drift)
+    store = _RecordingEventStore()
+
+    outcome = await _run(scene, _request(scene, 'follower', follower_wt), verify, store)
+
+    assert outcome.status == 'done', outcome
+    assert [row['gate_clearance'] for row in _gate_retries(store)] == ['reverified']
+    assert not marker.exists()
+
+
+async def _run_train_whose_member_patch_lands_upstream(
+    scene: _Scene,
+) -> tuple[MergeOutcome, _MovingVerify, _RecordingEventStore]:
+    """A three-member train whose first member's patch lands on main under its verify."""
     members = ('tm-a', 'tm-b', 'tm-c')
     worktrees: dict[str, Path] = {}
     for member in members:
@@ -238,12 +307,4 @@ async def test_train_whose_member_patch_lands_upstream_skips_the_reverify(
     )
     verify = _MovingVerify(scene.repo, _lands_patch_of(first_member_commit))
     store = _RecordingEventStore()
-
-    outcome = await _run(scene, request, verify, store)
-
-    assert outcome.status == 'done', outcome
-    assert len(verify.calls) == 1
-    assert _tree(scene.repo, 'main') == verify.calls[0].tree
-    [row] = _gate_retries(store)
-    assert row['gate_clearance'] == 'same_tree'
-    assert row['train_id'] == 'train-6647'
+    return await _run(scene, request, verify, store), verify, store

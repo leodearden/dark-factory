@@ -14,7 +14,8 @@ Three tables in the project's existing ``data/orchestrator/runs.db``:
   :func:`open_debt` call.  An observation writes its occurrence rows and its items in
   one local transaction (:func:`enqueue_debt`), and
   ``orchestrator/src/orchestrator/flake_debt_drain.py`` files the owners afterwards,
-  off the merge path (task 6934).
+  off the merge path (task 6934).  An item's context (:class:`DebtContext`) shapes the
+  de-flake task it owes (plans/offline-lane-red-path-prd.md §5.6).
 
 Living in the shared ``orchestrator`` package, on a DB every client project already
 has, is what hands this facility to all 8 projects with ZERO provisioning: the tables
@@ -76,12 +77,13 @@ import json
 import logging
 import sqlite3
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, Protocol
 
+from shared.project_layout import runs_db
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.task_metadata import DoneProvenance, parse_metadata
 from shared.task_statuses import TERMINAL, owner_liveness
@@ -108,7 +110,7 @@ CREATE TABLE IF NOT EXISTS flake_occurrence (   -- append-only; many rows per te
     test_id         TEXT    NOT NULL,   -- pytest node-id, or script-suite test name
     project_id      TEXT    NOT NULL,   -- denormalised: the dashboard aggregates across runs.db files
     verdict         TEXT    NOT NULL,   -- passes_in_isolation | fails_in_isolation | unconfirmable
-    call_site       TEXT    NOT NULL,   -- merge_gate | main_probe | chronic_marker
+    call_site       TEXT    NOT NULL,   -- merge_gate | main_probe | chronic_marker | offline_lane
     runner          TEXT,               -- 'local' | remote host name — WHERE the discriminator ran
     merge_sha       TEXT,
     task_id         TEXT,
@@ -196,12 +198,33 @@ class FlakeCallSite(StrEnum):
     merge_gate = 'merge_gate'  # the pre-merge verify gate
     main_probe = 'main_probe'  # the periodic probe of main
     chronic_marker = 'chronic_marker'  # a reify CHRONIC-FLAKY marker parsed from verify stdout
+    offline_lane = 'offline_lane'  # the offline integration lane (plans/offline-lane-red-path-prd.md D6)
+
+
+class EvidenceKind(StrEnum):
+    """How a test went red: an assertion failure or an error outside the assertion."""
+
+    failed = 'failed'
+    error = 'error'
+
+
+@dataclass(frozen=True)
+class FailureEvidence:
+    """One test's failure, as the observer saw it: the kind, the first line of the
+    report, and where the full record lives when one was kept."""
+
+    kind: EvidenceKind
+    first_line: str
+    record_dir: str | None = None
 
 
 @dataclass(frozen=True)
 class FlakeSuppression:
     """Discriminator output. Produced WHEREVER the worktree is (local or remote);
-    consumed ONLY on the dispatcher. Rides VerifyResult across the wire."""
+    consumed ONLY on the dispatcher. Rides VerifyResult across the wire.
+
+    Not hashable once *evidence* is set: the mapping is a plain ``dict``, so
+    ``dataclasses.asdict`` and the runner codec flatten it."""
 
     verdict: FlakeVerdict
     test_ids: tuple[str, ...]  # node-ids examined — EMPTY is legal only for `unconfirmable`
@@ -210,6 +233,7 @@ class FlakeSuppression:
     runner: str  # 'local' | remote host name — WHERE the re-run ran
     psi_cpu_some10: float | None  # shared.psi at observation; None when read_ok is False
     unconfirmable_reason: str | None  # populated iff verdict is unconfirmable
+    evidence: Mapping[str, FailureEvidence] | None = None  # per test id, for those it covers
 
 
 def _coerce_test_ids(value: object, *, context: str, warn: bool = True) -> tuple[str, ...]:
@@ -298,8 +322,7 @@ def flake_suppression_from_wire(d: object) -> FlakeSuppression | None:
         # Project onto exactly the declared field names: an unknown key from a NEWER
         # producer must not cost the observation it rides along with (forward-compat),
         # and `FlakeSuppression(**d)` would `TypeError` on it.
-        field_names = tuple(f.name for f in fields(FlakeSuppression))
-        kwargs = {name: d[name] for name in field_names if name in d}
+        kwargs = _declared(FlakeSuppression, d)
 
         # Coerce the two vocabulary fields back to members, falling back to the RAW value
         # so an off-vocabulary string reaches `record_flake_occurrence`'s B12 guard
@@ -316,6 +339,9 @@ def flake_suppression_from_wire(d: object) -> FlakeSuppression | None:
         if kwargs.get('test_ids') is not None:
             kwargs['test_ids'] = _coerce_test_ids(kwargs['test_ids'], context='the wire')
 
+        if 'evidence' in kwargs:
+            kwargs['evidence'] = _evidence_from_wire(kwargs['evidence'])
+
         # A missing REQUIRED key raises TypeError here and is caught below — a truncated
         # payload is a producer bug worth a loud line, not a half-built observation.
         return FlakeSuppression(**kwargs)
@@ -325,6 +351,38 @@ def flake_suppression_from_wire(d: object) -> FlakeSuppression | None:
             '%r; dropping the observation (a malformed sub-payload must never cost a '
             're-verify)',
             d,
+            exc_info=True,
+        )
+        return None
+
+
+def _declared(cls: type, entry: Mapping[str, Any]) -> dict[str, Any]:
+    """*entry* projected onto *cls*'s declared dataclass fields: an unknown key from a
+    newer producer is dropped, a missing one is left missing."""
+    return {f.name: entry[f.name] for f in fields(cls) if f.name in entry}
+
+
+def _evidence_from_wire(value: object) -> dict[str, FailureEvidence] | None:
+    """Rebuild a suppression's evidence from its JSON form, each entry projected onto
+    :class:`FailureEvidence`'s declared fields as the observation itself is.  ``None``
+    for none, and ``None`` plus a warning for anything malformed: the observation is
+    never dropped for its evidence."""
+    if value is None:
+        return None
+    try:
+        if not isinstance(value, dict):
+            raise TypeError(f'evidence is a {type(value).__name__}, not a dict')
+        evidence: dict[str, FailureEvidence] = {}
+        for test_id, entry in value.items():
+            kwargs = _declared(FailureEvidence, entry)
+            kwargs['kind'] = EvidenceKind(kwargs.get('kind'))
+            evidence[test_id] = FailureEvidence(**kwargs)
+        return evidence
+    except Exception:
+        logger.warning(
+            'flake_ledger: could not rebuild the evidence of a wire observation (%r); '
+            'keeping the observation without it',
+            value,
             exc_info=True,
         )
         return None
@@ -367,12 +425,8 @@ class DebtRow:
 
 
 def ledger_db_path(project_root: Path) -> Path:
-    """The project's ``runs.db``.
-
-    One spelling of a literal that is hand-built at 5+ sites today (harness.py:2119 and
-    friends) with no shared helper, so the ledger's consumers do not each re-derive it.
-    """
-    return project_root / 'data' / 'orchestrator' / 'runs.db'
+    """The flake ledger lives in the project's ``runs.db``."""
+    return runs_db(project_root)
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
@@ -587,11 +641,7 @@ def _occurrence_rows(
         )
         return []
 
-    detail = (
-        json.dumps({'unconfirmable_reason': s.unconfirmable_reason})
-        if s.unconfirmable_reason
-        else '{}'
-    )
+    evidence = _evidence_by_test(s)
     # Columns are named explicitly, never a positional `INSERT INTO t VALUES (...)`:
     # run_store.py:53-58's ALTER-parity note — a migrated DB and a fresh one must both
     # accept the same statement.
@@ -606,10 +656,46 @@ def _occurrence_rows(
             merge_sha,
             task_id,
             s.psi_cpu_some10,  # bound directly, so None becomes SQL NULL, never 0.0
-            detail,
+            _row_detail(s.unconfirmable_reason, evidence.get(test_id)),
         )
         for test_id in test_ids
     ]
+
+
+def _evidence_by_test(s: FlakeSuppression) -> Mapping[str, FailureEvidence]:
+    """*s*'s evidence, read once and checked; ``{}`` (logged) when it is malformed, so
+    bad evidence costs the evidence and never the rows."""
+    try:
+        evidence = s.evidence
+        if evidence is None:
+            return {}
+        if not isinstance(evidence, Mapping):
+            raise TypeError(f'evidence is a {type(evidence).__name__}, not a mapping')
+        for test_id, entry in evidence.items():
+            if not isinstance(entry, FailureEvidence):
+                raise TypeError(f'evidence for {test_id!r} is a {type(entry).__name__}')
+            EvidenceKind(entry.kind)
+        return evidence
+    except Exception:
+        logger.warning(
+            'flake_ledger: malformed evidence on an observation at call_site=%s; writing '
+            'its rows without evidence',
+            getattr(s, 'call_site', None),
+            exc_info=True,
+        )
+        return {}
+
+
+def _row_detail(reason: str | None, evidence: FailureEvidence | None) -> str:
+    """One row's ``detail`` JSON.  A row with no evidence keeps the bytes it always had."""
+    detail: dict[str, Any] = {'unconfirmable_reason': reason} if reason else {}
+    if evidence is not None:
+        detail['evidence'] = {
+            'kind': EvidenceKind(evidence.kind).value,
+            'first_line': evidence.first_line,
+            'record_dir': evidence.record_dir,
+        }
+    return json.dumps(detail) if detail else '{}'
 
 
 def _write_observation(conn: sqlite3.Connection, rows: Sequence[tuple]) -> set[_OccurrenceKey]:
@@ -771,6 +857,23 @@ def read_occurrences(
         return []
 
 
+def read_call_sites_written(db_path: Path) -> frozenset[str] | None:
+    """Every ``call_site`` spelling ``flake_occurrence`` holds, at any age.  ``None``
+    (logged) when the read failed (B12): a failed read is not an empty set."""
+    try:
+        conn = _open(db_path)
+        try:
+            rows = conn.execute('SELECT DISTINCT call_site FROM flake_occurrence').fetchall()
+        finally:
+            conn.close()
+        return frozenset(call_site for (call_site,) in rows)
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to read the call sites written to %s', db_path, exc_info=True,
+        )
+        return None
+
+
 # ---------------------------------------------------------------------------
 # The due list: what an observation owes open_debt, drained afterwards (task 6934)
 # ---------------------------------------------------------------------------
@@ -780,7 +883,8 @@ def read_occurrences(
 class DueItem:
     """What an observation asks the drain to do: one :func:`open_debt` call for
     *test_id*.  *observed_at* is raw (canonicalised on enqueue) and *call_site* is a
-    :class:`FlakeCallSite` or its spelling."""
+    :class:`FlakeCallSite` or its spelling, the one source of the item's call site: a
+    *context* naming another is dropped (:func:`context_at_call_site`)."""
 
     test_id: str
     observed_at: str
@@ -848,36 +952,23 @@ def _to_due_row(row: sqlite3.Row) -> DueRow:
     )
 
 
-def due_items_for(
-    s: FlakeSuppression, *, head: str | None, observing_task_id: str | None,
-) -> tuple[DueItem, ...]:
-    """One :class:`DueItem` per test *s* names, the sentinel excepted.
+def named_tests(s: FlakeSuppression) -> tuple[str, ...]:
+    """The tests *s* names, the sentinel excepted: the ids a debt can be opened for.
 
     Verdict-agnostic: whether the observation makes its tests debt-eligible is the
-    caller's decision.  Never raises; a malformed *s* is logged and owes nothing.
+    caller's decision.  Never raises; a malformed *s* is logged and names nothing.
 
-    A bare-``str`` ``test_ids`` is coerced here WITHOUT the warning: the items are
-    written by ``enqueue_debt(items, occurrence=s)``, whose row derivation warns once
-    for the same payload.
+    A bare-``str`` ``test_ids`` is coerced here WITHOUT the warning: the same payload's
+    rows are derived by :func:`enqueue_debt`, which warns once for it.
     """
     try:
         test_ids = _coerce_test_ids(
             s.test_ids, context=f'call_site={s.call_site}', warn=False,
         )
-        return tuple(
-            DueItem(
-                test_id=test_id,
-                observed_at=s.observed_at,
-                call_site=s.call_site,
-                head=head,
-                observing_task_id=observing_task_id,
-            )
-            for test_id in test_ids
-            if test_id != UNKNOWN_TEST_ID
-        )
+        return tuple(test_id for test_id in test_ids if test_id != UNKNOWN_TEST_ID)
     except Exception:
         logger.warning(
-            'flake_ledger: could not derive due items from an observation', exc_info=True,
+            'flake_ledger: could not read the tests an observation names', exc_info=True,
         )
         return ()
 
@@ -1183,7 +1274,270 @@ RESPONSIBILITY_REMOVE_FROM_LEDGER = (
 )
 
 
-def build_deflake_task_arguments(row: DebtRow) -> dict:
+class DebtTrigger(StrEnum):
+    """What made a test debt-eligible on the offline lane (offline-lane PRD D6).  The
+    merge gate's value is a follow-up's to add."""
+
+    cleared = 'cleared'
+    recovered = 'recovered'
+
+
+@dataclass(frozen=True)
+class RecentOccurrence:
+    """One recent red of the test, as its de-flake task lists it."""
+
+    pass_id: str | None
+    head: str | None
+    kind: EvidenceKind
+    first_line: str
+
+
+DEBT_CONTEXT_EVIDENCE_LIMIT: Final = 5
+
+
+@dataclass(frozen=True)
+class DebtContext:
+    """Why an observation made a test owe debt.  It shapes the de-flake task's text and
+    metadata (offline-lane PRD D6, §5.6), never whether the task is filed."""
+
+    call_site: FlakeCallSite
+    trigger: DebtTrigger
+    command: str | None = None
+    working_directory: str | None = None
+    reproduce: str | None = None
+    heads: tuple[str, ...] = ()
+    pass_ids: tuple[str, ...] = ()
+    evidence: tuple[RecentOccurrence, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'call_site', FlakeCallSite(self.call_site))
+        object.__setattr__(self, 'trigger', DebtTrigger(self.trigger))
+        if len(self.evidence) > DEBT_CONTEXT_EVIDENCE_LIMIT:
+            raise ValueError(
+                f'a DebtContext carries at most {DEBT_CONTEXT_EVIDENCE_LIMIT} evidence '
+                f'entries; got {len(self.evidence)}'
+            )
+
+
+def debt_context_to_json(ctx: DebtContext) -> str:
+    """*ctx* as the due list's ``context`` text."""
+    return json.dumps(asdict(ctx))
+
+
+def _strings(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise TypeError(f'expected a list of strings, got {value!r}')
+    return tuple(value)
+
+
+def _recent_occurrence_from_json(entry: Mapping[str, Any]) -> RecentOccurrence:
+    kwargs = _declared(RecentOccurrence, entry)
+    kwargs['kind'] = EvidenceKind(kwargs.get('kind'))
+    return RecentOccurrence(**kwargs)
+
+
+def debt_context_from_json(text: str) -> DebtContext | None:
+    """The :class:`DebtContext` a due item's *text* holds: ``None`` for ``'{}'``, and
+    ``None`` plus a warning for anything malformed.  Never raises."""
+    try:
+        raw = json.loads(text)
+        if raw == {}:
+            return None
+        if not isinstance(raw, dict):
+            raise TypeError(f'a debt context is a JSON object, got {type(raw).__name__}')
+        return DebtContext(
+            call_site=raw['call_site'],
+            trigger=raw['trigger'],
+            command=raw.get('command'),
+            working_directory=raw.get('working_directory'),
+            reproduce=raw.get('reproduce'),
+            heads=_strings(raw.get('heads', [])),
+            pass_ids=_strings(raw.get('pass_ids', [])),
+            evidence=tuple(_recent_occurrence_from_json(e) for e in raw.get('evidence', [])),
+        )
+    except Exception:
+        logger.warning(
+            'flake_ledger: could not decode a debt context (%r); filing without it',
+            text,
+            exc_info=True,
+        )
+        return None
+
+
+def context_at_call_site(call_site: str, ctx: DebtContext | None) -> DebtContext | None:
+    """*ctx* as the context of a due item at *call_site*, which is the one source of the
+    item's call site: a context naming another is dropped with a warning naming both, so
+    the de-flake task and the regression escalation are never worded for two call sites.
+    The owner is still owed; only the wording is lost."""
+    if ctx is None or ctx.call_site == call_site:
+        return ctx
+    logger.warning(
+        'flake_ledger: a debt context names call_site=%s on a due item at call_site=%s; '
+        "dropping the context, since the item's call site is the one source",
+        ctx.call_site.value,
+        call_site,
+    )
+    return None
+
+
+def due_item_context(item: DueRow) -> DebtContext | None:
+    """The context *item* carries, decoded and checked by :func:`context_at_call_site`:
+    ``None`` for none, a malformed one, or one naming another call site.  Never raises."""
+    return context_at_call_site(item.call_site, debt_context_from_json(item.context))
+
+
+#: What each lane trigger observed, worded as the observation (§5.5, §5.6).
+LANE_TRIGGER_OBSERVATIONS: Final[Mapping[DebtTrigger, str]] = {
+    DebtTrigger.cleared: (
+        'The test failed in an offline-lane detection run and passed an isolated, serial '
+        're-run at the same head.'
+    ),
+    DebtTrigger.recovered: (
+        'The test failed its offline-lane re-run and passed on a later lane pass at the '
+        'same head.'
+    ),
+}
+LANE_NOTHING_SUPPRESSED = 'Nothing was suppressed, and no merge depended on this result.'
+LIVE_DEPENDENCY_ROOT_DEFECT = (
+    'If the test exercises a live dependency, the root defect may be in how the product '
+    'handles a slow or failed call to it: changing that handling is a fix; relaxing the '
+    'test is not.'
+)
+LANE_TEST_NOT_ON_MERGE_GATE = (
+    'The merge gate does not run this test, so your own run of the reproduce line is '
+    "this task's evidence, and the offline lane will observe the test again after your "
+    'change lands.'
+)
+
+#: How a de-flake task or a regression escalation states a field nobody recorded.
+NOT_RECORDED: Final = '(not recorded)'
+
+
+def _deflake_title(row: DebtRow, observation: str) -> str:
+    """The one shape of a de-flake title: the test, what was observed, and the cycle."""
+    return f'Flake debt: {row.test_id} — {observation}, cycle {row.open_count}'
+
+
+def _evidence_block(evidence: Sequence[RecentOccurrence]) -> str:
+    """The recent occurrences, in the order given (most recent last); ``''`` for none."""
+    if not evidence:
+        return ''
+    lines = [f'Recent occurrences (at most {DEBT_CONTEXT_EVIDENCE_LIMIT}, most recent last):\n']
+    lines += [
+        f'  pass {e.pass_id or NOT_RECORDED}  head {(e.head or NOT_RECORDED)[:12]}  '
+        f'{EvidenceKind(e.kind).value}: {e.first_line}\n'
+        for e in evidence
+    ]
+    return ''.join(lines)
+
+
+def _field_lines(fields_: Sequence[tuple[str, object]]) -> str:
+    return ''.join(f'  {label + ":":<20}{value}\n' for label, value in fields_)
+
+
+def _joined(values: Sequence[str]) -> str:
+    return ', '.join(values) if values else NOT_RECORDED
+
+
+def _lane_task_text(row: DebtRow, ctx: DebtContext) -> tuple[str, str]:
+    """The title and description of a lane debt's de-flake task (offline-lane PRD §5.6)."""
+    on = 'on the offline lane' if ctx.command is None else f'on the offline lane ({ctx.command})'
+    evidence = _evidence_block(ctx.evidence)
+    description = (
+        f'{LANE_TRIGGER_OBSERVATIONS[ctx.trigger]} {LANE_NOTHING_SUPPRESSED}\n'
+        f'\n'
+        + _field_lines([
+            ('test', row.test_id),
+            ('project', row.project_id),
+            ('opened_at', row.opened_at),
+            ('open_count', row.open_count),
+            ('trigger', ctx.trigger.value),
+            ('command', ctx.command or NOT_RECORDED),
+            ('working directory', ctx.working_directory or NOT_RECORDED),
+            ('reproduce', ctx.reproduce or NOT_RECORDED),
+            ('heads', _joined(ctx.heads)),
+            ('pass ids', _joined(ctx.pass_ids)),
+        ])
+        + (f'\n{evidence}' if evidence else '')
+        + f'\n'
+        f'{RESPONSIBILITY_FIX_ROOT_DEFECT}.\n'
+        f'{RESPONSIBILITY_REMOVE_FROM_LEDGER}.\n'
+        f'\n'
+        f'{NEVER_WIDEN_A_TIMEOUT}\n'
+        f'\n'
+        f'{LIVE_DEPENDENCY_ROOT_DEFECT}\n'
+        f'\n'
+        f'{LANE_TEST_NOT_ON_MERGE_GATE}\n'
+        f'\n'
+        f'Auto-filed by the flake ledger when the debt row was opened (PRDs '
+        f'plans/flake-ledger-prd.md §5.9 and plans/offline-lane-red-path-prd.md §5.6).'
+    )
+    return _deflake_title(row, f'{ctx.trigger.value} {on}'), description
+
+
+def _merge_gate_task_text(row: DebtRow, ctx: DebtContext | None) -> tuple[str, str]:
+    """The title and description of a merge-gate suppression's de-flake task, with an
+    evidence block after the field block only when *ctx* carries evidence."""
+    block = _evidence_block(() if ctx is None else ctx.evidence)
+    description = (
+        f'The flake ledger recorded a `{FlakeVerdict.passes_in_isolation.value}` '
+        f'observation for this test and SUPPRESSED the red it produced, so a merge '
+        f'landed on a gate that had gone red:\n'
+        f'\n'
+        f'  test:        {row.test_id}\n'
+        f'  project:     {row.project_id}\n'
+        f'  opened_at:   {row.opened_at}\n'
+        f'  open_count:  {row.open_count}\n'
+        + (f'\n{block}' if block else '')
+        + f'\n'
+        f'What that verdict means, precisely: the test failed under load in the '
+        f'merge verify and then PASSED on an isolated, serial re-run. Read that as '
+        f'evidence about the SYSTEM, not as a verdict on the test — a test that '
+        f'passes alone and fails under load has repeatedly turned out to be a real '
+        f'production defect here (task 1836 -> 1841: a widened timeout masked a '
+        f'genuine SIGHUP bug for a day; esc-3650-2 was a real SIGPIPE-under-pipefail '
+        f'bug, task 3552). Diagnose before you conclude the test is at fault.\n'
+        f'\n'
+        f'{RESPONSIBILITY_FIX_ROOT_DEFECT}.\n'
+        f'{RESPONSIBILITY_REMOVE_FROM_LEDGER}.\n'
+        f'\n'
+        f'{NEVER_WIDEN_A_TIMEOUT}\n'
+        f'\n'
+        f'Auto-filed by the flake ledger when the debt row was opened (PRD '
+        f'plans/flake-ledger-prd.md §5.9). The merge already landed, so this is '
+        f'visible, owned debt rather than an incident.'
+    )
+    title = _deflake_title(
+        row, f'{FlakeVerdict.passes_in_isolation.value} after a merge-gate red was suppressed',
+    )
+    return title, description
+
+
+#: The de-flake task text per call site.  A call site with no row, and a debt with no
+#: context, are worded as the merge gate's.
+_DEFLAKE_TASK_TEXT: Final[
+    Mapping[FlakeCallSite, Callable[[DebtRow, DebtContext], tuple[str, str]]]
+] = {
+    FlakeCallSite.offline_lane: _lane_task_text,
+}
+
+
+def _deflake_metadata(row: DebtRow, ctx: DebtContext | None) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        'spawn_context': 'flake_ledger_debt',
+        'flake_debt_test': row.test_id,
+        'flake_debt_open_count': row.open_count,
+        'flake_debt_opened_at': row.opened_at,
+    }
+    if ctx is not None:
+        metadata['flake_debt_call_site'] = ctx.call_site.value
+        metadata['flake_debt_trigger'] = ctx.trigger.value
+        if ctx.command is not None:
+            metadata['flake_debt_command'] = ctx.command
+    return metadata
+
+
+def build_deflake_task_arguments(row: DebtRow, context: DebtContext | None = None) -> dict:
     """The ``submit_task`` argument block for the task that owns *row*'s debt (§5.9).
 
     Pure and side-effect free: :func:`open_debt` files the result, this only shapes it.
@@ -1212,56 +1566,31 @@ def build_deflake_task_arguments(row: DebtRow) -> dict:
       breaks for every non-standard path.  The adapter already HOLDS the project root and
       injects it (``chronic_flake.py::SchedulerChronicFlakeTaskClient.submit_task``).
 
-    The title carries the cycle ordinal from the second cycle on (the first cycle's
-    title is unchanged): the task store folds a submission whose title matches an
-    existing non-cancelled task, DONE ones included, so a re-entry filed under the
-    finished owner's title would be folded onto that done task and refused as no owner.
+    The title names the cycle on every cycle, the first included: the task store folds
+    a submission whose title matches an existing non-cancelled task, DONE ones
+    included, so a re-entry can never be filed under its finished owner's title, folded
+    onto that done task and refused as no owner.
 
     ``metadata.files`` is likewise omitted deliberately: a ``test_id`` may be a reify
     script-suite NAME rather than a path, and a wrong or over-wide concurrency lock
     derived from a guess is worse than no lock — the de-flake agent discovers the files.
+
+    *context*, when given, picks the text by its call site in :data:`_DEFLAKE_TASK_TEXT`
+    (an offline-lane debt is worded in the lane's terms, offline-lane PRD §5.6) and
+    stamps its call site, trigger and command into the metadata.  With none the block
+    is the merge gate's.
     """
-    cycle = f' (cycle {row.open_count})' if row.open_count > 1 else ''
+    if context is None:
+        title, description = _merge_gate_task_text(row, None)
+    else:
+        task_text = _DEFLAKE_TASK_TEXT.get(context.call_site, _merge_gate_task_text)
+        title, description = task_text(row, context)
     return {
-        'title': (
-            f'Flake debt: {row.test_id}{cycle} — {FlakeVerdict.passes_in_isolation.value} '
-            f'after a merge-gate red was suppressed'
-        ),
-        'description': (
-            f'The flake ledger recorded a `{FlakeVerdict.passes_in_isolation.value}` '
-            f'observation for this test and SUPPRESSED the red it produced, so a merge '
-            f'landed on a gate that had gone red:\n'
-            f'\n'
-            f'  test:        {row.test_id}\n'
-            f'  project:     {row.project_id}\n'
-            f'  opened_at:   {row.opened_at}\n'
-            f'  open_count:  {row.open_count}\n'
-            f'\n'
-            f'What that verdict means, precisely: the test failed under load in the '
-            f'merge verify and then PASSED on an isolated, serial re-run. Read that as '
-            f'evidence about the SYSTEM, not as a verdict on the test — a test that '
-            f'passes alone and fails under load has repeatedly turned out to be a real '
-            f'production defect here (task 1836 -> 1841: a widened timeout masked a '
-            f'genuine SIGHUP bug for a day; esc-3650-2 was a real SIGPIPE-under-pipefail '
-            f'bug, task 3552). Diagnose before you conclude the test is at fault.\n'
-            f'\n'
-            f'{RESPONSIBILITY_FIX_ROOT_DEFECT}.\n'
-            f'{RESPONSIBILITY_REMOVE_FROM_LEDGER}.\n'
-            f'\n'
-            f'{NEVER_WIDEN_A_TIMEOUT}\n'
-            f'\n'
-            f'Auto-filed by the flake ledger when the debt row was opened (PRD '
-            f'plans/flake-ledger-prd.md §5.9). The merge already landed, so this is '
-            f'visible, owned debt rather than an incident.'
-        ),
+        'title': title,
+        'description': description,
         'priority': 'medium',
         'planning_mode': True,
-        'metadata': {
-            'spawn_context': 'flake_ledger_debt',
-            'flake_debt_test': row.test_id,
-            'flake_debt_open_count': row.open_count,
-            'flake_debt_opened_at': row.opened_at,
-        },
+        'metadata': _deflake_metadata(row, context),
     }
 
 
@@ -1541,6 +1870,7 @@ async def _ensure_owner_task(
     *,
     task_client: FlakeLedgerTaskClient | None,
     owner_read: _OwnerRead | None = None,
+    context: DebtContext | None = None,
 ) -> DebtRow:
     """Enforce §5.9's invariant for *row*, returning the row as it stands afterwards.
 
@@ -1696,7 +2026,7 @@ async def _ensure_owner_task(
     # the other side-effects — the "independently guarded side-effects" discipline
     # `orchestrator/src/orchestrator/flake_recorder.py::_guarded` established.
     try:
-        outcome = await task_client.submit_task(build_deflake_task_arguments(row))
+        outcome = await task_client.submit_task(build_deflake_task_arguments(row, context))
     except Exception:
         logger.warning(
             'flake_ledger: failed to file a de-flake task for test_id=%s (project_id=%s) '
@@ -1970,6 +2300,7 @@ async def open_debt(
     on_regressed_after_resolution: Callable[[DebtRow], None] | None = None,
     resolve_budget_secs: float = _RESOLVE_BUDGET_SECS,
     head_contains_fix: Callable[[Mapping[str, Any]], Awaitable[bool | None]] | None = None,
+    context: DebtContext | None = None,
 ) -> DebtRow | None:
     """Open (or advance) the single ``flake_debt`` row for *test_id* (PRD §8.3).
 
@@ -2012,6 +2343,8 @@ async def open_debt(
     and the closed row is returned; ``None`` (undecided, or the check raised) decides
     nothing — no close, no upsert — and returns the row as read.  The check bounds its
     own wait.
+
+    *context* only shapes the filed task's text and metadata (offline-lane PRD D6).
 
     REGRESSION REPORT (task η).  A RE-ENTRY means the test flaked again after its fix
     landed, and *on_regressed_after_resolution* receives the re-entered row EXACTLY ONCE
@@ -2160,7 +2493,8 @@ async def open_debt(
     # already renders as the §5.9 breach it is -- never to "no row at all".
     try:
         return await _ensure_owner_task(
-            db_path, project_id, debt_row, task_client=task_client, owner_read=owner_read
+            db_path, project_id, debt_row,
+            task_client=task_client, owner_read=owner_read, context=context,
         )
     except Exception:
         logger.warning(

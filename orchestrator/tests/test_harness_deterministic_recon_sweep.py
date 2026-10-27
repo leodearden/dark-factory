@@ -58,6 +58,7 @@ Amendment pass (post-review) additionally covers:
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -89,6 +90,7 @@ from orchestrator.recovery_emission import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 def test_config_defaults_deterministic_recon_sweep() -> None:
     """OrchestratorConfig exposes deterministic_recon_sweep_enabled (True) and
     deterministic_recon_sweep_interval_secs (900.0) with the correct defaults."""
@@ -107,6 +109,16 @@ def _make_recon_harness() -> Harness:
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)
     h.config = OrchestratorConfig()
+    # Pin the one knob this file's emission tests actually depend on, instead
+    # of inheriting whatever dark-factory-orchestrator.yaml happens to say.
+    # `recovery_emission.enabled` is undeclared there today, so a bare config
+    # picks up the code default True by accident; an operator declaring it
+    # false silently deletes 18 tests' worth of coverage here (task 4481,
+    # measured).  Every OTHER key still reads the operational config, which is
+    # why this is a pin and not the code_default_config hatch.  Tests that are
+    # ABOUT the flag override it after construction (see
+    # TestDeterministicReconZeroBehaviorChange).
+    h.config.recovery_emission.enabled = True
     h.scheduler = MagicMock()
     h._escalation_queue = MagicMock()
     h._escalation_queue.make_id = MagicMock(return_value='esc-recon-1')
@@ -1867,9 +1879,20 @@ def _sentinel_alarms(h: Harness, tid: str = 'tid-pinned') -> list:
 
 
 async def _recon_passes(
-    h: Harness, clock: _FakeClock, count: int, *, interval: float = _RECON_INTERVAL,
+    h: Harness, clock: _FakeClock, count: int | None = None, *,
+    interval: float = _RECON_INTERVAL,
 ) -> None:
-    """Run *count* deterministic passes *interval* apart, as the loop would."""
+    """Run *count* deterministic passes *interval* apart, as the loop would.
+
+    *count* defaults to the fewest passes that clear BOTH halves of the alarm
+    predicate on the config under test: a streak of at least
+    ``veto_streak_threshold``, and a span — ``(count - 1) * interval`` — of at
+    least ``veto_streak_min_span_secs``.
+    """
+    if count is None:
+        cfg = h.config.recovery_emission
+        passes_to_span = math.ceil(cfg.veto_streak_min_span_secs / interval) + 1
+        count = max(cfg.veto_streak_threshold, passes_to_span)
     for i in range(count):
         if i:
             clock.advance(interval)
@@ -1894,7 +1917,7 @@ class TestDeterministicReconStreakRelease:
         h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
         _hold(h)
 
-        await _recon_passes(h, clock, 3)
+        await _recon_passes(h, clock)
 
         alarms = _sentinel_alarms(h)
         assert len(alarms) == 1, f'expected one sentinel alarm, got {alarms}'
@@ -1925,7 +1948,7 @@ class TestDeterministicReconStreakRelease:
         h, clock = _streak_recon_harness(tmp_path)
         h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
         held = _hold(h)
-        await _recon_passes(h, clock, 3)
+        await _recon_passes(h, clock)
         assert len(_sentinel_alarms(h)) == 1
 
         h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
@@ -1949,7 +1972,7 @@ class TestDeterministicReconStreakRelease:
         h, clock = _streak_recon_harness(tmp_path)
         h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
         held = _hold(h)
-        await _recon_passes(h, clock, 3)
+        await _recon_passes(h, clock)
         assert _tracked_for(h, 'tid-pinned') == {'deterministic_recon_deploy'}
 
         h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
@@ -1966,7 +1989,7 @@ class TestDeterministicReconStreakRelease:
         h, clock = _streak_recon_harness(tmp_path)
         h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
         held = _hold(h)
-        await _recon_passes(h, clock, 3)
+        await _recon_passes(h, clock)
         first = _sentinel_alarms(h)[0].id
 
         # The hold clears; the next pass releases and RE-FILES on the real tid
@@ -1976,7 +1999,7 @@ class TestDeterministicReconStreakRelease:
         await h._run_deterministic_recon_sweep()
         assert _sentinel_alarms(h) == []
 
-        await _recon_passes(h, clock, 3)
+        await _recon_passes(h, clock)
 
         alarms = _sentinel_alarms(h)
         assert len(alarms) == 1, f'the recurrence must alarm again, got {alarms}'
@@ -1990,7 +2013,7 @@ class TestDeterministicReconStreakRelease:
         h, clock = _streak_recon_harness(tmp_path)
         h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
         held = _hold(h)
-        await _recon_passes(h, clock, 3)
+        await _recon_passes(h, clock)
         h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
         clock.advance(_RECON_INTERVAL)
 
@@ -2022,7 +2045,7 @@ class TestDeterministicReconStreakRelease:
         h, clock = _streak_recon_harness(tmp_path)
         h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
         held = _hold(h)
-        await _recon_passes(h, clock, 3)
+        await _recon_passes(h, clock)
         (alarm,) = _sentinel_alarms(h)
         wrapper = self._wrap(
             h, alarm.id, task_id=f'{RECOVERY_VETO_STREAK_SENTINEL_PREFIX}tid-pinned',
@@ -2051,7 +2074,7 @@ class TestDeterministicReconStreakRelease:
         h, clock = _streak_recon_harness(tmp_path)
         h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
         held = _hold(h)
-        await _recon_passes(h, clock, 3)
+        await _recon_passes(h, clock)
         (alarm,) = _sentinel_alarms(h)
         wrapper = self._wrap(h, alarm.id, task_id='tid-pinned', category='risk_identified')
 
@@ -2081,7 +2104,7 @@ class TestDeterministicReconStreakReleaseIsSiteScoped:
             RecoverySite.reconcile_sweep, 'T-other', 'sig',
         )
 
-        await _recon_passes(h, clock, 3)
+        await _recon_passes(h, clock)
 
         assert _tracked_for(h, 'T-other') == {'reconcile_sweep'}, (
             'a sweep may only release streaks for the sites IT drives'
@@ -2101,7 +2124,7 @@ class TestDeterministicReconStreakReleaseIsSiteScoped:
         h, clock = _streak_recon_harness(tmp_path)
         h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
         held = _hold(h)
-        await _recon_passes(h, clock, 3)
+        await _recon_passes(h, clock)
         assert len(_sentinel_alarms(h)) == 1
         for _ in range(3):
             h._recovery_veto_tracker.observe(
@@ -2129,7 +2152,7 @@ class TestDeterministicReconStreakReleaseIsSiteScoped:
         h, clock = _streak_recon_harness(tmp_path)
         h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
         _hold(h)
-        await _recon_passes(h, clock, 3)
+        await _recon_passes(h, clock)
         assert len(_sentinel_alarms(h)) == 1
         for _ in range(3):
             h._recovery_veto_tracker.observe(

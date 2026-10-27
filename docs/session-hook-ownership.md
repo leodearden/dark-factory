@@ -88,6 +88,15 @@ when both of these hold:
 
 When both hold, SessionStart re-binds the record to the new id.
 
+The re-bind moves `claude_session_id` only. `claude_launch_session_id` keeps
+the id the first binding stamped and is never re-bound, so the launch
+transcript `<id>.jsonl` stays findable after a `/clear` or compaction
+(task 6069). Records bound before that field existed carry none and are not
+backfilled.
+
+Code: `orchestrator/src/orchestrator/session_hooks.py::_bind_claude_session_id`,
+`scripts/legibility/check_transcript_persistence.py::find_matching_transcript`.
+
 `resume` is excluded. `--resume` and `--continue` make a brand-new process
 report it, so a nested `claude -c -p` would present it. Honouring it would
 let an inheritor re-bind its spawner's record to itself. A spawned session
@@ -176,6 +185,12 @@ to the spawner's record. The withhold decision and the body written derive
 from the same snapshot, so they cannot disagree. Status, question and binding
 land in one `write_record`.
 
+On a Stop owner event (`may_bind` true and not withheld) the self-exit
+evaluation's `exit_request` stamp lands in that same write. A withheld or
+unproven event stamps nothing. The only second write is the error path: a
+failed signal stamps `kill_failed` after it. The preconditions are
+`plans/review-all-program-tooling-prd.md` §4 H5's.
+
 Every lane goes through one shared withhold, refresh, bind, question and
 write block: adopt, fork, hand-launched, and the unreadable fault. The
 unreadable lane differs only in where its snapshot comes from: it re-reads
@@ -191,8 +206,9 @@ registry caller and belongs in its own change.
 
 Code: `orchestrator/src/orchestrator/session_hooks.py::_RecordSnapshot`,
 `::_read_record_snapshot`, `::_HookSlugResolution`, `::_resolve_hook_slug`,
-`::run_session_start`, `::_run_status_refresh_and_retitle`. Introduced by
-task 4662.
+`::run_session_start`, `::_run_status_refresh_and_retitle`;
+`orchestrator/src/orchestrator/session_self_exit.py::SelfExit`. Introduced by
+task 4662; the self-exit stamp by task 7193.
 
 ## Forked-inheritor identity
 

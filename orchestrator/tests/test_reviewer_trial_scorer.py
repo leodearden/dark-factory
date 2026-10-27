@@ -28,6 +28,7 @@ from orchestrator.evals.reviewer_trial.scorer import (
     match_issues,
     score_panel_run,
 )
+from orchestrator.review_payload import ReviewPayload, ReviewPayloadError, Verdict
 
 
 class TestNormalizeLocation:
@@ -47,35 +48,25 @@ class TestNormalizeLocation:
         assert _normalize_location('  src/foo.py:10  ') == 'src/foo.py'
 
 
+def _found(*issues: dict) -> ReviewPayload:
+    return ReviewPayload(Verdict.ISSUES_FOUND, issues, None)
+
+
 class TestDeduplicateIssues:
     def test_no_duplicates(self) -> None:
         reviews = {
-            'r1': {
-                'issues': [
-                    {'location': 'a.py:1', 'category': 'bug', 'description': 'Bug A'},
-                ]
-            },
-            'r2': {
-                'issues': [
-                    {'location': 'b.py:2', 'category': 'style', 'description': 'Style B'},
-                ]
-            },
+            'r1': _found({'location': 'a.py:1', 'category': 'bug', 'description': 'Bug A'}),
+            'r2': _found({'location': 'b.py:2', 'category': 'style', 'description': 'Style B'}),
         }
         deduped = _deduplicate_issues(reviews)
         assert len(deduped) == 2
 
     def test_same_location_category_deduped(self) -> None:
         reviews = {
-            'r1': {
-                'issues': [
-                    {'location': 'a.py:1', 'category': 'bug', 'description': 'Short.'},
-                ]
-            },
-            'r2': {
-                'issues': [
-                    {'location': 'a.py:5', 'category': 'bug', 'description': 'Longer description here.'},
-                ]
-            },
+            'r1': _found({'location': 'a.py:1', 'category': 'bug', 'description': 'Short.'}),
+            'r2': _found(
+                {'location': 'a.py:5', 'category': 'bug', 'description': 'Longer description here.'},
+            ),
         }
         deduped = _deduplicate_issues(reviews)
         assert len(deduped) == 1
@@ -84,12 +75,10 @@ class TestDeduplicateIssues:
 
     def test_same_location_different_category_not_deduped(self) -> None:
         reviews = {
-            'r1': {
-                'issues': [
-                    {'location': 'a.py:1', 'category': 'bug', 'description': 'Bug.'},
-                    {'location': 'a.py:1', 'category': 'style', 'description': 'Style.'},
-                ]
-            },
+            'r1': _found(
+                {'location': 'a.py:1', 'category': 'bug', 'description': 'Bug.'},
+                {'location': 'a.py:1', 'category': 'style', 'description': 'Style.'},
+            ),
         }
         deduped = _deduplicate_issues(reviews)
         assert len(deduped) == 2
@@ -98,16 +87,12 @@ class TestDeduplicateIssues:
         assert _deduplicate_issues({}) == []
 
     def test_reviews_with_no_issues(self) -> None:
-        reviews = {'r1': {'issues': []}}
+        reviews = {'r1': _found()}
         assert _deduplicate_issues(reviews) == []
 
     def test_reviewer_name_preserved(self) -> None:
         reviews = {
-            'test_analyst': {
-                'issues': [
-                    {'location': 'a.py:1', 'category': 'bug', 'description': 'X'},
-                ]
-            },
+            'test_analyst': _found({'location': 'a.py:1', 'category': 'bug', 'description': 'X'}),
         }
         deduped = _deduplicate_issues(reviews)
         assert deduped[0]['reviewer'] == 'test_analyst'
@@ -360,7 +345,7 @@ class TestScorePanelRunCost:
             total_cost_usd=2.00,
             reviews={
                 'r1': {
-                    'verdict': 'NEEDS_CHANGES',
+                    'verdict': 'ISSUES_FOUND',
                     'issues': [reviewer_issue],
                 }
             },
@@ -395,7 +380,7 @@ class TestScorePanelRunCost:
         )
         run = PanelRunResult(
             variant_name='v1', diff_id='d3', total_cost_usd=1.0,
-            reviews={'r1': {'verdict': 'NEEDS_CHANGES', 'issues': _ONE_ISSUE}},
+            reviews={'r1': {'verdict': 'ISSUES_FOUND', 'issues': _ONE_ISSUE}},
         )
         calls: list[dict] = []
 
@@ -413,6 +398,49 @@ class TestScorePanelRunCost:
         gated, ungated = calls
         assert gated['oauth_token'] == 'tok-a'
         assert ungated.get('oauth_token') is None
+
+
+class TestScorePanelRunReviews:
+    @pytest.mark.asyncio
+    async def test_an_error_reviews_issues_never_reach_the_matcher(self) -> None:
+        issue_a = {'severity': 'blocking', 'location': 'a.py:1', 'category': 'bug', 'description': 'A'}
+        issue_b = {'severity': 'suggestion', 'location': 'b.py:2', 'category': 'style', 'description': 'B'}
+        diff = CorpusDiff(
+            diff_id='d4', language='python', source='synthetic',
+            diff_text='diff', description='d', ground_truth=[_make_gt('gt1')],
+        )
+        run = PanelRunResult(
+            variant_name='v1', diff_id='d4', total_cost_usd=1.0,
+            reviews={
+                'r1': {'verdict': 'ERROR', 'issues': [issue_a]},
+                'r2': {'verdict': 'ISSUES_FOUND', 'issues': [issue_b]},
+            },
+        )
+
+        with patch('orchestrator.evals.reviewer_trial.scorer.match_issues', new_callable=AsyncMock) as mock_match:
+            mock_match.return_value = Scored(MatchedIssues([], []), cost_usd=0.0)
+            await score_panel_run(run, diff)
+
+        assert mock_match.call_args.kwargs['reviewer_issues'] == [{**issue_b, 'reviewer': 'r2'}]
+
+    @pytest.mark.asyncio
+    async def test_an_off_contract_verdict_is_rejected_before_matching(self) -> None:
+        diff = CorpusDiff(
+            diff_id='d5', language='python', source='synthetic',
+            diff_text='diff', description='d', ground_truth=[_make_gt('gt1')],
+        )
+        run = PanelRunResult(
+            variant_name='v1', diff_id='d5', total_cost_usd=1.0,
+            reviews={'r1': {'verdict': 'NEEDS_CHANGES', 'issues': _ONE_ISSUE}},
+        )
+
+        with (
+            patch('orchestrator.evals.reviewer_trial.scorer.match_issues', new_callable=AsyncMock) as mock_match,
+            pytest.raises(ReviewPayloadError, match='NEEDS_CHANGES'),
+        ):
+            await score_panel_run(run, diff)
+
+        mock_match.assert_not_called()
 
 
 class TestMatcherIsolation:

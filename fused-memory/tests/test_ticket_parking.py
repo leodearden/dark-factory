@@ -8,6 +8,7 @@ curator injected through the interceptor's ``curator=`` constructor argument.
 
 import asyncio
 import json
+import logging
 from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
@@ -20,16 +21,16 @@ from shared.cli_invoke import AllAccountsCappedException
 from shared.usage_gate import PoolFrozen
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.middleware.candidate_key import normalize_title
 from fused_memory.middleware.curation_deferral import DEDUPE_SKIPPED_KEY, DeferReason
-from fused_memory.middleware.task_curator import (
+from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
     CuratorFailureError,
     PreparedCandidate,
     RewrittenTask,
-    TaskCurator,
-    normalize_title,
 )
+from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -71,12 +72,14 @@ class _ScriptedCurator:
     """A curator double answering each candidate, by title, with its next scripted verdict.
 
     A batch-level script entry (``batch_raises``) makes the next
-    ``curate_batch_prepared`` call raise instead of answering.
+    ``curate_batch_prepared`` call raise instead of answering; a title in
+    ``prepare_raises`` makes ``prepare_candidate`` raise for it.
     """
 
     def __init__(self, script: Mapping[str, Sequence[Verdict]]) -> None:
         self._script = {title: deque(verdicts) for title, verdicts in script.items()}
         self.batch_raises: deque[BaseException] = deque()
+        self.prepare_raises: set[str] = set()
         self.hold_prepare: dict[str, asyncio.Event] = {}
         self.created: list[tuple[str, str]] = []
 
@@ -92,6 +95,8 @@ class _ScriptedCurator:
         hold = self.hold_prepare.get(candidate.title)
         if hold is not None:
             await hold.wait()
+        if candidate.title in self.prepare_raises:
+            raise RuntimeError(f'prepare exploded for {candidate.title}')
         return PreparedCandidate(candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0)
 
     async def curate_batch_prepared(
@@ -510,6 +515,105 @@ class TestRequeue:
         assert (await _resolve(restarted, ticket_id))['status'] == 'combined'
 
 
+PARKED_LLM_FAILED_ANSWER = {'status': AWAITING_CURATION, 'reason': 'curation-deferred: llm-failed'}
+
+
+class TestCuratorEscapeParks:
+    """A curator failure that escapes curate() parks the ticket; only a zero-output hang creates."""
+
+    @pytest.mark.asyncio
+    async def test_a_failure_escaping_the_per_item_fallback_parks(self, make_interceptor, store, taskmaster):
+        curator = _ScriptedCurator({'Work': [CuratorFailureError('llm down')]})
+        curator.batch_raises.append(CuratorFailureError('batch down'))
+        interceptor = make_interceptor(curator)
+
+        ticket_id = await _submit(interceptor, 'Work')
+
+        assert await _resolve(interceptor, ticket_id) == PARKED_LLM_FAILED_ANSWER
+        assert await _parked_row(store, ticket_id) == _parked(DeferReason.LLM_FAILED)
+        assert taskmaster.add_task_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_failure_escaping_the_unprepared_backfill_parks(self, make_interceptor, store, taskmaster):
+        curator = _ScriptedCurator({'Work': [CuratorFailureError('llm down')]})
+        curator.prepare_raises.add('Work')
+        interceptor = make_interceptor(curator)
+
+        ticket_id = await _submit(interceptor, 'Work')
+
+        assert await _resolve(interceptor, ticket_id) == PARKED_LLM_FAILED_ANSWER
+        assert await _parked_row(store, ticket_id) == _parked(DeferReason.LLM_FAILED)
+        assert taskmaster.add_task_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('escape', ['per-item-fallback', 'unprepared-backfill'])
+    async def test_a_parked_escape_logs_its_failure_against_the_ticket(
+        self, make_interceptor, caplog, escape,
+    ):
+        """The parked row records only the defer reason, so the failure itself is logged."""
+        curator = _ScriptedCurator({'Work': [CuratorFailureError('claude not on PATH')]})
+        if escape == 'per-item-fallback':
+            curator.batch_raises.append(CuratorFailureError('batch down'))
+        else:
+            curator.prepare_raises.add('Work')
+        interceptor = make_interceptor(curator)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+            ticket_id = await _submit(interceptor, 'Work')
+            assert await _resolve(interceptor, ticket_id) == PARKED_LLM_FAILED_ANSWER
+
+        assert [
+            r.levelno for r in caplog.records
+            if ticket_id in r.getMessage() and 'claude not on PATH' in r.getMessage()
+        ] == [logging.WARNING]
+
+    @pytest.mark.asyncio
+    async def test_a_curator_that_raises_instead_of_deciding_parks(self, make_interceptor, store, taskmaster):
+        curator = _ScriptedCurator({'Work': []})
+        curator.batch_raises.append(RuntimeError('curator exploded'))
+        interceptor = make_interceptor(curator)
+
+        ticket_id = await _submit(interceptor, 'Work')
+
+        assert await _resolve(interceptor, ticket_id) == {
+            'status': AWAITING_CURATION, 'reason': 'curation-deferred: curator-raised',
+        }
+        assert await _parked_row(store, ticket_id) == _parked(DeferReason.CURATOR_RAISED)
+        assert taskmaster.add_task_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_zero_output_hang_escaping_curate_still_creates(self, make_interceptor, taskmaster):
+        curator = _ScriptedCurator({'Work': [CuratorFailureError('llm hung', zero_output_timeout=True)]})
+        curator.batch_raises.append(CuratorFailureError('batch down'))
+        interceptor = make_interceptor(curator)
+
+        ticket_id = await _submit(interceptor, 'Work', metadata=_CALLER_METADATA)
+
+        reason = 'curator-failed: CuratorFailureError: llm hung'
+        assert await _resolve(interceptor, ticket_id) == {
+            'status': 'created', 'task_id': '101', 'reason': f'create: {reason}',
+        }
+        [metadata] = taskmaster.added_metadata()
+        assert _marker_of(metadata) == {'reason': reason, 'at': metadata[DEDUPE_SKIPPED_KEY]['at']}
+
+    @pytest.mark.asyncio
+    async def test_a_parked_llm_failure_resolves_on_a_later_combine(self, make_interceptor, store, taskmaster):
+        curator = _ScriptedCurator({
+            'Overlapping work': [CuratorFailureError('llm down'), _combine_into_existing(taskmaster)],
+        })
+        curator.batch_raises.append(CuratorFailureError('batch down'))
+        interceptor = make_interceptor(curator)
+        ticket_id = await _submit(interceptor, 'Overlapping work')
+        assert await _resolve(interceptor, ticket_id) == PARKED_LLM_FAILED_ANSWER
+
+        assert await interceptor.requeue_awaiting_curation_ticket('project', ticket_id) is True
+
+        assert await _resolve(interceptor, ticket_id) == {
+            'status': 'combined', 'task_id': '7', 'reason': 'combine: overlaps 7',
+        }
+        assert taskmaster.add_task_calls == []
+
+
 def _marker_of(metadata: Any) -> dict[str, str] | None:
     marker = metadata.get(DEDUPE_SKIPPED_KEY) if isinstance(metadata, dict) else None
     if marker is None:
@@ -552,10 +656,9 @@ class TestDedupeSkippedMarker:
                 None, 'llm-failed: boom',
             ),
             (
-                [CuratorFailureError('llm down')],
-                CuratorFailureError('batch down'), 'curator-failed: CuratorFailureError: llm down',
+                [CuratorFailureError('llm hung', zero_output_timeout=True)],
+                CuratorFailureError('batch down'), 'curator-failed: CuratorFailureError: llm hung',
             ),
-            ([], RuntimeError('curator exploded'), 'no-curator-decision'),
             (
                 [CuratorDecision(action='drop', batch_target_index=5, justification='dup')],
                 None, 'batch-target-out-of-range: local=5',
@@ -570,7 +673,7 @@ class TestDedupeSkippedMarker:
             ),
         ],
         ids=[
-            'curator-degraded-create', 'curator-failed', 'no-curator-decision',
+            'curator-degraded-create', 'curator-failed-zot',
             'batch-target-out-of-range', 'combine-fell-through', 'drop-fell-through',
         ],
     )

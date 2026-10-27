@@ -224,10 +224,7 @@ from fused_memory.reconciliation.mem0_tombstone import (
     is_protected_mirror_record,
     record_mem0_deletion_tombstones,
 )
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -1092,9 +1089,10 @@ async def run(
     # The refusal reaches ``main``'s blanket ``except Exception``
     # (StoreMutationUnavailable subclasses RuntimeError), which logs and
     # returns 2. That is loud and non-zero, but the generic handler will label
-    # it a fatal sweep error -- which is exactly why the ``logger.error`` below
-    # must carry the fail-closed diagnosis (what was refused, that no marker
-    # was enumerated and nothing was mutated, and the remedy) BEFORE the raise. This also holds
+    # it a fatal sweep error -- which is exactly why the guard is handed this
+    # script's logger: its refusal record carries the fail-closed diagnosis
+    # (what was refused, that no marker was enumerated and nothing was
+    # mutated, and the remedy) BEFORE the raise. This also holds
     # under the ``--apply --check --max-backlog N`` predicate mode: a refused
     # run exits 2, so it can never be mistaken for a satisfied backlog gate.
     #
@@ -1102,21 +1100,16 @@ async def run(
     # builds ``'dry_run': not args.apply`` inline) so a read-only run stays
     # pure-read and needs no write capability at all.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(operation='sweep_orphan_flag_markers --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'sweep_orphan_flag_markers: --apply NOT started (fail-closed) -- '
-                "this process cannot write mem0's history directory, so deleting a "
-                'marker would remove its Qdrant point and then fail to write the '
-                'history, destroying records that survive nowhere but this log. '
-                'No marker was enumerated, nothing was mutated, and no backlog '
-                'predicate was evaluated. Route the sweep through the fused-memory '
-                'MCP server (the unsandboxed owner of the store), or re-run from an '
-                'unsandboxed operator shell. To obtain the sweep report safely from '
-                'anywhere, re-run without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='sweep_orphan_flag_markers --apply',
+            logger=logger,
+            extra_detail=(
+                'deleting a marker would remove its Qdrant point and then fail to '
+                'write the history, destroying records that survive nowhere but '
+                'this log. No marker was enumerated, nothing was mutated, and no '
+                'backlog predicate was evaluated.'
+            ),
+        )
 
     # --- Before counts (deterministic Qdrant payload-filter, not semantic) ---
     source_filter = {'source': MARKER_SOURCE}

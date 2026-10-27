@@ -375,7 +375,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit (mirrors test_workflow_e2e.py)."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -864,6 +864,7 @@ class TestStateMachineLegalityAndConsistency:
         run() RETURNS the real BLOCKED report — no synthetic mislabel (spec
         §8-E11) — and the violation is recorded in log mode, never raised.
         """
+        monkeypatch.setattr(config, 'workflow_exit_contract_enforce', False)
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
         event_store = MagicMock()
@@ -1258,7 +1259,7 @@ class TestHarnessConsumesTerminalReport:
         """
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
         config = OrchestratorConfig(project_root=repo, max_concurrent_tasks=1)
         harness = _build_harness(config)
         # `_build_harness` leaves `Scheduler` a bare MagicMock (only the

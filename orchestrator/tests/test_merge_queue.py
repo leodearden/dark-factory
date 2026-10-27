@@ -13163,6 +13163,11 @@ class TestRunPostMergeVerify:
         git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
         return git_ops
 
+    @pytest.fixture(autouse=True)
+    def _real_project_root(self, tmp_path: Path) -> None:
+        """The flake recorder writes to runs_db(req.config.project_root), so it must be a real path."""
+        self._project_root = tmp_path / 'project_root'
+
     def _make_req(self) -> MagicMock:
         req = MagicMock()
         req.task_id = 'task-verify-test'
@@ -13170,6 +13175,7 @@ class TestRunPostMergeVerify:
         req.module_configs = []
         req.config.merge_verify_min_free_disk_bytes = 1024
         req.config.merge_verify_workspace = False
+        req.config.project_root = self._project_root
         return req
 
     async def test_disk_guard_none_verify_passed_returns_none(self) -> None:
@@ -16072,7 +16078,10 @@ class TestReverifyRebasedTree:
         merge_wt, req, verified, rebased_from, rebased_onto = await self._rebased_onto_drift(
             git_ops,
             config.model_copy(
-                update={'merge_verify_breadth': 'full', 'merge_gate_history_pure': True},
+                update={
+                    'merge_verify_breadth': 'full', 'merge_gate_history_pure': True,
+                    'merge_gate_history_test_command': None,
+                },
             ),
             'rvrt-same',
         )
@@ -16112,7 +16121,10 @@ class TestReverifyRebasedTree:
         merge_wt, req, _, rebased_from, rebased_onto = await self._rebased_onto_drift(
             git_ops,
             config.model_copy(
-                update={'merge_verify_breadth': 'full', 'merge_gate_history_pure': True},
+                update={
+                    'merge_verify_breadth': 'full', 'merge_gate_history_pure': True,
+                    'merge_gate_history_test_command': None,
+                },
             ),
             f'rvrt-closed-{len(verified_merge_sha)}',
         )
@@ -21012,6 +21024,11 @@ class TestRunPostMergeVerifyRouting:
         git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[])
         return git_ops
 
+    @pytest.fixture(autouse=True)
+    def _real_project_root(self, tmp_path: Path) -> None:
+        """The flake recorder writes to runs_db(req.config.project_root), so it must be a real path."""
+        self._project_root = tmp_path / 'project_root'
+
     def _make_req(self) -> MagicMock:
         req = MagicMock()
         req.task_id = 'task-routing-test'
@@ -21022,6 +21039,7 @@ class TestRunPostMergeVerifyRouting:
         req.config.verify_env = {}
         req.config.merge_verify_cold_command_timeout_secs = None
         req.config.verify_cold_command_timeout_secs = None
+        req.config.project_root = self._project_root
         return req
 
     def _make_event_store(self, tmp_path: Path) -> EventStore:

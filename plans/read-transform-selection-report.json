@@ -185,31 +185,38 @@
   "e2_k": 10,
   "fixture_provenance": [
     {
+      "blob": "def34a5014216ac4a5f1662d0d32b7e40b539b44",
       "commit": "55e242a2c8681fb8a60fdb34e3d5194109781e87",
       "path": "fused-memory/tests/fixtures/write_triage_calibration.jsonl"
     },
     {
-      "commit": "02886ef290cde99ce88426cd1d3b5565a551e293",
+      "blob": "a02b4ae406147db0f3130661cfbbec0a47764e78",
+      "commit": "8b9a66a262180e4652b571d6c4d76a2df01b273d",
       "path": "fused-memory/tests/fixtures/memory_eval_topic_registry.json"
     },
     {
+      "blob": "a2feb863c1380c025b1c047a177a1bf173d78d7d",
       "commit": "55a9218a4c5809cad828db65781b1bd7389dff94",
       "path": "fused-memory/tests/fixtures/e2_arm_claims.jsonl"
     },
     {
+      "blob": "3be15d405842819c70beeb63616a07335b4f298f",
       "commit": "8972e9b17c746b7ec7cc377971cbc41fc25ad3d1",
       "path": "fused-memory/tests/fixtures/e2_query_set.jsonl"
     },
     {
+      "blob": "c25ad5e66087621aa7ac77c89d98cb7e79a7c843",
       "commit": "6b4809ec138e8ae04c810bffbab4728b6c1d395d",
       "path": "fused-memory/tests/fixtures/e2_distractor_slab.jsonl"
     },
     {
+      "blob": "beb63b69c26099602470254408d0874e5c9a3706",
       "commit": "234bf88e1f0ba9cc920cba39a799b1864aa834f4",
       "path": "fused-memory/tests/fixtures/production_query_sample.jsonl"
     },
     {
-      "commit": "9cff4de183361dfa86d9141b280b48efe149cb2d",
+      "blob": "2dddb2ffa9e999fb06d075786f03a3cb8e602590",
+      "commit": "91e577e210b0d406e62918a800cf357166b52582",
       "path": "fused-memory/tests/fixtures/e2_fetch_cache.json"
     }
   ],

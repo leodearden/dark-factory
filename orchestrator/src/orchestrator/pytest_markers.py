@@ -44,7 +44,7 @@ import shlex
 import tomllib
 from collections.abc import Callable, Iterator, Sequence
 
-from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
+from shared.pytest_mark_grammar import marker_name, pytestmark_elements
 
 
 class _Unsupported(Exception):
@@ -247,16 +247,6 @@ def resolve_marker_expression(
     return _marker_expr_from_tokens(tokens)
 
 
-def _pytestmark_binding(body: Sequence[ast.stmt]) -> ast.expr | None:
-    """The value of the LAST ``pytestmark`` binding among *body*'s direct children, else None."""
-    value: ast.expr | None = None
-    for statement in body:
-        bound = pytestmark_value(statement)
-        if bound is not None:
-            value = bound
-    return value
-
-
 def _pytestmark_marker_names(body: Sequence[ast.stmt]) -> frozenset[str]:
     """Marker names the ``pytestmark`` binding in *body* names, else an empty set.
 
@@ -271,21 +261,13 @@ def _pytestmark_marker_names(body: Sequence[ast.stmt]) -> frozenset[str]:
     rejects, breaking the "same shapes at both scopes" promise
     :func:`_class_marker_names` makes.
 
-    Only DIRECT children of *body* are considered — never ``ast.walk`` — so a
-    ``pytestmark`` bound inside an ``if`` is not the enclosing scope's marker.
-    Accepted value shapes: a bare ``pytest.mark.NAME``, a
-    ``pytest.mark.NAME(...)`` call, or a list/tuple of either.  A non-marker
-    element yields None from ``shared.pytest_mark_grammar.marker_name`` and is
-    skipped silently, without suppressing its siblings.  If the scope rebinds
-    ``pytestmark`` more than once, the LAST binding wins, mirroring Python's
-    own semantics.  The element grammar itself is ``shared.pytest_mark_grammar``.
+    Which binding wins, and which statements count, is
+    ``shared.pytest_mark_grammar.pytestmark_elements``.  A non-marker element
+    yields None from ``shared.pytest_mark_grammar.marker_name`` and is skipped
+    silently, without suppressing its siblings.
     """
-    value = _pytestmark_binding(body)
-    if value is None:
-        return frozenset()
-
     return frozenset(
-        name for name in (marker_name(element) for element in mark_elements(value))
+        name for name in (marker_name(element) for element in pytestmark_elements(body))
         if name is not None
     )
 
@@ -360,12 +342,8 @@ def module_level_timeout_arguments(source: str | None) -> tuple[ast.expr, ...]:
     except (SyntaxError, ValueError):
         return ()
 
-    value = _pytestmark_binding(tree.body)
-    if value is None:
-        return ()
-
     arguments: list[ast.expr] = []
-    for element in mark_elements(value):
+    for element in pytestmark_elements(tree.body):
         if not isinstance(element, ast.Call) or marker_name(element) != 'timeout':
             continue
         if element.args:

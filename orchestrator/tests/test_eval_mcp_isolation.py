@@ -30,10 +30,10 @@ from _git_fixtures import seed_repo
 from _workflow_helpers import FakeBriefing, FakeScheduler, fixed_prompt
 from shared.cli_invoke import AgentResult, build_claude_argv
 
-from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.roles import ARCHITECT, AgentRole
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.evals import runner, snapshots
+from orchestrator.evals import runner
+from orchestrator.evals.architect_eval import ArchitectEvalDeps
 from orchestrator.evals.compare import Synthesis, _assess_task, compare_models
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.judge import judge_plan_quality, run_judge
@@ -98,18 +98,19 @@ def _write_fixture(tmp_path: Path) -> Path:
     return task_path
 
 
-async def _drive_architect_eval(monkeypatch, tmp_path: Path) -> dict:
-    """Run the REAL ``run_architect_eval`` up to its invoke; return the kwargs ``invoke_agent`` received."""
+async def _drive_architect_eval(tmp_path: Path) -> dict:
+    """Run the REAL ``run_architect_eval`` up to its invoke; return the kwargs its injected invoke received."""
     worktree = tmp_path / 'wt'
     worktree.mkdir()
-    monkeypatch.setattr(snapshots, 'create_eval_worktree',
-                        AsyncMock(return_value=(worktree, 'run-abc')))
-    monkeypatch.setattr(snapshots, 'cleanup_eval_worktree', AsyncMock())
-    monkeypatch.setattr(snapshots, 'get_diff_between_commits', AsyncMock(return_value=''))
-    monkeypatch.setattr(BriefingAssembler, 'build_architect_prompt',
-                        AsyncMock(return_value='P'))
     mock_invoke = AsyncMock(return_value=AgentResult(success=True, output=''))
-    monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', mock_invoke)
+    deps = ArchitectEvalDeps(
+        store=MagicMock(spec=ResultStore),
+        create_worktree=AsyncMock(return_value=(worktree, 'run-abc')),
+        cleanup_worktree=AsyncMock(),
+        build_prompt=AsyncMock(return_value='P'),
+        invoke=mock_invoke,
+        read_reference_diff=AsyncMock(return_value=''),
+    )
 
     cfg = EvalConfig(name='architect-probe', backend='claude', model='opus',
                      effort='high', role='architect')
@@ -117,7 +118,7 @@ async def _drive_architect_eval(monkeypatch, tmp_path: Path) -> dict:
         _write_fixture(tmp_path), cfg,
         base_config=OrchestratorConfig(project_root=tmp_path / 'proj'),
         usage_gate=None,
-        store=MagicMock(spec=ResultStore),
+        deps=deps,
     )
     assert mock_invoke.await_args is not None, 'the architect was never invoked'
     return dict(mock_invoke.await_args.kwargs)
@@ -125,10 +126,10 @@ async def _drive_architect_eval(monkeypatch, tmp_path: Path) -> dict:
 
 @pytest.mark.asyncio
 async def test_architect_eval_invoke_is_strictly_scoped_to_plan_tools(
-    monkeypatch, tmp_path: Path, pinned_claude: str,
+    tmp_path: Path, pinned_claude: str,
 ) -> None:
     """The eval architect reaches plan-tools and nothing else, through the real cap-retry forwarding."""
-    kw = await _drive_architect_eval(monkeypatch, tmp_path)
+    kw = await _drive_architect_eval(tmp_path)
 
     assert kw.get('strict_mcp_config') is True
     assert set(kw['mcp_config']['mcpServers']) == {'plan-tools'}

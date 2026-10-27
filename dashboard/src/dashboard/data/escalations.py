@@ -56,7 +56,7 @@ def load_queue_escalations(
     which also walks the archive subtree.
 
     Only ``esc-*.json`` names an escalation.  The queue directory has other
-    residents: ``orchestrator/src/orchestrator/b3_gate.py::STATE_REL_PATH``
+    residents: ``orchestrator/src/orchestrator/b3_gate.py::STATE_FILENAME``
     keeps ``b3-state.json`` there, and a ``*.json`` glob read it as an id-less
     escalation.  :func:`escalation.queue.iter_all_escalation_paths`, and so the
     corpus walk the Escalations tab reads, globs ``esc-*.json`` for the same

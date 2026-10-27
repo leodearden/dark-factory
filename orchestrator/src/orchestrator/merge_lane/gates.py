@@ -24,7 +24,7 @@ import posixpath
 import re
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -1907,7 +1907,7 @@ async def _resolve_already_landed_branch(
     evidence exactly: 3604's landed file set equals its 3 declared plan
     files, 3572's equals its 7.
 
-    **4. SURVIVAL** — :meth:`GitOps.commit_effect_present_in_main` says the
+    **4. SURVIVAL** — ``describe_commit_effect_in_main(...).present`` says the
     attributing commit's own effect is STILL PRESENT at main's current HEAD
     (amendment pass, review finding #1).  Signals 1-3 are all statements about
     IMMUTABLE HISTORY: a merge commit stays an ancestor of main forever, and
@@ -2079,13 +2079,23 @@ async def _resolve_already_landed_branch(
     # the reconcile sweep applies before MARK_DONE (harness.py, the FIX 1'
     # effect-present refinement), so the two seams answer "is it still there"
     # identically instead of drifting.
-    if not await git_ops.commit_effect_present_in_main(landed_sha):
+    effect = await git_ops.describe_commit_effect_in_main(landed_sha)
+    if not effect.present:
         logger.warning(
             'already-landed: landing %s (mechanism=%s) for task_id=%s is an '
-            'ancestor of main but its effect is NOT present at current HEAD '
-            '(post-hoc revert) — failing closed rather than telling an '
-            'operator to close a task whose work is no longer on main',
-            landed_sha, mechanism, task_id,
+            'ancestor of main but the effect check did not confirm it '
+            'survives at current HEAD (failure=%s aggregate_survival=%s '
+            'added_lines_total=%s aggregate_threshold=%s '
+            'worst_guarded_path=%s worst_guarded_survival=%s '
+            'per_file_threshold=%s vacuous_paths=%s) — this check cannot '
+            'tell a genuine revert from a heavy later rewrite of the same '
+            'lines; failing closed rather than telling an operator to close '
+            'a task whose work may no longer be on main',
+            landed_sha, mechanism, task_id, effect.failure,
+            effect.aggregate_survival, effect.added_lines_total,
+            effect.aggregate_threshold, effect.worst_guarded_path,
+            effect.worst_guarded_survival, effect.per_file_threshold,
+            list(effect.vacuous_paths),
         )
         return None
 
@@ -2169,6 +2179,42 @@ def _entry_covered(norm: str, touched_set: set[str]) -> bool:
     return (
         _entry_touched_exactly(norm, touched_set)
         or _entry_touched_beneath(norm, touched_set)
+    )
+
+
+@dataclass(frozen=True)
+class DeclarationCoverage:
+    undeclared: tuple[str, ...]
+    """Changed paths no declared entry covers, sorted."""
+    undelivered: tuple[str, ...]
+    """Declared entries, exactly as written, that cover no changed path, sorted."""
+
+
+def declaration_coverage(
+    declared: Iterable[str], paths: Iterable[str],
+) -> DeclarationCoverage:
+    """Difference a declaration against changed paths, in both directions.
+
+    The git-free half of :func:`_check_plan_files_touched_in_branch`'s
+    coverage rule (:func:`_normalize_plan_path` + :func:`_entry_covered`),
+    applied per changed path for ``undeclared`` and per declared entry for
+    ``undelivered``.  The gate's existence probe and rename arm need git and
+    are not applied, so a renamed declared path reads as one undelivered
+    entry plus one undeclared path.  Caller:
+    ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_landed_scope``.
+    """
+    norms = {entry: _normalize_plan_path(entry) for entry in declared if entry}
+    path_set = set(paths)
+    undeclared = sorted(
+        p for p in path_set
+        if not any(_entry_covered(norm, {p}) for norm in norms.values())
+    )
+    undelivered = sorted(
+        entry for entry, norm in norms.items()
+        if not _entry_covered(norm, path_set)
+    )
+    return DeclarationCoverage(
+        undeclared=tuple(undeclared), undelivered=tuple(undelivered),
     )
 
 
@@ -3342,6 +3388,12 @@ async def _same_tree(git_ops: GitOps, a: str, b: str) -> bool:
     return rc == 0 and len(trees) == 2 and trees[0] == trees[1]
 
 
+def _declared_history_leg(req: MergeRequest) -> str | None:
+    """The project's same-tree history leg command, or None when it declares none."""
+    command = getattr(req.config, 'merge_gate_history_test_command', None)
+    return command if isinstance(command, str) and command.strip() else None
+
+
 async def _decide_reverify_gate(
     git_ops: GitOps,
     req: MergeRequest,
@@ -3362,6 +3414,11 @@ async def _decide_reverify_gate(
     )
     history_pure = getattr(req.config, 'merge_gate_history_pure', False) is True
     if history_pure and await _same_tree(git_ops, verified_merge_sha, merge_sha):
+        if (history_leg_command := _declared_history_leg(req)) is not None:
+            return decide(
+                reason=ReverifyGateReason.same_tree_history_leg,
+                history_leg_command=history_leg_command,
+            )
         return decide(reason=ReverifyGateReason.same_tree)
     overlap = await _rebase_delta_touched_overlap(
         req.worktree, rebased_from, rebased_onto, git_ops,
@@ -3436,18 +3493,24 @@ async def _reverify_rebased_tree(
        ``merge_gate_history_pure``: when *merge_sha*'s tree equals
        *verified_merge_sha*'s, clear as ``GateClearance.same_tree`` with no
        verify.  PRECONDITION: the gate's verdict is a function of the tree
-       alone.  A gate leg that reads git history (ancestry of HEAD, a
-       merge-base) can turn red on the same tree under a new parent, so for
-       such a project the key stays False and the tree is re-verified.  Under
-       the precondition a gate that passed tree T sees exactly T again, and
-       neither premise of :func:`_disjoint_skip_blockers` is consulted.
+       alone, except the tests ``merge_gate_history_test_command`` selects.
+       A gate leg that reads git history (ancestry of HEAD, a merge-base) can
+       turn red on the same tree under a new parent, so for a project that
+       cannot name those tests the key stays False and the tree is
+       re-verified.  When the project declares that command, only it runs, on
+       *merge_wt*, through *run_post_merge_verify* with
+       ``history_leg_command``: a pass clears as
+       ``GateClearance.history_leg``, and a red or unrunnable leg gets the
+       re-verify's full failure handling.  Under the precondition a gate that
+       passed tree T sees exactly T again, and neither premise of
+       :func:`_disjoint_skip_blockers` is consulted.
     1. **Disjoint** (``_rebase_delta_touched_overlap`` is empty) with no
        :func:`_disjoint_skip_blockers`: clear as ``GateClearance.disjoint``
        with no verify.  Disjointness alone is NOT sufficient: see that
        function's docstring for the two premises.
     2. Otherwise (an overlap, an unknown overlap, or untrusted disjointness):
-       delegate to *run_post_merge_verify* against the rebased *merge_wt*,
-       forwarding *event_store* so the re-verify writes its ``merge_verify``
+       delegate to *run_post_merge_verify* against the rebased *merge_wt*;
+       the worker's handles it carries write the re-verify's ``merge_verify``
        row.  ``None`` from it → ``GateClearance.reverified``; a
        ``MergeOutcome`` → verification failed or the disk guard fired, and
        *merge_wt* has already been cleaned up.
@@ -3474,10 +3537,12 @@ async def _reverify_rebased_tree(
         verbatim to ``_run_post_merge_verify``.  Default ``None`` produces
         legacy single-keep behaviour (only ``merge_wt`` is protected).
     run_post_merge_verify:
-        The worker's ``_run_post_merge_verify``, which this gate delegates the
-        re-verify to when it fires.
+        The worker's verify callable, carrying the worker's handles, its
+        event store included.  This gate delegates the re-verify to it when
+        it fires, and the declared history leg to it, as
+        ``history_leg_command``, on a same tree.
     event_store:
-        Receives the decision row, and is forwarded to the re-verify.
+        Receives the decision row only.
     """
     decision = await _decide_reverify_gate(
         git_ops, req,
@@ -3498,9 +3563,13 @@ async def _reverify_rebased_tree(
         max_enospc=max_enospc,
         merge_sha=merge_sha,
         keep_worktrees=keep_worktrees,
-        event_store=event_store,
+        history_leg_command=decision.history_leg_command,
     )
-    return GateClearance.reverified if failure is None else failure
+    if failure is not None:
+        return failure
+    if decision.history_leg_command is None:
+        return GateClearance.reverified
+    return GateClearance.history_leg
 
 
 async def _check_post_merge_pyright(

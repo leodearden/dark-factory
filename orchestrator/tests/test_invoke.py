@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -17,6 +18,9 @@ import pytest
 from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
+from shared.invocation_outcome import CapHit
+from shared.process_cost import ProcessCostBasis
+from shared.testing_fake_claude import install_fake_claude_cli
 from shared.testing_stdin import STDIN_STARVATION_STUB, make_starving_exec
 from shared.usage_gate import AccountLease, InvokeSlot
 
@@ -29,9 +33,11 @@ from orchestrator.agents.invoke import (
     _parse_gemini_output,
     _run_subprocess_local,
     _SubprocessResult,
+    codex_exec_argv,
     invoke_agent,
     invoke_with_cap_retry,
 )
+from orchestrator.agents.roles import ARCHITECT, IMPLEMENTER, REVIEWER_COMPREHENSIVE
 
 # Cap-retry path is now the unified shared loop; orchestrator callers
 # pass ``invoke_fn=invoke_agent`` to route through multi-backend dispatch.
@@ -140,7 +146,9 @@ class TestAccountNameThreading:
             _make_slot(account_name='acct-a', cap_hit=True),
             _make_slot(account_name='acct-b', cap_hit=False),
         ])
-        fake_invoke = AsyncMock(return_value=_make_result())
+        fake_invoke = AsyncMock(
+            side_effect=[_make_result(success=False), _make_result()],
+        )
 
         with patch(_SHARED_ASYNCIO_PATCH) as mock_asyncio:
             mock_asyncio.sleep = AsyncMock()
@@ -177,7 +185,7 @@ class TestCapHitResume:
         ])
 
         capped_result = _make_result(
-            success=True, cost_usd=0.5, session_id='sess-abc',
+            success=False, cost_usd=0.5, session_id='sess-abc',
         )
         capped_result.duration_ms = 6000
         capped_result.turns = 2
@@ -199,17 +207,29 @@ class TestCapHitResume:
             assert second_call.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
 
     async def test_no_resume_on_cap_hit_codex_backend(self):
-        """Codex backend cap hit → no resume_session_id (not supported).
+        """Codex backend cap hit → fresh retry, and the Claude pool never hears of it.
 
-        The unified loop resumes by session_id when the result has one, regardless
-        of backend.  Codex backends produce no session_id, so no resume happens.
+        Codex produces no session_id, so there is nothing to resume.  Its cap is
+        the ChatGPT window, not the leased Claude account's, so the loop waits
+        it out without asking the slot's cap detector or reporting a CapHit —
+        even though the capped slot's detector here would answer True.
         """
-        gate = _make_gate_yielding([
+        slots = [
             _make_slot(token='token-a', account_name='acct-a', cap_hit=True),
             _make_slot(token='token-b', account_name='acct-b', cap_hit=False),
-        ])
+        ]
+        gate = _make_gate_yielding(slots)
 
-        capped_result = _make_result(session_id='')  # codex: no session
+        capped_result = _make_result(
+            success=False,
+            output=(
+                "You've hit your usage limit. Upgrade to Pro "
+                '(https://chatgpt.com/explore/pro), visit '
+                'https://chatgpt.com/codex/settings/usage to purchase more credits '
+                'or try again at 1:07 PM.'
+            ),
+            session_id='',  # codex: no session
+        )
         ok_result = _make_result()
         ok_result.duration_ms = 6000
         ok_result.turns = 2
@@ -226,6 +246,10 @@ class TestCapHitResume:
             assert 'resume_session_id' not in second_call.kwargs
             assert second_call.kwargs.get('prompt') == 'hi'
 
+        slots[0].detect_cap_hit.assert_not_called()
+        reported = [arg for slot in slots for c in slot.report.call_args_list for arg in c.args]
+        assert not any(isinstance(arg, CapHit) for arg in reported)
+
     async def test_resume_failure_falls_back_to_fresh(self):
         """Resume returns success=False → retry with original prompt."""
         gate = _make_gate_yielding([
@@ -234,7 +258,7 @@ class TestCapHitResume:
             _make_slot(token='token-c', account_name='acct-b', cap_hit=False),
         ])
 
-        capped_result = _make_result(session_id='sess-abc')
+        capped_result = _make_result(success=False, session_id='sess-abc')
         failed_resume = _make_result(success=False)
         failed_resume.duration_ms = 6000
         failed_resume.turns = 2
@@ -672,6 +696,227 @@ class TestInvokeAgentForwardsMaxTurnsToCodex:
         mock_invoke_codex.assert_awaited_once()
         assert mock_invoke_codex.call_args.kwargs.get('max_turns') == 42
         assert mock_invoke_codex.call_args.kwargs.get('timeout_seconds') == 99.0
+
+
+@pytest.mark.asyncio
+class TestInvokeAgentForwardsToolListsToCodex:
+    """invoke_agent must hand the role's tool lists to the codex path, or
+    `codex_exec_argv` never sees them and every role runs the bypass."""
+
+    async def test_tool_lists_forwarded(self, tmp_path):
+        dummy_result = AgentResult(success=True, output='')
+        with patch('orchestrator.agents.invoke._invoke_codex',
+                   new_callable=AsyncMock, return_value=dummy_result) as mock_invoke_codex:
+            await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path,
+                backend='codex', model='gpt-6-astra',
+                allowed_tools=['Read', 'Grep'], disallowed_tools=['Edit', 'Write'],
+            )
+
+        mock_invoke_codex.assert_awaited_once()
+        assert mock_invoke_codex.call_args.kwargs.get('allowed_tools') == ['Read', 'Grep']
+        assert mock_invoke_codex.call_args.kwargs.get('disallowed_tools') == ['Edit', 'Write']
+
+
+_CODEX_READ_ONLY = ['-s', 'read-only']
+_CODEX_BYPASS = ['--dangerously-bypass-approvals-and-sandbox']
+
+
+def _codex_confinement(allowed_tools, disallowed_tools) -> list[str]:
+    """The confinement flags `codex_exec_argv` puts between `--json` and the stdin marker."""
+    argv = codex_exec_argv('gpt-6-astra', allowed_tools=allowed_tools, disallowed_tools=disallowed_tools)
+    return argv[argv.index('--json') + 1:argv.index('-')]
+
+
+class TestCodexConfinement:
+    """A role's tool lists collapse onto codex's one confinement lever: a
+    role that cannot write runs `-s read-only`; anything else keeps the
+    bypass. The real role constants are used so a role edit cannot desync."""
+
+    @pytest.mark.parametrize('role', [REVIEWER_COMPREHENSIVE, ARCHITECT], ids=['reviewer', 'architect'])
+    def test_role_denied_edit_and_write_is_read_only(self, role) -> None:
+        assert _codex_confinement(role.allowed_tools, role.disallowed_tools) == _CODEX_READ_ONLY
+
+    def test_implementer_keeps_the_bypass(self) -> None:
+        assert _codex_confinement(IMPLEMENTER.allowed_tools, IMPLEMENTER.disallowed_tools) == _CODEX_BYPASS
+
+    def test_wildcard_disallow_is_read_only(self) -> None:
+        assert _codex_confinement(None, ['*']) == _CODEX_READ_ONLY
+
+    def test_allowlist_naming_neither_edit_nor_write_is_read_only(self) -> None:
+        assert _codex_confinement(['Read', 'Bash'], []) == _CODEX_READ_ONLY
+
+    @pytest.mark.parametrize(
+        ('allowed', 'disallowed'), [(None, None), ([], []), (None, []), ([], None)],
+    )
+    def test_unrestricted_caller_keeps_the_bypass(self, allowed, disallowed) -> None:
+        assert _codex_confinement(allowed, disallowed) == _CODEX_BYPASS
+
+    def test_unrestricted_caller_argv_is_unchanged(self) -> None:
+        assert codex_exec_argv('gpt-6-astra') == [
+            'codex', 'exec', '-m', 'gpt-6-astra', '--json', *_CODEX_BYPASS, '-',
+        ]
+
+
+class TestCodexDroppedToolSpecWarning:
+    """codex has no per-tool allowlist, so every spec finer than "may write"
+    is lost; that loss is logged once, never dropped silently (the
+    `_invoke_pi` precedent)."""
+
+    @staticmethod
+    def _invoke_warnings(caplog) -> list[logging.LogRecord]:
+        return [
+            r for r in caplog.records
+            if r.name == 'orchestrator.agents.invoke' and r.levelno == logging.WARNING
+        ]
+
+    def test_reviewer_lists_log_one_warning_naming_only_the_lost_specs(self, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger='orchestrator.agents.invoke')
+        codex_exec_argv(
+            'gpt-6-astra',
+            allowed_tools=REVIEWER_COMPREHENSIVE.allowed_tools,
+            disallowed_tools=REVIEWER_COMPREHENSIVE.disallowed_tools,
+        )
+
+        warnings = self._invoke_warnings(caplog)
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        for lost in ('Bash(git:*)', 'mcp__verdict-tools__*', 'mcp__fused-memory__set_task_status'):
+            assert lost in message
+        for honoured in ('Read', 'Glob', 'Grep', 'Edit', 'Write'):
+            assert not re.search(rf'\b{honoured}\b', message), honoured
+
+    def test_unrestricted_caller_logs_no_warning(self, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger='orchestrator.agents.invoke')
+        codex_exec_argv('gpt-6-astra')
+        assert self._invoke_warnings(caplog) == []
+
+
+_CODEX_MCP_CONFIG = {'mcpServers': {
+    'verdict-tools': {
+        'command': '/venv/bin/python',
+        'args': ['-m', 'orchestrator.mcp.verdict_tools', '--meta-root', '/tmp/x "y"'],
+        'env': {'FASTMCP_SHOW_SERVER_BANNER': 'false'},
+    },
+    'plain': {'command': 'srv'},
+}}
+
+
+def _codex_mcp_overrides(mcp_config) -> list[str]:
+    """The `-c mcp_servers.*` override values on codex's argv for *mcp_config*."""
+    argv = codex_exec_argv('gpt-6-astra', mcp_config=mcp_config)
+    return [
+        value for flag, value in zip(argv, argv[1:], strict=False)
+        if flag == '-c' and value.startswith('mcp_servers.')
+    ]
+
+
+class TestCodexMcpServersNeverWrittenIntoCwd:
+    """MCP servers reach codex as per-invocation `-c mcp_servers.<name>.*`
+    overrides, so nothing is written into the caller's cwd: not a
+    `.codex/config.toml`, and no mkdir that a pre-existing `.codex` FILE
+    (the shape at the dark-factory root) turns into EEXIST."""
+
+    def test_override_args_round_trip_through_toml(self) -> None:
+        import tomllib
+
+        parsed = tomllib.loads('\n'.join(_codex_mcp_overrides(_CODEX_MCP_CONFIG)))
+        assert parsed == {'mcp_servers': {
+            'verdict-tools': {
+                'command': '/venv/bin/python',
+                'args': ['-m', 'orchestrator.mcp.verdict_tools', '--meta-root', '/tmp/x "y"'],
+                'env': {'FASTMCP_SHOW_SERVER_BANNER': 'false'},
+                'default_tools_approval_mode': 'approve',
+            },
+            'plain': {'command': 'srv', 'args': [], 'default_tools_approval_mode': 'approve'},
+        }}
+
+    def test_server_names_are_bare_key_segments(self) -> None:
+        """tomllib reads a quoted and a bare segment as one key, but codex's
+        `-c` splitter keeps the quotes in the server name (esc-5403-4)."""
+        key_paths = {
+            override.split('=', 1)[0] for override in _codex_mcp_overrides(_CODEX_MCP_CONFIG)
+        }
+        assert key_paths == {
+            'mcp_servers.verdict-tools.command',
+            'mcp_servers.verdict-tools.args',
+            'mcp_servers.verdict-tools.env',
+            'mcp_servers.verdict-tools.default_tools_approval_mode',
+            'mcp_servers.plain.command',
+            'mcp_servers.plain.args',
+            'mcp_servers.plain.default_tools_approval_mode',
+        }
+
+    @pytest.mark.parametrize('name', ['has space', 'dotted.name', 'quo"te', ''])
+    def test_a_name_no_bare_key_can_spell_is_rejected(self, name: str) -> None:
+        with pytest.raises(ValueError):
+            codex_exec_argv('gpt-6-astra', mcp_config={'mcpServers': {name: {'command': 'srv'}}})
+
+    def test_overrides_sit_just_before_the_stdin_marker(self) -> None:
+        argv = codex_exec_argv('gpt-6-astra', effort='high', mcp_config=_CODEX_MCP_CONFIG)
+        mcp_args = [arg for override in _codex_mcp_overrides(_CODEX_MCP_CONFIG) for arg in ('-c', override)]
+
+        assert argv[-1] == '-'
+        assert argv[-1 - len(mcp_args):-1] == mcp_args
+
+    async def _invoke_with_mcp(self, cwd: Path) -> dict:
+        captured: dict = {}
+
+        async def fake_run_subprocess_local(cmd, cwd, *args, **kwargs):
+            captured['cwd_entries'] = sorted(cwd.iterdir())
+            return _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=1)
+
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   side_effect=fake_run_subprocess_local):
+            await _invoke_codex(
+                prompt='p', system_prompt='s', cwd=cwd, model='gpt-6-astra',
+                max_budget_usd=1.0, mcp_config=_CODEX_MCP_CONFIG,
+                sandbox_modules=None, effort=None,
+            )
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_cwd_stays_empty_during_and_after_the_run(self, tmp_path) -> None:
+        captured = await self._invoke_with_mcp(tmp_path)
+
+        assert captured['cwd_entries'] == []
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_pre_existing_read_only_codex_file_is_left_untouched(self, tmp_path) -> None:
+        codex_file = tmp_path / '.codex'
+        codex_file.write_bytes(b'')
+        codex_file.chmod(0o444)
+
+        await self._invoke_with_mcp(tmp_path)
+
+        assert codex_file.is_file()
+        assert codex_file.read_bytes() == b''
+        assert codex_file.stat().st_mode & 0o777 == 0o444
+
+
+@pytest.mark.asyncio
+class TestInvokeCodexRunsTheBuiltArgv:
+    """`_invoke_codex` hands its runner exactly `codex_exec_argv`'s argv, with
+    every input threaded through and no wrap when no sandbox was requested."""
+
+    async def test_runner_receives_the_built_argv(self, tmp_path) -> None:
+        empty = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=1)
+        with patch('orchestrator.agents.invoke._run_subprocess_local',
+                   new_callable=AsyncMock, return_value=empty) as run:
+            await _invoke_codex(
+                prompt='p', system_prompt='s', cwd=tmp_path, model='gpt-6-astra',
+                max_budget_usd=1.0, mcp_config=_CODEX_MCP_CONFIG, sandbox_modules=None,
+                effort='high',
+                allowed_tools=REVIEWER_COMPREHENSIVE.allowed_tools,
+                disallowed_tools=REVIEWER_COMPREHENSIVE.disallowed_tools,
+            )
+
+        assert run.call_args.args[0] == codex_exec_argv(
+            'gpt-6-astra', effort='high', mcp_config=_CODEX_MCP_CONFIG,
+            allowed_tools=REVIEWER_COMPREHENSIVE.allowed_tools,
+            disallowed_tools=REVIEWER_COMPREHENSIVE.disallowed_tools,
+        )
 
 
 @pytest.mark.asyncio
@@ -2078,41 +2323,72 @@ class TestStdinStarvationRaceLocal:
         )
 
 
-class TestWriteCodexMcpConfig:
-    """codex loads ``.codex/config.toml`` as ``[mcp_servers.<name>]`` tables
-    with ``command`` + ``args``; the former ``[[mcp_servers]]`` array-of-tables
-    shape was rejected by codex 0.143 and 0.154 alike ("invalid type:
-    sequence, expected a map"), so no codex invocation with an MCP server had
-    ever started. Parse what we write with tomllib and check the shape."""
+_CUMULATIVE_COST_SESSIONS = (
+    Path(__file__).resolve().parents[2]
+    / 'shared' / 'tests' / 'fixtures' / 'cumulative_cost' / 'sessions.json'
+)
+_STEWARD_4895 = '59607ecd-9ecd-4f90-9ce6-bc71a7fb33e9'
 
-    def test_writes_one_table_per_server_with_command_args_and_env(self, tmp_path) -> None:
-        import tomllib
 
-        from orchestrator.agents.invoke import _write_codex_mcp_config
+@pytest.mark.asyncio
+class TestClaudeResumePriorForwarding:
+    """invoke_agent hands the resumed session's prior total to both claude sub-paths.
 
-        path = tmp_path / 'config.toml'
-        _write_codex_mcp_config(path, {'mcpServers': {
-            'verdict-tools': {
-                'command': '/venv/bin/python',
-                'args': ['-m', 'orchestrator.mcp.verdict_tools', '--meta-root', '/tmp/x "y"'],
-                'env': {'FASTMCP_SHOW_SERVER_BANNER': 'false'},
-            },
-            'plain': {'command': 'srv'},
-        }})
-        parsed = tomllib.loads(path.read_text())
-        servers = parsed['mcp_servers']
-        assert set(servers) == {'verdict-tools', 'plain'}
-        assert servers['verdict-tools']['command'] == '/venv/bin/python'
-        assert servers['verdict-tools']['args'] == ['-m', 'orchestrator.mcp.verdict_tools', '--meta-root', '/tmp/x "y"']
-        assert servers['verdict-tools']['env'] == {'FASTMCP_SHOW_SERVER_BANNER': 'false'}
-        assert servers['plain'] == {'command': 'srv', 'args': []}
-        assert 'mcp_servers' not in parsed.get('mcp_servers', {}).get('plain', {})
+    The fake ``claude`` (``shared.testing_fake_claude``, selected through
+    ``CLAUDE_BINARY``) answers the second process of steward session 59607ecd,
+    whose reported total is cumulative; each sub-path's own parse must charge
+    only that process's spend.
+    """
 
-    def test_no_servers_writes_an_empty_valid_file(self, tmp_path) -> None:
-        import tomllib
+    @pytest.fixture(autouse=True)
+    def _fake_claude(self, tmp_path, monkeypatch) -> None:
+        sessions = json.loads(_CUMULATIVE_COST_SESSIONS.read_text())
+        resume = json.dumps(sessions[_STEWARD_4895][1]['stdout'])
+        fake = install_fake_claude_cli(tmp_path / 'fake-claude', [resume])
+        monkeypatch.setenv('CLAUDE_BINARY', str(fake.executable))
+        monkeypatch.delenv('DF_AGENT_CPU_GOVERN', raising=False)
 
-        from orchestrator.agents.invoke import _write_codex_mcp_config
+    @staticmethod
+    def _sandbox_active():
+        return (
+            patch(
+                'orchestrator.agents.sandbox_dispatch.resolve_active_backend',
+                return_value='bwrap',
+            ),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.wrap_command',
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
+            ),
+        )
 
-        path = tmp_path / 'config.toml'
-        _write_codex_mcp_config(path, {'mcpServers': {}})
-        assert tomllib.loads(path.read_text()) == {}
+    async def test_unsandboxed_resume_is_charged_its_session_delta(self, tmp_path) -> None:
+        result = await invoke_agent(
+            prompt='p', system_prompt='s', cwd=tmp_path, backend='claude',
+            resume_session_id=_STEWARD_4895, resume_prior_total_cost_usd=2.288609,
+        )
+
+        assert result.cost_usd == pytest.approx(1.1174095, abs=1e-6)
+        assert result.cost_basis is ProcessCostBasis.SESSION_DELTA
+
+    async def test_sandboxed_resume_is_charged_its_session_delta(self, tmp_path) -> None:
+        backend_patch, wrap_patch = self._sandbox_active()
+        with backend_patch, wrap_patch:
+            result = await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path, backend='claude',
+                sandbox_modules=['x'],
+                resume_session_id=_STEWARD_4895, resume_prior_total_cost_usd=2.288609,
+            )
+
+        assert result.cost_usd == pytest.approx(1.1174095, abs=1e-6)
+        assert result.cost_basis is ProcessCostBasis.SESSION_DELTA
+
+    async def test_sandboxed_resume_without_prior_is_a_usage_estimate(self, tmp_path) -> None:
+        backend_patch, wrap_patch = self._sandbox_active()
+        with backend_patch, wrap_patch:
+            result = await invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path, backend='claude',
+                sandbox_modules=['x'], resume_session_id=_STEWARD_4895,
+            )
+
+        assert result.cost_usd == pytest.approx(1.1174095, abs=1e-6)
+        assert result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE

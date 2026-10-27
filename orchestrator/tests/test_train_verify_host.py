@@ -447,7 +447,9 @@ async def test_a_train_whose_hosts_are_all_taken_verifies_unleased_instead_of_wa
         train_outcome = await run.outcome(train.request)
 
     assert pred_held
-    assert verifier.verified == ['pred', train.tip]
+    assert verifier.verified == ['pred', train.tip, 'pred'], (
+        "the train's landing moved main under pred, so pred's gate re-verifies on the lane's verifier"
+    )
     assert pred_outcome.status == 'done', pred_outcome
     assert train_outcome.status == 'done', train_outcome
 

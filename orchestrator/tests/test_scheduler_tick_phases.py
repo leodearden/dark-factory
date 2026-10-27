@@ -863,6 +863,14 @@ class TestTickPhaseOrderLiteral:
             < order.index('reserve_now')
             < order.index('override_diff')
         )
+        # (6) the already-landed consult (task 4900) is its own phase,
+        # timed separately from the landed-outbox consult it follows.
+        assert order.count('already_landed_gate') == 1
+        assert (
+            order.index('already_landed_gate') == order.index('landed_outbox_gate') + 1
+        )
+        assert order.index('build_candidates') < order.index('landed_outbox_gate')
+        assert order.index('already_landed_gate') < order.index('starvation')
 
         # Every label genuinely drives dispatch — it maps to a real
         # coroutine method on Scheduler, not just a decorative string.
@@ -947,6 +955,57 @@ class TestTickTelemetry:
         assert set(phases) <= set(Scheduler._TICK_PHASE_ORDER)
         assert 'select_scored' in phases, 'the terminal phase must be timed too'
         assert all(isinstance(v, int) for v in phases.values())
+
+    @pytest.mark.asyncio
+    async def test_the_two_landed_consults_are_timed_as_separate_phases(
+        self, tmp_path,
+    ):
+        event_store = EventStore(tmp_path / 'runs.db', run_id='tick-phases')
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1), event_store=event_store)
+        scheduler.finish_startup()
+        task = {
+            'id': 'A', 'title': 'Task A', 'status': 'pending', 'dependencies': [],
+            'metadata': {'files': ['backend']}, 'priority': 'medium',
+        }
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+        scheduler._landed_outbox_gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = AsyncMock(return_value=False)
+
+        await scheduler.acquire_next()
+        await scheduler.work_product.join()
+
+        ticks = event_store.fetch_events_by_type('scheduler_tick')
+        assert len(ticks) == 1
+        phases = ticks[0]['data']['phases']
+        assert isinstance(phases['landed_outbox_gate'], int)
+        assert isinstance(phases['already_landed_gate'], int)
+
+    @pytest.mark.asyncio
+    async def test_already_landed_consult_still_sees_outbox_gated_candidates(
+        self, scheduler: Scheduler,
+    ):
+        """The phase split changes timing visibility only: the already-landed
+        consult is still asked about every candidate the outbox gate saw."""
+        tasks = [
+            {
+                'id': tid, 'title': f'Task {tid}', 'status': 'pending',
+                'dependencies': [], 'metadata': {'files': [f'mod_{tid}']},
+                'priority': 'medium',
+            }
+            for tid in ('Z', 'Y')
+        ]
+        scheduler.get_tasks = AsyncMock(return_value=tasks)
+        scheduler._landed_outbox_gate = AsyncMock(side_effect=lambda tid: tid == 'Z')
+        already_landed = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = already_landed
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None
+        assert result.task_id == 'Y'
+        assert not scheduler.lock_table.is_held('Z')
+        consulted = {call.args[0] for call in already_landed.await_args_list}
+        assert consulted == {'Z', 'Y'}
 
     @pytest.mark.asyncio
     async def test_early_return_tick_still_emits(self, scheduler: Scheduler):

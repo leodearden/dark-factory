@@ -18,9 +18,11 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import click
 from dotenv import load_dotenv
+from shared.project_layout import tasks_db
 
 from orchestrator.config import ConfigRequiredError, OrchestratorConfig, load_config
 from orchestrator.config_census_ignore import audit_census_ignore_entries
+from orchestrator.main_checkout_defaults import cli_default
 from orchestrator.verify_cancel import (
     WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     WATCHDOG_KILL_GRACE_SECS,
@@ -1461,9 +1463,8 @@ def eval_list_fixtures_cmd(tasks_dir: Path | None, cohort: str | None, audit: bo
                    'branches or writing fixtures')
 @click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
               help='Where fixture JSONs are written (default: orchestrator/evals/tasks)')
-@click.option('--df-root', type=click.Path(path_type=Path),
-              default=Path('/home/leo/src/dark-factory'),
-              help='dark_factory checkout to discover merges in')
+@click.option('--df-root', type=click.Path(path_type=Path), default=None,
+              help='dark_factory checkout to discover merges in (default: the main checkout)')
 @click.option('--reify-root', type=click.Path(path_type=Path),
               default=Path('/home/leo/src/reify'),
               help='reify checkout to discover merges in')
@@ -1471,7 +1472,7 @@ def eval_list_fixtures_cmd(tasks_dir: Path | None, cohort: str | None, audit: bo
               help='ISO-8601 provenance timestamp (default: now, UTC)')
 def eval_sample_cmd(since: str, target_low: int, target_high: int, seed: int,
                     cohort: str, dry_run: bool, tasks_dir: Path | None,
-                    df_root: Path, reify_root: Path, sampled_at: str | None):
+                    df_root: Path | None, reify_root: Path, sampled_at: str | None):
     """Cut a stratified near-HEAD eval-fixture corpus from both repos.
 
     Discovers completed-task merges in the df + reify checkouts, samples them
@@ -1484,7 +1485,8 @@ def eval_sample_cmd(since: str, target_low: int, target_high: int, seed: int,
     asyncio.run(_run_eval_sample(
         since=since, target_low=target_low, target_high=target_high, seed=seed,
         cohort=cohort, dry_run=dry_run, tasks_dir=tasks_dir,
-        df_root=Path(df_root), reify_root=Path(reify_root), sampled_at=sampled_at,
+        df_root=df_root or cli_default('--df-root', Path), reify_root=Path(reify_root),
+        sampled_at=sampled_at,
     ))
 
 
@@ -1517,9 +1519,7 @@ async def _run_eval_sample(*, since: str, target_low: int, target_high: int,
         found = await discover_completed_tasks(
             root, since=since, project=project, project_root=str(root),
         )
-        found = enrich_candidates_from_task_db(
-            found, root / '.taskmaster' / 'tasks' / 'tasks.db',
-        )
+        found = enrich_candidates_from_task_db(found, tasks_db(root))
         click.echo(f'discovered {len(found)} completed-task merge(s) in {project}')
         candidates.extend(found)
 
@@ -1575,16 +1575,13 @@ def _run_single_eval(
     still route to ``run_eval``, unchanged.
     """
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
+    from orchestrator.evals.eval_gate import campaign_usage_gate
     from orchestrator.evals.report import (
         build_plan_quality_report,
         format_invocation_errors,
         format_plan_quality_table,
     )
-    from orchestrator.evals.runner import (
-        campaign_usage_gate,
-        run_architect_eval,
-        run_eval,
-    )
+    from orchestrator.evals.runner import run_architect_eval, run_eval
 
     all_configs = EVAL_CONFIGS
 
@@ -1664,6 +1661,7 @@ def _run_single_eval(
                     )
                 )
 
+    _require_zai_coding_plan(configs)
     asyncio.run(_run())
 
 
@@ -1707,6 +1705,19 @@ def _resolve_eval_task_paths(base_config, tasks_dir: Path | None) -> list[Path]:
         click.echo(f'No eval fixtures found in {tasks_dir}', err=True)
         sys.exit(1)
     return sorted(tasks_dir.glob('*.json'))
+
+
+def _require_zai_coding_plan(configs) -> None:
+    """Probe the Z.ai Coding Plan once if any candidate targets it; an unusable plan fails the command."""
+    from orchestrator.evals.zai_probe import (
+        ZaiCodingPlanUnavailable,
+        require_zai_coding_endpoint_for,
+    )
+
+    try:
+        require_zai_coding_endpoint_for(configs)
+    except ZaiCodingPlanUnavailable as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _eval_prices(base_config) -> dict[str, Any]:
@@ -1768,6 +1779,7 @@ def _run_ofat_driver(
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
     candidates = ofat_candidates()
+    _require_zai_coding_plan(candidates)
     results = asyncio.run(run_ofat_stage(
         task_paths, candidates, base_config,
         max_parallel=max_parallel, trials=trials, timeout_override=timeout,
@@ -1794,6 +1806,7 @@ def _run_matrix_driver(
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
     candidates = ofat_candidates()
+    _require_zai_coding_plan(candidates)
     arch_cfgs = [c for c in candidates if c.role == 'architect']
     impl_cfgs = [c for c in candidates if c.role == 'implementer']
     results = asyncio.run(run_matrix_stage(
@@ -1843,6 +1856,7 @@ def _run_confirm_driver(
         sys.exit(1)
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
+    _require_zai_coding_plan([arch_cfg, impl_cfg])
     results = asyncio.run(run_confirm_stage(
         task_paths, arch_cfg, impl_cfg, base_config,
         max_parallel=max_parallel, trials=trials, timeout_override=timeout,

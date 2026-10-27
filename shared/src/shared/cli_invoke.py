@@ -13,7 +13,7 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +21,7 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard, TypeVar
 
 from shared.cost_store import CapReason
 from shared.proc_group import snapshot_process_group, terminate_process_group
+from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
 from shared.secret_env import agent_subprocess_env
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
@@ -46,6 +47,12 @@ logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
+# The backends that spend the leased Claude OAuth token, so only their caps are
+# a Claude account's caps: claude via CLAUDE_CODE_OAUTH_TOKEN, pi via
+# ANTHROPIC_OAUTH_TOKEN (orchestrator/src/orchestrator/agents/invoke.py::_invoke_pi).
+# codex bills the ChatGPT login and gemini a Google account; a cap there is the
+# backend's own window, waited out without touching the account pool.
+ACCOUNT_POOL_BACKENDS = frozenset({'claude', 'pi'})
 # Bounded retry budget for a pre-turn CLI rejection (task 3143 / esc-3118-1):
 # the CLI exited on argument validation before contacting the API, so nothing
 # was billed and no work was lost — a free retry.  ONE is deliberate: any
@@ -133,6 +140,15 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         takes the supervisor's unclean path.
 #                                         Neither blocks a queue.
 #
+# orchestrator/evals/architect_eval.py    14-day default OK (esc-4002-1, task
+#   (invoke_architect invocation)         7320).  A cap lands MID-cell after
+# orchestrator/evals/measurement.py       real spend, which --resume carries
+#   (measured_call invocation)            across the account switch: waiting
+#                                         is ~free, while tainting re-spends
+#                                         it.  AllAccountsCappedException is
+#                                         recorded as an Unmeasured with cause
+#                                         cap_exhausted, never raised.
+#
 # fused_memory/middleware/task_curator.py _CURATOR_CAP_WAIT_SANITY_SECS=120s
 #   (LLM triage calls)                    + park_on_frozen_pool=False.  DEFERS,
 #                                         never creates, when the pool cannot
@@ -168,34 +184,6 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         retries FRESH (resume_on_cap_hit=
 #                                         False).
 #
-# orchestrator/evals/runner.py            _EVAL_CAP_WAIT_SANITY_SECS = 172800 s (48 h).
-#   (run_architect_eval invocation)       RAISED from 1800 s on 2026-08-25
-#                                         (esc-3634-1).  It is the one caller in
-#                                         this table that does NOT take the
-#                                         short house value, deliberately.  A
-#                                         cap lands MID-cell after real spend,
-#                                         which --resume preserves across the
-#                                         account switch: waiting is ~free,
-#                                         while tainting discards that spend and
-#                                         pays it again on the re-run.  48 h
-#                                         skates the 5-hour account caps that
-#                                         produce the common short all-capped
-#                                         windows.  Since task 4002 it also
-#                                         bounds the gate park, so an
-#                                         all-capped window longer than 48 h
-#                                         taints the cell rather than parking
-#                                         to the reset (esc-4002-1).
-#                                         AllAccountsCappedException
-#                                         is still caught and recorded as a
-#                                         `cap_exhausted:` marker on the cell
-#                                         (tainted, so the cell is EXCLUDED from
-#                                         the reported mean rather than scored a
-#                                         fabricated 0.0), never raised.  No
-#                                         max_cap_retries: cooldown doubles per
-#                                         pool cycle, so a fixed count would
-#                                         give a BIGGER account pool LESS
-#                                         wall-clock patience.
-#
 # scripts/legibility/session_runner.py    NO patience at all: park_on_frozen_
 #   (nightly legibility trickle + census, pool=False + max_cap_retries=
 #    every LLM call they make)            gate.account_count.  The contract is
@@ -210,12 +198,6 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         PoolFrozen, which the runner types
 #                                         per task 5947 (all-capped defers at
 #                                         exit 0; all-auth-failed fails loud).
-#                                         is_usable_reply per stage: its
-#                                         codebook is dominated by usage-limit
-#                                         clusters, so a verdict QUOTING a
-#                                         banner must not cap a healthy
-#                                         account, while an unparseable exit-0
-#                                         banner still rotates.
 #                                         cap_wait_sanity_secs left at the
 #                                         default: the two bounds above always
 #                                         fire first.  Was an audited
@@ -461,7 +443,10 @@ class AgentResult:
     Fields:
     - ``success``: whether the agent completed without error
     - ``output``: the primary text response from the agent
-    - ``cost_usd``: total cost in USD (0.0 if not reported by the provider)
+    - ``cost_usd``: what THIS CLI process cost in USD (0.0 if not reported by
+      the provider).  For a resumed Claude session it is derived by
+      ``shared.process_cost.derive_process_cost`` and is never the session's
+      running total; ``cost_basis`` says how it was obtained
     - ``duration_ms``: wall-clock time in milliseconds
     - ``turns``: number of agentic turns (0 if not tracked)
     - ``session_id``: provider session identifier for resumption
@@ -494,11 +479,12 @@ class AgentResult:
       flaky candidate.  ``success`` stays False (NOT salvaged); callers should
       raise a loud, un-suppressed escalation so the substitution gets fixed.
     - ``ended_awaiting_background``: True when the run ended its turn while a
-      backgrounded Bash command was still pending — launched via
-      ``run_in_background`` and never subsequently REAPED, where a reap is a
-      ``BashOutput``/``KillShell``/``KillBash`` poll-or-kill OR a tool_use of
-      any kind whose input references the launch's id / output-file path as
-      recorded in its tool_result (task 3639; see
+      background task it started was still pending — a ``run_in_background``
+      Bash or a confirmed Monitor arm, never subsequently REAPED, where a reap
+      is a ``BashOutput``/``KillShell``/``KillBash`` poll-or-kill, a tool_use
+      of any kind whose input references the launch's id / output-file path as
+      recorded in its tool_result (task 3639), OR a delivered task-notification
+      naming the launch (task 5986; see
       ``detect_ended_awaiting_background`` for the full contract).  The headless
       one-shot ``claude --print`` session exits subtype=success and silently
       abandons the pending work (Reify-5164 RCA).  ``_parse_claude_output``
@@ -586,6 +572,16 @@ class AgentResult:
     distinct from the caller-supplied lineage alias (``opus``/``sonnet``) that
     callers record as ``model`` — that alias names the routing choice, this
     names the version that answered."""
+    cost_basis: ProcessCostBasis = ProcessCostBasis.REPORTED
+    """How ``cost_usd`` was obtained: the CLI's own figure, the delta over the
+    resumed session's prior total, or the priced usage block."""
+    reported_total_cost_usd: float | None = None
+    """The CLI's ``total_cost_usd`` verbatim, None when absent or malformed.  A
+    caller passes it back as ``resume_prior_total_cost_usd`` when it next
+    resumes this ``session_id``."""
+    cost_delta_clamped: bool = False
+    """True when a prior total was supplied for this resume and the delta over
+    it was rejected as implausible, so ``cost_usd`` fell back."""
 
 
 # The ``AgentResult.subtype`` the Claude CLI stamps when its own
@@ -810,8 +806,9 @@ def note_unreadable_transcript(
 #
 # AND THE SET DOES NOT HAVE TO BE CURRENT, which is the part a future reader
 # tempted to "resync" it needs first.  ``detect_ended_awaiting_background`` reaps
-# on EITHER this set OR its second clause (task 3639): a tool_use of ANY kind
-# whose input references the background task's id or output-file path.  That
+# on this set OR on either of two other clauses: a tool_use of ANY kind whose
+# input references the background task's id or output-file path (task 3639),
+# or a delivered task-notification naming it (task 5986).  The tool_use
 # clause is tool-agnostic, so it catches the ``Read``-the-output-file shape the
 # role wait-guidance now prescribes (roles.py WAIT_PATTERN_GUIDANCE) — which is
 # why correcting those prompts needed no change to this detector.  If the first
@@ -920,7 +917,7 @@ def _is_non_empty_str(value: object) -> TypeGuard[str]:
 def _content_blocks(record: object) -> list:
     """Return *record*'s content blocks (via ``_record_field``), or an empty
     list when it carries none.  Shared by ``_iter_result_texts`` and
-    ``detect_ended_awaiting_background``."""
+    ``detect_ended_awaiting_background``'s event walk."""
     return _record_field(record, 'content', _is_list) or []
 
 
@@ -944,36 +941,33 @@ def _iter_result_texts(record: dict):
                     yield sub['text']
 
 
-def _iter_input_strings(value: object):
+def _iter_input_strings(value: object) -> Iterator[str]:
     """Yield every ``str`` reachable inside a tool_use ``input`` *value*.
 
-    Walks dict values (and str keys) and list/tuple items depth-first; scalars
-    that are not ``str`` (``int``/``float``/``bool``/``None``) yield nothing,
-    and any other object yields its ``str()`` — preserving what
-    ``json.dumps(..., default=str)`` used to expose for an exotic leaf such as
-    a ``Path``.
+    Walks dict values (and str keys) and list/tuple items; scalars that are
+    not ``str`` (``int``/``float``/``bool``/``None``) yield nothing, and any
+    other object yields its ``str()`` — what ``json.dumps(..., default=str)``
+    would expose for an exotic leaf such as a ``Path``.
 
-    Replaces serializing the whole input (reviewer_comprehensive amendment,
-    task 3639): once ``bg_tokens`` is non-empty, EVERY subsequent tool_use was
-    fully ``json.dumps``-ed, allocating a complete string copy of every
-    ``Write`` body / ``Edit`` old+new pair / ``TodoWrite`` list in the
-    transcript on each invocation-end.  Yielding the already-materialized
-    strings lets ``any()`` short-circuit on the first hit and allocates
-    nothing for the common case.
+    The walk keeps its own stack, so an input nested past the interpreter's
+    recursion limit (``json.loads`` decodes one) is walked whole and never
+    raises.  Yielding the already-materialized strings lets ``any()``
+    short-circuit on the first hit without copying a ``Write`` body or an
+    ``Edit`` pair the way serializing the whole input would.
     """
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            if isinstance(key, str):
-                yield key
-            yield from _iter_input_strings(item)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            yield from _iter_input_strings(item)
-    elif value is not None and not isinstance(value, (int, float)):
-        # bool is an int subclass, so it is covered by the isinstance above.
-        yield str(value)
+    pending: list[object] = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            yield item
+        elif isinstance(item, dict):
+            pending.extend(key for key in item if isinstance(key, str))
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+        elif item is not None and not isinstance(item, (int, float)):
+            # bool is an int subclass, so it is covered by the isinstance above.
+            yield str(item)
 
 
 def _collect_bg_tokens(record: dict, tokens: set[str]) -> None:
@@ -1007,34 +1001,195 @@ def _collect_bg_tokens(record: dict, tokens: set[str]) -> None:
                 tokens.add(match)
 
 
+_MONITOR_TOOL = 'Monitor'
+_TASK_NOTIFICATION = 'task-notification'
+
+
+class _BackgroundEvent(enum.Enum):
+    LAUNCH = 'launch'
+    REAP = 'reap'
+
+
+def _mentions_token(texts: Iterable[str], tokens: set[str]) -> bool:
+    """Return True when any of *texts* contains any of *tokens* — the single
+    definition of "references a background task"."""
+    return any(token in text for text in texts for token in tokens)
+
+
+def _monitor_arm_task_id(record: dict, monitor_call_ids: set[str]) -> str | None:
+    """Return the armed task's id when *record* confirms a Monitor arm, else None.
+
+    A confirmation answers one of *monitor_call_ids* with a tool_result and
+    carries a structured ``toolUseResult.taskId`` that is a usable token (see
+    ``_MIN_BG_TOKEN_LEN``).  A rejected call carries no such field.  Never
+    raises.
+    """
+    tur = record.get('toolUseResult')
+    if not isinstance(tur, dict):
+        return None
+    task_id = tur.get('taskId')
+    if not isinstance(task_id, str) or len(task_id) < _MIN_BG_TOKEN_LEN:
+        return None
+    for block in _content_blocks(record):
+        if not isinstance(block, dict) or block.get('type') != 'tool_result':
+            continue
+        call_id = block.get('tool_use_id')
+        if isinstance(call_id, str) and call_id in monitor_call_ids:
+            return task_id
+    return None
+
+
+def _delivered_notification_texts(record: dict) -> list[str] | None:
+    """Return the texts of the task-notification *record* DELIVERED to the
+    model, or None when *record* is not such a delivery.
+
+    A delivery is a mid-turn ``attachment`` record (``queued_command`` with
+    ``commandMode`` ``task-notification``, text in ``prompt``) or a ``user``
+    record whose ``origin.kind`` is ``task-notification`` (text in its content,
+    a ``str`` or ``text`` sub-blocks).  ``queue-operation`` records are queue
+    bookkeeping, not delivery.  Never raises.
+    """
+    record_type = record.get('type')
+    if record_type == 'attachment':
+        attachment = record.get('attachment')
+        if not (
+            isinstance(attachment, dict)
+            and attachment.get('type') == 'queued_command'
+            and attachment.get('commandMode') == _TASK_NOTIFICATION
+        ):
+            return None
+        prompt = attachment.get('prompt')
+        return [prompt] if isinstance(prompt, str) else []
+    if record_type == 'user':
+        origin = record.get('origin')
+        if not (isinstance(origin, dict) and origin.get('kind') == _TASK_NOTIFICATION):
+            return None
+        text = _record_field(record, 'content', _is_non_empty_str)
+        if text is not None:
+            return [text]
+        return [
+            sub['text']
+            for sub in _content_blocks(record)
+            if isinstance(sub, dict) and isinstance(sub.get('text'), str)
+        ]
+    return None
+
+
+def _monitor_call_id(block: dict) -> str | None:
+    """Return the id of a ``Monitor`` tool_use *block*, else None."""
+    call_id = block.get('id')
+    if block.get('name') == _MONITOR_TOOL and isinstance(call_id, str):
+        return call_id
+    return None
+
+
+def _classify_tool_use(block: dict, tokens: set[str]) -> _BackgroundEvent | None:
+    """Classify one tool_use *block* as a launch, a reap, or neither.
+
+    Branch order is load-bearing: launch → ``Monitor`` call → named reap tool →
+    token reference.  A ``run_in_background`` Bash that mentions an earlier
+    token is a LAUNCH, and a ``Monitor`` call is neither: only its confirmed
+    arm (``_monitor_arm_task_id``) is a launch, so a Monitor naming a pending
+    launch's token does not reap it.
+    """
+    name = block.get('name')
+    if not isinstance(name, str):
+        name = ''  # a malformed name matches no tool and must not raise on lookup
+    if name == 'Bash':
+        inp = block.get('input')
+        if isinstance(inp, dict) and inp.get('run_in_background'):
+            return _BackgroundEvent.LAUNCH
+    elif name == _MONITOR_TOOL:
+        return None
+    elif name in _BACKGROUND_REAP_TOOLS or (
+        _tool_base_name(name) in _TERMINAL_SUBMISSION_TOOLS
+    ):
+        return _BackgroundEvent.REAP
+    if tokens and _mentions_token(_iter_input_strings(block.get('input')), tokens):
+        return _BackgroundEvent.REAP
+    return None
+
+
+def _background_events(records: list[dict]) -> Iterator[_BackgroundEvent]:
+    """Yield the background LAUNCH and REAP events of *records*, in record order.
+
+    Owns the identity tokens of the launches seen so far and the ids of the
+    Monitor calls awaiting confirmation.
+    """
+    tokens: set[str] = set()
+    monitor_call_ids: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        texts = _delivered_notification_texts(record)
+        if texts is not None:
+            if tokens and _mentions_token(texts, tokens):
+                yield _BackgroundEvent.REAP
+            continue
+        if record.get('type') == 'user':
+            _collect_bg_tokens(record, tokens)
+            task_id = _monitor_arm_task_id(record, monitor_call_ids)
+            if task_id is not None:
+                tokens.add(task_id)
+                yield _BackgroundEvent.LAUNCH
+            continue
+        if record.get('type') != 'assistant':
+            continue
+        for block in _content_blocks(record):
+            if not isinstance(block, dict) or block.get('type') != 'tool_use':
+                continue
+            call_id = _monitor_call_id(block)
+            if call_id is not None:
+                monitor_call_ids.add(call_id)
+            event = _classify_tool_use(block, tokens)
+            if event is not None:
+                yield event
+
+
 def detect_ended_awaiting_background(records: list[dict]) -> bool:
-    """Return True when the transcript's final background action was an unreaped
-    launch — i.e. the agent ended its turn while a backgrounded Bash command was
-    still pending, silently abandoning the work (the Reify-5164 RCA).
+    """Return True when the transcript's final background event was an unreaped
+    launch — i.e. the agent ended its turn while a background task it started (a
+    ``run_in_background`` Bash or a confirmed Monitor arm) was still pending,
+    silently abandoning the work (the Reify-5164 RCA).
 
     Contract (high-precision, no fragile parsing).  Over the ordered transcript
     *records*:
 
-    - a **launch** = a ``Bash`` tool_use whose ``input.run_in_background`` is
-      truthy;
-    - a **reap** = either of:
+    - a **launch** = either of:
+
+      * a ``Bash`` tool_use whose ``input.run_in_background`` is truthy;
+      * a CONFIRMED ``Monitor`` arm, positioned at its confirming ``user``
+        record: a tool_result answering an earlier ``Monitor`` call, carrying a
+        structured ``toolUseResult.taskId`` of at least ``_MIN_BG_TOKEN_LEN``
+        characters.  A rejected call, or a call with no confirmed arm, is not a
+        launch, and the ``Monitor`` call itself is neither a launch nor a reap;
+
+    - a **reap** = any of:
 
       * any ``BashOutput`` / ``KillShell`` / ``KillBash`` tool_use, or their
         Task-tool analogues ``TaskOutput`` (collects a backgrounded
         Task/subagent's result) and ``TaskStop`` (terminates it);
-      * a tool_use of ANY kind whose input references the background task's id
-        or output-file path, as recorded in the launch's tool_result
+      * a tool_use of ANY kind whose input references a launch's identity: a
+        Bash task's id or output-file path, as recorded in its tool_result
         (``toolUseResult.backgroundTaskId`` and the CLI's ``Output is being
-        written to: <path>`` sentence);
+        written to: <path>`` sentence), or an armed Monitor's task id;
+      * a task-notification DELIVERED to the model whose text contains a
+        launch's identity token — a Monitor event or expiry, or a Bash
+        completion.  Delivery is either a mid-turn ``attachment`` record
+        (``queued_command`` with ``commandMode`` ``task-notification``) or a
+        ``user`` record whose ``origin.kind`` is ``task-notification`` (the CLI
+        outlived the turn and delivered it as a new one).  Queue bookkeeping
+        (``queue-operation`` records) is not delivery: an event enqueued by a
+        process that then exited never reached the agent;
       * a terminal verdict submission (one of ``_TERMINAL_SUBMISSION_TOOLS``,
         matched on the segment after the last ``__``) — calling one writes the
         role's whole deliverable to ``verdicts/<role>.json``, so the session has
         finished its job and cannot still be waiting on anything.
 
-    Fire (True) iff ``index(last launch) > index(last reap)`` — the session's
-    final background-management action was a launch never followed by a
-    poll/kill.  Any engagement with a background task (a poll or kill after it)
-    clears the verdict, keeping precision high and avoiding fragile shell-id /
+    Fire (True) iff the final background event is a launch — the session's
+    final background event was a launch never followed by a reap.  Any
+    engagement with a background task (a reap of any kind after it) clears the
+    verdict, keeping precision high and avoiding fragile shell-id /
     result-text parsing that differs across CLI versions.
 
     RCA for the second reap clause (task 3639): the original vocabulary named
@@ -1072,66 +1227,22 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     still-running task once with ``BashOutput`` and THEN ends its turn anyway
     reaps after the launch → False.  Erring toward NOT downgrading a possibly
     complete run is the safe direction for a success→failure flip.
+
+    Its Monitor analogue (accepted on the same grounds): a streaming Monitor
+    that delivered a mid-stream event, after which the session ended awaiting
+    a later one, is reaped by that delivery → False.  Telling a terminal event
+    from a mid-stream one would need parsing of the notification text.
+
+    Reaps are positional, not per launch (accepted on the same grounds): an
+    earlier launch's delivered completion that lands after a later launch
+    clears the verdict while that later launch is still pending → False.
     """
     if not records:
         return False
-    last_launch_idx = -1
-    last_reap_idx = -1
-    pos = 0  # strictly-increasing position over tool_use blocks (record- then block-order)
-    bg_tokens: set[str] = set()  # identity tokens of the launches seen so far
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        if record.get('type') == 'user':
-            # A launch's tool_result arrives on a ``user`` record; harvest its
-            # identity tokens so later foreground references can be matched.
-            _collect_bg_tokens(record, bg_tokens)
-            continue
-        if record.get('type') != 'assistant':
-            continue
-        for block in _content_blocks(record):
-            if not isinstance(block, dict) or block.get('type') != 'tool_use':
-                continue
-            pos += 1
-            # Normalize the name to ``str`` ONCE, up front, so every membership
-            # test below is on a hashable.  A block carrying a non-scalar name
-            # (``'name': ['weird']``) previously reached ``name in
-            # _BACKGROUND_REAP_TOOLS`` and raised ``TypeError: unhashable
-            # type`` — breaking this function's "malformed blocks are skipped,
-            # never raise" contract at an unguarded call site inside
-            # ``_run_subprocess``, i.e. failing the whole agent invocation
-            # (reviewer_comprehensive amendment, task 3639).  ``''`` matches no
-            # tool name, so such a block falls through to the token check —
-            # exactly its pre-normalization classification for the non-raising
-            # shapes.
-            name = block.get('name')
-            if not isinstance(name, str):
-                name = ''
-            if name == 'Bash':
-                inp = block.get('input')
-                if isinstance(inp, dict) and inp.get('run_in_background'):
-                    last_launch_idx = pos
-                    continue
-            elif name in _BACKGROUND_REAP_TOOLS or (
-                _tool_base_name(name) in _TERMINAL_SUBMISSION_TOOLS
-            ):
-                last_reap_idx = pos
-                continue
-            # Branch order is load-bearing: launch → named reap tool →
-            # token reference.  A ``run_in_background`` Bash that happens to
-            # mention an earlier token is still classified as a LAUNCH.
-            if bg_tokens:
-                try:
-                    matched = any(
-                        token in text
-                        for text in _iter_input_strings(block.get('input'))
-                        for token in bg_tokens
-                    )
-                except Exception:  # pragma: no cover - the walk is total
-                    matched = False
-                if matched:
-                    last_reap_idx = pos
-    return last_launch_idx != -1 and last_launch_idx > last_reap_idx
+    final_event: _BackgroundEvent | None = None
+    for event in _background_events(records):
+        final_event = event
+    return final_event is _BackgroundEvent.LAUNCH
 
 
 # The CLI writes this in place of a model name on records it synthesised
@@ -1310,7 +1421,8 @@ def ended_awaiting_background_for_session(
     session_id: str,
 ) -> bool:
     """Return True when *session_id*'s on-disk transcript ended its turn with a
-    still-pending backgrounded Bash command.
+    still-pending background task (a run_in_background Bash or a confirmed
+    Monitor arm).
 
     Mirrors ``count_transcript_turns``' shape: delegate to
     ``read_transcript_records``; if it returns None (transcript not located or a
@@ -1775,7 +1887,7 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     1. ``classify_invocation(result, strict_confirm=True)`` is ``OK``
        (mirrors ``result.success``) → ``SUCCESS``.
     2. ``result.ended_awaiting_background`` → ``ENDED_AWAITING_BACKGROUND``
-       (the run ended its turn while a backgrounded Bash command was still
+       (the run ended its turn while a background task it started was still
        pending; ``_parse_claude_output`` already downgraded ``success`` to
        False, so this sits immediately below the OK check — it can never
        shadow a genuine success — and above the timeout rule, which it cannot
@@ -2128,16 +2240,29 @@ def _to_token_count(v: int | None) -> int | None:
     return v or None
 
 
+def _backend_window_wait_secs(resets_at: datetime | None, hits: int, now: datetime) -> float:
+    """Seconds to wait out a non-pool backend's cap window: the cooldown
+    doubling per consecutive hit, or until *resets_at* when that is later. The
+    floor holds when a named reset has already passed, so a backend that keeps
+    naming it is never redispatched back to back."""
+    backoff = min(_CAP_HIT_COOLDOWN_SECS * 2 ** (hits - 1), _MAX_CAP_COOLDOWN_SECS)
+    if resets_at is None:
+        return backoff
+    return max(backoff, (resets_at - now).total_seconds())
+
+
 def _reset_for_fresh_retry(invoke_kwargs: dict[str, Any], original_prompt: str) -> None:
     """Switch the retry loop to a fresh (non-resume) invocation.
 
-    Drops the resume session, restores the real task prompt, and regenerates a
-    pre-allocated session_id *when one was set* — the prior failed attempt may have
-    already committed that UUID to disk, and reusing it on a fresh `--session-id`
-    makes the CLI exit instantly with 'Session ID … is already in use'
-    (the 2026-05-26 reify-3604 wedge). Callers that pass no session_id keep none.
+    Drops the resume session and its prior total, restores the real task
+    prompt, and regenerates a pre-allocated session_id *when one was set* — the
+    prior failed attempt may have already committed that UUID to disk, and
+    reusing it on a fresh `--session-id` makes the CLI exit instantly with
+    'Session ID … is already in use' (the 2026-05-26 reify-3604 wedge).
+    Callers that pass no session_id keep none.
     """
     invoke_kwargs.pop('resume_session_id', None)
+    invoke_kwargs.pop('resume_prior_total_cost_usd', None)
     invoke_kwargs['prompt'] = original_prompt
     if invoke_kwargs.get('session_id'):
         invoke_kwargs['session_id'] = str(uuid.uuid4())
@@ -2184,7 +2309,8 @@ class _SubprocessResult:
     transcript_turns: int | None = None
     ended_awaiting_background: bool = False
     """True when the normal-exit transcript ended its turn with a still-pending
-    backgrounded Bash command; carried into AgentResult and used by
+    background task (a run_in_background Bash or a confirmed Monitor arm);
+    carried into AgentResult and used by
     _parse_claude_output to downgrade success→failure.  Never set on the
     timeout path (a timed-out run is already non-success)."""
     model_id: str | None = None
@@ -2221,6 +2347,7 @@ async def invoke_claude_agent(
     strict_mcp_config: bool = False,
     available_tools: list[str] | None = None,
     setting_sources: list[str] | None = None,
+    resume_prior_total_cost_usd: float | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -2254,6 +2381,11 @@ async def invoke_claude_agent(
     role charter.  A resumed session therefore gets the CURRENT role prompt —
     see ``build_claude_argv`` for the full rationale and the probed CLI
     behaviour.
+
+    *resume_prior_total_cost_usd* is the ``reported_total_cost_usd`` of the
+    result being resumed, so the resumed process is charged only its own
+    spend (see ``shared.process_cost``).  Ignored unless *resume_session_id*
+    is set.
 
     *session_id*, when set and *resume_session_id* is not, pre-allocates the
     session UUID via ``--session-id <id>`` so callers can resume the same
@@ -2317,6 +2449,7 @@ async def invoke_claude_agent(
         strict_mcp_config=strict_mcp_config,
         available_tools=available_tools,
         setting_sources=setting_sources,
+        resume_prior_total_cost_usd=resume_prior_total_cost_usd,
     )
 
 
@@ -2351,7 +2484,6 @@ async def invoke_with_cap_retry(
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     park_on_frozen_pool: bool = True,
-    is_usable_reply: Callable[[str], bool] | None = None,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -2411,20 +2543,14 @@ async def invoke_with_cap_retry(
     must defer rather than wait and must tell a cap from rejected
     credentials, which will not clear at a reset (task 6042).
 
-    *is_usable_reply* decides which SUCCESSFUL results are offered to the cap
-    detector.  ``UsageGate.detect_cap_hit`` builds a synthetic
-    ``success=False`` result before classifying, so a successful reply that
-    merely QUOTES a banner reads as a cap: measured 2026-10-02, a verdict
-    whose evidence quotes ``REAL_CLI_CAP_HIT_MESSAGES[0]`` classifies ``OK()``
-    as it is and ``CapHit`` once forced to fail.  ``None`` (the default)
-    offers every result, unchanged for the fleet.  A predicate offers a
-    successful result only when it REJECTS the output — a reply the caller
-    could not use at all, which is where a banner delivered at exit 0 lands —
-    so a usable reply quoting cap text never costs an account, while an exit-0
-    banner still rotates it (task 5637's route).  The predicate decides only
-    whether to ASK; the gate's strict detector still decides whether it is a
-    cap.  Failed results are always offered.  Consumer: the legibility runner,
-    whose replies routinely quote cap text (task 6042).
+    Only FAILED results are offered to the cap detector.
+    ``UsageGate.detect_cap_hit`` classifies a synthetic ``success=False``
+    result, so a successful reply that merely QUOTES a banner would read as a
+    cap and bench a healthy account (task 6042).  A genuine cap under
+    ``--output-format json`` always arrives with ``is_error`` true at exit 1
+    (measured, task 6213), so it fails here; the one exception is a salvaged
+    structured payload, which is finished work and is returned.  A successful
+    run's near-cap annotation is therefore not recorded (task 7334).
 
     *rebuild_prompt*, when provided, is a ``PromptBuilder`` awaited with no
     arguments immediately before EVERY re-dispatch — whatever triggered it
@@ -2673,7 +2799,8 @@ async def invoke_with_cap_retry(
         # None (the general scope). Scoped ONLY for the claude backend
         # (decision 7 "claude-backend scope only"): a non-claude backend
         # (codex/gemini) never touches the OAuth account pool's model-scoped
-        # caps, satisfying B8. Lazy import mirrors the invocation_outcome
+        # caps, satisfying B8 (account-level caps are scoped separately, by
+        # ACCOUNT_POOL_BACKENDS). Lazy import mirrors the invocation_outcome
         # import below to avoid the usage_gate<->cli_invoke cycle.
         # getattr(...,'_config',None) is None for a spec'd MagicMock gate and
         # scope_for(m, <no config>) is None, so every existing mock-based suite
@@ -2883,13 +3010,27 @@ async def invoke_with_cap_retry(
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                     continue  # __aexit__ releases probe slot
 
-                offered_to_cap_detector = (
-                    not result.success
-                    or is_usable_reply is None
-                    or not is_usable_reply(result.output)
-                )
-                if offered_to_cap_detector and slot.detect_cap_hit(
-                    result.stderr, result.output, backend=backend,
+                if isinstance(outcome, CapHit) and backend not in ACCOUNT_POOL_BACKENDS:
+                    slot.confirm(result.cost_usd)
+                    consecutive_cap_hits += 1
+                    wait = _backend_window_wait_secs(
+                        outcome.resets_at, consecutive_cap_hits, datetime.now(UTC),
+                    )
+                    _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                    logger.warning(
+                        f'{label}: {backend} cap hit ({outcome.reason}; resets_at='
+                        f'{outcome.resets_at}) is not a Claude account cap — sleeping '
+                        f'{wait:.0f}s then retrying fresh on account {account_name}',
+                    )
+                    now = time.monotonic()
+                    _check_cap_wait(now, now - retry_start, wait, consecutive_cap_hits)
+                    await asyncio.sleep(wait)
+                    continue
+
+                if (
+                    backend in ACCOUNT_POOL_BACKENDS
+                    and not result.success
+                    and slot.detect_cap_hit(result.stderr, result.output, backend=backend)
                 ):
                     consecutive_cap_hits += 1
                     full_cycles = (consecutive_cap_hits - 1) // num_accounts
@@ -3072,6 +3213,16 @@ async def invoke_with_cap_retry(
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         resume_or_fresh = 'fresh (no resumable progress)'
                     else:
+                        prior = next_resume_prior(
+                            armed_session_id=invoke_kwargs.get('resume_session_id'),
+                            armed_prior_usd=invoke_kwargs.get('resume_prior_total_cost_usd'),
+                            result_session_id=result.session_id,
+                            result_reported_total_usd=result.reported_total_cost_usd,
+                        )
+                        if prior is None:
+                            invoke_kwargs.pop('resume_prior_total_cost_usd', None)
+                        else:
+                            invoke_kwargs['resume_prior_total_cost_usd'] = prior
                         invoke_kwargs['resume_session_id'] = result.session_id
                         invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
                         # Distinguish a VERIFIED resume from an unverified one:
@@ -3109,7 +3260,8 @@ async def invoke_with_cap_retry(
                 # the retry loop can wait / fail over instead of silently returning a
                 # useless "success" to the caller.
                 if (
-                    not result.success  # is_error=true → success=False after fix 2
+                    backend in ACCOUNT_POOL_BACKENDS
+                    and not result.success  # is_error=true → success=False after fix 2
                     and result.cost_usd == 0
                     and result.turns <= 1
                     and result.duration_ms < 5000
@@ -3627,6 +3779,7 @@ async def _invoke_claude(
     strict_mcp_config: bool = False,
     available_tools: list[str] | None = None,
     setting_sources: list[str] | None = None,
+    resume_prior_total_cost_usd: float | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     # BEFORE build_claude_argv, which writes system-prompt / mcp-config temp
@@ -3720,7 +3873,11 @@ async def _invoke_claude(
             working_idle_secs=working_idle_secs,
             absolute_cap_secs=absolute_cap_secs,
         )
-        return _parse_claude_output(result)
+        return _parse_claude_output(
+            result,
+            resumed=bool(resume_session_id),
+            prior_total_cost_usd=resume_prior_total_cost_usd,
+        )
     finally:
         for path in temp_files:
             Path(path).unlink(missing_ok=True)
@@ -3728,11 +3885,22 @@ async def _invoke_claude(
             await bridge.stop()
 
 
-def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
+def _parse_claude_output(
+    result: _SubprocessResult,
+    *,
+    resumed: bool = False,
+    prior_total_cost_usd: float | None = None,
+) -> AgentResult:
     """Parse Claude Code JSON output into AgentResult.
 
     timed_out, transcript_turns and model_id are propagated directly from
     result on every return path.
+
+    *resumed* and *prior_total_cost_usd* must come from the argv the caller
+    actually spawned: a resumed process reports its session's running total,
+    and ``shared.process_cost.derive_process_cost`` turns that into this
+    process's cost.  Both call sites (``_invoke_claude`` and the orchestrator's
+    sandboxed sub-path) pass them.
     """
     if not result.stdout.strip():
         # Distinct subtype (task 2360 fix #3): a wall-clock timeout that DID
@@ -3786,7 +3954,12 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             model_id=result.model_id,
         )
 
-    cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
+    process_cost = derive_process_cost(
+        data,
+        resumed=resumed,
+        prior_total_usd=prior_total_cost_usd,
+        served_model_id=result.model_id,
+    )
     duration = data.get('duration_ms', 0)
     turns = data.get('num_turns', 0)
     session_id = data.get('session_id', '')
@@ -3820,8 +3993,8 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     is_success = (subtype == 'success' or result.returncode == 0) and not is_error
 
     # Ended-awaiting-background downgrade (task 2761): the run exited
-    # subtype=success but its transcript tail launched a backgrounded Bash
-    # command that was never polled/killed — the headless one-shot session
+    # subtype=success but its transcript tail launched a background task that
+    # was never reaped — the headless one-shot session
     # abandoned still-pending work (Reify-5164 RCA).  Flip an otherwise-success
     # verdict to failure so existing non-success handling retries/resumes rather
     # than proceeding on a half-done tree.  Guarded on ``is_success`` so it is an
@@ -3857,7 +4030,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     return AgentResult(
         success=is_success,
         output=output_text,
-        cost_usd=cost,
+        cost_usd=process_cost.cost_usd,
         duration_ms=duration,
         turns=turns,
         session_id=session_id,
@@ -3877,6 +4050,9 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         proc_tree=result.proc_tree,
         transcript_turns=result.transcript_turns,
         model_id=result.model_id,
+        cost_basis=process_cost.basis,
+        reported_total_cost_usd=process_cost.reported_total_usd,
+        cost_delta_clamped=process_cost.delta_clamped,
     )
 
 
@@ -4583,8 +4759,9 @@ async def _run_subprocess(
     #     classification lost the turn-count signal (carried None); deriving it
     #     from the records we already parse here restores it at zero extra I/O.
     #   • ended_awaiting_background — a run that exited subtype=success but whose
-    #     transcript tail launched a still-pending backgrounded Bash command
-    #     silently abandoned the work.  Symmetric to the timeout path's
+    #     transcript tail launched a still-pending background task (a
+    #     run_in_background Bash or a confirmed Monitor arm) silently abandoned
+    #     the work.  Symmetric to the timeout path's
     #     transcript re-read above; _parse_claude_output owns the actual
     #     success→failure downgrade.
     #   • model_id — the exact CLI-served model id, which the caller's alias

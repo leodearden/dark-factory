@@ -16,7 +16,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -543,6 +543,18 @@ def parse_failed_run_all_members(test_output: str) -> list[str]:
             seen.add(name)
             out.append(name)
     return out
+
+
+def select_failed_run_all_members(
+    test_output: str, channel_members: Sequence[str] | None,
+) -> list[str]:
+    """C3 rule 3: the channel's failed set (``VerifyResult.run_all_failed_members``)
+    when a run_all reported into a present channel, else the text marker parse
+    (rule 2). ``[]`` means the full run_all suite.
+    """
+    if channel_members is not None:
+        return list(channel_members)
+    return parse_failed_run_all_members(test_output)
 
 
 # ---------------------------------------------------------------------------
@@ -1544,8 +1556,8 @@ async def _run_shadow_compare(
 # build-STAGE categories only (a compile/CLI/tree-sitter/npm build break, where
 # zero test lines is EXPECTED); TEST_FAILURE-class categories with an empty map
 # stay inconclusive since a genuine test failure normally DOES emit parseable
-# lines and an empty map there is more likely a transport/parse hiccup.  Derived
-# from FailureCategory so a new build-stage category can't drift out of the set.
+# lines and an empty map there is more likely a transport/parse hiccup.  Hand-enumerated:
+# lint_error/type_error/infra_abort are not build-STAGE failures and stay inconclusive.
 _COARSE_BUILD_FAILURE_CATEGORIES: frozenset[str] = frozenset({
     FailureCategory.COMPILE_ERROR.value,
     FailureCategory.CARGO_CLI_ERROR.value,

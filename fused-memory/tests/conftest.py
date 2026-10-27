@@ -745,6 +745,9 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     off: the tracked YAML ships it on (task 3169), and with it on every
     Mem0-primary ``add_memory`` in a unit test would reach the real judge
     client.  A test of the triage path opts in on its own config.
+    ``overreach_guard.shadow_enabled`` is pinned off for the same reason: with
+    it on, every decision write in a unit test would reach the real overreach
+    judge; a test of the shadow opts in on its own config.
     """
     config = FusedMemoryConfig(
         llm=LLMConfig(
@@ -776,6 +779,7 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
         ),
     )
     config.write_triage.enabled = False
+    config.overreach_guard.shadow_enabled = False
     return config
 
 

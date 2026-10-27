@@ -22,7 +22,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
-from shared.branch_names import canonical_queued_branch_name
+from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
 
 from orchestrator.branch_stack import PreStackTip
 from orchestrator.git_ops import MergeResult
@@ -101,6 +101,17 @@ class MergeBounceRegistry:
         self._bounces.pop(branch, None)
 
 
+def _cancel_args(future: asyncio.Future | None) -> tuple[Any, ...]:
+    """The ``cancel()`` arguments that pass *future*'s cancel message on, if it has one."""
+    if future is None or not future.cancelled():
+        return ()
+    try:
+        future.result()
+    except asyncio.CancelledError as cancelled:
+        return cancelled.args
+    return ()
+
+
 @dataclass
 class _InFlightEntry:
     """Registry slot for a single in-flight merge branch.
@@ -146,10 +157,15 @@ class _InFlightEntry:
     """request_ids of the waiters :meth:`release_waiters` cancelled and dropped."""
 
     def release_waiters(self) -> None:
-        """Cancel every still-pending waiter, then drop them all, keeping their ids."""
+        """Cancel every still-pending waiter, then drop them all, keeping their ids.
+
+        Each waiter is cancelled with the primary's own cancel message, so an
+        operator's cancel reaches an attached TaskWorkflow as one.
+        """
+        cancel_args = _cancel_args(self.primary_future)
         for w in self.waiters:
             if not w.future.done():
-                w.future.cancel()
+                w.future.cancel(*cancel_args)
         self.released_waiter_ids = tuple(w.request_id for w in self.waiters)
         self.waiters.clear()
 
@@ -451,6 +467,14 @@ class InFlightMergeRegistry:
         """Return the in-flight entry for *branch*, or None if free."""
         return self._slots.get(branch)
 
+    def has_workflow_waiter(self, branch: str, request_id: str) -> bool:
+        """True while a TaskWorkflow waits, attached, on *request_id*'s slot for *branch*."""
+        entry = self._slots.get(branch)
+        return (
+            entry is not None and entry.request_id == request_id
+            and any(w.source == 'workflow' for w in entry.waiters)
+        )
+
     def primary_entry(self, branch: str, future: asyncio.Future) -> _InFlightEntry | None:
         """The live entry for *branch* only while *future* is its primary.
 
@@ -520,7 +544,7 @@ class InFlightMergeRegistry:
                 if target.done():
                     return  # guard: pre-resolved / detached future — skip
                 if pf.cancelled():
-                    target.cancel()
+                    target.cancel(*_cancel_args(pf))
                 elif (exc := pf.exception()) is not None:
                     target.set_exception(exc)
                 else:
@@ -706,6 +730,59 @@ class MergeDispatchResult:
     live worker snapshot entry.  Set on a C3 reject; None otherwise."""
 
 
+class MergeCancelRefusal(StrEnum):
+    """Why ``MergeLane.cancel_request`` left a live request alone (task 5248)."""
+
+    NOT_LIVE = 'not_live'
+    """The lane holds no undecided request under that id."""
+    FINALIZE_WINDOW = 'finalize_window'
+    """The request is landing; a cancel could abandon a merge that still lands."""
+    TRAIN_CANCEL_UNSUPPORTED = 'train_cancel_unsupported'
+    """The request is, or is being stacked into, a merge train; see
+    ``worker.py::_train_cancel_refusal``."""
+
+
+@dataclass(frozen=True)
+class MergeCancelVerdict:
+    """What ``MergeLane.cancel_request`` did with one request id.
+
+    *task_id*/*branch* name the request the lane found, so the caller can
+    retire it by branch, *state* is the ``snapshot()`` wire state it was in,
+    and *awaited_by_workflow* is the request's own flag; all are empty when
+    nothing was found.  *lane_disposes_worktree* is True when the lane is still
+    re-verifying in the request's merge worktree and disposes of it itself once
+    that returns, so the caller must not reap it.
+    """
+
+    request_id: str
+    refusal: MergeCancelRefusal | None
+    task_id: str | None = None
+    branch: str | None = None
+    state: str | None = None
+    awaited_by_workflow: bool = False
+    lane_disposes_worktree: bool = False
+
+    @property
+    def cancelled(self) -> bool:
+        return self.refusal is None
+
+
+@dataclass(frozen=True)
+class OperatorMergeCancel:
+    """The message an operator's cancel puts on a request's result future.
+
+    ``Future.cancel(msg)`` hands it to whoever awaits the future, inside the
+    ``CancelledError`` they get, which is how a TaskWorkflow tells an
+    operator's cancel of its merge from its own cancellation.
+    """
+
+    request_id: str
+
+    @classmethod
+    def carried_by(cls, error: asyncio.CancelledError) -> OperatorMergeCancel | None:
+        return next((arg for arg in error.args if isinstance(arg, cls)), None)
+
+
 @dataclass
 class WaiterRecord:
     """Server-side durable-intent waiter record keyed by request_id.
@@ -830,14 +907,14 @@ class QueuedBranch:
         computed by delegating to
         :func:`shared.branch_names.canonical_queued_branch_name` — the
         existing single source of truth for the prepend-unless-present rule
-        — rather than reimplementing it here; ``bare_id`` is then stripped
-        from it the same way the ``merge_queue_store.py`` journal
-        normalization does. This is the ONLY place branch-prefix *pairing*
+        — rather than reimplementing it here; ``bare_id`` is derived by
+        :func:`shared.branch_names.bare_queued_branch_id`, the inverse
+        direction of that same rule. This is the ONLY place branch-prefix *pairing*
         logic should live — callers should not reimplement prefix
         stripping/prepending elsewhere.
         """
         full_name = canonical_queued_branch_name(raw, branch_prefix)
-        bare_id = full_name.removeprefix(branch_prefix)
+        bare_id = bare_queued_branch_id(raw, branch_prefix)
         return cls(bare_id=bare_id, full_name=full_name)
 
 
@@ -912,6 +989,53 @@ class MergeRequest:
     reaper and journal recovery, whose submitters never park. Not journaled: a
     recovered request's workflow died with the process. Read only on single
     requests; a GroupMergeRequest is never a coalesce candidate."""
+
+
+@dataclass(frozen=True)
+class LaneMetadataWrite:
+    """Whether ``merge_relane`` persisted the new lane as one task's
+    ``metadata.merge_lane`` (task 5246)."""
+
+    task_id: str
+    written: bool
+
+
+@dataclass(frozen=True)
+class RelaneOutcome:
+    """What an operator's ``merge_relane`` did to a waiting merge (task 5246).
+
+    ``relaned`` is True when the addressed request, or for a coalesced member
+    the train carrying it (``via_train``), now belongs to ``lane``.
+    ``request_id`` and ``from_lane`` name that queue entry, and ``task_ids``
+    lists the tasks it carries: the request's own task, or every member of
+    the train.
+
+    That is the LIVE lane, and it lives only as long as the queue entry. A
+    solo request's journal record keeps it across a restart, but a train is
+    never journaled and is dissolved by a restart drain, so its live lane is
+    lost there. The DURABLE lane is ``metadata.merge_lane`` on each of
+    ``task_ids``: re-enqueued members inherit it. ``metadata_writes`` reports
+    that write per task. It is empty when nothing moved, and a False entry
+    means that task will re-enqueue at its old lane.
+
+    Otherwise ``refusal`` says why nothing moved:
+    - ``'already_picked'``: the merger has taken the request, so no lane
+      orders it any more. ``state`` is its lifecycle state.
+    - ``'not_found'``: nothing the lane holds answers to that id, or its
+      outcome is already decided. It can be transient while the request
+      passes between two of the lane's containers, so re-read
+      ``get_merge_queue``.
+    """
+
+    relaned: bool
+    lane: Literal['normal', 'high']
+    request_id: str | None = None
+    from_lane: Literal['normal', 'high'] | None = None
+    via_train: str | None = None
+    task_ids: tuple[str, ...] = ()
+    metadata_writes: tuple[LaneMetadataWrite, ...] = ()
+    refusal: Literal['already_picked', 'not_found'] | None = None
+    state: str | None = None
 
 
 @dataclass(frozen=True)

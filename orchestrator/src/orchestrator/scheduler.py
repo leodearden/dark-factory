@@ -11,7 +11,7 @@ import random
 import re
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -43,6 +43,7 @@ from shared.task_statuses import TaskStatus
 from shared.task_submit import SubmitFailed, SubmitOutcome, parse_submit_task_result
 
 from orchestrator import git_ops
+from orchestrator.already_landed_tick_view import AlreadyLandedGate, AlreadyLandedTickView
 from orchestrator.anchor_coverage_gate import AnchorCoverageGate
 from orchestrator.config import (
     DEFAULT_TIER,
@@ -54,6 +55,7 @@ from orchestrator.config import (
     PsiAdmissionConfig,
     coerce_tier,
 )
+from orchestrator.delivered_check_owner import derive_check_owner
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.dependency_verdict import DepKind, DepState, deps_verdict, task_external_deps
 from orchestrator.event_store import EventStore, EventType
@@ -688,6 +690,7 @@ class SchedulerCallbacks:
     on_warm_base_promote_l2: Callable[..., Any] | None = None
     on_warm_base_resolve: Callable[..., Any] | None = None
     suppress_blocked_write: Callable[[str], bool] | None = None
+    read_already_landed_tick_view: Callable[[], Awaitable[AlreadyLandedTickView]] | None = None
 
 
 def _render_retry_cap_report(
@@ -767,6 +770,10 @@ def _build_delivered_check_escalation(
     field comes from ``shared.capability_manifest.CHECK_SUBJECT_FIELD``,
     so a new check kind never renders a field its descriptor lacks.
 
+    Renders the failure only. The check's owner, declaration sites, remedy and
+    re-pend line are appended at filing time by
+    ``orchestrator/delivered_check_owner.py::render_check_owner``.
+
     Pure rendering — no side effects, no scheduler state.
     """
     name = check.get('name')
@@ -793,10 +800,6 @@ def _build_delivered_check_escalation(
     lines.append(f'paths: {check.get("paths", [])}')
     lines.append(f'expect: {check.get("expect")}')
     lines.append('observed: FAILED')
-    lines.append(
-        f'Blocked dependents are NOT auto-re-pended — set task {task_id} back '
-        f'to pending after the capability lands on main.'
-    )
     detail = '\n'.join(lines)
     return summary, detail
 
@@ -911,6 +914,9 @@ class SchedulerFacade(Protocol):
     async def dispatch_tool(
         self, name: str, arguments: dict, *, timeout: float = ...,
     ) -> dict: ...
+    async def submit_task(
+        self, arguments: dict, *, timeout: float = ...,
+    ) -> SubmitOutcome: ...
     async def get_tasks(self, *, statuses: Iterable[str] | None = ...) -> list[dict]: ...
     async def get_statuses(
         self, ids: list[str] | None = ...,
@@ -1238,54 +1244,44 @@ class ModuleLockTable:
         """
         return modules_conflict(a, b)
 
+    def _conflicting_holders(
+        self, module: str, exclude_task: str | None = None
+    ) -> set[str]:
+        """The *other* tasks holding a lock that conflicts with ``module``."""
+        return {
+            task_id
+            for task_id, task_modules in self._held.items()
+            if task_id != exclude_task
+            and any(self._conflicts(held, module) for held in task_modules)
+        }
+
     def _count_conflicts(self, module: str, exclude_task: str | None = None) -> int:
         """Count how many *other* tasks hold a lock that conflicts with ``module``."""
-        count = 0
-        for task_id, task_modules in self._held.items():
-            if task_id == exclude_task:
-                continue
-            if any(self._conflicts(held, module) for held in task_modules):
-                count += 1
-        return count
+        return len(self._conflicting_holders(module, exclude_task=exclude_task))
 
     # --- Park (reservation) helpers ---
 
-    def _iter_blocking_park_owners(
+    def _rank_blocking_parks(
         self,
         module: str,
         task_id: str,
         *,
-        ignore_owners: frozenset[str] = frozenset(),
-    ) -> Iterator[str]:
-        """EVERY owner of an ACTIVE park that blocks *task_id* on *module*.
+        ignore_owners: frozenset[str],
+    ) -> list[tuple[str, str]]:
+        """``(owner, parked_key)`` for every foreign active top *task_id* cannot pass on *module*.
 
-        THE single rank-aware park-blocking rule.  ``_blocking_park_owner`` is
-        the first-match view over it, ``_is_parked_blocks`` the bool view, and
-        ``park_owners_blocking`` the naming view — one rule, three views
-        (INV-5).  Forking the rank logic is what would let admission believe it
-        can borrow through a park that ``try_acquire`` then refuses: churn with
-        no dispatch.
-
-        A GENERATOR on purpose, so the first-match view stays short-circuiting
-        (``next()`` stops the scan at the first yield, exactly as the old
-        early-``return`` did) while the naming view can drain it.  More than
-        one owner can block a single requested module — two owners parked on
-        different children of the same requested parent both conflict with it —
-        and admission needs ALL of them, because ``try_acquire`` re-checks
-        every park and admits only the owners it was handed.
-
-        A buried (shadowed) reservation never blocks — only the active top of
-        each stack is consulted.
+        A buried (shadowed) reservation is never consulted — only the active
+        top of each stack (INV-2).  Order is ``_parked`` iteration order.
 
         Rank-aware (step-12): first compute task_id's OWN dominant rank — the
         minimum rank over active-top entries that *task_id* itself owns on keys
         conflicting with *module* (None if it has no such top).  A foreign
-        conflicting top then blocks UNLESS task_id's own dominant rank is
+        conflicting top then counts UNLESS task_id's own dominant rank is
         strictly less (strictly higher priority) — in which case task_id
-        preempts that foreign top and is not blocked by it.  This lets a
-        preemptor acquire its own module even when hierarchical victim parks
-        are kept under their original keys (their active tops are no longer
-        moved to the preemptor's key by a re-key step).
+        preempts that foreign top.  This lets a preemptor acquire its own
+        module even when hierarchical victim parks are kept under their
+        original keys (their active tops are no longer moved to the
+        preemptor's key by a re-key step).
 
         *ignore_owners* (task 3823 / PRD C7) names park owners whose parks are
         treated as absent for this request — the EASY-backfill admission
@@ -1304,6 +1300,7 @@ class ModuleLockTable:
                 own_dominant_rank = rank
 
         # Step 2: check each foreign conflicting active top.
+        blocking: list[tuple[str, str]] = []
         for parked_module, stack in self._parked.items():
             if not stack:
                 continue
@@ -1312,12 +1309,89 @@ class ModuleLockTable:
                 continue
             if not self._conflicts(parked_module, module):
                 continue
-            # Foreign conflicting top: block unless task_id has a strictly
+            # Foreign conflicting top: counts unless task_id has a strictly
             # higher-priority (strictly lower rank) own conflicting top.
             if own_dominant_rank is not None and own_dominant_rank < rank:
-                # task_id preempts this foreign top — not blocked by it.
+                # task_id preempts this foreign top.
                 continue
-            yield owner
+            blocking.append((owner, parked_module))
+        return blocking
+
+    def _iter_blocking_park_owners(
+        self,
+        module: str,
+        task_id: str,
+        *,
+        ignore_owners: frozenset[str] = frozenset(),
+    ) -> Iterator[str]:
+        """EVERY owner of an ACTIVE park that blocks *task_id* on *module*.
+
+        THE single rank-aware park-blocking rule.  ``_blocking_park_owner`` is
+        the first-match view over it, ``_is_parked_blocks`` the bool view, and
+        ``park_owners_blocking`` the naming view — one rule, three views
+        (INV-5).  Forking the rank logic is what would let admission believe it
+        can borrow through a park that ``try_acquire`` then refuses: churn with
+        no dispatch.
+
+        More than one owner can block a single requested module — two owners
+        parked on different children of the same requested parent both
+        conflict with it — and admission needs ALL of them, because
+        ``try_acquire`` re-checks every park and admits only the owners it was
+        handed.
+
+        Capacity (task 7313): a park takes one of its key's slots instead of
+        reserving the key exclusively.  A park on key K that
+        :meth:`_rank_blocking_parks` names blocks when either term fires:
+
+        (a) the hold term — a park counts as its owner's hold, so the request
+            is refused once *module* is at ``_limit_for(module)`` counting the
+            foreign holders and the blocking park owners, each task once;
+        (b) the owner's-slot term — a park keeps one slot of its own key, so
+            the request is refused when granting it would fill K for the owner
+            (:meth:`_park_owner_slot_taken`).
+
+        A limit of 1 on *module* makes the hold term always fire, and a limit
+        of 1 on K makes the owner's-slot term fire for every requester not
+        already counted on K, so a limit-1 park admits no new occupant,
+        hierarchical cases included.  The hold term counts park owners first
+        and scans holders only when the owners alone leave *module* room, so a
+        limit-1 request pays no extra scan.  The rule is
+        monotone in *ignore_owners*: ignoring an owner only removes hold-term
+        occupants, and the owner's-slot term reads holders only, never
+        *ignore_owners* — so once admission's named owners are ignored, no
+        remaining park starts blocking.
+
+        The hold term needs the full count, so nothing is yielded before every
+        park has been scanned; a generator keeps every view's call shape.
+        """
+        parks = self._rank_blocking_parks(module, task_id, ignore_owners=ignore_owners)
+        if not parks:
+            return
+        park_owners = {owner for owner, _key in parks}
+        limit = self._limit_for(module)
+        if len(park_owners) >= limit or len(
+            park_owners | self._conflicting_holders(module, exclude_task=task_id)
+        ) >= limit:
+            yield from (owner for owner, _key in parks)
+            return
+        for owner, key in parks:
+            if self._park_owner_slot_taken(owner, key, task_id):
+                yield owner
+
+    def _park_owner_slot_taken(self, owner: str, key: str, requester: str) -> bool:
+        """Would granting *requester* a key conflicting with *key* take *owner*'s slot on it?
+
+        True when the grant is what leaves the park owner's own later
+        acquisition of *key* no room under the held gate: *requester* does not
+        already hold a key conflicting with *key*, and the holders conflicting
+        with *key* plus *owner* itself already reach ``_limit_for(key)``.  A
+        requester already counted on *key* — say, expanding to a sibling under
+        a parked parent — leaves the owner's room unchanged.
+        """
+        holders = self._conflicting_holders(key)
+        if requester in holders:
+            return False
+        return len(holders | {owner}) >= self._limit_for(key)
 
     def _blocking_park_owner(
         self,
@@ -1330,9 +1404,8 @@ class ModuleLockTable:
 
         The first-match view of :meth:`_iter_blocking_park_owners`.  Enough for
         the gate (``_is_parked_blocks`` only needs to know THAT something
-        blocks) and it stops scanning at the first hit, which is why the hot
-        ``try_acquire`` path keeps its original cost.  Callers that must reason
-        about every blocking owner — admission — drain the generator instead.
+        blocks).  Callers that must reason about every blocking owner —
+        admission — drain the generator instead.
         """
         return next(
             self._iter_blocking_park_owners(
@@ -1382,22 +1455,15 @@ class ModuleLockTable:
 
         Honours ``_limit_for`` rather than mere presence: a module with
         headroom (``max_per_module`` > current holders) is free to take, so it
-        contributes no wait.  Built from the existing ``_conflicts`` /
-        ``_count_conflicts`` / ``_limit_for`` trio — no third conflict rule.
+        contributes no wait.  Built from the existing ``_conflicting_holders``
+        / ``_limit_for`` pair — no third conflict rule.
         """
         depth = self._config.lock_depth
         result: dict[str, list[str]] = {}
         for module in {normalize_lock(m, depth) for m in modules}:
-            if self._count_conflicts(module, exclude_task=exclude_task) < self._limit_for(module):
-                continue
-            holders = sorted(
-                task_id
-                for task_id, held in self._held.items()
-                if task_id != exclude_task
-                and any(self._conflicts(h, module) for h in held)
-            )
-            if holders:
-                result[module] = holders
+            holders = self._conflicting_holders(module, exclude_task=exclude_task)
+            if holders and len(holders) >= self._limit_for(module):
+                result[module] = sorted(holders)
         return result
 
     def blockers(self, task_id: str, modules: list[str]) -> list[Blocker]:
@@ -1431,8 +1497,10 @@ class ModuleLockTable:
         *,
         ignore_owners: frozenset[str] = frozenset(),
     ) -> bool:
-        """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*
-        and is owned by a different task that task_id cannot preempt (INV-2).
+        """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*,
+        is owned by a different task that task_id cannot preempt (INV-2), and
+        fires the two-term capacity rule of :meth:`_iter_blocking_park_owners`
+        (task 7313).
 
         The bool view of :meth:`_blocking_park_owner`, which carries the rank
         logic.  Kept as a delegate rather than inlined so ``try_acquire`` /
@@ -1994,7 +2062,8 @@ class ModuleLockTable:
         Uses hierarchical conflict detection: a lock on ``A/B`` conflicts with
         ``A/B/C`` (and vice-versa) but NOT with ``A/D``.  Also refuses if any
         requested module hierarchically conflicts with an active reservation
-        owned by a different task (see ``install_parks``).
+        owned by a different task (see ``install_parks``) under the capacity
+        rule of ``_iter_blocking_park_owners``.
 
         Returns True if all acquired, False if any unavailable.
 
@@ -2233,6 +2302,7 @@ class Scheduler:
         'override_diff',
         'build_candidates',
         'landed_outbox_gate',
+        'already_landed_gate',
         'starvation',
         'empty_candidate_gate',
         'psi_gate',
@@ -2774,11 +2844,12 @@ class Scheduler:
         # / merge-marker / content-equivalence) rather than this
         # orchestrator's own merge queue, so it also catches OUT-OF-BAND
         # landings (sibling direct-merge, prior run, squash/rebase/manual).
-        # Signature: (task_id: str) -> bool (async). True means the task is
+        # Signature: (task_id: str, *, task=None, tick_view=None) -> bool
+        # (async; AlreadyLandedGate). True means the task is
         # already fully landed on main and has been driven to done inline by
         # the hook's own routine, so acquire_next() must NOT dispatch it this
         # tick. Default None so bare-Scheduler unit tests are unaffected.
-        self._already_landed_gate: Callable[[str], Any] | None = None
+        self._already_landed_gate: AlreadyLandedGate | None = None
         # --- Snapshot write throttle (task 1332) ---
         # Test-injectable override for the _write_snapshot_best_effort write
         # target (task 2418).  None (default) preserves current behavior: the
@@ -4462,6 +4533,15 @@ class Scheduler:
         if check is None:
             check = {'name': check_name, 'kind': detail.get('kind')}
         dep_status = status_map.get(dep_id, 'unknown')
+        owner = (
+            derive_check_owner(
+                dep_id=dep_id,
+                dep_metadata=dep_task.get('metadata') or {},
+                check_name=check_name,
+            )
+            if isinstance(check_name, str) and check_name
+            else None
+        )
         summary, esc_detail = _build_delivered_check_escalation(
             task_id=task_id,
             dep_id=dep_id,
@@ -4476,6 +4556,8 @@ class Scheduler:
                     summary=summary,
                     detail=esc_detail,
                     category='dependency_capability',
+                    check=check,
+                    owner=owner,
                 )
             except Exception:
                 logger.warning(
@@ -6208,9 +6290,15 @@ class Scheduler:
         candidate alone (treated as not-gated) and can neither abort the
         tick nor stop the remaining candidates from being consulted
         (PROPERTY 1).
+
+        The per-tick view is read once per consult and may be ``None``, in
+        which case the gate does its own per-candidate reads.
         """
         if self._already_landed_gate is None:
             return set()
+        if not candidates:
+            return set()
+        tick_view = await self._read_already_landed_tick_view()
         gated: set[str] = set()
         for t in candidates:
             if self.is_deterministic(t):
@@ -6220,7 +6308,9 @@ class Scheduler:
                 continue
             tid = str(t.get('id', ''))
             try:
-                gated_now = await self._already_landed_gate(tid)
+                gated_now = await self._already_landed_gate(
+                    tid, task=t, tick_view=tick_view,
+                )
             except Exception:
                 logger.warning(
                     'Already-landed dispatch gate raised for task_id=%s — '
@@ -6234,6 +6324,21 @@ class Scheduler:
             if gated_now:
                 gated.add(tid)
         return gated
+
+    async def _read_already_landed_tick_view(self) -> AlreadyLandedTickView | None:
+        reader = self._callbacks.read_already_landed_tick_view
+        if reader is None:
+            return None
+        try:
+            return await reader()
+        except Exception:
+            logger.warning(
+                'Already-landed tick view read raised — failing open (the '
+                'gate does its own per-candidate reads this tick) so a git '
+                'hiccup can NEVER abort the tick (PROPERTY 1)',
+                exc_info=True,
+            )
+            return None
 
     # ---- acquire_next tick phases (W10-β) ----
     #
@@ -7505,34 +7610,48 @@ class Scheduler:
         return _CONTINUE
 
     async def _phase_landed_outbox_gate(self, ctx: TickContext) -> object:
-        """Landed-outbox + already-landed consult-before-dispatch gate.
+        """Landed-outbox consult-before-dispatch gate.
 
-        Reads: ``ctx.candidates``. Writes: ``ctx.gated_ids``,
-        ``ctx.candidates`` (filtered). Consulted once per candidate here,
-        BEFORE the starvation watchdog / pin loop / scored loop, so a
-        single ``gated_ids`` set is honored by both dispatch paths. A
-        gated task's merge already landed on main and is being driven to
-        done inline by the injected hook. ``_consult_landed_outbox`` is a
-        TOTAL function (fails open per-candidate on hook error) — no outer
-        try/except needed here. Always continues.
+        Reads: ``ctx.candidates``. Writes: ``ctx.gated_ids``. Consulted
+        once per candidate here, BEFORE the starvation watchdog / pin loop
+        / scored loop, so a single ``gated_ids`` set is honored by both
+        dispatch paths. A gated task's merge already landed on main and is
+        being driven to done inline by the injected hook.
+        ``ctx.candidates`` is left unfiltered: ``_phase_already_landed_gate``
+        consults the same list and then filters by the union.
+        ``_consult_landed_outbox`` is a TOTAL function (fails open
+        per-candidate on hook error) — no outer try/except needed here.
+        Always continues.
         """
-        gated_ids = await self._consult_landed_outbox(
+        ctx.gated_ids = await self._consult_landed_outbox(
             [str(t.get('id', '')) for t in ctx.candidates]
         )
+        return _CONTINUE
+
+    async def _phase_already_landed_gate(self, ctx: TickContext) -> object:
+        """Already-landed consult-before-dispatch gate, then the gated filter.
+
+        Reads: ``ctx.candidates``, ``ctx.gated_ids``. Writes:
+        ``ctx.gated_ids`` (unioned), ``ctx.candidates`` (filtered).
+        Consults the same candidate list ``_phase_landed_outbox_gate`` saw,
+        outbox-gated candidates included, so splitting the two consults
+        into separate phases changes only their timing visibility in
+        ``scheduler_tick.phases``. ``_consult_already_landed`` is a TOTAL
+        function — no outer try/except needed here. Always continues.
+        """
         # Already-landed pre-dispatch gate (task 2313) — consulted immediately
-        # after the landed-outbox gate above and unioned into the SAME
-        # gated_ids set, so both the scored candidate filter below and the
-        # pin loop honor a single source of truth (mirrors the
-        # _consult_landed_outbox / gated_ids pattern verbatim). Catches
-        # out-of-band landings (ancestry / merge-marker / content-
-        # equivalence) that never passed through this orchestrator's own
-        # merge queue.
-        gated_ids |= await self._consult_already_landed(ctx.candidates)
-        if gated_ids:
+        # after the landed-outbox gate and unioned into the SAME gated_ids
+        # set, so both the scored candidate filter below and the pin loop
+        # honor a single source of truth (mirrors the _consult_landed_outbox
+        # / gated_ids pattern verbatim). Catches out-of-band landings
+        # (ancestry / merge-marker / content-equivalence) that never passed
+        # through this orchestrator's own merge queue.
+        ctx.gated_ids |= await self._consult_already_landed(ctx.candidates)
+        if ctx.gated_ids:
             ctx.candidates = [
-                t for t in ctx.candidates if str(t.get('id', '')) not in gated_ids
+                t for t in ctx.candidates
+                if str(t.get('id', '')) not in ctx.gated_ids
             ]
-        ctx.gated_ids = gated_ids
         return _CONTINUE
 
     async def _phase_starvation(self, ctx: TickContext) -> object:

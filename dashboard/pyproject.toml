@@ -74,6 +74,9 @@ docstring-code-format = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "reads_git_history: the test reads the checkout's git history (log, merge-base, rev-list, describe), so a byte-identical tree under a new parent can verify differently; re-run alone on the merge gate's same-tree path by merge_gate_history_test_command. Not deselected by default.",
+]
 # PARALLEL TEST EXECUTION (task 5408). Spelling and flag ORDER copy
 # fused-memory/pyproject.toml verbatim, so every parallel module in this
 # workspace reads as one family rather than as independently-invented variants.

@@ -37,11 +37,14 @@ from fused_memory.reconciliation.blocked_gate_audit_section import (
     render_blocked_gate_audit_section,
 )
 from fused_memory.reconciliation.capped_task_list import render_capped_task_list
+from fused_memory.reconciliation.citation_verifier import STAGE_STAT_PREFIX
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
     STAGE3_REPORT_SCHEMA,
 )
+from fused_memory.reconciliation.cross_run_citation_scan import scan_cross_run_citations
+from fused_memory.reconciliation.dangling_citation import build_dangling_citation_finding
 from fused_memory.reconciliation.flag_dedup import (
     _content_fingerprint,
     _normalize_content_description,
@@ -3339,8 +3342,9 @@ class TaskKnowledgeSync(BaseStage):
     # ── Inference-bearing payload sections (task 5113) ──────────────────────
     # INCLUSION CRITERION — a section belongs here iff prompts/stage2.py tells
     # the model to draw an inference from that section's ABSENCE ("If
-    # `### Live-Workflow Signals` is absent from the payload, no task is live
-    # this cycle …"). Every payload builder renders these via
+    # `### Live-Workflow Signals` is absent from the payload, no task the
+    # `### Active Task Tree` lists is live this cycle …"). Every payload builder
+    # renders these via
     # _render_required_sections(). Enforced by
     # tests/reconciliation/test_stage2_payload_section_parity.py, whose module
     # docstring holds the section census: why each other conditional section
@@ -3895,7 +3899,7 @@ class TaskKnowledgeSync(BaseStage):
                         self.filtered_task_tree.cancelled_tasks,
                     )
                 )
-            summary = await _queue_briefing_refresh_tasks(
+            summary = await queue_briefing_refresh_tasks(
                 self.taskmaster,
                 self.scope.project_root,
                 mismatches,
@@ -4019,9 +4023,10 @@ class TaskKnowledgeSync(BaseStage):
             )
 
         # Done-Task Completion-Memory Audit — enumerate EVERY task that
-        # transitioned to `done` since the prior successful cycle boundary
-        # (watermark.last_full_run_completed) via an updatedAt-window scan over
-        # the UNCAPPED filtered.all_done_tasks.  This supersedes reliance on the
+        # transitioned to `done` inside the task-change window, which starts when
+        # the previous full run STARTED (why not its completion:
+        # tests/reconciliation/test_recon_window_anchor.py), via an updatedAt scan
+        # over the UNCAPPED filtered.all_done_tasks.  This supersedes reliance on the
         # 5-item Proactive Task Sample for done-task completion-memory coverage,
         # which systematically missed done tasks as throughput grew (the sample
         # sorts done tasks last, so they rarely survive the top-5 cut).  Gated on
@@ -4029,7 +4034,7 @@ class TaskKnowledgeSync(BaseStage):
         # (remediation is a focused second pass, not general sync).
         done_audit_section = ''
         if not self.remediation_mode:
-            boundary = watermark.last_full_run_completed
+            boundary = watermark.last_task_change_timestamp
             audit_tasks = select_done_since_boundary(filtered.all_done_tasks, boundary)
             total_audit = len(audit_tasks)
             boundary_label = (
@@ -4056,7 +4061,7 @@ class TaskKnowledgeSync(BaseStage):
             done_audit_section = (
                 f'\n### Done-Task Completion-Memory Audit '
                 f'({total_audit} since last cycle)\n'
-                f'Boundary (last full-run completed): {boundary_label}\n'
+                f'Boundary (previous full run started): {boundary_label}\n'
                 f'{audit_body}'
             )
 
@@ -4609,7 +4614,10 @@ class IntegrityCheck(BaseStage):
            read a Mem0-only task-count snapshot stat as evidence of a missing
            Graphiti temporal_facts edge, for every project (task 3487).  Records
            report.stats['snapshot_stat_edge_findings_dropped'] = before - after.
-        5. Calls record_task_dump_spot_check() to record a non-destructive
+        5. Calls scan_cross_run_citations() and appends one finding per
+           confirmed-absent mem0 citation on a settled run's finding, recording
+           the scan's stage3_cross_run_* stats (task 5749).
+        6. Calls record_task_dump_spot_check() to record a non-destructive
            observability stat when the cached task tree contains contamination
            signals.
 
@@ -4675,6 +4683,12 @@ class IntegrityCheck(BaseStage):
         report.stats['snapshot_stat_edge_findings_dropped'] = (
             _before - len(report.items_flagged)
         )
+
+        scan = await scan_cross_run_citations(
+            self.journal, self.memory, project_id=self.project_id
+        )
+        report.items_flagged.extend(build_dangling_citation_finding(r) for r in scan.dangling)
+        report.stats.update(scan.as_stats(STAGE_STAT_PREFIX[self.stage_id]))
 
         self.record_task_dump_spot_check(report)
         return report
@@ -5285,7 +5299,7 @@ async def _run_briefing_known_gaps_script(project_root: ProjectRoot) -> list[dic
         return None
 
 
-async def _queue_briefing_refresh_tasks(
+async def queue_briefing_refresh_tasks(
     taskmaster: TaskBackendProtocol,
     project_root: ProjectRoot,
     mismatches: list[dict],
@@ -5293,6 +5307,10 @@ async def _queue_briefing_refresh_tasks(
     run_id: str = '',
 ) -> dict:
     """Create 'Refresh briefing: remove task N from known_gaps' tasks for each mismatch.
+
+    Each mismatch is a dict carrying the ``task_id`` still listed in a
+    briefing's known_gaps, its ``subproject``, its ``title``, and the gap
+    text ``what``; one refresh task is filed per mismatch.
 
     Skips creation when a task with status 'pending' and the same canonical title
     already exists (exact-title de-dup, case-sensitive string equality).

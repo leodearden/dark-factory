@@ -15,8 +15,10 @@ from pathlib import Path
 import pytest
 from _fm_helpers import load_script_module
 
+from fused_memory.models.enums import MemoryCategory
 from fused_memory.reconciliation import task_filter
-from fused_memory.services import completion_claim_gate
+from fused_memory.services import completion_claim_gate, overreach_guard
+from fused_memory.services.overreach_guard import is_guarded_category
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_ruling_overreach.py'
 
@@ -215,7 +217,6 @@ class TestClassifiers:
     @pytest.mark.parametrize('name', ['ruling_lexeme_head', 'decision_anchor_head'])
     def test_a_lexeme_past_the_head_window_does_not_count(self, name) -> None:
         content = 'x' * 250 + ' ruling (Leo, 2026-09-01, esc-1-2)'
-        assert mod.HEAD_CHARS == 200
         assert mod.CLASSIFIERS[name](_episode(content)) is False
 
     def test_category_decisions_reads_the_parsed_category(self) -> None:
@@ -276,6 +277,29 @@ class TestSpecimens:
 
     def test_recall_with_no_specimen_read_is_not_computed(self) -> None:
         assert mod.specimen_recall('ruling_lexeme_head', {}) is None
+
+
+# --------------------------------------------------------------------------- #
+# The script evaluates the src class vocabulary (task 6137, design.md §8 leaf 1)
+# --------------------------------------------------------------------------- #
+
+class TestOneCopyOfTheClassVocabulary:
+    """The script's class predicate, classifier table and labels are src's own."""
+
+    def test_the_classifier_table_is_the_src_table(self) -> None:
+        assert mod.CLASSIFIERS.keys() == overreach_guard.EPISODE_CLASSIFIERS.keys()
+
+    @pytest.mark.parametrize('category', list(MemoryCategory))
+    def test_category_decisions_is_the_src_class_predicate(self, category) -> None:
+        episode = _episode('x', source=f'add_memory:{category.value}')
+        assert mod.CLASSIFIERS['category_decisions'](episode) is is_guarded_category(category)
+
+    @pytest.mark.parametrize('source', ['add_memory:bogus', None])
+    def test_an_unparseable_category_is_out_of_class(self, source) -> None:
+        assert mod.CLASSIFIERS['category_decisions'](_episode('x', source=source)) is False
+
+    def test_the_labels_are_the_src_labels(self) -> None:
+        assert mod.LABELS is overreach_guard.LABELS
 
 
 # --------------------------------------------------------------------------- #

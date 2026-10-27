@@ -1791,7 +1791,7 @@ class TestDigestCarriesOriginProjectTag:
 
     @pytest.mark.asyncio
     async def test_the_projection_is_narrow_and_never_leaks_managed_keys(self):
-        """Only origin-tag keys ride along — not the body, not mem0's own keys.
+        """Only the projected keys ride along — not the body, not mem0's own keys.
 
         No member of ``MEM0_MANAGED_METADATA_KEYS`` may appear in the emitted
         projection: mem0's ``user_id`` scoping key in particular must never be

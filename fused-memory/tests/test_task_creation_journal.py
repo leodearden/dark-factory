@@ -16,9 +16,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _curator_helpers import curator_returning
 from _fm_helpers import poll_until
 
 from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+from fused_memory.middleware.curator_types import CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_creation_journal import (
     TASK_COMBINED_OPERATION,
     TASK_CREATED_OPERATION,
@@ -28,7 +30,6 @@ from fused_memory.middleware.task_creation_journal import (
     read_run_creation_outcomes,
     task_key,
 )
-from fused_memory.middleware.task_curator import CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -393,18 +394,6 @@ async def ticket_store(tmp_path):
     await store.close()
 
 
-def _curator_returning(*decisions: CuratorDecision) -> MagicMock:
-    """A curator whose single-item ``curate`` returns *decisions* in order."""
-    curator = MagicMock()
-    curator.prepare_candidate = AsyncMock(return_value=None)
-    curator.curate = AsyncMock(side_effect=list(decisions))
-    curator.note_created = MagicMock()
-    curator.record_task = AsyncMock()
-    curator.reembed_task = AsyncMock(return_value=None)
-    curator.close = AsyncMock()
-    return curator
-
-
 @pytest_asyncio.fixture
 async def build_interceptor(taskmaster, event_buffer, ticket_store, write_journal):
     """Build TaskInterceptors around an injected curator; each is closed at teardown."""
@@ -495,7 +484,7 @@ class TestCuratorWorkerJournal:
     async def test_create_row_carries_the_submitters_attribution(
         self, build_interceptor, write_journal,
     ):
-        interceptor = build_interceptor(_curator_returning(CuratorDecision(action='create')))
+        interceptor = build_interceptor(curator_returning(CuratorDecision(action='create')))
 
         resolved = await _resolve(interceptor, await _submit(interceptor))
         outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
@@ -511,7 +500,7 @@ class TestCuratorWorkerJournal:
     async def test_drop_writes_task_combined_for_the_target(
         self, build_interceptor, write_journal, taskmaster,
     ):
-        interceptor = build_interceptor(_curator_returning(
+        interceptor = build_interceptor(curator_returning(
             CuratorDecision(action='drop', target_id='5', justification='dup'),
         ))
 
@@ -532,7 +521,7 @@ class TestCuratorWorkerJournal:
         taskmaster.get_task = AsyncMock(return_value={
             'id': '42', 'title': 'Existing Task', 'status': 'pending', 'metadata': {},
         })
-        interceptor = build_interceptor(_curator_returning(CuratorDecision(
+        interceptor = build_interceptor(curator_returning(CuratorDecision(
             action='combine',
             target_id='42',
             target_fingerprint='Existing Task',
@@ -563,7 +552,7 @@ class TestCuratorWorkerJournal:
             RuntimeError('backend down'),
             {'id': '43', 'title': 'Sentinel'},
         ])
-        interceptor = build_interceptor(_curator_returning(
+        interceptor = build_interceptor(curator_returning(
             CuratorDecision(action='refuse', justification='blocked premise'),
             CuratorDecision(action='create'),
             CuratorDecision(action='create'),
@@ -586,7 +575,7 @@ class TestCuratorWorkerJournal:
         self, build_interceptor, write_journal,
     ):
         """The f9e49aef / task 105 shape: Stage 2 of one project files into another."""
-        interceptor = build_interceptor(_curator_returning(CuratorDecision(action='create')))
+        interceptor = build_interceptor(curator_returning(CuratorDecision(action='create')))
 
         await _submit(interceptor, project_root='/home/leo/src/solar_challenge')
         outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.created)
@@ -597,7 +586,7 @@ class TestCuratorWorkerJournal:
     async def test_add_task_never_sees_attribution_kwargs(
         self, build_interceptor, write_journal, taskmaster,
     ):
-        interceptor = build_interceptor(_curator_returning(CuratorDecision(action='create')))
+        interceptor = build_interceptor(curator_returning(CuratorDecision(action='create')))
 
         await _resolve(interceptor, await _submit(interceptor))
 
@@ -613,7 +602,7 @@ class TestCuratorWorkerJournal:
             rows = await _creation_rows(write_journal)
             return rows or None
 
-        interceptor = build_interceptor(_curator_returning(CuratorDecision(action='create')))
+        interceptor = build_interceptor(curator_returning(CuratorDecision(action='create')))
 
         await _submit(interceptor, metadata={'source': 'no-causation'})
         [row] = await poll_until(_row, message='no unattributed creation row')
@@ -659,7 +648,7 @@ class TestOrphanRaceJournal:
             await release.wait()
             return decision
 
-        curator = _curator_returning()
+        curator = curator_returning()
         curator.curate = AsyncMock(side_effect=gated_curate)
         interceptor = build_interceptor(curator)
 
@@ -690,7 +679,7 @@ class TestIdempotencyHitJournal:
         self, build_interceptor, write_journal, taskmaster,
     ):
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': [self._EXISTING]})
-        interceptor = build_interceptor(_curator_returning())
+        interceptor = build_interceptor(curator_returning())
 
         resolved = await _resolve(interceptor, await _submit(interceptor, metadata=self._METADATA))
         outcomes = await _poll_outcomes(write_journal, RUN, lambda o: o.combined)
@@ -706,7 +695,7 @@ class TestNoJournalWired:
     @pytest.mark.asyncio
     async def test_submit_and_resolve_behave_as_before(self, build_interceptor):
         interceptor = build_interceptor(
-            _curator_returning(CuratorDecision(action='create')), journaled=False,
+            curator_returning(CuratorDecision(action='create')), journaled=False,
         )
 
         resolved = await _resolve(interceptor, await _submit(interceptor))

@@ -175,3 +175,43 @@ def test_streak_step_is_a_frozen_value(field: str):
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         setattr(step, field, 3)
+
+
+def test_tracked_keys_is_empty_for_a_fresh_instance():
+    assert KeyedStreaks(threshold=3).tracked_keys == frozenset()
+
+
+def test_tracked_keys_lists_the_keys_in_a_live_run():
+    streaks: KeyedStreaks[Hashable] = KeyedStreaks(threshold=3)
+
+    streaks.failure('a')
+    streaks.failure(('b', 1))
+
+    assert streaks.tracked_keys == frozenset({'a', ('b', 1)})
+
+
+def test_tracked_keys_drops_keys_whose_run_ended():
+    streaks: KeyedStreaks[Hashable] = KeyedStreaks(threshold=3)
+    for key in ['a', ('b', 1), 'c']:
+        streaks.failure(key)
+
+    streaks.success('a')
+    assert streaks.tracked_keys == frozenset({('b', 1), 'c'})
+
+    streaks.forget([('b', 1)])
+    assert streaks.tracked_keys == frozenset({'c'})
+
+    streaks.retain(lambda key: False)
+    assert streaks.tracked_keys == frozenset()
+
+
+def test_tracked_keys_is_a_snapshot():
+    streaks: KeyedStreaks[str] = KeyedStreaks(threshold=3)
+    streaks.failure('a')
+
+    snapshot = streaks.tracked_keys
+    streaks.failure('b')
+
+    assert isinstance(snapshot, frozenset)
+    assert snapshot == frozenset({'a'})
+    assert streaks.tracked_keys == frozenset({'a', 'b'})

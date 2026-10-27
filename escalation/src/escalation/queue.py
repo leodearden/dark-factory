@@ -48,6 +48,7 @@ from escalation.models import (
     Escalation,
     LateResolution,
     max_severity,
+    note_to_file_class_conflict,
 )
 
 logger = logging.getLogger(__name__)
@@ -367,6 +368,17 @@ class ResolveOutcome(TypedDict):
     resolution_class_corrected: str | None  # the stamp this call re-derived, or None
 
 
+def blank_resolve_outcome() -> ResolveOutcome:
+    """The outcome of a resolve that did nothing, which ``resolve()`` seeds first."""
+    return {
+        'applied': False,
+        'prior_status': None,
+        'prior_resolved_by': None,
+        'late_resolution_captured': False,
+        'resolution_class_corrected': None,
+    }
+
+
 def _elide(text: str, limit: int, what: str = 'amendment field') -> tuple[str, int]:
     """Return (*text* capped at *limit*, characters dropped).
 
@@ -387,6 +399,24 @@ def _elide(text: str, limit: int, what: str = 'amendment field') -> tuple[str, i
         f'{text[:limit]}\n[... {dropped} char(s) elided at the '
         f'{limit}-char {what} cap ...]'
     ), dropped
+
+
+def _stamped_resolution_class(
+    escalation: Escalation, resolution_class: str | None, resolved_by: str | None,
+) -> str | None:
+    """The class a terminal write stamps: *resolution_class*, else the resolver default.
+
+    ``ValueError`` with ``models.note_to_file_class_conflict``'s message when
+    *escalation* cannot carry that class.
+    """
+    stamped = (
+        resolution_class if resolution_class is not None
+        else default_resolution_class_for_resolver(resolved_by)
+    )
+    conflict = note_to_file_class_conflict(escalation, stamped)
+    if conflict is not None:
+        raise ValueError(conflict)
+    return stamped
 
 
 def _is_late_resolution_worth_capturing(
@@ -1010,9 +1040,16 @@ class EscalationQueue:
 
         An unregistered ``escalation.category`` raises
         ``UnregisteredEscalationCategory`` before anything is written (see
-        ``escalation.categories``).
+        ``escalation.categories``).  A ``note_to_file`` record raises
+        ``ValueError`` before anything is written: it is never pending.
         """
         require_registered_category(escalation.category)
+        if escalation.note_to_file:
+            raise ValueError(
+                f'note-to-file record {escalation.id} (task {escalation.task_id}) '
+                'is filed resolved via submit_resolved and is never pending; '
+                'submit() refused it'
+            )
         with escalation_id_lock(self.queue_dir, escalation.id):
             self._atomic_write(escalation.id, escalation.to_json(), durable=True)
         logger.info(f'Escalation submitted: {escalation.id} [{escalation.severity}]')
@@ -1509,6 +1546,7 @@ class EscalationQueue:
         *, resolved_by: str | None = None, resolution_turns: int | None = None,
         resolution_class: str | None = None,
         granted_files: list[str] | None = None,
+        resolution_action: str | None = None,
         outcome: ResolveOutcome | None = None,
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed.
@@ -1520,13 +1558,23 @@ class EscalationQueue:
         member cascade below: grants are L0 ``scope_violation`` escalations,
         which carry empty ``members`` lists.
 
+        ``resolution_action`` (task 6617): stamped onto the record when not
+        ``None``, inside the locked critical section, so it lands atomically
+        with the status flip — in the archived JSON and on the
+        ``_resolve_callback`` argument.  Never written on the already-terminal
+        path, and not propagated through the member cascade.  Legality is the
+        caller's job: ``escalation/action_effects.py::effect_for`` is the
+        authority ``escalation/server.py::resolve_issue`` consults first.
+
         ``resolution_class`` (plans/escalation-lifecycle-dashboard-prd.md Seam 1):
         an optional explicit ``'benign' | 'actionable'`` classification stamp,
         validated against ``RESOLUTION_CLASSES`` BEFORE the lock is taken —
         an invalid value raises ``ValueError`` naming the legal values and
         nothing is persisted (INV-1). When ``None``, the stamp defaults per
         the caller's ``resolved_by`` (see ``escalation.classify.
-        default_resolution_class_for_resolver``).
+        default_resolution_class_for_resolver``). A class the record cannot
+        carry (``models.note_to_file_class_conflict``) raises ``ValueError``
+        inside the critical section before anything is written.
 
         ``outcome`` (task 4495): an optional :class:`ResolveOutcome` dict filled
         in place with what this call DID — whether the resolution was actually
@@ -1613,11 +1661,7 @@ class EscalationQueue:
         # above, so an INV-1 rejection leaves the caller's dict untouched —
         # nothing is persisted and nothing is reported.
         if outcome is not None:
-            outcome['applied'] = False
-            outcome['prior_status'] = None
-            outcome['prior_resolved_by'] = None
-            outcome['late_resolution_captured'] = False
-            outcome['resolution_class_corrected'] = None
+            outcome.update(blank_resolve_outcome())
 
         with escalation_id_lock(self.queue_dir, escalation_id):
             esc = self.get(escalation_id)
@@ -1649,6 +1693,7 @@ class EscalationQueue:
                         outcome['resolution_class_corrected'] = corrected
                 return esc
 
+            stamped_class = _stamped_resolution_class(esc, resolution_class, resolved_by)
             if outcome is not None:
                 outcome['applied'] = True
                 outcome['prior_status'] = esc.status
@@ -1660,12 +1705,11 @@ class EscalationQueue:
                 esc.resolved_by = resolved_by
             if resolution_turns is not None:
                 esc.resolution_turns = resolution_turns
-            esc.resolution_class = (
-                resolution_class if resolution_class is not None
-                else default_resolution_class_for_resolver(resolved_by)
-            )
+            esc.resolution_class = stamped_class
             if granted_files is not None:
                 esc.granted_files = granted_files
+            if resolution_action is not None:
+                esc.resolution_action = resolution_action
 
             self._atomic_write(escalation_id, esc.to_json())
             self._archive_resolved(escalation_id, esc.resolved_at)
@@ -1760,8 +1804,9 @@ class EscalationQueue:
         corrected: str | None = None
         if esc.resolution_class == 'benign':
             # `resolution_class` was validated against RESOLUTION_CLASSES at
-            # the top of `resolve`, so the incoming value is known-legal here.
-            candidate = resolution_class or 'actionable'
+            # the top of `resolve` and paired through _stamped_resolution_class,
+            # so the incoming value is known-legal here.
+            candidate = _stamped_resolution_class(esc, resolution_class or 'actionable', resolved_by)
             corrected = candidate if candidate != esc.resolution_class else None
 
         entry, chars_elided = _build_late_resolution(
@@ -1979,12 +2024,14 @@ class EscalationQueue:
         validated against ``RESOLUTION_CLASSES`` before *escalation* is
         mutated at all — an invalid value raises ``ValueError`` naming the
         legal values and leaves the passed-in object untouched (INV-1).  When
-        ``None``, the stamp defaults per *resolved_by* via the same
-        ``default_resolution_class_for_resolver`` helper ``resolve()`` uses
-        (INV-5 — one classification site for both terminal-write paths).
+        ``None``, the stamp defaults per *resolved_by* via
+        ``_stamped_resolution_class``, the stamp site ``resolve()``,
+        ``submit_resolved`` and ``_capture_late_resolution`` share (INV-5).
         An unregistered ``escalation.category`` likewise raises
         ``UnregisteredEscalationCategory`` before any mutation (see
-        ``escalation.categories``).
+        ``escalation.categories``), and so does a ``note_to_file`` flag whose
+        stamped class is not ``NOTE_TO_FILE_CLASS``, or that class without the
+        flag, as ``ValueError`` naming both values.
 
         Contract:
         - Mutates *escalation* in-place (status/resolution/resolved_at/resolved_by)
@@ -2005,6 +2052,7 @@ class EscalationQueue:
                 f'invalid resolution_class {resolution_class!r}; '
                 f'expected one of {sorted(RESOLUTION_CLASSES)} or None'
             )
+        stamped_class = _stamped_resolution_class(escalation, resolution_class, resolved_by)
 
         # Step 1: mutate in memory
         escalation.status = 'resolved'
@@ -2012,10 +2060,7 @@ class EscalationQueue:
         escalation.resolved_at = datetime.now(UTC).isoformat()
         if resolved_by is not None:
             escalation.resolved_by = resolved_by
-        escalation.resolution_class = (
-            resolution_class if resolution_class is not None
-            else default_resolution_class_for_resolver(resolved_by)
-        )
+        escalation.resolution_class = stamped_class
 
         # Step 2: atomic write + best-effort archive under the per-id lock.
         # The lock prevents a concurrent same-id RMW from clobbering this write.
@@ -3056,16 +3101,15 @@ class EscalationQueue:
         record in one sweep is aged against the same instant.
 
         Returns the number of escalations where resolve() returned non-None.
-        In the common single-writer case this equals the number actually dismissed.
-        In a concurrent-write race (another process resolves an escalation between
-        get_pending() and resolve()), resolve() is a no-op but still returns the
-        existing escalation, so the count may include those no-ops.  The counter
-        is best read as "attempted dismissals, including no-ops for concurrent
-        resolutions".  This function is single-writer in practice.  The count
-        does NOT distinguish the three per-record outcomes — age-annotated,
-        strand-stamped, or ``pending_secs=unknown`` for a record whose
-        timestamp would not parse; a caller that needs that detail reads the
-        resolved records themselves.
+        This is an UPPER BOUND on the records this call dismissed, not an exact
+        count.  Other processes, among them fused-memory's middlewares and
+        reconciliation, write this queue directory concurrently, so a record
+        one of them resolves between get_pending() and resolve() is still
+        counted: resolve() on an already-terminal record is a no-op that
+        returns the stored record.  Nor does the count distinguish the three
+        per-record outcomes — age-annotated, strand-stamped, or
+        ``pending_secs=unknown`` for a record whose timestamp would not parse;
+        a caller that needs that detail reads the resolved records themselves.
         """
         pending = self.get_pending()
         now = now or datetime.now(UTC)

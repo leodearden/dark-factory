@@ -24,6 +24,54 @@
       "severity": "suggestion",
       "description": "focusOnBounds() applies a padding multiplier (default 1.2) to maxDim before computing camera distance, while the existing fitToView() and flyToEntity() do not. This means focusOnBounds-based views will have 20% more whitespace around the target than direct calls, creating inconsistent zoom behavior.",
       "mutation_type": "obvious_copy"
+    },
+    {
+      "id": "ts_obvious_copy_pool_01",
+      "location": "gui/src/viewport/selection.ts:301",
+      "category": "api_not_exposed",
+      "severity": "blocking",
+      "description": "focusOnBounds and focusOnEntities are added only as closure-local functions inside createSelection. Neither is declared on the SelectionContext interface (selection.ts:29-37) nor included in the object createSelection returns (selection.ts:301), so no caller, including the measurement tool the task names, can invoke them. The task requirement to surface both on SelectionContext is undelivered and the change has no observable effect.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "ts_obvious_copy_pool_02",
+      "location": "gui/src/__tests__/viewport/selection.test.ts",
+      "category": "missing_tests",
+      "severity": "blocking",
+      "description": "The task test strategy requires unit tests for focusOnBounds and focusOnEntities (camera on the current view axis at the expected distance, lookAt on the box centre, centre copied into controls.target, and no-op for an empty Box3 and for entity paths absent from getMeshes()). The change adds no tests at all; the only file touched is selection.ts.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "ts_obvious_copy_pool_03",
+      "location": "gui/src/viewport/selection.ts:248-251",
+      "category": "misleading_comment",
+      "severity": "suggestion",
+      "description": "The focusOnBounds docstring claims it is 'Used by the measurement tool to focus on measured geometry', but no measurement tool exists in gui/src and nothing calls the function. The docstring names a caller instead of the contract and omits what a caller needs: it keeps the current view direction, moves controls.target to the box centre, padding multiplies the largest box dimension, and an empty box is a no-op.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "ts_obvious_copy_pool_04",
+      "location": "gui/src/viewport/selection.ts:279-281",
+      "category": "redundant_lookup",
+      "severity": "suggestion",
+      "description": "focusOnEntities calls getMeshes() once per entity path inside its loop instead of fetching the map once, unlike setHovered and fitToView in the same file which hoist it. With the current provider (meshManager.getSceneMeshes returns its stored Map) the cost is negligible, so this is a consistency nit, not a measurable performance problem.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "ts_obvious_copy_pool_05",
+      "location": "gui/src/viewport/selection.ts:283",
+      "category": "redundant_guard",
+      "severity": "suggestion",
+      "description": "focusOnEntities checks box.isEmpty() and returns before calling focusOnBounds, which performs the identical isEmpty() check on its first line; the empty-box no-op invariant has two homes.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "ts_obvious_copy_pool_06",
+      "location": "gui/src/viewport/selection.ts:259-266",
+      "category": "degenerate_input",
+      "severity": "suggestion",
+      "description": "focusOnBounds does not guard a non-empty zero-size box (e.g. a single measured point, where min equals max) or a non-positive padding: maxDim*padding becomes 0 (or negative), so distance is 0 (or negative) and the camera is placed on (or past) the box centre, leaving lookAt(center) degenerate. The function is aimed at measured geometry, where point-sized boxes are plausible; the pre-existing fitToView/flyToEntity share the zero-size weakness.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "context": {

@@ -172,8 +172,8 @@ elif resolve["status"] == "refused":
     # Do NOT retry and do NOT record a task id.
     note_refused(resolve["reason"])
 elif resolve["status"] == "awaiting_curation":
-    # The curator's pool could not serve: the ticket is durably parked and
-    # retried automatically. No task_id yet. Do NOT re-submit; see
+    # The curator could not judge it yet: the ticket is durably parked and
+    # retried until it gets a verdict. No task_id yet. Do NOT re-submit; see
     # skills/_shared/ticket-failure-handling.md.
     note_parked(ticket)
 elif resolve["status"] == "failed":
@@ -558,10 +558,11 @@ If the block was caused by missing architectural context, write it to memory so 
 
 ```
 add_memory(
-  content="<the decision or convention that was missing>",
+  content="Task 3127 was blocked on <the decision or convention that was missing>",
   category="decisions_and_rationale",  # or "preferences_and_norms" for conventions
   project_id="<target project_id from TARGET_CONFIG>",
-  agent_id="claude-interactive"
+  agent_id="claude-interactive",
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the blocked task id here and in content; [] if none
 )
 ```
 

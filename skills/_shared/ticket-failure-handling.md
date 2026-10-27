@@ -42,9 +42,10 @@ record that verbatim wherever you would have recorded the created task id.
 ## `awaiting_curation`
 
 `awaiting_curation` is **non-terminal**, and neither a failure nor a creation.
-The curator's account pool could not serve, so the ticket is durably parked and
-the ticket janitor retries it until the curator reaches a verdict: it is later
-created, combined or refused.  **There is no `task_id` yet.**
+The curator could not judge the submission yet (the ticket's `reason` says
+why), so the ticket is durably parked and the ticket janitor retries it until
+the curator reaches a verdict: it is later created, combined or refused.
+**There is no `task_id` yet.**
 
 Record the ticket id where you would have recorded the task id, and do NOT
 re-submit (a second `submit_task` files a duplicate ticket).  Do not count it as

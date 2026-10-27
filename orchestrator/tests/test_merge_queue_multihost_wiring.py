@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _gate_fixtures import TEST_DEPLOYED_SHA, gated_remote_runner
-from _merge_lane_fakes import FakeVerifier, raises
+from _merge_lane_fakes import FakeVerifier, hangs_until, raises
 from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
@@ -32,7 +32,7 @@ from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
 from orchestrator.remote_gate import RunnerUnavailableKind
 from orchestrator.verify import VerifyResult
-from orchestrator.verify_runner import HostAllocator, HostLease, RemoteRunner
+from orchestrator.verify_runner import HostAllocator, RemoteRunner
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -84,11 +84,11 @@ def _make_runner_cfg(
 
 
 class TestBuildRemoteRunners:
-    """Tests for _build_remote_runners(config, cwd, *, deployed_sha, quarantine=None) -> list[RemoteRunner]."""
+    """Tests for build_remote_runners(config, cwd, *, deployed_sha, quarantine=None) -> list[RemoteRunner]."""
 
     def _call(self, config, cwd='/repo', *, quarantine=None):
-        from orchestrator.merge_lane.worker import _build_remote_runners
-        return _build_remote_runners(
+        from orchestrator.verify_hosts import build_remote_runners
+        return build_remote_runners(
             config, cwd, deployed_sha=TEST_DEPLOYED_SHA, quarantine=quarantine,
         )
 
@@ -197,7 +197,7 @@ class TestBuildRemoteRunners:
 
 
 class TestBuildRemoteRunnersGatePaths:
-    """Each RemoteRunner built by _build_remote_runners gets its gate layout.
+    """Each RemoteRunner built by build_remote_runners gets its gate layout.
 
     - df_remote_checkout / gate root == its VerifyRunnerConfig.gate_paths();
     - deployed_sha == the one passed in, on every runner;
@@ -206,8 +206,8 @@ class TestBuildRemoteRunnersGatePaths:
     """
 
     def _call(self, config, cwd='/repo', *, quarantine=None):
-        from orchestrator.merge_lane.worker import _build_remote_runners
-        return _build_remote_runners(
+        from orchestrator.verify_hosts import build_remote_runners
+        return build_remote_runners(
             config, cwd, deployed_sha=TEST_DEPLOYED_SHA, quarantine=quarantine,
         )
 
@@ -409,41 +409,6 @@ class _BodyVerifier(FakeVerifier):
 
     async def run_scoped(self, worktree, config, module_configs, task_files=None, **options):
         return await self.body(worktree, config, module_configs, task_files, **options)
-
-
-class _TwoHostAllocator:
-    """``HostAllocator`` double that leases out the runner doubles a test owns.
-
-    For the one case that must drive a local leg it controls — a verify that
-    parks on a gate, so the detective is observably in flight.  Drift tests
-    that only need the two legs to agree or diverge use the REAL
-    ``HostAllocator`` instead (see ``TestRunDriftCheck._drift_allocator``),
-    because only the real one builds the local trust anchor from the drift
-    check's own factory.
-    """
-
-    def __init__(self, local, remote):
-        self._local = local
-        self._remote = remote
-        self.released: list[str] = []
-
-    def acquire_local(self, factory):
-        """Lease the test-owned local double — but build the factory's runner
-        first, exactly where the real allocator builds it.
-
-        The product is dropped rather than leased (this double exists so a
-        test can dispatch on a runner it controls), yet invoking the factory
-        still matters: it is the only thing keeping a double that bypasses the
-        local leg from also silencing a broken ``_local_factory``.
-        """
-        factory()
-        return HostLease(name=self._local.name, runner=self._local, is_local=True)
-
-    def acquire_remote(self):
-        return HostLease(name=self._remote.name, runner=self._remote, is_local=False)
-
-    async def release(self, lease):
-        self.released.append(lease.name)
 
 
 # ---------------------------------------------------------------------------
@@ -1114,12 +1079,10 @@ class TestRunDriftCheck:
     def _drift_allocator(self, *, remote_result=None, quarantine=None):
         """The REAL allocator, pre-loaded with the remote leg as a double.
 
-        Real, not a double, because ``HostAllocator.acquire_local`` is what
-        invokes ``_run_drift_check``'s local factory: the local leg is then
-        the ``LocalRunner`` the drift check builds for itself — over the
-        throwaway checkout, with the full-gate spec — rather than a runner
-        handed in by the test, and the genuine acquire/release/quarantine
-        predicate runs.  That leg verifies through
+        Real, not a double, so the genuine acquire/release/quarantine
+        predicate runs.  The local leg is the ``LocalRunner`` the drift check
+        builds for itself — over the throwaway checkout, with the full-gate
+        spec — rather than a runner handed in by the test.  That leg verifies through
         ``orchestrator.merge_lane.worker.run_scoped_verification``, which conftest's
         autouse fixture already answers with a pass, so the agree/diverge
         matrix is driven entirely by *remote_result*.
@@ -1158,9 +1121,8 @@ class TestRunDriftCheck:
         """The throwaway checkout is created, verified in, and cleaned up.
 
         The middle statement is the one with teeth: the drift check's LOCAL
-        trust anchor is the LocalRunner the allocator builds from
-        ``_run_drift_check``'s own factory, and this pins what that runner was
-        built over — the throwaway checkout, not the merge worktree — and what
+        trust anchor is the LocalRunner ``_run_drift_check`` seats on its local
+        slot, and this pins what that runner was built over — the throwaway checkout, not the merge worktree — and what
         it dispatches — the FULL gate (``task_files=None``), not the scoped
         spec whose verdict the drift check exists to re-check (task 2886 fix
         1b, the entire reason it re-dispatches instead of reusing that
@@ -1188,8 +1150,8 @@ class TestRunDriftCheck:
 
         throwaway = git_ops.create_ephemeral_verify_worktree.return_value
         assert run_scoped.await_args is not None, (
-            'the local trust anchor never verified anything — the allocator '
-            'never built it from the drift check factory'
+            'the local trust anchor never verified anything — the drift '
+            'check never built it'
         )
         assert run_scoped.await_args.args[0] == throwaway, (
             'the local leg must verify in the THROWAWAY checkout '
@@ -1229,23 +1191,29 @@ class TestRunDriftCheck:
         # Escalation must have been submitted
         assert eq.submit.called
 
+def _drift_gate_worker():
+    """A minimal SpeculativeMergeWorker-like mock carrying the land hook's drift attrs.
+
+    _escalation_queue / _event_store need no setup: a MagicMock worker already
+    answers those reads with MagicMocks.  Bare-worker (no project_root):
+    _drift_state_path is None, so the drift cadence uses the in-memory
+    _drift_land_count (task 2886 fix 1a None-safe fallback); the persisted-path
+    cadence + restart survival is covered by
+    test_merge_drift.py::TestDriftCheckCadencePersistence.  _drift_check_tasks
+    starts empty, because a bare MagicMock attribute is truthy and would read
+    as a drift check already in flight.
+    """
+    worker = MagicMock()
+    worker._drift_land_count = 0
+    worker._runner_quarantine = set()
+    worker._drift_check_tasks = set()
+    worker._drift_state_path = None
+    return worker
+
+
 @pytest.mark.asyncio
 class TestMaybeRunDriftCheck:
     """_maybe_run_drift_check cadence gate."""
-
-    def _make_worker(self, config):
-        """Build a minimal SpeculativeMergeWorker-like mock with drift attrs."""
-        worker = MagicMock()
-        worker._drift_land_count = 0
-        worker._runner_quarantine = set()
-        # _escalation_queue / _event_store need no setup: a MagicMock worker
-        # already answers those reads with MagicMocks.
-        # Bare-worker (no project_root): _drift_state_path is None, so the drift
-        # cadence uses the in-memory _drift_land_count (task 2886 fix 1a
-        # None-safe fallback).  The persisted-path cadence + restart survival
-        # is covered by test_merge_drift.py::TestDriftCheckCadencePersistence.
-        worker._drift_state_path = None
-        return worker
 
     async def test_no_trigger_when_no_enabled_runners(self, tmp_path):
         """_maybe_run_drift_check is a no-op when verify_runners is empty."""
@@ -1254,7 +1222,7 @@ class TestMaybeRunDriftCheck:
         config = _make_config(verify_runners=[])
         req = _make_merge_request(config, worktree=tmp_path)
         git_ops = _make_git_ops_mock()
-        worker = self._make_worker(config)
+        worker = _drift_gate_worker()
 
         with patch('asyncio.create_task') as mock_create_task:
             await _maybe_run_drift_check(worker, git_ops, req, 'sha1', verifier=PRODUCTION_VERIFIER)
@@ -1271,7 +1239,7 @@ class TestMaybeRunDriftCheck:
         )
         req = _make_merge_request(config, worktree=tmp_path)
         git_ops = _make_git_ops_mock()
-        worker = self._make_worker(config)
+        worker = _drift_gate_worker()
 
         with patch('asyncio.create_task') as mock_create_task:
             # First land (count=1): no trigger
@@ -1299,7 +1267,7 @@ class TestMaybeRunDriftCheck:
         config = _make_config(verify_runners=[_make_runner_cfg('r1')], drift_every_n=100)
         req = _make_merge_request(config, worktree=tmp_path)
         git_ops = _make_git_ops_mock()
-        worker = self._make_worker(config)
+        worker = _drift_gate_worker()
 
         with patch('asyncio.create_task'):
             await _maybe_run_drift_check(worker, git_ops, req, 'sha1', verifier=PRODUCTION_VERIFIER)
@@ -1323,16 +1291,6 @@ class TestDriftCheckTaskGCSafety:
     in the worker, the drift detective can be GC'd mid-run and a
     remote-PASS / local-FAIL divergence goes undetected.
     """
-
-    def _make_worker_with_tasks(self, config):
-        """_make_worker extended with _drift_check_tasks (additive)."""
-        worker = MagicMock()
-        worker._drift_land_count = 0
-        worker._runner_quarantine = set()
-        worker._drift_check_tasks = set()
-        # Bare-worker: _drift_state_path None → in-memory cadence (fix 1a).
-        worker._drift_state_path = None
-        return worker
 
     async def test_worker_init_has_drift_check_tasks_attr(self):
         """(a) SpeculativeMergeWorker.__init__ sets _drift_check_tasks = set()."""
@@ -1358,43 +1316,35 @@ class TestDriftCheckTaskGCSafety:
         )
         req = _make_merge_request(config, worktree=tmp_path)
         git_ops = _make_drift_git_ops(tmp_path)
-        worker = self._make_worker_with_tasks(config)
+        worker = _drift_gate_worker()
 
-        gate = asyncio.Event()
-        task_holder: list = []
+        gate, entered = asyncio.Event(), asyncio.Event()
+        drift_tasks: list = []
 
-        # The real _run_drift_check is spawned: its local trust-anchor leg is a
-        # runner double that parks on `gate`, so the detective is genuinely
-        # in flight while the assertions below read the tracking set.  Nothing
-        # about the spawn is stubbed.
-        async def _gated_verify(*_args, **_kwargs):
-            task_holder.append(asyncio.current_task())
-            await gate.wait()
-            return _make_pass_result()
-
-        local = _runner_double('local', is_local=True)
-        local.run_merge_verify = AsyncMock(side_effect=_gated_verify)
+        # The real _run_drift_check is spawned over the REAL allocator: its
+        # local trust-anchor leg verifies through a port that parks on `gate`,
+        # so the detective is genuinely in flight while the assertions below
+        # read the tracking set.  Nothing about the spawn is stubbed.
         remote = _runner_double('laptop', is_local=False)
         worker._ensure_host_allocator = MagicMock(
-            return_value=_TwoHostAllocator(local, remote)
+            return_value=HostAllocator([remote], quarantine=set())
         )
+        verifier = FakeVerifier(default=hangs_until(gate, entered=entered))
 
         try:
-            await _maybe_run_drift_check(worker, git_ops, req, 'sha1', verifier=PRODUCTION_VERIFIER)
-
-            # Yield so the scheduler starts the task and it reaches gate.wait()
-            await asyncio.sleep(0)
+            await _maybe_run_drift_check(worker, git_ops, req, 'sha1', verifier=verifier)
+            await wait_responsive(entered.wait(), label='the drift local leg to park')
 
             # (b) While in-flight: task must be strongly referenced in the set
-            assert len(worker._drift_check_tasks) == 1, (
+            drift_tasks = list(worker._drift_check_tasks)
+            assert len(drift_tasks) == 1, (
                 'drift-check task not in _drift_check_tasks while in-flight '
                 '— event loop may GC the detective mid-run'
             )
 
             # Release the gate and let the task run to completion
             gate.set()
-            if task_holder:
-                await asyncio.gather(*task_holder, return_exceptions=True)
+            await asyncio.gather(*drift_tasks, return_exceptions=True)
             await asyncio.sleep(0)  # flush done-callback
 
             # (c) After completion: done-callback must have discarded the task
@@ -1403,8 +1353,7 @@ class TestDriftCheckTaskGCSafety:
             )
         finally:
             gate.set()  # always unblock the coroutine even if assertions failed
-            if task_holder:
-                await asyncio.gather(*task_holder, return_exceptions=True)
+            await asyncio.gather(*drift_tasks, return_exceptions=True)
             await asyncio.sleep(0)
 
 

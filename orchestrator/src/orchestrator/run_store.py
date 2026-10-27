@@ -5,16 +5,286 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, get_type_hints
 
+from shared.sqlite_column_migration import add_column_if_missing_sync
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
+
+from orchestrator.shadow_types import (
+    CostBasis,
+    PlanSource,
+    ReferenceKind,
+    ShadowCellState,
+    ShadowShape,
+)
+from orchestrator.workflow_types import WorkflowOutcome
 
 if TYPE_CHECKING:
     from orchestrator.harness import HarnessReport, TaskReport
 
 logger = logging.getLogger(__name__)
+
+# One blank-character set for every "non-empty text" rule, in the record and in the DDL.
+_BLANK_CHARS = ' \t\n\r'
+_STRATUM_SEPARATOR = '×'
+_SHADOW_CELL_DEFAULT_OWNER = 'shadow_coordinator'
+
+
+def _is_blank(text: str | None) -> bool:
+    return text is None or not text.strip(_BLANK_CHARS)
+
+
+@dataclass(frozen=True)
+class ShadowCell:
+    """One ``shadow_cells`` row (plans/live-shadow-eval-prd.md C1); field names are its columns."""
+
+    cell_id: str
+    project_id: str
+    task_id: str
+    shape: ShadowShape
+    candidate: str
+    incumbent: str
+    stratum: tuple[str, str, str]
+    base_sha: str
+    state: ShadowCellState
+    cost_basis: CostBasis
+    opened_at: datetime
+    settle_deadline: datetime
+    parent_cell_id: str | None = None
+    worktree_path: Path | None = None
+    plan_source: PlanSource | None = None
+    reason: str | None = None
+    reference_kind: ReferenceKind | None = None
+    reference_sha: str | None = None
+    result_path: Path | None = None
+    cost_usd: float = 0.0
+    cost_credits: float = 0.0
+    run_id: str | None = None
+    running_at: datetime | None = None
+    settled_at: datetime | None = None
+    owner: str = _SHADOW_CELL_DEFAULT_OWNER
+
+    def __post_init__(self) -> None:
+        self._check_identity()
+        self._check_timestamps()
+        self._check_costs()
+        self._check_stratum()
+        if self.state.requires_reason and _is_blank(self.reason):
+            self._refuse(f'state {self.state.value!r} requires a non-blank reason (got {self.reason!r})')
+
+    def _refuse(self, invariant: str) -> None:
+        raise ValueError(f'ShadowCell {self.cell_id!r}: {invariant}')
+
+    def _check_identity(self) -> None:
+        for name in ('cell_id', 'project_id', 'task_id', 'candidate', 'incumbent', 'base_sha', 'owner'):
+            value = getattr(self, name)
+            if _is_blank(value):
+                self._refuse(f'{name} must be non-blank (got {value!r})')
+        if self.parent_cell_id == self.cell_id:
+            self._refuse(f'parent_cell_id must differ from cell_id (got {self.parent_cell_id!r})')
+
+    def _check_timestamps(self) -> None:
+        for name in ('opened_at', 'settle_deadline', 'running_at', 'settled_at'):
+            value = getattr(self, name)
+            if value is not None and value.utcoffset() is None:
+                self._refuse(f'{name} must be timezone-aware (got naive {value!r})')
+        if self.settle_deadline <= self.opened_at:
+            self._refuse(
+                f'settle_deadline must lie after opened_at '
+                f'(got {self.settle_deadline.isoformat()} <= {self.opened_at.isoformat()})'
+            )
+
+    def _check_costs(self) -> None:
+        for name in ('cost_usd', 'cost_credits'):
+            value = getattr(self, name)
+            if not value >= 0:
+                self._refuse(f'{name} must be >= 0 (got {value!r})')
+        if self.cost_basis is CostBasis.METERED and self.cost_credits != 0:
+            self._refuse(
+                f'a {CostBasis.METERED.value} arm meters dollars, never credits '
+                f'(got cost_credits={self.cost_credits!r})'
+            )
+
+    def _check_stratum(self) -> None:
+        parts = self.stratum
+        if len(parts) != 3 or any(
+            _is_blank(part) or _STRATUM_SEPARATOR in part for part in parts
+        ):
+            self._refuse(
+                f'stratum must be three non-blank parts free of {_STRATUM_SEPARATOR!r} '
+                f'(got {parts!r})'
+            )
+
+
+_REASON_REQUIRED_STATES = ', '.join(
+    f"'{state.value}'" for state in ShadowCellState if state.requires_reason
+)
+_SQL_BLANK_CHARS = f"char({', '.join(str(ord(c)) for c in _BLANK_CHARS)})"
+
+_SHADOW_CELLS_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS shadow_cells (
+    cell_id         TEXT PRIMARY KEY,
+    parent_cell_id  TEXT,
+    project_id      TEXT NOT NULL,
+    task_id         TEXT NOT NULL,
+    shape           TEXT NOT NULL,
+    candidate       TEXT NOT NULL,
+    incumbent       TEXT NOT NULL,
+    stratum         TEXT NOT NULL,
+    base_sha        TEXT NOT NULL,
+    worktree_path   TEXT,
+    plan_source     TEXT,
+    state           TEXT NOT NULL,
+    reason          TEXT,
+    reference_kind  TEXT,
+    reference_sha   TEXT,
+    result_path     TEXT,
+    cost_usd        REAL NOT NULL DEFAULT 0,
+    cost_credits    REAL NOT NULL DEFAULT 0,
+    cost_basis      TEXT NOT NULL,
+    run_id          TEXT,
+    opened_at       TEXT NOT NULL,
+    running_at      TEXT,
+    settled_at      TEXT,
+    settle_deadline TEXT NOT NULL,
+    owner           TEXT NOT NULL DEFAULT '{_SHADOW_CELL_DEFAULT_OWNER}',
+    CHECK (state NOT IN ({_REASON_REQUIRED_STATES})
+           OR trim(coalesce(reason, ''), {_SQL_BLANK_CHARS}) <> ''),
+    CHECK (cost_basis <> '{CostBasis.METERED.value}' OR cost_credits = 0),
+    CHECK (cost_usd >= 0 AND cost_credits >= 0),
+    CHECK (trim(owner, {_SQL_BLANK_CHARS}) <> ''),
+    CHECK (parent_cell_id IS NULL OR parent_cell_id <> cell_id)
+);
+"""
+
+_SHADOW_CELL_COLUMNS = tuple(field.name for field in fields(ShadowCell))
+_SHADOW_CELL_ENUM_COLUMNS: dict[str, type[StrEnum]] = {
+    'shape': ShadowShape,
+    'state': ShadowCellState,
+    'cost_basis': CostBasis,
+    'plan_source': PlanSource,
+    'reference_kind': ReferenceKind,
+}
+_SHADOW_CELL_TIME_COLUMNS = ('opened_at', 'settle_deadline', 'running_at', 'settled_at')
+_SHADOW_CELL_PATH_COLUMNS = ('worktree_path', 'result_path')
+_PARENT_SHARED_COLUMNS = ('project_id', 'task_id', 'base_sha')
+
+
+def _shadow_cell_to_row(cell: ShadowCell) -> dict[str, Any]:
+    row: dict[str, Any] = {name: getattr(cell, name) for name in _SHADOW_CELL_COLUMNS}
+    for name in _SHADOW_CELL_ENUM_COLUMNS:
+        row[name] = None if row[name] is None else row[name].value
+    for name in _SHADOW_CELL_TIME_COLUMNS:
+        row[name] = None if row[name] is None else row[name].astimezone(UTC).isoformat()
+    for name in _SHADOW_CELL_PATH_COLUMNS:
+        row[name] = None if row[name] is None else str(row[name])
+    row['stratum'] = _STRATUM_SEPARATOR.join(cell.stratum)
+    return row
+
+
+def _shadow_cell_from_row(row: sqlite3.Row) -> ShadowCell:
+    values: dict[str, Any] = {name: row[name] for name in _SHADOW_CELL_COLUMNS}
+    for name, enum_cls in _SHADOW_CELL_ENUM_COLUMNS.items():
+        values[name] = _decode_enum(values['cell_id'], name, enum_cls, values[name])
+    for name in _SHADOW_CELL_TIME_COLUMNS:
+        values[name] = None if values[name] is None else datetime.fromisoformat(values[name])
+    for name in _SHADOW_CELL_PATH_COLUMNS:
+        values[name] = None if values[name] is None else Path(values[name])
+    values['stratum'] = tuple(values['stratum'].split(_STRATUM_SEPARATOR))
+    return ShadowCell(**values)
+
+
+def _decode_enum(
+    cell_id: str, column: str, enum_cls: type[StrEnum], raw: str | None,
+) -> StrEnum | None:
+    if raw is None:
+        return None
+    try:
+        return enum_cls(raw)
+    except ValueError:
+        raise ValueError(
+            f'shadow_cells row {cell_id!r}: unknown {column} value {raw!r}'
+        ) from None
+
+
+_INSERT_SHADOW_CELL_SQL = (
+    f'INSERT INTO shadow_cells ({", ".join(_SHADOW_CELL_COLUMNS)}) '
+    f'VALUES ({", ".join(f":{name}" for name in _SHADOW_CELL_COLUMNS)})'
+)
+
+
+def _require_valid_parent(conn: sqlite3.Connection, cell: ShadowCell) -> None:
+    parent = conn.execute(
+        f'SELECT {", ".join(_PARENT_SHARED_COLUMNS)} FROM shadow_cells WHERE cell_id = ?',
+        (cell.parent_cell_id,),
+    ).fetchone()
+    if parent is None:
+        raise ValueError(
+            f'ShadowCell {cell.cell_id!r}: parent_cell_id {cell.parent_cell_id!r} '
+            f'names no stored cell'
+        )
+    for column in _PARENT_SHARED_COLUMNS:
+        if parent[column] != getattr(cell, column):
+            raise ValueError(
+                f'ShadowCell {cell.cell_id!r}: parent {cell.parent_cell_id!r} has '
+                f'{column}={parent[column]!r} but the child has '
+                f'{column}={getattr(cell, column)!r}; a child cell shares its '
+                f"parent's project, task and base"
+            )
+
+
+@dataclass(frozen=True)
+class TaskResultRecord:
+    """One typed ``task_results`` row.
+
+    A NULL cost or counter reads 0, as in ``RunStore.get_task_cost``; NULL block
+    fields mean the row predates task 3068.
+    """
+
+    run_id: str
+    project_id: str
+    task_id: str
+    title: str | None
+    outcome: WorkflowOutcome
+    cost_usd: float
+    steward_cost_usd: float
+    steward_invocations: int
+    duration_ms: int
+    agent_invocations: int
+    execute_iterations: int
+    verify_attempts: int
+    review_cycles: int
+    completed_at: datetime | None
+    block_reason: str | None
+    block_phase: str | None
+
+
+_TASK_RESULT_COLUMNS = tuple(field.name for field in fields(TaskResultRecord))
+_TASK_RESULT_NUMERIC_TYPES = {
+    name: hint for name, hint in get_type_hints(TaskResultRecord).items() if hint in (int, float)
+}
+
+
+def _task_result_from_row(row: sqlite3.Row) -> TaskResultRecord:
+    values: dict[str, Any] = {name: row[name] for name in _TASK_RESULT_COLUMNS}
+    try:
+        values['outcome'] = WorkflowOutcome(values['outcome'])
+    except ValueError:
+        raise ValueError(
+            f'task_results row for task {values["task_id"]!r} (run {values["run_id"]!r}): '
+            f'unknown outcome {values["outcome"]!r}'
+        ) from None
+    for name, numeric_type in _TASK_RESULT_NUMERIC_TYPES.items():
+        values[name] = numeric_type(values[name] or 0)
+    values['completed_at'] = (
+        datetime.fromisoformat(values['completed_at']) if values['completed_at'] else None
+    )
+    return TaskResultRecord(**values)
+
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS runs (
@@ -90,7 +360,7 @@ CREATE TABLE IF NOT EXISTS main_sweep_cold_control (
     verdict_at  TEXT NOT NULL,
     swept_sha   TEXT NOT NULL
 );
-"""
+""" + _SHADOW_CELLS_SCHEMA
 
 
 class RunStore:
@@ -138,16 +408,12 @@ class RunStore:
     def _migrate_task_results_block_context(self, conn: sqlite3.Connection) -> None:
         """Add ``block_reason``/``block_phase`` to a pre-3068 ``task_results``.
 
-        Deliberately additive-only, with no ``PRAGMA user_version`` ladder:
-        ``RunStore`` has never had one, and this change needs no destructive
-        table rebuild, so the light feature-detect idiom
-        (``ticket_store._migrate_add_escalated_at`` /
-        ``write_journal._migrate``) is sufficient.  Introducing a version
-        header to an existing un-versioned DB would itself need a "version 0
-        means unknown" special case, for no benefit.
+        Additive-only, with no ``PRAGMA user_version`` ladder (``RunStore`` has
+        never had one), per the rule in
+        ``shared/src/shared/sqlite_column_migration.py``.
 
         Idempotent, and a no-op on a fresh DB — ``_SCHEMA`` already declares
-        both columns there, so ``PRAGMA table_info`` finds them present.
+        both columns there, so the probe finds them present.
 
         Existing rows read NULL for both columns, which is exactly right: NULL
         means "row predates task 3068", while ``''`` (what both writers now
@@ -159,33 +425,14 @@ class RunStore:
         ``RunStore(db_path)`` in ``except Exception: logger.error(...)`` and
         continues, so a raise here does NOT halt the run — it drops
         ``task_results`` persistence for the whole run.  That is strictly worse
-        than writing NULLs, so we do NOT raise on the one failure mode that is
-        both plausible and benign: a concurrent construction that already added
-        the column.  ``duplicate column name`` means the migration's goal is
-        met, and is swallowed per-column.  Everything else (a corrupt DB, a
-        lock we could not take inside the busy_timeout) still surfaces, because
-        those are real and a silent half-migrated schema would be worse.
+        than writing NULLs, which is why tolerating a concurrent construction
+        that already added the column matters here.
         """
-        existing = {row[1] for row in conn.execute('PRAGMA table_info(task_results)')}
-        added = []
-        for column in ('block_reason', 'block_phase'):
-            if column in existing:
-                continue
-            try:
-                # Column name is a hard-coded literal, never caller input.
-                conn.execute(f'ALTER TABLE task_results ADD COLUMN {column} TEXT')
-            except sqlite3.OperationalError as exc:
-                # Another RunStore construction won the race between our
-                # table_info read and this ALTER.  The column exists, which is
-                # all we wanted; raising would cost the caller task_results
-                # persistence for an entire run over a no-op.
-                if 'duplicate column name' not in str(exc).lower():
-                    raise
-                logger.debug(
-                    'RunStore: task_results.%s already added concurrently', column,
-                )
-                continue
-            added.append(column)
+        added = [
+            column
+            for column in ('block_reason', 'block_phase')
+            if add_column_if_missing_sync(conn, 'task_results', column, 'TEXT')
+        ]
         if added:
             conn.commit()
             logger.info(
@@ -196,13 +443,10 @@ class RunStore:
         """Add ``ewa_value`` to a pre-4559 ``scheduler_state``.
 
         Same shape as :meth:`_migrate_task_results_block_context`, deliberately:
-        additive-only, ``PRAGMA table_info`` feature-detect, no
-        ``PRAGMA user_version`` ladder.  ``RunStore`` has never had a version
-        header, and adding one to an existing un-versioned DB would itself need
-        a "version 0 means unknown" special case for no benefit.
+        additive-only, no ``PRAGMA user_version`` ladder.
 
         Idempotent, and a no-op on a fresh DB — ``_SCHEMA`` already declares the
-        column there, so ``PRAGMA table_info`` finds it present.
+        column there, so the probe finds it present.
 
         An existing row reads NULL, which is exactly right: NULL means "row
         predates task 4559", and ``Harness._load_persisted_scheduler_pause``
@@ -214,49 +458,22 @@ class RunStore:
         (``Harness.run``) wraps ``RunStore(db_path)`` in
         ``except Exception: logger.error(...)`` and continues, so it would drop
         persistence for the whole run rather than halt it.  That is strictly
-        worse than a NULL column, so the one plausible-and-benign failure — a
-        concurrent construction that already added the column between our
-        ``table_info`` read and this ``ALTER`` — is swallowed: ``duplicate
-        column name`` means the migration's goal is already met.  Everything
-        else (a corrupt DB, a lock we could not take inside the busy_timeout)
-        still surfaces, because a silent half-migrated schema would be worse.
+        worse than a NULL column.
         """
-        existing = {row[1] for row in conn.execute('PRAGMA table_info(scheduler_state)')}
-        if 'ewa_value' in existing:
-            return
-        try:
-            # Column name is a hard-coded literal, never caller input.
-            conn.execute('ALTER TABLE scheduler_state ADD COLUMN ewa_value REAL')
-        except sqlite3.OperationalError as exc:
-            if 'duplicate column name' not in str(exc).lower():
-                raise
-            logger.debug('RunStore: scheduler_state.ewa_value already added concurrently')
-            return
-        conn.commit()
-        logger.info('RunStore: migrated scheduler_state — added ewa_value')
+        if add_column_if_missing_sync(conn, 'scheduler_state', 'ewa_value', 'REAL'):
+            conn.commit()
+            logger.info('RunStore: migrated scheduler_state — added ewa_value')
 
     def _migrate_runs_code_sha(self, conn: sqlite3.Connection) -> None:
         """Add ``code_sha`` to a pre-6565 ``runs``.
 
         Same shape as :meth:`_migrate_scheduler_state_ewa_value`, deliberately:
-        additive-only, ``PRAGMA table_info`` feature-detect, the column added
-        LAST, a concurrent construction's ``duplicate column name`` swallowed
-        and every other failure raised.  An existing row reads NULL, meaning
-        "the run predates task 6565".
+        additive-only, the column added LAST.  An existing row reads NULL,
+        meaning "the run predates task 6565".
         """
-        existing = {row[1] for row in conn.execute('PRAGMA table_info(runs)')}
-        if 'code_sha' in existing:
-            return
-        try:
-            # Column name is a hard-coded literal, never caller input.
-            conn.execute('ALTER TABLE runs ADD COLUMN code_sha TEXT')
-        except sqlite3.OperationalError as exc:
-            if 'duplicate column name' not in str(exc).lower():
-                raise
-            logger.debug('RunStore: runs.code_sha already added concurrently')
-            return
-        conn.commit()
-        logger.info('RunStore: migrated runs — added code_sha')
+        if add_column_if_missing_sync(conn, 'runs', 'code_sha', 'TEXT'):
+            conn.commit()
+            logger.info('RunStore: migrated runs — added code_sha')
 
     def start_run(
         self,
@@ -353,6 +570,21 @@ class RunStore:
             return 0.0
         cost_usd, steward_cost_usd = row
         return float(cost_usd or 0.0) + float(steward_cost_usd or 0.0)
+
+    def get_task_outcome(self, project_id: str, task_id: str) -> TaskResultRecord | None:
+        """Production's latest recorded outcome for *task_id*, across every run."""
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                f'SELECT {", ".join(_TASK_RESULT_COLUMNS)} FROM task_results '
+                'WHERE project_id = ? AND task_id = ? '
+                'ORDER BY completed_at DESC, rowid DESC LIMIT 1',
+                (project_id, task_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        return None if row is None else _task_result_from_row(row)
 
     def finish_run(
         self,
@@ -628,3 +860,35 @@ class RunStore:
         if verdict_at.tzinfo is None:
             return verdict_at.replace(tzinfo=UTC)
         return verdict_at
+
+    # ------------------------------------------------------------------ #
+    # Shadow-eval cells (plans/live-shadow-eval-prd.md C1, task 5382)    #
+    # ------------------------------------------------------------------ #
+
+    def insert_shadow_cell(self, cell: ShadowCell) -> None:
+        """Insert a new cell; an existing ``cell_id`` raises ``sqlite3.IntegrityError``.
+
+        A ``parent_cell_id`` must name a stored cell of the same project, task
+        and base, else ``ValueError`` and nothing is written.
+        """
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            with conn:
+                conn.execute('BEGIN IMMEDIATE')
+                if cell.parent_cell_id is not None:
+                    _require_valid_parent(conn, cell)
+                conn.execute(_INSERT_SHADOW_CELL_SQL, _shadow_cell_to_row(cell))
+        finally:
+            conn.close()
+
+    def get_shadow_cell(self, cell_id: str) -> ShadowCell | None:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                'SELECT * FROM shadow_cells WHERE cell_id = ?', (cell_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return None if row is None else _shadow_cell_from_row(row)

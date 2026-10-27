@@ -25,6 +25,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_categories import FailureCategory
 
 
 def test_merge_shadow_exports_moved_public_symbols() -> None:
@@ -421,6 +422,37 @@ class TestCoarseShadowCompare:
         ):
             await _run_coarse_shadow_compare(
                 git_ops, req, 'd15cfull01020304', esc_queue, event_store,
+                verifier=PRODUCTION_VERIFIER,
+            )
+
+        esc_queue.submit.assert_not_called()
+        event_store.emit.assert_not_called()
+
+    @pytest.mark.parametrize(
+        'category',
+        [FailureCategory.LINT_ERROR, FailureCategory.TYPE_ERROR, FailureCategory.INFRA_ABORT],
+    )
+    async def test_task_4843_category_no_map_is_inconclusive_no_alarm(
+        self, category: FailureCategory,
+    ) -> None:
+        """Lint, type and abort reds are not build-STAGE failures: with no
+        parseable map they stay inconclusive, as unknown_test_failure always
+        did, instead of newly alarming a suspected red main. The build set is
+        hand-enumerated, so admitting one must be a loud, deliberate edit."""
+        from orchestrator.merge_lane.shadow import _run_coarse_shadow_compare
+
+        esc_queue = self._esc_queue()
+        event_store = MagicMock()
+        cold_red = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='cold verify red', category=category.value,
+        )
+        with patch(
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify_suite',
+            AsyncMock(return_value=cold_red), create=True,
+        ):
+            await _run_coarse_shadow_compare(
+                MagicMock(), self._req(), 'd15cfull01020304', esc_queue, event_store,
                 verifier=PRODUCTION_VERIFIER,
             )
 
@@ -964,6 +996,80 @@ def test_parse_failed_run_all_members_human_partial_summary_alone_is_empty() -> 
         )
         == []
     )
+
+
+
+_EVENT_CHANNEL_FIXTURE_DIR = Path(__file__).parent / 'fixtures' / 'reify_verify_event_channel'
+
+
+@pytest.mark.parametrize('branch', ['pool', 'serial'])
+def test_d5_channel_and_text_name_the_same_failed_run_all_members(branch: str) -> None:
+    """D5: on real captures, the channel's failed set equals the text marker's."""
+    from orchestrator.merge_lane.shadow import parse_failed_run_all_members
+    from orchestrator.verify_event_channel import (
+        encode_channel_open,
+        parse_verify_event_channel,
+    )
+
+    producer = (_EVENT_CHANNEL_FIXTURE_DIR / f'run_all-{branch}.events.jsonl').read_bytes()
+    text = (_EVENT_CHANNEL_FIXTURE_DIR / f'run_all-{branch}.log').read_text()
+    channel = parse_verify_event_channel(
+        encode_channel_open(role='merge', verify_id='V') + producer, verify_id='V',
+    )
+
+    from_channel = channel.failed_run_all_members()
+    from_text = parse_failed_run_all_members(text)
+    assert from_channel and from_text
+    assert from_channel == from_text
+
+
+@pytest.mark.parametrize(
+    'test_output',
+    [
+        pytest.param(
+            _run_all_fixture_line('FAILED test_worktree_lifecycle.sh test_skip_ledger.sh'),
+            id='clean-marker',
+        ),
+        pytest.param(_run_all_fixture_line('FAILED a.sh b.sh (partial)'), id='partial-marker'),
+        pytest.param('=== Summary: 3 discovered, 0 failed ===\n', id='no-marker'),
+    ],
+)
+def test_select_failed_run_all_members_without_a_channel_is_the_text_parse(
+    test_output: str,
+) -> None:
+    from orchestrator.merge_lane.shadow import (
+        parse_failed_run_all_members,
+        select_failed_run_all_members,
+    )
+
+    assert select_failed_run_all_members(test_output, None) == (
+        parse_failed_run_all_members(test_output)
+    )
+
+
+@pytest.mark.parametrize(
+    ('channel_members', 'expected'),
+    [
+        pytest.param(['b.sh'], ['b.sh'], id='channel-names-win'),
+        pytest.param([], [], id='channel-refusal-wins'),
+    ],
+)
+def test_select_failed_run_all_members_prefers_a_present_channel(
+    channel_members: list[str], expected: list[str],
+) -> None:
+    from orchestrator.merge_lane.shadow import select_failed_run_all_members
+
+    assert select_failed_run_all_members('FAILED a.sh\n', channel_members) == expected
+
+
+def test_select_failed_run_all_members_returns_its_own_list() -> None:
+    from orchestrator.merge_lane.shadow import select_failed_run_all_members
+
+    channel_members = ['b.sh']
+    selected = select_failed_run_all_members('FAILED a.sh\n', channel_members)
+    selected.append('c.sh')
+
+    assert channel_members == ['b.sh']
 
 
 def test_build_fail_fast_map_marks_cancelled_tests_not_started() -> None:
