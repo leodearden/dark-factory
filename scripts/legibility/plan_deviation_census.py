@@ -6,7 +6,6 @@ Design and rationale: plans/plan-deviation-recording-prd.md D8-D11.
 """
 from __future__ import annotations
 
-import functools
 import json
 import logging
 import math
@@ -21,8 +20,9 @@ from escalation.categories import EscalationCategory
 from escalation.disposition import ObservationConsumed
 from escalation.models import NOTE_TO_FILE_CLASS, Escalation, normalised_severity
 from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
-from legibility import census_trigger, state_docs, trickle_state
+from legibility import state_docs, trickle_state
 from legibility.config import LegibilityConfig, PlanDeviationCensus
+from shared.mcp_session import SyncMcpSession
 from shared.plan_deviation import DEVIATION_KINDS
 from shared.project_layout import escalation_queue_dir
 
@@ -550,11 +550,15 @@ def _failure(exc: BaseException) -> str:
 
 
 def _default_call_tool(cfg: LegibilityConfig) -> CallTool:
-    return functools.partial(
-        census_trigger.post_mcp_tool_call,
-        f'http://localhost:{cfg.escalation_port}/mcp',
-        timeout=_MCP_TIMEOUT_SECS,
-    )
+    def call_tool(tool_name: str, arguments: dict) -> dict:
+        with SyncMcpSession(
+            f'http://localhost:{cfg.escalation_port}',
+            client_name='legibility-plan-deviation-census',
+            timeout=_MCP_TIMEOUT_SECS,
+        ) as session:
+            return session.call_tool(tool_name, arguments)
+
+    return call_tool
 
 
 def run(
