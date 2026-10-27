@@ -737,14 +737,13 @@ _COMPACT_ESCALATION_FIELDS = (
     # (orphaned_recon_escalation_sweep.py::escalation_project_id and
     # derive_orphaned_recon_escalations.py) read FULL records, so nothing needs
     # it; (2) `None` means UNSTAMPED, and `attach_dedupe_child` never backfills a
-    # folded parent, so the ~117 records pending when 4951 landed will never
-    # carry it — a compact reader would see `null`, could not tell "legacy" from
-    # "no project", and would STILL need a get_escalation round-trip for exactly
-    # the records it cares about; (3) it costs ~20 bytes (`"project_id":null`) on
+    # folded parent, so a parent filed before 4951 never gains it — a compact
+    # reader would see `null`, could not tell "legacy" from "no project", and
+    # would STILL need a get_escalation round-trip for exactly the records it
+    # cares about; (3) it costs ~20 bytes (`"project_id":null`) on
     # EVERY compact row, including the dashboard's fetch_pins_recovery poll that
     # reads nothing but `pins_recovery`, for a value that is null on the
-    # overwhelming majority; (4) widening breaks the exact-key assertions in
-    # escalation/tests/test_server.py for no consumer.
+    # overwhelming majority.
     #
     # IF A PROJECT-SCOPED COMPACT DRAIN EVER EXISTS: add a server-side
     # `project_id` filter to get_pending_escalations (one filtered value per
