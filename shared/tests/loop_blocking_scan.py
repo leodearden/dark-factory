@@ -158,10 +158,10 @@ _DIRECTORY_ENTRY_WRITE_WHY = (
 )
 _PATH_RESOLUTION_WHY = (
     'filesystem metadata: path normalisation issues one lstat per path '
-    'component plus a readlink per symlink -- measured 19-33us for a 4-9 '
-    'component path (task 6089: 20000-call timeit, CPython 3.13.9), unbounded '
-    'against a cold, network or wedged filesystem, and the coroutine cannot '
-    'tell which it got'
+    'component plus a readlink per symlink -- cheap against a warm dentry '
+    'cache (measured: plans/inv8-caller-side-census-2026-09-03.md section '
+    '4d), unbounded against a cold, network or wedged filesystem, and the '
+    'coroutine cannot tell which it got'
 )
 
 # Dotted paths, matched after `import X as Y` alias substitution

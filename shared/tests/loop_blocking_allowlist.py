@@ -287,11 +287,10 @@ _PATH_RESOLVE_GUARD_WHY = (
     'ROOT CAUSE (one debt, measured cheap): one Path.resolve() per '
     'invocation of a single root or database path -- never a walk over what '
     'a directory holds -- canonicalising it immediately before awaited work '
-    'that costs far more (an aiosqlite or connect_daemon open). Its cost is '
-    'one lstat per path component plus a readlink per symlink: 19-33us '
-    'measured for a 4-9 component path (task 6089: 20000-call timeit, '
-    'CPython 3.13.9). The component count is set by the path the code, '
-    'configuration or caller supplies, not by what is on disk.'
+    'that costs far more (an aiosqlite or connect_daemon open). Its cost '
+    '(census section 4d) scales with the path\'s component count, which is '
+    'set by the path the code, configuration or caller supplies, not by '
+    'what is on disk.'
     + _CHEAP_RESOLVE_OWNER_WHY
 )
 
@@ -299,9 +298,9 @@ _PATH_RESOLVE_GUARD_WHY = (
 _VERIFIER_TOOL_PATH_GUARD_WHY = (
     'ROOT CAUSE (one debt, measured cheap): CodebaseVerifier.verify\'s '
     'read_file and grep_search tools each resolve() the model-chosen path '
-    'once, as an is_relative_to(codebase_root) containment guard -- 19-33us '
-    'per tool call (task 6089: 20000-call timeit, CPython 3.13.9), and each '
-    'tool call follows an LLM turn of seconds. read_file\'s read_text after '
+    'once, as an is_relative_to(codebase_root) containment guard -- one '
+    'Path.resolve per tool call (cost: census section 4d), and each tool '
+    'call follows an LLM turn of seconds. read_file\'s read_text after '
     'the guard is TASK 5270\'s row in the same coroutine, and grep_search\'s '
     'grep is already an awaited subprocess. If 5270 offloads read_file\'s '
     'whole body, delete the read_file resolve row with it.'
@@ -315,8 +314,8 @@ _STARTUP_PATH_RESOLVE_WHY = (
     'the server and before server.serve() binds, so no request is in flight '
     'to be delayed. A background loop run_server has already started (the '
     'reconciliation harness, the event queue) can be stalled for that one '
-    'resolve, 19-33us (task 6089: 20000-call timeit, CPython 3.13.9), once '
-    'per process lifetime. If it ever moves onto a request or reload path, '
+    'resolve (cost: census section 4d), once per process lifetime. If it '
+    'ever moves onto a request or reload path, '
     'its content_hash changes and the gate re-asks.'
     + _CHEAP_RESOLVE_OWNER_WHY
 )
@@ -438,9 +437,9 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'shared.prompt_artifact.PromptArtifactStore.resolve, not '
         'Path.resolve. That code lives under shared/src, outside the '
         'scanner\'s fused-memory/src scope, and it does block: unpinned it is '
-        'one exists() probe of the key\'s heuristics.txt, measured 16-21us '
-        '(task 6089: 20000-call timeit, CPython 3.13.9); pinned it adds a '
-        'JSON provenance load and a heuristics.txt read. '
+        'one exists() probe of the key\'s heuristics.txt (cost: census '
+        'section 4d); pinned it adds a JSON provenance load and a '
+        'heuristics.txt read. '
         'PromptArtifactStore.resolve\'s own docstring states this I/O and '
         'the once-per-invocation granularity it expects. It runs once per '
         'curator LLM round-trip, immediately before the awaited self._invoke '

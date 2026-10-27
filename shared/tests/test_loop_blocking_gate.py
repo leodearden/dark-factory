@@ -1111,8 +1111,9 @@ class TestPrimitiveTable:
 
         ``await cost_store.open()`` is server/main.py::_setup_curator_usage_gate's
         async CostStore open -- the false positive widening the table exposed.
-        ``aiofiles.open`` and anyio's ``iterdir`` are the canonical INV-8 fix;
-        flagging them would be a false RED on correctly fixed code.
+        ``aiofiles.open`` and anyio's ``iterdir`` and ``resolve`` are the
+        canonical INV-8 fix; flagging them would be a false RED on correctly
+        fixed code.
         """
         async_apis = {
             'awaited store open': """

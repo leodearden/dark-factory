@@ -312,10 +312,12 @@ Their keys did not change, so the ratchet is unaffected. Each disposition still
 describes the dominant cost of its call, so no ledger text changed. One
 consequence is worth knowing. `resolve_main_checkout` calls
 `Path(path).resolve()` on EVERY call, ahead of its `_MAIN_CHECKOUT_CACHE`
-lookup, so a warm call pays it too (~19–33 µs). That cost is cheap. It is not
-part of the cold-miss fork+exec that the 23-row ticket owns.
+lookup, so a warm call pays it too (the `Path.resolve` cost below). That cost
+is cheap. It is not part of the cold-miss fork+exec that the 23-row ticket owns.
 
-**Per-call cost**, measured for the rows task 7572 owns (CPython 3.13.9, min of
+**Per-call cost**, measured for the rows task 7572 owns. The task 6089
+justifications in the ledger and the scanner cite this paragraph rather than
+restating it, so a re-measurement edits only here (CPython 3.13.9, min of
 5 × 20000-call timeit, host load average ~160–180): `Path.resolve` 19–33 µs
 for a 4–9 component path; `os.path.realpath` 25–43 µs; `exists` 3–5 µs. An
 unpinned `PromptArtifactStore.resolve` costs 16–21 µs. The live main checkout
