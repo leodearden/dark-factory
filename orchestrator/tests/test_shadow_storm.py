@@ -259,8 +259,8 @@ class TestStormWindow:
 
 _METERED_CANDIDATE = 'claude-sonnet-max'
 _SUBSCRIPTION_CANDIDATE = 'glm-5.3-endpoint'
-_STREAK = 5
-_STREAK_TASKS = tuple(f'streak-{i}' for i in range(_STREAK))
+_STREAK_LENGTH = 5
+_STREAK_TASKS = tuple(f'streak-{i}' for i in range(_STREAK_LENGTH))
 _SEEDED_REASONS = {_S.FAILED: 'runner_raised:RuntimeError', _S.EXPIRED: 'settle_deadline'}
 
 
@@ -310,10 +310,10 @@ async def _open_and_finish(rig: CoordinatorRig, *task_ids: str) -> list[str]:
 
 
 async def _tripped_streak(tmp_path, costs) -> CoordinatorRig:
-    rig = _storm_rig(tmp_path, costs, failure_streak_pause=_STREAK)
+    rig = _storm_rig(tmp_path, costs, failure_streak_pause=_STREAK_LENGTH)
     _fail_every_run(rig)
     opened = await _open_and_finish(rig, *_STREAK_TASKS)
-    assert len(opened) == _STREAK
+    assert len(opened) == _STREAK_LENGTH
     return rig
 
 
@@ -363,8 +363,9 @@ class TestFailureStreakEscape:
         state = rig.coordinator.storm_state()
         assert (state.paused, state.cause) == (True, ShadowStormCause.FAILURE_STREAK)
         assert _causes(rig) == [ShadowStormCause.FAILURE_STREAK]
-        assert state.detail == rig.escalator.trips[0].detail
-        assert all(cell.cell_id in state.detail for cell in _cells(rig))
+        detail = rig.escalator.trips[0].detail
+        assert state.detail == detail
+        assert all(cell.cell_id in detail for cell in _cells(rig))
 
         later = await rig.coordinator.on_phase(
             make_task('after-the-storm'), WorkflowState.PLAN, entering=False,
@@ -372,7 +373,7 @@ class TestFailureStreakEscape:
 
         assert later == []
         assert _skip_reasons(rig) == ['paused']
-        assert len(_cells(rig)) == _STREAK
+        assert len(_cells(rig)) == _STREAK_LENGTH
 
     @pytest.mark.asyncio
     async def test_a_further_failure_while_paused_files_no_second_escalation(self, tmp_path, costs):
@@ -412,8 +413,7 @@ class TestFailureStreakEscape:
         opened = await _open_and_finish(rig, 'after-resume')
         await rig.coordinator.expire(rig.clock.now())
 
-        assert len(opened) == 1
-        assert rig.store.get_shadow_cell(opened[0]).state is _S.FAILED
+        assert [cell.state for cell in _cells(rig) if cell.cell_id in opened] == [_S.FAILED]
         assert rig.coordinator.storm_state().paused is False
         assert rig.store.get_shadow_storm(PROJECT_ID).paused is False
         assert len(rig.escalator.trips) == 1
@@ -436,9 +436,9 @@ class TestFailureStreakEscape:
     )
     @pytest.mark.asyncio
     async def test_a_completed_run_breaks_the_streak(self, tmp_path, costs, breaker, expected):
-        rig = _storm_rig(tmp_path, costs, failure_streak_pause=_STREAK)
+        rig = _storm_rig(tmp_path, costs, failure_streak_pause=_STREAK_LENGTH)
         _seed(rig, breaker, task_id='breaker')
-        for i in range(_STREAK - 1):
+        for i in range(_STREAK_LENGTH - 1):
             _seed(rig, _S.FAILED, task_id=f'failed-{i}')
 
         await rig.coordinator.expire(rig.clock.now())
@@ -501,7 +501,7 @@ class TestCostGuardsEscape:
 
 @pytest.mark.asyncio
 async def test_a_failing_escalation_leaves_the_pause_standing(tmp_path, costs, caplog):
-    rig = _storm_rig(tmp_path, costs, failure_streak_pause=_STREAK)
+    rig = _storm_rig(tmp_path, costs, failure_streak_pause=_STREAK_LENGTH)
     rig.escalator.raises = RuntimeError('escalation server down')
     _fail_every_run(rig)
 

@@ -33,7 +33,13 @@ from orchestrator.evals.live_fixture import live_stratum
 from orchestrator.evals.metrics import EvalMetrics
 from orchestrator.evals.task_sampler import repo_of_project
 from orchestrator.event_store import EventStore, EventType, ShadowSkipReason
-from orchestrator.run_store import CellChange, RunStore, ShadowCell, ShadowCellQuery
+from orchestrator.run_store import (
+    CellChange,
+    RunStore,
+    ShadowCell,
+    ShadowCellQuery,
+    ShadowStormRecord,
+)
 from orchestrator.shadow_scoring import ShadowReference, consequence_leg_warranted
 from orchestrator.shadow_types import (
     CostBasis,
@@ -70,6 +76,7 @@ __all__ = [
     'ShadowCoordinatorDeps',
     'ShadowRunner',
     'StormFacts',
+    'StormState',
     'StormTrip',
     'budget_exhausted',
     'candidate_has_credentials',
@@ -307,7 +314,7 @@ class RatioSkip(StrEnum):
 
 @dataclass(frozen=True)
 class CostPair:
-    """One settled cell's cost beside production's cost for the same task."""
+    """Settled cells' summed cost beside production's summed cost for the same tasks."""
 
     cell_cost_usd: float
     cell_basis: CostBasis
@@ -374,6 +381,29 @@ class StormTrip:
 
     cause: ShadowStormCause
     detail: str
+
+
+@dataclass(frozen=True)
+class StormState:
+    """Whether shadow evaluation is paused, and by which guard."""
+
+    paused: bool
+    cause: ShadowStormCause | None
+    detail: str | None
+
+    def __post_init__(self) -> None:
+        if self.paused is (self.cause is None):
+            raise ValueError(
+                f'StormState: a pause names its cause and only a pause does '
+                f'(got paused={self.paused!r}, cause={self.cause!r})'
+            )
+
+    @classmethod
+    def of(cls, record: ShadowStormRecord) -> StormState:
+        return cls(paused=record.paused, cause=record.cause, detail=record.detail)
+
+
+_UNPAUSED = StormState(paused=False, cause=None, detail=None)
 
 
 def _budget_trip(facts: StormFacts) -> str | None:
@@ -582,6 +612,15 @@ class ExpireSweep:
 
 _HELD_STATES = frozenset(state for state in ShadowCellState if state.held_by_run)
 
+# The runs a failure streak reads. A cap-excluded run says nothing about the
+# candidate, so it neither extends a streak nor breaks one.
+_RUN_ENDED_STATES = frozenset({
+    ShadowCellState.AWAITING_REFERENCE,
+    ShadowCellState.SETTLED,
+    ShadowCellState.FAILED,
+    ShadowCellState.EXPIRED,
+})
+
 _PLAN_SOURCE_BY_SHAPE: Mapping[ShadowShape, PlanSource] = MappingProxyType({
     ShadowShape.IMPLEMENTER: PlanSource.PRODUCTION,
     ShadowShape.ARCHITECT_CONSEQUENCE: PlanSource.CANDIDATE,
@@ -603,6 +642,15 @@ def _task_id_of(task: Mapping[str, Any]) -> str:
 def _base_sha_of(task: Mapping[str, Any]) -> str | None:
     sha = (task.get('metadata') or {}).get('branch_base_sha')
     return sha.strip() if isinstance(sha, str) and sha.strip() else None
+
+
+@dataclass(frozen=True)
+class _StormSnapshot:
+    """The store's view a storm evaluation reads: the pause row and the window's cells."""
+
+    storm: ShadowStormRecord
+    window: tuple[ShadowCell, ...]
+    run_ends_newest_first: tuple[ShadowCell, ...]
 
 
 @dataclass(frozen=True)
@@ -651,6 +699,7 @@ class ShadowCoordinator:
         self.run_id = run_id
         self._incumbents = MappingProxyType(dict(incumbents))
         self._drives: set[asyncio.Task[None]] = set()
+        self._storm = _UNPAUSED
 
     # -- open ---------------------------------------------------------------
 
@@ -830,6 +879,7 @@ class ShadowCoordinator:
         except Exception as exc:
             logger.warning('shadow cell %s: runner raised', cell_id, exc_info=True)
             await self._fail_held(cell_id, runner_raised_reason(exc))
+        await self._evaluate_storm()
 
     async def _run_cell(self, request: CellRequest) -> None:
         runner, cell_id = self._deps.runner, request.cell.cell_id
@@ -936,6 +986,8 @@ class ShadowCoordinator:
             for cell in awaiting:
                 if await self._settle(cell, reference):
                     settled.append(cell.cell_id)
+            if settled:
+                await self._evaluate_storm()
             return settled
         except Exception:
             logger.exception('shadow coordinator: settling task %s failed', task_id)
@@ -1018,6 +1070,7 @@ class ShadowCoordinator:
                 'shadow expire: %d overdue awaiting cell(s) deferred past the batch limit of %d',
                 len(rest), EXPIRE_BATCH_LIMIT,
             )
+        await self._evaluate_storm()
         return ExpireSweep(expired=tuple(expired), deferred=tuple(cell.cell_id for cell in rest))
 
     async def reconcile_on_start(self) -> list[str]:
@@ -1030,6 +1083,7 @@ class ShadowCoordinator:
         orphans = await asyncio.to_thread(self._fail_orphans)
         for cell in orphans:
             await self._emit_ended(cell)
+        await self._evaluate_storm()
         return [cell.cell_id for cell in orphans]
 
     def _fail_orphans(self) -> list[ShadowCell]:
@@ -1047,6 +1101,122 @@ class ShadowCoordinator:
             if orphan is not None:
                 failed.append(orphan)
         return failed
+
+    # -- storm escape -------------------------------------------------------
+
+    def storm_state(self) -> StormState:
+        """The pause this coordinator last observed or wrote; advisory, never the open gate."""
+        return self._storm
+
+    async def resume(self) -> bool:
+        """Lift the pause, restarting every storm window now; False when none stood."""
+        resumed = await asyncio.to_thread(
+            self._deps.store.resume_shadow_storm, self.project_id, self._deps.clock(),
+        )
+        self._storm = _UNPAUSED
+        return resumed
+
+    async def _evaluate_storm(self) -> None:
+        """Pause on a tripped storm guard; run after every cell end, expire and start. Never raises."""
+        try:
+            await self._check_storm()
+        except Exception:
+            logger.exception('shadow coordinator: storm evaluation failed')
+
+    async def _check_storm(self) -> None:
+        threshold = self._config.failure_streak_pause
+        snapshot = await asyncio.to_thread(self._storm_snapshot, threshold)
+        if snapshot.storm.paused:
+            self._storm = StormState.of(snapshot.storm)
+            return
+        settled = [cell for cell in snapshot.window if cell.state is ShadowCellState.SETTLED]
+        facts = StormFacts(
+            spent_usd=metered_spend(snapshot.window),
+            daily_budget_usd=self._config.daily_budget_usd,
+            run_ends_newest_first=tuple(
+                RunEndedCell(cell.cell_id, cell.state) for cell in snapshot.run_ends_newest_first
+            ),
+            failure_streak_pause=threshold,
+            ratios=await self._measured_ratios(settled),
+        )
+        trip = evaluate_storm(facts)
+        if trip is None:
+            self._storm = StormState.of(snapshot.storm)
+            return
+        await self._pause(trip)
+
+    def _storm_snapshot(self, threshold: int) -> _StormSnapshot:
+        store = self._deps.store
+        storm = store.get_shadow_storm(self.project_id)
+        if storm.paused:
+            return _StormSnapshot(storm, (), ())
+        since = storm_window_start(self._deps.clock(), storm.resumed_at)
+        return _StormSnapshot(
+            storm=storm,
+            window=tuple(store.find_shadow_cells(self._query(opened_since=since))),
+            run_ends_newest_first=tuple(store.find_shadow_cells(self._query(
+                states=_RUN_ENDED_STATES,
+                opened_since=storm.resumed_at,
+                newest_first=True,
+                limit=threshold,
+            ))),
+        )
+
+    async def _measured_ratios(self, settled: Sequence[ShadowCell]) -> dict[str, CostRatioVerdict]:
+        """The cost ratios, or none this round when production's cost is unreadable.
+
+        An unreadable cost store must not disarm the budget and streak guards too.
+        """
+        try:
+            return await self._cost_ratios(settled)
+        except Exception:
+            logger.warning(
+                'shadow storm: production cost unreadable; no cost ratio is measured this round',
+                exc_info=True,
+            )
+            return {}
+
+    async def _cost_ratios(self, settled: Sequence[ShadowCell]) -> dict[str, CostRatioVerdict]:
+        """Each candidate's settled cost beside production's: one cost read per candidate and basis."""
+        groups: dict[tuple[str, CostBasis], list[ShadowCell]] = {}
+        for cell in settled:
+            groups.setdefault((cell.candidate, cell.cost_basis), []).append(cell)
+        pairs: dict[str, list[CostPair]] = {}
+        for (candidate, basis), cells in sorted(groups.items()):
+            production = await self._deps.costs.tasks_invocation_cost(
+                self.project_id, sorted({cell.task_id for cell in cells}),
+            )
+            pairs.setdefault(candidate, []).append(CostPair(
+                cell_cost_usd=sum(cell.cost_usd for cell in cells),
+                cell_basis=basis,
+                production_cost_usd=production,
+                production_basis=PRODUCTION_COST_BASIS,
+            ))
+        ceiling = self._config.cost_ratio_ceiling
+        return {candidate: cost_ratio_verdict(found, ceiling) for candidate, found in pairs.items()}
+
+    async def _pause(self, trip: StormTrip) -> None:
+        """Write the durable pause; only the call that created it files the escalation."""
+        store = self._deps.store
+        created = await asyncio.to_thread(
+            store.pause_shadow_storm, self.project_id, trip.cause, trip.detail, self._deps.clock(),
+        )
+        if not created:
+            self._storm = StormState.of(
+                await asyncio.to_thread(store.get_shadow_storm, self.project_id),
+            )
+            return
+        self._storm = StormState(paused=True, cause=trip.cause, detail=trip.detail)
+        logger.warning('shadow coordinator: paused on %s: %s', trip.cause.value, trip.detail)
+        try:
+            await self._deps.escalate(trip)
+        except Exception:
+            logger.exception(
+                'shadow coordinator: the %s storm escalation failed; the pause stands',
+                trip.cause.value,
+            )
+
+    # -- lifetime -----------------------------------------------------------
 
     async def join(self) -> None:
         """Wait for every live drive, including any a finishing drive spawned."""
