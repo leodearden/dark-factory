@@ -1386,8 +1386,8 @@ is `git grep`, through `Bash`:
 
 `-P` is real PCRE, so the rejected pattern runs unchanged. It reads only the
 files git knows about: the tracked ones, plus the untracked ones
-`--untracked` adds, minus anything an ignore file excludes. That is the same
-filter `Grep` applies, with no per-project exclude list to get right:
+`--untracked` adds, minus anything an ignore file excludes. That is the
+`.gitignore` filtering `Grep` also does, with no per-project exclude list to get right:
 `.venv`, `node_modules`, a build-output tree such as `target/` and a main
 checkout's task-worktree copies are all skipped, whatever a project calls
 them. So running it from the checkout root, or leaving out `-- <path>`, is
