@@ -551,6 +551,14 @@ def _seed_l2_twin(queue: EscalationQueue, member_ids: list[str]) -> Escalation:
     return l2
 
 
+_STRAND_RECORD_ID = re.compile(r'esc-__stale_l0_strand_sweep__-\d+')
+
+
+def _strand_record_ids_cited(detail: str) -> list[str]:
+    """Every strand-sweep record id (an L1 or its L2 twin) a detail names, in order."""
+    return _STRAND_RECORD_ID.findall(detail)
+
+
 @pytest.mark.asyncio
 class TestStaleL0StrandEscalationSurvivesRestart:
     """The strand record must outlive the restart that destroyed the evidence.
@@ -667,6 +675,34 @@ class TestStaleL0StrandEscalationSurvivesRestart:
         assert len(later) == 1
         assert 'esc-7777-1' in later[0].detail
         assert l2.id in later[0].detail
+
+    async def test_third_sweep_cites_each_open_record_once_in_id_order(
+        self, strand_harness: Harness
+    ):
+        """Two open records, one clustered: each cited once, the L2 beside its member.
+
+        The first sweep has nothing open, so it cites no strand record at all,
+        and no sweep ever cites the record it is filing.
+        """
+        queue = _queue_of(strand_harness)
+        _seed_escalation(queue, 'esc-5189-7', '5189', age_secs=STRAND_AGE_SECS)
+        await strand_harness._dismiss_stale_escalations()
+        (first,) = _aggregate_escalations(strand_harness)
+        l2 = _seed_l2_twin(queue, [first.id])
+
+        _seed_escalation(queue, 'esc-7777-1', '7777', age_secs=STRAND_AGE_SECS)
+        await strand_harness._dismiss_stale_escalations()
+        (second,) = [e for e in _aggregate_escalations(strand_harness) if e.id != first.id]
+
+        _seed_escalation(queue, 'esc-8888-1', '8888', age_secs=STRAND_AGE_SECS)
+        await strand_harness._dismiss_stale_escalations()
+        (third,) = [
+            e for e in _aggregate_escalations(strand_harness)
+            if e.id not in {first.id, second.id}
+        ]
+
+        assert _strand_record_ids_cited(first.detail) == []
+        assert _strand_record_ids_cited(third.detail) == [first.id, l2.id, second.id]
 
     async def test_every_filing_sweep_logs_its_filing_line(
         self, strand_harness: Harness, caplog
