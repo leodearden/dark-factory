@@ -510,8 +510,8 @@ def test_a_reload_that_never_reached_the_tool_fails_closed(tmp_path, fault):
 
 
 def test_a_dead_socket_fails_closed(tmp_path):
-    """Nothing listening at all -- httpx's own transport exception, which is
-    neither of the two census_trigger raises and must fail the same way."""
+    """Nothing listening at all -- the connect fails before any request is
+    delivered, and must fail closed the same way."""
     config = _make_repo(tmp_path, "8", marker=True)
 
     proc = _run(ClosedPort(), config, "8")
@@ -544,10 +544,9 @@ def test_the_transport_diagnostic_keeps_the_committed_shas_remedy(tmp_path):
 # ---------------------------------------------------------------------------
 # Which interpreter runs the script's python steps
 #
-# The transport is not stdlib: it needs httpx, plus pydantic via
-# census_trigger's module-level `legibility.config` import. Measured here on
-# 2026-09-12: the system interpreter (/usr/bin/python3, 3.12.3) has neither
-# (it does have yaml), while every venv in this tree has all three. So a
+# The transport is not stdlib: shared.mcp_session needs httpx. Measured here
+# on 2026-09-12: the system interpreter (/usr/bin/python3, 3.12.3) lacks it
+# (it does have yaml), while every venv in this tree has both. So a
 # reload step that inherits whatever `python3` the caller's shell offers is a
 # deploy gate an operator cannot reach from a login shell -- the same
 # unreachable-gate outcome as the transport defect above, with a different

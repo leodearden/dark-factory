@@ -155,8 +155,8 @@ def test_a_reload_that_never_reached_the_tool_fails_closed(tmp_path, fault):
 
 
 def test_a_dead_socket_fails_closed(tmp_path):
-    """Nothing listening at all -- httpx's own transport exception, which is
-    neither of the two census_trigger raises and must fail the same way."""
+    """Nothing listening at all -- the connect fails before any request is
+    delivered, and must fail closed the same way."""
     config = _seeded(tmp_path)
 
     proc = _run(ClosedPort(), config, "6")

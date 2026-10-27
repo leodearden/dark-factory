@@ -1,6 +1,6 @@
 """Test doubles for the environment of a shell script that commits an
 orchestrator config and then hot-reloads it through
-`legibility.census_trigger.post_mcp_tool_call`.
+`shared.mcp_session.SyncMcpSession`.
 
 That environment has three parts, each faked here for real rather than by a
 stand-in binary on PATH: the escalation MCP the reload talks to (a loopback
@@ -157,7 +157,7 @@ class FakeEscalationMcp:
     def delete_count(self):
         """How many session-terminating DELETEs the server saw.
 
-        Read by the wire tests rather than left to census_trigger's own suite:
+        Read by the wire tests rather than left to SyncMcpSession's own suite:
         the server a reload script talks to is the long-lived escalation
         process, and a session it never releases stays in
         `StreamableHTTPSessionManager`'s registry with a live anyio task behind
@@ -230,8 +230,9 @@ TRANSPORT_FAULTS = {
     # The shape a raw single-shot POST hits against the live server today --
     # the direct regression test for the defect.
     "always_400": {"initialize_reply": FakeEscalationMcp.MISSING_SESSION_REPLY},
-    # census_trigger raises a RuntimeError naming this; the script must
-    # surface it rather than swallow it.
+    # The session-less notifications/initialized that follows is refused 400,
+    # so SyncMcpSession fails the handshake; the script must surface it rather
+    # than swallow it.
     "initialize_assigns_no_session": {"initialize_reply": INITIALIZE_WITHOUT_A_SESSION},
     # The request reached the server but never a tool.
     "envelope_level_error": {"tool_call_reply": ENVELOPE_LEVEL_ERROR},
@@ -259,8 +260,8 @@ class ClosedPort:
 # The `python3` a caller's shell offers
 #
 # Measured on 2026-09-12: the system interpreter (/usr/bin/python3, 3.12.3)
-# lacks httpx and pydantic, both of which the reload transport needs, while
-# every venv in this tree has them. Whether an interpreter lacks the transport
+# lacks httpx, which the reload transport needs, while every venv in this
+# tree has it. Whether an interpreter lacks the transport
 # is decided by running the gate's own import step under it, so the premise a
 # test skips on is the very branch the gate takes.
 # ---------------------------------------------------------------------------
