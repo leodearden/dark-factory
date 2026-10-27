@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from shared.mcp_post import MCP_POST_HEADERS, decode_mcp_response_body
+from shared.mcp_session import McpCallError, McpFailureKind, SyncMcpSession
 from shared.testing_mcp_stub import RecordedRequest, StubAnswer, StubMcpServer
 
 PAYLOAD = {"success": True, "id": "7"}
@@ -230,3 +231,53 @@ class TestFailureAnswers:
         body = decode_mcp_response_body(resp)
         assert "result" not in body
         assert body["error"]["code"] == -32602
+
+
+class TestToolsHandler:
+    """``tools=`` answers each OK tools/call through a per-tool handler."""
+
+    def test_a_client_gets_exactly_the_handlers_mapping(self):
+        seen = []
+
+        def handler(name, arguments):
+            seen.append((name, dict(arguments)))
+            return {"tasks": [{"id": 1}], "root": arguments["project_root"]}
+
+        with (
+            StubMcpServer(stateful=False, tools=handler) as server,
+            SyncMcpSession(server.url, client_name="stub-fidelity") as session,
+        ):
+            reply = session.call_tool("get_tasks", {"project_root": "/r"})
+
+        assert reply == {"tasks": [{"id": 1}], "root": "/r"}
+        assert seen == [("get_tasks", {"project_root": "/r"})]
+
+    def test_the_stateful_mode_frames_the_handlers_answer_as_sse(self):
+        answer = {"id": "esc-1", "status": "pending"}
+        with StubMcpServer(stateful=True, tools=lambda name, arguments: answer) as server:
+            session_id = _open_session(server)
+            resp = _post(server, TOOLS_CALL, session_id=session_id)
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        result = decode_mcp_response_body(resp)["result"]
+        assert result["structuredContent"] == answer
+        assert json.loads(result["content"][0]["text"]) == answer
+
+    def test_without_a_handler_the_fixed_payload_answers(self):
+        with StubMcpServer(stateful=False, payload=PAYLOAD, tools=None) as server:
+            resp = _post(server, TOOLS_CALL)
+        assert resp.json()["result"]["structuredContent"] == PAYLOAD
+
+    @pytest.mark.parametrize("stateful", [False, True], ids=["stateless", "stateful"])
+    def test_a_raising_handler_answers_a_tool_error(self, stateful):
+        def handler(name, arguments):
+            raise KeyError("no task 7")
+
+        with (
+            StubMcpServer(stateful=stateful, tools=handler) as server,
+            SyncMcpSession(server.url, client_name="stub-fidelity") as session,
+            pytest.raises(McpCallError) as excinfo,
+        ):
+            session.call_tool("get_task", {"id": "7"})
+
+        assert excinfo.value.kind is McpFailureKind.TOOL_ERROR
+        assert "KeyError" in str(excinfo.value)
