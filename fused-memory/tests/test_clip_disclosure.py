@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from fused_memory.middleware.curator_types import clip_for_prompt
 from fused_memory.utils.clip_disclosure import (
     TRUNCATION_FACTS_KEY,
     TextClip,
@@ -38,14 +37,6 @@ def test_elide_text_over_the_cap_keeps_the_head_and_counts_the_rest():
 
     assert clip.text == 'a' * 10 + elision_marker(7)
     assert clip.fact == TruncationFact(field='desc', cap=10, elided=7)
-
-
-@pytest.mark.parametrize(
-    ('value', 'cap'),
-    [('', 5), ('abc', 5), ('abcde', 5), ('abcdef', 5), ('x' * 4000, 300), ('é' * 12, 3)],
-)
-def test_elide_text_spells_the_marker_exactly_as_the_curator_prompt_does(value, cap):
-    assert elide_text(value, cap, field='f').text == clip_for_prompt(value, cap)
 
 
 def test_clip_text_reports_the_same_fact_but_leaves_the_text_unmarked():

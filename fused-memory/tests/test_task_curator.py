@@ -229,7 +229,8 @@ class TestFlattenTaskTree:
         assert flatten_task_tree({}) == []
 
 class TestClipForPrompt:
-    """`clip_for_prompt` is the single owner of truncate-and-mark (INV-5).
+    """`clip_for_prompt` is the curator prompt's single route to
+    `utils/clip_disclosure.py::elide_text`, which owns truncate-and-mark.
 
     Both the pool side (`PoolEntry.render`) and the candidate side (the
     candidate section of the single and batch prompts) route through it, so
@@ -268,6 +269,14 @@ class TestClipForPrompt:
     def test_marker_keeps_the_ellipsis_prefix(self):
         clipped = clip_for_prompt('z' * 50, 10)
         assert clipped[10] == '\u2026'
+
+    @pytest.mark.parametrize('cap', [0, -1])
+    def test_a_non_positive_cap_is_rejected_not_rendered(self, cap):
+        with pytest.raises(ValueError, match='cap'):
+            clip_for_prompt('abc', cap)
+
+    def test_empty_text_fits_a_zero_cap_unchanged(self):
+        assert clip_for_prompt('', 0) == ''
 
 
 class TestEmbeddingText:
