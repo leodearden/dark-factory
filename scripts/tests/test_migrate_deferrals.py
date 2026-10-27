@@ -12,14 +12,14 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import migrate_deferrals
 import pytest
-from deferral_fake_fused_memory import FakeFusedMemory
+from deferral_fake_fused_memory import FakeFusedMemory, FakeFusedMemoryServer
 from deferral_store import TaskRow
 from migrate_deferrals import (
     AlreadyRecorded,
@@ -344,9 +344,15 @@ def make_root(tmp_path: Path, project_root_with_tasks_db: Callable[[Path], Path]
 
 
 @pytest.fixture
-def migrate(capsys: pytest.CaptureFixture[str], units_dir: Path) -> Callable[..., Migration]:
+def fused_memory() -> Iterator[FakeFusedMemoryServer]:
+    with FakeFusedMemoryServer() as server:
+        yield server
+
+
+@pytest.fixture
+def migrate(capsys: pytest.CaptureFixture[str], units_dir: Path, fused_memory: FakeFusedMemoryServer) -> Callable[..., Migration]:
     def _run(*argv: str) -> Migration:
-        code = migrate_deferrals.main(['--fused-memory-url', 'http://fake', '--units-dir', str(units_dir), *argv])
+        code = migrate_deferrals.main(['--fused-memory-url', fused_memory.url, '--units-dir', str(units_dir), *argv])
         out, err = capsys.readouterr()
         return Migration(code, out, err)
 
@@ -354,11 +360,9 @@ def migrate(capsys: pytest.CaptureFixture[str], units_dir: Path) -> Callable[...
 
 
 @pytest.fixture
-def serve(install_fake_httpx: Callable[..., Any]) -> Callable[..., FakeFusedMemory]:
+def serve(fused_memory: FakeFusedMemoryServer) -> Callable[..., FakeFusedMemory]:
     def _serve(projects: Mapping[str, list[dict[str, Any]]], *, echo: bool = True) -> FakeFusedMemory:
-        fake = FakeFusedMemory(projects, echo=echo)
-        install_fake_httpx(fake.post)
-        return fake
+        return fused_memory.serve(FakeFusedMemory(projects, echo=echo))
 
     return _serve
 
