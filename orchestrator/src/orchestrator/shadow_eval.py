@@ -518,11 +518,18 @@ class CellRequest:
 
 
 class ShadowRunner(Protocol):
-    """Two stages, so every C1 state is real: a prepared worktree, then a run in it."""
+    """A prepared worktree, a run in it, and its release, so every C1 state is real.
+
+    ``release`` is called exactly once for every worktree ``prepare``
+    returned, once the coordinator is done with it, whatever became of the
+    cell: completed, capped, raised, lost to another writer or cancelled.
+    """
 
     async def prepare(self, request: CellRequest) -> Path: ...
 
     async def run(self, request: CellRequest, worktree: Path) -> CellRunOutcome: ...
+
+    async def release(self, request: CellRequest, worktree: Path) -> None: ...
 
 
 _CAP_REASONS: Mapping[RunEnd, CellEndReason] = MappingProxyType({
@@ -787,7 +794,8 @@ class ShadowCoordinator:
         The snapshot and the insert share one lock, so a concurrent opener
         counts this cell and ``max_concurrent`` is a hard limit. The daily cap
         counts dollars already spent, so the runs in flight can overshoot it
-        by their own cost; the budget storm guard then pauses.
+        by their own cost; the budget storm guard then pauses. Once inserted,
+        the cell gets its drive even if the announcement is cancelled.
         """
         async with self._open_lock:
             inputs = await asyncio.to_thread(self._open_inputs, task, shape, candidate)
@@ -803,8 +811,10 @@ class ShadowCoordinator:
                     inputs.task_id, shape, candidate.name, ShadowSkipReason.ALREADY_OPEN,
                 )
                 return None
-        await self._emit(EventType.shadow_cell_opened, cell, host=decision.host.value)
-        self._spawn(CellRequest(cell=cell, task=task, candidate=candidate, plan=plan))
+        try:
+            await self._emit(EventType.shadow_cell_opened, cell, host=decision.host.value)
+        finally:
+            self._spawn(CellRequest(cell=cell, task=task, candidate=candidate, plan=plan))
         return cell.cell_id
 
     def _open_inputs(self, task: dict, shape: ShadowShape, candidate: EvalConfig) -> OpenInputs:
@@ -890,21 +900,37 @@ class ShadowCoordinator:
         drive.add_done_callback(self._drives.discard)
 
     async def _drive(self, request: CellRequest) -> None:
-        """Run one cell through its lifecycle; every exit writes the cell's successor."""
+        """Run one cell through its lifecycle; every exit writes the cell's successor.
+
+        Every exit also releases the worktree, if ``prepare`` returned one.
+        """
         cell_id = request.cell.cell_id
+        worktree: Path | None = None
         try:
-            await self._run_cell(request)
+            worktree = await self._deps.runner.prepare(request)
+            await self._run_prepared(request, worktree)
         except asyncio.CancelledError:
             await self._fail_held(cell_id, CellEndReason.CANCELLED_AT_SHUTDOWN.value)
             raise
         except Exception as exc:
             logger.warning('shadow cell %s: runner raised', cell_id, exc_info=True)
             await self._fail_held(cell_id, runner_raised_reason(exc))
+        finally:
+            if worktree is not None:
+                await self._release(request, worktree)
         await self._evaluate_storm()
 
-    async def _run_cell(self, request: CellRequest) -> None:
+    async def _release(self, request: CellRequest, worktree: Path) -> None:
+        try:
+            await self._deps.runner.release(request, worktree)
+        except Exception:
+            logger.warning(
+                'shadow cell %s: releasing worktree %s failed',
+                request.cell.cell_id, worktree, exc_info=True,
+            )
+
+    async def _run_prepared(self, request: CellRequest, worktree: Path) -> None:
         runner, cell_id = self._deps.runner, request.cell.cell_id
-        worktree = await runner.prepare(request)
         opened = await self._advance(
             cell_id, ShadowCellState.SAMPLED,
             CellChange(ShadowCellState.OPENED, self._deps.clock(), worktree_path=worktree),
@@ -1108,19 +1134,28 @@ class ShadowCoordinator:
         return [cell.cell_id for cell in orphans]
 
     def _fail_orphans(self) -> list[ShadowCell]:
-        store = self._deps.store
-        change = CellChange(
-            ShadowCellState.FAILED,
-            self._deps.clock(),
-            reason=CellEndReason.ORPHANED_BY_RESTART.value,
+        held = self._deps.store.find_shadow_cells(self._query(states=_HELD_STATES))
+        return self._fail_cells(
+            [cell for cell in held if cell.run_id != self.run_id],
+            CellEndReason.ORPHANED_BY_RESTART,
         )
+
+    def _fail_still_held(self) -> list[ShadowCell]:
+        held = self._deps.store.find_shadow_cells(
+            self._query(states=_HELD_STATES, run_id=self.run_id),
+        )
+        return self._fail_cells(held, CellEndReason.CANCELLED_AT_SHUTDOWN)
+
+    def _fail_cells(self, cells: Sequence[ShadowCell], reason: CellEndReason) -> list[ShadowCell]:
+        """Fail each cell from the held state it was read in; one that moved on is skipped."""
+        change = CellChange(ShadowCellState.FAILED, self._deps.clock(), reason=reason.value)
         failed: list[ShadowCell] = []
-        for cell in store.find_shadow_cells(self._query(states=_HELD_STATES)):
-            if cell.run_id == self.run_id:
-                continue
-            orphan = store.advance_shadow_cell(cell.cell_id, expected=cell.state, change=change)
-            if orphan is not None:
-                failed.append(orphan)
+        for cell in cells:
+            successor = self._deps.store.advance_shadow_cell(
+                cell.cell_id, expected=cell.state, change=change,
+            )
+            if successor is not None:
+                failed.append(successor)
         return failed
 
     # -- storm escape -------------------------------------------------------
@@ -1245,10 +1280,20 @@ class ShadowCoordinator:
             await asyncio.gather(*list(self._drives), return_exceptions=True)
 
     async def aclose(self) -> None:
-        """Cancel every live drive; each writes its cell's successor before it ends."""
-        for drive in list(self._drives):
-            drive.cancel()
-        await self.join()
+        """Cancel every drive, then fail whatever cell this run still holds (INV-6).
+
+        Cancelling repeats until no drive is left: a drive cancelled while it
+        announces consequence leg 2 still spawns leg 2's drive. A drive
+        cancelled before its first step never wrote its own successor, so the
+        closing sweep does; an insert that lands after the sweep is left to
+        the next start's ``reconcile_on_start``.
+        """
+        while self._drives:
+            for drive in list(self._drives):
+                drive.cancel()
+            await asyncio.gather(*list(self._drives), return_exceptions=True)
+        for cell in await asyncio.to_thread(self._fail_still_held):
+            await self._emit_ended(cell)
 
     # -- events -------------------------------------------------------------
 

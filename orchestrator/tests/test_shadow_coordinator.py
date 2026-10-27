@@ -37,7 +37,7 @@ from shared.cost_store import CostStore
 from orchestrator.config import PsiAdmissionConfig
 from orchestrator.evals.live_fixture import live_stratum
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.run_store import RunStore, ShadowCell, ShadowCellQuery
+from orchestrator.run_store import CellChange, RunStore, ShadowCell, ShadowCellQuery
 from orchestrator.shadow_eval import (
     CREDIT_WINDOW,
     CellRunOutcome,
@@ -392,6 +392,7 @@ async def test_shutdown_fails_a_running_cell_before_releasing_it(tmp_path, costs
     assert cell.state is _S.FAILED
     assert cell.reason == 'cancelled_at_shutdown'
     assert len(_ended_events(rig)) == 1
+    assert rig.runner.released_cell_ids() == [cell.cell_id]
 
 
 class _OverlappingSnapshots:
@@ -436,6 +437,77 @@ async def test_concurrent_triggers_never_open_past_max_concurrent(tmp_path, cost
     assert sorted(len(ids) for ids in opened) == [0, 1]
     assert len(_cells(rig)) == 1
     assert _skip_reasons(rig) == ['concurrency_full']
+
+
+@pytest.mark.parametrize(
+    'script',
+    [
+        {},
+        {'run_raises': RuntimeError('boom')},
+        {'outcome': CellRunOutcome(end=RunEnd.USAGE_CAP)},
+    ],
+    ids=['completed', 'run-raised', 'capped'],
+)
+@pytest.mark.asyncio
+async def test_a_prepared_worktree_is_released_once_whatever_the_run_did(tmp_path, costs, script):
+    rig = build_coordinator(tmp_path, costs)
+    rig.runner.script(ShadowShape.IMPLEMENTER, 'claude-sonnet-max', **script)
+
+    await _plan_exit(rig, make_task('5387'))
+    await rig.coordinator.join()
+
+    cell = _only_cell(rig)
+    assert rig.runner.released == [(rig.runner.prepared[0], cell.worktree_path)]
+
+
+@pytest.mark.asyncio
+async def test_a_worktree_whose_cell_was_lost_is_still_released(tmp_path, costs):
+    rig = build_coordinator(tmp_path, costs)
+
+    def another_writer_wins(request):
+        rig.store.advance_shadow_cell(
+            request.cell.cell_id,
+            expected=_S.SAMPLED,
+            change=CellChange(_S.FAILED, rig.clock.now(), reason='orphaned_by_restart'),
+        )
+
+    rig.runner.script(
+        ShadowShape.IMPLEMENTER, 'claude-sonnet-max', after_prepare=another_writer_wins,
+    )
+
+    await _plan_exit(rig, make_task('5387'))
+    await rig.coordinator.join()
+
+    cell = _only_cell(rig)
+    assert (cell.state, cell.reason) == (_S.FAILED, 'orphaned_by_restart')
+    assert rig.runner.ran == []
+    assert rig.runner.released_cell_ids() == [cell.cell_id]
+
+
+@pytest.mark.asyncio
+async def test_a_raising_prepare_has_nothing_to_release(tmp_path, costs):
+    rig = build_coordinator(tmp_path, costs)
+    rig.runner.script(ShadowShape.IMPLEMENTER, 'claude-sonnet-max', prepare_raises=OSError('disk'))
+
+    await _plan_exit(rig, make_task('5387'))
+    await rig.coordinator.join()
+
+    assert rig.runner.released == []
+
+
+@pytest.mark.asyncio
+async def test_a_raising_release_leaves_the_cell_outcome_standing(tmp_path, costs, caplog):
+    rig = build_coordinator(tmp_path, costs)
+    rig.runner.script(
+        ShadowShape.IMPLEMENTER, 'claude-sonnet-max', release_raises=OSError('busy'),
+    )
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.shadow_eval'):
+        await _plan_exit(rig, make_task('5387'))
+        await rig.coordinator.join()
+
+    assert _only_cell(rig).state is _S.AWAITING_REFERENCE
+    assert any('releasing' in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -592,3 +664,35 @@ async def test_without_the_consequence_shape_a_planned_leg_opens_no_leg_two(tmp_
     await _plan_entry(rig, make_task('5387'))
 
     assert [cell.shape for cell in _cells(rig)] == [ShadowShape.ARCHITECT]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_the_leg_two_open_still_fails_leg_two(tmp_path, costs, monkeypatch):
+    rig = _consequence_rig(tmp_path, costs)
+    _script_leg_one(rig, terminal_kind='planned', plan_steps=3, plan=_CANDIDATE_PLAN)
+    loop = asyncio.get_running_loop()
+    announcing_leg_two = asyncio.Event()
+    let_announce_finish = threading.Event()
+    emit = rig.events.emit
+
+    def held_leg_two_announcement(event_type, **kwargs):
+        if (
+            event_type is EventType.shadow_cell_opened
+            and kwargs['data']['shape'] == ShadowShape.ARCHITECT_CONSEQUENCE.value
+        ):
+            loop.call_soon_threadsafe(announcing_leg_two.set)
+            let_announce_finish.wait(timeout=30)
+        return emit(event_type, **kwargs)
+
+    monkeypatch.setattr(rig.events, 'emit', held_leg_two_announcement)
+
+    try:
+        await rig.coordinator.on_phase(make_task('5387'), WorkflowState.PLAN, entering=True)
+        await wait_responsive(announcing_leg_two.wait(), label='leg 2 is being announced')
+        await asyncio.wait_for(rig.coordinator.aclose(), timeout=5)
+    finally:
+        let_announce_finish.set()
+
+    [leg_two] = _of_shape(rig, ShadowShape.ARCHITECT_CONSEQUENCE)
+    assert (leg_two.state, leg_two.reason) == (_S.FAILED, 'cancelled_at_shutdown')
+    assert not any(cell.state.held_by_run for cell in _cells(rig))

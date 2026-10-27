@@ -113,9 +113,11 @@ class Script:
 
     outcome: CellRunOutcome | None = None
     prepare_raises: BaseException | None = None
+    after_prepare: Callable[[CellRequest], None] | None = None
     run_raises: BaseException | None = None
     block: asyncio.Event | None = None
     before_return: Callable[[CellRequest], None] | None = None
+    release_raises: BaseException | None = None
 
 
 class FakeRunner:
@@ -127,6 +129,7 @@ class FakeRunner:
         self.scripts: dict[tuple[ShadowShape, str], Script] = {}
         self.prepared: list[CellRequest] = []
         self.ran: list[CellRequest] = []
+        self.released: list[tuple[CellRequest, Path]] = []
         self.run_started = asyncio.Event()
 
     def script(self, shape: ShadowShape, candidate: str, **kwargs: Any) -> Script:
@@ -145,6 +148,8 @@ class FakeRunner:
         script = self._script_for(request)
         if script.prepare_raises is not None:
             raise script.prepare_raises
+        if script.after_prepare is not None:
+            script.after_prepare(request)
         return self.worktree_for(request)
 
     async def run(self, request: CellRequest, worktree: Path) -> CellRunOutcome:
@@ -158,6 +163,15 @@ class FakeRunner:
         if script.run_raises is not None:
             raise script.run_raises
         return script.outcome or self.default
+
+    async def release(self, request: CellRequest, worktree: Path) -> None:
+        self.released.append((request, worktree))
+        script = self._script_for(request)
+        if script.release_raises is not None:
+            raise script.release_raises
+
+    def released_cell_ids(self) -> list[str]:
+        return [request.cell.cell_id for request, _ in self.released]
 
 
 class RecordingEscalator:
