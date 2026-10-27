@@ -40,12 +40,18 @@ the born-at-L2 human gates (the design_concern / milestone_gate /
 milestone_check_failed / curator_adjudication_missing categories, and the
 ``orchestrator-deterministic`` sentinel role) are never auto-closable even
 when a class predicate would otherwise match. That guarantee belongs to the
-MCP ``resolve_issue`` path. One direct-queue path also auto-closes L2s, gated
-by MEMBERSHIP rather than by class, so the category denylist does not bind it:
-``orchestrator/src/orchestrator/recovery_emission.py::resolve_recovery_veto_streak_escalation``
-resolves an L2 of ANY category whose every member is an already-resolved
-recovery-veto-streak alarm and which carries no blocking declared pin. Such
-a wrapper holds nothing the detector has not itself stood down.
+MCP ``resolve_issue`` path. Direct-queue paths also auto-close L2s, gated by
+MEMBERSHIP rather than by class, so the category denylist does not bind them:
+
+- ``orchestrator/src/orchestrator/sentinel_alarm_wrappers.py::discharge_sentinel_wrappers``,
+  called by ``recovery_emission.py::resolve_recovery_veto_streak_escalation``
+  and ``zero_progress_requeue.py::resolve_zero_progress_requeue_alert``,
+  resolves an L2 of ANY category whose every member is an already-resolved
+  alarm of the resolving detector's own class;
+- ``orchestrator/src/orchestrator/offline_lane_escalations.py::release_lane_record``
+  resolves an L2 whose only member is the lane's own released record.
+
+Such a wrapper holds nothing the detector has not itself stood down.
 
 Task 4541 adds ``PROMOTE_SENTINEL_BOUND_ROLES``, keyed on the agent_role of
 the records being PROMOTED rather than on the caller's identity, so unlike
