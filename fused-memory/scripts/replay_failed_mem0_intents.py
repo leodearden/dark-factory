@@ -19,6 +19,7 @@ import asyncio
 import collections
 import contextlib
 import json
+import logging
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -33,6 +34,12 @@ from mcp.types import Implementation
 from shared.cli_boundary import LoudArgumentParser, run_cli
 
 from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
+
+logger = logging.getLogger(__name__)
 
 MCP_URL = 'http://127.0.0.1:8002/mcp'
 ADD_MEMORY_TIMEOUT = timedelta(seconds=180)
@@ -236,6 +243,17 @@ async def open_mcp_add_memory(url: str) -> AsyncIterator[AddMemoryFn]:
 async def _run(
     journal_dir: Path, selection: Selection, *, apply: bool, mcp_url: str
 ) -> list[ReplayOutcome]:
+    if apply:
+        assert_store_mutation_allowed(
+            operation='replay_failed_mem0_intents --apply',
+            logger=logger,
+            extra_detail=(
+                'a replay would land through the MCP server, a network call, while '
+                "its failed -> completed stamp on write_journal.db was refused, "
+                'leaving the row failed for a re-run to replay again. Nothing was '
+                'selected and nothing was replayed'
+            ),
+        )
     journal = WriteJournal(journal_dir)
     await journal.initialize()
     try:
@@ -293,9 +311,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
     if not WriteJournal(args.journal_dir).db_path.is_file():
         parser.error(f'no write_journal.db in {args.journal_dir}')
-    outcomes = asyncio.run(
-        _run(args.journal_dir, selection, apply=args.apply, mcp_url=args.mcp_url)
-    )
+    try:
+        outcomes = asyncio.run(
+            _run(args.journal_dir, selection, apply=args.apply, mcp_url=args.mcp_url)
+        )
+    except StoreMutationUnavailable:
+        return EXIT_RUN_FAILED
     for outcome in outcomes:
         print(outcome.render())
     counts = collections.Counter(outcome.outcome for outcome in outcomes)
