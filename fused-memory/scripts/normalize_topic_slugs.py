@@ -570,12 +570,22 @@ class Rename:
 # Pure core — planning
 # ---------------------------------------------------------------------------
 
+def _in_selection(legacy_topic: object, topics: frozenset[str] | None) -> bool:
+    """Whether a ``--topic`` selection covers *legacy_topic*.
+
+    ``None`` is no selection and covers every value.  A selection holds only
+    strings, so a non-string topic (a ``topic_unfoldable`` entry) is never in one.
+    """
+    return topics is None or (isinstance(legacy_topic, str) and legacy_topic in topics)
+
+
 def plan_renames(
     records,
     *,
     project_id: str,
     occupied_topics=None,
     canonical_ids_by_topic=None,
+    topics: frozenset[str] | None = None,
 ) -> tuple[list[Rename], list[dict]]:
     """Decide what to rename in one project's records, and what to refuse.
 
@@ -615,6 +625,9 @@ def plan_renames(
     Args:
         records: Scroll-shaped record dicts for ONE project.
         project_id: The corpus they came from; stamped onto every row.
+        topics: The legacy values whose verdicts to return; ``None`` returns
+            every verdict.  It narrows the verdicts only: a selected value
+            that an unselected spelling contests is still refused.
 
     Returns:
         ``(renames, skips)`` — frozen :class:`Rename` rows, and report-ready
@@ -625,7 +638,9 @@ def plan_renames(
 
     # --- pass 1: what does the corpus already look like? -------------------
     # Built BEFORE any verdict, from the whole record set, so no decision can
-    # depend on the order the backend happened to page records back in.
+    # depend on the order the backend happened to page records back in.  It
+    # ignores *topics* for the same reason: the planner must see every legacy
+    # value to know which targets are contested.
     #
     #   observed_topics       every topic value present, conforming or not
     #   canonical_ids_by_topic  which records under a topic claim canonical
@@ -687,7 +702,7 @@ def plan_renames(
     for record in records:
         metadata = record.get('metadata') or {}
         topic = metadata.get('topic')
-        if not _is_non_conforming_topic(topic):
+        if not _is_non_conforming_topic(topic) or not _in_selection(topic, topics):
             continue
 
         memory_id = record.get('id')
@@ -1652,15 +1667,6 @@ class GateCensusIncomplete(RuntimeError):
         self.gaps = gaps
 
 
-def _in_selection(legacy_topic: object, topics: frozenset[str] | None) -> bool:
-    """Whether a ``--topic`` selection covers *legacy_topic*.
-
-    ``None`` is no selection and covers every value.  A selection holds only
-    strings, so a non-string topic (a ``topic_unfoldable`` entry) is never in one.
-    """
-    return topics is None or (isinstance(legacy_topic, str) and legacy_topic in topics)
-
-
 def _selection_defect(topic: object) -> str | None:
     """Why *topic* cannot be a selected legacy value, or ``None`` if it can."""
     if not isinstance(topic, str):
@@ -1863,15 +1869,10 @@ async def run(
             project_id=project_id,
             occupied_topics=enumerated['occupied_topics'],
             canonical_ids_by_topic=enumerated['canonical_ids_by_topic'],
+            topics=topics,
         )
-        # Narrowed AFTER planning, never before: the planner must see every
-        # legacy value to know which targets are contested.
-        _record_skips([
-            entry for entry in plan_skips
-            if _in_selection(entry.get('old_topic', entry.get('topic')), topics)
-        ])
-        all_renames.extend(
-            rename for rename in renames if _in_selection(rename.old_topic, topics))
+        _record_skips(plan_skips)
+        all_renames.extend(renames)
 
     groups, gate_skips = pair_gate_blocks(
         all_renames,
