@@ -66,6 +66,7 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 
 **Monitor signal** — a synthetic sentinel `task_id` that reports ON a task rather than recording work done on one:
 - Signature: the `task_id` is not a task number but a sentinel — `__recovery_veto_streak__<real_task_id>` (the same recovery veto held a task for N consecutive sweeps) and, by the same shape, `__zero_progress_requeue__<real_task_id>`. The record pins nothing real: the sentinel exists precisely so that observing a hold cannot deepen it, which is why an open L2 in this class never blocks the task it names.
+- Promote a record of either sentinel class under its sentinel `task_id` VERBATIM, never under the real id read out of its body: for both classes the server refuses a real id with `code: 'sentinel_task_id_required'` (`escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`) and returns the `required_task_ids` to re-issue with.
 - Every record in a class like this looks alike at the mechanism level, so clustering by that shared mechanism over-folds unrelated incidents into one L2. Key each by its ORIGINATING cause instead — for veto streaks, the escalations the record already names as open on the held task: see [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__).
 
 ## Shallow-by-default → Deepen-on-signal RCA
