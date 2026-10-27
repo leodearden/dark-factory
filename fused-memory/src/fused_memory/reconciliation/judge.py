@@ -80,7 +80,6 @@ JUDGE_VERDICT_SCHEMA: dict[str, Any] = {
             'items': {
                 'type': 'object',
                 'properties': {
-                    'entry_id': {'type': ['string', 'null']},
                     'issue': {'type': 'string'},
                     'severity': {'type': 'string', 'enum': _VERDICT_SEVERITY_VALUES},
                     'recommendation': {'type': 'string'},
@@ -333,7 +332,6 @@ class Judge:
                 logger.warning(f'Judge: project {run.project_id} is halted, skipping review')
                 return None
 
-            entries = await self.journal.get_entries(run_id)
             combined_actions = await self.journal.get_run_actions_combined(run_id)
             recent_verdicts = await self.journal.get_recent_verdicts(
                 run.project_id, limit=10
@@ -349,7 +347,7 @@ class Judge:
                 since=datetime.now(UTC) - timedelta(hours=trend_window_hours),
             )
 
-            prompt = self._build_review_prompt(run, entries, recent_verdicts, combined_actions)
+            prompt = self._build_review_prompt(run, recent_verdicts, combined_actions)
             try:
                 response_text = await self._call_llm(prompt)
             except JudgeInfraError as err:
@@ -504,24 +502,13 @@ class Judge:
             )
         return None
 
-    def _build_review_prompt(self, run, entries, recent_verdicts,
+    def _build_review_prompt(self, run, recent_verdicts,
                              combined_actions: list[dict] | None = None) -> str:
         # recent_verdicts is intentionally NOT fed into the LLM prompt.
         # _check_error_trends handles systemic-pattern detection in code; exposing the
         # history here caused a feedback loop where the LLM generated 'systemic_trend'
         # findings whenever prior verdicts were non-ok, keeping the streak alive.
         del recent_verdicts
-
-        entry_summaries = []
-        for e in entries:
-            entry_summaries.append({
-                'id': e.id,
-                'operation': e.operation,
-                'target_system': e.target_system,
-                'reasoning': e.reasoning,
-                'has_before': e.before_state is not None,
-                'has_after': e.after_state is not None,
-            })
 
         stage_reports = {}
         for stage_id, report in run.stage_reports.items():
@@ -541,7 +528,7 @@ class Judge:
         action_summaries = [
             {
                 'operation': a.get('operation', a.get('action_type', '?')),
-                'target': a.get('target', a.get('target_system', '?')),
+                'target': a.get('target', '?'),
                 'source': a.get('source', '?'),
                 'created_at': a.get('created_at', '?'),
             }
@@ -563,9 +550,6 @@ class Judge:
 
 ### MCP Actions ({len(action_summaries)} total)
 {json.dumps(action_summaries, indent=2, default=str)}
-
-### Journal Entries ({len(entries)} total)
-{json.dumps(entry_summaries, indent=2, default=str)}
 
 Review this run and provide your verdict as JSON.
 """

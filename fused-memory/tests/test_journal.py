@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -9,7 +10,6 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.models.reconciliation import (
-    JournalEntry,
     JudgeVerdict,
     ReconciliationRun,
     RunStatus,
@@ -90,27 +90,34 @@ async def test_run_lifecycle(journal):
 
 
 @pytest.mark.asyncio
-async def test_journal_entries(journal):
-    run_id = str(uuid.uuid4())
-    entry = JournalEntry(
-        id=str(uuid.uuid4()),
-        run_id=run_id,
-        stage=StageId.memory_consolidator,
-        timestamp=datetime.now(UTC),
-        operation='delete_memory',
-        target_system='mem0',
-        before_state={'id': '123', 'content': 'old'},
-        after_state=None,
-        reasoning='Duplicate found',
-        evidence=[{'query': 'test', 'match': True}],
-    )
-    await journal.add_entry(entry)
+async def test_fresh_schema_creates_exactly_this_table_set(journal):
+    """The tables ReconciliationJournal.initialize() creates, read from the DB file.
 
-    entries = await journal.get_entries(run_id)
-    assert len(entries) == 1
-    assert entries[0].operation == 'delete_memory'
-    assert entries[0].before_state == {'id': '123', 'content': 'old'}
-    assert entries[0].evidence == [{'query': 'test', 'match': True}]
+    A tripwire on schema drift: the dashboard, a separate process, reads
+    these tables directly, so adding or dropping one must show up here.
+    The set cannot show that each table has a live producer (INV-13); whoever
+    adds a table owes that check.  recon_ledger shares the file but is
+    created by ReconLedgerStore, not by the journal.
+    """
+    db_path = journal.data_dir / 'reconciliation.db'
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    finally:
+        conn.close()
+
+    assert {name for (name,) in rows} == {
+        'watermarks',
+        'runs',
+        'judge_verdicts',
+        'event_buffer',
+        'reconciliation_locks',
+        'burst_state',
+        'chunk_boundaries',
+        'run_actions',
+        'halt_state',
+        'judge_pending',
+    }
 
 
 @pytest.mark.asyncio

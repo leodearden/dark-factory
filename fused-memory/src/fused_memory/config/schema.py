@@ -1758,7 +1758,6 @@ class ReconciliationConfig(BaseModel):
         return self
 
     # Safety
-    max_mutations_per_stage: int = Field(default=50)
     halt_on_judge_serious: bool = Field(default=True)
 
     # Done-provenance gate — when True, set_task_status(done) rejects calls

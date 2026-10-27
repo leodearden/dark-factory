@@ -99,21 +99,6 @@ class AssembledPayload:
     token_budget: int = 0
 
 
-class JournalEntry(BaseModel):
-    """One per reconciliation operation — full audit trail."""
-
-    id: str
-    run_id: str = ''
-    stage: StageId | None = None
-    timestamp: datetime
-    operation: str
-    target_system: str  # 'graphiti', 'mem0', 'taskmaster'
-    before_state: dict | None = None
-    after_state: dict | None = None
-    reasoning: str = ''
-    evidence: list[dict] = Field(default_factory=list)
-
-
 class StageReport(BaseModel):
     """Output of each pipeline stage."""
 

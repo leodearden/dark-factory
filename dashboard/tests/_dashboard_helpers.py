@@ -777,20 +777,6 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
 
-CREATE TABLE IF NOT EXISTS journal_entries (
-    id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    stage TEXT,
-    timestamp TEXT NOT NULL,
-    operation TEXT NOT NULL,
-    target_system TEXT NOT NULL,
-    before_state TEXT,
-    after_state TEXT,
-    reasoning TEXT DEFAULT '',
-    evidence TEXT DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_journal_run ON journal_entries(run_id);
-
 CREATE TABLE IF NOT EXISTS judge_verdicts (
     run_id TEXT PRIMARY KEY,
     reviewed_at TEXT NOT NULL,
