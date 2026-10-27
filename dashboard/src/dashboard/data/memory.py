@@ -17,6 +17,7 @@ from typing import Any
 import anyio
 import httpx
 from shared.mcp_idempotency import maybe_inject_client_op_id
+from shared.mcp_post import MCP_POST_HEADERS, decode_mcp_response_body, mcp_endpoint_url
 
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum, DatumState, unknown_datum
@@ -32,11 +33,6 @@ from dashboard.data.mcp_fanout import (
 )
 
 logger = logging.getLogger(__name__)
-
-MCP_HEADERS = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json, text/event-stream',
-}
 
 # Twin of orchestrator.mcp_lifecycle's use of shared.mcp_idempotency (task
 # 2712; hoisted into the shared module by task 2766 so the two McpSession
@@ -117,30 +113,6 @@ async def cancel_inflight_exchanges() -> None:
     await cancel_and_await(running_here, 'MCP exchange(s)')
 
 
-def _parse_mcp_response(resp: httpx.Response) -> dict:
-    """Parse an MCP JSON-RPC response (JSON or SSE)."""
-    content_type = resp.headers.get('content-type', '')
-    if 'text/event-stream' in content_type:
-        return _parse_sse_response(resp.text)
-    try:
-        return resp.json()
-    except (json.JSONDecodeError, ValueError):
-        return _parse_sse_response(resp.text)
-
-
-def _parse_sse_response(text: str) -> dict:
-    """Extract the last ``data:`` line from an SSE response and parse as JSON."""
-    last_data = None
-    for line in text.split('\n'):
-        if line.startswith('data: '):
-            last_data = line[6:]
-        elif line.startswith('data:'):
-            last_data = line[5:]
-    if last_data:
-        return json.loads(last_data)
-    raise ValueError(f'No data line in SSE response: {text[:200]}')
-
-
 def _extract_tool_result(rpc_response: dict) -> dict:
     """Pull the inner dict out of a JSON-RPC tools/call result."""
     content = rpc_response.get('result', {}).get('content', [])
@@ -162,7 +134,7 @@ class McpSession:
 
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip('/')
-        self.mcp_endpoint = f'{self.base_url}/mcp'
+        self.mcp_endpoint = mcp_endpoint_url(self.base_url)
         self._session_id: str | None = None
         self._initialized = False
         self._request_id = 0
@@ -223,7 +195,7 @@ class McpSession:
 
         maybe_inject_client_op_id(method, params)
 
-        headers = dict(MCP_HEADERS)
+        headers = dict(MCP_POST_HEADERS)
         if self._session_id:
             headers['Mcp-Session-Id'] = self._session_id
 
@@ -233,7 +205,7 @@ class McpSession:
         if sid := resp.headers.get('mcp-session-id'):
             self._session_id = sid
 
-        return _parse_mcp_response(resp)
+        return decode_mcp_response_body(resp)
 
     async def _raw_notify(
         self,
@@ -242,7 +214,7 @@ class McpSession:
         timeout: float = 10,
     ) -> None:
         payload: dict = {'jsonrpc': '2.0', 'method': method}
-        headers = dict(MCP_HEADERS)
+        headers = dict(MCP_POST_HEADERS)
         if self._session_id:
             headers['Mcp-Session-Id'] = self._session_id
         resp = await _post(client, self.mcp_endpoint, payload, headers, timeout)

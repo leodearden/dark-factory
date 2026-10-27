@@ -377,23 +377,43 @@ def mcp_notify_response() -> httpx.Response:
     return httpx.Response(202, headers={'mcp-session-id': MCP_SESSION_ID})
 
 
-def mcp_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
-    """A ``tools/call`` result carrying *inner* as JSON text content.
+def _tool_result_envelope(inner: dict, request_id: int) -> dict:
+    """The JSON-RPC ``tools/call`` result carrying *inner* as JSON text content.
 
     MCP nests the tool's own payload as a JSON *string* inside
     ``result.content[0].text``, so *inner* is serialized, not embedded — which
     is exactly the double-encoding the dashboard readers have to undo.
     """
+    return {
+        'jsonrpc': '2.0',
+        'id': request_id,
+        'result': {
+            'content': [{'type': 'text', 'text': json.dumps(inner)}],
+        },
+    }
+
+
+def mcp_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
+    """A ``tools/call`` result carrying *inner*, framed as a JSON body."""
     return httpx.Response(
         200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'content': [{'type': 'text', 'text': json.dumps(inner)}],
-            },
-        },
+        json=_tool_result_envelope(inner, request_id),
         headers={'mcp-session-id': MCP_SESSION_ID},
+    )
+
+
+def mcp_sse_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
+    """The same ``tools/call`` result, framed as a Streamable-HTTP SSE body.
+
+    FastMCP may answer ``text/event-stream`` instead of ``application/json``;
+    the envelope inside the ``data:`` frame is identical to
+    :func:`mcp_tool_response`'s.
+    """
+    envelope = json.dumps(_tool_result_envelope(inner, request_id))
+    return httpx.Response(
+        200,
+        text=f'event: message\ndata: {envelope}\n\n',
+        headers={'content-type': 'text/event-stream', 'mcp-session-id': MCP_SESSION_ID},
     )
 
 

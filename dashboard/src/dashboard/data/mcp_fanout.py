@@ -268,11 +268,12 @@ _DEFAULT_PER_URL_DEADLINE_SECONDS = 75.0
 #    every individual ``self._network_stream.read(...)``. So the budget is
 #    re-armed per socket read, and a peer emitting one byte just inside each
 #    read window keeps the request alive indefinitely with the budget never
-#    firing. This is not exotic on this transport:
-#    ``memory.MCP_HEADERS`` sends ``Accept: application/json,
-#    text/event-stream`` and ``client.post`` reads the FULL body, so an SSE
-#    response the server never closes parks ``resp.text`` forever under a
-#    per-request budget that is behaving exactly as documented.
+#    firing. This is not exotic on this transport: ``memory.McpSession``
+#    sends ``shared.mcp_post.MCP_POST_HEADERS``, whose ``Accept`` is
+#    ``application/json, text/event-stream``, and ``client.post`` reads the
+#    FULL body, so an SSE response the server never closes parks
+#    ``resp.text`` forever under a per-request budget that is behaving
+#    exactly as documented.
 # 2. ``httpcore._async.connection::AsyncHTTPConnection.handle_async_request``
 #    acquires ``self._request_lock`` (an ``anyio.Lock``) with NO timeout; only
 #    the ``_connect`` inside it is budgeted.
