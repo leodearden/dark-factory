@@ -192,7 +192,7 @@ add_memory(
   category="observations_and_summaries",
   project_id="<project_id>",
   agent_id="claude-review-briefing",
-  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the acceptance task a new known_gaps entry points at as accepted_by, filed per "Every known gap needs an owning task", here and in content; [] if none was filed
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the acceptance task a new known_gaps entry points at as accepted_by, filed per "Every known gap needs an owning task", here and in content; if none was filed, use [] and drop the known gap sentence from content
 )
 ```
 

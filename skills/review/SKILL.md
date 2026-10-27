@@ -217,7 +217,7 @@ add_memory(
   category="observations_and_summaries",
   project_id="<project_id>",
   agent_id="claude-review",
-  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the human gate of the chain this run filed (contract §11), here and in content; [] if it filed none, as under --findings-only
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the human gate of the chain this run filed (contract §11), here and in content; if it filed none, as under --findings-only, use [] and drop the gate sentence from content
 )
 ```
 

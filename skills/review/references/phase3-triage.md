@@ -150,7 +150,7 @@ add_memory(
   category="observations_and_summaries",
   project_id="<project_id>",
   agent_id="claude-review",
-  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the human gate Step 7 filed, here and in content; [] if Step 7 filed no chain
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the human gate Step 7 filed, here and in content; if Step 7 filed no chain, use [] and drop the human gate clause from content
 )
 ```
 
