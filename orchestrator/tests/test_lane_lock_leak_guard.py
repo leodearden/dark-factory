@@ -877,11 +877,9 @@ class TestSettledLaneLockHolderRead:
         ``test_a_permanently_empty_read_degrades_and_never_raises``).
 
         The poll is bounded through the explicit ``timeout=``/``interval=0``
-        parameters, not the shipped 0.5s/0.02s globals: under full-suite xdist
-        load the default pair let CPU starvation expire the deadline before the
-        third scripted read ("got [] after 2 read(s)", task 6117).  Why
-        ``interval=0`` keeps a read count off the wall clock is argued in that
-        same sibling's docstring.
+        parameters rather than the 0.5s/0.02s globals, so the read count does
+        not depend on the wall clock (see
+        ``test_a_permanently_empty_read_degrades_and_never_raises``).
         """
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
 
