@@ -3502,3 +3502,242 @@ class TestMainWiresTheGateLockstep:
         args = argparse.Namespace(project_roots=['/rf', '/df', '/rf'])
 
         assert _mod.resolve_gate_roots(args) == ('/rf', '/df')
+
+
+# ===========================================================================
+# --topic — narrowing the write set to named legacy values
+# ===========================================================================
+
+class TestTopicSelection:
+    """``run(..., topics=frozenset({...}))`` narrows WHAT is renamed, never what is read.
+
+    A selection names LEGACY source values.  It narrows the planned renames,
+    the plan-time refusals and the gate pairing to those values; enumeration,
+    coverage and the collision index stay corpus-wide, so a selected value an
+    unselected spelling contests is still refused.
+    """
+
+    @staticmethod
+    def _two_legacy_values(*extra: dict) -> tuple[MagicMock, _FakeCorpus]:
+        return _run_service({
+            'dark_factory': [_crec('m1', 'legacy_a'), _crec('m2', 'legacy_b'), *extra],
+        })
+
+    @pytest.mark.asyncio
+    async def test_the_selection_narrows_the_renames(self):
+        service, corpus = self._two_legacy_values()
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True,
+                                 topics=frozenset({'legacy_a'}))
+
+        assert corpus.topic_of('dark_factory', 'm1') == 'legacy-a'
+        assert corpus.topic_of('dark_factory', 'm2') == 'legacy_b'
+        assert report['rename_count'] == 1
+        assert {row['old_topic'] for row in report['results']} == {'legacy_a'}
+        assert resolve_exit(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unselected_values_refusal_is_not_this_runs(self):
+        service, corpus = self._two_legacy_values(
+            _crec('m3', 'dup_topic'), _crec('m4', 'dup-topic'))
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True,
+                                 topics=frozenset({'legacy_a'}))
+
+        assert report['skips']['slug_collision'] == []
+        assert corpus.topic_of('dark_factory', 'm3') == 'dup_topic'
+        assert resolve_exit(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_selected_values_refusal_is_still_filed(self):
+        service, corpus = _run_service({
+            'dark_factory': [_crec('m1', 'dup_topic'), _crec('m2', 'dup-topic')],
+        })
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True,
+                                 topics=frozenset({'dup_topic'}))
+
+        assert [entry['old_topic'] for entry in report['skips']['slug_collision']] == [
+            'dup_topic',
+        ]
+        assert corpus.topic_of('dark_factory', 'm1') == 'dup_topic'
+        assert resolve_exit(report) == 1
+
+    def test_an_unselected_value_gets_no_verdict_of_any_kind(self):
+        records = [
+            _rec('m1', '!!!'),
+            _rec('', 'no_id'),
+            _rec('m2', 'dup_topic'), _rec('m3', 'dup-topic'),
+            _rec('m4', 'plain_legacy'),
+        ]
+
+        unnarrowed = _mod.plan_renames(records, project_id='dark_factory')
+        narrowed = _mod.plan_renames(records, project_id='dark_factory',
+                                     topics=frozenset({'other_legacy'}))
+
+        assert sorted(entry['reason'] for entry in unnarrowed[1]) == [
+            'record_without_id', 'slug_collision', 'topic_unfoldable',
+        ]
+        assert [rename.old_topic for rename in unnarrowed[0]] == ['plain_legacy']
+        assert narrowed == ([], [])
+
+    @pytest.mark.asyncio
+    async def test_only_a_selected_values_id_less_record_is_filed(self):
+        """A refusal that is not a collision is narrowed by its legacy value too.
+
+        The selected value's id-less record cannot be written, so it is both
+        refused and left behind as residue; the unselected one is not this run's.
+        """
+        service, corpus = _run_service({'dark_factory': [
+            _crec('m1', 'legacy_a'),
+            _crec('', 'legacy_a'),
+            _crec('m2', 'legacy_b') | {'id': None},
+        ]})
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True,
+                                 topics=frozenset({'legacy_a'}))
+
+        assert [(entry['memory_id'], entry['topic'])
+                for entry in report['skips']['record_without_id']] == [('', 'legacy_a')]
+        assert corpus.topic_of('dark_factory', 'm1') == 'legacy-a'
+        assert [entry['legacy_topic'] for entry in report['skips']['legacy_slug_residue']] == [
+            'legacy_a',
+        ]
+        assert resolve_exit(report) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_unselected_spelling_still_contests_a_selected_one(self):
+        """The collision index is corpus-wide: the selection filters the plan, not its input."""
+        service, corpus = _run_service({
+            'dark_factory': [_crec('m1', 'foo_bar'), _crec('m2', 'Foo_Bar')],
+        })
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True,
+                                 topics=frozenset({'foo_bar'}))
+
+        assert [entry['old_topic'] for entry in report['skips']['slug_collision']] == [
+            'foo_bar',
+        ]
+        assert corpus.topic_of('dark_factory', 'm1') == 'foo_bar'
+        assert corpus.writes == []
+
+    @pytest.mark.asyncio
+    async def test_no_selection_renames_every_legacy_value(self):
+        service, corpus = self._two_legacy_values()
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        assert corpus.topic_of('dark_factory', 'm1') == 'legacy-a'
+        assert corpus.topic_of('dark_factory', 'm2') == 'legacy-b'
+        assert report['rename_count'] == 2
+
+    @staticmethod
+    def _gated_legacy_a() -> tuple[MagicMock, _FakeCorpus, object]:
+        """``legacy_a`` carries a record and a gate; ``other_slug`` only a gate."""
+        service, corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_a')]})
+        census = _census(tasks=[_gate_task('4220', 'legacy_a'),
+                                _gate_task('4221', 'other_slug')])
+        return service, corpus, census
+
+    @pytest.mark.asyncio
+    async def test_an_unselected_gate_is_neither_paired_nor_an_orphan(self):
+        service, _corpus, census = self._gated_legacy_a()
+
+        report = await run_sweep(service, projects=('dark_factory',), gates=census,
+                                 client=_client(), topics=frozenset({'legacy_a'}))
+
+        assert [(row['gate_task_id'], row['outcome']) for row in report['gate_results']] == [
+            ('4220', 'would_patch_gate'),
+        ]
+        assert report['skips']['orphan_gate_topic'] == []
+
+    @pytest.mark.asyncio
+    async def test_without_a_selection_the_same_gate_is_an_orphan(self):
+        service, _corpus, census = self._gated_legacy_a()
+
+        report = await run_sweep(service, projects=('dark_factory',), gates=census,
+                                 client=_client())
+
+        assert [entry['gate_topic'] for entry in report['skips']['orphan_gate_topic']] == [
+            'other_slug',
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('apply', [False, True])
+    @pytest.mark.parametrize(('topics', 'named'), [
+        (frozenset(), 'empty'),
+        (frozenset({'legacy-a'}), 'legacy-a'),
+        (frozenset({'a' * 101}), 'a' * 101),
+        (frozenset({42}), '42'),
+    ], ids=['empty', 'conforming-target', 'no-fold', 'non-str'])
+    async def test_an_invalid_selection_is_refused_before_anything_is_read(
+        self, monkeypatch, topics, named, apply,
+    ):
+        """A selection names LEGACY values; the likely typo is the target slug.
+
+        The guard is rigged to refuse, so an ``--apply`` that reached the
+        preflight before validating would raise ``StoreMutationUnavailable``.
+        """
+        deny(_mod, monkeypatch)
+        service, corpus = self._two_legacy_values()
+
+        with pytest.raises(ValueError) as refused:
+            await run_sweep(service, projects=('dark_factory',), apply=apply,
+                            topics=topics)
+
+        assert named in str(refused.value)
+        assert corpus.scrolls == []
+        assert corpus.writes == []
+
+    @staticmethod
+    def _selection_line(rendered: str) -> str:
+        [line] = [line for line in rendered.splitlines()
+                  if line.startswith('**Topic selection:**')]
+        return line
+
+    @pytest.mark.asyncio
+    async def test_the_report_states_its_selection(self):
+        service, _corpus = self._two_legacy_values()
+
+        narrowed = await run_sweep(service, projects=('dark_factory',),
+                                   topics=frozenset({'legacy_b', 'legacy_a'}))
+        default = await run_sweep(service, projects=('dark_factory',))
+
+        assert narrowed['topic_selection'] == ['legacy_a', 'legacy_b']
+        assert default['topic_selection'] is None
+
+    @pytest.mark.asyncio
+    async def test_the_markdown_names_the_selection(self):
+        service, _corpus = self._two_legacy_values()
+
+        narrowed = await run_sweep(service, projects=('dark_factory',),
+                                   topics=frozenset({'legacy_a', 'legacy_b'}))
+        default = await run_sweep(service, projects=('dark_factory',))
+
+        narrowed_line = self._selection_line(_mod.render_markdown(narrowed))
+        assert 'legacy_a' in narrowed_line
+        assert 'legacy_b' in narrowed_line
+        assert 'every non-conforming value' in self._selection_line(
+            _mod.render_markdown(default))
+
+    def test_named_topics_replace_every_value(self):
+        assert _mod.resolve_topics(
+            argparse.Namespace(topics=['a_b', 'c_d', 'a_b'])) == frozenset({'a_b', 'c_d'})
+        assert _mod.resolve_topics(argparse.Namespace(topics=None)) is None
+
+    def test_main_narrows_an_apply_to_every_named_value(self, tmp_path):
+        corpus = _FakeCorpus({'dark_factory': [
+            _crec('df1', 'legacy_a'), _crec('df2', 'legacy_b'), _crec('df3', 'legacy_c'),
+        ]})
+        client = _census_client({'/repo': _listing('dark_factory', '/repo')})
+        open_memory, open_client, _urls = _openers(corpus, client)
+
+        code = _mod.main(
+            _argv(tmp_path, '--apply', '--topic', 'legacy_a', '--topic', 'legacy_b'),
+            open_memory_service=open_memory, open_client=open_client)
+
+        assert corpus.topic_of('dark_factory', 'df1') == 'legacy-a'
+        assert corpus.topic_of('dark_factory', 'df2') == 'legacy-b'
+        assert corpus.topic_of('dark_factory', 'df3') == 'legacy_c'
+        assert _written_report(tmp_path)['topic_selection'] == ['legacy_a', 'legacy_b']
+        assert code == 0
