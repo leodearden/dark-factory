@@ -1522,7 +1522,8 @@ The fix:
   clocks). The dir mtime is the fallback for a record-less resident and for an
   empty or unparseable stamp. A new last column, `age_source=record|dir-mtime`,
   names the clock a row used; it is also the last key of each JSON lane object.
-  The clock is read once per run.
+  The clock is read once per run, and a stamp ahead of it (a skewed writer)
+  reads `age_min=0`, never a negative age.
 - **One parse.** `lib_lane_state.sh::lane_state_epoch` is the single parse of
   `updated_at`. It owns the empty-first guard that GNU `date -d ''` needs (it
   exits 0 and answers today's midnight).
