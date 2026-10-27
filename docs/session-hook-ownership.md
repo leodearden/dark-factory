@@ -35,9 +35,10 @@ record it names vouches for it, by an equal `claude_session_id` or
 `claude_owner_pid`. The slug a pointer names then goes through the same
 ownership decision as an env slug. So an event whose `session_id` mismatches
 the record falls through to the hand-launched keying, unless it is a re-mint
-reached through the pid pointer. Every bind writes the session-id pointer,
-and every write of a record whose `claude_owner_pid` is the event's claude
-writes the pid pointer, so spawned, T3-hosted and hand-launched records carry
+reached through the pid pointer. Every bind, and every dead-owner reclaim
+(see §Session-id re-mints), writes the session-id pointer, and every write
+of a record whose `claude_owner_pid` is the event's claude writes the pid
+pointer, so spawned, T3-hosted and hand-launched records carry
 the same pointers. This is the only way a T3-hosted session reaches its spawn record,
 because it has no `CLAUDE_SPAWN_*` environment at all: the T3 lane binds the
 record to the session id of the transcript that names the record dir, and
@@ -109,14 +110,27 @@ A session with no `CLAUDE_SPAWN_SESSION_ID` re-binds the same way through
 its pid pointer: the new id misses `sessions-by-claude-id`, the owning
 claude's pid finds the record, and the pid condition above holds. The
 re-bind also writes a session-id pointer for the new id. A T3 thread that T3
-resumes in a new process keeps its session id, so its session-id pointer
-still resolves. When no live process holds the recorded `claude_owner_pid`,
-that event re-stamps it with the new claude and writes its pid pointer, so a
-later re-mint in the new process re-binds. A live recorded owner is left in
-place, because then the event is a nested `claude --resume` of the same
-session. A thread whose resume fails starts a fresh session id in a new
-process, which no pointer links to the record; it gets a hand-launched
-record.
+resumes in a new process keeps its session id.
+
+When no live process holds the recorded `claude_owner_pid`, the resumed
+process's event re-stamps it with the new claude. This dead-owner reclaim
+applies on two lanes:
+
+- an event reached through its session-id pointer;
+- an event reached through the hand-launched keying, whose slug embeds that
+  same session id, so a record bound to it is proven the session's own.
+
+An event that adopts its `CLAUDE_SPAWN_SESSION_ID` does not reclaim: there a
+reclaim would also satisfy the self-exit owner-pid precondition in the same
+event. The reclaim writes both pointers. A later re-mint in the new process
+therefore re-binds, and a record bound before the session-id pointer existed
+(task 7489) gains one at its next event. This is how a thread opened directly
+in T3's UI keeps its pid pointer across T3's resume in a new process: it has
+no spawn record and is keyed by the hand-launched keying (task 7614). A live
+recorded owner is left in place, because then the event is a nested
+`claude --resume` of the same session. A thread whose resume fails starts a
+fresh session id in a new process, which no pointer links to the record; it
+gets a hand-launched record.
 
 The re-bind moves `claude_session_id` only. `claude_launch_session_id` keeps
 the id the first binding stamped and is never re-bound, so the launch
@@ -125,6 +139,7 @@ transcript `<id>.jsonl` stays findable after a `/clear` or compaction
 backfilled.
 
 Code: `orchestrator/src/orchestrator/session_hooks.py::_bind_claude_session_id`,
+`::_reclaim_dead_owner_pid`, `::_HookSlugResolution.session_id_keyed`,
 `scripts/legibility/check_transcript_persistence.py::find_matching_transcript`.
 
 `resume` is excluded. `--resume` and `--continue` make a brand-new process
