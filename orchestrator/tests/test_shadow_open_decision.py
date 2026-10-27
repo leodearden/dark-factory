@@ -11,6 +11,7 @@ import dataclasses
 import random
 
 import pytest
+from shared.psi import PsiSample
 
 from orchestrator.config import PsiAdmissionConfig
 from orchestrator.evals.configs import EvalConfig, get_config_by_name
@@ -30,7 +31,6 @@ from orchestrator.shadow_eval import (
 )
 from orchestrator.shadow_types import CostBasis, ShadowShape
 from orchestrator.workflow_types import WorkflowState
-from shared.psi import PsiSample
 
 _STRATUM = ('df', 'feature', 'full')
 _R = ShadowSkipReason
