@@ -38,7 +38,11 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.mcp_markup_middleware import (
+    MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+)
 from shared.project_layout import escalation_queue_dir
 from shared.toolcall_markup import MARKUP_OVERRIDE_KEY
 
@@ -1000,6 +1004,35 @@ class TestTheWidenedRepairVocabularyStaysContained:
         assert 'swallowed tail' in queued[0].detail
 
     @pytest.mark.asyncio
+    async def test_a_dropped_slice_files_with_no_sink_warning(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path, caplog
+    ):
+        """The dropped-slice kind is one the sink KNOWS, so it must not be
+        filed under the "unrecognised record kind" warning.
+
+        Keyed on the logger and the level rather than on the warning's
+        wording, so rewording that warning cannot make this row pass
+        vacuously. The queued record is the precondition that proves the
+        sink really ran on this path.
+        """
+        steer_project_root(monkeypatch, tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.markup_sink'):
+            await self._submit(artifacts)
+
+        queued = queued_residue(tmp_path)
+        assert len(queued) == 1, f'expected one residue record, got {queued!r}'
+        assert "field='metadata'" in queued[0].detail
+        warnings = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.mcp.markup_sink'
+            and record.levelno >= logging.WARNING
+        ]
+        assert warnings == [], (
+            f'the sink warned while filing a kind it knows: {warnings!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_an_unreachable_queue_drops_nothing_into_the_worktree(
         self, monkeypatch, artifacts: TaskArtifacts
     ):
@@ -1029,6 +1062,23 @@ class _RefusingQueue:
 
     def submit(self, esc: Any) -> str:
         raise OSError('No space left on device')
+
+
+class _RecordingQueue:
+    """A queue that takes every record and keeps it for the row to read."""
+
+    def __init__(self) -> None:
+        self.submitted: list[Any] = []
+
+    def make_id(self, anchor: str) -> str:
+        return f'esc-{anchor}-1'
+
+    def get_by_task(self, anchor: str, status: str = '') -> list[Any]:
+        return []
+
+    def submit(self, esc: Any) -> str:
+        self.submitted.append(esc)
+        return esc.id
 
 
 class TestVerdictToolsResidueChannelIsShared:
@@ -1114,18 +1164,8 @@ class TestVerdictToolsResidueChannelIsShared:
         """The channel is the queue."""
         from orchestrator.mcp import markup_sink, verdict_tools
 
-        submitted: list[Any] = []
-
-        class _Queue:
-            def make_id(self, anchor: str) -> str:
-                return f'esc-{anchor}-1'
-
-            def get_by_task(self, anchor: str, status: str = '') -> list[Any]:
-                return []
-
-            def submit(self, esc: Any) -> str:
-                submitted.append(esc)
-                return esc.id
+        queue = _RecordingQueue()
+        submitted = queue.submitted
 
         from escalation.models import Escalation
 
@@ -1134,7 +1174,7 @@ class TestVerdictToolsResidueChannelIsShared:
             spec=verdict_tools._MARKUP_SINK_SPEC,
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: tmp_path,
-            open_channel=lambda root: (Escalation, _Queue()),
+            open_channel=lambda root: (Escalation, queue),
         )
         record = {
             'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
@@ -1162,6 +1202,42 @@ class TestVerdictToolsResidueChannelIsShared:
         assert 'THE ONLY SURVIVING COPY' in filed.detail
         assert "owner='l2-escalation-watcher'" in filed.detail
         assert 'verdict-tools' in filed.detail
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_unknown_kind_still_files_and_warns_naming_the_known_kinds(
+        self, tmp_path, caplog,
+    ):
+        """The anti-vacuity partner of the dropped-slice no-warning row: the
+        warning still exists for the case it is meant for, and names both the
+        offending kind and the kinds the sink does accept."""
+        queue = _RecordingQueue()
+        sink = markup_sink.make_escalation_sink(
+            worktree=tmp_path,
+            spec=verdict_tools._MARKUP_SINK_SPEC,
+            subject_task_id=lambda: '6083',
+            resolve_root=lambda worktree: tmp_path,
+            open_channel=lambda root: (Escalation, queue),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.markup_sink'):
+            await sink({
+                'error_type': 'mcp_markup_some_future_kind',
+                'tool': 'submit_review_verdict',
+                'field': 'issues',
+                'raw_value': 'THE ONLY SURVIVING COPY',
+            })
+
+        assert len(queue.submitted) == 1
+        assert 'THE ONLY SURVIVING COPY' in queue.submitted[0].detail
+        (warning,) = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'orchestrator.mcp.markup_sink'
+            and record.levelno >= logging.WARNING
+        ]
+        assert 'mcp_markup_some_future_kind' in warning
+        assert MARKUP_UNRECOVERED_PARAM_ERROR_TYPE in warning, (
+            f'the warning does not name the kinds this sink knows: {warning!r}'
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
