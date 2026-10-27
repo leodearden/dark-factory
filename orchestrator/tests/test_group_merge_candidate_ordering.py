@@ -75,12 +75,11 @@ def _production_landing_merge(root: Path, tid: str) -> str | None:
 
 
 def _assert_runbook_agrees_with_production(root: Path, tid: str, candidate: str) -> None:
+    """Assert the runbook's *candidate* for ``task/<tid>`` equals ``GitOps.landing_merge_for``."""
     assert _production_landing_merge(root, tid) == candidate, (
         "the runbook's rc=0 candidate query (skills/_shared/deriving-landed-sha.md step 4) "
         'and GitOps.landing_merge_for must agree; a disagreement means one of them moved '
-        'and the other needs the same change.  Without --topo-order production returns a '
-        'date-ordered LATER merge, so _no_op_question measures {merge}^1..{merge} for an '
-        'unrelated merge'
+        'and the other needs the same change'
     )
 
 
