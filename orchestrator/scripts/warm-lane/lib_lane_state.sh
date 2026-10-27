@@ -26,10 +26,10 @@
 # WHY THE TWO HALVES USE DIFFERENT MECHANISMS
 # -------------------------------------------
 # The lane-state half is pure bash: NO jq, NO python3. It is called once per
-# lane from warm-lane-audit.sh, which runs from a systemd timer and from the
-# disk-pressure paths and is forbidden from ever aborting — a hard jq/python3
-# requirement there would be a new environmental failure mode for an
-# advisory-only read of two flat top-level string scalars.
+# lane from warm-lane-audit.sh, which runs from the disk-pressure paths and is
+# forbidden from ever aborting — a hard jq/python3 requirement there would be a
+# new environmental failure mode for an advisory-only read of flat top-level
+# string scalars.
 #
 # The protected-prefix half DOES shell out to python3, because
 # PROTECTED_PREFIXES cannot be faithfully text-scraped: five of its keys are
@@ -126,8 +126,9 @@ _lane_state_record() {
 # release, so a second read is a DIFFERENT INSTANT and can report a pair of
 # values that never coexisted.
 #
-# FAILS OPEN to 'unknown', always — callers include a systemd-timer audit and
-# the disk-pressure paths, which must never abort on one bad lane. The two
+# FAILS OPEN to 'unknown', always — callers include the timer-driven gc sweep
+# (warm-lane-gc-sweep.sh, which execs warm-lane-gc.sh) and the audit's
+# disk-pressure path, which must never abort on one bad lane. The two
 # causes are kept DISTINCT because they send an operator to two different
 # places:
 #   no-readable-record   no state dir, or no readable <lane>.json there. The

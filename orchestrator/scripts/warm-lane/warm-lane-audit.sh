@@ -5,7 +5,7 @@
 #
 # Part of PRD docs/prds/warm-lane-pool-sizing-lifecycle.md §9.1, §10 B1/B2.
 # Consumer: reify ζ (integration gate), dark-factory θ (soft-floor dispatch
-# throttle), the operator, and a health timer (§13 open-Q 3).
+# throttle), and the operator.
 #
 # Usage:
 #   scripts/warm-lane-audit.sh [--mount WORKTREES_DIR] [--format table|json] \
