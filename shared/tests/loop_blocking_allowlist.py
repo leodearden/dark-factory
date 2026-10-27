@@ -112,7 +112,9 @@ _completion_claim_gate -> verify_claims; its sibling row,
 create_mcp_server._claim_commit_presence, was then fixed and deleted by
 task 4853) and three added by widening the vocabulary to shutil.rmtree.  Task 5099 re-measured at HEAD b4e1349e1c
 after widening it to the directory-walk/metadata calls: 190 files scanned,
-91 findings (55 before; census section 4c).
+91 findings (55 before; census section 4c).  Task 6089 re-measured at HEAD
+d8b04e7aaa after widening it to Path.resolve / os.path.realpath: 290 files
+scanned, 90 findings (80 before; census section 4d).
 """
 
 from __future__ import annotations
@@ -187,7 +189,12 @@ _BACKLOG_POLICY_RECORD_IO_WHY = (
     '4484 step-9\'s ticket tkt_0RT7RHRS9ZTJSQK328919XXEJW became task '
     '5075, coalesced into 5270. The is_dir and glob rows task 5099 '
     'added when it widened the vocabulary are TASK 6086, filed to fold '
-    'into the same offload.'
+    'into the same offload. The queue.resolve row task 6089 added is '
+    'escalation.queue.EscalationQueue.resolve, matched by the method name '
+    'resolve though it is not Path.resolve: an escalation_id_lock flock, an '
+    'atomic record rewrite and an archive move, once per pending halt '
+    'record. It is TASK 6086\'s, whose offload moves the whole closing loop '
+    'into one asyncio.to_thread hop.'
 )
 
 #: The shared justification of every ``CodebaseVerifier.verify`` LLM-tool row.
@@ -266,6 +273,53 @@ _DEAD_LETTER_APPEND_WHY = (
     'population is larger. Filed by task 5099 as TASK 6085.'
 )
 
+#: Task 6089: who owns the measured-cheap ``resolve`` rows its widening added.
+_CHEAP_RESOLVE_OWNER_WHY = (
+    ' OWNED BY TASK 7572, created from task 6089\'s follow-up ticket '
+    'tkt_0RW94QBGG9RSRP47XQXGGV1KFK. Under the INV-12 day-one ruling '
+    '(esc-5603-1) a measured-cheap site is no longer a resting state in this '
+    'ledger, so 7572 offloads it (asyncio.to_thread, or anyio.Path.resolve '
+    'for a Path) and deletes the row, or obtains a per-row Policy ruling.'
+)
+
+#: Task 6089: one canonicalising resolve() in front of an awaited open.
+_PATH_RESOLVE_GUARD_WHY = (
+    'ROOT CAUSE (one debt, measured cheap): one Path.resolve() per '
+    'invocation of a single root or database path -- never a walk over what '
+    'a directory holds -- canonicalising it immediately before awaited work '
+    'that costs far more (an aiosqlite or connect_daemon open). Its cost '
+    '(census section 4d) scales with the path\'s component count, which is '
+    'set by the path the code, configuration or caller supplies, not by '
+    'what is on disk.'
+    + _CHEAP_RESOLVE_OWNER_WHY
+)
+
+#: Task 6089: the verifier LLM tools' path-containment guard.
+_VERIFIER_TOOL_PATH_GUARD_WHY = (
+    'ROOT CAUSE (one debt, measured cheap): CodebaseVerifier.verify\'s '
+    'read_file and grep_search tools each resolve() the model-chosen path '
+    'once, as an is_relative_to(codebase_root) containment guard -- one '
+    'Path.resolve per tool call (cost: census section 4d), and each tool '
+    'call follows an LLM turn of seconds. read_file\'s read_text after '
+    'the guard is TASK 5270\'s row in the same coroutine, and grep_search\'s '
+    'grep is already an awaited subprocess. If 5270 offloads read_file\'s '
+    'whole body, delete the read_file resolve row with it.'
+    + _CHEAP_RESOLVE_OWNER_WHY
+)
+
+#: Task 6089: run_server canonicalising configured paths before it serves.
+_STARTUP_PATH_RESOLVE_WHY = (
+    'ROOT CAUSE (one debt, startup only): run_server canonicalises a '
+    'configured path with Path.resolve() once per process, while it builds '
+    'the server and before server.serve() binds, so no request is in flight '
+    'to be delayed. A background loop run_server has already started (the '
+    'reconciliation harness, the event queue) can be stalled for that one '
+    'resolve (cost: census section 4d), once per process lifetime. If it '
+    'ever moves onto a request or reload path, '
+    'its content_hash changes and the gate re-asks.'
+    + _CHEAP_RESOLVE_OWNER_WHY
+)
+
 #: The shared justification of both ``gc_run_config_dir`` rows in harness.py.
 _RUN_CONFIG_DIR_GC_WHY = (
     'ROOT CAUSE (one defect, 2 rows): two harness coroutines call the '
@@ -340,6 +394,13 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'accepted',
         _FIXED_STAT_GUARD_WHY,
     ),
+    (
+        'fused-memory/src/fused_memory/mcp_tools/scheduler_state.py',
+        'read_scheduler_events',
+        '14947dd93734',
+        'filed',
+        _PATH_RESOLVE_GUARD_WHY,
+    ),
 
     # ---- middleware/task_interceptor.py ----
     (
@@ -362,6 +423,28 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'd7b1b643f3fe',
         'accepted',
         _COMBINE_AUDIT_APPEND_WHY,
+    ),
+
+    # ---- middleware/task_curator.py ----
+    (
+        'fused-memory/src/fused_memory/middleware/task_curator.py',
+        'TaskCurator._invoke_curator',
+        '2be781b317a0',
+        'filed',
+        'ROOT CAUSE (one debt, bounded by an LLM call): _invoke_curator reaches '
+        '_resolve_curator_prompt -> self._prompt_store.resolve(...). The '
+        'scanner matches the method name resolve, but the receiver is '
+        'shared.prompt_artifact.PromptArtifactStore.resolve, not '
+        'Path.resolve. That code lives under shared/src, outside the '
+        'scanner\'s fused-memory/src scope, and it does block: unpinned it is '
+        'one exists() probe of the key\'s heuristics.txt (cost: census '
+        'section 4d); pinned it adds a JSON provenance load and a '
+        'heuristics.txt read. '
+        'PromptArtifactStore.resolve\'s own docstring states this I/O and '
+        'the once-per-invocation granularity it expects. It runs once per '
+        'curator LLM round-trip, immediately before the awaited self._invoke '
+        'of seconds -- the same bound the COMBINE audit append rests on.'
+        + _CHEAP_RESOLVE_OWNER_WHY,
     ),
 
     # ---- middleware/ticket_store.py ----
@@ -406,6 +489,13 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
         'BacklogPolicy.on_judge_unhalt',
         '48269c8edbbd',
+        'filed',
+        _BACKLOG_POLICY_RECORD_IO_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
+        'BacklogPolicy.on_judge_unhalt',
+        'f8315799ebea',
         'filed',
         _BACKLOG_POLICY_RECORD_IO_WHY,
     ),
@@ -712,6 +802,20 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'accepted',
         _FIXED_STAT_GUARD_WHY,
     ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/verify.py',
+        'CodebaseVerifier.verify.read_file',
+        '8ad4f6cd803f',
+        'filed',
+        _VERIFIER_TOOL_PATH_GUARD_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/verify.py',
+        'CodebaseVerifier.verify.grep_search',
+        'd96696388685',
+        'filed',
+        _VERIFIER_TOOL_PATH_GUARD_WHY,
+    ),
 
     # ---- services/durable_queue.py ----
     (
@@ -739,6 +843,15 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'recon_write_policy Gate 2), not once per task in a fan-out. The '
         'row surfaced only because task 3778 made detect_live_workflow a '
         'coroutine; its git probes, the real cost, are awaited.',
+    ),
+
+    # ---- services/overreach_shadow.py ----
+    (
+        'fused-memory/src/fused_memory/services/overreach_shadow.py',
+        'OverreachShadowStore.open_read_only',
+        'fa698adde643',
+        'filed',
+        _PATH_RESOLVE_GUARD_WHY,
     ),
 
     # ---- services/planned_episode_registry.py ----
@@ -788,6 +901,27 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'serving traffic, so there is no concurrent work to stall. If it '
         'ever moves onto a request or reload path, the content_hash '
         'changes and the gate re-asks.',
+    ),
+    (
+        'fused-memory/src/fused_memory/server/main.py',
+        'run_server',
+        '8a884f86a26c',
+        'filed',
+        _STARTUP_PATH_RESOLVE_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/server/main.py',
+        'run_server',
+        'beb5b61c6b9a',
+        'filed',
+        _STARTUP_PATH_RESOLVE_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/server/main.py',
+        'run_server',
+        '43c97372205c',
+        'filed',
+        _STARTUP_PATH_RESOLVE_WHY,
     ),
 
     # ---- server/tools.py ----
@@ -1221,6 +1355,13 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'handler cannot be added silently under a blessed 22. Follow-up '
         'filed by task 4484 step-9.'
         ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
+    ),
+    (
+        'fused-memory/src/fused_memory/server/tools.py',
+        'create_mcp_server.request_park_eviction',
+        'a0b1b5c60eed',
+        'filed',
+        _PATH_RESOLVE_GUARD_WHY,
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
