@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -74,10 +75,17 @@ class Mem0RetryPolicy:
             )
 
     def retry_at(self, *, attempts: int, now: datetime) -> datetime:
-        """When to re-issue a write that has failed ``attempts`` times."""
+        """When to re-issue a write that has failed ``attempts`` times.
+
+        Retries are unbounded, so the doubling stops at the first exponent
+        that reaches the cap: a float times ``2 ** 1024`` overflows.
+        """
+        doublings_to_cap = math.ceil(
+            math.log2(self.max_delay_seconds / self.initial_delay_seconds)
+        )
         delay = min(
             self.max_delay_seconds,
-            self.initial_delay_seconds * 2 ** (attempts - 1),
+            self.initial_delay_seconds * 2 ** min(attempts - 1, doublings_to_cap),
         )
         return now + timedelta(seconds=delay)
 

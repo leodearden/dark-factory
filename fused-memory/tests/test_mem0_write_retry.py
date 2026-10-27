@@ -108,6 +108,10 @@ class TestMem0RetryPolicy:
         assert self._POLICY.retry_at(attempts=3, now=now) == now + timedelta(seconds=120)
         assert self._POLICY.retry_at(attempts=20, now=now) == now + timedelta(seconds=900)
 
+    def test_backoff_stays_capped_after_unbounded_attempts(self):
+        now = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
+        assert self._POLICY.retry_at(attempts=5000, now=now) == now + timedelta(seconds=900)
+
     def test_default_policy_exists(self):
         assert isinstance(DEFAULT_MEM0_RETRY_POLICY, Mem0RetryPolicy)
 
