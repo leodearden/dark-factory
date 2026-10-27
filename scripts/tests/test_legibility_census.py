@@ -6580,83 +6580,6 @@ def test_main_hands_run_census_a_window_source_over_the_project_ledger(tmp_path,
     assert source.selection.ledger.state is session_ledger.LedgerState.CREATED
 
 
-# ---------------------------------------------------------------------------
-# task 2953: _post_mcp_tool_call() streamable-HTTP Accept headers
-# ---------------------------------------------------------------------------
-
-class _FakeHttpxResponse:
-    """A 200 `application/json` reply, i.e. the STATELESS fused-memory shape.
-
-    `status_code` and `headers` were added for task 3644: `_post_mcp_tool_call`
-    now delegates to `census_trigger.post_mcp_tool_call`, which reads
-    `status_code` (to detect the stateful escalation server's 400 "Missing
-    session ID") and `content-type` (to detect an SSE-framed body) before
-    decoding. Without them this fake would die on an AttributeError and stop
-    exercising the real code path -- so the task-2953 header contract below
-    keeps being asserted against the transport that actually ships, not
-    against a fake the implementation has outgrown."""
-
-    def __init__(self, payload):
-        self._payload = payload
-        self.status_code = 200
-        self.headers = {"content-type": "application/json"}
-
-    def raise_for_status(self):
-        pass
-
-    def json(self):
-        return self._payload
-
-
-def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_httpx, monkeypatch):
-    """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
-    lacking an Accept header covering both application/json and
-    text/event-stream (verified live against a local MCP /mcp endpoint --
-    shared by census.py's submit_task and escalate_info posters via this one
-    function). httpx is imported lazily, but it IS importable here -- a
-    direct dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`,
-    task 2965) -- so an un-faked call would really hit the network. The
-    shared `install_fake_httpx` fixture substitutes a stub so the outbound
-    request shape is assertable without a live listener on :8002."""
-    captured_kwargs = {}
-    rpc_response = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {"structuredContent": {"ok": True}},
-    }
-
-    def _fake_post(url, **kwargs):
-        captured_kwargs.update(kwargs)
-        return _FakeHttpxResponse(rpc_response)
-
-    install_fake_httpx(_fake_post)
-
-    # ENTITLED to reach census's real delegate: this test owns the endpoint --
-    # `install_fake_httpx` substitutes a stub httpx BELOW the transport, so
-    # nothing leaves the process, and the whole point is to assert the real
-    # outbound request shape. Declared around the call rather than inferred
-    # (task 5279 W1).
-    with alarm.own_endpoint():
-        result = mod._post_mcp_tool_call(
-            "http://localhost:8002/mcp", "submit_task", {"a": 1},
-        )
-
-    assert result == {"ok": True}
-    headers = captured_kwargs.get("headers") or {}
-    assert "application/json" in headers.get("Accept", "")
-    assert "text/event-stream" in headers.get("Accept", "")
-    # Content-Type is part of the same transport contract -- pin it too so a
-    # future edit dropping it can't pass on the Accept assertions alone.
-    assert headers.get("Content-Type") == "application/json"
-    # The JSON-RPC tools/call body (name + arguments) must still ride along.
-    envelope = captured_kwargs.get("json") or {}
-    assert envelope.get("method") == "tools/call"
-    assert envelope.get("params", {}).get("name") == "submit_task"
-    assert envelope.get("params", {}).get("arguments") == {"a": 1}
-
-
-
-
 def test_main_hard_failure_under_pytest_reaches_no_real_mcp_endpoint(tmp_path, monkeypatch):
     """With no poster injected, the alarm's default poster refuses to post
     from inside pytest, and main()'s exit contract is unchanged."""
@@ -10317,27 +10240,43 @@ def test_main_hands_run_census_a_task_store_on_the_fused_memory_endpoint(tmp_pat
     assert store.find_tasks_by_metadata("/abs/root", key="x_finding_key", value="fk-000000000000") == ()
 
     [(url, tool_name, arguments)] = posts
-    assert (url, tool_name) == ("http://fused-memory.test:9999/mcp", "find_tasks_by_metadata")
+    assert (url, tool_name) == ("http://fused-memory.test:9999", "find_tasks_by_metadata")
     assert {key: arguments[key] for key in ("project_root", "key", "value")} == {
         "project_root": "/abs/root", "key": "x_finding_key", "value": "fk-000000000000",
     }
 
 
-def test_post_mcp_tool_call_forwards_its_timeout_to_the_transport(install_fake_httpx):
-    captured = {}
+def _tool_calls(server):
+    return [
+        (request.body["params"]["name"], request.body["params"]["arguments"])
+        for request in server.requests
+        if request.http_method == "POST" and request.body.get("method") == "tools/call"
+    ]
 
-    def _fake_post(url, **kwargs):
-        captured.update(kwargs)
-        return _FakeHttpxResponse({"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"ok": True}}})
 
-    install_fake_httpx(_fake_post)
+def test_the_fused_memory_poster_serves_a_task_store_over_a_real_socket():
+    with StubMcpServer(stateful=False, payload=_EMPTY_FIND_PAGE) as server:
+        store = task_store.McpTaskStore(url=server.url, post=mod._post_mcp_tool_call)
+        with alarm.own_endpoint():
+            hits = store.find_tasks_by_metadata("/abs/root", key="x_finding_key", value="fk-000000000000")
 
-    # ENTITLED: install_fake_httpx stubs httpx below the transport, so this
-    # test owns the endpoint it posts to.
-    with alarm.own_endpoint():
-        mod._post_mcp_tool_call("http://localhost:8002/mcp", "resolve_ticket", {"ticket": "t"}, timeout=130.0)
+    assert hits == ()
+    [(tool_name, arguments)] = _tool_calls(server)
+    assert tool_name == "find_tasks_by_metadata"
+    assert {key: arguments[key] for key in ("project_root", "key", "value", "offset")} == {
+        "project_root": "/abs/root", "key": "x_finding_key", "value": "fk-000000000000", "offset": 0,
+    }
 
-    assert captured["timeout"] == 130.0
+
+def test_default_submit_fn_reaches_submit_task_on_the_fused_memory_base_url(monkeypatch):
+    with StubMcpServer(stateful=False, payload={"ticket": "tkt_1"}) as server:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+        with alarm.own_endpoint():
+            reply = mod.default_submit_fn(title="t", project_root="/abs/root")
+
+    assert reply == {"ticket": "tkt_1"}
+    assert {request.path for request in server.requests} == {"/mcp"}
+    assert _tool_calls(server) == [("submit_task", {"title": "t", "project_root": "/abs/root"})]
 
 
 def test_main_task_store_refuses_a_real_post_under_pytest(tmp_path, monkeypatch):
