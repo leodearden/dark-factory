@@ -147,6 +147,11 @@ import yaml
 from legibility import codebook
 from legibility.config import Census as _LegibilityCensus
 
+if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
+    sys.path.insert(0, _SHARED_SRC)
+
+from shared.mcp_session import McpCallError, SyncMcpSession
+
 logger = logging.getLogger("legibility.census_trigger")
 
 
@@ -708,8 +713,8 @@ def extract_done_count(payload) -> int:
     done-count of 0 -- no warning, no exception, no way to tell a real
     empty project from a failed call. fused-memory's `@mcp_tool_errors`
     returns its `{"error", "error_type"}` dict on an `isError: false`
-    JSON-RPC response, so `_extract_tool_result` unwraps it as though it
-    were a genuine result and the old idiom read it as 0. That fabricated 0
+    JSON-RPC response, so the client unwraps it as though it were a
+    genuine result and the old idiom read it as 0. That fabricated 0
     was persisted as a real census baseline on 2026-07-24 and on 2026-07-31
     (task 3291) — an unsound baseline that stayed latent only for as long as
     the fetch itself was broken (the same defect zeroed `current_done`, so
@@ -726,14 +731,12 @@ def extract_done_count(payload) -> int:
     non-mapping `statuses` key, a non-dict payload, or the tool-error
     envelope is treated as unavailable.
 
-    Note this strictness deliberately lives HERE and not in
-    `_extract_tool_result`: that unwrapper is shared with
-    `census._post_mcp_tool_call`, which serves `submit_task` and
-    `escalate_info`, and those callers legitimately receive and inspect the
-    `{"error": ...}` dict (submit_task's documented rejection shape).
-    Raising there would break unrelated paths; raising at the
-    get_statuses-specific boundary closes the hole at both call sites at
-    once without touching them.
+    Note this strictness deliberately lives HERE and not in the MCP client:
+    `SyncMcpSession.call_tool` hands every caller the tool's reply as-is,
+    and `submit_task`'s callers legitimately receive and inspect its
+    `{"error": ...}` rejection dict. Raising at the get_statuses-specific
+    boundary closes the hole for both done-count consumers without touching
+    unrelated paths.
 
     Raises:
         StatusFetchUnavailable: with a message naming the offending shape --
@@ -1338,94 +1341,32 @@ def post_mcp_tool_call(
 
 
 def default_status_fetcher(project_root: str | Path):
-    """Return a zero-arg best-effort get_statuses caller.
+    """Return a zero-arg get_statuses caller for *project_root*.
 
-    Since task 4148 this is the SHARED production factory for all three
-    consumers -- the standalone `evaluate` CLI below, `census.py`'s `main()`,
-    and the nightly trickle, whose `run_nightly` defaults its
-    `status_fetcher` seam to `default_status_fetcher(cfg.project_root)`.
-    (It previously served the `evaluate` CLI alone: nothing on the nightly
-    path ever built a fetcher, so condition (b) fell through to
-    `compute_tasks_landed`'s `status_fetcher is None` arm on every real run.)
+    The shared production factory for the `evaluate` CLI, `census.py`'s
+    `main()` and the nightly trickle. It calls fused-memory at
+    `$FUSED_MEMORY_MCP_URL` (default `http://localhost:8002`) and returns
+    the tool's reply, the `{"statuses": {...}}` mapping
+    `compute_tasks_landed` reads. Any failure raises `StatusFetchUnavailable`
+    naming the URL.
 
-    Reads the fused-memory MCP endpoint from the `FUSED_MEMORY_MCP_URL` env
-    var, defaulting to
-    `http://localhost:8002`. `httpx` is imported lazily so importing this
-    module for its pure core never needs it, and so tests can substitute a
-    stub for the real POST -- not for availability (see module docstring);
-    that ImportError, along with
-    any network/HTTP/parse failure, is wrapped as `StatusFetchUnavailable`
-    so callers can catch fetch failures deterministically rather than a bare
-    Exception. The call itself goes through :func:`post_mcp_tool_call`, so the
-    return value is the tool's own unwrapped result -- matching
-    `compute_tasks_landed`'s expected `{"statuses": {...}}` shape rather than
-    the outer JSON-RPC envelope -- and this consumer gets the session
-    handshake and SSE decoding for free along with the other three.
-
-    *project_root* is resolved to an ABSOLUTE path before it crosses the
-    wire: the MCP `get_statuses` argument is interpreted by the SERVER's
-    cwd, not the client's, so a relative path is meaningless there and is
-    hard-rejected by fused-memory's `_normalize_project_root` (task 3291 --
-    see the comment at the resolve call below).
+    *project_root* is resolved to an ABSOLUTE path here, at the wire, for
+    every consumer at once: the server resolves the argument against its own
+    cwd, and fused-memory's `_normalize_project_root` rejects a relative
+    path. An absolute root is sent unchanged.
     """
-    # THE ROOT-CAUSE FIX (task 3291). The MCP argument is resolved by the
-    # server process, not this one, so a relative path is not merely
-    # fragile -- fused-memory's `_normalize_project_root` rejects it
-    # outright with {"error": "project_root must be a non-empty absolute
-    # path, got: '.'", "error_type": "ValidationError"}. That envelope rides
-    # an `isError: false` JSON-RPC response, so it used to sail through
-    # `_extract_tool_result` and get counted as a done-count of 0.
-    #
-    # census.py resolves its own, now required, --project-root (task 3269);
-    # the `evaluate` CLI's "." default still depends on this resolve().
-    #
-    # Resolving HERE, at the wire boundary, rather than at each CLI
-    # entrypoint, fixes every consumer at once -- census.py's main(), the
-    # nightly trickle's decide_for_project, and the `evaluate` CLI all build
-    # their fetcher through this one function. Fixing it at the CLIs instead
-    # would need lockstep edits with the same silent-failure risk this
-    # module already single-sources MCP_STREAMABLE_HTTP_HEADERS to avoid.
-    #
-    # census.py's own Path(args.project_root) stays relative-friendly: it is
-    # used for local filesystem access (config, codebook, report, state),
-    # where a cwd-relative path resolves correctly in-process. Only the
-    # over-the-wire argument was ever broken.
     project_root_str = str(Path(project_root).resolve())
-    url = os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL)
+    base_url = os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL)
 
     def _fetch() -> dict:
         try:
-            # Availability probe only -- the POST itself goes out through
-            # `post_mcp_tool_call`, which does its own lazy import. Kept so an
-            # absent httpx still surfaces as the specific "httpx is not
-            # installed" StatusFetchUnavailable rather than as a generic
-            # "get_statuses unreachable" wrapped ImportError.
-            import httpx  # noqa: F401
-        except ImportError as exc:
-            raise StatusFetchUnavailable("httpx is not installed") from exc
-
-        try:
-            # Routed through the ONE shared transport (review finding, task
-            # 3644 amendment pass) rather than a hand-rolled POST: this is the
-            # fourth legibility MCP consumer, and the other three moved. The
-            # hand-rolled copy was byte-for-byte what `post_mcp_tool_call` does
-            # MINUS the session handshake and SSE decoding -- so it was the one
-            # remaining place where a fused-memory switch to a stateful
-            # `http_app()` (the same default the escalation server runs) would
-            # silently break the done-count baseline through
-            # `StatusFetchUnavailable`, i.e. reproduce this exact bug in the
-            # last unmigrated consumer.
-            return post_mcp_tool_call(
-                f"{url}/mcp",
-                "get_statuses",
-                {"project_root": project_root_str},
-                timeout=10.0,
-            )
-        except StatusFetchUnavailable:
-            raise
-        except Exception as exc:  # noqa: BLE001 - any failure must fail safe
+            with SyncMcpSession(
+                base_url, client_name="legibility-census-trigger", timeout=10.0,
+            ) as session:
+                return session.call_tool("get_statuses", {"project_root": project_root_str})
+        except McpCallError as exc:
             raise StatusFetchUnavailable(
-                f"get_statuses unreachable at {url}: {exc}"
+                f"get_statuses unreachable at {base_url}: {exc}"
             ) from exc
 
     return _fetch
