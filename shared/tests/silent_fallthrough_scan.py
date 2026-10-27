@@ -537,6 +537,7 @@ SCOPE_ROOTS: tuple[str, ...] = (
     "shared/src",
     "sampler/src",
     "cockpit/src",
+    "client-feed/src",
     "scripts",
 )
 

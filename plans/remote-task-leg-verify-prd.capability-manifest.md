@@ -29,7 +29,7 @@ a §4 design decision.
    edit could never have been δ1's.
 2. **Rows 9, 12 and 13 named halves produced downstream of γ.** The RU-tracker half of rows 9
    and 12 needs δ1's public tracker entry. The `SOFT_CANCELLED` workflow outcome in row 13
-   needs δ2's workflow wiring. **Resolution:** γ asserts the `on_unavailable(name, kind)`
+   needs δ2's workflow wiring. **Resolution:** γ asserts the `on_unavailable(name, exc)`
    hook call and the dispatcher-side cancel-before-unwind order. δ1 asserts the tracker half
    of row 9. ι executes all three rows end to end.
 3. **Row 3 spans two producers.** The fake-ssh `rc ≠ 0 → RunnerUnavailable(kind='transport')`
@@ -70,7 +70,7 @@ slot. Up to `max_concurrent_tasks` workflows share one dispatcher (heuristic 7).
 | `TaskVerifyDispatcher` | producer γ (new `task_verify_dispatch.py`) | PASS | grep `^class TaskVerifyDispatcher[(:]` |
 | public `build_remote_runners` | producer γ, moved from `merge_lane/drift.py::_build_remote_runners` (present) | PASS | grep `^def build_remote_runners\(` |
 | policy without config keys | as written: producer-downstream (δ2) **FAIL** → resolution 1 | PASS | manual |
-| dispatcher substrate | `verify_plan.py::derive_verify_plan`, `GitOps.has_uncommitted_work`, `RemoteRunner.sync_if_stale`, `verify_categories.py` `INFRA_TRANSIENT_CATEGORIES` (all present) | PASS | manual |
+| dispatcher substrate | `verify_plan.py::derive_verify_plan`, `GitOps.has_uncommitted_work`, `RemoteRunner.ensure_gate`, `verify_categories.py` `INFRA_TRANSIENT_CATEGORIES` (all present) | PASS | manual |
 | lease released on every exit | built by γ; rows 13, 14, 21 | PASS | manual |
 
 ### δ1 — harness-owned allocator (hub carry, stage 1)
@@ -78,7 +78,7 @@ slot. Up to `max_concurrent_tasks` workflows share one dispatcher (heuristic 7).
 | Capability | Evidence | Verdict | Check |
 |---|---|---|---|
 | `merge_lane_wants_host()` | producer δ1 over worker `_redispatch`, `_verifier_queue`, `_pending_verifier_get`, `_merge_ahead_ledger` (present) | PASS | grep `def merge_lane_wants_host\(` |
-| public RU tracker entry | producer δ1 over `_quarantine_unreachable_host`, `_record_runner_unavailable`, `_record_runner_recovered` (present) | PASS | grep `def note_runner_unavailable\(` |
+| public RU tracker entry | producer δ1 over `_record_runner_recovered` (present); the unavailable side is 6565's public `bench_unavailable_runner` (present) | PASS | grep `def note_runner_recovered\(` |
 | harness owns the pool | producer δ1 in `Harness.__init__`, injected via `Harness._start_merge_worker` (present); `HostPool` from γ upstream | PASS | grep `HostPool\(` in `harness.py` |
 
 ### δ2 — workflow, config, dispatcher wiring (hub carry, stage 2)

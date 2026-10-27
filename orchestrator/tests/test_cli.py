@@ -536,7 +536,7 @@ class TestRunUntilIdleFlag:
         # AsyncMock so `await harness.run(...)` inside the real _main resolves.
         from unittest.mock import AsyncMock
         fake_harness.run = AsyncMock(return_value=fake_report)
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
         return fake_harness
 
     def test_flag_threads_until_idle_true(self, monkeypatch):
@@ -639,7 +639,7 @@ class TestRunArmsWatchdog:
         fake_report.summary.return_value = 'all done'
         fake_harness.run = MagicMock()
 
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
 
         # asyncio.run returns fake_report (bypasses _main entirely).
         # Close the coroutine to avoid "coroutine was never awaited" warnings.
@@ -677,7 +677,7 @@ class TestRunArmsWatchdog:
         monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
 
         fake_harness = MagicMock()
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
 
         # asyncio.run raises CancelledError to simulate SIGTERM path.
         # Close the coroutine to avoid "coroutine was never awaited" warnings.
@@ -724,7 +724,7 @@ class TestRunArmsWatchdog:
         fake_report = MagicMock()
         fake_report.blocked = 0
         fake_report.summary.return_value = 'all done'
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
 
         # Capture what 'armed_with' is while asyncio.run is "executing".
         armed_during_asyncio_run: list = []
@@ -784,7 +784,7 @@ class TestRunArmsWatchdog:
         fake_report = MagicMock()
         fake_report.blocked = 0
         fake_report.summary.return_value = 'all done'
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
 
         def fake_asyncio_run(coro):
             coro.close()
@@ -839,7 +839,7 @@ class TestRunArmsWatchdog:
         fake_report = MagicMock()
         fake_report.blocked = 3  # non-zero forces the sys.exit(1) branch
         fake_report.summary.return_value = 'blocked'
-        monkeypatch.setattr('orchestrator.harness.Harness', lambda config: fake_harness)
+        monkeypatch.setattr('orchestrator.harness.Harness', lambda config, **_: fake_harness)
 
         def fake_asyncio_run(coro):
             coro.close()
@@ -2673,3 +2673,55 @@ def test_verify_merge_hands_exit_to_a_fired_watchdog_on_every_path(
     assert _VERIFY_MERGE_RESULT_JSON not in r.stdout, (
         f'never print a VerifyResult for a build the watchdog killed; stdout={r.stdout!r}'
     )
+
+
+class TestRunCapturesTheDeployedSha:
+    """Task 6565 D1: ``run`` brackets the harness import and injects the sha."""
+
+    def _invoke(self, monkeypatch, *, enabled_runners):
+        monkeypatch.setattr(cli_module, '_force_exit_after_delay', lambda *a, **k: MagicMock())
+        fake_config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        fake_config.enabled_verify_runners = enabled_runners
+        monkeypatch.setattr(cli_module, 'load_config', lambda _path: fake_config)
+        fake_report = MagicMock(blocked=0)
+        fake_report.summary.return_value = 'ok'
+        received: dict[str, object] = {}
+
+        def fake_harness(config, **kwargs):
+            received.update(kwargs)
+            harness = MagicMock()
+            harness.run = AsyncMock(return_value=fake_report)
+            return harness
+
+        monkeypatch.setattr('orchestrator.harness.Harness', fake_harness)
+        result = CliRunner().invoke(cli_module.main, ['run', '--config', '/dev/null'])
+        return result, received
+
+    def test_harness_receives_the_checkout_head(self, monkeypatch):
+        from orchestrator.deployed_sha import DeployedSha, checkout_head, resolve_code_checkout
+
+        result, received = self._invoke(monkeypatch, enabled_runners=[])
+
+        assert result.exit_code == 0, result.output
+        deployed = received['deployed_sha']
+        assert isinstance(deployed, DeployedSha)
+        checkout = resolve_code_checkout()
+        assert checkout is not None
+        assert deployed.sha == checkout_head(checkout)
+
+    def test_unreadable_sha_with_an_enabled_remote_runner_refuses_to_start(self, monkeypatch):
+        monkeypatch.setattr('orchestrator.deployed_sha.resolve_code_checkout', lambda: None)
+
+        result, received = self._invoke(monkeypatch, enabled_runners=[MagicMock()])
+
+        assert result.exit_code == 1
+        assert 'remote verify runner is enabled' in result.output
+        assert received == {}
+
+    def test_unreadable_sha_without_remote_runners_starts_with_none(self, monkeypatch):
+        monkeypatch.setattr('orchestrator.deployed_sha.resolve_code_checkout', lambda: None)
+
+        result, received = self._invoke(monkeypatch, enabled_runners=[])
+
+        assert result.exit_code == 0, result.output
+        assert received == {'deployed_sha': None}

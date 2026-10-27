@@ -115,18 +115,16 @@
     "backend": "codex",
     "output": "Error: rate limit",
     "strict_confirm": true,
-    "expected": "CapHit",
-    "resets_at": "none",
-    "provenance": "usage_gate.py CODEX_CAP_PATTERNS"
+    "expected": "Failure",
+    "provenance": "task 5403 review: generic phrase with no confirm keyword -> strict regime rejects (codex/gemini analogue of claude_toggle_strict_true_non_cap)"
   },
   {
     "id": "codex_quota_exceeded",
     "backend": "codex",
     "output": "Error: quota exceeded",
     "strict_confirm": true,
-    "expected": "CapHit",
-    "resets_at": "none",
-    "provenance": "usage_gate.py CODEX_CAP_PATTERNS"
+    "expected": "Failure",
+    "provenance": "task 5403 review: generic phrase with no confirm keyword -> strict regime rejects (codex/gemini analogue of claude_toggle_strict_true_non_cap)"
   },
   {
     "id": "codex_insufficient_quota",
@@ -151,18 +149,16 @@
     "backend": "gemini",
     "output": "Error: quota exceeded",
     "strict_confirm": true,
-    "expected": "CapHit",
-    "resets_at": "none",
-    "provenance": "usage_gate.py GEMINI_CAP_PATTERNS"
+    "expected": "Failure",
+    "provenance": "task 5403 review: generic phrase with no confirm keyword -> strict regime rejects (codex/gemini analogue of claude_toggle_strict_true_non_cap)"
   },
   {
     "id": "gemini_rate_limit",
     "backend": "gemini",
     "output": "Error: rate limit",
     "strict_confirm": true,
-    "expected": "CapHit",
-    "resets_at": "none",
-    "provenance": "usage_gate.py GEMINI_CAP_PATTERNS"
+    "expected": "Failure",
+    "provenance": "task 5403 review: generic phrase with no confirm keyword -> strict regime rejects (codex/gemini analogue of claude_toggle_strict_true_non_cap)"
   },
   {
     "id": "gemini_resource_exhausted_lower",
@@ -414,5 +410,39 @@
     "expected": "CapHit",
     "resets_at": "set",
     "provenance": "task 3314 (plans/server-side-api-error-handling-prd.md task alpha, contract C1); 2026-07-29 provider-outage incident \u2014 the ServerError tier sits BELOW cap detection: a 5xx carrying a real cap body still caps the account. Also rides TestB3CapHitDrivesAccountCapped, pinning that cap accounting is untouched by the new tier"
+  },
+  {
+    "id": "codex_chatgpt_usage_window",
+    "backend": "codex",
+    "output": "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 1:07 PM.",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "set",
+    "provenance": "task 5403; codex-cli 0.154.0 ChatGPT usage window, carried by an `error` + `turn.failed` pair while `codex exec` exits 0: 47 pairs in plans/fable-evidence-package-2026-09-10/campaign/run-trial1-xfam.log (untracked, main checkout) and the live reproduction on 2026-09-11"
+  },
+  {
+    "id": "codex_quota_exceeded_billing",
+    "backend": "codex",
+    "output": "Quota exceeded. Check your plan and billing details.",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "none",
+    "provenance": "task 5403 review: codex-cli 0.154.0's own QuotaExceeded text, read from the installed binary's strings; 'billing' is its confirm keyword"
+  },
+  {
+    "id": "codex_failed_reply_discussing_rate_limits",
+    "backend": "codex",
+    "output": "The cap-retry loop backs off on a rate limit before it fails over.\nCodex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
+    "strict_confirm": true,
+    "expected": "Failure",
+    "provenance": "task 5403 review: a failed reply that discusses rate limits, then fails on codex-cli 0.154.0's context-window error, is not a cap (no confirm keyword)"
+  },
+  {
+    "id": "gemini_failed_reply_discussing_rate_limits",
+    "backend": "gemini",
+    "output": "The cap-retry loop backs off on a rate limit before it fails over.\nCodex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
+    "strict_confirm": true,
+    "expected": "Failure",
+    "provenance": "task 5403 review: a failed reply that discusses rate limits, then fails on codex-cli 0.154.0's context-window error, is not a cap (no confirm keyword)"
   }
 ]

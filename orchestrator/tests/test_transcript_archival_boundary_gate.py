@@ -43,7 +43,6 @@ task 4384.
 
 from __future__ import annotations
 
-import asyncio
 import errno
 import logging
 import os
@@ -89,7 +88,7 @@ TASK_ID = '42'
 def git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_transcript_repo(repo))
+    _init_transcript_repo(repo)
     return repo
 
 

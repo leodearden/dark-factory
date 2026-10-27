@@ -31,8 +31,8 @@ agreement with this module rather than allowed to go stale.
 Ledger-backed marker UPSERT (task 2227)
 ----------------------------------------
 ``dedup_flags`` is the entry point.  For each flag with a computable
-signature — ``(task_id, flag_type)`` via ``compute_flag_signature``,
-falling back to ``compute_content_fingerprint_signature`` for null-task_id
+signature — ``(task_id, flag_type)`` via ``compute_marker_signature``, which
+falls back to ``compute_content_fingerprint_signature`` for null-task_id
 flags lacking ``cited_tasks`` — the corresponding ``stage1_flag_marker``
 row is looked up via ``get_by_identity(project_id, 'stage1_flag_marker',
 task_id, flag_type, run_id='')``.  Note ``run_id=''`` in the identity: the
@@ -57,14 +57,15 @@ that cycle (task 4864).  Neither is persisted.  The sanitizing now serves
 the gate's input validation alone — an unserialisable or malformed
 LLM-authored citation must never reach the resolver — not a payload write.
 
-**Invariant (task 4712):** no INPUT to :func:`compute_flag_signature` may be
+**Invariant (task 4712):** no INPUT to :func:`compute_marker_signature` may be
 persisted in the marker payload as durable cross-cycle state.
-:func:`compute_flag_signature` folds every ``cited_tasks`` entry's
-``task_id`` into the row's own key (see its "cited_tasks union" section
-below), so a value derived from citations is unconditionally stored in a row
-keyed by itself — reachable only when a LATER cycle happens to present the
-IDENTICAL citation set, in which case that cycle's own citation already
-resolves the gate and the anchor adds nothing.  A prior version of this
+:func:`compute_marker_signature` folds every ``cited_tasks`` entry's
+``task_id`` into the row's own key (see :func:`compute_flag_signature`'s
+"cited_tasks union" section below), so a value derived from citations is
+unconditionally stored in a row keyed by itself — reachable only when a
+LATER cycle happens to present the IDENTICAL citation set, in which case
+that cycle's own citation already resolves the gate and the anchor adds
+nothing.  A prior version of this
 module persisted the UNION of the prior row's anchor and the current cycle's
 citations (``_union_cited_tasks``, now deleted) specifically to survive
 citation-less cycles; measured evidence disproved it —
@@ -307,6 +308,8 @@ because the ledger is absent.
 Public API
 ----------
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
+- ``compute_marker_signature(flag, *, project_id)`` — cheap, sync, no I/O;
+  the ``stage1_flag_marker`` ledger identity of *flag* in *project_id*.
 - ``compute_content_fingerprint_signature(flag)`` — cheap, sync, no I/O;
   fallback signature for null-task_id flags lacking ``cited_tasks``.
 - ``canonical_flag_type_family(flag_type)`` — cheap, sync, no I/O;
@@ -384,6 +387,7 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_WRITTEN_STAT_KEY,
 )
 from fused_memory.utils.async_utils import gather_collect
+from fused_memory.utils.validation import validate_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -528,15 +532,28 @@ class FlagTypeFamily:
     collapses, and :meth:`log_drift` makes the rest observable.
 
     ``name`` labels the family in the drift log; ``spellings`` are the
-    measured ones; ``drift_token`` marks a ``flag_type`` as probably meant for
-    this family.  A non-empty ``unseen_spelling_tokens`` also admits a
-    never-observed spelling whose tokens include all of them.
+    measured ones; a ``flag_type`` whose casefolded text contains any one of
+    the ``drift_tokens`` is probably meant for this family.  A non-empty
+    ``unseen_spelling_tokens`` also admits a never-observed spelling whose
+    tokens include all of them.
     """
 
     name: str
     spellings: frozenset[str]
-    drift_token: str
+    drift_tokens: frozenset[str]
     unseen_spelling_tokens: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        tokens = self.drift_tokens
+        if (
+            not isinstance(tokens, frozenset)
+            or not tokens
+            or any(not t or t != t.casefold() for t in tokens)
+        ):
+            raise ValueError(
+                f'FlagTypeFamily {self.name!r}: drift_tokens must be a non-empty frozenset '
+                f'of non-empty casefolded substrings, got {tokens!r}'
+            )
 
     @cached_property
     def _canonical_spellings(self) -> frozenset[str]:
@@ -551,13 +568,17 @@ class FlagTypeFamily:
         tokens = {t for t in _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold()) if t}
         return bool(self.unseen_spelling_tokens) and self.unseen_spelling_tokens <= tokens
 
+    def _probably_meant_for_family(self, flag_type: str) -> bool:
+        folded = flag_type.casefold()
+        return any(token in folded for token in self.drift_tokens)
+
     def log_drift(self, flags: list[dict[str, Any]], *, log_event: str) -> None:
-        """Log as *log_event* each ``flag_type`` carrying ``drift_token`` that does not match."""
+        """Log as *log_event* each ``flag_type`` carrying a drift token that does not match."""
         unmatched = [
             ft
             for flag in flags
             if isinstance(ft := flag.get('flag_type'), str)
-            and self.drift_token in ft.casefold()
+            and self._probably_meant_for_family(ft)
             and not self.matches(ft)
         ]
         if unmatched:
@@ -1442,17 +1463,17 @@ async def dedup_flags(
 
     For each flag in *flags*:
 
-    - Signature is computed first via ``compute_flag_signature(flag)``
-      (keyed on top-level task_id or cited_tasks fallback).  When that returns
-      None, ``compute_content_fingerprint_signature(flag)`` is tried as a
-      fallback (task-1654 Fix 2) for null-task_id flags lacking cited_tasks.
-      Only when BOTH helpers return None is the flag returned unchanged — no
-      I/O performed.
+    - Signature is ``compute_marker_signature(flag, project_id=project_id)``:
+      the top-level task_id / cited_tasks union, a foreign cited id qualified
+      as ``'<project>:<id>'``, with the content-fingerprint fallback
+      (task-1654 Fix 2) for null-task_id flags lacking cited_tasks.  When it
+      returns None the flag is returned unchanged — no I/O performed.
     - If a signature is computable, the resulting ``task_id`` (``tid``) is
       validated by ``_is_valid_marker_task_id``.  This guard accepts numeric
-      keys, comma-joined integer lists, and canonical ``fp:+32-hex`` content-
-      fingerprint keys (task-1670 Option A); it rejects only genuinely-invalid
-      tids (empty string, malformed ``fp:`` variants, non-numeric strings, etc.).
+      keys, comma-joined lists of integers or ``'<project>:<digits>'``
+      components, and canonical ``fp:+32-hex`` content-fingerprint keys
+      (task-1670 Option A); it rejects only genuinely-invalid tids (empty
+      string, malformed ``fp:`` variants, non-numeric strings, etc.).
       When rejected the flag is returned unchanged and no ledger I/O is performed.
     - A flag explicitly marked ``flag_for_stage2=False`` (per
       :func:`_is_completion_flag`) is a ONE-TIME completion marker: see
@@ -1529,7 +1550,7 @@ async def dedup_flags(
       ``get_tasks`` calls, and every foreign project's backlog is fetched at
       most once per ``dedup_flags`` call.
     * **The discovered citation NEVER touches the flag or the payload.**
-      ``compute_flag_signature`` read ``cited_tasks`` at the top of the loop
+      ``compute_marker_signature`` read ``cited_tasks`` at the top of the loop
       and folds them into the marker row's KEY, so writing a discovered
       citation back would RELOCATE the row instead of annotating it; under a
       HIT-only gate the relocated cycle is a MISS, and because discovery
@@ -1627,14 +1648,7 @@ async def dedup_flags(
     # no get_tasks call is issued at all.
     discovery_tracked_terms: dict[str, list[_TrackedTask] | None] = {}
     for flag in flags:
-        sig = compute_flag_signature(flag)
-        # Content-fingerprint fallback (task-1654 Fix 2): for null-task_id flags
-        # that lack cited_tasks, compute_flag_signature returns None.  Route them
-        # through the content-fingerprint path so dedup_flags writes/matches a
-        # marker and the finding stops re-escalating every cycle.
-        # Only appended unchanged (pass-through) when BOTH helpers return None.
-        if sig is None:
-            sig = compute_content_fingerprint_signature(flag)
+        sig = compute_marker_signature(flag, project_id=project_id)
         if sig is None:
             result.append(flag)
             continue
@@ -2347,6 +2361,9 @@ async def write_suppression_record(
 def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     """Return a (task_id_str, flag_type_str) signature for *flag*, or ``None``.
 
+    This is the project-agnostic in-run signature; a flag's ledger identity is
+    :func:`compute_marker_signature`.
+
     Both ``task_id`` and ``flag_type`` must be present (i.e. not ``None``) for
     a signature to be computed.  Values are coerced to ``str`` so that an
     integer task_id (common in LLM output) and a string task_id compare equal.
@@ -2413,6 +2430,31 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     Returns ``None`` for flags without enough signal to deduplicate — these are
     passed through unchanged by :func:`dedup_flags`.
     """
+    return _task_union_signature(flag, home_project_id=None)
+
+
+def compute_marker_signature(
+    flag: dict[str, Any], *, project_id: str
+) -> tuple[str, str] | None:
+    """Return *flag*'s ``stage1_flag_marker`` ledger identity in *project_id*, or ``None``.
+
+    The task component is :func:`compute_flag_signature`'s union, except that
+    a cited task from a project other than *project_id* contributes
+    ``'<project>:<task_id>'``.  Every bare id names a task of the row's own
+    ``project_id``.  Both halves are stripped, and a foreign citation whose
+    qualified component :func:`_is_valid_marker_task_id` would reject
+    contributes its bare id, as before.  A flag with no task anchor falls back
+    to :func:`compute_content_fingerprint_signature`.
+    """
+    return (
+        _task_union_signature(flag, home_project_id=project_id)
+        or compute_content_fingerprint_signature(flag)
+    )
+
+
+def _task_union_signature(
+    flag: dict[str, Any], *, home_project_id: str | None
+) -> tuple[str, str] | None:
     task_id = flag.get('task_id')
 
     # cited_tasks union (task-2432): whenever cited_tasks is present, the
@@ -2427,7 +2469,7 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
         if task_id is not None:
             task_id_parts.update(part.strip() for part in str(task_id).split(',') if part.strip())
         task_id_parts.update(
-            str(c['task_id'])
+            _cited_task_component(c, home_project_id)
             for c in cited_tasks
             if isinstance(c, dict) and c.get('task_id') is not None
         )
@@ -2438,6 +2480,20 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     if task_id is None or flag_type is None:
         return None
     return (str(task_id), str(flag_type))
+
+
+def _cited_task_component(cited: dict[str, Any], home_project_id: str | None) -> str:
+    bare = str(cited['task_id'])
+    cited_project = cited.get('project_id')
+    if home_project_id is None or not isinstance(cited_project, str):
+        return bare
+    project = cited_project.strip()
+    if not project or project == home_project_id:
+        return bare
+    qualified = f'{project}:{bare.strip()}'
+    if _is_valid_marker_task_component(qualified):
+        return qualified
+    return bare
 
 
 # --------------------------------------------------------------------------- #
@@ -2496,12 +2552,16 @@ def _is_valid_marker_task_id(tid: str) -> bool:
     - A comma-joined list of non-negative integers (e.g. ``'12,15'``), which is
       the shape produced by :func:`compute_flag_signature`'s ``cited_tasks``
       fallback for multi-task findings.
+    - Any of those components written ``'<project>:<digits>'`` (e.g.
+      ``'12,reify:650'``), the foreign cited id :func:`compute_marker_signature`
+      emits; the project half must pass ``validate_project_id``.
 
     Rejects:
     - Falsy / empty input.
     - Malformed fp: forms: ``'fp:'`` (no hex), too-short or too-long hex bodies,
       uppercase hex, non-hex characters in the body.
-    - Any component that is not a non-negative integer after strip (numeric path).
+    - Any component that is neither a non-negative integer nor
+      ``'<project>:<digits>'`` after strip.
     - Trailing/leading commas that yield empty components (e.g. ``'12,'``).
 
     Mirrors the codebase's canonical isdigit-based, dot-rejecting task-id
@@ -2518,9 +2578,14 @@ def _is_valid_marker_task_id(tid: str) -> bool:
     # Canonical content-fingerprint branch: fp: + exactly 32 lowercase hex chars.
     if _CONTENT_FP_RE.fullmatch(tid):
         return True
-    # Numeric / comma-joined branch (existing convention, unchanged).
-    components = tid.split(',')
-    return all(part.strip().isdigit() for part in components)
+    return all(_is_valid_marker_task_component(part.strip()) for part in tid.split(','))
+
+
+def _is_valid_marker_task_component(component: str) -> bool:
+    project, separator, task_id = component.partition(':')
+    if not separator:
+        return component.isdigit()
+    return task_id.isdigit() and validate_project_id(project) is None
 
 
 def is_content_fingerprint_task_id(tid: str) -> bool:
@@ -2837,12 +2902,12 @@ def filter_stale_count_snapshot_corrections(
 # Terminal-metadata guard helpers (task-1725)
 # --------------------------------------------------------------------------- #
 
-#: Flag types that assert a task has stale / left-over metadata blobs.
-#: Both spellings are included to be robust against LLM naming drift.
-STALE_METADATA_FLAG_TYPES: frozenset[str] = frozenset({
-    'stale_metadata',
-    'task_metadata_stale',
-})
+#: The finding that a task has stale / left-over metadata blobs.
+STALE_METADATA_FAMILY = FlagTypeFamily(
+    name='stale_metadata',
+    spellings=frozenset({'stale_metadata', 'task_metadata_stale'}),
+    drift_tokens=frozenset({'stale'}),
+)
 
 #: Task statuses that represent terminal states with no further execution need.
 #: A task in one of these states will never re-execute, so its metadata blobs
@@ -2892,10 +2957,11 @@ async def filter_terminal_metadata_flags(
 ) -> list[dict[str, Any]]:
     """Drop stale_metadata flags for tasks that are in a terminal state.
 
-    For each flag whose ``flag_type`` is in ``STALE_METADATA_FLAG_TYPES`` and
-    that carries a ``task_id``, calls ``taskmaster.get_task(task_id,
-    project_root)`` and DROPS the flag iff the extracted status is in
-    ``TERMINAL_STATUSES`` (``'cancelled'`` or ``'done'``).
+    For each flag whose ``flag_type`` :data:`STALE_METADATA_FAMILY` matches
+    (case/separator/word-order variants included) and that carries a
+    ``task_id``, calls ``taskmaster.get_task(task_id, project_root)`` and DROPS
+    the flag iff the extracted status is in ``TERMINAL_STATUSES``
+    (``'cancelled'`` or ``'done'``).
 
     **Fail-safe direction**: this filter DROPS flags, so it drops ONLY on
     positively-confirmed terminal status.  get_task errors, non-dict results,
@@ -2926,32 +2992,13 @@ async def filter_terminal_metadata_flags(
     check_task_ids: list[Any] = []
 
     for i, flag in enumerate(flags):
-        flag_type = flag.get('flag_type')
-        if flag_type in STALE_METADATA_FLAG_TYPES and flag.get('task_id') is not None:
+        if STALE_METADATA_FAMILY.matches(flag.get('flag_type')) and flag.get('task_id') is not None:
             check_positions.append(i)
             check_task_ids.append(flag.get('task_id'))
 
-    # Detect potential LLM naming drift: flag_type strings that look like
-    # stale-metadata variants (contain 'stale') but are not in
-    # STALE_METADATA_FLAG_TYPES.  When the model emits an unrecognised spelling
-    # the filter silently becomes a no-op; this log makes that observable so
-    # operators can update STALE_METADATA_FLAG_TYPES.
-    drift_candidates = [
-        ft
-        for flag in flags
-        if (ft := flag.get('flag_type')) is not None
-        and isinstance(ft, str)
-        and 'stale' in ft.lower()
-        and ft not in STALE_METADATA_FLAG_TYPES
-    ]
-    if drift_candidates:
-        logger.info(
-            'reconciliation.terminal_metadata_filter_possible_drift '
-            'unmatched_flag_types=%s known_types=%s '
-            '— update STALE_METADATA_FLAG_TYPES if drift confirmed',
-            drift_candidates,
-            sorted(STALE_METADATA_FLAG_TYPES),
-        )
+    STALE_METADATA_FAMILY.log_drift(
+        flags, log_event='reconciliation.terminal_metadata_filter_possible_drift',
+    )
 
     if not check_positions:
         return list(flags)
@@ -2980,7 +3027,6 @@ async def filter_terminal_metadata_flags(
         result = results_by_pos[i]
         status = _extract_terminal_status(result)
         task_id = flag.get('task_id')
-        flag_type = flag.get('flag_type')
 
         if status in TERMINAL_STATUSES:
             logger.info(
@@ -2998,24 +3044,15 @@ async def filter_terminal_metadata_flags(
 # Stale-bulk-get_statuses guard helpers (task-3007)
 # --------------------------------------------------------------------------- #
 
-#: Flag types asserting the SQLite backend's bulk ``get_statuses`` returned a
+#: The finding that the SQLite backend's bulk ``get_statuses`` returned a
 #: census that is stale relative to a live/scoped read.  The canonical spelling
 #: the Stage-1/Stage-3 harness emits is ``stale_bulk_get_statuses_recurrence``;
-#: the recurrence-less ``stale_bulk_get_statuses`` is included to be robust
-#: against LLM naming drift.  Case / separator / word-order variants of either
-#: spelling are ALSO matched at filter time via
-#: :func:`canonical_flag_type_family`, so only genuinely-distinct token multisets
-#: need to be listed here.
-STALE_BULK_GET_STATUSES_FLAG_TYPES: frozenset[str] = frozenset({
-    'stale_bulk_get_statuses_recurrence',
-    'stale_bulk_get_statuses',
-})
-
-#: Precomputed canonical-family keys for :data:`STALE_BULK_GET_STATUSES_FLAG_TYPES`
-#: so a reworded / reordered LLM spelling of the flag_type still matches (mirrors
-#: the family matching used by ``filter_suppressed`` / ``write_suppression_record``).
-_STALE_BULK_GET_STATUSES_FAMILIES: frozenset[str] = frozenset(
-    canonical_flag_type_family(ft) for ft in STALE_BULK_GET_STATUSES_FLAG_TYPES
+#: the recurrence-less ``stale_bulk_get_statuses`` is a genuinely-distinct
+#: token multiset, so it is listed too.
+STALE_BULK_GET_STATUSES_FAMILY = FlagTypeFamily(
+    name='stale_bulk_get_statuses',
+    spellings=frozenset({'stale_bulk_get_statuses_recurrence', 'stale_bulk_get_statuses'}),
+    drift_tokens=frozenset({'statuses'}),
 )
 
 
@@ -3039,14 +3076,13 @@ async def filter_stale_bulk_get_statuses_flags(
     disagree (verified: tasks 2455/2651/2694 already hardened the connection
     layer, and existing tests prove bulk+scoped reads observe committed writes).
 
-    For each flag whose ``flag_type`` FAMILY (:func:`canonical_flag_type_family`)
-    is in :data:`STALE_BULK_GET_STATUSES_FLAG_TYPES` and that carries a
-    ``task_id``, this filter re-runs the flag's OWN A/B claim LIVE — a fresh
-    unscoped ``taskmaster.get_statuses(project_root)`` and a fresh scoped
-    ``taskmaster.get_statuses(project_root, ids=[tid])`` — and DROPS the flag iff
-    the two now AGREE on the cited task (both report the same non-None status),
-    proving the alleged divergence was a benign capture-time artifact that does
-    not reproduce.
+    For each flag whose ``flag_type`` :data:`STALE_BULK_GET_STATUSES_FAMILY`
+    matches and that carries a ``task_id``, this filter re-runs the flag's OWN
+    A/B claim LIVE — a fresh unscoped ``taskmaster.get_statuses(project_root)``
+    and a fresh scoped ``taskmaster.get_statuses(project_root, ids=[tid])`` —
+    and DROPS the flag iff the two now AGREE on the cited task (both report the
+    same non-None status), proving the alleged divergence was a benign
+    capture-time artifact that does not reproduce.
 
     **Fail-safe direction is KEEP**: this filter drops ONLY on positively-confirmed
     live agreement.  A live-reproduced divergence, a cited status absent/None on
@@ -3073,38 +3109,17 @@ async def filter_stale_bulk_get_statuses_flags(
     if not taskmaster or not project_root:
         return list(flags)
 
-    # Positions whose flag_type FAMILY matches STALE_BULK_GET_STATUSES_FLAG_TYPES
-    # and that carry a task_id — only these are re-verified.
     check_positions: list[int] = []
     for i, flag in enumerate(flags):
-        flag_type = flag.get('flag_type')
         if (
-            isinstance(flag_type, str)
-            and canonical_flag_type_family(flag_type) in _STALE_BULK_GET_STATUSES_FAMILIES
+            STALE_BULK_GET_STATUSES_FAMILY.matches(flag.get('flag_type'))
             and flag.get('task_id') is not None
         ):
             check_positions.append(i)
 
-    # Detect potential LLM naming drift: flag_type strings that mention 'statuses'
-    # but whose family is not in STALE_BULK_GET_STATUSES_FLAG_TYPES.  When the
-    # model emits an unrecognised spelling the filter silently becomes a no-op;
-    # this log makes that observable (mirrors filter_terminal_metadata_flags).
-    drift_candidates = [
-        ft
-        for flag in flags
-        if (ft := flag.get('flag_type')) is not None
-        and isinstance(ft, str)
-        and 'statuses' in ft.lower()
-        and canonical_flag_type_family(ft) not in _STALE_BULK_GET_STATUSES_FAMILIES
-    ]
-    if drift_candidates:
-        logger.info(
-            'reconciliation.stale_bulk_get_statuses_filter_possible_drift '
-            'unmatched_flag_types=%s known_types=%s '
-            '— update STALE_BULK_GET_STATUSES_FLAG_TYPES if drift confirmed',
-            drift_candidates,
-            sorted(STALE_BULK_GET_STATUSES_FLAG_TYPES),
-        )
+    STALE_BULK_GET_STATUSES_FAMILY.log_drift(
+        flags, log_event='reconciliation.stale_bulk_get_statuses_filter_possible_drift',
+    )
 
     if not check_positions:
         return list(flags)
@@ -4243,7 +4258,7 @@ def _is_systemic_pattern_candidate(flag: dict[str, Any]) -> bool:
     A flag qualifies iff its ``category`` OR ``flag_type`` is
     ``'systemic_pattern'`` (LLM-authored flags may carry the finding kind
     under either field — checking both is robust to shaping/naming drift,
-    mirroring ``STALE_METADATA_FLAG_TYPES``' both-spellings robustness) AND
+    mirroring ``STALE_METADATA_FAMILY``' both-spellings robustness) AND
     its ``description`` asserts never-tracked language per
     :func:`_asserts_never_tracked`.
 
@@ -5027,10 +5042,9 @@ async def acknowledge_resolved_flags(
     """Best-effort batch acknowledgment entry point for a list of resolved flags.
 
     For each flag in *resolved_flags*, computes its signature exactly as
-    ``dedup_flags`` does — :func:`compute_flag_signature` first, falling back to
-    :func:`compute_content_fingerprint_signature` — and delegates to
-    :func:`acknowledge_flag_marker` for the ``(task_id, flag_type)`` pair.
-    Flags for which both signature helpers return ``None`` are skipped (no I/O).
+    ``dedup_flags`` does — :func:`compute_marker_signature` in *project_id* —
+    and delegates to :func:`acknowledge_flag_marker` for the ``(task_id,
+    flag_type)`` pair.  Flags with no signature are skipped (no I/O).
 
     Signatures are de-duplicated (order-preserving) BEFORE dispatch: two flags
     reducing to the same ``(task_id, flag_type)`` — e.g. two ``stale_metadata``
@@ -5065,9 +5079,7 @@ async def acknowledge_resolved_flags(
     """
     sigs: list[tuple[str, str]] = []
     for flag in resolved_flags:
-        sig = compute_flag_signature(flag)
-        if sig is None:
-            sig = compute_content_fingerprint_signature(flag)
+        sig = compute_marker_signature(flag, project_id=project_id)
         if sig is None:
             continue
         sigs.append(sig)
@@ -5275,21 +5287,24 @@ def filter_snapshot_stat_edge_findings(
 # Style-only authorship guard helpers (task 3138, PRD §9 leaf μ)
 # --------------------------------------------------------------------------- #
 
-#: Flag types asserting that an entry's content was injected, fabricated, or
-#: written by someone outside this deployment.  Several spellings are listed
-#: because the family has no committed schema entry — Stage 1 emits it as
-#: free-form LLM output, so the set is a best-effort census of the plausible
-#: spellings (the ``STALE_METADATA_FLAG_TYPES`` idiom).  An unrecognised
-#: spelling degrades to a visible drift log rather than a silent no-op.
-AUTHORSHIP_SUSPICION_FLAG_TYPES: frozenset[str] = frozenset({
-    'possible_injection',
-    'prompt_injection',
-    'injected_content',
-    'possible_fabrication',
-    'fabricated_content',
-    'foreign_authorship',
-    'suspicious_authorship',
-})
+#: The finding that an entry's content was injected, fabricated, or written by
+#: someone outside this deployment.  ``spellings`` are a best-effort census of
+#: the plausible ones, not a closed set; FlagTypeFamily tolerates their
+#: respellings, and any other spelling carrying one of the three stems
+#: degrades to a visible drift log rather than a silent no-op.
+AUTHORSHIP_SUSPICION_FAMILY = FlagTypeFamily(
+    name='authorship_suspicion',
+    spellings=frozenset({
+        'possible_injection',
+        'prompt_injection',
+        'injected_content',
+        'possible_fabrication',
+        'fabricated_content',
+        'foreign_authorship',
+        'suspicious_authorship',
+    }),
+    drift_tokens=frozenset({'inject', 'fabricat', 'foreign'}),
+)
 
 
 def _classify_authorship(agent_id: Any) -> str:
@@ -5344,9 +5359,9 @@ async def filter_style_only_authorship_flags(
     it — it never read the stored ``agent_id``.  Writing style is not evidence
     of authorship; provenance is.
 
-    A flag is a CANDIDATE iff its ``flag_type`` is in
-    :data:`AUTHORSHIP_SUSPICION_FLAG_TYPES`.  For each candidate, every mem0
-    citation in ``cited_memories`` is resolved via
+    A flag is a CANDIDATE iff :data:`AUTHORSHIP_SUSPICION_FAMILY` matches its
+    ``flag_type``.  For each candidate, every mem0 citation in
+    ``cited_memories`` is resolved via
     ``memory_service.get_memory_by_id(project_id, memory_id)`` — whose
     ``metadata`` is the raw Qdrant payload and therefore still carries the
     top-level ``agent_id`` that mem0's ``AsyncMemory`` promotes out of metadata
@@ -5399,29 +5414,12 @@ async def filter_style_only_authorship_flags(
 
     candidate_positions: list[int] = [
         i for i, flag in enumerate(flags)
-        if flag.get('flag_type') in AUTHORSHIP_SUSPICION_FLAG_TYPES
+        if AUTHORSHIP_SUSPICION_FAMILY.matches(flag.get('flag_type'))
     ]
 
-    # Detect potential LLM naming drift: flag_type strings that look like this
-    # family but are not in AUTHORSHIP_SUSPICION_FLAG_TYPES.  The family has no
-    # committed schema entry, so an unrecognised spelling would silently make
-    # the gate a no-op; this log makes that observable (the
-    # filter_terminal_metadata_flags drift-log precedent).
-    drift_candidates = [
-        ft
-        for flag in flags
-        if isinstance(ft := flag.get('flag_type'), str)
-        and any(token in ft.lower() for token in ('inject', 'fabricat', 'foreign'))
-        and ft not in AUTHORSHIP_SUSPICION_FLAG_TYPES
-    ]
-    if drift_candidates:
-        logger.info(
-            'reconciliation.style_only_authorship_filter_possible_drift '
-            'unmatched_flag_types=%s known_types=%s '
-            '— update AUTHORSHIP_SUSPICION_FLAG_TYPES if drift confirmed',
-            drift_candidates,
-            sorted(AUTHORSHIP_SUSPICION_FLAG_TYPES),
-        )
+    AUTHORSHIP_SUSPICION_FAMILY.log_drift(
+        flags, log_event='reconciliation.style_only_authorship_filter_possible_drift',
+    )
 
     if not candidate_positions:
         # No candidates at all — skip every lookup, so a normal cycle (in which
@@ -5531,24 +5529,25 @@ async def filter_style_only_authorship_flags(
 #: ``growth`` tokens (``'mem0_duplicate_cluster_growth'``,
 #: ``'memory_cluster_growth_detected'``).
 #:
-#: That token arm is deliberately BROADER than the exact-family matching used
-#: by the sibling filters (:func:`filter_terminal_metadata_flags`,
-#: :func:`filter_stale_bulk_get_statuses_flags`,
-#: :func:`filter_style_only_authorship_flags`).  Over-matching is safe HERE in
-#: a way it is not for :func:`filter_suppressed`, whose family collisions can
-#: hide a genuinely-recurring finding for cycles: this family only ever admits
-#: a flag to :func:`filter_accounted_cluster_growth_flags`, which DROPS solely
-#: after positively confirming that EVERY cited memory UUID is already written
-#: into the referenced task's own description body.  A mis-classified
-#: flag_type can therefore only ever reclassify a finding that is, by
-#: construction, already accounted for -- never silence an unaccounted one.
+#: That token arm is deliberately BROADER than the sibling families
+#: (:data:`STALE_METADATA_FAMILY`, :data:`STALE_BULK_GET_STATUSES_FAMILY`,
+#: :data:`AUTHORSHIP_SUSPICION_FAMILY`), which match only canonical variants
+#: of their spellings and carry no ``unseen_spelling_tokens``.  Over-matching
+#: is safe HERE in a way it is not for :func:`filter_suppressed`, whose family
+#: collisions can hide a genuinely-recurring finding for cycles: this family
+#: only ever admits a flag to :func:`filter_accounted_cluster_growth_flags`,
+#: which DROPS solely after positively confirming that EVERY cited memory UUID
+#: is already written into the referenced task's own description body.  A
+#: mis-classified flag_type can therefore only ever reclassify a finding that
+#: is, by construction, already accounted for -- never silence an unaccounted
+#: one.
 CLUSTER_GROWTH_FAMILY = FlagTypeFamily(
     name='cluster_growth',
     spellings=frozenset({
         'procedural_knowledge_cluster_growth',
         'duplicate_procedural_knowledge_cluster_growth',
     }),
-    drift_token='cluster',
+    drift_tokens=frozenset({'cluster'}),
     unseen_spelling_tokens=frozenset({'cluster', 'growth'}),
 )
 
@@ -5921,7 +5920,7 @@ async def filter_accounted_cluster_growth_flags(
 PREMATURE_WIDENING_CAVEAT_FAMILY = FlagTypeFamily(
     name='premature_widening_caveat',
     spellings=frozenset({'premature_widening_evidence_caveat'}),
-    drift_token='caveat',
+    drift_tokens=frozenset({'caveat'}),
 )
 
 

@@ -39,21 +39,7 @@ Run step 1 for **every** finding (structural ones too, so a finding `/prd` alrea
 
 ### §8 step 1 — key lookup
 
-`find_tasks_by_metadata(project_root, key="x_finding_key", value=<key>)` on the fused-memory MCP. Until that tool exists, use the read-only forensic query (`CLAUDE.md` §"Forensic reads of tasks.db"): the store is `<project_root>/.taskmaster/tasks/tasks.db` — never a worktree's, never the 0-byte `.taskmaster/tasks.db` decoy — and its shape comes from `python scripts/tasks_db_schema.py --project-root <project_root>` (run from a dark-factory checkout), not from memory.
-
-```python
-import sqlite3
-db = sqlite3.connect(f"file:{project_root}/.taskmaster/tasks/tasks.db?mode=ro", uri=True)
-LOOKUP = """
-SELECT t.id, t.status, t.priority, t.title
-FROM (SELECT * FROM tasks WHERE json_valid(metadata)) AS t,
-     json_each(t.metadata, '$.x_finding_key') AS k
-WHERE k.value = ?
-"""
-rows = {key: db.execute(LOOKUP, (key,)).fetchall() for key in finding_keys}
-```
-
-`json_each` with a path matches both a scalar `x_finding_key` and a list of keys. Then, per contract §8 step 1:
+`find_tasks_by_metadata(project_root, key="x_finding_key", value=<key>)` on the fused-memory MCP, once per finding key. It covers every status and matches a list-valued `x_finding_key` by membership, so a task filed with several keys is found by any one of them. Page on `pagination.has_more` with `offset += returned`. `tasks_with_key == 0` means no task carries the key at all. Then, per contract §8 step 1:
 
 - **a.** A hit in `pending`, `in-progress`, `blocked`, `deferred` or `merge-deferred` → `filed:<id>`; do not file.
 - **b.** A `cancelled` hit carrying `metadata.x_acceptance_reason` → `accepted:<id>`; do not file. A `cancelled` hit without it was abandoned, not accepted: treat it as absent and go on to step 2.
@@ -61,7 +47,7 @@ rows = {key: db.execute(LOOKUP, (key,)).fetchall() for key in finding_keys}
 
 A briefing `known_gaps` entry covering the finding counts only through its `accepted_by` task: read that task and apply a/b/c to it. A gap without a pointer suppresses nothing; it is already in `method.extra.briefing_defects`.
 
-An error payload or a failed query means step 1 did not run — never read it as "no match". Neither the MCP tool nor the database usable → this run **files nothing** (contract §8). Say so in the summary and leave dispositions `open`.
+An error payload means step 1 did not run — never read it as "no match". The tool returns an error payload or cannot be reached → this run **files nothing** (contract §8). Say so in the summary and leave dispositions `open`.
 
 ### §8 step 2 — semantic lookup
 
@@ -104,6 +90,7 @@ resolve = resolve_ticket(ticket=submit_result["ticket"], project_root=project_ro
 | `created` | `filed:<task_id>` |
 | `combined` | `filed:<task_id>`, `dedup_step: "3"` |
 | `refused` | stays `open`; record `resolve["reason"]`; do not retry |
+| `awaiting_curation` | `filed:<ticket>` (parked; no task id yet); do not re-submit |
 | `failed` | stays `open`; record the reason; retry only per the shared doc's retryable matrix |
 
 Every filed task has a concrete title, the evidence, the expected fix and the finding metadata. When one fix must land before another (wiring before the test of the wiring), add the edge with `add_dependency` after both resolve.
@@ -148,7 +135,7 @@ Interactive runs wait for the answers before Step 7. A run the user cannot atten
 Only a run that completed Phase 3 files the chain; a `--findings-only` run never reaches this step. Follow `skills/_shared/filing-the-trigger-chain.md` §§0–5 exactly; it holds the only copy of the calls, the form probe and the supersede order. The run-specific values are `skill = "review"` and `run_id = <run_id>`, with `<project_root>` and `<project_id>` as pinned.
 
 - **§0** — acceptance tasks are not "filed tasks" for the chain; the operational tasks from Step 2 and the mechanical tasks from Step 5 are. No filed tasks → no chain.
-- **§1** — the open-chain lookup keys on `json_extract(metadata, '$.trigger_chain.skill') = 'review'` in a non-terminal status.
+- **§1** — the open-chain lookup filters `find_tasks_by_metadata(key="trigger_chain", include_value=True)` rows on `matched_value["skill"] == "review"` in a non-terminal status.
 - **§2** — the form probe runs in the dark-factory checkout, never in `<project_root>`.
 - **§5** — an open older `/review` chain is superseded before this run files its own.
 - **§5 step 2** — when `method.extra.launched_from` names the escalation that launched this run, that is the escalation resolved with "ran as <run_id>"; there is no separate resolution step.
@@ -159,11 +146,11 @@ Record the form (`final`, `interim` or `none`), the chain task ids, any supersed
 
 ```
 add_memory(
-  content="Review {run_id} ({scope}, as_of {as_of_sha:10}, since {since:10|none}): {n} findings — {high} high/{medium} medium/{low} low; filed {filed}; {already} already owned; {structural} structural for deliberation; {fixed} fixed since last run. Next run: {chain form, task ids}.",
+  content="Review {run_id} ({scope}, as_of {as_of_sha:10}, since {since:10|none}): {n} findings — {high} high/{medium} medium/{low} low; filed {filed}; {already} already owned; {structural} structural for deliberation; {fixed} fixed since last run. Next run: {chain form}, human gate task 3127.",
   category="observations_and_summaries",
   project_id="<project_id>",
   agent_id="claude-review",
-  entities=[]
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the human gate Step 7 filed, here and in content; if Step 7 filed no chain, use [] and drop the human gate clause from content
 )
 ```
 

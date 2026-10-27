@@ -46,6 +46,7 @@ from shared.governed_exceptions import (
     UndisposedException,
     disposition_record,
     governed_exceptions,
+    owner_from_record,
     owner_record,
     parse_disposition_marker,
 )
@@ -260,8 +261,41 @@ class TestWireFormat:
             owner_record(bad)
         assert repr(bad) in str(excinfo.value)
 
-    def test_both_are_published(self):
+    @pytest.mark.parametrize('ref', [TaskRef(5601), TicketRef(TICKET_ID)])
+    def test_owner_from_record_inverts_owner_record(self, ref):
+        assert owner_from_record(owner_record(ref)) == ref
+
+    @pytest.mark.parametrize(
+        ('record', 'offending'),
+        [
+            pytest.param('task 5601', 'task 5601', id='not-a-dict'),
+            pytest.param({'id': 5601}, {'id': 5601}, id='missing-type'),
+            pytest.param({'type': 'task'}, {'type': 'task'}, id='missing-id'),
+            pytest.param(
+                {'type': 'policy', 'id': 'inv12-x'},
+                {'type': 'policy', 'id': 'inv12-x'},
+                id='unknown-type',
+            ),
+            pytest.param({'type': 'task', 'id': '5601'}, '5601', id='str-task-id'),
+            pytest.param({'type': 'task', 'id': True}, True, id='bool-task-id'),
+            pytest.param({'type': 'ticket', 'id': 'tkt_lowercase'}, 'tkt_lowercase', id='bad-ticket'),
+        ],
+    )
+    def test_owner_from_record_refuses_a_malformed_record(self, record, offending):
+        """The operand checks are the constructors'; the record shape is the reader's.
+
+        A well-tagged record with a bad id is refused by ``TaskRef`` or
+        ``TicketRef`` themselves, so the offending value is the id; anything
+        that is not a tagged ``{'type', 'id'}`` record is refused whole.
+        """
+        with pytest.raises(MalformedDisposition) as excinfo:
+            owner_from_record(record)
+        assert excinfo.value.value == offending
+        assert type(excinfo.value.value) is type(offending)
+
+    def test_all_three_are_published(self):
         assert 'owner_record' in governed_module.__all__
+        assert 'owner_from_record' in governed_module.__all__
         assert 'disposition_record' in governed_module.__all__
 
 

@@ -83,11 +83,11 @@ import logging
 import subprocess
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.cli_invoke import AgentResult
 from test_scheduler_dispatch_literal_tripwire import _dispatch_tool_literals
 from test_workflow_factory import (
     _CONSTRUCT_RE,
@@ -198,7 +198,7 @@ def committed_diff_fixture(tmp_path: Path) -> tuple[Path, str]:
 
 def _fake_invoke_agent(
     captured_prompts: list[str],
-) -> Callable[..., Coroutine[Any, Any, SimpleNamespace]]:
+) -> Callable[..., Coroutine[Any, Any, AgentResult]]:
     """Return an ``invoke_agent`` replacement that records prompts.
 
     Monkeypatch the returned coroutine over ``judge.invoke_agent`` (or
@@ -208,15 +208,17 @@ def _fake_invoke_agent(
     reads).  No real agent runs, so B4 grades the real committed diff for free.
     """
 
-    async def _fake(**kwargs: Any) -> SimpleNamespace:
+    async def _fake(**kwargs: Any) -> AgentResult:
         captured_prompts.append(str(kwargs.get('prompt', '')))
-        return SimpleNamespace(
+        return AgentResult(
+            success=True,
             structured_output={
                 'winner': 'A',
                 'confidence': 0.9,
                 'reasoning': 'canned boundary-suite verdict',
             },
             output='{"winner": "A", "confidence": 0.9, "reasoning": "r"}',
+            cost_usd=0.0,
         )
 
     return _fake

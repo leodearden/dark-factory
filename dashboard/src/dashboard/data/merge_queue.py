@@ -7,9 +7,10 @@ Note on queue_depth_timeseries approximation
 --------------------------------------------
 The events table only records completions: ``EventStore.emit()`` is called
 synchronously *after* an attempt finishes.  We therefore approximate
-"queue depth" as the count of ``merge_attempt`` events per 15-minute bucket
-(throughput proxy), *not* true in-flight queue depth.  The MergeWorker's
-in-flight queue state is in-memory and not persisted to the events table.
+"queue depth" as the count of ``merge_attempt`` events per bucket, its width
+chosen from ``BUCKET_LADDER`` by the window length (throughput proxy), *not*
+true in-flight queue depth.  The MergeWorker's in-flight queue state is
+in-memory and not persisted to the events table.
 """
 
 from __future__ import annotations
@@ -127,6 +128,17 @@ def _bucket_minutes_for_window(hours: int) -> int:
     return 1440  # unreachable — BUCKET_LADDER always ends with (None, ...)
 
 
+class DepthSeries(ChartData):
+    """merge_attempt counts per bucket, and the width in minutes each bucket spans."""
+
+    bucket_minutes: int
+
+
+def _empty_depth(hours: int) -> DepthSeries:
+    """Return the empty depth series of an *hours* window, still naming its width."""
+    return {'labels': [], 'values': [], 'bucket_minutes': _bucket_minutes_for_window(hours)}
+
+
 def _align_bucket(t: datetime, bucket_min: int) -> datetime:
     """Floor *t* to the nearest bucket boundary using epoch-based arithmetic.
 
@@ -155,7 +167,7 @@ def _align_bucket(t: datetime, bucket_min: int) -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# 1. Queue depth timeseries (15-min bins)
+# 1. Queue depth timeseries (adaptive BUCKET_LADDER bins)
 # ---------------------------------------------------------------------------
 
 async def queue_depth_timeseries(
@@ -163,10 +175,11 @@ async def queue_depth_timeseries(
     *,
     hours: int = 24,
     now: datetime | None = None,
-) -> ChartData:
+) -> DepthSeries:
     """Approximate merge queue throughput as adaptive-width bucket counts.
 
-    Returns ChartData with ISO bucket-start labels and integer counts.
+    Returns a DepthSeries with ISO bucket-start labels, integer counts and
+    the ``bucket_minutes`` they were counted at.
     Bucket width is chosen adaptively via ``_bucket_minutes_for_window`` so
     the point count stays manageable for all window sizes:
 
@@ -179,16 +192,16 @@ async def queue_depth_timeseries(
     inclusive.  The current bucket is always included.
 
     Args:
-        db: aiosqlite connection, or None (returns empty ChartData).
+        db: aiosqlite connection, or None (returns the window's empty series).
         hours: Look-back window in hours (default 24).
         now: Reference timestamp for bucket alignment.  When None (the default),
             ``datetime.now(UTC)`` is used.  Pass an explicit value in tests to
             get deterministic bucket counts and eliminate boundary flakiness.
     """
     if db is None:
-        return {'labels': [], 'values': []}
+        return _empty_depth(hours)
 
-    async def _query(conn: aiosqlite.Connection) -> ChartData:
+    async def _query(conn: aiosqlite.Connection) -> DepthSeries:
         effective_now = resolve_now(now)
         cutoff = effective_now - timedelta(hours=hours)
 
@@ -233,9 +246,9 @@ async def queue_depth_timeseries(
 
         labels = [b.isoformat() for b in buckets]
         values: list[int | float] = [counts[lbl] for lbl in labels]
-        return {'labels': labels, 'values': values}
+        return {'labels': labels, 'values': values, 'bucket_minutes': bucket_min}
 
-    return await with_db(db, _query, {'labels': [], 'values': []})
+    return await with_db(db, _query, _empty_depth(hours))
 
 
 # ---------------------------------------------------------------------------
@@ -785,9 +798,10 @@ async def build_per_project_merge_queue(
 
     Returns:
         Dict ``{pid: {depth_timeseries, outcomes, latency, recent, recent_total, speculative, train_events, train_throughput}}``,
-        where ``speculative`` is a ``Datum[dict]`` and ``recent_total`` a ``Datum[int]``.
+        where ``depth_timeseries`` is a :class:`DepthSeries` carrying its
+        ``bucket_minutes``, ``speculative`` a ``Datum[dict]`` and
+        ``recent_total`` a ``Datum[int]``.
     """
-    _DEFAULT_DEPTH: ChartData = {'labels': [], 'values': []}
     bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
 
     async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
@@ -801,7 +815,7 @@ async def build_per_project_merge_queue(
                 train_throughput_stats(db, hours=hours, now=now),
                 return_exceptions=True,
             )
-            depth = safe_gather_result(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
+            depth = safe_gather_result(depth_r, _empty_depth(hours), f'{pid}/depth')
             attempts = safe_gather_result(attempts_r, MergeAttempts(), f'{pid}/attempts')
             recent = _leg_or_unread(
                 recent_r,
@@ -840,7 +854,7 @@ async def build_per_project_merge_queue(
                 f'the merge history of {pid} could not be read: {describe_exc(exc)}', bound,
             )
             return pid, {
-                'depth_timeseries': _DEFAULT_DEPTH,
+                'depth_timeseries': _empty_depth(hours),
                 'outcomes': MergeAttempts().outcome_chart(),
                 'latency': MergeAttempts().latency(),
                 'recent': [],
@@ -912,7 +926,8 @@ async def fetch_live_merge_queues(
     """Fan out get_merge_queue to every escalation URL concurrently.
 
     Returns ``{project_label: {entries, reachable, [error]}}``.  Keys match
-    the labels from ``config.escalation_urls`` (project basenames).  Failures
+    the labels from ``config.escalation_urls`` (project label —
+    ``dashboard/project_labels.py::ProjectLabels``).  Failures
     (transport errors, timeouts, or orchestrator/worker down) produce
     ``{entries: [], reachable: False, error: ...}`` — an authoritative empty
     queue produces ``{entries: [], reachable: True}``.

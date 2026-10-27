@@ -23,9 +23,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _process_tree_fakes import claude_process_tree, counting_walks
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
+from orchestrator.session_ownership_probes import EventProbes, ProcessTree
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HOOKS_DIR = _REPO_ROOT / 'skills' / 'spawn' / 'hooks'
@@ -371,7 +373,8 @@ def test_run_session_start_hand_launched_uses_session_leader_as_liveness_pid(
     # entrypoint (dead within seconds) -- reap_stale_records' stale_pid rule
     # would then reclaim a long-idle hand-launched session's record even
     # though its terminal is still alive. os.getsid(0) resolves to the
-    # durable POSIX session leader instead (see _hand_launched_liveness_pid).
+    # durable POSIX session leader instead (see
+    # session_ownership_probes.py::EventProbes.hand_launched_liveness_pid).
     hook_input = {'session_id': 'sess-pid', 'cwd': '/home/leo/src/dark-factory'}
     env: dict[str, str] = {}
 
@@ -564,7 +567,6 @@ def test_run_notification_and_stop_converge_onto_spawn_claude_slug_not_uuid(
 
 def test_run_session_start_binds_claude_session_id_on_first_adoption(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The first hook event to adopt a spawn-claude.sh `launching` record
     # stamps its own Claude Code session_id onto it -- the token that later
@@ -590,10 +592,9 @@ def test_run_session_start_binds_claude_session_id_on_first_adoption(
 
     hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
     env = _owner_ppid_env(slug, 3215500)
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 3215501)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 3215500)
+    tree = claude_process_tree(3215501, 3215500)
 
-    sh.run_session_start(hook_input, env, root=tmp_path)
+    sh.run_session_start(hook_input, env, root=tmp_path, process_tree=tree)
 
     record = sr.read_record(slug, root=tmp_path)
     assert record.claude_session_id == 'uuid-parent'
@@ -888,10 +889,7 @@ def test_run_notification_from_nested_inheritor_does_not_flip_the_parent(
     assert forked.question.text == 'nested asks something'
 
 
-def test_refresh_path_binds_a_legacy_unbound_record(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_refresh_path_binds_a_legacy_unbound_record(tmp_path: Path) -> None:
     # Migration safety: an in-flight session whose record predates task 4193
     # (or was written by spawn-claude.sh's `launching`) is bound by the very
     # next Notification/Stop from its PROVEN owner, without waiting for a
@@ -904,10 +902,9 @@ def test_refresh_path_binds_a_legacy_unbound_record(
     )
     hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
     env = _owner_ppid_env(slug, 3215560)
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 3215561)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 3215560)
+    tree = claude_process_tree(3215561, 3215560)
 
-    sh.run_stop(hook_input, env, root=tmp_path)
+    sh.run_stop(hook_input, env, root=tmp_path, process_tree=tree)
 
     record = sr.read_record(slug, root=tmp_path)
     assert record.status == sr.Status.IDLE
@@ -915,10 +912,7 @@ def test_refresh_path_binds_a_legacy_unbound_record(
     assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
-def test_refresh_path_leaves_an_unproven_legacy_record_unbound(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_refresh_path_leaves_an_unproven_legacy_record_unbound(tmp_path: Path) -> None:
     # esc-4193-10 / L2 ruling item 8, the deploy-day shape: every record
     # already live when this lands is unbound AND its session's env predates
     # CLAUDE_SPAWN_OWNER_PPID, so no event under that slug can prove
@@ -931,12 +925,12 @@ def test_refresh_path_leaves_an_unproven_legacy_record_unbound(
         root=tmp_path,
     )
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
 
     sh.run_stop(
         {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'},
         env,
         root=tmp_path,
+        process_tree=claude_process_tree(None),
     )
 
     record = sr.read_record(slug, root=tmp_path)
@@ -1160,7 +1154,8 @@ def test_hook_session_slug_treats_a_blank_session_id_as_unknown(tmp_path: Path) 
 
 def test_bind_claude_session_id_ignores_a_blank_stdin_session_id() -> None:
     record = sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING)
-    assert sh._bind_claude_session_id(record, {'session_id': '   '}) is False
+    probes = EventProbes({}, claude_process_tree(None))
+    assert sh._bind_claude_session_id(record, {'session_id': '   '}, probes=probes) is False
     assert record.claude_session_id is None
 
 
@@ -1171,14 +1166,13 @@ def test_bind_claude_session_id_ignores_a_blank_stdin_session_id() -> None:
 
 def test_hook_session_slug_adopts_env_slug_when_a_clear_remints_the_session_id(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # /clear mints a new session_id in the SAME process, so the owning
     # session's own SessionStart legitimately mismatches its binding.
     # Reading that as an inheritor would re-introduce the task-2511 split.
     # "SAME process" is load-bearing and now checked: the bound
     # claude_owner_pid must match the pid resolved for this event.
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 424_242)
+    tree = claude_process_tree(424_242)
     slug = 'session-cockpit-3215080'
     sr.write_record(
         sr.SessionRecord(
@@ -1197,10 +1191,13 @@ def test_hook_session_slug_adopts_env_slug_when_a_clear_remints_the_session_id(
     }
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
-    assert sh.hook_session_slug(hook_input, env, root=tmp_path, allow_remint=True) == slug
+    assert (
+        sh.hook_session_slug(hook_input, env, root=tmp_path, allow_remint=True, process_tree=tree)
+        == slug
+    )
     # ... but only where a `source` field means anything. Without the
     # SessionStart-only opt-in the same event is a plain mismatch and forks.
-    assert sh.hook_session_slug(hook_input, env, root=tmp_path) != slug
+    assert sh.hook_session_slug(hook_input, env, root=tmp_path, process_tree=tree) != slug
 
 
 def test_hook_session_slug_does_not_forgive_a_resume_remint(tmp_path: Path) -> None:
@@ -1232,7 +1229,6 @@ def test_hook_session_slug_does_not_forgive_a_resume_remint(tmp_path: Path) -> N
 @pytest.mark.parametrize('source', ['clear', 'compact'])
 def test_run_session_start_rebinds_on_an_owner_only_source(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     source: str,
 ) -> None:
     # ... and the record is RE-bound to the new id, so the session stays
@@ -1243,7 +1239,7 @@ def test_run_session_start_rebinds_on_an_owner_only_source(
     # not enough: auto-compaction fires source='compact' unprompted, so a
     # nested claude reaches this path too and must NOT be forgiven -- see
     # test_nested_compact_cannot_invert_ownership.
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 424_242)
+    tree = claude_process_tree(424_242)
     slug = f'session-cockpit-321508{["clear", "compact"].index(source) + 1}'
     sr.write_record(
         sr.SessionRecord(
@@ -1262,7 +1258,7 @@ def test_run_session_start_rebinds_on_an_owner_only_source(
     }
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
-    sh.run_session_start(hook_input, env, root=tmp_path)
+    sh.run_session_start(hook_input, env, root=tmp_path, process_tree=tree)
 
     record = sr.read_record(slug, root=tmp_path)
     assert record.claude_session_id == 'uuid-after'
@@ -1569,156 +1565,13 @@ def test_adopted_session_still_resolves_the_spawn_window_marker(
 # ---------------------------------------------------------------------------
 
 
-def test_parent_pid_of_resolves_this_process_parent() -> None:
-    assert sh._parent_pid_of(os.getpid()) == os.getppid()
-
-
-def test_parent_pid_of_returns_none_for_an_unresolvable_pid() -> None:
-    # Never raises: an absent /proc entry (or no /proc at all) is a plain
-    # "cannot tell", which every caller treats as a best-effort miss.
-    assert sh._parent_pid_of(-1) is None
-
-
-def _install_fake_tree(
-    monkeypatch: pytest.MonkeyPatch,
-    chain: list[tuple[int, str]],
-) -> None:
-    """Simulate a process tree for the ancestor walk.
-
-    *chain* is ordered child-first and starts at THIS process's parent, as
-    ``(pid, comm)`` pairs. ``os.getppid`` is pinned to ``chain[0]`` so the
-    walk starts inside the simulation rather than at the real parent.
-    """
-    parents = {pid: chain[i + 1][0] for i, (pid, _) in enumerate(chain[:-1])}
-    comms = dict(chain)
-    monkeypatch.setattr(sh.os, 'getppid', lambda: chain[0][0])
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: parents.get(pid))
-    monkeypatch.setattr(sh, '_process_comm', lambda pid: comms.get(pid))
-
-
-# The tree measured end-to-end with a probe hook on claude 2.1.241. The
-# `sh -c` wrapper Claude Code interposes is the level a fixed-depth
-# grandparent lookup mistook for the firing claude.
-_REAL_HOOK_CHAIN = [
-    (2028035, 'hook.sh'),
-    (2028032, 'sh'),
-    (2025347, 'claude'),
-    (2025344, 'bash'),
-]
-
-
-def test_owning_claude_pid_skips_the_shell_wrapper_claude_code_interposes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Regression pin for the task-4193 review finding: the real tree is
-    # `claude -> sh -c -> hook.sh -> python`, so the GRANDPARENT (2028032)
-    # is the ephemeral `sh`, not the claude. Resolving by identity must
-    # reach past it to 2025347 -- otherwise `_owner_ppid_verdict` compares
-    # one level short and judges every genuine owner an inheritor.
-    _install_fake_tree(monkeypatch, _REAL_HOOK_CHAIN)
-    assert sh._owning_claude_pid() == 2025347
-
-
-def test_owning_claude_pid_still_resolves_without_a_shell_wrapper(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Identity resolution is indifferent to whether the wrapper is present,
-    # so a harness that execs the hook directly still resolves.
-    _install_fake_tree(monkeypatch, [(500, 'hook.sh'), (400, 'claude')])
-    assert sh._owning_claude_pid() == 400
-
-
-def test_owner_ppid_verdict_accepts_the_genuine_owner_through_the_wrapper(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # End-to-end over the measured tree: CLAUDE_SPAWN_OWNER_PPID carries the
-    # payload bash (2025344), i.e. the firing claude's DIRECT parent. The
-    # verdict must be True -- the pre-fix grandparent lookup returned False.
-    _install_fake_tree(monkeypatch, _REAL_HOOK_CHAIN)
-    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '2025344'}) is True
-
-
-def test_owner_ppid_verdict_still_rejects_a_nested_claude(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A nested `claude -p` from an agent's Bash tool: its own first claude
-    # ancestor is ITSELF, whose parent is the tool's shell -- not the
-    # inherited payload-bash pid, so it mismatches and is judged an
-    # inheritor even though it carries the env var verbatim.
-    _install_fake_tree(
-        monkeypatch,
-        [
-            (900035, 'hook.sh'),
-            (900032, 'sh'),
-            (900010, 'claude'),  # the NESTED claude
-            (900005, 'bash'),  # the Bash tool's shell
-            (2025347, 'claude'),  # the owner, further up
-            (2025344, 'bash'),
-        ],
-    )
-    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '2025344'}) is False
-
-
-def test_owning_claude_pid_returns_none_when_no_claude_ancestor_is_found(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # No /proc (macOS), a mid-read race, or a hook reparented away: the
-    # answer is "cannot prove ownership", never a guessed pid.
-    _install_fake_tree(monkeypatch, [(500, 'hook.sh'), (400, 'bash'), (300, 'init')])
-    assert sh._owning_claude_pid() is None
-
-
-def test_owning_claude_pid_walk_is_bounded(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A claude sitting deeper than the bound is not reached, so a runaway
-    # walk can never reach init and mint a bogus owner.
-    chain = [(1000 - i, 'bash') for i in range(sh._MAX_CLAUDE_ANCESTOR_HOPS)]
-    chain.append((1000 - sh._MAX_CLAUDE_ANCESTOR_HOPS, 'claude'))
-    _install_fake_tree(monkeypatch, chain)
-    assert sh._owning_claude_pid() is None
-
-
-def test_nested_claude_liveness_pid_is_the_nested_claude_not_the_wrapper(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Second task-4193 review finding: stamping the `sh` wrapper's pid
-    # (2028032) gave a forked-inheritor record an ALREADY-DEAD launcher_pid,
-    # so `stale_pid` could reap the record of a still-running nested
-    # session. The stamped pid must be the claude itself.
-    _install_fake_tree(monkeypatch, _REAL_HOOK_CHAIN)
-    assert sh._nested_claude_liveness_pid() == 2025347
-
-
-def test_nested_claude_liveness_pid_falls_back_to_the_durable_pid(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # No /proc, a mid-read race, or a hook reparented to init: degrade to
-    # the coarse-but-durable pid rather than guessing.
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
-    assert sh._nested_claude_liveness_pid() == sh._hand_launched_liveness_pid()
-
-
-def test_process_comm_returns_none_for_an_unresolvable_pid() -> None:
-    # Never raises -- the same best-effort contract as _parent_pid_of.
-    assert sh._process_comm(-1) is None
-
-
-def test_process_comm_reads_this_process_name() -> None:
-    assert sh._process_comm(os.getpid()) is not None
-
-
-def test_forked_inheritor_record_gets_a_pid_that_dies_with_it(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # _hand_launched_liveness_pid's session leader outlives every nested
+def test_forked_inheritor_record_gets_a_pid_that_dies_with_it(tmp_path: Path) -> None:
+    # The hand-launched liveness pid (the session leader) outlives every nested
     # claude, so a fork stamped with it would never satisfy
     # reap_stale_records' stale_pid rule -- one permanent extra row per
-    # nested `claude -p` an agent shells out to.
-    # **_kw absorbs the per-event `probes` memo the caller now forwards
-    # (task 4662); the stub's VALUE and every assertion below are unchanged.
-    monkeypatch.setattr(sh, '_nested_claude_liveness_pid', lambda **_kw: 424242)
+    # nested `claude -p` an agent shells out to. The injected tree's nested
+    # claude IS the pid the forked record must carry.
+    tree = claude_process_tree(424242)
 
     slug = 'session-cockpit-3215093'
     _write_bound_parent(slug, tmp_path, 3215093)
@@ -1727,28 +1580,23 @@ def test_forked_inheritor_record_gets_a_pid_that_dies_with_it(
     # not win here either.
     env = {'CLAUDE_SPAWN_SESSION_ID': slug, 'CLAUDE_SPAWN_LAUNCHER_PID': '3215093'}
 
-    sh.run_session_start(hook_input, env, root=tmp_path)
+    sh.run_session_start(hook_input, env, root=tmp_path, process_tree=tree)
 
-    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    forked_slug = sh.hook_session_slug(hook_input, env, root=tmp_path, process_tree=tree)
+    forked = sr.read_record(forked_slug, root=tmp_path)
     assert forked.launcher_pid == 424242
 
 
-def test_hand_launched_record_keeps_the_durable_session_leader_pid(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The nested-pid resolver is fork-only: a hand-launched session still
-    # gets the terminal-lifetime pid _hand_launched_liveness_pid documents.
-    def _boom() -> int:
-        raise AssertionError('the nested-claude pid resolver is for forked inheritors only')
-
-    monkeypatch.setattr(sh, '_nested_claude_liveness_pid', _boom)
-    monkeypatch.setattr(sh, '_hand_launched_liveness_pid', lambda: 515151)
+def test_hand_launched_record_keeps_the_durable_session_leader_pid(tmp_path: Path) -> None:
+    # The nested-claude pid is fork-only: a hand-launched session gets the
+    # terminal-lifetime session leader. A 424242 here would mean the
+    # fork-only resolver ran.
+    tree = dataclasses.replace(claude_process_tree(424242), session_leader_pid=lambda: 515151)
 
     hook_input = {'session_id': 'sess-hand', 'cwd': '/home/leo/src/dark-factory'}
-    sh.run_session_start(hook_input, env={}, root=tmp_path)
+    sh.run_session_start(hook_input, env={}, root=tmp_path, process_tree=tree)
 
-    slug = sh.hook_session_slug(hook_input, env={}, root=tmp_path)
+    slug = sh.hook_session_slug(hook_input, env={}, root=tmp_path, process_tree=tree)
     assert sr.read_record(slug, root=tmp_path).launcher_pid == 515151
 
 
@@ -1867,7 +1715,6 @@ def test_refresh_path_writes_normally_to_a_bound_launching_record(
 
 def test_owning_session_start_still_wins_the_launching_record_after_a_nested_stop(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The whole inversion story end to end: the nested event refrains, then
     # the owner's SessionStart binds, and from there the nested claude forks
@@ -1888,34 +1735,30 @@ def test_owning_session_start_still_wins_the_launching_record_after_a_nested_sto
     # The owning claude is the direct child of the payload bash whose pid
     # spawn-claude.sh exported; the nested one's parent is its agent's
     # Bash-tool shell, so the same env var yields opposite verdicts.
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 3215777)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 3215776)
+    nested_tree = claude_process_tree(3215777, 3215776)
+    owner_tree = claude_process_tree(3215511, 3215510)
 
-    sh.run_stop(nested, env, root=tmp_path)
+    sh.run_stop(nested, env, root=tmp_path, process_tree=nested_tree)
     # Assert HERE, before run_session_start's unconditional `status = RUNNING`
     # masks it: that reset is what hid the original defect from this test.
     assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 3215511)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 3215510)
-    sh.run_session_start(owner, env, root=tmp_path)
+    sh.run_session_start(owner, env, root=tmp_path, process_tree=owner_tree)
 
     parent = sr.read_record(slug, root=tmp_path)
     assert parent.claude_session_id == 'uuid-parent'
     assert parent.result_file == '/tmp/result-3215101.md'
 
     # The nested claude's next event now forks instead of flipping it.
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 3215777)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 3215776)
-    sh.run_stop(nested, env, root=tmp_path)
+    sh.run_stop(nested, env, root=tmp_path, process_tree=nested_tree)
     assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
-    forked = sr.read_record(sh.hook_session_slug(nested, env, root=tmp_path), root=tmp_path)
+    forked_slug = sh.hook_session_slug(nested, env, root=tmp_path, process_tree=nested_tree)
+    forked = sr.read_record(forked_slug, root=tmp_path)
     assert forked.status == sr.Status.IDLE
     assert forked.claude_session_id == 'uuid-nested'
 
 
 def test_refresh_path_still_binds_a_legacy_record_that_is_past_launching(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The LAUNCHING guard must not cost the migration case it sits next to:
     # a pre-task-4193 in-flight record is RUNNING/AWAITING_INPUT/IDLE, never
@@ -1928,10 +1771,9 @@ def test_refresh_path_still_binds_a_legacy_record_that_is_past_launching(
         root=tmp_path,
     )
     hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 3215521)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 3215520)
+    tree = claude_process_tree(3215521, 3215520)
 
-    sh.run_stop(hook_input, _owner_ppid_env(slug, 3215520), root=tmp_path)
+    sh.run_stop(hook_input, _owner_ppid_env(slug, 3215520), root=tmp_path, process_tree=tree)
 
     assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
 
@@ -3136,7 +2978,7 @@ def test_session_start_sh_converges_onto_pre_written_launching_record(tmp_path: 
     assert dirs[0].name == slug
 
 
-def test_nested_compact_cannot_invert_ownership(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_nested_compact_cannot_invert_ownership(tmp_path: Path) -> None:
     # Automatic compaction fires SessionStart source='compact' with NO user
     # action, so any nested `claude -p` that runs long enough reaches the
     # remint path. Source alone proves the emitter holds *a* session, not
@@ -3155,27 +2997,25 @@ def test_nested_compact_cannot_invert_ownership(tmp_path: Path, monkeypatch: pyt
     )
     # The owner's own SessionStart: direct child of the exported payload
     # bash, so it may claim the record.
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4400501)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4400500)
     owner = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory'}
-    sh.run_session_start(owner, env, root=tmp_path)
+    sh.run_session_start(owner, env, root=tmp_path, process_tree=claude_process_tree(4400501, 4400500))
     assert sr.read_record(slug, root=tmp_path).claude_owner_pid is not None
 
     # A DIFFERENT process (the nested claude) presenting an auto-compact.
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 999_001)
+    nested_tree = claude_process_tree(999_001, 4400500)
     nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory', 'source': 'compact'}
-    sh.run_session_start(nested, env, root=tmp_path)
+    sh.run_session_start(nested, env, root=tmp_path, process_tree=nested_tree)
 
     spawner = sr.read_record(slug, root=tmp_path)
     assert spawner.claude_session_id == 'uuid-owner'      # NOT rebound
     assert spawner.result_file == '/tmp/result-4400010.md'
-    forked = sr.read_record(sh.hook_session_slug(nested, env, root=tmp_path), root=tmp_path)
+    forked_slug = sh.hook_session_slug(nested, env, root=tmp_path, process_tree=nested_tree)
+    forked = sr.read_record(forked_slug, root=tmp_path)
     assert forked.claude_session_id == 'uuid-nested'
 
 
 def test_owner_auto_compact_still_converges_on_its_own_record(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The other direction, and the reason 'compact' is not simply dropped
     # from the owner-only set: auto-compaction is routine, so forking on it
@@ -3188,12 +3028,12 @@ def test_owner_auto_compact_still_converges_on_its_own_record(
         sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=4400011),
         root=tmp_path,
     )
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4400511)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4400510)
-    sh.run_session_start({'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory'}, env, root=tmp_path)
+    tree = claude_process_tree(4400511, 4400510)
+    owner = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory'}
+    sh.run_session_start(owner, env, root=tmp_path, process_tree=tree)
 
     remint = {'session_id': 'uuid-owner-2', 'cwd': '/home/leo/src/dark-factory', 'source': 'compact'}
-    sh.run_session_start(remint, env, root=tmp_path)
+    sh.run_session_start(remint, env, root=tmp_path, process_tree=tree)
 
     assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-owner-2'
     assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
@@ -3229,7 +3069,6 @@ def test_legacy_record_without_owner_pid_adopts_rather_than_splitting_the_owner(
 
 def test_unresolvable_current_owner_pid_adopts_rather_than_splitting_the_owner(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The mirror of the case above, and the one the pre-existing pin could
     # never observe (both _owning_claude_pid() calls happened inside one
@@ -3245,9 +3084,8 @@ def test_unresolvable_current_owner_pid_adopts_rather_than_splitting_the_owner(
         ),
         root=tmp_path,
     )
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
     remint = {'session_id': 'uuid-owner-2', 'cwd': '/home/leo/src/dark-factory', 'source': 'compact'}
-    sh.run_session_start(remint, env, root=tmp_path)
+    sh.run_session_start(remint, env, root=tmp_path, process_tree=claude_process_tree(None))
 
     assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-owner-2'
     assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
@@ -3269,7 +3107,6 @@ def _owner_ppid_env(slug: str, ppid: int) -> dict[str, str]:
 
 def test_nested_session_start_cannot_capture_an_unbound_launching_record(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # THE REVIEWER'S BLOCKING CASE (esc-4193-9). SessionStart is the event
     # that reaches the launch window FIRST -- a nested claude always fires
@@ -3284,24 +3121,23 @@ def test_nested_session_start_cannot_capture_an_unbound_launching_record(
     env = _owner_ppid_env(slug, 4193500)
     # The nested claude's parent is its agent's Bash-tool shell, not the
     # payload bash spawn-claude.sh exported.
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193777)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193776)
+    tree = claude_process_tree(4193777, 4193776)
 
     nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
-    sh.run_session_start(nested, env, root=tmp_path)
+    sh.run_session_start(nested, env, root=tmp_path, process_tree=tree)
 
     spawn_record = sr.read_record(slug, root=tmp_path)
     assert spawn_record.claude_session_id is None
     assert spawn_record.status is sr.Status.LAUNCHING
     assert spawn_record.role == 'cockpit'
-    forked = sr.read_record(sh.hook_session_slug(nested, env, root=tmp_path), root=tmp_path)
+    forked_slug = sh.hook_session_slug(nested, env, root=tmp_path, process_tree=tree)
+    forked = sr.read_record(forked_slug, root=tmp_path)
     assert forked.claude_session_id == 'uuid-nested'
     assert forked.parent_session_id == slug
 
 
 def test_owner_session_start_binds_the_unbound_launching_record(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The other half: the session spawn-claude.sh actually launched is the
     # direct child of the payload bash whose pid it exported, so it adopts
@@ -3309,11 +3145,10 @@ def test_owner_session_start_binds_the_unbound_launching_record(
     slug = 'session-cockpit-4193002'
     _launching_record(slug, tmp_path, pid=4193002)
     env = _owner_ppid_env(slug, 4193500)
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
+    tree = claude_process_tree(4193501, 4193500)
 
     owner = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
-    sh.run_session_start(owner, env, root=tmp_path)
+    sh.run_session_start(owner, env, root=tmp_path, process_tree=tree)
 
     record = sr.read_record(slug, root=tmp_path)
     assert record.claude_session_id == 'uuid-owner'
@@ -3323,7 +3158,6 @@ def test_owner_session_start_binds_the_unbound_launching_record(
 
 def test_nested_then_owner_session_start_leaves_the_spawn_record_with_the_owner(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The end-to-end ordering the reviewer reproduced against the branch:
     # nested SessionStart -> nested Stop -> owner SessionStart. Previously
@@ -3333,17 +3167,15 @@ def test_nested_then_owner_session_start_leaves_the_spawn_record_with_the_owner(
     _launching_record(slug, tmp_path, pid=4193003)
     env = _owner_ppid_env(slug, 4193500)
 
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193777)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193776)
+    nested_tree = claude_process_tree(4193777, 4193776)
     nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
-    sh.run_session_start(nested, env, root=tmp_path)
-    sh.run_stop(nested, env, root=tmp_path)
+    sh.run_session_start(nested, env, root=tmp_path, process_tree=nested_tree)
+    sh.run_stop(nested, env, root=tmp_path, process_tree=nested_tree)
     assert sr.read_record(slug, root=tmp_path).status is sr.Status.LAUNCHING
 
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
+    owner_tree = claude_process_tree(4193501, 4193500)
     owner = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
-    sh.run_session_start(owner, env, root=tmp_path)
+    sh.run_session_start(owner, env, root=tmp_path, process_tree=owner_tree)
 
     record = sr.read_record(slug, root=tmp_path)
     assert record.claude_session_id == 'uuid-owner'
@@ -3352,7 +3184,6 @@ def test_nested_then_owner_session_start_leaves_the_spawn_record_with_the_owner(
 
 def test_no_verdict_nested_session_start_leaves_the_spawn_record_for_its_owner(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # esc-4193-10, the reviewer's end-to-end repro. Two routine shapes yield
     # NO ownership verdict at all: macOS (no /proc, so _owning_claude_pid()
@@ -3368,18 +3199,18 @@ def test_no_verdict_nested_session_start_leaves_the_spawn_record_for_its_owner(
     slug = 'session-cockpit-4193007'
     _launching_record(slug, tmp_path, pid=4193007)
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}  # spawned before OWNER_PPID existed
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
+    tree = claude_process_tree(None)
 
     nested = {'session_id': 'uuid-NESTED', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
-    sh.run_session_start(nested, env, root=tmp_path)
+    sh.run_session_start(nested, env, root=tmp_path, process_tree=tree)
     assert sr.read_record(slug, root=tmp_path).claude_session_id is None
 
     owner = {'session_id': 'uuid-OWNER', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
-    sh.run_session_start(owner, env, root=tmp_path)
+    sh.run_session_start(owner, env, root=tmp_path, process_tree=tree)
 
     # The owner still CONVERGES on the spawn record instead of forking, and
     # the record is still open (unbound) rather than claimed by the nested.
-    assert sh.hook_session_slug(owner, env, root=tmp_path) == slug
+    assert sh.hook_session_slug(owner, env, root=tmp_path, process_tree=tree) == slug
     record = sr.read_record(slug, root=tmp_path)
     assert record.claude_session_id is None
     assert record.status is sr.Status.RUNNING
@@ -3389,7 +3220,6 @@ def test_no_verdict_nested_session_start_leaves_the_spawn_record_for_its_owner(
 
 def test_owner_ppid_proof_still_binds_where_no_verdict_would_not(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The other half of the asymmetry: withholding the bind is scoped to
     # UNPROVEN ownership only, so a modern spawn (spawn-claude.sh exports
@@ -3399,18 +3229,15 @@ def test_owner_ppid_proof_still_binds_where_no_verdict_would_not(
     slug = 'session-cockpit-4193008'
     _launching_record(slug, tmp_path, pid=4193008)
     env = _owner_ppid_env(slug, 4193600)
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193601)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193600)
 
     owner = {'session_id': 'uuid-OWNER', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
-    sh.run_session_start(owner, env, root=tmp_path)
+    sh.run_session_start(owner, env, root=tmp_path, process_tree=claude_process_tree(4193601, 4193600))
     assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-OWNER'
 
     # Now a nested claude, with the probe gone dark (no /proc): the BINDING
     # is the discriminator from here on, so it forks on its own.
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
     nested = {'session_id': 'uuid-NESTED', 'cwd': '/home/leo/src/dark-factory'}
-    sh.run_stop(nested, env, root=tmp_path)
+    sh.run_stop(nested, env, root=tmp_path, process_tree=claude_process_tree(None))
 
     record = sr.read_record(slug, root=tmp_path)
     assert record.claude_session_id == 'uuid-OWNER'
@@ -3419,7 +3246,6 @@ def test_owner_ppid_proof_still_binds_where_no_verdict_would_not(
 
 def test_owner_stop_is_not_withheld_from_a_still_launching_record(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Ruling item 4-iii. The launch-window withholding suppressed status AND
     # the pending question for EVERY event, including the legitimate
@@ -3431,11 +3257,10 @@ def test_owner_stop_is_not_withheld_from_a_still_launching_record(
     slug = 'session-cockpit-4193004'
     _launching_record(slug, tmp_path, pid=4193004)
     env = _owner_ppid_env(slug, 4193500)
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
+    tree = claude_process_tree(4193501, 4193500)
 
     owner = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory'}
-    sh.run_notification({**owner, 'message': 'may I proceed?'}, env, root=tmp_path)
+    sh.run_notification({**owner, 'message': 'may I proceed?'}, env, root=tmp_path, process_tree=tree)
 
     record = sr.read_record(slug, root=tmp_path)
     assert record.status is sr.Status.AWAITING_INPUT
@@ -3445,7 +3270,6 @@ def test_owner_stop_is_not_withheld_from_a_still_launching_record(
 
 def test_unknown_provenance_event_is_still_withheld_inside_the_window(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # No verdict at all (a session spawned by a pre-task-4193
     # spawn-claude.sh, or a platform with no /proc): provenance is genuinely
@@ -3453,9 +3277,13 @@ def test_unknown_provenance_event_is_still_withheld_inside_the_window(
     slug = 'session-cockpit-4193005'
     _launching_record(slug, tmp_path, pid=4193005)
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
 
-    sh.run_stop({'session_id': 'uuid-anon', 'cwd': '/home/leo/src/dark-factory'}, env, root=tmp_path)
+    sh.run_stop(
+        {'session_id': 'uuid-anon', 'cwd': '/home/leo/src/dark-factory'},
+        env,
+        root=tmp_path,
+        process_tree=claude_process_tree(None),
+    )
 
     record = sr.read_record(slug, root=tmp_path)
     assert record.status is sr.Status.LAUNCHING
@@ -3464,7 +3292,6 @@ def test_unknown_provenance_event_is_still_withheld_inside_the_window(
 
 def test_withholding_expires_so_a_stuck_record_is_never_blind_forever(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Nothing else bounds the window: no LAUNCHING reaper, and
     # reap_stale_records needs a DEAD launcher_pid, which is
@@ -3480,9 +3307,13 @@ def test_withholding_expires_so_a_stuck_record_is_never_blind_forever(
         root=tmp_path,
     )
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
 
-    sh.run_stop({'session_id': 'uuid-late', 'cwd': '/home/leo/src/dark-factory'}, env, root=tmp_path)
+    sh.run_stop(
+        {'session_id': 'uuid-late', 'cwd': '/home/leo/src/dark-factory'},
+        env,
+        root=tmp_path,
+        process_tree=claude_process_tree(None),
+    )
 
     record = sr.read_record(slug, root=tmp_path)
     assert record.status is sr.Status.IDLE
@@ -3507,7 +3338,6 @@ def test_withholding_expires_so_a_stuck_record_is_never_blind_forever(
 )
 def test_unreadable_or_stale_start_ts_expires_immediately_instead_of_withholding_forever(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     start_ts: str,
 ) -> None:
     # start_ts defaults to '' on SessionRecord, and may also arrive corrupt
@@ -3524,9 +3354,13 @@ def test_unreadable_or_stale_start_ts_expires_immediately_instead_of_withholding
     slug = 'session-cockpit-4661001'
     _launching_record(slug, tmp_path, pid=4661001, start_ts=start_ts)
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
 
-    sh.run_stop({'session_id': 'uuid-expired', 'cwd': '/home/leo/src/dark-factory'}, env, root=tmp_path)
+    sh.run_stop(
+        {'session_id': 'uuid-expired', 'cwd': '/home/leo/src/dark-factory'},
+        env,
+        root=tmp_path,
+        process_tree=claude_process_tree(None),
+    )
 
     record = sr.read_record(slug, root=tmp_path)
     assert record.status is sr.Status.IDLE
@@ -3535,7 +3369,6 @@ def test_unreadable_or_stale_start_ts_expires_immediately_instead_of_withholding
 
 def test_naive_start_ts_inside_the_window_still_withholds(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The discriminating case for the tz-naive-assumed-UTC branch. A stale
     # naive timestamp (above) would also expire under a WRONG assumption --
@@ -3547,9 +3380,13 @@ def test_naive_start_ts_inside_the_window_still_withholds(
     recent_naive = (datetime.now(UTC) - timedelta(seconds=5)).replace(tzinfo=None).isoformat()
     _launching_record(slug, tmp_path, pid=4661004, start_ts=recent_naive)
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
 
-    sh.run_stop({'session_id': 'uuid-naive-recent', 'cwd': '/home/leo/src/dark-factory'}, env, root=tmp_path)
+    sh.run_stop(
+        {'session_id': 'uuid-naive-recent', 'cwd': '/home/leo/src/dark-factory'},
+        env,
+        root=tmp_path,
+        process_tree=claude_process_tree(None),
+    )
 
     record = sr.read_record(slug, root=tmp_path)
     assert record.status is sr.Status.LAUNCHING
@@ -3558,7 +3395,6 @@ def test_naive_start_ts_inside_the_window_still_withholds(
 
 def test_sibling_mode_running_unbound_record_is_still_protected(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Ruling item 4-i: resolve_sibling() runs `refresh --status running`
     # immediately at launch on EVERY backend branch, so a
@@ -3573,152 +3409,15 @@ def test_sibling_mode_running_unbound_record_is_still_protected(
         root=tmp_path,
     )
     env = _owner_ppid_env(slug, 4193500)
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193777)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193776)
+    tree = claude_process_tree(4193777, 4193776)
 
     nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
-    sh.run_session_start(nested, env, root=tmp_path)
+    sh.run_session_start(nested, env, root=tmp_path, process_tree=tree)
 
     assert sr.read_record(slug, root=tmp_path).claude_session_id is None
     assert sr.read_record(
-        sh.hook_session_slug(nested, env, root=tmp_path), root=tmp_path
+        sh.hook_session_slug(nested, env, root=tmp_path, process_tree=tree), root=tmp_path
     ).claude_session_id == 'uuid-nested'
-
-
-def test_owner_ppid_verdict_is_none_for_every_unresolvable_input(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Fail-soft: never False (fork) on an input the probe simply cannot read.
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
-    assert sh._owner_ppid_verdict({}) is None
-    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '   '}) is None
-    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': 'not-a-pid'}) is None
-    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '1'}) is None
-    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '4193500'}) is True
-    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '4193999'}) is False
-
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
-    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '4193500'}) is None
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: None)
-    assert sh._owner_ppid_verdict({'CLAUDE_SPAWN_OWNER_PPID': '4193500'}) is None
-
-
-# ---------------------------------------------------------------------------
-# _EventProbes -- the per-event /proc probe memo (task 4662)
-#
-# One hook event consults _owner_ppid_verdict TWICE (slug ownership, then the
-# launch-window withhold) and _owning_claude_pid once more at bind time.
-# Each walk is up to _MAX_CLAUDE_ANCESTOR_HOPS x 2 /proc reads against a hard
-# _HOOK_TIMEOUT_SECS budget. Memoizing collapses them onto one observation --
-# which is also a correctness property: the adopt/fork decision and the
-# withhold decision are then made from the SAME probe result.
-# ---------------------------------------------------------------------------
-
-
-def _count_owning_claude_pid(
-    monkeypatch: pytest.MonkeyPatch, value: int | None
-) -> list[int]:
-    """Patch ``sh._owning_claude_pid`` to return *value*, counting its calls."""
-    calls: list[int] = []
-
-    def _probe() -> int | None:
-        calls.append(1)
-        return value
-
-    monkeypatch.setattr(sh, '_owning_claude_pid', _probe)
-    return calls
-
-
-def test_event_probes_walks_proc_once_for_repeated_pid_reads(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls = _count_owning_claude_pid(monkeypatch, 4193501)
-    probes = sh._EventProbes({})
-
-    assert probes.owning_claude_pid() == 4193501
-    assert probes.owning_claude_pid() == 4193501
-    assert probes.owning_claude_pid() == 4193501
-    assert len(calls) == 1
-
-
-def test_event_probes_walks_proc_once_for_repeated_verdicts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls = _count_owning_claude_pid(monkeypatch, 4193501)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
-    probes = sh._EventProbes({'CLAUDE_SPAWN_OWNER_PPID': '4193500'})
-
-    assert probes.owner_ppid_verdict() is True
-    assert probes.owner_ppid_verdict() is True
-    assert len(calls) == 1
-
-
-@pytest.mark.parametrize('verdict_first', [True, False])
-def test_event_probes_share_one_walk_across_both_probes(
-    monkeypatch: pytest.MonkeyPatch, verdict_first: bool
-) -> None:
-    """The verdict and the bind-time pid stamp consume ONE walk, either order."""
-    calls = _count_owning_claude_pid(monkeypatch, 4193501)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
-    probes = sh._EventProbes({'CLAUDE_SPAWN_OWNER_PPID': '4193500'})
-
-    if verdict_first:
-        assert probes.owner_ppid_verdict() is True
-        assert probes.owning_claude_pid() == 4193501
-    else:
-        assert probes.owning_claude_pid() == 4193501
-        assert probes.owner_ppid_verdict() is True
-    assert len(calls) == 1
-
-
-def test_event_probes_caches_none_as_a_resolved_answer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """None is a legitimate resolved answer, not "not yet computed"."""
-    calls = _count_owning_claude_pid(monkeypatch, None)
-    probes = sh._EventProbes({'CLAUDE_SPAWN_OWNER_PPID': '4193500'})
-
-    assert probes.owning_claude_pid() is None
-    assert probes.owning_claude_pid() is None
-    assert len(calls) == 1
-
-    calls_v = _count_owning_claude_pid(monkeypatch, None)
-    probes_v = sh._EventProbes({'CLAUDE_SPAWN_OWNER_PPID': '4193500'})
-    assert probes_v.owner_ppid_verdict() is None
-    assert probes_v.owner_ppid_verdict() is None
-    assert len(calls_v) == 1
-
-
-def test_event_probes_verdict_matches_unmemoized_verdict_bit_for_bit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """SEMANTIC PARITY: the memo must not change a single verdict.
-
-    Mirrors test_owner_ppid_verdict_is_none_for_every_unresolvable_input's
-    enumeration, asserting the memoized and un-memoized spellings agree on
-    each input rather than restating the expected answers independently.
-    """
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: 4193500)
-    envs: list[dict[str, str]] = [
-        {},
-        {'CLAUDE_SPAWN_OWNER_PPID': '   '},
-        {'CLAUDE_SPAWN_OWNER_PPID': 'not-a-pid'},
-        {'CLAUDE_SPAWN_OWNER_PPID': '1'},
-        {'CLAUDE_SPAWN_OWNER_PPID': '4193500'},  # owner -> True
-        {'CLAUDE_SPAWN_OWNER_PPID': '4193999'},  # nested -> False
-    ]
-    for env in envs:
-        assert sh._EventProbes(env).owner_ppid_verdict() is sh._owner_ppid_verdict(env)
-    # And the two unresolvable-probe shapes.
-    env = {'CLAUDE_SPAWN_OWNER_PPID': '4193500'}
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
-    assert sh._EventProbes(env).owner_ppid_verdict() is sh._owner_ppid_verdict(env)
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda pid: None)
-    assert sh._EventProbes(env).owner_ppid_verdict() is sh._owner_ppid_verdict(env)
 
 
 # ---------------------------------------------------------------------------
@@ -3735,20 +3434,17 @@ def test_event_probes_verdict_matches_unmemoized_verdict_bit_for_bit(
 
 
 def _owner_shape(
-    slug: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, pid: int
-) -> tuple[dict[str, str], list[int]]:
+    slug: str, tmp_path: Path, *, pid: int
+) -> tuple[dict[str, str], ProcessTree, list[int]]:
     """LAUNCHING+unbound record whose OWNER_PPID verdict resolves to True."""
     _launching_record(slug, tmp_path, pid=pid)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda p: 4193500)
-    calls = _count_owning_claude_pid(monkeypatch, 4193501)
-    return _owner_ppid_env(slug, 4193500), calls
+    tree, walks = counting_walks(claude_process_tree(4193501, 4193500))
+    return _owner_ppid_env(slug, 4193500), tree, walks
 
 
-def test_notification_walks_proc_exactly_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_notification_walks_proc_exactly_once(tmp_path: Path) -> None:
     slug = 'session-cockpit-4662001'
-    env, calls = _owner_shape(slug, tmp_path, monkeypatch, pid=4662001)
+    env, tree, walks = _owner_shape(slug, tmp_path, pid=4662001)
 
     sh.run_notification(
         {
@@ -3758,9 +3454,10 @@ def test_notification_walks_proc_exactly_once(
         },
         env,
         root=tmp_path,
+        process_tree=tree,
     )
 
-    assert len(calls) == 1
+    assert len(walks) == 1
     # OUTCOME PARITY (mirrors test_owner_stop_is_not_withheld_...).
     record = sr.read_record(slug, root=tmp_path)
     assert record.status is sr.Status.AWAITING_INPUT
@@ -3768,29 +3465,26 @@ def test_notification_walks_proc_exactly_once(
     assert record.claude_session_id == 'uuid-owner'
 
 
-def test_stop_walks_proc_exactly_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_stop_walks_proc_exactly_once(tmp_path: Path) -> None:
     slug = 'session-cockpit-4662002'
-    env, calls = _owner_shape(slug, tmp_path, monkeypatch, pid=4662002)
+    env, tree, walks = _owner_shape(slug, tmp_path, pid=4662002)
 
     sh.run_stop(
         {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory'},
         env,
         root=tmp_path,
+        process_tree=tree,
     )
 
-    assert len(calls) == 1
+    assert len(walks) == 1
     record = sr.read_record(slug, root=tmp_path)
     assert record.status is sr.Status.IDLE
     assert record.claude_session_id == 'uuid-owner'
 
 
-def test_session_start_walks_proc_exactly_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_session_start_walks_proc_exactly_once(tmp_path: Path) -> None:
     slug = 'session-cockpit-4662003'
-    env, calls = _owner_shape(slug, tmp_path, monkeypatch, pid=4662003)
+    env, tree, walks = _owner_shape(slug, tmp_path, pid=4662003)
 
     sh.run_session_start(
         {
@@ -3800,46 +3494,44 @@ def test_session_start_walks_proc_exactly_once(
         },
         env,
         root=tmp_path,
+        process_tree=tree,
     )
 
-    assert len(calls) == 1
+    assert len(walks) == 1
     record = sr.read_record(slug, root=tmp_path)
     assert record.status is sr.Status.RUNNING
     assert record.claude_session_id == 'uuid-owner'
     assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
-def test_nested_session_start_walks_proc_at_most_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_nested_session_start_walks_proc_at_most_once(tmp_path: Path) -> None:
     """The fork mirror: memoizing must not weaken the nested-inheritor guard.
 
     Mirrors test_nested_session_start_cannot_capture_an_unbound_launching_record
     -- the spawn record must be left unbound and LAUNCHING -- while pinning
-    that the fork path (ownership verdict, _nested_claude_liveness_pid's
-    liveness pid, and the bind-time stamp) also settles on one walk.
+    that the fork path (ownership verdict, the nested-claude liveness pid,
+    and the bind-time stamp) also settles on one walk.
     """
     slug = 'session-cockpit-4662004'
     _launching_record(slug, tmp_path, pid=4662004)
     env = _owner_ppid_env(slug, 4193500)
     # A nested claude's parent is its agent's Bash-tool shell, not the
     # payload bash spawn-claude.sh exported.
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda p: 4193776)
-    calls = _count_owning_claude_pid(monkeypatch, 4193777)
+    tree, walks = counting_walks(claude_process_tree(4193777, 4193776))
 
     nested = {
         'session_id': 'uuid-nested',
         'cwd': '/home/leo/src/dark-factory',
         'source': 'startup',
     }
-    sh.run_session_start(nested, env, root=tmp_path)
+    sh.run_session_start(nested, env, root=tmp_path, process_tree=tree)
 
-    assert len(calls) <= 1
+    assert len(walks) <= 1
     spawn_record = sr.read_record(slug, root=tmp_path)
     assert spawn_record.claude_session_id is None
     assert spawn_record.status is sr.Status.LAUNCHING
     forked = sr.read_record(
-        sh.hook_session_slug(nested, env, root=tmp_path), root=tmp_path
+        sh.hook_session_slug(nested, env, root=tmp_path, process_tree=tree), root=tmp_path
     )
     assert forked.claude_session_id == 'uuid-nested'
     assert forked.parent_session_id == slug
@@ -3955,7 +3647,8 @@ def test_resolution_adopts_and_carries_the_probes_snapshot(tmp_path: Path) -> No
     hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
-    resolution = sh._resolve_hook_slug(hook_input, env, tmp_path)
+    probes = EventProbes(env, claude_process_tree(None))
+    resolution = sh._resolve_hook_slug(hook_input, env, tmp_path, probes=probes)
 
     assert resolution.slug == slug
     assert resolution.rejected_env_slug is None
@@ -3979,7 +3672,8 @@ def test_resolution_forks_without_offering_the_rejected_snapshot(
     hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
-    resolution = sh._resolve_hook_slug(hook_input, env, tmp_path)
+    probes = EventProbes(env, claude_process_tree(None))
+    resolution = sh._resolve_hook_slug(hook_input, env, tmp_path, probes=probes)
 
     assert resolution.slug != slug
     assert resolution.rejected_env_slug == slug
@@ -3998,7 +3692,8 @@ def test_resolution_reads_nothing_for_a_hand_launched_session(
     monkeypatch.setattr(sr, 'read_record', _boom)
     hook_input = {'session_id': 'sess-hand', 'cwd': '/home/leo/src/dark-factory'}
 
-    resolution = sh._resolve_hook_slug(hook_input, {}, tmp_path)
+    probes = EventProbes({}, claude_process_tree(None))
+    resolution = sh._resolve_hook_slug(hook_input, {}, tmp_path, probes=probes)
 
     assert resolution.snapshot is None
     assert resolution.rejected_env_slug is None
@@ -4019,7 +3714,8 @@ def test_resolution_blank_stdin_session_id_reads_nothing(
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
     hook_input = {'session_id': '  ', 'cwd': '/home/leo/src/dark-factory'}
 
-    resolution = sh._resolve_hook_slug(hook_input, env, tmp_path)
+    probes = EventProbes(env, claude_process_tree(None))
+    resolution = sh._resolve_hook_slug(hook_input, env, tmp_path, probes=probes)
 
     assert resolution.slug == slug
     assert resolution.may_bind is True
@@ -4048,10 +3744,12 @@ def test_resolution_snapshot_slug_invariant_holds_on_every_shape(
         ({'session_id': '  ', 'cwd': cwd}, {'CLAUDE_SPAWN_SESSION_ID': adopted}),
     ]
     for hook_input, env in shapes:
-        resolution = sh._resolve_hook_slug(hook_input, env, tmp_path)
+        tree = claude_process_tree(None)
+        probes = EventProbes(env, tree)
+        resolution = sh._resolve_hook_slug(hook_input, env, tmp_path, probes=probes)
         assert resolution.snapshot is None or resolution.snapshot.slug == resolution.slug
         # hook_session_slug's public signature and str return are unchanged.
-        public = sh.hook_session_slug(hook_input, env, root=tmp_path)
+        public = sh.hook_session_slug(hook_input, env, root=tmp_path, process_tree=tree)
         assert isinstance(public, str)
         assert public == resolution.slug
 
@@ -4130,7 +3828,7 @@ def test_refresh_path_reads_the_written_record_exactly_once(
         assert record.question is not None and record.question.text == 'may I proceed?'
 
 
-def test_hand_launched_refresh_reads_the_written_record_exactly_once(
+def test_hand_launched_refresh_writes_the_body_its_decision_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     hook_input = {'session_id': 'sess-hand', 'cwd': '/home/leo/src/dark-factory'}
@@ -4140,7 +3838,9 @@ def test_hand_launched_refresh_reads_the_written_record_exactly_once(
 
     sh.run_stop(hook_input, {}, root=tmp_path)
 
-    assert io.reads_of(slug) == 1
+    # Read 1 is the session-id pointer's vouch; read 2 is the one the decision and the write share.
+    assert io.reads_of(slug) == 2
+    assert [written.cwd for written in io.writes] == ['read-2']
     assert sr.read_record(slug, root=tmp_path).status is sr.Status.IDLE
 
 
@@ -4184,8 +3884,6 @@ def test_first_bind_event_writes_exactly_once(
         root=tmp_path,
     )
     env = _owner_ppid_env(slug, 4193500)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda p: 4193500)
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
     io = _RegistryIO(monkeypatch)
 
     sh.run_notification(
@@ -4196,6 +3894,7 @@ def test_first_bind_event_writes_exactly_once(
         },
         env,
         root=tmp_path,
+        process_tree=claude_process_tree(4193501, 4193500),
     )
 
     assert io.reads_of(slug) == 1
@@ -4489,8 +4188,6 @@ def test_fault_lane_does_not_withhold_from_a_positively_identified_owner(
     slug = 'session-cockpit-4662052'
     _spawn_launching_record(slug, tmp_path)
     env = _owner_ppid_env(slug, 4193500)
-    monkeypatch.setattr(sh, '_parent_pid_of', lambda p: 4193500)
-    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 4193501)
     calls = _boom_once_read(monkeypatch)
 
     sh.run_notification(
@@ -4501,6 +4198,7 @@ def test_fault_lane_does_not_withhold_from_a_positively_identified_owner(
         },
         env,
         root=tmp_path,
+        process_tree=claude_process_tree(4193501, 4193500),
     )
 
     assert len(calls) >= 1
@@ -4565,3 +4263,285 @@ def test_fault_lane_propagates_a_persistently_corrupt_body(tmp_path: Path) -> No
         sh.run_stop(hook_input, env, root=tmp_path)
 
     assert record_path.read_text() == 'not-json{{{'
+
+
+# ---------------------------------------------------------------------------
+# Task 7193: the self-exit decision is Stop-only
+# ---------------------------------------------------------------------------
+
+
+def test_notification_takes_no_self_exit_decision(tmp_path: Path) -> None:
+    slug = 'prd-df-7193-7193250'
+    record_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            self_exit=True,
+            claude_session_id='uuid-owner',
+            claude_owner_pid=7_193_201,
+            launcher_pid=7_193_250,
+        ),
+        root=tmp_path,
+    )
+    (record_dir / sr.RESULT_FILENAME).write_text('outcome: done\n', encoding='utf-8')
+    marker = record_dir / sr.EXIT_REQUESTED_FILENAME
+    marker.write_text('uuid-owner', encoding='utf-8')
+
+    sh.run_notification(
+        {'session_id': 'uuid-owner', 'cwd': str(tmp_path), 'background_tasks': [], 'session_crons': []},
+        _owner_ppid_env(slug, 7_193_200),
+        root=tmp_path,
+        process_tree=claude_process_tree(7_193_201, 7_193_200),
+    )
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.AWAITING_INPUT
+    assert record.exit_request is None
+    assert marker.exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 7489: pointer keying -- a session with no CLAUDE_SPAWN_SESSION_ID (a
+# T3-hosted one) reaches its record through sessions-by-claude-id, then
+# sessions-by-pid, before the hand-launched keying.
+# ---------------------------------------------------------------------------
+
+_T3_CWD = '/home/leo/src/dark-factory'
+_T3_SLUG = 'session-dark-factory-7489001'
+_T3_OWNER = 7_489_101
+_NESTED = 7_489_202
+
+
+def _write_t3_record(
+    tmp_path: Path,
+    *,
+    session_id: str,
+    status: sr.Status = sr.Status.RUNNING,
+    owner_pid: int = _T3_OWNER,
+) -> None:
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=_T3_SLUG,
+            status=status,
+            title='t3 child',
+            cwd=_T3_CWD,
+            launcher_pid=7_489_900,
+            display=sr.Display(kind=sr.DisplayKind.T3.value, t3_thread_id='thread-7489'),
+            claude_session_id=session_id,
+            claude_launch_session_id=session_id,
+            claude_owner_pid=owner_pid,
+        ),
+        root=tmp_path,
+    )
+    sr.write_claude_session_pointer(session_id, _T3_SLUG, root=tmp_path)
+    sr.write_session_pointer(owner_pid, _T3_SLUG, root=tmp_path)
+
+
+def _reaped_pid() -> int:
+    child = subprocess.Popen(['true'])
+    child.wait()
+    return child.pid
+
+
+def _hand_slug(session_id: str, tmp_path: Path) -> str:
+    """The hand-launched keying's slug: what the hooks resolve against a registry with no pointers."""
+    return sh.hook_session_slug(
+        _t3_event(session_id),
+        {},
+        root=tmp_path / 'pointerless-fleet',
+        process_tree=claude_process_tree(None),
+    )
+
+
+def _session_slugs(tmp_path: Path) -> set[str]:
+    return {path.name for path in sr.sessions_dir(root=tmp_path).iterdir()}
+
+
+def _t3_event(session_id: str, **extra: str) -> dict[str, str]:
+    return {'session_id': session_id, 'cwd': _T3_CWD, **extra}
+
+
+@pytest.mark.parametrize(
+    ('handler', 'expected'),
+    [
+        (sh.run_session_start, sr.Status.RUNNING),
+        (sh.run_notification, sr.Status.AWAITING_INPUT),
+        (sh.run_stop, sr.Status.IDLE),
+    ],
+)
+def test_session_id_pointer_resolves_every_event_onto_the_t3_record(
+    tmp_path: Path,
+    handler: Callable[..., object],
+    expected: sr.Status,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3', status=sr.Status.LAUNCHING)
+
+    handler(_t3_event('sid-t3'), {}, root=tmp_path, process_tree=claude_process_tree(_T3_OWNER))
+
+    record = sr.read_record(_T3_SLUG, root=tmp_path)
+    assert record.status is expected
+    assert record.display is not None and record.display.kind == sr.DisplayKind.T3.value
+    assert _session_slugs(tmp_path) == {_T3_SLUG}
+
+
+def test_session_start_keeps_the_t3_display_over_an_inherited_tmux_env(tmp_path: Path) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3')
+
+    sh.run_session_start(
+        _t3_event('sid-t3'),
+        {'TMUX': '/tmp/tmux-1000/default,1,0', 'TMUX_PANE': '%3'},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_OWNER),
+    )
+
+    display = sr.read_record(_T3_SLUG, root=tmp_path).display
+    assert display is not None
+    assert (display.kind, display.t3_thread_id) == (sr.DisplayKind.T3.value, 'thread-7489')
+
+
+def test_a_session_id_pointer_the_record_no_longer_vouches_for_falls_through(
+    tmp_path: Path,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-current')
+    sr.write_claude_session_pointer('sid-stale', _T3_SLUG, root=tmp_path)
+
+    sh.run_notification(
+        _t3_event('sid-stale'), {}, root=tmp_path, process_tree=claude_process_tree(_T3_OWNER)
+    )
+
+    t3 = sr.read_record(_T3_SLUG, root=tmp_path)
+    assert (t3.status, t3.claude_session_id) == (sr.Status.RUNNING, 'sid-current')
+    assert _session_slugs(tmp_path) == {_T3_SLUG, _hand_slug('sid-stale', tmp_path)}
+
+
+@pytest.mark.parametrize('source', ['clear', 'compact'])
+def test_pid_pointer_rebinds_the_t3_record_on_a_remint(tmp_path: Path, source: str) -> None:
+    _write_t3_record(tmp_path, session_id='sid-before')
+
+    sh.run_session_start(
+        _t3_event('sid-after', source=source),
+        {},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_OWNER),
+    )
+
+    record = sr.read_record(_T3_SLUG, root=tmp_path)
+    assert record.claude_session_id == 'sid-after'
+    assert record.claude_launch_session_id == 'sid-before'
+    assert record.claude_owner_pid == _T3_OWNER
+    assert sr.resolve_session_slug_for_claude_session_id('sid-after', root=tmp_path) == _T3_SLUG
+    assert sr.resolve_session_slug_for_pid(_T3_OWNER, root=tmp_path) == _T3_SLUG
+    assert _session_slugs(tmp_path) == {_T3_SLUG}
+
+
+@pytest.mark.parametrize('source', ['startup', 'resume'])
+def test_pid_pointer_does_not_rebind_the_t3_record_on_a_plain_session_start(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-before')
+
+    sh.run_session_start(
+        _t3_event('sid-new', source=source),
+        {},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_OWNER),
+    )
+
+    assert sr.read_record(_T3_SLUG, root=tmp_path).claude_session_id == 'sid-before'
+    assert _session_slugs(tmp_path) == {_T3_SLUG, _hand_slug('sid-new', tmp_path)}
+
+
+def test_a_nested_claude_cannot_capture_the_t3_record(tmp_path: Path) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3')
+    nested = claude_process_tree(_NESTED, _T3_OWNER)
+
+    sh.run_session_start(_t3_event('sid-nested', source='resume'), {}, root=tmp_path, process_tree=nested)
+    sh.run_session_start(_t3_event('sid-nested-2', source='compact'), {}, root=tmp_path, process_tree=nested)
+    sh.run_stop(_t3_event('sid-nested-2'), {}, root=tmp_path, process_tree=nested)
+
+    t3 = sr.read_record(_T3_SLUG, root=tmp_path)
+    assert (t3.status, t3.claude_session_id, t3.claude_owner_pid) == (
+        sr.Status.RUNNING,
+        'sid-t3',
+        _T3_OWNER,
+    )
+    assert sr.resolve_session_slug_for_pid(_T3_OWNER, root=tmp_path) == _T3_SLUG
+    assert _session_slugs(tmp_path) == {_T3_SLUG, _hand_slug('sid-nested', tmp_path)}
+
+
+def test_an_env_slug_binding_writes_a_session_id_pointer(tmp_path: Path) -> None:
+    slug = 'session-cockpit-7489300'
+    sr.write_record(
+        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=7_489_300),
+        root=tmp_path,
+    )
+
+    sh.run_session_start(
+        _t3_event('sid-env'),
+        _owner_ppid_env(slug, 7_489_310),
+        root=tmp_path,
+        process_tree=claude_process_tree(7_489_311, 7_489_310),
+    )
+
+    assert sr.resolve_session_slug_for_claude_session_id('sid-env', root=tmp_path) == slug
+
+
+def test_a_hand_launched_record_carries_its_owner_pid_and_both_pointers(tmp_path: Path) -> None:
+    record = sh.run_session_start(
+        _t3_event('sid-hand'), {}, root=tmp_path, process_tree=claude_process_tree(7_489_401)
+    )
+
+    assert record.session_slug == _hand_slug('sid-hand', tmp_path)
+    assert record.claude_owner_pid == 7_489_401
+    assert sr.resolve_session_slug_for_pid(7_489_401, root=tmp_path) == record.session_slug
+    assert sr.resolve_session_slug_for_claude_session_id('sid-hand', root=tmp_path) == record.session_slug
+
+
+def test_a_hand_launched_clear_keeps_the_session_on_its_record(tmp_path: Path) -> None:
+    tree = claude_process_tree(7_489_501)
+    sh.run_session_start(_t3_event('sid-first'), {}, root=tmp_path, process_tree=tree)
+
+    sh.run_session_start(_t3_event('sid-second', source='clear'), {}, root=tmp_path, process_tree=tree)
+    sh.run_stop(_t3_event('sid-second'), {}, root=tmp_path, process_tree=tree)
+
+    record = sr.read_record(_hand_slug('sid-first', tmp_path), root=tmp_path)
+    assert (record.status, record.claude_session_id) == (sr.Status.IDLE, 'sid-second')
+    assert _session_slugs(tmp_path) == {_hand_slug('sid-first', tmp_path)}
+
+
+_T3_RESUMED = 7_489_102
+
+
+def test_a_resume_in_a_new_process_reclaims_a_dead_owner_then_rebinds_on_compact(
+    tmp_path: Path,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3', owner_pid=_reaped_pid())
+    resumed = claude_process_tree(_T3_RESUMED)
+
+    sh.run_session_start(_t3_event('sid-t3', source='resume'), {}, root=tmp_path, process_tree=resumed)
+
+    assert sr.read_record(_T3_SLUG, root=tmp_path).claude_owner_pid == _T3_RESUMED
+    assert sr.resolve_session_slug_for_pid(_T3_RESUMED, root=tmp_path) == _T3_SLUG
+
+    sh.run_session_start(_t3_event('sid-compacted', source='compact'), {}, root=tmp_path, process_tree=resumed)
+
+    assert sr.read_record(_T3_SLUG, root=tmp_path).claude_session_id == 'sid-compacted'
+    assert _session_slugs(tmp_path) == {_T3_SLUG}
+
+
+def test_a_same_session_id_from_a_new_process_leaves_a_live_owner_in_place(
+    tmp_path: Path,
+) -> None:
+    _write_t3_record(tmp_path, session_id='sid-t3', owner_pid=os.getpid())
+
+    sh.run_session_start(
+        _t3_event('sid-t3', source='resume'),
+        {},
+        root=tmp_path,
+        process_tree=claude_process_tree(_T3_RESUMED, os.getpid()),
+    )
+
+    assert sr.read_record(_T3_SLUG, root=tmp_path).claude_owner_pid == os.getpid()
+    assert sr.resolve_session_slug_for_pid(_T3_RESUMED, root=tmp_path) is None

@@ -62,7 +62,7 @@ inventory this closes):
     only the live ones: ``playwright`` too. A role that adopts an ambient-only
     server reaches it in production and not under eval; give it an
     orchestrator-built config instead. The eval-only spawn sites outside the
-    workflow (``evals/runner.py::architect_eval_mcp_scope``, the judges in
+    workflow (``evals/architect_eval.py::architect_eval_mcp_scope``, the judges in
     ``evals/judge.py``, the assessors in ``evals/compare.py``) scope
     themselves directly.
 """

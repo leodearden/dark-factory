@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from typing import Any
 
 import pytest
 from shared.cli_invoke import _SubprocessResult
+from shared.invocation_outcome import CapHit, Failure, classify_invocation
+from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents.invoke import (
+    _estimate_cost,
     _parse_codex_output,
     _parse_gemini_output,
     _parse_pi_output,
@@ -77,6 +81,7 @@ class TestParseGeminiValidStats:
         # gemini-3-flash: input=0.075/1M, output=0.30/1M
         # cost = (100 * 0.075 + 50 * 0.30) / 1_000_000 = 0.0000225
         assert agent_result.cost_usd > 0.0
+        assert agent_result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE
 
 
 class TestParseCodexNullUsage:
@@ -133,6 +138,7 @@ class TestParseCodexValidUsage:
         # o4-mini: input=1.10/1M, output=4.40/1M
         # cost = (200 * 1.10 + 100 * 4.40) / 1_000_000 = 0.00066
         assert agent_result.cost_usd > 0.0
+        assert agent_result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE
 
 
 class TestParseCodexOutputConfigPrices:
@@ -227,6 +233,313 @@ class TestParseCodexOutputUnknownModelFallback:
         )
         # _FALLBACK_PRICE: input=2.0/1M, output=8.0/1M
         assert agent_result.cost_usd == pytest.approx((200 * 2.0 + 100 * 8.0) / 1_000_000)
+
+
+# Measured gpt-6-astra rollout usage (task 5403): codex counts cached tokens
+# INSIDE input_tokens.
+_ASTRA_INPUT_TOKENS = 311881
+_ASTRA_CACHED_INPUT_TOKENS = 277760
+_ASTRA_OUTPUT_TOKENS = 1442
+
+
+class TestEstimateCostCachedInput:
+    """The cached share of input_tokens is priced at cached_input_per_1m and
+    only the remainder at input_per_1m; an entry with no cached rate prices
+    every input token at input_per_1m, exactly as before."""
+
+    @pytest.mark.parametrize('as_price_entry', [True, False])
+    def test_measured_astra_rollout_prices_the_cached_share_at_the_cached_rate(
+        self, as_price_entry: bool,
+    ) -> None:
+        rates = {'input_per_1m': 10.0, 'output_per_1m': 50.0, 'cached_input_per_1m': 1.0}
+        prices = {'gpt-6-astra': PriceEntry(**rates) if as_price_entry else rates}
+
+        cost = _estimate_cost(
+            'gpt-6-astra', _ASTRA_INPUT_TOKENS, _ASTRA_OUTPUT_TOKENS, prices,
+            cached_input_tokens=_ASTRA_CACHED_INPUT_TOKENS,
+        )
+
+        # ((311881 - 277760) * 10 + 277760 * 1 + 1442 * 50) / 1e6 = 0.69107,
+        # against 3.19091 with every input token at the uncached rate.
+        assert cost == pytest.approx(0.69107)
+
+    def test_entry_without_cached_rate_prices_cached_tokens_at_input_rate(self) -> None:
+        prices = {'gpt-6-astra': PriceEntry(input_per_1m=10.0, output_per_1m=50.0)}
+
+        with_cached = _estimate_cost(
+            'gpt-6-astra', _ASTRA_INPUT_TOKENS, _ASTRA_OUTPUT_TOKENS, prices,
+            cached_input_tokens=_ASTRA_CACHED_INPUT_TOKENS,
+        )
+
+        assert with_cached == _estimate_cost(
+            'gpt-6-astra', _ASTRA_INPUT_TOKENS, _ASTRA_OUTPUT_TOKENS, prices,
+        )
+        # (311881 * 10 + 1442 * 50) / 1e6
+        assert with_cached == pytest.approx(3.19091)
+
+    def test_fallback_price_without_cached_key_does_not_raise(self) -> None:
+        cost = _estimate_cost('totally-unknown-model', 300, 100, {}, cached_input_tokens=200)
+
+        # _FALLBACK_PRICE has no cached rate: (300 * 2.0 + 100 * 8.0) / 1e6
+        assert cost == pytest.approx((300 * 2.0 + 100 * 8.0) / 1_000_000)
+
+
+# Measured verbatim from codex-cli 0.154.0 on 2026-09-11, carried by both an
+# `error` and a `turn.failed` event while `codex exec` exited 0.
+_CODEX_USAGE_LIMIT_MESSAGE = (
+    "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+    'visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 1:07 PM.'
+)
+# A codex-cli 0.154.0 binary string: an item-level `error` is a warning the
+# run continues past ("Defaulting to fallback metadata"), not a failure.
+_CODEX_MODEL_METADATA_WARNING = (
+    'Model metadata for `gpt-6-astra` not found. Defaulting to fallback metadata; '
+    'this can degrade performance and cause issues.'
+)
+
+
+def _codex_stream(*events: dict[str, Any]) -> _SubprocessResult:
+    return _make_subprocess_result(stdout='\n'.join(json.dumps(e) for e in events), returncode=0)
+
+
+class TestParseCodexErrorCarriers:
+    """codex exits 0 on a failed turn, so the failure lives only in the JSONL
+    stream: `turn.failed` and item-level `error` events must not be dropped."""
+
+    def test_lone_turn_failed_is_a_failure_carrying_its_message(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-tf-1'},
+            {'type': 'turn.started'},
+            {'type': 'turn.failed', 'error': {'message': _CODEX_USAGE_LIMIT_MESSAGE}},
+        ), 'gpt-6-astra')
+
+        assert agent_result.success is False
+        assert _CODEX_USAGE_LIMIT_MESSAGE in agent_result.output
+
+    def test_item_level_error_text_is_surfaced(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-ie-1'},
+            {'type': 'item.completed', 'item': {'type': 'error', 'message': _CODEX_MODEL_METADATA_WARNING}},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 5}},
+        ), 'gpt-6-astra')
+
+        assert _CODEX_MODEL_METADATA_WARNING in agent_result.output
+
+    def test_item_level_error_alone_does_not_fail_a_completed_turn(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-ie-2'},
+            {'type': 'item.completed', 'item': {'type': 'error', 'message': _CODEX_MODEL_METADATA_WARNING}},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 5}},
+        ), 'gpt-6-astra')
+
+        assert agent_result.success is True
+
+    def test_measured_error_and_turn_failed_pair_reports_the_message_once(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-pair-1'},
+            {'type': 'turn.started'},
+            {'type': 'error', 'message': _CODEX_USAGE_LIMIT_MESSAGE},
+            {'type': 'turn.failed', 'error': {'message': _CODEX_USAGE_LIMIT_MESSAGE}},
+        ), 'gpt-6-astra')
+
+        assert agent_result.success is False
+        assert agent_result.output.count(_CODEX_USAGE_LIMIT_MESSAGE) == 1
+
+
+# A codex-cli 0.154.0 binary string: a fatal, non-cap turn failure.
+_CODEX_CONTEXT_WINDOW_ERROR = (
+    "Codex ran out of room in the model's context window. "
+    'Start a new thread or clear earlier history before retrying.'
+)
+# Agent prose quoting this repo's cap code, as a review of it would.
+_PROSE_QUOTING_CAP_TEXT = (
+    "The diff adds 'usage limit reached' to CODEX_CAP_PATTERNS; "
+    'on a real cap codex says try again at 1:07 PM.'
+)
+
+
+def _codex_fatal_pair(message: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    return (
+        {'type': 'error', 'message': message},
+        {'type': 'turn.failed', 'error': {'message': message}},
+    )
+
+
+class TestParseCodexFailedTurnReportsOnlyCodexErrors:
+    """A failed turn's output is codex's own error report, never the agent's
+    prose, so a reply that discusses caps is not read as one."""
+
+    def test_failed_turn_drops_agent_prose_and_is_not_a_cap(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-prose-1'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': _PROSE_QUOTING_CAP_TEXT}},
+            *_codex_fatal_pair(_CODEX_CONTEXT_WINDOW_ERROR),
+        ), 'gpt-6-astra')
+
+        assert agent_result.success is False
+        assert agent_result.output.count(_CODEX_CONTEXT_WINDOW_ERROR) == 1
+        assert _PROSE_QUOTING_CAP_TEXT not in agent_result.output
+        outcome = classify_invocation(agent_result, strict_confirm=True, backend='codex')
+        assert isinstance(outcome, Failure)
+
+    def test_measured_cap_still_classifies_as_a_cap_with_its_reset(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-cap-1'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'starting the review'}},
+            *_codex_fatal_pair(_CODEX_USAGE_LIMIT_MESSAGE),
+        ), 'gpt-6-astra')
+
+        assert agent_result.output == _CODEX_USAGE_LIMIT_MESSAGE
+        outcome = classify_invocation(agent_result, strict_confirm=True, backend='codex')
+        assert isinstance(outcome, CapHit)
+        assert outcome.resets_at is not None
+
+    def test_failed_turn_keeps_item_level_warnings(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-warn-1'},
+            {'type': 'item.completed', 'item': {'type': 'error', 'message': _CODEX_MODEL_METADATA_WARNING}},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'partial work'}},
+            *_codex_fatal_pair(_CODEX_CONTEXT_WINDOW_ERROR),
+        ), 'gpt-6-astra')
+
+        assert _CODEX_MODEL_METADATA_WARNING in agent_result.output
+        assert _CODEX_CONTEXT_WINDOW_ERROR in agent_result.output
+
+    def test_timed_out_run_quoting_a_cap_is_not_a_cap(self) -> None:
+        stream = replace(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-timeout-1'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': _PROSE_QUOTING_CAP_TEXT}},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': _CODEX_USAGE_LIMIT_MESSAGE}},
+        ), returncode=-9, timed_out=True)
+
+        agent_result = _parse_codex_output(stream, 'gpt-6-astra')
+
+        assert agent_result.success is False
+        assert agent_result.timed_out is True
+        assert _PROSE_QUOTING_CAP_TEXT not in agent_result.output
+        assert _CODEX_USAGE_LIMIT_MESSAGE not in agent_result.output
+        assert 'timed out' in agent_result.output
+        outcome = classify_invocation(agent_result, strict_confirm=True, backend='codex')
+        assert not isinstance(outcome, CapHit)
+
+    def test_nonzero_exit_without_error_event_reports_codex_exit_and_warnings(self) -> None:
+        stream = replace(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-rc-1'},
+            {'type': 'item.completed', 'item': {'type': 'error', 'message': _CODEX_MODEL_METADATA_WARNING}},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': _CODEX_USAGE_LIMIT_MESSAGE}},
+        ), returncode=2)
+
+        agent_result = _parse_codex_output(stream, 'gpt-6-astra')
+
+        assert agent_result.success is False
+        assert agent_result.output == f'codex exited rc=2\n{_CODEX_MODEL_METADATA_WARNING}'
+        outcome = classify_invocation(agent_result, strict_confirm=True, backend='codex')
+        assert isinstance(outcome, Failure)
+
+    def test_nonzero_exit_with_unparseable_stdout_drops_the_raw_text(self) -> None:
+        agent_result = _parse_codex_output(_make_subprocess_result(
+            stdout=f'not json: {_CODEX_USAGE_LIMIT_MESSAGE}', returncode=1,
+        ), 'gpt-6-astra')
+
+        assert agent_result.success is False
+        assert agent_result.output == 'codex exited rc=1'
+
+    def test_completed_turn_still_reports_agent_text(self) -> None:
+        agent_result = _parse_codex_output(_codex_stream(
+            {'type': 'thread.started', 'thread_id': 'tid-ok-1'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'review complete'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 5}},
+        ), 'gpt-6-astra')
+
+        assert agent_result.success is True
+        assert 'review complete' in agent_result.output
+
+
+_ASTRA_PRICES = {
+    'gpt-6-astra': PriceEntry(input_per_1m=10.0, output_per_1m=50.0, cached_input_per_1m=1.0),
+}
+
+
+def _codex_turns(*usages: dict[str, int]) -> _SubprocessResult:
+    return _codex_stream(
+        {'type': 'thread.started', 'thread_id': 'tid-usage'},
+        {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'done'}},
+        *({'type': 'turn.completed', 'usage': usage} for usage in usages),
+    )
+
+
+class TestParseCodexCachedUsage:
+    """turn.completed usage carries cached_input_tokens INSIDE input_tokens;
+    the parser prices that split and reports the counts in AgentResult's
+    shared convention, where input_tokens excludes cache reads."""
+
+    _MEASURED_USAGE = {
+        'input_tokens': _ASTRA_INPUT_TOKENS,
+        'cached_input_tokens': _ASTRA_CACHED_INPUT_TOKENS,
+        'cache_write_input_tokens': 0,
+        'output_tokens': _ASTRA_OUTPUT_TOKENS,
+    }
+
+    def test_measured_usage_prices_the_cached_split(self) -> None:
+        agent_result = _parse_codex_output(
+            _codex_turns(self._MEASURED_USAGE), 'gpt-6-astra', _ASTRA_PRICES,
+        )
+
+        # ((311881 - 277760) * 10 + 277760 * 1 + 1442 * 50) / 1e6
+        assert agent_result.cost_usd == pytest.approx(0.69107)
+
+    def test_measured_usage_populates_the_token_fields(self) -> None:
+        agent_result = _parse_codex_output(
+            _codex_turns(self._MEASURED_USAGE), 'gpt-6-astra', _ASTRA_PRICES,
+        )
+
+        assert agent_result.input_tokens == _ASTRA_INPUT_TOKENS - _ASTRA_CACHED_INPUT_TOKENS
+        assert agent_result.output_tokens == _ASTRA_OUTPUT_TOKENS
+        assert agent_result.cache_read_tokens == _ASTRA_CACHED_INPUT_TOKENS
+        assert agent_result.cache_create_tokens == 0
+
+    def test_usage_across_two_turns_adds_field_wise(self) -> None:
+        second = {
+            'input_tokens': 1000, 'cached_input_tokens': 400,
+            'cache_write_input_tokens': 50, 'output_tokens': 20,
+        }
+
+        agent_result = _parse_codex_output(
+            _codex_turns(self._MEASURED_USAGE, second), 'gpt-6-astra', _ASTRA_PRICES,
+        )
+
+        assert agent_result.turns == 2
+        assert agent_result.input_tokens == 312881 - 278160
+        assert agent_result.output_tokens == 1462
+        assert agent_result.cache_read_tokens == 278160
+        assert agent_result.cache_create_tokens == 50
+        # ((312881 - 278160) * 10 + 278160 * 1 + 1462 * 50) / 1e6
+        assert agent_result.cost_usd == pytest.approx(0.69847)
+
+    def test_cached_above_input_clamps_and_warns_once(self, caplog) -> None:
+        usage = {'input_tokens': 1200, 'cached_input_tokens': 1500, 'output_tokens': 10}
+
+        with caplog.at_level(logging.WARNING):
+            agent_result = _parse_codex_output(_codex_turns(usage), 'gpt-6-astra', _ASTRA_PRICES)
+
+        # Non-cached count clamped at 0: (0 * 10 + 1500 * 1 + 10 * 50) / 1e6
+        assert agent_result.cost_usd == pytest.approx(0.002)
+        assert agent_result.input_tokens == 0
+        assert agent_result.cache_read_tokens == 1500
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert '1500' in warnings[0]
+        assert '1200' in warnings[0]
+
+    def test_usage_without_cached_keys_prices_as_before(self) -> None:
+        agent_result = _parse_codex_output(
+            _codex_turns({'input_tokens': 200, 'output_tokens': 100}),
+            'gpt-6-astra', _ASTRA_PRICES,
+        )
+
+        assert agent_result.cost_usd == (200 * 10.0 + 100 * 50.0) / 1_000_000
 
 
 class TestPiToolName:
@@ -480,6 +793,7 @@ class TestParsePiCostFallback:
         )
         assert agent_result.success is True
         assert agent_result.cost_usd == pytest.approx((400 * 100.0 + 200 * 100.0) / 1_000_000)
+        assert agent_result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE
 
     def test_zero_native_cost_falls_back_to_price_table(self):
         """`cost.total`==0.0 (present but zero) is treated the same as
@@ -491,6 +805,7 @@ class TestParsePiCostFallback:
             prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
         )
         assert agent_result.cost_usd == pytest.approx((400 * 100.0 + 200 * 100.0) / 1_000_000)
+        assert agent_result.cost_basis is ProcessCostBasis.USAGE_ESTIMATE
 
     def test_nonzero_native_cost_wins_over_price_table(self):
         """`cost.total` present and >0 -> the native value is used verbatim;
@@ -503,6 +818,7 @@ class TestParsePiCostFallback:
             prices={'o4-mini': {'input_per_1m': 100.0, 'output_per_1m': 100.0}},
         )
         assert agent_result.cost_usd == pytest.approx(0.01234)
+        assert agent_result.cost_basis is ProcessCostBasis.REPORTED
 
 
 class TestWritePiMcpConfig:

@@ -83,7 +83,11 @@ uncommitted ad-hoc probe.
   the runtime probe, row shaping and the external-dep read.
 - **Terminal window:** in a further fresh process, `?terminal=dark-factory` took
   4.25 s and 3.38 MB in all. The window alone took 0.77 s for 400 rows (0.32 MB),
-  served `lower_bound` as the newest 400 of 4682 terminal rows.
+  served `lower_bound` as the newest 400 of 4682 terminal rows. After task 5950
+  (2026-10-18): the same request serves only the window and served_at — 0.32 MB
+  against 5.25 MB from the pre-5950 handler in the same process, over the
+  service's ten roots, cold, three runs each (2.33–3.02 s against 5.77–6.60 s),
+  the window `lower_bound` as the newest 400 of 5209 in every run.
 - **Against the 2026-09-18 baseline (6.8 s / 16.4 MB):** the cold render is
   39–46 % faster and its payload 81 % smaller. The baseline acquisition was
   0.38 s + 2.49 s + 2.25 s and included terminal rows. The default render no

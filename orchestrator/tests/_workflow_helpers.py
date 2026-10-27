@@ -29,8 +29,10 @@ from escalation.queue import EscalationQueue
 from shared.cli_invoke import PromptBuilder
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 from shared.locking import normalize_lock
+from shared.task_submit import SubmitFailed, SubmitOutcome
 
 from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -95,6 +97,7 @@ class FakeScheduler:
         # scheduler.py::Scheduler.blocked_writes_suppressed: their 'blocked'
         # writes are absorbed, every other write lands.
         self.blocked_write_suppressed_ids: set[str] = set()
+        self.submit_task_calls: list[tuple[dict, float]] = []
 
     async def set_task_status(
         self,
@@ -193,6 +196,11 @@ class FakeScheduler:
         self, name: str, arguments: dict, *, timeout: float = 15
     ) -> dict:
         return {}
+
+    async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
+        """Record the call; the fake files nothing, so it never claims a SubmittedTask."""
+        self.submit_task_calls.append((arguments, timeout))
+        return SubmitFailed('FakeScheduler files nothing')
 
     def release(self, task_id: str) -> None:
         pass
@@ -478,6 +486,7 @@ class FakeBriefing:
     async def build_debugger_prompt(
         self, failures: str, plan: dict, context: str | None = None,
         task_id: str | None = None,
+        *, attempt_context=None,
     ) -> str:
         return f'Fix: {failures[:100]}'
 
@@ -491,6 +500,13 @@ class FakeBriefing:
         # drift neither ruff nor pyright reports — only a call through this
         # fake would have caught it.
         return f'Review ({reviewer_type}): {diff[:100]}'
+
+    async def build_context_complete_reviewer_prompt(
+        self, reviewer_type: str, subject: ReviewSubject, context: str | None = None,
+        *, amendment_suggestions: list[dict] | None = None,
+    ) -> str:
+        first_path = subject.change.files[0].path if subject.change.files else ''
+        return f'Review-d2 ({reviewer_type}): {first_path}'
 
     async def build_completion_judge_prompt(
         self,
@@ -523,7 +539,7 @@ class FakeBriefing:
 
     async def build_revalidation_prompt(
         self, task: dict, existing_plan: dict, changed_files: list,
-        worktree=None, context: str | None = None,
+        worktree=None, context: str | None = None, *, text_drift=None,
     ) -> str:
         return f'Revalidate: {task.get("title", "")}'
 
@@ -671,6 +687,7 @@ def _make(
     config.steward_completion_timeout = 300.0
     config.project_root = project_root
     config.git.branch_prefix = 'task/'
+    config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
 
     set_task_status = AsyncMock()
     scheduler = MagicMock()
@@ -811,7 +828,7 @@ def _build_harness(config: OrchestratorConfig) -> Harness:
 GIT_REPO_SEED = RepoSeed(files=(('README.md', '# Test\n'),), message='init')
 
 
-async def _init_git_repo(repo: Path) -> None:
+def _init_git_repo(repo: Path) -> None:
     seed_repo(repo, GIT_REPO_SEED)
 
 
@@ -871,7 +888,7 @@ E2E_REPO_SEED = RepoSeed(
 )
 
 
-async def _init_repo(repo: Path) -> None:
+def _init_repo(repo: Path) -> None:
     seed_repo(repo, E2E_REPO_SEED)
 
 
@@ -1360,7 +1377,7 @@ TRANSCRIPT_REPO_SEED = RepoSeed(
 )
 
 
-async def _init_transcript_repo(repo: Path) -> None:
+def _init_transcript_repo(repo: Path) -> None:
     """Seed a real, committed git repo for the transcript-archival suites.
 
     A THIRD seeder beside the two already in this module, deliberately not a

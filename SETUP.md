@@ -59,23 +59,24 @@ The script is idempotent (safe to re-run) and self-reports each step with
 3. **`uv sync`** across the Python subprojects (`shared`, `escalation`, `fused-memory`, `orchestrator`, `dashboard`), in dependency order.
 4. **fused-memory systemd unit** — renders `scripts/fused-memory.service.template` into `~/.config/systemd/user/fused-memory.service` (substituting your real repo path and `uv` binary path), enables it, and starts it only if `fused-memory/.env` already exists (see §4 — you'll usually run this once before secrets exist, then `systemctl --user restart fused-memory` after writing them).
 5. **Orchestrator systemd units + watchdog** — see the **Known gap** callout immediately below; this step is the one you must edit for your own project set.
-6. **jCodeMunch** — optional personal productivity tooling (AST-based code retrieval) the repo's original maintainer uses. Safe to let run; skip/ignore if you don't want it — nothing else in this repo depends on it. Step 6 also installs the version-pinned `jcodemunch-mcp` launcher with `uv tool install` (the pin lives in `shared/src/shared/jcodemunch_launch.py`) and registers it in your user-level Claude config, so uv's tool bin dir (`uv tool dir --bin`) must be on your PATH.
+6. **jCodeMunch** — optional personal productivity tooling (AST-based code retrieval) the repo's original maintainer uses. Safe to let run; skip/ignore if you don't want it, but note that orchestrator agents and reconciliation stages are always given the `jcodemunch` MCP server (launched as `jcodemunch-mcp` from your PATH). If that launcher is missing the server fails to start, and those sessions run without the `mcp__jcodemunch__*` tools rather than failing. Step 6 also installs the version-pinned `jcodemunch-mcp` launcher with `uv tool install` (the pin lives in `shared/src/shared/jcodemunch_launch.py`) and registers it in your user-level Claude config, so uv's tool bin dir (`uv tool dir --bin`) must be on your PATH.
 7. **Dashboard systemd units** — renders and enables `dark-factory-dashboard` + its watchdog timer (installed, not started — see §7).
 8. **Claude Code skill symlinks** — wires the in-repo `skills/` into your Claude Code install. Covered in full in §8 below.
-9. **Git hooks** — runs `hooks/setup.sh`, which points `core.hooksPath` at `hooks/` (pre-commit, pre-merge-commit).
+9. **Git hooks** — runs `hooks/setup.sh`, which points `core.hooksPath` at `hooks/` (pre-commit, pre-merge-commit), then `python3 scripts/merge_lane_ratchet_merge.py install`, which writes dark-factory's own merge driver for the ratchet baseline (`merge.ratchet-baseline.driver`, named by `.gitattributes`) into the repo's `.git/config`. Without the driver a merge of two branches that both moved the baseline conflicts instead of composing.
 10. **Manual steps reminder** — printed only, for migrating data from another host (`export-data.sh`/`import-data.sh`); irrelevant on a genuinely fresh install.
 12. **Health checks** — re-probes FalkorDB, Qdrant, fused-memory, and jCodeMunch, plus a parity check between your installed fused-memory unit and its template.
 
 ### Known gap: step 5 hardcodes the maintainer's other projects
 
 `scripts/setup-host.sh`'s orchestrator-units step unconditionally installs
-and enables systemd units for **six projects that are not part of this
+and enables systemd units for **seven projects that are not part of this
 repo and won't exist on your machine**: `orchestrator-reify.service`,
 `orchestrator-autopilot-video.service`,
 `orchestrator-my-solar-challenge.service`,
 `orchestrator-solar-challenge-platform.service`,
-`orchestrator-know-live.service`, and
-`orchestrator-pump-web-ui.service`. Each `ExecStart` points at
+`orchestrator-know-live.service`,
+`orchestrator-pump-web-ui.service`, and
+`orchestrator-stream-touch.service`. Each `ExecStart` points at
 a `dark-factory-orchestrator.yaml` in a sibling repo that doesn't exist for
 you, so once `default.target` restarts them (next login/boot), they'll
 crash-loop until `StartLimitBurst` is exhausted. `orchestrator-dark-factory.service`
@@ -93,7 +94,8 @@ systemctl --user disable --now \
   orchestrator-my-solar-challenge.service \
   orchestrator-solar-challenge-platform.service \
   orchestrator-know-live.service \
-  orchestrator-pump-web-ui.service
+  orchestrator-pump-web-ui.service \
+  orchestrator-stream-touch.service
 ```
 
 Keep `orchestrator-watchdog.timer` enabled — it skips disabled units, so
@@ -522,22 +524,36 @@ requirement for a working install — skip this section unless you need it.
   export PATH="<toolchain-bin-dirs>:$PATH"
   exec <path-to-checkout>/.venv/bin/orchestrator "$@"
   ```
-  Keep the wrapper bare — the liveness probe the dispatcher uses
-  (`orchestrator verify-merge --help`, unqualified) is deliberately
-  unqualified so it exercises the exact same PATH resolution a real dispatch
-  does; wrapping the probe in `uv run` or an absolute `.venv/bin` path would
-  test something weaker than what actually runs.
+  **The shim contract (task 6565).** The `exec` line must be
+  `"${ORCH_GATE_BIN:-<path-to-checkout>/.venv/bin/orchestrator}" "$@"`
+  (a subshell-form call, not `exec`, if your wrapper logs an EXIT line).
+  The dispatcher prefixes every remote `orchestrator` call with
+  `env ORCH_GATE_BIN=<gate checkout>/.venv/bin/orchestrator`, which is how a
+  verify runs in the dispatcher's own immutable gate checkout rather than in
+  whatever the shared tree holds; with `ORCH_GATE_BIN` unset the wrapper runs
+  the shared tree exactly as before. A wrapper that ignores the variable is
+  caught by the handshake (below) and benches the host. Apply the edit with
+  `scripts/deploy/install_laptop_gate_shim.sh` (idempotent; `--check` is a
+  read-only contract check that exits 0 iff the installed wrapper honours
+  `ORCH_GATE_BIN`). Keep the PATH export and any wrapper-side logging in
+  place; the dispatcher's `ensure-gate` call resolves `orchestrator` through
+  this same wrapper.
 
-**A Dark-Factory code checkout on a shared verify host backs every project
-whose `verify_runners` entry points at it.** Refreshing the checkout (the
-next subsection) upgrades all of them at once, atomically, whether they are
-ready for it or not — and must never be done while a verify is in flight on
-that host, since the checkout is the code a live verify is currently
-executing.
+**The shared Dark-Factory checkout on a verify host is no longer the code a
+verify runs.** It is the *source* the per-sha gate checkouts are cloned from
+(`verify_runners[].df_checkout_path`) and the fallback the shim runs when
+`ORCH_GATE_BIN` is unset. Refreshing it (the next subsection) no longer
+upgrades the verify code of any project, and a stale shared tree no longer
+produces a stale gate. Each dispatcher pushes its own deployed commit to
+`refs/gate/<sha>` in that repository and verifies in an immutable checkout of
+that commit under `gate_checkouts_path`; DF and reify at different commits
+use different directories, at the same commit they share one.
 
 ### Provisioning the remote host
 
-After fast-forwarding the checkout to the workstation's `main` (a plain
+The gate checkouts need no manual refresh. For the project checkout (and
+the shared Dark-Factory tree, if you keep it current as the shim fallback),
+after fast-forwarding to the workstation's `main` (a plain
 `git fetch && git reset --hard origin/main` — never `git clean`; leave
 whatever untracked paths are already on that host alone), re-provision the
 environment at the new commit:
@@ -548,7 +564,8 @@ npm ci
 ```
 
 - **Always `--all-packages`, never a bare `uv sync`.** A Dark-Factory
-  checkout is a **uv workspace**, and a bare `uv sync` exits `0` while
+  checkout is a **uv workspace** (the gate builder does this itself for each
+  gate checkout), and a bare `uv sync` exits `0` while
   *pruning the other members' console scripts* — including the
   `orchestrator` entry point this host exists to expose (task 4539). Losing
   it turns every subsequent dispatch into a silent `rc=127`.
@@ -572,17 +589,20 @@ Two probes, run with the same ssh options the dispatcher itself uses
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
-    -o ServerAliveCountMax=4 <host> 'orchestrator verify-merge --help'  # REMOTE_LIVENESS_CMD
-ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
     -o ServerAliveCountMax=4 <host> true                                 # RemoteRunner.health()
+ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=4 <host> 'env ORCH_GATE_BIN=/bin/echo orchestrator gate-identity'
+                                                                          # the shim honours ORCH_GATE_BIN
 ```
 
-- The CLI probe must be spelled **bare** — `orchestrator verify-merge
-  --help`, not `uv run orchestrator ...` and not an absolute `.venv/bin`
-  path. It is bare on purpose so the probe exercises the exact same PATH
-  resolution (through the host's `orchestrator` wrapper — "What lives on
-  the remote host" above) that a real dispatch does; a qualified spelling
-  can pass while the real dispatch still fails `rc=127`.
+- The second probe is the shim check: it must print `gate-identity` (what
+  `/bin/echo` answers when the wrapper really ran `$ORCH_GATE_BIN`). The
+  real handshake needs no hand-run: the dispatcher's `ensure-gate` publishes
+  its commit, builds or reuses the gate checkout, and compares the gate's
+  `gate-identity` (`code_sha` and a fingerprint of the verify wire shapes)
+  with its own before any verify is spent. It is spelled through the bare
+  `orchestrator` wrapper on purpose, so it exercises the same PATH
+  resolution a real dispatch does.
 - Assert exit code `0` on both. Hand-running a probe without the
   `ConnectTimeout`/`ServerAlive*` options can hang on an unreachable host
   instead of failing fast the way the dispatcher's own probe does — the
@@ -590,26 +610,17 @@ ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
   every exception and returns `False`, so a transport error and a
   live-but-failing host look identical from the caller's side.
 
-**A passing probe proves the CLI is reachable, not that the checkout is
-current.** The CLI probe already exits `0` against a stale checkout — it
-only executes `--help`, which needs no correct code, just a resolvable
-entry point. The currency check is separate: `git rev-parse HEAD` on the
-remote must equal the dispatching workstation's `origin/main`. This
-distinction is not cosmetic — but the reason is *not* that a stale
-checkout narrows the module set. Task 4536 closed exactly that hole:
-`verify_runner.py::run_merge_verify_on_worktree` unconditionally installs
-the dispatcher's set over the remote's own discovery walk
-(`config._module_configs = {mc.prefix: mc for mc in module_configs}`), so
-the module SET is authoritative from the wire spec and a stale remote can
-no longer silently drop modules the spec named or inject ones it did not.
-
-What a stale checkout still does is **run stale verify code**. The remote
-executes its own tree's timeouts, admission logic, pre-provision handling
-and breadth handling. The pre-provision *command* now comes from the
-dispatcher's spec (task 6127), but when and how it runs is still the
-remote's code. The gate that decides your merge is the one in the remote's
-checkout, not the one you reviewed on the workstation. Verify currency,
-every time, not just reachability.
+**A passing probe proves the host answers, not that it runs your code.**
+Code currency is no longer a property of the remote checkout: every verify
+runs in a gate checkout of the dispatcher's deployed commit, and the
+handshake above refuses a gate whose identity differs from the dispatcher's.
+That closes the old failure where the remote ran its own tree's timeouts,
+admission logic and breadth handling. A host that cannot produce a matching
+gate is benched in the `skew` class rather than silently verifying with other
+code; see `OPERATIONS.md` §"Reading a verify-host bench". (The module set was
+already authoritative from the wire spec since task 4536:
+`verify_runner.py::run_merge_verify_on_worktree` installs the dispatcher's
+set over the remote's own discovery walk.)
 
 ### The per-host YAML
 
@@ -816,31 +827,30 @@ verify_runners:
     git_remote: <git-remote-name> # git remote pointing at the remote's PROJECT checkout
     config_path: <remote-path>    # passed as --config; omit (null) to let the
                                    # remote fall back to its own ORCH_CONFIG_PATH
-    df_checkout_path: <remote-path>  # remote path to the Dark-Factory orchestrator
-                                      # CODE checkout -- distinct from git_remote's
-                                      # project checkout. When set, opts into an
-                                      # automatic currency sync at dispatch time
-                                      # (HEAD-compare vs. the dispatcher, then
-                                      # git pull --ff-only + uv sync --all-packages
-                                      # when stale -- npm ci is NOT part of this
-                                      # sync; see below). Omit (null, the default)
-                                      # to keep the checkout's currency a manual
-                                      # concern, refreshed as in this section.
+    df_checkout_path: <remote-path>  # REQUIRED when enabled. Remote path of the
+                                      # Dark-Factory repository the gate checkouts
+                                      # are cloned from -- distinct from git_remote's
+                                      # project checkout. The dispatcher pushes its
+                                      # deployed commit there as refs/gate/<sha>.
+    gate_checkouts_path: <remote-path>  # optional; absolute directory holding one
+                                      # immutable checkout per deployed commit.
+                                      # Default: the sibling `dark-factory-gate` of
+                                      # df_checkout_path. Restart-tier.
     enabled: true
 verify_drift_check_every_n_lands: 20   # companion setting: periodic remote/local
                                         # verdict cross-check cadence
 ```
 
-Worked example, modelled on a live deployment (reify's, which does not set
-`df_checkout_path` — its checkout currency is managed manually, the same
-way this section documents):
+Worked example, modelled on a live deployment (Dark Factory's own):
 
 ```yaml
 verify_runners:
   - name: laptop
     ssh_host: leo-laptop
     git_remote: leo-laptop
-    config_path: /home/leo/.config/orchestrator/reify-laptop.yaml
+    config_path: /home/leo/.config/orchestrator/dark-factory-laptop.yaml
+    df_checkout_path: /home/leo/src/dark-factory
+    gate_checkouts_path: /home/leo/src/dark-factory-gate
     enabled: true
 verify_drift_check_every_n_lands: 20
 ```
@@ -856,29 +866,20 @@ Four operator-facing facts:
   reload accepts the edit into the file but reports it under
   `restart_required` — see `OPERATIONS.md`'s config-reload tiers. Don't
   expect a live pool change from a reload alone.
-- **A project that self-hosts its own verify runner has `git_remote`'s
-  project checkout and `df_checkout_path` pointing at the *same* tree.**
-  Worth knowing before opting into the `df_checkout_path` auto-sync in
-  that configuration — the sync and the thing being verified are then the
-  same checkout, not two independent ones.
-- **The `df_checkout_path` auto-sync covers the `uv` half only.** Nothing
-  in `verify_runner.py` invokes `npm` — `sync_if_stale` runs `git pull
-  --ff-only` then `uv sync --all-packages` and stops there — so a commit
-  that bumps `package-lock.json` (a new pinned `npx pyright`, say) leaves
-  the remote's Node-installed tools stale even with the automatic sync
-  enabled; `npm ci` stays a manual concern in "Provisioning the remote
-  host" above either way. Three more things the automation does silently:
-  it asserts a post-sync liveness probe (`REMOTE_LIVENESS_CMD`) and
-  **benches the runner** if that fails rather than leaving it looking
-  synced; it compares the remote's head against the dispatcher's
-  `@{upstream}` before declaring the runner stale, so a dispatcher that is
-  merely ahead of a healthy, origin-current remote doesn't trigger a false
-  `runner_stale` alert; and it refuses to pull while a verify is in flight
-  on that runner — serialised on a per-runner lock, `sync_if_stale` returns
-  `skipped: verify in flight` without pulling or benching, and re-checks on
-  the next dispatch — so opting in does not re-introduce the
-  pull-under-live-verify hazard "What lives on the remote host" above warns
-  a manual refresh must avoid by hand.
+- **`df_checkout_path` is required for an enabled runner, and an absolute
+  path.** A runner that cannot be gated is a configuration error at load,
+  not a dispatch through a shared tree. A process that has an enabled runner
+  but cannot resolve its own deployed commit refuses to start, for the same
+  reason.
+- **The gate builder runs `uv sync --all-packages`; it does not run
+  `npm ci`.** A commit that bumps `package-lock.json` still needs the Node-installed tools provisioned on the host ("Provisioning
+  the remote host" above). Gate directories are built on first use of a
+  commit (about a second warm, a minute cold), are marked ready only once
+  their own binary answers the handshake for their commit, are never written
+  after that, and are reaped when idle for 7 days (leftover trash after 1 day)
+  by a detached sweep launched at most hourly per orchestrator process (never against a benched host: unreachable, skew or divergence) that touches only a root carrying the
+  `.dark-factory-gate-root` marker. The dispatcher emits `runner_stale` then
+  `runner_synced` (kind `gate_checkout`) when it had to build one.
 
 For the environment-parity checklist between a workstation and a laptop
 verify host, and day-2 operational notes for a live laptop runner, see

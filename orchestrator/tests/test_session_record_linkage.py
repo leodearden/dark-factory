@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
+from _process_tree_fakes import claude_process_tree
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -398,51 +399,67 @@ class TestSessionStartStampsPointer:
     _OWNER = 3_215_501
 
     def test_a_hand_launched_session_is_findable_from_its_claude_pid(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path
     ) -> None:
-        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._OWNER)
-
-        record = sh.run_session_start({'session_id': 'sess-hl', 'cwd': _CWD}, {}, root=tmp_path)
+        record = sh.run_session_start(
+            {'session_id': 'sess-hl', 'cwd': _CWD},
+            {},
+            root=tmp_path,
+            process_tree=claude_process_tree(self._OWNER),
+        )
 
         assert sr.resolve_session_slug_for_pid(self._OWNER, root=tmp_path) == record.session_slug
 
     def test_the_pointer_is_keyed_on_the_claude_pid_not_the_launcher_pid(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path
     ) -> None:
-        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._OWNER)
-
-        record = sh.run_session_start({'session_id': 'sess-hl', 'cwd': _CWD}, {}, root=tmp_path)
+        record = sh.run_session_start(
+            {'session_id': 'sess-hl', 'cwd': _CWD},
+            {},
+            root=tmp_path,
+            process_tree=claude_process_tree(self._OWNER),
+        )
 
         assert record.launcher_pid != self._OWNER
         assert sr.resolve_session_slug_for_pid(record.launcher_pid, root=tmp_path) is None
 
     def test_an_unresolvable_claude_pid_writes_the_record_but_no_pointer(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path
     ) -> None:
-        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
-
-        record = sh.run_session_start({'session_id': 'sess-hl', 'cwd': _CWD}, {}, root=tmp_path)
+        record = sh.run_session_start(
+            {'session_id': 'sess-hl', 'cwd': _CWD},
+            {},
+            root=tmp_path,
+            process_tree=claude_process_tree(None),
+        )
 
         assert sr.read_record(record.session_slug, root=tmp_path) == record
         assert _pointer_files(tmp_path) == []
 
     def test_a_session_that_never_binds_gets_no_pointer(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path
     ) -> None:
-        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._OWNER)
-
-        record = sh.run_session_start({'session_id': '', 'cwd': _CWD}, {}, root=tmp_path)
+        record = sh.run_session_start(
+            {'session_id': '', 'cwd': _CWD},
+            {},
+            root=tmp_path,
+            process_tree=claude_process_tree(self._OWNER),
+        )
 
         assert record.claude_session_id is None
         assert _pointer_files(tmp_path) == []
 
     def test_an_unwritable_pointer_dir_never_breaks_the_hook(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path
     ) -> None:
-        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._OWNER)
         sr.session_pointers_dir(tmp_path).write_text('not a directory', encoding='utf-8')
 
-        record = sh.run_session_start({'session_id': 'sess-hl', 'cwd': _CWD}, {}, root=tmp_path)
+        record = sh.run_session_start(
+            {'session_id': 'sess-hl', 'cwd': _CWD},
+            {},
+            root=tmp_path,
+            process_tree=claude_process_tree(self._OWNER),
+        )
 
         assert sr.read_record(record.session_slug, root=tmp_path) == record
 
@@ -468,25 +485,23 @@ class TestRefreshEventsStampPointer:
     def test_a_session_already_running_at_rollout_is_linked_by_its_next_event(
         self,
         tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
         handler: Callable[..., str],
     ) -> None:
-        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._OWNER)
+        tree = claude_process_tree(self._OWNER)
         linked_root = tmp_path / 'linked'
         slug = self._bound_hand_launched_record(linked_root)
         unwritable_root = tmp_path / 'unwritable'
         self._bound_hand_launched_record(unwritable_root)
         sr.session_pointers_dir(unwritable_root).write_text('x', encoding='utf-8')
 
-        retitle = handler(self._HOOK_INPUT, {}, root=linked_root)
+        retitle = handler(self._HOOK_INPUT, {}, root=linked_root, process_tree=tree)
 
         assert sr.resolve_session_slug_for_pid(self._OWNER, root=linked_root) == slug
-        assert retitle == handler(self._HOOK_INPUT, {}, root=unwritable_root)
+        assert retitle == handler(self._HOOK_INPUT, {}, root=unwritable_root, process_tree=tree)
 
     def test_a_withheld_launch_window_event_stamps_nothing(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path
     ) -> None:
-        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._OWNER)
         slug = 'session-cockpit-4237001'
         sr.write_record(
             sr.SessionRecord(
@@ -499,14 +514,17 @@ class TestRefreshEventsStampPointer:
         )
 
         sh.run_notification(
-            self._HOOK_INPUT, {'CLAUDE_SPAWN_SESSION_ID': slug}, root=tmp_path
+            self._HOOK_INPUT,
+            {'CLAUDE_SPAWN_SESSION_ID': slug},
+            root=tmp_path,
+            process_tree=claude_process_tree(self._OWNER),
         )
 
         assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
         assert not sr.session_pointer_path_for_pid(self._OWNER, root=tmp_path).exists()
 
     def test_a_nested_claude_points_at_its_forked_record_never_its_spawners(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path
     ) -> None:
         spawner_pid, nested_pid = 4_237_100, 4_237_200
         spawner_slug = 'session-cockpit-4237100'
@@ -520,12 +538,12 @@ class TestRefreshEventsStampPointer:
             root=tmp_path,
         )
         sr.write_session_pointer(spawner_pid, spawner_slug, root=tmp_path)
-        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: nested_pid)
 
         forked = sh.run_session_start(
             {'session_id': 'uuid-nested', 'cwd': _CWD},
             {'CLAUDE_SPAWN_SESSION_ID': spawner_slug},
             root=tmp_path,
+            process_tree=claude_process_tree(nested_pid),
         )
 
         assert forked.session_slug != spawner_slug
@@ -1130,6 +1148,22 @@ def _registry(root: Path) -> dict[str, sr.SessionRecord]:
     return {record.session_slug: record for record in records}
 
 
+def _leave_claude_pid_unset(monkeypatch: pytest.MonkeyPatch, root: Path, pid: int) -> None:
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+
+def _set_claude_pid_without_a_pointer(monkeypatch: pytest.MonkeyPatch, root: Path, pid: int) -> None:
+    monkeypatch.setenv('CLAUDE_PID', str(pid))
+
+
+def _set_claude_pid_with_an_unvouched_pointer(
+    monkeypatch: pytest.MonkeyPatch, root: Path, pid: int
+) -> None:
+    monkeypatch.setenv('CLAUDE_PID', str(pid))
+    sr.write_record(_record('another-sessions-record', owner_pid=pid + 1), root=root)
+    sr.write_session_pointer(pid, 'another-sessions-record', root=root)
+
+
 class TestWriteDecisionRecordSlug:
     _PID = 4_237_600
     _RESTARTED_PID = 4_237_700
@@ -1164,35 +1198,50 @@ class TestWriteDecisionRecordSlug:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         _link_pid(self._PID, 'watcher-own-record', tmp_path)
         monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+        caplog.set_level(logging.DEBUG)
 
         _, decision = self._file(tmp_path, capsys)
 
         assert decision.record_slug == 'watcher-own-record'
         assert decision.session_id == f'watcher-df-{self._PID}'
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
-    @pytest.mark.parametrize('claude_pid', [None, str(_PID)], ids=['unset', 'no-pointer'])
-    def test_an_unresolvable_record_slug_still_files_blank_and_quiet(
+    @pytest.mark.parametrize(
+        ('arrange', 'names_the_pid'),
+        [
+            (_leave_claude_pid_unset, False),
+            (_set_claude_pid_without_a_pointer, True),
+            (_set_claude_pid_with_an_unvouched_pointer, True),
+        ],
+        ids=['unset', 'no-pointer', 'unvouched-pointer'],
+    )
+    def test_an_unresolvable_record_slug_still_files_blank_and_warns(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
         caplog: pytest.LogCaptureFixture,
-        claude_pid: str | None,
+        arrange: Callable[[pytest.MonkeyPatch, Path, int], None],
+        names_the_pid: bool,
     ) -> None:
-        if claude_pid is None:
-            monkeypatch.delenv('CLAUDE_PID', raising=False)
-        else:
-            monkeypatch.setenv('CLAUDE_PID', claude_pid)
+        arrange(monkeypatch, tmp_path, self._PID)
         caplog.set_level(logging.DEBUG)
 
         out, decision = self._file(tmp_path, capsys)
 
         assert out == f'{self._FILED_ID}\n'
         assert decision.record_slug == ''
-        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        [warning] = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning.name == sr.logger.name
+        message = warning.getMessage()
+        assert message.startswith(f'write-decision --id {self._ID} ')
+        assert 'BLANK record_slug' in message
+        assert sr.SESSION_PID_ENV in message
+        assert str(self._PID) in message or not names_the_pid
 
     def test_a_hand_launched_watchers_decision_links_to_its_registry_record(
         self,
@@ -1200,8 +1249,12 @@ class TestWriteDecisionRecordSlug:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._PID)
-        sh.run_session_start({'session_id': 'sess-watcher', 'cwd': _CWD}, {}, root=tmp_path)
+        sh.run_session_start(
+            {'session_id': 'sess-watcher', 'cwd': _CWD},
+            {},
+            root=tmp_path,
+            process_tree=claude_process_tree(self._PID),
+        )
         monkeypatch.setenv('CLAUDE_PID', str(self._PID))
 
         _, decision = self._file(tmp_path, capsys, session_id=f'watcher-df-{self._PID}')

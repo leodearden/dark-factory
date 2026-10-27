@@ -391,7 +391,7 @@ async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
 
     from dashboard.data.scheduler import collect_scheduler_state
 
-    project = dummy_config.project_root.name  # _project_label result
+    project = dummy_config.project_root.name  # a lone root's label is its basename
 
     snapshot = _scheduler_snapshot(
         skip_counts={'1': 2},
@@ -1527,13 +1527,7 @@ def test_clear_override_rejects_invalid_body(client, body):
     """Invalid body → 400 with no MCP call."""
     from unittest.mock import AsyncMock, patch
 
-    # Also suppress the background _metrics_loop task: its initial _run_once()
-    # can fire during await request.json() and call mcp_tool_call, incrementing
-    # call_count before the endpoint even runs its validation logic.
-    with (
-        patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp,
-        patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock()),
-    ):
+    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
         if body is None:
             resp = client.post(
                 '/api/v2/dashboard/scheduler/clear-override',
@@ -1617,10 +1611,7 @@ def test_reorder_pin_queue_rejects_invalid_body(client, body):
     """Invalid body → 400 with no MCP call."""
     from unittest.mock import AsyncMock, patch
 
-    # Patch collect_metrics_snapshot to prevent the background _metrics_loop
-    # from calling mcp_tool_call during the request and inflating call_count.
-    with patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock()), \
-         patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
         if body is None:
             resp = client.post(
                 '/api/v2/dashboard/scheduler/reorder-pin-queue',
@@ -2055,10 +2046,7 @@ def test_override_endpoint_rejects_invalid_ttl_minutes(client, bad_ttl):
     """POST /override with invalid ttl_minutes → 400 invalid_ttl_minutes, no MCP call."""
     from unittest.mock import AsyncMock, patch
 
-    # Patch collect_metrics_snapshot to prevent the background _metrics_loop
-    # from calling mcp_tool_call during the request and inflating call_count.
-    with patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock()), \
-         patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
         resp = client.post(
             '/api/v2/dashboard/scheduler/override',
             json={
@@ -3552,8 +3540,8 @@ async def test_two_same_basename_roots_each_keep_their_own_snapshot(
 
     A label-keyed join would emit one root's pin entry under the other's
     ``project_root``, and the React drawer's override POSTs would then target
-    the wrong project.  No task rows are returned: the row filter is still
-    label-keyed, and this test is about the per-root SNAPSHOT join only.
+    the wrong project.  No task rows are returned: this test is about the
+    per-root SNAPSHOT join only.
     """
     from unittest.mock import AsyncMock, patch
 

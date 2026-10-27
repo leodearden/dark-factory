@@ -1281,6 +1281,29 @@ class TestCompleteRunIfStatus:
         assert after.completed_at == before.completed_at
 
 
+class TestIsRunCompleted:
+    """The journal's one answer to whether a run durably completed."""
+
+    @pytest.mark.asyncio
+    async def test_a_run_journaled_completed_answers_true(self, journal):
+        run_id = await TestCompleteRunIfStatus._seed(journal, RunStatus.completed)
+
+        assert await journal.is_run_completed(run_id) is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'status', [RunStatus.running, RunStatus.failed, RunStatus.interrupted]
+    )
+    async def test_a_run_in_any_other_status_answers_false(self, journal, status):
+        run_id = await TestCompleteRunIfStatus._seed(journal, status)
+
+        assert await journal.is_run_completed(run_id) is False
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_run_id_answers_false_without_raising(self, journal):
+        assert await journal.is_run_completed('nonexistent-id') is False
+
+
 class TestUpdateRunStageReportsPreservesCitationRepairs:
     """The run owner's wholesale rewrite never erases a citation repair a
     compare-and-set writer persisted: the owner's copy predates the repair, so

@@ -598,12 +598,84 @@ class ServiceRestart:
 
 
 @dataclass(frozen=True)
+class OrchestratorStartup:
+    """One orchestrator process start, as registered in `runs`.
+
+    The writer is orchestrator/src/orchestrator/run_store.py::RunStore.start_run,
+    called from orchestrator/src/orchestrator/harness.py::Harness.run.
+    """
+
+    started_at: str
+    run_id: str
+
+
+@dataclass(frozen=True)
+class RestartRequiredReload:
+    """One `config_reload` that left leaves restart-required, and the startup that loaded them.
+
+    Only an orchestrator startup strictly after the reload can have loaded the
+    leaves; ``first_startup_after`` is None when none follows inside the window.
+    """
+
+    timestamp: str
+    leaves: tuple[str, ...]
+    first_startup_after: OrchestratorStartup | None
+
+
+@dataclass(frozen=True)
 class ScopedCapScan:
     """Whether the model's cap scope has been hit, and whether it can yet be (check 4)."""
 
     scoped_hits: tuple[ScopedCapHit, ...]
     unscoped_cap_hit_count: int
     restarts: tuple[ServiceRestart, ...]
+    orchestrator_startups: tuple[OrchestratorStartup, ...]
+    restart_required_reloads: tuple[RestartRequiredReload, ...]
+
+
+def _orchestrator_startups(
+    conn: sqlite3.Connection, *, since: datetime, until: datetime | None
+) -> tuple[OrchestratorStartup, ...]:
+    """Every orchestrator startup in ``[since, until)``, in start order."""
+    bounds, params = _time_bounds('started_at', since, until)
+    return tuple(
+        OrchestratorStartup(started_at=started_at, run_id=run_id)
+        for started_at, run_id in conn.execute(
+            f'SELECT started_at, run_id FROM runs WHERE {bounds} ORDER BY started_at, run_id',
+            params,
+        )
+    )
+
+
+def _restart_required_reloads(
+    conn: sqlite3.Connection,
+    *,
+    since: datetime,
+    until: datetime | None,
+    startups: Sequence[OrchestratorStartup],
+) -> tuple[RestartRequiredReload, ...]:
+    """Each `config_reload` in ``[since, until)`` that left a leaf restart-required.
+
+    The producer's ``restart_required`` maps each such leaf to ``{old, new}``;
+    a value that is not a mapping names no leaves.  *startups* are the window's
+    own, so a startup at or after *until* is never credited and a re-run over
+    a fixed *until* reproduces.  Both timestamps are spelled as :func:`iso`
+    describes, so comparing the strings compares the instants.
+    """
+    reloads = []
+    for row in load_events(conn, 'config_reload', since, until):
+        restart_required = row.payload.get('restart_required')
+        leaves = tuple(restart_required) if isinstance(restart_required, dict) else ()
+        if not leaves:
+            continue
+        reloads.append(RestartRequiredReload(
+            timestamp=row.timestamp,
+            leaves=leaves,
+            first_startup_after=next(
+                (s for s in startups if s.started_at > row.timestamp), None,
+            ),
+        ))
+    return tuple(reloads)
 
 
 def scan_scoped_cap(
@@ -613,7 +685,7 @@ def scan_scoped_cap(
     since: datetime,
     until: datetime | None = None,
 ) -> ScopedCapScan:
-    """Cap hits attributable to *model*'s scope, plus the restarts, in ``[since, until)``.
+    """Cap hits attributable to *model*'s scope, plus restarts and startups, in ``[since, until)``.
 
     The writer of the shape read here is ``shared/src/shared/usage_gate.py::
     UsageGate._handle_cap_detected`` — its scoped path emits ``{"reason": ...,
@@ -628,9 +700,9 @@ def scan_scoped_cap(
     orchestrator restarts, a cap on *model* lands on the account-level path, and
     dropping scope-less rows would hide precisely that.
 
-    Restarts are returned NAMED for the same reason: only an orchestrator
-    restart reloads a restart-tier leaf, so a count that lumps in dashboard and
-    fused-memory restarts answers "has it had a chance to take effect?" wrongly.
+    The witness that a restart-tier leaf has been loaded is the `runs` row an
+    orchestrator startup registers (``orchestrator_startups``), which
+    ``restart_required_reloads`` pairs with each reload that flagged one.
     """
     bounds, params = _time_bounds('created_at', since, until)
     cursor = conn.execute(
@@ -662,10 +734,15 @@ def scan_scoped_cap(
         )
         for row in load_events(conn, 'service_restart', since, until)
     ]
+    startups = _orchestrator_startups(conn, since=since, until=until)
     return ScopedCapScan(
         scoped_hits=tuple(scoped),
         unscoped_cap_hit_count=unscoped,
         restarts=tuple(restarts),
+        orchestrator_startups=startups,
+        restart_required_reloads=_restart_required_reloads(
+            conn, since=since, until=until, startups=startups,
+        ),
     )
 
 
@@ -966,20 +1043,7 @@ def render_markdown(result: AuditResult) -> str:
                 f'failure of the rule; it means the rule has not been reached._']
     out += ['']
 
-    out += [f'### 4. Scoped cap posture for `{model}` {span}', '']
-    out += markdown_table(
-        ['created_at', 'account', 'reason'],
-        [(h.created_at, h.account_name, h.reason) for h in result.scoped_cap.scoped_hits],
-    )
-    out += ['', f'Account-level (unscoped) cap hits in the same period: '
-                f'{result.scoped_cap.unscoped_cap_hit_count}', '',
-            'Service restarts since then (only an orchestrator restart reloads a '
-            'restart-tier leaf):', '']
-    out += markdown_table(
-        ['timestamp', 'service', 'reason'],
-        [(r.timestamp, r.service, r.reason or '-') for r in result.scoped_cap.restarts],
-    )
-    out += ['']
+    out += _scoped_cap_section(result.scoped_cap, model, span)
 
     spend = result.spend
     # '-' for the three ceiling cells when no ceiling was supplied: there is no
@@ -1008,6 +1072,44 @@ def render_markdown(result: AuditResult) -> str:
     out += ['', f'Roles outside the admitted set: '
                 f'{", ".join(containment.unexpected_roles) or "none"}', '']
     return '\n'.join(out)
+
+
+def _scoped_cap_section(scan: ScopedCapScan, model: str, span: str) -> list[str]:
+    """Section 4: the scope's cap hits, then whether its restart-tier leaf is loaded yet."""
+    out = [f'### 4. Scoped cap posture for `{model}` {span}', '']
+    out += markdown_table(
+        ['created_at', 'account', 'reason'],
+        [(h.created_at, h.account_name, h.reason) for h in scan.scoped_hits],
+    )
+    out += ['', f'Account-level (unscoped) cap hits in the same period: '
+                f'{scan.unscoped_cap_hit_count}', '',
+            f'Orchestrator startups {span}, from the `runs` table (only an '
+            'orchestrator startup loads a restart-tier leaf):', '']
+    out += markdown_table(
+        ['started_at', 'run_id'],
+        [(s.started_at, s.run_id) for s in scan.orchestrator_startups],
+    )
+    out += ['', f'Config reloads {span} that left a leaf restart-required, with the '
+                'first orchestrator startup after each:', '']
+    out += markdown_table(
+        ['reloaded at', 'restart-required leaves', 'first startup after', 'run_id'],
+        [_reload_row(r) for r in scan.restart_required_reloads],
+    )
+    out += ['', f'`service_restart` events {span}:', '']
+    out += markdown_table(
+        ['timestamp', 'service', 'reason'],
+        [(r.timestamp, r.service, r.reason or '-') for r in scan.restarts],
+    )
+    out += ['']
+    return out
+
+
+def _reload_row(reload: RestartRequiredReload) -> tuple[str, str, str, str]:
+    """*reload* as one row of section 4's reload table."""
+    after = reload.first_startup_after
+    if after is None:
+        return reload.timestamp, ', '.join(reload.leaves), 'none in window', '-'
+    return reload.timestamp, ', '.join(reload.leaves), after.started_at, after.run_id
 
 
 def _merge_cell(outcome: MergeOutcome | None) -> str:

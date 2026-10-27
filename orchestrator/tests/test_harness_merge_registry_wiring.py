@@ -71,7 +71,6 @@ class TestStartEscalationServerInjectsRegistry:
         h = _build_harness(mock_orch_config)
 
         # Set up attributes _start_escalation_server reads from config
-        mock_orch_config.escalation.queue_dir = str(tmp_path / 'esc')
         mock_orch_config.escalation.host = '127.0.0.1'
         mock_orch_config.escalation.port = 19999
         # _start_escalation_server wires review_checkpoint if not None
@@ -190,9 +189,7 @@ class TestStartMergeWorkerCallsLivenessGuard:
              patch('asyncio.create_task') as mock_create_task, \
              patch('orchestrator.merge_lane.liveness.enforce_merge_liveness_margin') as mock_guard:
 
-            # SpeculativeMergeWorker.run() must be awaitable to satisfy create_task
             mock_smw = MagicMock()
-            mock_smw.run = AsyncMock(return_value=None)
             mock_smw_cls.return_value = mock_smw
 
             # Coordinator mock — note_merge is the on_merge_landed callback

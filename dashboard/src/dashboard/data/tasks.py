@@ -443,7 +443,7 @@ async def _fanout_read(
     return await first_success(
         config.fused_memory_urls,
         _call,
-        log_label=fanout_label(label, read.project_root),
+        log_label=fanout_label(label, read.project_root, config.project_labels),
         offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
     )
 
@@ -721,7 +721,7 @@ async def fetch_statuses(
     return await first_success(
         config.fused_memory_urls,
         _call,
-        log_label=fanout_label('fetch_statuses', project_root_str),
+        log_label=fanout_label('fetch_statuses', project_root_str, config.project_labels),
         offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
     )
 
@@ -799,7 +799,7 @@ async def _read_task(
     return await first_success(
         config.fused_memory_urls,
         _call,
-        log_label=fanout_label(log_name, root),
+        log_label=fanout_label(log_name, root, config.project_labels),
         offline_result=lambda errs: TaskReadOffline('; '.join(errs)),
     )
 
@@ -827,10 +827,11 @@ async def fetch_task_prose(
 ) -> TaskProseRead:
     """Read ONE task's description/details for the Tasks tab's Task Detail pane.
 
-    The ACTIVE_TASKS rows omit both fields; the pane fetches them here for the
-    selected task only. Each outcome is its own type because the route answers
-    each with a different status: :class:`TaskProse`, :class:`TaskNotFound`
-    or :class:`TaskReadOffline`, classified by :func:`_read_task`.
+    The task rows (``TASKS_SNAPSHOT[p].rows``) omit both fields; the pane
+    fetches them here for the selected task only. Each outcome is its own type
+    because the route answers each with a different status:
+    :class:`TaskProse`, :class:`TaskNotFound` or :class:`TaskReadOffline`,
+    classified by :func:`_read_task`.
 
     *timeout* is per HTTP request; the caller bounds the whole read.
     Uncached, deliberately: a primary-key lookup fetched only on selection.

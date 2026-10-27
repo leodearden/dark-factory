@@ -3,12 +3,13 @@
 PRD: plans/session-attention-rail-prd.md T3 (spine root; §4.1-4.2, §4.8, §6 G5).
 
 This module is the shared, versioned contract for the global, cross-project
-session registry at ``~/.claude/fleet/sessions/<slug>/record.json``. It is
-deliberately stdlib-only and self-contained (no intra-orchestrator imports)
-so it can be:
+session registry at ``~/.claude/fleet/sessions/<slug>/record.json``. It
+imports only the stdlib plus this checkout's stdlib-only ``shared`` leaves,
+and nothing from the rest of the orchestrator, so it can be:
 
-- invoked directly by ``skills/spawn/spawn-claude.sh`` via an absolute path
-  (no venv/PYTHONPATH/install required), and
+- invoked directly by ``skills/spawn/spawn-claude.sh`` and the SKILL.md verb
+  lines via an absolute path (no venv/PYTHONPATH/install required: the
+  bootstrap below reaches ``shared/src`` from ``__file__``), and
 - imported as ``orchestrator.session_registry`` by downstream Python
   consumers (T4 verify, T5 result, T6 hooks, T7 leases).
 
@@ -38,18 +39,25 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-# NOTE: no non-stdlib imports at module scope, deliberately — see the module
-# docstring's stdlib-only clause and _atomic_write_text below. This module is
-# executed by absolute path from skills/spawn/spawn-claude.sh with no venv,
-# install or workspace packages available, so a `from shared import ...` here
-# makes it unimportable there. Nor a `from orchestrator import <sibling>`:
-# running a script by path puts only the script's OWN directory on sys.path,
-# so intra-orchestrator imports fail there too even though they work for
-# consumers that import this module with PYTHONPATH set.
+# NOTE: this module is executed by absolute path from
+# skills/spawn/spawn-claude.sh and the SKILL.md verb lines with no venv,
+# install or PYTHONPATH, so the only non-stdlib imports allowed at module
+# scope are this checkout's stdlib-only `shared` leaves, reached through the
+# bootstrap below. It APPENDS, so an installed or PYTHONPATH `shared` wins.
+# No third-party import, and no `from orchestrator import <sibling>`: running
+# a script by path puts only the script's OWN directory on sys.path, so
+# intra-orchestrator imports fail there even though they work for consumers
+# that import this module with PYTHONPATH set.
 # Pinned by the tier-1 (bare shell, NO PYTHONPATH) row of
 # _BARE_SHELL_ENTRYPOINTS in
 # test_session_registry.py::TestStdlibOnlySelfContainment, and mutation-tested
 # there via _MUST_BE_REJECTED.
+if (
+    _CHECKOUT_SHARED_SRC := str(Path(__file__).resolve().parents[3] / 'shared' / 'src')
+) not in sys.path and Path(_CHECKOUT_SHARED_SRC).is_dir():
+    sys.path.append(_CHECKOUT_SHARED_SRC)
+
+from shared.project_id import fold_project_token
 
 # ---------------------------------------------------------------------------
 # Schema / contract (PRD §6 G5): consumers import this; they never re-derive
@@ -61,7 +69,10 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 1
 
 # 3: LeaseHolder.record_slug and DecisionRecord.record_slug (task 4237).
-SCHEMA_MINOR = 3
+# 4: SessionRecord.self_exit (task 7179).
+# 5: SessionRecord.exit_request and exit_requested_at (task 7193).
+# 6: SessionRecord.claude_launch_session_id (task 6069).
+SCHEMA_MINOR = 6
 """Additive-extension counter for this module's contract (Fleet Cockpit C1,
 plans/fleet-cockpit-prd.md §6.1). A CODE-LEVEL signal only -- never persisted
 per-record. Bump this when a new backward-compatible (optional/defaulted)
@@ -81,6 +92,69 @@ cross-checked at runtime) with skills/spawn/spawn-claude.sh's own
 ``str(record_dir)`` (== spawn-claude.sh's ``SESSION_RECORD_DIR``), so bash's
 ``$SESSION_RECORD_DIR/result.md`` and this module's
 ``str(record_dir / RESULT_FILENAME)`` are byte-identical paths."""
+
+EXIT_REQUESTED_FILENAME = 'exit-requested'
+"""The marker a self-exit session writes into its record dir; spawn-claude.sh's trailer spells it literally."""
+
+
+class ResultOutcome(StrEnum):
+    """The ``outcome:`` header of RESULT_FILENAME; IN_PROGRESS marks a checkpoint, not an end."""
+
+    DONE = 'done'
+    BLOCKED = 'blocked'
+    ABANDONED = 'abandoned'
+    HANDED_OFF = 'handed-off'
+    IN_PROGRESS = 'in-progress'
+
+
+RESULT_OUTCOMES: tuple[ResultOutcome, ...] = tuple(ResultOutcome)
+TERMINAL_RESULT_OUTCOMES: frozenset[ResultOutcome] = frozenset(RESULT_OUTCOMES) - {ResultOutcome.IN_PROGRESS}
+OWNING_OUTCOMES: frozenset[ResultOutcome] = frozenset({ResultOutcome.DONE, ResultOutcome.HANDED_OFF})
+
+
+def parse_result_outcome(text: str) -> ResultOutcome | None:
+    """The spawn contract's ``outcome:`` header value, or None when absent or not a contract outcome."""
+    lines = text.lstrip().splitlines()
+    if lines and lines[0].strip() == '---':
+        lines = lines[1:]
+    for line in lines:
+        if not line.strip() or line.strip() == '---':
+            return None
+        key, sep, value = line.partition(':')
+        if sep and key.strip() == 'outcome':
+            try:
+                return ResultOutcome(value.strip())
+            except ValueError:
+                return None
+    return None
+
+
+class ExitRequestState(StrEnum):
+    """Where the Stop hook's self-exit evaluation ended (plans/review-all-program-tooling-prd.md §4 H5)."""
+
+    REFUSED = 'refused'
+    ATTEMPTED = 'attempted'
+    KILL_FAILED = 'kill_failed'
+
+
+@dataclass(frozen=True)
+class ExitRequest:
+    """One self-exit evaluation as the Stop hook stamped it; ``reason`` names a refusal or a failed signal."""
+
+    state: ExitRequestState
+    reason: str | None
+    pid: int | None
+    at: str
+    marker_session_id: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'state': ExitRequestState(self.state).value,
+            'reason': self.reason,
+            'pid': self.pid,
+            'at': self.at,
+            'marker_session_id': self.marker_session_id,
+        }
 
 
 class Status(StrEnum):
@@ -144,25 +218,28 @@ class DisplayKind(StrEnum):
 
     WM = 'wm'
     TMUX = 'tmux'
+    T3 = 't3'
 
 
 @dataclass
 class Display:
     """Where to find/focus this session's terminal (Fleet Cockpit C1, PRD §6.1).
 
-    kind: DisplayKind's wire value ('wm' or 'tmux'); stored as a plain
+    kind: DisplayKind's wire value ('wm', 'tmux' or 't3'); stored as a plain
         ``str`` (no from_dict coercion -- see SpawnMode's docstring for why).
     wm_title: the spawned terminal's window title, for a 'wm' kind's
         window-manager lookup.
     wm_window_id: the window-manager's own window id, when known.
     tmux_target: a tmux target spec (e.g. ``'session:window.pane'``), for a
         'tmux' kind.
+    t3_thread_id: the T3 Code thread hosting the session, for a 't3' kind.
     """
 
     kind: str
     wm_title: str = ''
     wm_window_id: str | None = None
     tmux_target: str | None = None
+    t3_thread_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -170,6 +247,7 @@ class Display:
             'wm_title': self.wm_title,
             'wm_window_id': self.wm_window_id,
             'tmux_target': self.tmux_target,
+            't3_thread_id': self.t3_thread_id,
         }
 
     @classmethod
@@ -179,6 +257,7 @@ class Display:
             wm_title=data.get('wm_title', ''),
             wm_window_id=data.get('wm_window_id'),
             tmux_target=data.get('tmux_target'),
+            t3_thread_id=data.get('t3_thread_id'),
         )
 
 
@@ -217,7 +296,7 @@ def _coerce_owner_pid(value: Any) -> int | None:
 
 
 def _coerce_session_id(value: Any) -> str | None:
-    """Read ``claude_session_id`` from a record body, tolerating junk.
+    """Read a stored Claude Code session id from a record body, tolerating junk.
 
     Mirrors ``_coerce_owner_pid``: anything that is not a ``str`` reads as
     None ("no session id bound") instead of surviving to the hook trio's
@@ -232,6 +311,25 @@ def _coerce_session_id(value: Any) -> str | None:
         return None
     stripped = value.strip()
     return stripped or None
+
+
+def _coerce_exit_request(value: Any) -> ExitRequest | None:
+    """Read ``exit_request`` from a record body; a non-dict or an unknown state reads None. Never raises."""
+    if not isinstance(value, dict):
+        return None
+    try:
+        state = ExitRequestState(value.get('state'))
+    except ValueError:
+        return None
+    reason = value.get('reason')
+    at = value.get('at')
+    return ExitRequest(
+        state=state,
+        reason=reason if isinstance(reason, str) else None,
+        pid=_coerce_owner_pid(value.get('pid')),
+        at=at if isinstance(at, str) else '',
+        marker_session_id=_coerce_session_id(value.get('marker_session_id')),
+    )
 
 
 @dataclass
@@ -277,6 +375,13 @@ class SessionRecord:
         from a nested claude that merely inherited CLAUDE_SPAWN_SESSION_ID.
         A non-str or whitespace-only value in a record body reads back as
         None instead of surviving unchanged (see ``_coerce_session_id``).
+    claude_launch_session_id: the Claude Code ``session_id`` this record was
+        FIRST bound to, stamped once by ``session_hooks._bind_claude_session_id``
+        and never re-bound, so it still names the launch transcript after a
+        ``/clear`` or compaction re-mint moves ``claude_session_id``. None for
+        an unbound record or one bound before this field existed; junk reads
+        None (see ``_coerce_session_id``). Consumer:
+        ``scripts/legibility/check_transcript_persistence.py::find_matching_transcript``.
     claude_owner_pid: pid of the ``claude`` PROCESS that bound
         ``claude_session_id``, stamped at the same moment, or None for a
         record bound before this field existed (or where the pid could not
@@ -288,6 +393,15 @@ class SessionRecord:
         ``session_hooks._env_slug_is_owned``. A non-int, bool, or
         non-positive value in a record body reads back as None instead of
         surviving unchanged (see ``_coerce_owner_pid``).
+    self_exit: true when the spawn was launched with CLAUDE_SPAWN_SELF_EXIT=1;
+        stamped at ``launching`` and preserved by every later
+        read-modify-write. Anything but a JSON true reads back as False.
+    exit_request: the Stop hook's last self-exit evaluation, or None; written
+        only when the ``exit-requested`` marker is present on a proven-owner
+        event. See ExitRequest and ``session_self_exit.py``.
+    exit_requested_at: when the hook last stamped an ATTEMPTED evaluation, or
+        None if it never has; a later refusal or kill_failed stamp leaves it
+        in place.
     """
 
     session_slug: str
@@ -310,7 +424,11 @@ class SessionRecord:
     display: Display | None = field(default=None, kw_only=True)
     question: Question | None = field(default=None, kw_only=True)
     claude_session_id: str | None = field(default=None, kw_only=True)
+    claude_launch_session_id: str | None = field(default=None, kw_only=True)
     claude_owner_pid: int | None = field(default=None, kw_only=True)
+    self_exit: bool = field(default=False, kw_only=True)
+    exit_request: ExitRequest | None = field(default=None, kw_only=True)
+    exit_requested_at: str | None = field(default=None, kw_only=True)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain, JSON-scalar-only dict (status as its wire string)."""
@@ -335,13 +453,18 @@ class SessionRecord:
             'display': self.display.to_dict() if self.display is not None else None,
             'question': self.question.to_dict() if self.question is not None else None,
             'claude_session_id': self.claude_session_id,
+            'claude_launch_session_id': self.claude_launch_session_id,
             'claude_owner_pid': self.claude_owner_pid,
+            'self_exit': self.self_exit,
+            'exit_request': self.exit_request.to_dict() if self.exit_request is not None else None,
+            'exit_requested_at': self.exit_requested_at,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SessionRecord:
         display_data = data.get('display')
         question_data = data.get('question')
+        exit_requested_at = data.get('exit_requested_at')
         return cls(
             session_slug=data['session_slug'],
             status=Status(data['status']),
@@ -363,7 +486,11 @@ class SessionRecord:
             display=Display.from_dict(display_data) if isinstance(display_data, dict) else None,
             question=Question.from_dict(question_data) if isinstance(question_data, dict) else None,
             claude_session_id=_coerce_session_id(data.get('claude_session_id')),
+            claude_launch_session_id=_coerce_session_id(data.get('claude_launch_session_id')),
             claude_owner_pid=_coerce_owner_pid(data.get('claude_owner_pid')),
+            self_exit=data.get('self_exit') is True,
+            exit_request=_coerce_exit_request(data.get('exit_request')),
+            exit_requested_at=exit_requested_at if isinstance(exit_requested_at, str) else None,
         )
 
     def to_json(self) -> str:
@@ -663,7 +790,7 @@ def session_pointer_path_for_pid(pid: int, root: Path | str | None = None) -> Pa
     return session_pointers_dir(root) / str(pid)
 
 
-def _is_record_key(slug: str) -> bool:
+def is_record_key(slug: str) -> bool:
     """True iff *slug* can name a record dir directly inside ``sessions_dir``.
 
     The one well-formedness check for every pointer and ``record_slug`` read
@@ -693,7 +820,7 @@ def write_session_pointer(pid: int, slug: str, root: Path | str | None = None) -
     is not a record key, and False (after a WARNING) when the write itself
     fails. Never raises: its callers are session hooks.
     """
-    if pid <= 0 or not _is_record_key(slug):
+    if pid <= 0 or not is_record_key(slug):
         return False
     path = session_pointer_path_for_pid(pid, root=root)
     if _read_session_pointer(path) == slug:
@@ -725,13 +852,81 @@ def resolve_session_slug_for_pid(pid: int, root: Path | str | None = None) -> st
     if pid <= 0:
         return None
     slug = _read_session_pointer(session_pointer_path_for_pid(pid, root=root))
-    if slug is None or not _is_record_key(slug):
+    if slug is None or not is_record_key(slug):
         return None
     try:
         record = read_record(slug, root=root)
     except (OSError, CorruptSessionRecord):
         return None
     return slug if record.claude_owner_pid == pid else None
+
+
+CLAUDE_SESSION_POINTERS_DIRNAME = 'sessions-by-claude-id'
+
+
+def claude_session_pointers_dir(root: Path | str | None = None) -> Path:
+    """The session-id pointer dir, ``<fleet_root>/sessions-by-claude-id/``; a sibling of ``sessions_dir`` like ``session_pointers_dir``."""
+    return fleet_root(root) / CLAUDE_SESSION_POINTERS_DIRNAME
+
+
+def claude_session_pointer_path(session_id: str, root: Path | str | None = None) -> Path:
+    return claude_session_pointers_dir(root) / session_id
+
+
+def _is_session_id_token(session_id: str) -> bool:
+    """True iff *session_id* is safe as a pointer file name: the ``CLAUDE_CODE_SESSION_ID`` token shape."""
+    return _SESSION_ID_RE.fullmatch(session_id) is not None
+
+
+def write_claude_session_pointer(
+    session_id: str, slug: str, root: Path | str | None = None
+) -> bool:
+    """Record *slug* as the record key of the Claude Code session *session_id*.
+
+    The session-id twin of ``write_session_pointer``, with the same contract:
+    last writer wins, True without rewriting when the pointer already holds
+    *slug*, False without writing for an unsafe *session_id* or a *slug* that
+    is not a record key, False after a WARNING when the write fails, and
+    never raises.
+    """
+    if not _is_session_id_token(session_id) or not is_record_key(slug):
+        return False
+    path = claude_session_pointer_path(session_id, root=root)
+    if _read_session_pointer(path) == slug:
+        return True
+    try:
+        _atomic_write_text(path, slug)
+    except OSError as exc:
+        logger.warning(
+            'claude session pointer write failed: session_id=%s slug=%s path=%s: %s',
+            session_id,
+            slug,
+            path,
+            exc,
+        )
+        return False
+    return True
+
+
+def resolve_session_slug_for_claude_session_id(
+    session_id: str, root: Path | str | None = None
+) -> str | None:
+    """Return the record slug the Claude Code session *session_id* is bound to, or None.
+
+    Vouched like ``resolve_session_slug_for_pid``: the pointer's slug is
+    returned only when the record it names carries
+    ``claude_session_id == session_id``. Read-only; never raises.
+    """
+    if not _is_session_id_token(session_id):
+        return None
+    slug = _read_session_pointer(claude_session_pointer_path(session_id, root=root))
+    if slug is None or not is_record_key(slug):
+        return None
+    try:
+        record = read_record(slug, root=root)
+    except (OSError, CorruptSessionRecord):
+        return None
+    return slug if record.claude_session_id == session_id else None
 
 
 def encode_cwd(cwd: str) -> str:
@@ -809,7 +1004,7 @@ def qualify_decision_id(project: object, local_id: str) -> str:
     the sitting's existing ``<project>-<esc>`` ids. See
     plans/4835-decision-plumbing-decisions.md.
     """
-    folded = normalize_project_token(project)
+    folded = fold_project_token(project)
     if not folded:
         return local_id
     return f'{folded}{DECISION_ID_PROJECT_SEPARATOR}{local_id}'
@@ -835,28 +1030,20 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
     THIS IS THE DELIBERATE EXCEPTION to task 3223's consolidation, which moved
     this repo's copies of the tmp+rename writer onto
-    :func:`shared.safe_io.atomic_write_text`. This module does NOT delegate,
-    and must not be "finished off" by a later cleanup.
+    :func:`shared.safe_io.atomic_write_text`. This module does NOT delegate.
 
-    Why: this module is invoked by absolute path from
+    Why it was kept: this module is invoked by absolute path from
     ``skills/spawn/spawn-claude.sh`` under an interpreter with no venv, no
-    install and no workspace packages on ``sys.path`` (see the module
-    docstring's stdlib-only clause, which is a hard constraint, not a stylistic
-    preference). A module-scope ``from shared import safe_io`` makes the whole
-    module unimportable there — measured as ``ModuleNotFoundError: No module
-    named 'shared'`` — and the only visible symptom is a hook subprocess that
-    silently never writes ``record.json``. The contract is pinned directly by
-    the tier-1 (bare shell, NO PYTHONPATH) row of ``_BARE_SHELL_ENTRYPOINTS`` in
-    ``test_session_registry.py::TestStdlibOnlySelfContainment`` — which
-    mutation-tests it by injecting this very import — and this
-    function is recorded in ``_ALLOWED_RENAMERS`` in
+    install and no workspace packages on ``sys.path``. Before the module-scope
+    ``shared/src`` bootstrap existed, a ``from shared import safe_io`` made the
+    whole module unimportable there — measured as ``ModuleNotFoundError: No
+    module named 'shared'`` — and the only visible symptom was a hook
+    subprocess that silently never wrote ``record.json``. The bootstrap now
+    reaches ``shared``'s stdlib-only leaves, ``safe_io`` among them, so whether
+    to delegate is open again (ticket tkt_0RW29CREM5XVXNE710FGF4W5MA). Until
+    that is decided, this function stays recorded in ``_ALLOWED_RENAMERS`` in
     ``tests/scripts/test_atomic_write_regrowth.py`` so the anti-regrowth guard
-    reads it as the documented exception it is rather than a fresh copy.
-
-    The cost is conscious: the repo keeps two hand-rolled copies of this
-    pattern instead of one. A documented, allowlisted, test-pinned second copy
-    is strictly better than a module that cannot be imported by its own
-    documented entrypoint.
+    reads it as a documented exception rather than a fresh copy.
 
     ``os.fdopen(fd, 'w')`` with no explicit encoding defaults to the ambient
     locale's encoding, which is host-dependent. Task 3387 fixed the resulting
@@ -957,6 +1144,7 @@ def update_display(
     wm_title: str = '',
     wm_window_id: str | None = None,
     tmux_target: str | None = None,
+    t3_thread_id: str | None = None,
 ) -> SessionRecord:
     """Strict read-modify-write of *display* (mirrors update_status).
 
@@ -970,7 +1158,11 @@ def update_display(
     """
     record = read_record(slug, root=root)
     record.display = Display(
-        kind=kind, wm_title=wm_title, wm_window_id=wm_window_id, tmux_target=tmux_target
+        kind=kind,
+        wm_title=wm_title,
+        wm_window_id=wm_window_id,
+        tmux_target=tmux_target,
+        t3_thread_id=t3_thread_id,
     )
     write_record(record, root=root)
     return record
@@ -1254,7 +1446,7 @@ CLOSING_DECISION_STATES = frozenset({DecisionState.ANSWERED, DecisionState.DROPP
 
 def _decision_identity(project: object, escalations_dir: str | Path) -> tuple[str, str]:
     """The folded (project, queue stamp) pair a caller names a fleet-global decision record by."""
-    return normalize_project_token(project), normalize_escalations_dir(escalations_dir)
+    return fold_project_token(project), normalize_escalations_dir(escalations_dir)
 
 
 def _refuse_unless_named_record(
@@ -1304,7 +1496,7 @@ def close_decision_with_evidence(
 
     Decision ids are fleet-global while ``esc-<task>-<n>`` numbering restarts
     per project, so the caller names the record it means by the project and
-    queue stamp it READ (compared folded, through normalize_project_token and
+    queue stamp it READ (compared folded, through fold_project_token and
     normalize_escalations_dir), and any other record at that id is refused.
     That is the close-side twin of _run_write_decision's collision rule.
 
@@ -1877,79 +2069,6 @@ def normalize_escalations_dir(value: str | Path) -> str:
         return raw
 
 
-_PROJECT_TOKEN_UNDERSCORE_RE = re.compile(r'_+')
-"""Collapses a run of '_' to one, mirroring the _DECISION_ID_SANITIZE_RE
-idiom (module-level compiled regex, used by exactly one normalizer). Applied
-AFTER '-' has been translated to '_', so 'dark--factory' and 'dark-_factory'
-both land on 'dark_factory'."""
-
-
-PROJECT_TOKEN_ALIASES: dict[str, str] = {
-    'df': 'dark_factory',
-}
-"""Maps an ALREADY-FOLDED project token to its ALREADY-FOLDED canonical
-spelling, for the cases case/separator folding alone cannot merge (task
-3807). Applied as the LAST step of normalize_project_token, so both key and
-value must themselves already be canonical under the fold.
-
-ADMISSION RULE for a new entry -- TWO clauses, BOTH necessary (clause 2
-added by task 3813, which was filed to keep this rule honest):
-
-  1. The canonical value must be the ``memory.project_id`` declared by a
-     real project root's ``dark-factory-orchestrator.yaml``.
-  2. The alias must heal an ACTUAL SPLIT: after case/separator folding,
-     that project's rows must still sit in >=2 buckets. A bucket whose
-     NAME merely disagrees with the declared ``project_id``, with every
-     row already in ONE bucket, is COSMETIC and admits nothing.
-
-Together they keep the table mechanical and auditable instead of a
-per-case judgement call, and clause 1 is the reason this table is
-deliberately NOT a config read: this module is stdlib-only with no
-intra-orchestrator imports (see module docstring), so the mapping is a
-hand-maintained constant kept in sync with those configs.
-
-Clause 2 states the principle the table already embodies rather than
-adding a new one. ``df -> dark_factory`` qualifies because it healed a
-MEASURED 22/17/2 three-way split in which each partition was invisible to
-a reap scoped to either of the others -- a correctness bug. An alias that
-heals no split can only ever move rows out from under whatever reaps them
-today, which is a strictly larger risk than the naming mismatch it tidies.
-The solar-challenge entry fails clause 2 and is recorded as declined in
-PROJECT_TOKEN_ALIASES_DECLINED below.
-
-EVIDENCE for the sole seeded entry: three independent declarations name
-``dark_factory`` as this project's identity -- ``dark-factory-orchestrator
-.yaml`` (``memory.project_id``), ``orchestrator/src/orchestrator/config.py``
-(the ``project_id`` field default), and CLAUDE.md's write-tagging
-convention. ``df`` appears ONLY inside the decision registry and as a
-hand-typed ``df-`` prefix on ``--id`` (which is part of the id a human
-types, never derived from ``--project``), so aliasing it costs nothing
-elsewhere.
-
-Folding alone merges a split whose spellings differ ONLY by case or
-separator -- ``autopilot-video`` = ``autopilot_video`` -- so those need no
-entry here. It does NOT reconcile a project whose filed tokens fold to
-something OTHER than its declared ``memory.project_id``; only an alias can
-bridge that.
-
-RESIDUAL NAMING MISMATCH -- DECIDED (task 3813): DECLINED. See
-PROJECT_TOKEN_ALIASES_DECLINED below for the evidence.
-``/home/leo/src/solar-challenge`` declares ``my_solar_challenge``, but its
-5 OPEN decisions are filed under ``solar-challenge`` (3) and
-``solar_challenge`` (2) (re-measured 2026-09-07, 748 records; unchanged
-from 2026-08-07). Folding merges those two into ONE bucket -- strictly
-better than before, when a reap scoped to either missed the other -- but
-the bucket is named ``solar_challenge``, so a reaper passing the
-config-declared ``my_solar_challenge`` matches ZERO of them. Adding
-``'solar_challenge': 'my_solar_challenge'`` would rename that bucket, and
-the amended admission rule above does NOT license it: clause 2 fails,
-because folding already left every row in ONE bucket, so there is no split
-left to heal. Reap that project with a token that folds to
-``solar_challenge`` -- permanently, not "until 3813 lands" -- and note the
-collapse guard is unaffected either way, since ``solar_challenge_platform``
-is a distinct project root with a distinct folded token."""
-
-
 PROJECT_TOKEN_ALIASES_DECLINED: dict[str, tuple[str, str]] = {
     'solar_challenge': (
         'my_solar_challenge',
@@ -1961,12 +2080,13 @@ PROJECT_TOKEN_ALIASES_DECLINED: dict[str, tuple[str, str]] = {
 """Aliases CONSIDERED and DELIBERATELY DECLINED (task 3813), keyed
 already-folded-alias -> (already-folded declined canonical, one-line reason).
 
-WHAT THIS IS. The deliberate mirror image of PROJECT_TOKEN_ALIASES above:
-same folded-to-folded key/value invariant (pinned by a named test), so
+WHAT THIS IS. The deliberate mirror image of
+``shared.project_id.PROJECT_ID_ALIASES``: same folded-to-folded key/value
+invariant under ``fold_project_token`` (pinned by a named test), so
 PROMOTING a declined entry is a one-line move between the two dicts and
 DECLINING a live one is the same move in reverse. It is read by
 ``declined_project_token_hint`` and by two guard tests; it is deliberately
-NOT consulted by ``normalize_project_token``, so it costs nothing on the
+NOT consulted by ``fold_project_token``, so it costs nothing on the
 fold's hot path and every existing test of that fold is untouched. The
 in-repo precedent for encoding a deliberate exclusion next to the table it
 governs is ``fused-memory/scripts/consolidate_namespace_families.py``
@@ -2029,90 +2149,6 @@ decline wrong), or solar-challenge's config being changed to declare
 and its hint together)."""
 
 
-def normalize_project_token(value: object) -> str:
-    """The ONE canonical spelling of a project token (task 3807).
-
-    Direct sibling of ``normalize_escalations_dir`` and wired the same way:
-    both sides of the (fleet-global decisions <-> per-project reaper) join
-    run their project token through this one helper -- the ``write-decision``
-    verb stamps the normalized form onto ``DecisionRecord.project``, and the
-    ``reap-decisions`` verb normalizes both its own ``--project`` and the
-    decision's stored value before comparing them. Routing both through one
-    function is what makes ``df``, ``dark-factory`` and ``Dark_Factory``
-    compare EQUAL; a raw string compare silently PARTITIONS one project's
-    decisions, which is the bug this exists to prevent (measured 2026-08-06:
-    41 OPEN dark-factory decisions split 22/17/2 across
-    ``dark_factory``/``df``/``dark-factory``, each partition invisible to a
-    reap scoped to either of the others).
-
-    The fold: strip, casefold, ``-`` -> ``_``, collapse ``_`` runs, strip
-    edge ``_``, then apply PROJECT_TOKEN_ALIASES.
-
-    Returns ``''`` -- the "unset" sentinel, never a token -- for an empty,
-    whitespace-only or ``None`` *value*, mirroring normalize_escalations_dir's
-    ``''`` contract so a reader learns ONE rule for both boundary
-    normalizers. ``''`` only ever matches ``''``, so an unset token cannot
-    accidentally join a real project.
-
-    IDEMPOTENT: ``f(f(x)) == f(x)`` for every input. Load-bearing --
-    ``migrate_decision_project_tokens`` decides a record is already canonical
-    by comparing ``normalize_project_token(p) == p``, so a non-idempotent
-    fold would rewrite every record on every run.
-
-    It deliberately merges ONLY case and separator differences (plus an
-    explicit alias). It does NOT merge tokens that differ by more than that:
-    ``solar_challenge`` and ``solar_challenge_platform`` are two DIFFERENT
-    project roots whose tokens merely share a prefix, and merging them would
-    let one project's reaper close the other's decisions -- strictly worse
-    than the bug being fixed. A named collapse-guard test pins that.
-
-    SCOPE: at the WRITE path, this canonicalizes ``DecisionRecord.project``
-    ONLY. ``SessionRecord.project`` is deliberately still written raw --
-    ``identity.project`` feeds ``build_session_slug`` (the record's on-disk
-    directory identity) and the stored value is parsed from
-    ``record.title``, the literal terminal title, so folding it at the spawn
-    path would churn the slug namespace and desynchronize a documented
-    mirror.
-
-    The cockpit folds BOTH record kinds at its READ boundary instead (task
-    3812), so its picker and its scorer key can no longer disagree, and the
-    fix is retroactive over every already-written record with no migration
-    run. ``cockpit/src/cockpit/registry_reader.py`` IS that boundary and its
-    module docstring is where the reasoning lives; its entry points are
-    ``::_read_record_soft`` for sessions and ``::scan_decisions`` for
-    decisions, joined by the ``priorities.yaml`` ``project_weights`` KEYS at
-    load (``cockpit/src/cockpit/priority.py::_canonical_project_weights``)
-    and the picker candidates
-    (``cockpit/src/cockpit/panes/weight_editor.py::known_projects``).
-
-    Do not read "canonical" here as "canonical fleet-wide": the on-disk
-    session records themselves are still unnormalized (they are TTL-reaped
-    by ``reap_stale_records`` rather than migrated, which is why they need
-    no ``migrate_session_project_tokens`` twin), so any OTHER consumer
-    comparing a raw ``SessionRecord.project`` must run it through this
-    function itself.
-
-    Stdlib-only and fail-soft: never raises, and coerces a non-str *value*
-    via ``str()`` rather than rejecting it -- ``42`` becomes ``'42'``, which
-    matches no real project (the fail-OPEN direction, leaving a decision
-    visible to the human rather than risking a false close). ``None`` is the
-    one coercion NOT left to ``str()``: it means "unset", but ``str(None)``
-    would fold to ``'none'`` -- an ordinary-looking token, not a sentinel --
-    so a hand-edited record carrying ``"project": null`` (which
-    ``DecisionRecord.from_dict`` accepts unguarded) would be migrated onto a
-    literal ``'none'`` bucket a reaper could then match. ``None`` therefore
-    maps to ``''`` alongside the empty string. Keeps this module's
-    no-intra-orchestrator-imports rule (see module docstring).
-    """
-    if value is None:
-        return ''
-    raw = str(value).strip()
-    if not raw:
-        return ''
-    folded = _PROJECT_TOKEN_UNDERSCORE_RE.sub('_', raw.casefold().replace('-', '_')).strip('_')
-    return PROJECT_TOKEN_ALIASES.get(folded, folded)
-
-
 def declined_project_token_hint(value: object, action: str = '') -> str | None:
     """One-line operator warning when *value* names a DECLINED alias target
     (task 3813). Returns None -- the overwhelmingly common case -- otherwise.
@@ -2164,14 +2200,14 @@ def declined_project_token_hint(value: object, action: str = '') -> str | None:
     message that is less specific but still TRUE, never one that confidently
     describes the wrong verb.
 
-    Folds *value* through ``normalize_project_token`` first, so case and
+    Folds *value* through ``fold_project_token`` first, so case and
     separator variants of the config-declared token (``My-Solar-Challenge``)
     all hit, and a non-str or ``None`` *value* coerces fail-soft to a
     matchless token or ``''`` rather than raising. Returning None costs one
     scan of a one-entry dict. Stdlib-only, no intra-orchestrator imports
     (see module docstring).
     """
-    folded = normalize_project_token(value)
+    folded = fold_project_token(value)
     if not folded:
         return None
     for alias, (declined_canonical, _reason) in PROJECT_TOKEN_ALIASES_DECLINED.items():
@@ -2207,7 +2243,7 @@ def declined_project_token_hint(value: object, action: str = '') -> str | None:
 def project_token_census(decisions: Iterable[DecisionRecord]) -> Counter[str]:
     """How many *decisions*, in any state, carry each folded project token; an unset token is dropped."""
     return Counter(
-        token for token in (normalize_project_token(d.project) for d in decisions) if token
+        token for token in (fold_project_token(d.project) for d in decisions) if token
     )
 
 
@@ -2218,7 +2254,7 @@ def unmatched_project_token_hint(value: object, census: Mapping[str, int]) -> st
     the tokens that DO exist, most common first, so a mismatched spelling is
     one glance from its fix.
     """
-    folded = normalize_project_token(value)
+    folded = fold_project_token(value)
     if not folded or folded in census:
         return None
     present = ', '.join(
@@ -2378,7 +2414,7 @@ class MigratedDecision:
         this is also its filename stem before and after.
     old_project: the non-canonical token it was filed under.
     new_project: the canonical token it now carries (see
-        normalize_project_token).
+        fold_project_token).
     """
 
     id: str
@@ -2395,7 +2431,7 @@ def migrate_decision_project_tokens(
 
     Repairs the population filed BEFORE ``write-decision`` canonicalized
     ``--project`` (task 3807). For each ``list_decisions(root)`` entry whose
-    stored token differs from ``normalize_project_token`` of itself, rewrites
+    stored token differs from ``fold_project_token`` of itself, rewrites
     ONLY that field. Returns one MigratedDecision per record actually
     changed; an already-canonical record and an unrelated project's record
     are skipped and absent from the result.
@@ -2434,7 +2470,7 @@ def migrate_decision_project_tokens(
         is inherited from a shape already pinned by TestDecisionIdLock rather
         than re-argued here.
 
-    (d) IDEMPOTENT. Because ``normalize_project_token`` is idempotent, a
+    (d) IDEMPOTENT. Because ``fold_project_token`` is idempotent, a
         second run finds nothing to change and returns ``[]`` without
         rewriting a single file. That is what makes this safe to keep
         permanently as the repair tool for a hand-edited record, rather than
@@ -2473,14 +2509,14 @@ def migrate_decision_project_tokens(
         # Cheap pre-filter off the scan snapshot -- avoids taking a lock for
         # the (usually large) already-canonical majority. NOT the decision of
         # record: for a real run that is re-made under the lock below.
-        if normalize_project_token(decision.project) == decision.project:
+        if fold_project_token(decision.project) == decision.project:
             continue
         if dry_run:
             migrated.append(
                 MigratedDecision(
                     id=decision.id,
                     old_project=decision.project,
-                    new_project=normalize_project_token(decision.project),
+                    new_project=fold_project_token(decision.project),
                 )
             )
             continue
@@ -2496,7 +2532,7 @@ def migrate_decision_project_tokens(
                 # disk at write time or the audit trail lies.
                 record = DecisionRecord.from_json(path.read_text())
                 old_project = record.project
-                new_project = normalize_project_token(old_project)
+                new_project = fold_project_token(old_project)
                 if new_project == old_project:
                     # A concurrent writer already canonicalized it.
                     continue
@@ -2586,6 +2622,11 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def pid_alive(pid: int) -> bool:
+    """Whether *pid* names a live process; ``_pid_alive``'s contract."""
+    return _pid_alive(pid)
+
+
 @dataclass(frozen=True)
 class ReapedSessionRecord:
     """One session-registry record directory removed by reap_stale_records.
@@ -2627,7 +2668,9 @@ def reap_stale_records(
     - status is terminal (EXITED/FAILED_TO_START) and age > TERMINAL_TTL ->
       reaped, reason='terminal_ttl' (independent of launcher_pid liveness).
     - status is non-terminal, launcher_pid is dead, and age >
-      NON_TERMINAL_HEARTBEAT_TTL -> reaped, reason='stale_pid'.
+      NON_TERMINAL_HEARTBEAT_TTL -> reaped, reason='stale_pid'. A T3-hosted
+      record (``display.kind == 't3'``) is exempt: its liveness is its
+      thread, swept by ``mark_t3_sessions_exited``.
     - otherwise -> kept.
 
     Directories are visited in ``sorted(iterdir())`` order (directory-name
@@ -2676,7 +2719,11 @@ def reap_stale_records(
         else:
             if record.status in TERMINAL_STATUSES:
                 reason = 'terminal_ttl' if age > TERMINAL_TTL else None
-            elif not _pid_alive(record.launcher_pid) and age > NON_TERMINAL_HEARTBEAT_TTL:
+            elif (
+                not is_t3_record(record)
+                and not _pid_alive(record.launcher_pid)
+                and age > NON_TERMINAL_HEARTBEAT_TTL
+            ):
                 reason = 'stale_pid'
             else:
                 reason = None
@@ -2723,36 +2770,28 @@ def _is_stale_session_pointer(path: Path, root: Path | str | None) -> bool:
     slug = _read_session_pointer(path)
     return (
         slug is None
-        or not _is_record_key(slug)
+        or not is_record_key(slug)
         or not record_path_for_slug(slug, root=root).is_file()
     )
 
 
-def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
-    """Remove every ``sessions-by-pid/`` entry that can no longer serve a reader.
+def _is_stale_claude_session_pointer(path: Path, root: Path | str | None) -> bool:
+    if path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX):
+        return _is_abandoned_temp_file(path)
+    if not _is_session_id_token(path.name):
+        return True
+    return resolve_session_slug_for_claude_session_id(path.name, root=root) is None
 
-    An entry is stale when its name is not a canonical positive pid, its pid
-    is dead, its content is not a record key, or the record it names has no
-    ``record.json``. The one exception is a ``write_session_pointer`` temp
-    file, which is left to its writer until ``_POINTER_TEMP_FILE_GRACE`` has
-    passed, so a sweep never unlinks it out from under a concurrent
-    ``os.replace``. A dead pid's pointer goes even while its record still
-    exists: its owner can never query it again, and a process that reuses
-    the pid must not inherit it. Record bodies are never parsed, so the cost
-    is O(pointer files), not O(records).
 
-    This is a separate sweep from ``reap_stale_records`` because that one
-    derives identity from each record's PATH and never reads the body, so it
-    cannot know which pointers name the records it removes. Returns the
-    removed paths; an entry that cannot be removed is logged and skipped.
-    """
-    base = session_pointers_dir(root)
+def _reap_pointer_dir(
+    base: Path, is_stale: Callable[[Path, Path | str | None], bool], root: Path | str | None
+) -> list[Path]:
     if not base.is_dir():
         return []
     entries = sorted(base.iterdir())
     removed: list[Path] = []
     for path in entries:
-        if not _is_stale_session_pointer(path, root):
+        if not is_stale(path, root):
             continue
         try:
             path.unlink()
@@ -2767,6 +2806,38 @@ def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
         base,
     )
     return removed
+
+
+def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
+    """Remove every pointer entry that can no longer serve a reader.
+
+    A ``sessions-by-pid/`` entry is stale when its name is not a canonical
+    positive pid, its pid is dead, its content is not a record key, or the
+    record it names has no ``record.json``; no record body is parsed for it.
+    A dead pid's pointer goes even while its record still exists: its owner
+    can never query it again, and a process that reuses the pid must not
+    inherit it.
+
+    A ``sessions-by-claude-id/`` entry is stale when its name is not a
+    session-id token or the record it names no longer vouches for it (gone,
+    unreadable, or bound to another session id), so each such entry costs one
+    record read.
+
+    In both dirs a temp file of ``_atomic_write_text`` is left to its writer
+    until ``_POINTER_TEMP_FILE_GRACE`` has passed, so a sweep never unlinks it
+    out from under a concurrent ``os.replace``.
+
+    This is a separate sweep from ``reap_stale_records`` because that one
+    derives identity from each record's PATH and never reads the body, so it
+    cannot know which pointers name the records it removes. Returns the
+    removed paths; an entry that cannot be removed is logged and skipped.
+    """
+    return [
+        *_reap_pointer_dir(session_pointers_dir(root), _is_stale_session_pointer, root),
+        *_reap_pointer_dir(
+            claude_session_pointers_dir(root), _is_stale_claude_session_pointer, root
+        ),
+    ]
 
 
 ORPHAN_EXIT_CODE: int = 200
@@ -2788,7 +2859,7 @@ of every reserved range avoids that ambiguity."""
 def _mark_exited_if_still_non_terminal(
     slug: str, root: Path | str | None, *, exit_code: int
 ) -> SessionRecord | None:
-    """TOCTOU-safe terminal stamp used only by the liveness sweep.
+    """TOCTOU-safe terminal stamp used by the liveness sweeps and ``mark_session_folded``.
 
     Re-reads *slug* itself -- a second, fresher read than the sweep's own
     caller-side liveness check -- and, ONLY if status is still non-terminal
@@ -2882,6 +2953,11 @@ def mark_orphaned_sessions_exited(
     record) never aborts the sweep -- it is logged and skipped, exactly
     like ``reap_stale_records``'s own fault handling.
 
+    A T3-hosted record (``display.kind == 't3'``) is never swept here: its
+    ``launcher_pid`` is the spawn script, which exits in sibling mode, and its
+    hooks fall silent whenever the thread waits on a human.
+    ``mark_t3_sessions_exited`` sweeps it by thread instead.
+
     *now* is injectable for deterministic tests; defaults to the real UTC
     clock. Returns the list of records this call marked (their post-mark,
     now-EXITED state).
@@ -2904,6 +2980,8 @@ def mark_orphaned_sessions_exited(
             continue  # missing/corrupt body -- reap_stale_records' 'corrupt' rule's job
         if record.status in TERMINAL_STATUSES:
             continue  # already terminal -- idempotent, never re-stamped
+        if is_t3_record(record):
+            continue  # liveness is the thread's, swept by mark_t3_sessions_exited
         if _pid_alive(record.launcher_pid):
             continue  # a live launcher_pid is never swept, regardless of age
 
@@ -2933,6 +3011,89 @@ def mark_orphaned_sessions_exited(
         marked.append(marked_record)
 
     return marked
+
+
+def is_t3_record(record: SessionRecord) -> bool:
+    """Whether *record* is hosted by a T3 Code thread (``display.kind == 't3'``)."""
+    return record.display is not None and record.display.kind == DisplayKind.T3
+
+
+def _same_real_path(left: str, right: str) -> bool:
+    return bool(left) and bool(right) and os.path.realpath(left) == os.path.realpath(right)
+
+
+def mark_t3_sessions_exited(
+    project_root: str,
+    known_threads: Mapping[str, bool],
+    root: Path | str | None = None,
+    *,
+    listed_at: datetime | None = None,
+) -> list[str]:
+    """Mark EXITED every live T3-hosted record of *project_root* whose thread has gone.
+
+    *known_threads* is one project's thread listing, thread id -> archived.
+    A non-terminal record with ``display.kind == 't3'`` and a
+    ``t3_thread_id``, whose ``cwd`` is *project_root* by realpath, is marked
+    (exit_code ``ORPHAN_EXIT_CODE``) when its thread is absent from the
+    listing or listed as archived. Records of other projects are untouched,
+    since the listing says nothing about them. With *listed_at*, a record
+    written after that instant is skipped: the listing predates it and cannot
+    vouch for its thread's absence.
+
+    Returns the marked slugs. One unreadable or unwritable record is logged
+    and skipped, never fatal.
+    """
+    base = sessions_dir(root)
+    if not base.is_dir():
+        return []
+    marked: list[str] = []
+    for slug_dir in sorted(base.iterdir()):
+        slug = slug_dir.name
+        try:
+            record = read_record(slug, root=root)
+        except (FileNotFoundError, CorruptSessionRecord):
+            continue
+        display = record.display
+        if (
+            record.status in TERMINAL_STATUSES
+            or display is None
+            or display.kind != DisplayKind.T3
+            or not display.t3_thread_id
+            or not _same_real_path(record.cwd, project_root)
+            or known_threads.get(display.t3_thread_id, True) is False
+        ):
+            continue
+        if listed_at is not None and _written_after(slug_dir / 'record.json', listed_at):
+            continue
+        try:
+            if _mark_exited_if_still_non_terminal(slug, root, exit_code=ORPHAN_EXIT_CODE):
+                marked.append(slug)
+        except (FileNotFoundError, CorruptSessionRecord, OSError):
+            logger.error('mark_t3_sessions_exited: failed to mark %s', slug, exc_info=True)
+    return marked
+
+
+def _written_after(path: Path, instant: datetime) -> bool:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC) > instant
+    except OSError:
+        return True
+
+
+FOLDED_EXIT_CODE: int = 201
+"""Synthetic exit code ``mark_session_folded`` stamps on a hand-launched
+record whose session turned out to be a spawn's: the spawn record now carries
+that session. Clear of every code ``ORPHAN_EXIT_CODE``'s docstring lists, and
+of that sentinel itself."""
+
+
+def mark_session_folded(slug: str, root: Path | str | None = None) -> SessionRecord | None:
+    """Mark the record *slug* EXITED with ``FOLDED_EXIT_CODE`` unless already terminal.
+
+    Returns the marked record, or None when it was already terminal. Raises
+    like ``read_record`` when it is missing or unreadable.
+    """
+    return _mark_exited_if_still_non_terminal(slug, root, exit_code=FOLDED_EXIT_CODE)
 
 
 def _normalize_wm_window_id(raw: str | None) -> str | None:
@@ -3264,7 +3425,7 @@ def _parse_session_id(env: Mapping[str, str]) -> str | None:
     return session_id if _SESSION_ID_RE.fullmatch(session_id) else None
 
 
-def _is_shared_session_host(pid: int) -> bool:
+def is_shared_session_host(pid: int) -> bool:
     """Whether *pid* is a ``claude agents`` process hosting several sessions.
 
     The one home of the rule that a pid hosting several sessions cannot vouch
@@ -3287,7 +3448,7 @@ class SessionIdentity:
     claude_pid: ``$CLAUDE_PID`` parsed, or None when unusable.
     session_id: ``$CLAUDE_CODE_SESSION_ID`` parsed, or None when unusable.
     shared_host: whether *claude_pid* is a shared ``claude agents`` host
-        (_is_shared_session_host), so that pid does not die with this session.
+        (is_shared_session_host), so that pid does not die with this session.
     """
 
     claude_pid: int | None
@@ -3321,7 +3482,7 @@ def resolve_session_identity(env: Mapping[str, str] | None = None) -> SessionIde
     return SessionIdentity(
         claude_pid=claude_pid,
         session_id=_parse_session_id(env),
-        shared_host=claude_pid is not None and _is_shared_session_host(claude_pid),
+        shared_host=claude_pid is not None and is_shared_session_host(claude_pid),
     )
 
 
@@ -3380,12 +3541,12 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
 
     THE FALLBACK IS 0 DELIBERATELY, and specifically NOT ``os.getsid(0)`` ->
     ``os.getppid()`` (which this returned before review). Those are the
-    durable-pid idiom ``session_hooks._hand_launched_liveness_pid`` uses for
-    T6's hand-launched RECORDS, and they are wrong HERE, because a lease pid
-    is consumed by a REAPER rather than merely displayed: the POSIX session
-    leader is ordinarily the interactive shell, which session_hooks itself
-    documents as living "for the terminal's whole lifetime" -- so it stays
-    alive after the ``claude`` process it stood in for has crashed.
+    durable-pid idiom ``session_ownership_probes.py::EventProbes.hand_launched_liveness_pid``
+    uses for T6's hand-launched RECORDS, and they are wrong HERE, because a
+    lease pid is consumed by a REAPER rather than merely displayed: the POSIX
+    session leader is ordinarily the interactive shell, which lives for the
+    terminal's whole lifetime -- so it stays alive after the ``claude``
+    process it stood in for has crashed.
     ``_pid_alive`` would then answer True forever, and because BOTH staleness
     rules (claim_lease's ``is_stale`` and reap_stale_leases' ``stale_pid``)
     require a DEAD pid AND an aged heartbeat, a crashed holder's lease would
@@ -3692,7 +3853,7 @@ def holder_record_state(
     """Classify *holder*'s registry record -- see ``HolderRecordState``. Never raises."""
     if holder is None or not holder.record_slug:
         return HolderRecordState.UNLINKED
-    if not _is_record_key(holder.record_slug):
+    if not is_record_key(holder.record_slug):
         return HolderRecordState.UNREADABLE
     try:
         record = read_record(holder.record_slug, root=root)
@@ -3871,11 +4032,11 @@ def _read_lease_holder_state(
 def _lease_is_stale(holder: LeaseHolder | None, *, holder_alive: bool, age_secs: float) -> bool:
     """Whether a lease is reapable: heartbeat past LEASE_HEARTBEAT_TTL and no pid vouching for it.
 
-    A running shared-host pid cannot vouch for its session (see _is_shared_session_host).
+    A running shared-host pid cannot vouch for its session (see is_shared_session_host).
     """
     if age_secs <= LEASE_HEARTBEAT_TTL.total_seconds():
         return False
-    return holder is None or not holder_alive or _is_shared_session_host(holder.pid)
+    return holder is None or not holder_alive or is_shared_session_host(holder.pid)
 
 
 def claim_lease(
@@ -4481,6 +4642,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
     cwd = env.get('CLAUDE_SPAWN_CWD') or os.getcwd()
     launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
     launcher_pid = int(launcher_pid_raw) if launcher_pid_raw else os.getpid()
+    self_exit = env.get('CLAUDE_SPAWN_SELF_EXIT') == '1'
 
     identity = parse_spawn_identity(env, title, prompt, cwd)
     slug = build_session_slug(identity.role, identity.project, identity.task_id, launcher_pid)
@@ -4500,6 +4662,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
         start_ts=datetime.now(UTC).isoformat(),
         result_file=str(record_dir / RESULT_FILENAME),
         transcript_path=transcript_path_for_cwd(cwd),
+        self_exit=self_exit,
     )
     write_record(record)
     with contextlib.suppress(Exception):
@@ -4513,7 +4676,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
     return str(record_dir)
 
 
-def _slug_root_from_record_dir(record_dir: str) -> tuple[str, Path]:
+def slug_root_from_record_dir(record_dir: str) -> tuple[str, Path]:
     """Derive (slug, root) from a record dir printed by `launching`.
 
     The dir is ``<root>/sessions/<slug>``, so its name is the slug and its
@@ -4526,12 +4689,12 @@ def _slug_root_from_record_dir(record_dir: str) -> tuple[str, Path]:
 
 
 def _run_exit(record_dir: str, code: int) -> None:
-    slug, root = _slug_root_from_record_dir(record_dir)
+    slug, root = slug_root_from_record_dir(record_dir)
     update_status(slug, root=root, status=Status.EXITED, exit_code=code)
 
 
 def _run_refresh(record_dir: str, status_value: str) -> None:
-    slug, root = _slug_root_from_record_dir(record_dir)
+    slug, root = slug_root_from_record_dir(record_dir)
     refresh_record(slug, root=root, status=Status(status_value))
 
 
@@ -4541,8 +4704,9 @@ def _run_set_display(
     wm_title: str,
     wm_window_id: str | None,
     tmux_target: str | None,
+    t3_thread_id: str | None = None,
 ) -> None:
-    slug, root = _slug_root_from_record_dir(record_dir)
+    slug, root = slug_root_from_record_dir(record_dir)
     update_display(
         slug,
         root=root,
@@ -4550,6 +4714,7 @@ def _run_set_display(
         wm_title=wm_title,
         wm_window_id=wm_window_id,
         tmux_target=tmux_target,
+        t3_thread_id=t3_thread_id,
     )
 
 
@@ -4839,13 +5004,38 @@ def _locked_filing_target(
                 legacy = _read_decision_or_none(local_id)
                 if (
                     legacy is not None
-                    and normalize_project_token(legacy.project) == canonical_project
+                    and fold_project_token(legacy.project) == canonical_project
                 ):
                     yield local_id, legacy
                 else:
                     yield qualified, None
             return
         yield qualified, _read_decision_or_none(qualified)
+
+
+def _resolve_filing_record_slug(local_id: str, project: str) -> str:
+    """Return the record_slug a write-decision filing of *local_id* stamps.
+
+    That is resolve_own_record_slug's slug, else '' after a WARNING, because a
+    blank one leaves that cockpit row unable to focus its filer's session for
+    the record's life (task 7527).
+    """
+    slug = resolve_own_record_slug()
+    if slug is not None:
+        return slug
+    logger.warning(
+        'write-decision --id %s --project %s: $%s=%r resolves to no vouched session record '
+        '(unset, unusable or a shared `claude agents` host pid; or no sessions-by-pid/<pid> '
+        'pointer whose record still names that pid as its owner), so this decision gets a '
+        'BLANK record_slug and its cockpit row cannot focus the filing session (Enter-to-focus) '
+        'for the life of the record. This alone does not refuse the filing; an id on stdout is '
+        'what says it landed.',
+        local_id,
+        project,
+        SESSION_PID_ENV,
+        os.environ.get(SESSION_PID_ENV),
+    )
+    return ''
 
 
 def _run_write_decision(
@@ -4878,12 +5068,19 @@ def _run_write_decision(
     ``record_slug`` is best-effort enrichment derived from ``$CLAUDE_PID``'s
     pid pointer (resolve_own_record_slug), never typed by the caller and
     never a reason to refuse or delay a filing: an unresolvable one is filed
-    as '' and is visible downstream as an unresolved link.
+    as '', is announced by a WARNING at dispatch
+    (_resolve_filing_record_slug), and is visible downstream as an
+    unresolved link.
 
-    ``project`` is stored NORMALIZED (see normalize_project_token, task
-    3807), so ``df``, ``dark-factory`` and ``Dark_Factory`` all persist as
+    ``project`` is stored NORMALIZED (see shared.project_id.fold_project_token,
+    task 3807), so ``df``, ``dark-factory`` and ``Dark_Factory`` all persist as
     the one canonical ``dark_factory`` and ``reap-decisions`` can no longer
-    miss a partition. This NORMALIZES an unrecognized spelling rather than
+    miss a partition. Only ``DecisionRecord.project`` is folded on write:
+    ``SessionRecord.project`` stays raw because it feeds
+    ``build_session_slug``, and the cockpit folds both record kinds at its
+    read boundary (``cockpit/src/cockpit/registry_reader.py``), so any other
+    reader comparing a raw ``SessionRecord.project`` must fold it itself.
+    This NORMALIZES an unrecognized spelling rather than
     REJECTING it, deliberately: (1) this verb is fail-soft by contract --
     main() always returns 0 and write_decision never raises -- so a rejection
     would silently DROP the decision, which is precisely the
@@ -5026,7 +5223,7 @@ def _run_write_decision(
         )
         return
 
-    canonical_project = normalize_project_token(project)
+    canonical_project = fold_project_token(project)
     if canonical_project != project:
         logger.warning(
             'write-decision: normalized --project %r -> %r', project, canonical_project
@@ -5078,7 +5275,7 @@ def _run_write_decision(
             )
             record = incoming
             if existing is not None:
-                if normalize_project_token(existing.project) != canonical_project:
+                if fold_project_token(existing.project) != canonical_project:
                     # SAME id, DIFFERENT project: an id COLLISION, not a
                     # MODE-2 collapse. The id is project-qualified (task
                     # 4835), so this is reachable only when the qualified id
@@ -5091,7 +5288,7 @@ def _run_write_decision(
                     # claiming to be project A's ask while B's human gate is
                     # invisible and unreapable by B's reaper.
                     #
-                    # BOTH sides go through normalize_project_token (task
+                    # BOTH sides go through fold_project_token (task
                     # 3807), exactly as the reap-decisions project axis does.
                     # A raw compare here would read one project's own
                     # historical spellings as a cross-project collision --
@@ -5237,7 +5434,7 @@ def _run_reap_decisions(project: str, escalations_dir: str, *, expect_matches: b
        (``<project_root>/data/escalations``), so a decision belonging to a
        DIFFERENT project is skipped. Scoping this way keeps the join correct
        without fragile project_id -> path auto-discovery. The match is on the
-       CANONICAL token (see normalize_project_token, task 3807), with BOTH
+       CANONICAL token (see fold_project_token, task 3807), with BOTH
        sides normalized -- the reaper's own ``--project`` AND the decision's
        stored value -- so a single run covers every historical spelling of
        one project. A raw compare silently PARTITIONED one project's
@@ -5313,7 +5510,7 @@ def _run_reap_decisions(project: str, escalations_dir: str, *, expect_matches: b
     decision, mirroring `write-decision` printing the filed id.
     """
     reaper_dir = normalize_escalations_dir(escalations_dir)
-    reaper_project = normalize_project_token(project)
+    reaper_project = fold_project_token(project)
 
     # Advisory only (tasks 3813, 4835). Deliberately OUTSIDE _status, so it
     # fires ONCE per invocation rather than once per record scanned -- a
@@ -5332,7 +5529,7 @@ def _run_reap_decisions(project: str, escalations_dir: str, *, expect_matches: b
         # older build), which is exactly the 173 legacy records the migration
         # verb exists to repair; comparing honestly means the fix holds even
         # for a record the migration has not reached yet.
-        if normalize_project_token(decision.project) != reaper_project:
+        if fold_project_token(decision.project) != reaper_project:
             return None
         if decision.escalation_id is None:
             # Belt-and-suspenders, not reachable via reap_answered_decisions
@@ -5521,6 +5718,7 @@ def _build_parser() -> argparse.ArgumentParser:
     set_display_p.add_argument('--tmux-target', default=None)
     set_display_p.add_argument('--wm-title', default='')
     set_display_p.add_argument('--wm-window-id', default=None)
+    set_display_p.add_argument('--t3-thread-id', default=None)
 
     sub.add_parser('reap', help='sweep and remove stale session records')
 
@@ -5620,7 +5818,7 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "this decision's project; stored NORMALIZED to one canonical token "
-            '(see normalize_project_token), so df/dark-factory/Dark_Factory all '
+            '(see fold_project_token), so df/dark-factory/Dark_Factory all '
             'persist as dark_factory'
         ),
     )
@@ -5679,7 +5877,7 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             'project to scope the reap to; matched on the canonical token '
-            '(see normalize_project_token), so ONE run closes every '
+            '(see fold_project_token), so ONE run closes every '
             'historical spelling of that project'
         ),
     )
@@ -5835,7 +6033,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.verb == 'refresh':
             _run_refresh(args.record, args.status)
         elif args.verb == 'set-display':
-            _run_set_display(args.record, args.kind, args.wm_title, args.wm_window_id, args.tmux_target)
+            _run_set_display(
+                args.record,
+                args.kind,
+                args.wm_title,
+                args.wm_window_id,
+                args.tmux_target,
+                args.t3_thread_id,
+            )
         elif args.verb == 'reap':
             _run_reap()
         elif args.verb == 'lease-claim':
@@ -5860,7 +6065,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.session_id,
                 args.severity,
                 args.escalations_dir,
-                record_slug=resolve_own_record_slug() or '',
+                record_slug=_resolve_filing_record_slug(args.id, args.project),
             )
         elif args.verb == 'reap-decisions':
             _run_reap_decisions(

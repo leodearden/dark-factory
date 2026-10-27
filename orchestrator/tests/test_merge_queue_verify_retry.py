@@ -459,7 +459,7 @@ def _make_git_ops_mock() -> MagicMock:
     m.get_main_sha = AsyncMock(return_value='main-sha')
     m.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)
     m.cleanup_merge_worktree = AsyncMock()
-    m.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+    m.create_ephemeral_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
     m.get_head_tree_hash = AsyncMock(return_value='deadbeef')
     return m
 
@@ -1019,7 +1019,7 @@ _PROBED_PLANNED = [
 ]
 
 
-def _verify_result(test_output: str):
+def _verify_result(test_output: str, **overrides):
     from orchestrator.verify import VerifyResult
 
     return VerifyResult(
@@ -1029,6 +1029,7 @@ def _verify_result(test_output: str):
         type_output='',
         summary='attempt-0 red',
         category='disk_pressure',
+        **overrides,
     )
 
 
@@ -1075,10 +1076,20 @@ async def test_build_attempt0_payload_narrows_only_the_first_profile(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('run_all_failed_members', 'expected_members'),
+    [
+        pytest.param(None, ['test_skip_ledger.sh'], id='channel-absent-text-parse'),
+        pytest.param(['test_from_channel.sh'], ['test_from_channel.sh'], id='channel-present'),
+    ],
+)
 async def test_build_attempt0_payload_fields_come_from_df_owned_sources(
     tmp_path: Path,
+    run_all_failed_members: list[str] | None,
+    expected_members: list[str],
 ) -> None:
-    """tree_oid from reify's sidecar; run_all members parsed; gui_specs empty."""
+    """tree_oid from reify's sidecar; run_all members from the channel, else
+    parsed (C3 rule 3); gui_specs empty."""
     from orchestrator.merge_lane import worker as mq
 
     _place_real_sidecar(tmp_path)
@@ -1088,13 +1099,14 @@ async def test_build_attempt0_payload_fields_come_from_df_owned_sources(
 
     with patch.object(mq, '_probe_nextest_planned', _fake_probe):
         payload = await mq._build_attempt0_payload(
-            tmp_path, _verify_result(_FAIL_FAST_OUTPUT)
+            tmp_path,
+            _verify_result(_FAIL_FAST_OUTPUT, run_all_failed_members=run_all_failed_members),
         )
 
     assert payload is not None
     expected_oid = json.loads(_REIFY_SIDECAR_FIXTURE.read_text())['tree_oid']
     assert payload.tree_oid == expected_oid
-    assert payload.run_all_members == ['test_skip_ledger.sh']
+    assert payload.run_all_members == expected_members
     # Deliberately empty: no real reify gui failure log was available to pin a
     # fixture to, and an empty value makes verify.sh run the FULL gui suite.
     assert payload.gui_specs == []

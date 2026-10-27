@@ -22,23 +22,40 @@ do not yet exist.
 from __future__ import annotations
 
 import asyncio
+import threading
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _escalation_server_capture import create_server_kwargs
+from escalation.queue import EscalationQueue
+from shared.project_layout import escalation_queue_dir
 
+from orchestrator.background_service import BackgroundService, ManagedService
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.flake_debt_drain import STALE_DUE_ESCALATION_SENTINEL
+from orchestrator.flake_ledger import (
+    DueItem,
+    FlakeCallSite,
+    enqueue_debt,
+    ledger_db_path,
+    read_due_items,
+    record_failed_due_attempt,
+)
 from orchestrator.harness import Harness
 from orchestrator.verify_admission_gate import AdmissionPlan, AdmissionPolicy, gate_for
 
 # Canonical start-order registration list — task 2241 plan.json "HARNESS
-# MIGRATION": escalation-server and merge-worker first (the recovery block
-# depends on both being live); the remaining bespoke adapter (offline-lane)
+# MIGRATION": the loop-stall monitor first, so it watches every other
+# service's whole life and stops last (task 7366); then escalation-server and
+# merge-worker (the recovery block depends on both being live); the remaining bespoke adapter (offline-lane)
 # and the seven BackgroundService sweeps follow, then the always-on services
 # that keep their cadence whatever the dispatch loop does (task 5344; the
-# verify-admission watch, task 5628).
+# verify-admission watch, task 5628; the flake-debt drain, task 6934).
 _CANONICAL_ORDER = [
+    'loop-stall-monitor',
     'escalation-server',
     'merge-worker',
     'offline-lane',
@@ -53,6 +70,7 @@ _CANONICAL_ORDER = [
     'stale-service-restart',
     'merge-heartbeat',
     'verify-admission-watch',
+    'flake-debt-drain',
 ]
 
 
@@ -91,6 +109,32 @@ class TestLifecycleRegistrationOrder:
         names = [s.name for s in harness._lifecycle.services]
         assert 'warm-lane-gc' not in names
         assert names == [n for n in _CANONICAL_ORDER if n != 'warm-lane-gc']
+
+    @pytest.mark.asyncio
+    async def test_the_first_service_is_a_live_loop_stall_monitor(
+        self, tmp_path: Path,
+    ) -> None:
+        harness = Harness(OrchestratorConfig(project_root=tmp_path))
+        harness._build_lifecycle_registry()
+        assert harness._lifecycle is not None
+        first = harness._lifecycle.services[0]
+        assert isinstance(first, ManagedService)
+        assert first.name == 'loop-stall-monitor'
+
+        await first.start()
+        try:
+            assert len(_live_stall_watchdogs()) == 1
+        finally:
+            await first.stop()
+
+        assert _live_stall_watchdogs() == []
+
+
+def _live_stall_watchdogs() -> list[threading.Thread]:
+    return [
+        t for t in threading.enumerate()
+        if t.name == 'loop-stall-watchdog' and t.is_alive()
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -285,3 +329,62 @@ class TestVerifyAdmissionWatchPass:
         assert len(store.fetch_events_by_type(EventType.verify_admission_heartbeat)) == 1
         [aged] = store.fetch_events_by_type(EventType.verify_admission_wait_aged)
         assert aged['data']['waiter']['task_id'] == 'W'
+
+
+# ---------------------------------------------------------------------------
+# task 6934: the flake-debt drain pass reads the escalation queue the harness
+# creates AFTER the registry is built
+# ---------------------------------------------------------------------------
+
+
+class TestFlakeDebtDrainPass:
+    """The registered ``flake-debt-drain`` pass reaches the live escalation queue.
+
+    ``_build_lifecycle_registry`` runs before ``_start_escalation_server`` creates
+    the queue, so a queue captured at registration would be ``None`` for the
+    drain's whole life and its stale-item escalation would degrade to a log line.
+    """
+
+    @pytest.mark.asyncio
+    async def test_pass_files_the_stale_item_escalation_on_the_harness_queue(
+        self, tmp_path: Path,
+    ) -> None:
+        config = OrchestratorConfig(project_root=tmp_path)
+        config.escalation.host = '127.0.0.1'
+        config.escalation.port = 0
+        h = Harness(config)
+        h.review_checkpoint = None
+        h._build_lifecycle_registry()
+        await create_server_kwargs(h)
+
+        db_path = ledger_db_path(tmp_path)
+        now = datetime.now(UTC)
+        enqueue_debt(
+            db_path,
+            config.fused_memory.project_id,
+            [DueItem(
+                test_id='tests/test_flaky.py::test_x',
+                observed_at=now.isoformat(),
+                call_site=FlakeCallSite.merge_gate,
+                head=None,
+                observing_task_id=None,
+            )],
+            now=now - timedelta(minutes=31),
+        )
+        [item] = read_due_items(db_path, now=now + timedelta(days=1), limit=10) or []
+        assert record_failed_due_attempt(
+            db_path, item.id, reason='task_client_failed',
+            next_attempt_at=now + timedelta(hours=1),
+        )
+
+        assert h._lifecycle is not None
+        [drain] = [
+            s for s in h._lifecycle.services
+            if isinstance(s, BackgroundService) and s.name == 'flake-debt-drain'
+        ]
+        await drain.pass_fn()
+
+        fresh = EscalationQueue(escalation_queue_dir(tmp_path))
+        [record] = fresh.get_by_task(STALE_DUE_ESCALATION_SENTINEL, status='pending')
+        assert record.level == 1
+        assert record.category == 'infra_issue'

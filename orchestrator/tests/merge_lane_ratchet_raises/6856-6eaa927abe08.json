@@ -1,0 +1,42 @@
+{
+  "task_id": "6856",
+  "reason": "C3 rule 3: shadow.py gains the channel-or-text run_all failed-member selector (consumer of reify's REIFY_VERIFY_EVENT_LOG)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/shadow.py",
+      "baseline": 134,
+      "current": 135
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/shadow.py",
+      "baseline": 1812,
+      "current": 1824
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/shadow.py",
+      "baseline": 1042,
+      "current": 1046
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4992,
+      "current": 4993
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58693,
+      "current": 58705
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31953,
+      "current": 31957
+    }
+  ]
+}

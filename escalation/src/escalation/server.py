@@ -7,7 +7,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, assert_never, cast
@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Any, assert_never, cast
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import Field, ValidationError
-from shared.branch_names import canonical_queued_branch_name
+from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
 from shared.eval_lane import eval_lane_provenance
 
 # Fully qualified rather than `from shared import ...`: the module is
@@ -45,6 +45,7 @@ from escalation.authority import (
     l2_auto_close_class,
 )
 from escalation.canonical import canonical_root_cause
+from escalation.categories import UnregisteredEscalationCategory, require_registered_category
 from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe_off_loop as _dedupe_submit_or_dedupe_off_loop
@@ -60,23 +61,29 @@ from escalation.merge_status_answer import (
     hint_for,
     map_terminal_state,
 )
+from escalation.mismatch_streak import DEFAULT_MISMATCH_STREAK_THRESHOLD, MismatchStreak
 from escalation.models import (
     ACTION_KEEP_DRIVING,
     ACTION_TERMINATE_CLEANLY,
     AGENT_FILABLE_LEVELS,
     BORN_AT_L2_SEVERITIES,
     KNOWN_SEVERITIES,
+    NOTE_TO_FILE_CLASS,
     RESOLUTION_CLASSES,
     STATUS_ACCEPTED_UNPERSISTED,
     Escalation,
     EvidenceEntry,
     max_severity,
+    note_to_file_class_conflict,
 )
+from escalation.note_to_file import file_note_to_file, note_to_file_refusal
 from escalation.pins import classify_pins
-from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
+from escalation.project_root_guard import ProjectRootGuard
+from escalation.queue import AmendmentOutcome, EscalationQueue, blank_resolve_outcome
 from escalation.queue import observed_submit_response as _observed_submit_response
 from escalation.related_pending import related_pending
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
+from escalation.sha_citations import resolve_cited_shas
 from escalation.store_identity import StoreIdentity
 from escalation.tool_description_block import AppendToEveryToolDescription
 
@@ -85,6 +92,7 @@ if TYPE_CHECKING:
         MergeQueueStore,
         PersistedMergeRequest,
     )
+    from orchestrator.merge_lane.types import LaneMetadataWrite
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +140,25 @@ def _read_members(queue: EscalationQueue, member_ids: list[str]) -> dict[str, Es
     archive each time.
     """
     return {mid: queue.get(mid) for mid in dict.fromkeys(member_ids)}
+
+
+def _partition_usable_members(
+    members: dict[str, Escalation | None],
+) -> tuple[dict[str, str], list[str]]:
+    """Split *members* into ``({id: severity} usable, [id] unusable)``.
+
+    USABLE means the id resolves AND its severity is in ``KNOWN_SEVERITIES``;
+    :func:`_derive_l2_severity` says why.  The one home of that rule for both
+    the derivation and :func:`_info_only_refusal`.
+    """
+    usable: dict[str, str] = {}
+    unusable: list[str] = []
+    for mid, member in members.items():
+        if member is not None and member.severity in KNOWN_SEVERITIES:
+            usable[mid] = member.severity
+        else:
+            unusable.append(mid)
+    return usable, unusable
 
 
 def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
@@ -183,21 +210,17 @@ def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
     seed would be indistinguishable from a real info member, and the explicit
     nothing-usable branch is what carries the fail-safe.
     """
-    resolved: list[str] = []
-    unusable: list[str] = []
-    for mid, member in members.items():
-        if member is None:
-            unusable.append(mid)
-        elif member.severity not in KNOWN_SEVERITIES:
+    usable, unusable = _partition_usable_members(members)
+    for mid in unusable:
+        member = members[mid]
+        if member is not None:
             logger.warning(
                 'promote_to_l2: member escalation %s carries out-of-vocabulary '
                 'severity %r (expected one of %s); excluding it from the derived '
                 'L2 severity rather than propagating it.',
                 mid, member.severity, sorted(KNOWN_SEVERITIES),
             )
-            unusable.append(mid)
-        else:
-            resolved.append(member.severity)
+    resolved = list(usable.values())
 
     if not resolved:
         logger.warning(
@@ -218,6 +241,57 @@ def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
     for sev in resolved[1:]:
         derived = max_severity(derived, sev)
     return derived
+
+
+def _info_only_refusal(members: dict[str, Escalation | None]) -> dict[str, Any]:
+    """The ``info_only_cluster`` refusal for a cluster that derived ``'info'``.
+
+    The refusal's ``members`` key names only the records the derivation used —
+    each one ``'info'``, since they derived ``'info'`` — so each is safe to
+    close at L1.  Every other id goes to ``unusable``: a phantom id has no
+    record to close, and an out-of-vocabulary severity is not known to be
+    informational.  The *members* argument is :func:`_read_members`' answer.
+    """
+    usable, unusable = _partition_usable_members(members)
+    return {
+        'status': 'refused',
+        'code': 'info_only_cluster',
+        'members': list(usable),
+        'unusable': unusable,
+        'derived_severity': 'info',
+    }
+
+
+def _park_on_info_refusal(rec: Escalation) -> dict[str, Any] | None:
+    """The ``park_on_info`` refusal for parking a never-pinning *rec*, else None.
+
+    Whether *rec* pins is the pin chain's answer
+    (``escalation/src/escalation/pins.py::classify_pins``), whose non-pinning
+    class is the info record (link 1). A park could not hold that record's task
+    (task 6578). The chain is asked with no live claimant, because the park's
+    teardown kills the run before the stranded-blocked sweep looks.
+    """
+    if not classify_pins(rec.task_id, [rec], live_claimant=False).non_pinning:
+        return None
+    return {
+        'error': (
+            f'refusing to park info-severity escalation {rec.id} (task '
+            f'{rec.task_id}): an info record never pins its task (pins.py '
+            'link 1), so the park could not hold it and the stranded-blocked '
+            'sweep would re-pend it'
+        ),
+        'code': 'park_on_info',
+        'hint': (
+            f'to hold task {rec.task_id}, defer it on fused-memory: '
+            f"set_task_status(id='{rec.task_id}', status='deferred', "
+            f"deferral={{'kind': 'until_condition', 'condition': 'Leo rules "
+            f"{rec.id}', 'reason': '<one line>'}}) -- see "
+            'docs/task-authoring.md §9 "Deferring a task". Otherwise leave '
+            f"{rec.id} pending, or close it with action='close_only'."
+        ),
+        'escalation_id': rec.id,
+        'task_id': rec.task_id,
+    }
 
 
 def _sentinel_bound_task_ids(members: dict[str, Escalation | None]) -> frozenset[str]:
@@ -285,7 +359,8 @@ def _amend_not_pending_refusal(escalation_id: str, status: str) -> dict[str, str
 
 
 # The role the steward's own filings carry (orchestrator.steward
-# _auto_escalate_to_human hard-codes ``agent_role='steward'``). Level-1 is the
+# _auto_escalate_to_human files under orchestrator.agents.roles.STEWARD.name,
+# which escalation cannot import). Level-1 is the
 # steward's documented recourse, so an L1 from this role — or from a harness
 # sentinel — is the EXPECTED shape and is not logged.
 _EXPECTED_L1_FILER_ROLE = 'steward'
@@ -421,11 +496,27 @@ def _get_merge_journal(harness: Any | None) -> MergeQueueStore | None:
 
 @dataclass(frozen=True)
 class _PollKey:
-    """One merge_status lookup: request_id outranks branch, which outranks task_id."""
+    """One merge_status lookup: request_id outranks branch, which outranks task_id.
+
+    ``branch`` holds the bare id every producer writes (``QueuedBranch.bare_id``),
+    so a key carrying a branch is built through :meth:`parse`.
+    """
 
     request_id: str | None = None
     branch: str | None = None
     task_id: str | None = None
+
+    @classmethod
+    def parse(
+        cls,
+        *,
+        request_id: str | None,
+        branch: str | None,
+        task_id: str | None,
+        branch_prefix: str,
+    ) -> _PollKey:
+        bare = bare_queued_branch_id(branch, branch_prefix) if branch is not None else None
+        return cls(request_id=request_id, branch=bare, task_id=task_id)
 
     @property
     def landing_key(self) -> str | None:
@@ -460,29 +551,51 @@ class _ProbeFailed(Exception):
         )
 
 
-def _require_matching_project_root(harness: Any, project_root: str) -> str | None:
-    """Return an error message if *project_root* doesn't match this server's project.
+def _require_matching_project_root(wired_root: Path, project_root: str) -> str | None:
+    """Return an error message if *project_root* doesn't match *wired_root*.
 
-    The escalation server closes over exactly one project's ``harness``, so
-    *project_root* can never be used to route a call — it is a defensive
-    validation guard.  Resolved-path equality (not string equality) so
-    trailing slashes / relative segments / symlink differences don't produce
-    false-positive mismatches.  Returns None when they match.
+    The escalation server closes over exactly one project, so *project_root*
+    can never be used to route a call — it is a defensive validation guard.
+    Resolved-path equality (not string equality) so trailing slashes /
+    relative segments / symlink differences don't produce false-positive
+    mismatches.  Returns None when they match.
 
     Shared by claim_warm_worktree and release_warm_worktree (PRD β, task
-    2011) so a multi-project interactive caller (/do, /warm) that mis-targets
-    an escalation MCP endpoint gets a clean testable failure instead of
-    claiming/releasing a worktree against the wrong orchestrator.
+    2011), which pass their harness's git_ops root, and by
+    ``_project_root_refusal``, which passes the store identity's root, so a
+    caller that mis-targets an escalation MCP endpoint gets one clean,
+    testable failure wording.
     """
-    gops_root = Path(harness.git_ops.project_root).resolve()
+    wired_resolved = wired_root.resolve()
     given_root = Path(project_root).resolve()
-    if given_root != gops_root:
+    if given_root != wired_resolved:
         return (
             f'project_root mismatch: {project_root!r} does not match this '
-            f"server's wired project ({harness.git_ops.project_root!s}, "
-            f'resolved {gops_root!s}).'
+            f"server's wired project ({wired_root!s}, "
+            f'resolved {wired_resolved!s}).'
         )
     return None
+
+
+def _project_root_refusal(identity: StoreIdentity, project_root: str) -> str | None:
+    """The PRD §6.3 verdict on an asserted *project_root*: a refusal message, or None to proceed.
+
+    ``create_server`` hands it to ``escalation.project_root_guard::ProjectRootGuard``.
+    """
+    if identity.kind == 'reconciliation':
+        return (
+            f'this endpoint serves the reconciliation store ({identity.queue_dir}), '
+            'not a project task queue; it never contains orchestrator task escalations '
+            f'(asserted project_root={project_root!r}).'
+        )
+    assert identity.project_root is not None
+    mismatch = _require_matching_project_root(identity.project_root, project_root)
+    if mismatch is None:
+        return None
+    return (
+        f'{mismatch} This endpoint serves project {identity.project_id!r} '
+        f'(escalation store {identity.queue_dir}).'
+    )
 
 
 def _project_task_runtime_entry(s: Any) -> TaskRuntimeEntry:
@@ -538,29 +651,6 @@ def _project_task_runtime_entry(s: Any) -> TaskRuntimeEntry:
 RESOLVE_ACTIONS: tuple[str, ...] = ('resume', 'restart', 'park', 'abandon', 'close_only')
 # park is no longer dismissed — it keeps the record open at L2 (version-a).
 _DISMISS_ACTIONS: frozenset[str] = frozenset({'abandon', 'close_only'})
-
-CATEGORIES = [
-    'scope_violation',
-    'design_concern',
-    'cleanup_needed',
-    'dependency_discovered',
-    'risk_identified',
-    'infra_issue',
-    'task_failure',
-    # Reconciliation categories
-    'recon_failure',
-    'recon_backlog_overflow',
-    'recon_stale_run',
-    'recon_integrity_issue',
-    # Review triage
-    'review_suggestions',
-    # Stranded-blocked recovery (PRD-3 D5 / C6)
-    'stranded_blocked',
-    # Verified-green stranded remediation: durable merge/verify failure of a
-    # reaper-submitted branch (stranding-remediation-scheduler-ergonomics-prd.md
-    # leaf α).  Inert/unvalidated (action_effects.py:23) — vocabulary parity only.
-    'stranded_merge_failed',
-]
 
 # OUTPUT keys of a compact row — the triage-relevant subset a long-running L2
 # watcher needs to decide whether to pull a full record.  NOTE these are output
@@ -635,6 +725,30 @@ _COMPACT_ESCALATION_FIELDS = (
     # and giving absence a second, different meaning on a neighbouring key would
     # be exactly the legibility trap that contract exists to prevent.
     'pin_declared_by',
+    # project_id (task 4951) is DELIBERATELY NOT PROJECTED — decided in task 5776
+    # (won't-fix), so do not re-file it as an oversight.
+    #
+    # THE GAP IS REAL BUT NARROW: the reconciliation queue is shared across
+    # projects, so a compact row there cannot name its subject project.  An
+    # orchestrator queue is per-project (each endpoint serves one project), so
+    # for those the answer is already the endpoint itself.
+    #
+    # WHY IT IS NOT WORTH A KEY ON EVERY ROW: (1) the in-repo consumers
+    # (orphaned_recon_escalation_sweep.py::escalation_project_id and
+    # derive_orphaned_recon_escalations.py) read FULL records, so nothing needs
+    # it; (2) `None` means UNSTAMPED, and `attach_dedupe_child` never backfills a
+    # folded parent, so a parent filed before 4951 never gains it — a compact
+    # reader would see `null`, could not tell "legacy" from "no project", and
+    # would STILL need a get_escalation round-trip for exactly the records it
+    # cares about; (3) it costs ~20 bytes (`"project_id":null`) on
+    # EVERY compact row, including the dashboard's fetch_pins_recovery poll that
+    # reads nothing but `pins_recovery`, for a value that is null on the
+    # overwhelming majority.
+    #
+    # IF A PROJECT-SCOPED COMPACT DRAIN EVER EXISTS: add a server-side
+    # `project_id` filter to get_pending_escalations (one filtered value per
+    # call, no per-row cost) rather than widening this tuple — and note that no
+    # such filter exists today.
 )
 
 # get_pending_escalations(compact=True) additionally keeps its computed
@@ -1014,15 +1128,17 @@ def create_server(
     startup_sweep: bool = True,
     startup_sweep_now: datetime | None = None,
     store_identity: StoreIdentity | None = None,
+    mismatch_streak_threshold: int = DEFAULT_MISMATCH_STREAK_THRESHOLD,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
 
     *harness* is the running ``orchestrator.harness.Harness``.  When passed,
     it enables the ``release_workflow`` tool which lets external callers
     (humans via /unblock, automation) ask the orchestrator to soft-cancel a
-    workflow whose task has been completed out-of-band.  When omitted (e.g.
-    in tests with no orchestrator), the tool reports that no workflow is
-    active.
+    workflow whose task has been completed out-of-band, and the
+    ``clear_verify_host_quarantine`` operator clear.  When omitted (e.g. in
+    tests with no orchestrator), both tools report that no orchestrator is
+    attached.
 
     *dedupe_config* controls infra_issue deduplication.  When omitted,
     ``DedupeConfig()`` is used (enabled, 600 s window, infra_issue category).
@@ -1056,9 +1172,12 @@ def create_server(
     registry is never imported, preserving the standalone import path.
 
     *startup_sweep* (default True) — when True, runs
-    ``sweep.run_startup_sweep(queue.queue_dir)`` at construction time (the
-    pre-serving single-writer window) to relocate resolved/dismissed root
-    orphans and loose archive files, and prune stale dated subdirs.  Non-fatal:
+    ``sweep.run_startup_sweep(queue.queue_dir)`` at construction time, before
+    the server binds, to relocate resolved/dismissed root orphans and loose
+    archive files, prune stale dated subdirs and reap orphaned sidecar locks.
+    Other processes write the same queue directory concurrently; the
+    concurrency contract the sweep honours is stated in the
+    ``escalation/src/escalation/sweep.py`` module docstring.  Non-fatal:
     any exception is logged at WARNING level and the server continues binding.
     Pass False in tests that pre-populate the queue and do not want the sweep
     to run.
@@ -1073,8 +1192,15 @@ def create_server(
     (``escalation.store_identity::StoreIdentity``), passed by both production
     call sites.  When given, one transform appends the PRD §6.2 store-identity
     block to every tool's description; None leaves each description exactly
-    its docstring.  ``plans/escalation-store-ambiguity-prd.md`` §6.3 specifies
-    its other consumer.
+    its docstring.  It is also read by the optional ``project_root`` guard
+    (``escalation.project_root_guard::ProjectRootGuard``,
+    ``plans/escalation-store-ambiguity-prd.md`` §6.3): a tool call asserting a
+    root this store does not serve is refused; with no identity, nothing is.
+
+    *mismatch_streak_threshold* (default 5) — how many refused assertions of
+    one ``project_root`` within the streak's window file (or fold) ONE
+    ``infra_issue`` L1 into this server's own queue
+    (``escalation.mismatch_streak::MismatchStreak``).
     """
     mcp = FastMCP('escalation', instructions=ESCALATION_SERVER_INSTRUCTIONS)
     if store_identity is not None:
@@ -1159,13 +1285,14 @@ def create_server(
         subject_task_id = record.get('subject_task_id')
         detail = '\n'.join([
             # WHOSE call leaked. Rendered FIRST and unconditionally because on
-            # this server it is the only attribution that ever resolves: the
+            # this server it is the only attribution that always resolves: the
             # middleware's `_identity` reads `agent_id` / `project_root` /
-            # `project_id` off the call's own arguments, and no escalation tool
-            # declares any of the three, so the two fields below it are
-            # structurally None here. The record's own `task_id` is the
-            # synthetic anchor, not the caller's, so without these two lines a
-            # critical L2 record names nobody at all.
+            # `project_id` off the call's own arguments; no escalation tool
+            # declares `agent_id` or `project_id`, and the five that accept an
+            # OPTIONAL `project_root` see it omitted by fleet callers, so
+            # `project` below usually stays None. The record's own `task_id` is
+            # the synthetic anchor, not the caller's, so without these two
+            # lines a critical L2 record names nobody at all.
             f'subject_task_id={subject_task_id!r}',
             f'subject_agent_role={record.get("subject_agent_role")!r}',
             # The OWNER that will exit this hold unprompted (INV-7), read off
@@ -1315,7 +1442,16 @@ def create_server(
 
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
 
-    # --- Startup sweep (pre-serving single-writer window) ---
+    # --- Optional project_root assertion (PRD §6.3) ---
+    # Sync tools call check() directly: FastMCP already runs them on a worker
+    # thread.  Async tools await check_off_loop().
+    project_root_guard = ProjectRootGuard(
+        store_identity,
+        MismatchStreak(queue, threshold=mismatch_streak_threshold),
+        _project_root_refusal,
+    )
+
+    # --- Startup sweep (before binding; other processes write this queue concurrently) ---
     if startup_sweep:
         try:
             _sweep.run_startup_sweep(queue.queue_dir, now=startup_sweep_now)
@@ -1649,6 +1785,8 @@ def create_server(
                with resolution_action='close_only' via submit_resolved before
                ANY other gate or lookup, so no argument can mint it pending or
                at L2
+          (claimant stamp, then) esc.note_to_file → file_note_to_file: resolved
+               note-to-file, archived; no downgrade, gate 1-4 or dedupe runs
           1. terminal_state_is_the_bug=True  → bypass (submit normally)
           2. category == 'review_suggestions' → bypass (A4b owns this category)
           3. task_status_lookup is None       → bypass (chokepoint disabled)
@@ -1674,7 +1812,7 @@ def create_server(
                 'production signal, the eval measurement is scored from the '
                 'cell result artifacts',
                 resolved_by='escalation-eval-lane-containment',
-                resolution_class='benign',
+                resolution_class=NOTE_TO_FILE_CLASS if esc.note_to_file else 'benign',
             )
             return {
                 'id': contained.id,
@@ -1717,6 +1855,9 @@ def create_server(
                 # Normalise blank/whitespace-only to None so an empty string
                 # never reaches pins._norm_id as a pseudo-value.
                 esc.filing_claimant_run_id = (_claimant or '').strip() or None
+
+        if esc.note_to_file:
+            return file_note_to_file(queue, esc)
 
         # C4/D3: Agent-role severity downgrade — runs FIRST, before the born-at-L2
         # stamp, so the existing level=2 gate and the _submit_or_dedupe L2-bypass
@@ -1833,11 +1974,16 @@ def create_server(
         workflow_state: str | None = None,
         evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
+        project_root: str | None = None,
+        note_to_file: bool = False,
     ) -> dict[str, Any]:
         """Report a non-blocking observation. The agent continues working after this call.
 
         Categories: scope_violation, design_concern, cleanup_needed,
-        dependency_discovered, risk_identified, infra_issue.
+        dependency_discovered, risk_identified, infra_issue.  Any category must
+        be a registered ``escalation.categories.EscalationCategory`` value; an
+        unregistered one is rejected with an ``{'error': ...}`` response naming
+        the closest registered values.
 
         *severity* defaults to ``'info'``.  Pass ``'critical'`` or ``'urgent'`` to
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
@@ -1865,7 +2011,16 @@ def create_server(
         fact.  A single observation is not sufficient to recommend a destructive
         intervention (a ref move / rewind) — re-run or re-measure first.
 
+        *note_to_file* — set True for a record that requests nothing: a note
+        kept for the archive.  Info severity only; any other severity is
+        refused with ``code='note_to_file_requires_info'`` and nothing is
+        written.  The note is filed resolved (``resolution_class:
+        note-to-file``) and archived at filing, so no reviewer, steward or
+        watcher reads it, and the task is untouched.
+
         Response shape (``level`` is present on every branch):
+        - Note to file:           ``{id, status, resolution_class, level}``
+          where status='resolved' and resolution_class='note-to-file'
         - Queued (task alive):    ``{id, status, level}``  where status='queued'
         - Deduped (folded):       ``{id, status, parent_id, child_id, level}``
           (L2 escalations are never deduped — they always produce 'queued')
@@ -1884,6 +2039,8 @@ def create_server(
           ``action`` key — that is only on the blocker path — so an info filer
           simply carries on, as it already does on every other branch.
         """
+        if (refusal := await project_root_guard.check_off_loop(project_root)) is not None:
+            return refusal
         if severity not in KNOWN_SEVERITIES:
             return {
                 'error': (
@@ -1891,6 +2048,12 @@ def create_server(
                     f'expected one of {sorted(KNOWN_SEVERITIES)}'
                 ),
             }
+        try:
+            require_registered_category(category)
+        except UnregisteredEscalationCategory as exc:
+            return {'error': str(exc)}
+        if note_to_file and (refusal := note_to_file_refusal(severity)) is not None:
+            return refusal
         esc_id = await asyncio.to_thread(queue.make_id, task_id)
         esc = Escalation(
             id=esc_id,
@@ -1904,6 +2067,7 @@ def create_server(
             worktree=worktree,
             workflow_state=workflow_state,
             evidence=cast(list[EvidenceEntry], evidence or []),
+            note_to_file=note_to_file,
         )
         # Returns {id, status} or resolved record.
         # No 'action' key — that is only on the blocker path.
@@ -1923,6 +2087,7 @@ def create_server(
         evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
         level: int = 0,
+        project_root: str | None = None,
     ) -> dict[str, Any]:
         """Report a blocking problem. After calling this, follow the response's
         ``action``: on ``'terminate_cleanly'`` commit any in-progress work, log your
@@ -1933,7 +2098,10 @@ def create_server(
         the repeat is bounded at one).
 
         Categories: scope_violation, design_concern, cleanup_needed,
-        dependency_discovered, risk_identified, infra_issue.
+        dependency_discovered, risk_identified, infra_issue.  Any category must
+        be a registered ``escalation.categories.EscalationCategory`` value; an
+        unregistered one is rejected with an ``{'error': ...}`` response naming
+        the closest registered values.
 
         *severity* defaults to ``'blocking'``.  Pass ``'critical'`` or ``'urgent'`` to
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
@@ -2025,6 +2193,8 @@ def create_server(
           way — so its state is unknown).  ``action`` is
           ``'terminate_cleanly'`` on every OTHER branch above.
         """
+        if (refusal := await project_root_guard.check_off_loop(project_root)) is not None:
+            return refusal
         if severity not in KNOWN_SEVERITIES:
             return {
                 'error': (
@@ -2032,6 +2202,10 @@ def create_server(
                     f'expected one of {sorted(KNOWN_SEVERITIES)}'
                 ),
             }
+        try:
+            require_registered_category(category)
+        except UnregisteredEscalationCategory as exc:
+            return {'error': str(exc)}
         # Task 3236: validate `level` BEFORE constructing the Escalation, using
         # the same {'error': ...} early-return shape as the severity guard above,
         # so a misconfigured caller gets immediate feedback instead of a
@@ -2141,6 +2315,9 @@ def create_server(
         |              |            | workflow effect            |                        |
         +--------------+------------+----------------------------+------------------------+
 
+        A ``park`` on an info-severity target is refused with code
+        ``park_on_info`` and the record is not touched (see Gate precedence).
+
         **Resolution text** reaches the agent only on the L0 live-resume path
         (``action='resume'``).  For all other actions the text is stored on the
         record for audit purposes but is not injected into any agent briefing.
@@ -2171,9 +2348,11 @@ def create_server(
         against ``escalation.models.RESOLUTION_CLASSES`` before any gate runs
         or the record is touched; an unrecognised value returns
         ``{'error': ..., 'code': 'invalid_resolution_class'}`` with NO record
-        change. Written only at resolution — never author-supplied
-        otherwise. Not forwarded to the ``park`` action (the record stays
-        open at L2, unclassified until eventually resolved).
+        change. A class that conflicts with the record's ``note_to_file``
+        flag (``escalation.models.note_to_file_class_conflict``) returns the
+        same code, also with no record change. Written only at resolution —
+        never author-supplied otherwise. Not forwarded to the ``park`` action
+        (the record stays open at L2, unclassified until eventually resolved).
 
         **A resolve on an ALREADY-AUTO-DISMISSED record does NOT take effect**
         (task 4495).  ``queue.resolve``'s status check is an atomic
@@ -2238,12 +2417,15 @@ def create_server(
         ``escalation.action_effects`` module docstring for the archive
         verification behind this).
 
-        **Gate precedence**: the connection-capability gate (``bad_capability_header``
-        / ``level_forbidden``, checked first) runs BEFORE this Table B legality
-        gate. A caller that both asserts a forbidden/unparseable capability
-        header AND passes an illegal ``action`` receives the capability error,
-        not ``illegal_transition`` — no record is mutated by either gate, so
-        this ordering is an error-reporting precedence only, not a correctness
+        **Gate precedence**, in order: the connection-capability gate
+        (``bad_capability_header`` / ``level_forbidden``) → this Table B
+        legality gate (``illegal_transition``) → the park-on-info gate
+        (``park_on_info``, via ``_park_on_info_refusal``; ``park`` only, on an
+        info-severity target, because an info record never pins its task,
+        pins.py link 1) → park's early return → the declared-pin gate
+        (``declared_pin_refused``). A caller failing several gates receives the
+        earliest one's error. None of these gates mutates the record, so the
+        ordering is an error-reporting precedence only, not a correctness
         difference.
 
         **Declared-pin gate** (task 4377).  A record carrying
@@ -2320,17 +2502,16 @@ def create_server(
         POSITIONALLY (the gate sits after park's early return) so it cannot be
         got wrong by a later edit.
 
-        In the **Gate precedence** ordering this gate runs LAST: after
-        ``bad_capability_header`` / ``level_forbidden`` and after
-        ``illegal_transition``, so a caller failing several gates learns about
-        the capability and legality problems first.  None of the four mutates
-        the record, so the ordering is an error-reporting precedence only.
+        In the **Gate precedence** ordering this gate runs LAST: after the
+        capability, Table B and park-on-info gates, so a caller failing several
+        gates learns about the capability and legality problems first.  None
+        of them mutates the record, so the ordering is an error-reporting
+        precedence only.
 
-        NOTE: the ``target_status`` values above are not yet written by
-        resolve_issue — this call changes only the escalation record; the
-        task-status effects described in the table earlier in this docstring
-        remain owned by the orchestrator harness. Wiring the harness to
-        consume Table B directly is a separate, out-of-scope follow-up.
+        NOTE: resolve_issue itself writes no task status — this call changes
+        only the escalation record. The orchestrator harness applies the
+        ``target_status`` values above. Table B's consumers are listed in the
+        ``escalation/src/escalation/action_effects.py`` module docstring.
         """
         if terminate is not None:
             return {
@@ -2376,14 +2557,20 @@ def create_server(
                 }
         identity = headers.get(_IDENTITY_HEADER)
 
-        # Single record lookup reused by the capability gate below, the Table B
-        # gate further down, and the pre-stamp write after it. queue.get() reads
-        # from disk, so identity-mapped callers previously paid for two reads
-        # per resolve (once for the ceiling check, again for Table B); one
-        # fetch is now shared by both gates (efficiency note, PRD C8/D7 review).
+        # Single record lookup reused by the capability gate below and the Table
+        # B and declared-pin gates further down. queue.get() reads from disk,
+        # so identity-mapped callers previously paid for two reads per resolve
+        # (once for the ceiling check, again for Table B); one fetch is now
+        # shared by the gates (efficiency note, PRD C8/D7 review). `rec` is a
+        # read-only GATING snapshot: no write uses it, because every write goes
+        # through a queue method that re-reads under `escalation_id_lock`.
         rec = queue.get(escalation_id)
         if rec is None:
             return {'error': f'Escalation {escalation_id} not found'}
+        if resolution_class is not None and (
+            conflict := note_to_file_class_conflict(rec, resolution_class)
+        ):
+            return {'error': conflict, 'code': 'invalid_resolution_class'}
 
         # D7 effective ceiling: an identity mapped in ROLE_LEVEL_ALLOWLIST is
         # AUTHORITATIVE — a present X-Escalation-Levels header may only
@@ -2451,10 +2638,8 @@ def create_server(
         # capability header AND an illegal action) sees 'bad_capability_header'
         # / 'level_forbidden', not 'illegal_transition'. Neither gate mutates
         # the record, so this is an error-reporting precedence only — see the
-        # "Gate precedence" note in the resolve_issue docstring. `rec` was
-        # already fetched above (shared with the capability gate); nothing
-        # mutates the record between that fetch and here, so it is reused
-        # rather than re-read from disk.
+        # "Gate precedence" note in the resolve_issue docstring. `rec` is the
+        # gating snapshot fetched above (shared with the capability gate).
         effect = effect_for(action, rec.level, rec.category)
         if effect is None:
             return {
@@ -2467,10 +2652,12 @@ def create_server(
             }
 
         if action == 'park':
+            if (refusal := _park_on_info_refusal(rec)) is not None:
+                return refusal
             # Version-a: park keeps the escalation open at L2.
             # queue.park() handles all stamping (level=2, resolution_action='park',
             # resolution text) and fires the resolve callback for teardown WITHOUT
-            # archiving the record.  No pre-stamp needed — park() owns the full write.
+            # archiving the record.  park() owns the full write, as resolve() does.
             esc = queue.park(
                 escalation_id, resolution,
                 resolved_by=resolved_by, resolution_turns=resolution_turns,
@@ -2484,9 +2671,8 @@ def create_server(
         # AFTER the `park` early-return above, so park is structurally exempt
         # with no `action != 'park'` condition that a later edit could get wrong
         # — park keeps the record OPEN and never archives it, so it cannot spend
-        # a pin.  And it sits BEFORE the resolution_action pre-stamp below, so a
-        # refusal persists nothing (INV-1), exactly as the capability and Table B
-        # gates do.
+        # a pin.  And it sits BEFORE queue.resolve, so a refusal persists
+        # nothing (INV-1), exactly as the capability and Table B gates do.
         #
         # Classifies the TARGET plus EVERY member of an L2 cluster, because the
         # BULK CLOSE of a homogeneous cluster is precisely the operation that
@@ -2543,27 +2729,14 @@ def create_server(
                 ],
             }
 
-        # Pre-stamp resolution_action on the pending record so resolve()'s
-        # read-modify-write carries it into the archived JSON (C1 persistence).
-        # Guard: only rewrite pending records — archived records must not be resurrected.
-        # Reuses `rec` fetched at the top of the gate sequence above (shared by
-        # the capability and Table B gates) instead of re-reading from disk:
-        # queue.get() is a pure read and nothing mutates the record between
-        # that fetch and here (the park branch above already returned), so
-        # `rec` is still current and a further queue.get() would be redundant.
-        if rec.status == 'pending':
-            rec.resolution_action = action
-            queue._rewrite(escalation_id, rec)
         dismiss = action in _DISMISS_ACTIONS
-        resolve_outcome: ResolveOutcome = {
-            'applied': False, 'prior_status': None, 'prior_resolved_by': None,
-            'late_resolution_captured': False, 'resolution_class_corrected': None,
-        }
+        resolve_outcome = blank_resolve_outcome()
         esc = queue.resolve(
             escalation_id, resolution, dismiss=dismiss,
             resolved_by=resolved_by, resolution_turns=resolution_turns,
             resolution_class=resolution_class,
             granted_files=granted_files,
+            resolution_action=action,
             outcome=resolve_outcome,
         )
         if esc is None:
@@ -2617,7 +2790,8 @@ def create_server(
         task_id: str | None = None,
         level: int | None = None,
         compact: bool = False,
-    ) -> list[dict[str, Any]]:
+        project_root: str | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         """List all pending escalations, optionally filtered by task ID and/or level.
 
         *level* — when set, returns only escalations at the given escalation level:
@@ -2681,6 +2855,8 @@ def create_server(
         prevent, so callers must treat an absent key as UNKNOWN and render
         nothing rather than "not pinning".
         """
+        if (refusal := await project_root_guard.check_off_loop(project_root)) is not None:
+            return refusal
         # Read the pending set ONCE, unfiltered, and narrow it in memory.  The
         # `level` filter is applied here rather than pushed into the queue
         # because `_annotate_pins_recovery` needs the UNFILTERED set to classify
@@ -2832,6 +3008,7 @@ def create_server(
     def get_task_escalation_history(
         task_id: str,
         level: int | None = None,
+        project_root: str | None = None,
     ) -> dict[str, Any]:
         """Every escalation ever filed for a task, as a self-describing envelope.
 
@@ -2891,6 +3068,8 @@ def create_server(
         unlike the adjacent ``get_escalation``: this is a scan, not an id
         lookup, so zero matches is a valid answer rather than a failure.
         """
+        if (refusal := project_root_guard.check(project_root)) is not None:
+            return refusal
         escalations = get_task_escalations(task_id, level=level)
         return {
             'task_id': task_id,
@@ -2902,8 +3081,11 @@ def create_server(
     @mcp.tool()
     def get_escalation(
         escalation_id: str,
+        project_root: str | None = None,
     ) -> dict[str, Any]:
         """Get a single escalation by ID."""
+        if (refusal := project_root_guard.check(project_root)) is not None:
+            return refusal
         esc = queue.get(escalation_id)
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
@@ -3209,7 +3391,9 @@ def create_server(
         3997): the record's OWN framing stays immutable, but the framing a fold
         carried in is no longer lost.  That list is bounded — oldest-shed at
         ``queue._MAX_AMENDMENTS``, with every drop counted in the record's
-        ``amendments_truncated``.
+        ``amendments_truncated``.  The info-only refusal (see *severity*) is
+        judged BEFORE this fold, so an all-info cluster is never folded into an
+        already-pending L2 either.
 
         **Members stay at L1**: the member L1 escalations are referenced but
         NOT promoted; they remain pending at L1 until the L2 is resolved.
@@ -3281,14 +3465,21 @@ def create_server(
         summary:
             One-line cluster hypothesis.
         category:
-            Escalation category; defaults to ``'design_concern'``.
+            Escalation category; defaults to ``'design_concern'``.  Must be a
+            registered ``escalation.categories.EscalationCategory`` value; an
+            unregistered one is rejected with an ``{'error': ...}`` response
+            naming the closest registered values.
         severity:
             Severity tag, decoupled from ``level=2`` — the tool sets
             ``level=2`` explicitly.  **Omit it (or pass ``None``) and the L2
             INHERITS ``max(member severities)``** — this is the correct default
             in the overwhelming majority of cases, and is what stops a cluster
             of purely-informational L1s from being born ``'blocking'`` and
-            paging a human (task 3976).
+            paging a human (task 3976).  An omitted severity whose members
+            derive ``'info'`` is REFUSED rather than minted or folded (PRD
+            ``plans/info-l0-disposition-router-prd.md`` D4, task 5222): see
+            **Info-only refusal** under Response shapes.  An explicit value
+            bypasses that refusal in both directions.
 
             An EXPLICIT value overrides the derivation in BOTH directions at
             mint time.  Upward in particular stays fully available and is not
@@ -3323,10 +3514,13 @@ def create_server(
             ``'blocking'`` and classified ``QUEUE_HANDOFF`` in
             ``escalation.pins``, and the only info-severity L2s were ones
             ``escalation.queue.EscalationQueue.park()`` promoted from an
-            already-open L0/L1.  Link 1 in ``escalation.pins`` short-circuits
+            already-open L0/L1.  Since task 5222 a silent all-info promote
+            mints nothing, so an info L2 now comes only from an explicit
+            ``severity='info'`` or from ``park()``.  Link 1 in
+            ``escalation.pins`` short-circuits
             on ``severity == 'info'`` BEFORE the ``level != 0`` link — "an
-            info record never pins, at any level" — so an inherited-info L2
-            no longer vetoes its subject task's ``done`` flip.  That is the
+            info record never pins, at any level" — so such an info L2
+            does not veto its subject task's ``done`` flip.  That is the
             INTENDED semantics and was considered here, not an oversight: the
             members it clusters were themselves non-pinning, and a record that
             does not merit a human's attention must not hold a task open
@@ -3359,6 +3553,15 @@ def create_server(
         ``severity`` reports what was ACTUALLY filed, which for a caller that
         omitted the argument is how the inherited value becomes visible — and
         on the update path is the post-floor value, not the argument.
+
+        Info-only refusal (an omitted *severity* whose members derive
+        ``'info'``; nothing is minted and nothing is folded)::
+
+            {'status': 'refused', 'code': 'info_only_cluster',
+             'members': [<the info members the derivation used>],
+             'unusable': [<ids that did not resolve, or carry an
+                           out-of-vocabulary severity>],
+             'derived_severity': 'info'}
 
         Error::
 
@@ -3429,6 +3632,10 @@ def create_server(
                     f'expected one of {sorted(KNOWN_SEVERITIES)}'
                 ),
             }
+        try:
+            require_registered_category(category)
+        except UnregisteredEscalationCategory as exc:
+            return {'error': str(exc)}
 
         # Everything from here on is inside the lock: the FIND and the WRITE it
         # decides between must not interleave with another promote on this
@@ -3461,6 +3668,7 @@ def create_server(
                 members = _read_members(queue, member_ids)
                 derived = None if severity is not None else _derive_l2_severity(members)
                 return (
+                    members,
                     derived,
                     queue.find_pending_l2_by_root_cause(root_cause),
                     _sentinel_bound_task_ids(members),
@@ -3468,7 +3676,7 @@ def create_server(
                 )
 
             (
-                derived, existing_id, required_task_ids, eval_lane_members,
+                members, derived, existing_id, required_task_ids, eval_lane_members,
             ) = await asyncio.to_thread(_read_for_promote)
 
             if eval_lane_members:
@@ -3482,6 +3690,17 @@ def create_server(
                     for member_id, reason in eval_lane_members.items()
                 )
                 return _eval_lane_refusal(f'member(s) {named} are eval-lane artifacts')
+
+            # PRD info-l0-disposition-router D4: a cluster whose members derive
+            # 'info' never enters L2 by default — not minted, not folded into an
+            # existing L2.  An explicit severity bypasses it in both directions.
+            if severity is None and derived == 'info':
+                logger.info(
+                    'promote_to_l2: refused info-only cluster under task_id=%r '
+                    'root_cause=%r; members=%s',
+                    task_id, root_cause, member_ids,
+                )
+                return _info_only_refusal(members)
 
             # CREATE must land on some severity, so an underivable set fails safe
             # UP to 'blocking' — unchanged from before task 3976.
@@ -3727,7 +3946,8 @@ def create_server(
         said whether ``metadata.merge_lane`` had been honoured, which is half
         of why the key could sit inert unnoticed.  ``lane_source`` rides with
         it because ``'normal'`` alone cannot distinguish "the task asked for
-        normal" from "nothing asked at all".  The rest of the audit trail is
+        normal" from "nothing asked at all" from "the task-store read failed"
+        (``'unavailable'``, task 5564).  The rest of the audit trail is
         elsewhere, and deliberately so: ``get_merge_queue`` already carries
         ``lane`` per queue item (from the worker snapshot,
         ``orchestrator/src/orchestrator/merge_queue.py::
@@ -3755,7 +3975,10 @@ def create_server(
           lane_applied}``.  Branch was
           freshly dispatched (or wait_secs timeout expired).  ``lane`` is the
           resolved merge lane and ``lane_source`` names which input won it —
-          ``'argument'``, ``'task_metadata'`` or ``'default'`` (task 4888).
+          ``'argument'``, ``'task_metadata'``, ``'default'`` (the task was
+          read and asked for nothing) or ``'unavailable'`` (the task-store
+          read failed, so the lane fell open to ``'normal'`` without finding
+          out what the task asked for; tasks 4888, 5564).
           ``lane_applied`` is True here: the lane rode the enqueued request.
           ``position`` is ``int | None``;
           ``None`` means the live merge-worker snapshot was unavailable, so
@@ -3771,8 +3994,9 @@ def create_server(
           ``lane_applied`` is **False** here and the resolution is audit only.
           Branch on ``lane_applied``, never on ``lane`` alone: a ``lane='high'``
           hotfix that coalesced is riding a possibly-``'normal'`` in-flight
-          entry.  To actually get the high lane, ``merge_cancel`` the
-          in-flight entry and resubmit, or wait for it and resubmit after.
+          entry.  To actually get the high lane, ``merge_relane`` that
+          entry while it still waits for the merger; once it has been picked,
+          ``merge_cancel`` it and resubmit, or wait for it and resubmit after.
           The in-flight entry's OWN lane is not echoed here — this arm can
           reach a foreign or pre-restart merger for which no in-process entry
           exists at all (``poll_by='branch'``), so it is not knowable
@@ -3924,7 +4148,7 @@ def create_server(
             if _task_metadata is None:
                 _task_metadata = await git_authority.task_metadata(
                     harness,
-                    full_branch.removeprefix(orch_config.git.branch_prefix),
+                    bare_queued_branch_id(branch, orch_config.git.branch_prefix),
                     site='merge_request',
                 )
             return _task_metadata
@@ -3998,13 +4222,11 @@ def create_server(
             # merely slow into a silent lane downgrade at a threshold no
             # measurement here justifies, and report it as
             # `lane_source='default'`, i.e. "nothing asked at all" when the
-            # truth is "we could not find out".  That conflation is present
-            # today on the 15s failure too and is recorded as a known gap
-            # (esc-4888 amendment pass): `task_metadata` returns
-            # `TaskMetadataResult.unavailable`, so the honest source is
-            # available to a later change that widens the `lane_source`
-            # vocabulary; this pass does not, because that vocabulary is
-            # pinned as closed across four surfaces.
+            # truth is "we could not find out".  Since task 5564 a failed
+            # read is reported as `lane_source='unavailable'` instead, so a
+            # degraded store is distinguishable from a healthy no-op
+            # submission — but a shorter timeout would still make that
+            # downgrade routine, which is why it stays declined.
             #
             # Fail-soft with its OWN try/except (merge_request's fast-path has
             # no enclosing fire-safe wrapper): a probe fault must never break
@@ -4067,8 +4289,8 @@ def create_server(
                 if _degenerate_verdict is not None:
                     return _degenerate_verdict
                 try:
-                    # Derive the id from the branch, exactly as merge_status
-                    # does (server.py `tid = full_branch.removeprefix(prefix)`),
+                    # Derive the id from the branch, as _task_metadata_once
+                    # does through bare_queued_branch_id,
                     # NOT from the caller-supplied task_id parameter (review
                     # #6).  merge_request takes task_id and branch as two
                     # independent parameters; keying the metadata off one and
@@ -4122,11 +4344,17 @@ def create_server(
         # lane — an explicit argument makes the metadata irrelevant by the
         # precedence rule, so it never triggers a read.  task_metadata returns
         # {} on every failure mode and never raises, so this can degrade a lane
-        # to 'normal' but can never fail a submission.
+        # to 'normal' but can never fail a submission; its `unavailable` flag
+        # rides along so the degradation is reported as
+        # lane_source='unavailable' rather than passing for 'default'.
+        lane_metadata = (
+            None if validated_lane is not None else await _task_metadata_once()
+        )
         lane_choice = resolve_merge_lane(
             requested=validated_lane,
-            task_metadata=(
-                None if validated_lane is not None else (await _task_metadata_once()).metadata
+            task_metadata=None if lane_metadata is None else lane_metadata.metadata,
+            metadata_unavailable=(
+                lane_metadata is not None and lane_metadata.unavailable
             ),
         )
 
@@ -4438,6 +4666,29 @@ def create_server(
         return result
 
     @mcp.tool()
+    async def clear_verify_host_quarantine(host: str) -> dict[str, Any]:
+        """Return a benched remote verify host to this orchestrator's verify pool.
+
+        The operator clear for a host the merge worker benched (task 6565,
+        design D6): an unreachable ('ru') or gate-skew ('skew') bench —
+        including a STICKY skew bench, which is never re-admitted
+        automatically — or a verdict-divergence quarantine.  It does not probe
+        the host first; use it once the cause is fixed.  A PARKED slot is still
+        freed only after a clean probe that no stale verify runs there.  The
+        open unreachability and skew L1s for the host are resolved.
+
+        Returns ``{host, cleared, quarantine_class, was_sticky}`` plus
+        ``reason`` when nothing was cleared (no orchestrator, no merge worker,
+        an unknown or un-benched host, or a PARKED slot not yet clean).
+        """
+        if harness is None:
+            return {
+                'host': host, 'cleared': False,
+                'reason': 'No orchestrator harness wired in — running in standalone mode',
+            }
+        return await harness.clear_verify_host_quarantine(host)
+
+    @mcp.tool()
     async def release_workflow(
         task_id: str,
         timeout_secs: int = 30,
@@ -4662,6 +4913,8 @@ def create_server(
 
         This snapshot captures the blind spot missed by runs.db-events: a
         genuinely-queued entry with no _merge-* worktree and no merge events.
+        A request still waiting for the merger whose outcome is already decided
+        (resolved or cancelled) is never listed.
         """
         if merge_queue is None:
             return {'error': 'Merge queue not available — orchestrator not running'}
@@ -4753,6 +5006,41 @@ def create_server(
             }
         return await harness.reload_config()
 
+    # --- Cited-SHA resolution (task 5751) ---
+
+    @mcp.tool()
+    async def resolve_escalation_shas(escalation_id: str) -> dict[str, Any]:
+        """Resolve the commit SHAs an escalation cites to the commits they landed as on main.
+
+        Scans the record's ``summary``, ``detail`` and each ``evidence``
+        entry's ``observation`` for 7-40 hex SHA tokens and maps each one a
+        rebase orphaned to its landed twin on main (patch-id first, then a
+        unique exact subject; never a guess).  Returns ``{escalation_id,
+        resolved_shas: [{cited, landed, subject, method}], skipped_shas}``,
+        both in cited order.  Only the first
+        ``escalation.sha_citations.MAX_CITED_SHAS_RESOLVED`` distinct tokens
+        are looked up; ``skipped_shas`` lists the rest, unresolved.  A looked-up token absent from ``resolved_shas`` is
+        already on main, is not a commit, or has no twin.
+
+        Read-only: the record is never rewritten, and ``get_escalation`` /
+        ``get_task_escalations`` are unchanged — they still show the SHAs as
+        filed.  An unknown id returns ``{error}`` naming it; a standalone
+        server (no harness wired) returns ``{'error': 'no git authority
+        wired'}``.
+        """
+        git_ops = getattr(harness, 'git_ops', None)
+        if git_ops is None:
+            return {'error': 'no git authority wired'}
+        esc = await asyncio.to_thread(queue.get, escalation_id)
+        if esc is None:
+            return {'error': f'Escalation {escalation_id} not found'}
+        citations = await resolve_cited_shas(esc, git_ops)
+        return {
+            'escalation_id': esc.id,
+            'resolved_shas': list(citations.resolved),
+            'skipped_shas': list(citations.skipped),
+        }
+
     # --- Interactive warm-worktree tools (PRD β / task 2011) ---
 
     @mcp.tool()
@@ -4790,7 +5078,9 @@ def create_server(
         """
         if harness is None or getattr(harness, 'git_ops', None) is None:
             return {'error': 'escalation server running standalone — no harness wired'}
-        mismatch = _require_matching_project_root(harness, project_root)
+        mismatch = _require_matching_project_root(
+            Path(harness.git_ops.project_root), project_root,
+        )
         if mismatch is not None:
             return {'error': mismatch}
 
@@ -4859,7 +5149,9 @@ def create_server(
         """
         if harness is None or getattr(harness, 'git_ops', None) is None:
             return {'error': 'escalation server running standalone — no harness wired'}
-        mismatch = _require_matching_project_root(harness, project_root)
+        mismatch = _require_matching_project_root(
+            Path(harness.git_ops.project_root), project_root,
+        )
         if mismatch is not None:
             return {'error': mismatch}
 
@@ -4890,9 +5182,8 @@ def create_server(
                     f'{path.name.removeprefix(gops.config.iact_prefix)}'
                 )
         else:
-            branch = path_or_branch
-            branch = canonical_queued_branch_name(branch, gops.config.branch_prefix)
-            slug = branch.removeprefix(gops.config.branch_prefix)
+            branch = canonical_queued_branch_name(path_or_branch, gops.config.branch_prefix)
+            slug = bare_queued_branch_id(path_or_branch, gops.config.branch_prefix)
             path = gops.worktree_base / f'{gops.config.iact_prefix}{slug}'
 
         # Runtime-only reverse import — mirrors claim_warm_worktree above.
@@ -5096,8 +5387,10 @@ def create_server(
     ) -> dict[str, Any]:
         """Return the current merge state for a merge request.
 
-        Accepts one of: request_id (authoritative), branch (most-recent), or
-        task_id (most-recent).  Tiers, by strength of claim
+        Accepts one of: request_id (authoritative), branch (most-recent; bare
+        or carrying ``orch_config.git.branch_prefix``, matched literally when
+        no ``orch_config`` is attached), or task_id (most-recent).  Tiers, by
+        strength of claim
         (``plans/merge-status-durable-non-landed-prd.md`` D5):
 
             live snapshot → event store (this run) → git authority
@@ -5119,8 +5412,100 @@ def create_server(
         if request_id is None and branch is None and task_id is None:
             return {'error': 'At least one of request_id, branch, or task_id is required'}
 
-        key = _PollKey(request_id=request_id, branch=branch, task_id=task_id)
+        key = _PollKey.parse(
+            request_id=request_id, branch=branch, task_id=task_id,
+            branch_prefix=orch_config.git.branch_prefix if orch_config is not None else '',
+        )
         return (await _resolve(key)).to_response()
+
+    async def _cancel_in_lane(request_id: str) -> dict[str, Any]:
+        """merge_cancel for a live request this server holds no waiter for (task 5248).
+
+        The merge lane cancels it by id, whoever awaits it; a cancel then
+        retires it here exactly as the waiter path does.  A TaskWorkflow that
+        awaits it blocks and escalates on the cancel; when none does, this
+        server files that escalation itself, so no cancel goes unowned.
+        """
+        from orchestrator.merge_lane import (
+            MergeCancelRefusal,
+            MergeCancelVerdict,
+            retire_cancelled_merge_request,
+        )
+
+        worker = _get_merge_worker(harness)
+        verdict = (
+            worker.cancel_request(request_id) if worker is not None
+            else MergeCancelVerdict(request_id, MergeCancelRefusal.NOT_LIVE)
+        )
+        if verdict.refusal is not None:
+            refusal_reasons = {
+                MergeCancelRefusal.NOT_LIVE: (
+                    f'Request {request_id!r} left the live merge queue before the '
+                    'cancel reached it; poll merge_status for its outcome.'
+                ),
+                MergeCancelRefusal.FINALIZE_WINDOW: (
+                    f'Request {request_id!r} is landing (its CAS is in progress); a '
+                    'cancel now could abandon a merge that still lands. Poll '
+                    'merge_status for its outcome.'
+                ),
+                MergeCancelRefusal.TRAIN_CANCEL_UNSUPPORTED: (
+                    f'Request {request_id!r} is, or is being stacked into, a merge '
+                    'train, and trains cannot be cancelled yet. Block the member '
+                    "tasks instead, or wait for the train's outcome."
+                ),
+            }
+            state = (
+                _map_live_state(verdict.state) if verdict.state is not None
+                else (await _resolve(_PollKey(request_id=request_id))).state
+            )
+            return {
+                'cancelled': False,
+                'state': state,
+                'reason': refusal_reasons[verdict.refusal],
+                'code': verdict.refusal.value,
+            }
+        workflow_awaits = verdict.awaited_by_workflow or (
+            _registry is not None and verdict.branch is not None
+            and _registry.has_workflow_waiter(verdict.branch, request_id)
+        )
+        await retire_cancelled_merge_request(
+            request_id=request_id,
+            branch=verdict.branch,
+            task_id=verdict.task_id,
+            registry=_registry,
+            retention=_get_terminal_retention(harness),
+            git_ops=getattr(harness, 'git_ops', None),
+            event_store=event_store,
+            reap_worktree=not verdict.lane_disposes_worktree,
+        )
+        if not workflow_awaits and verdict.task_id is not None:
+            await _escalate_workflowless_cancel(verdict.task_id, request_id, verdict.branch)
+        return {'cancelled': True, 'state': MergeState.abandoned, 'reason': None}
+
+    async def _escalate_workflowless_cancel(
+        task_id: str, request_id: str, branch: str | None,
+    ) -> None:
+        """File the L1 a TaskWorkflow would have filed for an operator's cancel."""
+        await _submit_or_dedupe(Escalation(
+            id=await asyncio.to_thread(queue.make_id, task_id),
+            task_id=task_id,
+            agent_role='escalation-server',
+            severity='blocking',
+            category='merge_cancelled_by_operator',
+            summary=(
+                f'Merge request {request_id} for task {task_id} cancelled by an '
+                'operator (merge_cancel); no workflow awaited it and the branch '
+                'was not merged. A later workflow for this task may resubmit; '
+                'block the task to stop it'
+            ),
+            detail=(
+                f'request_id={request_id} branch={branch} task_id={task_id}. The '
+                'request was submitted with no TaskWorkflow awaiting it (journal '
+                'recovery, the stranded-branch reaper, or an MCP merge_request '
+                'whose submitter is gone).'
+            ),
+            level=1,
+        ))
 
     # ── merge_cancel — explicit cancellation via waiter-future cancel (PRD β2 / task 1632) ──
 
@@ -5129,9 +5514,10 @@ def create_server(
         """Cancel an in-flight merge request by its request_id.
 
         Accepts a single *request_id* parameter (authoritative merge-request identifier
-        returned by merge_request).  Returns a dict with three fields:
+        returned by merge_request).  Returns a dict with three fields, plus
+        ``code`` when the merge lane refused a live request (path 1):
 
-            cancelled (bool)  — True only when a pending waiter was successfully cancelled.
+            cancelled (bool)  — True only when the request was cancelled by this call.
             state     (str)   — A ``shared.merge_state.MergeState`` member, except
                                 that the live branch relays merge_status's live
                                 state verbatim, including its deliberate
@@ -5148,6 +5534,8 @@ def create_server(
                                 (the CONTRIBUTING.md lint-command-mirror convention) — edit
                                 the partition, not this list.
             reason    (str|None) — None on success; non-None string on every other path.
+            code      (str)   — the lane's refusal, a MergeCancelRefusal value
+                                ('not_live' | 'finalize_window' | 'train_cancel_unsupported').
 
         Branch order (every path returns; the one raise is a breached
         merge_status_answer.py invariant on path 1, which surfaces as a tool
@@ -5156,8 +5544,13 @@ def create_server(
              restarted, a coalesced id, or a request this server never held): resolve
              the request_id through merge_status's walk (live → current run → journal →
              prior runs → no_record; git needs a branch, so it is skipped).  A live hit
-             means the worker holds the request but this server has no waiter for it:
-             cancelled False with the live state, not cancellable here.  A current-run
+             (a workflow-enqueued, recovered, or otherwise waiterless request) is
+             cancelled by the merge lane itself, MergeLane.cancel_request, then
+             retired as on path 4; when no TaskWorkflow awaits it, this server files
+             the merge_cancelled_by_operator L1 the workflow would have.  The lane
+             refuses a request mid-CAS or a train: cancelled False with the lane's
+             state and a ``code`` naming the refusal
+             (orchestrator.merge_lane.MergeCancelRefusal).  A current-run
              outcome returns that state with 'Request already finalized; cannot
              cancel.'; an epistemic answer returns its state with the reason's hint.
              Coalesced submissions (in_flight / attached paths in merge_request) do
@@ -5185,12 +5578,14 @@ def create_server(
             cancel's _on_finalized records terminal 'abandoned' first, then forget
             removes it), so an immediate resubmit gets a FRESH entry and never
             coalesces onto / observes the cancelled corpse.
-        Still async (unchanged): MergeWorker._request_abandoned drops the queued
-        work item at its next checkpoint via the cancel→worker CancelledError seam.
-        Because retirement yields the loop (the C1 removal is awaited), the
-        merge_request _waiters.pop done-callback fires during the first cancel, so an
-        immediate double-cancel finds rec=None and resolves via the current-run tier:
-        the live tier ignores the worker's cancelled (waiter_alive False) entry.
+        Only the physical drop stays async: the merger drops the queued work item
+        when it next dequeues it
+        (orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._request_abandoned),
+        but orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.snapshot
+        stops listing a decided request at once.  Because retirement yields the
+        loop (the C1 removal is awaited), the merge_request _waiters.pop
+        done-callback fires during the first cancel, so an immediate double-cancel
+        finds rec=None, misses the live tier and answers from the current-run tier.
 
         The tool is async so that future mutation runs on the event loop (not a FastMCP
         threadpool worker — PRD Open Q4 off-loop lesson).  The lookup → cancel sequence
@@ -5211,18 +5606,7 @@ def create_server(
                     ),
                 }
             if answer.source is MergeStatusSource.live:
-                return {
-                    'cancelled': False,
-                    'state': answer.state,
-                    'reason': (
-                        f'Request {request_id!r} is in the live merge queue, but this '
-                        'server holds no waiter for it, so it cannot be cancelled '
-                        "here: merge_cancel only cancels requests submitted through "
-                        "this server's merge_request that are still awaiting an "
-                        'outcome (for example, a workflow-enqueued or startup-'
-                        'recovered request has no such waiter).'
-                    ),
-                }
+                return await _cancel_in_lane(request_id)
             return {
                 'cancelled': False,
                 'state': answer.state,
@@ -5270,5 +5654,115 @@ def create_server(
             event_store=event_store,
         )
         return {'cancelled': True, 'state': MergeState.abandoned, 'reason': None}
+
+    # ── merge_relane — move an already-enqueued request between lanes (task 5246) ──
+
+    @mcp.tool()
+    async def merge_relane(
+        lane: str,
+        request_id: str | None = None,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Move a merge request that is still waiting for the merger into *lane*.
+
+        A request's lane is decided ONCE, at enqueue, from ``merge_request``'s
+        ``lane`` or the task's ``metadata.merge_lane``.  Editing that metadata
+        afterwards moves nothing, so this tool is the lever for an
+        already-enqueued request.  ``lane='high'`` gets the request picked
+        ahead of every normal-lane request, and ``lane='normal'`` demotes it.
+        It is non-preemptive: a merge or verify already in progress is never
+        touched.
+
+        Name the request with exactly one of *request_id* (as
+        ``get_merge_queue`` lists it) or *task_id*.  A task coalesced into a
+        train has no queue entry of its own, because coalescing retired its
+        request id.  Address it by *task_id* instead: its whole train moves,
+        named by ``via_train``.
+
+        The LIVE lane changes at once.  The DURABLE lane is this tool's
+        ``metadata.merge_lane`` write (``metadata_mode='merge'``, that key
+        only) on every task the entry carries: the request's own task, or
+        every member of a train.  A train's live lane is lost when the train
+        dissolves (a restart drain dissolves an unstarted one), but its
+        members re-enqueue at the written lane.  ``metadata_writes`` reports
+        each write.  A ``written: False`` entry means that task will
+        re-enqueue at its old lane, so set its ``metadata.merge_lane`` by
+        hand.
+        If you relane a request seconds after it was enqueued, re-read
+        ``metadata_writes`` or ``get_task``: a workflow's whole-blob metadata
+        write at the enqueue boundary can race the ``merge_lane`` write.
+
+        Returns ``{relaned, lane, request_id, from_lane, via_train, task_ids,
+        metadata_writes, refusal, state}``
+        (orchestrator/src/orchestrator/merge_lane/types.py::RelaneOutcome).
+        ``refusal`` is ``'already_picked'`` once the merger has taken the
+        request (``state`` names where it is) and nothing is written.
+        ``'not_found'`` can be transient while a request passes between two
+        of the lane's containers, so re-read ``get_merge_queue`` before
+        concluding it is gone.  Bad input or no merge worker returns
+        ``{error, code, hint}`` with ``code`` ``'invalid_lane'``,
+        ``'invalid_target'`` or ``'no_merge_worker'``, and nothing moves.
+
+        Operator-only: this tool appears in no agent role's allow-list.
+        """
+        try:
+            validated_lane = validate_requested_lane(lane)
+        except InvalidMergeLane as exc:
+            valid = ', '.join(repr(v) for v in exc.valid_lanes)
+            return {
+                'error': f'invalid merge lane {exc.value!r}',
+                'code': 'invalid_lane',
+                'hint': f'lane must be one of: {valid}',
+            }
+        if (request_id is None) == (task_id is None):
+            return {
+                'error': 'name the request with exactly one of request_id or task_id',
+                'code': 'invalid_target',
+                'hint': 'a coalesced member is addressed by task_id',
+            }
+        worker = _get_merge_worker(harness)
+        if worker is None or not hasattr(worker, 'relane'):
+            return {
+                'error': 'Merge worker not available',
+                'code': 'no_merge_worker',
+                'hint': 'the orchestrator is not running in this process',
+            }
+        outcome = worker.relane(validated_lane, request_id=request_id, task_id=task_id)
+        if outcome.relaned:
+            outcome = replace(
+                outcome,
+                metadata_writes=await _write_merge_lane_metadata(outcome.task_ids, outcome.lane),
+            )
+        answer = asdict(outcome)
+        if outcome.refusal == 'not_found' and request_id is not None:
+            answer['hint'] = (
+                "a coalesced member's own request id is retired: address it by task_id"
+            )
+        return answer
+
+    async def _write_merge_lane_metadata(
+        task_ids: Sequence[str], lane: str,
+    ) -> tuple[LaneMetadataWrite, ...]:
+        """Persist *lane* as ``metadata.merge_lane`` on each task, concurrently.
+
+        Through the scheduler's own ``update_task`` with ``metadata_mode='merge'``
+        and only that key, so every sibling key is preserved.  Each result is
+        reported, never swallowed: no scheduler counts as a failed write.
+        """
+        from orchestrator.merge_lane.types import (
+            LaneMetadataWrite,
+        )
+
+        scheduler = getattr(harness, 'scheduler', None)
+
+        async def _write(tid: str) -> LaneMetadataWrite:
+            written = scheduler is not None and await scheduler.update_task(
+                tid, {'merge_lane': lane}, metadata_mode='merge',
+            )
+            if not written:
+                logger.warning('merge_relane: metadata.merge_lane=%s not written for task %s', lane, tid)
+            return LaneMetadataWrite(task_id=tid, written=bool(written))
+
+        return tuple(await asyncio.gather(*(_write(tid) for tid in task_ids)))
 
     return mcp

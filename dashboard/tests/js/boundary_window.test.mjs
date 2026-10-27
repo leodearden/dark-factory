@@ -81,3 +81,17 @@ test('sketch #9: the donut centre, summed inline in tabs.jsx and so asserted her
     assert.equal(block.outcomes.values.length, block.outcomes.labels.length, win);
   }
 });
+
+test('the depth chart names the bucket width its served labels are spaced at', async () => {
+  const expected = { '24h': '15-min buckets', '7d': '1-h buckets' };
+  for (const [win, caption] of Object.entries(expected)) {
+    const { client, block } = await mergeBlock(win);
+    const { labels, bucket_minutes: bucketMinutes } = block.depth;
+
+    assert.equal(client.window.DF_MERGE_QUEUE.depthBucketCaption(block.depth), caption, win);
+    assert.ok(labels.length >= 2, `${win}: the fixture's merges leave at least two buckets after the trim`);
+    for (let i = 1; i < labels.length; i += 1) {
+      assert.equal(Date.parse(labels[i]) - Date.parse(labels[i - 1]), bucketMinutes * 60_000, `${win} gap at ${i}`);
+    }
+  }
+});

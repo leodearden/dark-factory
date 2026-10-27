@@ -627,7 +627,7 @@ def score_pairs(
     - ``outcome``: one of ``write_triage.py::TRIAGE_OUTCOMES``.
     - ``judged_candidate_id``: the record the judge's verdict names, hoisted to
       the canonical record production attaches to
-      (``write_triage.py::_canonical_id_of``, task 6007). None when nothing
+      (``write_triage.py::canonical_id_of``, task 6007). None when nothing
       was attached.
     - ``band_winner_id``: the write's nearest neighbour on the frozen slate.
     - ``parse_failure``: the judge's reply could not be parsed, and triage

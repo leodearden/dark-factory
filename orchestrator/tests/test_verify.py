@@ -1855,6 +1855,43 @@ class TestApplyCargoScopeRoutesThroughVerifyCmd:
         )
 
 
+class TestStripXdistGroupSuffix:
+    """``strip_xdist_group_suffix`` removes the ``@<group>`` xdist adds under ``--dist loadgroup``."""
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [
+            pytest.param('x.py::t@grp', 'x.py::t', id='plain-test'),
+            pytest.param('x.py::t[p]@grp', 'x.py::t[p]', id='parametrised'),
+            pytest.param('x.py::C::t[p]@grp', 'x.py::C::t[p]', id='class-qualified'),
+            pytest.param('x.py::t@g1_g2', 'x.py::t', id='several-groups-joined'),
+            pytest.param('x.py::t[a@b]@grp', 'x.py::t[a@b]', id='at-inside-params-kept'),
+            pytest.param('x.py::t[a::b]@grp', 'x.py::t[a::b]', id='double-colon-inside-params'),
+            pytest.param(
+                'pkg.tests.test_probe.TestBox::test_inner@probe_group',
+                'pkg.tests.test_probe.TestBox::test_inner',
+                id='junit-classname-spelling',
+            ),
+        ],
+    )
+    def test_group_suffix_is_stripped(self, raw: str, expected: str):
+        assert verify.strip_xdist_group_suffix(raw) == expected
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            pytest.param('x.py::t', id='no-suffix'),
+            pytest.param('x.py::t[a@b]', id='at-only-inside-params'),
+            pytest.param('x.py', id='bare-file-of-collection-error'),
+            pytest.param('dir@v2/x.py::t', id='at-in-path'),
+            pytest.param('x.py::t[a@b', id='unclosed-params-truncated-id'),
+            pytest.param('tests.t', id='bare-junit-module-id'),
+        ],
+    )
+    def test_id_without_a_group_suffix_is_unchanged(self, raw: str):
+        assert verify.strip_xdist_group_suffix(raw) == raw
+
+
 class TestParsePytestFailures:
     """``parse_pytest_failures`` types each failing test by kind and first failure line."""
 
@@ -2081,6 +2118,48 @@ class TestParsePytestFailures:
 
     def test_empty_input_parses_to_empty_tuple(self):
         assert verify.parse_pytest_failures('') == ()
+
+    def test_xdist_loadgroup_summary_lines_yield_plain_node_ids(self):
+        output = (
+            'FAILED pkg/tests/test_probe.py::test_ok[a@b]@probe_group - AssertionError: as...\n'
+            'FAILED pkg/tests/test_probe.py::test_ok[1]@probe_group - AssertionError: asse...\n'
+            'FAILED pkg/tests/test_probe.py::TestBox::test_inner@probe_group - AssertionEr...\n'
+        )
+        assert self._parse(output) == [
+            ('pkg/tests/test_probe.py::test_ok[a@b]', 'failed', 'AssertionError: as...'),
+            ('pkg/tests/test_probe.py::test_ok[1]', 'failed', 'AssertionError: asse...'),
+            ('pkg/tests/test_probe.py::TestBox::test_inner', 'failed', 'AssertionEr...'),
+        ]
+
+    def test_xdist_loadgroup_error_line_yields_plain_node_id(self):
+        assert self._parse('ERROR tests/a.py::test_x@grp - RuntimeError: setup') == [
+            ('tests/a.py::test_x', 'error', 'RuntimeError: setup'),
+        ]
+
+    def test_xdist_loadgroup_crash_notice_yields_plain_node_id(self):
+        output = "worker 'gw1' crashed while running 'tests/a.py::test_x[1]@grp'"
+        assert self._parse(output) == [('tests/a.py::test_x[1]', 'failed', '')]
+
+    def test_xdist_loadgroup_node_down_preceding_line_yields_plain_node_id(self):
+        output = 'tests/a.py::test_x@grp\n[gw0] node down: Not properly terminated\n'
+        assert self._parse(output) == [('tests/a.py::test_x', 'failed', '')]
+
+    def test_xdist_loadgroup_id_finds_its_unsuffixed_section(self):
+        output = (
+            '=== FAILURES ===\n'
+            '___ test_x[1] ___\n'
+            'E   AssertionError: grouped\n'
+            '=== short test summary info ===\n'
+            'FAILED tests/a.py::test_x[1]@grp\n'
+        )
+        assert self._parse(output) == [('tests/a.py::test_x[1]', 'failed', 'AssertionError: grouped')]
+
+    def test_xdist_loadgroup_id_dedups_across_summary_and_crash_surfaces(self):
+        output = (
+            'FAILED tests/a.py::t@g\n'
+            "worker 'gw0' crashed while running 'tests/a.py::t@g'\n"
+        )
+        assert verify.node_ids_of(verify.parse_pytest_failures(output)) == ['tests/a.py::t']
 
     def test_extract_failing_test_ids_is_the_node_ids_of_the_parse(self):
         output = (
@@ -2489,6 +2568,12 @@ class TestExtractTestOutcomesFromJunit:
             'tests/test_b.py::test_nofile': 'passed',
             'test_bare': 'passed',
         }
+
+    def test_an_xdist_loadgroup_name_is_keyed_without_its_group_suffix(self, tmp_path: Path):
+        outcomes = self._read(
+            tmp_path, self._suite('<testcase classname="tests.test_sample" name="test_g[1]@grp" />'),
+        )
+        assert outcomes == {'tests.test_sample::test_g[1]': 'passed'}
 
 
 # ---------------------------------------------------------------------------
@@ -11425,20 +11510,15 @@ class TestWithJunitxmlStr:
         assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
 
 
-class TestSerialPytestStrRefusedRewriteIsLogged:
-    """_serial_pytest_str must RECORD a refused serial rewrite, not swallow it.
+class TestSerialPytestStrLogsOnlyUnappliedRewrites:
+    """_serial_pytest_str places the flags where it can and RECORDS where it cannot.
 
-    Task 4121, the "louder failure" half. ``verify_cmd``'s raw-chain appender
-    refuses outright rather than splice the flags into an unclosed quote —
-    the rule, and the measurements behind it, live in
-    ``verify_cmd._unspliceable_pytest_spans`` and are deliberately not
-    restated here.
-
-    Refusing is right, but a SILENT refusal is its own defect: the
-    ENV_TRANSIENT retry then re-runs the ORIGINAL command and fails for its
-    own reason, and an operator reading that log cannot tell "recovery ran
-    without its flags" from "recovery ran". One WARNING here makes the
-    difference legible.
+    A quoted chain operator (``-k 'a && b'``) once made the raw-chain
+    appender refuse (task 4121); since task 4178 those chains are recovered,
+    with no WARNING. A raw-retained PYTEST chain that still comes back
+    unchanged is logged: the ENV_TRANSIENT retry then re-runs the ORIGINAL
+    command, and an operator reading that log cannot otherwise tell
+    "recovery ran without its flags" from "recovery ran".
 
     Modelled test-for-test on ``TestWithJunitxmlStr`` above — this file's
     established template for a ``*_str`` wrapper's capability-loss record —
@@ -11446,29 +11526,30 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
     same way rather than each inventing its own assertion style.
     """
 
-    _REFUSED = "pytest -k 'a && b' tests/ && true"
-
-    def test_refused_rewrite_returns_the_callers_own_string_and_logs_once(
-        self, caplog: pytest.LogCaptureFixture,
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            pytest.param("pytest -k 'a && b' tests/ && true", id='quoted-and-single'),
+            pytest.param('pytest -k "a && b" tests/ && true', id='quoted-and-double'),
+            pytest.param("pytest -k 'a | b' tests/ && true", id='quoted-pipe'),
+            pytest.param("pytest --deselect 'x;y' tests/ && true", id='quoted-semicolon'),
+            pytest.param("uv run pytest -k 'a && b' tests/ && true", id='uv-run-prefix'),
+            pytest.param("( cd x && pytest -k 'a && b' tests/ )", id='inside-subshell'),
+            pytest.param("pytest -k 'a && b' t1/ && pytest t2/", id='two-invocations'),
+        ],
+    )
+    def test_a_quoted_chain_operator_is_recovered_without_a_warning(
+        self, raw: str, caplog: pytest.LogCaptureFixture,
     ):
         from orchestrator.verify import _serial_pytest_str
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            result = _serial_pytest_str(self._REFUSED, invocation_dir=None)
+            result = _serial_pytest_str(raw, invocation_dir=None)
 
-        assert result is self._REFUSED, "the no-op must return the caller's own string"
-        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
-        assert len(records) == 1, f'expected exactly one record, got {[r.message for r in records]}'
-        assert records[0].levelno == logging.WARNING
-        # Asserted on substance, not prose: the command must be quotable from
-        # the record, and a stable keyword must identify WHICH recovery was
-        # lost. Anchoring on the full sentence would make this a spelling test.
-        assert self._REFUSED in records[0].getMessage()
-        assert 'serial' in records[0].getMessage().lower()
-        # The OFFENDING SPAN, not just the whole command: on a long
-        # multi-segment test_command the operator would otherwise have to
-        # re-derive the regex segmentation by hand to find it.
-        assert "pytest -k 'a " in records[0].getMessage()
+        assert result is not raw
+        assert result is not None
+        assert 'no:xdist' in result
+        assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
 
     def test_the_message_does_not_assert_a_cause_it_has_not_measured(
         self, caplog: pytest.LogCaptureFixture,
@@ -11501,21 +11582,23 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
     ):
         """The asymmetry ``_with_pytest_numprocesses_str``'s docstring claims.
 
-        Both wrappers refuse identically (one appender), but only the serial
-        one logs: a suppressed ``-n`` leaves the command at its configured
-        worker count, which is the pre-cap status quo and not a lost
-        capability, whereas suppressed serial-recovery flags mean a recovery
-        attempt ran without the thing that makes it a recovery. That claim is
-        pinned here rather than left to the docstring, since the serial twin
-        got a whole class for exactly this and the asymmetry was otherwise
-        unguarded.
+        Both wrappers find nothing to append to in ``echo "pytest" && true``
+        (one appender; the serial twin's WARNING for it is pinned above), but
+        only the serial one logs: a suppressed ``-n`` leaves the command at
+        its configured worker count, which is the pre-cap status quo and not
+        a lost capability, whereas suppressed serial-recovery flags mean a
+        recovery attempt ran without the thing that makes it a recovery. That
+        claim is pinned here rather than left to the docstring, since the
+        serial twin got a whole class for exactly this and the asymmetry was
+        otherwise unguarded.
         """
         from orchestrator.verify import _with_pytest_numprocesses_str
 
+        cmd = 'echo "pytest" && true'
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            result = _with_pytest_numprocesses_str(self._REFUSED, '4')
+            result = _with_pytest_numprocesses_str(cmd, '4')
 
-        assert result is self._REFUSED, "the no-op must return the caller's own string"
+        assert result is cmd, "the no-op must return the caller's own string"
         assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
 
     @pytest.mark.parametrize(
@@ -11550,12 +11633,12 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
         STRUCTURED path, never reaches the appender, and IS successfully
         mutated via ``base_flags`` — a span-content gate would warn about a
         command that lost nothing. The fourth is the over-refusal guard at
-        the log level: ``pytest tests/ && echo "pytest done"`` has an
-        unterminated SPAN (``'pytest done"'``, the word inside ``echo``'s
-        argument) but no unterminated INVOCATION, so its real invocation is
-        rewritten normally and there is nothing to report. The non-pytest and
-        OPAQUE cases are expected, benign no-ops; logging those would fire on
-        every lint and type leg and train operators to ignore the record.
+        the log level: ``pytest tests/ && echo "pytest done"`` has the word
+        ``pytest`` inside ``echo``'s argument but no unterminated INVOCATION,
+        so its real invocation is rewritten normally and there is nothing to
+        report. The non-pytest and OPAQUE cases are expected, benign no-ops;
+        logging those would fire on every lint and type leg and train
+        operators to ignore the record.
         """
         from orchestrator.verify import _serial_pytest_str
 
@@ -11651,13 +11734,12 @@ class TestSerialPytestStrReSuppliesGoverningAddopts:
         from orchestrator.verify import _serial_pytest_str
 
         tree = _write_serial_recovery_tree(tmp_path)
-        refused = "pytest -k 'a && b' tests/ && true"
+        refused = 'echo "pytest" && true'
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
             assert _serial_pytest_str(refused, invocation_dir=tree) is refused
         records = [r for r in caplog.records if r.name == 'orchestrator.verify']
         assert len(records) == 1
         assert refused in records[0].getMessage()
-        assert "pytest -k 'a " in records[0].getMessage()
 
 
 # ---------------------------------------------------------------------------
@@ -12089,6 +12171,35 @@ class TestRunVerificationThreadsEachLegsOwnDuration:
         assert result.summary == 'Failures: lint issues'
         assert result.category != 'infra_kill'
         assert SIGNAL_KILL_SUMMARY_MARKER not in result.summary
+
+    @pytest.mark.asyncio
+    async def test_a_lint_failure_beside_a_green_test_leg_records_the_test_leg_as_passed(
+        self, tmp_path: Path,
+    ):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__lint_cmd__':
+                return 1, 'x.py:1:1: F401 unused import\n', False
+            return 0, '19639 passed in 2351s\n' if cmd == '__test_cmd__' else '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert result.test_leg_failed is False
+        assert '19639 passed' in result.test_output
+        assert '## Test Output' not in result.failure_report()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_test_leg_is_recorded_as_failed(self, tmp_path: Path):
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__test_cmd__':
+                return 1, '....\n19638 passed, 1 error in 2351s\n', False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert result.test_leg_failed is True
+        assert '## Test Output' in result.failure_report()
 
 
 # ---------------------------------------------------------------------------

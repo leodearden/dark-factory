@@ -24,6 +24,8 @@ Shape contract (returned by collect_scheduler_state):
     modules: list[dict]  — one per unique module path that appears in any lock set:
         path        str
         holder      str | None   task_id of in-flight holder, or None
+        holder_live bool | None  True/False iff a holder exists and the live set
+                                 is known; None otherwise (unknown, never departed)
         contention  int          count of tasks whose lock_set includes this path
         sorted by contention desc, ties broken alphabetically by path
 
@@ -83,7 +85,7 @@ from shared.scheduler_state import (
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import collect_tasks_with_counts
-from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success, project_label
+from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.task_snapshot import SnapshotHealth, classify
 from dashboard.data.utils import resolve_now
@@ -269,9 +271,12 @@ def _module_contention_counts(
                          ``park_stacks`` is also ``None``.
 
     Returns:
-        ``[{path, holder, contention, project, holder_project,
+        ``[{path, holder, contention, project, holder_project, holder_live,
             parked_by, parked_by_project, parked_owner_live, park_stack}, ...]``
         sorted by contention descending, ties broken alphabetically by path.
+
+        holder_live  bool | None  True/False iff a holder exists and
+                     *live_task_ids* was supplied
 
         New additive fields (inert when *park_stacks* is ``None``):
           parked_by        str | None  active-top park owner (stack[-1]) if any
@@ -319,6 +324,11 @@ def _module_contention_counts(
             (tid for mod, tid in current_holders.items() if modules_conflict(mod, path)),
             None,
         )
+        holder_live = (
+            (holder in live_task_ids)
+            if (holder is not None and live_task_ids is not None)
+            else None
+        )
         # Resolve the matching park stack via the same hierarchical prefix rule
         # so park and holder resolution stay consistent across sub-depth keys.
         stack = next(
@@ -352,6 +362,9 @@ def _module_contention_counts(
             # the holder task_id since taskmaster ids are project-scoped.
             'project': project,
             'holder_project': project if holder else None,
+            # The holder's liveness against the same live_task_ids that sets
+            # parked_owner_live; None when unknown.
+            'holder_live': holder_live,
             # Park ownership — additive fields; inert when park_stacks is None.
             'parked_by': parked_by,
             'parked_by_project': parked_by_project,
@@ -683,12 +696,12 @@ async def collect_scheduler_state(
                           ``rows`` and ``modules``: with no task rows, no
                           owner's liveness is known.
 
-    Snapshot data is joined to its root by position, so two roots sharing a
-    basename keep their own pin queue, park stacks and ``project_root``; the
-    label-keyed outputs (task rows, sparkline and recovery keys, module
-    contention) still collapse them.
+    Snapshot data is joined to its root by position. Every label-keyed output
+    is keyed by labels unique across the configured roots
+    (``dashboard/project_labels.py::ProjectLabels``).
     """
     effective_now = resolve_now(now)
+    labels = config.project_labels
     since = effective_now - timedelta(hours=1)
 
     # Fetch active tasks (for lock sets and titles).
@@ -704,7 +717,7 @@ async def collect_scheduler_state(
     # Determine which project roots still need querying
     roots_to_query = [
         root for root in config.all_project_roots
-        if project_label(root) not in offline_projects
+        if labels.of(root) not in offline_projects
     ]
 
     async def _one_project(root) -> tuple[SchedulerStateSnapshot | None, list[dict], list[dict]]:
@@ -738,7 +751,7 @@ async def collect_scheduler_state(
         *online-but-empty* so a legitimately quiescent project is never
         misclassified as offline.
         """
-        label = project_label(root)
+        label = labels.of(root)
 
         async def _fetch_events(
             url: str, event_types: list[str], limit: int, kind: str,
@@ -804,11 +817,7 @@ async def collect_scheduler_state(
         snapshot, skip_events, recovery_events = await first_success(
             config.fused_memory_urls,
             _call,
-            # String-identical to the former f'get_scheduler_state[{label}]' —
-            # fanout_label's basename form IS project_label's. Routed through
-            # the helper so all four fan-out sites share one definition of the
-            # per-project-root throttle-key convention (see its docstring).
-            log_label=fanout_label('get_scheduler_state', root),
+            log_label=fanout_label('get_scheduler_state', root, labels),
             offline_result=lambda errs: (None, [], []),
         )
         return snapshot, skip_events, recovery_events
@@ -833,7 +842,7 @@ async def collect_scheduler_state(
     # present-with-[] means "read succeeded, no sweeps", absent means offline.
     all_recovery_events: dict[str, list[dict]] = {}
 
-    # Paired by position: two roots may share a basename.
+    # Paired by position: the root, not its label, is each result's identity.
     for root, result in zip(roots_to_query, per_project_results, strict=True):
         if isinstance(result, BaseException):
             logger.warning(
@@ -841,7 +850,7 @@ async def collect_scheduler_state(
             )
             continue
         snapshot, skip_events, recovery_events = result
-        label = project_label(root)
+        label = labels.of(root)
 
         # None snapshot means every URL failed (offline); an empty one means
         # online-but-empty.
@@ -865,7 +874,7 @@ async def collect_scheduler_state(
             uid = task.get('id') or ''
             # uid format: 'project/T-NNN' → raw_id = 'NNN'
             try:
-                raw_id = uid.split('/T-', 1)[1]
+                raw_id = uid.rsplit('/T-', 1)[1]
             except (IndexError, AttributeError):
                 raw_id = uid
             enriched.append({
@@ -1020,6 +1029,7 @@ def _merge_module_lists(
                 # used to look up sparklines and joined row metadata.
                 if m.get('holder_project'):
                     merged[key]['holder_project'] = m['holder_project']
+                merged[key]['holder_live'] = m.get('holder_live')
         else:
             merged[key] = dict(m)
     return sorted(merged.values(), key=lambda m: (-m['contention'], m['path']))

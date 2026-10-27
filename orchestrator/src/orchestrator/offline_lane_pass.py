@@ -1,6 +1,6 @@
-"""One pass of one offline-lane command: detect, confirm a red, ask the outcome hooks, then the engine.
+"""One pass of one offline-lane command: detect, probe and confirm a red, ask the outcome hooks, then the engine.
 
-PRD ``plans/offline-lane-red-path-prd.md`` D4, D13 and section 5.7.  The engine's
+PRD ``plans/offline-lane-red-path-prd.md`` D4, D7, D13 and sections 5.7 and 5.10.  The engine's
 :meth:`~orchestrator.offline_lane_episodes.LaneEngine.observe` sees every pass, green
 included, and is the only point at which a pass has an effect; the pass record then
 keeps the outcome and that effect.
@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Protocol
 from orchestrator.offline_lane_confirm import (
     Confirmed,
     ConfirmTarget,
+    Outage,
     PassOutcome,
     Unconfirmable,
     outcome_to_json,
@@ -28,13 +29,16 @@ from orchestrator.offline_lane_filing import EvidenceNote
 from orchestrator.offline_lane_records import (
     LEGACY_INFRA_COMMAND,
     LEGACY_NUMERIC_COMMAND,
+    LanePass,
     Leg,
     Phase,
+    ProbeKind,
+    ProbeResult,
     RunRecord,
     RunRecordStore,
     classify_exit,
 )
-from orchestrator.offline_lane_runs import ConfirmRunner, confirm_runner
+from orchestrator.offline_lane_runs import ConfirmRunner, ProbeSeam, confirm_runner, run_probe
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -116,6 +120,21 @@ async def _hook_notes(
     return tuple(notes)
 
 
+async def _probed(
+    target: LaneLeg, worktree: Path, store: RunRecordStore, lane_pass: LanePass, probe_runner: ProbeSeam,
+) -> ProbeResult | None:
+    """The outage probe's answer, written onto the detect record; None when *target* declares no probe."""
+    cmd = target.lane_command
+    if cmd is None or not cmd.outage_probe:
+        return None
+    probe = await probe_runner(cmd, worktree)
+    try:
+        await asyncio.to_thread(store.set_probe, lane_pass, probe)
+    except (LookupError, OSError):
+        logger.exception('offline-lane: %s: probe answer not written onto the detect record', target.command)
+    return probe
+
+
 async def run_pass(
     target: LaneLeg,
     *,
@@ -126,23 +145,33 @@ async def run_pass(
     store: RunRecordStore,
     engine: PassObserver,
     hooks: Sequence[PassOutcomeHook],
+    probe_runner: ProbeSeam = run_probe,
 ) -> bool:
     """Run one pass of *target* at *head*; true when its detection was green.
 
-    A red detection that left no run record (an injected seam) is handed to *confirm*
-    with no record, which the lane's confirm answers ``Unconfirmable(NO_DETECT_RECORD)``.
+    A red detection of a command that declares ``outage_probe`` runs the probe first;
+    an outage answer skips the confirm and the hooks.  A red detection that left no run
+    record (an injected seam) is handed to *confirm* with no record, which the lane's
+    confirm answers ``Unconfirmable(NO_DETECT_RECORD)``.
     """
     lane_pass = await asyncio.to_thread(store.allocate_pass, target.command, target.leg, head)
     started = time.monotonic()
     returncode, _tail = await detect()
     _log_sub_run(target, head, returncode, time.monotonic() - started)
     detect_record = store.last_record(target.command, Phase.DETECT)
-    outcome: ConfirmOutcome | None = None
+    outcome: PassOutcome | None = None
+    probe: ProbeResult | None = None
     notes: tuple[EvidenceNote, ...] = ()
     if returncode != 0:
-        confirm_target = ConfirmTarget(target.leg, worktree, target.lane_command)
-        outcome = await confirm(confirm_target, detect_record, confirm_runner(store, lane_pass))
-        notes = await _hook_notes(hooks, target.command, head, outcome, _run_records(store, target.command))
+        probe = await _probed(target, worktree, store, lane_pass, probe_runner)
+        detect_record = store.last_record(target.command, Phase.DETECT)
+        if probe is not None and probe.result == ProbeKind.OUTAGE:
+            outcome = Outage(probe)
+        else:
+            confirm_target = ConfirmTarget(target.leg, worktree, target.lane_command)
+            confirmed = await confirm(confirm_target, detect_record, confirm_runner(store, lane_pass))
+            notes = await _hook_notes(hooks, target.command, head, confirmed, _run_records(store, target.command))
+            outcome = confirmed
     effect = await engine.observe(PassObservation(
         command=target.command,
         leg=target.leg.value,
@@ -155,6 +184,7 @@ async def run_pass(
         fix_task_priority=target.priority,
         notes=notes,
         lane_command=target.lane_command,
+        probe=probe,
     ))
     await asyncio.to_thread(
         store.set_pass_blocks,

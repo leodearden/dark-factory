@@ -153,31 +153,41 @@ def test_git_config_offline_lane_knobs():
     assert cfg_default.offline_lane_poll_interval_secs == 120.0, (
         'offline_lane_poll_interval_secs must default to 120.0'
     )
-    assert cfg_default.offline_lane_red_advances_before_blocker == 3, (
-        'offline_lane_red_advances_before_blocker must default to 3 (§11.3, β3 C4)'
-    )
+    assert cfg_default.offline_lane_persist_passes == 2
+    assert cfg_default.offline_lane_recheck_secs == 1800.0
+    assert cfg_default.offline_lane_red_unlanded_hours == 24.0
 
     cfg_set = GitConfig(
         offline_lane_enabled=True,
         offline_lane_test_threads=4,
         offline_lane_poll_interval_secs=30.0,
-        offline_lane_red_advances_before_blocker=5,
+        offline_lane_persist_passes=3,
+        offline_lane_recheck_secs=600.0,
+        offline_lane_red_unlanded_hours=48.5,
     )
     assert cfg_set.offline_lane_enabled is True
     assert cfg_set.offline_lane_test_threads == 4
     assert cfg_set.offline_lane_poll_interval_secs == 30.0
-    assert cfg_set.offline_lane_red_advances_before_blocker == 5
+    assert cfg_set.offline_lane_persist_passes == 3
+    assert cfg_set.offline_lane_recheck_secs == 600.0
+    assert cfg_set.offline_lane_red_unlanded_hours == 48.5
 
 
 def test_git_config_offline_lane_knobs_validation():
     """offline_lane_test_threads is ge=1; offline_lane_poll_interval_secs is gt=0;
-    offline_lane_red_advances_before_blocker is ge=1."""
+    offline_lane_persist_passes is ge=1; offline_lane_recheck_secs and
+    offline_lane_red_unlanded_hours are gt=0."""
     with pytest.raises(ValidationError):
         GitConfig(offline_lane_test_threads=0)
     with pytest.raises(ValidationError):
         GitConfig(offline_lane_poll_interval_secs=0.0)
     with pytest.raises(ValidationError):
-        GitConfig(offline_lane_red_advances_before_blocker=0)
+        GitConfig(offline_lane_persist_passes=0)
+    assert GitConfig(offline_lane_persist_passes=1).offline_lane_persist_passes == 1
+    with pytest.raises(ValidationError):
+        GitConfig(offline_lane_recheck_secs=0.0)
+    with pytest.raises(ValidationError):
+        GitConfig(offline_lane_red_unlanded_hours=0.0)
 
 
 def test_git_config_offline_lane_infra_enabled_default_and_settable():

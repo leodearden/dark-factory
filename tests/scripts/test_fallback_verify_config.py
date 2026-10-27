@@ -793,6 +793,7 @@ MEASURED_FLEET_SEGMENT_SECS = {
     'fused-memory': 123.87,
     'tests/scripts': 105.0,
     'scripts/tests': 113.0,
+    'client-feed': 2.67,
 }
 
 
@@ -834,6 +835,9 @@ MEASURED_FLEET_SEGMENT_PROVENANCE: dict[str, _SegmentProvenance] = {
     'scripts/tests': _SegmentProvenance(
         '2026-08-01', 1, '3384',
         'standalone local run recorded in commit 7249f40f14 (no persisted summary)'),
+    'client-feed': _SegmentProvenance(
+        '2026-10-15', 3, '6966',
+        'standalone local runs recorded in the task 6966 commit message'),
 }
 
 # The suites the chain runs that have NO figure in MEASURED_FLEET_SEGMENT_SECS:
@@ -1346,6 +1350,7 @@ MEASURED_FLEET_TYPE_SEGMENT_SECS = {
     "escalation": 42,
     "sampler": 11,
     "cockpit": 17,
+    "client-feed": 5,
 }
 
 

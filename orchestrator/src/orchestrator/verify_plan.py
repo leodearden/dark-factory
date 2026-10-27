@@ -21,6 +21,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.pytest_markers import (
     addopts_tokens,
     deselecting_expression_for_targets,
+    is_whole_tree_guard_module,
     locate_pytest_config,
 )
 from orchestrator.verify_cmd import (
@@ -700,6 +701,8 @@ def _derive_module_runs(
     existing_files: list[str],
     worktree_reader: Callable[[str], str | None],
     role: Literal['merge', 'task'] = 'task',
+    *,
+    list_pkg_tests: Callable[[str], list[str]] | None = None,
 ) -> list[PlannedRun]:
     """Derive one ModuleConfig's PlannedRuns — one per (module, tool) slot.
 
@@ -717,11 +720,13 @@ def _derive_module_runs(
     (``'lint:'``/``'pyright:'``/``'pytest:'``) so a caller can recover tool
     identity even for a SKIPPED slot, whose ``cmd`` is ``None``.
 
-    *role* (λ, task 2589, R3; widened by task 3294) is the task-role pytest
-    floor's policy fork. At ``role == 'task'``, ANY touched SOURCE/STRUCTURAL
-    file under the prefix runs the owning module's full ``test_command`` —
-    whether or not collectable test files were touched in the same diff.
-    Only a test-tree-ONLY diff keeps FILE_SCOPED selection (R3's
+    *role* (λ, task 2589, R3; widened by task 3294; narrowed by task 7253) is
+    the task-role pytest floor's policy fork. At ``role == 'task'``, ANY
+    touched SOURCE/STRUCTURAL file under the prefix fires the floor — whether
+    or not collectable test files were touched in the same diff — and the
+    floor runs those touched tests plus the owning module's whole-tree guard
+    family (:func:`_task_role_production_pytest_run`). Only a test-tree-ONLY
+    diff keeps plain FILE_SCOPED selection (R3's
     "touched-test-only diffs keep file-scoped selection"). ``role ==
     'merge'`` is unchanged in every cell (R4): it keeps the legacy
     FILE_SCOPED/SKIPPED shape, because the broad merge gate is a separate,
@@ -857,15 +862,16 @@ def _derive_module_runs(
     #   2. TEST_DATA touched     -> FULL_SUITE (D1: consumed by tests we can't
     #      enumerate from the path alone)
     #   3. role='task' AND a production (SOURCE ∪ STRUCTURAL) file touched
-    #      -> FULL_SUITE, the task-3294 floor. It sits HERE, above arm 4, so
-    #      that coverage is monotone in the diff: co-committing a test must
-    #      not narrow a run the production file alone would have widened.
+    #      -> FILE_SCOPED to the touched tests plus the module's whole-tree
+    #      guard family, else the FULL_SUITE floor. It sits HERE, above arm 4,
+    #      so that coverage is monotone in the diff: co-committing a test only
+    #      adds a target.
     #   4a. collectable tests, ALL provably deselected by the module's own `-m`
     #      -> FULL_SUITE, the task-3494 arm. It sits BELOW arms 1-3 so those
-    #      stay unreachable-by-construction from the new probe, and it is a
-    #      sub-branch of arm 4 rather than a peer because it fires only on the
-    #      selection arm 4 would otherwise emit. See the MARKER DESELECTION
-    #      paragraph in this function's docstring.
+    #      never reach it (arm 3 runs the same probe over its own selection),
+    #      and it is a sub-branch of arm 4 rather than a peer because it fires
+    #      only on the selection arm 4 would otherwise emit. See the MARKER
+    #      DESELECTION paragraph in this function's docstring.
     #   4b. collectable tests     -> FILE_SCOPED to them
     #   5. otherwise             -> an explicit reasoned SKIPPED (the task-1852
     #      "not silent" requirement: never a dropped command)
@@ -887,24 +893,11 @@ def _derive_module_runs(
                 f'pytest: test-data module touched ({test_data_trigger}) — full suite required',
             ))
         elif role == 'task' and production_trigger is not None:
-            test_cmd = parse_config_command(mc.test_command)
-            # The reason is the operator-facing record of WHY this widened.
-            # A mixed diff (production + co-committed tests) must not be
-            # described as "source-only" — and must say that the touched
-            # tests did NOT narrow it, or the widened run reads as a scoper
-            # bug rather than the deliberate task-3294 policy.
-            if collectable_tests:
-                reason = (
-                    f'pytest: production module touched ({production_trigger}) — '
-                    'owning-module full suite (task role); co-committed test file(s) '
-                    'do NOT narrow it; sibling modules NOT run'
-                )
-            else:
-                reason = (
-                    'pytest: source-only diff — owning-module full suite (task role); '
-                    'sibling modules NOT run'
-                )
-            runs.append(PlannedRun(mc.prefix, test_cmd, ScopeKind.FULL_SUITE, reason))
+            runs.append(_task_role_production_pytest_run(
+                mc.prefix, mc.test_command, production_trigger, collectable_tests,
+                _whole_tree_guard_family(mc.prefix, list_pkg_tests, worktree_reader),
+                worktree_reader,
+            ))
         elif collectable_tests:
             deselecting = deselecting_expression_for_command(
                 mc.test_command, collectable_tests, worktree_reader,
@@ -945,6 +938,95 @@ def _derive_module_runs(
         ))
 
     return runs
+
+
+def _whole_tree_guard_family(
+    prefix: str,
+    list_pkg_tests: Callable[[str], list[str]] | None,
+    worktree_reader: Callable[[str], str | None],
+) -> tuple[str, ...]:
+    """*prefix*'s collectable tests that :func:`is_whole_tree_guard_module` admits, sorted.
+
+    Only a listed file whose content marks it a guard is classified, so a
+    touched test outside the family is classified once, by the diff alone.
+    ``()`` when no *list_pkg_tests* seam was supplied: nothing can be enumerated.
+    """
+    if list_pkg_tests is None:
+        return ()
+    return tuple(sorted(
+        path for path in list_pkg_tests(prefix)
+        if is_whole_tree_guard_module(worktree_reader(path)) and _is_collectable_test_file(path)
+    ))
+
+
+def _task_role_production_pytest_run(
+    prefix: str,
+    test_command: str,
+    production_trigger: str,
+    collectable_tests: list[str],
+    guard_family: tuple[str, ...],
+    worktree_reader: Callable[[str], str | None],
+) -> PlannedRun:
+    """Arm 3: the task-role floor for a diff touching production code under *prefix*.
+
+    FILE_SCOPED to *collectable_tests* plus *guard_family* (touched first,
+    deduplicated), else the task-3294 full-suite floor when there is no family
+    or the module's own ``-m`` would deselect the whole narrowed selection.
+    Why it is narrowed, and when to re-widen it: ``docs/task-role-pytest-floor.md``.
+    """
+    if not guard_family:
+        return _task_3294_floor_run(
+            prefix, test_command, production_trigger, collectable_tests,
+            why=f'no whole-tree guard family found for {prefix}',
+        )
+    targets = tuple(dict.fromkeys((*collectable_tests, *guard_family)))
+    deselecting = deselecting_expression_for_command(test_command, targets, worktree_reader)
+    if deselecting is not None:
+        return _task_3294_floor_run(
+            prefix, test_command, production_trigger, collectable_tests,
+            why=f'the narrowed selection is entirely deselected by -m {deselecting!r}',
+        )
+    return PlannedRun(
+        prefix,
+        scope_prefix_to_keyword(test_command, 'pytest', list(targets)),
+        ScopeKind.FILE_SCOPED,
+        f'pytest: production module touched ({production_trigger}) — task role runs '
+        f'{len(collectable_tests)} touched test file(s) plus the {len(guard_family)}-module '
+        'whole-tree guard family instead of the owning-module full suite (task-3294 floor '
+        'narrowed by gate 5702); the full suite runs at the merge gate',
+        scoped_targets=targets,
+    )
+
+
+def _task_3294_floor_run(
+    prefix: str,
+    test_command: str,
+    production_trigger: str,
+    collectable_tests: list[str],
+    *,
+    why: str,
+) -> PlannedRun:
+    """The task-3294 owning-module full-suite floor, with *why* it was not narrowed.
+
+    A mixed diff (production + co-committed tests) is never described as
+    "source-only", and says its touched tests did NOT narrow the run, so the
+    widened run reads as policy rather than a scoper bug.
+    """
+    if collectable_tests:
+        reason = (
+            f'pytest: production module touched ({production_trigger}) — '
+            'owning-module full suite (task role); co-committed test file(s) '
+            'do NOT narrow it; sibling modules NOT run'
+        )
+    else:
+        reason = (
+            'pytest: source-only diff — owning-module full suite (task role); '
+            'sibling modules NOT run'
+        )
+    return PlannedRun(
+        prefix, parse_config_command(test_command), ScopeKind.FULL_SUITE,
+        f'{reason} — not narrowed: {why}',
+    )
 
 
 def _merge_breadth_is_full(config: OrchestratorConfig | None) -> bool:
@@ -1312,6 +1394,8 @@ def derive_verify_plan(
     config: OrchestratorConfig | None,
     worktree_reader: Callable[[str], str | None],
     role: Literal['merge', 'task'] = 'task',
+    *,
+    list_pkg_tests: Callable[[str], list[str]] | None = None,
 ) -> VerifyPlan:
     """Derive the declarative VerifyPlan for one verify attempt (PRD task γ).
 
@@ -1336,7 +1420,12 @@ def derive_verify_plan(
     ``derive_verify_plan`` never executes that guard itself, staying pure.
 
     Module-config branch (*module_configs* non-empty): each ModuleConfig is
-    scoped independently via :func:`_derive_module_runs`.
+    scoped independently via :func:`_derive_module_runs`. *list_pkg_tests*
+    (same contract as :func:`reverse_dependent_test_targets`' seam: a module
+    prefix to the worktree-root-relative ``.py`` files under its tests tree,
+    collectable or not) is how the task-role floor enumerates a module's
+    whole-tree guard family; without it that floor stays the owning-module
+    full suite.
 
     Fallback branch (*module_configs* empty): a single synthetic
     ``'__fallback__'`` module is derived from *config*'s global commands via
@@ -1374,9 +1463,31 @@ def derive_verify_plan(
             if merge_full:
                 runs.extend(_derive_full_suite_runs(mc, role))
             else:
-                runs.extend(_derive_module_runs(mc, existing_files, worktree_reader, role=role))
+                runs.extend(_derive_module_runs(
+                    mc, existing_files, worktree_reader, role=role,
+                    list_pkg_tests=list_pkg_tests,
+                ))
         return VerifyPlan(runs=tuple(runs))
     return VerifyPlan(runs=tuple(_derive_fallback_runs(existing_files, config, worktree_reader)))
+
+
+def executed_module_prefixes(plan: VerifyPlan) -> frozenset[str]:
+    """The module prefixes *plan* executes: none for a TRIVIAL plan, and never a
+    module whose only run is the cmd-None 'no files under prefix' SKIPPED.
+
+    This is the which-modules-execute rule: ``run_scoped_verification``'s executor
+    (``verify.py::_executed_module_configs_from_plan``) and the task-verify
+    dispatcher's eligibility both call it.
+    """
+    if len(plan.runs) == 1 and plan.runs[0].scope_kind is ScopeKind.TRIVIAL:
+        return frozenset()
+    runs_by_prefix: dict[str, list[PlannedRun]] = {}
+    for run in plan.runs:
+        runs_by_prefix.setdefault(run.module_prefix, []).append(run)
+    return frozenset(
+        prefix for prefix, runs in runs_by_prefix.items()
+        if not (len(runs) == 1 and runs[0].cmd is None and runs[0].scope_kind is ScopeKind.SKIPPED)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1454,9 +1565,10 @@ def reverse_dependent_test_targets(
     of how many of ITS depended-upon packages fired or how many of THEIR
     files changed.
 
-    Via the injected *list_pkg_tests* (a dependent's collectable test files)
-    and *read_content* (that file's text) callables, keeps only the test
-    files that actually import one of the triggering packages. A dependent
+    Via the injected *list_pkg_tests* (the ``.py`` files under a dependent's
+    tests tree) and *read_content* (that file's text) callables, keeps only
+    the collectable test files that actually import one of the triggering
+    packages. A dependent
     with no importing test files is omitted entirely — never an empty-list
     entry. Both the outer list (by dependent name) and each inner file list
     are sorted for deterministic output.
@@ -1480,7 +1592,7 @@ def reverse_dependent_test_targets(
         import_names = [_package_import_name(pkg) for pkg in dependent_triggers[dependent]]
         coupled = sorted(
             f for f in list_pkg_tests(dependent)
-            if _imports_any(read_content(f), import_names)
+            if _is_collectable_test_file(f) and _imports_any(read_content(f), import_names)
         )
         if coupled:
             result.append((dependent, coupled))

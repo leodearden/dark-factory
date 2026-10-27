@@ -10,12 +10,16 @@ and no private name is reached into.
 from __future__ import annotations
 
 import asyncio
+import os
+import threading
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import httpx
 import pytest
 from _canned_mcp import CannedMCP, _raw_row
+from shared.process_identity import Liveness, ProcessIdentity, capture
+from shared.task_deferral import HeldBySessionDeferral, PlanningDeferral, record_to_json
 
 NOW = datetime(2026, 9, 20, 12, 0, 0, tzinfo=UTC)
 """The one injected instant every test stamps against.
@@ -769,3 +773,127 @@ class TestSnapshotDegradation:
         assert unit.census.as_of == sibling_at
         assert unit.census.reason == reason
         assert classify(unit) is SnapshotHealth.DEGRADED
+
+
+# ---------------------------------------------------------------------------
+# TestHoldReads — what a deferred hold's referents read as, once per unit (task 6527)
+# ---------------------------------------------------------------------------
+
+HELD_ROW = 71
+STRAY_HELD_ROW = 72
+PLANNING_ROW = 73
+
+
+def _held_by_session(holder: ProcessIdentity) -> dict:
+    return {'deferral': record_to_json(HeldBySessionDeferral(
+        holder=holder, deferred_at=NOW, stamped_at=NOW,
+    ))}
+
+
+class TestHoldReads:
+    """Holder liveness is read from /proc once per unit and off the event loop.
+
+    The status map is offered as carrier statuses only when it was measured.
+    """
+
+    @staticmethod
+    async def _acquire(canned, client, config, root, *, now):
+        from dashboard.data.task_snapshot import acquire_snapshot
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            return await acquire_snapshot(client, config, root, now=now)
+
+    @pytest.fixture()
+    def live_holder(self) -> ProcessIdentity:
+        holder = capture(os.getpid())
+        assert holder is not None, 'the test process must be able to identify itself'
+        return holder
+
+    @pytest.fixture()
+    def liveness_reads(self, monkeypatch) -> list[threading.Thread]:
+        """Wrap the unit's ``read_liveness``, recording the thread each call ran on."""
+        import dashboard.data.task_snapshot as snapshot_mod
+
+        real = snapshot_mod.read_liveness
+        threads: list[threading.Thread] = []
+
+        def recording(holders, **kwargs):
+            threads.append(threading.current_thread())
+            return real(holders, **kwargs)
+
+        monkeypatch.setattr(snapshot_mod, 'read_liveness', recording)
+        return threads
+
+    async def test_a_deferred_session_holder_is_read_into_the_unit(
+        self, project_root, dashboard_config, dummy_client, live_holder, liveness_reads
+    ):
+        canned = CannedMCP(
+            rows=[
+                _raw_row(HELD_ROW, 'deferred', metadata=_held_by_session(live_holder)),
+                _raw_row(STRAY_HELD_ROW, 'pending', metadata=_held_by_session(live_holder)),
+            ],
+            status_map={HELD_ROW: 'deferred', STRAY_HELD_ROW: 'pending'},
+        )
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config, project_root,
+                                       now=NOW)
+
+        assert snapshot.holder_liveness == {HELD_ROW: Liveness.ALIVE}, (
+            'only the DEFERRED row names a holder; a stray record names none'
+        )
+
+    async def test_proc_is_read_once_per_unit_and_off_the_event_loop(
+        self, project_root, dashboard_config, dummy_client, live_holder, liveness_reads
+    ):
+        canned = CannedMCP(
+            rows=[_raw_row(HELD_ROW, 'deferred', metadata=_held_by_session(live_holder))],
+            status_map={HELD_ROW: 'deferred'},
+        )
+        for now in (NOW, NOW + timedelta(seconds=1)):
+            await self._acquire(canned, dummy_client, dashboard_config, project_root, now=now)
+
+        assert len(liveness_reads) == 1, 'a unit served from the cache must not re-read /proc'
+        assert liveness_reads[0] is not threading.main_thread(), (
+            '/proc must be read on a worker thread, never on the event loop'
+        )
+
+    async def test_a_unit_with_no_session_hold_reads_no_proc(
+        self, project_root, dashboard_config, dummy_client, live_holder, liveness_reads
+    ):
+        planning = record_to_json(PlanningDeferral(deferred_at=NOW, stamped_at=NOW))
+        canned = CannedMCP(
+            rows=[
+                _raw_row(STRAY_HELD_ROW, 'pending', metadata=_held_by_session(live_holder)),
+                _raw_row(PLANNING_ROW, 'deferred', metadata={'deferral': planning}),
+            ],
+            status_map={STRAY_HELD_ROW: 'pending', PLANNING_ROW: 'deferred'},
+        )
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config, project_root,
+                                       now=NOW)
+
+        assert liveness_reads == []
+        assert snapshot.holder_liveness == {}
+
+    async def test_the_status_map_is_offered_only_when_it_was_measured(
+        self, project_root, dashboard_config, dummy_client, monkeypatch
+    ):
+        import dashboard.data.task_snapshot as snapshot_mod
+        from dashboard.data.datum import DatumState
+        from dashboard.data.task_snapshot import measured_status_map
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        good = await self._acquire(canned, dummy_client, dashboard_config, project_root,
+                                   now=NOW)
+        measured = measured_status_map(good)
+        assert measured is not None and dict(measured) == status_map
+
+        monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
+        canned.fail_when = lambda call: call['tool'] == 'get_statuses'
+        degraded = await self._acquire(canned, dummy_client, dashboard_config, project_root,
+                                       now=NOW + timedelta(seconds=20))
+
+        assert degraded.rows.state is DatumState.FRESH
+        assert degraded.census.state is DatumState.STALE
+        assert measured_status_map(degraded) is None, (
+            'an unread map must not offer an empty one, or every carrier reads as missing'
+        )

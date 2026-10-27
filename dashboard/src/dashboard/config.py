@@ -6,10 +6,13 @@ import logging
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Final
 
 import yaml
+
+from dashboard.project_labels import ProjectLabels
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,17 @@ _LEGACY_CONFIG_NAMES: Final = (
     'orchestrator-config.yaml',
     'orchestrator/config.yaml',
 )
+
+_ON_OFF: Final = {'on': True, 'off': False}
+
+
+def _parse_on_off(var: str, raw: str) -> bool:
+    """Read an on/off env switch, refusing any other spelling loudly."""
+    try:
+        return _ON_OFF[raw.strip().lower()]
+    except KeyError:
+        spellings = ' or '.join(repr(s) for s in _ON_OFF)
+        raise ValueError(f'{var} must be {spellings}, got {raw!r}') from None
 
 
 def _read_escalation_url(yaml_path: Path) -> str | None:
@@ -138,7 +152,8 @@ def _discover_root_escalation_url(root: Path) -> str | None:
 def _discover_escalation_urls(roots: Iterable[Path]) -> dict[str, str]:
     """Derive each root's escalation MCP URL from its orchestrator config.
 
-    Keyed by project basename — the same key the Merge UI uses. Prefers the
+    Keyed by each root's project label, unique across *roots* (see
+    ``dashboard/project_labels.py::ProjectLabels``). Prefers the
     canonical ``dark-factory-orchestrator.yaml`` name, falling back to legacy
     spellings (see ``_discover_root_escalation_url``). A root that yields no
     URL at all — no config found under any spelling, or a config found with
@@ -152,6 +167,8 @@ def _discover_escalation_urls(roots: Iterable[Path]) -> dict[str, str]:
     a legitimately non-orchestrator or still-legacy root re-emits its WARNING
     only once per process lifetime — a bounded reminder, not log spam.
     """
+    roots = tuple(roots)
+    labels = ProjectLabels.of_roots(roots)
     out: dict[str, str] = {}
     for root in roots:
         url = _discover_root_escalation_url(root)
@@ -164,7 +181,7 @@ def _discover_escalation_urls(roots: Iterable[Path]) -> dict[str, str]:
                 _LEGACY_CONFIG_NAMES,
             )
             continue
-        out[root.name] = url
+        out[labels.of(root)] = url
     return out
 
 
@@ -198,6 +215,13 @@ class DashboardConfig:
     fused_memory_urls: list[str] = field(default_factory=lambda: list(DEFAULT_FUSED_MEMORY_URLS))
     known_project_roots: list[Path] = field(default_factory=list)
     escalation_urls: dict[str, str] = field(default_factory=dict)
+    # Whether lifespan starts the two background samplers
+    # (dashboard/src/dashboard/loops.py::_burndown_loop / ::_metrics_loop), the
+    # only writers of the burndown and metrics history the charts read.
+    # Env DASHBOARD_SAMPLERS=on|off, default on. Under off that history stops
+    # accruing while every page still serves; that is how the test suite's
+    # function-scoped clients run (dashboard/tests/conftest.py::samplers_off).
+    samplers_enabled: bool = True
 
     def __post_init__(self) -> None:
         """Normalize all Path fields to their canonical (symlink-resolved) forms.
@@ -221,6 +245,14 @@ class DashboardConfig:
     def all_project_roots(self) -> tuple[Path, ...]:
         """Every configured project root, ``project_root`` first, each named once."""
         return tuple(dict.fromkeys((self.project_root, *self.known_project_roots)))
+
+    @cached_property
+    def project_labels(self) -> ProjectLabels:
+        """Each root in :attr:`all_project_roots` by its label, unique across that roster.
+
+        Built once per config; a ``dataclasses.replace`` copy is labelled afresh.
+        """
+        return ProjectLabels.of_roots(self.all_project_roots)
 
     def _runtime_data_dir(self, env_var: str, subdir: str) -> Path:
         """Resolve a managed fused-memory runtime data dir, env-var first.
@@ -346,6 +378,8 @@ class DashboardConfig:
             kwargs['fused_memory_urls'] = [u.strip() for u in urls.split(',') if u.strip()]
         if (roots := os.environ.get('DASHBOARD_KNOWN_PROJECT_ROOTS')) is not None:
             kwargs['known_project_roots'] = [Path(p.strip()) for p in roots.split(',') if p.strip()]
+        if (samplers := os.environ.get('DASHBOARD_SAMPLERS')) is not None:
+            kwargs['samplers_enabled'] = _parse_on_off('DASHBOARD_SAMPLERS', samplers)
 
         config = cls(**kwargs)
         if root is None:

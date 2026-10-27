@@ -24,6 +24,7 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from importlib import resources as pkg_resources
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -781,10 +782,10 @@ _FILED = SubmittedTask('fix-7', 'deferred')
 
 
 class _StubScheduler:
-    """Stub scheduler exposing ``dispatch_tool`` and ``submit_task`` — the surface
-    ``SchedulerChronicFlakeTaskClient`` depends on (duck-typed; no import of
-    the real ``Scheduler``, mirroring the module's cross-project scope
-    boundary).  ``submit_task`` answers with a canned outcome: parsing the response
+    """Stub scheduler exposing ``dispatch_tool`` and ``submit_task`` — the
+    ``SchedulerTaskStore`` surface ``SchedulerChronicFlakeTaskClient`` depends on
+    (no import of the real ``Scheduler``, mirroring the module's cross-project
+    scope boundary).  ``submit_task`` answers with a canned outcome: parsing the response
     is ``Scheduler.submit_task``'s job, driven for real in
     :class:`TestSubmitTaskThroughTheRealScheduler`."""
 
@@ -801,7 +802,7 @@ class _StubScheduler:
         self.calls: list[tuple[str, dict, float | None]] = []
         self.submit_calls: list[tuple[dict, float]] = []
 
-    async def dispatch_tool(self, name, arguments, *, timeout=15):
+    async def dispatch_tool(self, name: str, arguments: dict, *, timeout: float = 15) -> Any:
         self.calls.append((name, arguments, timeout))
         if self.raises is not None:
             raise self.raises
@@ -1485,6 +1486,160 @@ class TestSchedulerClientReadsOneTaskLive:
         raised = RuntimeError('mcp down')
         _, client = await self._client(None, raises=raised)
         assert await client.get_task('7') == (None, raised)
+
+
+_OPEN_STATUSES = ['blocked', 'in-progress', 'pending']
+_LEGACY_ROW = {
+    'task_id': 850, 'title': 'offline-lane red', 'status': 'pending', 'priority': 'high',
+    'updated_at': '2026-10-19T09:00:00Z',
+}
+_ENGINE_ROW = {**_LEGACY_ROW, 'task_id': 869}
+
+
+def _metadata_page(rows, *, has_more=False) -> dict:
+    return {
+        'results': rows,
+        'pagination': {'offset': 0, 'returned': len(rows), 'total': len(rows), 'has_more': has_more},
+    }
+
+
+class _PagingScheduler(_StubScheduler):
+    """Answers successive ``dispatch_tool`` calls from *pages*, in order."""
+
+    def __init__(self, pages):
+        super().__init__()
+        self.pages = list(pages)
+
+    async def dispatch_tool(self, name: str, arguments: dict, *, timeout: float = 15) -> Any:
+        self.calls.append((name, arguments, timeout))
+        return self.pages.pop(0)
+
+
+class TestSchedulerClientFindsTasksByMetadata:
+    """``find_tasks_by_metadata``: the exact metadata lookup the offline lane reads its
+    open fix tasks through.  An empty list is an ANSWER ("no such open task"), so a
+    failure must come back in band as the error half, never as ``[]`` alone."""
+
+    def _client(self, scheduler):
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        return SchedulerChronicFlakeTaskClient(scheduler, '/proj')
+
+    async def _find(self, scheduler):
+        return await self._client(scheduler).find_tasks_by_metadata(
+            'spawn_context', 'offline_lane_red', tuple(_OPEN_STATUSES),
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatches_key_value_statuses_and_the_first_page(self):
+        scheduler = _StubScheduler(mcp_tool_envelope(_metadata_page([])))
+        await self._find(scheduler)
+        assert [call[:2] for call in scheduler.calls] == [
+            (
+                'find_tasks_by_metadata',
+                {
+                    'project_root': '/proj',
+                    'key': 'spawn_context',
+                    'value': 'offline_lane_red',
+                    'statuses': _OPEN_STATUSES,
+                    'limit': 100,
+                    'offset': 0,
+                },
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [mcp_tool_envelope(_metadata_page([_LEGACY_ROW])), _metadata_page([_LEGACY_ROW])],
+        ids=['production_jsonrpc_body', 'bare_payload'],
+    )
+    async def test_the_rows_are_returned_verbatim_with_no_error(self, envelope):
+        rows, error = await self._find(_StubScheduler(envelope))
+        assert (rows, error) == ([_LEGACY_ROW], None)
+        assert rows[0]['task_id'] == 850
+
+    @pytest.mark.asyncio
+    async def test_an_empty_page_is_an_answer(self):
+        assert await self._find(_StubScheduler(mcp_tool_envelope(_metadata_page([])))) == ([], None)
+
+    @pytest.mark.asyncio
+    async def test_pages_are_followed_until_has_more_is_false(self):
+        scheduler = _PagingScheduler([
+            mcp_tool_envelope(_metadata_page([_LEGACY_ROW], has_more=True)),
+            mcp_tool_envelope(_metadata_page([_ENGINE_ROW])),
+        ])
+        assert await self._find(scheduler) == ([_LEGACY_ROW, _ENGINE_ROW], None)
+        assert [call[1]['offset'] for call in scheduler.calls] == [0, 1]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            mcp_tool_envelope({'error': 'statuses invalid', 'error_type': 'ValidationError'}),
+            {'error': 'statuses invalid', 'error_type': 'ValidationError'},
+            _mcp_is_error_body('find_tasks_by_metadata'),
+            _JSONRPC_PROTOCOL_ERROR,
+            mcp_tool_envelope({'pagination': {'has_more': False}}),
+            mcp_tool_envelope({'results': 'not a list', 'pagination': {'has_more': False}}),
+            mcp_tool_envelope({'results': ['not a dict'], 'pagination': {'has_more': False}}),
+            mcp_tool_envelope({'results': [{'status': 'pending'}], 'pagination': {'has_more': False}}),
+            mcp_tool_envelope({'results': [_LEGACY_ROW]}),
+            mcp_tool_envelope({'results': [_LEGACY_ROW], 'pagination': 'not a dict'}),
+            mcp_tool_envelope({'results': [_LEGACY_ROW], 'pagination': {'returned': 1}}),
+            mcp_tool_envelope({'results': [_LEGACY_ROW], 'pagination': {'has_more': 'no'}}),
+            None,
+        ],
+        ids=[
+            'structured_tool_error',
+            'bare_structured_tool_error',
+            'mcp_is_error',
+            'jsonrpc_protocol_error',
+            'no_results',
+            'results_not_a_list',
+            'row_not_a_dict',
+            'row_without_task_id',
+            'no_pagination',
+            'pagination_not_a_dict',
+            'pagination_without_has_more',
+            'has_more_not_a_bool',
+            'none',
+        ],
+    )
+    async def test_an_unreadable_answer_is_reported_in_band(self, envelope):
+        rows, error = await self._find(_StubScheduler(envelope))
+        assert rows == []
+        assert isinstance(error, ValueError)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('envelope', 'server_text'),
+        [
+            (
+                mcp_tool_envelope({'error': 'statuses invalid', 'error_type': 'ValidationError'}),
+                'statuses invalid',
+            ),
+            (_mcp_is_error_body('find_tasks_by_metadata'), 'boom'),
+        ],
+        ids=['structured_tool_error', 'mcp_is_error'],
+    )
+    async def test_a_refusal_carries_the_servers_text(self, envelope, server_text):
+        _, error = await self._find(_StubScheduler(envelope))
+        assert server_text in str(error)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_second_page_yields_no_partial_list(self):
+        scheduler = _PagingScheduler([
+            mcp_tool_envelope(_metadata_page([_LEGACY_ROW], has_more=True)),
+            mcp_tool_envelope({'error': 'taskmaster unavailable', 'error_type': 'TaskmasterError'}),
+        ])
+        rows, error = await self._find(scheduler)
+        assert rows == []
+        assert 'taskmaster unavailable' in str(error)
+
+    @pytest.mark.asyncio
+    async def test_a_raising_dispatch_is_reported_not_raised(self):
+        raised = RuntimeError('mcp down')
+        assert await self._find(_StubScheduler(raises=raised)) == ([], raised)
 
 
 class TestExtractStatusesMap:

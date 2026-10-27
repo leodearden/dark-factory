@@ -126,7 +126,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +143,29 @@ class TrainState(TypedDict):
     order: int            # this task's position in the train (0-based)
     parked_members: list[str]  # sibling task_ids at merge-deferred, excluding self
     failing_member: str   # this task's id (the one that triggered BLOCKED)
+
+
+SidecarOnMain = Literal['declares', 'does_not_declare', 'unverified']
+
+
+class CheckSidecarSite(TypedDict):
+    """The owner's capability-manifest sidecar, as read at main when the escalation was filed."""
+
+    path: str  # shared.capability_manifest.sidecar_path(owner's metadata.prd_path), repo-relative
+    on_main: SidecarOnMain
+
+
+class DeliveredCheckOwner(TypedDict):
+    """Who declares a failing delivered check, and where (`dependency_capability`, task 7514).
+
+    `task_id` is the DEPENDENCY whose metadata.delivered_checks carries `check_name`;
+    the record's own task_id is the blocked dependent, which is only ever re-pended.
+    `sidecar` is None when the owner has no prd_path.
+    """
+
+    task_id: str
+    check_name: str
+    sidecar: CheckSidecarSite | None
 
 
 class IndexHealthState(TypedDict):
@@ -434,9 +457,15 @@ AGENT_FILABLE_LEVELS: frozenset[int] = frozenset({0, 1})
 # 'moot-terminal-subject' they are deliberately neither 'benign' nor
 # 'actionable'.  The decision vocabulary lives in
 # escalation/src/escalation/disposition.py.
+#
+# NOTE_TO_FILE_CLASS is stamped only by escalate_info(note_to_file=True), filed
+# resolved at filing; like 'moot-terminal-subject' it is neither benign nor
+# actionable.  Rationale: plans/plan-deviation-recording-prd.md D2.
+NOTE_TO_FILE_CLASS: str = 'note-to-file'
 RESOLUTION_CLASSES: frozenset[str] = frozenset({
     'benign', 'actionable', 'moot-terminal-subject', 'stale-strand',
     'addressed', 'observation-consumed', 'converted', 'status-info',
+    NOTE_TO_FILE_CLASS,
 })
 
 
@@ -446,16 +475,7 @@ class Escalation:
     task_id: str
     agent_role: str
     severity: str  # "blocking" | "info" | "critical" | "urgent"
-    category: str  # scope_violation, design_concern, cleanup_needed,
-    # dependency_discovered, risk_identified, infra_issue,
-    # reconciliation_stale_human_operator, reconciliation_stale_gate_backlog,
-    # recon_missing_index
-    # REFACTOR TRIGGER (task 3709): this vocabulary is prose, not a checked
-    # contract — nothing rejects a typo'd category at submit time, and the
-    # dedup correctness of every categorized detector depends on filer and
-    # reader spelling it identically.  The NEXT category addition promotes
-    # this comment to an enum (or a submit-time lint) instead of growing
-    # another line.
+    category: str  # a registered escalation.categories.EscalationCategory value — enforced at queue submit, never on rehydration
     summary: str  # one-line
     detail: str = ''  # full context
     suggested_action: str = ''  # expand_scope, create_followup_task, abort_task, etc.
@@ -522,6 +542,12 @@ class Escalation:
     # _atomic_write / resolve / park / stamp_triage are field-agnostic
     # passthroughs that need no change.
     index_health: IndexHealthState | None = None
+    # Task 7514 — the dependency that declares the failing delivered check, for
+    # `dependency_capability` escalations filed by the harness.  None for every
+    # other escalation kind; legacy JSON (pre-field) deserialises to None via the
+    # from_dict __dataclass_fields__ filter — zero migration, same pattern as
+    # train_state / index_health above.
+    delivered_check_owner: DeliveredCheckOwner | None = None
     # C1 action chosen at resolve_issue time (resume/restart/park/abandon/close_only).
     # None for records resolved before α1 or for L2 cascade members (β derives theirs
     # from the parent via resolved_by='l2-cascade:<id>' attribution).
@@ -714,8 +740,16 @@ class Escalation:
     # `fused_memory/reconciliation/orphaned_recon_escalation_sweep.py::escalation_project_id`.
     # Zero migration by the same from_dict __dataclass_fields__ filter as
     # every field above.  Deliberately NOT added to
-    # `_COMPACT_ESCALATION_FIELDS` (server.py) — its readers load full records.
+    # `_COMPACT_ESCALATION_FIELDS` (server.py) — its readers load full records;
+    # the reasoning (task 5776, won't-fix) is recorded beside that tuple.
     project_id: str | None = None
+    # NOTE TO FILE (plans/plan-deviation-recording-prd.md D2) — a filer-declared
+    # record that requests nothing: never pending (EscalationQueue.submit), and
+    # filed by EscalationQueue.submit_resolved.  Every resolution-class stamp
+    # site refuses this flag without NOTE_TO_FILE_CLASS, and that class without
+    # this flag, via note_to_file_class_conflict.  Zero migration via the
+    # from_dict filter.
+    note_to_file: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -730,3 +764,14 @@ class Escalation:
     @classmethod
     def from_json(cls, text: str) -> Escalation:
         return cls.from_dict(json.loads(text))
+
+
+def note_to_file_class_conflict(escalation: Escalation, resolution_class: str | None) -> str | None:
+    """Why *escalation* cannot carry *resolution_class* under the note-to-file pairing, else None."""
+    if escalation.note_to_file == (resolution_class == NOTE_TO_FILE_CLASS):
+        return None
+    return (
+        f'escalation {escalation.id}: note_to_file={escalation.note_to_file} with '
+        f'resolution_class={resolution_class!r}; {NOTE_TO_FILE_CLASS!r} is stamped on a '
+        'note_to_file record and on nothing else'
+    )

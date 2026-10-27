@@ -4,8 +4,8 @@ Step-1: compute_preexisting_main_break_fingerprint helper produces the same
         fingerprint as the inline composition in _verify_debugfix_loop, and
         returns '' on failure.
 Step-13: _submit_to_merge_queue routes a MAIN_HEALTH_RED_REASON_PREFIX outcome
-         to _mark_blocked(escalate_to_human=True, category='preexisting_main_break',
-         dedupe_fingerprint=..., suggested_action='await_preexisting_main_hotfix').
+         to one foldable L1 carrying the shared dedupe fingerprint, then blocks
+         via _mark_blocked(skip_escalation=True) (task 5471).
 """
 from __future__ import annotations
 
@@ -14,10 +14,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.main_health_actions import MainHealthNextAction
 from orchestrator.merge_lane.worker import MAIN_HEALTH_RED_REASON_PREFIX, MergeOutcome
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -141,9 +143,9 @@ class TestComputePreexistingMainBreakFingerprint:
 
 class TestSubmitToMergeQueueMainHealthRouting:
     """_submit_to_merge_queue must route a MAIN_HEALTH_RED_REASON_PREFIX blocked
-    outcome to _mark_blocked(escalate_to_human=True, category='preexisting_main_break',
-    dedupe_fingerprint=..., suggested_action='await_preexisting_main_hotfix'),
-    and must NOT touch the steward or the generic task-fault path.
+    outcome to one foldable ``preexisting_main_break`` L1 carrying the shared
+    dedupe fingerprint, and must NOT touch the steward or the generic
+    task-fault path.
 
     Pattern mirrors test_workflow_e2e.py: set workflow.merge_queue, patch
     enqueue_merge_request to deliver the MergeOutcome, call with a branch name.
@@ -167,6 +169,7 @@ class TestSubmitToMergeQueueMainHealthRouting:
         mark_blocked_mock = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
         workflow._mark_blocked = mark_blocked_mock  # type: ignore[method-assign]
         workflow._write_merge_failure_review = MagicMock()
+        workflow.escalation_queue = EscalationQueue(tmp_path / 'escalations')
 
         # Deliver the MergeOutcome via the enqueue hook (same pattern as e2e tests).
         async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
@@ -181,19 +184,15 @@ class TestSubmitToMergeQueueMainHealthRouting:
             )
 
         assert result == WorkflowOutcome.BLOCKED
+        [esc] = workflow.escalation_queue.get_pending()
+        assert esc.category == 'preexisting_main_break'
+        assert esc.level == 1
+        assert esc.dedupe_fingerprint == fp
+        assert esc.suggested_action == MainHealthNextAction.NO_FIX_OWNER
         mark_blocked_mock.assert_called_once()
         call_kwargs = mark_blocked_mock.call_args[1]
-        assert call_kwargs.get('escalate_to_human') is True, (
-            f'Expected escalate_to_human=True; got {call_kwargs}'
-        )
-        assert call_kwargs.get('category') == 'preexisting_main_break', (
-            f'Expected category=preexisting_main_break; got {call_kwargs}'
-        )
-        assert call_kwargs.get('dedupe_fingerprint') == fp, (
-            f'Expected dedupe_fingerprint={fp!r}; got {call_kwargs}'
-        )
-        assert call_kwargs.get('suggested_action') == 'await_preexisting_main_hotfix', (
-            f'Expected suggested_action=await_preexisting_main_hotfix; got {call_kwargs}'
+        assert call_kwargs.get('skip_escalation') is True, (
+            f'The L1 is already filed; got {call_kwargs}'
         )
         assert call_kwargs.get('merge_phase') is True, (
             f'Expected merge_phase=True (forwarded); got {call_kwargs}'

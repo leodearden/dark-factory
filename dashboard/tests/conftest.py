@@ -144,7 +144,17 @@ def two_url_config(tmp_path):
 
 
 @pytest.fixture()
-def client():
+def samplers_off(monkeypatch):
+    """Any app lifespan started later in this test runs without the two background samplers.
+
+    Request it from a test that builds its own ``TestClient(app)`` and asserts
+    on a patched MCP seam (task 5826).
+    """
+    monkeypatch.setenv('DASHBOARD_SAMPLERS', 'off')
+
+
+@pytest.fixture()
+def client(samplers_off):
     """Create a TestClient for the dashboard FastAPI app.
 
     Its lifespan is isolated on BOTH axes by the session-scoped
@@ -154,6 +164,9 @@ def client():
     rather than the operator's live instance on 8002 (task 5185).  The second
     half is not cosmetic: without it every lifespan here makes two real MCP
     round trips, and one slow response wedges ``TestClient.__exit__``.
+
+    The samplers are off, because their discovery ``ps``-scans the real host
+    and their reads land on whatever MCP seam the test patched (task 5826).
     """
     from dashboard.app import app
 
@@ -162,7 +175,7 @@ def client():
 
 
 @pytest.fixture()
-def two_url_client(monkeypatch):
+def two_url_client(monkeypatch, samplers_off):
     """TestClient running the lifespan with a two-URL fused-memory config.
 
     Uses monkeypatch.setenv so DashboardConfig.from_env() inside the lifespan
@@ -172,6 +185,9 @@ def two_url_client(monkeypatch):
     Only the fused-memory URLs are overridden here; project_root still comes
     from the session-scoped ``_isolated_project_root`` temp dir, so this
     lifespan does not touch the operator's live checkout either (task 3503).
+
+    The samplers are off, because their discovery ``ps``-scans the real host
+    and their reads land on whatever MCP seam the test patched (task 5826).
     """
     from dashboard.app import app
 

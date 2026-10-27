@@ -9,8 +9,10 @@ guard it supersedes (``test_merge_queue_reachback_patch_guard.py`` carries its
 Ratchet contract
 ----------------
 ``orchestrator/tests/merge_lane_ratchet_baseline.json`` freezes every measure at
-its value on the commit that introduced it. The gate FAILS on any measure that
-rises above its baseline (ratchet semantics). Equality is permitted -- this is a
+its value on the commit that introduced it, except the two size measures
+(``metrics.REPORTED_ONLY_MEASURES``), which are reported but never ratcheted.
+The gate FAILS on any other measure that rises above its baseline (ratchet
+semantics). Equality is permitted -- this is a
 ratchet, not a day-one gate, and on the introducing commit 62 lane functions
 already exceed cognitive 15 and ``merge_queue.py`` is 21,550 lines. The two
 CEILINGS (1,500 lines per file, cognitive 15 per function) therefore apply only
@@ -22,7 +24,7 @@ commit (``python scripts/merge_lane_metrics.py --write-baseline
 orchestrator/tests/merge_lane_ratchet_baseline.json``). A raise is a different
 matter but not a forbidden one: it must be AUTHORIZED, never silent. Adding
 ``--authorize-raise <task-id> --reason <text>`` to that same command records the
-per-measure delta in ``merge_lane_ratchet_authorized_raises.json``; without
+per-measure delta as one new file under ``merge_lane_ratchet_raises/``; without
 those flags ``--write-baseline`` refuses to absorb a raise over an EXISTING
 baseline, so regenerating cannot make this test pass by widening the ratchet.
 Deleting the baseline first would -- there is then nothing to compare against --
@@ -51,14 +53,18 @@ import ast
 import copy
 import dataclasses
 import json
-import sys
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 from _git_fixtures import RepoSeed, build_repo
-from _merge_lane_ratchet_fixtures import synthetic_report
+from _merge_lane_ratchet_fixtures import (
+    blank_file_entry,
+    metrics,
+    source_measures,
+    synthetic_report,
+)
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # This module AST-parses the Appendix A cluster (8 CLUSTER_PATHS entries, one
@@ -108,17 +114,6 @@ pytestmark = [
     pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
     pytest.mark.xdist_group('merge_lane_ratchet'),
 ]
-
-# Make scripts/merge_lane_metrics.py importable. This is the sanctioned
-# precedent for an orchestrator/tests/ module importing a scripts/ one -- see
-# test_run_vllm_eval.py -- and needs no new pyright config: orchestrator/
-# pyproject.toml's [tool.pyright] extraPaths already carries "../scripts".
-_SCRIPTS = Path(__file__).parents[2] / 'scripts'
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
-
-import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
-import source_measures  # type: ignore[import-not-found]  # noqa: E402
 
 _REPO_ROOT = Path(__file__).parents[2]
 
@@ -1347,6 +1342,19 @@ class TestBaselineIO:
         assert 'baseline.json' in str(excinfo.value)
 
 
+def _ledger_files(ledger: Path) -> dict[str, str]:
+    """Every file in the ledger directory *ledger*, by name -- what a write may not touch."""
+    return {path.name: path.read_text(encoding='utf-8') for path in sorted(ledger.iterdir())}
+
+
+def _corrupt_ledger(tmp_path: Path) -> Path:
+    """A ledger directory holding one entry that cannot be read."""
+    ledger = tmp_path / 'raises'
+    ledger.mkdir()
+    (ledger / 'corrupt.json').write_text('{ not json at all', encoding='utf-8')
+    return ledger
+
+
 class TestWriteBaselineRefusesAnUnauthorizedRaise:
     """The write path is where the ratchet is actually enforceable.
 
@@ -1378,15 +1386,15 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     ) -> None:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] += 103  # the real task-5342 shape
+        current['files'][_MQ]['cognitive'] += 15
 
         with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
             metrics.write_baseline(target, current)
 
         message = str(excinfo.value)
-        assert 'lines' in message
+        assert 'cognitive' in message
         assert _MQ in message
-        assert '21550' in message and '21653' in message
+        assert '2133' in message and '2148' in message
         # The refusal must name the sanctioned path, not merely forbid the move.
         assert '--authorize-raise' in message
 
@@ -1395,7 +1403,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     ) -> None:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] += 103
+        current['files'][_MQ]['cognitive'] += 15
 
         with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
             metrics.write_baseline(target, current)
@@ -1414,7 +1422,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         before = target.read_text(encoding='utf-8')
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] += 103
+        current['files'][_MQ]['cognitive'] += 15
 
         with pytest.raises(metrics.UnauthorizedRaise):
             metrics.write_baseline(target, current)
@@ -1478,12 +1486,27 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # Lowering is the POINT. It must cost nothing extra.
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] -= 4000
+        current['files'][_MQ]['cognitive'] -= 400
 
         written = metrics.write_baseline(target, current)
         assert written.path == target
         assert written.record is None
         assert target.read_text(encoding='utf-8') == metrics.render_baseline(current)
+
+    def test_a_size_only_rise_is_written_without_authorization(
+        self, tmp_path: Path
+    ) -> None:
+        target = self._seeded(tmp_path)
+        ledger = tmp_path / 'raises'
+        current = copy.deepcopy(_ratchet_baseline())
+        _grow_mq_size(current)
+        current['files'][self._NEW_PATH] = blank_file_entry(lines=1400, prose_lines=600)
+
+        written = metrics.write_baseline(target, current, ledger=ledger)
+
+        assert written.record is None
+        assert target.read_text(encoding='utf-8') == metrics.render_baseline(current)
+        assert not ledger.exists()
 
     def test_a_recorded_raise_authorizes_no_later_one(self, tmp_path: Path) -> None:
         # THE BYPASS THE DESIGN EXISTS TO CLOSE: pre-write a record, then
@@ -1493,21 +1516,21 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # which leaves this branch green whether the gate consults the file or
         # not.
         target = self._seeded(tmp_path)
-        ledger = tmp_path / 'ledger.json'
+        ledger = tmp_path / 'raises'
         first = copy.deepcopy(_ratchet_baseline())
-        first['files'][_MQ]['lines'] += 103
+        first['files'][_MQ]['cognitive'] += 15
         metrics.write_baseline(
             target, first, authorization=self._AUTHORIZATION, ledger=ledger
         )
-        recorded = ledger.read_text(encoding='utf-8')
-        assert metrics.load_ledger(ledger)['raises']
+        recorded = _ledger_files(ledger)
+        assert metrics.load_ledger(ledger)
 
         further = copy.deepcopy(first)
-        further['files'][_MQ]['lines'] += 50
+        further['files'][_MQ]['cognitive'] += 5
         with pytest.raises(metrics.UnauthorizedRaise):
             metrics.write_baseline(target, further, ledger=ledger)
 
-        assert ledger.read_text(encoding='utf-8') == recorded
+        assert _ledger_files(ledger) == recorded
         assert target.read_text(encoding='utf-8') == metrics.render_baseline(first)
 
     def test_a_plain_regeneration_never_reads_the_ledger(
@@ -1516,15 +1539,14 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # The other face of the same property: with nothing to record, the
         # ledger is not consulted, so a lowering regeneration cannot be blocked
         # by the health of a file it does not touch. load_ledger fails HARD on
-        # a malformed file, so any read at all would redden this.
+        # a malformed entry, so any read at all would redden this.
         target = self._seeded(tmp_path)
-        ledger = tmp_path / 'ledger.json'
-        ledger.write_text('{ not json at all', encoding='utf-8')
+        ledger = _corrupt_ledger(tmp_path)
         lowered = copy.deepcopy(_ratchet_baseline())
-        lowered['files'][_MQ]['lines'] -= 4000
+        lowered['files'][_MQ]['cognitive'] -= 400
 
         assert metrics.write_baseline(target, lowered, ledger=ledger).record is None
-        assert ledger.read_text(encoding='utf-8') == '{ not json at all'
+        assert _ledger_files(ledger) == {'corrupt.json': '{ not json at all'}
 
     def test_unauthorized_raise_is_not_a_metrics_error(self) -> None:
         # The exit ladder: 1 is "a measure rose", 2 is "the instrument broke".
@@ -1552,7 +1574,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     ) -> None:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][self._NEW_PATH] = _blank_file_entry(
+        current['files'][self._NEW_PATH] = blank_file_entry(
             lines=metrics.FILE_LINE_CEILING + 1
         )
 
@@ -1583,29 +1605,18 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         ]
         assert [v.key for v in breaches] == [f'{_MQ}::brand_new']
 
-    def test_a_new_file_exactly_at_the_line_ceiling_is_no_ceiling_breach(
+    def test_a_new_file_exactly_at_the_line_ceiling_is_written_without_authorization(
         self, tmp_path: Path
     ) -> None:
         # A ceiling is a ceiling, not a floor -- mirrors
         # TestCeilingsApplyOnlyToNewKeys::test_a_new_file_exactly_at_the_line_ceiling_is_allowed.
-        #
-        # It is asserted as "no ceiling violation" rather than "the write
-        # succeeds" because it cannot be the latter: 1,500 new lines raise
-        # total:lines by 1,500, so this write is refused by the TOTALS arm
-        # whatever the ceiling says. Contriving the fixture to net the totals to
-        # zero would only hide which arm fired.
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][self._NEW_PATH] = _blank_file_entry(
+        current['files'][self._NEW_PATH] = blank_file_entry(
             lines=metrics.FILE_LINE_CEILING
         )
 
-        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
-            metrics.write_baseline(target, current)
-
-        assert 'new_file_over_ceiling' not in {
-            v.measure for v in excinfo.value.violations
-        }
+        assert metrics.write_baseline(target, current).record is None
 
     def test_the_git_ops_size_exemption_holds_on_the_write_path(
         self, tmp_path: Path
@@ -1631,9 +1642,9 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     def test_an_authorized_ceiling_breach_is_recorded(self, tmp_path: Path) -> None:
         # The discriminator pair, completed for ceilings.
         target = self._seeded(tmp_path)
-        ledger = tmp_path / 'ledger.json'
+        ledger = tmp_path / 'raises'
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][self._NEW_PATH] = _blank_file_entry(
+        current['files'][self._NEW_PATH] = blank_file_entry(
             lines=metrics.FILE_LINE_CEILING + 1
         )
 
@@ -1641,352 +1652,13 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
             target, current, authorization=self._AUTHORIZATION, ledger=ledger
         )
 
-        measures = metrics.load_ledger(ledger)['raises'][0]['measures']
+        measures = metrics.load_ledger(ledger)[0]['measures']
         breach = next(
             row for row in measures if row['measure'] == 'new_file_over_ceiling'
         )
         assert breach['key'] == self._NEW_PATH
         assert breach['baseline'] == metrics.FILE_LINE_CEILING
         assert breach['current'] == metrics.FILE_LINE_CEILING + 1
-
-
-def _baseline_image(tmp_path: Path, name: str, report: dict) -> Path:
-    """*report* written as committed baseline bytes, for a path-taking face."""
-    target = tmp_path / name
-    target.write_text(metrics.render_baseline(report), encoding='utf-8')
-    return target
-
-
-def _violation_fields(violation: metrics.Violation) -> tuple[str, str, int, int]:
-    """The four fields a ledger record is projected from, message excluded.
-
-    Asserting on the tuple rather than on ``message`` is what keeps these
-    tests about the COMPARISON: the wording lives in ``Violation.rose`` and is
-    pinned by ``TestViolationShape``, so re-deriving it here would be a
-    second copy that drifts.
-    """
-    return (
-        violation.measure,
-        violation.key,
-        violation.baseline,
-        violation.current,
-    )
-
-
-class TestCompareBaselineFiles:
-    """The comparison the WRITER cannot make: two committed IMAGES, not a tree.
-
-    ``write_baseline``'s gate compares a fresh report against whatever happens to
-    be at the destination, so deleting that destination -- or rendering elsewhere
-    and copying over -- leaves it nothing to compare and every measure resets.
-    These pin the face that reads two baseline FILES, which is what lets the
-    committed-diff auditor ask "did this diff raise anything" without the tree.
-
-    Synthetic images throughout, written with ``render_baseline`` into tmp_path:
-    microseconds, and never the module-scoped ``live_report`` measurement.
-    """
-
-    @staticmethod
-    def _pair(tmp_path: Path, mutate) -> tuple[Path, Path]:
-        """Two images: the seed, and the seed with one measure perturbed."""
-        moved = copy.deepcopy(synthetic_report())
-        mutate(moved)
-        return (
-            _baseline_image(tmp_path, 'previous.json', synthetic_report()),
-            _baseline_image(tmp_path, 'current.json', moved),
-        )
-
-    def test_a_rise_is_reported_per_path_and_in_the_derived_total(
-        self, tmp_path: Path
-    ) -> None:
-        previous, current = self._pair(
-            tmp_path, lambda report: report['files']['a.py'].__setitem__('lines', 1005)
-        )
-
-        raises = metrics.compare_baseline_files(previous, current)
-
-        # The per-path violation is field-for-field what the writer's own gate
-        # would have produced, so a ledger record derived from either describes
-        # the same raise. The total comes along because it is DERIVED -- moving
-        # the mass to a new path is the shape that check exists for.
-        assert [_violation_fields(v) for v in raises] == [
-            _violation_fields(metrics.Violation.rose('lines', 'a.py', 1000, 1005)),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205),
-        ]
-
-    def test_a_fall_is_clean(self, tmp_path: Path) -> None:
-        previous, current = self._pair(
-            tmp_path, lambda report: report['files']['a.py'].__setitem__('lines', 995)
-        )
-
-        # Lowering is the point of a ratchet, so it must never need authorizing.
-        assert metrics.compare_baseline_files(previous, current) == []
-
-    def test_byte_identical_images_are_clean(self, tmp_path: Path) -> None:
-        previous, current = self._pair(tmp_path, lambda report: None)
-
-        assert previous.read_bytes() == current.read_bytes()
-        assert metrics.compare_baseline_files(previous, current) == []
-
-    def test_the_argument_order_cannot_read_clean_when_crossed(
-        self, tmp_path: Path
-    ) -> None:
-        # THE ONE MISTAKE THAT WOULD DISARM THE AUDITOR SILENTLY.
-        # ``_measure_raises`` takes (current, previous) while this face takes
-        # (previous, current), so a crossed call is a live hazard -- and a
-        # crossed call reads CLEAN, which is the failure a gate must never have.
-        previous, current = self._pair(
-            tmp_path, lambda report: report['files']['a.py'].__setitem__('lines', 1005)
-        )
-
-        assert metrics.compare_baseline_files(previous, current)
-        assert metrics.compare_baseline_files(current, previous) == []
-
-    def test_a_new_oversized_path_breaches_the_ceiling(self, tmp_path: Path) -> None:
-        # Proves ``_check_ceilings`` is reached, not just the four rise arms: a
-        # path ABSENT from the previous image is held to the ceiling, so writing
-        # an oversized new file into the baseline cannot grandfather it.
-        oversized = metrics.FILE_LINE_CEILING + 1
-        previous, current = self._pair(
-            tmp_path,
-            lambda report: report['files'].__setitem__(
-                'new_big.py', _blank_file_entry(lines=oversized)
-            ),
-        )
-
-        raises = metrics.compare_baseline_files(previous, current)
-
-        assert (
-            'new_file_over_ceiling',
-            'new_big.py',
-            metrics.FILE_LINE_CEILING,
-            oversized,
-        ) in [_violation_fields(v) for v in raises]
-
-    def test_a_missing_image_is_a_named_hard_failure(self, tmp_path: Path) -> None:
-        # Inherited from load_baseline, never re-implemented: an unreadable
-        # image must never read as an empty-baseline pass (INV-11).
-        previous = _baseline_image(tmp_path, 'previous.json', synthetic_report())
-        absent = tmp_path / 'gone.json'
-
-        with pytest.raises(metrics.RatchetError) as excinfo:
-            metrics.compare_baseline_files(previous, absent)
-
-        assert str(absent) in str(excinfo.value)
-
-    def test_a_malformed_image_is_a_named_hard_failure(self, tmp_path: Path) -> None:
-        previous = _baseline_image(tmp_path, 'previous.json', synthetic_report())
-        broken = tmp_path / 'broken.json'
-        broken.write_text('{"files": {', encoding='utf-8')
-
-        with pytest.raises(metrics.RatchetError) as excinfo:
-            metrics.compare_baseline_files(previous, broken)
-
-        message = str(excinfo.value)
-        assert str(broken) in message
-        assert 'not valid JSON' in message
-
-
-class TestCompareMergedBaselineFiles:
-    """The 3-WAY BOUND a merge commit's staged baseline is compared against.
-
-    A conflicted merge finished with `git commit` stages a baseline descended
-    from two parents (esc-3620-11). Read against HEAD alone, every measure
-    MERGE_HEAD moved is a raise; read against either parent, keeping one side's
-    stale value re-absorbs the other side's lowering. The bound is what git does
-    to the file text, applied per measure against the merge base: a measure one
-    side moved stands at that side's value, up or down, and where both moved,
-    the higher side bounds it.
-
-    The seed's numbers: a.py lines 1000, b.py lines 200, total:lines 1200.
-    """
-
-    @staticmethod
-    def _moved(*moves: tuple[str, str, int]) -> dict:
-        """The seed with each ``(path, measure, value)`` set in its ``files``."""
-        report = synthetic_report()
-        for path, measure, value in moves:
-            report['files'][path][measure] = value
-        return report
-
-    @staticmethod
-    def _bounded(
-        tmp_path: Path,
-        current: dict,
-        *,
-        base: dict | None,
-        ours: dict | None,
-        theirs: dict | None,
-    ) -> list[tuple[str, str, int, int]]:
-        """The raises *current* makes over the bound, as field tuples."""
-
-        def image(name: str, report: dict | None) -> Path | None:
-            return None if report is None else _baseline_image(tmp_path, name, report)
-
-        raises = metrics.compare_merged_baseline_files(
-            base=image('base.json', base),
-            ours=image('ours.json', ours),
-            theirs=image('theirs.json', theirs),
-            current=_baseline_image(tmp_path, 'current.json', current),
-        )
-        return [_violation_fields(violation) for violation in raises]
-
-    def test_a_measure_only_theirs_moved_stands_at_theirs_value(
-        self, tmp_path: Path
-    ) -> None:
-        # THE INCIDENT'S SHAPE: ours never touched the baseline, so the bound IS
-        # theirs' image -- and the reported baseline is the bound, not HEAD's.
-        seed, theirs = synthetic_report(), self._moved(('a.py', 'lines', 1005))
-
-        assert self._bounded(tmp_path, theirs, base=seed, ours=seed, theirs=theirs) == []
-        assert self._bounded(
-            tmp_path,
-            self._moved(('a.py', 'lines', 1006)),
-            base=seed,
-            ours=seed,
-            theirs=theirs,
-        ) == [
-            ('lines', 'a.py', 1005, 1006),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1206),
-        ]
-
-    @pytest.mark.parametrize('lowered_by', ['ours', 'theirs'])
-    def test_a_lowering_one_side_made_is_not_reabsorbed_from_the_other(
-        self, tmp_path: Path, lowered_by: str
-    ) -> None:
-        # THE CASE EVERY EITHER-PARENT RULE ADMITS. Keeping the unmoved side's
-        # 1000 is clean against that side, and in a conflicted merge on main it
-        # would land an unrecorded widening.
-        seed, lowered = synthetic_report(), self._moved(('a.py', 'lines', 995))
-
-        assert self._bounded(
-            tmp_path,
-            seed,
-            base=seed,
-            ours=lowered if lowered_by == 'ours' else seed,
-            theirs=lowered if lowered_by == 'theirs' else seed,
-        ) == [
-            ('lines', 'a.py', 995, 1000),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1195, 1200),
-        ]
-
-    def test_own_moves_stand_per_measure_not_per_path(self, tmp_path: Path) -> None:
-        # Both sides moved a.py, but different MEASURES of it: taking theirs'
-        # whole entry keeps theirs' cognitive lowering and undoes ours' lines one.
-        ours = self._moved(('a.py', 'lines', 995))
-        theirs = self._moved(('a.py', 'cognitive', 110))
-
-        assert self._bounded(
-            tmp_path, theirs, base=synthetic_report(), ours=ours, theirs=theirs
-        ) == [
-            ('lines', 'a.py', 995, 1000),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1195, 1200),
-        ]
-
-    def test_where_both_sides_moved_a_measure_the_higher_bounds_it(
-        self, tmp_path: Path
-    ) -> None:
-        seed = synthetic_report()
-        ours = self._moved(('a.py', 'lines', 990))
-        theirs = self._moved(('a.py', 'lines', 1005))
-
-        assert self._bounded(tmp_path, theirs, base=seed, ours=ours, theirs=theirs) == []
-        assert self._bounded(
-            tmp_path,
-            self._moved(('a.py', 'lines', 1006)),
-            base=seed,
-            ours=ours,
-            theirs=theirs,
-        ) == [
-            ('lines', 'a.py', 1005, 1006),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1206),
-        ]
-
-    def test_moves_on_different_paths_add_up_in_the_derived_total(
-        self, tmp_path: Path
-    ) -> None:
-        # ONE side moved each path, so each move stands, and the total is
-        # DERIVED from the bound: 1215. A per-measure max of the parents' own
-        # totals would read 1210 and refuse the merge.
-        ours = self._moved(('a.py', 'lines', 1005))
-        theirs = self._moved(('b.py', 'lines', 210))
-        merged = self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 210))
-
-        assert self._bounded(
-            tmp_path, merged, base=synthetic_report(), ours=ours, theirs=theirs
-        ) == []
-
-    def test_a_path_one_side_deleted_stays_deleted(self, tmp_path: Path) -> None:
-        seed, ours = synthetic_report(), synthetic_report()
-        del ours['files']['b.py']
-
-        assert ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1000, 1200) in self._bounded(
-            tmp_path, seed, base=seed, ours=ours, theirs=seed
-        )
-
-    def test_a_deletion_does_not_undo_the_other_sides_move(
-        self, tmp_path: Path
-    ) -> None:
-        # git's modify/delete conflict: the modification stands.
-        ours = synthetic_report()
-        del ours['files']['b.py']
-        theirs = self._moved(('b.py', 'lines', 190))
-
-        assert self._bounded(
-            tmp_path, theirs, base=synthetic_report(), ours=ours, theirs=theirs
-        ) == []
-
-    def test_an_absent_base_bounds_each_measure_by_the_higher_parent(
-        self, tmp_path: Path
-    ) -> None:
-        # No common ancestor, or no baseline at it: git merges such histories
-        # against the empty tree, so each side moved every measure it holds.
-        ours = synthetic_report()
-        theirs = self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 190))
-
-        assert self._bounded(
-            tmp_path,
-            self._moved(('a.py', 'lines', 1005)),
-            base=None,
-            ours=ours,
-            theirs=theirs,
-        ) == []
-        assert ('lines', 'b.py', 200, 201) in self._bounded(
-            tmp_path,
-            self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 201)),
-            base=None,
-            ours=ours,
-            theirs=theirs,
-        )
-
-    def test_an_absent_parent_image_moved_nothing(self, tmp_path: Path) -> None:
-        # A parent without a baseline must not read as having lowered every
-        # measure to nothing, which would refuse a resolver who keeps theirs.
-        seed, theirs = synthetic_report(), self._moved(('a.py', 'lines', 1005))
-
-        assert self._bounded(tmp_path, theirs, base=seed, ours=None, theirs=theirs) == []
-        assert ('lines', 'a.py', 1005, 1006) in self._bounded(
-            tmp_path,
-            self._moved(('a.py', 'lines', 1006)),
-            base=seed,
-            ours=None,
-            theirs=theirs,
-        )
-
-    def test_a_name_set_both_sides_moved_is_bounded_by_the_side_naming_more(
-        self, tmp_path: Path
-    ) -> None:
-        # DISTINCT names, the unit the per-path comparison counts in.
-        seed, ours, theirs = synthetic_report(), synthetic_report(), synthetic_report()
-        ours['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux']
-        theirs['tests']['t1.py']['patch_targets'] = ['foo']
-        widened = copy.deepcopy(ours)
-        widened['tests']['t1.py']['patch_targets'].append('zap')
-
-        assert self._bounded(tmp_path, ours, base=seed, ours=ours, theirs=theirs) == []
-        assert ('patch_targets', 't1.py', 3, 4) in self._bounded(
-            tmp_path, widened, base=seed, ours=ours, theirs=theirs
-        )
 
 
 class TestAuthorizedRaise:
@@ -2004,13 +1676,13 @@ class TestAuthorizedRaise:
     def _seeded(tmp_path: Path) -> tuple[Path, Path]:
         target = tmp_path / 'b.json'
         metrics.write_baseline(target, _ratchet_baseline())
-        return target, tmp_path / 'ledger.json'
+        return target, tmp_path / 'raises'
 
     @staticmethod
     def _raised() -> dict:
-        """The real task-5342 shape: several measures up across two sections."""
+        """Several measures up across two sections, as task 5342's raise was."""
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] += 103
+        current['files'][_MQ]['function_local_imports'] += 2
         current['files'][_MQ]['cognitive'] += 15
         current['functions'][_VERIFIER_LOOP] += 7
         return current
@@ -2042,7 +1714,7 @@ class TestAuthorizedRaise:
             target, self._raised(), authorization=authorization, ledger=ledger
         )
 
-        entries = metrics.load_ledger(ledger)['raises']
+        entries = metrics.load_ledger(ledger)
         assert len(entries) == 1
         assert entries[0]['task_id'] == authorization.task_id
         assert entries[0]['reason'] == authorization.reason
@@ -2073,7 +1745,7 @@ class TestAuthorizedRaise:
             target, current, authorization=self._authorization(), ledger=ledger
         )
 
-        assert metrics.load_ledger(ledger)['raises'][0]['measures'] == expected
+        assert metrics.load_ledger(ledger)[0]['measures'] == expected
 
     def test_the_derived_totals_travel_with_the_per_path_rises(
         self, tmp_path: Path
@@ -2086,13 +1758,28 @@ class TestAuthorizedRaise:
             target, self._raised(), authorization=self._authorization(), ledger=ledger
         )
 
-        measures = metrics.load_ledger(ledger)['raises'][0]['measures']
+        measures = metrics.load_ledger(ledger)[0]['measures']
         totals = [row for row in measures if row['measure'].startswith('total:')]
         assert {row['measure'] for row in totals} == {
-            'total:lines', 'total:cognitive'
+            'total:cognitive', 'total:function_local_imports'
         }
         assert all(row['key'] == metrics.CLUSTER_TOTAL_KEY for row in totals)
         assert {row['key'] for row in measures} >= {_MQ, _VERIFIER_LOOP}
+
+    def test_a_size_rise_riding_with_an_authorized_raise_is_not_recorded(
+        self, tmp_path: Path
+    ) -> None:
+        target, ledger = self._seeded(tmp_path)
+        current = self._raised()
+        _grow_mq_size(current)
+
+        metrics.write_baseline(
+            target, current, authorization=self._authorization(), ledger=ledger
+        )
+
+        recorded = {row['measure'] for row in metrics.load_ledger(ledger)[0]['measures']}
+        assert not recorded & {'lines', 'prose_lines', 'total:lines', 'total:prose_lines'}
+        assert {'cognitive', 'function_local_imports'} <= recorded
 
     @pytest.mark.parametrize(
         ('task_id', 'reason', 'field'),
@@ -2144,7 +1831,7 @@ class TestAuthorizedRaise:
         # the real ones harder to read.
         target, ledger = self._seeded(tmp_path)
         lowered = copy.deepcopy(_ratchet_baseline())
-        lowered['files'][_MQ]['lines'] -= 4000
+        lowered['files'][_MQ]['cognitive'] -= 400
 
         written = metrics.write_baseline(
             target, lowered, authorization=self._authorization(), ledger=ledger
@@ -2163,13 +1850,18 @@ class TestAuthorizedRaise:
 
 
 class TestAuthorizedRaiseLedger:
-    """The ledger file's own contract, and the polarity split it makes deliberate."""
+    """The ledger directory's own contract, and the polarity split it makes deliberate.
+
+    One file per authorization, named for its content, so two branches
+    authorizing at once add two different files and never conflict -- the tail
+    of the retired single array conflicted on every such pair.
+    """
 
     @staticmethod
-    def _record(task_id: str) -> dict:
+    def _record(task_id: str, rise: int = 103) -> dict:
         return metrics.authorization_record(
             metrics.RaiseAuthorization(task_id=task_id, reason=f'reason {task_id}'),
-            [metrics.Violation.rose('lines', _MQ, 21550, 21653)],
+            [metrics.Violation.rose('lines', _MQ, 21550, 21550 + rise)],
         )
 
     def test_absence_is_empty_here_and_fatal_for_the_baseline(
@@ -2182,447 +1874,114 @@ class TestAuthorizedRaiseLedger:
         # authorized, which is the fail-CLOSED state: it permits nothing.
         missing = tmp_path / 'nope.json'
 
-        assert metrics.load_ledger(missing)['raises'] == []
+        assert metrics.load_ledger(missing) == []
 
         with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.load_baseline(missing)
         assert 'nope.json' in str(excinfo.value)
 
     @pytest.mark.parametrize(
-        ('content', 'why'),
+        ('name', 'content', 'why'),
         [
-            pytest.param('{"raises": ', 'invalid JSON', id='truncated'),
-            pytest.param('[]', 'a JSON array at top level', id='array'),
-            pytest.param('{"raises": {}}', 'a non-list raises', id='raises-not-list'),
-            pytest.param('{}', 'no raises key at all', id='raises-missing'),
+            pytest.param('x.json', '{"measures": ', 'invalid JSON', id='truncated'),
+            pytest.param('x.json', '[]', 'a JSON array at top level', id='array'),
+            pytest.param(
+                'x.json', '{"task_id": "5342"}', 'a name not derived from the content',
+                id='misnamed',
+            ),
         ],
     )
-    def test_a_malformed_ledger_is_a_named_hard_failure(
-        self, tmp_path: Path, content: str, why: str
+    def test_a_malformed_entry_is_a_named_hard_failure(
+        self, tmp_path: Path, name: str, content: str, why: str
     ) -> None:
-        # A ledger that cannot be parsed is one whose entries cannot be audited.
-        # Reading it as empty would hide history, so corruption -- unlike
+        # An entry that cannot be read is provenance that cannot be audited.
+        # Reading it as absent would hide history, so corruption -- unlike
         # absence -- fails hard and names the file.
-        target = tmp_path / 'ledger.json'
-        target.write_text(content, encoding='utf-8')
+        ledger = tmp_path / 'raises'
+        ledger.mkdir()
+        (ledger / name).write_text(content, encoding='utf-8')
         with pytest.raises(metrics.RatchetError) as excinfo:
-            metrics.load_ledger(target)
-        assert 'ledger.json' in str(excinfo.value), why
+            metrics.load_ledger(ledger)
+        assert name in str(excinfo.value), why
 
-    def test_render_round_trips_without_dropping_an_entry(self) -> None:
-        ledger = metrics.empty_ledger()
-        ledger['raises'] = [self._record('5342'), self._record('5500')]
-        assert json.loads(metrics.render_ledger(ledger))['raises'] == ledger['raises']
-
-    def test_rendering_is_idempotent(self) -> None:
-        ledger = metrics.empty_ledger()
-        ledger['raises'] = [self._record('5342')]
-        once = metrics.render_ledger(ledger)
-        assert metrics.render_ledger(json.loads(once)) == once
-
-    def test_leads_with_a_readme_and_ends_with_one_newline(self) -> None:
-        text = metrics.render_ledger(metrics.empty_ledger())
-        assert text.splitlines()[1].lstrip().startswith('"_README":')
-        assert text.endswith('\n') and not text.endswith('\n\n')
-
-    def test_append_preserves_prior_entries_in_order(self, tmp_path: Path) -> None:
-        # APPEND-ONLY means history is never rewritten: a reviewer reading the
-        # file reads every raise the baseline has ever absorbed.
-        target = tmp_path / 'ledger.json'
-        written = [self._record(task_id) for task_id in ('5342', '5500', '5600')]
-        for record in written:
-            metrics.append_authorization(target, record)
-
-        stored = metrics.load_ledger(target)['raises']
-        assert [entry['task_id'] for entry in stored] == ['5342', '5500', '5600']
-        assert stored[:2] == written[:2]
-
-    def test_append_on_a_missing_path_creates_a_legible_file(
+    def test_a_ledger_path_that_is_a_file_is_a_named_hard_failure(
         self, tmp_path: Path
     ) -> None:
-        target = tmp_path / 'ledger.json'
-        metrics.append_authorization(target, self._record('5342'))
+        # The retired shape at the new path: a single file is not a ledger.
+        target = tmp_path / 'raises'
+        target.write_text('{"raises": []}', encoding='utf-8')
+        with pytest.raises(metrics.RatchetError) as excinfo:
+            metrics.load_ledger(target)
+        assert 'not a directory' in str(excinfo.value)
 
-        loaded = metrics.load_ledger(target)
-        assert loaded['schema_version'] == metrics.LEDGER_SCHEMA_VERSION
-        assert '--authorize-raise' in loaded['_README']
+    def test_an_entry_round_trips_through_its_file(self) -> None:
+        record = self._record('5342')
+        text = metrics.render_entry(record)
+
+        assert metrics.parse_entry(metrics.entry_filename(record), text) == record
+        assert metrics.render_entry(json.loads(text)) == text
+
+    def test_the_name_leads_with_the_task_and_ends_with_a_content_digest(self) -> None:
+        name = metrics.entry_filename(self._record('5342'))
+
+        assert name.startswith('5342-') and name.endswith('.json')
+        assert name != metrics.entry_filename(self._record('5342', rise=104))
+
+    def test_a_free_text_task_id_still_makes_a_plain_file_name(self) -> None:
+        name = metrics.entry_filename(self._record('3790 carry/../x'))
+
+        assert '/' not in name and ' ' not in name
+
+    def test_each_authorization_is_its_own_file_and_none_is_rewritten(
+        self, tmp_path: Path
+    ) -> None:
+        # APPEND-ONLY by construction: recording one entry cannot touch another.
+        ledger = tmp_path / 'raises'
+        first = metrics.append_authorization(ledger, self._record('5342'))
+        before = first.read_text(encoding='utf-8')
+        for task_id in ('5500', '5600'):
+            metrics.append_authorization(ledger, self._record(task_id))
+
+        assert first.read_text(encoding='utf-8') == before
+        assert sorted(entry['task_id'] for entry in metrics.load_ledger(ledger)) == [
+            '5342', '5500', '5600'
+        ]
+
+    def test_recording_the_same_entry_twice_is_one_file(self, tmp_path: Path) -> None:
+        ledger = tmp_path / 'raises'
+        metrics.append_authorization(ledger, self._record('5342'))
+        metrics.append_authorization(ledger, self._record('5342'))
+
+        assert len(metrics.load_ledger(ledger)) == 1
+
+    def test_the_first_append_writes_a_legible_readme(self, tmp_path: Path) -> None:
+        ledger = tmp_path / 'raises'
+        metrics.append_authorization(ledger, self._record('5342'))
+
+        readme = (ledger / metrics.LEDGER_README_NAME).read_text(encoding='utf-8')
+        assert readme == metrics.render_ledger_readme()
+        assert '--authorize-raise' in json.loads(readme)['_README']
 
     def test_the_committed_ledger_is_present_and_legible(self) -> None:
-        # ANTI-VACUITY for the artifact a human actually opens. Its day-one
-        # `raises` list is empty, which is a legible state -- not an absent one,
-        # and not a file whose only copy of the rule is in a docstring.
-        path = _REPO_ROOT / metrics.LEDGER_RELPATH
-        # EXISTENCE is asserted on the PATH, not inferred from load_ledger:
-        # absence reads as the empty ledger by design (the polarity pinned
-        # above), so every other assertion here would pass just as happily with
-        # nothing committed at all -- and the file a reader opens next to the
-        # baseline would not exist.
-        assert path.exists(), path
-        committed = metrics.load_ledger(path)
-        assert committed['schema_version'] == metrics.LEDGER_SCHEMA_VERSION
-        assert '--authorize-raise' in committed['_README']
-        assert isinstance(committed['raises'], list)
-        # Written by the module's own writer, so the committed bytes stay a
-        # no-op round trip rather than drifting into a hand-edited shape.
-        assert path.read_text(encoding='utf-8') == metrics.render_ledger(committed)
-
-
-def _ledger_record(task_id: str, reason: str = 'net-additive work') -> dict:
-    """One ledger entry, built by the real writer rather than hand-written."""
-    return metrics.authorization_record(
-        metrics.RaiseAuthorization(task_id=task_id, reason=reason),
-        [metrics.Violation.rose('lines', _MQ, 21550, 21653)],
-    )
-
-
-def _ledger(*records: dict) -> dict:
-    return {**metrics.empty_ledger(), 'raises': list(records)}
-
-
-class TestLedgerAppendedEntries:
-    """The ledger delta, and what makes append_authorization's promise checkable.
-
-    ``append_authorization``'s docstring promises that "a reviewer reading the
-    file reads every raise this baseline has ever absorbed". That is a claim
-    about every FUTURE writer of the file, not just about that function, and
-    nothing enforced it: a commit could quietly drop or rewrite a historical
-    entry and the promise would stay standing and false. These pin the reader
-    that checks it.
-    """
-
-    def test_an_unchanged_ledger_appended_nothing(self) -> None:
-        ledger = _ledger(_ledger_record('5485'))
-
-        assert metrics.ledger_appended_entries(ledger, copy.deepcopy(ledger)) == []
-
-    def test_the_appended_suffix_is_returned_in_order(self) -> None:
-        history = _ledger_record('5485')
-        first, second = _ledger_record('5722'), _ledger_record('5723')
-
-        appended = metrics.ledger_appended_entries(
-            _ledger(history), _ledger(history, first, second)
-        )
-
-        assert appended == [first, second]
-
-    def test_the_day_one_shape_is_the_whole_list(self) -> None:
-        # Previous is the fail-CLOSED empty ledger -- the state a commit that
-        # authorizes the very first raise starts from.
-        record = _ledger_record('5722')
-
-        assert metrics.ledger_appended_entries(
-            metrics.empty_ledger(), _ledger(record)
-        ) == [record]
-
-    def test_dropping_a_historical_entry_is_refused_by_name(self) -> None:
-        history = [_ledger_record('5485'), _ledger_record('5675')]
-
-        with pytest.raises(metrics.RatchetError) as excinfo:
-            metrics.ledger_appended_entries(_ledger(*history), _ledger(history[0]))
-
-        message = str(excinfo.value)
-        assert 'append-only' in message
-        # HOW MANY went missing, not merely that something did: the number is
-        # what tells a reviewer whether this was one bad rebase or a wipe.
-        assert '1' in message
-
-    def test_rewriting_an_entry_in_place_is_refused(self) -> None:
-        # LENGTH EQUALITY IS NOT PREFIX EQUALITY. A rewrite keeps the count
-        # identical, so any check that compared lengths would pass it -- and a
-        # rewritten `reason` is exactly how a raise stops reading as what it was.
-        history = _ledger_record('5485')
-        forged = _ledger_record('5485', reason='actually it was a refactor')
-
-        with pytest.raises(metrics.RatchetError):
-            metrics.ledger_appended_entries(_ledger(history), _ledger(forged))
-
-    def test_reordering_history_is_refused(self) -> None:
-        first, second = _ledger_record('5485'), _ledger_record('5675')
-
-        with pytest.raises(metrics.RatchetError):
-            metrics.ledger_appended_entries(
-                _ledger(first, second), _ledger(second, first)
-            )
-
-
-class TestLedgerMergedEntries:
-    """The ledger delta of a MERGE commit, read against BOTH parents' histories.
-
-    A conflicted merge finished with `git commit` runs pre-commit with
-    MERGE_HEAD set (esc-3620-11), so its staged ledger descends from two
-    recorded histories, not one. Each parent's entries must survive whole AND
-    in that parent's own order; the two histories may interleave, the way git's
-    merge of the text interleaves them, but nothing foreign may sit among them.
-    Only what follows both histories and belongs to NEITHER parent is the
-    merge's OWN -- the one thing that may cover a raise the merge makes.
-    """
-
-    @staticmethod
-    def _entries() -> tuple[dict, dict, dict]:
-        """History both parents share, then one entry only ours / only theirs added."""
-        return _ledger_record('5485'), _ledger_record('5722'), _ledger_record('3620')
-
-    def test_a_parent_without_a_ledger_constrains_nothing(self) -> None:
-        # THE INCIDENT'S SHAPE: the task branch predates the ledger, so HEAD
-        # reads as the fail-closed empty one and main's entries are history.
-        _history, _ours_own, theirs_own = self._entries()
-
-        assert metrics.ledger_merged_entries(
-            metrics.empty_ledger(), _ledger(theirs_own), _ledger(theirs_own)
-        ) == []
-
-    def test_one_sides_additions_are_history_not_the_merges_own(self) -> None:
-        history, _ours_own, theirs_own = self._entries()
-
-        assert metrics.ledger_merged_entries(
-            _ledger(history),
-            _ledger(history, theirs_own),
-            _ledger(history, theirs_own),
-        ) == []
-
-    @pytest.mark.parametrize(
-        'theirs_first', [True, False], ids=['theirs-then-ours', 'ours-then-theirs']
-    )
-    def test_both_sides_additions_are_accepted_in_either_block_order(
-        self, theirs_first: bool
-    ) -> None:
-        # A resolver facing a both-sides-appended conflict keeps both entries in
-        # whichever order the conflict shows them; either interleaving keeps
-        # each parent's entries unchanged and in that parent's own order.
-        history, ours_own, theirs_own = self._entries()
-        blocks = [theirs_own, ours_own] if theirs_first else [ours_own, theirs_own]
-
-        assert metrics.ledger_merged_entries(
-            _ledger(history, ours_own),
-            _ledger(history, theirs_own),
-            _ledger(history, *blocks),
-        ) == []
-
-    def test_the_merges_own_additions_are_returned_in_order(self) -> None:
-        history, ours_own, theirs_own = self._entries()
-        first, second = _ledger_record('5792'), _ledger_record('5793')
-
-        appended = metrics.ledger_merged_entries(
-            _ledger(history, ours_own),
-            _ledger(history, theirs_own),
-            _ledger(history, theirs_own, ours_own, first, second),
-        )
-
-        assert appended == [first, second]
-
-    @pytest.mark.parametrize('dropped', ['ours', 'theirs'])
-    def test_dropping_an_entry_either_side_recorded_is_refused(
-        self, dropped: str
-    ) -> None:
-        # BOTH histories, not either: a merge resolved on main that kept only
-        # the task's entries would silently drop main's recorded ones.
-        history, ours_own, theirs_own = self._entries()
-        kept = theirs_own if dropped == 'ours' else ours_own
-
-        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
-            metrics.ledger_merged_entries(
-                _ledger(history, ours_own),
-                _ledger(history, theirs_own),
-                _ledger(history, kept),
-            )
-
-        assert 'append-only' in str(excinfo.value)
-
-    def test_rewriting_an_entry_one_side_recorded_is_refused(self) -> None:
-        # Same count, changed `reason`: length equality is not prefix equality
-        # here either.
-        history, ours_own, theirs_own = self._entries()
-        forged = _ledger_record('3620', reason='actually it was a refactor')
-
-        with pytest.raises(metrics.AppendOnlyViolation):
-            metrics.ledger_merged_entries(
-                _ledger(history, ours_own),
-                _ledger(history, theirs_own),
-                _ledger(history, forged, ours_own),
-            )
-
-    @staticmethod
-    def _merged_before() -> tuple[dict, dict, dict, dict]:
-        """Shared history, ours' own, theirs' own, and theirs' next addition.
-
-        The shape of a branch that merged main once, kept ours-then-theirs, and
-        now merges main again after main appended one more entry.
-        """
-        return (
-            _ledger_record('5485'),
-            _ledger_record('5792'),
-            _ledger_record('3620'),
-            _ledger_record('3790'),
-        )
-
-    def test_a_branch_that_kept_ours_then_theirs_can_merge_again(self) -> None:
-        # The reviewer's case, measured: git merges [h,o,t] and [h,t,t2] over
-        # base [h,t] cleanly to [h,o,t,t2]. No block order reproduces that.
-        history, ours_own, theirs_own, theirs_next = self._merged_before()
-
-        assert metrics.ledger_merged_entries(
-            _ledger(history, ours_own, theirs_own),
-            _ledger(history, theirs_own, theirs_next),
-            _ledger(history, ours_own, theirs_own, theirs_next),
-        ) == []
-
-    def test_a_branch_merging_after_another_landed_interleaves(self) -> None:
-        # Main now carries another branch's ours-then-theirs order, and this
-        # branch appended past the entry the two share.
-        history, other_own, shared, _theirs_next = self._merged_before()
-        ours_next = _ledger_record('5801')
-
-        assert metrics.ledger_merged_entries(
-            _ledger(history, shared, ours_next),
-            _ledger(history, other_own, shared),
-            _ledger(history, other_own, shared, ours_next),
-        ) == []
-
-    def test_the_merges_own_entries_follow_an_interleaved_history(self) -> None:
-        history, ours_own, theirs_own, theirs_next = self._merged_before()
-        own = _ledger_record('5900')
-
-        assert metrics.ledger_merged_entries(
-            _ledger(history, ours_own, theirs_own),
-            _ledger(history, theirs_own, theirs_next),
-            _ledger(history, ours_own, theirs_own, theirs_next, own),
-        ) == [own]
-
-    def test_reordering_one_parents_own_entries_is_refused(self) -> None:
-        # Ours recorded its own entry BEFORE the shared one; moving it after
-        # theirs' history rewrites the order ours recorded.
-        history, ours_own, theirs_own, theirs_next = self._merged_before()
-
-        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
-            metrics.ledger_merged_entries(
-                _ledger(history, ours_own, theirs_own),
-                _ledger(history, theirs_own, theirs_next),
-                _ledger(history, theirs_own, theirs_next, ours_own),
-            )
-
-        assert 'append-only' in str(excinfo.value)
-
-    def test_a_foreign_entry_inside_the_histories_is_refused(self) -> None:
-        history, ours_own, theirs_own, theirs_next = self._merged_before()
-        foreign = _ledger_record('5900')
-
-        with pytest.raises(metrics.AppendOnlyViolation):
-            metrics.ledger_merged_entries(
-                _ledger(history, ours_own, theirs_own),
-                _ledger(history, theirs_own, theirs_next),
-                _ledger(history, foreign, ours_own, theirs_own, theirs_next),
-            )
-
-    @pytest.mark.parametrize('with_own', [False, True], ids=['copy-only', 'copy-then-own'])
-    def test_a_copied_parent_entry_is_not_the_merges_own(self, with_own: bool) -> None:
-        # A duplicate of a recorded entry after both histories is still
-        # HISTORY: counting it as coverage is the standing permission
-        # LEDGER_README forbids.
-        history, ours_own, theirs_own, _theirs_next = self._merged_before()
-        own = [_ledger_record('5900')] if with_own else []
-
-        assert metrics.ledger_merged_entries(
-            _ledger(history, ours_own),
-            _ledger(history, theirs_own),
-            _ledger(history, ours_own, theirs_own, theirs_own, *own),
-        ) == own
-
-
-class TestUnrecordedRaises:
-    """Which measured raises THIS commit's ledger entries do not name.
-
-    The inverse of ``authorization_record``: the writer projects Violations into
-    a record, this asks whether a record covers a Violation. Records here are
-    built by calling ``authorization_record`` for real rather than hand-written,
-    so what is pinned is the round trip against the actual producer -- a
-    hand-written dict would pin this module's idea of the vocabulary instead of
-    the writer's, which is the drift the shared field names exist to prevent.
-    """
-
-    @staticmethod
-    def _record(raises: list[metrics.Violation], task_id: str = '5722') -> dict:
-        return metrics.authorization_record(
-            metrics.RaiseAuthorization(task_id=task_id, reason=f'reason {task_id}'),
-            raises,
-        )
-
-    @staticmethod
-    def _lines_raise() -> metrics.Violation:
-        return metrics.Violation.rose('lines', _MQ, 21550, 21653)
-
-    @staticmethod
-    def _cognitive_raise() -> metrics.Violation:
-        return metrics.Violation.rose('cognitive', _MQ, 2133, 2140)
-
-    def test_a_record_derived_from_the_raises_covers_them_all(self) -> None:
-        raises = [self._lines_raise(), self._cognitive_raise()]
-
-        assert metrics.unrecorded_raises(raises, [self._record(raises)]) == []
-
-    def test_no_records_leaves_every_raise_unrecorded_in_order(self) -> None:
-        raises = [self._lines_raise(), self._cognitive_raise()]
-
-        # The common refusal: a commit that staged a raising baseline and never
-        # touched the ledger. Order is the input's, so the refusal message is
-        # diffable run to run.
-        assert metrics.unrecorded_raises(raises, []) == raises
-
-    def test_a_stale_record_naming_a_different_landing_value_covers_nothing(
-        self,
-    ) -> None:
-        # THE CASE THIS FUNCTION EXISTS FOR. A hand-written or stale entry names
-        # the right measure and the right key, so any (measure, key) check would
-        # wave it through -- while the baseline it accompanies landed somewhere
-        # else entirely. `current` is the discriminator.
-        stale = self._record([metrics.Violation.rose('lines', _MQ, 21550, 21600)])
-        raises = [self._lines_raise()]
-
-        assert metrics.unrecorded_raises(raises, [stale]) == raises
-
-    def test_a_record_for_an_unrelated_measure_covers_nothing(self) -> None:
-        raises = [self._lines_raise()]
-
-        unrelated = self._record([self._cognitive_raise()])
-
-        assert metrics.unrecorded_raises(raises, [unrelated]) == raises
-
-    def test_two_records_union_rather_than_the_last_one_winning(self) -> None:
-        lines, cognitive = self._lines_raise(), self._cognitive_raise()
-
-        # Two authorized writes in one commit append two records; coverage is
-        # the union of both, not whichever landed last.
-        records = [self._record([lines]), self._record([cognitive], task_id='5723')]
-
-        assert metrics.unrecorded_raises([lines, cognitive], records) == []
-
-    def test_a_differing_baseline_still_covers_when_current_matches(self) -> None:
-        # DELIBERATE: the triple is (measure, key, current), not the full
-        # four-tuple. An agent who runs --write-baseline --authorize-raise TWICE
-        # in one commit records b->m and m->f, while the HEAD-to-staged delta
-        # reads b->f. Requiring `baseline` to match would refuse that correctly
-        # authorized commit.
-        midpoint = self._record([metrics.Violation.rose('lines', _MQ, 21600, 21653)])
-
-        assert metrics.unrecorded_raises([self._lines_raise()], [midpoint]) == []
-
-    @pytest.mark.parametrize(
-        'measures', [None, 'lines', 7], ids=['missing', 'string', 'int']
-    )
-    def test_a_record_without_a_measures_list_covers_nothing_and_does_not_crash(
-        self, measures: object
-    ) -> None:
-        # Hand-mutated on purpose -- authorization_record cannot produce these.
-        # A ledger a human edited badly must REFUSE the commit, not raise a
-        # TypeError out of the gate: a crash reads as a broken instrument and
-        # sends the reader hunting the wrong thing.
-        record = self._record([self._lines_raise()])
-        if measures is None:
-            del record['measures']
-        else:
-            record['measures'] = measures
-        raises = [self._lines_raise()]
-
-        assert metrics.unrecorded_raises(raises, [record]) == raises
+        # ANTI-VACUITY for the artifact a human actually opens. EXISTENCE is
+        # asserted on the PATH, not inferred from load_ledger: absence reads as
+        # the empty ledger by design (the polarity pinned above), so every
+        # other assertion here would pass just as happily with nothing
+        # committed at all.
+        ledger = _REPO_ROOT / metrics.LEDGER_DIR_RELPATH
+        assert ledger.is_dir(), ledger
+        readme = (ledger / metrics.LEDGER_README_NAME).read_text(encoding='utf-8')
+        assert readme == metrics.render_ledger_readme()
+        # Every entry was written by the module's own writer and never edited:
+        # its name is derived from its content, and its bytes are a no-op
+        # round trip rather than a hand-edited shape.
+        entries = metrics.load_ledger(ledger)
+        assert entries
+        for entry in entries:
+            path = ledger / metrics.entry_filename(entry)
+            assert path.read_text(encoding='utf-8') == metrics.render_entry(entry), path
+        # The retired single array is gone: one home for one fact.
+        assert not (_REPO_ROOT / metrics.LEGACY_LEDGER_RELPATH).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -2688,18 +2047,6 @@ def _ratchet_baseline() -> dict:
     }
 
 
-def _blank_file_entry(**overrides: int) -> dict:
-    entry = {
-        'lines': 0,
-        'prose_lines': 0,
-        'cognitive': 0,
-        'function_local_imports': 0,
-        'reexport_names': 0,
-    }
-    entry.update(overrides)
-    return entry
-
-
 def _bump_file(measure: str):
     def mutate(current: dict) -> None:
         current['files'][_MQ][measure] += 1
@@ -2713,20 +2060,24 @@ def _add_file(measure: str):
         # the baseline, so no per-path comparison fires -- only the derived
         # cluster total can catch it, which is precisely the rename-gaming shape.
         current['files']['orchestrator/src/orchestrator/merge_new.py'] = (
-            _blank_file_entry(**{measure: 1})
+            blank_file_entry(**{measure: 1})
         )
 
     return mutate
 
 
+def _grow_mq_size(current: dict) -> None:
+    """The real task-5342 size shape: worker.py 103 lines and 50 prose lines longer."""
+    current['files'][_MQ]['lines'] += 103
+    current['files'][_MQ]['prose_lines'] += 50
+
+
 #: (test id, mutation, expected violation measure, expected violation key).
-#: THE SEEDED-FIXTURE SELF-TEST (INV-10 tier 1): every ratcheted measure and
-#: every derived total gets its own +1, and the ratchet must EXECUTE to a named
-#: violation for it. A measure missing from this table is a measure nothing
-#: proves is actually compared.
+#: THE SEEDED-FIXTURE SELF-TEST (INV-10 tier 1): every RATCHETED measure and
+#: every derived total of one gets its own +1, and the ratchet must EXECUTE to a
+#: named violation for it. A measure missing from this table is a measure
+#: nothing proves is actually compared.
 _SEEDS = [
-    ('files.lines', _bump_file('lines'), 'lines', _MQ),
-    ('files.prose_lines', _bump_file('prose_lines'), 'prose_lines', _MQ),
     ('files.cognitive', _bump_file('cognitive'), 'cognitive', _MQ),
     (
         'files.function_local_imports',
@@ -2756,13 +2107,6 @@ _SEEDS = [
         lambda cur: cur['tests'][_TEST_FILE]['patch_targets'].append('_new_leaf'),
         'patch_targets',
         _TEST_FILE,
-    ),
-    ('total.lines', _add_file('lines'), 'total:lines', metrics.CLUSTER_TOTAL_KEY),
-    (
-        'total.prose_lines',
-        _add_file('prose_lines'),
-        'total:prose_lines',
-        metrics.CLUSTER_TOTAL_KEY,
     ),
     (
         'total.cognitive',
@@ -2802,6 +2146,17 @@ _SEEDS = [
     ),
 ]
 
+#: (test id, mutation): a rise in a SIZE measure alone, per path and in the
+#: derived total. Size is measured and reported, never ratcheted (PRD
+#: plans/review-all-s25-scripts-instruments-prd.md D10).
+_SIZE_ONLY_SEEDS = [
+    ('files.lines', _bump_file('lines')),
+    ('files.prose_lines', _bump_file('prose_lines')),
+    ('total.lines', _add_file('lines')),
+    ('total.prose_lines', _add_file('prose_lines')),
+    ('files.task_5342_shape', _grow_mq_size),
+]
+
 
 class TestCheckAgainstBaseline:
     @pytest.mark.parametrize(
@@ -2826,6 +2181,29 @@ class TestCheckAgainstBaseline:
         # is firing on a measure nobody touched.
         others = [v for v in violations if v is not matching[0]]
         assert all(v.measure == f'total:{measure}' for v in others), others
+
+    @pytest.mark.parametrize(
+        'mutate', [pytest.param(m, id=name) for name, m in _SIZE_ONLY_SEEDS]
+    )
+    def test_a_rise_in_a_size_measure_alone_is_no_violation(self, mutate) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        mutate(current)
+
+        assert metrics.check_against_baseline(current, baseline) == []
+
+    def test_a_structural_rise_beside_a_size_rise_is_reported_alone(self) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        _grow_mq_size(current)
+        current['files'][_MQ]['function_local_imports'] += 1
+
+        violations = metrics.check_against_baseline(current, baseline)
+
+        assert [(v.measure, v.key, v.baseline, v.current) for v in violations] == [
+            ('function_local_imports', _MQ, 12, 13),
+            ('total:function_local_imports', metrics.CLUSTER_TOTAL_KEY, 17, 18),
+        ]
 
     def test_an_identical_current_is_clean(self) -> None:
         baseline = _ratchet_baseline()
@@ -2854,7 +2232,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         new_path = 'orchestrator/src/orchestrator/merge_new.py'
-        current['files'][new_path] = _blank_file_entry(lines=1501)
+        current['files'][new_path] = blank_file_entry(lines=1501)
         ceilings = [
             v
             for v in metrics.check_against_baseline(current, baseline)
@@ -2867,7 +2245,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         current['files']['orchestrator/src/orchestrator/merge_new.py'] = (
-            _blank_file_entry(lines=1500)
+            blank_file_entry(lines=1500)
         )
         assert not [
             v
@@ -2892,7 +2270,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         baseline = _ratchet_baseline()
         del baseline['files'][_GIT_OPS]
         current = copy.deepcopy(baseline)
-        current['files'][_GIT_OPS] = _blank_file_entry(lines=14721)
+        current['files'][_GIT_OPS] = blank_file_entry(lines=14721)
         assert not [
             v
             for v in metrics.check_against_baseline(current, baseline)
@@ -2906,7 +2284,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         del baseline['files'][_GIT_OPS]
         current = copy.deepcopy(baseline)
         current['files']['orchestrator/src/orchestrator/merge_new.py'] = (
-            _blank_file_entry(lines=14721)
+            blank_file_entry(lines=14721)
         )
         assert [
             v
@@ -2915,15 +2293,15 @@ class TestCeilingsApplyOnlyToNewKeys:
         ]
 
     def test_the_exemption_is_scoped_to_the_ceiling_not_to_the_ratchet(self) -> None:
-        # git_ops.py's 14,721 lines are exempt from the CEILING and still frozen
-        # by the RATCHET, so they cannot grow unwatched.
+        # git_ops.py is exempt from the CEILING, and its structural measures
+        # are still frozen by the RATCHET, so they cannot grow unwatched.
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['files'][_GIT_OPS]['lines'] += 1
+        current['files'][_GIT_OPS]['cognitive'] += 1
         assert [
             v
             for v in metrics.check_against_baseline(current, baseline)
-            if v.measure == 'lines' and v.key == _GIT_OPS
+            if v.measure == 'cognitive' and v.key == _GIT_OPS
         ]
 
     def test_a_new_function_over_the_cognitive_ceiling_is_a_violation(self) -> None:
@@ -2996,7 +2374,7 @@ class TestComparatorPreconditions:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         current['enumeration']['complete'] = False
-        current['files'][_MQ]['lines'] += 5000
+        current['files'][_MQ]['cognitive'] += 5000
         with pytest.raises(metrics.RatchetError):
             metrics.check_against_baseline(current, baseline)
 
@@ -3005,7 +2383,7 @@ class TestViolationShape:
     def test_a_violation_carries_both_numbers_and_a_stable_order(self) -> None:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['files'][_MQ]['lines'] += 1
+        current['files'][_MQ]['function_local_imports'] += 1
         current['files'][_GIT_OPS]['cognitive'] += 1
         violations = metrics.check_against_baseline(current, baseline)
         per_path = [v for v in violations if v.key in (_MQ, _GIT_OPS)]
@@ -3020,7 +2398,7 @@ class TestViolationShape:
     def test_the_comparator_mutates_neither_input(self) -> None:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['files'][_MQ]['lines'] += 1
+        current['files'][_MQ]['cognitive'] += 1
         before = (json.dumps(current, sort_keys=True), json.dumps(baseline, sort_keys=True))
         metrics.check_against_baseline(current, baseline)
         after = (json.dumps(current, sort_keys=True), json.dumps(baseline, sort_keys=True))
@@ -3082,6 +2460,23 @@ class TestReportCli:
         totals = metrics.derive_totals(stub_measurement)
         assert str(totals['cognitive']) in out
         assert str(totals['lines']) in out
+
+    def test_report_still_prints_both_size_columns_and_totals(
+        self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Size leaves the RATCHET, never the report: --report is where a reader
+        # still sees how big each file is.
+        assert metrics.main(['--report']) == 0
+        rows = capsys.readouterr().out.splitlines()
+        totals = metrics.derive_totals(stub_measurement)
+
+        header = next(row for row in rows if row.startswith('path ')).split()
+        assert header[1:3] == ['lines', 'prose']
+        totals_row = next(row for row in rows if row.startswith('TOTALS ')).split()
+        assert totals_row[1:3] == [str(totals['lines']), str(totals['prose_lines'])]
+        for path, entry in stub_measurement['files'].items():
+            row = next(row for row in rows if row.startswith(f'{path} ')).split()
+            assert row[1] == str(entry['lines']), path
 
     def test_report_carries_the_test_suite_measures(
         self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
@@ -3162,13 +2557,26 @@ class TestCheckCli:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         doctored = copy.deepcopy(stub_measurement)
-        doctored['files'][_MQ]['lines'] -= 10
+        doctored['files'][_MQ]['cognitive'] -= 10
         baseline = tmp_path / 'baseline.json'
         metrics.write_baseline(baseline, doctored)
         assert metrics.main(['--check', '--baseline', str(baseline)]) == 1
         err = capsys.readouterr().err
         assert _MQ in err
-        assert 'lines' in err
+        assert 'cognitive' in err
+
+    def test_check_passes_a_tree_whose_size_alone_rose(
+        self, stub_measurement: dict, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        doctored = copy.deepcopy(stub_measurement)
+        doctored['files'][_MQ]['lines'] -= 10
+        doctored['files'][_MQ]['prose_lines'] -= 10
+        baseline = tmp_path / 'baseline.json'
+        metrics.write_baseline(baseline, doctored)
+
+        assert metrics.main(['--check', '--baseline', str(baseline)]) == 0
+        assert capsys.readouterr().err == ''
 
     def test_check_resolves_its_defaults_and_exits_clean(
         self, stub_measurement: dict, no_private_tree_scan: None,
@@ -3229,8 +2637,7 @@ class TestWriteBaselineCli:
         # so "a plain regeneration never depends on that file's health" has to
         # be pinned rather than read off a call site that no longer says it.
         target = tmp_path / 'b.json'
-        ledger = tmp_path / 'ledger.json'
-        ledger.write_text('{ not json at all', encoding='utf-8')
+        ledger = _corrupt_ledger(tmp_path)
 
         assert metrics.main([
             '--write-baseline', str(target), '--ledger', str(ledger)
@@ -3238,7 +2645,7 @@ class TestWriteBaselineCli:
         assert target.read_text(encoding='utf-8') == metrics.render_baseline(
             stub_measurement
         )
-        assert ledger.read_text(encoding='utf-8') == '{ not json at all'
+        assert _ledger_files(ledger) == {'corrupt.json': '{ not json at all'}
 
 
 class TestAuthorizeRaiseCli:
@@ -3254,8 +2661,8 @@ class TestAuthorizeRaiseCli:
         target = tmp_path / 'b.json'
         metrics.write_baseline(target, stub)
         raised = copy.deepcopy(stub)
-        raised['files'][_MQ]['lines'] += 103
-        return target, tmp_path / 'ledger.json', raised
+        raised['files'][_MQ]['cognitive'] += 15
+        return target, tmp_path / 'raises', raised
 
     def test_an_authorized_raise_is_written_and_recorded(
         self, stub_measurement: dict, tmp_path: Path,
@@ -3272,7 +2679,7 @@ class TestAuthorizeRaiseCli:
         ]) == 0
 
         assert target.read_text(encoding='utf-8') == metrics.render_baseline(raised)
-        entries = metrics.load_ledger(ledger)['raises']
+        entries = metrics.load_ledger(ledger)
         assert len(entries) == 1
         assert entries[0]['task_id'] == '5342'
         out = capsys.readouterr().out
@@ -3391,10 +2798,10 @@ class TestAuthorizeRaiseCli:
         # to the agent who typed the flags, exactly like one that was granted
         # and recorded (INV-11).
         target = tmp_path / 'b.json'
-        ledger = tmp_path / 'ledger.json'
+        ledger = tmp_path / 'raises'
         metrics.write_baseline(target, stub_measurement)
         lowered = copy.deepcopy(stub_measurement)
-        lowered['files'][_MQ]['lines'] -= 10
+        lowered['files'][_MQ]['cognitive'] -= 10
         monkeypatch.setattr(metrics, 'build_report', lambda root: copy.deepcopy(lowered))
 
         assert metrics.main([
@@ -3411,7 +2818,7 @@ class TestAuthorizeRaiseCli:
 
     def test_ledger_defaults_to_the_committed_path(self) -> None:
         args = metrics._build_parser().parse_args(['--check'])
-        assert Path(args.ledger).name == 'merge_lane_ratchet_authorized_raises.json'
+        assert Path(args.ledger).name == 'merge_lane_ratchet_raises'
 
 
 class TestCliContract:
@@ -3476,7 +2883,7 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
         for fragment in (
             '--authorize-raise',
             '--reason',
-            metrics.LEDGER_RELPATH,
+            metrics.LEDGER_DIR_RELPATH,
             metrics.BASELINE_RELPATH,
             # The MECHANISM NAME an agent greps for after being blocked. Until
             # task 5722 this paragraph told them "what no gate can see is a
@@ -3509,7 +2916,7 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
             encoding='utf-8'
         )
         assert '--authorize-raise' in committed
-        assert metrics.LEDGER_RELPATH in committed
+        assert metrics.LEDGER_DIR_RELPATH in committed
         assert json.loads(committed)['_README'].endswith(metrics.RAISE_REMEDY)
 
     def test_the_readme_composes_the_remedy_rather_than_paraphrasing_it(
@@ -3522,7 +2929,7 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         doctored = copy.deepcopy(stub_measurement)
-        doctored['files'][_MQ]['lines'] -= 10
+        doctored['files'][_MQ]['cognitive'] -= 10
         baseline = tmp_path / 'baseline.json'
         metrics.write_baseline(baseline, doctored)
 

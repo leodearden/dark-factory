@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from fused_memory.models.reconciliation import RunStatus
 from fused_memory.reconciliation.sqlite_failures import await_best_effort
 
 if TYPE_CHECKING:
@@ -25,8 +24,7 @@ async def restore_unless_completed(
     project_id: str,
     run_id: str,
 ) -> int:
-    run = await journal.get_run(run_id)
-    if run is not None and run.status == RunStatus.completed:
+    if await journal.is_run_completed(run_id):
         return 0
     return await buffer.restore_drained(project_id, run_id=run_id)
 

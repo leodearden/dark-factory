@@ -183,7 +183,7 @@ The survey files nothing on the structural route (contract §6); its mechanical 
 2. **Remediation program doc** — per report-format.md §Artifact 3: streams carrying finding keys, seam ownership, invariants (pointing at `docs/legibility/design-invariants.md`, never minting ids), resolved decisions, shared conventions (filed tasks carry `x_finding_key`/`x_finding_run`, contract §8; findings cited by key), and the FILED table with keys per task.
 3. **`/prd` per stream** — agent-mode streams via an agent team, design-heavy streams via spawned interactive sessions. Each runs contract §8's dedup protocol and stamps the keys.
 4. **Trigger chain** (contract §11; none under `--findings-only`). Follow `skills/_shared/filing-the-trigger-chain.md` §§0–5 with `skill="hotspot-survey"` (bare name, no slash) and `run_id=<this survey's run_id>`; the calls live only there. What is specific to this survey:
-   - The run's filed tasks are Phase 5's mechanical tickets plus whatever the `/prd` sessions file later. File the chain at the end of deliberation under `planning_mode` and leave it `deferred`, in either form (snippet §3's program paragraph, §4); the program doc's shared conventions name the gate id so each `/prd` session adds its own dependencies in the interim form. Commit it only once the FILED table is complete and the run has filed tasks: `scripts/check_run_completion.py` exits 2 (an error) for a run with none.
+   - The run's filed tasks are Phase 5's mechanical tickets plus whatever the `/prd` sessions file later. File the chain at the end of deliberation under `planning_mode` and leave it `deferred`, in either form (snippet §3's program paragraph, §4), re-stamped `until_condition` before this session ends and its `deferral` echo confirmed (snippet §3; `docs/task-authoring.md` §9 "Deferring a task"); the program doc's shared conventions name the gate id so each `/prd` session adds its own dependencies in the interim form. Release it with `set_task_status(status="pending")`, not `commit_planning`, only once the FILED table is complete and the run has filed tasks: `scripts/check_run_completion.py` exits 2 (an error) for a run with none.
    - Pick the form by probing the dark-factory checkout, the factory root, never the surveyed project (snippet §2); for reify the probe runs in dark-factory.
    - First supersede any open chain whose `trigger_chain.skill` is `hotspot-survey` (snippet §1, §5). The old human gate's escalation resolves as `ran as <run_id>` when it is the `--launched-from` escalation (snippet §5 step 2), recorded as `extra.launched_from`.
    - Chain tasks carry `metadata.trigger_chain`, never `x_finding_run`. A run that files no tasks files no chain and says so under `extra` (snippet §0).
@@ -212,10 +212,10 @@ At the end, write a survey summary to fused-memory:
 
 ```
 add_memory(
-  content="Bug-hotspot survey <run_id> (<mode>, as_of <sha>, since <sha|none>): <N> agents, <tokens>; mined <corpora>; <K> clusters reviewed of <C>; <X> confirmed / <Y> weakened / <Z> refuted / <U> unverified new findings; carried <c> still open, <f> fixed; fix signal <chosen> (raw <raw>). Report: <md path>, findings: <json path>.",
+  content="Bug-hotspot survey <run_id> (<mode>, as_of <sha>, since <sha|none>): <N> agents, <tokens>; mined <corpora>; <K> clusters reviewed of <C>; <X> confirmed / <Y> weakened / <Z> refuted / <U> unverified new findings; carried <c> still open, <f> fixed; fix signal <chosen> (raw <raw>). Report: <md path>, findings: <json path>. Next survey gated by task 3127.",
   category="observations_and_summaries",
   project_id=<overlay>, agent_id="claude-interactive",
-  entities=[]   # a task or run this summary is about, e.g. [{'kind': 'task', 'id': <the chain's human gate id>}]
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the human gate of the trigger chain Hand-off step 4 filed, here and in content; if it filed none, as under --findings-only, use [] and drop the gate sentence from content
 )
 ```
 

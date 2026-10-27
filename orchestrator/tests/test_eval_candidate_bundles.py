@@ -325,7 +325,7 @@ class TestCandidatePriceCostBasis:
     def test_cost_basis_is_the_prd_decision_16_vocabulary(self):
         from enum import StrEnum
 
-        from orchestrator.evals.configs import CostBasis
+        from orchestrator.shadow_types import CostBasis
 
         assert issubclass(CostBasis, StrEnum)
         assert {member.value for member in CostBasis} == {'metered', 'subscription'}
@@ -334,8 +334,8 @@ class TestCandidatePriceCostBasis:
         from orchestrator.evals.configs import (
             CANDIDATE_ENDPOINT_PRICES,
             CandidateEndpointPrice,
-            CostBasis,
         )
+        from orchestrator.shadow_types import CostBasis
 
         assert CANDIDATE_ENDPOINT_PRICES
         for price in CANDIDATE_ENDPOINT_PRICES.values():
@@ -350,7 +350,8 @@ class TestCandidatePriceCostBasis:
         ('kimi-latest', 'metered', False),
     ])
     def test_per_model_cost_basis_is_pinned(self, model, basis, imputed):
-        from orchestrator.evals.configs import CANDIDATE_ENDPOINT_PRICES, CostBasis
+        from orchestrator.evals.configs import CANDIDATE_ENDPOINT_PRICES
+        from orchestrator.shadow_types import CostBasis
 
         price = CANDIDATE_ENDPOINT_PRICES[model]
         assert price.cost_basis is CostBasis(basis)

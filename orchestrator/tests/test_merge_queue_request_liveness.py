@@ -195,7 +195,8 @@ async def _make_branch_with_file(
 class TestCheckRequestLiveness:
     """Unit tests for SpeculativeMergeWorker._check_request_liveness(now).
 
-    RED until step-8 GREEN adds the method to merge_queue.py.
+    The method lives in orchestrator/src/orchestrator/merge_lane/worker.py and
+    delegates to request_ledger.py::report_stuck_requests.
     """
 
     async def test_stuck_request_warns_and_alarms_once(
@@ -232,7 +233,7 @@ class TestCheckRequestLiveness:
         assert esc.category == 'merge_request_stuck'
         assert req.request_id in esc.summary
 
-    async def test_second_call_is_deduped_by_open_l1(
+    async def test_second_sweep_of_the_same_episode_is_deduped(
         self,
         tmp_path: Path,
         config: OrchestratorConfig,
@@ -258,21 +259,15 @@ class TestCheckRequestLiveness:
             warnings_after_first = [r for r in caplog.records if r.levelno == logging.WARNING]
             assert len(warnings_after_first) == 1, 'first call must warn exactly once'
 
-            # An open L1 now exists for this request's sentinel (real escalation
-            # queues would report has_open_l1 True after the submit above); mirror
-            # that with the fake's open_it() and confirm no duplicate is filed.
-            fake_eq.open_it()
-            worker._check_request_liveness(t0 + 3000, threshold_s=1000)
-            assert len(fake_eq.filed) == 1, 'second call must not submit a duplicate escalation'
+            # The fake reports no open L1, as after a human closed the first
+            # alarm. A second sweep of the SAME dequeue episode, below the next
+            # alarm tier, must neither re-file nor re-warn.
+            worker._check_request_liveness(t0 + 2500, threshold_s=1000)
+            assert len(fake_eq.filed) == 1, 'second sweep must not submit a duplicate escalation'
 
-            # The WARNING log is dedup'd exactly like the escalation: a second
-            # sweep of the SAME still-open (never resolved/requeued) episode
-            # must not re-log — otherwise a genuinely leaked/wedged request
-            # would spam an identical WARNING on every heartbeat poll forever.
             warnings_after_second = [r for r in caplog.records if r.levelno == logging.WARNING]
             assert len(warnings_after_second) == 1, (
-                'second call for the same open stuck episode must not re-warn '
-                '— the WARNING log must be dedup\'d per episode like the escalation'
+                'second sweep of the same stuck episode must not re-warn'
             )
 
     async def test_observation_only_never_resolves_or_halts(
@@ -338,9 +333,9 @@ class TestCheckRequestLiveness:
     ) -> None:
         """Amendment (post-verification review, task 1992): the WARNING log
         dedup is per-EPISODE, not permanent — a requeue (on_requeued) followed
-        by a later re-dequeue (on_dequeue) must re-warn, mirroring the
-        escalation's has_open_l1 contract which likewise only dedups within a
-        single open episode.
+        by a later re-dequeue (on_dequeue) must re-warn, because the alarm
+        ladder that drives both the WARNING and the escalation restarts with
+        each dequeue episode.
         """
 
         fake_eq = RecordingEscalations()
@@ -372,7 +367,7 @@ class TestCheckRequestLiveness:
         assert len(warnings) == 1, (
             'a fresh episode after on_requeued + re-on_dequeue must re-warn '
             'once, not stay silently suppressed by the PRIOR episode\'s '
-            'warned flag'
+            'alarm count'
         )
 
 

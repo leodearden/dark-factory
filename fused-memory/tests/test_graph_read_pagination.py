@@ -42,6 +42,7 @@ from _fm_helpers import (
 )
 from falkordb.asyncio import FalkorDB
 
+from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
 from fused_memory.backends.graphiti_client import (
     INCOMPLETE_CENSUS_UNAVAILABLE,
     INCOMPLETE_SHORT_READ,
@@ -2746,12 +2747,15 @@ class TestQueryEdgesByTimeRangePagination:
             backend, FakeCappedGraph(make_windowed_edge_corpus(self.WINDOW_EDGES))
         )
         await _edges_in_window(backend)
-        where = 'e.valid_at >= $start AND e.valid_at <= $end'
+        where = 'e.valid_at >= $start AND ' + exact_string_upper_bound(
+            'e.valid_at', 'end', inclusive=True,
+        )
         assert len(graph.queries) == (
             len(graph.census_queries) + len(graph.page_queries)
         )
         census = graph.census_queries[0]
         assert where in census
+        assert 'e.valid_at <= $end' not in census
         assert census.rstrip().endswith('RETURN count(*)')
         assert 'SKIP' not in census.upper()
         population = census.rsplit('RETURN count(*)', 1)[0]

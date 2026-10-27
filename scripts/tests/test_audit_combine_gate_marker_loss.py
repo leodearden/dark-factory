@@ -223,10 +223,9 @@ def test_load_combine_targets_empty_db_returns_empty_dict(make_tasks_db):
 # The schema MIRRORS THE LIVE ONE (data/reconciliation/tickets.db, verified
 # read-only) so tests exercise real column shapes and NOT NULL constraints
 # rather than invented ones. It stays LOCAL to this file rather than moving
-# into scripts/tests/conftest.py, exactly as test_audit_wiped_metadata_files.py
-# keeps its audit-specific `_make_runs_db` local: the tickets schema is
-# specific to this detector, so promoting it would widen the blast radius of a
-# change to every scripts/ test for no reuse benefit.
+# into scripts/tests/conftest.py: the tickets schema is specific to this
+# detector, so promoting it would widen the blast radius of a change to every
+# scripts/ test for no reuse benefit.
 # ---------------------------------------------------------------------------
 
 _TICKETS_SCHEMA = """

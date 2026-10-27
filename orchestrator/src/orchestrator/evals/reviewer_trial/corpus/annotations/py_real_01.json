@@ -24,6 +24,54 @@
       "severity": "suggestion",
       "description": "The heuristic safety net (zero-cost, instant, <=1-turn failed result = probable cap hit) is a reasonable belt-and-suspenders approach, but it could false-positive on legitimately fast failures like syntax errors in the prompt. The conditions are conservative (success=False AND cost==0 AND turns<=1 AND duration<5s), making false positives unlikely in practice.",
       "mutation_type": "real_world"
+    },
+    {
+      "id": "py_real_01_pool_01",
+      "location": "shared/tests/test_cap_retry.py",
+      "category": "missing_tests",
+      "severity": "blocking",
+      "description": "The task test strategy requires tests in test_cli_invoke.py (an is_error payload with exit code 0 / subtype='success' does not classify as success, ordinary success untouched), test_usage_gate.py (every known cap message, including 'You're out of extra usage', is detected and non-cap text is not) and test_cap_retry.py (a capped invocation drives the cooldown/rotation branch). The change adds none; existing cap-retry tests stay out of the new heuristic only because make_result defaults cost_usd=0.5.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "py_real_01_pool_02",
+      "location": "shared/src/shared/cli_invoke.py:259",
+      "category": "heuristic_false_positive",
+      "severity": "blocking",
+      "description": "The heuristic's 'near-instant, zero-cost' test reads AgentResult fields that default to 0 whenever the CLI produced no JSON: _parse_claude_output returns success=False with cost_usd=0.0, turns=0, duration_ms=0 for empty stdout (subtype 'error_empty_output') and for non-JSON stdout, discarding the measured _SubprocessResult.duration_ms. A process SIGKILLed after its multi-hour timeout_seconds, or a CLI crash or startup error with no stdout, is therefore treated as a cap hit: the account is marked capped and the same prompt is re-run fresh in a loop, instead of the failure being returned to the caller.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "py_real_01_pool_03",
+      "location": "shared/src/shared/cli_invoke.py:270",
+      "category": "private_cross_module_call",
+      "severity": "suggestion",
+      "description": "invoke_with_cap_retry calls the private UsageGate._handle_cap_detected across the module boundary, and cap classification is now split between usage_gate.detect_cap_hit (text patterns) and an inline result-shape heuristic in cli_invoke. UsageGate has no public way to mark an account capped, and tests using the MagicMock _mock_gate would accept the private call silently.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "py_real_01_pool_04",
+      "location": "shared/src/shared/cli_invoke.py:276-285",
+      "category": "duplicated_logic",
+      "severity": "suggestion",
+      "description": "The heuristic branch copies the pattern-cap branch's cooldown computation (consecutive_cap_hits increment, full_cycles, min(base*2**cycles, max)) and its prompt/resume reset into an already long invoke_with_cap_retry, and the copies have already diverged: the heuristic branch omits cost_store.save_account_event('cap_hit', run_id, project_id, details=label), so heuristic cap hits leave no per-run cap_hit record.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "py_real_01_pool_05",
+      "location": "shared/src/shared/cli_invoke.py:257",
+      "category": "unclear_comment",
+      "severity": "suggestion",
+      "description": "The heuristic's comment 'is_error=true \u2192 success=False after fix 2' refers to a change numbering from the authoring session that a later reader cannot resolve, and the thresholds (turns <= 1, duration_ms < 5000, cost == 0) are inline magic numbers rather than named constants or a named predicate.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "py_real_01_pool_06",
+      "location": "shared/src/shared/usage_gate.py:46",
+      "category": "unconfirmed_pattern_match",
+      "severity": "suggestion",
+      "description": "detect_cap_hit substring-matches CAP_HIT_PREFIXES against stderr plus the agent's whole result text, and the CAP_CONFIRM_KEYWORDS 'must also appear' confirmation is defined but never applied. Adding the bare prefix 'You're out of extra usage' widens that pre-existing false-positive surface (an agent output quoting the phrase marks the account capped). The repo's integration-test docstring also associates this message with stale/invalid tokens, a case the reset probe could never clear; whether the message ever means anything other than extra-usage exhaustion is unconfirmed.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "context": {

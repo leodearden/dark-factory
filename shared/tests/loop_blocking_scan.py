@@ -156,6 +156,13 @@ _DIRECTORY_ENTRY_WRITE_WHY = (
     'filesystem directory-entry write: creates, removes or renames an entry, '
     'so it waits on the filesystem journal, not merely the page cache'
 )
+_PATH_RESOLUTION_WHY = (
+    'filesystem metadata: path normalisation issues one lstat per path '
+    'component plus a readlink per symlink -- cheap against a warm dentry '
+    'cache (measured: plans/inv8-caller-side-census-2026-09-03.md section '
+    '4d), unbounded against a cold, network or wedged filesystem, and the '
+    'coroutine cannot tell which it got'
+)
 
 # Dotted paths, matched after `import X as Y` alias substitution
 # (`subprocess.run(...)`) and after `from X import Y` binding resolution
@@ -222,6 +229,7 @@ DOTTED_PRIMITIVES: dict[str, str] = {
     'os.path.exists': _METADATA_WHY,
     'os.path.isfile': _METADATA_WHY,
     'os.path.isdir': _METADATA_WHY,
+    'os.path.realpath': _PATH_RESOLUTION_WHY,
     'os.makedirs': _DIRECTORY_ENTRY_WRITE_WHY,
     'os.mkdir': _DIRECTORY_ENTRY_WRITE_WHY,
     'os.rmdir': _DIRECTORY_ENTRY_WRITE_WHY,
@@ -287,8 +295,8 @@ BUILTIN_PRIMITIVES: dict[str, str] = {
 # section 4c).  `replace`, `remove` and `walk` stay out of this table for good:
 # by attribute name alone they are str.replace, list.remove and ast.walk, so
 # every string edit would become a merge-blocking row -- their os.* spellings
-# are matched above as receiver-pinned dotted paths.  `resolve` (Path.resolve)
-# and os.path.realpath are the next widening, owned by task 6089 (+12 rows).
+# are matched above as receiver-pinned dotted paths.  `resolve` IS matched by
+# name although other classes define it too: why, census section 4d.
 METHOD_PRIMITIVES: dict[str, str] = {
     'read_text': (
         'filesystem: the primitive behind task 4091\'s and task 4201\'s missed '
@@ -316,6 +324,7 @@ METHOD_PRIMITIVES: dict[str, str] = {
     'is_file': _METADATA_WHY,
     'is_dir': _METADATA_WHY,
     'stat': _METADATA_WHY,
+    'resolve': _PATH_RESOLUTION_WHY,
     'iterdir': _DIRECTORY_READ_WHY,
     'glob': _DIRECTORY_READ_WHY,
     'rglob': _DIRECTORY_READ_WHY,

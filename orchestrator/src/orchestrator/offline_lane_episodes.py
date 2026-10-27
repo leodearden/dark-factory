@@ -1,6 +1,6 @@
 """The offline lane's red-path engine: the reads around a pass, the fix-task filing, the escalations.
 
-PRD ``plans/offline-lane-red-path-prd.md`` D8, D10-D12 and section 5.4.  The records and
+PRD ``plans/offline-lane-red-path-prd.md`` D7, D8, D10-D12 and sections 5.4 and 5.10.  The records and
 the pure effect of a pass live in
 ``orchestrator/src/orchestrator/offline_lane_episode_state.py``; :class:`LaneEngine`
 reads what :func:`apply_pass` needs, saves its result, files the fix tasks it names and
@@ -33,23 +33,39 @@ Rules the engine and its pure rules keep beyond the PRD's text:
   answered from the engine's own store for the run-record prune.
 - R11 a due filing with no covering task whose every episode has ended is cancelled,
   not retried; one live episode keeps the whole group's filing going.
+- R12 each probe answer, in a pass or on a tick, maintains both probe records: the one
+  of the answer's kind is filed, or amended when the answer changed; the other is
+  released with the level-2s that hold it.  A record resolved by hand is replaced only
+  by a pass.
+- R13 before submitting for a group with no covering task, the engine looks up the
+  project's open lane fix tasks (``spawn_context`` ``offline_lane_red``, each read live),
+  at most once per pass or tick, and binds each test to the first that covers it (its
+  ``x_offline_lane`` command and nodes, or a pre-cutover task's ``failing_tests``),
+  committed and named in ``prior_task_ids``.  Only the rest are submitted.  A failed
+  lookup, or one open lane task that cannot be read, files nothing for any command in
+  that pass or tick: every such filing stays due with the reason, which names that task
+  and reaches the stuck-filing record.
+- R14 a command record that has observed no pass takes its last pass and last green
+  head from the command's run records before the pass, so a cutover or a lost store
+  keeps a green pass on record.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from shared.task_statuses import OwnerLiveness, owner_liveness
+from shared.task_statuses import OwnerLiveness, TaskStatus, owner_liveness
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
-from orchestrator.flake_ledger import fix_contained, resolving_commit
-from orchestrator.offline_lane_confirm import Confirmed, Unconfirmable, outcome_from_json
+from orchestrator.flake_ledger import FlakeLedgerTaskClient, fix_contained, resolving_commit
+from orchestrator.offline_lane_confirm import Confirmed, Outage, Unconfirmable, outcome_from_json
 from orchestrator.offline_lane_episode_state import (
     CommandRecord,
     CoveringVerdict,
@@ -59,43 +75,63 @@ from orchestrator.offline_lane_episode_state import (
     PassEffect,
     PassObservation,
     PassReads,
+    apply_outage,
     apply_pass,
     recheck_due,
     reproduce_for,
     reproduced_nodes,
     unconfirmable_node,
+    with_probe,
+    with_recorded_history,
 )
 from orchestrator.offline_lane_escalations import (
+    PENDING_ESCALATION,
+    ProbeReport,
     StuckFiling,
     UnlandedRed,
+    amend_outage,
+    amend_probe_broken,
     amend_stuck_filing,
     escalation_state,
+    file_outage,
+    file_probe_broken,
     file_stuck_filing,
     file_unlanded_red,
+    release_lane_record,
     resolve_stuck_filing,
 )
 from orchestrator.offline_lane_filing import (
+    SPAWN_CONTEXT,
+    SPAWN_CONTEXT_KEY,
     UNKNOWN,
     CountedPassEvidence,
     TestEvidence,
     build_lane_command_task_arguments,
     build_lane_fix_task_arguments,
+    covering_lane_task,
 )
-from orchestrator.offline_lane_records import PassRecord, RunRecord, RunRecordStore
+from orchestrator.offline_lane_records import (
+    RECORD_RETENTION,
+    PassRecord,
+    ProbeKind,
+    ProbeResult,
+    RunRecord,
+    RunRecordStore,
+)
+from orchestrator.offline_lane_runs import ProbeSeam, command_cwd, run_probe
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
-    from orchestrator.config import OrchestratorConfig
-    from orchestrator.flake_ledger import FlakeLedgerTaskClient
+    from orchestrator.config import LaneCommand, OrchestratorConfig
 
 logger = logging.getLogger(__name__)
 
 UNKNOWN_MODE = 'unknown'
 UNKNOWN_STATUS = 'unknown'
-PENDING_ESCALATION = 'pending'
 CLOSED_ESCALATION_STATES = frozenset({'resolved', 'dismissed'})
 DEFERRED_STATUS = 'deferred'
+_OPEN_STATUSES = tuple(sorted(s.value for s in TaskStatus if owner_liveness(s) is OwnerLiveness.OPEN))
 
 
 def _utc_now() -> datetime:
@@ -103,18 +139,55 @@ def _utc_now() -> datetime:
 
 
 def lane_policy(config: OrchestratorConfig) -> LanePolicy:
-    """The lane's persistence policy, read at every pass and tick; the defaults until δ3."""
-    return LanePolicy()
+    """The lane's persistence policy, read from the live ``config.git`` knobs."""
+    return LanePolicy(
+        persist_passes=config.git.offline_lane_persist_passes,
+        recheck_secs=config.git.offline_lane_recheck_secs,
+        red_unlanded_hours=config.git.offline_lane_red_unlanded_hours,
+    )
 
 
-class GitAncestry(Protocol):
+class LaneGit(Protocol):
+    """What the engine asks of git: one ancestry read, and where the lane's worktree is."""
+
     async def is_ancestor_checked(self, ancestor: str, descendant: str) -> bool | None: ...
+
+    @property
+    def persistent_offline_deep_worktree_path(self) -> Path: ...
+
+
+class LaneTaskClient(FlakeLedgerTaskClient, Protocol):
+    """The lane's task seam: the flake ledger's, and the metadata lookup R13 adopts open fix tasks through."""
+
+    async def find_tasks_by_metadata(
+        self, key: str, value: str, statuses: Sequence[str],
+    ) -> tuple[list[dict], Exception | None]: ...
 
 
 @dataclass(frozen=True)
 class TickResult:
     commands_due: tuple[str, ...]
     tasks_filed: tuple[str, ...]
+
+
+_OpenLaneTasks = tuple[dict[str, Mapping[str, Any]], str | None]
+
+
+class _OpenLaneTaskLookup:
+    """R13's read of the open lane fix tasks, made at most once per pass or tick and shared by its filings.
+
+    A task submitted later in the same pass or tick names only its own group's nodes, which no
+    other group shares, so no filing needs to see it.
+    """
+
+    def __init__(self, read: Callable[[], Awaitable[_OpenLaneTasks]]) -> None:
+        self._read = read
+        self._answer: _OpenLaneTasks | None = None
+
+    async def answer(self) -> _OpenLaneTasks:
+        if self._answer is None:
+            self._answer = await self._read()
+        return self._answer
 
 
 @dataclass(frozen=True)
@@ -175,15 +248,27 @@ def _after_submit(
             liveness = owner_liveness(status)
             if not combined or liveness is OwnerLiveness.DEFERRED:
                 return bound
-            return _with_episodes(
-                bound, nodes, planning_committed=True, filing_due=False, filing_due_since=None,
-                reproduce=None, binding_swallowed=liveness is not OwnerLiveness.OPEN,
+            committed = _with_episodes(
+                bound, nodes, planning_committed=True, binding_swallowed=liveness is not OwnerLiveness.OPEN,
             )
+            return _cleared(committed, nodes)
         case SubmittedTicket(ticket_id=ticket_id):
             failure = f'submit_task returned ticket {ticket_id!r}, not a task: planning mode did not take effect'
         case SubmitFailed(reason=reason):
             failure = reason
     return _with_episodes(record, nodes, filing_failure=failure)
+
+
+def _adopted(record: CommandRecord, adopted: Mapping[str, str], now: datetime) -> CommandRecord:
+    """R13: each node of *adopted* bound to its open task, as a submission combined into an open task binds."""
+    for node, task_id in adopted.items():
+        prior = record.episodes[node].prior_task_ids
+        record = _with_episodes(
+            record, (node,), covering_task_id=task_id, planning_committed=True, filed_at=now,
+            filing_failure=None, binding_swallowed=False,
+            prior_task_ids=prior if task_id in prior else (*prior, task_id),
+        )
+    return _cleared(record, tuple(adopted))
 
 
 def _after_commit(record: CommandRecord, nodes: Sequence[str], task_id: str, read: _TaskRead) -> CommandRecord:
@@ -260,30 +345,99 @@ def _stuck_reason(stuck: Sequence[Episode]) -> str:
     return '; '.join(reasons) or 'no filing attempt has completed'
 
 
+class _ProbeSource(StrEnum):
+    """Who ran a probe: a red pass, or the tick's probe loop during an outage."""
+
+    PASS = 'pass'
+    TICK = 'tick'
+
+
+@dataclass(frozen=True)
+class _ProbeRecord:
+    """One of the two probe records a command keeps: where its id is stored, and how it is written."""
+
+    kind: ProbeKind
+    stored: Callable[[CommandRecord], str | None]
+    with_id: Callable[[CommandRecord, str | None], CommandRecord]
+    file: Callable[[EscalationQueue, ProbeReport], str]
+    amend: Callable[[EscalationQueue, str, ProbeReport], bool]
+
+
+_PROBE_RECORDS = (
+    _ProbeRecord(
+        ProbeKind.OUTAGE,
+        lambda record: record.outage_escalation_id,
+        lambda record, escalation_id: replace(record, outage_escalation_id=escalation_id),
+        file_outage,
+        amend_outage,
+    ),
+    _ProbeRecord(
+        ProbeKind.BROKEN,
+        lambda record: record.probe_broken_escalation_id,
+        lambda record, escalation_id: replace(record, probe_broken_escalation_id=escalation_id),
+        file_probe_broken,
+        amend_probe_broken,
+    ),
+)
+
+_RELEASED_BECAUSE = {
+    ProbeKind.UP: 'The outage probe passed; the lane closed its own record.',
+    ProbeKind.BROKEN: 'The outage probe is now broken; the lane closed this record and opened a broken-probe record.',
+    ProbeKind.OUTAGE: 'The outage probe now names a failed dependency; the lane closed this record and opened an outage record.',
+}
+_NO_PROBE_DECLARED = 'This command no longer declares an outage probe; the lane closed its own record.'
+_NOT_CONFIGURED = 'This command is no longer configured or enabled; the lane closed its own record.'
+
+
+def _answer(probe: ProbeResult | None) -> tuple[str, int | None, str | None, str] | None:
+    """What a probe record states of a probe: everything but its duration."""
+    if probe is None:
+        return None
+    return (probe.result, probe.returncode, probe.failed_dependency, probe.first_line)
+
+
+def _release_reason(answer: ProbeResult | None) -> str:
+    return _NO_PROBE_DECLARED if answer is None else _RELEASED_BECAUSE[ProbeKind(answer.result)]
+
+
+def _no_effect(escalations_raised: tuple[str, ...]) -> PassEffect:
+    return PassEffect(
+        tests_counted=(), episodes_started=(), episodes_extended=(), episodes_ended=(),
+        threshold_reached=(), stale_heads=(), no_decision=(), tasks_filed=(),
+        escalations_raised=escalations_raised,
+    )
+
+
 class LaneEngine:
     """The red path of the offline lane: :meth:`observe` once per pass, :meth:`tick` on the worker's idle poll."""
 
     def __init__(
         self,
         config: OrchestratorConfig,
-        git: GitAncestry,
+        git: LaneGit,
         *,
-        task_client: FlakeLedgerTaskClient | None,
+        task_client: LaneTaskClient | None,
         escalation_queue: EscalationQueue | None,
         now: Callable[[], datetime] | None = None,
+        probe_runner: ProbeSeam = run_probe,
     ) -> None:
         self._config = config
         self._git = git
         self._tasks = task_client
         self._queue = escalation_queue
         self._now = now or _utc_now
+        self._probe_runner = probe_runner
         self._store = EpisodeStore(config.project_root, clock=self._now)
         self._records = RunRecordStore(config.project_root, clock=self._now)
 
     async def observe(self, observation: PassObservation) -> PassEffect:
+        if isinstance(observation.outcome, Outage):
+            return await self._observed_outage(observation, observation.outcome.probe)
         policy = lane_policy(self._config)
         record = await asyncio.to_thread(self._store.load, observation.command)
-        record, filed = await self._retry_due_filings(record)
+        open_tasks = _OpenLaneTaskLookup(self._open_lane_tasks)
+        record, filed = await self._retry_due_filings(record, open_tasks)
+        record = await self._with_recorded_history(record, observation)
         reads, statuses = await self._pass_reads(record, observation)
         applied = apply_pass(record, observation, reads, policy, self._now())
         record = applied.record
@@ -294,31 +448,172 @@ class LaneEngine:
             and (task_id := record.episodes[node].covering_task_id) is not None
         }
         groups = [*applied.to_file, *(g for g in _due_groups(record) if _covering(record, g) in unfinished)]
-        record, opened = await self._open_filings(record, groups, observation)
+        record, opened = await self._open_filings(record, groups, observation, open_tasks)
         saved = record
         record, raised = await self._raise_unlanded(record, applied.unlanded, statuses)
         record = await self._maintained_stuck_record(record, policy)
+        probed: tuple[str, ...] = ()
+        if observation.probe is not None:
+            record, probed = await self._probe_answered(record, observation, observation.probe)
         if record != saved:
             await self._save(record)
-        return replace(applied.effect, tasks_filed=(*filed, *opened), escalations_raised=raised)
+        return replace(applied.effect, tasks_filed=(*filed, *opened), escalations_raised=(*raised, *probed))
+
+    async def _observed_outage(self, observation: PassObservation, probe: ProbeResult) -> PassEffect:
+        """D5's outage row: held episodes are marked, the probe records kept, and nothing is filed."""
+        record = await asyncio.to_thread(self._store.load, observation.command)
+        record = apply_outage(record, observation)
+        record, raised = await self._probe_answered(record, observation, probe)
+        await self._save(record)
+        return _no_effect(raised)
+
+    async def _probe_answered(
+        self, record: CommandRecord, observation: PassObservation, probe: ProbeResult,
+    ) -> tuple[CommandRecord, tuple[str, ...]]:
+        cmd = observation.lane_command
+        if cmd is None:
+            raise ValueError(f'{observation.command}: a probe answered a pass with no lane command')
+        record_dir = str(self._records.pass_directory(observation.command, observation.pass_id))
+        return await self._probe_records_kept(record, cmd, probe, _ProbeSource.PASS, record_dir)
 
     async def tick(self, *, head: str) -> TickResult:
         policy = lane_policy(self._config)
         due: list[str] = []
         filed: list[str] = []
+        open_tasks = _OpenLaneTaskLookup(self._open_lane_tasks)
         for command in await asyncio.to_thread(self._store.commands):
             record = await asyncio.to_thread(self._store.load, command)
-            record, tasks = await self._retry_due_filings(record)
+            record, tasks = await self._retry_due_filings(record, open_tasks)
             filed.extend(tasks)
             saved = record
             record = await self._maintained_stuck_record(record, policy)
-            rechecked = recheck_due(record, head, policy, self._now())
+            record, probe_due = await self._probe_loop(record, self._lane_command(command), policy)
+            rechecked = None if probe_due else recheck_due(record, head, policy, self._now())
             if rechecked is not None:
                 record = rechecked
+            if probe_due or rechecked is not None:
                 due.append(command)
             if record != saved:
                 await self._save(record)
         return TickResult(tuple(due), tuple(filed))
+
+    def _lane_command(self, command: str) -> LaneCommand | None:
+        """*command*'s configuration as of now, read on every tick so a reload takes effect."""
+        return next((cmd for cmd in self._config.git.offline_lane_commands if cmd.name == command), None)
+
+    async def _probe_loop(
+        self, record: CommandRecord, cmd: LaneCommand | None, policy: LanePolicy,
+    ) -> tuple[CommandRecord, bool]:
+        """D7's probe loop and its two hold exits; true when the command is due a pass."""
+        probe_ids = [kind.stored(record) for kind in _PROBE_RECORDS]
+        if cmd is None or not cmd.enabled or not cmd.outage_probe:
+            if not record.in_outage and not any(probe_ids):
+                return record, False
+            reason = _NO_PROBE_DECLARED if cmd is not None and cmd.enabled else _NOT_CONFIGURED
+            record = replace(record, last_probe_result=None)
+            for kind in _PROBE_RECORDS:
+                record, _ = await self._released(record, kind, reason)
+            return record, False
+        if not record.in_outage:
+            return await self._stale_records_released(record), False
+        now = self._now()
+        if record.last_probe_at is not None and now - record.last_probe_at < policy.recheck:
+            return record, False
+        worktree = self._git.persistent_offline_deep_worktree_path
+        if not await asyncio.to_thread(command_cwd(worktree, cmd).is_dir):
+            return record, True
+        answer = await self._probe_runner(cmd, worktree)
+        record, _ = await self._probe_records_kept(record, cmd, answer, _ProbeSource.TICK, None)
+        return record, answer.result != ProbeKind.OUTAGE
+
+    async def _stale_records_released(self, record: CommandRecord) -> CommandRecord:
+        """The record with every stored probe record that no longer matches the last answer released.
+
+        The flag follows the releases: it stays set while any of them fails, and clears once all succeed.
+        """
+        answer = record.last_probe_result
+        stale = [
+            kind for kind in _PROBE_RECORDS
+            if kind.stored(record) is not None and (answer is None or kind.kind != answer.result)
+        ]
+        if not stale:
+            return record
+        behind = False
+        for kind in stale:
+            record, failed = await self._released(record, kind, _release_reason(answer))
+            behind = behind or failed
+        return replace(record, probe_record_behind=behind)
+
+    async def _probe_records_kept(
+        self,
+        record: CommandRecord,
+        cmd: LaneCommand,
+        answer: ProbeResult,
+        source: _ProbeSource,
+        record_dir: str | None,
+    ) -> tuple[CommandRecord, tuple[str, ...]]:
+        """R12: the record after *answer*, with both probe records maintained; the ids this call filed."""
+        previous = record.last_probe_result
+        record = with_probe(record, answer, self._now())
+        if self._queue is None:
+            logger.error('offline-lane: %s: no escalation queue; %s probe record not written', record.command, answer.result)
+            return record, ()
+        report = ProbeReport(
+            command=record.command,
+            probe_command=cmd.outage_probe or '',
+            cwd=str(command_cwd(self._git.persistent_offline_deep_worktree_path, cmd)),
+            timeout_secs=cmd.outage_probe_timeout_secs,
+            probe=answer,
+            record_dir=record_dir,
+        )
+        changed = _answer(answer) != _answer(previous) or record.probe_record_behind
+        record = await self._stale_records_released(replace(record, probe_record_behind=False))
+        filed: list[str] = []
+        behind = record.probe_record_behind
+        for kind in _PROBE_RECORDS:
+            if kind.kind == answer.result:
+                record, opened, failed = await self._kept(self._queue, record, kind, report, source, changed)
+                filed.extend([opened] if opened else [])
+                behind = behind or failed
+        return replace(record, probe_record_behind=behind), tuple(filed)
+
+    async def _kept(
+        self,
+        queue: EscalationQueue,
+        record: CommandRecord,
+        kind: _ProbeRecord,
+        report: ProbeReport,
+        source: _ProbeSource,
+        changed: bool,
+    ) -> tuple[CommandRecord, str | None, bool]:
+        """The record of the answer's kind: amended while pending, else filed (by a pass, or when none is stored)."""
+        stored = kind.stored(record)
+        try:
+            if stored is not None:
+                pending = await asyncio.to_thread(escalation_state, queue, stored) == PENDING_ESCALATION
+                if pending and (not changed or await asyncio.to_thread(kind.amend, queue, stored, report)):
+                    return record, None, False
+                if source is _ProbeSource.TICK:
+                    return record, None, False
+            opened = await asyncio.to_thread(kind.file, queue, report)
+        except Exception:
+            logger.exception('offline-lane: %s: %s probe record not written; retried at the next probe',
+                             record.command, kind.kind)
+            return record, None, True
+        return kind.with_id(record, opened), opened, False
+
+    async def _released(self, record: CommandRecord, kind: _ProbeRecord, reason: str) -> tuple[CommandRecord, bool]:
+        """The record with *kind*'s stored record released and its id cleared; true when the release failed."""
+        stored = kind.stored(record)
+        if stored is None or self._queue is None:
+            return record, False
+        try:
+            await asyncio.to_thread(release_lane_record, self._queue, stored, reason)
+        except Exception:
+            logger.exception('offline-lane: %s: %s probe record not written; retried at the next probe',
+                             record.command, kind.kind)
+            return record, True
+        return kind.with_id(record, None), False
 
     def pinned_pass_ids(self) -> frozenset[str]:
         """The counted pass ids the held episodes refer to; synchronous, for the run-record prune off the loop."""
@@ -427,13 +722,30 @@ class LaneEngine:
             return False
         return state in CLOSED_ESCALATION_STATES
 
+    async def _with_recorded_history(self, record: CommandRecord, observation: PassObservation) -> CommandRecord:
+        """R14; the run records are evidence, never a gate, so an unreadable listing seeds nothing."""
+        if record.last_pass_id is not None:
+            return record
+        try:
+            recorded = await asyncio.to_thread(self._recorded_before, observation)
+        except (OSError, ValueError):
+            logger.exception('offline-lane: %s: run records unreadable, no history seeded', record.command)
+            return record
+        return with_recorded_history(record, recorded)
+
+    def _recorded_before(self, observation: PassObservation) -> list[PassRecord]:
+        recorded = self._records.passes_since(observation.command, observation.started_at - RECORD_RETENTION)
+        return [earlier for earlier in recorded if earlier.started_at < observation.started_at]
+
     async def _previous_detect(self, record: CommandRecord) -> RunRecord | None:
         if record.last_pass_id is None:
             return None
         previous = await asyncio.to_thread(self._records.load_pass, record.command, record.last_pass_id)
         return None if previous is None else previous.detect
 
-    async def _retry_due_filings(self, record: CommandRecord) -> tuple[CommandRecord, list[str]]:
+    async def _retry_due_filings(
+        self, record: CommandRecord, open_tasks: _OpenLaneTaskLookup,
+    ) -> tuple[CommandRecord, list[str]]:
         if self._tasks is None:
             return record, []
         filed: list[str] = []
@@ -443,12 +755,16 @@ class LaneEngine:
                                record.command, list(group))
                 record = await self._saved(record, _cancelled(record, group))
                 continue
-            record, task_id = await self._file(self._tasks, record, group, opening=None)
+            record, task_id = await self._file(self._tasks, record, group, opening=None, open_tasks=open_tasks)
             filed.extend([task_id] if task_id else [])
         return record, filed
 
     async def _open_filings(
-        self, record: CommandRecord, groups: Sequence[tuple[str, ...]], observation: PassObservation,
+        self,
+        record: CommandRecord,
+        groups: Sequence[tuple[str, ...]],
+        observation: PassObservation,
+        open_tasks: _OpenLaneTaskLookup,
     ) -> tuple[CommandRecord, list[str]]:
         if self._tasks is None:
             for group in groups:
@@ -456,17 +772,18 @@ class LaneEngine:
             return record, []
         filed: list[str] = []
         for group in groups:
-            record, task_id = await self._file(self._tasks, record, group, opening=observation)
+            record, task_id = await self._file(self._tasks, record, group, opening=observation, open_tasks=open_tasks)
             filed.extend([task_id] if task_id else [])
         return record, filed
 
     async def _file(
         self,
-        client: FlakeLedgerTaskClient,
+        client: LaneTaskClient,
         record: CommandRecord,
         nodes: tuple[str, ...],
         *,
         opening: PassObservation | None,
+        open_tasks: _OpenLaneTaskLookup,
     ) -> tuple[CommandRecord, str | None]:
         """PRD 5.4, each step its own write; a retry resumes at the first step not yet recorded.
 
@@ -477,6 +794,9 @@ class LaneEngine:
         filed = None
         record = await self._saved(record, _marked_due(record, nodes, reproduce, self._now()))
         if _covering(record, nodes) is None:
+            record, nodes = await self._adopt_open_tasks(open_tasks, record, nodes)
+            if not nodes:
+                return record, None
             outcome = await self._submit(client, await self._fix_task_arguments(record, nodes, reproduce, opening))
             record = await self._saved(record, _after_submit(record, nodes, outcome, self._now()))
             filed = self._submitted(record, nodes)
@@ -488,6 +808,44 @@ class LaneEngine:
         record = await self._saved(record, _after_commit(record, nodes, task_id, read))
         record = await self._saved(record, _cleared(record, nodes))
         return record, filed
+
+    async def _adopt_open_tasks(
+        self, lookup: _OpenLaneTaskLookup, record: CommandRecord, nodes: tuple[str, ...],
+    ) -> tuple[CommandRecord, tuple[str, ...]]:
+        """R13: the saved record with every node an open lane fix task covers bound to it; the nodes left to submit."""
+        open_tasks, failure = await lookup.answer()
+        if failure is not None:
+            logger.warning('offline-lane: %s: filing for %s not attempted, still due: %s',
+                           record.command, list(nodes), failure)
+            return await self._saved(record, _with_episodes(record, nodes, filing_failure=failure)), ()
+        adopted = {
+            node: task_id for node in nodes
+            if (task_id := covering_lane_task(open_tasks, record.command, node)) is not None
+        }
+        if adopted:
+            logger.warning('offline-lane: %s: adopted the open lane fix tasks covering %s, not filing for them',
+                           record.command, adopted)
+        record = await self._saved(record, _adopted(record, adopted, self._now()))
+        return record, tuple(node for node in nodes if node not in adopted)
+
+    async def _open_lane_tasks(self) -> _OpenLaneTasks:
+        """The project's open lane fix tasks, read live, in lookup order; or why they could not be read."""
+        if self._tasks is None:
+            return {}, 'no task client'
+        try:
+            rows, error = await self._tasks.find_tasks_by_metadata(SPAWN_CONTEXT_KEY, SPAWN_CONTEXT, _OPEN_STATUSES)
+        except Exception as exc:
+            rows, error = [], exc
+        if error is not None:
+            return {}, f'open lane task lookup failed: {error}'
+        open_tasks: dict[str, Mapping[str, Any]] = {}
+        for task_id in (str(row['task_id']) for row in rows):
+            read = await self._read_task(task_id)
+            if read.error is not None:
+                return {}, f'open lane task {task_id} unreadable: {read.error}'
+            if read.task is not None and owner_liveness(read.status) is OwnerLiveness.OPEN:
+                open_tasks[task_id] = read.task
+        return open_tasks, None
 
     def _submitted(self, record: CommandRecord, nodes: Sequence[str]) -> str | None:
         episode = record.episodes[nodes[0]]
