@@ -890,13 +890,20 @@ class TestSettledLaneLockHolderRead:
 
         monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _lossy_reader)
 
-        result = await git_ops_mod._settled_lane_lock_holder_pids(lock_path)
+        result = await git_ops_mod._settled_lane_lock_holder_pids(
+            lock_path, timeout=10.0, interval=0,
+        )
 
         assert result == [4242], (
             f'a lossy empty read must be polled past, not returned as the '
             f'holder set — returning it drops the holder pid+pgid from the '
             f'operator message and fails layer (1) of the leak predicate; '
             f'got {result!r} after {len(calls)} read(s)'
+        )
+        assert len(calls) == 3, (
+            f'the helper must return on the FIRST non-empty poll rather than '
+            f'keep reading the kernel lock table to the deadline; the reader '
+            f'was called {len(calls)} time(s)'
         )
 
     async def test_a_non_empty_first_read_is_returned_without_a_second_read(
