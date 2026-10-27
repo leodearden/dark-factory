@@ -2385,8 +2385,8 @@ class CuratorConfig(BaseModel):
     # (get_tasks over the whole tree + an embedder call + a qdrant query).
     # That path now hands the prepared bundle to ``curate``, so a smaller
     # batch no longer costs a rebuild.
-    entry_description_chars: int = Field(default=2000)
-    entry_details_chars: int = Field(default=1500)
+    entry_description_chars: int = Field(default=2000, ge=1)
+    entry_details_chars: int = Field(default=1500, ge=1)
 
     # Batch-curator knobs — the worker drains up to batch_max tickets per
     # round-trip; timeout, turns, and budget scale linearly with N and are
