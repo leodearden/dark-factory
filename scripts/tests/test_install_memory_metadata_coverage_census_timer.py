@@ -355,6 +355,20 @@ def test_service_is_a_thin_oneshot_around_the_committed_wrapper():
     assert _values(service, 'Service', 'WorkingDirectory') == [PRODUCTION_ROOT]
 
 
+def test_service_pins_the_boot_catch_up_path():
+    """A Persistent=true boot catch-up run gets the user manager's minimal
+    PATH (journal excerpt in scripts/fused-memory-flag-marker-sweep.service).
+    This line is the unit-level half of the fix; the wrapper's own uv
+    resolution covers a stale installed unit that predates it."""
+    environment = _values(_directives(SERVICE_NAME), 'Service', 'Environment')
+    path_entries = [v for v in environment if v.startswith('PATH=')]
+    assert len(path_entries) == 1, environment
+    directories = path_entries[0].removeprefix('PATH=').split(':')
+    # Production home, literally: the installed unit is a byte copy.
+    assert '/home/leo/.local/bin' in directories, directories
+    assert '/usr/bin' in directories, directories
+
+
 def test_service_sends_both_streams_to_the_journal():
     """The report is written to files, but the run's narration -- and any
     shortfall the census exits 1 on -- is only ever readable in the journal."""
