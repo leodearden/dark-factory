@@ -16,6 +16,13 @@ blobs, so a branch that changes a stamped fixture (the fetch cache, say) and
 regenerates stays green through the merge lane's rebases
 (``orchestrator/src/orchestrator/git_ops.py::GitOps.advance_main``).
 
+The price is a coupling: ANY content edit to ANY stamped fixture (the seven
+``fused-memory/scripts/read_transform_selection.py::main`` passes as
+``fixture_paths``) fails both the comparison and the blob guard, even an
+edit no metric reads, such as an E1-only re-key of
+``memory_eval_topic_registry.json``.  A task that edits a stamped fixture
+must list this pair in its files and regenerate it in the same change.
+
 Merge lane, offline: no network, Qdrant or OPENAI_API_KEY.  Git is needed
 only to take and resolve the fixture stamps.
 
