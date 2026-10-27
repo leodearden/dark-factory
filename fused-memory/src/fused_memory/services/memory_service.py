@@ -145,6 +145,7 @@ from fused_memory.services.topic_anchor import (
     resolve_topic_anchor_enabled,
     select_canonical_payload,
 )
+from fused_memory.services.write_journal import Mem0IntentStatus
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
 from fused_memory.utils.referent_resolution import (
@@ -7041,7 +7042,7 @@ class MemoryService:
                 # In-request call resolved without raising → stamp terminal.
                 if self._write_journal and intent_id:
                     await self._write_journal.resolve_mem0_intent(
-                        intent_id, 'completed'
+                        intent_id, Mem0IntentStatus.COMPLETED
                     )
                 if not mem0_ids and _MEM0_ADD_INFER_PINNED_FALSE:
                     # mem0.add() did not raise but returned no results — a silent
@@ -7072,7 +7073,7 @@ class MemoryService:
                     # backend_op as safe to re-issue).
                     if self._write_journal and intent_id:
                         await self._write_journal.resolve_mem0_intent(
-                            intent_id, 'failed', reason=str(e)
+                            intent_id, Mem0IntentStatus.FAILED, reason=str(e)
                         )
 
         # Layer 1 journal entry
@@ -7258,7 +7259,7 @@ class MemoryService:
                 # Write landed; only the completion stamp was lost.
                 await self._write_journal.resolve_mem0_intent(
                     intent_id,
-                    'completed',
+                    Mem0IntentStatus.COMPLETED,
                     reason='reconciled: mem0 backend_op confirms write landed',
                 )
                 summary['reconciled'] += 1
@@ -7277,7 +7278,7 @@ class MemoryService:
                     await self.reissue_mem0_intent(intent)
                     await self._write_journal.resolve_mem0_intent(
                         intent_id,
-                        'completed',
+                        Mem0IntentStatus.COMPLETED,
                         reason='reconciled: re-issued after failed-only mem0 backend_op',
                     )
                     summary['reissued'] += 1
@@ -7298,7 +7299,7 @@ class MemoryService:
                             f'(write_op_id={write_op_id}, payload_digest={payload_digest})'
                         )
                         await self._write_journal.resolve_mem0_intent(
-                            intent_id, 'dead', reason=reason
+                            intent_id, Mem0IntentStatus.DEAD, reason=reason
                         )
                         summary['dead_lettered'] += 1
                         logger.error(
@@ -7321,7 +7322,7 @@ class MemoryService:
                     'would risk a duplicate twin; manual replay available.'
                 )
                 await self._write_journal.resolve_mem0_intent(
-                    intent_id, 'dead', reason=reason
+                    intent_id, Mem0IntentStatus.DEAD, reason=reason
                 )
                 summary['dead_lettered'] += 1
                 logger.warning(
