@@ -138,7 +138,8 @@ def build_eval_orch_config(
     Reviewer is the new 1× Opus comprehensive reviewer (matches production
     after the reviewer-panel trial replaced the 5× sonnet panel; merged
     via 594658fbe3 / 2c26a30bca).
-    Only the implementer varies per eval config.
+    Only the implementer varies per eval config, and the implementer candidate's
+    ``harness_variant`` becomes the cell's ``implementer_brief_variant``.
 
     ``architect_config`` (eval-revival μ) drives the both-live end-to-end matrix
     /confirm runs (``run_end_to_end``): when supplied, the architect's
@@ -267,6 +268,7 @@ def build_eval_orch_config(
         'sandbox': SandboxConfig(enabled=False),
         'project_root': Path(task.get('project_root', str(base.project_root))),
         'env_overrides': config.env_overrides,
+        'implementer_brief_variant': config.harness_variant,
     }
     # BUG 2a: pin the eval verify interpreter to the target's own
     # .python-version (via verify_env['UV_PYTHON']) so `uv run pytest/ruff/
