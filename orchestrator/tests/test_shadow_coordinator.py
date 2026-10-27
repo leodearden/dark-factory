@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 from datetime import timedelta
 from pathlib import Path
 
@@ -316,14 +317,35 @@ async def test_credits_exhaustion_holds_the_candidate_for_the_credit_window(tmp_
 
 
 @pytest.mark.asyncio
-async def test_on_phase_never_raises_even_when_the_resolver_does(tmp_path, costs):
+async def test_a_raising_resolver_is_an_unknown_candidate_skip_naming_the_error(
+    tmp_path, costs, caplog,
+):
     def exploding_resolver(name: str):
         raise RuntimeError(f'cannot resolve {name}')
 
     rig = build_coordinator(tmp_path, costs, resolve_candidate=exploding_resolver)
 
-    assert await _plan_exit(rig, make_task('5387')) == []
+    with caplog.at_level(logging.ERROR, logger='orchestrator.shadow_eval'):
+        assert await _plan_exit(rig, make_task('5387')) == []
+
     assert _cells(rig) == []
+    [skip] = rig.events_of(EventType.shadow_cell_skipped)
+    assert skip['data']['reason'] == 'unknown_candidate'
+    assert skip['data']['resolver_error'] == 'RuntimeError'
+    assert any(
+        record.levelno == logging.ERROR and 'claude-sonnet-max' in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_clean_resolver_miss_names_no_resolver_error(tmp_path, costs):
+    rig = build_coordinator(tmp_path, costs, config=shadow_config(candidates=['no-such-candidate']))
+
+    await _plan_exit(rig, make_task('5387'))
+
+    [skip] = rig.events_of(EventType.shadow_cell_skipped)
+    assert 'resolver_error' not in skip['data']
 
 
 @pytest.mark.asyncio

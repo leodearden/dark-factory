@@ -743,9 +743,8 @@ class ShadowCoordinator:
     ) -> str | None:
         """One (shape, candidate) attempt; a failure here never stops the others."""
         try:
-            candidate = self._resolve(name)
+            candidate = await self._resolve(task_id, shape, name)
             if candidate is None:
-                await self._emit_skip(task_id, shape, name, ShadowSkipReason.UNKNOWN_CANDIDATE)
                 return None
             return await self._open_cell(task, shape, candidate)
         except Exception:
@@ -754,12 +753,24 @@ class ShadowCoordinator:
             )
             return None
 
-    def _resolve(self, name: str) -> EvalConfig | None:
+    async def _resolve(self, task_id: str, shape: ShadowShape, name: str) -> EvalConfig | None:
+        """The named candidate, or ``None`` after an ``unknown_candidate`` skip.
+
+        A raising resolver is logged at ERROR and its exception class rides on
+        the skip, so a broken resolver is told apart from a misnamed candidate.
+        """
         try:
-            return self._deps.resolve_candidate(name)
-        except Exception:
-            logger.warning('shadow coordinator: candidate %r did not resolve', name, exc_info=True)
+            candidate = self._deps.resolve_candidate(name)
+        except Exception as exc:
+            logger.exception('shadow coordinator: resolving candidate %r raised', name)
+            await self._emit_skip(
+                task_id, shape, name, ShadowSkipReason.UNKNOWN_CANDIDATE,
+                resolver_error=type(exc).__name__,
+            )
             return None
+        if candidate is None:
+            await self._emit_skip(task_id, shape, name, ShadowSkipReason.UNKNOWN_CANDIDATE)
+        return candidate
 
     async def _open_cell(
         self,
@@ -1248,12 +1259,17 @@ class ShadowCoordinator:
         )
 
     async def _emit_skip(
-        self, task_id: str, shape: ShadowShape, candidate: str, reason: ShadowSkipReason,
+        self,
+        task_id: str,
+        shape: ShadowShape,
+        candidate: str,
+        reason: ShadowSkipReason,
+        **detail: str,
     ) -> None:
         await asyncio.to_thread(
             self._deps.events.emit,
             EventType.shadow_cell_skipped,
             task_id=task_id,
-            data={'reason': reason.value, 'shape': shape.value, 'candidate': candidate},
+            data={'reason': reason.value, 'shape': shape.value, 'candidate': candidate, **detail},
         )
 
