@@ -44,8 +44,15 @@ from orchestrator.shadow_eval import (
     ShadowCoordinatorDeps,
     cost_basis_of,
 )
-from orchestrator.shadow_types import CostBasis, PlanSource, ShadowCellState, ShadowShape
-from orchestrator.workflow_types import WorkflowState
+from orchestrator.shadow_scoring import ShadowReference, score_architect_cell
+from orchestrator.shadow_types import (
+    CostBasis,
+    PlanSource,
+    ReferenceKind,
+    ShadowCellState,
+    ShadowShape,
+)
+from orchestrator.workflow_types import WorkflowOutcome, WorkflowState
 
 _S = ShadowCellState
 
@@ -389,3 +396,111 @@ def _deps_only(tmp_path: Path) -> ShadowCoordinatorDeps:
         read_host_sample=calm_sample,
         psi_config=PsiAdmissionConfig(),
     )
+
+
+_CANDIDATE_PLAN = {
+    'steps': [{'id': 'step-1', 'type': 'test'}, {'id': 'step-2', 'type': 'impl'}],
+    'files': ['orchestrator/src/orchestrator/shadow_eval.py'],
+}
+
+
+def _consequence_rig(tmp_path, costs, *, shapes=(ShadowShape.ARCHITECT_CONSEQUENCE,)) -> CoordinatorRig:
+    return build_coordinator(tmp_path, costs, config=shadow_config(shapes=list(shapes)))
+
+
+def _script_leg_one(rig: CoordinatorRig, **metrics) -> None:
+    rig.runner.script(
+        ShadowShape.ARCHITECT, 'claude-sonnet-max',
+        outcome=completed(plan=metrics.pop('plan', None), **metrics),
+    )
+
+
+async def _plan_entry(rig: CoordinatorRig, task: dict) -> list[str]:
+    opened = await rig.coordinator.on_phase(task, WorkflowState.PLAN, entering=True)
+    await rig.coordinator.join()
+    return opened
+
+
+def _of_shape(rig: CoordinatorRig, shape: ShadowShape) -> list[ShadowCell]:
+    return [cell for cell in _cells(rig) if cell.shape is shape]
+
+
+@pytest.mark.asyncio
+async def test_plan_entry_opens_the_architect_leg_one_cell(tmp_path, costs):
+    rig = _consequence_rig(tmp_path, costs)
+
+    opened = await _plan_entry(rig, make_task('5387'))
+
+    [leg_one] = _cells(rig)
+    assert opened == [leg_one.cell_id]
+    assert leg_one.shape is ShadowShape.ARCHITECT
+    assert leg_one.plan_source is None
+    assert leg_one.incumbent == INCUMBENTS[ShadowShape.ARCHITECT]
+
+
+@pytest.mark.asyncio
+async def test_a_declined_leg_one_opens_no_leg_two_and_records_the_decline(tmp_path, costs):
+    rig = _consequence_rig(tmp_path, costs)
+    _script_leg_one(rig, terminal_kind='already_done', plan_steps=0)
+
+    [leg_one_id] = await _plan_entry(rig, make_task('5387'))
+
+    assert _of_shape(rig, ShadowShape.ARCHITECT_CONSEQUENCE) == []
+    assert [cell for cell in _cells(rig) if cell.parent_cell_id == leg_one_id] == []
+    leg_one = rig.store.get_shadow_cell(leg_one_id)
+    assert leg_one is not None
+    assert leg_one.state is _S.AWAITING_REFERENCE
+
+    await rig.coordinator.on_production_terminal('5387', WorkflowOutcome.CANCELLED)
+
+    leg_one = rig.store.get_shadow_cell(leg_one_id)
+    assert leg_one is not None
+    assert (leg_one.state, leg_one.reference_kind) == (_S.SETTLED, ReferenceKind.NONE)
+    [request] = rig.runner.ran
+    outcome = rig.runner.scripts[(ShadowShape.ARCHITECT, 'claude-sonnet-max')].outcome
+    assert outcome is not None and outcome.metrics is not None
+    score = score_architect_cell(outcome.metrics, ShadowReference.none(), None)
+    assert score.terminal_kind == 'already_done'
+    assert request.cell.cell_id == leg_one_id
+
+
+@pytest.mark.asyncio
+async def test_a_plan_then_decline_is_a_decline(tmp_path, costs):
+    rig = _consequence_rig(tmp_path, costs)
+    _script_leg_one(rig, terminal_kind='already_done', plan_steps=6, plan=_CANDIDATE_PLAN)
+
+    await _plan_entry(rig, make_task('5387'))
+
+    assert _of_shape(rig, ShadowShape.ARCHITECT_CONSEQUENCE) == []
+
+
+@pytest.mark.asyncio
+async def test_a_planned_leg_one_opens_leg_two_on_the_candidate_plan(tmp_path, costs):
+    rig = _consequence_rig(tmp_path, costs)
+    _script_leg_one(rig, terminal_kind='planned', plan_steps=3, plan=_CANDIDATE_PLAN)
+
+    [leg_one_id] = await _plan_entry(rig, make_task('5387'))
+
+    [leg_two] = _of_shape(rig, ShadowShape.ARCHITECT_CONSEQUENCE)
+    leg_one = rig.store.get_shadow_cell(leg_one_id)
+    assert leg_one is not None
+    assert leg_two.parent_cell_id == leg_one_id
+    assert leg_two.plan_source is PlanSource.CANDIDATE
+    assert leg_two.base_sha == leg_one.base_sha
+    assert leg_two.incumbent == INCUMBENTS[ShadowShape.ARCHITECT_CONSEQUENCE]
+    assert leg_two.state is _S.AWAITING_REFERENCE
+    [leg_two_request] = [
+        request for request in rig.runner.ran
+        if request.cell.shape is ShadowShape.ARCHITECT_CONSEQUENCE
+    ]
+    assert leg_two_request.plan == _CANDIDATE_PLAN
+
+
+@pytest.mark.asyncio
+async def test_without_the_consequence_shape_a_planned_leg_opens_no_leg_two(tmp_path, costs):
+    rig = _consequence_rig(tmp_path, costs, shapes=(ShadowShape.ARCHITECT,))
+    _script_leg_one(rig, terminal_kind='planned', plan_steps=3, plan=_CANDIDATE_PLAN)
+
+    await _plan_entry(rig, make_task('5387'))
+
+    assert [cell.shape for cell in _cells(rig)] == [ShadowShape.ARCHITECT]
