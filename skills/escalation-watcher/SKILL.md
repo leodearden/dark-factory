@@ -2247,20 +2247,10 @@ DecisionRecord. The stamp changes nothing about what you do.
 
 ### Never stamp a record you are going to rule yourself
 
-This rule comes before the mechanics because skimming past it is how the measurement goes bad.
-
 A `design_concern` you close under "Standing rule: accept verified info-level design deviations
 (Leo, 2026-09-17)" above gets **no shadow stamp**. You are the adjudicator there, so there is no
-independent decision to compare your proposal against.
-
-The reason, in one line you can check: the weekly count reads `resolved_by` back through
-`escalation/src/escalation/classify.py::classify_resolver_tier`, where `escalation-watcher`
-classifies as `human` — exactly like a Leo ruling. A stamp plus a self-close is therefore the
-session agreeing with itself, and it would push a class toward its own adoption threshold on the
-strength of your own actions.
-
-The count does catch it: such a record is bucketed `self_resolved` and dropped from every rate. So a
-violation costs the sample, not the truth — but it still costs the sample.
+independent decision to compare your proposal against. Why, and how the weekly count buckets a
+violation as `self_resolved`, is in `docs/escalation-standing-policy.md` §"The integrity rule".
 
 ### Stamping
 
@@ -2313,12 +2303,10 @@ x_shadow_ruling: {"class": "risk_identified_branch_behind_main", "proposed_actio
 
 ### Never stamp a human-forever gate
 
-`docs/escalation-standing-policy.md` lists all seven. Two are detectable from the record itself and
-`escalation/src/escalation/shadow_ruling.py::mechanically_gated` finds them: a `milestone_gate`
-category and the `orchestrator-deterministic` role. The other five — model admission, physical
-operator actions, irreversible deletions, spend or eval launches, and a post-breaker
-`resume_scheduler` — have no signal on the record, so they are your judgement. A stamp on any of
-them is reported as `gated_stamps` and excluded from every rate.
+`docs/escalation-standing-policy.md` §"Human-forever gates" lists all seven and says which two
+`escalation/src/escalation/shadow_ruling.py::mechanically_gated` detects from the record; the other
+five are your judgement. A stamp on any of them is reported as `gated_stamps` and excluded from
+every rate.
 
 ### Two facts about attribution and timing
 
@@ -2337,21 +2325,9 @@ uv run --directory escalation python -m escalation.shadow_ruling \
     --queue-dir <project_root>/data/escalations
 ```
 
-Read it as: `agreed` / `diverged` over the **comparable** denominator printed beside the rate;
-`not_comparable` for proposals whose action is task-side and leaves no `resolution_action` to check
-against; `non_human_resolver` for a record no human resolved at all — a cascade, a sweep, the
-steward — counted per class, because the aggregate `resolver_tiers` line says only which tier took
-the sample; `gated_stamps`, `self_resolved` and `rejected_stamps` for stamps excluded from every rate
-— those three are counted over the same window as the rate. A class whose records are mostly
-`self_resolved` is not a class with a small sample — it is not measurable yet, and a non-zero
-`rejected_stamps` means the count could not read that many markers at all.
-
-`unresolved_lifetime` is the exception and says so in its name: a pending record has no
-`resolved_at` to window on, so that number is the standing backlog at sweep time, not a count from
-the window in the header.
-
-A class adopts only when task 3346 has landed **and** it has met the threshold in
-`docs/escalation-standing-policy.md`. Until both hold, keep stamping and keep escalating.
+How to read each bucket it prints is in `docs/escalation-standing-policy.md` §"How the shadow
+measurement is read". When a class may adopt is in §"Adoption preconditions"; until a class adopts,
+keep stamping and keep escalating.
 
 ## Context Conservation
 
