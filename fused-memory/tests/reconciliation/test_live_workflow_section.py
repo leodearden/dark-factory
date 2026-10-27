@@ -31,6 +31,7 @@ from fused_memory.reconciliation.live_workflow_section import (
     LIVE_WORKFLOW_SECTION_HEADER,
     NOT_LIVE_TOKEN,
     LandedToken,
+    LiveSignal,
     LiveWorkflowSnapshot,
     build_live_workflow_snapshot,
     render_live_workflow_section,
@@ -441,3 +442,65 @@ class TestLiveWorkflowSectionIsHonest:
         )
 
         _assert_rows_are_honest(_section_of(payload))
+
+
+#: When the task tree was read: 20 minutes before render, twice the heartbeat TTL.
+READ_AT = NOW - timedelta(minutes=20)
+
+
+def _heartbeating(task_id: int, *, heartbeat_at: datetime, status: str = 'in-progress') -> dict:
+    return {
+        **_task(task_id, status=status),
+        'claimant_run_id': f'run-a1d3b5dba75a/{task_id}-011fcff1/pid=1807449',
+        'heartbeat_at': heartbeat_at.isoformat(),
+    }
+
+
+class TestClaimsAreAgedAtTheTreeReadInstant:
+    """A heartbeat fresh when the tree was read stays fresh however late the section renders."""
+
+    @pytest.mark.asyncio
+    async def test_in_progress_task_is_corroborated_by_a_heartbeat_fresh_at_the_read_instant(
+        self, repo: Path,
+    ) -> None:
+        _pending_with_worktree(repo, 6027)
+        task = _heartbeating(6027, heartbeat_at=READ_AT - timedelta(minutes=1))
+
+        snapshot = await build_live_workflow_snapshot(
+            [task], ProjectRoot(str(repo)), now=NOW, claims_read_at=READ_AT,
+        )
+
+        row = snapshot.row_for('6027')
+        assert row is not None, 'a claimant fresh at the read instant corroborates the in-progress task'
+        assert row.is_live is True
+        assert row.signals == (LiveSignal.WORKTREE,)
+        assert row.claimant is ClaimantLabel.LIVE
+
+    @pytest.mark.asyncio
+    async def test_claimant_label_is_aged_at_the_read_instant(self, repo: Path) -> None:
+        _pending_with_worktree(repo, 6027)
+        task = _heartbeating(6027, heartbeat_at=READ_AT - timedelta(minutes=1), status='pending')
+
+        snapshot = await build_live_workflow_snapshot(
+            [task], ProjectRoot(str(repo)), now=NOW, claims_read_at=READ_AT,
+        )
+
+        row = snapshot.row_for('6027')
+        assert row is not None and row.claimant is ClaimantLabel.LIVE
+        assert f'claimant={ClaimantLabel.LIVE}' in _line_for(snapshot.render(), 'task/6027')
+
+    @pytest.mark.asyncio
+    async def test_recent_commit_window_stays_on_now(self, repo: Path) -> None:
+        _pending_with_worktree(repo, 6028, when=NOW - timedelta(hours=7))
+        read_at = NOW - timedelta(hours=2)
+        task = _heartbeating(6028, heartbeat_at=read_at - timedelta(minutes=1))
+
+        snapshot = await build_live_workflow_snapshot(
+            [task], ProjectRoot(str(repo)), now=NOW, claims_read_at=read_at,
+        )
+
+        row = snapshot.row_for('6028')
+        assert row is not None and row.is_live is True
+        assert LiveSignal.RECENT_COMMIT not in row.signals, (
+            'the commit is 7h old at `now`; only a leaked read instant would make it 5h old'
+        )
