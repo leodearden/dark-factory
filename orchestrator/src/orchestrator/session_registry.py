@@ -281,20 +281,20 @@ class Question:
         return cls(text=data['text'], asked_at=data['asked_at'])
 
 
-def _is_json_integer(value: Any) -> bool:
-    """A JSON integer; bool is excluded because Python's ``True`` would otherwise pass as int 1."""
+def _is_strict_int(value: Any) -> bool:
+    """An int that is not a bool: Python's ``True`` would otherwise pass as int 1."""
     return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _coerce_owner_pid(value: Any) -> int | None:
     """Read ``claude_owner_pid`` from a record body, tolerating junk.
 
-    Anything that is not a positive ``_is_json_integer`` -- absent, null, a
+    Anything that is not a positive ``_is_strict_int`` -- absent, null, a
     bool, a string, a float, 0, a negative -- reads as None, i.e. "no owner
     pid bound". Never raises: this is on ``from_dict``'s path, and a
     hand-edited or older record body must not be what breaks a session hook.
     """
-    if not _is_json_integer(value):
+    if not _is_strict_int(value):
         return None
     return value if value > 0 else None
 
@@ -3988,7 +3988,7 @@ class LeaseHolder:
     record_slug: str = ''
 
     def __post_init__(self) -> None:
-        if not _is_json_integer(self.pid):
+        if not _is_strict_int(self.pid):
             raise TypeError(f'LeaseHolder.pid must be an int (not a bool), got {self.pid!r}')
         for name in ('session_slug', 'start_ts', 'record_slug'):
             value = getattr(self, name)
