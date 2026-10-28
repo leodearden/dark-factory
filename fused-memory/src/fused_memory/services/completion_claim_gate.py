@@ -49,12 +49,14 @@ imports IT, and a cycle would be fatal.
 
 from __future__ import annotations
 
+import functools
 import logging
 import re
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 
 from shared.project_id import fold_project_token
@@ -477,7 +479,7 @@ def extract_completion_claims(
     claims: list[CompletionClaim] = []
     seen: set[tuple[str, str, str, str | None]] = set()
     assertive = _blank_quotations(text)
-    registry: Mapping[str, str] = {fold_project_token(pid): pid for pid in known_project_ids}
+    registry = _fold_index(frozenset(known_project_ids))
 
     for clause, offset in _iter_clauses(text):
         mentions = _ref_mentions(
@@ -510,11 +512,33 @@ def extract_completion_claims(
     return claims
 
 
+@functools.lru_cache(maxsize=8)
+def _fold_index(known_project_ids: frozenset[str]) -> Mapping[str, str]:
+    """Each registered id's :func:`fold_project_token`, mapped to the id itself.
+
+    Two registered ids that share a fold (say 'df' beside 'dark_factory') make
+    that token ambiguous. The alphabetically first id keeps it, so the choice
+    never depends on set order, and a WARNING names both ids. The cache makes
+    that warning once per registry rather than once per write.
+    """
+    index: dict[str, str] = {}
+    for pid in sorted(known_project_ids):
+        token = fold_project_token(pid)
+        kept = index.setdefault(token, pid)
+        if kept != pid:
+            logger.warning(
+                'completion_claim_gate: registered projects %r and %r both fold to %r; '
+                'a ref qualified by that word is adjudicated in %r',
+                kept, pid, token, kept,
+            )
+    return MappingProxyType(index)
+
+
 def _registered_project(word: str, registry: Mapping[str, str]) -> str | None:
     """The registry's own key for the project *word* names, else None.
 
-    The ONLY place a written project word becomes a project id. *registry*
-    maps each registered id's :func:`fold_project_token` to the id itself.
+    The ONLY place a written project word becomes a project id. *registry* is
+    a :func:`_fold_index`.
     """
     return registry.get(fold_project_token(word))
 

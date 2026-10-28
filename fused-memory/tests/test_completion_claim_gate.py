@@ -14,6 +14,8 @@ exception is the make_commit_probe suite, which builds a throwaway repo).
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from _distinct_git_repo import init_distinct_git_repo
 
@@ -29,6 +31,7 @@ from fused_memory.services.completion_claim_gate import (
 )
 
 _KNOWN = frozenset({'reify', 'dark_factory'})
+_GATE_LOGGER = 'fused_memory.services.completion_claim_gate'
 
 
 def _extract(text: str, default_project_id: str = 'reify') -> list[CompletionClaim]:
@@ -288,23 +291,18 @@ class TestProximityBinding:
             ('task', '4213', 'dark_factory'),
         ]
 
-    @pytest.mark.parametrize(
-        ('text', 'expected'),
-        [
-            pytest.param(
-                "The prompt's \"Files Changed on Main\" list is then the fork-point diff "
-                '(merge-base..main), not the diff since the last confirm_plan, because '
-                "confirm_plan never advances metadata.json's base_commit, so the Lever B "
-                'revalidation skip never fires (filed as dark-factory task 6141).',
-                [('filing_dispatch', 'task', '6141', 'dark_factory')],
-                id='esc-unverified-claim-6141-1',
-            ),
-        ],
-    )
-    def test_foreign_qualified_specimen_binds_to_the_named_project(self, text, expected):
-        claims = _extract(text, default_project_id='solar_challenge')
+    def test_specimen_esc_unverified_claim_6141_1_binds_to_the_named_project(self):
+        claims = _extract(
+            "The prompt's \"Files Changed on Main\" list is then the fork-point diff "
+            '(merge-base..main), not the diff since the last confirm_plan, because '
+            "confirm_plan never advances metadata.json's base_commit, so the Lever B "
+            'revalidation skip never fires (filed as dark-factory task 6141).',
+            default_project_id='solar_challenge',
+        )
 
-        assert [(c.kind, c.subject, c.ref, c.project_id) for c in claims] == expected, claims
+        assert [(c.kind, c.subject, c.ref, c.project_id) for c in claims] == [
+            ('filing_dispatch', 'task', '6141', 'dark_factory'),
+        ], claims
 
     @pytest.mark.parametrize(
         'text', ['task 1985 and task 1986 landed', 'task 1985, task 1986 landed'],
@@ -485,6 +483,19 @@ class TestCrossProjectRefResolution:
         assert [(c.subject, c.ref, c.project_id) for c in claims] == [
             ('task', '3142', 'reify'),
         ]
+
+    def test_registered_ids_sharing_a_fold_resolve_to_one_and_warn_naming_both(self, caplog):
+        with caplog.at_level(logging.WARNING, logger=_GATE_LOGGER):
+            claims = extract_completion_claims(
+                'dark-factory task 3142 has landed',
+                default_project_id='solar_challenge',
+                known_project_ids={'df', 'dark_factory', 'solar_challenge'},
+            )
+
+        assert [(c.ref, c.project_id) for c in claims] == [('3142', 'dark_factory')]
+        collisions = [r.getMessage() for r in caplog.records if r.name == _GATE_LOGGER]
+        assert len(collisions) == 1, collisions
+        assert "'df'" in collisions[0] and "'dark_factory'" in collisions[0], collisions
 
     def test_unqualified_ref_inherits_the_writers_project(self):
         claims = _extract('task 3142 has landed', default_project_id='reify')
