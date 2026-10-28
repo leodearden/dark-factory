@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -164,21 +165,14 @@ def queued_residue(root: Path) -> list[Any]:
     )
 
 
-def steer_project_root(monkeypatch, root: Path | None) -> None:
-    """Point BOTH injected channels — escalation sink and fact journal — at
-    *root*; ``None`` makes the root unresolvable, so the queue is unreachable.
+def rooted_at(root: Path | None) -> Callable[[Path], Path | None]:
+    """A project-root resolver that answers *root* for every worktree.
 
-    ``raising`` is left at its default TRUE deliberately: a renamed or inlined
-    ``_markup_project_root`` must fail here, not leave monkeypatch quietly
-    creating an unused attribute. Without it most rows would fail loudly
-    anyway, but a row whose assertions are only that the call succeeded — the
-    journal-outage row — would pass VACUOUSLY, never having been steered at the
-    collision it means to force. ``test_plan_tools_markup_guard.py`` patches
-    the identical seam the same way.
+    Passed to ``create_server``, it points BOTH injected channels — escalation
+    sink and fact journal — at *root*; ``None`` makes the root unresolvable, so
+    the queue is unreachable.
     """
-    monkeypatch.setattr(
-        verdict_tools, '_markup_project_root', lambda worktree: root,
-    )
+    return lambda worktree: root
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +199,13 @@ def seed_plan(artifacts: TaskArtifacts) -> None:
     })
 
 
-async def repaired_call(artifacts: TaskArtifacts):
+async def repaired_call(
+    artifacts: TaskArtifacts,
+    *,
+    resolve_project_root: Callable[[Path], Path | None] = (
+        markup_sink.resolve_project_root
+    ),
+):
     """Drive the ``ISSUES_SPECIMEN`` leak through the REAL server, repaired.
 
     Module level rather than a method because two suites need it: the B14
@@ -219,7 +219,9 @@ async def repaired_call(artifacts: TaskArtifacts):
     # three, which is exactly what the specimen's own `supplied` records.
     assert sorted(record['supplied']) == ['reviewer', 'summary', 'verdict']
 
-    server = create_server(artifacts, REVIEWER_ROLE)
+    server = create_server(
+        artifacts, REVIEWER_ROLE, resolve_project_root=resolve_project_root,
+    )
     async with Client(server) as client:
         return await client.call_tool('submit_review_verdict', {
             'reviewer': REVIEWER_ROLE,
@@ -498,9 +500,18 @@ class TestUnrepairableResidueIsPreserved:
         assert record['expected_recovered'] == []
         return record['value']
 
-    async def _refuse(self, artifacts: TaskArtifacts) -> dict[str, Any]:
+    async def _refuse(
+        self,
+        artifacts: TaskArtifacts,
+        *,
+        resolve_project_root: Callable[[Path], Path | None] = (
+            markup_sink.resolve_project_root
+        ),
+    ) -> dict[str, Any]:
         """Drive the specimen as ``submit_review_verdict.summary``."""
-        server = create_server(artifacts, REVIEWER_ROLE)
+        server = create_server(
+            artifacts, REVIEWER_ROLE, resolve_project_root=resolve_project_root,
+        )
         async with Client(server) as client:
             with pytest.raises(ToolError) as excinfo:
                 await client.call_tool('submit_review_verdict', {
@@ -537,7 +548,7 @@ class TestUnrepairableResidueIsPreserved:
 
     @pytest.mark.asyncio
     async def test_the_residue_survives_in_full(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(c) "The entire issues payload destroyed with no surviving copy
         anywhere on disk" — made FALSE.
@@ -545,11 +556,10 @@ class TestUnrepairableResidueIsPreserved:
         Verbatim and entire, deliberately unlike ``build_markup_block``'s
         200-char excerpt: this is the only surviving copy.
         """
-        steer_project_root(monkeypatch, tmp_path)
         value = self._value()
         assert len(value) == 3525
 
-        await self._refuse(artifacts)
+        await self._refuse(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         queued = queued_residue(tmp_path)
         assert len(queued) == 1, f'expected exactly one residue record, got {queued!r}'
@@ -557,13 +567,12 @@ class TestUnrepairableResidueIsPreserved:
 
     @pytest.mark.asyncio
     async def test_the_refusal_names_the_residue(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(d) A bounced reviewer must be able to point an operator at its own
         preserved data — an id it cannot look up is no better than none."""
-        steer_project_root(monkeypatch, tmp_path)
 
-        payload = await self._refuse(artifacts)
+        payload = await self._refuse(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         filed = queue_under(tmp_path).get(payload['escalation_id'])
         assert filed is not None
@@ -571,13 +580,12 @@ class TestUnrepairableResidueIsPreserved:
 
     @pytest.mark.asyncio
     async def test_the_residue_carries_its_routing_fields(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(e) INV-7: a machine-readable owner plus the standing L2 bound, and
         the flat fields locating the leak."""
-        steer_project_root(monkeypatch, tmp_path)
 
-        await self._refuse(artifacts)
+        await self._refuse(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         (filed,) = queued_residue(tmp_path)
         assert filed.category == 'mcp_markup_residue'
@@ -588,13 +596,12 @@ class TestUnrepairableResidueIsPreserved:
 
     @pytest.mark.asyncio
     async def test_the_refused_record_states_its_refusal(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """The guard row for the kind dispatch: a REFUSED call's record keeps
         saying what the refusal cost, and never that the call was forwarded."""
-        steer_project_root(monkeypatch, tmp_path)
 
-        await self._refuse(artifacts)
+        await self._refuse(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         (filed,) = queued_residue(tmp_path)
         assert verdict_tools._MARKUP_SINK_SPEC.refusal_consequence in filed.detail
@@ -602,19 +609,18 @@ class TestUnrepairableResidueIsPreserved:
 
     @pytest.mark.asyncio
     async def test_the_hint_makes_the_preservation_claim(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(f) On this server preservation ACTUALLY happened, so the
         preserved variant of the hint is the true one."""
-        steer_project_root(monkeypatch, tmp_path)
 
-        payload = await self._refuse(artifacts)
+        payload = await self._refuse(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         assert 'preserved verbatim' in payload['hint']
 
     @pytest.mark.asyncio
     async def test_an_unreachable_queue_leaves_nothing_in_the_worktree_and_says_so(
-        self, monkeypatch, artifacts: TaskArtifacts
+        self, artifacts: TaskArtifacts
     ):
         """(f, floor) Queue or nothing — no worktree-local copy to strand.
 
@@ -623,9 +629,7 @@ class TestUnrepairableResidueIsPreserved:
         middleware and so bought the caller a preservation claim that was
         false. The caller still holds the payload, and must be told to keep it.
         """
-        steer_project_root(monkeypatch, None)
-
-        payload = await self._refuse(artifacts)
+        payload = await self._refuse(artifacts, resolve_project_root=rooted_at(None))
 
         assert payload['escalation_id'] is None
         assert 'nothing was preserved' in payload['hint'].lower()
@@ -659,7 +663,7 @@ class TestUnrepairableResidueIsPreserved:
 
     @pytest.mark.asyncio
     async def test_the_fact_still_fires(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(g) INV-2: EVERY outcome emits ``markup_detected``, including this
         one. A refusal that emitted no fact would be invisible to the storm
@@ -673,7 +677,7 @@ class TestUnrepairableResidueIsPreserved:
         not: the fact must still fire on the outcome nothing else records
         per-event.
 
-        Patching ``_markup_project_root`` steers the escalation sink to
+        The resolver passed to ``create_server`` steers the escalation sink to
         ``tmp_path`` as well, so this row's residue filing opens a real
         ``EscalationQueue`` under the temp tree. That is hermetic, and it is
         what makes this the ONE outcome where BOTH channels fire — so it is
@@ -685,10 +689,9 @@ class TestUnrepairableResidueIsPreserved:
         catch that disagreement. What happens when the queue cannot be reached
         at all is the business of the (f, floor) row above.
         """
-        steer_project_root(monkeypatch, tmp_path)
         seed_plan(artifacts)
 
-        await self._refuse(artifacts)
+        await self._refuse(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         facts = journal_lines(tmp_path)
         assert len(facts) == 1, f'expected exactly one fact, got {facts!r}'
@@ -962,8 +965,17 @@ class TestTheWidenedRepairVocabularyStaysContained:
     """
 
     @staticmethod
-    async def _submit(artifacts: TaskArtifacts, reviewer: str = REVIEWER_ROLE):
-        server = create_server(artifacts, REVIEWER_ROLE)
+    async def _submit(
+        artifacts: TaskArtifacts,
+        reviewer: str = REVIEWER_ROLE,
+        *,
+        resolve_project_root: Callable[[Path], Path | None] = (
+            markup_sink.resolve_project_root
+        ),
+    ):
+        server = create_server(
+            artifacts, REVIEWER_ROLE, resolve_project_root=resolve_project_root,
+        )
         async with Client(server) as client:
             return await client.call_tool('submit_review_verdict', {
                 'reviewer': reviewer,
@@ -1006,12 +1018,11 @@ class TestTheWidenedRepairVocabularyStaysContained:
 
     @pytest.mark.asyncio
     async def test_the_dropped_value_survives_in_the_residue_channel(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """Nothing is guessed AND nothing is destroyed — the C2 pair."""
-        steer_project_root(monkeypatch, tmp_path)
 
-        await self._submit(artifacts)
+        await self._submit(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         queued = queued_residue(tmp_path)
         assert len(queued) == 1, f'expected one residue record, got {queued!r}'
@@ -1020,7 +1031,7 @@ class TestTheWidenedRepairVocabularyStaysContained:
 
     @pytest.mark.asyncio
     async def test_a_dropped_slice_files_with_no_sink_warning(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path, caplog
+        self, artifacts: TaskArtifacts, tmp_path: Path, caplog
     ):
         """The dropped-slice kind is one the sink KNOWS, so it must not be
         filed under the "unrecognised record kind" warning.
@@ -1030,10 +1041,8 @@ class TestTheWidenedRepairVocabularyStaysContained:
         vacuously. The queued record is the precondition that proves the
         sink really ran on this path.
         """
-        steer_project_root(monkeypatch, tmp_path)
-
         with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.markup_sink'):
-            await self._submit(artifacts)
+            await self._submit(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         queued = queued_residue(tmp_path)
         assert len(queued) == 1, f'expected one residue record, got {queued!r}'
@@ -1049,14 +1058,13 @@ class TestTheWidenedRepairVocabularyStaysContained:
 
     @pytest.mark.asyncio
     async def test_the_dropped_slice_record_does_not_claim_a_refusal(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """This call was FORWARDED and its verdict landed
         (``test_the_call_still_lands``), so the record must not say the call
         was refused or that no verdict was written."""
-        steer_project_root(monkeypatch, tmp_path)
 
-        await self._submit(artifacts)
+        await self._submit(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         (residue,) = queued_residue(tmp_path)
         assert verdict_tools._MARKUP_SINK_SPEC.refusal_consequence not in residue.detail
@@ -1065,15 +1073,18 @@ class TestTheWidenedRepairVocabularyStaysContained:
 
     @pytest.mark.asyncio
     async def test_the_dropped_slice_record_claims_no_landing_it_cannot_see(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """The slice is filed BEFORE the call is forwarded, so the sink cannot
         know whether the call then succeeds. Here it does not: the tool rejects
         the mismatched reviewer and writes nothing, after the record was filed,
         so the record must not say the call landed."""
-        steer_project_root(monkeypatch, tmp_path)
 
-        result = await self._submit(artifacts, reviewer=f'not_{REVIEWER_ROLE}')
+        result = await self._submit(
+            artifacts,
+            reviewer=f'not_{REVIEWER_ROLE}',
+            resolve_project_root=rooted_at(tmp_path),
+        )
 
         assert result.data['status'] == 'error'
         assert artifacts.read_verdict(REVIEWER_ROLE) is None
@@ -1082,14 +1093,13 @@ class TestTheWidenedRepairVocabularyStaysContained:
 
     @pytest.mark.asyncio
     async def test_an_unreachable_queue_drops_nothing_into_the_worktree(
-        self, monkeypatch, artifacts: TaskArtifacts
+        self, artifacts: TaskArtifacts
     ):
         """Queue or nothing on the FORWARD tier too: the call still lands, and
         the dropped slice is reported as preserved nowhere rather than under a
         worktree-local filename that dies with the lane."""
-        steer_project_root(monkeypatch, None)
 
-        result = await self._submit(artifacts)
+        result = await self._submit(artifacts, resolve_project_root=rooted_at(None))
 
         assert result.data['status'] == 'ok'
         assert result.meta is not None
@@ -1435,24 +1445,20 @@ class TestTheVerdictFactReachesADurableJournal:
     It is also the cleanest rig: because the repaired path never touches the
     escalation channel, these rows need no fake queue and no clock.
 
-    Every row steers the project root through the ``_markup_project_root``
-    seam. That indirection is load-bearing, not convenience:
-    ``make_fact_journal``'s default resolver is bound at module-DEFINITION
-    time, so patching ``markup_sink.resolve_project_root`` afterwards would not
-    reach a server ``create_server`` has already built — the journal would run
-    a real ``git rev-parse`` against a bare ``tmp_path``, resolve nothing, and
-    write no line whether or not the wiring landed.
+    Every row passes a project-root resolver to ``create_server``. Without it
+    the journal would run a real ``git rev-parse`` against a bare
+    ``tmp_path``, resolve nothing, and write no line whether or not the wiring
+    landed.
     """
 
     @pytest.mark.asyncio
     async def test_a_repaired_call_is_journalled_with_its_task_id(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(a) THE user-observable signal, on the measured leak shape."""
-        steer_project_root(monkeypatch, tmp_path)
         seed_plan(artifacts)
 
-        await repaired_call(artifacts)
+        await repaired_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         (line,) = journal_lines(tmp_path)
         assert line['tool'] == 'submit_review_verdict'
@@ -1468,7 +1474,7 @@ class TestTheVerdictFactReachesADurableJournal:
 
     @pytest.mark.asyncio
     async def test_the_journal_is_the_only_durable_trace_of_a_repair(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(b) The boundary-specific row: FORWARD_REPAIR leaves nothing else.
 
@@ -1476,9 +1482,7 @@ class TestTheVerdictFactReachesADurableJournal:
         escalation channel is not consulted, so no residue record does either.
         Only the journal knows this happened at all.
         """
-        steer_project_root(monkeypatch, tmp_path)
-
-        result = await repaired_call(artifacts)
+        result = await repaired_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         assert result.data['status'] == 'ok'
         assert artifacts.read_verdict(REVIEWER_ROLE) is not None
@@ -1490,7 +1494,7 @@ class TestTheVerdictFactReachesADurableJournal:
 
     @pytest.mark.asyncio
     async def test_a_burst_is_one_line_per_event(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(c) The journal is per-EVENT; the storm escalation is per-WINDOW.
 
@@ -1499,11 +1503,10 @@ class TestTheVerdictFactReachesADurableJournal:
         / window_seconds / outcome / project, and ``project`` is structurally
         None on this boundary. WHICH caller leaked is a per-event fact.
         """
-        steer_project_root(monkeypatch, tmp_path)
         seed_plan(artifacts)
 
         for _ in range(3):
-            await repaired_call(artifacts)
+            await repaired_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         lines = journal_lines(tmp_path)
         assert len(lines) == 3, 'one line per repair, not one per window'
@@ -1511,7 +1514,7 @@ class TestTheVerdictFactReachesADurableJournal:
 
     @pytest.mark.asyncio
     async def test_a_journal_outage_never_changes_the_outcome(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(d) The journal is ADDITIVE: the outcome is decided before it runs.
 
@@ -1520,9 +1523,8 @@ class TestTheVerdictFactReachesADurableJournal:
         record-keeping file could not be written.
         """
         markup_journal.journal_path(tmp_path, 'verdict-tools').mkdir(parents=True)
-        steer_project_root(monkeypatch, tmp_path)
 
-        result = await repaired_call(artifacts)
+        result = await repaired_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         assert result.data['status'] == 'ok'
         assert artifacts.read_verdict(REVIEWER_ROLE) is not None
@@ -1686,7 +1688,7 @@ class TestTheStormRecordNamesTheJournal:
 
     @pytest.mark.asyncio
     async def test_following_the_records_own_instruction_now_succeeds(
-        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+        self, artifacts: TaskArtifacts, tmp_path: Path
     ):
         """(c) The end-to-end row, and the only one that catches the two halves
         drifting apart.
@@ -1695,10 +1697,9 @@ class TestTheStormRecordNamesTheJournal:
         merely better-worded. So this one FOLLOWS it: pull the path the record
         names out of its own body, open that exact file, and read the line.
         """
-        steer_project_root(monkeypatch, tmp_path)
         seed_plan(artifacts)
 
-        await repaired_call(artifacts)
+        await repaired_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         named = [tok for tok in self._storm_detail().split() if tok.endswith('.jsonl')]
         assert len(named) == 1, (
