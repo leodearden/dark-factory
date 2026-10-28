@@ -47,6 +47,7 @@ from orchestrator.offline_lane_confirm import (
 from orchestrator.offline_lane_episode_state import (
     EPISODE_RETENTION,
     CommandRecord,
+    CoveringStatuses,
     CoveringVerdict,
     Episode,
     EpisodeStore,
@@ -207,6 +208,18 @@ def test_the_pass_effect_is_json(tmp_path: Path):
     assert json.loads(json.dumps(applied.effect.to_json()))['episodes_ended'] == [
         {'node': A, 'reason': 'cleared', 'counted_passes': 1, 'reproduced_heads': [HEAD0]},
     ]
+
+
+def test_covering_statuses_name_the_done_and_closed_tasks_terminal():
+    covering = CoveringStatuses(
+        {'1': 'pending', '2': 'in-progress', '3': 'blocked', '4': 'deferred', '5': 'done', '6': 'cancelled'},
+    )
+
+    assert covering.terminal_task_ids == frozenset({'5', '6'})
+
+
+def test_unreadable_covering_statuses_name_no_task_terminal():
+    assert CoveringStatuses({'5': 'done'}, 'task store unreachable').terminal_task_ids == frozenset()
 
 
 # --- D5: what one pass does to a held test's episode -------------------------------
