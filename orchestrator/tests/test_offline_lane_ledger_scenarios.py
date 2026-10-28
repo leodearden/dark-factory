@@ -300,6 +300,8 @@ async def test_the_lanes_rows_leave_the_merge_gates_report_counters_unchanged(tm
 
     assert after.gate_blind_by_call_site['merge_gate'] == before.gate_blind_by_call_site['merge_gate']
     assert after.systemic_by_call_site['merge_gate'] == before.systemic_by_call_site['merge_gate']
+    assert before.call_sites_written is not None
+    assert after.call_sites_written is not None
     assert 'offline_lane' not in before.call_sites_written
     assert 'offline_lane' in after.call_sites_written
     assert (before.gate_blind_by_call_site['offline_lane'].total, after.gate_blind_by_call_site['offline_lane'].total) == (0, 3)

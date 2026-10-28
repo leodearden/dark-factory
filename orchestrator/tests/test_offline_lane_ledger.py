@@ -123,6 +123,7 @@ class TestConfirmedVerdicts:
 
     def test_a_test_detect_does_not_name_takes_the_confirm_failure(self) -> None:
         observation = _red(reproduced=(A,))
+        assert observation.detect is not None
         detect = replace(observation.detect, failures=())
         confirm = replace(
             _run('confirm', HEAD1, observation.started_at),
