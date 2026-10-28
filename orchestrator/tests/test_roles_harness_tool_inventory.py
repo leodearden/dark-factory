@@ -339,12 +339,11 @@ def test_scan_keeps_a_shadowed_name_and_folds_an_import() -> None:
     same object under the same name, so it is scanned once, under the first
     module listed. Fixtures are synthetic modules, so this pins no prompt.
     """
+    imported = 'imported text'
     lower = types.ModuleType('pkg.lower')
     upper = types.ModuleType('pkg.upper')
-    lower.SHARED = 'imported text'
-    lower.SHADOWED = 'lower text'
-    upper.SHARED = lower.SHARED
-    upper.SHADOWED = 'upper text'
+    vars(lower).update(SHARED=imported, SHADOWED='lower text')
+    vars(upper).update(SHARED=imported, SHADOWED='upper text')
 
     assert _prompt_constants((lower, upper)) == [
         _PromptConstant('lower', 'SHADOWED', 'lower text'),
