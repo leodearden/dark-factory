@@ -289,12 +289,38 @@ CREATE TABLE IF NOT EXISTS overrides (
     ttl_until     TEXT,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'operator',
     PRIMARY KEY (project_root, task_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_overrides_pinned
     ON overrides(project_root, pinned, pin_order);
-"""  # Source of truth: orchestrator/src/orchestrator/overrides.py:33-49
+"""  # Source of truth: orchestrator/src/orchestrator/overrides.py::_SCHEMA
+
+# Mirrors orchestrator/src/orchestrator/overrides.py::_migrate_add_source_column.
+# Every write through these tools is an operator write, so it stamps this value
+# and takes ownership of the row from the starvation watchdog.
+_OPERATOR_SOURCE = 'operator'
+
+
+async def _migrate_overrides_source_column(db: aiosqlite.Connection) -> None:
+    """Add ``source`` to a pre-ownership overrides table, idempotently.
+
+    The orchestrator migrates the same file, so losing the race to its ALTER
+    ('duplicate column name') is success, not failure.
+    """
+    cursor = await db.execute('PRAGMA table_info(overrides)')
+    columns = {row[1] for row in await cursor.fetchall()}
+    if 'source' in columns:
+        return
+    try:
+        await db.execute(
+            'ALTER TABLE overrides ADD COLUMN source TEXT NOT NULL '
+            f"DEFAULT '{_OPERATOR_SOURCE}'"
+        )
+    except aiosqlite.OperationalError as exc:
+        if 'duplicate column name' not in str(exc):
+            raise
 
 # Mirrors orchestrator/src/orchestrator/config.py PRIORITY_RANK keys.
 # Source of truth: orchestrator/src/orchestrator/config.py:27.
@@ -350,6 +376,7 @@ async def _open_overrides_db(
     busy_ms = 30000 if autocommit else 5000
     await apply_full_durability_pragmas(db, busy_timeout_ms=busy_ms)
     await db.executescript(_OVERRIDE_SCHEMA)
+    await _migrate_overrides_source_column(db)
     return db
 
 
@@ -10827,8 +10854,8 @@ def create_mcp_server(
                         """
                         INSERT INTO overrides
                             (project_root, task_id, boost_tier, pinned, pin_order,
-                             reserve_now, ttl_until, created_at, updated_at)
-                        VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?)
+                             reserve_now, ttl_until, created_at, updated_at, source)
+                        VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?, ?)
                         ON CONFLICT(project_root, task_id) DO UPDATE SET
                             boost_tier  = COALESCE(?, boost_tier),
                             pinned      = COALESCE(?, pinned),
@@ -10836,7 +10863,8 @@ def create_mcp_server(
                                                ELSE COALESCE(?, pin_order) END,
                             reserve_now = COALESCE(?, reserve_now),
                             ttl_until   = COALESCE(?, ttl_until),
-                            updated_at  = ?
+                            updated_at  = ?,
+                            source      = ?
                         """,
                         (
                             # INSERT values
@@ -10849,6 +10877,7 @@ def create_mcp_server(
                             ttl_until_iso,
                             now_iso,
                             now_iso,
+                            _OPERATOR_SOURCE,
                             # UPDATE SET values
                             boost_tier,
                             pinned_int,
@@ -10857,6 +10886,7 @@ def create_mcp_server(
                             reserve_now_int,
                             ttl_until_iso,
                             now_iso,
+                            _OPERATOR_SOURCE,
                         ),
                     )
                     await db.execute('COMMIT')
@@ -11053,7 +11083,10 @@ def create_mcp_server(
 
         Returns:
             ``{'pin_queue': [{'task_id': ..., 'boost_tier': ..., 'pinned': ...,
-            'pin_order': ..., 'reserve_now': ..., 'ttl_until': ...}, ...]}``
+            'pin_order': ..., 'reserve_now': ..., 'ttl_until': ...,
+            'source': ...}, ...]}`` where ``source`` is ``'operator'`` or
+            ``'starvation_watchdog'`` (a watchdog auto-pin, which carries a
+            ``ttl_until``).
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -11062,7 +11095,8 @@ def create_mcp_server(
         db = await _open_overrides_db(project_root)
         try:
             cursor = await db.execute(
-                'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
+                'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, '
+                'ttl_until, source '
                 'FROM overrides '
                 'WHERE project_root=? AND pinned=1 '
                 'ORDER BY pin_order ASC',
@@ -11077,6 +11111,7 @@ def create_mcp_server(
                     'pin_order': r[3],
                     'reserve_now': bool(r[4]),
                     'ttl_until': r[5],
+                    'source': r[6],
                 }
                 for r in rows
             ]
