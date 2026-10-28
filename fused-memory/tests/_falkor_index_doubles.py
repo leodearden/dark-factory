@@ -1,10 +1,9 @@
-"""Mock-graph doubles shared by the FalkorDB index-provisioning suites.
+"""Fixtures and mock-graph doubles shared by the FalkorDB index suites.
 
-Two suites drive ``GraphitiBackend``'s index provisioning against mock graphs:
-``test_ensure_indices.py`` pins β's diff-and-create, and
-``test_index_provisioning_wiring.py`` pins γ's wiring of it into the startup
-sweep and the first write.  Both build the same ``CALL db.indexes()`` rows and
-read back the same issued statements, so those doubles live here once.
+This module holds the measured ``CALL db.indexes()`` header, the trap state
+esc-3375-1 protected as evidence, and the doubles that build ``db.indexes()``
+rows and read back the statements a mock graph was sent.  The FalkorDB index
+suites all need the same ones, so each lives here once.
 
 Rows are DERIVED from α's normal form (``IndexSpec`` sets, folded back through
 ``parse_index_statement``), never hard-coded: a graphiti change to the index set
@@ -19,7 +18,6 @@ from collections import defaultdict
 from unittest.mock import MagicMock
 
 import redis.exceptions
-from test_falkor_indices import LIVE_HEADER
 
 from fused_memory.backends.falkor_indices import IndexSpec, parse_index_statement
 
@@ -28,6 +26,23 @@ from fused_memory.backends.falkor_indices import IndexSpec, parse_index_statemen
 #: but note the IMPLEMENTATION must not key on this wording (D2); it decides
 #: structurally, via ``list_graphs()`` membership.
 EMPTY_KEY_ERROR = redis.exceptions.ResponseError('Invalid graph operation on empty key')
+
+#: MEASURED read-only 2026-08-06: the header ``CALL db.indexes()`` returns, via
+#: ``redis-cli GRAPH.RO_QUERY dark_factory "CALL db.indexes()"`` and via a raw
+#: ``falkordb.asyncio`` client on the ro path; no index was created or dropped.
+#: Nine ``(type, name)`` pairs: ``entitytype`` is position 6, ``options`` position 3.
+LIVE_HEADER = [
+    [1, 'label'], [1, 'properties'], [1, 'types'], [1, 'options'], [1, 'language'],
+    [1, 'stopwords'], [1, 'entitytype'], [1, 'status'], [1, 'info'],
+]
+
+#: The trap state esc-3375-1 protected as evidence: an ``Entity(uuid)`` and a
+#: ``RELATES_TO(uuid)`` range index, and nothing else.  Every composite range
+#: statement upstream emits for those two labels is rejected wholesale against it.
+TRAP_PRESENT = {
+    ('Entity', 'NODE', 'uuid', 'RANGE'),
+    ('RELATES_TO', 'RELATIONSHIP', 'uuid', 'RANGE'),
+}
 
 
 def rows_for(specs: set[IndexSpec]) -> list[list]:
