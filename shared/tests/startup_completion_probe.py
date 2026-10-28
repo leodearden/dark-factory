@@ -757,9 +757,12 @@ def sample_proc(pid: int | None) -> dict:
     try:
         child_pids = (proc / 'task' / str(pid) / 'children').read_text().split()
         for child in child_pids:
-            child_fields = read_stat_fields(proc.parent / child, skip_malformed=True)
+            child_pid = int(child)
+            child_fields = read_stat_fields(
+                proc.parent / str(child_pid), skip_malformed=True
+            )
             comm = None if child_fields is None else child_fields.comm
-            out['children'].append({'pid': int(child), 'comm': comm})
+            out['children'].append({'pid': child_pid, 'comm': comm})
     except (OSError, ValueError):
         pass
     return out
