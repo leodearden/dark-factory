@@ -11,11 +11,13 @@ never as a clean.
 """
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.testing_mcp_stub import StubMcpServer
 
 from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
 
@@ -120,3 +122,37 @@ async def test_update_task_that_raises_is_an_error_not_a_clean(capsys):
 
     assert counts == (1, 0, 1)
     assert 'dropped' not in capsys.readouterr().out
+
+
+_TASK_NOT_FOUND_REPLY = {
+    'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 9999',
+    'error_type': 'TaskNotFoundError',
+}
+_NON_NUMERIC_ID_REPLY = {
+    'error': "INVALID_TASK_ID: non-numeric task id: 'infra'",
+    'error_type': 'TaskmasterError',
+    'metadata': {},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('get_task_reply', [_TASK_NOT_FOUND_REPLY, _NON_NUMERIC_ID_REPLY])
+async def test_refused_get_task_is_an_error_not_a_noop(capsys, get_task_reply):
+    client = _ScriptedClient({'get_task': get_task_reply})
+
+    counts = await _mod.clean_one_project(client, _PROJECT_ROOT, ['9999'], dry_run=False)
+
+    assert counts == (0, 0, 1)
+    assert [name for name, _ in client.calls] == ['get_task']
+    assert get_task_reply['error_type'] in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_main_async_exits_nonzero_on_a_refused_reply():
+    with StubMcpServer(stateful=False, payload=_TASK_NOT_FOUND_REPLY) as stub:
+        args = argparse.Namespace(
+            server_url=stub.url, project_roots=[_PROJECT_ROOT], task_ids='9999', dry_run=False,
+        )
+        exit_code = await _mod.main_async(args)
+
+    assert exit_code == 1
