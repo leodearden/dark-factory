@@ -49,7 +49,11 @@ from orchestrator.branch_stack import UnstackOutcome
 from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.deployed_sha import DeployedSha
-from orchestrator.dry_run_unblock import run_dry_run_unblock
+from orchestrator.dry_run_unblock import (
+    investigation_in_flight,
+    investigation_task_name,
+    run_dry_run_unblock,
+)
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_recorder import (
     record_flake_observation,
@@ -1139,11 +1143,10 @@ def _spawn_merge_verify_dry_run(
     None-safe: no-ops when *handles* is ``None`` or ``handles.scheduler`` is
     ``None`` — the solo-reverify and train module-level
     ``_run_post_merge_verify`` callers pass no handles.  Also no-ops when
-    ``req.config.unblock_auto.enabled`` is falsy, when a not-done
-    investigation task is already registered in ``handles.background_tasks``
-    under this task's name (mirrors ``workflow._spawn_dry_run_unblock``'s
-    enablement and in-flight-dedup guards), or when ``req.worktree`` is
-    missing/nonexistent.
+    ``req.config.unblock_auto.enabled`` is falsy, when an investigation for
+    this task is already running anywhere on the event loop (mirrors
+    ``workflow._spawn_dry_run_unblock``'s enablement and in-flight-dedup
+    guards), or when ``req.worktree`` is missing/nonexistent.
 
     The investigation always reads ``req.worktree`` — the task's OWN retained
     worktree — rather than the ephemeral merge worktree: by the time this
@@ -1164,16 +1167,7 @@ def _spawn_merge_verify_dry_run(
     ua = getattr(req.config, 'unblock_auto', None)
     if not ua or not ua.enabled:
         return
-    task_name = f'unblock-auto-{req.task_id}'
-    # Skip if an investigation for this task is already running (e.g. rapid
-    # re-blocks across successive merge-verify retries).  Duplicate proposals
-    # are unhelpful and would multiply budget spend up to the investigation's
-    # own timeout ceiling per re-block (mirrors
-    # workflow._spawn_dry_run_unblock's dedup guard).
-    if any(
-        t.get_name() == task_name and not t.done()
-        for t in handles.background_tasks
-    ):
+    if investigation_in_flight(req.task_id):
         logger.debug(
             'Task %s: merge-verify dry-run investigation already in '
             'progress, skipping duplicate spawn',
@@ -1201,7 +1195,7 @@ def _spawn_merge_verify_dry_run(
                 cost_store=handles.cost_store,
                 block_class=BlockClass.MERGE_VERIFY_RED,
             ),
-            name=task_name,
+            name=investigation_task_name(req.task_id),
         )
         handles.background_tasks.add(task)
         task.add_done_callback(handles.background_tasks.discard)

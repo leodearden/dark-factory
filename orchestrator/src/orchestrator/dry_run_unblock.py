@@ -309,6 +309,31 @@ _DISALLOWED_TOOLS: list[str] = [
 ]
 
 # ---------------------------------------------------------------------------
+# In-flight identity
+# ---------------------------------------------------------------------------
+
+def investigation_task_name(task_id: str) -> str:
+    """The asyncio task name every spawner registers an investigation under."""
+    return f'unblock-auto-{task_id}'
+
+
+def investigation_in_flight(task_id: str) -> bool:
+    """Whether an investigation for *task_id* is running on the current loop.
+
+    The event loop lives exactly as long as the orchestrator process, which is
+    how long an investigation can live, so the scan sees runs started by any
+    earlier TaskWorkflow instance for the task and by the merge lane. With no
+    running loop it answers False.
+    """
+    try:
+        running = asyncio.all_tasks()
+    except RuntimeError:
+        return False
+    name = investigation_task_name(task_id)
+    return any(t.get_name() == name and not t.done() for t in running)
+
+
+# ---------------------------------------------------------------------------
 # SHA capture helper
 # ---------------------------------------------------------------------------
 
