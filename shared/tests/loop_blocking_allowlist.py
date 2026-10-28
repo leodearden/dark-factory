@@ -256,21 +256,9 @@ _COMBINE_AUDIT_APPEND_WHY = (
     'append of a single JSON line under 2 KB (descriptions truncated to '
     '500 chars), with no fsync. It runs once per curator COMBINE decision, '
     'each of which follows an LLM call of seconds, so the append is never '
-    'on a hot or storm-coupled path. The EventQueue dead-letter append is '
-    'the one defect of this shape, because it fires during a drop storm.'
-)
-
-#: Task 5099: EventQueue._write_dead_letter's inline append.
-_DEAD_LETTER_APPEND_WHY = (
-    'ROOT CAUSE (one defect): EventQueue._write_dead_letter runs '
-    'mkdir + exists + stat + the cascade rotation + open(\'a\') + write '
-    'inline on the loop thread, and its async callers reach it without a '
-    'hop. The enqueue overflow_drop branch fires EXACTLY when the loop is '
-    'saturated, so the blocking append is coupled to the storm it '
-    'records, and a rotation renames files on the same thread. '
-    'UNDERSTATED BY THESE ROWS: the scanner resolves only self.enqueue, '
-    'not other receivers\' event_queue.enqueue(...), so the real caller '
-    'population is larger. Filed by task 5099 as TASK 6085.'
+    'on a hot or storm-coupled path. The one storm-coupled defect of this '
+    'shape, the EventQueue dead-letter append that fires during a drop '
+    'storm, was moved onto a dedicated writer thread by task 6085.'
 )
 
 #: Task 6089: who owns the measured-cheap ``resolve`` rows its widening added.
@@ -516,34 +504,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'd325858ad5fe',
         'accepted',
         _MKDIR_ON_STORE_OPEN_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
-        'EventQueue.recover',
-        '2f9ae36b2bc7',
-        'filed',
-        _DEAD_LETTER_APPEND_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
-        'EventQueue.close',
-        'c8191bbaf10a',
-        'filed',
-        _DEAD_LETTER_APPEND_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
-        'EventQueue._commit_with_retry',
-        '93d589ee10dd',
-        'filed',
-        _DEAD_LETTER_APPEND_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
-        'EventQueue._enqueue_on_loop',
-        'f46e02910e17',
-        'filed',
-        _DEAD_LETTER_APPEND_WHY,
     ),
 
     # ---- reconciliation/harness.py ----
