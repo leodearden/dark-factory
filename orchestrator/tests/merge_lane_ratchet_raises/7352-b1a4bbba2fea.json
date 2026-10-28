@@ -1,0 +1,24 @@
+{
+  "task_id": "7352",
+  "reason": "Net-additive bug fix: worker.py::SpeculativeMergeWorker._void_and_remerge records the adoption-voided verdict's own merge commit as a dead base (one guarded _record_dead_base call plus docstring site-list edits), so a depth-2 follower stacked on it with no host at void time is re-merged at dispatch instead of verifying on an orphaned base and paying a gate re-verify (task 7352, review-6273 finding). Not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2277,
+      "current": 2279
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_void_and_remerge",
+      "baseline": 3,
+      "current": 5
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5034,
+      "current": 5036
+    }
+  ]
+}
