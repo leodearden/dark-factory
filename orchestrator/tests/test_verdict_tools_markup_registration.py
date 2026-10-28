@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1527,6 +1528,114 @@ class TestTheVerdictFactReachesADurableJournal:
         assert artifacts.read_verdict(REVIEWER_ROLE) is not None
         assert result.meta is not None
         assert result.meta['markup_repair']['outcome'] == 'repaired'
+
+
+# ---------------------------------------------------------------------------
+# create_server takes the project-root resolver (task 6098).
+# ---------------------------------------------------------------------------
+
+
+def git(*args: str, cwd: Path) -> None:
+    """Run one git command in *cwd*, failing loudly."""
+    subprocess.run(
+        ['git', *args], cwd=str(cwd), check=True, capture_output=True, text=True,
+    )
+
+
+class TestCreateServerTakesAProjectRootResolver:
+    """One resolver, passed to ``create_server``, decides where BOTH injected
+    channels file: the residue escalation and the fact journal.
+
+    Each steered row resolves to a checkout DISTINCT from the server's own
+    worktree, so a record that lands there can only have got there through the
+    resolver's answer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_one_resolver_steers_both_channels(
+        self, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """The unrepairable outcome is the one where both channels fire, so it
+        is where a residue record and its journal line must meet."""
+        main_checkout = tmp_path / 'main'
+        server = create_server(
+            artifacts, REVIEWER_ROLE,
+            resolve_project_root=lambda worktree: main_checkout,
+        )
+        seed_plan(artifacts)
+        record = specimen(UNREPAIRABLE_SPECIMEN)
+        assert record['expected_outcome'] == 'unrepairable'
+
+        async with Client(server) as client:
+            with pytest.raises(ToolError) as excinfo:
+                await client.call_tool('submit_review_verdict', {
+                    'reviewer': REVIEWER_ROLE,
+                    'verdict': 'ISSUES_FOUND',
+                    'issues': [],
+                    'summary': record['value'],
+                })
+        payload = json.loads(str(excinfo.value))
+
+        filed = sorted(escalation_queue_dir(main_checkout).rglob('esc-*.json'))
+        assert len(filed) == 1, f'expected exactly one residue record, got {filed!r}'
+        (line,) = journal_lines(main_checkout)
+        assert line['outcome'] == 'unrepairable'
+        assert queue_under(main_checkout).get(payload['escalation_id']) is not None
+
+    @pytest.mark.asyncio
+    async def test_the_resolver_is_asked_lazily_with_the_servers_worktree(
+        self, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """Construction resolves nothing: one ``git rev-parse`` per server start
+        would land on every agent invocation, not only on the calls that leak."""
+        main_checkout = tmp_path / 'main'
+        asked: list[Path] = []
+
+        def recording_resolver(worktree: Path) -> Path:
+            asked.append(worktree)
+            return main_checkout
+
+        server = create_server(
+            artifacts, REVIEWER_ROLE, resolve_project_root=recording_resolver,
+        )
+        assert asked == []
+        seed_plan(artifacts)
+        record = specimen(ISSUES_SPECIMEN)
+
+        async with Client(server) as client:
+            await client.call_tool('submit_review_verdict', {
+                'reviewer': REVIEWER_ROLE,
+                'verdict': 'ISSUES_FOUND',
+                record['param']: record['value'],
+            })
+
+        assert asked
+        assert all(worktree == artifacts.worktree for worktree in asked)
+        (line,) = journal_lines(main_checkout)
+        assert line['outcome'] == 'repaired'
+
+    @pytest.mark.asyncio
+    async def test_the_default_resolver_files_into_the_main_checkout(
+        self, tmp_path: Path
+    ):
+        """With no resolver passed, a lane's journal line reaches its MAIN
+        checkout — never the lane, which dies at ``git worktree remove``."""
+        checkout = tmp_path / 'repo'
+        checkout.mkdir()
+        git('init', cwd=checkout)
+        git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit',
+            '--allow-empty', '-m', 'root', cwd=checkout)
+        lane = tmp_path / 'lane'
+        git('worktree', 'add', str(lane), '-b', 'task/1', cwd=checkout)
+        lane_artifacts = TaskArtifacts(lane)
+        lane_artifacts.init('test-1', 'Test task', 'A test')
+        seed_plan(lane_artifacts)
+
+        await repaired_call(lane_artifacts)
+
+        (line,) = journal_lines(checkout)
+        assert line['subject_task_id'] == 'test-1'
+        assert not markup_journal.journal_path(lane, 'verdict-tools').exists()
 
 
 # ---------------------------------------------------------------------------
