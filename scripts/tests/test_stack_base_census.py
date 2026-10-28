@@ -11,6 +11,9 @@ onto <sha>`` exactly as the orchestrator's stacker leaves it.
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
+import json
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
@@ -434,3 +437,136 @@ async def test_a_record_that_does_not_read_back_is_reported_unwritten(repo: Path
     assert 'task/M' in outcomes[0].detail
     assert p_tip in outcomes[0].detail
     assert stack_base_refs(repo) == []
+
+
+# ---------------------------------------------------------------------------
+# step-9: the CLI
+# ---------------------------------------------------------------------------
+
+
+def stack_member(repo: Path, name: str, onto: str) -> Path:
+    """task/<name> branches from main, commits, and is rebased onto *onto*."""
+    wt = add_member(repo, name, 'main', {f'{name.lower()}.txt': f'{name}\n'})
+    rebase(wt, onto)
+    return wt
+
+
+def run_cli(repo: Path, tasks_db: Path, *extra: str) -> int:
+    return census.main(['--project-root', str(repo), '--tasks-db', str(tasks_db), *extra])
+
+
+def test_the_default_run_prints_a_markdown_report_and_writes_nothing(
+    repo: Path, make_tasks_db, capsys: pytest.CaptureFixture[str],
+) -> None:
+    add_member(repo, 'P', 'main', {'p.txt': 'p\n'})
+    p_tip = rev(repo, 'task/P')
+    stack_member(repo, 'M', 'task/P')
+    stack_member(repo, '105', 'task/P')
+    u_wt = add_member(repo, 'U', 'main', {'u1.txt': '1\n'})
+    git(repo, 'update-ref', 'refs/heads/task/X', rev(repo, 'task/U'))
+    commit(u_wt, {'u2.txt': '2\n'}, 'U: second')
+
+    assert run_cli(repo, make_tasks_db([{'id': 105, 'status': 'done'}])) == 0
+
+    out = capsys.readouterr().out
+    assert rev(repo, 'main') in out
+    assert 'unlanded task branches: 5' in out
+    assert '### task/M: confirmed' in out
+    assert '### task/U: unadjudicated' in out
+    assert f'base: `{p_tip}`' in out
+    assert f'cut: `{p_tip}`' in out
+    assert f'git rebase --onto main {p_tip} task/M' in out
+    assert 'task/X' in out
+    assert '| already_clean | 0 |' in out
+    assert '| recorded | 0 |' in out
+    assert '| inert | 1 |' in out
+    assert stack_base_refs(repo) == []
+
+
+def test_json_output_round_trips_every_finding(
+    repo: Path, make_tasks_db, capsys: pytest.CaptureFixture[str],
+) -> None:
+    add_member(repo, 'P', 'main', {'p.txt': 'p\n'})
+    p_tip = rev(repo, 'task/P')
+    stack_member(repo, 'M', 'task/P')
+    clean_wt = stack_member(repo, 'K', 'task/P')
+    rebase(clean_wt, '--onto', 'main', p_tip, 'task/K')
+    stack_member(repo, '105', 'task/P')
+    tasks_db = make_tasks_db([{'id': 105, 'status': 'done'}])
+
+    assert run_cli(repo, tasks_db, '--json') == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert {f['branch']: f['verdict'] for f in payload['findings']} == {
+        'task/M': 'confirmed',
+        'task/K': 'already_clean',
+        'task/105': 'inert',
+    }
+    expected = asyncio.run(census.run_census(
+        repo, main_branch='main', statuses=census.load_task_statuses(tasks_db),
+    ))
+    assert payload['findings'] == [
+        json.loads(json.dumps(dataclasses.asdict(finding))) for finding in expected.findings
+    ]
+    assert payload['main_sha'] == expected.main_sha
+    assert payload['unlanded_branches'] == expected.unlanded_branches
+
+
+def adoption_lines(out: str) -> list[str]:
+    return [line for line in out.splitlines() if line.startswith('adopt ')]
+
+
+def test_adopt_confirmed_exits_zero_when_every_record_reads_back(
+    repo: Path, make_tasks_db, capsys: pytest.CaptureFixture[str],
+) -> None:
+    stacked_on_p(repo)
+    p_tip = rev(repo, 'task/P')
+
+    assert run_cli(repo, make_tasks_db([]), '--adopt-confirmed') == 0
+
+    lines = adoption_lines(capsys.readouterr().out)
+    assert len(lines) == 1
+    assert lines[0].startswith(f'adopt task/M at {p_tip}: written')
+    assert stack_base_refs(repo) == ['refs/dark-factory/stack-base/task/M']
+
+
+def test_adopt_confirmed_exits_one_when_a_record_does_not(
+    repo: Path, make_tasks_db, capsys: pytest.CaptureFixture[str],
+) -> None:
+    stacked_on_p(repo)
+    p_tip = rev(repo, 'task/P')
+    lock = repo / '.git' / 'refs' / 'dark-factory' / 'stack-base' / 'task' / 'M.lock'
+    lock.parent.mkdir(parents=True)
+    lock.write_text('')
+
+    assert run_cli(repo, make_tasks_db([]), '--adopt-confirmed') == 1
+
+    lines = adoption_lines(capsys.readouterr().out)
+    assert len(lines) == 1
+    assert lines[0].startswith(f'adopt task/M at {p_tip}: NOT WRITTEN')
+    assert stack_base_refs(repo) == []
+
+
+def test_a_missing_tasks_db_warns_and_treats_every_branch_as_live(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    stacked_on_p(repo, member='105')
+    missing = tmp_path / 'absent' / 'tasks.db'
+
+    assert run_cli(repo, missing, '--json') == 0
+
+    captured = capsys.readouterr()
+    assert str(missing) in captured.err
+    payload = json.loads(captured.out)
+    assert {f['branch']: f['verdict'] for f in payload['findings']} == {'task/105': 'confirmed'}
+
+
+def test_a_project_root_that_is_not_a_repo_exits_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    not_a_repo = tmp_path / 'plain'
+    not_a_repo.mkdir()
+
+    assert run_cli(not_a_repo, tmp_path / 'tasks.db') == 2
+
+    assert 'git rev-parse' in capsys.readouterr().err
