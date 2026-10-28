@@ -194,6 +194,9 @@ class TestConstructorInjectedHooksFire:
         scheduler.lock_table.try_acquire('seed', ['backend'])
         scheduler._dispatched.add('seed')
         scheduler.get_tasks = AsyncMock(return_value=[task])
+        # The watchdog corroborates a finding with a live status read before
+        # it fires (task 3821).
+        scheduler.get_statuses = AsyncMock(return_value=({'starved': 'pending'}, None))
         scheduler.finish_startup()
 
         # Drive 3 ticks to accumulate skip_count >= skip_threshold (3).

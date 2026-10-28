@@ -97,6 +97,7 @@ from orchestrator.recovery_emission import (
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.sentinel_l1 import file_sentinel_l1
 from orchestrator.starvation_watchdog import (
+    STARVATION_WATCHDOG_ROLE,
     CandidateFacts,
     Finding,
     LockRefusals,
@@ -2831,6 +2832,9 @@ class Scheduler:
         # get_by_task dedup).  Cleared when the task dispatches or is GC'd.
         # ALIASED to _streak_starvation.escalated (task 2124).
         self._starvation_escalated = self._streak_starvation.escalated
+        # Whether the escalated set has been seeded from the open watchdog
+        # escalations a previous process filed (task 3821).
+        self._starvation_rehydrated = False
         # --- Warm-base hard-down watchdog state (task 2061) ---
         # SINGLETON latch — one host-scoped warm-lane CoW seed base, so exactly
         # one signal/window/L2 (unlike the starvation watchdog's per-task dict/
@@ -4619,7 +4623,9 @@ class Scheduler:
 
         Stamps every candidate's durable eligibility anchor, then classifies
         each not-yet-escalated candidate with the predicate in
-        ``starvation_watchdog.py`` and delivers every finding.  Called once per
+        ``starvation_watchdog.py`` and delivers every finding whose task a
+        live status read still shows ``pending`` (INV-3); a failed read
+        delivers nothing, so the findings recur next tick.  Called once per
         tick by ``_phase_starvation``, whose try/except keeps a watchdog
         failure from ever aborting the tick (PROPERTY 1).
         """
@@ -4627,6 +4633,7 @@ class Scheduler:
         candidates = {str(t.get('id', '')): t for t in ctx.candidates}
         candidates.pop('', None)
         self._eligibility.observe(candidates, now)
+        self._rehydrate_starvation_escalated()
         cfg = self.config.starvation_watchdog
         if not cfg.enabled:
             return
@@ -4646,7 +4653,40 @@ class Scheduler:
             if gate is not None:
                 blockers = tuple(self.lock_table.blockers(tid, self._get_modules(task)))
                 findings.append(Finding(facts, gate, blockers))
-        await self._deliver_starvation_findings(ctx, findings, now)
+        if not findings:
+            return
+        statuses, err = await self.get_statuses([f.facts.task_id for f in findings])
+        if err is not None:
+            logger.warning(
+                'Starvation watchdog: live status read failed (%r); delivering '
+                'none of %d finding(s) this tick', err, len(findings),
+            )
+            return
+        live = [f for f in findings if statuses.get(f.facts.task_id) == 'pending']
+        await self._deliver_starvation_findings(ctx, live, now)
+
+    def _rehydrate_starvation_escalated(self) -> None:
+        """Seed the escalated set, once per process, from open watchdog escalations.
+
+        A restart then neither re-files an alarm a previous process left open
+        nor leaves it unresolved: the ``'starvation'`` GC resolves it once its
+        task leaves ``pending``.  A failed read retries on the next pass.
+        """
+        queue = self.escalation_queue
+        if self._starvation_rehydrated or queue is None:
+            return
+        try:
+            pending = queue.get_pending()
+        except Exception:
+            logger.warning(
+                'Starvation watchdog: cannot read open escalations; retrying next pass',
+                exc_info=True,
+            )
+            return
+        for esc in pending:
+            if esc.agent_role == STARVATION_WATCHDOG_ROLE:
+                self._streak_starvation.mark_escalated(esc.task_id)
+        self._starvation_rehydrated = True
 
     async def _deliver_starvation_findings(
         self, ctx: TickContext, findings: list[Finding], now: datetime,
