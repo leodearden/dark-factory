@@ -95,6 +95,9 @@ from orchestrator.recovery_emission import (
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.sentinel_l1 import file_sentinel_l1
+from orchestrator.starvation_watchdog import (
+    STARVATION_WATCHDOG_MARKER as _STARVATION_WATCHDOG_MARKER,
+)
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.strict_event_reads import task_ids_with_event
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
@@ -239,13 +242,6 @@ __all__ = [
 _STARVATION_NON_ELIGIBLE = frozenset(
     {'blocked', 'deferred', 'review', 'merge-deferred'}
 )
-
-# Stable grep-anchor token leading every starvation-watchdog escalation summary.
-# Tests and downstream classifiers key on this literal, so it is single-sourced
-# here rather than repeated across the two escalation-message branches in
-# _apply_starvation_watchdog (idle-only backstop vs. dual-gate lock-contention) —
-# the one fragment that MUST stay identical between them can no longer drift.
-_STARVATION_WATCHDOG_MARKER = 'STARVATION_WATCHDOG'
 
 
 class SetTaskStatusRejected(Exception):
