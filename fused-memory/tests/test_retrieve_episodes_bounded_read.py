@@ -13,7 +13,6 @@ import contextlib
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
-from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
@@ -41,7 +40,12 @@ class EpisodeGraph:
 
     def __init__(self, episodes: list[dict]) -> None:
         self.episodes = episodes
+        self.selected_as: list[str] = []
         self.calls: list[tuple[str, dict]] = []
+
+    def select(self, graph_name: str) -> EpisodeGraph:
+        self.selected_as.append(graph_name)
+        return self
 
     async def ro_query(self, cypher: str, params: dict) -> _Result:
         self.calls.append((cypher, params))
@@ -74,7 +78,7 @@ def _row(uuid: str, created_at_iso: str, *, group_id: str = 'dark_factory') -> d
 
 def _backend_over(mock_config, make_backend, graph: EpisodeGraph) -> GraphitiBackend:
     backend = make_backend(mock_config)
-    backend._driver._get_graph = MagicMock(return_value=graph)
+    backend._driver._get_graph = graph.select
     return backend
 
 
@@ -89,9 +93,7 @@ class TestRetrieveEpisodesQuery:
         self, mock_config, make_backend,
     ):
         graph = EpisodeGraph([])
-        get_graph = MagicMock(return_value=graph)
-        backend = make_backend(mock_config)
-        backend._driver._get_graph = get_graph
+        backend = _backend_over(mock_config, make_backend, graph)
 
         await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=5)
 
@@ -100,7 +102,7 @@ class TestRetrieveEpisodesQuery:
         assert params == {'group_ids': ['dark_factory'], 'limit': 5}
         assert 'ORDER BY created_at DESC, uuid DESC' in cypher
         assert '<' not in cypher
-        get_graph.assert_called_once_with('dark_factory')
+        assert graph.selected_as == ['dark_factory']
 
     @pytest.mark.asyncio
     async def test_rows_decode_into_episodic_nodes(self, mock_config, make_backend):
