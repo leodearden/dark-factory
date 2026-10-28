@@ -28,7 +28,6 @@ This test loads the *committed* ``dark-factory-orchestrator.yaml`` directly
 in ``test_orchestrator_restart_config_drift.py``.
 """
 
-import ast
 import pathlib
 import posixpath
 import re
@@ -677,48 +676,6 @@ POST_CAP_ORCHESTRATOR_GREEN_SECS = {
 # percentiles and the n that produced them cannot drift apart.
 POST_CAP_ORCHESTRATOR_GREEN_N = 28
 
-# Task 3353's census record is the single home of the orchestrator figure, and
-# the `orchestrator` row below is DERIVED from it. It is read from that file's
-# SOURCE rather than imported, because a guard must not import a sibling guard
-# (the convention module_budget_family.py states).
-CENSUS_HOME_PATH = REPO_ROOT / 'tests' / 'scripts' / 'test_module_verify_budgets.py'
-ORCHESTRATOR_CENSUS_NAME = 'ORCHESTRATOR_BUDGET_CENSUS'
-
-
-class _CensusFigures(NamedTuple):
-    """The ``BudgetCensus`` fields the fleet table consumes."""
-
-    n: int
-    p50: float
-    measured_at: str
-
-
-def _read_census_figures(path: pathlib.Path, name: str) -> _CensusFigures:
-    """The literal keyword arguments of the module-level ``<name> = BudgetCensus(...)`` in *path*."""
-    for node in ast.parse(path.read_text(encoding='utf-8')).body:
-        if (
-            isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Call)
-            and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
-        ):
-            keywords = {kw.arg: kw.value for kw in node.value.keywords}
-            missing = [f for f in _CensusFigures._fields if f not in keywords]
-            if missing:
-                raise LookupError(
-                    f'{path}::{name} passes no {missing} keyword(s) (task 3496); '
-                    'MEASURED_FLEET_SEGMENT_SECS derives its orchestrator row from them'
-                )
-            return _CensusFigures(
-                **{f: ast.literal_eval(keywords[f]) for f in _CensusFigures._fields}
-            )
-    raise LookupError(
-        f'{path} binds no module-level `{name} = BudgetCensus(...)` (task 3496); '
-        'MEASURED_FLEET_SEGMENT_SECS derives its orchestrator row from that record'
-    )
-
-
-ORCHESTRATOR_CENSUS = _read_census_figures(CENSUS_HOME_PATH, ORCHESTRATOR_CENSUS_NAME)
-
 # Measured per-segment wall-clock of the FALLBACK fleet chain, in seconds.
 #
 # PROVENANCE — this table now spans THREE measurement epochs. Do not read it as
@@ -730,11 +687,14 @@ ORCHESTRATOR_CENSUS = _read_census_figures(CENSUS_HOME_PATH, ORCHESTRATOR_CENSUS
 #     escalation esc-3062-3. One logged run each, except `tests/scripts`, which
 #     uses the LOWEST of four independent measurements (105-127s).
 #
-#   orchestrator — DERIVED, not copied: ORCHESTRATOR_CENSUS.p50 to 2 dp, read
-#     from task 3353's census record (ORCHESTRATOR_CENSUS_NAME in
-#     CENSUS_HOME_PATH, above). That record is the single home of the figure's
-#     window, regime scoping, percentiles and census_command; re-measuring means
-#     replacing it, and this row and its provenance follow. Superseded
+#   orchestrator — DERIVED, not copied: ORCHESTRATOR_BUDGET_CENSUS.p50 to 2 dp,
+#     from task 3353's census record at
+#     tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS.
+#     It is IMPORTED because that is a non-test helper; a guard must not import
+#     a sibling guard (the convention module_budget_family.py states). That
+#     record is the single home of the figure's window, regime scoping,
+#     percentiles and census_command; re-measuring means replacing it, and
+#     this row and its provenance follow. Superseded
 #     predecessors: task 4902's 1765.95 (n=28, 2026-08-28;
 #     POST_CAP_ORCHESTRATOR_GREEN_SECS above) and task 3062's 1366.23 (one run,
 #     2026-07-31). Independent corroboration of the 2026-09-14 census: the M1a
@@ -790,7 +750,7 @@ ORCHESTRATOR_CENSUS = _read_census_figures(CENSUS_HOME_PATH, ORCHESTRATOR_CENSUS
 MEASURED_FLEET_SEGMENT_SECS = {
     'shared': 120.21,
     'escalation': 123.29,
-    'orchestrator': round(ORCHESTRATOR_CENSUS.p50, 2),
+    'orchestrator': round(ORCHESTRATOR_BUDGET_CENSUS.p50, 2),
     'fused-memory': 123.87,
     'tests/scripts': 105.0,
     'scripts/tests': 113.0,
@@ -827,8 +787,8 @@ MEASURED_FLEET_SEGMENT_PROVENANCE: dict[str, _SegmentProvenance] = {
     'escalation': _SegmentProvenance(
         '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
     'orchestrator': _SegmentProvenance(
-        ORCHESTRATOR_CENSUS.measured_at, ORCHESTRATOR_CENSUS.n, '3353',
-        f'verify-summary corpus read by {ORCHESTRATOR_CENSUS_NAME}.census_command'),
+        ORCHESTRATOR_BUDGET_CENSUS.measured_at, ORCHESTRATOR_BUDGET_CENSUS.n, '3353',
+        'verify-summary corpus read by ORCHESTRATOR_BUDGET_CENSUS.census_command'),
     'fused-memory': _SegmentProvenance(
         '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
     'tests/scripts': _SegmentProvenance(

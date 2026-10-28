@@ -57,7 +57,8 @@ see drift between. This file now imports ``min_budget``,
 ``FAMILY_PUBLISHER_PATHS``, ``FAMILY_READER_PATH`` and ``published_pairs`` from
 ``module_budget_family`` — a non-test sibling, on the ``setup_host_sections`` /
 ``systemd_unit_invariants`` precedent already established in this directory —
-and takes its setup from the ``root_config`` / ``discover_module_configs`` /
+imports ``BudgetCensus`` and ``ORCHESTRATOR_BUDGET_CENSUS`` from the non-test
+``verify_budget_census_records`` (task 6172), and takes its setup from the ``root_config`` / ``discover_module_configs`` /
 ``executed_for_touched`` fixtures in ``tests/scripts/conftest.py``. Every guard
 in the family still fails entirely on its own.
 
@@ -108,7 +109,6 @@ import os
 import pathlib
 import textwrap
 from collections.abc import Callable
-from typing import NamedTuple
 
 import pytest
 import yaml
@@ -120,6 +120,7 @@ from module_budget_family import (
     published_pairs,
 )
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from verify_budget_census_records import ORCHESTRATOR_BUDGET_CENSUS, BudgetCensus
 
 from orchestrator import verify
 
@@ -239,7 +240,9 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #                 other six, named here so the divergence reads as a decision
 #                 rather than an arithmetic slip.
 #                 ORCHESTRATOR_BUDGET_CENSUS.regime / regime_since carry the
-#                 scope, and its comment block lists all three regimes found.
+#                 scope, and its comment block in
+#                 tests/scripts/verify_budget_census_records.py lists all
+#                 three regimes found.
 #                 THE CORPUS IS EPHEMERAL, which bounds what any re-measure
 #                 can recover: it is `.worktrees/*/.task/verify/*.summary.json`
 #                 and worktrees are reset. MEASURED 2026-09-16 — re-running
@@ -389,93 +392,10 @@ RULED_INTERIM_BUDGET_EXCEPTIONS: dict[str, str] = {
 CENSUS_FLOOR_REFUSAL_CEILING = 7200
 
 
-class BudgetCensus(NamedTuple):
-    """One module's verify-duration census, frozen with its own provenance.
-
-    THE POINT OF THE SHAPE. The prose entry in
-    ``RULED_INTERIM_BUDGET_EXCEPTIONS`` could say "7200 is an operator
-    estimate" and nothing could check it. These fields are asserted against, so
-    the excepted branch stops asserting prose and starts asserting a
-    DERIVATION.
-
-    ``census_command`` and ``measured_at`` are not decoration: they are what
-    make the next figure a REPEAT rather than a re-derivation, which is exactly
-    what ``MEASURED_MODULE_SUITE_WORST_SECS``' own provenance block demands.
-    Re-measure by re-running that command, and replace the whole record.
-
-    ``regime``/``regime_since`` exist because a bare trailing window is WRONG
-    here, and provably so. A 14-day window from 2026-09-14 reaches back to
-    08-31 and straddles the retired 3-slot / 3600-ceiling regime, whose max was
-    4991s -> a floor of 7500, which trips the refusal ceiling above on evidence
-    from a configuration that no longer exists. D17's rule says "under the
-    PREVAILING config", so the window is
-    ``intersection(trailing-14d, prevailing regime)`` and the assertion
-    ``window_start >= regime_since`` holds it there. That assertion goes INERT
-    on its own once 14 days of prevailing-regime data exist, which is the point
-    — it narrows the window only while narrowing is needed, and says why.
-    """
-
-    window_start: str
-    window_end: str
-    regime: str
-    regime_since: str
-    n: int
-    p50: float
-    p90: float
-    max_secs: float
-    timed_out: int
-    census_command: str
-    measured_at: str
-
-
-# MEASURED 2026-09-14 by the verbatim command below, over the PREVAILING
-# config regime. RE-MEASURE BY REPEATING THAT COMMAND and replacing this whole
-# record, so the next figure is a repeat rather than a re-derivation.
-#
-# THE THREE REGIMES THE CENSUS FOUND, which is why this one is scoped:
-#   pre-2026-09-03          n=26  p50=1551  p90=2385  max=3225   t/o=1   floor 4900
-#   09-03 .. 09-12T08       n=26  p50=3090  p90=4223  max=4991   t/o=14  floor 7500
-#   since 09-12T08 (THIS)   n=14  p50=3275  p90=3685  max=4626   t/o=0   floor 7000
-# The middle regime corroborates the segmentation on its own evidence: 14
-# timeouts against this regime's 0, which is the distress commit 36c4c71eb4
-# relieved by raising the ceiling 3600 -> 7200.
-#
-# DIVERGENCE FROM D17's STATED FIGURES, recorded rather than smoothed over.
-# The ruling expected max=3753 -> floor 5700. Measured max is 4626 -> floor
-# 7000, because a green run landed at 2026-09-14T09:35 (task 3541) after the
-# ruling was written, making 3753 the second-highest. n/p50/p90 all match the
-# ruling's shape. Consequence filed as esc-3353-15: headroom against the
-# refusal ceiling is 174s of floor (7000 vs 7200), i.e. a single green run
-# above 4800s trips assertion (3) above. That is the ruling's INTENDED
-# behaviour — the finding surfaces instead of the budget silently rising — so
-# when it fires, read it as the escalate branch working.
-#
-# EVERY IN-WINDOW RUN IS UNSTAMPED. Deliverable 1 of this task adds the host
-# load stamp; it had not merged when this was measured, so all 14 records
-# carry no load reading and the census's load bands are all empty. The figures
-# here are therefore durations under UNKNOWN host load — which is precisely the
-# gap D1 closes for the next re-measure.
-ORCHESTRATOR_BUDGET_CENSUS = BudgetCensus(
-    window_start='2026-09-12T08:00:00+00:00',
-    window_end='2026-09-15T00:00:00+00:00',
-    regime='prevailing config since the 3600 -> 7200 fleet-ceiling raise',
-    regime_since='2026-09-12T08:00:00+00:00',
-    n=14,
-    p50=3274.9211449669992,
-    p90=3684.5928532374005,
-    max_secs=4626.166946739017,
-    timed_out=0,
-    census_command=(
-        'uv run --project shared python scripts/verify_budget_census.py '
-        '--root /home/leo/src/dark-factory --module orchestrator '
-        '--label test --role task '
-        '--window 2026-09-12T08:00:00+00:00..2026-09-15T00:00:00+00:00'
-    ),
-    measured_at='2026-09-14',
-)
-
 # Keyed by prefix, like every other justification dict here, so the
 # parametrized branch below stays total rather than special-casing one name.
+# Each record is IMPORTED from tests/scripts/verify_budget_census_records.py,
+# its single home, which test_fallback_verify_config.py reads too.
 RULED_BUDGET_CENSUS: dict[str, BudgetCensus] = {
     'orchestrator': ORCHESTRATOR_BUDGET_CENSUS,
 }
