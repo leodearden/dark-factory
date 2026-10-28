@@ -113,7 +113,12 @@ def _member(mid, *, canonical=None, topic=_TOPIC, supersedes=None, **extra_meta)
 
 
 def _uuid(n):
+    """Digits and dashes only, so `.upper()` is a no-op: a case-folding test
+    must use `_HEX_LETTERED_UUID`."""
     return f'00000000-0000-4000-8000-{n:012d}'
+
+
+_HEX_LETTERED_UUID = 'abcdef00-0000-4000-8000-00000000004a'
 
 
 def _closure(members, gate_block=None, **kwargs):
@@ -419,7 +424,7 @@ class TestClosureRoutesProbeConfirmedClaims:
         assert 'absorbed_member_still_live' in codes
 
     def test_routing_is_case_insensitive(self):
-        mixed = 'abcdef00-0000-4000-8000-00000000004a'
+        mixed = _HEX_LETTERED_UUID
         assert mixed.upper() != mixed
         verdict = _closure(
             self._claiming([mixed.upper()]), unstamped_live_ids=[mixed]
@@ -916,7 +921,7 @@ class TestUnstampedCandidates:
         ) == ()
 
     def test_a_claim_and_an_observation_of_one_id_dedupe_case_insensitively(self):
-        mixed = 'abcdef00-0000-4000-8000-00000000004a'
+        mixed = _HEX_LETTERED_UUID
         assert mixed.upper() != mixed
         assert consolidation_gate.unstamped_candidates(
             _prov([mixed]), members=self._claiming([mixed.upper()])
