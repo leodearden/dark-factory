@@ -281,6 +281,31 @@ class TestProximityBinding:
             ('task', '4213', 'dark_factory'),
         ]
 
+    def test_forward_binding_through_a_hyphenated_project_qualifier(self):
+        claims = _extract('prevention filed as dark-factory task 4213', default_project_id='reify')
+
+        assert [(c.subject, c.ref, c.project_id) for c in claims] == [
+            ('task', '4213', 'dark_factory'),
+        ]
+
+    @pytest.mark.parametrize(
+        ('text', 'expected'),
+        [
+            pytest.param(
+                "The prompt's \"Files Changed on Main\" list is then the fork-point diff "
+                '(merge-base..main), not the diff since the last confirm_plan, because '
+                "confirm_plan never advances metadata.json's base_commit, so the Lever B "
+                'revalidation skip never fires (filed as dark-factory task 6141).',
+                [('filing_dispatch', 'task', '6141', 'dark_factory')],
+                id='esc-unverified-claim-6141-1',
+            ),
+        ],
+    )
+    def test_foreign_qualified_specimen_binds_to_the_named_project(self, text, expected):
+        claims = _extract(text, default_project_id='solar_challenge')
+
+        assert [(c.kind, c.subject, c.ref, c.project_id) for c in claims] == expected, claims
+
     @pytest.mark.parametrize(
         'text', ['task 1985 and task 1986 landed', 'task 1985, task 1986 landed'],
     )
@@ -419,6 +444,32 @@ class TestCrossProjectRefResolution:
         assert claims[0].subject == 'task'
         assert claims[0].ref == '3142'
         assert claims[0].project_id == 'dark_factory'
+
+    @pytest.mark.parametrize(
+        ('text', 'writer', 'project'),
+        [
+            ('dark-factory task 3142 has landed', 'reify', 'dark_factory'),
+            ('Dark-Factory task 3142 has landed', 'reify', 'dark_factory'),
+            ("dark-factory's task 3142 has landed", 'reify', 'dark_factory'),
+            ('DF task 3142 has landed', 'reify', 'dark_factory'),
+            ('dark-factory:3142 was merged', 'reify', 'dark_factory'),
+            ('dark-factory#3142 was merged', 'reify', 'dark_factory'),
+            ('Reify task 3142 has landed', 'dark_factory', 'reify'),
+        ],
+    )
+    def test_qualifier_spelling_folds_to_the_registered_project(self, text, writer, project):
+        claims = _extract(text, default_project_id=writer)
+
+        assert [(c.subject, c.ref, c.project_id) for c in claims] == [
+            ('task', '3142', project),
+        ], f'{text!r} -> {claims!r}'
+
+    def test_word_folding_to_an_unregistered_id_is_not_a_qualifier(self):
+        claims = _extract('dark-factory-side task 3142 has landed', default_project_id='reify')
+
+        assert [(c.subject, c.ref, c.project_id) for c in claims] == [
+            ('task', '3142', 'reify'),
+        ]
 
     def test_unqualified_ref_inherits_the_writers_project(self):
         claims = _extract('task 3142 has landed', default_project_id='reify')
