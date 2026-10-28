@@ -152,3 +152,56 @@ def test_main_lease_claim_on_a_non_int_pid_body_stands_down_instead_of_failing_o
     assert lines[0] == 'decision=stand-down'
     assert '<unknown>' in lines[1]
     assert lines[2] == 'holder_liveness=held'
+
+
+_NON_STR_FIELDS = pytest.mark.parametrize(
+    ('field', 'bad'),
+    [('session_slug', 7), ('start_ts', 3), ('record_slug', 5)],
+    ids=['session_slug', 'start_ts', 'record_slug'],
+)
+
+
+def _body_with(field: str, bad: object) -> dict[str, object]:
+    return {**_body(os.getpid()), field: bad}
+
+
+@_NON_STR_FIELDS
+def test_from_dict_rejects_a_non_str_field(field: str, bad: object) -> None:
+    with pytest.raises(TypeError, match=field) as excinfo:
+        sr.LeaseHolder.from_dict(_body_with(field, bad))
+    assert repr(bad) in str(excinfo.value)
+
+
+@_NON_STR_FIELDS
+def test_lease_status_reports_a_non_str_field_body_as_unreadable(
+    tmp_path: Path, field: str, bad: object
+) -> None:
+    _seed_raw_lease(tmp_path, 'watcher-df', _body_with(field, bad), age=timedelta(minutes=5))
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.state == 'unreadable'
+    assert status.holder_slug is None
+    assert status.holder_record_slug is None
+    assert status.holder_record_state is sr.HolderRecordState.UNLINKED
+
+
+def test_claim_lease_within_ttl_on_a_non_int_record_slug_body_stands_down(tmp_path: Path) -> None:
+    _seed_raw_lease(tmp_path, 'watcher-df', _body_with('record_slug', 5), age=_WITHIN_TTL)
+
+    claim = sr.claim_lease(
+        'watcher-df', holder=_claimant(), policy=sr.LeasePolicy.STAND_DOWN, root=tmp_path, now=_NOW
+    )
+
+    assert claim.decision is sr.LeaseDecision.STAND_DOWN
+    assert claim.holder is None
+    assert '<unknown>' in claim.message
+
+
+@pytest.mark.parametrize('present', [True, False], ids=['null', 'missing'])
+def test_falsy_record_slug_still_reads_as_unlinked(present: bool) -> None:
+    body = _body(os.getpid())
+    if present:
+        body['record_slug'] = None
+
+    assert sr.LeaseHolder.from_dict(body).record_slug == ''
