@@ -694,3 +694,56 @@ async def test_scenario_40_a_recovery_is_judged_at_its_evidence_head_not_the_end
     after = read_debt(lane.ledger, A)
     assert after is not None and after.open_count == 1
     assert len(lane.client.submitted) == 1
+
+
+# --- the fix digest names the live de-flake owner ---------------------------------------
+
+
+async def _owed(lane: Lane, node: str = A) -> str:
+    """*node* cleared once with no episode and drained: the id of its open de-flake owner."""
+    await lane.red(reproduced=(), cleared=(node,))
+    await lane.drain()
+    debt = read_debt(lane.ledger, node)
+    assert debt is not None and debt.owner_task_id is not None
+    lane.clock.advance(minutes=30)
+    return debt.owner_task_id
+
+
+@pytest.mark.parametrize(('status', 'named'), [('pending', True), ('deferred', True), ('done', False)])
+@pytest.mark.asyncio
+async def test_the_fix_digest_names_a_live_de_flake_owner(tmp_path: Path, status: str, named: bool):
+    lane = Lane(tmp_path)
+    owner = await _owed(lane)
+    lane.client.tasks[owner]['status'] = status
+
+    await _fix_filed(lane)
+
+    details = lane.client.submitted[-1]['details']
+    assert ('Live de-flake owners:' in details) is named
+    assert (f'{A}: task {owner}' in details) is named
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_owner_status_is_named_as_unreadable_and_the_fix_is_still_filed(tmp_path: Path):
+    lane = Lane(tmp_path)
+    owner = await _owed(lane)
+    await lane.red()
+    lane.client.statuses_error = ConnectionError('task store unreachable')
+
+    effect = await lane.spaced_red()
+
+    assert len(effect.tasks_filed) == 1
+    assert f'{A}: task {owner} (status unreadable' in lane.client.submitted[-1]['details']
+
+
+@pytest.mark.asyncio
+async def test_only_the_tests_owing_debt_are_listed(tmp_path: Path):
+    lane = Lane(tmp_path)
+    owner = await _owed(lane, B)
+    await lane.red((A, B))
+
+    await lane.spaced_red(A, B)
+
+    details = lane.client.submitted[-1]['details']
+    assert f'{B}: task {owner}' in details
+    assert f'{A}: task' not in details
