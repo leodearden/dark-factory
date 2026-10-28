@@ -17,13 +17,15 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from escalation.queue import EscalationQueue
 from shared.psi import PsiSample
 
 from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig, StarvationWatchdogConfig
 from orchestrator.eligibility_clock import EligibilityClockStore
 from orchestrator.event_store import EventStore
-from orchestrator.overrides import OverrideStore
+from orchestrator.overrides import OverrideSource, OverrideStore
 from orchestrator.scheduler import Scheduler, SchedulerCallbacks, TaskAssignment
+from orchestrator.starvation_watchdog import AUTO_PIN_CAP_SENTINEL
 
 T0 = datetime(2026, 10, 1, tzinfo=UTC)
 FLOOR = 259200.0
@@ -102,8 +104,23 @@ class _Rig:
     def warned_ids(self) -> list[str]:
         return [str(c.args[0]) for c in self.warn.call_args_list]
 
+    @property
+    def root(self) -> str:
+        return str(self.scheduler.config.project_root)
+
     def override_rows(self) -> dict:
-        return self.overrides.get_overrides(str(self.scheduler.config.project_root))
+        return self.overrides.get_overrides(self.root)
+
+    def watchdog_pins(self) -> list[str]:
+        return [
+            tid for tid, row in self.overrides.get_pin_queue(self.root)
+            if row.source is OverrideSource.STARVATION_WATCHDOG
+        ]
+
+    def set_status(self, task_id: str, status: str) -> None:
+        for task in self.tasks:
+            if str(task['id']) == task_id:
+                task['status'] = status
 
 
 def _rig(
@@ -330,6 +347,156 @@ async def test_a_young_park_suppresses_every_gate_even_when_dual_is_satisfied(
 
     assert rig.detected() == []
     rig.warn.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Bounded, owned auto-pin (task 3821)
+# ---------------------------------------------------------------------------
+
+
+async def _refused_while_lows_dispatch(rig: _Rig, *extra: dict) -> None:
+    """S ('2') is refused hot/b.py in three scans that a lower-ranked low task wins.
+
+    A young high task ('1') stays the top candidate, so S accrues lock
+    refusals but no top-skips.  The next tick's watchdog pass fires S on
+    gate 'lock_refused'.
+    """
+    rig.set_tasks([_seed(), _task('2', 'medium', 'hot/b.py'), *extra])
+    assert await rig.tick_id() == '0'
+    rig.advance(FLOOR)
+    rig.tasks.append(_task('1', 'high', 'hot/a.py'))
+    for _ in range(3):
+        await rig.tick_with_low_winner()
+    assert rig.detected() == []
+
+
+@pytest.mark.asyncio
+async def test_a_fire_pins_the_task_after_the_operator_pins(tmp_path: Path) -> None:
+    rig = _rig(tmp_path)
+    for tid in ('B1', 'B2'):
+        rig.overrides.set_override(rig.root, tid, pinned=True)
+    blocked = [_task(tid, 'medium', f'free/{tid}.py') for tid in ('B1', 'B2')]
+    for task in blocked:
+        task['status'] = 'blocked'
+    await _refused_while_lows_dispatch(rig, *blocked)
+
+    await rig.tick_with_low_winner()
+
+    queue = rig.overrides.get_pin_queue(rig.root)
+    assert [(tid, row.pin_order, row.source) for tid, row in queue] == [
+        ('B1', 1, OverrideSource.OPERATOR),
+        ('B2', 2, OverrideSource.OPERATOR),
+        ('2', 3, OverrideSource.STARVATION_WATCHDOG),
+    ]
+    ttl = rig.scheduler.config.starvation_watchdog.auto_pin_ttl_secs
+    assert queue[2][1].ttl_until == rig.wall[0] + timedelta(seconds=ttl)
+    [event] = rig.detected('2')
+    assert event['gate'] == 'lock_refused'
+    assert event['auto_pinned'] is True
+    assert event['pin_order'] == 3
+    assert event['source'] == 'starvation_watchdog'
+    assert event['disposition'] == 'auto_pinned'
+    assert rig.warned_ids() == ['2']
+    assert rig.warn.call_args.kwargs['level'] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'override', [{'pinned': True}, {'boost_tier': 'high'}], ids=['pinned', 'boost-only'],
+)
+async def test_an_operator_row_is_never_touched(tmp_path: Path, override: dict) -> None:
+    rig = _rig(tmp_path)
+    await _refused_while_lows_dispatch(rig)
+    rig.overrides.set_override(rig.root, '2', **override)
+    before = rig.override_rows()['2']
+
+    await rig.tick_with_low_winner()
+
+    assert rig.override_rows()['2'] == before
+    [event] = rig.detected('2')
+    assert event['auto_pinned'] is False
+    assert event['disposition'] == 'operator_override'
+    assert event['source'] == 'operator'
+    assert rig.warned_ids() == ['2']
+
+
+@pytest.mark.asyncio
+async def test_the_cap_bounds_watchdog_pins_and_files_one_cohort_l1(tmp_path: Path) -> None:
+    rig = _rig(tmp_path, auto_pin_max_concurrent=2, auto_pin_ttl_secs=10 * FLOOR)
+    queue = EscalationQueue(tmp_path / 'esc')
+    rig.scheduler.escalation_queue = queue
+    seed = _task('0', 'critical', 'hot/a.py', 'hot/b.py', 'hot/c.py', 'hot/d.py')
+    rig.set_tasks([seed, _task('S1', 'medium', 'hot/b.py'), _task('S2', 'medium', 'hot/c.py')])
+    assert await rig.tick_id() == '0'
+    rig.advance(60)
+    rig.tasks.append(_task('S3', 'medium', 'hot/d.py'))
+    assert await rig.tick() is None
+    rig.advance(FLOOR)
+    rig.tasks.append(_task('1', 'high', 'hot/a.py'))
+    rig.tasks.append(_task('S4', 'medium', 'hot/d.py'))
+    for _ in range(4):
+        await rig.tick_with_low_winner()
+
+    assert sorted(rig.watchdog_pins()) == ['S1', 'S2']
+    [capped] = rig.detected('S3')
+    assert capped['disposition'] == 'cap_reached'
+    assert capped['auto_pinned'] is False
+    assert sorted(rig.warned_ids()) == ['S1', 'S2']
+    [cap_l1] = queue.get_by_task(AUTO_PIN_CAP_SENTINEL, status='pending', level=1)
+    assert 'task S3' in cap_l1.detail
+
+    rig.advance(FLOOR)
+    await rig.tick_with_low_winner()
+
+    [later] = rig.detected('S4')
+    assert later['disposition'] == 'cap_reached'
+    assert len(queue.get_by_task(AUTO_PIN_CAP_SENTINEL, status='pending', level=1)) == 1
+    assert sorted(rig.watchdog_pins()) == ['S1', 'S2']
+
+
+@pytest.mark.asyncio
+async def test_dispatch_releases_the_watchdog_pin_but_never_an_operator_pin(
+    tmp_path: Path,
+) -> None:
+    rig = _rig(tmp_path)
+    await _refused_while_lows_dispatch(rig)
+    await rig.tick_with_low_winner()
+    assert rig.watchdog_pins() == ['2']
+
+    rig.scheduler.release('0')
+    assert await rig.tick_id() == '2'
+    assert '2' not in rig.override_rows()
+
+    rig.tasks.append(_task('OP', 'low', 'free/op.py'))
+    rig.overrides.set_override(rig.root, 'OP', pinned=True)
+    assert await rig.tick_id() == 'OP'
+    assert rig.override_rows()['OP'].source is OverrideSource.OPERATOR
+
+
+@pytest.mark.asyncio
+async def test_leaving_pending_releases_the_watchdog_pin(tmp_path: Path) -> None:
+    rig = _rig(tmp_path)
+    await _refused_while_lows_dispatch(rig)
+    await rig.tick_with_low_winner()
+    assert rig.watchdog_pins() == ['2']
+
+    rig.set_status('2', 'blocked')
+    await rig.tick()
+
+    assert '2' not in rig.override_rows()
+
+
+@pytest.mark.asyncio
+async def test_a_previous_process_watchdog_pin_is_released_at_dispatch(tmp_path: Path) -> None:
+    store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+    assert store.create_watchdog_pin(
+        str(tmp_path), 'W', ttl_until=T0 + timedelta(days=3650),
+    ) == 1
+    rig = _rig(tmp_path, tasks=[_task('W', 'low', 'free/w.py')])
+
+    assert await rig.tick_id() == 'W'
+
+    assert 'W' not in rig.override_rows()
 
 
 # ---------------------------------------------------------------------------
