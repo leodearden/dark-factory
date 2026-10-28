@@ -1588,11 +1588,11 @@ _NON_TERMINAL_OUTCOMES: frozenset[OutcomeKind] = frozenset({
 ``plan_files_narrowed``: a mid-submission waypoint — enqueue / ``merge_queued``
 follows in the same flow.
 
-FROZEN CONTRACT: this exact set is mirrored by the dashboard's
-``_ACTIVE_ONLY`` allowlist (``dashboard/src/dashboard/data/merge_queue.py``),
-which has no import on this module. Changing this set REQUIRES updating that
-allowlist in the same change — see the pinning test in
-``tests/test_outcome_kind.py::TestOutcomeKindFrozenContract``.
+FROZEN CONTRACT: ``scripts/merge_lane_throughput.py::_NON_TERMINAL_OUTCOMES``
+mirrors this exact set as literal strings and does not import this module, so
+nothing fails on its side if this set changes. Changing this set REQUIRES
+updating that mirror in the same change — the pinning test is
+``orchestrator/tests/test_outcome_kind.py::TestOutcomeKindFrozenContract``.
 """
 
 
