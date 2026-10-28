@@ -186,6 +186,21 @@ def test_lease_status_reports_a_non_str_field_body_as_unreadable(
     assert status.holder_record_state is sr.HolderRecordState.UNLINKED
 
 
+@_NON_STR_FIELDS
+def test_reap_stale_leases_reaps_a_non_str_field_body_as_corrupt_not_stale_pid(
+    tmp_path: Path, field: str, bad: object
+) -> None:
+    body = {**_body(_DEAD_PID), field: bad}
+    _seed_raw_lease(tmp_path, 'a-bad-field', body, age=_PAST_TTL)
+    _seed_raw_lease(tmp_path, 'b-bad-field-fresh', body, age=_WITHIN_TTL)
+
+    reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
+
+    assert {r.lease_name: r.reason for r in reaped} == {'a-bad-field': 'corrupt'}
+    remaining = {p.stem for p in sr.leases_dir(root=tmp_path).glob('*.lease')}
+    assert remaining == {'b-bad-field-fresh'}
+
+
 def test_claim_lease_within_ttl_on_a_non_int_record_slug_body_stands_down(tmp_path: Path) -> None:
     _seed_raw_lease(tmp_path, 'watcher-df', _body_with('record_slug', 5), age=_WITHIN_TTL)
 
