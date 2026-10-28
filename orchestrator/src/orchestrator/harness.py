@@ -179,6 +179,7 @@ from orchestrator.slot_lease import (
     suspended_slot_tasks,
     wedged_slot_escalation,
 )
+from orchestrator.starvation_watchdog import STARVATION_WATCHDOG_ROLE
 from orchestrator.strand_conversion import record_strand_conversion
 from orchestrator.stranded_verified_green import (
     DURABLE_MERGE_FAILURE_STATUSES,
@@ -8649,15 +8650,15 @@ class Harness:
         deduped while a pending watchdog escalation already exists.  No-ops
         gracefully when no escalation queue is attached.
 
-        **Routing note:** filed at ``severity='info', level=0``.  Level-0 INFO
-        escalations are surfaced via the steward's pending-escalation view and
-        any external monitors polling the escalation queue (e.g. dashboards,
-        alerting webhooks).  They do NOT auto-promote to L1/L2 and do NOT
-        block or interrupt the scheduler — they are a passive signal intended
-        for an operator reviewing the queue at their next opportunity.  If
-        immediate paging is required for a specific deployment, configure an
-        external monitor to watch for ``agent_role='orchestrator-starvation-watchdog'``
-        pending entries and promote or alert as appropriate.
+        **Routing note:** filed at ``severity='info'`` and the scheduler's
+        *level*.  Level 0 is the info trail of a pinning gate (``dual``,
+        ``lock_refused``): the info-L0 router (task 5223) closes it as
+        status-info, keyed by ``STARVATION_WATCHDOG_ROLE``, which
+        ``escalation.classify.INFO_L0_MECHANICAL_ROLES`` must list.  Level 1
+        is a ``park_blocked`` firing: an auto-pin cannot help a task parked
+        behind a live holder, so a human sees it.  Neither feeds the EWA
+        breaker's numerator (``digest.counts_toward_ewa_numerator``): the
+        watchdog's alarms are observations, not faults.
         """
         if not self._escalation_queue:
             return
@@ -8665,7 +8666,7 @@ class Harness:
         existing = [
             e
             for e in self._escalation_queue.get_by_task(task_id, status='pending')
-            if e.agent_role == 'orchestrator-starvation-watchdog'
+            if e.agent_role == STARVATION_WATCHDOG_ROLE
         ]
         if existing:
             logger.debug(
@@ -8680,7 +8681,7 @@ class Harness:
         esc = Escalation(
             id=self._escalation_queue.make_id(task_id),
             task_id=task_id,
-            agent_role='orchestrator-starvation-watchdog',
+            agent_role=STARVATION_WATCHDOG_ROLE,
             severity='info',
             category='risk_identified',
             summary=summary[:200],
@@ -8697,11 +8698,12 @@ class Harness:
         )
 
     async def _resolve_starvation_info(self, task_id: str) -> None:
-        """Resolve an open starvation-watchdog INFO escalation for a task.
+        """Resolve every open starvation-watchdog escalation (L0 or L1) for a task.
 
         Wired as ``on_starvation_resolve`` in the ``SchedulerCallbacks`` bundle.
         Called at both dispatch sites and from the GC backstop when the task
-        is terminal.
+        leaves ``pending``, so an open watchdog L1 cannot outlive the wait it
+        reports.
 
         Uses ``EscalationQueue.resolve`` which is idempotent (no-op if already
         resolved), so double-resolve from the dispatch site and the GC backstop
@@ -8713,13 +8715,13 @@ class Harness:
         pending = [
             e
             for e in self._escalation_queue.get_by_task(task_id, status='pending')
-            if e.agent_role == 'orchestrator-starvation-watchdog'
+            if e.agent_role == STARVATION_WATCHDOG_ROLE
         ]
         for esc in pending:
             self._escalation_queue.resolve(
                 esc.id,
                 'auto-resolved: task dispatched (starvation watchdog)',
-                resolved_by='orchestrator-starvation-watchdog',
+                resolved_by=STARVATION_WATCHDOG_ROLE,
             )
             logger.info(
                 'Starvation watchdog: auto-resolved INFO escalation %s for task %s',
@@ -16372,8 +16374,10 @@ class Harness:
         # May drift by a small constant under concurrency; not a correctness gate.
         self._escalation_event_count += 1  # task 1327 AFK hardening
         # A submission advances the EWA numerator as well as the gate; a
-        # resolution (below) advances the gate ONLY.  Task 4559.
-        self._escalation_submit_count += 1  # task 4559 — EWA numerator
+        # resolution (below) advances the gate ONLY.  Task 4559.  A
+        # starvation-watchdog alarm advances the gate only (task 3821).
+        if digest_mod.counts_toward_ewa_numerator(escalation):
+            self._escalation_submit_count += 1  # task 4559 — EWA numerator
         event = self._escalation_events.get(escalation.task_id)
         if event:
             event.set()
