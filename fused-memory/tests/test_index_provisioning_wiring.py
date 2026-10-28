@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Set as AbstractSet
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -35,7 +36,11 @@ from _falkor_index_doubles import (
 )
 from shared.testing_virtual_clock import virtual_clock_test
 
-from fused_memory.backends.falkor_indices import expected_index_set, plan_index_statements
+from fused_memory.backends.falkor_indices import (
+    IndexSpec,
+    expected_index_set,
+    plan_index_statements,
+)
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV
@@ -43,7 +48,7 @@ from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV
 _LOGGER = 'fused_memory.backends.graphiti_client'
 
 
-def _plan_for(present: set) -> list[str]:
+def _plan_for(present: AbstractSet[IndexSpec]) -> list[str]:
     """The statements β issues against a graph that already carries *present*."""
     return [statement for statement, _specs in plan_index_statements(expected_index_set() - present)]
 

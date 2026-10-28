@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from collections.abc import Set as AbstractSet
 from unittest.mock import MagicMock
 
 import redis.exceptions
@@ -39,13 +40,13 @@ LIVE_HEADER = [
 #: The trap state esc-3375-1 protected as evidence: an ``Entity(uuid)`` and a
 #: ``RELATES_TO(uuid)`` range index, and nothing else.  Every composite range
 #: statement upstream emits for those two labels is rejected wholesale against it.
-TRAP_PRESENT = {
+TRAP_PRESENT: frozenset[IndexSpec] = frozenset({
     ('Entity', 'NODE', 'uuid', 'RANGE'),
     ('RELATES_TO', 'RELATIONSHIP', 'uuid', 'RANGE'),
-}
+})
 
 
-def rows_for(specs: set[IndexSpec]) -> list[list]:
+def rows_for(specs: AbstractSet[IndexSpec]) -> list[list]:
     """Invert the normal form back into ``CALL db.indexes()``-shaped rows.
 
     FalkorDB merges every index on a label into ONE record, so specs are grouped
@@ -107,7 +108,7 @@ class StatefulGraph:
     interleave at all.
     """
 
-    def __init__(self, present: set[IndexSpec]):
+    def __init__(self, present: AbstractSet[IndexSpec]):
         self.present = set(present)
         self.issued: list[str] = []
 
