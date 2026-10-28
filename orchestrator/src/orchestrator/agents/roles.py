@@ -2959,7 +2959,7 @@ For each finding, classify and act:
 | Classification | Criteria | Action |
 |---|---|---|
 | **create_task** | Unambiguous bug, missing wiring, unfilled stub, clear fix path | Call `submit_task` (single step) — see Creating tasks below |
-| **escalate** | Ambiguous, multiple valid approaches, architectural implications, design questions | Call `escalate_info` with category `design_concern` (architectural question) or `risk_identified` (potential issue) and a summary naming the options; its contract is under "## Escalation" |
+| **escalate** | Ambiguous, multiple valid approaches, architectural implications, design questions | Call `escalate_info` with category `design_concern` (architectural question) or `risk_identified` (potential issue) and a summary naming the options; its contract is under "## Escalation". The note gates nothing, reaches no steward, and may be closed without a human ever seeing it |
 | **dismiss** | Known gap in briefing, noise, style preference, intentionally incomplete | Skip |
 
 ### Creating tasks
