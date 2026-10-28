@@ -61,12 +61,20 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from shared.psi import PsiSample, cpu_some10_or_none, read_psi_sample
 from shared.task_statuses import OwnerLiveness, TaskStatus, owner_liveness
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask, SubmittedTicket
 
-from orchestrator.flake_ledger import FlakeLedgerTaskClient, fix_contained, resolving_commit
+from orchestrator.flake_ledger import (
+    FlakeCallSite,
+    FlakeLedgerTaskClient,
+    fix_contained,
+    resolving_commit,
+)
+from orchestrator.flake_recorder import record_call_site_observations
 from orchestrator.offline_lane_confirm import Confirmed, Outage, Unconfirmable, outcome_from_json
 from orchestrator.offline_lane_episode_state import (
+    Applied,
     CommandRecord,
     CoveringVerdict,
     Episode,
@@ -110,6 +118,7 @@ from orchestrator.offline_lane_filing import (
     build_lane_fix_task_arguments,
     covering_lane_task,
 )
+from orchestrator.offline_lane_ledger import pass_suppressions
 from orchestrator.offline_lane_records import (
     RECORD_RETENTION,
     PassRecord,
@@ -420,6 +429,7 @@ class LaneEngine:
         escalation_queue: EscalationQueue | None,
         now: Callable[[], datetime] | None = None,
         probe_runner: ProbeSeam = run_probe,
+        read_psi: Callable[[], PsiSample] = read_psi_sample,
     ) -> None:
         self._config = config
         self._git = git
@@ -427,6 +437,7 @@ class LaneEngine:
         self._queue = escalation_queue
         self._now = now or _utc_now
         self._probe_runner = probe_runner
+        self._read_psi = read_psi
         self._store = EpisodeStore(config.project_root, clock=self._now)
         self._records = RunRecordStore(config.project_root, clock=self._now)
 
@@ -440,6 +451,7 @@ class LaneEngine:
         record = await self._with_recorded_history(record, observation)
         reads, statuses = await self._pass_reads(record, observation)
         applied = apply_pass(record, observation, reads, policy, self._now())
+        await self._recorded_in_ledger(record, applied, observation)
         record = applied.record
         await self._save(record)
         unfinished = {
@@ -458,6 +470,32 @@ class LaneEngine:
         if record != saved:
             await self._save(record)
         return replace(applied.effect, tasks_filed=(*filed, *opened), escalations_raised=(*raised, *probed))
+
+    async def _recorded_in_ledger(self, before: CommandRecord, applied: Applied, observation: PassObservation) -> None:
+        """D6: what this pass tells the flake ledger, written before the episodes' new state and any filing."""
+        if not isinstance(observation.outcome, Confirmed | Unconfirmable):
+            return
+        record_dir = str(self._records.pass_directory(observation.command, observation.pass_id))
+        await record_call_site_observations(
+            pass_suppressions(observation, record_dir=record_dir, psi_cpu_some10=self._pressure()),
+            call_site=FlakeCallSite.offline_lane,
+            project_root=self._config.project_root,
+            project_id=self._config.fused_memory.project_id,
+            head_sha=observation.head,
+            observed_at=observation.started_at.isoformat(),
+            observing_task_id=None,
+            debt_eligible={},
+            event_store=None,
+            escalation_queue=self._queue,
+        )
+
+    def _pressure(self) -> float | None:
+        """Host CPU pressure for the ledger's rows; a failed read is ``None`` and never changes an outcome."""
+        try:
+            return cpu_some10_or_none(self._read_psi())
+        except Exception:
+            logger.warning('offline-lane: host pressure read failed; recording psi_cpu_some10=None', exc_info=True)
+            return None
 
     async def _observed_outage(self, observation: PassObservation, probe: ProbeResult) -> PassEffect:
         """D5's outage row: held episodes are marked, the probe records kept, and nothing is filed."""
