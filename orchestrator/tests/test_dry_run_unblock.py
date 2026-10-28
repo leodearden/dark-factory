@@ -3642,3 +3642,75 @@ class TestPriorInvestigationCoversReblock:
         await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
 
         assert invoke.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# task 3125 review fix: when the branch identity cannot be captured, coverage
+# dedup is off for that run, and the run says so at WARNING.
+# ---------------------------------------------------------------------------
+
+def _trunk_only_repo(tmp_path: Path) -> Path:
+    """A real repo with no `main` ref, so `git diff main...HEAD` exits non-zero."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _init_git_repo(repo)
+    _git(repo, 'branch', '-m', 'main', 'trunk')
+    return repo
+
+
+def _dry_run_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == 'orchestrator.dry_run_unblock'
+    ]
+
+
+class TestBranchPatchIdFailureIsLoud:
+    @pytest.mark.asyncio
+    async def test_missing_main_ref_warns_and_still_investigates(self, tmp_path, caplog):
+        repo = _trunk_only_repo(tmp_path)
+        scheduler = _fresh_scheduler()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            invoke = await _investigate(repo, scheduler, reason='verify exhausted')
+
+        warnings = _dry_run_warnings(caplog)
+        assert len(warnings) == 1, warnings
+        assert _COVER_TASK_ID in warnings[0], warnings[0]
+        assert str(repo) in warnings[0], warnings[0]
+        assert 'main' in warnings[0], warnings[0]
+        assert invoke.await_count == 1
+        assert (await _proposals(scheduler))[-1]['branch_patch_id'] is None
+
+    @pytest.mark.asyncio
+    async def test_git_spawn_exception_warns_and_still_investigates(self, tmp_path, caplog):
+        repo = _feature_repo(tmp_path)
+        scheduler = _fresh_scheduler()
+        no_git = AsyncMock(side_effect=FileNotFoundError('git not found'))
+
+        with (
+            patch('orchestrator.dry_run_unblock.run_git', new=no_git),
+            caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'),
+        ):
+            invoke = await _investigate(repo, scheduler, reason='verify exhausted')
+
+        warnings = _dry_run_warnings(caplog)
+        assert len(warnings) == 1, warnings
+        assert _COVER_TASK_ID in warnings[0], warnings[0]
+        assert str(repo) in warnings[0], warnings[0]
+        assert 'git not found' in warnings[0], warnings[0]
+        assert invoke.await_count == 1
+        assert (await _proposals(scheduler))[-1]['branch_patch_id'] is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_identity_never_skips(self, tmp_path, caplog):
+        repo = _trunk_only_repo(tmp_path)
+        scheduler = _fresh_scheduler()
+        invoke = AsyncMock(return_value=_proposal_result())
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+            await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+
+        assert invoke.await_count == 2
+        assert len(_dry_run_warnings(caplog)) == 2, _dry_run_warnings(caplog)
