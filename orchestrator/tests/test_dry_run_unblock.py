@@ -12,6 +12,7 @@ import json as _json
 import logging
 import re
 import subprocess
+from datetime import datetime
 from importlib import resources as pkg_resources
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -3384,3 +3385,219 @@ class TestSkillCommandsFitTheEnvelope:
         assert not unadmitted, (
             f'the unblock-auto skill instructs calls its envelope denies: {unadmitted}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3125 guard (2): a re-block the latest proposal already covers is not
+# re-investigated, and the coverage key survives a rebase onto a moved main.
+# State is read through the public scheduler.get_task only.
+# ---------------------------------------------------------------------------
+
+_COVER_TASK_ID = '3125'
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', '-C', str(repo), *args], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _commit_file(repo: Path, name: str, text: str, message: str) -> str:
+    """Commit one named file; never `git add .`, which would sweep in the
+    investigation's `.task/` config dir."""
+    (repo / name).write_text(text)
+    _git(repo, 'add', name)
+    _git(repo, 'commit', '-m', message)
+    return _git(repo, 'rev-parse', 'HEAD')
+
+
+def _feature_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _init_git_repo(repo)
+    _git(repo, 'checkout', '-b', 'feature')
+    _commit_file(repo, 'extra.txt', 'feature work\n', 'feature commit')
+    return repo
+
+
+def _advance_main_and_rebase(repo: Path) -> str:
+    before = _git(repo, 'rev-parse', 'HEAD')
+    _git(repo, 'checkout', 'main')
+    _commit_file(repo, 'unrelated.txt', 'main moved on\n', 'advance main')
+    _git(repo, 'checkout', 'feature')
+    _git(repo, 'rebase', 'main')
+    after = _git(repo, 'rev-parse', 'HEAD')
+    assert after != before, 'test precondition: the rebase must move HEAD'
+    return after
+
+
+def _proposal_result(risk_label: str = 'human-review-required'):
+    return _make_agent_result(structured_output={
+        'proposal_text': 'Re-spec the task',
+        'risk_label': risk_label,
+        'files_referenced': [],
+    })
+
+
+async def _investigate(
+    worktree: Path, scheduler, *, reason: str,
+    risk_label: str = 'human-review-required', invoke: AsyncMock | None = None,
+) -> AsyncMock:
+    from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+    if invoke is None:
+        invoke = AsyncMock(return_value=_proposal_result(risk_label))
+    with patch('orchestrator.dry_run_unblock.invoke_agent', new=invoke):
+        await run_dry_run_unblock(
+            task_id=_COVER_TASK_ID,
+            worktree=str(worktree),
+            reason=reason,
+            detail='',
+            scheduler=scheduler,
+            mcp=MagicMock(),
+            config=_make_config(),
+        )
+    return invoke
+
+
+async def _proposals(scheduler) -> list[dict]:
+    task = await scheduler.get_task(_COVER_TASK_ID)
+    return task['metadata']['dry_run_proposals']
+
+
+def _fresh_scheduler() -> _RecordingScheduler:
+    return _RecordingScheduler({'dry_run_proposals': [], 'files': ['src/foo.py']})
+
+
+class TestPriorInvestigationCoversReblock:
+    @pytest.mark.asyncio
+    async def test_entry_stamps_branch_patch_id(self, tmp_path):
+        from orchestrator.dry_run_unblock import DRY_RUN_PROPOSAL_SCHEMA
+
+        repo = _feature_repo(tmp_path)
+        scheduler = _fresh_scheduler()
+
+        await _investigate(repo, scheduler, reason='verify exhausted')
+
+        latest = (await _proposals(scheduler))[-1]
+        assert isinstance(latest.get('branch_patch_id'), str)
+        assert latest['branch_patch_id']
+        assert 'branch_patch_id' not in DRY_RUN_PROPOSAL_SCHEMA['properties']
+
+    @pytest.mark.asyncio
+    async def test_same_content_same_reason_is_not_reinvestigated(self, tmp_path):
+        """The skip re-affirms the entry's currency for the briefing's
+        last_blocked_at check without touching the age b3_gate reads."""
+        repo = _feature_repo(tmp_path)
+        scheduler = _fresh_scheduler()
+        invoke = AsyncMock(return_value=_proposal_result())
+
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+        first = dict((await _proposals(scheduler))[-1])
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+
+        assert invoke.await_count == 1
+        proposals = await _proposals(scheduler)
+        assert len(proposals) == 1
+        assert (
+            datetime.fromisoformat(proposals[-1]['timestamp'])
+            > datetime.fromisoformat(first['timestamp'])
+        )
+        assert proposals[-1]['investigated_at'] == first['investigated_at']
+
+    @pytest.mark.asyncio
+    async def test_rebase_onto_advanced_main_is_not_reinvestigated(self, tmp_path):
+        repo = _feature_repo(tmp_path)
+        scheduler = _fresh_scheduler()
+        invoke = AsyncMock(return_value=_proposal_result())
+
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+        _advance_main_and_rebase(repo)
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+
+        assert invoke.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_rebase_during_investigation_is_not_reinvestigated(self, tmp_path):
+        """The entry is stamped from the dispatch-time capture; a rebase while
+        the agent runs leaves the patch-id, and so the coverage, intact."""
+        repo = _feature_repo(tmp_path)
+        scheduler = _fresh_scheduler()
+
+        def _rebase_then_answer(*_args, **_kwargs):
+            _advance_main_and_rebase(repo)
+            return _proposal_result()
+
+        rebasing = AsyncMock(side_effect=_rebase_then_answer)
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=rebasing)
+        second = await _investigate(repo, scheduler, reason='verify exhausted')
+
+        assert rebasing.await_count == 1
+        assert second.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_new_branch_content_is_reinvestigated(self, tmp_path):
+        repo = _feature_repo(tmp_path)
+        scheduler = _fresh_scheduler()
+        invoke = AsyncMock(return_value=_proposal_result())
+
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+        _commit_file(repo, 'more.txt', 'more feature work\n', 'second feature commit')
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+
+        assert invoke.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_different_block_reason_is_reinvestigated(self, tmp_path):
+        repo = _feature_repo(tmp_path)
+        scheduler = _fresh_scheduler()
+        invoke = AsyncMock(return_value=_proposal_result())
+
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+        await _investigate(
+            repo, scheduler, reason='Steward re-escalated to human', invoke=invoke,
+        )
+
+        assert invoke.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_empty_branch_is_an_identity(self, tmp_path):
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        scheduler = _fresh_scheduler()
+        invoke = AsyncMock(return_value=_proposal_result())
+
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+
+        assert invoke.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_legacy_entry_without_patch_id_does_not_cover(self, tmp_path):
+        repo = _feature_repo(tmp_path)
+        scheduler = _RecordingScheduler({
+            'dry_run_proposals': [{
+                'proposal_text': 'written before branch_patch_id existed',
+                'risk_label': 'human-review-required',
+                'files_referenced': [],
+                'block_reason': 'verify exhausted',
+                'investigated_at': '2026-01-01T00:00:00+00:00',
+                'timestamp': '2026-01-01T00:00:00+00:00',
+            }],
+            'files': ['src/foo.py'],
+        })
+
+        invoke = await _investigate(repo, scheduler, reason='verify exhausted')
+
+        assert invoke.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_unknown_identity_fails_open(self, tmp_path):
+        scheduler = _fresh_scheduler()
+        invoke = AsyncMock(return_value=_proposal_result())
+
+        await _investigate(tmp_path, scheduler, reason='verify exhausted', invoke=invoke)
+        await _investigate(tmp_path, scheduler, reason='verify exhausted', invoke=invoke)
+
+        assert invoke.await_count == 2
