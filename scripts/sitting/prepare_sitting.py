@@ -157,7 +157,8 @@ def read_sources(
     sessions = ownership.index_sessions(sessions_root)
     if not sessions.available:
         shortfalls.append(Shortfall('session_registry', str(sessions_root), 'no sessions root'))
-    task_rows = _task_rows(queues)
+    queue_roots = inventory.queue_project_roots(queues)
+    task_rows = _task_rows(queue_roots)
     stored, problem = _load_preparations(preparation_path)
     shortfalls += [*found.shortfalls, *sessions.shortfalls, *([problem] if problem else [])]
     shortfalls += [Shortfall('tasks_db', project, rows.unavailable) for project, rows in task_rows.items()
@@ -354,8 +355,7 @@ def _queueless(roots: Iterable[str]) -> list[Shortfall]:
     ]
 
 
-def _task_rows(queues: Iterable[str]) -> Mapping[str, TaskRows]:
-    roots = {inventory.queue_project(q): root for q in queues if (root := inventory.queue_project_root(q)) is not None}
+def _task_rows(roots: Mapping[str, Path]) -> Mapping[str, TaskRows]:
     return MappingProxyType({project: ownership.load_task_rows(root) for project, root in roots.items()})
 
 
