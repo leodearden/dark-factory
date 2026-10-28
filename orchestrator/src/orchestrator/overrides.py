@@ -27,6 +27,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -45,12 +46,46 @@ CREATE TABLE IF NOT EXISTS overrides (
     ttl_until     TEXT,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'operator',
     PRIMARY KEY (project_root, task_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_overrides_pinned
     ON overrides(project_root, pinned, pin_order);
 """
+
+
+_ADD_SOURCE_COLUMN = (
+    "ALTER TABLE overrides ADD COLUMN source TEXT NOT NULL DEFAULT 'operator'"
+)
+
+
+class OverrideSource(StrEnum):
+    """Who owns an overrides row.
+
+    An operator write always takes ownership.  The starvation watchdog only
+    ever creates a row where none exists and only ever deletes rows it still
+    owns, so it can never clobber or clear an operator's override.
+    """
+
+    OPERATOR = 'operator'
+    STARVATION_WATCHDOG = 'starvation_watchdog'
+
+
+def _migrate_add_source_column(conn: sqlite3.Connection) -> None:
+    """Add ``source`` to a pre-ownership overrides table, idempotently.
+
+    fused-memory's override tools migrate the same file, so losing the race
+    to a concurrent ALTER ('duplicate column name') is success, not failure.
+    """
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(overrides)')}
+    if 'source' in columns:
+        return
+    try:
+        conn.execute(_ADD_SOURCE_COLUMN)
+    except sqlite3.OperationalError as exc:
+        if 'duplicate column name' not in str(exc):
+            raise
 
 
 class PinOrderCollision(Exception):
@@ -75,19 +110,22 @@ class OverrideRow:
     pin_order: int | None
     reserve_now: bool
     ttl_until: datetime | None
+    source: OverrideSource
+
+
+_ROW_COLUMNS = 'boost_tier, pinned, pin_order, reserve_now, ttl_until, source'
 
 
 def _row_to_override(row: Any) -> OverrideRow:
-    """Convert a sqlite3 Row to an OverrideRow."""
-    boost_tier, pinned, pin_order, reserve_now, ttl_until = (
-        row[0], row[1], row[2], row[3], row[4]
-    )
+    """Convert a sqlite3 row selected as ``_ROW_COLUMNS`` to an OverrideRow."""
+    boost_tier, pinned, pin_order, reserve_now, ttl_until, source = row
     return OverrideRow(
         boost_tier=boost_tier,
         pinned=bool(pinned),
         pin_order=pin_order,
         reserve_now=bool(reserve_now),
         ttl_until=datetime.fromisoformat(ttl_until) if ttl_until else None,
+        source=OverrideSource(source),
     )
 
 
@@ -146,6 +184,7 @@ class OverrideStore:
         conn = self._connect()
         try:
             conn.executescript(_SCHEMA)
+            _migrate_add_source_column(conn)
         finally:
             conn.close()
 
@@ -192,6 +231,10 @@ class OverrideStore:
         ``pin_order``; by contrast ``pinned=None`` (omitted) means unchanged.
         Use :meth:`clear_override` as the canonical way to clear any field to
         avoid this asymmetry.
+
+        **Ownership:** every call stamps ``source='operator'``, on insert and
+        on update alike, so an operator touching a watchdog pin takes it over
+        and :meth:`release_watchdog_pin` will no longer delete it.
 
         **Concurrency note:** ``set_override`` is the only writer in this
         class that opens its connection with ``isolation_level=None`` and an
@@ -294,8 +337,8 @@ class OverrideStore:
                     """
                     INSERT INTO overrides
                         (project_root, task_id, boost_tier, pinned, pin_order,
-                         reserve_now, ttl_until, created_at, updated_at)
-                    VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?)
+                         reserve_now, ttl_until, created_at, updated_at, source)
+                    VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?, ?)
                     ON CONFLICT(project_root, task_id) DO UPDATE SET
                         boost_tier  = COALESCE(?, boost_tier),
                         pinned      = COALESCE(?, pinned),
@@ -303,19 +346,20 @@ class OverrideStore:
                                            ELSE COALESCE(?, pin_order) END,
                         reserve_now = COALESCE(?, reserve_now),
                         ttl_until   = COALESCE(?, ttl_until),
-                        updated_at  = ?
+                        updated_at  = ?,
+                        source      = ?
                     """,
                     (
                         # INSERT values
                         project_root, task_id,
                         boost_tier, pinned_int, pin_order,
                         reserve_now_int, ttl_iso,
-                        now_iso, now_iso,
+                        now_iso, now_iso, OverrideSource.OPERATOR,
                         # UPDATE SET values
                         boost_tier, pinned_int,
                         pinned_int, pin_order,   # CASE WHEN new_pinned=0 THEN NULL ELSE COALESCE(new_pin_order, existing_pin_order) END
                         reserve_now_int, ttl_iso,
-                        now_iso,
+                        now_iso, OverrideSource.OPERATOR,
                     ),
                 )
                 conn.execute('COMMIT')
@@ -506,7 +550,7 @@ class OverrideStore:
         conn = self._connect()
         try:
             rows = conn.execute(
-                'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
+                f'SELECT task_id, {_ROW_COLUMNS} '
                 'FROM overrides WHERE project_root=?',
                 (project_root,),
             ).fetchall()
@@ -529,7 +573,7 @@ class OverrideStore:
         conn = self._connect()
         try:
             rows = conn.execute(
-                'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
+                f'SELECT task_id, {_ROW_COLUMNS} '
                 'FROM overrides '
                 'WHERE project_root=? AND pinned=1 '
                 'ORDER BY pin_order ASC',

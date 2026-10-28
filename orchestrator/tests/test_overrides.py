@@ -51,7 +51,7 @@ class TestSchema:
 
 class TestSetGet:
     def test_set_boost_then_get_overrides_returns_row(self, tmp_path: Path) -> None:
-        from orchestrator.overrides import OverrideRow, OverrideStore
+        from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 
         store = OverrideStore(tmp_path / 'scheduler_overrides.db')
         store.set_override('proj', 'task-A', boost_tier='high')
@@ -64,6 +64,7 @@ class TestSetGet:
                 pin_order=None,
                 reserve_now=False,
                 ttl_until=None,
+                source=OverrideSource.OPERATOR,
             )
         }
 
@@ -531,7 +532,7 @@ class TestSeparateDB:
         SQLite file from taskmaster state.  If someone ever consolidates the
         storage, this test will fail and force a conscious decision.
         """
-        from orchestrator.overrides import OverrideRow, OverrideStore
+        from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 
         db_path = tmp_path / 'scheduler_overrides.db'
         store = OverrideStore(db_path)
@@ -561,6 +562,7 @@ class TestSeparateDB:
             pin_order=1,
             reserve_now=False,
             ttl_until=None,
+            source=OverrideSource.OPERATOR,
         )
 
 
