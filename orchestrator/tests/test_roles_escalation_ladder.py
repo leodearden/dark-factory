@@ -58,6 +58,7 @@ from __future__ import annotations
 import pytest
 from escalation.models import ACTION_KEEP_DRIVING, ACTION_TERMINATE_CLEANLY
 
+from orchestrator.agents.harness_guidance import EXTERNAL_KILL_GUIDANCE
 from orchestrator.agents.roles import (
     _ESCALATION_INSTRUCTIONS,
     _ESCALATION_TOOLS,
@@ -65,7 +66,6 @@ from orchestrator.agents.roles import (
     ESCALATE_BLOCKER_TOOL,
     ESCALATE_INFO_CONTRACT,
     ESCALATION_LADDER_CORE,
-    EXTERNAL_KILL_GUIDANCE,
     INFO_ONLY_ESCALATION_INSTRUCTIONS,
     NON_STEWARD_LEVEL_GATE,
     RESERVED_BOUND_ROUTING_RULE,

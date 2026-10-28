@@ -29,12 +29,13 @@ precondition that is machine-checkable (IMPLEMENTER really does carry the
 block — see ``test_amender_reminder_cannot_dangle`` for the half that is not).
 
 Size figures are deliberately absent from this file, with one flagged
-historical exception (see ``test_combined_guidance_is_stated_up_front``). The
-block's measured bytes are stated in exactly one place — the comment above
-``WAIT_PATTERN_REMINDER`` in ``roles.py`` — together with the command to
-re-derive them. An earlier revision hand-copied the figure to 6 sites in this
-file and 2 in ``roles.py``, and all 8 were wrong (task 3607 review). Say "the
-full block".
+historical exception (see ``test_combined_guidance_is_stated_up_front``). No
+byte figure for the block is stated anywhere; re-derive one when you need it::
+
+    cd orchestrator && uv run python -c 'from orchestrator.agents.harness_guidance import BACKGROUND_WAIT_GUIDANCE, WAIT_PATTERN_REMINDER; print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))'
+
+An earlier revision hand-copied the figure to 6 sites in this file and 2 in
+``roles.py``, and all 8 were wrong (task 3607 review). Say "the full block".
 
 Its real effect is on model behaviour and is not unit-testable, but silent
 removal during a prompt refactor is a genuine safety regression — the repo
@@ -85,14 +86,14 @@ from _role_splice_contract import (
 )
 
 from orchestrator.agents.briefing import BriefingAssembler
-from orchestrator.agents.roles import (
+from orchestrator.agents.harness_guidance import (
     BACKGROUND_TASK_WARNING,
     BACKGROUND_WAIT_GUIDANCE,
     EXTERNAL_KILL_GUIDANCE,
-    ROLES,
     WAIT_PATTERN_GUIDANCE,
     WAIT_PATTERN_REMINDER,
 )
+from orchestrator.agents.roles import ROLES
 from orchestrator.config import OrchestratorConfig
 
 # Secondary, deliberately LOOSE bound on how much identity paragraph may
@@ -170,6 +171,9 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
     That idle mechanism is NOT uniform across the spliced roles, so two bounds
     are pinned here rather than one — see the second assertion for why
     ``timeouts.steward`` binds the steward through a different code path.
+    deep_reviewer is dispatched with no ``timeout_seconds`` at all
+    (``orchestrator/src/orchestrator/review_checkpoint.py``), so no watchdog
+    kill fires for it and only the harness Bash cap binds it.
 
     ``WAIT_PATTERN_GUIDANCE`` / ``WAIT_PATTERN_REMINDER`` state a ~25-minute
     background threshold derived from that 1800s bound. This test does NOT
@@ -178,9 +182,11 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
     reworded to say the opposite, so it costs every future prompt edit without
     buying correctness. What IS checkable is the premise the prose was derived
     from — if the config default moves, the derivation is stale and an editor
-    has to revisit the wording deliberately. The standing instruction not to
-    "restore" 3900000 lives as a provenance comment above the constants in
-    roles.py, which is the right home for an editorial rule.
+    has to revisit the wording deliberately. The standing rule for that
+    wording: 3900000 is the harness Bash cap, not the binding ceiling, so do not
+    "restore" it as the threshold. The ~25-minute threshold stays under the
+    tightest real ceiling, the steward's FLAT 1800s, which has no idle slack to
+    reclaim.
 
     BOTH sources of that 1800 are checked, because they are two hand-maintained
     copies and only one of them binds. ``defaults.yaml`` is what a dispatched
@@ -210,7 +216,7 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
         'wait-pattern guidance quotes 1800s / 30 minutes as the session idle '
         'bound and derives its ~25-minute background threshold from it. If the '
         'two now DISAGREE, defaults.yaml is the one that binds a dispatched '
-        'session — fix the drift first. Then update both constants in roles.py '
+        'session — fix the drift first. Then update both constants in harness_guidance.py '
         'to stay under the new bound, and update this assertion.'
     )
 
@@ -235,7 +241,7 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
         f'config.py Field default={field_steward}s (both were 1800s). '
         'WAIT_PATTERN_GUIDANCE tells the steward its ceiling is a FLAT 1800s / '
         '30 minutes from session start that nothing resets — update that bullet '
-        'in roles.py, and re-check that the ~25-minute background threshold '
+        'in harness_guidance.py, and re-check that the ~25-minute background threshold '
         'still leaves margin under the new value.'
     )
 
@@ -387,7 +393,7 @@ def test_combined_guidance_appears_exactly_once_per_role() -> None:
     ``BACKGROUND_TASK_WARNING`` and ``EXTERNAL_KILL_GUIDANCE`` counts are each
     checked separately because the combined unit CONTAINS them: a leftover bare
     ``+ BACKGROUND_TASK_WARNING`` tail, or an ``+ EXTERNAL_KILL_GUIDANCE``
-    appended to ``_BASH_CAPABLE_ROLE_PREAMBLE`` as well, would push that half's
+    appended to ``BASH_CAPABLE_ROLE_PREAMBLE`` as well, would push that half's
     count to 2 while the combined count stayed at 1.
 
     The counts were one combined ``{role: {const: count}}`` payload before task
@@ -418,7 +424,7 @@ def test_combined_guidance_appears_exactly_once_per_role() -> None:
             'A count of 2 for EXTERNAL_KILL_GUIDANCE means a stale standalone '
             '`+ EXTERNAL_KILL_GUIDANCE` survives beside the composed '
             'BACKGROUND_WAIT_GUIDANCE (e.g. appended to the tail of '
-            '_BASH_CAPABLE_ROLE_PREAMBLE as well), doubling the block in every '
+            'BASH_CAPABLE_ROLE_PREAMBLE as well), doubling the block in every '
             'session of that role — delete it, the composed unit already carries it.'
         ),
     )
@@ -473,8 +479,8 @@ def test_amender_reminder_cannot_dangle() -> None:
     source is precisely the brittle pin two review cycles removed from this
     file. So re-pointing ``build_amender_prompt`` at a role without the block
     would dangle the pointer silently — an accepted, documented gap, recorded
-    here and above ``WAIT_PATTERN_REMINDER`` in ``roles.py`` rather than papered
-    over by a test name that implies more coverage than exists.
+    here rather than papered over by a test name that implies more coverage
+    than exists.
     """
     assert BACKGROUND_WAIT_GUIDANCE in ROLES['implementer'].system_prompt, (
         "IMPLEMENTER lost BACKGROUND_WAIT_GUIDANCE, so build_amender_prompt's "
