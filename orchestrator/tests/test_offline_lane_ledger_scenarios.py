@@ -9,15 +9,19 @@ pure rules are ``test_offline_lane_ledger.py``'s subject.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from _lane_episode_fakes import (
     COMMAND,
+    FIX_COMMIT,
     HEAD0,
     HEAD1,
+    HEAD2,
+    HEAD3,
     LANE_COMMAND,
     T0,
     A,
@@ -26,16 +30,22 @@ from _lane_episode_fakes import (
     Lane,
     _run,
 )
+from escalation.categories import EscalationCategory
 from shared.lane_probe import OUTAGE_EXIT_STATUS
 from shared.psi import PsiSample
 
 from orchestrator import flake_recorder
 from orchestrator.flake_ledger import (
     UNKNOWN_TEST_ID,
+    DebtTrigger,
+    DueRow,
     FlakeCallSite,
     FlakeOccurrenceRow,
     FlakeSuppression,
     FlakeVerdict,
+    due_item_context,
+    read_debt,
+    read_due_items,
     read_occurrences,
 )
 from orchestrator.flake_report import build_report
@@ -46,7 +56,12 @@ from orchestrator.offline_lane_confirm import (
     Unconfirmable,
     UnconfirmableReason,
 )
-from orchestrator.offline_lane_episode_state import PassEffect, unconfirmable_node
+from orchestrator.offline_lane_episode_state import (
+    EpisodeStore,
+    OfferedDebt,
+    PassEffect,
+    unconfirmable_node,
+)
 from orchestrator.offline_lane_ledger import NUMERIC_UNNAMED_CLEAR
 from orchestrator.offline_lane_records import (
     LEGACY_NUMERIC_COMMAND,
@@ -66,6 +81,47 @@ def _rows(lane: Lane, test_id: str | None = None) -> list[FlakeOccurrenceRow]:
 
 def _detail(row: FlakeOccurrenceRow) -> dict:
     return json.loads(row.detail)
+
+
+def _due(lane: Lane) -> list[DueRow]:
+    """Every item on the due list, backed off or not: the list is stamped with the wall clock."""
+    items = read_due_items(lane.ledger, now=datetime.now(UTC) + timedelta(days=1), limit=50)
+    assert items is not None
+    return items
+
+
+def _pending(lane: Lane, category: EscalationCategory) -> list:
+    assert lane.queue is not None
+    return [e for e in lane.queue.get_pending() if e.category == category]
+
+
+def _merge_gate_clear(index: int) -> FlakeSuppression:
+    return FlakeSuppression(
+        verdict=FlakeVerdict.passes_in_isolation,
+        test_ids=(f'tests/test_m.py::test_{index}',),
+        observed_at=(T0 + timedelta(minutes=index)).isoformat(),
+        call_site=FlakeCallSite.merge_gate,
+        runner='local',
+        psi_cpu_some10=1.0,
+        unconfirmable_reason=None,
+    )
+
+
+def _done(lane: Lane, task_id: str) -> None:
+    lane.client.set_status(task_id, 'done', done_provenance={'kind': 'merged', 'commit': FIX_COMMIT})
+
+
+async def _fix_filed(lane: Lane) -> str:
+    """A reproduced on two spaced passes, which files its fix task; the task's id."""
+    await lane.red()
+    effect = await lane.spaced_red()
+    (task_id,) = effect.tasks_filed
+    return task_id
+
+
+async def _clear(lane: Lane, node: str = A, *, head: str = HEAD1) -> PassEffect:
+    lane.clock.advance(minutes=30)
+    return await lane.red(reproduced=(), cleared=(node,), head=head)
 
 
 def _current(lane: Lane, command: str = COMMAND) -> LanePass:
@@ -248,3 +304,191 @@ async def test_the_lanes_rows_leave_the_merge_gates_report_counters_unchanged(tm
     assert 'offline_lane' in after.call_sites_written
     assert (before.gate_blind_by_call_site['offline_lane'].total, after.gate_blind_by_call_site['offline_lane'].total) == (0, 3)
     assert after.systemic_by_call_site['offline_lane'].peak_distinct_tests == 1
+
+
+# --- a cleared test owes debt unless an open fix task covers it ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_scenario_26_a_first_clear_owes_debt_and_the_drain_files_its_owner(tmp_path: Path):
+    lane = Lane(tmp_path)
+
+    effect = await lane.red(reproduced=(), cleared=(A,))
+
+    assert effect.debts_offered == (OfferedDebt(A, DebtTrigger.cleared, HEAD1),)
+    (item,) = _due(lane)
+    assert (item.test_id, item.call_site, item.head) == (A, 'offline_lane', HEAD1)
+    context = due_item_context(item)
+    assert context is not None
+    assert (context.trigger, context.command, context.working_directory, context.heads) == (
+        DebtTrigger.cleared, COMMAND, 'integration', (HEAD1,),
+    )
+    assert context.reproduce is not None and A in context.reproduce
+    assert [entry.first_line for entry in context.evidence] == [f'AssertionError in {A}']
+
+    await lane.drain()
+
+    debt = read_debt(lane.ledger, A)
+    assert debt is not None and debt.owner_task_id is not None
+    (filed,) = lane.client.submitted
+    assert 'cleared on the offline lane (integration)' in filed['title']
+    assert 'cycle 1' in filed['title']
+    assert context.reproduce in filed['description']
+    assert f'AssertionError in {A}' in filed['description']
+    assert (filed['metadata']['flake_debt_call_site'], filed['metadata']['flake_debt_trigger']) == (
+        'offline_lane', 'cleared',
+    )
+
+    await _clear(lane)
+    await lane.drain()
+
+    assert len(lane.client.submitted) == 1
+
+
+@pytest.mark.asyncio
+async def test_scenario_29_nine_clears_in_one_pass_make_no_task_client_call_and_nine_owners(tmp_path: Path):
+    lane = Lane(tmp_path)
+    nodes = tuple(f'tests/test_n.py::test_{index}' for index in range(9))
+
+    effect = await lane.red(reproduced=(), cleared=nodes)
+
+    assert lane.log == []
+    assert sorted(item.test_id for item in _due(lane)) == sorted(nodes)
+    assert effect.debts_offered == tuple(OfferedDebt(node, DebtTrigger.cleared, HEAD1) for node in nodes)
+
+    await lane.drain()
+
+    assert len(lane.client.submitted) == 9
+
+
+@pytest.mark.asyncio
+async def test_scenario_30_lane_clears_never_count_toward_the_merge_gates_storm(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(flake_recorder, '_merge_flake_suppression_streak', 0)
+    lane = Lane(tmp_path)
+    for index in range(6):
+        await _clear(lane, f'tests/test_s.py::test_{index}')
+
+    for index in range(4):
+        await flake_recorder.record_flake_observation(
+            _merge_gate_clear(index), project_root=tmp_path, project_id=lane.project_id,
+            merge_sha=HEAD0, task_id=str(4200 + index), escalation_queue=lane.queue,
+        )
+    assert _pending(lane, EscalationCategory.MERGE_FLAKE_SUPPRESSION_STORM) == []
+
+    await flake_recorder.record_flake_observation(
+        _merge_gate_clear(4), project_root=tmp_path, project_id=lane.project_id,
+        merge_sha=HEAD0, task_id='4204', escalation_queue=lane.queue,
+    )
+    assert len(_pending(lane, EscalationCategory.MERGE_FLAKE_SUPPRESSION_STORM)) == 1
+
+
+@pytest.mark.asyncio
+async def test_scenario_33_an_open_fix_task_covers_a_clear_until_it_is_done(tmp_path: Path):
+    lane = Lane(tmp_path)
+    task_id = await _fix_filed(lane)
+
+    covered = await _clear(lane)
+
+    assert _due(lane) == []
+    assert (covered.debts_offered, covered.debts_undecided) == ((), ())
+
+    _done(lane, task_id)
+    offered = await _clear(lane)
+
+    assert [item.test_id for item in _due(lane)] == [A]
+    assert offered.debts_offered == (OfferedDebt(A, DebtTrigger.cleared, HEAD1),)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_covering_status_leaves_the_clear_undecided_and_visible(tmp_path: Path, caplog):
+    lane = Lane(tmp_path)
+    task_id = await _fix_filed(lane)
+    _done(lane, task_id)
+    lane.client.statuses_error = ConnectionError('task store unreachable')
+
+    with caplog.at_level(logging.ERROR):
+        undecided = await _clear(lane)
+
+    assert _due(lane) == []
+    assert (undecided.debts_offered, undecided.debts_undecided) == ((), (A,))
+    assert any(
+        r.levelno >= logging.ERROR and A in r.getMessage() and task_id in r.getMessage() for r in caplog.records
+    )
+
+    lane.client.statuses_error = None
+    offered = await _clear(lane)
+
+    assert offered.debts_offered == (OfferedDebt(A, DebtTrigger.cleared, HEAD1),)
+    assert [item.test_id for item in _due(lane)] == [A]
+
+
+@pytest.mark.asyncio
+async def test_the_ledger_is_written_before_the_episodes_new_state(tmp_path: Path, monkeypatch):
+    lane = Lane(tmp_path)
+    await lane.red()
+    lane.clock.advance(minutes=30)
+
+    def unwritable(self, record):
+        raise OSError('episode file unwritable')
+
+    monkeypatch.setattr(EpisodeStore, 'save', unwritable)
+    with pytest.raises(OSError):
+        await lane.red(reproduced=(), cleared=(A,))
+    monkeypatch.undo()
+
+    assert [r.verdict for r in _rows(lane, A)] == ['fails_in_isolation', 'passes_in_isolation']
+    assert [item.test_id for item in _due(lane)] == [A]
+    assert lane.episode().live
+
+
+@pytest.mark.asyncio
+async def test_scenarios_31_and_40_a_clear_re_opens_debt_only_at_a_head_holding_the_fix(tmp_path: Path):
+    lane = Lane(tmp_path)
+    await lane.red(reproduced=(), cleared=(A,))
+    await lane.drain()
+    first = read_debt(lane.ledger, A)
+    assert first is not None and first.owner_task_id is not None
+    _done(lane, first.owner_task_id)
+    lane.ancestry.answers[(FIX_COMMIT, HEAD2)] = False
+
+    await _clear(lane, head=HEAD2)
+    await lane.drain()
+
+    assert len(_rows(lane, A)) == 2
+    assert _pending(lane, EscalationCategory.REGRESSED_AFTER_RESOLUTION) == []
+    stale = read_debt(lane.ledger, A)
+    assert stale is not None and stale.open_count == 1
+    assert len(lane.client.submitted) == 1
+
+    await _clear(lane, head=HEAD3)
+    await lane.drain()
+
+    reopened = read_debt(lane.ledger, A)
+    assert reopened is not None and reopened.open_count == 2
+    (regression,) = _pending(lane, EscalationCategory.REGRESSED_AFTER_RESOLUTION)
+    assert 'offline-lane' in f'{regression.summary}\n{regression.detail}'
+    cycle_one, cycle_two = lane.client.submitted
+    assert 'cycle 2' in cycle_two['title']
+    assert cycle_two['title'] != cycle_one['title']
+    assert reopened.owner_task_id != first.owner_task_id
+
+
+@pytest.mark.asyncio
+async def test_scenario_40_a_clear_enqueued_before_the_fix_is_dropped_once_its_owner_is_done(tmp_path: Path):
+    lane = Lane(tmp_path)
+    await lane.red(reproduced=(), cleared=(A,))
+    await lane.drain()
+    owner = read_debt(lane.ledger, A)
+    assert owner is not None and owner.owner_task_id is not None
+    lane.ancestry.answers[(FIX_COMMIT, HEAD2)] = False
+
+    offered = await _clear(lane, head=HEAD2)
+    _done(lane, owner.owner_task_id)
+    await lane.drain()
+
+    assert offered.debts_offered == (OfferedDebt(A, DebtTrigger.cleared, HEAD2),)
+    assert _due(lane) == []
+    assert _pending(lane, EscalationCategory.REGRESSED_AFTER_RESOLUTION) == []
+    after = read_debt(lane.ledger, A)
+    assert after is not None and after.open_count == 1
+    assert len(lane.client.submitted) == 1
