@@ -18586,7 +18586,7 @@ class TestHarnessCheckGraphitiQueueHealth:
 def _index_records_for(specs):
     """Invert an IndexSpec set into GraphitiBackend.list_indices()-shaped records.
 
-    Reuses ``test_ensure_indices._rows_for`` (the single row inverter) and then
+    Reuses ``_falkor_index_doubles.py::rows_for`` (the single row inverter) and then
     applies the SAME by-name column projection ``list_indices`` itself performs,
     so the fixture cannot drift from the shape the real method returns: rows are
     what ``CALL db.indexes()`` yields, records are what ``list_indices`` returns
@@ -18596,8 +18596,7 @@ def _index_records_for(specs):
     so a graphiti upgrade that changes the index set cannot make these tests pass
     against a stale expectation.
     """
-    from test_ensure_indices import _rows_for
-    from test_falkor_indices import LIVE_HEADER
+    from _falkor_index_doubles import LIVE_HEADER, rows_for
 
     from fused_memory.backends.falkor_indices import resolve_header_positions
 
@@ -18611,7 +18610,7 @@ def _index_records_for(specs):
         },
     )
     return [
-        {key: row[idx] for key, idx in positions.items()} for row in _rows_for(specs)
+        {key: row[idx] for key, idx in positions.items()} for row in rows_for(specs)
     ]
 
 
