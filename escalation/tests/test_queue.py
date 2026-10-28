@@ -380,7 +380,9 @@ class TestDismissAllPendingKeep:
 
         assert count == 4
         for esc_id in ('esc-1-1', 'esc-2-1', 'esc-3-1', 'esc-4-1'):
-            assert queue.get(esc_id).status == 'dismissed'  # type: ignore[union-attr]
+            swept = queue.get(esc_id)
+            assert swept is not None
+            assert swept.status == 'dismissed'
 
     @pytest.mark.parametrize('keep', [None, lambda esc: True])
     def test_level_1_is_preserved_either_way(self, tmp_path: Path, keep):
@@ -388,7 +390,9 @@ class TestDismissAllPendingKeep:
 
         queue.dismiss_all_pending('Stale from prior run', keep=keep)
 
-        assert queue.get('esc-5-1').status == 'pending'  # type: ignore[union-attr]
+        level_1 = queue.get('esc-5-1')
+        assert level_1 is not None
+        assert level_1.status == 'pending'
 
 
 class TestAmendmentRoom:

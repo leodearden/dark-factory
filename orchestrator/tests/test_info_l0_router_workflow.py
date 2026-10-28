@@ -103,13 +103,13 @@ def _wip_interrupting_steward() -> type:
     """A steward that publishes a wip-present interruption as soon as it starts."""
 
     class _Steward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002 — factory signature
+        def __init__(self, wt_path, cfg_dir):
             self._channel: asyncio.Queue | None = None
 
         def set_outcome_channel(self, channel: asyncio.Queue) -> None:
             self._channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002 — steward interface
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -122,15 +122,15 @@ def _wip_interrupting_steward() -> type:
     return _Steward
 
 
-async def _blocked_fall_through(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:  # noqa: ARG001
+async def _blocked_fall_through(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:
     assert await workflow._mark_blocked('synthetic failure') == WorkflowOutcome.BLOCKED
 
 
-async def _skip_escalation_sweep(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:  # noqa: ARG001
+async def _skip_escalation_sweep(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:
     await workflow._mark_blocked('synthetic failure', skip_escalation=True)
 
 
-async def _wip_interruption(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:  # noqa: ARG001
+async def _wip_interruption(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:
     worktree = tmp_path / 'wt'
     worktree.mkdir()
     workflow.worktree = worktree
@@ -138,7 +138,7 @@ async def _wip_interruption(workflow: TaskWorkflow, queue: EscalationQueue, tmp_
     assert await workflow._mark_blocked('synthetic failure') == WorkflowOutcome.REQUEUED
 
 
-async def _open_l1_override(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:  # noqa: ARG001
+async def _open_l1_override(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:
     _submit(queue, severity='blocking', level=1)
     channel: asyncio.Queue = asyncio.Queue()
     channel.put_nowait(StewardInterrupted('timeout', wip_commits_present=True))
@@ -146,7 +146,7 @@ async def _open_l1_override(workflow: TaskWorkflow, queue: EscalationQueue, tmp_
     assert isinstance(await workflow._await_steward_completion(), StewardReescalatedL1)
 
 
-async def _steward_wait_timeout(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:  # noqa: ARG001
+async def _steward_wait_timeout(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:
     await asyncio.wait_for(workflow._wait_for_resolution(), 10)
     assert workflow._steward_wait_expired
 
@@ -212,13 +212,13 @@ def _blocking_first_steward(queue: EscalationQueue, *, settles_info: bool, stops
     """
 
     class _Steward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002 — factory signature
+        def __init__(self, wt_path, cfg_dir):
             self._loop: asyncio.Task | None = None
 
-        def set_outcome_channel(self, channel: asyncio.Queue) -> None:  # noqa: ARG002 — steward interface
+        def set_outcome_channel(self, channel: asyncio.Queue) -> None:
             pass
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002 — steward interface
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -320,7 +320,7 @@ def _finalizer_workflow(
     workflow, queue = _workflow(tmp_path, router_enabled=router_enabled)
     workflow.event_store = EventStore(tmp_path / 'runs.db', run_id='run-test')
     curator = FakeCurator()
-    workflow.scheduler.dispatch_tool = curator  # type: ignore[method-assign]
+    workflow.scheduler.dispatch_tool = curator
     return workflow, queue, curator, _spy_cleanups(workflow)
 
 
@@ -336,14 +336,14 @@ def _spy_cleanups(workflow: TaskWorkflow) -> list[str]:
     def _config_dir() -> None:
         calls.append('cleanup_config_dir')
 
-    async def _release_lane(_task_id: str) -> bool:
+    async def _release_lane(task_id_or_branch: str, *, allow_disk_backstop: bool = False) -> bool:
         calls.append('release_lane')
         return True
 
-    workflow._stop_claimant_heartbeat = _heartbeat  # type: ignore[method-assign]
-    workflow._maybe_cleanup_done_worktree = _worktree  # type: ignore[method-assign]
-    workflow._cleanup_config_dir = _config_dir  # type: ignore[method-assign]
-    workflow.git_ops.release_lane_for_terminal_task = _release_lane  # type: ignore[method-assign]
+    workflow._stop_claimant_heartbeat = _heartbeat
+    workflow._maybe_cleanup_done_worktree = _worktree
+    workflow._cleanup_config_dir = _config_dir
+    workflow.git_ops.release_lane_for_terminal_task = _release_lane
     return calls
 
 
@@ -360,7 +360,7 @@ async def _exit_with(workflow: TaskWorkflow, outcome: WorkflowOutcome, *, row: s
         await _scheduler(workflow).set_task_status(TASK_ID, row)
         return outcome
 
-    workflow._drive = _drive  # type: ignore[method-assign]
+    workflow._drive = _drive
     return await workflow.run()
 
 
@@ -475,7 +475,7 @@ class TestExitFinalizerRoutesInfoNotes:
             await asyncio.Event().wait()
             raise AssertionError('the soft cancel never interrupted _drive')
 
-        workflow._drive = _drive  # type: ignore[method-assign]
+        workflow._drive = _drive
         running = asyncio.create_task(workflow.run())
         await wait_responsive(driving.wait(), label='the workflow is driving')
         await _scheduler(workflow).set_task_status(TASK_ID, 'done')
@@ -528,7 +528,7 @@ class TestExitFinalizerNoOps:
     async def test_an_unreadable_queue_does_not_stop_the_later_cleanups(self, tmp_path: Path):
         workflow, queue, _curator, cleanups = _finalizer_workflow(tmp_path)
         workflow.state = WorkflowState.DONE
-        queue.get_by_task = MagicMock(side_effect=OSError('queue dir unreadable'))  # type: ignore[method-assign]
+        queue.get_by_task = MagicMock(side_effect=OSError('queue dir unreadable'))
 
         await _exit_with(workflow, WorkflowOutcome.DONE, row='done')
 
@@ -539,13 +539,13 @@ def _recording_steward(started: list[str]) -> type:
     """A steward that records its start and resolves at once."""
 
     class _Steward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002 — factory signature
+        def __init__(self, wt_path, cfg_dir):
             self._channel: asyncio.Queue | None = None
 
         def set_outcome_channel(self, channel: asyncio.Queue) -> None:
             self._channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002 — steward interface
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -566,11 +566,11 @@ async def _post_merge_tail(workflow: TaskWorkflow, tmp_path: Path) -> list[str]:
     workflow.worktree = worktree
     started: list[str] = []
     workflow._steward_factory = _recording_steward(started)
-    workflow._run_merge_phase = AsyncMock(return_value=None)  # type: ignore[method-assign]
-    workflow._clear_merge_retry_pending = AsyncMock()  # type: ignore[method-assign]
-    workflow._clear_merge_phase_entered = AsyncMock()  # type: ignore[method-assign]
-    workflow._write_completion_to_memory = AsyncMock()  # type: ignore[method-assign]
-    workflow._finalise_merged_done = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
+    workflow._run_merge_phase = AsyncMock(return_value=None)
+    workflow._clear_merge_retry_pending = AsyncMock()
+    workflow._clear_merge_phase_entered = AsyncMock()
+    workflow._write_completion_to_memory = AsyncMock()
+    workflow._finalise_merged_done = AsyncMock(return_value=WorkflowOutcome.DONE)
     assert await workflow._merge_and_finalise(f'task/{TASK_ID}') == WorkflowOutcome.DONE
     return started
 
