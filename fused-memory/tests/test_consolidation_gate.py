@@ -967,7 +967,8 @@ class TestUnstampedCandidates:
 
     def test_the_original_id_spelling_is_returned_not_the_folded_one(self):
         """A refusal must name the id exactly as the gate recorded it."""
-        stray = _uuid(42).upper()
+        stray = _HEX_LETTERED_UUID.upper()
+        assert stray.lower() != stray
         assert consolidation_gate.unstamped_candidates(
             _prov([stray]), members=_well_formed_cluster(2)
         ) == (stray,)
