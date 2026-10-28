@@ -240,9 +240,10 @@ _ROW_WORST_CASE_FIXED_SECS: float = (
 
 #: Per-test opt-out from a boundary test module's inherited `timeout = 60`
 #: (orchestrator/pyproject.toml:103, thread-mode -- os._exit()s the xdist
-#: worker on expiry).  2x the FIXED terms, because this module's own comment
-#: (~:870-879) records ~15x elasticity on `from orchestrator.cli import main`
-#: under a full-suite storm and those terms do not track load themselves.
+#: worker on expiry).  2x the FIXED terms, because
+#: test_laptop_warm_verify_boundary.py's comment (~:870-879) records ~15x
+#: elasticity on `from orchestrator.cli import main` under a full-suite storm
+#: and those terms do not track load themselves.
 #: The discovery term is counted ONCE and exempted from that 2x: it now
 #: scales with loadavg-per-core on its own, so applying the storm factor to
 #: it as well would double-count the same elasticity.
@@ -274,8 +275,9 @@ _ROW5_WORST_CASE_FIXED_SECS: float = (
 
 #: Row 5's per-test opt-out from the inherited `timeout = 60`, in the same
 #: shape as ROW_PER_TEST_TIMEOUT_SECS above: 2x the FIXED terms (they do not
-#: track load, and this module records ~15x elasticity on the child's
-#: `from orchestrator.cli import main` under a full-suite storm), plus the two
+#: track load, and test_laptop_warm_verify_boundary.py records ~15x
+#: elasticity on the child's `from orchestrator.cli import main` under a
+#: full-suite storm), plus the two
 #: discovery waits counted ONCE at MAX and exempted from that 2x -- they now
 #: scale with loadavg-per-core themselves, so applying the storm factor to
 #: them as well would double-count the same elasticity.

@@ -21,36 +21,15 @@ from orchestrator.verify_cancel (the SAME /proc walkers the production
 watchdog/cancel kill paths use) -- single source of truth, zero divergent
 ad-hoc process-tree parsing.
 
-That single-source rule holds exactly where it decides anything, and task
-4014 added ONE deliberate, narrow exception on the other side of a
-discovery/assertion split:
+This module holds the SS9 rows and the AST guards over every test that
+drives the harness.  The rest of the gate lives beside it:
 
-* ASSERTIONS -- every row's kill verdict goes through ``wait_pids_exited``
-  (a zombie-aware ``shared/src/shared/proc_group.py::read_stat_fields``
-  read), applied by ``assert_pre_kill_tree_exited`` to the pids
-  ``snapshot_pre_kill_tree`` captured while the leader was alive.  Those
-  pids, and the descendant set ``wait_subtree_live`` RETURNS, are still
-  discovered only by the production walkers
-  ``collect_descendants``/``read_ppid_map``.
-* the ARRANGE-phase discovery GATE adds a cheap Linux
-  ``/proc/<pid>/task/*/children`` pre-filter (:func:`read_direct_children`)
-  that decides nothing except whether to spend a full rescan on a given poll
-  tick.
-
-The measurement that motivates it: ``read_ppid_map()`` costs 49.67 ms at 917
-live processes, one ``children`` read costs 0.0183 ms -- ~2700x, against a
-50 ms poll interval.  So the old shape already doubled the effective
-sampling period AT IDLE, and under a full-suite storm (~8000 procs, ~400ms
-per scan) it collapsed ~10x -- while burning ~917 file reads per tick in CPU
-competition with the very leader it was waiting to see fork.  The probe is
-tri-state and degrades to the pre-4014 full walk when it cannot answer, so a
-kernel without CONFIG_PROC_CHILDREN keeps today's exact behaviour.
-
-Division of labour with the sibling de-flake: task 4025 addressed the
-WATCHDOG WINDOW (and its banner below is explicit that this "MOVES the cliff
-from 1.0s to 10s, it does not remove it"); task 4014 addressed the POLLER
-above it -- the per-tick cost, the transient-child race, and the flat 20s
-discovery ceiling that did not track load.
+* _verify_boundary_harness.py -- the real-subprocess harness, and the
+  rationale for its discovery/assertion split.
+* _verify_boundary_ceilings.py -- the timing ceilings and per-test budgets.
+* test_verify_boundary_harness.py / test_verify_boundary_ceilings.py --
+  their self-tests.
+* test_verify_merge_env_overrides.py -- the CLI env-override seam tests.
 """
 
 from __future__ import annotations
@@ -1107,7 +1086,8 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     (:func:`spawn_ssh_heartbeat_dispatcher`'s *extra_env*, ambiently inherited
     by the grandchild verify-merge) -- the pinned 10s+5s window, deliberately
     NOT production's own (90s+5s since task 4195); see ROW_WATCHDOG_ENV's
-    comment above for the pin rationale.  Per ``run_stdin_watchdog``, EOF fires on the very next
+    comment in _verify_boundary_ceilings.py for the pin rationale.  Per
+    ``run_stdin_watchdog``, EOF fires on the very next
     ``select`` readiness check regardless of *heartbeat_timeout* -- only
     ``grace_secs`` (the SIGTERM->SIGKILL pause in ``fire_watchdog_kill``)
     materially bounds this row's timing (~5s, measured ~7.3s end-to-end).
@@ -1296,7 +1276,8 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     + 5.0s kill grace; production is 90.0s+5.0s since task 4195, injected down
     to this) -- directly on the spawned verify-merge, so the assertion window
     here is ~15s rather than production's ~95s; see ROW_WATCHDOG_ENV's comment
-    above for the pin rationale and the honest cliff-moved caveat.
+    in _verify_boundary_ceilings.py for the pin rationale and the honest
+    cliff-moved caveat.
 
     Asserts the leader self-exits non-zero with the ``heartbeat_starvation``
     trigger, and only that trigger, on its stderr, and that every pid

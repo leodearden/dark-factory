@@ -1089,9 +1089,9 @@ async def env_probe_local_run(
 #: writer's only blocking operation is a ``threading.Event.wait`` that ``stop()``
 #: ends within one GIL switch, and its write end is non-blocking so ``os.write``
 #: can never park on a full pipe — so 5.0s is ~6x the ~0.85s worst single-gap
-#: additive scheduling delay measured at loadavg 113-178 (recorded in
-#: ``test_laptop_warm_verify_boundary.py``'s ``HeartbeatWriter`` comment) and is
-#: never reached in practice.
+#: additive scheduling delay measured at loadavg 113-178 (recorded in the
+#: ROW_WATCHDOG banner of ``orchestrator/tests/_verify_boundary_ceilings.py``)
+#: and is never reached in practice.
 #:
 #: WHO PAYS THE WAIT: not the event loop.  ``Thread.join`` is synchronous, and
 #: the coroutine that tears the writer down runs on the orchestrator's single
