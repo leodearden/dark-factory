@@ -33,6 +33,7 @@ from shared.project_id import project_id_for_root
 from shared.project_layout import (
     ESCALATION_QUEUE_RELPATH,
     park_eviction_requests_db,
+    scheduler_eligibility_db,
     scheduler_overrides_db,
 )
 from shared.task_metadata import KNOWN_ROLE_NAMES
@@ -5989,6 +5990,15 @@ class OrchestratorConfig(BaseSettings):
         keep the operator eviction lever narrow-blast-radius (PRD D3).
         """
         return park_eviction_requests_db(self.project_root)
+
+    @property
+    def eligibility_clock_db_path(self) -> Path:
+        """Path to the starvation watchdog's durable eligibility-clock database.
+
+        One wall-clock anchor per dispatch candidate, kept across restarts so
+        a restart cannot re-stamp the whole backlog into one alarm cohort.
+        """
+        return scheduler_eligibility_db(self.project_root)
 
     model_config = SettingsConfigDict(
         env_prefix='ORCH_',
