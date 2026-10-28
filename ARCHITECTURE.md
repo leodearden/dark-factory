@@ -828,7 +828,11 @@ path, snapshotting `main` at run start and coalescing advances — it never
 gates a merge, and defaults to disabled (`git.offline_lane_enabled: false`). Each pass writes a record; each failing
 test is a per-test episode that is filed as one fix task once reproduced on
 `git.offline_lane_persist_passes` spaced passes, with one bounded level-1
-escalation if the fix stays unlanded. A command that declares an outage probe
+escalation if the fix stays unlanded. Every non-outage red pass is recorded in
+the flake ledger at call site `offline_lane`, and a cleared test, or a held red
+that failed and passed at one head with no fix task filed, owes flake debt
+whose de-flake task the ledger's drain files (`plans/offline-lane-red-path-prd.md`
+D6). A command that declares an outage probe
 (`outage_probe`) runs it after a red detection, and a probe that exits 75
 naming a dependency makes the pass an outage, which is escalated, not filed.
 The lane re-runs the probe alone until it passes, then closes its own

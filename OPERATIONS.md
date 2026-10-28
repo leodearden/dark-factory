@@ -227,7 +227,11 @@ next to the per-phase `detect.log`, `confirm.log` and `*.junit.xml`.
 `confirm` run blocks (`null` for a phase that did not run), the `outcome`,
 and `effect`: `tests_counted`, `episodes_started`,
 `episodes_extended`, `episodes_ended`, `threshold_reached`, `stale_heads`,
-`no_decision`, `tasks_filed` and `escalations_raised`. `effect` is `null` while
+`no_decision`, `tasks_filed`, `escalations_raised`, `debts_offered` (the tests
+this pass put on the flake ledger's due list, each with its trigger, `cleared`
+or `recovered`, and the head of its evidence) and `debts_undecided` (the cleared
+tests it did not offer because their covering fix task's status could not be
+read; the orchestrator log names each at ERROR). `effect` is `null` while
 a pass is still running, and stays `null` if the pass was cut short (it is
 written after the engine observes).
 
@@ -275,7 +279,7 @@ after 14 days without a write.
 
 **Outages.** A command may declare `outage_probe`; dark-factory's `qdrant-integration` runs `python scripts/lane_dependency_probe.py` in `fused-memory/`. After a red detection run the lane runs the probe once, at normal priority, bounded by `outage_probe_timeout_secs` (180). If it exits 0 the red goes on to the confirm as usual. If it exits 75 with a first stdout line `<dependency>: <reason>`, the pass is an outage: no confirm, no fix task and no ledger row, and each held episode gets `had_outage_pass: true`. The lane then opens one `infra_issue` level-1 escalation on the command's sentinel, naming the dependency and the pass directory, and amends it only when the probe's answer changes. While the command's `last_probe_result` reads `outage`, the lane re-runs the probe alone every `recheck_secs` on its idle poll, and held reds are not rechecked. When the probe exits 0, the lane resolves its own record and any level-2 whose only member it is (a level-2 with other members is amended instead), then runs the command again. The lane also closes the outage record when the probe turns broken, or when the probe or the command is removed or disabled. You do not need to close it. If you resolve it while the dependency is still down, the lane opens nothing until the next red pass whose probe fails. Any other probe result is a broken probe: another exit code, 75 with no line, a crash, or the timeout. The red is then handled as if no probe were declared, and a second `infra_issue` record says the probe is broken until a probe next exits 0, or 75 with a name. To run the probe by hand: `cd fused-memory && python scripts/lane_dependency_probe.py; echo $?`. Name dependencies (`qdrant falkordb embedder chat-model`) to check only those. Exit 75 means "this dependency is not usable", and the printed line names it. Any other non-zero exit is a defect in the probe. The command's record in `offline_lane_episodes.json` carries `last_probe_result` (the probe object), `last_probe_at`, `outage_escalation_id` and `probe_broken_escalation_id`.
 
-Appended by later leaves of plans/offline-lane-red-path-prd.md.
+**The flake ledger.** The lane's rows are read by call site with `orchestrator flake-ledger` (see *Reading the flake ledger*), listed under `offline_lane`, apart from the merge gate's; the de-flake task a lane debt opened is found by its metadata (`flake_debt_call_site: offline_lane`, `flake_debt_trigger: cleared` or `recovered`, `flake_debt_command: <command>`), for example with `find_tasks_by_metadata`. Every non-outage red pass writes one row per test it examined, at the pass's head and start. A cleared test, or a held red that failed and passed at one head with no fix task filed, owes flake debt, and the ledger's drain files its de-flake task; a cleared test that an open or deferred fix task covers owes none. When a fix task is filed for a test that owes debt, its details name the live de-flake owner under `Live de-flake owners:`.
 
 ### Reading the verify artefact archive (`data/verify-logs/<task_id>/`)
 
