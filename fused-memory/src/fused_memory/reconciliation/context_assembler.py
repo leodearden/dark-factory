@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from fused_memory.models.reconciliation import (
@@ -138,9 +137,6 @@ class ContextAssembler:
         chunk_events: list[ReconciliationEvent] = []
         context_items: dict[str, ContextItem] = {}
 
-        # Compute effective watermark: align context window with event batch
-        effective_wm = self._compute_effective_watermark(events, watermark)
-
         # Process events in batches for parallelized context fetching
         event_idx = 0
         budget_reached = False
@@ -205,27 +201,8 @@ class ContextAssembler:
             context_items=context_items,
             total_tokens=used,
             events_remaining=events_remaining,
-            effective_watermark=effective_wm,
             token_budget=budget,
         )
-
-    def _compute_effective_watermark(
-        self,
-        events: list[ReconciliationEvent],
-        watermark: Watermark,
-    ) -> datetime:
-        """Effective watermark = min(last_run_completed, earliest_event.timestamp).
-
-        Ensures the context window covers the period the events are about.
-        """
-        candidates: list[datetime] = []
-        if watermark.last_full_run_completed:
-            candidates.append(watermark.last_full_run_completed)
-        if events:
-            candidates.append(min(e.timestamp for e in events))
-        if not candidates:
-            return datetime.now(UTC)
-        return min(candidates)
 
     async def _fetch_context(
         self,

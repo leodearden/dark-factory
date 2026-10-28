@@ -162,7 +162,9 @@ Phase 3 — observability + rollout:
   `analyze_speculation_depth.py`. Depth histogram + items-per-verify +
   deep-fail rate in the merge report; reader keys on `chain_items`. Signal:
   report renders from live events; reader output matches git-derived truth
-  on fixtures. Prereqs: δ.
+  on fixtures. Prereqs: δ. Landed (task 3188): the merge report is the
+  orchestrator digest's `## Deep merge-ahead chains` section, and
+  `analyze_speculation_depth.py` keys on `chain_items`.
 - **ζ — reify canary enable at cap=6.** Deterministic deploy task
   (`before_done` script: set `merge_deep.chain_cap: 6` in reify's
   `dark-factory-orchestrator.yaml`, commit, reload, assert `applied`).
@@ -246,6 +248,7 @@ Phase 3 — observability + rollout:
 3. **η1 predicate thresholds** — exact numeric gates derived from the first
    soak week's baseline; the script owns the comparison per the predicate
    contract. Decide when authoring η1's script.
-4. **`depth` field back-compat** — keep emitting legacy `depth` alongside
-   `chain_items` or retire it. Suggested: keep one release, then retire.
-   Decide in ε.
+4. ~~`depth` field back-compat~~ **RESOLVED 10-20 (ε, task 3188)**: keep
+   emitting legacy `depth` alongside `chain_items` for one release; where both
+   are present `chain_items` is authoritative, and `depth`-only rows are
+   counted, never bucketed. Retirement is owned by task 4767.

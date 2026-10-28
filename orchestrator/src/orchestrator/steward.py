@@ -56,6 +56,7 @@ from shared.cli_invoke import (
     is_timed_out_with_progress,
 )
 from shared.proc_group import terminate_process_group
+from shared.process_cost import next_resume_prior
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
@@ -160,6 +161,7 @@ class TaskSteward:
         self.cost_store = cost_store
 
         self._session_id: str | None = None
+        self._session_reported_total_usd: float | None = None
         self._stopped = False
         self._task: asyncio.Task | None = None
         # The four guards below are restart-durable and TTL-bounded (task
@@ -195,6 +197,11 @@ class TaskSteward:
             ),
             ttl=_STEWARD_GUARD_TTL,
         )
+        # Paid-for pre-triage outcome per escalation id (task 5821): every
+        # re-handle of the same L0 (timeout / empty-output re-queue) would
+        # otherwise pay for triage again.  Holds the fallback (original)
+        # escalation too when triage ran and produced no usable verdict.
+        self._pretriaged: dict[str, Escalation] = {}
         # Escalations a steward has permanently given up on — TERMINAL for this
         # TASK, never re-handled (task 3170, fix B).  Before this existed
         # nothing recorded that a cap had already fired, so ANY early return
@@ -533,15 +540,7 @@ class TaskSteward:
             self._stopped = True
             return
 
-        # Guard: lifetime budget exhausted
-        if self.metrics.total_cost_usd >= self.config.steward_lifetime_budget:
-            self._auto_escalate_to_human(
-                escalation, 'Steward lifetime budget exhausted '
-                f'(${self.metrics.total_cost_usd:.2f} / '
-                f'${self.config.steward_lifetime_budget:.2f})',
-                outcome=StewardBudgetExhausted(),
-            )
-            self._mark_capped(escalation.id)
+        if self._give_up_if_lifetime_budget_spent(escalation):
             return
 
         # Guard: per-escalation retry limit
@@ -619,6 +618,10 @@ class TaskSteward:
                     f'{len(suggestions)} suggestions'
                 )
                 escalation = await self._pre_triage_suggestions(escalation)
+                # The CLI checks --max-budget-usd only between turns, so a
+                # triage can overshoot the headroom its own guard left.
+                if self._give_up_if_lifetime_budget_spent(escalation):
+                    return
 
         # Prompt: initial (full briefing) vs continuation (just the escalation)
         is_initial = self._session_id is None
@@ -646,9 +649,9 @@ class TaskSteward:
         escalation_url = f'http://{esc_cfg.host}:{esc_cfg.port}/mcp'
         mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
 
-        # Per-invocation budget: capped by lifetime remaining
-        remaining = self.config.steward_lifetime_budget - self.metrics.total_cost_usd
-        per_invocation = min(self.config.budgets.steward, remaining)
+        per_invocation = min(
+            self.config.budgets.steward, self._remaining_lifetime_budget(),
+        )
 
         # Invoke with session persistence and cap-hit recovery
         result = await self._invoke_with_session(
@@ -691,6 +694,8 @@ class TaskSteward:
                     # denominator.
                     'ended_awaiting_background': result.ended_awaiting_background,
                     'retry_aborted': result.retry_aborted,
+                    'cost_basis': result.cost_basis.value,
+                    'cost_delta_clamped': result.cost_delta_clamped,
                 },
             )
 
@@ -729,7 +734,7 @@ class TaskSteward:
             # session id so the next attempt rebuilds a fresh initial prompt at the
             # current cwd instead of repeating the same instant failure.
             cleared = self._session_id is not None
-            self._session_id = None
+            self._drop_session()
             logger.warning(
                 f'Steward for task {self.task_id}: invocation produced no output '
                 f'(empty stdout) — retry_count NOT incremented '
@@ -891,6 +896,8 @@ class TaskSteward:
         )
         if self._session_id is not None:
             kwargs['resume_session_id'] = self._session_id
+            if self._session_reported_total_usd is not None:
+                kwargs['resume_prior_total_cost_usd'] = self._session_reported_total_usd
 
         # `backend` below reaches invoke_agent: invoke_with_cap_retry forwards
         # it into invoke_kwargs only when a custom invoke_fn is supplied, and
@@ -924,10 +931,26 @@ class TaskSteward:
             **kwargs,
         )
 
-        if result.session_id:
-            self._session_id = result.session_id
+        self._adopt_session(result)
 
         return result
+
+    def _adopt_session(self, result) -> None:
+        """Resume *result*'s session next time, carrying its reported total as the prior."""
+        if not result.session_id:
+            return
+        self._session_reported_total_usd = next_resume_prior(
+            armed_session_id=self._session_id,
+            armed_prior_usd=self._session_reported_total_usd,
+            result_session_id=result.session_id,
+            result_reported_total_usd=result.reported_total_cost_usd,
+        )
+        self._session_id = result.session_id
+
+    def _drop_session(self) -> None:
+        """Start the next invocation fresh: forget the session and its prior total together."""
+        self._session_id = None
+        self._session_reported_total_usd = None
 
     # ------------------------------------------------------------------
     # Pre-triage for large suggestion sets
@@ -940,8 +963,15 @@ class TaskSteward:
 
         Returns the escalation with its detail field replaced by pre-triaged
         markdown.  If triage fails, returns the original escalation unchanged
-        so the steward falls back to inline triage.
+        so the steward falls back to inline triage.  Also falls back (without
+        invoking) when the remaining lifetime budget cannot cover the triage
+        budget with headroom left for the main invocation.  The outcome of a
+        triage that actually ran is cached per escalation id.
         """
+        cached = self._pretriaged.get(escalation.id)
+        if cached is not None:
+            return cached
+
         from orchestrator.agents.triage import (
             TRIAGE,
             build_triage_prompt,
@@ -950,6 +980,43 @@ class TaskSteward:
         )
         from orchestrator.artifacts import TaskArtifacts
         from orchestrator.workflow import _inject_verdict_tools_mcp
+
+        # Route resolution (task η): the inner triage invoke resolves
+        # model/effort/budget/max_turns through the shared resolver + emits a
+        # routing_decision event. backend stays self.config.backends.triage
+        # (resolver-external).
+        decision = await resolve_and_record_route(
+            role_name='triage',
+            role_defaults=RoleDefaults(
+                TRIAGE.default_model,
+                # Layer-4 effort base kept == EffortConfig.triage's default
+                # ('medium') — the value config-layer-3 always supplies today.
+                # AgentRole has no default_effort field, so effort is the one
+                # RoleDefaults field not sourced from the TRIAGE role object;
+                # matching the config default means a future EffortConfig field
+                # removal degrades to the same effort rather than silently
+                # jumping to a mismatched base.
+                'medium',
+                TRIAGE.default_budget, TRIAGE.default_max_turns,
+            ),
+            config=self.config,
+            task_id=self.task_id,
+            task_metadata=self.task.get('metadata'),
+            in_memory_task=self.task,
+            event_store=self.event_store,
+            cost_store=self.cost_store,
+        )
+        remaining = self._remaining_lifetime_budget()
+        if remaining <= decision.budget_usd:
+            # Strict, so a triage that stays within its cap leaves a positive
+            # remainder for the main invocation's --max-budget-usd.
+            logger.warning(
+                'Steward for task %s: pre-triage skipped — remaining lifetime '
+                'budget $%.2f does not cover triage budget $%.2f, falling '
+                'back to inline triage',
+                self.task_id, remaining, decision.budget_usd,
+            )
+            return escalation
 
         suggestions = json.loads(_strip_hash_prefix(escalation.detail))
         prompt = build_triage_prompt(suggestions, self.task)
@@ -980,42 +1047,15 @@ class TaskSteward:
         # (not a from-scratch skeleton) so the 'orchestrator' family TRIAGE
         # declares — and the get_tasks/search dedup step its system prompt
         # instructs the agent to run — is explicitly wired here, rather than
-        # relying on the ambient project_root/.mcp.json merge that cli_invoke
-        # performs (--mcp-config without --strict-mcp-config). That merge
-        # happens to supply fused-memory today, but it's an accident of cwd
-        # and merge behavior neither of which this method controls; building
-        # from self.mcp.mcp_config_json() makes the wiring match the role
-        # declaration directly. No escalation_url: TRIAGE grants no
-        # escalation tools.
+        # relying on the ambient .mcp.json merge that cli_invoke performs
+        # from cwd (--mcp-config without --strict-mcp-config), which this
+        # method does not control. Building from self.mcp.mcp_config_json()
+        # makes the wiring match the role declaration directly. No
+        # escalation_url: TRIAGE grants no escalation tools.
         mcp_config = _inject_verdict_tools_mcp(
             self.mcp.mcp_config_json(), self.worktree, TRIAGE,
         )
 
-        # Route resolution (task η): the inner triage invoke resolves
-        # model/effort/budget/max_turns through the shared resolver + emits a
-        # routing_decision event. backend stays self.config.backends.triage
-        # (resolver-external).
-        decision = await resolve_and_record_route(
-            role_name='triage',
-            role_defaults=RoleDefaults(
-                TRIAGE.default_model,
-                # Layer-4 effort base kept == EffortConfig.triage's default
-                # ('medium') — the value config-layer-3 always supplies today.
-                # AgentRole has no default_effort field, so effort is the one
-                # RoleDefaults field not sourced from the TRIAGE role object;
-                # matching the config default means a future EffortConfig field
-                # removal degrades to the same effort rather than silently
-                # jumping to a mismatched base.
-                'medium',
-                TRIAGE.default_budget, TRIAGE.default_max_turns,
-            ),
-            config=self.config,
-            task_id=self.task_id,
-            task_metadata=self.task.get('metadata'),
-            in_memory_task=self.task,
-            event_store=self.event_store,
-            cost_store=self.cost_store,
-        )
         try:
             result = await invoke_with_cap_retry(
                 self.usage_gate,
@@ -1026,7 +1066,7 @@ class TaskSteward:
                 invoke_fn=self._invoke_agent_counted,
                 prompt=prompt,
                 system_prompt=TRIAGE.system_prompt,
-                cwd=self.config.project_root,
+                cwd=self.worktree,
                 model=decision.model,
                 max_turns=decision.max_turns,
                 max_budget_usd=decision.budget_usd,
@@ -1071,6 +1111,7 @@ class TaskSteward:
                 f'Steward for task {self.task_id}: pre-triage failed, '
                 f'falling back to inline triage'
             )
+            self._pretriaged[escalation.id] = escalation
             return escalation
 
         new_detail = format_pretriaged_detail(
@@ -1080,7 +1121,7 @@ class TaskSteward:
         # Return a modified copy — don't mutate the queue's version
         from escalation.models import Escalation as EscModel
 
-        return EscModel(
+        pretriaged = EscModel(
             **{
                 **escalation.to_dict(),
                 'detail': new_detail,
@@ -1091,6 +1132,8 @@ class TaskSteward:
                 ),
             },
         )
+        self._pretriaged[escalation.id] = pretriaged
+        return pretriaged
 
     # ------------------------------------------------------------------
     # Give-up without an L1 hand-off (task-2060 resume-plan branches)
@@ -1197,6 +1240,25 @@ class TaskSteward:
 
         return stored
 
+    def _remaining_lifetime_budget(self) -> float:
+        return self.config.steward_lifetime_budget - self.metrics.total_cost_usd
+
+    def _give_up_if_lifetime_budget_spent(self, escalation: Escalation) -> bool:
+        """Re-escalate *escalation* to L1 once the lifetime budget is spent.
+
+        Returns whether it gave up; the caller must then return at once.
+        """
+        if self._remaining_lifetime_budget() > 0:
+            return False
+        self._auto_escalate_to_human(
+            escalation, 'Steward lifetime budget exhausted '
+            f'(${self.metrics.total_cost_usd:.2f} / '
+            f'${self.config.steward_lifetime_budget:.2f})',
+            outcome=StewardBudgetExhausted(),
+        )
+        self._mark_capped(escalation.id)
+        return True
+
     def _give_up_with_wip(
         self, escalation: Escalation, outcome: StewardInterrupted,
     ) -> None:
@@ -1300,7 +1362,7 @@ class TaskSteward:
         reesc = EscModel(
             id=self.escalation_queue.make_id(self.task_id),
             task_id=self.task_id,
-            agent_role='steward',
+            agent_role=STEWARD.name,
             severity=escalation.severity,
             category=escalation.category,
             summary=f'Steward re-escalation: {reason}',

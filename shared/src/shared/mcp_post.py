@@ -58,15 +58,10 @@ The ingredients stay public — :data:`MCP_POST_HEADERS`,
 :func:`decode_mcp_response_body` — for a caller that genuinely needs a
 non-``tools/call`` request or a hand-built envelope.
 
-``orchestrator.mcp_lifecycle.McpSession`` (the session-handshake transport)
-consumes :data:`MCP_POST_HEADERS`, :func:`mcp_endpoint_url` and
-:func:`decode_mcp_response_body`, so the orchestrator holds no copy of them.
-
-ONE TWIN REMAINS.  ``dashboard/src/dashboard/data/memory.py`` still carries
-its own ``MCP_HEADERS``, ``_parse_mcp_response`` and ``_parse_sse_response``.
-The dependency direction already allows it to import this module instead;
-that file was simply outside task 4819's module locks.  Until it is migrated,
-a change to the headers or the decoder here must be mirrored there.
+``shared.mcp_session``'s ``McpSession`` and ``SyncMcpSession`` (the
+session-handshake transports) and ``dashboard.data.memory``'s ``McpSession``
+consume :data:`MCP_POST_HEADERS`, :func:`mcp_endpoint_url` and
+:func:`decode_mcp_response_body`, so none of them holds a copy.
 
 Public API::
 
@@ -135,9 +130,9 @@ def mcp_endpoint_url(base_url: str) -> str:
 
     The ``rstrip('/')`` is load-bearing, not cosmetic — a configured base that
     already ends in ``/`` would otherwise produce ``…//mcp``, which is a
-    different path than the server mounts.  ``McpSession.__init__``
-    (``orchestrator/src/orchestrator/mcp_lifecycle.py``) builds its endpoint
-    with this function.
+    different path than the server mounts.  ``McpSession`` and
+    ``SyncMcpSession`` (``shared/src/shared/mcp_session.py``) build their
+    endpoint with this function.
 
     >>> mcp_endpoint_url('http://127.0.0.1:8002')
     'http://127.0.0.1:8002/mcp'
@@ -354,9 +349,12 @@ async def call_mcp_tool(
     call.
 
     Returns ``None``, always with a warning, when no reply dict arrived: any
-    failure :func:`check_mcp_post_response` reports, a ``result.isError``
-    answer, or a text block that is not a JSON object.  Propagates a transport
-    exception from ``client.post``, as :func:`post_mcp_tool_call` does.
+    failure :func:`check_mcp_post_response` reports, or any shape
+    ``parse_tool_result`` refuses — a JSON-RPC error
+    (``EnvelopeShape.JSON_RPC_ERROR``), a ``result.isError`` answer
+    (``EnvelopeShape.IS_ERROR``) or a text block that is not a JSON object.
+    Propagates a transport exception from ``client.post``, as
+    :func:`post_mcp_tool_call` does.
     """
     resp = await _send_tool_call(
         client, base_url, tool, arguments,
@@ -368,12 +366,6 @@ async def call_mcp_tool(
         body = decode_mcp_response_body(resp)
     except ValueError as exc:
         logger.warning('MCP tool reply could not be decoded [%s]: %s', context, exc)
-        return None
-    result = body.get('result') if isinstance(body, dict) else None
-    if isinstance(result, dict) and result.get('isError'):
-        logger.warning(
-            'MCP tool call returned isError [%s]: %s', context, str(result)[:200],
-        )
         return None
     reply, err = parse_tool_result(body, None, dict)
     return None if err is not None else reply

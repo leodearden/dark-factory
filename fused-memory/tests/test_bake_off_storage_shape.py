@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import functools
 import re
+import subprocess
 import types
 from collections.abc import Container
 from pathlib import Path
@@ -4178,6 +4179,38 @@ class TestFixtureProvenance:
         provenance = _mod().fixture_provenance([ARM_CLAIMS_PATH])
 
         assert not provenance[0]['path'].startswith('/')
+
+    def test_a_committed_fixtures_blob_is_the_one_heads_tree_holds(self):
+        entry = _mod().fixture_provenance([ARM_CLAIMS_PATH])[0]
+
+        held = subprocess.run(
+            ['git', 'rev-parse', '--verify', '--quiet', f'HEAD:{entry["path"]}'],
+            cwd=ARM_CLAIMS_PATH.parent, capture_output=True, text=True,
+            check=True,
+        )
+
+        assert entry['blob'] == held.stdout.strip()
+
+    def test_the_blob_identifies_content_not_path(self, tmp_path):
+        first, twin, other = (tmp_path / name for name in (
+            'first.jsonl', 'twin.jsonl', 'other.jsonl'))
+        first.write_text('{"same": true}\n')
+        twin.write_text('{"same": true}\n')
+        other.write_text('{"same": false}\n')
+
+        provenance = _mod().fixture_provenance([first, twin, other])
+
+        assert provenance[0]['blob']
+        assert provenance[0]['blob'] == provenance[1]['blob']
+        assert provenance[2]['blob'] != provenance[0]['blob']
+        assert [entry['commit'] for entry in provenance] == [None, None, None]
+
+    def test_a_path_git_cannot_read_reports_no_blob_rather_than_a_wrong_one(
+        self, tmp_path,
+    ):
+        provenance = _mod().fixture_provenance([tmp_path / 'missing.jsonl'])
+
+        assert provenance[0]['blob'] is None
 
 
 # ===========================================================================

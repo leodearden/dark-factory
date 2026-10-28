@@ -1,0 +1,10 @@
+prd: plans/worktree-lane-lifecycle-prd.md
+schema_version: 1
+tasks:
+- label: omega
+  task_id: 2260
+  title: 'W11-ω: B+H integration gate (mechanisms 1+2) — two-way boundary suite B1–B6'
+  note: 'Minimal sidecar written by task 6591 (plans/dashboard-prd-lanes-prd.md §9 ε): this PRD has no decompose-time YAML sidecar, so only its signal leaf is declared, hand-bound to the task whose prd_task_label is omega.'
+  capabilities: []
+signal_leaves:
+- omega

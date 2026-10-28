@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
+import _checkout as _checkout
 import suite_census_pinning
 import suite_census_rust
 from source_measures import MetricsError

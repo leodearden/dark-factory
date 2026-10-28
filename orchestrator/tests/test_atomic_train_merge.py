@@ -33,7 +33,8 @@ from _orch_helpers import wire_scheduler_liveness_mock
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import AdvanceOutcome, GitOps, TrainMembership, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     ABANDONED_REASON_PREFIX,
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
@@ -42,7 +43,6 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult, run_scoped_verification
 
 # Real git + real cargo integration module (see module docstring): a workspace
@@ -448,7 +448,7 @@ class TestScenario2WorktreeBase:
 
         # Create α branch off main with one commit so it has a non-main tip.
         wt_a, alpha_sha = await make_stacked_member(
-            git_ops, "alpha", (await git_ops._freshen_main())[0],
+            git_ops, "alpha", await git_ops._freshen_main(),
             lambda wt: (wt / "alpha.txt").write_text("alpha\n"),
         )
 
@@ -712,7 +712,7 @@ class TestScenario5GroupMergeVerify:
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         lane = MergeLane(git_ops, queue)
 
-        with patch("orchestrator.merge_queue.run_scoped_verification", side_effect=_spy_verify):
+        with patch("orchestrator.merge_lane.worker.run_scoped_verification", side_effect=_spy_verify):
             outcome = await merge_through_lane(lane, queue, req)
 
         # (i) Outcome is done.
@@ -2110,11 +2110,11 @@ class TestGate01TrainDiskGuard:
 
         with (
             patch(
-                "orchestrator.merge_queue.run_scoped_verification",
+                "orchestrator.merge_lane.worker.run_scoped_verification",
                 AsyncMock(return_value=_make_passing_verify_result()),
             ),
             patch(
-                "orchestrator.merge_queue.shutil.disk_usage",
+                "orchestrator.merge_lane.worker.shutil.disk_usage",
                 return_value=MagicMock(free=1 * _GIB),  # 1 GiB << 10 GiB threshold
             ),
             patch.object(
@@ -2190,7 +2190,7 @@ class TestGate03TrainVerifyTimeoutLoopBreaker:
         lane = MergeLane(git_ops, queue)
         verify = AsyncMock(return_value=times_out().result)
 
-        with patch("orchestrator.merge_queue.run_scoped_verification", verify):
+        with patch("orchestrator.merge_lane.worker.run_scoped_verification", verify):
             async with running_lane(lane) as run:
                 # Submissions 1..MAX run merge + verify and surface the timeout.
                 requests = [first_req]
@@ -2264,7 +2264,7 @@ class TestGate05TrainPostMergeEquivalence:
 
         with (
             patch(
-                "orchestrator.merge_queue.run_scoped_verification",
+                "orchestrator.merge_lane.worker.run_scoped_verification",
                 AsyncMock(return_value=_make_passing_verify_result()),
             ),
             patch(

@@ -73,7 +73,14 @@ def _resolve_reify_checkout(start: Path | None = None) -> reify_checkout.ReifyCh
     )
 
 
-_LCG_LOGGER = 'fused_memory.middleware.lock_charter_guard'
+_SCHEMA_WARNING = 'task_metadata.schema_warning'
+_SOURCE = 'source=lock_charter_guard.extract_files'
+
+
+def _discard_lines(caplog) -> list[str]:
+    messages = (r.getMessage() for r in caplog.records)
+    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+
 
 # ---------------------------------------------------------------------------
 # Drift guard — two tiers:
@@ -115,7 +122,7 @@ _CANONICAL_EXTENSIONS = [
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
     'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
-    'template', 'timer', 'tombstones', 'toml', 'ts', 'tsx', 'txt', 'typed',
+    'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 ]
 
@@ -410,6 +417,8 @@ _ACCEPT_PATHS = [
     # reify file with a `tombstones` extension; filename is PRD-normative
     # (reify docs/prds/v0_6/spec-conformance-suite.md D3).
     'docs/reify-language-spec.tombstones',  # reify
+    # reify #9058 (α-first): the first tracked reify `.tsv`, landed by reify #8662.
+    'tests/infra/affected-crates-direct-sets.tsv',  # reify
 ]
 
 
@@ -1092,17 +1101,17 @@ class TestExtractFiles:
 
     def test_unparseable_json_warns_and_returns_empty(self, caplog):
         """RED (task 2166 step-9): the str/json branch currently discards silently."""
-        with caplog.at_level(logging.WARNING, logger=_LCG_LOGGER):
+        with caplog.at_level(logging.WARNING):
             result = extract_files('not valid json {{{')
         assert result == []
-        warns = [
-            r for r in caplog.records
-            if r.name == _LCG_LOGGER and r.levelno >= logging.WARNING
-        ]
-        assert any('task_metadata.schema_warning' in r.message for r in warns), (
-            f'expected a task_metadata.schema_warning WARNING; got '
-            f'{[r.message for r in warns]!r}'
-        )
+        assert len(_discard_lines(caplog)) == 1
+
+    @pytest.mark.parametrize('metadata', [42, ['a/b.rs']], ids=repr)
+    def test_non_str_unreadable_metadata_warns_and_returns_empty(self, metadata, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = extract_files(metadata)
+        assert result == []
+        assert len(_discard_lines(caplog)) == 1
 
     def test_json_non_dict_returns_empty(self):
         # JSON string that parses to a list, not a dict

@@ -219,9 +219,12 @@ SKILLS_CONSUMING_TESTS = (
     # test_every_enumeration_site_is_pinned and the citation-drift checks —
     # the single broadest skills/ consumer in the repo (task 4941).
     "scripts/tests/test_design_invariants_consistency.py",
-    # Reads skills/reflect/SKILL.md to execute its `entities=` examples against
-    # the live entities_gate (task 3675).
+    # Reads the skills/ docs named in its _GUARDED_DOCS to execute their
+    # `entities=` examples against the live entities_gate (tasks 3675, 5555, 5866).
     "fused-memory/tests/test_referent_declaration_examples.py",
+    # EXECUTES every merge-marker search in skills/**/*.md against a shadowed
+    # fixture history (task 5774).
+    "tests/scripts/test_merge_marker_search_snippets.py",
 )
 
 

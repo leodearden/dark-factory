@@ -616,6 +616,34 @@ class TestUsageGateProbeProcessGroup:
         mock_tpg.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_usage_gate_probe_child_env_carries_only_the_probed_credential(
+    probing_gate: tuple[UsageGate, AccountState], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe child sees its own account's token and config dir, never the pool."""
+    gate, acct = probing_gate
+    monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', 'pool-a-' + 'A' * 41)
+    monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_B', 'pool-b-' + 'B' * 41)
+    monkeypatch.setenv('OPENAI_API_KEY', 'openai-' + 'o' * 41)
+    captured_envs: list[dict] = []
+
+    async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+        env = kwargs.get('env')
+        assert isinstance(env, dict)
+        captured_envs.append(env)
+        return _fake_probe_proc(0, b'{"ok": true}')
+
+    with patch('shared.usage_gate.asyncio.create_subprocess_exec', side_effect=fake_exec):
+        await gate._run_probe(acct)
+
+    (env,) = captured_envs
+    assert [k for k in env if k.startswith('CLAUDE_OAUTH_TOKEN_')] == []
+    assert 'OPENAI_API_KEY' not in env
+    assert 'ANTHROPIC_API_KEY' not in env
+    assert env['CLAUDE_CODE_OAUTH_TOKEN'] == acct.token
+    assert env['CLAUDE_CONFIG_DIR'] == str(gate._config_dir_for(acct).path)
+
+
 # ---------------------------------------------------------------------------
 # _run_probe exit-code classification — distinguish local budget cap
 # (API accepted the request) from real Anthropic-side failures.
@@ -2760,8 +2788,8 @@ async def _idle_task() -> asyncio.Task:
 
 @pytest.mark.asyncio
 class TestSighupUncapsViaTransition:
-    """step-15: _on_sighup_async drives every account to AVAILABLE through
-    one forced _transition call each (DD-4)."""
+    """step-15: _on_sighup_async drives every account that is not
+    AUTH_FAILED to AVAILABLE through one forced _transition call each (DD-4)."""
 
     async def test_sighup_forces_every_account_to_available_via_transition(self):
         gate = make_gate(['a', 'b'], wait_for_reset=False, cost_store=None)
@@ -2772,8 +2800,7 @@ class TestSighupUncapsViaTransition:
         a.probe_count = 2
         a.resume_task = await _idle_task()
 
-        b.phase = AccountPhase.AUTH_FAILED
-        b.auth_failed_at = datetime.now(UTC)
+        b.phase = AccountPhase.PROBE_IN_FLIGHT
         b.auth_reprobe_task = await _idle_task()
 
         gate._open.clear()
@@ -2800,7 +2827,6 @@ class TestSighupUncapsViaTransition:
         assert a.resets_at is None
         assert a.pause_started_at is None
         assert a.probe_count == 0
-        assert b.auth_failed_at is None
         assert gate._open.is_set() is True
         assert gate._paused_reason == ''
 

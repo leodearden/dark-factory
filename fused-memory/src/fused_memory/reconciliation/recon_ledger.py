@@ -43,6 +43,7 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     connect_daemon,
 )
+from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_TTL,
@@ -330,24 +331,10 @@ class ReconLedgerStore:
             await db.executescript(TABLE_SQL)
 
         # Safe migration: add the nullable entity_uuid column to pre-existing
-        # recon_ledger tables (task 2894 α, journal.py:214-249 ALTER-TABLE
-        # house pattern). On a fresh DB the column is already created by
-        # TABLE_SQL, so this ALTER fails ("duplicate column name") and is a
-        # harmless rollback; on an old DB it adds the column. Runs BEFORE
-        # INDEX_SQL so ix_recon_ledger_project_kind_entity can reference it.
-        #
-        # The catch is NARROWED to the expected "duplicate column name" case
-        # (loud-over-silent): a genuine migration failure — a locked/corrupt DB,
-        # a disk error — is re-raised here with its own message rather than
-        # swallowed and left to re-surface one statement later as a confusing
-        # "no such column: entity_uuid" from the INDEX_SQL that references it.
-        try:
-            async with self._access.write() as db:
-                await db.execute('ALTER TABLE recon_ledger ADD COLUMN entity_uuid TEXT')
-        except Exception as exc:
-            # The write unit has already rolled itself back.
-            if 'duplicate column name' not in str(exc).lower():
-                raise  # Not the benign "column already exists" case — surface it.
+        # recon_ledger tables (task 2894 α). Runs BEFORE INDEX_SQL so
+        # ix_recon_ledger_project_kind_entity can reference it.
+        async with self._access.write() as db:
+            await add_column_if_missing(db, 'recon_ledger', 'entity_uuid', 'TEXT')
 
         async with self._access.write() as db:
             await db.executescript(INDEX_SQL)
@@ -482,6 +469,27 @@ class ReconLedgerStore:
             project_id, RECORD_KIND_MEM0_TOMBSTONE, task_id=memory_id
         )
 
+    async def mem0_tombstones_with_prefix(
+        self, project_id: str, prefix: str
+    ) -> list[ReconLedgerRecord]:
+        """Return the tombstones in *project_id* whose memory id starts with *prefix*, by id.
+
+        The uuid-prefix miss report's reach into a store keyed by the full id
+        (task 5323), in one query: each row is the record
+        :meth:`get_mem0_tombstone` returns for its id. ``substr`` equality,
+        not ``LIKE``: LIKE folds case and reads ``%``/``_`` as wildcards, and
+        a prefix is a literal.
+        """
+        rows = await self._require_access().read_all(
+            """
+            SELECT * FROM recon_ledger
+            WHERE project_id = ? AND record_kind = ? AND substr(task_id, 1, ?) = ?
+            ORDER BY task_id
+            """,
+            (project_id, RECORD_KIND_MEM0_TOMBSTONE, len(prefix), prefix),
+        )
+        return [_record_from_row(row) for row in rows]
+
     async def list_by_kind(
         self, project_id: str, record_kind: str, state: str
     ) -> list[ReconLedgerRecord]:
@@ -502,6 +510,26 @@ class ReconLedgerStore:
             ORDER BY created_at, task_id, flag_type, run_id
             """,
             (project_id, record_kind, state),
+        )
+        return [_record_from_row(row) for row in rows]
+
+    async def list_by_flag_type(
+        self, project_id: str, record_kind: str, flag_type: str, *, task_id: str = ''
+    ) -> list[ReconLedgerRecord]:
+        """Return every row of one ``(project, kind, task_id, flag_type)``.
+
+        Spans every ``run_id`` and every state; ordered by ``created_at`` then
+        ``run_id``. Served by the primary-key prefix. Returns raw records, as
+        :meth:`list_by_kind` does, and likewise does not filter on
+        ``expires_at``.
+        """
+        rows = await self._require_access().read_all(
+            """
+            SELECT * FROM recon_ledger
+            WHERE project_id = ? AND record_kind = ? AND task_id = ? AND flag_type = ?
+            ORDER BY created_at, run_id
+            """,
+            (project_id, record_kind, task_id, flag_type),
         )
         return [_record_from_row(row) for row in rows]
 
@@ -610,7 +638,10 @@ class ReconLedgerStore:
         early-collection path is narrowed to single-task markers, the
         dominant/incident-driving shape, by this collapse). Fail-safe
         direction is preserved either way: uncertain/unmatched => keep, never
-        delete on partial information.
+        delete on partial information.  A project-qualified component (e.g.
+        ``'reify:650'``, from ``flag_dedup.compute_marker_signature``) never
+        equals a terminal id either, so foreign-cited markers are reaped by
+        TTL only — the same fail-safe direction.
 
         When ``terminal_task_ids`` is empty, the terminal-referenced clause is
         omitted entirely and an expiry-only DELETE runs instead — an explicit

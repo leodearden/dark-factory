@@ -20,6 +20,7 @@ re-deriving a *pending* step's status back to ``done`` in the first place.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -712,3 +713,122 @@ class TestInterIterationRebaseRederivesStepStatus:
         # And the reachability invariant still holds.
         for step in (step_1, step_2):
             assert await git_ops.is_ancestor(step['commit'], post_rebase_head)
+
+
+# ---------------------------------------------------------------------------
+# task 5726: only orchestrator-written log entries are rederive evidence
+# ---------------------------------------------------------------------------
+
+
+def _append_agent_line(artifacts: TaskArtifacts, entry: dict) -> None:
+    """Append *entry* the way an agent's shell heredoc does, bypassing
+    ``TaskArtifacts.append_iteration_log``."""
+    with open(artifacts.root / 'iterations.jsonl', 'a') as log:
+        log.write(json.dumps(entry) + '\n')
+
+
+_AGENT_LINES_NAMING_STEP_2 = [
+    pytest.param(
+        {
+            'iteration': 2,
+            'agent': 'implementer',
+            'steps_completed': ['step-2'],
+            'blocker': 'escalated',
+            'deviations': [],
+            'next': 'resume after escalation',
+        },
+        id='omits-committed-5588',
+    ),
+    pytest.param(
+        {
+            'agent': 'implementer',
+            'steps_completed': ['step-2'],
+            'committed': True,
+            'source': 'agent',
+            'timestamp': '2026-08-06T04:25:00',
+        },
+        id='committed-true-source-agent-3713',
+    ),
+    pytest.param(
+        {
+            'agent': 'implementer',
+            'steps_completed': ['step-2'],
+            'committed': True,
+            'source': 'post-escalation-resume',
+        },
+        id='post-escalation-resume-3668',
+    ),
+    pytest.param(
+        {'agent': 'claude-task-3088-implementer', 'steps_completed': ['step-2']},
+        id='role-named-agent-3088',
+    ),
+]
+
+
+@pytest.mark.asyncio
+class TestRederiveIgnoresAgentAuthoredEntries:
+    @pytest.mark.parametrize('agent_line', _AGENT_LINES_NAMING_STEP_2)
+    async def test_agent_authored_entry_naming_unlanded_step_is_not_rederived(
+        self, config, git_ops, task_assignment, agent_line: dict,
+    ):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'impl.py').write_text('implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_plan(artifacts, workflow, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+            {'id': 'step-2', 'type': 'impl', 'status': 'pending', 'commit': None},
+        ])
+        artifacts.append_iteration_log({
+            'agent': 'implementer', 'steps_completed': ['step-1'],
+            'commit': step_commit, 'committed': True,
+        })
+        claimed_commit = {'commit': step_commit} if agent_line.get('committed') is True else {}
+        _append_agent_line(artifacts, agent_line | claimed_commit)
+
+        result = await workflow._rederive_step_status_from_branch_state()
+
+        assert result == ['step-1']
+        by_id = {s['id']: s for s in artifacts.read_plan()['steps']}
+        assert by_id['step-1']['status'] == 'done'
+        assert by_id['step-2']['status'] == 'pending'
+        assert by_id['step-2']['commit'] is None
+
+    async def test_agent_authored_entry_cannot_override_orchestrator_step_commit(
+        self, config, git_ops, task_assignment,
+    ):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'a.py').write_text('step-1 work\n')
+        commit_a = await git_ops.commit(wt, 'feat: GREEN — step-1')
+        (wt / 'b.py').write_text('unrelated\n')
+        commit_b = await git_ops.commit(wt, 'chore: unrelated')
+        assert commit_a and commit_b and commit_a != commit_b
+
+        workflow.plan = _write_plan(artifacts, workflow, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+        ])
+        artifacts.append_iteration_log({
+            'agent': 'implementer', 'steps_completed': ['step-1'],
+            'commit': commit_a, 'committed': True,
+        })
+        _append_agent_line(artifacts, {
+            'agent': 'implementer', 'steps_completed': ['step-1'],
+            'commit': commit_b, 'committed': True,
+            'source': 'agent', 'timestamp': '2026-08-06T04:25:00',
+        })
+
+        result = await workflow._rederive_step_status_from_branch_state()
+
+        assert result == ['step-1']
+        step_1 = artifacts.read_plan()['steps'][0]
+        assert step_1['status'] == 'done'
+        assert step_1['commit'] == commit_a

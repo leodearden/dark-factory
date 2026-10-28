@@ -18,11 +18,9 @@ a skip is indistinguishable from a pass to anything reading an exit code — the
 precise conflation this task's other half fixes inside verify.  So this script
 has exactly three outcomes, ``EXIT_OK`` / ``EXIT_DRIFT`` / ``EXIT_UNAVAILABLE``,
 and "I could not look" is reported as loudly as "I looked and found drift".
-The assertions below therefore pin ``!= EXIT_OK`` explicitly on every
-could-not-look path, not merely ``== EXIT_UNAVAILABLE``: the failure being
-guarded against is a future refactor quietly folding unavailable into success,
-and an equality assertion against a renamed-but-still-zero constant would not
-catch it.
+Every could-not-look case below asserts ``== EXIT_UNAVAILABLE``; that this can
+never also mean success is pinned once, by `TestExitCodeContract` fixing the
+three codes as the literals 0, 1 and 2, so a renumbering to zero fails there.
 
 HERMETICITY IS A HARD RULE HERE (task 3226 pre-3), not a style preference.
 reify's live vector may legitimately differ from dark-factory's at any instant —
@@ -42,6 +40,7 @@ because ``--import-mode=importlib`` deliberately does not).
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -83,6 +82,7 @@ def _plant_guard(
     extensionless: list[str] | None = None,
     rc: int = 0,
     sleep_secs: float | None = None,
+    warning: str | None = None,
 ) -> Path:
     """Write a FAKE reify ``scripts/lock-charter-guard.sh`` under *repo* and return it.
 
@@ -91,7 +91,9 @@ def _plant_guard(
     unrecognised flag prints usage to stderr and exits 2 (measured 2026-08-09 on
     the live script, and recorded on ``_reify_guard_vector`` in the two in-suite
     copies).  *rc* and *sleep_secs* exist to drive the BROKEN-emitter arms: a
-    script that is present and then fails, and one that hangs.
+    script that is present and then fails, and one that hangs.  *warning* is a
+    ``printf`` format written to stderr before answering, so an octal escape in
+    it reaches the stream as a raw byte.
     """
     scripts_dir = repo / 'scripts'
     scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -106,6 +108,8 @@ def _plant_guard(
         return f"printf '%s\\n' {joined}"
 
     body = ['#!/usr/bin/env bash']
+    if warning is not None:
+        body.append(f"printf '{warning}\\n' >&2")
     if sleep_secs is not None:
         body.append(f'sleep {sleep_secs}')
     if rc != 0:
@@ -270,7 +274,6 @@ class TestCheckVectors:
         report = drift.check_vectors(repo)
 
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE
-        assert report['exit_code'] != drift.EXIT_OK
         assert report['status'] == 'unavailable'
 
     def test_nonexistent_repo_dir_is_unavailable(self, tmp_path):
@@ -293,7 +296,6 @@ class TestCheckVectors:
         report = drift.check_vectors(repo)
 
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE
-        assert report['exit_code'] not in (drift.EXIT_OK, drift.EXIT_DRIFT)
         assert report['status'] == 'unavailable'
 
     def test_hanging_guard_is_bounded_and_reports_unavailable(self, tmp_path):
@@ -314,13 +316,39 @@ class TestCheckVectors:
         report = drift.check_vectors(repo, timeout=0.5)
 
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE
-        assert report['exit_code'] not in (drift.EXIT_OK, drift.EXIT_DRIFT)
         assert report['status'] == 'unavailable'
 
     def test_unavailable_detail_names_the_script_it_could_not_run(self, tmp_path):
         repo = tmp_path / 'reify'
         repo.mkdir()
         assert 'lock-charter-guard.sh' in drift.check_vectors(repo)['detail']
+
+    def test_non_utf8_guard_output_is_unavailable_not_drift(self, tmp_path):
+        """The guard answered in bytes this script cannot read: could-not-look, not a vector to diff."""
+        repo = tmp_path / 'reify'
+        script = repo / 'scripts' / 'lock-charter-guard.sh'
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/usr/bin/env bash\nprintf '\\351\\n'\n")  # emits byte 0xE9
+        script.chmod(0o755)
+
+        report = drift.check_vectors(repo)
+
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert report['status'] == 'unavailable'
+
+    def test_non_utf8_stderr_beside_a_readable_answer_is_still_an_answer(self, tmp_path):
+        """stdout is the answer and stderr only commentary: a garbled warning must not void a vector it could read."""
+        repo = tmp_path / 'reify'
+        _plant_guard(
+            repo,
+            extensions=DF_EXTENSIONS,
+            extensionless=DF_EXTENSIONLESS,
+            warning='\\351 deprecated flag',  # stderr carries byte 0xE9
+        )
+
+        report = drift.check_vectors(repo)
+
+        assert report['exit_code'] == drift.EXIT_OK, report['detail']
 
 
 class TestGuardVectorHelper:
@@ -443,6 +471,26 @@ def _plant_repo(root: Path, paths: list[str], *, gitlinks: list[str] | None = No
     return root
 
 
+def _track_non_utf8_path(repo: Path) -> None:
+    """Track a file in *repo* whose NAME is bytes that are not valid UTF-8.
+
+    ``.py`` is an allowlisted extension, so only a decode problem, never a
+    finding, can change the outcome of a sweep over this repo.  A filesystem
+    that enforces UTF-8 names (APFS, ZFS ``utf8only``) refuses the file with
+    ``EILSEQ``; that skips, and any other ``OSError`` still errors.
+    """
+    name = b'caf\xe9.py'  # 0xE9 is Latin-1 é; a lone 0xE9 is invalid UTF-8
+    try:
+        with open(os.fsencode(repo) + b'/' + name, 'wb') as fh:
+            fh.write(b'x\n')
+    except OSError as exc:
+        if exc.errno != errno.EILSEQ:
+            raise
+        pytest.skip(f'filesystem rejects non-UTF-8 file names: {exc}')
+    # `ls-files -z` suppresses git's quoting, so these raw bytes reach the decoder.
+    subprocess.run(['git', '-C', str(repo), 'add', '--', name], check=True, capture_output=True)
+
+
 class TestCheckCorpus:
     """``check_corpus(reify_repo)`` — every tracked path must classify as a file."""
 
@@ -519,9 +567,22 @@ class TestCheckCorpus:
         report = drift.check_corpus(plain)
 
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE
-        assert report['exit_code'] != drift.EXIT_OK
         assert report['status'] == 'unavailable'
         assert report['findings'] == {}
+
+    def test_unavailable_detail_names_the_undecodable_path(self, tmp_path):
+        """One odd filename blinds the sweep until it is renamed, so the report must say WHICH file.
+
+        A byte offset into ``git ls-files`` output is not something an operator
+        can act on; the path is.
+        """
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        _track_non_utf8_path(repo)
+
+        report = drift.check_corpus(repo)
+
+        assert report['exit_code'] == drift.EXIT_UNAVAILABLE
+        assert r'caf\xe9.py' in report['detail']
 
     def test_first_offending_path_is_recorded_per_extension(self, tmp_path):
         """One representative path per extension, not an unbounded list.
@@ -598,6 +659,33 @@ class TestTrackedPaths:
 
         assert report['exit_code'] == drift.EXIT_UNAVAILABLE, report
 
+    def test_non_utf8_tracked_path_raises_guard_unavailable(self, tmp_path):
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        _track_non_utf8_path(repo)
+
+        with pytest.raises(drift.GuardUnavailable):
+            drift.tracked_paths(repo)
+
+    def test_non_utf8_tracked_path_exits_unavailable_never_drift(self, tmp_path):
+        """An escaping UnicodeDecodeError exits 1, which this script's own contract
+        reads as DRIFT: could-not-look reported as a finding."""
+        repo = _plant_repo(tmp_path / 'reify', ['a/b.py'])
+        _track_non_utf8_path(repo)
+        _plant_guard(repo, extensions=DF_EXTENSIONS, extensionless=DF_EXTENSIONLESS)
+
+        env = {k: v for k, v in os.environ.items() if k != 'REIFY_ROOT'}
+        proc = subprocess.run(
+            [sys.executable, drift.__file__, '--reify-repo', str(repo)],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(drift.__file__).parent),
+            env=env,
+            timeout=60,
+        )
+
+        assert proc.returncode == drift.EXIT_UNAVAILABLE, proc.stderr
+        assert 'Traceback' not in proc.stderr
+
 
 class TestCheckComposition:
     """``check`` — the worst of its parts, so an unavailable half is never masked."""
@@ -672,8 +760,9 @@ class TestCheckComposition:
 # What THIS file pins is only what is specific to THIS call site: that it
 # DELEGATES rather than keeping a private copy of the walk, that it binds the
 # right marker and starts at its own tree, that an explicit flag out-ranks the
-# env var, that the answer does not vary with the caller's cwd, and that no
-# `parents[N]` index arithmetic has crept back in.
+# env var, that the answer does not vary with the caller's cwd, that no
+# `parents[N]` index arithmetic has crept back in, and that provenance is never
+# re-derived from an ambient REIFY_ROOT.
 # ---------------------------------------------------------------------------
 
 
@@ -763,6 +852,24 @@ class TestResolve:
             f'start varied with cwd {cwd} — resolution must key off the script, '
             f'not the caller'
         )
+
+    def test_ambient_reify_root_neither_replaces_nor_reattributes_a_discovered_root(
+        self, tmp_path, monkeypatch,
+    ):
+        """A root the resolver DISCOVERED stays discovered, whatever REIFY_ROOT holds now.
+
+        Re-reading the env var here would credit the operator with a path they
+        never set; see ``resolve``'s docstring.
+        """
+        discovered = tmp_path / 'discovered-reify'
+        monkeypatch.setattr(
+            reify_checkout,
+            'resolve_reify_checkout',
+            lambda marker, *, start: reify_checkout.ReifyCheckout(discovered, False),
+        )
+        monkeypatch.setenv('REIFY_ROOT', str(tmp_path / 'operator-set-elsewhere'))
+
+        assert drift.resolve() == reify_checkout.ReifyCheckout(discovered, False)
 
 
 class TestMainCli:
@@ -869,6 +976,36 @@ class TestMainCli:
         assert str(bogus) in err
         assert 'REIFY_ROOT' in err
 
+    def test_message_about_a_discovered_root_never_blames_reify_root(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """A DISCOVERED root that cannot serve must not be reported as the operator's typo.
+
+        Blaming REIFY_ROOT here would send the operator hunting for a path they
+        never set; see ``resolve``'s docstring.
+        """
+        discovered = tmp_path / 'discovered-reify'
+        discovered.mkdir()  # a checkout WITHOUT the guard script, so main() explains why
+        elsewhere = tmp_path / 'operator-set-elsewhere'
+        monkeypatch.setattr(
+            reify_checkout,
+            'resolve_reify_checkout',
+            lambda marker, *, start: reify_checkout.ReifyCheckout(discovered, False),
+        )
+        monkeypatch.setenv('REIFY_ROOT', str(elsewhere))
+
+        rc = drift.main([])
+
+        assert rc == drift.EXIT_UNAVAILABLE
+        err = capsys.readouterr().err
+        expected = reify_checkout.reify_skip_reason(
+            drift.GUARD_RELPATH, discovered, named_by_env=False
+        )
+        assert expected is not None
+        assert expected in err
+        assert 'REIFY_ROOT' not in err
+        assert str(elsewhere) not in err
+
     def test_module_is_executable(self):
         """A script an operator is told to run must be runnable."""
         assert os.access(drift.__file__, os.X_OK), (
@@ -885,9 +1022,8 @@ class TestMainCli:
 
         Everything above calls ``main()`` in-process, which cannot observe the
         ``sys.exit(main(...))`` wiring at the bottom of the module.  A scheduled
-        job or CI lane branches on the numeric exit STATUS, so the could-not-look
-        arm is asserted ``!= 0`` as well as ``== EXIT_UNAVAILABLE``: the failure
-        being guarded against is a future refactor that swallows the return value
+        job or CI lane branches on the numeric exit STATUS, and the failure being
+        guarded against is a future refactor that swallows the return value
         (``main(...)`` called bare, or wrapped in a ``try``) and lets an
         unavailable run exit 0 — a skip reported as a pass, which is exactly the
         conflation this script exists to end.
@@ -907,5 +1043,3 @@ class TestMainCli:
         )
 
         assert proc.returncode == expected, proc.stderr
-        if expected != drift.EXIT_OK:
-            assert proc.returncode != drift.EXIT_OK

@@ -111,6 +111,54 @@ class GuardUnavailable(Exception):
     """
 
 
+def _run_or_unavailable(argv: list[str], *, what: str, timeout: float) -> subprocess.CompletedProcess[str]:
+    """Run *argv* to completion and return its result, or raise `GuardUnavailable`.
+
+    Owns only "did the process answer at all"; each caller judges its rc.  Every
+    could-not-answer escape — a timeout, an ``OSError`` (no binary, permission
+    bits, ENOENT), a stdout that is not UTF-8 — becomes `GuardUnavailable`,
+    because an escaping exception exits 1, which a caller reads as DRIFT: a
+    false accusation against reify.  The codec is pinned rather than taken from
+    the locale, so whether the same bytes are readable never depends on who ran
+    this.
+
+    Only stdout is the answer, so only stdout must decode; stderr is commentary,
+    decoded leniently, and a garbled warning beside a readable answer does not
+    void it.
+    """
+    try:
+        raw = subprocess.run(argv, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise GuardUnavailable(
+            f'{what} did not finish within {timeout}s — treated as unavailable '
+            f'rather than waited on indefinitely'
+        ) from exc
+    except OSError as exc:
+        raise GuardUnavailable(f'could not run {what}: {exc}') from exc
+    try:
+        stdout = raw.stdout.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise GuardUnavailable(
+            f'{what} answered with output that is not valid UTF-8 ({exc}), in '
+            f'{_record_holding(exc)[:400]!r} — its answer could not be read'
+        ) from exc
+    stderr = raw.stderr.decode('utf-8', errors='backslashreplace')
+    return subprocess.CompletedProcess(argv, raw.returncode, stdout, stderr)
+
+
+def _record_holding(exc: UnicodeDecodeError) -> bytes:
+    """The NUL- or newline-delimited record of *exc*'s input that holds the undecodable bytes.
+
+    Both callers' answers are sequences of such records — ``git ls-files -z``
+    entries and guard vector lines — so this names the offending path or entry,
+    where the codec's own message gives only a byte offset.
+    """
+    data = exc.object
+    head = max(data.rfind(b'\0', 0, exc.start), data.rfind(b'\n', 0, exc.start)) + 1
+    tails = [i for i in (data.find(b'\0', exc.end), data.find(b'\n', exc.end)) if i != -1]
+    return data[head:min(tails, default=len(data))]
+
+
 def _guard_vector(script: Path, flag: str, *, timeout: float = SUBPROCESS_TIMEOUT_SECS) -> list[str]:
     """Return the sorted vector emitted by reify's guard *script* for *flag*.
 
@@ -124,32 +172,19 @@ def _guard_vector(script: Path, flag: str, *, timeout: float = SUBPROCESS_TIMEOU
     renamed or dropped an emitter, leaving it green forever while enforcing
     nothing.
 
-    Every could-not-answer path funnels into `GuardUnavailable`: a missing file,
-    an ``OSError`` (no bash, permission bits, ENOENT), a non-zero rc, and a
-    timeout.  Letting an ``OSError`` escape instead would exit with Python's own
-    code 1 — which a caller reads as DRIFT, a false accusation against reify.
+    Raises `GuardUnavailable` for a missing script and a non-zero rc here, and
+    for a timeout, an ``OSError`` or an undecodable stdout via `_run_or_unavailable`.
     """
     if not script.is_file():
         raise GuardUnavailable(
             f'reify guard script {script} is not a file — no cross-repo '
             f'comparison was performed'
         )
-    try:
-        result = subprocess.run(
-            ['bash', str(script), flag],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise GuardUnavailable(
-            f'reify guard script {script} {flag} did not finish within '
-            f'{timeout}s — treated as unavailable rather than waited on '
-            f'indefinitely'
-        ) from exc
-    except OSError as exc:
-        raise GuardUnavailable(f'could not run {script} {flag}: {exc}') from exc
-
+    result = _run_or_unavailable(
+        ['bash', str(script), flag],
+        what=f'reify guard script {script} {flag}',
+        timeout=timeout,
+    )
     if result.returncode != 0:
         raise GuardUnavailable(
             f'reify guard script {script} {flag} exited {result.returncode}, '
@@ -267,25 +302,16 @@ def tracked_paths(
     deriving the exclusion from the mode column rather than from hardcoded
     submodule names means it keeps working the day reify renames or adds one.
 
-    Raises `GuardUnavailable` whenever ``git`` did not answer — a non-zero rc
-    (not a checkout), an ``OSError`` (no ``git`` on ``PATH``), or a timeout.
-    Returning an empty corpus would report a vacuous, confident OK, and an
-    escaping ``OSError`` would exit 1, which a caller reads as DRIFT.
+    Raises `GuardUnavailable` whenever ``git`` did not answer: a non-zero rc
+    (not a checkout) here, and every other could-not-answer escape — including
+    a tracked path whose name is not UTF-8 — via `_run_or_unavailable`.
+    Returning an empty corpus would report a vacuous, confident OK.
     """
-    try:
-        result = subprocess.run(
-            ['git', '-C', str(repo_root), 'ls-files', '-s', '-z'],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise GuardUnavailable(
-            f'`git ls-files` in {repo_root} did not finish within {timeout}s — '
-            f'the tracked corpus was never swept'
-        ) from exc
-    except OSError as exc:
-        raise GuardUnavailable(f'could not run `git ls-files` in {repo_root}: {exc}') from exc
+    result = _run_or_unavailable(
+        ['git', '-C', str(repo_root), 'ls-files', '-s', '-z'],
+        what=f'`git ls-files` in {repo_root}',
+        timeout=timeout,
+    )
     if result.returncode != 0:
         raise GuardUnavailable(
             f'`git ls-files` in {repo_root} exited {result.returncode} — not a '

@@ -22,9 +22,13 @@ two things, fail-soft and fast:
   same trick `tests/scripts/test_spawn_claude.py` uses), and writes the
   emitted OSC retitle sequence to `/dev/tty`.
 - `install-hooks.sh` — merges the trio into the real `~/.claude/settings.json`.
-- `session_hooks.py` (in `orchestrator/src/orchestrator/`, not here) holds all
-  the testable logic: identity/slug resolution, the registry read/refresh
-  calls, the OSC/title helpers, and the settings-merge function. The bash
+- `session_hooks.py` (in `orchestrator/src/orchestrator/`, not here) holds the
+  hook logic: identity/slug resolution, the registry read/refresh calls, the
+  OSC/title helpers, and the settings-merge function. Its process-tree
+  ownership probes live in
+  `orchestrator/src/orchestrator/session_ownership_probes.py` (tested in
+  `orchestrator/tests/test_session_ownership_probes.py`). The ownership model
+  both implement is explained in `docs/session-hook-ownership.md`. The bash
   files here stay thin by design (PRD §4 decision 9) — assert behavior
   against the Python module in `orchestrator/tests/test_session_hooks.py`,
   not against these scripts directly (except for the one bash-level

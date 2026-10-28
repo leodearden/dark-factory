@@ -9,13 +9,16 @@ import logging
 import os
 import time
 import uuid as uuid_mod
-from datetime import UTC, datetime
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
+from shared.defects import DeclareEvent, MalformedDefectRef, OutcomeEvent
 from shared.delivered_check_polarity import (
     GATE_REF,
     extract_delivered_checks,
@@ -23,11 +26,22 @@ from shared.delivered_check_polarity import (
     polarity_error,
 )
 from shared.task_statuses import ACTIVE
+from shared.uuid_prefix_guard import Namespace, Resolution, ResolverUnavailable
 
+from fused_memory.backends.defect_records import (
+    DefectEventInvalid,
+    parse_declare_wire,
+    parse_outcome_wire,
+)
 from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.backends.mem0_client import (
     _FUSED_MEMORY_OWNED_METADATA_KEYS,
     MEM0_MANAGED_METADATA_KEYS,
+)
+from fused_memory.backends.metadata_lookup import (
+    DEFAULT_LOOKUP_LIMIT,
+    InvalidMetadataLookupError,
+    validate_metadata_query,
 )
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
@@ -35,6 +49,11 @@ from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
 )
+from fused_memory.memory_metadata import (
+    SUPERSEDED_BY_METADATA_KEY,
+    TRIAGE_CONTESTED_METADATA_KEY,
+)
+from fused_memory.middleware.deferral_gate import StatusWriteScope
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
     inject_task_kind,
@@ -73,13 +92,19 @@ from fused_memory.middleware.routing_intent_guard import (
     routing_intent_reject,
     routing_intent_warning,
 )
+from fused_memory.middleware.simple_task_files_guard import simple_task_files_error
 from fused_memory.middleware.task_interceptor import (
     TERMINAL_STATUSES,
     TicketStoreNotConfiguredError,
     _is_ticket_id,
     _looks_like_task_id,
 )
-from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
+from fused_memory.models.enums import (
+    MEM0_PRIMARY,
+    MemoryCategory,
+    SourceStore,
+    routes_to_graphiti,
+)
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.reconciliation.citation_verifier import (
     find_live_citation_occurrences,
@@ -160,6 +185,10 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_topic_cluster_autoseed_enabled,
     resolve_topic_guard_clusters,
 )
+from fused_memory.server.resolve_prefix_route import (
+    register_resolve_prefix_route,
+    resolver_unavailable_body,
+)
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.server.topic_cluster_store import TopicClusterStore, seed_topic_cluster
 from fused_memory.server.write_triage import (
@@ -171,8 +200,9 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     ROUTED_KEY,
     TriageFailOpenCounter,
-    attach_write_landed,
+    attach_write_durable,
     declares_attach_keys,
+    declares_supersession,
     emit_triage_fail_open_storm_escalation,
     resolve_write_triage_enabled,
     triage_write,
@@ -201,12 +231,14 @@ from fused_memory.services.consolidation_ops import (
     patch_memory_metadata,
     read_topic_closure,
 )
+from fused_memory.services.id_resolver import IdResolver, is_uuid_prefix
 from fused_memory.services.memory_service import MemoryService, metadata_row_text
 from fused_memory.services.read_telemetry import (
     fallback_search_summary,
     summarize_search_query,
     summarize_search_results,
 )
+from fused_memory.services.supersession_mark import mark_superseded
 from fused_memory.utils.clip_disclosure import truncation_fields
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
@@ -501,6 +533,7 @@ Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
 - get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers; pass page_size/offset to paginate (keep page_size <= 2000 — larger pages can exceed the MCP tool-response transport limit and be rejected wholesale), with auto_paginate=True as an opt-in one-page fallback (never automatic — see the tool docstring)
 - search_tasks: Semantic search over already-filed tasks (ranked by similarity, enriched with current status) — use to check if a task like X was already filed
+- find_tasks_by_metadata: Exact lookup of tasks carrying top-level metadata key K (value omitted = presence; a str/int matches a scalar by equality or a list by membership), across every status including deferred and cancelled; paged (limit <= 100; page on has_more with offset += returned); include_value=True adds matched_value
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
 - update_task / remove_task: Task CRUD
 - add_dependency / remove_dependency: Dependency management
@@ -644,6 +677,79 @@ def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] |
         return canonicalize_project_id(project_id), None
     except PathShapedProjectIdError as e:
         return project_id, {'error': str(e), 'error_type': type(e).__name__}
+
+
+#: The refusal a read tool gives a prefix that names several ids; the uuid
+#: prefix guard refuses with the same error_type.
+_AMBIGUOUS_UUID_PREFIX = 'ambiguous_uuid_prefix'
+
+
+@dataclass(frozen=True)
+class _ResolvedId:
+    """The prefix named exactly one live id in the tool's namespace: read *full_id*."""
+
+    full_id: str
+
+
+@dataclass(frozen=True)
+class _PrefixResponse:
+    """The prefix named no one readable id: *body* is the tool's whole response."""
+
+    body: dict[str, Any]
+
+
+async def _resolve_or_respond(
+    id_resolver: IdResolver, project_id: str, prefix: str, *, serves: Namespace,
+) -> _ResolvedId | _PrefixResponse:
+    """Resolve a read tool's prefix-shaped id argument, or answer for the tool (PRD C4).
+
+    The response is the outage (``prefix_checked: False``, never a miss —
+    INV-11), the ambiguity refusal with its candidates, or the miss report of
+    what each namespace holds.
+    """
+    try:
+        resolution = await id_resolver.resolve_prefix(project_id, prefix)
+    except ResolverUnavailable as exc:
+        return _PrefixResponse({
+            **resolver_unavailable_body(exc),
+            'prefix': prefix,
+            'project_id': project_id,
+            'prefix_checked': False,
+        })
+    if resolution.outcome == 'ambiguous':
+        return _PrefixResponse({
+            'error': (
+                f'{prefix!r} is the prefix of {len(resolution.candidates)} ids; '
+                'pass the full uuid of the one you mean'
+            ),
+            'error_type': _AMBIGUOUS_UUID_PREFIX,
+            'prefix': prefix,
+            'project_id': project_id,
+            'prefix_checked': True,
+            'candidates': [candidate._asdict() for candidate in resolution.candidates],
+        })
+    if resolution.outcome == 'unique' and resolution.candidates[0].namespace == serves:
+        return _ResolvedId(resolution.candidates[0].id)
+    return _PrefixResponse({
+        'found': False,
+        'prefix_checked': True,
+        'prefix': prefix,
+        'project_id': project_id,
+        'namespaces': await id_resolver.miss_report(project_id, prefix, resolution),
+        'hint': _prefix_miss_hint(prefix, resolution, serves),
+    })
+
+
+def _prefix_miss_hint(prefix: str, resolution: Resolution, serves: Namespace) -> str:
+    malformed = validate_full_uuid(prefix)
+    remediation = malformed['hint'] if malformed else ''
+    if resolution.candidates:
+        elsewhere = resolution.candidates[0].namespace
+        return (
+            f'No {serves} id starts with {prefix!r}, but a live {elsewhere} id does '
+            f'(see namespaces). {remediation}'
+        )
+    return f'No live id in any namespace starts with {prefix!r}. {remediation}'
 
 
 _UPDATE_MEMORY_MODES = ('merge', 'replace')
@@ -1117,14 +1223,16 @@ def _status_page(
     return {k: statuses[k] for k in page_keys}, len(ordered)
 
 
-def _validate_paging(page_size: Any, offset: Any) -> dict[str, Any] | None:
+def _validate_paging(
+    page_size: Any, offset: Any, *, size_arg: str = 'page_size',
+) -> dict[str, Any] | None:
     """Validate shared ``page_size``/``offset`` paging inputs.
 
     Returns a ValidationError payload dict when an input is malformed, or None
-    when both are acceptable.  Shared by ``get_tasks`` and ``get_statuses`` so
-    both tools reject identical inputs identically and a future fix to the
-    bool/int guard lands in ONE place (it was previously copy-pasted, so it
-    had to be fixed twice).
+    when both are acceptable.  Shared by ``get_tasks``, ``get_statuses`` and
+    ``find_tasks_by_metadata`` so they reject identical inputs identically and
+    a future fix to the bool/int guard lands in ONE place (it was previously
+    copy-pasted, so it had to be fixed twice).
 
     ``bool`` is rejected explicitly because it is an ``int`` subclass:
     ``page_size=True`` would otherwise silently mean a 1-entry page.
@@ -1132,21 +1240,69 @@ def _validate_paging(page_size: Any, offset: Any) -> dict[str, Any] | None:
     would spin a paging caller forever.
 
     Callers must invoke this BEFORE touching the interceptor, so a malformed
-    request costs no backend work.
+    request costs no backend work. ``size_arg`` is the page-size argument's
+    name in the calling tool, so the error names what the caller passed.
     """
     if page_size is not None and (
         not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0
     ):
         return {
-            'error': 'page_size must be a positive integer',
+            'error': f'{size_arg} must be a positive integer; got {page_size!r}',
             'error_type': 'ValidationError',
         }
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         return {
-            'error': 'offset must be a non-negative integer',
+            'error': f'offset must be a non-negative integer; got {offset!r}',
             'error_type': 'ValidationError',
         }
     return None
+
+
+def _validate_statuses(statuses: Any) -> dict[str, Any] | None:
+    """Return a ValidationError payload unless ``statuses`` is None or a list of str.
+
+    ``[]`` is valid and matches nothing. Shared by ``get_tasks`` and
+    ``find_tasks_by_metadata``, so a bare string is rejected identically by both.
+    """
+    if statuses is None or (
+        isinstance(statuses, list) and all(isinstance(s, str) for s in statuses)
+    ):
+        return None
+    return {
+        'error': f'statuses must be a list of status strings; got {statuses!r}',
+        'error_type': 'ValidationError',
+    }
+
+
+# find_tasks_by_metadata's page-size cap, and its include_value page budget in
+# serialized bytes of ``results`` (plans/task-metadata-lookup-prd.md decision 6).
+METADATA_LOOKUP_LIMIT_CAP = 100
+RESULT_BYTE_BUDGET = 48_000
+
+
+def _json_bytes(obj: Any) -> int:
+    """Serialized size as the lookup contract measures it: stdlib ``json.dumps``, UTF-8 bytes."""
+    return len(json.dumps(obj).encode('utf-8'))
+
+
+def _elided_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    elided = {'_elided': True, 'bytes': _json_bytes(row['matched_value'])}
+    return {**row, 'matched_value': elided, 'truncated_value': True}
+
+
+def _fit_rows_to_budget(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The longest prefix of *rows* whose serialized list fits ``RESULT_BYTE_BUDGET``.
+
+    Sizes add up exactly as ``json.dumps`` of the list: ``[]`` plus each row
+    plus a ``', '`` between rows. A first row too big to fit alone comes back
+    as the only row, with its value elided.
+    """
+    size = len('[]')
+    for count, row in enumerate(rows):
+        size += _json_bytes(row) + (len(', ') if count else 0)
+        if size > RESULT_BYTE_BUDGET:
+            return list(rows[:count]) if count else [_elided_row(row)]
+    return list(rows)
 
 
 def _pagination_meta(
@@ -1196,10 +1352,17 @@ def create_mcp_server(
     curator_usage_gate: UsageGate | None = None,
     known_projects: dict[str, str] | None = None,
     topic_cluster_store: TopicClusterStore | None = None,
+    id_resolver: IdResolver | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
+
+    def _resolver() -> IdResolver:
+        # Built per use: the resolver is stateless and its factory reads the
+        # service's CURRENT config, so a hot reload of the read timeout or
+        # collection prefix applies to the next resolution.
+        return id_resolver or IdResolver.for_memory_service(memory_service)
     _taskmaster_configured = task_interceptor is not None
 
     async def _backlog_gate(project_id: str) -> dict | None:
@@ -1310,13 +1473,17 @@ def create_mcp_server(
         ``add_memory`` path, so the cheap hop is worth taking.
         """
         esc_id = None
+        storm_with_counts = {
+            **storm,
+            'mem0_intents_in_window': await _mem0_intents_in_window(storm),
+        }
         # `or [project_id]`: a burst whose labels were all unresolvable still
         # deserves an alarm somewhere, and this call's own project is the only
         # queue we can name.
         for pid in storm.get('projects') or [project_id]:
             try:
                 filed = await asyncio.to_thread(
-                    emit_triage_fail_open_storm_escalation, _kp.get(pid), storm,
+                    emit_triage_fail_open_storm_escalation, _kp.get(pid), storm_with_counts,
                 )
             except Exception:  # pragma: no cover — defensive only
                 logger.exception(
@@ -1328,6 +1495,22 @@ def create_mcp_server(
             if filed is not None and esc_id is None:
                 esc_id = filed
         return esc_id
+
+    async def _mem0_intents_in_window(storm: dict) -> dict[str, int] | None:
+        """Mem0 intent counts by status over the storm's window; None when unavailable."""
+        if write_journal is None:
+            return None
+        since = datetime.now(UTC) - timedelta(seconds=float(storm.get('window_seconds') or 0))
+        try:
+            return await write_journal.count_mem0_intents_by_status(since=since)
+        except Exception as exc:
+            logger.warning(
+                'write_triage: could not count mem0_intents for the fail-open storm '
+                'record (%s: %s); it will say the counts are unavailable',
+                type(exc).__name__,
+                exc,
+            )
+            return None
 
     def _known_project_gate(project_id: str) -> dict | None:
         """Return an error dict if project_id is absent from the known_projects registry."""
@@ -1452,6 +1635,13 @@ def create_mcp_server(
         # all IS the signal; the body is a fixed constant so nothing dynamic
         # can creep in and turn this back into a state read.
         return JSONResponse(_ALIVE_BODY, status_code=200)
+
+    # POST /resolve-prefix: the uuid-prefix resolver for out-of-process callers (PRD C5).
+    register_resolve_prefix_route(
+        mcp,
+        lambda project_id, prefix: _resolver().resolve_prefix(project_id, prefix),
+        known_projects=_kp,
+    )
 
     # ------------------------------------------------------------------
     # Write tools
@@ -3105,9 +3295,12 @@ def create_mcp_server(
         declaration your own content CONTRADICTS is rejected
         (error_type=DeclaredReferentConflictRejected) and the episode is not
         ingested — the block names both what you declared and what the content
-        actually cites. Only a conflict is ever rejected: omitting `entities`,
-        or passing [] to record that you considered referents and none applied,
-        always succeeds.
+        actually cites. A conflict is a near-miss typo (the content names a
+        task one edit away from a declared id and writes the declared number
+        nowhere) or the declared number under another project. Fix the id if
+        it is wrong; if it is right, write `task NNN` in the content. Only a
+        conflict is ever rejected: an absent declaration, or [] (you
+        considered referents and none applied), never is.
 
         Args:
             content: Raw text, conversation, or JSON to ingest
@@ -3144,13 +3337,14 @@ def create_mcp_server(
                 is NOT "all entities": extraction legitimately derives entities
                 no caller could predict, and this parameter names only the
                 referents the episode is ABOUT. A declaration the content
-                contradicts is REJECTED
+                contradicts — a near-miss typo of a declared task number, or
+                that number under another project — is REJECTED
                 (error_type=DeclaredReferentConflictRejected) and nothing is
-                ingested. ANY wrong shape — a bare string, a single un-wrapped
-                dict, a bad entry inside the list — is rejected as a
-                ValidationError whose message carries the accepted entry shape,
-                so you never have to guess the remedy. Absence is never
-                rejected, so omitting this always succeeds.
+                ingested; fix the id, or write `task NNN` in the content. ANY
+                wrong shape — a bare string, a single un-wrapped dict, a bad
+                entry inside the list — is rejected as a ValidationError whose
+                message carries the accepted entry shape, so you never have to
+                guess the remedy. Absence is never rejected.
                 One asymmetry against add_memory, and it is a tier below this
                 parameter: add_episode persists no metadata, so there is no
                 metadata['task_id'] fallback here — a declaration overrides
@@ -3428,29 +3622,34 @@ def create_mcp_server(
         overwrite. No agent class is force-stored (task 3134).
         Your own classification of a record is not triage's to replace.
 
+        To correct a memory, write the correction as a new memory with
+        ``metadata={'supersedes': [<id>]}``: it is always stored standalone
+        (never attached under the record it replaces), and each superseded
+        record is marked with ``metadata.x_superseded_by=<the new id>``, which
+        ``search`` and ``get_memory_by_id`` return, briefings render as
+        ``superseded by <id>``, and the ack's ``supersession`` key reports.
+
         Optionally DECLARE what the memory is about with `entities`. A
         declaration outranks the referents scanned out of the content, so it is
         how you correct a body whose prose names a task ambiguously or not at
         all. A declaration your own content CONTRADICTS is rejected
         (error_type=DeclaredReferentConflictRejected) and the write does not
         happen — the block names both what you declared and what the content
-        actually cites. Only a conflict is ever rejected: omitting `entities`,
-        or passing [] to record that you considered referents and none applied,
-        always succeeds.
+        actually cites. A conflict is a near-miss typo (the content names a
+        task one edit away from a declared id and writes the declared number
+        nowhere) or the declared number under another project. Fix the id if
+        it is wrong; if it is right, write `task NNN` in the content. Only a
+        conflict is ever rejected: an absent declaration, or [] (you
+        considered referents and none applied), never is.
 
-        Two halves of that, and they have DIFFERENT scopes — the rejection is
-        universal, the recording is not. Every add_memory call is checked for a
-        declared/prose conflict, whatever its category. But a declaration is
-        RECORDED only on a write that reaches Graphiti — an
+        A declaration is RECORDED only on a write that reaches Graphiti — an
         entities_and_relations, temporal_facts or decisions_and_rationale
-        category, or dual_write=True. On a Mem0-primary write
+        category, or dual_write=True. On an explicit Mem0-primary category
         (procedural_knowledge, preferences_and_norms,
-        observations_and_summaries) the referent set has nowhere to live: your
-        `entities` is validated against the content and then discarded, and
-        nothing downstream can tell it apart from a call that omitted the
-        parameter. So on those three categories `entities` buys you the
-        typo-catch and nothing else — which is still worth having, but do not
-        expect it to steer retrieval.
+        observations_and_summaries) without dual_write, the referent set has
+        nowhere to live: your `entities` is shape-checked, then discarded, and
+        never conflict-rejected. With category omitted it IS conflict-checked,
+        because the destination is not known until the write is classified.
 
         Content asserting that concrete, NAMED work is complete ("task N's fix
         has been applied", "re-filed as ticket tkt_...") is cross-checked
@@ -3479,6 +3678,15 @@ def create_mcp_server(
         pattern list and the rationale; the literals themselves are enumerated
         once, in :mod:`shared.toolcall_markup`, and nothing in this package
         spells them.
+
+        If the embedding provider fails transiently (429, 5xx, connection), the
+        Mem0 leg is NOT dropped: the ack carries stores_pending_retry=['mem0'],
+        memory_ids is empty, the message says mem0_pending_retry, and the
+        server retries the write for as long as its failures stay transient. A
+        later non-transient failure dead-letters it (status 'dead' in the
+        write journal's mem0_intents, logged at ERROR). Do NOT re-submit the
+        same content (that would duplicate it). The Mem0 leg has landed only
+        when the ack lists mem0 in stores_written and memory_ids is non-empty.
 
         Args:
             content: The memory itself (a fact, preference, procedure, etc.)
@@ -3511,17 +3719,19 @@ def create_mcp_server(
                       extraction pipeline legitimately derives entities no caller
                       could predict, and this parameter names only the referents
                       the memory is ABOUT. A declaration the content contradicts
-                      is REJECTED (error_type=DeclaredReferentConflictRejected)
-                      and nothing is written. ANY wrong shape — a bare string,
+                      — a near-miss typo of a declared task number, or that
+                      number under another project — is REJECTED
+                      (error_type=DeclaredReferentConflictRejected) and nothing
+                      is written; fix the id, or write `task NNN` in the
+                      content. ANY wrong shape — a bare string,
                       a single un-wrapped dict, a bad entry inside the list — is
                       rejected as a ValidationError whose message carries the
                       accepted entry shape, so you never have to guess the
-                      remedy. Absence is never rejected, so omitting this
-                      parameter always succeeds. RECORDED only on a write that
+                      remedy. Absence is never rejected. RECORDED only on a write that
                       reaches Graphiti (a GRAPHITI_PRIMARY category, or
-                      dual_write=True); on a Mem0-primary category it is
-                      checked for a conflict and then discarded — see the
-                      scope note above.
+                      dual_write=True); on an explicit Mem0-primary category
+                      without dual_write it is shape-checked, then discarded,
+                      and never conflict-rejected — see the scope note above.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -3555,8 +3765,19 @@ def create_mcp_server(
         # through `canonicalize_project_id` — so the gate and `MemoryService`
         # classify local-vs-foreign referents identically. A raw id here would
         # let the two disagree about whether a qualifier names us.
+        #
+        # `category is None` counts as recorded: the classifier picks the
+        # destination below this boundary, and running it here too would be a
+        # second classification site (INV-5).
+        declaration_recorded = category is None or routes_to_graphiti(
+            MemoryCategory(category), dual_write=dual_write,
+        )
         if err := entities_gate(
-            entities, content=content, group_id=project_id, agent_id=agent_id,
+            entities,
+            content=content,
+            group_id=project_id,
+            agent_id=agent_id,
+            declaration_recorded=declaration_recorded,
         ):
             return err
         # MCP-markup rejection no longer happens here: task 4458 retired this
@@ -3645,6 +3866,7 @@ def create_mcp_server(
         # for why ANY `kind` counts (not just the child kinds) and what that
         # costs in coverage.
         caller_owns_attach_keys = declares_attach_keys(metadata)
+        caller_declares_supersession = declares_supersession(metadata)
         # Write triage (task 3127, PRD leaf beta) SUPERSEDES the two reject
         # guards below rather than layering on top of them (D2: redirect
         # supersedes reject). The two paths are mutually exclusive: when triage
@@ -3676,12 +3898,13 @@ def create_mcp_server(
                 # transport error, timeout and unparseable output, and that
                 # `except` arm counts it and returns `stored`.
                 judge=judge_write,
-                # Both predicates are already derived above, from the metadata
+                # The predicates are already derived above, from the metadata
                 # and agent_id this body holds. Passed IN rather than
                 # recomputed inside triage_write: a second derivation is a
                 # second place for the two to disagree about who is exempt.
                 allow_near_duplicate=allow_near_duplicate,
                 caller_owns_attach_keys=caller_owns_attach_keys,
+                caller_declares_supersession=caller_declares_supersession,
             )
         # DEFERRED, DELIBERATELY: the topic-cluster signal contributes nothing
         # to triage routing in this leaf. The PRD's band rule (§Bands) is
@@ -3844,6 +4067,11 @@ def create_mcp_server(
             # allow_near_duplicate is a write-time-only control flag for the
             # guard above; it must never be persisted into stored metadata.
             cleaned_meta.pop('allow_near_duplicate', None)
+            # Only the contested attach below may write this, so no caller can
+            # make a hand-declared contest look triage-written.
+            cleaned_meta.pop(TRIAGE_CONTESTED_METADATA_KEY, None)
+            # Only services/supersession_mark.py::mark_superseded may write this.
+            cleaned_meta.pop(SUPERSEDED_BY_METADATA_KEY, None)
         # An ATTACH outcome reroutes this same write into a child of the memory
         # it restates: same content, same category, same agent, plus the parent
         # link. It does NOT touch the canonical — triage issues no
@@ -3900,10 +4128,11 @@ def create_mcp_server(
             _triage_fail_open_counter.record(project=project_id)
         write_meta = cleaned_meta
         if attached_to is not None:
-            # Every key written here is an ATTACH_OWNED_KEY, and overwriting
-            # them is safe ONLY because `caller_owns_attach_keys` force-stored
-            # every write that carried any one of them — so none can be
-            # present here. Adding a key to this dict without adding it to
+            # Every key written here is an ATTACH_OWNED_KEY (the triage-contest
+            # marker excepted: TestOnlyTriageWritesTheTriageContestMarker), and
+            # overwriting them is safe ONLY because `caller_owns_attach_keys`
+            # force-stored every write that carried any one of them — so none
+            # can be present here. Adding a key to this dict without adding it to
             # ATTACH_OWNED_KEYS re-opens the loss for that key; the gate suite
             # pins the two sets against each other for exactly that reason,
             # unioned across the outcomes because they no longer write the
@@ -3938,6 +4167,8 @@ def create_mcp_server(
                 # this one. The canonical it contradicts is left exactly as it
                 # was, and nothing is scheduled to settle the disagreement.
                 write_meta[CONTESTED_METADATA_KEY] = True
+                # Read by link-heal's H1 row 2: a contest triage made is healable.
+                write_meta[TRIAGE_CONTESTED_METADATA_KEY] = True
         try:
             result = await memory_service.add_memory(
                 content=content,
@@ -3999,14 +4230,17 @@ def create_mcp_server(
                 # Kept for the same reason: the pre-triage write carried the tag.
                 **claim_kwargs,
             )
-        if attached_to is not None and not attach_write_landed(result):
+        if attached_to is not None and not attach_write_durable(result):
             # A RAISE IS ONLY HALF THE FAILURE SURFACE — and the smaller half,
             # the same asymmetry `triage_write` handles for retrieval.
             # `MemoryService.add_memory` does NOT raise when a store fails: it
             # catches the Graphiti/Mem0 exception into `_graphiti_error` /
             # `_mem0_error`, folds it into `message`, and returns an ordinary
-            # AddMemoryResponse with NO memory_ids. So a child write that died
-            # at the store never reaches the `except` arm above, and the ack
+            # AddMemoryResponse with NO memory_ids (a Mem0 leg durably queued
+            # for server-side retry is not such a failure: it lists mem0 under
+            # `stores_pending_retry`, and the retry lands the child the ack
+            # names). So a child write that died at the store never reaches
+            # the `except` arm above, and the ack
             # would otherwise announce `restated` + canonical_id for a link
             # that was never persisted — precisely the "ack claiming an attach
             # that did not happen" the comment below calls worse than no ack.
@@ -4028,7 +4262,21 @@ def create_mcp_server(
             )
             _triage_fail_open_counter.record(project=project_id)
             attached_to = None
+        # Marks each record this write supersedes, now that the new id exists.
+        # Not a triage event; see services/supersession_mark.py.
+        supersession = await mark_superseded(
+            memory_service,
+            metadata=metadata,
+            written=result,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            source=source,
+        )
         ack = result.model_dump()
+        if supersession is not None:
+            ack.update(supersession.to_ack())
         if unverified_flag is not None:
             ack[UNVERIFIED_CLAIM_TAG] = _report_unverified_claims(
                 unverified_flag, agent_id, project_id,
@@ -4876,9 +5124,21 @@ def create_mcp_server(
 
         Args:
             project_id: Project scope (required)
-            memory_id: Raw Mem0/Qdrant point-id (memory UUID) to look up
+            memory_id: Raw Mem0/Qdrant point-id (memory UUID) to look up, or
+                an 8-31 lowercase-hex prefix of one
 
         Returns:
+            For a PREFIX that names exactly one live memory: that memory's
+            hit or miss below, plus ``resolved_from_prefix``. For any other
+            prefix: the miss report ``{'found': False, 'prefix_checked': True,
+            'prefix', 'project_id', 'namespaces', 'hint'}`` listing what each
+            namespace (mem0, mem0_tombstone, graphiti_node, graphiti_edge)
+            holds, with ``mem0_tombstone: None`` when the tombstone store could
+            not be read; ``{'error_type': 'ambiguous_uuid_prefix', 'candidates', ...}``
+            when it names several ids; ``{'error_type': 'resolver_unavailable',
+            'store', 'prefix_checked': False, ...}`` when a store could not be
+            read. Any other non-uuid id is a ``ValidationError`` with a ``hint``.
+
             ``{'found': True, 'memory_id', 'project_id', 'content', 'metadata'}``
             on a hit (``metadata`` is the full raw Qdrant payload); ``{'found':
             False, 'memory_id', 'project_id'}`` on a genuine miss — plus
@@ -4914,6 +5174,15 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
+        resolved_from_prefix: str | None = None
+        if is_uuid_prefix(memory_id):
+            match await _resolve_or_respond(_resolver(), project_id, memory_id, serves='mem0'):
+                case _PrefixResponse(body=response):
+                    return response
+                case _ResolvedId(full_id=full_id):
+                    resolved_from_prefix, memory_id = memory_id, full_id
+        elif err := validate_full_uuid(memory_id, field_name='memory_id'):
+            return err
         record = await memory_service.get_memory_by_id(
             project_id=project_id,
             memory_id=memory_id,
@@ -4924,6 +5193,8 @@ def create_mcp_server(
                 'memory_id': memory_id,
                 'project_id': project_id,
             }
+            if resolved_from_prefix is not None:
+                miss['resolved_from_prefix'] = resolved_from_prefix
             # A miss may be a DELIBERATE reap rather than a never-existed. The
             # lookup is guarded and the key omitted when empty, so this can
             # only ever add information to an answer that is already correct —
@@ -4960,6 +5231,8 @@ def create_mcp_server(
             'content': record['content'],
             'metadata': record['metadata'],
         }
+        if resolved_from_prefix is not None:
+            hit['resolved_from_prefix'] = resolved_from_prefix
         # ADDITIVE ONLY (task 3129): a canonical gains its group; a CHILD keeps
         # its own content/metadata/memory_id and gains only grouped.parent —
         # replacing a child's body with its parent's would make a citation
@@ -5095,8 +5368,15 @@ def create_mcp_server(
         want to confirm its identity without the fuzzy/semantic matching that
         can mask duplicate-node pathology.
 
+        An 8-31 lowercase-hex PREFIX naming exactly one Entity node is read
+        through to it (the result gains ``resolved_from_prefix``, as does the
+        NodeNotFoundError, with the resolved ``entity_uuid``, if the node is
+        gone by read time); any other prefix returns get_memory_by_id's miss
+        report, ambiguity refusal or ``resolver_unavailable`` shape instead of
+        a NodeNotFoundError.
+
         Args:
-            entity_uuid: UUID of the Entity node to look up
+            entity_uuid: UUID of the Entity node to look up, or a prefix of one
             project_id: Project scope (required)
             agent_id: Which agent is reading (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
@@ -5107,6 +5387,26 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
+        resolved_from_prefix: str | None = None
+        if is_uuid_prefix(entity_uuid):
+            match await _resolve_or_respond(
+                _resolver(), project_id, entity_uuid, serves='graphiti_node',
+            ):
+                case _PrefixResponse(body=response):
+                    await _log_read(
+                        operation='get_entity_by_uuid',
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        params={'entity_uuid': entity_uuid},
+                        result_summary={
+                            'prefix_checked': response['prefix_checked'],
+                            'outcome': response.get('error_type', 'miss_report'),
+                        },
+                    )
+                    return response
+                case _ResolvedId(full_id=full_id):
+                    resolved_from_prefix, entity_uuid = entity_uuid, full_id
         try:
             result = await memory_service.get_entity_by_uuid(
                 entity_uuid=entity_uuid, project_id=project_id
@@ -5123,6 +5423,8 @@ def create_mcp_server(
                     'has_summary': bool(result.get('summary')),
                 },
             )
+            if resolved_from_prefix is not None:
+                return {**result, 'resolved_from_prefix': resolved_from_prefix}
             return result
         except NodeNotFoundError as e:
             # Expected diagnostic outcome, not a backend failure — this tool
@@ -5137,7 +5439,10 @@ def create_mcp_server(
                 params={'entity_uuid': entity_uuid},
                 result_summary={'found': False},
             )
-            return {'error': str(e), 'error_type': type(e).__name__}
+            miss = {'error': str(e), 'error_type': type(e).__name__}
+            if resolved_from_prefix is not None:
+                miss |= {'entity_uuid': entity_uuid, 'resolved_from_prefix': resolved_from_prefix}
+            return miss
         except Exception as e:
             await _log_read(
                 operation='get_entity_by_uuid',
@@ -8312,16 +8617,9 @@ def create_mcp_server(
         _paging_error = _validate_paging(page_size, offset)
         if _paging_error is not None:
             return _paging_error
-        if statuses is not None and not isinstance(statuses, list):
-            return {
-                'error': 'statuses must be a list of status strings',
-                'error_type': 'ValidationError',
-            }
-        if statuses is not None and any(not isinstance(s, str) for s in statuses):
-            return {
-                'error': 'statuses must be a list of status strings',
-                'error_type': 'ValidationError',
-            }
+        _statuses_error = _validate_statuses(statuses)
+        if _statuses_error is not None:
+            return _statuses_error
 
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -8772,6 +9070,9 @@ def create_mcp_server(
         heartbeat_at: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
         client_op_id: str | None = None,
+        deferral: dict | None = None,
+        expected_stamped_at: str | None = None,
+        restamp_only: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
@@ -8842,6 +9143,27 @@ def create_mcp_server(
             client_op_id: Optional client-supplied idempotency key (task 2712).
                 A retry with the same key applies once and returns the recorded
                 outcome. Omit for today's behavior.
+            deferral: What ends the hold. REQUIRED to enter ``deferred``, refused
+                with any other status. One of
+                ``{'kind': 'carried_by', 'carrier_task_id': <id>}``,
+                ``{'kind': 'until_condition', 'condition': <text>, 'expires_at': <ISO, optional>}``
+                or ``{'kind': 'held_by_session', 'holder_pid': <your $CLAUDE_PID>,
+                'grace_secs': <600..86400, optional>}``; each may add ``reason``.
+                On a row already ``deferred`` it re-stamps (replaces) the record
+                without a status change. Every successful write echoes the
+                stored record as ``deferral`` (entry, re-stamp) or the removed
+                one as ``deferral_cleared`` (any exit from ``deferred``); no echo
+                means the server predates the gate. Refusals: ``deferral_required``,
+                ``deferral_invalid`` (with ``reason_code``, ``field``, ``value``),
+                ``deferral_changed``. Recipe: docs/task-authoring.md §9
+                "Deferring a task".
+            expected_stamped_at: Compare-and-set, single id only: the write is
+                refused ``deferral_changed`` unless the row's current record has
+                this ``stamped_at``.
+            restamp_only: Guarded re-stamp, single id only, ``status='deferred'``
+                and a ``deferral`` required: refused ``deferral_changed`` unless
+                the row is ``deferred`` now with the record named by
+                ``expected_stamped_at`` (omitted = no record).
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -8870,6 +9192,9 @@ def create_mcp_server(
             reopen_reason=reopen_reason,
             agent_id=agent_id,
             client_op_id=client_op_id,
+            deferral=deferral,
+            expected_stamped_at=expected_stamped_at,
+            restamp_only=restamp_only,
             **claimant_kwargs,
         )
 
@@ -8944,6 +9269,8 @@ def create_mcp_server(
 
         Callers should follow up with ``resolve_ticket`` to obtain the final
         task_id once the curator has decided (create / drop / combine).
+        When the curator cannot judge it yet, the ticket parks as
+        ``awaiting_curation`` and is curated later.
 
         ``planning_mode=True`` switches to a synchronous, curator-bypassing
         path for batched human decomposition (e.g., breaking a PRD into ~50
@@ -9010,9 +9337,13 @@ def create_mcp_server(
                 the change is a single coherent edit — docs or comments, a
                 rename, a localized behaviour-preserving refactor, a typo/wording
                 fix, a one-spot bug fix — that needs no new abstraction and no
-                cross-module design, and you can name the target file(s). It is
-                fine for a simple task to be high priority or to touch several
-                files/modules, as long as the change is mechanically simple.
+                cross-module design, and you can name the target file(s).
+                Declaring "simple" REQUIRES a non-empty metadata.files naming
+                those files: a fileless simple submission is rejected
+                (error_type='SimpleTaskFilesRequired'), and files=[] does not
+                satisfy it. It is fine for a simple task to be high priority or
+                to touch several files/modules, as long as the change is
+                mechanically simple.
                 When unsure, omit it — the full path is the safe default, and a
                 mis-declared task simply falls back to the architect.
             tag: Tag context (optional)
@@ -9109,6 +9440,16 @@ def create_mcp_server(
         _retired_err = retired_key_modules_error(metadata)
         if _retired_err is not None:
             return _retired_err
+
+        # Simple-task files guard δ (task 4524, plans/module-tagger-retirement-prd.md
+        # decision 2): a complexity='simple' submission must declare
+        # metadata.files. Placed after inject_task_kind and before the
+        # interceptor's planning_mode branch, so both creation paths are
+        # covered; after ε, so a modules carrier is first told to use files.
+        # update_task and commit_planning deliberately do not call it.
+        _simple_err = simple_task_files_error(metadata)
+        if _simple_err is not None:
+            return _simple_err
 
         # model_overrides shape guard ζ (PRD adaptive-model-routing, decision 9):
         # reject a malformed metadata.model_overrides (unknown role name,
@@ -9329,6 +9670,11 @@ def create_mcp_server(
           is the target task's id.
         - ``failed``   — an error occurred; ``reason`` describes it. Common
           reasons: ``timeout``, ``server_restart``, ``expired``.
+        - ``awaiting_curation`` — NON-terminal: the curator could not judge the
+          submission yet (``reason`` says why), so it is durably parked and
+          retried automatically until it gets a verdict. NO ``task_id`` is
+          returned. It is neither a failure nor a creation: do NOT re-submit
+          and do NOT count it as created; call ``resolve_ticket`` again later.
         - ``refused``  — a deterministic guard (cancelled-premise blocklist /
           recon premise registry) rejected the candidate. **NO TASK WAS
           CREATED and NO ``task_id`` is returned** — the key is absent, not
@@ -9399,8 +9745,8 @@ def create_mcp_server(
 
         Args:
             project_root: Absolute path to project root.
-            status: Optional status filter ('pending', 'created', 'failed',
-                'combined', 'refused'). 'refused' means a deterministic guard
+            status: Optional status filter ('pending', 'awaiting_curation',
+                'created', 'failed', 'combined', 'refused', 'cancelled'). 'refused' means a deterministic guard
                 rejected the candidate and no task was created.
                 When None, all statuses are returned.
             since: Optional ISO-8601 timestamp; only tickets with
@@ -9481,8 +9827,225 @@ def create_mcp_server(
 
     @mcp.tool()
     @mcp_tool_errors()
+    async def find_tasks_by_metadata(
+        project_root: str,
+        key: str,
+        value: Any = None,
+        statuses: Any = None,
+        limit: int = DEFAULT_LOOKUP_LIMIT,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: Any = False,
+    ) -> dict[str, Any]:
+        """Exact lookup of the tasks whose top-level ``metadata[key]`` matches ``value``.
+
+        Searches every status, including ``deferred`` and ``cancelled``, which
+        ``search_tasks`` does not. Semantics: plans/task-metadata-lookup-prd.md.
+
+        Args:
+            project_root: Absolute path to project root.
+            key: One top-level metadata key matching ``[A-Za-z0-9_][A-Za-z0-9_-]*``.
+            value: Omit to match every task carrying ``key`` (even as JSON null).
+                A str or int matches a scalar by equality or a list by
+                membership, type-strictly: 40 does not match "40". bool, float,
+                dict and list values are rejected.
+            statuses: Optional list of task statuses to search within
+                (default: all); an unknown status is a ValidationError.
+            limit: Page size >= 1; values above 100 are clamped to 100 (default 50).
+            offset: Zero-based index into the matches, ordered by task id.
+            tag: Tag context (optional).
+            include_value: True adds ``matched_value``, the whole ``metadata[key]``.
+
+        Returns ``results`` (``task_id``, ``title``, ``status``, ``priority``,
+        ``updated_at``), ``tasks_with_key`` (how many tasks in the searched
+        statuses carry ``key``), ``pagination`` (page on ``has_more`` with
+        ``offset += returned``), ``malformed_metadata_ids`` when some task's
+        metadata is not a JSON object, and the echoed arguments. An ``error``
+        payload means the lookup failed; it never means "no match".
+        """
+        paging_error = _validate_paging(limit, offset, size_arg='limit')
+        if paging_error is not None:
+            return paging_error
+        statuses_error = _validate_statuses(statuses)
+        if statuses_error is not None:
+            return statuses_error
+        page_size = min(limit, METADATA_LOOKUP_LIMIT_CAP)
+        try:
+            validate_metadata_query(
+                key=key, value=value, statuses=statuses, include_value=include_value,
+            )
+        except InvalidMetadataLookupError as e:
+            return {'error': str(e), 'error_type': 'ValidationError'}
+        normalized = _normalize_project_root(project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        found = await task_interceptor.find_tasks_by_metadata(
+            normalized, key, value,
+            statuses=statuses, limit=page_size, offset=offset, tag=tag,
+            include_value=include_value,
+        )
+        results = _fit_rows_to_budget(found['results']) if include_value else found['results']
+        pid = resolve_project_id(normalized)
+        response: dict[str, Any] = {
+            'project_id': pid,
+            'project_root': normalized,
+            'key': key,
+            'value': value,
+            'statuses': statuses,
+            'results': results,
+            'tasks_with_key': found['tasks_with_key'],
+            'pagination': _pagination_meta(
+                total=found['total'], offset=offset, page_size=page_size,
+                returned=len(results),
+            ),
+        }
+        if found['malformed_metadata_ids']:
+            response['malformed_metadata_ids'] = found['malformed_metadata_ids']
+        await _log_read(
+            'find_tasks_by_metadata',
+            project_id=pid,
+            result_summary={
+                'project_id': pid, 'key': key,
+                'total': found['total'], 'returned': len(results),
+            },
+        )
+        return response
+
+    async def _defect_write_reply(
+        project_root: str,
+        task_id: str,
+        event: DeclareEvent | OutcomeEvent,
+        *,
+        operation: Literal['declare_defect', 'record_defect_outcome'],
+        agent_id: str | None,
+        tag: str | None,
+    ) -> dict[str, Any]:
+        reply = await task_interceptor.apply_defect_events(
+            task_id, project_root, [event], operation=operation, agent_id=agent_id, tag=tag,
+        )
+        if reply.get('success') is not True:
+            return reply
+        return {**reply, 'project_id': resolve_project_id(project_root), 'project_root': project_root}
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def declare_defect(
+        project_root: str,
+        task_id: str,
+        event: dict[str, Any],
+        tag: str | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Declare a defect on a task, or record a closure, retirement or sighting of one.
+
+        Any filer may call it. ``event`` is the JSON dump of one
+        ``shared.defects`` declare event: ``Declare``, ``DeclareClosure``,
+        ``DeclareRetirement`` or ``Sighting``. It is folded into the task's
+        record for its ref (``metadata.defects``, or
+        ``metadata.defect_test_retirements`` for a retirement) in one write,
+        under the transition rules in ``shared/src/shared/defects.py``.
+
+        Refused, with nothing written: a task in a terminal status
+        (``defect_write_to_terminal_task``); a transition the rules forbid
+        (``defect_transition_refused``); a ``duplicate_of`` or
+        ``superseded_by`` ref that no task declares (``defect_ref_not_live``,
+        see ``lookup_defect_ref``); an event that is not a declare event
+        (``defect_event_invalid``). Each refusal is
+        ``{'success': False, 'error': <code>, 'task_id', ..., 'detail'}``.
+        """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
+        if err := _reject_if_ticket_id('task_id', task_id):
+            return err
+        normalized = await asyncio.to_thread(_normalize_project_root, project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        try:
+            parsed = parse_declare_wire(event)
+        except DefectEventInvalid as exc:
+            return exc.to_error_dict(task_id=task_id)
+        return await _defect_write_reply(
+            normalized, task_id, parsed, operation='declare_defect', agent_id=agent_id, tag=tag,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def record_defect_outcome(
+        project_root: str,
+        task_id: str,
+        ref: str,
+        event: dict[str, Any],
+        tag: str | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Record a proof of, or a ruling on, the defect *ref* declared on a task.
+
+        ``event`` is the JSON dump of one ``shared.defects`` outcome event,
+        ``Proof`` or ``Rule``, and must concern *ref*
+        (``defect_ref_mismatch`` otherwise). Applied in one write under the
+        same rules and refusals as ``declare_defect``.
+
+        Its intended callers are the orchestrator workflow
+        (``SchedulerFacade.dispatch_tool``) and ``scripts/prove_defect.py``
+        (``plans/defect-tests-prd.md`` decision 7); interactive sessions are
+        Leo's trust domain and are not machine-guarded. No dispatched role's
+        ``allowed_tools`` grants it
+        (``orchestrator/tests/test_role_defect_outcome_authority.py``), but
+        that list is a permission allow list, not a denial: a dispatched
+        session that mounts fused-memory can still reach this tool, since no
+        role denies it through ``disallowed_tools`` yet.
+        """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
+        if err := _reject_if_ticket_id('task_id', task_id):
+            return err
+        normalized = await asyncio.to_thread(_normalize_project_root, project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        try:
+            parsed = parse_outcome_wire(event, ref=ref)
+        except DefectEventInvalid as exc:
+            return exc.to_error_dict(task_id=task_id)
+        return await _defect_write_reply(
+            normalized, task_id, parsed, operation='record_defect_outcome',
+            agent_id=agent_id, tag=tag,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def lookup_defect_ref(
+        project_root: str,
+        ref: str,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        """The tasks, of any status, whose ``metadata.defects`` declares *ref*.
+
+        A ref is live when it has a carrier; ``declare_defect`` requires a
+        ``duplicate_of`` or ``superseded_by`` ref to be live. Returns ``ref``,
+        ``live``, ``carriers`` (``task_id``, ``task_status``,
+        ``defect_status``) and ``unreadable_task_ids``, the tasks whose
+        defect entries could not be read. A ref outside the grammar is a
+        ``ValidationError`` naming the known prefixes.
+        """
+        normalized = await asyncio.to_thread(_normalize_project_root, project_root)
+        if isinstance(normalized, dict):
+            return normalized
+        try:
+            lookup = await task_interceptor.lookup_defect_ref(normalized, ref, tag=tag)
+        except MalformedDefectRef as e:
+            return {'error': str(e), 'error_type': 'ValidationError'}
+        pid = resolve_project_id(normalized)
+        await _log_read(
+            'lookup_defect_ref',
+            project_id=pid,
+            result_summary={'project_id': pid, 'ref': ref, 'carriers': len(lookup.carriers)},
+        )
+        return {'project_id': pid, 'project_root': normalized, **lookup.as_dict()}
+
+    @mcp.tool()
+    @mcp_tool_errors()
     async def cancel_ticket(ticket_id: str) -> dict[str, Any]:
-        """Cancel a pending curator ticket by its ticket_id.
+        """Cancel a pending or parked (``awaiting_curation``) curator ticket by its ticket_id.
 
         Four outcome shapes (v1 contract):
 
@@ -9511,6 +10074,9 @@ def create_mcp_server(
         project_root: str,
         task_ids: str,
         target_status: str = 'pending',
+        deferral: dict | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Commit a batch of tasks created via ``submit_task(planning_mode=True)``.
 
@@ -9532,6 +10098,19 @@ def create_mcp_server(
             target_status: ``pending`` to release for scheduling (default),
                 ``deferred`` to leave them parked, or ``cancelled`` to discard
                 the planned batch.  Other status values are rejected.
+            deferral: Required iff ``target_status='deferred'``: what ends the
+                hold, in the ``set_task_status`` ``deferral`` shape. Each id is
+                re-stamped with it (its ``deferred_at`` is kept) and the record
+                is echoed per id as ``deferral``.
+            agent_id: Which agent is committing (optional, auto-derived from
+                MCP context); a re-stamp records it as ``stamped_by``.
+
+        RELEASE RULE (``pending``/``cancelled``): only a ``planning`` hold, or a
+        row with no record, is released. Any other hold is refused per id with
+        ``deferral_invalid`` / ``reason_code='not_planning_hold'`` and stays
+        parked; a plain ``set_task_status(status='pending')`` still releases
+        it. Each released id echoes the record it removed as
+        ``deferral_cleared`` (``None`` when there was none).
 
         A ``pending`` commit stamps ONE shared ``metadata.pending_since``
         across the whole batch (task 3816, PRD
@@ -9714,10 +10293,14 @@ def create_mcp_server(
                 for f in findings
             )
 
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
         result = await task_interceptor.set_task_status(
             task_id=','.join(ids),
             status=target_status,
             project_root=project_root,
+            agent_id=agent_id,
+            deferral=deferral,
+            scope=StatusWriteScope.COMMIT_PLANNING,
         )
         if target_status == 'pending':
             # Best-effort/never-raising (see index_committed_tasks docstring) —
@@ -9736,16 +10319,13 @@ def create_mcp_server(
             # already-fetched tasks_data (no extra reads). Only attaches the
             # report key when a sidecar actually exists on disk, so a batch
             # with no capability-manifest involvement gets a byte-identical
-            # legacy response. agent_id is intentionally omitted: unlike most
-            # write tools in this module, commit_planning takes no
-            # agent_id/ctx parameter of its own — the set_task_status call
-            # above this one is likewise un-attributed — so passing None
-            # here is parity with that call, not a missed wiring.
+            # legacy response.
             manifest_report = await stamp_capability_manifests(
                 project_root=project_root,
                 ids=ids,
                 tasks_data=list(tasks_data),
                 task_interceptor=task_interceptor,
+                agent_id=agent_id,
             )
             if manifest_report is not None and isinstance(result, dict):
                 result['manifest_stamping'] = manifest_report
@@ -9829,7 +10409,13 @@ def create_mcp_server(
                 change this behavior.  ``allow_mcp_markup=True`` bypasses the
                 MCP-markup boundary guard for deliberately quoted markup; it is
                 write-time-only and stripped before the merge, so it is never
-                persisted.
+                persisted. It must be a JSON object: a dict, or a JSON string
+                encoding one. Anything else is refused in every
+                ``metadata_mode`` and nothing is written: unparseable text, or
+                a JSON string encoding a string, number or boolean, returns
+                ``error == 'metadata_not_an_object'``; an array (or a string
+                encoding one) fails argument validation before the tool runs,
+                and ``'null'`` reads as an omitted ``metadata``.
             metadata_mode: Controls how ``metadata`` is merged with the existing
                 blob. One of:
                 - ``'merge'`` (default when omitted) — shallow last-write-wins.
@@ -9842,7 +10428,12 @@ def create_mcp_server(
                   remainder back. It works on done/merged tasks, but you must
                   send back the ``done_provenance`` you just read, unchanged —
                   adding, changing or dropping it is rejected with
-                  ``error == 'done_provenance_via_update_task'``.
+                  ``error == 'done_provenance_via_update_task'``. The same
+                  holds for ``defects`` and ``defect_test_retirements``,
+                  refused with ``error == 'defect_records_via_update_task'``:
+                  after creation only ``declare_defect`` and
+                  ``record_defect_outcome`` write them, and every other mode
+                  refuses either key outright, echo included.
             append: DEPRECATED shim. ``True`` → ``'additive'``. A bare
                 ``append=False`` (no ``metadata_mode``) on a metadata write is
                 now **rejected** by the backend — it used to silently whole-blob
@@ -10510,15 +11101,15 @@ def create_mcp_server(
             project_root: Absolute path to project root.
 
         Returns:
-            Snapshot dict with keys: skip_counts, parks, effective_priorities,
-            pin_queue, overrides, current_holders, snapshot_at.
-            Returns the empty skeleton when no snapshot file exists yet.
+            Every SchedulerStateSnapshot field (13 keys). ``snapshot_at`` is
+            null when no orchestrator has written a snapshot yet.
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        return await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        snapshot = await asyncio.to_thread(read_scheduler_state, Path(project_root))
+        return snapshot.to_json()
 
     @mcp.tool()
     @mcp_tool_errors()

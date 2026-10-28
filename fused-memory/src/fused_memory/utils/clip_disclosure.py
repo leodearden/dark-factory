@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from shared.elision import elision_marker, word_boundary_head
+
 # Not 'truncated': that response key already carries a bool elsewhere in fused-memory.
 TRUNCATION_FACTS_KEY = 'truncation_facts'
 
@@ -33,10 +35,6 @@ class TextClip:
     fact: TruncationFact | None
 
 
-def elision_marker(elided: int) -> str:
-    return f'…[+{elided} chars elided]'
-
-
 def _clip(value: object, cap: int, *, field: str, marked: bool) -> TextClip:
     text = str(value or '')
     elided = len(text) - cap
@@ -54,6 +52,18 @@ def clip_text(value: object, cap: int, *, field: str) -> TextClip:
 def elide_text(value: object, cap: int, *, field: str) -> TextClip:
     """Cut to ``cap`` and append the counted marker: for text an LLM reads as prose."""
     return _clip(value, cap, field=field, marked=True)
+
+
+def fit_at_word(text: str, limit: int) -> str:
+    """Cut to at most ``limit`` chars ending in '…', for bounded text a mid-token cut would garble.
+
+    The cut backs up to the last word boundary unless that would keep half the budget or less.
+    """
+    if limit <= 0:
+        raise ValueError(f'fit_at_word limit must be positive, got {limit!r}')
+    if len(text) <= limit:
+        return text
+    return word_boundary_head(text, limit - 1) + '…'
 
 
 def truncation_fields(*facts: TruncationFact | None) -> dict[str, list[dict[str, Any]]]:

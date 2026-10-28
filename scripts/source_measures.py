@@ -19,9 +19,11 @@ import enum
 import subprocess
 import tokenize
 import tomllib
+from collections import Counter
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from io import StringIO
 from pathlib import Path
+from types import MappingProxyType
 from typing import NamedTuple
 
 # NOTE: module scope imports only the stdlib ON PURPOSE. complexipy and radon
@@ -533,13 +535,106 @@ class PatchCall:
     attribute: str | None
 
 
-def _str_constant(expr: ast.expr) -> str | None:
-    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
-        return expr.value
+_NO_CONSTANTS: Mapping[str, str] = MappingProxyType({})
+
+
+def _static_string(expr: ast.expr, constants: Mapping[str, str]) -> str | None:
+    """*expr*'s value when it is statically a string: a str literal, a name in
+    *constants*, a plain f-string over such values, or ``+`` of two of them."""
+    if isinstance(expr, ast.Constant):
+        return expr.value if isinstance(expr.value, str) else None
+    if isinstance(expr, ast.Name):
+        return constants.get(expr.id)
+    if isinstance(expr, ast.JoinedStr):
+        return _static_f_string(expr, constants)
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        left = _static_string(expr.left, constants)
+        right = _static_string(expr.right, constants)
+        return None if left is None or right is None else left + right
     return None
 
 
-def _patch_call(node: ast.Call) -> PatchCall | None:
+def _static_f_string(expr: ast.JoinedStr, constants: Mapping[str, str]) -> str | None:
+    """*expr* folded, or None if any placeholder carries a conversion, a format
+    spec, or a value that is not statically a string."""
+    parts: list[str] = []
+    for part in expr.values:
+        if isinstance(part, ast.FormattedValue):
+            if part.conversion != -1 or part.format_spec is not None:
+                return None
+            part = part.value
+        value = _static_string(part, constants)
+        if value is None:
+            return None
+        parts.append(value)
+    return ''.join(parts)
+
+
+_NAMED_BINDERS = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.ExceptHandler,
+    ast.MatchAs,
+    ast.MatchStar,
+)
+
+
+def _bound_names(node: ast.AST) -> Iterator[str]:
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+        yield node.id
+    elif isinstance(node, ast.arg):
+        yield node.arg
+    elif isinstance(node, ast.alias):
+        yield node.asname or node.name.partition('.')[0]
+    elif isinstance(node, _NAMED_BINDERS) and node.name:
+        yield node.name
+
+
+def _assigned_values(node: ast.AST) -> Iterator[tuple[str, ast.expr]]:
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                yield target.id, node.value
+    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value:
+        yield node.target.id, node.value
+
+
+def string_constants_in_tree(tree: ast.AST) -> dict[str, str]:
+    """Names bound exactly once in *tree*, each mapped to its value when that
+    one binding assigns a static string (see ``_static_string``).
+
+    Order-independent: a value may name a constant bound later in the file.
+    Scope-blind: the census is file-wide, so a binding it cannot see (a
+    ``from m import *`` or a ``globals()`` write) leaves the name resolved.
+    """
+    binding_counts: Counter[str] = Counter()
+    candidates: dict[str, ast.expr] = {}
+    for node in ast.walk(tree):
+        binding_counts.update(_bound_names(node))
+        candidates.update(_assigned_values(node))
+    return _fold_to_fixpoint(
+        {name: expr for name, expr in candidates.items() if binding_counts[name] == 1}
+    )
+
+
+def _fold_to_fixpoint(pending: Mapping[str, ast.expr]) -> dict[str, str]:
+    """Each of *pending* that folds once the names folded before it are known,
+    repeating until a pass folds nothing; every pass shrinks *pending*."""
+    resolved: dict[str, str] = {}
+    while True:
+        folded = {
+            name: value
+            for name, expr in pending.items()
+            if (value := _static_string(expr, resolved)) is not None
+        }
+        if not folded:
+            return resolved
+        resolved.update(folded)
+        pending = {name: expr for name, expr in pending.items() if name not in folded}
+
+
+def _patch_call(node: ast.Call, constants: Mapping[str, str]) -> PatchCall | None:
     func = node.func
     is_setattr = isinstance(func, ast.Attribute) and func.attr == 'setattr'
     is_dotted_patch = isinstance(func, ast.Attribute) and func.attr == 'patch'
@@ -552,22 +647,28 @@ def _patch_call(node: ast.Call) -> PatchCall | None:
             or (isinstance(func.value, ast.Attribute) and func.value.attr == 'patch')
         )
     )
-    target = _str_constant(node.args[0])
+    target = _static_string(node.args[0], constants)
     if target is not None:
         if is_setattr or is_dotted_patch or is_bare_patch:
             return PatchCall(target=target, receiver=None, attribute=None)
         return None
     if (is_setattr or is_patch_object) and len(node.args) >= 2:
-        attribute = _str_constant(node.args[1])
+        attribute = _static_string(node.args[1], constants)
         if attribute is not None:
             return PatchCall(target=None, receiver=node.args[0], attribute=attribute)
     return None
 
 
-def patch_calls_in_tree(node: ast.AST) -> tuple[PatchCall, ...]:
-    """Every patch-shaped call under *node*, in ``ast.walk`` order, duplicates kept."""
+def patch_calls_in_tree(
+    node: ast.AST, *, constants: Mapping[str, str] = _NO_CONSTANTS
+) -> tuple[PatchCall, ...]:
+    """Every patch-shaped call under *node*, in ``ast.walk`` order, duplicates kept.
+
+    A name argument is read only through *constants* (``string_constants_in_tree``
+    builds them for a whole file); the default resolves none.
+    """
     calls = (
-        _patch_call(call)
+        _patch_call(call, constants)
         for call in ast.walk(node)
         if isinstance(call, ast.Call) and call.args
     )
@@ -660,6 +761,10 @@ def patch_targets(
     (``patch.object(m, '_c')``, ``monkeypatch.setattr(m, '_c', v)``) counts
     only when ``m`` IS a member: bound to one by an import, or spelled as one.
 
+    An argument is read as a string when it is statically one: a literal, a
+    name bound once in the file to such a string, or an f-string / ``+`` built
+    from those. So parking a dotted path in a constant does not hide it.
+
     Distinct pairs, not call sites. AST-based, so a docstring or comment quoting
     a dotted path is never mistaken for a real patch site.
     """
@@ -671,7 +776,8 @@ def patch_targets_in_tree(
 ) -> frozenset[PatchTarget]:
     """``patch_targets`` over an already-parsed tree."""
     bindings = _module_bindings(tree, modules)
-    found = (_patch_target(call, bindings, modules) for call in patch_calls_in_tree(tree))
+    calls = patch_calls_in_tree(tree, constants=string_constants_in_tree(tree))
+    found = (_patch_target(call, bindings, modules) for call in calls)
     return frozenset(target for target in found if target is not None and target.leaf)
 
 
@@ -808,6 +914,11 @@ class MemberRoots:
     def declared(cls, name: str) -> MemberRoots:
         return cls(name=name, pseudo=False, src_root=f'{name}/src', tests_root=f'{name}/tests')
 
+    @classmethod
+    def single_package(cls, name: str) -> MemberRoots:
+        """The one package of a non-workspace project, in the PyPA src layout."""
+        return cls(name=name, pseudo=False, src_root='src', tests_root='tests')
+
     def kind_of(self, path: str) -> FileKind | None:
         if path.startswith(self.tests_root + '/'):
             return FileKind.TESTS
@@ -851,15 +962,23 @@ class DomainMember:
     files: tuple[DomainFile, ...]
 
 
-#: The repo's two Python roots that are not workspace members, described by the
-#: same rule as a member: plans/quality-metrics-snapshot-prd.md decision 3.
-PSEUDO_MEMBERS: tuple[MemberRoots, ...] = (
-    MemberRoots(name='scripts', pseudo=True, src_root='scripts', tests_root='scripts/tests'),
-    MemberRoots(name='tests', pseudo=True, src_root=None, tests_root='tests'),
+_SCRIPTS_PSEUDO_MEMBER = MemberRoots(
+    name='scripts', pseudo=True, src_root='scripts', tests_root='scripts/tests'
 )
+_TESTS_PSEUDO_MEMBER = MemberRoots(name='tests', pseudo=True, src_root=None, tests_root='tests')
+
+#: The Python roots that follow a workspace's members without being members,
+#: described by the same rule as a member: plans/quality-metrics-snapshot-prd.md
+#: decision 3.
+PSEUDO_MEMBERS: tuple[MemberRoots, ...] = (_SCRIPTS_PSEUDO_MEMBER, _TESTS_PSEUDO_MEMBER)
+
+#: The pseudo-members that follow a single package: top-level tests/ is the
+#: package's own tests root, so it is no pseudo-member here.
+_SINGLE_PACKAGE_PSEUDO_MEMBERS: tuple[MemberRoots, ...] = (_SCRIPTS_PSEUDO_MEMBER,)
 
 
 _MEMBERS_KEY = '[tool.uv.workspace].members'
+_PROJECT_NAME_KEY = '[project].name'
 
 
 def _load_toml(path: Path) -> dict[str, object]:
@@ -873,10 +992,16 @@ def _load_toml(path: Path) -> dict[str, object]:
         raise MetricsError(f'{path}: is not valid TOML -- {exc}') from exc
 
 
-def _member_list(path: Path, config: dict[str, object]) -> list[str]:
-    found: object = config
-    for key in ('tool', 'uv', 'workspace', 'members'):
+def _lookup(config: object, *keys: str) -> object:
+    """The value at the nested table path *keys*; None where any table is absent."""
+    found = config
+    for key in keys:
         found = found.get(key) if isinstance(found, dict) else None
+    return found
+
+
+def _member_list(path: Path, config: dict[str, object]) -> list[str]:
+    found = _lookup(config, 'tool', 'uv', 'workspace', 'members')
     if (
         not isinstance(found, list)
         or not found
@@ -889,14 +1014,13 @@ def _member_list(path: Path, config: dict[str, object]) -> list[str]:
     return found
 
 
-def _declared_members(root: Path) -> tuple[str, ...]:
-    """``[tool.uv.workspace].members`` of *root*'s pyproject.toml.
+def _declared_members(path: Path, config: dict[str, object]) -> tuple[str, ...]:
+    """``[tool.uv.workspace].members`` of the pyproject.toml at *path*, read as *config*.
 
     Each must be a plain directory name (uv's glob expansion cannot be
     reproduced from the index), listed once, and not a pseudo-member's name.
     """
-    path = root / 'pyproject.toml'
-    members = _member_list(path, _load_toml(path))
+    members = _member_list(path, config)
     globbed = [member for member in members if any(char in member for char in '*?[')]
     if globbed:
         raise MetricsError(
@@ -906,13 +1030,65 @@ def _declared_members(root: Path) -> tuple[str, ...]:
     duplicates = sorted({member for member in members if members.count(member) > 1})
     if duplicates:
         raise MetricsError(f'{path}: {_MEMBERS_KEY} lists duplicate member(s) {duplicates!r}')
-    collisions = sorted(set(members) & {pseudo.name for pseudo in PSEUDO_MEMBERS})
+    _require_no_pseudo_collision(path, _MEMBERS_KEY, members, PSEUDO_MEMBERS)
+    return tuple(members)
+
+
+def _require_no_pseudo_collision(
+    path: Path, key: str, names: Sequence[str], pseudo_members: Sequence[MemberRoots]
+) -> None:
+    """Members are keyed by name in evidence and --summary, so no two may share one."""
+    collisions = sorted(set(names) & {pseudo.name for pseudo in pseudo_members})
     if collisions:
         raise MetricsError(
-            f'{path}: {_MEMBERS_KEY} names {collisions!r}, which collide with the '
+            f'{path}: {key} names {collisions!r}, which collide with the '
             'pseudo-member of the same name'
         )
-    return tuple(members)
+
+
+def _project_name(path: Path, config: dict[str, object]) -> str:
+    name = _lookup(config, 'project', 'name')
+    if not isinstance(name, str) or not name:
+        raise MetricsError(
+            f'{path}: has neither {_MEMBERS_KEY} nor a {_PROJECT_NAME_KEY}; a uv workspace '
+            f'declares its members, and a single-package project is named by its '
+            f'[project] table -- found {_PROJECT_NAME_KEY} = {name!r}'
+        )
+    return name
+
+
+def _single_package_members(
+    root: Path, path: Path, config: dict[str, object]
+) -> tuple[MemberRoots, ...]:
+    """The single package [project].name names, then ``_SINGLE_PACKAGE_PSEUDO_MEMBERS``.
+
+    The src layout is inferred from the absence of a workspace table, so it must
+    be evidenced: src/ holds tracked .py.
+    """
+    name = _project_name(path, config)
+    _require_no_pseudo_collision(path, _PROJECT_NAME_KEY, (name,), _SINGLE_PACKAGE_PSEUDO_MEMBERS)
+    package = MemberRoots.single_package(name)
+    if not _git_output(root, 'ls-files', '-z', '--', f'{package.src_root}/*.py'):
+        raise MetricsError(
+            f'{path}: declares no {_MEMBERS_KEY}, so it is read as the single-package '
+            f'project {name!r} in the src layout ({package.src_root}/ and '
+            f'{package.tests_root}/), but {package.src_root}/ holds no tracked .py; '
+            "declare the workspace's members or keep the package under "
+            f'{package.src_root}/'
+        )
+    return (package, *_SINGLE_PACKAGE_PSEUDO_MEMBERS)
+
+
+def _domain_members(root: Path) -> tuple[MemberRoots, ...]:
+    """The members *root*'s pyproject.toml defines, in the layout its tables choose."""
+    path = root / 'pyproject.toml'
+    config = _load_toml(path)
+    if _lookup(config, 'tool', 'uv', 'workspace') is None:
+        return _single_package_members(root, path, config)
+    return (
+        *(MemberRoots.declared(name) for name in _declared_members(path, config)),
+        *PSEUDO_MEMBERS,
+    )
 
 
 def _tracked_blobs(root: Path, *pathspecs: str) -> tuple[tuple[str, str], ...]:
@@ -950,42 +1126,58 @@ def _domain_member(
     return DomainMember(name=member.name, pseudo=member.pseudo, files=files)
 
 
-def _require_declared_members_populated(domain: tuple[DomainMember, ...]) -> None:
+def _require_declared_members_populated(
+    members: Sequence[MemberRoots], domain: tuple[DomainMember, ...]
+) -> None:
     """A DECLARED member with no files would read as measured and clean.
 
     A pseudo-member is a convention, not a declaration, so it may be empty.
     """
-    empty = [member.name for member in domain if not member.pseudo and not member.files]
+    empty = [
+        roots
+        for roots, member in zip(members, domain, strict=True)
+        if not member.pseudo and not member.files
+    ]
     if empty:
         raise MetricsError(
             '; '.join(
-                f'{name} has no tracked .py under {name}/src or {name}/tests'
-                for name in empty
+                f'{roots.name} has no tracked .py under {roots.src_root} or {roots.tests_root}'
+                for roots in empty
             )
         )
 
 
-def _workspace_members(root: Path) -> tuple[MemberRoots, ...]:
-    """The declared members of *root*'s pyproject.toml, then ``PSEUDO_MEMBERS``."""
-    return (
-        *(MemberRoots.declared(name) for name in _declared_members(root)),
-        *PSEUDO_MEMBERS,
-    )
+def _require_disjoint_members(domain: tuple[DomainMember, ...]) -> None:
+    """A file under two members' roots would be measured twice."""
+    holders: dict[str, list[str]] = {}
+    for member in domain:
+        for domain_file in member.files:
+            holders.setdefault(domain_file.path, []).append(member.name)
+    shared = [(path, names) for path, names in sorted(holders.items()) if len(names) > 1]
+    if shared:
+        raise MetricsError(
+            "tracked file(s) under two members' roots would be measured twice: "
+            + '; '.join(f'{path} is held by members {names!r}' for path, names in shared)
+        )
 
 
 def workspace_domain(root: Path) -> tuple[DomainMember, ...]:
-    """Every workspace member's tracked ``.py`` files, classified src or tests.
+    """Every member's tracked ``.py`` files, classified src or tests.
 
-    The member list's one home is the root pyproject.toml's
-    ``[tool.uv.workspace].members``, followed by ``PSEUDO_MEMBERS``. Files come
-    from the index, not the disk, so an untracked file is outside the domain, as
-    is every file under no member's src or tests root (``hooks/`` included).
+    The member list's one home is the root pyproject.toml: a uv workspace's
+    ``[tool.uv.workspace].members`` followed by ``PSEUDO_MEMBERS``, or, with no
+    workspace table, the single src-layout package ``[project].name`` names
+    followed by the scripts pseudo-member (plans/quality-metrics-snapshot-prd.md
+    decision 3). Files come from the index, not the disk, so an untracked file
+    is outside the domain, as is every file under no member's src or tests root
+    (``hooks/`` included).
     """
     _require_work_tree_top(root)
-    members = _workspace_members(root)
+    members = _domain_members(root)
     entries = _tracked_blobs(root, '*.py')
     domain = tuple(_domain_member(member, entries) for member in members)
-    _require_declared_members_populated(domain)
+    _require_declared_members_populated(members, domain)
+    _require_disjoint_members(domain)
     return domain
 
 
@@ -1006,7 +1198,7 @@ def uncommitted_domain_paths(root: Path) -> tuple[str, ...]:
     Untracked files are not listed: they are outside the domain.
     """
     _require_work_tree_top(root)
-    members = _workspace_members(root)
+    members = _domain_members(root)
     listing = _git_output(
         root, 'status', '--porcelain=v1', '-z', '--untracked-files=no', '--no-renames',
         '--', '*.py',

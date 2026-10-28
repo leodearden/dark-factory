@@ -1000,7 +1000,7 @@ class TestTheWindowClosesWhenTheCommandDoes:
         import contextlib  # noqa: PLC0415
 
         @contextlib.asynccontextmanager
-        async def recording_slot(role, config):
+        async def recording_slot(role, config, request):
             events.append('slot-enter')
             try:
                 yield

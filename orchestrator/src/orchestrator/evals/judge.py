@@ -8,16 +8,20 @@ import logging
 import math
 import random
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from itertools import combinations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from shared.cli_invoke import no_mcp_servers_config
+
 from orchestrator.agents.invoke import invoke_agent
 
 from .elo import (
-    MAX_PER_PAIR,
+    MAX_UNMEASURED_PER_PAIR,
+    PAIRWISE_RESULT,
     TaskPool,
     _pair_key,
     ensure_config_in_pool,
@@ -30,6 +34,7 @@ from .measurement import (
     Unmeasured,
     json_answer,
     measured_call,
+    require_answer_iff_measured,
 )
 from .plan_predicates import is_scorable_plan, plan_confirmed
 from .snapshots import get_diff
@@ -40,25 +45,48 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class JudgeVerdict:
-    """Result of one pairwise comparison."""
+    """Result of one pairwise comparison: a winner, or why there is none."""
 
     task_id: str
     config_a: str
     config_b: str
-    winner: str       # 'A', 'B', or 'tie'
+    winner: str | None  # a PAIRWISE_RESULT key; None exactly when unmeasured
     confidence: float
     reasoning: str
+    unmeasured: Unmeasured | None = None
+
+    def __post_init__(self) -> None:
+        require_answer_iff_measured('JudgeVerdict', 'winner', self.winner, self.unmeasured)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
+_UNSWAPPED = {'A': 'B', 'B': 'A', 'tie': 'tie'}
+
+
+def parse_winner(payload: dict, key: str = 'winner') -> str:
+    """*payload*'s winner; ``KeyError`` when absent, ``ValueError`` when not A/B/tie."""
+    winner = payload[key]
+    if winner not in PAIRWISE_RESULT:
+        raise ValueError(f'{key} must be one of {list(PAIRWISE_RESULT)}, got {winner!r}')
+    return winner
+
+
+def parse_confidence(payload: dict) -> float:
+    """*payload*'s confidence; ``KeyError`` when absent, ``ValueError`` when not finite."""
+    confidence = float(payload['confidence'])
+    if not math.isfinite(confidence):
+        raise ValueError(f'non-finite confidence {confidence!r}')
+    return confidence
+
+
 JUDGE_SCHEMA = {
     'type': 'object',
     'properties': {
-        'winner': {'type': 'string', 'enum': ['A', 'B', 'tie']},
+        'winner': {'type': 'string', 'enum': list(PAIRWISE_RESULT)},
         'confidence': {'type': 'number', 'minimum': 0.0, 'maximum': 1.0},
         'reasoning': {'type': 'string'},
     },
@@ -84,6 +112,8 @@ async def run_judge(
     """Blind pairwise comparison using Claude opus with max thinking.
 
     result_a/b are EvalResult dicts with 'worktree_path' and 'config_name'.
+    A refused call or an answer without a valid winner and a finite
+    confidence is an unmeasured verdict (``winner`` None), never a tie.
     """
     # Get diffs (use pre-computed diff if available, e.g. for reference impl).
     # Thread the authoritative base commit so get_diff yields the full
@@ -133,36 +163,52 @@ Compare these implementations on:
 
 Output JSON: {{"winner": "A" or "B" or "tie", "confidence": 0.0-1.0, "reasoning": "..."}}"""
 
-    result = await invoke_agent(
+    task_id = task.get('id', 'unknown')
+    config_a = result_a['config_name']
+    config_b = result_b['config_name']
+    outcome = await measured_call(
+        invoke_agent,
+        functools.partial(
+            _parse_pairwise_verdict,
+            task_id=task_id, config_a=config_a, config_b=config_b, swapped=swapped,
+        ),
+        stage=MeasurementStage.PAIRWISE_JUDGE,
+        backend='claude',
+        label=f'Pairwise judge {task_id}: {config_a} vs {config_b}',
         prompt=prompt,
         system_prompt='You are an expert code reviewer performing blinded pairwise comparison. Be precise and fair.',
         cwd=Path('/tmp'),
         model='opus',
         effort='max',
-        backend='claude',
         max_budget_usd=5.0,
         output_schema=JUDGE_SCHEMA,
+        # The judge needs no MCP: it answers through output_schema. The truthy
+        # zero-server config is what makes the strict flag bite (task 4757);
+        # mcp_config=None would leave the cwd's ambient .mcp.json merged.
+        mcp_config=no_mcp_servers_config(),
+        strict_mcp_config=True,
     )
+    if isinstance(outcome, Unmeasured):
+        return JudgeVerdict(
+            task_id, config_a, config_b, winner=None, confidence=0.0, reasoning='',
+            unmeasured=outcome,
+        )
+    return outcome.value
 
-    # Parse verdict
-    try:
-        verdict = result.structured_output or json.loads(result.output)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning(f'Judge produced unparseable output: {result.output[:200]}')
-        verdict = {'winner': 'tie', 'confidence': 0.0, 'reasoning': 'Judge output parse failure'}
 
-    # Account for swap
-    winner = verdict.get('winner', 'tie')
-    if swapped:
-        winner = {'A': 'B', 'B': 'A', 'tie': 'tie'}.get(winner, 'tie')
-
+def _parse_pairwise_verdict(
+    result: AgentResult, *, task_id: str, config_a: str, config_b: str, swapped: bool,
+) -> JudgeVerdict:
+    """The judge's verdict for the configs as given, undoing the prompt's swap."""
+    payload = json_answer(result)
+    winner = parse_winner(payload)
     return JudgeVerdict(
-        task_id=task.get('id', 'unknown'),
-        config_a=result_a['config_name'],
-        config_b=result_b['config_name'],
-        winner=winner,
-        confidence=verdict.get('confidence', 0.0),
-        reasoning=verdict.get('reasoning', ''),
+        task_id=task_id,
+        config_a=config_a,
+        config_b=config_b,
+        winner=_UNSWAPPED[winner] if swapped else winner,
+        confidence=parse_confidence(payload),
+        reasoning=str(payload.get('reasoning', '')),
     )
 
 
@@ -190,15 +236,28 @@ async def run_tournament(
     return verdicts
 
 
+@dataclass(frozen=True)
+class TournamentTally:
+    """Judge calls that scored and calls that did not measure; both spent the round budget."""
+
+    judged: int
+    unmeasured: int
+
+
 async def run_elo_tournament(
     result_dicts: list[dict],
     task: dict,
     pool: TaskPool,
     max_rounds: int = 50,
-) -> int:
+    *,
+    max_unmeasured_per_pair: int = MAX_UNMEASURED_PER_PAIR,
+) -> TournamentTally:
     """Run Elo-based matchup selection until budget exhausted or all pairs maxed.
 
-    Mutates *pool* in place.  Returns the number of judge calls made.
+    Mutates *pool* in place with measured verdicts only: an unmeasured one
+    moves no rating and no pair count. A pair is unschedulable for this run
+    once it has *max_unmeasured_per_pair* unmeasured verdicts, or when either
+    contender has no result; neither is persisted, so a later run re-measures.
     """
     # Seed any new configs into the pool
     for r in result_dicts:
@@ -207,19 +266,21 @@ async def run_elo_tournament(
     # Build lookup: config_name → result dict
     by_config: dict[str, dict] = {r['config_name']: r for r in result_dicts}
 
-    rounds_used = 0
-    while rounds_used < max_rounds:
-        matchup = next_matchup(pool)
+    unschedulable: set[str] = set()
+    unmeasured_by_pair: Counter[str] = Counter()
+    judged = unmeasured = 0
+    while judged + unmeasured < max_rounds:
+        matchup = next_matchup(pool, skip=unschedulable)
         if matchup is None:
             logger.info('All pairs maxed out, stopping')
             break
 
         config_a, config_b = matchup
+        key = _pair_key(config_a, config_b)
 
         # Skip if either config has no result available (e.g. worktree deleted)
         if config_a not in by_config or config_b not in by_config:
-            key = _pair_key(config_a, config_b)
-            pool.pair_counts[key] = MAX_PER_PAIR  # avoid infinite loop
+            unschedulable.add(key)
             continue
 
         logger.info(
@@ -228,13 +289,24 @@ async def run_elo_tournament(
         )
 
         verdict = await run_judge(by_config[config_a], by_config[config_b], task)
+        if verdict.winner is None:
+            unmeasured += 1
+            unmeasured_by_pair[key] += 1
+            if unmeasured_by_pair[key] >= max_unmeasured_per_pair:
+                unschedulable.add(key)
+                logger.warning(
+                    f'Elo pair {key} retired for this run after '
+                    f'{unmeasured_by_pair[key]} unmeasured verdicts'
+                )
+            continue
+
         record_match(
             pool, config_a, config_b,
             verdict.winner, verdict.confidence, verdict.reasoning,
         )
-        rounds_used += 1
+        judged += 1
 
-    return rounds_used
+    return TournamentTally(judged=judged, unmeasured=unmeasured)
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +576,8 @@ async def judge_plan_quality(
         effort='max',
         max_budget_usd=5.0,
         output_schema=PLAN_QUALITY_SCHEMA,
+        mcp_config=no_mcp_servers_config(),
+        strict_mcp_config=True,
     )
 
 

@@ -850,6 +850,9 @@ MAX_CANCELLED_TASKS_RETAINED: int = 15
 # always reference the same set of tasks — see task_knowledge_sync.assemble_payload().
 MAX_ACTIVE_TASKS_RENDERED: int = 50
 
+ACTIVE_TASK_TREE_TITLE: str = 'Active Task Tree'
+ACTIVE_TASK_TREE_HEADER: str = f'### {ACTIVE_TASK_TREE_TITLE}'
+
 # Status priority for sorting: lower value = higher priority.
 # Matches _select_proactive_sample in task_knowledge_sync.py.
 # 'done': 4 is included so that _select_proactive_sample (which sorts ALL tasks
@@ -1073,9 +1076,9 @@ def select_done_since_boundary(
 
     Enumerates the FULL set of done tasks whose ``updatedAt`` is at or after
     *boundary* (the prior successful reconciliation cycle boundary — typically
-    ``Watermark.last_full_run_completed``), so the Stage-2 completion-memory
-    audit covers every task that reached ``done`` since the last cycle instead
-    of a small fixed sample.  Intended to consume the uncapped
+    ``Watermark.last_task_change_timestamp``, the previous full run's start), so
+    the Stage-2 completion-memory audit covers every task that reached ``done``
+    since the last cycle instead of a small fixed sample.  Intended to consume the uncapped
     ``FilteredTaskTree.all_done_tasks`` (not the 30-capped ``done_tasks``) so
     the coverage does not silently shrink as task throughput grows.
 
@@ -1564,7 +1567,7 @@ def _format_header(shown: int, omitted_active: int, tree: FilteredTaskTree) -> s
         tree: FilteredTaskTree supplying the done/cancelled/other/total counts.
     """
     return (
-        f'### Active Task Tree\n'
+        f'{ACTIVE_TASK_TREE_HEADER}\n'
         f'({shown} active shown'
         + (f', {omitted_active} more active omitted by max_tasks cap' if omitted_active > 0 else '')
         + f', {tree.done_count} done, {tree.cancelled_count} cancelled, '

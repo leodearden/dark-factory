@@ -837,7 +837,7 @@ class TestStormBurstAlarm:
             task_id=STORM_ANCHOR,
             agent_role='escalation-watcher',
             severity='blocking',
-            category='escalation_cluster',
+            category='design_concern',
             summary='Unrelated cluster record filed on the same synthetic anchor.',
             level=1,
         ))
@@ -925,13 +925,14 @@ UNTYPABLE_EVIDENCE = '[{"observation": "the tail was cut off'
 class TestTheResidueNamesWhoseCallLeaked:
     """A paging L2 record that attributes to nobody cannot be triaged.
 
-    On THIS server the middleware's ``agent_id``/``project`` axes are
-    structurally ``None``: ``MarkupGuardMiddleware._identity`` resolves them
-    from arguments named ``agent_id`` / ``project_root`` / ``project_id``, and
-    no escalation tool declares any of the three. The record's own ``task_id``
-    is the synthetic ``mcp-markup-residue`` anchor — correctly so, since a
-    live task id at level 2 would halt the very task that leaked. So the
-    middleware's ``subject_*`` axes are the ONLY attribution that ever
+    On THIS server the middleware's ``agent_id``/``project`` axes usually stay
+    ``None``: ``MarkupGuardMiddleware._identity`` resolves them from arguments
+    named ``agent_id`` / ``project_root`` / ``project_id``; no escalation tool
+    declares ``agent_id`` or ``project_id``, and the five tools that accept an
+    OPTIONAL ``project_root`` see it omitted by fleet callers. The record's
+    own ``task_id`` is the synthetic ``mcp-markup-residue`` anchor — correctly
+    so, since a live task id at level 2 would halt the very task that leaked.
+    So the middleware's ``subject_*`` axes are the attribution that always
     resolves here, and dropping them leaves a critical record naming nobody
     while the caller supplied both.
     """

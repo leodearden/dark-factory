@@ -149,8 +149,6 @@ _ALLOWED_RENAMERS = {
         'TestStdlibOnlySelfContainment. Do not "finish" this migration.',
     ('orchestrator/src/orchestrator/session_hooks.py', '_run_install'):
         'Out of task 3223 enumerated scope; left alone deliberately.',
-    ('orchestrator/src/orchestrator/verify_cancel.py', 'write_pgid_file'):
-        'Out of task 3223 enumerated scope; left alone deliberately.',
     ('escalation/src/escalation/queue.py', 'EscalationQueue._atomic_write_path'):
         'Out of task 3223 enumerated scope. This is the helper 3223 was MODELLED '
         'on (its durable= flag became fsync=); a follow-up may migrate it.',
@@ -226,6 +224,15 @@ _ALLOWED_RENAMERS = {
         'already-current skip). The EXDEV branch delegates to _archive_one '
         'when the rename is physically impossible, so the cross-device case '
         'is handled by the entry above rather than by a second writer here.',
+    ('shared/src/shared/secret_redaction.py', 'redact_in_place'):
+        'REWRITES an existing transcript in place by the 2026-10-11 redaction '
+        'method (task 6820): a line-streaming redacting copy into a sibling temp, '
+        'then os.replace. atomic_write_text cannot express it: (1) a transcript is '
+        'streamed line by line (the corpus is ~58 GB), whereas atomic_write_text '
+        'takes a str already fully in memory; (2) the original mode and atime/mtime '
+        'are copied onto the temp and a stat stamp (ino, size, mtime_ns) is '
+        're-checked BEFORE the replace, and atomic_write_text exposes no '
+        'pre-replace seam for either.',
     # --- Sites surfaced by task 3388's widening of _SRC_TREES to six trees.
     # Each reason below was written from READING that site, not pattern-matched
     # from a neighbour: an entry whose reason came from the entry above it is
@@ -254,7 +261,7 @@ _ALLOWED_RENAMERS = {
         'disjoint-path discipline, so two writers can never share a temp path '
         'even if they bypass _persist_lock), and the asyncio.to_thread offload '
         'that keeps the blocking I/O off the event loop under burst load.',
-    ('fused-memory/src/fused_memory/reconciliation/event_queue.py', 'EventQueue._rotate_dead_letter'):
+    ('fused-memory/src/fused_memory/reconciliation/dead_letter_writer.py', 'DeadLetterWriter._rotate'):
         'MOVES existing files: cascade-rotates dead_letter.jsonl -> .1 -> .2 '
         '-> ... There is no content string, only os.replace(src, dst) per '
         'slot, so this is the same class as escalation sweep._atomic_move / '
@@ -263,7 +270,7 @@ _ALLOWED_RENAMERS = {
     ('fused-memory/src/fused_memory/reconciliation/event_queue.py', 'EventQueue.replay_dead_letters'):
         'MOVES an existing file: os.replace snapshots each dead-letter file '
         'onto a ``.replaying`` sibling as an atomic CLAIM — race-safe against '
-        'concurrent _write_dead_letter appends and self-guarding against '
+        'concurrent dead-letter writer appends and self-guarding against '
         're-replay, since a second call finds nothing left to snapshot. A '
         'claim, not a write; same class as escalation sweep._atomic_move / '
         'queue._archive_resolved.',
@@ -331,10 +338,6 @@ _ALLOWED_RENAMERS = {
         'writer of the legibility pipeline\'s canonical registry, and '
         'byte-stable given byte-stable input so a no-change night commits '
         'nothing — a migration must not perturb either property.',
-    ('scripts/legibility/trickle_state.py', 'record_run'):
-        'Out of task 3223 enumerated scope; left alone deliberately. '
-        'Same-directory mkstemp + os.replace of the trickle-state document the '
-        'function also returns; ordinary write path with no seam of its own.',
     ('scripts/migrate_transcript_archive_gunzip.py', 'gunzip_one'):
         'PRE-REPLACE SEAM, and the same one already recorded above for shared '
         'transcript_archive._archive_one — cited rather than re-argued. It '

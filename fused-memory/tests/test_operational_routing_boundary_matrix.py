@@ -43,9 +43,10 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from fused_memory.middleware.curator_types import CuratorDecision
 from fused_memory.middleware.operational_ask_registry import OperationalAskEntry
 from fused_memory.middleware.operational_routing_guard import OPERATIONAL_LLM_GATE_MARKER_KEY
-from fused_memory.middleware.task_curator import CuratorDecision, TaskCurator
+from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.server.tools import create_mcp_server
 
 
@@ -184,7 +185,7 @@ async def _submit_normal_and_get(
     ``task_kind`` on this path: a no-op 'create' decision carries no routing
     opinion of its own.
     """
-    async def _neutral_curate(self, candidate, project_id, project_root):
+    async def _neutral_curate(self, candidate, project_id, project_root, *, prepared=None):
         return CuratorDecision(action='create', justification='ζ-test-neutralized')
 
     monkeypatch.setattr(TaskCurator, 'curate', _neutral_curate)
@@ -380,15 +381,14 @@ def _inject_operational_registry(
     """Monkeypatch the operational-ask registry loader to return a single
     injected entry, for scenario 5's untagged-legacy substring-fallback test.
 
-    Patches ``fused_memory.middleware.operational_ask_registry.load_operational_registry``
+    Patches ``fused_memory.middleware.task_curator.load_operational_registry``
     at the MODULE level (never the shipped config/operational_ask_registry.yaml —
     a production-config edit is out of scope for this test-only task).
-    ``TaskCurator._maybe_route_deterministic`` resolves this name via a local
-    ``from ... import load_operational_registry`` INSIDE its function body on
-    its first call (lazy-load, then cached on ``self._operational_registry``
-    for the lifetime of the TaskCurator instance) — so patching the module
-    attribute before that first call is picked up regardless of whatever
-    (unread — scenario 5 never touches disk) path
+    ``TaskCurator._maybe_route_deterministic`` looks this name up in its own
+    module on its first call (lazy-load, then cached on
+    ``self._operational_registry`` for the lifetime of the TaskCurator
+    instance) — so patching that binding before the first call is picked up
+    regardless of whatever (unread — scenario 5 never touches disk) path
     ``config.curator.operational_ask_registry_path`` names. The curator is
     deliberately left ACTIVE here (unlike ``_submit_normal_and_get``'s
     ``TaskCurator.curate`` neutralization) — scenario 5 must reach
@@ -398,7 +398,7 @@ def _inject_operational_registry(
         return [entry]
 
     monkeypatch.setattr(
-        'fused_memory.middleware.operational_ask_registry.load_operational_registry',
+        'fused_memory.middleware.task_curator.load_operational_registry',
         _fake_load,
     )
 

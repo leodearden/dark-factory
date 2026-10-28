@@ -11,9 +11,10 @@ tells the model to draw an inference from that section's ABSENCE**. Today that
 set has exactly one member, ``### Live-Workflow Signals``, because
 ``prompts/stage2.py`` says:
 
-    "If `### Live-Workflow Signals` is absent from the payload, no task is live
-     this cycle — neither through a per-task signal nor through the project-wide
-     lock — and none has landing evidence; no live-workflow suppression applies."
+    "If `### Live-Workflow Signals` is absent from the payload, no task the
+     `### Active Task Tree` lists is live this cycle — neither through a
+     per-task signal nor through the project-wide lock — and none of them has
+     landing evidence; no live-workflow suppression applies to them."
 
 A builder that omits the section therefore makes the model conclude something
 FALSE, which is what makes the section mandatory.
@@ -158,14 +159,14 @@ class TestEveryPayloadBuilderRendersTheRequiredSections:
 
         assert not offending_lines, (
             f'{STAGE2_CLASS}.{builder_name} returns a Stage-2 payload that never '
-            f'interpolates self.{AGGREGATOR}(filtered) at '
+            f'interpolates self.{AGGREGATOR}(filtered, tree_read_at) at '
             f'{TKS_SRC.name}:{",".join(str(n) for n in offending_lines)} '
             f'(of {len(builder.payload_returns)} payload-returning branch(es) in '
             f'this builder), so that branch can omit '
             f'{sorted(s.header for s in TaskKnowledgeSync.REQUIRED_SECTIONS)} — '
             f"and prompts/stage2.py's absence-inference then makes the model "
             f'conclude no task is live. Fix: interpolate '
-            f'{{await self.{AGGREGATOR}(filtered)}} into the returned f-string, or '
+            f'{{await self.{AGGREGATOR}(filtered, tree_read_at)}} into the returned f-string, or '
             f'bind it to a local and interpolate that local.'
         )
 
@@ -175,7 +176,7 @@ class TestEveryPayloadBuilderRendersTheRequiredSections:
         A builder that still called ``self._build_live_workflow_section(…)``
         itself would satisfy the test above while making "adding a section is
         one edit" false again. The aggregator dispatches via
-        ``getattr(self, section.renderer)(filtered)``, which is not a named call
+        ``getattr(self, section.renderer)(filtered, tree_read_at)``, which is not a named call
         and so is unaffected.
         """
         builder = STAGE2_PAYLOAD_BUILDERS[builder_name]
@@ -184,7 +185,7 @@ class TestEveryPayloadBuilderRendersTheRequiredSections:
             assert not calls_named(builder.node, section.renderer), (
                 f'{STAGE2_CLASS}.{builder_name} calls self.{section.renderer}() '
                 f'directly. Registered sections must be reached ONLY through '
-                f'self.{AGGREGATOR}(filtered), or adding the next section is once '
+                f'self.{AGGREGATOR}(filtered, tree_read_at), or adding the next section is once '
                 f'again one edit per builder rather than one edit to '
                 f'REQUIRED_SECTIONS. Delete the direct call and the local it feeds.'
             )

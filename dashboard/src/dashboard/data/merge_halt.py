@@ -4,7 +4,8 @@ Each orchestrator runs its own escalation MCP, and that MCP owns the
 merge-queue halt state for its orchestrator. To surface halt status on
 the dashboard we fan out ``get_merge_halt_status`` calls across every
 known escalation URL concurrently and aggregate the results into a
-``{project_label: {wired, halted, owner_esc_id, offline}}`` dict.
+``{project_label: {wired, halted, owner_esc_id, offline}}`` dict, keyed by
+project label (``dashboard/project_labels.py::ProjectLabels``).
 
 The default ``mcp_tool_call`` timeout is 10s — too slow for a 3s polling
 loop. The probe budget is bounded at **two complementary layers**, both
@@ -31,11 +32,18 @@ from typing import Any
 
 import httpx
 
+from dashboard.data.mcp_fanout import FANOUT_FAILURE_EXCEPTIONS
 from dashboard.data.memory import mcp_tool_call
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PER_CALL_TIMEOUT = 2.0
+
+# OSError is this probe's own addition on top of the shared fan-out failure
+# set: anything escaping _probe_one 500s /merge-queue.
+_PROBE_FAILURE_EXCEPTIONS: tuple[type[Exception], ...] = (
+    *FANOUT_FAILURE_EXCEPTIONS, OSError,
+)
 
 
 async def _probe_one(
@@ -50,7 +58,7 @@ async def _probe_one(
             ),
             timeout=timeout,
         )
-    except (TimeoutError, httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, ValueError, OSError) as exc:
+    except _PROBE_FAILURE_EXCEPTIONS as exc:
         logger.debug('get_merge_halt_status failed for %s: %s', base_url, exc)
         return {'wired': False, 'halted': False, 'offline': True, 'error': str(exc)}
     return {
@@ -70,8 +78,9 @@ async def get_merge_halt_status(
     """Probe every escalation URL concurrently; return ``{label: status}``.
 
     Per-project labels match the keys used by ``shape_merge_queue`` (project
-    basename). Failures are reported as ``{wired, halted: False, offline: True}``
-    so the UI can render an Offline pill rather than a blank panel.
+    label — ``dashboard/project_labels.py::ProjectLabels``). Failures are
+    reported as ``{wired, halted: False, offline: True}`` so the UI can render
+    an Offline pill rather than a blank panel.
     """
     if not escalation_urls:
         return {}

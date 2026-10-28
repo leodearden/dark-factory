@@ -44,7 +44,7 @@ from orchestrator.scheduler import TaskAssignment
 def git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_transcript_repo(repo))
+    _init_transcript_repo(repo)
     return repo
 
 
@@ -70,12 +70,10 @@ def task_assignment() -> TaskAssignment:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("code_default_config")
 class TestProducerHook:
 
-    async def test_end_to_end_transcript_appears(
-        self, monkeypatch, git_repo, git_ops, task_assignment
-    ):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    async def test_end_to_end_transcript_appears(self, git_repo, git_ops, task_assignment):
         config = _config(git_repo)  # transcript_archive enabled by default
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         config_dir = workflow._config_dir
@@ -103,10 +101,7 @@ class TestProducerHook:
         assert archived.exists()
         assert archived.read_bytes() == fake_bytes
 
-    async def test_flag_guard_disabled_skips_helper(
-        self, monkeypatch, git_repo, git_ops, task_assignment
-    ):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    async def test_flag_guard_disabled_skips_helper(self, git_repo, git_ops, task_assignment):
         config = _config(git_repo, transcript_archive={'enabled': False})
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
@@ -119,10 +114,7 @@ class TestProducerHook:
 
         mock_helper.assert_not_called()
 
-    async def test_arg_wiring(
-        self, monkeypatch, git_repo, git_ops, task_assignment
-    ):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    async def test_arg_wiring(self, git_repo, git_ops, task_assignment):
         config = _config(git_repo)  # enabled by default
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
@@ -141,9 +133,7 @@ class TestProducerHook:
             archive_root=config.project_root / 'data/orchestrator/agent-transcripts',
         )
 
-    async def test_helper_error_does_not_mask_in_flight(
-        self, monkeypatch, git_repo, git_ops, task_assignment
-    ):
+    async def test_helper_error_does_not_mask_in_flight(self, git_repo, git_ops, task_assignment):
         """A non-cancellation error escaping the helper is swallowed, not raised.
 
         archive_task_transcripts guards per-file work with ``except OSError`` but
@@ -153,7 +143,6 @@ class TestProducerHook:
         ``try/except Exception`` is the structural guarantee that it cannot — even
         if the helper's contract regresses (review #1).
         """
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)  # enabled by default
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
@@ -172,9 +161,7 @@ class TestProducerHook:
         assert result.success is True
         mock_helper.assert_called_once()
 
-    async def test_cancellation_propagates_not_swallowed(
-        self, monkeypatch, git_repo, git_ops, task_assignment
-    ):
+    async def test_cancellation_propagates_not_swallowed(self, git_repo, git_ops, task_assignment):
         """CancelledError from the archive await must re-raise, never be swallowed.
 
         Loop teardown / hard-kill surfaces CancelledError from the ``await``; the
@@ -184,7 +171,6 @@ class TestProducerHook:
         ``except Exception`` deliberately does NOT catch CancelledError (a
         BaseException), so this asserts the two clauses are ordered correctly.
         """
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)  # enabled by default
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
@@ -200,6 +186,7 @@ class TestProducerHook:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("code_default_config")
 class TestCleanupConfigDirArchivesFirst:
     """Task 3619: the teardown sites must archive BEFORE they delete.
 
@@ -222,10 +209,9 @@ class TestCleanupConfigDirArchivesFirst:
         return p, payload
 
     async def test_cleanup_archives_the_transcript_it_is_about_to_destroy(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
         """(a) The measured bug, closed at its source."""
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
@@ -241,7 +227,7 @@ class TestCleanupConfigDirArchivesFirst:
         assert not config_dir_path.exists()
 
     async def test_the_archive_root_composition_matches_the_other_two_sites(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
         """(b) One composition, so the already-current skip fires across all three.
 
@@ -251,7 +237,6 @@ class TestCleanupConfigDirArchivesFirst:
         tree, the already-current check would never match, and every pass would
         re-archive into a corpus no reader looks at.
         """
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
@@ -267,7 +252,7 @@ class TestCleanupConfigDirArchivesFirst:
         )
 
     async def test_preserve_still_short_circuits_and_touches_nothing(
-        self, monkeypatch, git_repo, git_ops, task_assignment, caplog
+        self, git_repo, git_ops, task_assignment, caplog
     ):
         """(c) The forensic breaker path is untouched by this change.
 
@@ -276,7 +261,6 @@ class TestCleanupConfigDirArchivesFirst:
         pointless; DELETING there would destroy the evidence the breaker tripped
         to collect. The early return must stay ahead of everything.
         """
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
@@ -297,7 +281,7 @@ class TestCleanupConfigDirArchivesFirst:
         assert any('preserved for forensic analysis' in r.getMessage() for r in caplog.records)
 
     async def test_the_kill_switch_gates_archival_never_teardown(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
         """(d) enabled=False → the plain cleanup() this wraps, nothing else.
 
@@ -306,7 +290,6 @@ class TestCleanupConfigDirArchivesFirst:
         credential dirs — a much worse outcome than the transcripts they meant
         to stop writing.
         """
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo, transcript_archive={'enabled': False})
         workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
@@ -321,7 +304,7 @@ class TestCleanupConfigDirArchivesFirst:
         assert not _archive_root(git_repo).exists()
 
     async def test_recycle_also_archives_before_it_destroys(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
         """(e) The zero-output-hang recycle is a THIRD transcript-destroying cleanup().
 
@@ -330,7 +313,6 @@ class TestCleanupConfigDirArchivesFirst:
         its transcript is exactly the forensic record of a wedge — the thing an
         operator most wants and the thing this path has been silently deleting.
         """
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         workflow.worktree = cwd
@@ -351,7 +333,7 @@ class TestCleanupConfigDirArchivesFirst:
         assert list(workflow._config_dir.path.glob('projects/**/*.jsonl')) == []
 
     async def test_an_archiver_error_never_blocks_the_teardown(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
         """Defence in depth: a helper that regresses must not strand the dir.
 
@@ -360,7 +342,6 @@ class TestCleanupConfigDirArchivesFirst:
         a credential-bearing directory on every task, so the guard is cheap
         relative to the risk.
         """
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
@@ -377,6 +358,7 @@ class TestCleanupConfigDirArchivesFirst:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("code_default_config")
 class TestProducerHookIsUncancellable:
     """Task 3619: the producer hook must survive the SIGTERM that triggers it.
 
@@ -402,7 +384,7 @@ class TestProducerHookIsUncancellable:
         return _side_effect
 
     async def test_a_cancelled_invocation_still_archives_its_transcript(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
         """The SIGTERM shape: cancellation propagates AND the archive exists.
 
@@ -415,7 +397,6 @@ class TestProducerHookIsUncancellable:
         ``asyncio.to_thread`` distinguishes "archival happened" from "archival
         happened on a cancellable await".
         """
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         payload = b'{"transcript":"in flight at SIGTERM"}\n'
@@ -438,7 +419,7 @@ class TestProducerHookIsUncancellable:
         assert archived.read_bytes() == payload
 
     async def test_archival_does_not_go_through_to_thread(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
         """Pin the SYNCHRONOUS call, not merely a passing end-to-end result.
 
@@ -447,7 +428,6 @@ class TestProducerHookIsUncancellable:
         cancellation point that loses the transcript. Making
         ``asyncio.to_thread`` explode proves archival does not route through it.
         """
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         payload = b'{"transcript":"synchronous"}\n'
@@ -469,7 +449,7 @@ class TestProducerHookIsUncancellable:
         assert archived.read_bytes() == payload
 
     async def test_this_site_copies_so_a_resumed_session_keeps_reading(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
         """The producer COPIES; only the teardown sites move.
 
@@ -478,7 +458,6 @@ class TestProducerHookIsUncancellable:
         under a live session would turn every resume into a no_transcript
         fallback — the opposite of what this task exists to enable.
         """
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         payload = b'{"transcript":"still live"}\n'

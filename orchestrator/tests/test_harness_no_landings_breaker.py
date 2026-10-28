@@ -19,7 +19,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
-from orchestrator.merge_queue import NoLandingsCircuitBreaker
+from orchestrator.merge_lane.worker import NoLandingsCircuitBreaker
 from orchestrator.run_store import RunStore
 
 # Role tag used by the breaker escalation (must match implementation)

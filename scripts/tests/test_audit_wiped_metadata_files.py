@@ -15,8 +15,8 @@ NO TEST HERE ASSERTS A COUNT OR TASK ID DERIVED FROM THE LIVE DATABASES.
 tasks.db and runs.db are mutated continuously by the running orchestrator, so
 a test pinning "the live DB yields N candidates" would be a guessed threshold
 that goes red the moment another task merges. Every assertion runs against
-synthetic temp databases built by the helpers below, whose contents the test
-controls exactly.
+synthetic temp databases built by conftest's `make_tasks_db` and
+`make_runs_db` fixtures, whose contents the test controls exactly.
 """
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
     CONFIRMED_NULL_SHA_DONE_PATH,
     CONTRADICTED_REAL_MERGE_SHA,
+    EVENT_LOG_UNREAD,
     FIDELITY_FILE_LEVEL,
     FIDELITY_LOCK_LEVEL,
     NO_MERGE_EVENT,
@@ -53,79 +54,10 @@ from audit_wiped_metadata_files import (
     merge_plan_file_sources,
 )
 
-# ---------------------------------------------------------------------------
-# Temp-DB fixture builders.
-#
-# Both schemas MIRROR THE LIVE SCHEMAS so tests exercise real column shapes
-# and NOT NULL constraints rather than invented ones:
-#   - tasks:  fused-memory's sqlite_task_backend.py _SCHEMA_SQL, verified
-#             read-only against /home/leo/src/dark-factory/.taskmaster/tasks/tasks.db
-#   - events: orchestrator/src/orchestrator/event_store.py:23-41 (_SCHEMA)
-# Only the columns the audit actually reads are included, plus the NOT NULL
-# ones it must satisfy to insert a realistic row.
-# ---------------------------------------------------------------------------
+from shared import project_layout
 
-# The tasks-table schema and the tasks.db builder live in scripts/tests/
-# conftest.py, behind the `make_tasks_db` fixture (task
-# 3336) — they were previously copied near-identically into all three
-# sweep-script test files. The events schema below stays local: runs.db is
-# audit-specific and is NOT duplicated in the two scanners.
-
-_EVENTS_SCHEMA = """
-CREATE TABLE events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL,
-    run_id      TEXT    NOT NULL,
-    task_id     TEXT,
-    event_type  TEXT    NOT NULL,
-    phase       TEXT,
-    role        TEXT,
-    data        TEXT    DEFAULT '{}',
-    cost_usd    REAL,
-    duration_ms INTEGER
-);
-"""
-
-
-def _make_runs_db(tmp_path: Path, events: list[dict], name: str = "runs.db") -> Path:
-    """Build a temp runs.db mirroring the live events schema and insert *events*.
-
-    Each event dict may carry: ``event_type`` (required), ``task_id``,
-    ``run_id``, ``timestamp``, ``phase``, ``role``, and ``data``. ``data`` is
-    passed through VERBATIM when it is a str or None — so a test can insert
-    malformed JSON or a NULL payload — and json-encoded otherwise. Rows are
-    inserted in list order, so ``events`` order IS ascending ``id`` order,
-    which is the ordering the audit relies on for "latest wins".
-    """
-    db_path = tmp_path / name
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(_EVENTS_SCHEMA)
-        for i, event in enumerate(events):
-            data = event.get("data")
-            if data is not None and not isinstance(data, str):
-                data = json.dumps(data)
-            task_id = event.get("task_id")
-            conn.execute(
-                "INSERT INTO events (timestamp, run_id, task_id, event_type, "
-                "phase, role, data, cost_usd, duration_ms) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    event.get("timestamp", f"2026-07-30T00:00:{i:02d}+00:00"),
-                    event.get("run_id", "run-1"),
-                    None if task_id is None else str(task_id),
-                    event["event_type"],
-                    event.get("phase"),
-                    event.get("role"),
-                    data,
-                    event.get("cost_usd"),
-                    event.get("duration_ms"),
-                ),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return db_path
+# Both temp-DB builders live in scripts/tests/conftest.py: tasks.db behind
+# `make_tasks_db` (task 3336) and runs.db behind `make_runs_db` (task 5989).
 
 
 # ---------------------------------------------------------------------------
@@ -153,29 +85,6 @@ def test_make_tasks_db_roundtrips_rows(tmp_path, make_tasks_db):
         ("master", 1, "done", '{"files": ["a.py"]}'),
         ("master", 3, "done", "{not json"),
         ("other", 2, "cancelled", None),
-    ]
-
-
-def test_make_runs_db_assigns_ascending_ids_in_list_order(tmp_path):
-    db_path = _make_runs_db(
-        tmp_path,
-        [
-            {"event_type": "set_to_plan", "task_id": 7, "data": {"files": ["m"]}},
-            {"event_type": "phase_skipped", "task_id": 7, "data": None},
-            {"event_type": "merge_finalized", "task_id": None, "data": "{bad"},
-        ],
-    )
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        rows = conn.execute(
-            "SELECT id, task_id, event_type, data FROM events ORDER BY id"
-        ).fetchall()
-    finally:
-        conn.close()
-    assert rows == [
-        (1, "7", "set_to_plan", '{"files": ["m"]}'),
-        (2, "7", "phase_skipped", None),
-        (3, None, "merge_finalized", "{bad"),
     ]
 
 
@@ -266,10 +175,9 @@ def test_load_task_records_on_empty_db_returns_empty_mapping(tmp_path, make_task
 # ---------------------------------------------------------------------------
 
 
-def test_load_plan_files_from_events_reads_phase_skipped_as_file_level(tmp_path):
+def test_load_plan_files_from_events_reads_phase_skipped_as_file_level(make_runs_db):
     """(a) phase_skipped.plan_files is FILE_LEVEL."""
-    db_path = _make_runs_db(
-        tmp_path,
+    db_path = make_runs_db(
         [
             {
                 "event_type": "phase_skipped",
@@ -294,11 +202,10 @@ def test_load_plan_files_from_events_reads_phase_skipped_as_file_level(tmp_path)
     assert record.fidelity == FIDELITY_FILE_LEVEL
 
 
-def test_load_plan_files_from_events_reads_set_to_plan_as_lock_level(tmp_path):
+def test_load_plan_files_from_events_reads_set_to_plan_as_lock_level(make_runs_db):
     """(b) set_to_plan.files carries the lock-level `needed` set, so it is
     tagged LOCK_LEVEL and must never be presented as verbatim plan.files."""
-    db_path = _make_runs_db(
-        tmp_path,
+    db_path = make_runs_db(
         [
             {
                 "event_type": "set_to_plan",
@@ -319,7 +226,7 @@ def test_load_plan_files_from_events_reads_set_to_plan_as_lock_level(tmp_path):
     assert record.fidelity == FIDELITY_LOCK_LEVEL
 
 
-def test_load_plan_files_from_events_file_level_beats_lock_level_either_order(tmp_path):
+def test_load_plan_files_from_events_file_level_beats_lock_level_either_order(make_runs_db):
     """(c) FILE_LEVEL wins regardless of which row has the higher id."""
     phase_skipped = {
         "event_type": "phase_skipped",
@@ -333,10 +240,10 @@ def test_load_plan_files_from_events_file_level_beats_lock_level_either_order(tm
     }
 
     lock_last = load_plan_files_from_events(
-        str(_make_runs_db(tmp_path, [phase_skipped, set_to_plan], name="a.db"))
+        str(make_runs_db([phase_skipped, set_to_plan], name="a.db"))
     )
     file_last = load_plan_files_from_events(
-        str(_make_runs_db(tmp_path, [set_to_plan, phase_skipped], name="b.db"))
+        str(make_runs_db([set_to_plan, phase_skipped], name="b.db"))
     )
 
     for records in (lock_last, file_last):
@@ -344,10 +251,9 @@ def test_load_plan_files_from_events_file_level_beats_lock_level_either_order(tm
         assert records["7"].files == ("a.py",)
 
 
-def test_load_plan_files_from_events_latest_wins_within_one_fidelity_tier(tmp_path):
+def test_load_plan_files_from_events_latest_wins_within_one_fidelity_tier(make_runs_db):
     """(d) within one tier the later row (higher id) wins."""
-    db_path = _make_runs_db(
-        tmp_path,
+    db_path = make_runs_db(
         [
             {"event_type": "phase_skipped", "task_id": 7, "data": {"plan_files": ["old.py"]}},
             {"event_type": "phase_skipped", "task_id": 7, "data": {"plan_files": ["new.py"]}},
@@ -355,8 +261,7 @@ def test_load_plan_files_from_events_latest_wins_within_one_fidelity_tier(tmp_pa
     )
     assert load_plan_files_from_events(str(db_path))["7"].files == ("new.py",)
 
-    lock_db = _make_runs_db(
-        tmp_path,
+    lock_db = make_runs_db(
         [
             {"event_type": "set_to_plan", "task_id": 8, "data": {"files": ["old_mod"]}},
             {"event_type": "set_to_plan", "task_id": 8, "data": {"files": ["new_mod"]}},
@@ -366,11 +271,10 @@ def test_load_plan_files_from_events_latest_wins_within_one_fidelity_tier(tmp_pa
     assert load_plan_files_from_events(str(lock_db))["8"].files == ("new_mod",)
 
 
-def test_load_plan_files_from_events_skips_every_unusable_row(tmp_path):
+def test_load_plan_files_from_events_skips_every_unusable_row(make_runs_db):
     """(e)(f)(g): missing key, empty list, malformed/NULL data, NULL task_id,
     and unrelated event types are all skipped without raising."""
-    db_path = _make_runs_db(
-        tmp_path,
+    db_path = make_runs_db(
         [
             # (e) phase_skipped with no plan_files key at all.
             {"event_type": "phase_skipped", "task_id": 1, "data": {"reason": "x"}},
@@ -394,11 +298,10 @@ def test_load_plan_files_from_events_skips_every_unusable_row(tmp_path):
     assert load_plan_files_from_events(str(db_path)) == {}
 
 
-def test_load_plan_files_from_events_does_not_let_an_empty_later_row_erase_a_hit(tmp_path):
+def test_load_plan_files_from_events_does_not_let_an_empty_later_row_erase_a_hit(make_runs_db):
     """A later row whose list is empty is skipped, not treated as an update
     that blanks the earlier real signal."""
-    db_path = _make_runs_db(
-        tmp_path,
+    db_path = make_runs_db(
         [
             {"event_type": "phase_skipped", "task_id": 7, "data": {"plan_files": ["real.py"]}},
             {"event_type": "phase_skipped", "task_id": 7, "data": {"plan_files": []}},
@@ -407,8 +310,8 @@ def test_load_plan_files_from_events_does_not_let_an_empty_later_row_erase_a_hit
     assert load_plan_files_from_events(str(db_path))["7"].files == ("real.py",)
 
 
-def test_load_plan_files_from_events_on_empty_db_returns_empty_mapping(tmp_path):
-    assert load_plan_files_from_events(str(_make_runs_db(tmp_path, []))) == {}
+def test_load_plan_files_from_events_on_empty_db_returns_empty_mapping(make_runs_db):
+    assert load_plan_files_from_events(str(make_runs_db([]))) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -670,7 +573,7 @@ def test_merge_plan_file_sources_on_empty_inputs_returns_empty():
     assert merge_plan_file_sources({}, {}) == {}
 
 
-def test_every_source_label_the_loaders_emit_is_ranked_by_the_precedence(tmp_path):
+def test_every_source_label_the_loaders_emit_is_ranked_by_the_precedence(tmp_path, make_runs_db):
     """TOTALITY, checked against the labels the loaders actually PRODUCE
     rather than by restating the tuple's literal contents.
 
@@ -682,8 +585,7 @@ def test_every_source_label_the_loaders_emit_is_ranked_by_the_precedence(tmp_pat
     base.mkdir()
     _write_meta_root_plan(base, "1", {"task_id": 1, "files": ["a.py"]})
     _write_legacy_plan(base, "2", {"task_id": 2, "files": ["b.py"]})
-    db_path = _make_runs_db(
-        tmp_path,
+    db_path = make_runs_db(
         [
             {"event_type": "phase_skipped", "task_id": 3, "data": {"plan_files": ["c.py"]}},
             {"event_type": "set_to_plan", "task_id": 4, "data": {"files": ["orchestrator"]}},
@@ -825,9 +727,8 @@ def test_classify_treats_an_empty_string_sha_as_no_sha():
     )
 
 
-def test_load_merge_signatures_groups_by_task_in_id_order(tmp_path):
-    db_path = _make_runs_db(
-        tmp_path,
+def test_load_merge_signatures_groups_by_task_in_id_order(make_runs_db):
+    db_path = make_runs_db(
         [
             {"event_type": "merge_finalized", "task_id": 7, "data": _finalized("blocked")},
             {"event_type": "merge_finalized", "task_id": 8, "data": _finalized("already_merged")},
@@ -842,9 +743,8 @@ def test_load_merge_signatures_groups_by_task_in_id_order(tmp_path):
     assert [p["state"] for p in signatures["8"]] == ["already_merged"]
 
 
-def test_load_merge_signatures_skips_malformed_and_ignores_other_event_types(tmp_path):
-    db_path = _make_runs_db(
-        tmp_path,
+def test_load_merge_signatures_skips_malformed_and_ignores_other_event_types(make_runs_db):
+    db_path = make_runs_db(
         [
             {"event_type": "merge_finalized", "task_id": 7, "data": "{not json"},
             {"event_type": "merge_finalized", "task_id": 7, "data": None},
@@ -860,8 +760,8 @@ def test_load_merge_signatures_skips_malformed_and_ignores_other_event_types(tmp
     assert [p["state"] for p in signatures["7"]] == ["conflict"]
 
 
-def test_load_merge_signatures_on_empty_db_returns_empty(tmp_path, make_tasks_db):
-    assert load_merge_signatures(str(_make_runs_db(tmp_path, []))) == {}
+def test_load_merge_signatures_on_empty_db_returns_empty(make_tasks_db, make_runs_db):
+    assert load_merge_signatures(str(make_runs_db([]))) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -872,7 +772,7 @@ def test_load_merge_signatures_on_empty_db_returns_empty(tmp_path, make_tasks_db
 # ---------------------------------------------------------------------------
 
 
-def _make_project(tmp_path, make_tasks_db, tasks=(), events=(), plans=(), name="proj"):
+def _make_project(tmp_path, make_tasks_db, make_runs_db, tasks=(), events=(), plans=(), name="proj"):
     """Build a whole project root with the three inputs audit_project reads.
 
     *plans* is a list of ``(worktree_name, plan_dict)`` written to the
@@ -885,7 +785,7 @@ def _make_project(tmp_path, make_tasks_db, tasks=(), events=(), plans=(), name="
 
     runs_dir = root / "data" / "orchestrator"
     runs_dir.mkdir(parents=True)
-    _make_runs_db(runs_dir, list(events))
+    make_runs_db(list(events), directory=runs_dir)
 
     worktrees = root / ".worktrees"
     worktrees.mkdir(parents=True)
@@ -894,11 +794,11 @@ def _make_project(tmp_path, make_tasks_db, tasks=(), events=(), plans=(), name="
     return root
 
 
-def test_audit_project_reports_a_wiped_task_with_full_provenance(tmp_path, make_tasks_db):
+def test_audit_project_reports_a_wiped_task_with_full_provenance(tmp_path, make_tasks_db, make_runs_db):
     """(a) non-empty plan scope + empty metadata.files IS reported, carrying
     every field a downstream repair would need."""
     root = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[{"id": 2464, "status": "done", "metadata": {"files": []}}],
         events=[
             {
@@ -923,10 +823,10 @@ def test_audit_project_reports_a_wiped_task_with_full_provenance(tmp_path, make_
     assert candidate.wipe_signature == CONFIRMED_NULL_SHA_DONE_PATH
 
 
-def test_audit_project_does_not_report_a_task_whose_files_survived(tmp_path, make_tasks_db):
+def test_audit_project_does_not_report_a_task_whose_files_survived(tmp_path, make_tasks_db, make_runs_db):
     """(b) non-empty metadata.files means nothing was wiped."""
     root = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[{"id": 1, "status": "done", "metadata": {"files": ["a.py"]}}],
         plans=[("1", {"task_id": 1, "files": ["a.py"]})],
     )
@@ -937,11 +837,11 @@ def test_audit_project_does_not_report_a_task_whose_files_survived(tmp_path, mak
     assert audit.coverage.tasks_with_file_level_signal == 1
 
 
-def test_audit_project_does_not_report_a_task_whose_plan_declared_no_scope(tmp_path, make_tasks_db):
+def test_audit_project_does_not_report_a_task_whose_plan_declared_no_scope(tmp_path, make_tasks_db, make_runs_db):
     """(c) an empty plan file list is not a declared scope, so an empty
     metadata.files is not evidence of a wipe."""
     root = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[{"id": 1, "status": "done", "metadata": {"files": []}}],
         plans=[("1", {"task_id": 1, "files": []})],
     )
@@ -953,11 +853,11 @@ def test_audit_project_does_not_report_a_task_whose_plan_declared_no_scope(tmp_p
     assert audit.coverage.tasks_with_file_level_signal == 0
 
 
-def test_audit_project_counts_plan_records_with_no_matching_task(tmp_path, make_tasks_db):
+def test_audit_project_counts_plan_records_with_no_matching_task(tmp_path, make_tasks_db, make_runs_db):
     """(d) a plan/event signal for a task absent from tasks.db is counted
     separately rather than crashing or being silently dropped."""
     root = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[{"id": 1, "status": "done", "metadata": {"files": []}}],
         plans=[
             ("1", {"task_id": 1, "files": ["a.py"]}),
@@ -970,11 +870,11 @@ def test_audit_project_counts_plan_records_with_no_matching_task(tmp_path, make_
     assert audit.coverage.plan_records_without_task == 1
 
 
-def test_audit_project_orders_candidates_by_tag_then_numeric_id(tmp_path, make_tasks_db):
+def test_audit_project_orders_candidates_by_tag_then_numeric_id(tmp_path, make_tasks_db, make_runs_db):
     """(e) deterministic ordering — numeric, so 100 sorts after 20."""
     ids = [100, 20, 3]
     root = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=(
             [{"id": i, "tag": "master", "metadata": {"files": []}} for i in ids]
             + [{"id": 50, "tag": "alpha", "metadata": {"files": []}}]
@@ -991,11 +891,11 @@ def test_audit_project_orders_candidates_by_tag_then_numeric_id(tmp_path, make_t
     ]
 
 
-def test_audit_project_coverage_counts_every_tier(tmp_path, make_tasks_db):
+def test_audit_project_coverage_counts_every_tier(tmp_path, make_tasks_db, make_runs_db):
     """(f) total, file-level, lock-level-only, and no-signal counts, where
     no-signal includes tasks with no plan record at all."""
     root = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[
             {"id": 1, "metadata": {"files": []}},   # file-level signal
             {"id": 2, "metadata": {"files": []}},   # lock-level signal only
@@ -1022,7 +922,7 @@ def test_audit_project_coverage_counts_every_tier(tmp_path, make_tasks_db):
     assert lock_candidates[0].plan_files == ("orchestrator",)
 
 
-def test_audit_project_coverage_tiers_partition_tasks_even_across_tags(tmp_path, make_tasks_db):
+def test_audit_project_coverage_tiers_partition_tasks_even_across_tags(tmp_path, make_tasks_db, make_runs_db):
     """The coverage tiers count TASKS, not plan records.
 
     A plan record is keyed by a BARE task id, so the same numeric id under two
@@ -1034,7 +934,7 @@ def test_audit_project_coverage_tiers_partition_tasks_even_across_tags(tmp_path,
     total_tasks exactly.
     """
     root = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[
             {"id": 42, "tag": "master", "metadata": {"files": []}},
             {"id": 42, "tag": "alpha", "metadata": {"files": ["kept.py"]}},
@@ -1060,22 +960,46 @@ def test_audit_project_coverage_tiers_partition_tasks_even_across_tags(tmp_path,
     ] == [("master", 42)]
 
 
-def test_audit_project_degrades_to_no_merge_event_without_a_runs_db(tmp_path, make_tasks_db):
-    """A project with no runs.db still audits; every signature is UNKNOWN."""
+def test_audit_project_without_a_runs_db_records_the_event_log_unread(tmp_path, make_tasks_db, make_runs_db):
+    """A project with no runs.db still audits, but claims nothing about merges.
+
+    NO_MERGE_EVENT asserts a READ log holds no merge_finalized for the task;
+    with no log there was nothing to read, so every signature is
+    EVENT_LOG_UNREAD and the coverage says the log was not read (INV-13).
+    """
     root = _make_project(
-        tmp_path, make_tasks_db,
-        tasks=[{"id": 1, "metadata": {"files": []}}],
-        plans=[("1", {"task_id": 1, "files": ["a.py"]})],
+        tmp_path, make_tasks_db, make_runs_db,
+        tasks=[{"id": 1, "metadata": {"files": []}}, {"id": 2, "metadata": {"files": []}}],
+        plans=[
+            ("1", {"task_id": 1, "files": ["a.py"]}),
+            ("2", {"task_id": 2, "files": ["b.py"]}),
+        ],
     )
-    (root / "data" / "orchestrator" / "runs.db").unlink()
+    project_layout.runs_db(root).unlink()
 
     audit = audit_project(str(root))
 
+    assert audit.coverage.event_log_read is False
+    assert [c.wipe_signature for c in audit.candidates] == [EVENT_LOG_UNREAD, EVENT_LOG_UNREAD]
+
+
+def test_audit_project_with_a_runs_db_lacking_the_tasks_merge_reports_no_merge_event(
+    tmp_path, make_tasks_db, make_runs_db
+):
+    root = _make_project(
+        tmp_path, make_tasks_db, make_runs_db,
+        tasks=[{"id": 1, "metadata": {"files": []}}],
+        plans=[("1", {"task_id": 1, "files": ["a.py"]})],
+    )
+
+    audit = audit_project(str(root))
+
+    assert audit.coverage.event_log_read is True
     assert [c.wipe_signature for c in audit.candidates] == [NO_MERGE_EVENT]
 
 
-def test_audit_project_on_an_empty_project_reports_zero_and_does_not_crash(tmp_path, make_tasks_db):
-    root = _make_project(tmp_path, make_tasks_db)
+def test_audit_project_on_an_empty_project_reports_zero_and_does_not_crash(tmp_path, make_tasks_db, make_runs_db):
+    root = _make_project(tmp_path, make_tasks_db, make_runs_db)
     audit = audit_project(str(root))
 
     assert audit.candidates == []
@@ -1114,6 +1038,7 @@ def _coverage(root="/tmp/proj", **overrides):
         "tasks_with_lock_level_signal_only": 400,
         "tasks_without_plan_signal": 2049,
         "plan_records_without_task": 2,
+        "event_log_read": True,
     }
     fields.update(overrides)
     return AuditCoverage(**fields)
@@ -1198,13 +1123,25 @@ def test_format_report_renders_every_coverage_line_verbatim():
     ]
     start = lines.index(caveat[0])
     assert lines[start:start + 3] == caveat
-    assert lines[start + 3:start + 8] == [
+    assert lines[start + 3:start + 9] == [
         "    total tasks scanned:                8123",
         "    with a file-level plan signal:      415",
         "    with only a lock-level signal:      662",
         "    with NO plan signal at all:         1990",
         "    plan records with no such task:     37",
+        "    event log (runs.db):                present",
     ]
+
+
+def test_format_report_renders_an_absent_event_log_row_verbatim():
+    report = format_report([_audit([], event_log_read=False)])
+    lines = report.splitlines()
+
+    start = lines.index("    plan records with no such task:     2")
+    assert lines[start + 1] == (
+        "    event log (runs.db):                ABSENT at /tmp/proj/data/orchestrator/runs.db"
+        " — wipe signatures unknown (event_log_unread)"
+    )
 
 
 def test_format_report_marks_lock_level_candidates_with_an_explicit_caveat():
@@ -1364,11 +1301,11 @@ def _run_cli(*args):
     )
 
 
-def test_discover_project_roots_precedence_and_missing_db_drop(tmp_path, make_tasks_db):
+def test_discover_project_roots_precedence_and_missing_db_drop(tmp_path, make_tasks_db, make_runs_db):
     """(a) explicit --project-root > DASHBOARD_KNOWN_PROJECT_ROOTS > the
     dark-factory default; a root with no tasks.db is silently dropped."""
-    real = _make_project(tmp_path, make_tasks_db, name="real")
-    other = _make_project(tmp_path, make_tasks_db, name="other")
+    real = _make_project(tmp_path, make_tasks_db, make_runs_db, name="real")
+    other = _make_project(tmp_path, make_tasks_db, make_runs_db, name="other")
     env = {"DASHBOARD_KNOWN_PROJECT_ROOTS": f"{other},{tmp_path / 'nonexistent'}"}
 
     # Explicit wins outright.
@@ -1385,19 +1322,19 @@ def test_discover_project_roots_precedence_and_missing_db_drop(tmp_path, make_ta
     assert isinstance(discover_project_roots(None, env={}), list)
 
 
-def test_main_exit_0_when_no_candidates(tmp_path, make_tasks_db):
+def test_main_exit_0_when_no_candidates(tmp_path, make_tasks_db, make_runs_db):
     """(b) clean project -> exit 0, and the coverage block still prints."""
-    root = _make_project(tmp_path, make_tasks_db, tasks=[{"id": 1, "metadata": {"files": ["a.py"]}}])
+    root = _make_project(tmp_path, make_tasks_db, make_runs_db, tasks=[{"id": 1, "metadata": {"files": ["a.py"]}}])
     result = _run_cli("--project-root", str(root))
 
     assert result.returncode == 0
     assert "COVERAGE" in result.stdout
 
 
-def test_main_exit_1_when_a_candidate_is_found(tmp_path, make_tasks_db):
+def test_main_exit_1_when_a_candidate_is_found(tmp_path, make_tasks_db, make_runs_db):
     """(b) at least one candidate -> exit 1."""
     root = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[{"id": 2464, "metadata": {"files": []}}],
         plans=[("2464", {"task_id": 2464, "files": ["a.py"]})],
     )
@@ -1416,10 +1353,10 @@ def test_main_exit_2_when_no_project_root_resolves(tmp_path):
     assert "no project root" in result.stderr.lower()
 
 
-def test_main_json_flag_emits_parseable_json(tmp_path, make_tasks_db):
+def test_main_json_flag_emits_parseable_json(tmp_path, make_tasks_db, make_runs_db):
     """(c) --json emits parseable JSON on stdout."""
     root = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[{"id": 7, "metadata": {"files": []}}],
         plans=[("7", {"task_id": 7, "files": ["a.py"]})],
     )
@@ -1430,15 +1367,15 @@ def test_main_json_flag_emits_parseable_json(tmp_path, make_tasks_db):
     assert payload["projects"][0]["candidates"][0]["task_id"] == 7
 
 
-def test_main_project_root_is_repeatable(tmp_path, make_tasks_db):
+def test_main_project_root_is_repeatable(tmp_path, make_tasks_db, make_runs_db):
     """(d) --project-root repeats; both projects appear in the output."""
     a = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[{"id": 1, "metadata": {"files": []}}],
         plans=[("1", {"task_id": 1, "files": ["a.py"]})],
         name="a",
     )
-    b = _make_project(tmp_path, make_tasks_db, tasks=[{"id": 2, "metadata": {"files": ["k.py"]}}], name="b")
+    b = _make_project(tmp_path, make_tasks_db, make_runs_db, tasks=[{"id": 2, "metadata": {"files": ["k.py"]}}], name="b")
 
     result = _run_cli("--project-root", str(a), "--project-root", str(b), "--json")
 
@@ -1446,17 +1383,17 @@ def test_main_project_root_is_repeatable(tmp_path, make_tasks_db):
     assert [p["project_root"] for p in payload["projects"]] == [str(a), str(b)]
 
 
-def test_main_skips_a_corrupt_project_and_warns_that_results_are_incomplete(tmp_path, make_tasks_db):
+def test_main_skips_a_corrupt_project_and_warns_that_results_are_incomplete(tmp_path, make_tasks_db, make_runs_db):
     """(e) a corrupt tasks.db is warned about on stderr and SKIPPED without
     aborting the sweep; the other project's results still print, together
     with an explicit incompleteness warning."""
     good = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[{"id": 5, "metadata": {"files": []}}],
         plans=[("5", {"task_id": 5, "files": ["a.py"]})],
         name="good",
     )
-    bad = _make_project(tmp_path, make_tasks_db, name="bad")
+    bad = _make_project(tmp_path, make_tasks_db, make_runs_db, name="bad")
     (bad / ".taskmaster" / "tasks" / "tasks.db").write_text("this is not a database")
 
     result = _run_cli("--project-root", str(bad), "--project-root", str(good))
@@ -1470,12 +1407,12 @@ def test_main_skips_a_corrupt_project_and_warns_that_results_are_incomplete(tmp_
     assert "incomplete" in stderr
 
 
-def test_main_exit_code_and_summary_agree_on_a_contradicted_only_project(tmp_path, make_tasks_db):
+def test_main_exit_code_and_summary_agree_on_a_contradicted_only_project(tmp_path, make_tasks_db, make_runs_db):
     """A project whose ONLY candidate is contradicted still exits 1 (there IS
     a row to look at), so the summary line must not claim zero candidates —
     an operator or CI reading both would otherwise get two answers."""
     root = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[{"id": 9, "metadata": {"files": []}}],
         plans=[("9", {"task_id": 9, "files": ["a.py"]})],
         events=[
@@ -1493,12 +1430,12 @@ def test_main_exit_code_and_summary_agree_on_a_contradicted_only_project(tmp_pat
     assert "0 reportable" in summary and "1 contradicted" in summary
 
 
-def test_main_exits_3_when_every_resolved_project_was_unreadable(tmp_path, make_tasks_db):
+def test_main_exits_3_when_every_resolved_project_was_unreadable(tmp_path, make_tasks_db, make_runs_db):
     """Nothing was audited at all — that must NOT share exit 0 with 'audited
     everything, found nothing'. A cron/CI consumer reading only the exit code
     would otherwise record a total failure as a clean sweep."""
-    bad_a = _make_project(tmp_path, make_tasks_db, name="bad-a")
-    bad_b = _make_project(tmp_path, make_tasks_db, name="bad-b")
+    bad_a = _make_project(tmp_path, make_tasks_db, make_runs_db, name="bad-a")
+    bad_b = _make_project(tmp_path, make_tasks_db, make_runs_db, name="bad-b")
     for bad in (bad_a, bad_b):
         (bad / ".taskmaster" / "tasks" / "tasks.db").write_text("not a database")
 
@@ -1510,7 +1447,7 @@ def test_main_exits_3_when_every_resolved_project_was_unreadable(tmp_path, make_
     assert "incomplete" in stderr
     # And the mixed case is still exit 1, not 3 — one readable project audited.
     good = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[{"id": 5, "metadata": {"files": []}}],
         plans=[("5", {"task_id": 5, "files": ["a.py"]})],
         name="good",
@@ -1519,28 +1456,36 @@ def test_main_exits_3_when_every_resolved_project_was_unreadable(tmp_path, make_
     assert mixed.returncode == 1
 
 
-def test_main_audits_a_project_whose_runs_db_is_missing(tmp_path, make_tasks_db):
-    """(f) a readable tasks.db with no runs.db still audits, degrading every
-    signature to NO_MERGE_EVENT rather than crashing."""
+def test_main_audits_a_project_whose_runs_db_is_missing(tmp_path, make_tasks_db, make_runs_db):
+    """(f) a readable tasks.db with no runs.db still audits, and says the event
+    log was ABSENT instead of reporting every task NO_MERGE_EVENT (INV-13)."""
     root = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[{"id": 3, "metadata": {"files": []}}],
         plans=[("3", {"task_id": 3, "files": ["a.py"]})],
     )
-    (root / "data" / "orchestrator" / "runs.db").unlink()
+    project_layout.runs_db(root).unlink()
 
-    result = _run_cli("--project-root", str(root), "--json")
+    as_json = _run_cli("--project-root", str(root), "--json")
+    as_text = _run_cli("--project-root", str(root))
 
-    assert result.returncode == 1
-    payload = json.loads(result.stdout)
-    assert payload["projects"][0]["candidates"][0]["wipe_signature"] == NO_MERGE_EVENT
+    assert as_json.returncode == 1
+    project = json.loads(as_json.stdout)["projects"][0]
+    assert project["coverage"]["event_log_read"] is False
+    assert project["candidates"][0]["wipe_signature"] == "event_log_unread"
+    assert as_text.returncode == 1
+    assert (
+        f"    {'event log (runs.db):':<36}ABSENT at {project_layout.runs_db(root)}"
+        " — wipe signatures unknown (event_log_unread)"
+    ) in as_text.stdout.splitlines()
+    assert "no_merge_event" not in as_text.stdout
 
 
-def test_main_min_fidelity_defaults_to_file_level(tmp_path, make_tasks_db):
+def test_main_min_fidelity_defaults_to_file_level(tmp_path, make_tasks_db, make_runs_db):
     """--min-fidelity defaults to file-level, so lock-level-only candidates
     are OPT-IN — a module path must not silently enter a repair feed."""
     root = _make_project(
-        tmp_path, make_tasks_db,
+        tmp_path, make_tasks_db, make_runs_db,
         tasks=[{"id": 4, "metadata": {"files": []}}],
         events=[{"event_type": "set_to_plan", "task_id": 4, "data": {"files": ["orchestrator"]}}],
     )

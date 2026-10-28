@@ -35,14 +35,15 @@ test_app.py's TestWriteDiscipline (the C5a session/detail path) and
 TestRefreshWriteDiscipline (the C5b queue/attention path) for the
 end-to-end proof of the refresh-path half of this contract.
 
-Every decision READ goes through cockpit.registry_reader.scan_decisions --
-registry_reader's folding wrapper over C1's list_decisions, which
-canonicalizes DecisionRecord.project (task 3812) -- at both of this
-module's read sites: _scan_registry, and _reread_decisions (the post-write
-re-read _apply_boost and action_drop share). That does not weaken the
-discipline above: scan_decisions is itself read-only, so the canonicalized
-record exists in memory only and can never be written back (this module
-still never calls write_decision).
+Every decision READ goes through the app's one decisions reader, the
+`decisions_reader` constructor kwarg, which defaults to
+cockpit.registry_reader.scan_decisions -- registry_reader's folding wrapper
+over C1's list_decisions, which canonicalizes DecisionRecord.project (task
+3812) -- at both of this module's read sites: _scan_registry, and
+_reread_decisions (the post-write re-read _apply_boost and action_drop
+share). That does not weaken the discipline above: scan_decisions is itself
+read-only, so the canonicalized record exists in memory only and can never
+be written back (this module still never calls write_decision).
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
 from orchestrator.session_registry import (
     DecisionRecord,
@@ -178,6 +180,18 @@ def _decisions_snapshot(decisions: list[DecisionRecord]) -> dict[str, tuple]:
     }
 
 
+class DecisionsReader(Protocol):
+    """CockpitApp's `decisions_reader` seam, the decision-side twin of SessionScannerProtocol.
+
+    Contract, as registry_reader.scan_decisions (the default) keeps it: read-only,
+    and every returned DecisionRecord.project is already canonicalized.
+    """
+
+    def __call__(self, root: Path | str | None) -> list[DecisionRecord]:
+        """Return every readable DecisionRecord under the fleet *root*."""
+        ...
+
+
 class DetailOwner(StrEnum):
     """Which table's cursor last claimed the detail pane.
 
@@ -236,6 +250,7 @@ class CockpitApp(App):
         fleet_root: Path | str | None = None,
         poll_interval: float = 1.5,
         scanner: SessionScannerProtocol | None = None,
+        decisions_reader: DecisionsReader | None = None,
         now_fn: Callable[[], datetime] | None = None,
         backend: FocusArrangeBackend | None = None,
         spawn_runner: Callable[[list[str]], None] | None = None,
@@ -248,6 +263,7 @@ class CockpitApp(App):
         self.fleet_root = fleet_root
         self.poll_interval = poll_interval
         self._scanner = scanner if scanner is not None else SessionScanner(self.fleet_root)
+        self._decisions_reader = decisions_reader if decisions_reader is not None else scan_decisions
         self._now_fn = now_fn if now_fn is not None else lambda: datetime.now(UTC)
         self._backend = backend
         self._default_backends: dict[str, FocusArrangeBackend] = {
@@ -412,19 +428,20 @@ class CockpitApp(App):
     def _scan_registry(self) -> tuple[list[SessionRecord], list[DecisionRecord]]:
         """I/O half of a refresh: scan disk for the current records/decisions.
 
-        Touches only self._scanner/self.fleet_root -- no widget access -- so
-        this is safe to call off the main/UI thread (see
-        _scan_registry_worker, which does exactly that).
+        Touches only self._scanner/self._decisions_reader/self.fleet_root --
+        no widget access -- so this is safe to call off the main/UI thread
+        (see _scan_registry_worker, which does exactly that).
 
-        Decisions are read via registry_reader.scan_decisions, the folding
-        wrapper over C1's list_decisions, so DecisionRecord.project arrives
+        Decisions are read via self._decisions_reader
+        (registry_reader.scan_decisions by default), the folding wrapper
+        over C1's list_decisions, so DecisionRecord.project arrives
         already canonicalized -- the same rule the scanner applies to
         SessionRecord.project (task 3812). Why both row kinds must fold
         together is argued in registry_reader's module docstring, the one
         home for that rationale.
         """
         records = self._scanner.scan()
-        decisions = scan_decisions(self.fleet_root)
+        decisions = self._decisions_reader(self.fleet_root)
         return records, decisions
 
     def _apply_scan(
@@ -1023,8 +1040,9 @@ class CockpitApp(App):
 
         Lets the queue re-score without waiting for a poll tick, and updates
         the snapshot too, so that tick does not re-detect the write as an
-        external change. Reads through registry_reader.scan_decisions, so
-        the task-3812 project fold holds here as well.
+        external change. Reads through self._decisions_reader, the same
+        reader _scan_registry uses, so the task-3812 project fold holds here
+        as well.
 
         A SEQUENCED read: it takes a seq from _next_scan_seq() and advances
         _applied_decisions_seq, so a poll scan issued before the write,
@@ -1037,7 +1055,7 @@ class CockpitApp(App):
         froze the session table for as long as they kept coming.
         """
         seq = self._next_scan_seq()
-        self._decisions = scan_decisions(self.fleet_root)
+        self._decisions = self._decisions_reader(self.fleet_root)
         self._decisions_snapshot = _decisions_snapshot(self._decisions)
         self._applied_decisions_seq = seq
 

@@ -565,8 +565,7 @@ class TestResolveZeroProgressRequeueAlert:
             escalation_queue=queue, event_store=None, task_id='3068',
             recovered_streak=1, threshold=5, filed_at={},
         ) is False
-        queue.get_by_task.assert_not_called()
-        queue.resolve.assert_not_called()
+        assert queue.method_calls == []
 
     def test_long_streak_checks_disk_even_without_a_memo_entry(self, tmp_path):
         """A PRIOR process may have filed before a restart wiped the memo."""
@@ -608,7 +607,7 @@ class TestResolveZeroProgressRequeueAlert:
             agent_role='someone-else',
             severity='blocking',
             level=1,
-            category='merge_conflict',
+            category='merge_error',
             summary='not ours',
             detail='not ours',
         )
@@ -633,11 +632,258 @@ class TestResolveZeroProgressRequeueAlert:
 
         queue = MagicMock()
         queue.get_by_task.side_effect = RuntimeError('queue wedged')
+        queue.get_pending.side_effect = RuntimeError('queue wedged')
 
         assert _resolve(
             escalation_queue=queue, event_store=None, task_id='3068',
             recovered_streak=9, threshold=5, filed_at={'3068': 9},
         ) is False
+
+
+def _role() -> str:
+    from orchestrator.zero_progress_requeue import ZERO_PROGRESS_REQUEUE_ROLE
+
+    return ZERO_PROGRESS_REQUEUE_ROLE
+
+
+def _file_alarm(queue, task_id: str = '3068'):
+    """File the real zero-progress alarm for *task_id* and return the pending record."""
+    assert _emit(**_default_kwargs(queue, None, task_id=task_id)) is True
+    (alarm,) = queue.get_by_task(_sentinel(task_id), status='pending')
+    return alarm
+
+
+def _submit(queue, esc_id: str, *, task_id: str, level: int, members=(),
+            agent_role='escalation-watcher-auto', category='risk_identified',
+            pin_declared_by=()):
+    """Submit a real record — an L2 wrapper when *members* is given."""
+    from escalation.models import Escalation
+
+    esc = Escalation(
+        id=esc_id, task_id=task_id, agent_role=agent_role, severity='blocking',
+        category=category, summary=f'{esc_id} summary', level=level,
+        members=list(members), pin_declared_by=list(pin_declared_by),
+    )
+    queue.submit(esc)
+    return esc
+
+
+def _status(queue, esc_id: str) -> str:
+    record = queue.get(esc_id)
+    assert record is not None, f'{esc_id} vanished'
+    return record.status
+
+
+def _recover(queue, task_id: str = '3068', event_store=None) -> bool:
+    return _resolve(
+        escalation_queue=queue, event_store=event_store, task_id=task_id,
+        recovered_streak=7, threshold=5,
+    )
+
+
+class TestResolveZeroProgressWrappers:
+    """The recovery also discharges L2 wrappers of the alarm, under ANY task id.
+
+    A wrapper is an L2 whose members are zero-progress alarms.  It is
+    discharged by MEMBERSHIP — never by its category or task_id, both chosen by
+    an LLM — and only when none of its members is still pending, so the LAST
+    recovering member-task closes a shared wrapper and none closes another
+    task's live alarm through the cascade.
+    """
+
+    def test_a_sentinel_id_wrapper_is_discharged_whatever_its_category(self, tmp_path):
+        """(a) The server-enforced sentinel shape, under a category an LLM chose."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(
+            queue, 'esc-wrap-1', task_id=_sentinel('3068'), level=2,
+            members=[alarm.id], category='design_concern',
+        )
+
+        assert _recover(queue) is True
+
+        assert _status(queue, alarm.id) == 'resolved'
+        assert _status(queue, wrapper.id) == 'resolved'
+
+    def test_a_real_id_wrapper_is_discharged_with_its_alarm(self, tmp_path):
+        """(b) The pre-guard esc-5469-11 shape: the L2 minted under the REAL task id."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id])
+
+        assert _recover(queue) is True
+
+        assert _status(queue, alarm.id) == 'resolved'
+        assert _status(queue, wrapper.id) == 'resolved'
+
+    def test_the_own_alarm_is_resolved_before_its_wrapper(self, tmp_path):
+        """(c) Attribution stays the detector's, not ``l2-cascade:<id>``."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id])
+
+        _recover(queue)
+
+        for record_id in (alarm.id, wrapper.id):
+            record = queue.get(record_id)
+            assert record is not None
+            assert record.status == 'resolved'
+            assert record.resolved_by == _role(), f'{record_id} lost the detector attribution'
+
+    def test_a_wrapper_outliving_its_operator_resolved_member_is_discharged(
+        self, tmp_path,
+    ):
+        """(d) Nothing pending under the sentinel, yet the wrapper still closes."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id])
+        queue.resolve(alarm.id, 'looked at it', resolved_by='interactive')
+        assert queue.get_by_task(_sentinel('3068'), status='pending') == []
+
+        assert _recover(queue) is True
+
+        assert _status(queue, wrapper.id) == 'resolved'
+
+    def test_a_cross_task_wrapper_waits_for_its_last_member_task(self, tmp_path):
+        """(e) NEGATIVE then POSITIVE: never close a wrapper holding a live alarm."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        mine = _file_alarm(queue, '3068')
+        theirs = _file_alarm(queue, '7000')
+        wrapper = _submit(
+            queue, 'esc-wrap-1', task_id=_sentinel('3068'), level=2,
+            members=[mine.id, theirs.id],
+        )
+
+        _recover(queue, '3068')
+
+        assert _status(queue, wrapper.id) == 'pending'
+        assert queue.get(theirs.id) == theirs, "task 7000's live alarm must be untouched"
+
+        assert _recover(queue, '7000') is True
+
+        assert _status(queue, wrapper.id) == 'resolved'
+
+    def test_a_wrapper_mixing_in_ordinary_work_stays_pending(self, tmp_path):
+        """(f) NEGATIVE: an ordinary member means a human is still deciding something."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        work = _submit(
+            queue, 'esc-3068-2', task_id='3068', level=1, agent_role='implementer',
+        )
+        wrapper = _submit(
+            queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id, work.id],
+        )
+
+        _recover(queue)
+
+        assert _status(queue, wrapper.id) == 'pending'
+        assert _status(queue, work.id) == 'pending'
+
+    def test_a_wrapper_with_no_readable_alarm_member_stays_pending(self, tmp_path):
+        """(g) NEGATIVE: empty members, or a member that resolves to nothing."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _file_alarm(queue)
+        empty = _submit(queue, 'esc-wrap-empty', task_id=_sentinel('3068'), level=2)
+        ghost = _submit(
+            queue, 'esc-3068-11', task_id='3068', level=2, members=['esc-ghost-1'],
+        )
+
+        _recover(queue)
+
+        assert _status(queue, empty.id) == 'pending'
+        assert _status(queue, ghost.id) == 'pending'
+
+    def test_a_wrapper_carrying_a_declared_pin_stays_pending(self, tmp_path):
+        """(h) NEGATIVE: an auto-close never spends a pin someone declared."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(
+            queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id],
+            pin_declared_by=['operator-gate'],
+        )
+
+        _recover(queue)
+
+        assert _status(queue, wrapper.id) == 'pending'
+
+    def test_a_failing_wrapper_pass_keeps_the_own_alarm_resolve(self, tmp_path):
+        """(i) ISOLATION: a member-read fault must not report real work as nothing."""
+        from escalation.queue import EscalationQueue
+
+        class _MemberReadsFail:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def get(self, esc_id):
+                raise RuntimeError('member read failed')
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id])
+
+        assert _recover(_MemberReadsFail(queue)) is True
+
+        assert _status(queue, alarm.id) == 'resolved'
+        assert _status(queue, wrapper.id) == 'pending'
+
+    def test_a_wrapper_mixing_sentinel_classes_stays_pending(self, tmp_path):
+        """(j) NEGATIVE: membership is matched per alarm role, never across classes."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        streak = _submit(
+            queue, 'esc-streak-3068-1', task_id='__recovery_veto_streak__3068',
+            level=1, agent_role='orchestrator-recovery-veto-streak',
+        )
+        queue.resolve(streak.id, 'streak broke', resolved_by='orchestrator-recovery-veto-streak')
+        wrapper = _submit(
+            queue, 'esc-wrap-1', task_id=_sentinel('3068'), level=2,
+            members=[alarm.id, streak.id],
+        )
+
+        _recover(queue)
+
+        assert _status(queue, wrapper.id) == 'pending'
+
+    def test_the_recovery_event_counts_discharged_wrappers(self, tmp_path):
+        """(k) The recovered event reports wrappers beside the own-alarm count."""
+        from _recording_event_store import _RecordingEventStore
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.event_store import EventType
+
+        queue = EscalationQueue(tmp_path)
+        rec = _RecordingEventStore()
+        alarm = _file_alarm(queue)
+        _submit(queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id])
+
+        assert _recover(queue, event_store=rec) is True
+
+        (recovered,) = [
+            entry for (etype, entry) in rec.events
+            if etype == EventType.zero_progress_requeue_recovered
+        ]
+        assert recovered['data'] == {'streak': 7, 'resolved': 1, 'wrappers': 1}
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +904,7 @@ def _load_package_defaults() -> dict:
 class TestZeroProgressRequeueConfig:
     """The detector must be operator-visible, tunable, and hot-reloadable."""
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_section_is_registered_on_orchestrator_config(self):
         """OrchestratorConfig exposes zero_progress_requeue with the defaults.
 

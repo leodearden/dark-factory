@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from fused_memory.middleware.task_curator import clip_for_prompt
 from fused_memory.utils.clip_disclosure import (
     TRUNCATION_FACTS_KEY,
     TextClip,
@@ -14,6 +13,7 @@ from fused_memory.utils.clip_disclosure import (
     elide_text,
     elision_marker,
     fetch_cap_note,
+    fit_at_word,
     truncation_fields,
     window_note,
 )
@@ -39,14 +39,6 @@ def test_elide_text_over_the_cap_keeps_the_head_and_counts_the_rest():
     assert clip.fact == TruncationFact(field='desc', cap=10, elided=7)
 
 
-@pytest.mark.parametrize(
-    ('value', 'cap'),
-    [('', 5), ('abc', 5), ('abcde', 5), ('abcdef', 5), ('x' * 4000, 300), ('é' * 12, 3)],
-)
-def test_elide_text_spells_the_marker_exactly_as_the_curator_prompt_does(value, cap):
-    assert elide_text(value, cap, field='f').text == clip_for_prompt(value, cap)
-
-
 def test_clip_text_reports_the_same_fact_but_leaves_the_text_unmarked():
     value = 'a' * 10 + 'b' * 7
 
@@ -68,6 +60,84 @@ def test_non_string_input_is_coerced_before_clipping(clipper):
 
     assert clip.text.startswith('123')
     assert clip.fact == TruncationFact(field='f', cap=3, elided=4)
+
+
+def test_fit_at_word_leaves_text_at_or_under_the_limit_unchanged():
+    """Text at or under the limit comes back verbatim, with no ellipsis."""
+    short = 'x' * 20
+    assert fit_at_word(short, 500) == short
+    assert '…' not in fit_at_word(short, 500)
+    exact = 'y' * 500
+    assert fit_at_word(exact, 500) == exact
+
+
+def test_fit_at_word_backs_up_to_the_last_word_boundary():
+    """The cut drops the trailing word whole, so no fragment like '8679,868' (task 2080) reaches the ellipsis."""
+    text = ('A' * 495) + ' ' + ('Z' * 10)
+
+    assert fit_at_word(text, 500) == ('A' * 495) + '…'
+
+
+def test_fit_at_word_hard_cuts_when_the_window_has_no_whitespace():
+    """With no whitespace to back up to, the cut lands at limit - 1 so the ellipsis still fits the limit."""
+    result = fit_at_word('N' * 600, 500)
+
+    assert result == ('N' * 499) + '…'
+    assert len(result) == 500
+
+
+def test_fit_at_word_ignores_whitespace_that_would_keep_half_the_budget_or_less():
+    """A boundary that would discard more than half the budget is passed over for a hard cut."""
+    text = 'ab ' + ('N' * 600)
+
+    assert fit_at_word(text, 500) == text[:499] + '…'
+
+
+def test_fit_at_word_takes_a_boundary_well_past_half_the_budget():
+    """A boundary comfortably past half the budget is taken, even far from the window's edge."""
+    text = ('A' * 300) + ' ' + ('B' * 300)
+
+    assert fit_at_word(text, 500) == ('A' * 300) + '…'
+
+
+def test_fit_at_word_strips_whitespace_before_the_ellipsis():
+    """A run of whitespace at the cut is stripped, so the result never reads 'word   …'."""
+    text = ('A' * 300) + '   ' + ('B' * 300)
+
+    assert fit_at_word(text, 500) == ('A' * 300) + '…'
+
+
+_PROSE = 'the quick brown fox jumps over the lazy dog ' * 30
+
+
+@pytest.mark.parametrize(
+    ('text', 'limit'),
+    [
+        ('N' * 600, 1),
+        ('N' * 600, 2),
+        ('N' * 600, 120),
+        ('N' * 600, 500),
+        (_PROSE, 1),
+        (_PROSE, 2),
+        (_PROSE, 120),
+        (_PROSE, 500),
+        (' ' * 50, 2),
+        ('short prose', 120),
+    ],
+)
+def test_fit_at_word_never_exceeds_the_limit_and_marks_exactly_the_cut_text(text, limit):
+    """The result fits the limit, and ends in an ellipsis exactly when the text was over it."""
+    result = fit_at_word(text, limit)
+
+    assert len(result) <= limit
+    assert result.endswith('…') == (len(text) > limit)
+
+
+@pytest.mark.parametrize('limit', [0, -1])
+@pytest.mark.parametrize('text', ['', 'N' * 600], ids=['empty', 'over'])
+def test_fit_at_word_rejects_a_non_positive_limit(text, limit):
+    with pytest.raises(ValueError, match='limit'):
+        fit_at_word(text, limit)
 
 
 def test_truncation_fields_serializes_only_the_present_facts_in_order():

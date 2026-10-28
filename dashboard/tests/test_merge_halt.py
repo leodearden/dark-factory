@@ -22,6 +22,7 @@ class _PerPortHandler:
     ``responses`` maps port → halt-status dict to return on tools/call.
     ``fail_ports`` raise httpx.ConnectError.
     ``slow_ports`` sleep before responding (to drive the timeout path).
+    ``raise_ports`` maps port → an arbitrary exception INSTANCE to raise.
     """
 
     def __init__(
@@ -30,14 +31,18 @@ class _PerPortHandler:
         *,
         fail_ports: set[int] | None = None,
         slow_ports: dict[int, float] | None = None,
+        raise_ports: dict[int, BaseException] | None = None,
     ):
         self.responses = responses or {}
         self.fail_ports = fail_ports or set()
         self.slow_ports = slow_ports or {}
+        self.raise_ports = raise_ports or {}
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         port = request.url.port
         assert port is not None
+        if port in self.raise_ports:
+            raise self.raise_ports[port]
         if port in self.fail_ports:
             raise httpx.ConnectError('refused')
         if port in self.slow_ports:
@@ -141,6 +146,61 @@ class TestGetMergeHaltStatus:
             result = await get_merge_halt_status(client, _urls(8100, 8102, 8105))
         # All projects must appear regardless of per-call failure.
         assert set(result) == {'proj8100', 'proj8102', 'proj8105'}
+
+
+def _server_error() -> httpx.HTTPStatusError:
+    request = httpx.Request('POST', 'http://127.0.0.1:8108/mcp')
+    response = httpx.Response(500, request=request)
+    return httpx.HTTPStatusError('server error', request=request, response=response)
+
+
+class TestProbeFailuresAreContained:
+    """No probe failure may escape _probe_one.
+
+    ``get_merge_halt_status`` gathers its probes with
+    ``return_exceptions=False``, and the ``/merge-queue`` handler in
+    ``dashboard/src/dashboard/api/merge_queue.py`` gathers
+    ``get_merge_halt_status`` the same way, so any exception escaping
+    ``_probe_one`` 500s ``/merge-queue`` instead of marking one project
+    offline.
+    """
+
+    @pytest.mark.parametrize(
+        'exc',
+        [
+            httpx.ConnectError('refused'),
+            httpx.ReadTimeout('no bytes'),
+            _server_error(),
+            TimeoutError('whole-operation deadline'),
+            ValueError('soft failure'),
+            OSError('network is unreachable'),
+        ],
+        ids=[
+            'connect_error',
+            'httpx_timeout',
+            'http_status_error',
+            'builtin_timeout',
+            'value_error',
+            'os_error',
+        ],
+    )
+    async def test_failure_marks_only_that_project_offline(self, exc):
+        """Listed explicitly, not derived from the site's catch tuple, so this
+        pins the behaviour independently of how that tuple is spelled."""
+        from dashboard.data.merge_halt import get_merge_halt_status
+        handler = _PerPortHandler(
+            {8100: {'wired': True, 'halted': False}},
+            raise_ports={8108: exc},
+        )
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await get_merge_halt_status(client, _urls(8100, 8108))
+
+        assert result['proj8100']['offline'] is False
+        assert result['proj8108']['offline'] is True
+        assert result['proj8108']['wired'] is False
+        assert result['proj8108']['halted'] is False
+        assert 'error' in result['proj8108']
 
 
 class TestProbeOneTimeoutBudget:

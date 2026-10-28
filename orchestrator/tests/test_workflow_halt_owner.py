@@ -43,7 +43,7 @@ import pytest
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from escalation.queue import EscalationQueue
 
-from orchestrator.merge_queue import MergeOutcome
+from orchestrator.merge_lane.worker import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import _ORPHAN_HALT_NO_QUEUE_TOKENS, TaskWorkflow, WorkflowOutcome
 

@@ -48,7 +48,7 @@ from fused_memory.backends.mem0_client import split_managed_metadata
 
 # The experimental-key prefix, composed rather than re-spelled — see
 # CONTESTED_METADATA_KEY below.
-from fused_memory.memory_metadata import EXPERIMENTAL_KEY_PREFIX
+from fused_memory.memory_metadata import EXPERIMENTAL_KEY_PREFIX, SUPERSEDED_BY_METADATA_KEY
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 
@@ -139,6 +139,11 @@ CONTESTED_METADATA_KEY = f'{EXPERIMENTAL_KEY_PREFIX}contested'
 #: and cannot cause a false-positive drop.
 ORIGIN_PROJECT_TAG_KEYS = ('src_project', 'project_id', 'group_id', 'project')
 
+#: The metadata keys a nested entry (digest or pinned child) carries: the
+#: origin tags plus the supersession mark, so a superseded child reads as
+#: superseded wherever it is nested.
+NESTED_ENTRY_METADATA_KEYS = (*ORIGIN_PROJECT_TAG_KEYS, SUPERSEDED_BY_METADATA_KEY)
+
 #: Marks a ``parent_id`` no store could resolve.  ONE spelling shared by both
 #: surfaces — the search entry (:func:`group_search_results`) and the grouped
 #: block of a point-id read (:func:`group_memory_document`) — so a consumer
@@ -211,15 +216,16 @@ def _digest(text: str) -> str:
     return text[:_DIGEST_CHARS] + _DIGEST_ELLIPSIS
 
 
-def _origin_tags(meta: Mapping[str, Any] | None) -> dict[str, str]:
-    """The origin-project tags present on *meta*, projected for the wire.
+def _nested_entry_metadata(meta: Mapping[str, Any] | None) -> dict[str, str]:
+    """The metadata a nested entry carries, projected from *meta* for the wire.
 
-    A PROJECTION over :data:`ORIGIN_PROJECT_TAG_KEYS`, never the payload
+    A PROJECTION over :data:`NESTED_ENTRY_METADATA_KEYS`, never the payload
     wholesale: only those keys' non-empty string values are copied, so the
     body (``data``), the content hash and every other mem0-managed key stay
     out.  That keeps the added wire bulk to a few short strings AND makes the
     "no managed key can be mistaken for an origin tag" property structural
-    rather than incidental.
+    rather than incidental.  The supersession mark rides along with the origin
+    tags, so a superseded child is read as superseded, not as current.
 
     WHY the emitters stop narrowing this away: a nested entry (an amendment
     digest, a pinned matched child) is agent-visible content that the
@@ -233,7 +239,7 @@ def _origin_tags(meta: Mapping[str, Any] | None) -> dict[str, str]:
     """
     return {
         key: value
-        for key in ORIGIN_PROJECT_TAG_KEYS
+        for key in NESTED_ENTRY_METADATA_KEYS
         if isinstance(value := (meta or {}).get(key), str) and value.strip()
     }
 
@@ -252,13 +258,14 @@ def _digest_entry(row: Mapping[str, Any]) -> dict[str, Any]:
     # Omitted (never False) when uncontested, per the fault-only convention.
     if is_contested_child(payload):
         entry['contested'] = True
-    # The child's ORIGIN project, so a consumer holding only this digest can
-    # still classify the body it carries — see :func:`_origin_tags`.  Omitted
-    # (never ``{}``) when the child carries no tag, matching the
-    # fault-only/omit-when-absent convention ``contested`` and ``truncated``
-    # already follow: the common corpus is untagged and pays no wire cost.
-    if tags := _origin_tags(payload):
-        entry['metadata'] = tags
+    # The child's ORIGIN project and supersession mark, so a consumer holding
+    # only this digest can still classify the body it carries — see
+    # :func:`_nested_entry_metadata`.  Omitted (never ``{}``) when the child
+    # carries none, matching the fault-only/omit-when-absent convention
+    # ``contested`` and ``truncated`` already follow: the common corpus is
+    # untagged and pays no wire cost.
+    if projected := _nested_entry_metadata(payload):
+        entry['metadata'] = projected
     return entry
 
 
@@ -541,11 +548,11 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
     stop.  ``digest`` keeps its own meaning (the bounded pointer every listed
     amendment carries); ``content`` is added ALONGSIDE it.
 
-    A pinned entry also carries the child's ORIGIN-PROJECT TAGS (see
-    :func:`_origin_tags`) alongside ``kind``, because a pinned body is
-    agent-visible content — the orchestrator briefing renders it verbatim into
-    a dispatched agent's prompt — and a cross-project filter can only classify
-    it if the tag rides along with the body.
+    A pinned entry also carries the child's ORIGIN-PROJECT TAGS and
+    supersession mark (see :func:`_nested_entry_metadata`) alongside ``kind``,
+    because a pinned body is agent-visible content — the orchestrator briefing
+    renders it verbatim into a dispatched agent's prompt — and a reader can
+    only classify it if that metadata rides along with the body.
 
     Mutates only *block* — a dict this call's :func:`build_grouped_document`
     just built, never a shared or cached structure.
@@ -557,11 +564,12 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
     body = getattr(hit, 'content', '') or ''
     for digest in block.get('amendments') or []:
         if digest.get('id') == child_id:
-            # No origin-tag re-stamp here, deliberately: this entry came from
-            # :func:`_digest_entry`, which already tagged it from the RAW Qdrant
-            # payload — a superset of the normalised ``hit.metadata`` read below
-            # — so re-stamping could only introduce a disagreement between two
-            # reads of the same record.  The asymmetry is intent, not oversight.
+            # No re-stamp of the projected metadata here, deliberately: this
+            # entry came from :func:`_digest_entry`, which already projected it
+            # from the RAW Qdrant payload — a superset of the normalised
+            # ``hit.metadata`` read below — so re-stamping could only introduce
+            # a disagreement between two reads of the same record.  The
+            # asymmetry is intent, not oversight.
             digest['matched'] = True
             # Unconditional, not "only when the digest was cut": the invariant
             # a consumer can rely on is "a matched entry carries the body the
@@ -580,9 +588,9 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
         'kind': meta.get('kind'),
         'matched': True,
     }
-    # Omitted (never ``{}``) when untagged — see :func:`_origin_tags`.
-    if tags := _origin_tags(meta):
-        entry['metadata'] = tags
+    # Omitted (never ``{}``) when untagged — see :func:`_nested_entry_metadata`.
+    if projected := _nested_entry_metadata(meta):
+        entry['metadata'] = projected
     pinned.append(entry)
 
 

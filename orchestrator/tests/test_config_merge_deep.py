@@ -86,15 +86,14 @@ class TestMergeDeepKnobInProjectYaml:
     on main) writes: ``merge_deep:\\n  chain_cap: <cap>`` in the project YAML.
     """
 
-    def test_project_yaml_override_loads_through(self, monkeypatch, tmp_path):
+    def test_project_yaml_override_loads_through(self, tmp_path):
         """Project layer beats package defaults (test_config.py:982 precedent)."""
         project_cfg = tmp_path / 'orchestrator.yaml'
         project_cfg.write_text(yaml.dump({'merge_deep': {'chain_cap': 6}}))
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         cfg = load_config(project_cfg)
         assert cfg.merge_deep.chain_cap == 6
 
-    def test_knob_is_a_known_census_key(self, monkeypatch, tmp_path):
+    def test_knob_is_a_known_census_key(self, tmp_path):
         """Registering the submodel makes ``merge_deep.chain_cap`` a KNOWN key,
         so the deploy script's edit is neither silently dropped by pydantic
         ``extra='ignore'`` nor censused as a phantom key (which would file a
@@ -102,16 +101,14 @@ class TestMergeDeepKnobInProjectYaml:
         """
         project_cfg = tmp_path / 'orchestrator.yaml'
         project_cfg.write_text(yaml.dump({'merge_deep': {'chain_cap': 6}}))
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         assert census_config_keys(project_cfg).unknown == []
 
-    def test_typo_under_the_knob_still_censuses(self, monkeypatch, tmp_path):
+    def test_typo_under_the_knob_still_censuses(self, tmp_path):
         """Negative control: the census must still descend INTO merge_deep, so a
         typo'd leaf is reported rather than swallowed by the new known parent.
         """
         project_cfg = tmp_path / 'orchestrator.yaml'
         project_cfg.write_text(yaml.dump({'merge_deep': {'chain_capp': 6}}))
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         paths = [uk.path for uk in census_config_keys(project_cfg).unknown]
         assert 'merge_deep.chain_capp' in paths, (
             f'expected the typo to be censused under the known merge_deep parent; got {paths!r}'
@@ -131,13 +128,12 @@ class TestChainCapBoundValidation:
         with pytest.raises(ValidationError):
             MergeDeepConfig(chain_cap=bad_value)
 
-    def test_negative_cap_rejected_at_load(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_negative_cap_rejected_at_load(self):
         """Covers the 'rejected at load' signal: OrchestratorConfig builds the
         merge_deep submodel from the nested dict shape YAML deserializes into, so
         a bad project YAML fails at load rather than reaching dispatch.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError):
             OrchestratorConfig(merge_deep={'chain_cap': -1})  # type: ignore[arg-type]
 
@@ -166,20 +162,16 @@ class TestMergeDeepReloadDisposition:
             f'but is missing from RELOADABLE_FIELDS'
         )
 
-    def test_cap_edit_lands_in_applied_candidates_not_restart_required(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_cap_edit_lands_in_applied_candidates_not_restart_required(self):
         live = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))
         fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=6))
         diff = diff_config(live, fresh)
         assert 'merge_deep.chain_cap' in diff.applied_candidates
         assert 'merge_deep.chain_cap' not in diff.restart_required
 
-    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_applies_in_place(self):
         live = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))
         fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=6))
         report = apply_reload(live, fresh)
@@ -188,14 +180,13 @@ class TestMergeDeepReloadDisposition:
         assert 'merge_deep.chain_cap' not in report['restart_required']
         assert live.merge_deep.chain_cap == 6
 
-    def test_reload_preserves_submodel_identity(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_reload_preserves_submodel_identity(self):
         """Invariant I3: β's chain builder and γ's dispatch gate may hold a
         reference to the submodel, so a hot-reload must MUTATE it in place rather
         than rebind the field — otherwise a held reference keeps reading a stale
         cap and an operator's kill (cap -> 0) would not take effect.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))
         fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=6))
         submodel = live.merge_deep
@@ -206,6 +197,7 @@ class TestMergeDeepReloadDisposition:
         assert submodel.chain_cap == 6
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestHarnessReloadAppliesChainCap:
     """The user-observable signal named in the task description: an operator
     hot-reload reports the knob under the ``applied`` disposition.
@@ -219,7 +211,6 @@ class TestHarnessReloadAppliesChainCap:
     async def test_reload_config_reports_chain_cap_as_applied(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         harness, event_store = _make_harness(tmp_path)
         assert harness.config.merge_deep.chain_cap == 0
 
@@ -243,6 +234,7 @@ class TestHarnessReloadAppliesChainCap:
         assert data['applied']['merge_deep.chain_cap'] == {'old': 0, 'new': 6}
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestDefaultsYamlMergeDeepBlock:
     """The shipped defaults.yaml declares the ``merge_deep:`` block explicitly so
     the knob is discoverable and retunable in a project's
@@ -250,7 +242,7 @@ class TestDefaultsYamlMergeDeepBlock:
     (the git:/chronic_flake:/psi_admission: precedent).
     """
 
-    def test_defaults_yaml_does_not_drift_from_the_field_default(self, monkeypatch, tmp_path):
+    def test_defaults_yaml_does_not_drift_from_the_field_default(self):
         """The single canonical pin for "the shipped default is the kill switch".
 
         Drift guard, and deliberately the ONLY place the value 0 is asserted:
@@ -263,8 +255,6 @@ class TestDefaultsYamlMergeDeepBlock:
         it fails loudly if the stanza is dropped or retuned, if the Field default
         changes, or if the knob stops being reachable through a loaded config.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         defaults = _load_package_defaults()
         assert 'merge_deep' in defaults, (
             'the shipped defaults.yaml must declare the merge_deep: block so the '
@@ -278,6 +268,7 @@ class TestDefaultsYamlMergeDeepBlock:
         )
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestChainCapZeroIsANoOp:
     """The α-scoped byte-identity leg of the PRD's kill-switch contract.
 
@@ -313,12 +304,10 @@ class TestChainCapZeroIsANoOp:
         )
         assert dumped['merge_deep']['chain_cap'] == 0
 
-    def test_explicit_zero_stanza_moves_no_leaf(self, monkeypatch, tmp_path):
+    def test_explicit_zero_stanza_moves_no_leaf(self):
         """An explicit kill-switch stanza must be indistinguishable from an absent
         one, so shipping the defaults.yaml block cannot move any config leaf.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig()
         self._assert_kill_switch_is_live(live)
         fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))
@@ -326,12 +315,10 @@ class TestChainCapZeroIsANoOp:
         assert diff.applied_candidates == {}
         assert diff.restart_required == {}
 
-    def test_whole_config_surface_is_unperturbed(self, monkeypatch, tmp_path):
+    def test_whole_config_surface_is_unperturbed(self):
         """Whole-config equality: adding the stanza at 0 perturbs nothing else in
         the config surface — the only way α could have changed merge behaviour.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig()
         self._assert_kill_switch_is_live(live)
         fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))

@@ -14,6 +14,7 @@ from escalation.models import (
     RESOLUTION_CLASSES,
     SEVERITY_RANK,
     Amendment,
+    DeliveredCheckOwner,
     Escalation,
     EvidenceEntry,
     IndexHealthState,
@@ -485,6 +486,65 @@ class TestEscalationIndexHealthField:
         )
 
 
+class TestEscalationDeliveredCheckOwnerField:
+    """Escalation carries the failing delivered check's owner as data (task 7514).
+
+    A `dependency_capability` record's task is the blocked DEPENDENT; the
+    check belongs to the dependency named here. Same additive zero-migration
+    contract as `index_health`.
+    """
+
+    _OWNER: DeliveredCheckOwner = {
+        'task_id': '5405',
+        'check_name': 'pattern-module-substrate',
+        'sidecar': {
+            'path': 'docs/prds/v0_6/eradicate-silent-undef.capability-manifest.yaml',
+            'on_main': 'declares',
+        },
+    }
+    _OWNER_WITHOUT_SIDECAR: DeliveredCheckOwner = {
+        'task_id': '6371',
+        'check_name': 'x-cap',
+        'sidecar': None,
+    }
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base: dict[str, Any] = {
+            'id': 'esc-5542-0001',
+            'task_id': '5542',
+            'agent_role': 'orchestrator-scheduler',
+            'severity': 'critical',
+            'category': 'dependency_capability',
+            'summary': 'DEP_CAPABILITY_NOT_DELIVERED: task 5542 - dep 5405 done',
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    def test_default_is_none_and_surfaces_in_to_dict(self):
+        esc = self._make_base_esc()
+        assert esc.delivered_check_owner is None
+        assert esc.to_dict()['delivered_check_owner'] is None
+
+    @pytest.mark.parametrize('owner', [_OWNER, _OWNER_WITHOUT_SIDECAR])
+    def test_round_trip_via_to_dict_from_dict(self, owner):
+        esc = self._make_base_esc(delivered_check_owner=owner)
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.delivered_check_owner == owner
+
+    @pytest.mark.parametrize('owner', [_OWNER, _OWNER_WITHOUT_SIDECAR])
+    def test_round_trip_via_to_json_from_json(self, owner):
+        esc = self._make_base_esc(delivered_check_owner=owner)
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.delivered_check_owner == owner
+        assert restored.to_json() == esc.to_json()
+
+    def test_legacy_json_without_the_key_deserialises_to_none(self):
+        payload = self._make_base_esc().to_dict()
+        del payload['delivered_check_owner']
+        restored = Escalation.from_json(json.dumps(payload))
+        assert restored.delivered_check_owner is None
+
+
 class TestEscalationResolutionAction:
     """Escalation dataclass has a resolution_action field (C1 § action enum for resolve_issue)."""
 
@@ -621,7 +681,7 @@ class TestEscalationResolutionClass:
     def test_resolution_classes_contains_exactly_the_legal_values(self):
         """RESOLUTION_CLASSES contains exactly {'benign', 'actionable',
         'moot-terminal-subject', 'stale-strand', 'addressed', 'observation-consumed',
-        'converted', 'status-info'} — no extras.
+        'converted', 'status-info', 'note-to-file'} — no extras.
 
         'moot-terminal-subject' is the distinct, non-benign stamp the task-2724
         revalidation sweep writes.
@@ -635,11 +695,15 @@ class TestEscalationResolutionClass:
 
         'addressed', 'observation-consumed', 'converted' and 'status-info' are
         the info-L0 disposition classes of plans/info-l0-disposition-router-prd.md D14.
+
+        'note-to-file' is the filer-declared note-to-file class of
+        plans/plan-deviation-recording-prd.md D2.
         """
         assert (
             frozenset({
                 'benign', 'actionable', 'moot-terminal-subject', 'stale-strand',
                 'addressed', 'observation-consumed', 'converted', 'status-info',
+                'note-to-file',
             })
             == RESOLUTION_CLASSES
         )
@@ -2108,3 +2172,39 @@ class TestEscalationProjectId:
         assert restored.project_id is None, (
             f'Expected project_id=None for legacy JSON, got {restored.project_id!r}'
         )
+
+
+class TestNoteToFileField:
+    """`note_to_file` — a filer-declared record that requests nothing
+    (plans/plan-deviation-recording-prd.md D2).
+
+    These tests pin the FIELD's default and round-trip only; the never-pending
+    invariant is pinned at its enforcement points in test_note_to_file.py.
+    """
+
+    def _make_base_esc(self, **overrides) -> Escalation:
+        return Escalation(
+            id='esc-5751-1',
+            task_id='5751',
+            agent_role='implementer',
+            severity='info',
+            category='design_concern',
+            summary='test escalation for note_to_file',
+            **overrides,
+        )
+
+    def test_note_to_file_default_is_false(self):
+        """Escalation constructed without note_to_file has note_to_file=False."""
+        assert self._make_base_esc().note_to_file is False
+
+    def test_from_dict_legacy_dict_omits_note_to_file(self):
+        """from_dict() on a dict without the note_to_file key yields False — zero migration."""
+        legacy = self._make_base_esc().to_dict()
+        del legacy['note_to_file']
+        assert Escalation.from_dict(legacy).note_to_file is False
+
+    def test_note_to_file_round_trips(self):
+        """note_to_file=True survives to_dict/from_dict and to_json/from_json."""
+        esc = self._make_base_esc(note_to_file=True)
+        assert Escalation.from_dict(esc.to_dict()).note_to_file is True
+        assert Escalation.from_json(esc.to_json()).note_to_file is True

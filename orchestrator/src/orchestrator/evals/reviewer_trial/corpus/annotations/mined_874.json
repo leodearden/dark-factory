@@ -16,6 +16,62 @@
       "severity": "suggestion",
       "description": "The `filterwarnings = [\"error:...\"]` entries are set at the project-wide `[tool.pytest.ini_options]` level, so unawaited-coroutine and sync-test-in-asyncio-class warnings become hard errors for the entire suite, not just merge_queue tests. Any pre-existing test elsewhere that legitimately leaks a coroutine or has a sync test in an `@pytest.mark.asyncio` class will now fail; only the test_steward class split addresses one such case.",
       "mutation_type": "test_gap"
+    },
+    {
+      "id": "mined_874_pool_01",
+      "location": "orchestrator/tests/test_merge_queue.py:92",
+      "category": "permissive_test_double",
+      "severity": "suggestion",
+      "description": "The rewritten verify fakes return MagicMock(passed=..., summary=...) instead of the real orchestrator.verify.VerifyResult dataclass. MagicMock invents truthy attributes, so on every mocked failure merge_queue reads verify.timed_out as truthy and bumps _post_merge_verify_timeouts (the loop-breaker path), and verify.failure_report() returns a MagicMock whose repr is interpolated into the blocked reason. Failed-verify tests therefore silently exercise the timeout loop-breaker path; the old AsyncMock fakes had the same flaw, but the change rewrote every one of these construction sites.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_874_pool_02",
+      "location": "orchestrator/tests/test_merge_queue.py:507",
+      "category": "duplicated_fixture",
+      "severity": "suggestion",
+      "description": "The failing-verify fake `AsyncMock(return_value=MagicMock(passed=False, summary='tests failed'))` is written out three times (lines 507, 1332, 2538) next to the existing _mock_verify_pass() helper, with no matching failure helper.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_874_pool_03",
+      "location": "orchestrator/tests/test_merge_queue.py:1059",
+      "category": "inconsistent_idiom",
+      "severity": "suggestion",
+      "description": "The change converts some verify fakes to MagicMock values but leaves eight others building results as `AsyncMock()` with attributes assigned afterwards (lines ~1059, 2586, 2629, 2666, 2702, 2770, 2825, 2886), which avoid the unawaited-coroutine leak only because they pass or hand-stub failure_report with a lambda. The file now has two idioms for the same fake, and copying the AsyncMock one onto a failure path reintroduces the leak.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_874_pool_04",
+      "location": "orchestrator/tests/test_merge_queue.py:2232",
+      "category": "dead_test_double",
+      "severity": "suggestion",
+      "description": "Both `_fail_n_pass_n1` verify fakes (test_merge_queue.py:1162 and :2232) take (merge_wt, cfg, module_configs, task_files=None) with no **kwargs, but SpeculativeMergeWorker calls run_scoped_verification with max_retries=0 and is_merge_verify=True. Every call therefore raises TypeError before the body runs and is reported as a 'Verification error' blocked outcome. The change rewrote both bodies (including the new AssertionError guard at 1162), but the rewritten bodies are dead code and the tests exercise the verify-exception path rather than the verify-failed path they describe.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_874_pool_05",
+      "location": "orchestrator/pyproject.toml:57-77",
+      "category": "inaccurate_comment",
+      "severity": "blocking",
+      "description": "The new filterwarnings comment misdescribes how the filters work. It presents the RuntimeWarning filter and the PytestUnraisableExceptionWarning filter as covering two independent emission paths, but they are coupled: the unawaited-coroutine RuntimeWarning, once turned into an error inside the coroutine finalizer, becomes an unraisable exception that pytest reports as PytestUnraisableExceptionWarning, so a leaking test fails only when both entries are present and removing either one silently disables enforcement. It also says the asyncio mark-mismatch warning is emitted 'at the collection phase', but pytest-asyncio 1.3.0 emits it from pytest_pyfunc_call, i.e. at call time.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_874_pool_06",
+      "location": "orchestrator/pyproject.toml:49-77",
+      "category": "verbose_comment",
+      "severity": "suggestion",
+      "description": "The new [tool.pytest.ini_options] block carries about 20 lines of rationale prose (why the regexes anchor on verbs, CPython-version message formats, why no literal colon) that defends the design rather than stating it; it is drift-prone and belongs in the commit message or a doc/test, with a one-line pointer per filter in the config.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_874_pool_07",
+      "location": "orchestrator/pyproject.toml:49",
+      "category": "unenforced_guard",
+      "severity": "suggestion",
+      "description": "Nothing tests that the new filterwarnings entries actually turn an unawaited coroutine or a sync test under an asyncio mark into a failure. They depend on upstream message wording (which the comment itself calls fragile) and only work as a pair, so a pytest/CPython/pytest-asyncio upgrade or an edit could disable them with no signal.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

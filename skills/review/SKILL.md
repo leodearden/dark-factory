@@ -200,7 +200,7 @@ After the last phase run, write both files under `<project_root>/review/reports/
 |---------|-----------|
 | Review briefing | Warn, suggest `/review-briefing`, skip smoke and path tracing |
 | Prior committed report | `mode: full`, `since: none` |
-| Task store unreachable (MCP and read-only sqlite) | Report only; file nothing, say so (§8) |
+| Task store unreachable (`find_tasks_by_metadata` errors or is unreachable) | Report only; file nothing, say so (§8) |
 | fused-memory MCP down | No memory context, no filing; report says so |
 | Test suite / lint / typecheck config | Skip that command, note it in `phase1` |
 | `$QUALITY_DOC` (no `docs/code-quality.md` and no `guidance()` render) | Stop Phase 2: judging without the definition is not this skill |
@@ -213,11 +213,11 @@ After the last phase run:
 
 ```
 add_memory(
-  content="Review {run_id} for {scope} at {as_of_sha:10}: {n} findings ({high} high), {filed} filed, {structural} for deliberation, {fixed} fixed since {since:10}. Key concerns: {list}.",
+  content="Review {run_id} for {scope} at {as_of_sha:10}: {n} findings ({high} high), {filed} filed, {structural} for deliberation, {fixed} fixed since {since:10}. Key concerns: {list}. Next run gated by task 3127.",
   category="observations_and_summaries",
   project_id="<project_id>",
   agent_id="claude-review",
-  entities=[]
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the human gate of the chain this run filed (contract §11), here and in content; if it filed none, as under --findings-only, use [] and drop the gate sentence from content
 )
 ```
 

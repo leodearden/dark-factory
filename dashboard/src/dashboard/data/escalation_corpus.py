@@ -34,9 +34,11 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
+from shared.task_tags import DEFAULT_TAG
 
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum, DatumState, unknown_datum
@@ -140,11 +142,11 @@ class EscalationCorpus:
         return any(scan.reached for scan in self.scans)
 
 
-def _orchestrator_queue(root: Path) -> QueueRef:
+def _orchestrator_queue(root: Path, label: str) -> QueueRef:
     """The escalation queue of the project at *root*, beside that project's run ledger."""
     data = root / 'data'
     return QueueRef(
-        id=str(root), label=root.name, kind=QueueKind.ORCHESTRATOR,
+        id=str(root), label=label, kind=QueueKind.ORCHESTRATOR,
         directory=data / 'escalations', runs_db=data / 'orchestrator' / 'runs.db',
     )
 
@@ -159,8 +161,11 @@ def reconciliation_queue(config: DashboardConfig) -> QueueRef:
 
 def corpus_queues(config: DashboardConfig) -> tuple[QueueRef, ...]:
     """Every escalation queue: the primary root, the other known roots, reconciliation."""
-    roots = dict.fromkeys([config.project_root, *config.known_project_roots])
-    return (*(_orchestrator_queue(root) for root in roots), reconciliation_queue(config))
+    labels = config.project_labels
+    return (
+        *(_orchestrator_queue(root, labels.of(root)) for root in config.all_project_roots),
+        reconciliation_queue(config),
+    )
 
 
 def _scan(queue: QueueRef) -> QueueScan:
@@ -285,3 +290,53 @@ def views_over(
         )
         for view in EscalationView
     }
+
+
+@dataclass(frozen=True, slots=True)
+class PendingEscalations:
+    """One orchestrator queue's pending live escalations, by the id of the task each names.
+
+    An orchestrator names no tag when it reads its tasks, so every task its queue
+    names is in the task store's default tag; of any other tag the queue knows nothing.
+    """
+
+    by_task_id: Mapping[str, tuple[str, ...]]
+
+    def pinning(self, tag: str, task_id: int | str) -> tuple[str, ...] | None:
+        """The ids of the pending escalations naming *tag*/*task_id*; None outside the queue's tag."""
+        if tag != DEFAULT_TAG:
+            return None
+        return self.by_task_id.get(str(task_id), ())
+
+
+def _live_queue_fully_read(scan: QueueScan) -> bool:
+    """Whether every file at *scan*'s queue root was read; the archive holds no live escalation."""
+    return scan.reached and not any(
+        unreadable.location is Location.ROOT for unreadable in scan.unreadable
+    )
+
+
+def pending_escalation_ids(
+    corpus_datum: Datum[EscalationCorpus], queue_id: str,
+) -> PendingEscalations | None:
+    """The queue's pending live escalations by task; None when that queue root was not fully read.
+
+    A queue directory that was not found is unknown even for a project that has
+    never escalated: an absent directory reads the same as an unmounted one.
+    """
+    corpus = corpus_datum.value
+    if corpus is None:
+        return None
+    try:
+        scan = corpus.scan(queue_id)
+    except KeyError:
+        return None
+    if not _live_queue_fully_read(scan):
+        return None
+    by_task: dict[str, list[str]] = {}
+    for record in scan.records:
+        if EscalationView.QUEUE_PENDING.admits(record):
+            by_task.setdefault(record.escalation.task_id, []).append(record.escalation.id)
+    return PendingEscalations(
+        MappingProxyType({task_id: tuple(sorted(ids)) for task_id, ids in by_task.items()})
+    )

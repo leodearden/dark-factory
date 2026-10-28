@@ -2,9 +2,14 @@
 
 Covers ``orchestrator.offline_lane.OfflineLaneWorker`` in isolation: the
 ``on_post_merge`` enqueue-and-return trigger seam, the always-from-head
-``_run_once`` snapshot, the coalescing ``run()`` loop (trigger-driven +
-poll-backstop, fail-open), the lockfile singleton, and the default
-``run-offline-deep.sh`` suite-runner seam.
+``_run_once`` snapshot, every leg's pass through ``run_pass`` (the confirm on
+red, the pass record's blocks), the coalescing ``run()`` loop (trigger-driven +
+poll-backstop, fail-open), the idle poll's engine tick and the rechecks it
+names, the lockfile singleton, and the default detect seams.
+
+The red path itself is the engine's: ``test_offline_lane_episodes.py`` pins it
+at its interface, ``test_offline_lane_pass.py`` pins one pass, and
+``test_offline_lane_confirm.py`` pins the confirm.
 
 See also ``test_harness_offline_lane.py`` for the harness-side
 launch/stop/registration wiring, and
@@ -16,19 +21,43 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import shlex
+from collections.abc import Awaitable, Callable, Sequence
+from datetime import datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from _lane_episode_fakes import Clock, FakeLedgerClient
 from _orch_helpers import pydantic_spec
-from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT
+from escalation.queue import EscalationQueue
 from pydantic import ValidationError
 from shared.testing_virtual_clock import virtual_clock_test
 
-from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.offline_lane import OfflineLaneWorker, _parse_confirmed_failures
+from orchestrator.config import GitConfig, LaneCommand, OrchestratorConfig
+from orchestrator.offline_lane import OfflineLaneWorker
+from orchestrator.offline_lane_confirm import (
+    Confirmed,
+    ConfirmMode,
+    ConfirmTarget,
+    Unconfirmable,
+    outcome_to_json,
+    serial_confirm_command,
+)
+from orchestrator.offline_lane_episode_state import PassEffect, PassObservation
+from orchestrator.offline_lane_episodes import TickResult
+from orchestrator.offline_lane_pass import ConfirmSeam
+from orchestrator.offline_lane_records import (
+    LEGACY_INFRA_COMMAND,
+    LEGACY_NUMERIC_COMMAND,
+    Leg,
+    PassRecord,
+    Phase,
+    RunRecord,
+)
+from orchestrator.offline_lane_runs import ConfirmRunner
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -59,13 +88,12 @@ def _make_worker(
     git_ops: MagicMock | None = None,
     config: MagicMock | None = None,
     suite_runner=None,
-    confirmation_runner=None,
     infra_runner=None,
-    infra_confirmation_runner=None,
     command_runner=None,
-    command_confirmation_runner=None,
+    confirm: ConfirmSeam | None = None,
     task_client=None,
     escalation_queue=None,
+    now: Callable[[], datetime] | None = None,
 ) -> OfflineLaneWorker:
     """Build an OfflineLaneWorker wired with mock deps for isolated testing."""
     return OfflineLaneWorker(
@@ -73,36 +101,36 @@ def _make_worker(
         config if config is not None else _make_config(tmp_path),
         lock_path=tmp_path / 'offline_lane.lock',
         suite_runner=suite_runner,
-        confirmation_runner=confirmation_runner,
         infra_runner=infra_runner,
-        infra_confirmation_runner=infra_confirmation_runner,
         command_runner=command_runner,
-        command_confirmation_runner=command_confirmation_runner,
+        confirm=confirm,
         task_client=task_client,
         escalation_queue=escalation_queue,
+        now=now,
     )
 
 
-# A faithful reproduction of reify scripts/verify.sh's error+usage() dump
-# (reify:5308 incident, verified against task 5264's corrupted fields): an
-# em-dash ``verify.sh: ERROR — <msg>`` banner on stderr followed by the full
-# usage() block (bare ``Usage:``/``Options:`` section headers + invocation and
-# option lines).  run-offline-deep.sh merges stderr into stdout, so this whole
-# blob reaches the numeric confirmation seam's parser.  Shared by the
-# _parse_confirmed_failures unit tests and the seam-level rejection test.
-_VERIFY_USAGE_DUMP = (
-    "verify.sh: ERROR — unknown argument '--test-threads=1'\n"
-    "\n"
-    "scripts/verify.sh — unified verification entrypoint for Reify.\n"
-    "\n"
-    "Usage:\n"
-    "  verify.sh <test|lint|typecheck|all> [options]\n"
-    "\n"
-    "Options:\n"
-    "  --scope <all|rust|gui|infra>  Restrict verification to a subsystem.\n"
-    "  --profile <fast|full|both>    Select the verification profile.\n"
-    "  -h|--help  Show usage.\n"
-)
+def _child_writing(output: bytes, *, returncode: int):
+    """A fake ``create_subprocess_exec`` whose child writes *output* into the file it is handed."""
+
+    async def fake_exec(*argv, **kwargs):
+        kwargs['stdout'].write(output)
+        proc = AsyncMock()
+        proc.returncode = returncode
+        return proc
+
+    return fake_exec
+
+
+async def _inline(fn, *args, **kwargs):
+    return fn(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def _inline_thread_hops():
+    """Run every ``asyncio.to_thread`` hop on the loop, process-wide: the virtual clock rejects executor work."""
+    with patch('orchestrator.offline_lane.asyncio.to_thread', new=_inline):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -125,31 +153,41 @@ def test_git_config_offline_lane_knobs():
     assert cfg_default.offline_lane_poll_interval_secs == 120.0, (
         'offline_lane_poll_interval_secs must default to 120.0'
     )
-    assert cfg_default.offline_lane_red_advances_before_blocker == 3, (
-        'offline_lane_red_advances_before_blocker must default to 3 (§11.3, β3 C4)'
-    )
+    assert cfg_default.offline_lane_persist_passes == 2
+    assert cfg_default.offline_lane_recheck_secs == 1800.0
+    assert cfg_default.offline_lane_red_unlanded_hours == 24.0
 
     cfg_set = GitConfig(
         offline_lane_enabled=True,
         offline_lane_test_threads=4,
         offline_lane_poll_interval_secs=30.0,
-        offline_lane_red_advances_before_blocker=5,
+        offline_lane_persist_passes=3,
+        offline_lane_recheck_secs=600.0,
+        offline_lane_red_unlanded_hours=48.5,
     )
     assert cfg_set.offline_lane_enabled is True
     assert cfg_set.offline_lane_test_threads == 4
     assert cfg_set.offline_lane_poll_interval_secs == 30.0
-    assert cfg_set.offline_lane_red_advances_before_blocker == 5
+    assert cfg_set.offline_lane_persist_passes == 3
+    assert cfg_set.offline_lane_recheck_secs == 600.0
+    assert cfg_set.offline_lane_red_unlanded_hours == 48.5
 
 
 def test_git_config_offline_lane_knobs_validation():
     """offline_lane_test_threads is ge=1; offline_lane_poll_interval_secs is gt=0;
-    offline_lane_red_advances_before_blocker is ge=1."""
+    offline_lane_persist_passes is ge=1; offline_lane_recheck_secs and
+    offline_lane_red_unlanded_hours are gt=0."""
     with pytest.raises(ValidationError):
         GitConfig(offline_lane_test_threads=0)
     with pytest.raises(ValidationError):
         GitConfig(offline_lane_poll_interval_secs=0.0)
     with pytest.raises(ValidationError):
-        GitConfig(offline_lane_red_advances_before_blocker=0)
+        GitConfig(offline_lane_persist_passes=0)
+    assert GitConfig(offline_lane_persist_passes=1).offline_lane_persist_passes == 1
+    with pytest.raises(ValidationError):
+        GitConfig(offline_lane_recheck_secs=0.0)
+    with pytest.raises(ValidationError):
+        GitConfig(offline_lane_red_unlanded_hours=0.0)
 
 
 def test_git_config_offline_lane_infra_enabled_default_and_settable():
@@ -264,11 +302,10 @@ class TestOfflineLaneCommandsReload:
             f'missing from RELOADABLE_FIELDS'
         )
 
-    def test_commands_edit_lands_in_applied_candidates(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_commands_edit_lands_in_applied_candidates(self):
         from orchestrator.config import LaneCommand, diff_config
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(git=GitConfig(offline_lane_commands=[]))
         fresh = OrchestratorConfig(
             git=GitConfig(
@@ -281,11 +318,10 @@ class TestOfflineLaneCommandsReload:
         assert 'git.offline_lane_commands' in diff.applied_candidates
         assert 'git.offline_lane_commands' not in diff.restart_required
 
-    def test_apply_reload_applies_commands_in_place(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_applies_commands_in_place(self):
         from orchestrator.config import LaneCommand, apply_reload
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(git=GitConfig(offline_lane_commands=[]))
         fresh = OrchestratorConfig(
             git=GitConfig(
@@ -381,6 +417,7 @@ async def test_run_once_snapshots_head_at_run_start_and_invokes_seam(tmp_path: P
 
 
 @pytest.mark.timeout(10)
+@_inline_thread_hops()
 @virtual_clock_test
 async def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path):
     """Multiple dirty-sets during one run collapse into exactly one re-run.
@@ -447,6 +484,7 @@ async def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path):
 
 
 @pytest.mark.timeout(10)
+@_inline_thread_hops()
 @virtual_clock_test
 async def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path):
     """A missed trigger is caught by a periodic get_main_sha poll.
@@ -525,6 +563,7 @@ async def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path):
 
 
 @pytest.mark.timeout(10)
+@_inline_thread_hops()
 @virtual_clock_test
 async def test_loop_is_fail_open_and_cancellation_clean(tmp_path: Path):
     """A broken lane run can never wedge the process (worker leg of C7).
@@ -593,6 +632,7 @@ async def test_loop_is_fail_open_and_cancellation_clean(tmp_path: Path):
 
 
 @pytest.mark.timeout(10)
+@_inline_thread_hops()
 @virtual_clock_test
 async def test_loop_backoff_grows_and_caps_on_consecutive_failures(tmp_path: Path):
     """Consecutive run() failures back off exponentially, capped (task 2016 amendment).
@@ -700,13 +740,11 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
     worker = _make_worker(tmp_path)  # no suite_runner injected -> default seam
     wt_path = tmp_path / '_offline-deep'
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'suite output\n', b''))
-    mock_proc.returncode = 0
+    lane_pass = worker.records.allocate_pass(LEGACY_NUMERIC_COMMAND, Leg.NUMERIC, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'suite output\n', returncode=0),
     ) as mock_exec:
         rc, tail = await worker.suite_runner(wt_path, 'HEAD1', 6)
 
@@ -731,7 +769,7 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
             f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
             f'not replace it (missing/altered {key!r})'
         )
-    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
 
@@ -758,13 +796,11 @@ async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: P
     wt_path = tmp_path / '_offline-deep'
     cmd = LaneCommand(name='q', command='pytest -m integration', cwd='fused-memory')
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'command output\n', None))
-    mock_proc.returncode = 1
+    lane_pass = worker.records.allocate_pass(cmd.name, Leg.GENERIC, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'command output\n', returncode=1),
     ) as mock_exec:
         rc, tail = await worker.command_runner(cmd, wt_path, 'HEAD1')
 
@@ -778,7 +814,8 @@ async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: P
     assert argv[:5] == ['nice', '-n', '19', 'ionice', '-c3'], (
         'argv must start with the idle nice/ionice prefix (D4)'
     )
-    assert argv[-3:] == ['sh', '-c', 'pytest -m integration'], (
+    junit_path = shlex.quote(str(lane_pass.junit_path(Phase.DETECT)))
+    assert argv[-3:] == ['sh', '-c', f'pytest -m integration --junitxml {junit_path}'], (
         'argv must end with sh -c <command>'
     )
     assert kwargs['cwd'] == str(wt_path / 'fused-memory'), (
@@ -792,7 +829,7 @@ async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: P
             f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy '
             f'(missing/altered {key!r})'
         )
-    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
 
@@ -805,13 +842,11 @@ async def test_default_run_command_cwd_dot_is_worktree_root(tmp_path: Path):
     wt_path = tmp_path / '_offline-deep'
     cmd = LaneCommand(name='r', command='pytest', cwd='.')
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'', None))
-    mock_proc.returncode = 0
+    worker.records.allocate_pass(cmd.name, Leg.GENERIC, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'', returncode=0),
     ) as mock_exec:
         await worker.command_runner(cmd, wt_path, 'HEAD1')
 
@@ -821,801 +856,229 @@ async def test_default_run_command_cwd_dot_is_worktree_root(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# _handle_red_run — confirmation re-run + dedup'd fix-task spawn (β3, task 1954)
+# _run_once — every leg goes through run_pass: the confirm on red, the pass record's blocks
 # ---------------------------------------------------------------------------
+
+
+def _pass_record(worker: OfflineLaneWorker, command: str) -> PassRecord:
+    lane_pass = worker.records.current_pass(command)
+    assert lane_pass is not None, f'no pass was allocated for {command}'
+    record = worker.records.load_pass(command, lane_pass.pass_id)
+    assert record is not None
+    return record
+
+
+class _RecordingConfirm:
+    """An injected confirm seam answering *outcome* (or raising it) and remembering each target it was shown."""
+
+    def __init__(self, *outcomes: Confirmed | Unconfirmable | Exception) -> None:
+        self.outcomes = list(outcomes)
+        self.targets: list[ConfirmTarget] = []
+
+    async def __call__(
+        self, target: ConfirmTarget, detect: RunRecord | None, runner: ConfirmRunner,
+    ) -> Confirmed | Unconfirmable:
+        self.targets.append(target)
+        outcome = self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+_HELD = Confirmed(ConfirmMode.NARROWED, ('tests/t.py::test_x',), (), ())
+_CLEARED = Confirmed(ConfirmMode.NARROWED, (), ('tests/t.py::test_x',), ())
 
 
 @pytest.mark.asyncio
-async def test_handle_red_run_flake_logs_and_does_not_spawn(tmp_path: Path):
-    """A confirmation re-run with NO still-failing test is a flake (B6).
-
-    No fix task, no escalation — just a low-severity "intermittent
-    nondeterminism" log line.
-
-    Step 7 (RED): the new constructor params + _handle_red_run do not exist
-    yet — must fail before impl.
-    """
-    confirmation_runner = AsyncMock(return_value=[])
-    task_client = AsyncMock()
-    escalation_queue = MagicMock()
-    worker = _make_worker(
-        tmp_path,
-        confirmation_runner=confirmation_runner,
-        task_client=task_client,
-        escalation_queue=escalation_queue,
-    )
-
-    with patch('orchestrator.offline_lane.logger') as mock_logger:
-        await worker._handle_red_run(Path('/tmp/_offline-deep'), 'HEAD1')
-
-    confirmation_runner.assert_awaited_once_with(Path('/tmp/_offline-deep'), 'HEAD1')
-    assert any(
-        'intermittent nondeterminism' in call.args[0]
-        for call in mock_logger.info.call_args_list
-    ), 'expected an "intermittent nondeterminism" info log line'
-    task_client.submit_fix_task.assert_not_awaited()
-    escalation_queue.submit.assert_not_called()
-    assert worker.open_fix_tasks == {}
-
-
-# ---------------------------------------------------------------------------
-# _run_once — wiring the red path by returncode (β3, task 1954, step-9/10)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_run_once_wires_red_and_green_paths_by_returncode(tmp_path: Path):
-    """_run_once branches on the suite result's returncode.
-
-    A green (rc == 0) pass records the snapshot head as ``_last_green_head``
-    and never calls ``_handle_red_run``. A red (rc != 0) pass awaits
-    ``_handle_red_run(wt, head)`` exactly once and leaves ``_last_green_head``
-    untouched.
-
-    Step 9 (RED): _run_once currently only logs PASS/FAIL and never
-    branches — ``_last_green_head`` is never set and ``_handle_red_run`` is
-    never invoked. Must fail before impl.
-    """
+async def test_run_once_confirms_only_a_red_pass_and_records_each_pass_outcome(tmp_path: Path):
+    """A green pass is observed with no outcome and asks no confirm; a red one asks the confirm once,
+    and the pass record keeps that outcome and the engine's effect."""
     wt_path = tmp_path / '_offline-deep'
+    confirm = _RecordingConfirm(_HELD)
 
-    # -- Scenario A: green run (rc == 0) sets _last_green_head, no red path.
-    git_ops_a = _make_git_ops(head='HEAD1', worktree_path=wt_path)
-    suite_runner_a = AsyncMock(return_value=(0, ''))
-    worker_a = _make_worker(tmp_path, git_ops=git_ops_a, suite_runner=suite_runner_a)
-    worker_a._handle_red_run = AsyncMock()
-    worker_a._dirty = True
-
-    await worker_a._run_once()
-
-    assert worker_a._last_green_head == 'HEAD1', (
-        'a green (rc == 0) run must record the snapshot head as _last_green_head'
+    green = _make_worker(
+        tmp_path / 'green', git_ops=_make_git_ops(head='HEAD1', worktree_path=wt_path),
+        config=_make_config(tmp_path / 'green'), suite_runner=AsyncMock(return_value=(0, '')), confirm=confirm,
     )
-    worker_a._handle_red_run.assert_not_awaited()
+    await green._run_once()
 
-    # -- Scenario B: red run (rc != 0) awaits _handle_red_run once, no green update.
-    git_ops_b = _make_git_ops(head='HEAD2', worktree_path=wt_path)
-    suite_runner_b = AsyncMock(return_value=(1, ''))
-    worker_b = _make_worker(tmp_path, git_ops=git_ops_b, suite_runner=suite_runner_b)
-    worker_b._handle_red_run = AsyncMock()
-    worker_b._dirty = True
+    assert confirm.targets == []
+    green_record = _pass_record(green, LEGACY_NUMERIC_COMMAND)
+    assert green_record.outcome is None
+    assert isinstance(green_record.effect, dict)
 
-    await worker_b._run_once()
-
-    assert worker_b._last_green_head is None, (
-        'a red (rc != 0) run must NOT update _last_green_head'
+    red = _make_worker(
+        tmp_path / 'red', git_ops=_make_git_ops(head='HEAD2', worktree_path=wt_path),
+        config=_make_config(tmp_path / 'red'), suite_runner=AsyncMock(return_value=(1, '')), confirm=confirm,
     )
-    worker_b._handle_red_run.assert_awaited_once_with(wt_path, 'HEAD2')
+    await red._run_once()
+
+    assert confirm.targets == [ConfirmTarget.numeric(wt_path)]
+    red_record = _pass_record(red, LEGACY_NUMERIC_COMMAND)
+    assert red_record.head == 'HEAD2'
+    assert red_record.outcome == outcome_to_json(_HELD)
+    assert isinstance(red_record.effect, dict)
 
 
 @pytest.mark.asyncio
 async def test_run_once_gates_legacy_numeric_sub_run(tmp_path: Path):
-    """_run_once fires the legacy numeric sub-run only when the gate is on (D2).
-
-    With offline_lane_legacy_numeric_enabled=False (and no generic commands),
-    the numeric suite_runner is never awaited and _last_green_head advances
-    vacuously (the disabled leg is treated as green). With the default True
-    gate, the numeric suite_runner IS awaited once (byte-identical prior
-    behaviour).
-
-    Step 9 (RED): the numeric sub-run is currently unconditional — suite_runner
-    is awaited even when the gate is False. Must fail before impl.
-    """
+    """_run_once runs the legacy numeric leg only when its gate is on (D2): off, no numeric pass exists."""
     wt_path = tmp_path / '_offline-deep'
 
-    # -- gate OFF: numeric suite_runner is NOT awaited; head advances green ----
-    git_ops_off = _make_git_ops(head='HEAD1', worktree_path=wt_path)
     suite_runner_off = AsyncMock(return_value=(0, ''))
-    config_off = _make_config(
-        tmp_path, offline_lane_legacy_numeric_enabled=False, offline_lane_commands=[],
-    )
     worker_off = _make_worker(
-        tmp_path, git_ops=git_ops_off, config=config_off, suite_runner=suite_runner_off,
+        tmp_path / 'off',
+        git_ops=_make_git_ops(head='HEAD1', worktree_path=wt_path),
+        config=_make_config(
+            tmp_path / 'off', offline_lane_legacy_numeric_enabled=False, offline_lane_commands=[],
+        ),
+        suite_runner=suite_runner_off,
     )
-    worker_off._handle_red_run = AsyncMock()
-    worker_off._dirty = True
-
     await worker_off._run_once()
 
     suite_runner_off.assert_not_awaited()
-    worker_off._handle_red_run.assert_not_awaited()
-    assert worker_off._last_green_head == 'HEAD1', (
-        'a disabled legacy-numeric leg is vacuously green, so _last_green_head advances'
-    )
+    assert worker_off.records.current_pass(LEGACY_NUMERIC_COMMAND) is None
 
-    # -- gate ON (default True): numeric suite_runner IS awaited once ---------
-    git_ops_on = _make_git_ops(head='HEAD2', worktree_path=wt_path)
     suite_runner_on = AsyncMock(return_value=(0, ''))
-    config_on = _make_config(tmp_path)  # default: legacy numeric enabled
     worker_on = _make_worker(
-        tmp_path, git_ops=git_ops_on, config=config_on, suite_runner=suite_runner_on,
+        tmp_path / 'on',
+        git_ops=_make_git_ops(head='HEAD2', worktree_path=wt_path),
+        config=_make_config(tmp_path / 'on'),
+        suite_runner=suite_runner_on,
     )
-    worker_on._handle_red_run = AsyncMock()
-    worker_on._dirty = True
-
     await worker_on._run_once()
 
     suite_runner_on.assert_awaited_once()
-    assert worker_on._last_green_head == 'HEAD2'
+    assert _pass_record(worker_on, LEGACY_NUMERIC_COMMAND).head == 'HEAD2'
 
 
 # ---------------------------------------------------------------------------
-# _handle_red_run — new-fingerprint fix-task spawn (β3, task 1954, step-11/12)
+# The default confirm, reached through the worker on the pass its detection opened
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_handle_red_run_new_fingerprint_files_fix_task_and_info_escalation(
-    tmp_path: Path,
-):
-    """A confirmed red run with a NEW fingerprint files a fix task + INFO escalation (B4).
+def _children(*children: tuple[bytes, int]):
+    """A fake ``create_subprocess_exec`` serving one ``(output, returncode)`` child per launch, in order."""
+    queued = list(children)
 
-    The suspect range spans the last-known-green head through the current
-    head; the fingerprint is recorded in ``open_fix_tasks`` so a same-set
-    recurrence updates rather than re-files (see the DEDUP test).
+    async def fake_exec(*argv, **kwargs):
+        output, returncode = queued.pop(0)
+        return await _child_writing(output, returncode=returncode)(*argv, **kwargs)
 
-    Step 11 (RED): the non-empty branch of _handle_red_run is still a stub
-    (raises ``NotImplementedError``) — must fail before impl.
-    """
-    from orchestrator.workflow import compute_failing_test_set_fingerprint
+    return fake_exec
 
-    confirmed_ids = ['t::a', 't::b']
-    confirmation_runner = AsyncMock(return_value=confirmed_ids)
-    task_client = AsyncMock()
-    task_client.submit_fix_task = AsyncMock(return_value='fix-99')
-    escalation_queue = MagicMock()
-    escalation_queue.get_by_task.return_value = []
-    escalation_queue.make_id.return_value = 'esc-fix-99-1'
 
-    worker = _make_worker(
-        tmp_path,
-        confirmation_runner=confirmation_runner,
-        task_client=task_client,
-        escalation_queue=escalation_queue,
-    )
-    worker._last_green_head = 'GREEN'
-
-    wt = Path('/tmp/_offline-deep')
-    await worker._handle_red_run(wt, 'HEAD1')
-
-    task_client.submit_fix_task.assert_awaited_once()
-    arguments = task_client.submit_fix_task.await_args.args[0]
-    assert arguments['status'] == 'pending'
-    assert arguments['metadata']['merge_lane'] == 'normal'
-    assert arguments['metadata']['failing_tests'] == ['t::a', 't::b']
-    assert arguments['metadata']['suspect_ranges'] == ['GREEN..HEAD1']
-
-    fp = compute_failing_test_set_fingerprint(confirmed_ids)
-    assert worker.open_fix_tasks[fp] == 'fix-99'
-    assert worker._red_advance_counts[fp] == 1
-
-    escalation_queue.submit.assert_called_once()
-    esc = escalation_queue.submit.call_args.args[0]
-    assert esc.severity == 'info'
-    assert esc.level == 0
-    assert esc.agent_role == 'orchestrator-offline-lane'
-
-
-@pytest.mark.asyncio
-async def test_handle_red_run_threads_priority_into_filed_task(tmp_path: Path):
-    """_handle_red_run threads its priority kwarg through to the filed fix task.
-
-    A generic per-project command red path files at ``LaneCommand.fix_task_priority``
-    (here 'medium'); the legacy bare call keeps the byte-identical 'high' default.
-
-    Step 7 (RED): _handle_red_run has no priority kwarg — must fail with
-    TypeError before impl.
-    """
-    # -- explicit priority='medium' threads into arguments['priority'] --------
-    confirmation_runner = AsyncMock(return_value=['tests::test_x'])
-    task_client = AsyncMock()
-    task_client.submit_fix_task = AsyncMock(return_value='T1')
-    escalation_queue = MagicMock()
-    escalation_queue.get_by_task.return_value = []
-    escalation_queue.make_id.return_value = 'esc-T1-1'
-    worker = _make_worker(
-        tmp_path, task_client=task_client, escalation_queue=escalation_queue,
-    )
-    wt = Path('/tmp/_offline-deep')
-
-    await worker._handle_red_run(
-        wt, 'HEAD1', confirmation_runner=confirmation_runner, priority='medium',
-    )
-    task_client.submit_fix_task.assert_awaited_once()
-    assert task_client.submit_fix_task.await_args.args[0]['priority'] == 'medium'
-
-    # -- bare call (no priority) defaults to the byte-identical 'high' --------
-    confirmation_runner2 = AsyncMock(return_value=['tests::test_x'])
-    task_client2 = AsyncMock()
-    task_client2.submit_fix_task = AsyncMock(return_value='T2')
-    escalation_queue2 = MagicMock()
-    escalation_queue2.get_by_task.return_value = []
-    escalation_queue2.make_id.return_value = 'esc-T2-1'
-    # Its own project_root, because the red-path state is restart-durable and
-    # therefore SHARED by every worker rooted at one project (task 5352): left
-    # on tmp_path, worker2 would see worker1's open fix task for this same
-    # failing-test set and take the append-suspect-range branch instead of
-    # filing.  The subject here is the priority default, not the dedup.
-    worker2 = _make_worker(
-        tmp_path,
-        config=_make_config(tmp_path / 'project-2'),
-        task_client=task_client2,
-        escalation_queue=escalation_queue2,
-    )
-    await worker2._handle_red_run(wt, 'HEAD1', confirmation_runner=confirmation_runner2)
-    task_client2.submit_fix_task.assert_awaited_once()
-    assert task_client2.submit_fix_task.await_args.args[0]['priority'] == 'high'
-
-
-@pytest.mark.asyncio
-async def test_handle_red_run_empty_task_id_does_not_pollute_dedup_or_escalate(
-    tmp_path: Path,
-):
-    """A ``submit_fix_task`` that returns ``''`` (unparseable MCP envelope)
-    must NOT be recorded in ``open_fix_tasks`` under the bogus empty id, and
-    must NOT file an escalation (task 2016 amendment).
-
-    Recording ``''`` would make a later genuine recurrence of the same
-    fingerprint look "already open" under an id with no real fix task behind
-    it — silently swallowing it forever — and would file a meaningless INFO
-    escalation with ``task_id=''``.
-    """
-    from orchestrator.workflow import compute_failing_test_set_fingerprint
-
-    confirmed_ids = ['t::a', 't::b']
-    confirmation_runner = AsyncMock(return_value=confirmed_ids)
-    task_client = AsyncMock()
-    task_client.submit_fix_task = AsyncMock(return_value='')
-    escalation_queue = MagicMock()
-
-    worker = _make_worker(
-        tmp_path,
-        confirmation_runner=confirmation_runner,
-        task_client=task_client,
-        escalation_queue=escalation_queue,
-    )
-
-    with patch('orchestrator.offline_lane.logger') as mock_logger:
-        await worker._handle_red_run(Path('/tmp/_offline-deep'), 'HEAD1')
-
-    fp = compute_failing_test_set_fingerprint(confirmed_ids)
-    assert fp not in worker.open_fix_tasks, 'an empty task id must not be recorded as open'
-    assert fp not in worker._red_advance_counts
-    escalation_queue.submit.assert_not_called()
-    assert mock_logger.error.call_count >= 1, (
-        'expected an error log when submit_fix_task returns no task id'
-    )
-
-
-# ---------------------------------------------------------------------------
-# _handle_red_run — dedup across advances (β3, task 1954, step-13/14)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_handle_red_run_dedup_appends_suspect_range_not_new_task(tmp_path: Path):
-    """A confirmed red run with an ALREADY-OPEN fingerprint updates, not re-files (B5).
-
-    Priming open_fix_tasks/_red_advance_counts for the same failing-test set
-    and advancing again at a new head must append the new suspect range to
-    the existing fix task rather than filing a duplicate, and must not raise
-    a second INFO escalation.
-
-    Step 13 (RED): the existing-fingerprint branch of _handle_red_run is not
-    implemented yet — must fail before impl.
-    """
-    from orchestrator.workflow import compute_failing_test_set_fingerprint
-
-    confirmed_ids = ['t::a', 't::b']
-    confirmation_runner = AsyncMock(return_value=confirmed_ids)
-    task_client = AsyncMock()
-    task_client.get_status = AsyncMock(return_value='in-progress')
-    escalation_queue = MagicMock()
-
-    worker = _make_worker(
-        tmp_path,
-        confirmation_runner=confirmation_runner,
-        task_client=task_client,
-        escalation_queue=escalation_queue,
-    )
-    fp = compute_failing_test_set_fingerprint(confirmed_ids)
-    worker.open_fix_tasks[fp] = 'fix-99'
-    worker._red_advance_counts[fp] = 1
-    worker._last_green_head = 'GREEN'
-
-    wt = Path('/tmp/_offline-deep')
-    await worker._handle_red_run(wt, 'HEAD2')
-
-    task_client.append_suspect_range.assert_awaited_once_with('fix-99', 'GREEN..HEAD2')
-    task_client.submit_fix_task.assert_not_awaited()
-    escalation_queue.submit.assert_not_called()
-    assert worker._red_advance_counts[fp] == 2
-
-
-# ---------------------------------------------------------------------------
-# _maybe_promote_blocker — STALL -> escalate_blocker by N-advances (β3, task 1954, step-15/16)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_handle_red_run_promotes_blocker_at_n_advances(tmp_path: Path):
-    """A same-set red advance that reaches N confirmed-red advances stages a
-    born-at-L2 ``escalate_blocker`` promotion (B7/C4) — exactly once, and a
-    further same-set advance beyond N must not re-promote (idempotent) nor
-    spawn a new fix task.
-
-    Step 15 (RED): _maybe_promote_blocker is a no-op stub — must fail before impl.
-    """
-    from orchestrator.workflow import compute_failing_test_set_fingerprint
-
-    confirmed_ids = ['t::a', 't::b']
-    confirmation_runner = AsyncMock(return_value=confirmed_ids)
-    task_client = AsyncMock()
-    task_client.get_status = AsyncMock(return_value='in-progress')
-    escalation_queue = MagicMock()
-    escalation_queue.get_by_task.return_value = []
-    escalation_queue.make_id.return_value = 'esc-fix-99-2'
-
-    config = _make_config(tmp_path, offline_lane_red_advances_before_blocker=3)
-    worker = _make_worker(
-        tmp_path,
-        config=config,
-        confirmation_runner=confirmation_runner,
-        task_client=task_client,
-        escalation_queue=escalation_queue,
-    )
-    fp = compute_failing_test_set_fingerprint(confirmed_ids)
-    worker.open_fix_tasks[fp] = 'fix-99'
-    worker._red_advance_counts[fp] = 2
-    worker._last_green_head = 'GREEN'
-
-    wt = Path('/tmp/_offline-deep')
-    await worker._handle_red_run(wt, 'HEAD3')
-
-    assert worker._red_advance_counts[fp] == 3, 'count still bumps on the promoting advance'
-    escalation_queue.submit.assert_called_once()
-    esc = escalation_queue.submit.call_args.args[0]
-    assert esc.severity == 'critical'
-    assert esc.level == 2
-    assert esc.agent_role == 'orchestrator-offline-lane'
-    assert esc.task_id == 'fix-99'
-    task_client.submit_fix_task.assert_not_awaited()
-
-    # A 4th same-set advance must NOT file a further blocker (idempotent) and
-    # must NOT spawn a new fix task.
-    await worker._handle_red_run(wt, 'HEAD4')
-
-    assert worker._red_advance_counts[fp] == 4
-    escalation_queue.submit.assert_called_once()
-    task_client.submit_fix_task.assert_not_awaited()
-
-
-# ---------------------------------------------------------------------------
-# _maybe_promote_blocker — terminal fix-task status + done-clears (step-17/18)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize('terminal_status', ['cancelled', 'deferred'])
-@pytest.mark.asyncio
-async def test_handle_red_run_promotes_blocker_on_terminal_status(
-    tmp_path: Path, terminal_status: str,
-):
-    """A fix task that reaches a TERMINAL non-done status (cancelled/deferred)
-    promotes to escalate_blocker even if the N-advances count has not been
-    reached — the fix task can't land, so waiting further is pointless.
-
-    Step 17 (RED): the terminal-status branch is not implemented yet — must
-    fail before impl.
-    """
-    from orchestrator.workflow import compute_failing_test_set_fingerprint
-
-    confirmed_ids = ['t::a', 't::b']
-    confirmation_runner = AsyncMock(return_value=confirmed_ids)
-    task_client = AsyncMock()
-    task_client.get_status = AsyncMock(return_value=terminal_status)
-    escalation_queue = MagicMock()
-    escalation_queue.get_by_task.return_value = []
-    escalation_queue.make_id.return_value = 'esc-fix-99-2'
-
-    config = _make_config(tmp_path, offline_lane_red_advances_before_blocker=3)
-    worker = _make_worker(
-        tmp_path,
-        config=config,
-        confirmation_runner=confirmation_runner,
-        task_client=task_client,
-        escalation_queue=escalation_queue,
-    )
-    fp = compute_failing_test_set_fingerprint(confirmed_ids)
-    worker.open_fix_tasks[fp] = 'fix-99'
-    worker._red_advance_counts[fp] = 1  # well below N=3
-    worker._last_green_head = 'GREEN'
-
-    wt = Path('/tmp/_offline-deep')
-    await worker._handle_red_run(wt, 'HEAD2')
-
-    escalation_queue.submit.assert_called_once()
-    esc = escalation_queue.submit.call_args.args[0]
-    assert esc.severity == 'critical'
-    assert esc.level == 2
-    assert esc.agent_role == 'orchestrator-offline-lane'
-    assert esc.task_id == 'fix-99'
-    assert fp in worker._promoted_blockers
-    task_client.submit_fix_task.assert_not_awaited()
-
-    # A further same-set advance must not re-promote (idempotent).
-    await worker._handle_red_run(wt, 'HEAD3')
-    escalation_queue.submit.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_handle_red_run_done_status_clears_fingerprint(tmp_path: Path):
-    """A fix task that reaches 'done' clears the fingerprint from
-    open_fix_tasks / _red_advance_counts — a genuine LATER recurrence of the
-    same failing set must file a FRESH fix task rather than being silently
-    swallowed by stale in-memory state. No blocker is filed on the clearing
-    advance.
-
-    Step 17 (RED): the done-clears branch is not implemented yet — must
-    fail before impl.
-    """
-    from orchestrator.workflow import compute_failing_test_set_fingerprint
-
-    confirmed_ids = ['t::a', 't::b']
-    confirmation_runner = AsyncMock(return_value=confirmed_ids)
-    task_client = AsyncMock()
-    task_client.get_status = AsyncMock(return_value='done')
-    escalation_queue = MagicMock()
-
-    worker = _make_worker(
-        tmp_path,
-        confirmation_runner=confirmation_runner,
-        task_client=task_client,
-        escalation_queue=escalation_queue,
-    )
-    fp = compute_failing_test_set_fingerprint(confirmed_ids)
-    worker.open_fix_tasks[fp] = 'fix-99'
-    worker._red_advance_counts[fp] = 2
-    worker._last_green_head = 'GREEN'
-
-    wt = Path('/tmp/_offline-deep')
-    await worker._handle_red_run(wt, 'HEAD2')
-
-    assert fp not in worker.open_fix_tasks, 'a done fix task must clear the fingerprint'
-    assert fp not in worker._red_advance_counts
-    assert fp not in worker._promoted_blockers
-    escalation_queue.submit.assert_not_called()
-    task_client.submit_fix_task.assert_not_awaited()
-
-
-# ---------------------------------------------------------------------------
-# Default confirmation-runner seam (step-19/20)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_default_confirmation_run_builds_serial_confirm_command(tmp_path: Path):
-    """The default (uninjected) confirmation_runner seam builds the real
-    serial confirm-failures invocation and parses the confirmed-still-failing
-    test IDs from stdout (one per line).
-
-    No confirmation_runner is supplied, so the worker falls back to its
-    ``_default_confirmation_run`` seam. ``asyncio.create_subprocess_exec`` is
-    mocked, so this asserts ONLY that the argv/env/cwd invocation is built
-    correctly and stdout is parsed — real script existence/execution is
-    ζ's job (cross-project scope boundary; see module docstring), mirroring
-    ``test_default_suite_runner_builds_run_offline_deep_command`` (β2).
-
-    Step 19 (RED): _default_confirmation_run is a NotImplementedError stub
-    — must fail before impl.
-    """
-    worker = _make_worker(tmp_path)  # no confirmation_runner injected -> default seam
-    wt_path = tmp_path / '_offline-deep'
-
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(b'tests::test_a\ntests::test_b\n', b'')
-    )
-    mock_proc.returncode = 0
-
-    with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
-    ) as mock_exec:
-        confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
-
-    assert confirmed == ['tests::test_a', 'tests::test_b']
-
-    mock_exec.assert_awaited_once()
-    argv = mock_exec.call_args.args
-    kwargs = mock_exec.call_args.kwargs
-    assert argv[0] == 'scripts/run-offline-deep.sh', (
-        'argv must invoke the offline-deep script'
-    )
-    assert '--test-threads=1' in argv, 'the confirmation re-run must be serial (1 thread)'
-    assert any(a.startswith('--confirm') for a in argv[1:]), (
-        'argv must carry a confirm-failures flag distinguishing this from a '
-        'normal suite run'
-    )
-    assert kwargs['cwd'] == str(wt_path), 'cwd must be the _offline-deep worktree'
-    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline', (
-        'DF_VERIFY_ROLE=offline must be set, same as the normal suite run'
-    )
+def _assert_lane_env(env: dict[str, str]) -> None:
+    assert env['DF_VERIFY_ROLE'] == 'offline'
     for key, value in os.environ.items():
-        if key == 'DF_VERIFY_ROLE':
-            continue
-        assert kwargs['env'].get(key) == value, (
-            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
-            f'not replace it (missing/altered {key!r})'
-        )
-    assert kwargs['stdout'] == asyncio.subprocess.PIPE
-    assert kwargs['stderr'] == asyncio.subprocess.STDOUT
+        if key != 'DF_VERIFY_ROLE':
+            assert env.get(key) == value, f'the lane env must overlay os.environ (missing/altered {key!r})'
 
 
 @pytest.mark.asyncio
-async def test_default_confirmation_run_empty_stdout_means_no_confirmed_failures(
-    tmp_path: Path,
-):
-    """Blank/whitespace-only lines are not test IDs — empty stdout confirms nothing.
-
-    Step 19 (RED): _default_confirmation_run is a NotImplementedError stub
-    — must fail before impl.
+async def test_a_red_numeric_pass_runs_the_serial_confirm_failed_invocation(tmp_path: Path):
+    """The default numeric confirm re-runs reify's script serially with ``--confirm-failed`` in the
+    lane worktree, writes the confirm phase of the same pass, and reproduces the ids printed under exit 100.
     """
-    worker = _make_worker(tmp_path)
     wt_path = tmp_path / '_offline-deep'
-
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'\n  \n', b''))
-    mock_proc.returncode = 0
+    worker = _make_worker(tmp_path, git_ops=_make_git_ops(head='HEAD1', worktree_path=wt_path))
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
-    ):
-        confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_children((b'red\n', 1), (b'tests::test_b\ntests::test_a\n', 100)),
+    ) as mock_exec:
+        await worker._run_once()
 
-    assert confirmed == []
-
-
-@pytest.mark.asyncio
-async def test_default_confirmation_run_rejects_verify_usage_dump(tmp_path: Path):
-    """The default numeric confirmation seam rejects a reify verify.sh
-    usage/help/error dump instead of turning every usage line into a bogus
-    confirmed test ID (task 5308; reify:5264 incident).
-
-    No confirmation_runner is injected, so the real ``_default_confirmation_run``
-    seam runs; ``run-offline-deep.sh`` merges stderr into stdout, so a malformed
-    verify.sh invocation floods this seam with usage() text.
-    ``create_subprocess_exec`` is mocked to emit that dump with returncode 64
-    (verify.sh's arg-error exit).
-
-    RED: pre-fix the seam's inline comprehension yields the non-blank usage
-    lines rather than ``[]``.
-    """
-    worker = _make_worker(tmp_path)  # no confirmation_runner injected -> default seam
-    wt_path = tmp_path / '_offline-deep'
-
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(_VERIFY_USAGE_DUMP.encode(), b''))
-    mock_proc.returncode = 64
-
-    with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
-    ):
-        confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
-
-    assert confirmed == []
-
-
-# ---------------------------------------------------------------------------
-# _parse_confirmed_failures helper — numeric-seam usage/help guard (task 5308)
-# ---------------------------------------------------------------------------
-
-
-def test_parse_confirmed_failures_passes_normal_ids_through():
-    """Normal newline-separated test IDs parse through unchanged (prior behaviour)."""
-    assert _parse_confirmed_failures('tests::test_a\ntests::test_b\n') == [
-        'tests::test_a',
-        'tests::test_b',
-    ]
-
-
-def test_parse_confirmed_failures_rejects_verify_usage_dump():
-    """A faithful verify.sh ERROR+usage() dump is not a set of failing tests -> []."""
-    assert _parse_confirmed_failures(_VERIFY_USAGE_DUMP) == []
-
-
-def test_parse_confirmed_failures_rejects_bare_error_line():
-    """A lone ``verify.sh: ERROR — …`` banner (no usage block) -> []."""
-    assert _parse_confirmed_failures(
-        "verify.sh: ERROR — unknown argument '--test-threads=1'\n"
-    ) == []
-
-
-def test_parse_confirmed_failures_rejects_embedded_usage_header():
-    """A bare ``Usage:``/``Options:`` header among otherwise-plausible lines -> []."""
-    assert _parse_confirmed_failures(
-        'tests::test_a\nOptions:\ntests::test_b\n'
-    ) == []
-    assert _parse_confirmed_failures(
-        'tests::test_a\nUsage:\ntests::test_b\n'
-    ) == []
-
-
-def test_parse_confirmed_failures_empty_on_blank_input():
-    """Blank/whitespace-only input confirms nothing -> []."""
-    assert _parse_confirmed_failures('') == []
-    assert _parse_confirmed_failures('\n  \n') == []
-
-
-# ---------------------------------------------------------------------------
-# _default_confirm_command — generic per-project confirm seam (task 2789, step-13/14)
-# ---------------------------------------------------------------------------
+    lane_pass = worker.records.current_pass(LEGACY_NUMERIC_COMMAND)
+    assert lane_pass is not None
+    confirm_call = mock_exec.call_args_list[1]
+    assert list(confirm_call.args) == ['scripts/run-offline-deep.sh', '--test-threads=1', '--confirm-failed']
+    assert confirm_call.kwargs['cwd'] == str(wt_path)
+    _assert_lane_env(confirm_call.kwargs['env'])
+    assert Path(confirm_call.kwargs['stdout'].name) == lane_pass.output_path(Phase.CONFIRM)
+    assert confirm_call.kwargs['stderr'] == asyncio.subprocess.STDOUT
+    assert _pass_record(worker, LEGACY_NUMERIC_COMMAND).outcome == outcome_to_json(
+        Confirmed(ConfirmMode.LEG_NATIVE, ('tests::test_b', 'tests::test_a'), (), ()),
+    )
 
 
 @pytest.mark.asyncio
-async def test_default_confirm_command_serializes_and_extracts_node_ids(tmp_path: Path):
-    """The default command_confirmation_runner serializes the command and
-    extracts still-failing pytest node-ids from FULL stdout.
-
-    Reuses the reify-side confirm primitives (PRD sec 5): _serial_pytest_str
-    rewrites the command serial (-p no:xdist -o addopts=<value>), and
-    _extract_failing_test_ids pulls the FAILED/ERROR node-ids. cwd/env mirror
-    _default_run_command (idle nice/ionice, DF_VERIFY_ROLE=offline).
-
-    Step 13 (RED): _default_confirm_command / the command_confirmation_runner
-    seam do not exist — must fail before impl.
-    """
+async def test_a_red_generic_pass_confirms_the_detected_failures_narrowed_and_serial(tmp_path: Path):
+    """A structured pytest command's default confirm re-runs only the detection's failing tests, serially,
+    at idle nice/ionice in the command's cwd, and reproduces those that fail again."""
     from orchestrator.config import LaneCommand
-    from orchestrator.verify import _extract_failing_test_ids, _serial_pytest_str
 
-    worker = _make_worker(tmp_path)
     wt_path = tmp_path / '_offline-deep'
     cmd = LaneCommand(name='q', command='pytest -m integration', cwd='fused-memory')
-
-    stdout = b'FAILED tests/test_q.py::test_a\nFAILED tests/test_q.py::test_b\n'
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(stdout, None))
-    mock_proc.returncode = 1
+    worker = _make_worker(
+        tmp_path,
+        git_ops=_make_git_ops(head='HEAD1', worktree_path=wt_path),
+        config=_make_config(tmp_path, offline_lane_legacy_numeric_enabled=False, offline_lane_commands=[cmd]),
+    )
+    failing = ['tests/test_q.py::test_a', 'tests/test_q.py::test_b']
+    stdout = b''.join(f'FAILED {node}\n'.encode() for node in failing)
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_children((stdout, 1), (stdout, 1)),
     ) as mock_exec:
-        ids = await worker.command_confirmation_runner(cmd, wt_path, 'HEAD1')
+        await worker._run_once()
 
-    assert ids == _extract_failing_test_ids(stdout.decode())
-    assert ids == ['tests/test_q.py::test_a', 'tests/test_q.py::test_b']
-
-    argv = list(mock_exec.call_args.args)
-    kwargs = mock_exec.call_args.kwargs
-    expected_serial = _serial_pytest_str(
-        'pytest -m integration', invocation_dir=wt_path / 'fused-memory',
+    lane_pass = worker.records.current_pass(cmd.name)
+    assert lane_pass is not None
+    argv = list(mock_exec.call_args_list[1].args)
+    kwargs = mock_exec.call_args_list[1].kwargs
+    expected_command = serial_confirm_command(
+        cmd, failing, invocation_dir=wt_path / 'fused-memory', junit_path=lane_pass.junit_path(Phase.CONFIRM),
     )
-    assert argv[:5] == ['nice', '-n', '19', 'ionice', '-c3'], (
-        'confirm re-run must also run at idle nice/ionice'
-    )
-    assert argv[-3:] == ['sh', '-c', expected_serial], (
-        'the confirm re-run must be serialized via _serial_pytest_str'
-    )
-    assert '-p no:xdist' in argv[-1], 'serial re-run must disable xdist'
+    assert argv[:5] == ['nice', '-n', '19', 'ionice', '-c3']
+    assert argv[-3:] == ['sh', '-c', expected_command]
+    assert '-p no:xdist' in argv[-1]
     assert kwargs['cwd'] == str(wt_path / 'fused-memory')
-    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline'
-    assert kwargs['stdout'] == asyncio.subprocess.PIPE
-    assert kwargs['stderr'] == asyncio.subprocess.STDOUT
-
-
-@pytest.mark.asyncio
-async def test_default_confirm_command_re_supplies_the_lane_cwds_addopts(tmp_path: Path):
-    """The serial confirm keeps the governing config's addopts minus xdist (task 5079).
-
-    The walk is bounded at the lane's run cwd, so ``sub``'s own config is the
-    one read. The CLI ``-m warm_lane_bash`` still wins over the re-supplied
-    ``-m 'not warm_lane_bash'``: pytest prepends addopts to argv.
-    """
-    from orchestrator.config import LaneCommand
-
-    worker = _make_worker(tmp_path)
-    wt_path = tmp_path / '_offline-deep'
-    (wt_path / 'sub').mkdir(parents=True)
-    (wt_path / 'sub' / 'pyproject.toml').write_text(ORCH_SHAPED_PYPROJECT, encoding='utf-8')
-    cmd = LaneCommand(name='w', command='pytest -m warm_lane_bash', cwd='sub')
-
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'all tests passed\n', None))
-    mock_proc.returncode = 0
-
-    with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
-    ) as mock_exec:
-        await worker.command_confirmation_runner(cmd, wt_path, 'HEAD1')
-
-    tokens = shlex.split(mock_exec.call_args.args[-1])
-    assert tokens[:3] == ['pytest', '-m', 'warm_lane_bash'], tokens
-    assert tokens[3:] == ['-p', 'no:xdist', '-o', "addopts=-m 'not warm_lane_bash'"], tokens
-
-
-@pytest.mark.asyncio
-async def test_default_confirm_command_no_failures_is_flake(tmp_path: Path):
-    """stdout with no FAILED/ERROR lines yields [] (the flake path)."""
-    from orchestrator.config import LaneCommand
-
-    worker = _make_worker(tmp_path)
-    wt_path = tmp_path / '_offline-deep'
-    cmd = LaneCommand(name='q', command='pytest -m integration')
-
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'all tests passed\n', None))
-    mock_proc.returncode = 0
-
-    with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
-    ):
-        ids = await worker.command_confirmation_runner(cmd, wt_path, 'HEAD1')
-
-    assert ids == []
-
-
-@pytest.mark.asyncio
-async def test_default_confirm_command_nonzero_exit_without_node_ids_files_sentinel(
-    tmp_path: Path,
-):
-    """A genuinely-red command with no parseable pytest node-ids is NOT a flake.
-
-    Amendment (reviewer_comprehensive, robustness): the default confirm seam is
-    pytest-oriented, but ``command`` is an arbitrary shell string. For a
-    non-pytest command (e.g. ``make check``) — or a pytest crash — that
-    reproduces red, ``_extract_failing_test_ids`` returns []. Swallowing that
-    as a flake (no fix task, no escalation) is a silent fail-soft that violates
-    the loud-over-silent / no-silent-fail-soft norm. The exit code
-    disambiguates: rc != 0 with no node-ids returns a stable
-    ``<name>::nonzero-exit`` sentinel so _handle_red_run still
-    fingerprints/files/escalates rather than classifying it a flake (contrast
-    ``test_default_confirm_command_no_failures_is_flake``, where rc == 0 means
-    the command reproduced GREEN — a real flake -> []).
-    """
-    from orchestrator.config import LaneCommand
-
-    worker = _make_worker(tmp_path)
-    wt_path = tmp_path / '_offline-deep'
-    cmd = LaneCommand(name='make-check', command='make check', cwd='fused-memory')
-
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(b'make: *** [Makefile:12: check] Error 1\n', None)
+    _assert_lane_env(kwargs['env'])
+    assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.CONFIRM)
+    assert _pass_record(worker, cmd.name).outcome == outcome_to_json(
+        Confirmed(ConfirmMode.NARROWED, tuple(failing), (), ()),
     )
-    mock_proc.returncode = 1
+
+
+@pytest.mark.asyncio
+async def test_a_red_infra_pass_confirms_the_failures_both_runs_name(tmp_path: Path):
+    """The default infra confirm re-invokes H9 with the detect seam's argv/env/cwd; a test both runs name
+    reproduces and one the confirm passed is cleared."""
+    wt_path = tmp_path / '_offline-deep'
+    worker = _make_worker(
+        tmp_path,
+        git_ops=_make_git_ops(head='HEAD1', worktree_path=wt_path),
+        config=_make_config(tmp_path, offline_lane_legacy_numeric_enabled=False, offline_lane_infra_enabled=True),
+    )
+    detect = (
+        b'  RESULT: FAIL (test_cgroup_delegation.sh)\n'
+        b'  RESULT: FAIL (test_reflink_fs.sh)\n'
+        b'  RESULT: FAIL (test_cgroup_burn.sh)\n'
+    )
+    confirm = (
+        b'  RESULT: FAIL (test_cgroup_burn.sh)\n'
+        b'  RESULT: PASS (test_reflink_fs.sh)\n'
+        b'  RESULT: FAIL (test_cgroup_delegation.sh)\n'
+    )
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
-    ):
-        ids = await worker.command_confirmation_runner(cmd, wt_path, 'HEAD1')
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_children((detect, 1), (confirm, 1)),
+    ) as mock_exec:
+        await worker._run_once()
 
-    # Non-empty => _handle_red_run fingerprints + files a fix task, rather than
-    # treating the confirmed-red command as intermittent nondeterminism.
-    assert ids == ['make-check::nonzero-exit']
+    confirm_call = mock_exec.call_args_list[1]
+    assert list(confirm_call.args) == ['tests/infra/run_all.sh', '--scope', 'host-infra']
+    assert confirm_call.kwargs['cwd'] == str(wt_path)
+    _assert_lane_env(confirm_call.kwargs['env'])
+    assert _pass_record(worker, LEGACY_INFRA_COMMAND).outcome == outcome_to_json(Confirmed(
+        ConfirmMode.INTERSECTED,
+        ('test_cgroup_delegation.sh', 'test_cgroup_burn.sh'),
+        ('test_reflink_fs.sh',),
+        (),
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -1624,28 +1087,14 @@ async def test_default_confirm_command_nonzero_exit_without_node_ids_files_senti
 
 
 def test_infra_seams_injected_or_default(tmp_path: Path):
-    """infra_runner/infra_confirmation_runner are stored when injected, else
-    fall back to their bound default methods (task 1959, IE1).
-
-    Mirrors the existing suite_runner/confirmation_runner wiring.
-
-    Step 3 (RED): the constructor params and the default methods do not
-    exist yet — must fail before impl.
-    """
+    """infra_runner is stored when injected, else falls back to the default seam (task 1959, IE1)."""
     sentinel_infra = AsyncMock(return_value=(0, ''))
-    sentinel_conf = AsyncMock(return_value=[])
-    worker = _make_worker(
-        tmp_path, infra_runner=sentinel_infra, infra_confirmation_runner=sentinel_conf,
-    )
+    worker = _make_worker(tmp_path, infra_runner=sentinel_infra)
     assert worker.infra_runner is sentinel_infra
-    assert worker.infra_confirmation_runner is sentinel_conf
 
     worker_default = _make_worker(tmp_path)
-    assert worker_default.infra_runner == worker_default._default_run_infra
-    assert (
-        worker_default.infra_confirmation_runner
-        == worker_default._default_infra_confirmation_run
-    )
+    assert callable(worker_default.infra_runner)
+    assert worker_default.infra_runner is not sentinel_infra
 
 
 # ---------------------------------------------------------------------------
@@ -1673,13 +1122,11 @@ async def test_default_infra_runner_builds_run_all_host_infra_command(tmp_path: 
     worker = _make_worker(tmp_path)  # no infra_runner injected -> default seam
     wt_path = tmp_path / '_offline-deep'
 
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(return_value=(b'infra output\n', b''))
-    mock_proc.returncode = 0
+    lane_pass = worker.records.allocate_pass(LEGACY_INFRA_COMMAND, Leg.INFRA, 'HEAD1')
 
     with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
+        'orchestrator.offline_lane_runs.asyncio.create_subprocess_exec',
+        side_effect=_child_writing(b'infra output\n', returncode=0),
     ) as mock_exec:
         rc, tail = await worker.infra_runner(wt_path, 'HEAD1', 6)
 
@@ -1704,158 +1151,8 @@ async def test_default_infra_runner_builds_run_all_host_infra_command(tmp_path: 
             f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
             f'not replace it (missing/altered {key!r})'
         )
-    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
-
-
-# ---------------------------------------------------------------------------
-# Default infra-confirmation-runner seam (task 1959, IE1, step-7/8)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_default_infra_confirmation_run_parses_result_fail_lines(tmp_path: Path):
-    """The default (uninjected) infra_confirmation_runner seam re-invokes H9
-    and parses ``RESULT: FAIL (<name>)`` lines into a sorted, de-duplicated
-    list of still-failing test-file-names (PASS lines excluded).
-
-    No infra_confirmation_runner is supplied, so the worker falls back to
-    its ``_default_infra_confirmation_run`` seam. ``create_subprocess_exec``
-    is mocked, so this asserts ONLY that the argv/env/cwd invocation is
-    built correctly and stdout is parsed — real script existence/execution
-    on reify main is cross-project scope (see module docstring).
-
-    Step 7 (RED): _default_infra_confirmation_run is a NotImplementedError
-    stub — must fail before impl.
-    """
-    worker = _make_worker(tmp_path)  # no infra_confirmation_runner injected
-    wt_path = tmp_path / '_offline-deep'
-
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(
-            b'--- Running: test_cgroup_burn.sh ---\n'
-            b'  RESULT: FAIL (test_cgroup_burn.sh)\n'
-            b'  RESULT: PASS (test_reflink_fs.sh)\n'
-            b'  RESULT: FAIL (test_cgroup_delegation.sh)\n',
-            b'',
-        )
-    )
-    mock_proc.returncode = 1
-
-    with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
-    ) as mock_exec:
-        confirmed = await worker.infra_confirmation_runner(wt_path, 'HEAD1')
-
-    assert confirmed == ['test_cgroup_burn.sh', 'test_cgroup_delegation.sh'], (
-        'FAIL file-names must be sorted, de-duplicated, and exclude PASS lines'
-    )
-
-    mock_exec.assert_awaited_once()
-    argv = mock_exec.call_args.args
-    kwargs = mock_exec.call_args.kwargs
-    assert list(argv) == ['tests/infra/run_all.sh', '--scope', 'host-infra']
-    assert kwargs['cwd'] == str(wt_path), 'cwd must be the _offline-deep worktree'
-    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline'
-    for key, value in os.environ.items():
-        if key == 'DF_VERIFY_ROLE':
-            continue
-        assert kwargs['env'].get(key) == value, (
-            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
-            f'not replace it (missing/altered {key!r})'
-        )
-
-
-@pytest.mark.asyncio
-async def test_default_infra_confirmation_run_no_fail_lines_means_no_confirmed_failures(
-    tmp_path: Path,
-):
-    """Output with only PASS / no RESULT lines confirms nothing.
-
-    Step 7 (RED): _default_infra_confirmation_run is a NotImplementedError
-    stub — must fail before impl.
-    """
-    worker = _make_worker(tmp_path)
-    wt_path = tmp_path / '_offline-deep'
-
-    mock_proc = AsyncMock()
-    mock_proc.communicate = AsyncMock(
-        return_value=(b'  RESULT: PASS (test_reflink_fs.sh)\n', b'')
-    )
-    mock_proc.returncode = 0
-
-    with patch(
-        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
-        return_value=mock_proc,
-    ):
-        confirmed = await worker.infra_confirmation_runner(wt_path, 'HEAD1')
-
-    assert confirmed == []
-
-
-# ---------------------------------------------------------------------------
-# _handle_red_run — optional confirmation_runner kwarg for infra reuse
-# (task 1959, IE1, step-9/10)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_handle_red_run_uses_injected_confirmation_runner_for_infra(tmp_path: Path):
-    """_handle_red_run accepts an OPTIONAL confirmation_runner kwarg so the
-    infra sub-run's red path reuses the entire confirm→fingerprint→file/
-    update→escalate machinery (IE-D1/§6) with its OWN confirmation seam,
-    while the numeric call site (bare, no kwarg) keeps using
-    self.confirmation_runner unchanged (back-compat).
-
-    Step 9 (RED): _handle_red_run has no confirmation_runner param yet — the
-    kwarg call raises TypeError. Must fail before impl.
-    """
-    from orchestrator.workflow import compute_failing_test_set_fingerprint
-
-    numeric_confirmation_runner = AsyncMock(return_value=['numeric::should-not-be-used'])
-    infra_confirmed = ['test_cgroup_burn.sh', 'test_reflink_fs.sh']
-    infra_conf = AsyncMock(return_value=infra_confirmed)
-    task_client = AsyncMock()
-    task_client.submit_fix_task = AsyncMock(return_value='fix-infra-1')
-    escalation_queue = MagicMock()
-    escalation_queue.get_by_task.return_value = []
-    escalation_queue.make_id.return_value = 'esc-1'
-
-    worker = _make_worker(
-        tmp_path,
-        confirmation_runner=numeric_confirmation_runner,
-        task_client=task_client,
-        escalation_queue=escalation_queue,
-    )
-    worker._last_green_head = 'GREEN'
-
-    wt = Path('/tmp/_offline-deep')
-    await worker._handle_red_run(wt, 'HEAD1', confirmation_runner=infra_conf)
-
-    infra_conf.assert_awaited_once_with(wt, 'HEAD1')
-    numeric_confirmation_runner.assert_not_awaited()
-
-    task_client.submit_fix_task.assert_awaited_once()
-    arguments = task_client.submit_fix_task.await_args.args[0]
-    assert arguments['metadata']['failing_tests'] == sorted(infra_confirmed)
-    assert arguments['metadata']['merge_lane'] == 'normal'
-
-    fp = compute_failing_test_set_fingerprint(infra_confirmed)
-    assert worker.open_fix_tasks[fp] == 'fix-infra-1'
-
-    escalation_queue.submit.assert_called_once()
-    esc = escalation_queue.submit.call_args.args[0]
-    assert esc.severity == 'info'
-    assert esc.level == 0
-    assert esc.agent_role == 'orchestrator-offline-lane'
-
-    # Back-compat: the bare (no-kwarg) call site still uses the numeric
-    # self.confirmation_runner.
-    wt2 = Path('/tmp/_offline-deep-2')
-    await worker._handle_red_run(wt2, 'HEAD1')
-    numeric_confirmation_runner.assert_awaited_once_with(wt2, 'HEAD1')
 
 
 # ---------------------------------------------------------------------------
@@ -1863,151 +1160,99 @@ async def test_handle_red_run_uses_injected_confirmation_runner_for_infra(tmp_pa
 # ---------------------------------------------------------------------------
 
 
-def _log_call_text(call) -> str:
-    """Join a mock logger call's args into one searchable string.
-
-    Format-agnostic: works whether the message uses %-style placeholders
-    or plain text, since it just concatenates the format string with all
-    of its interpolation args.
-    """
-    return ' '.join(str(a) for a in call.args)
+def _sub_run_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if ' sub-run head=' in r.getMessage()]
 
 
 @pytest.mark.asyncio
-async def test_run_once_runs_both_sub_runs_when_infra_enabled(tmp_path: Path):
-    """_run_once runs the infra sub-run (at the SAME snapshot head, in the
-    SAME worktree) when offline_lane_infra_enabled is True, reusing β3's red
-    path via the infra confirmation runner; _last_green_head only advances
-    when ALL executed sub-runs pass at that head. When infra is disabled
-    (default), only the numeric sub-run runs — byte-identical to prior
-    behavior.
-
-    Mirrors test_run_once_wires_red_and_green_paths_by_returncode.
-
-    Step 11 (RED): _run_once does not run the infra sub-run yet —
-    infra_runner is never awaited and _handle_red_run is never called with
-    confirmation_runner=infra_confirmation_runner. Must fail before impl.
-    """
+async def test_run_once_runs_both_sub_runs_when_infra_enabled(tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    """_run_once runs the infra sub-run at the SAME snapshot head, in the SAME worktree, when
+    offline_lane_infra_enabled is True, confirming its red with the infra confirm target; with infra
+    disabled (default) only the numeric sub-run runs."""
     wt_path = tmp_path / '_offline-deep'
 
     # -- Scenario A: infra enabled, numeric green + infra red.
-    git_ops_a = _make_git_ops(head='HEAD1', worktree_path=wt_path)
-    config_a = _make_config(tmp_path, offline_lane_infra_enabled=True)
+    config_a = _make_config(tmp_path / 'a', offline_lane_infra_enabled=True)
     suite_runner_a = AsyncMock(return_value=(0, ''))
     infra_runner_a = AsyncMock(return_value=(1, ''))
-    infra_conf_a = AsyncMock(return_value=[])
+    confirm_a = _RecordingConfirm(_CLEARED)
     worker_a = _make_worker(
-        tmp_path,
-        git_ops=git_ops_a,
+        tmp_path / 'a',
+        git_ops=_make_git_ops(head='HEAD1', worktree_path=wt_path),
         config=config_a,
         suite_runner=suite_runner_a,
         infra_runner=infra_runner_a,
-        infra_confirmation_runner=infra_conf_a,
+        confirm=confirm_a,
     )
-    worker_a._handle_red_run = AsyncMock()
-    worker_a._dirty = True
 
-    with patch('orchestrator.offline_lane.logger') as mock_logger:
+    with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane_pass'):
         await worker_a._run_once()
 
     threads_a = config_a.git.offline_lane_test_threads
     suite_runner_a.assert_awaited_once_with(wt_path, 'HEAD1', threads_a)
     infra_runner_a.assert_awaited_once_with(wt_path, 'HEAD1', threads_a)
-    worker_a._handle_red_run.assert_awaited_once_with(
-        wt_path, 'HEAD1', confirmation_runner=worker_a.infra_confirmation_runner,
-    )
-    assert worker_a._last_green_head is None, (
-        'infra red must block the both-green advance even though numeric was green'
-    )
-
-    info_texts = [_log_call_text(call) for call in mock_logger.info.call_args_list]
-    assert any('numeric' in t and 'HEAD1' in t and 'PASS' in t for t in info_texts), (
-        f'expected a numeric-labeled PASS log line, got {info_texts!r}'
-    )
-    assert any('infra' in t and 'HEAD1' in t and 'FAIL' in t for t in info_texts), (
-        f'expected an infra-labeled FAIL log line, got {info_texts!r}'
-    )
+    assert confirm_a.targets == [ConfirmTarget.infra(wt_path)]
+    lines = _sub_run_lines(caplog)
+    assert any(t.startswith('offline-lane: numeric sub-run head=HEAD1 status=PASS') for t in lines), lines
+    assert any(t.startswith('offline-lane: infra sub-run head=HEAD1 status=FAIL') for t in lines), lines
 
     # -- Scenario B: infra enabled, both sub-runs green.
-    git_ops_b = _make_git_ops(head='HEAD2', worktree_path=wt_path)
-    config_b = _make_config(tmp_path, offline_lane_infra_enabled=True)
-    suite_runner_b = AsyncMock(return_value=(0, ''))
+    config_b = _make_config(tmp_path / 'b', offline_lane_infra_enabled=True)
     infra_runner_b = AsyncMock(return_value=(0, ''))
+    confirm_b = _RecordingConfirm(_CLEARED)
     worker_b = _make_worker(
-        tmp_path,
-        git_ops=git_ops_b,
+        tmp_path / 'b',
+        git_ops=_make_git_ops(head='HEAD2', worktree_path=wt_path),
         config=config_b,
-        suite_runner=suite_runner_b,
+        suite_runner=AsyncMock(return_value=(0, '')),
         infra_runner=infra_runner_b,
+        confirm=confirm_b,
     )
-    worker_b._handle_red_run = AsyncMock()
-    worker_b._dirty = True
 
     await worker_b._run_once()
 
     infra_runner_b.assert_awaited_once_with(wt_path, 'HEAD2', config_b.git.offline_lane_test_threads)
-    worker_b._handle_red_run.assert_not_awaited()
-    assert worker_b._last_green_head == 'HEAD2'
+    assert confirm_b.targets == []
 
     # -- Scenario C: infra disabled (default) — numeric-only, unchanged.
-    git_ops_c = _make_git_ops(head='HEAD3', worktree_path=wt_path)
-    config_c = _make_config(tmp_path)  # offline_lane_infra_enabled defaults False
-    suite_runner_c = AsyncMock(return_value=(0, ''))
     infra_runner_c = AsyncMock(return_value=(0, ''))
     worker_c = _make_worker(
-        tmp_path,
-        git_ops=git_ops_c,
-        config=config_c,
-        suite_runner=suite_runner_c,
+        tmp_path / 'c',
+        git_ops=_make_git_ops(head='HEAD3', worktree_path=wt_path),
+        config=_make_config(tmp_path / 'c'),
+        suite_runner=AsyncMock(return_value=(0, '')),
         infra_runner=infra_runner_c,
     )
-    worker_c._handle_red_run = AsyncMock()
-    worker_c._dirty = True
 
     await worker_c._run_once()
 
     infra_runner_c.assert_not_awaited()
-    worker_c._handle_red_run.assert_not_awaited()
-    assert worker_c._last_green_head == 'HEAD3'
+    assert worker_c.records.current_pass(LEGACY_INFRA_COMMAND) is None
 
 
 # ---------------------------------------------------------------------------
-# _run_once / run() — a red-handling/infra-leg exception must not advance
-# _last_run_head, so the poll backstop can retry (task 2016, step-1/2)
+# _run_once / run() — a raising confirm or leg must not advance _last_run_head,
+# so the poll backstop can retry (task 2016, step-1/2)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_run_once_red_handling_exception_does_not_advance_last_run_head(
-    tmp_path: Path,
-):
-    """A numeric red-handling exception must NOT permanently advance _last_run_head.
+async def test_run_once_confirm_exception_does_not_advance_last_run_head(tmp_path: Path):
+    """A red pass whose confirm raises must leave _last_run_head unadvanced, so the poll backstop
+    still sees the head as outstanding and retries it."""
+    worker = _make_worker(
+        tmp_path,
+        git_ops=_make_git_ops(head='HEAD1'),
+        suite_runner=AsyncMock(return_value=(1, '')),
+        confirm=_RecordingConfirm(RuntimeError('confirm boom')),
+    )
 
-    Today ``_last_run_head`` is set immediately after ``suite_runner``
-    returns — BEFORE ``_handle_red_run`` runs — so a raise from the
-    red-handling leg still leaves ``_last_run_head`` pointing at the
-    just-failed head, silently defeating ``run()``'s poll-backstop retry
-    (the head no longer looks "missed"). The step-2 fix moves the advance
-    to the end of ``_run_once``, after red-handling completes without
-    raising.
-
-    Step 1 (RED): ``_last_run_head`` is still set before ``_handle_red_run``
-    runs — must fail (``_last_run_head`` will be ``'HEAD1'``, not ``None``)
-    before the step-2 reorder.
-    """
-    git_ops = _make_git_ops(head='HEAD1')
-    suite_runner = AsyncMock(return_value=(1, ''))
-    worker = _make_worker(tmp_path, git_ops=git_ops, suite_runner=suite_runner)
-    worker._handle_red_run = AsyncMock(side_effect=RuntimeError('red handling boom'))
-    worker._dirty = True
-
-    with pytest.raises(RuntimeError, match='red handling boom'):
+    with pytest.raises(RuntimeError, match='confirm boom'):
         await worker._run_once()
 
     assert worker._last_run_head is None, (
-        '_last_run_head must NOT advance when _handle_red_run raises — the '
-        'run-start snapshot head must stay outstanding so the poll backstop '
-        'retries it'
+        '_last_run_head must NOT advance when a red pass raises — the run-start snapshot head '
+        'must stay outstanding so the poll backstop retries it'
     )
 
 
@@ -2017,15 +1262,8 @@ async def test_run_once_infra_leg_exception_does_not_advance_last_run_head(
 ):
     """An infra sub-run leg exception must also NOT advance _last_run_head.
 
-    Mirrors the numeric-leg test above but for the infra sub-run
-    (``offline_lane_infra_enabled=True``): a numeric-green pass followed by
-    an ``infra_runner`` raise must leave ``_last_run_head`` unadvanced too —
-    the step-2 fix must place the advance after BOTH red-handling legs and
-    the infra sub-run, not just the numeric leg.
-
-    Step 1 (RED): ``_last_run_head`` is set right after the numeric
-    ``suite_runner`` returns, before the infra sub-run even starts — must
-    fail before the step-2 reorder.
+    A numeric-green pass followed by an ``infra_runner`` raise must leave
+    ``_last_run_head`` unadvanced too: the advance comes after every leg.
     """
     git_ops = _make_git_ops(head='HEAD1')
     config = _make_config(tmp_path, offline_lane_infra_enabled=True)
@@ -2038,7 +1276,6 @@ async def test_run_once_infra_leg_exception_does_not_advance_last_run_head(
         suite_runner=suite_runner,
         infra_runner=infra_runner,
     )
-    worker._dirty = True
 
     with pytest.raises(RuntimeError, match='infra boom'):
         await worker._run_once()
@@ -2050,383 +1287,517 @@ async def test_run_once_infra_leg_exception_does_not_advance_last_run_head(
 
 
 @pytest.mark.timeout(10)
+@_inline_thread_hops()
 @virtual_clock_test
-async def test_loop_retries_after_red_handling_exception(tmp_path: Path):
-    """run()'s poll backstop retries a red-handling exception (Bug #2, end-to-end).
-
-    Because ``_run_once`` (after the step-2 reorder) no longer advances
-    ``_last_run_head`` until red-handling completes without raising, a
-    failed pass leaves the head outstanding; ``run()``'s existing poll
-    backstop (``head != self._last_run_head``) re-flags it on the very next
-    poll tick, so ``_handle_red_run`` is retried rather than silently
-    dropped. Mirrors ``test_loop_is_fail_open_and_cancellation_clean``'s
-    background-task + done-Event + tracking-sleep pattern.
-
-    Step 1 (RED): before the step-2 reorder, the first (failing) pass's
-    ``_last_run_head = head`` (set before ``_handle_red_run`` runs) leaves
-    the poll backstop believing the head was already handled —
-    ``_handle_red_run`` is never retried and this test times out waiting for
-    the 2nd call. Must fail before impl.
-    """
-    calls = {'n': 0}
+async def test_loop_retries_after_a_confirm_exception(tmp_path: Path):
+    """run()'s poll backstop retries a red pass whose confirm raised (Bug #2, end-to-end): the failed
+    pass leaves the head outstanding, so the next poll re-flags it and the confirm is asked again."""
+    asked = {'n': 0}
     done = asyncio.Event()
 
-    async def _handle_red_run_effect(wt, head):
-        calls['n'] += 1
-        if calls['n'] == 1:
-            raise RuntimeError('red handling boom')
+    async def _confirm(target: ConfirmTarget, detect: RunRecord | None, runner: ConfirmRunner) -> Confirmed:
+        asked['n'] += 1
+        if asked['n'] == 1:
+            raise RuntimeError('confirm boom')
         done.set()
+        return _CLEARED
 
-    git_ops = _make_git_ops(head='HEAD1')
-    config = _make_config(tmp_path, offline_lane_poll_interval_secs=0.05)
-    suite_runner = AsyncMock(return_value=(1, ''))
-    worker = _make_worker(tmp_path, git_ops=git_ops, config=config, suite_runner=suite_runner)
-    worker._handle_red_run = AsyncMock(side_effect=_handle_red_run_effect)
-    worker._dirty = True
+    worker = _make_worker(
+        tmp_path,
+        git_ops=_make_git_ops(head='HEAD1'),
+        config=_make_config(tmp_path, offline_lane_poll_interval_secs=0.05),
+        suite_runner=AsyncMock(return_value=(1, '')),
+        confirm=_confirm,
+    )
 
-    real_sleep = asyncio.sleep
-
-    async def _tracking_sleep(delay, *a, **k):
-        return await real_sleep(0)
-
-    with patch('orchestrator.offline_lane.asyncio.sleep', side_effect=_tracking_sleep), \
-            patch('orchestrator.offline_lane.logger'):
+    with patch('orchestrator.offline_lane.logger'):
         task = asyncio.create_task(worker.run())
         try:
-            await asyncio.wait_for(done.wait(), timeout=3.0)
+            await worker.on_post_merge('task-1', 'base', 'head')
+            await asyncio.wait_for(done.wait(), timeout=600)
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-    assert worker._handle_red_run.await_count >= 2, (
-        'the poll backstop must re-flag the still-outstanding head and retry '
-        '_handle_red_run after the first pass raised'
-    )
+    assert asked['n'] == 2, 'the poll backstop must re-run the head whose confirm raised'
 
 
 # ---------------------------------------------------------------------------
-# _run_once — generic per-project command sub-runs (task 2789, step-15/16)
-#
-# The PRD sec 7 behavioral matrix (T1-T6), exercised through the REAL reused
-# red path with injected fakes — no failing test ever lands on main (INV-5:
-# the generic path reuses the whole confirm→fingerprint→file/update→escalate
-# engine, adding only per-command iteration + a priority kwarg).
+# _run_once — generic per-project command sub-runs (task 2789)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_run_once_iterates_generic_commands_skipping_disabled(tmp_path: Path):
-    """_run_once runs each ENABLED generic command once (disabled ones skipped),
-    logs a labeled sub-run line, and — when every sub-run is green — advances
-    _last_green_head (Structural + T3).
-
-    Step 15 (RED): _run_once does not iterate offline_lane_commands yet —
-    command_runner is never awaited. Must fail before impl.
-    """
+async def test_run_once_iterates_generic_commands_skipping_disabled(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    """_run_once runs each ENABLED generic command once (disabled ones skipped) and logs a labeled
+    sub-run line for it."""
     from orchestrator.config import LaneCommand
 
     wt_path = tmp_path / '_offline-deep'
     cmd_a = LaneCommand(name='cmd-alpha', command='pytest -m integration', cwd='fused-memory')
     cmd_b = LaneCommand(name='cmd-beta', command='pytest -m slow', enabled=False)
-    git_ops = _make_git_ops(head='HEAD1', worktree_path=wt_path)
-    config = _make_config(tmp_path, offline_lane_commands=[cmd_a, cmd_b])
-    suite_runner = AsyncMock(return_value=(0, ''))
     command_runner = AsyncMock(return_value=(0, ''))
     worker = _make_worker(
-        tmp_path, git_ops=git_ops, config=config,
-        suite_runner=suite_runner, command_runner=command_runner,
+        tmp_path,
+        git_ops=_make_git_ops(head='HEAD1', worktree_path=wt_path),
+        config=_make_config(tmp_path, offline_lane_commands=[cmd_a, cmd_b]),
+        suite_runner=AsyncMock(return_value=(0, '')),
+        command_runner=command_runner,
     )
-    worker._handle_red_run = AsyncMock()
-    worker._dirty = True
 
-    with patch('orchestrator.offline_lane.logger') as mock_logger:
+    with caplog.at_level(logging.INFO, logger='orchestrator.offline_lane_pass'):
         await worker._run_once()
 
     command_runner.assert_awaited_once_with(cmd_a, wt_path, 'HEAD1')
-    worker._handle_red_run.assert_not_awaited()
-    assert worker._last_green_head == 'HEAD1', (
-        'all sub-runs green (numeric + the one enabled generic command) must '
-        'advance _last_green_head (T3)'
-    )
-
-    info_texts = [_log_call_text(call) for call in mock_logger.info.call_args_list]
-    assert any(
-        'cmd-alpha' in t and 'sub-run' in t and 'HEAD1' in t and 'PASS' in t
-        for t in info_texts
-    ), f'expected a labeled generic sub-run PASS log line, got {info_texts!r}'
-    assert not any('cmd-beta' in t for t in info_texts), (
-        'a disabled generic command must be skipped — never run nor logged'
-    )
+    lines = _sub_run_lines(caplog)
+    assert any(t.startswith('offline-lane: cmd-alpha sub-run head=HEAD1 status=PASS') for t in lines), lines
+    assert not any('cmd-beta' in t for t in lines), 'a disabled generic command must be neither run nor logged'
 
 
 @pytest.mark.asyncio
-async def test_run_once_generic_command_red_reuses_red_path_with_priority(tmp_path: Path):
-    """A red generic command reuses _handle_red_run with priority=cmd.fix_task_priority
-    and a confirmation_runner bound to command_confirmation_runner(cmd, …) (T6).
-
-    With the legacy numeric gate OFF, only the generic command runs (suite_runner
-    is never awaited); a red result blocks the all-green _last_green_head advance.
-
-    Step 15 (RED): _run_once does not iterate offline_lane_commands yet. Must
-    fail before impl.
-    """
+async def test_run_once_confirms_each_generic_red_with_its_own_command(tmp_path: Path):
+    """Each red generic command is confirmed against its OWN LaneCommand (no late-binding of the loop
+    variable), and with the legacy numeric gate off only the generic commands run."""
     from orchestrator.config import LaneCommand
 
     wt_path = tmp_path / '_offline-deep'
-    cmd = LaneCommand(
-        name='q', command='pytest -m integration', cwd='fused-memory',
-        fix_task_priority='low',
-    )
-    git_ops = _make_git_ops(head='HEAD1', worktree_path=wt_path)
-    config = _make_config(
-        tmp_path, offline_lane_legacy_numeric_enabled=False,
-        offline_lane_commands=[cmd],
-    )
+    cmd_q = LaneCommand(name='q', command='pytest -m integration', cwd='fused-memory', fix_task_priority='low')
+    cmd_r = LaneCommand(name='r', command='make check')
     suite_runner = AsyncMock(return_value=(0, ''))
     command_runner = AsyncMock(return_value=(1, 'tail'))
-    command_confirmation_runner = AsyncMock(return_value=['tests::test_x'])
+    confirm = _RecordingConfirm(_CLEARED)
     worker = _make_worker(
-        tmp_path, git_ops=git_ops, config=config,
-        suite_runner=suite_runner, command_runner=command_runner,
-        command_confirmation_runner=command_confirmation_runner,
+        tmp_path,
+        git_ops=_make_git_ops(head='HEAD1', worktree_path=wt_path),
+        config=_make_config(
+            tmp_path, offline_lane_legacy_numeric_enabled=False, offline_lane_commands=[cmd_q, cmd_r],
+        ),
+        suite_runner=suite_runner,
+        command_runner=command_runner,
+        confirm=confirm,
     )
-    worker._handle_red_run = AsyncMock()
-    worker._dirty = True
 
     await worker._run_once()
 
     suite_runner.assert_not_awaited()
-    command_runner.assert_awaited_once_with(cmd, wt_path, 'HEAD1')
-    worker._handle_red_run.assert_awaited_once()
-    call = worker._handle_red_run.await_args
-    assert call is not None
-    assert call.args == (wt_path, 'HEAD1')
-    assert call.kwargs['priority'] == 'low', (
-        "the filed fix task's priority must come from LaneCommand.fix_task_priority"
-    )
-    # The bound confirmation_runner must delegate to
-    # command_confirmation_runner(cmd, wt, head) — the per-iteration cmd binding
-    # (guards against the late-binding-closure bug).
-    conf = call.kwargs['confirmation_runner']
-    confirmed = await conf(wt_path, 'HEAD1')
-    command_confirmation_runner.assert_awaited_once_with(cmd, wt_path, 'HEAD1')
-    assert confirmed == ['tests::test_x']
-
-    assert worker._last_green_head is None, (
-        'a red generic sub-run must block the all-green _last_green_head advance'
-    )
+    assert command_runner.await_args_list == [call(cmd_q, wt_path, 'HEAD1'), call(cmd_r, wt_path, 'HEAD1')]
+    assert confirm.targets == [ConfirmTarget.generic(cmd_q, wt_path), ConfirmTarget.generic(cmd_r, wt_path)]
 
 
+@pytest.mark.parametrize(
+    ('leg', 'priority'),
+    [('numeric', 'high'), ('generic', 'low')],
+    ids=['legacy-numeric-at-high', 'generic-at-its-own-priority'],
+)
 @pytest.mark.asyncio
-async def test_run_once_generic_red_files_fix_task_end_to_end(tmp_path: Path):
-    """A confirmed-red generic command files exactly one fix task at the command's
-    priority + one L0 INFO escalation, through the REAL red path (T1).
-
-    _handle_red_run is NOT mocked here — the whole confirm→fingerprint→file→
-    INFO-escalation engine is reused (INV-5). The offline lane never touches
-    the merge queue (never-a-gate, C7).
-
-    Step 15 (RED): _run_once does not iterate offline_lane_commands yet, so no
-    fix task is ever filed. Must fail before impl.
-    """
+async def test_run_once_a_red_reproduced_on_two_spaced_passes_files_one_task(
+    tmp_path: Path, leg: str, priority: str,
+):
+    """The worker's engine files a fix task only on the second reproduced pass at least 30 minutes on,
+    exactly once, at the leg's priority, as a normal queued task — and never touches the merge queue."""
     from orchestrator.config import LaneCommand
-    from orchestrator.workflow import compute_failing_test_set_fingerprint
 
     wt_path = tmp_path / '_offline-deep'
-    cmd = LaneCommand(name='q', command='pytest -m integration')  # default priority 'medium'
-    git_ops = _make_git_ops(head='HEAD1', worktree_path=wt_path)
-    config = _make_config(
-        tmp_path, offline_lane_legacy_numeric_enabled=False,
-        offline_lane_commands=[cmd],
+    cmd = LaneCommand(name='q', command='pytest -m integration', fix_task_priority='low')
+    config = (
+        _make_config(tmp_path)
+        if leg == 'numeric'
+        else _make_config(tmp_path, offline_lane_legacy_numeric_enabled=False, offline_lane_commands=[cmd])
     )
-    command_runner = AsyncMock(return_value=(1, 'tail'))
-    confirmed_ids = ['tests::test_x']
-    command_confirmation_runner = AsyncMock(return_value=confirmed_ids)
-    task_client = AsyncMock()
-    task_client.submit_fix_task = AsyncMock(return_value='fix-1')
-    escalation_queue = MagicMock()
-    escalation_queue.get_by_task.return_value = []
-    escalation_queue.make_id.return_value = 'esc-fix-1-1'
+    heads = iter(['HEAD1', 'HEAD2'])
+    git_ops = _make_git_ops(worktree_path=wt_path)
+    git_ops.get_main_sha = AsyncMock(side_effect=lambda: next(heads))
+    git_ops.is_ancestor_checked = AsyncMock(return_value=True)
+    client = FakeLedgerClient([])
+    clock = Clock()
     worker = _make_worker(
-        tmp_path, git_ops=git_ops, config=config,
-        command_runner=command_runner,
-        command_confirmation_runner=command_confirmation_runner,
-        task_client=task_client, escalation_queue=escalation_queue,
+        tmp_path,
+        git_ops=git_ops,
+        config=config,
+        suite_runner=AsyncMock(return_value=(1, '')),
+        command_runner=AsyncMock(return_value=(1, '')),
+        confirm=_RecordingConfirm(_HELD),
+        task_client=client,
+        now=clock,
     )
-    worker._dirty = True
 
     await worker._run_once()
+    assert client.submitted == [], 'a first reproduced pass files nothing'
+    clock.advance(minutes=30)
+    await worker._run_once()
 
-    task_client.submit_fix_task.assert_awaited_once()
-    arguments = task_client.submit_fix_task.await_args.args[0]
-    assert arguments['priority'] == 'medium', (
-        "the default LaneCommand.fix_task_priority ('medium') must reach the filed task"
-    )
+    (arguments,) = client.submitted
+    assert arguments['priority'] == priority
+    assert arguments['metadata']['spawn_context'] == 'offline_lane_red'
     assert arguments['metadata']['merge_lane'] == 'normal', (
         'the offline lane files a NORMAL queued fix task — never a merge gate'
     )
-    assert arguments['metadata']['failing_tests'] == ['tests::test_x']
-
-    fp = compute_failing_test_set_fingerprint(confirmed_ids)
-    assert worker.open_fix_tasks[fp] == 'fix-1'
-
-    escalation_queue.submit.assert_called_once()
-    esc = escalation_queue.submit.call_args.args[0]
-    assert esc.severity == 'info'
-    assert esc.level == 0
-
-    # Never-a-gate (C7): the worker only snapshots head + resets the warm
-    # worktree — it must never touch the merge queue / merge lane target.
     touched = {str(c[0]).split('.')[0] for c in git_ops.mock_calls if c[0]}
     assert not any(
-        kw in name.lower()
-        for name in touched
-        for kw in ('merge', 'queue', 'enqueue', 'target')
+        kw in name.lower() for name in touched for kw in ('merge', 'queue', 'enqueue', 'target')
     ), f'offline lane must never touch the merge queue (never-a-gate); git_ops calls: {touched}'
 
 
 @pytest.mark.asyncio
-async def test_run_once_generic_red_flake_files_nothing(tmp_path: Path):
-    """A generic command red that does NOT reproduce on the confirm re-run is a
-    flake (T2): no fix task, no escalation — just the intermittent log line.
-
-    Step 15 (RED): _run_once does not iterate offline_lane_commands yet. Must
-    fail before impl.
-    """
+async def test_run_once_a_red_the_confirm_clears_files_nothing(tmp_path: Path):
+    """A generic red whose confirm clears the failing test on two spaced passes is a flake: nothing is filed."""
     from orchestrator.config import LaneCommand
 
-    wt_path = tmp_path / '_offline-deep'
     cmd = LaneCommand(name='q', command='pytest -m integration')
-    git_ops = _make_git_ops(head='HEAD1', worktree_path=wt_path)
-    config = _make_config(
-        tmp_path, offline_lane_legacy_numeric_enabled=False,
-        offline_lane_commands=[cmd],
-    )
-    command_runner = AsyncMock(return_value=(1, 'tail'))
-    command_confirmation_runner = AsyncMock(return_value=[])  # flake: nothing confirmed
-    task_client = AsyncMock()
-    escalation_queue = MagicMock()
+    client = FakeLedgerClient([])
+    clock = Clock()
     worker = _make_worker(
-        tmp_path, git_ops=git_ops, config=config,
-        command_runner=command_runner,
-        command_confirmation_runner=command_confirmation_runner,
-        task_client=task_client, escalation_queue=escalation_queue,
+        tmp_path,
+        git_ops=_make_git_ops(head='HEAD1', worktree_path=tmp_path / '_offline-deep'),
+        config=_make_config(tmp_path, offline_lane_legacy_numeric_enabled=False, offline_lane_commands=[cmd]),
+        command_runner=AsyncMock(return_value=(1, 'tail')),
+        confirm=_RecordingConfirm(_CLEARED),
+        task_client=client,
+        now=clock,
     )
-    worker._dirty = True
 
-    with patch('orchestrator.offline_lane.logger') as mock_logger:
-        await worker._run_once()
+    await worker._run_once()
+    clock.advance(minutes=30)
+    await worker._run_once()
 
-    task_client.submit_fix_task.assert_not_awaited()
-    escalation_queue.submit.assert_not_called()
-    assert any(
-        'intermittent nondeterminism' in call.args[0]
-        for call in mock_logger.info.call_args_list
-    ), 'expected an "intermittent nondeterminism" flake log line'
+    assert client.submitted == []
+
+
+async def _drive_one_pass(worker: OfflineLaneWorker, command: str) -> None:
+    """A merge lands and ``run()`` is driven as a background task until *command*'s next pass has recorded its effect."""
+    before = worker.records.current_pass(command)
+    await worker.on_post_merge('task-1', 'BASE', 'HEAD1')
+    task = asyncio.create_task(worker.run())
+    try:
+        while True:
+            assert not task.done(), f'the loop died: {task.exception()!r}'
+            current = worker.records.current_pass(command)
+            if current is not None and current is not before:
+                record = worker.records.load_pass(command, current.pass_id)
+                if record is not None and record.effect is not None:
+                    return
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 @pytest.mark.asyncio
-async def test_run_once_generic_red_dedups_then_promotes_l2_at_n_advances(tmp_path: Path):
-    """The same generic-command failing set across N confirmed-red advances files
-    once, appends the suspect range on later advances (never re-files), and stages
-    exactly one born-at-L2 blocker at N (T4) — all via the reused red engine.
-
-    Step 15 (RED): _run_once does not iterate offline_lane_commands yet. Must
-    fail before impl.
-    """
-    from orchestrator.config import LaneCommand
-    from orchestrator.workflow import compute_failing_test_set_fingerprint
-
-    wt_path = tmp_path / '_offline-deep'
+async def test_a_pass_record_older_than_the_retention_survives_while_a_held_episode_counts_it(tmp_path: Path):
+    """The run-record prune spares every pass an episode the engine still holds counted: the red that opened an
+    episode bound to an open task outlives the retention, while an unreferenced pass of that age is pruned."""
     cmd = LaneCommand(name='q', command='pytest -m integration')
-    heads = ['HEAD1', 'HEAD2', 'HEAD3']
-    head_calls = {'n': 0}
-
-    async def _get_main_sha() -> str:
-        h = heads[min(head_calls['n'], len(heads) - 1)]
-        head_calls['n'] += 1
-        return h
-
-    git_ops = MagicMock()
-    git_ops.get_main_sha = AsyncMock(side_effect=_get_main_sha)
-    git_ops.reset_persistent_offline_deep_worktree = AsyncMock(return_value=wt_path)
-    config = _make_config(
-        tmp_path, offline_lane_legacy_numeric_enabled=False,
-        offline_lane_commands=[cmd], offline_lane_red_advances_before_blocker=3,
-    )
-    command_runner = AsyncMock(return_value=(1, 'tail'))
-    confirmed_ids = ['tests::test_x']
-    command_confirmation_runner = AsyncMock(return_value=confirmed_ids)
-    task_client = AsyncMock()
-    task_client.submit_fix_task = AsyncMock(return_value='fix-1')
-    task_client.get_status = AsyncMock(return_value='in-progress')
-    escalation_queue = MagicMock()
-    escalation_queue.get_by_task.return_value = []
-    escalation_queue.make_id.return_value = 'esc-1'
+    clock = Clock()
+    client = FakeLedgerClient([])
     worker = _make_worker(
-        tmp_path, git_ops=git_ops, config=config,
-        command_runner=command_runner,
-        command_confirmation_runner=command_confirmation_runner,
-        task_client=task_client, escalation_queue=escalation_queue,
+        tmp_path,
+        git_ops=_make_git_ops(head='HEAD1', worktree_path=tmp_path / '_offline-deep'),
+        config=_make_config(tmp_path, offline_lane_legacy_numeric_enabled=False, offline_lane_commands=[cmd]),
+        command_runner=AsyncMock(return_value=(1, 'tail')),
+        confirm=_RecordingConfirm(_HELD),
+        task_client=client,
+        escalation_queue=EscalationQueue(tmp_path / 'queue'),
+        now=clock,
     )
-    fp = compute_failing_test_set_fingerprint(confirmed_ids)
+    await _drive_one_pass(worker, 'q')
+    counted_pass_id = _pass_record(worker, 'q').pass_id
+    unreferenced = worker.records.allocate_pass('stale', Leg.GENERIC, 'HEAD9')
+    clock.advance(minutes=30)
+    await _drive_one_pass(worker, 'q')
+    (task_id,) = client.tasks
+    client.set_status(task_id, 'in-progress')
 
-    # advance 1 — files the fix task
-    worker._dirty = True
-    await worker._run_once()
-    task_client.submit_fix_task.assert_awaited_once()
-    assert worker.open_fix_tasks[fp] == 'fix-1'
-    assert worker._red_advance_counts[fp] == 1
+    for _ in range(15):
+        clock.advance(hours=23)
+        await _drive_one_pass(worker, 'q')
 
-    # advance 2 — appends the suspect range, no re-file, no L2 yet
-    worker._dirty = True
-    await worker._run_once()
-    task_client.submit_fix_task.assert_awaited_once()
-    task_client.append_suspect_range.assert_awaited()
-    assert worker._red_advance_counts[fp] == 2
-
-    # advance 3 — reaches N=3, stages exactly one born-at-L2 blocker
-    worker._dirty = True
-    await worker._run_once()
-    task_client.submit_fix_task.assert_awaited_once()  # never re-filed
-    assert worker._red_advance_counts[fp] == 3
-
-    levels = [c.args[0].level for c in escalation_queue.submit.call_args_list]
-    assert levels.count(0) == 1, 'exactly one L0 INFO on the first file'
-    assert levels.count(2) == 1, 'exactly one born-at-L2 blocker at N advances'
-    l2 = next(c.args[0] for c in escalation_queue.submit.call_args_list if c.args[0].level == 2)
-    assert l2.severity == 'critical'
-    assert l2.agent_role == 'orchestrator-offline-lane'
-    assert l2.task_id == 'fix-1'
+    assert worker.records.load_pass('q', counted_pass_id) is not None
+    assert not worker.records.pass_directory('stale', unreferenced.pass_id).exists()
 
 
 @pytest.mark.asyncio
 async def test_run_once_no_generic_commands_is_reify_byte_identical(tmp_path: Path):
-    """With no generic commands and the legacy numeric gate ON, _run_once is
-    byte-identical to prior reify behaviour (T5): the numeric suite runs, the
-    command_runner is never awaited, and a green pass advances _last_green_head.
-
-    Regression guard — must pass BOTH before and after step-16 (an empty
-    offline_lane_commands list must not change numeric behaviour).
-    """
+    """With no generic commands and the legacy numeric gate ON, _run_once runs the numeric suite and
+    never the command_runner (T5)."""
     wt_path = tmp_path / '_offline-deep'
-    git_ops = _make_git_ops(head='HEAD1', worktree_path=wt_path)
     config = _make_config(tmp_path)  # defaults: legacy numeric ON, commands=[]
     suite_runner = AsyncMock(return_value=(0, ''))
     command_runner = AsyncMock(return_value=(0, ''))
     worker = _make_worker(
-        tmp_path, git_ops=git_ops, config=config,
-        suite_runner=suite_runner, command_runner=command_runner,
+        tmp_path,
+        git_ops=_make_git_ops(head='HEAD1', worktree_path=wt_path),
+        config=config,
+        suite_runner=suite_runner,
+        command_runner=command_runner,
     )
-    worker._handle_red_run = AsyncMock()
-    worker._dirty = True
 
     await worker._run_once()
 
-    suite_runner.assert_awaited_once_with(
-        wt_path, 'HEAD1', config.git.offline_lane_test_threads,
-    )
+    suite_runner.assert_awaited_once_with(wt_path, 'HEAD1', config.git.offline_lane_test_threads)
     command_runner.assert_not_awaited()
-    worker._handle_red_run.assert_not_awaited()
-    assert worker._last_green_head == 'HEAD1'
+
+
+# ---------------------------------------------------------------------------
+# run() — the idle poll ticks the engine and runs the rechecks it names
+#
+# The worker's engine is replaced by a scripted one so each tick's answer is
+# chosen; every leg's seam logs ``<leg>@<head>`` and every worktree reset
+# ``reset@<head>``, so a test reads the whole sequence of the loop's work.
+# ---------------------------------------------------------------------------
+
+
+_POLL_SECS = 120.0
+_NO_EFFECT = PassEffect(
+    tests_counted=(), episodes_started=(), episodes_extended=(), episodes_ended=(),
+    threshold_reached=(), stale_heads=(), no_decision=(), tasks_filed=(), escalations_raised=(),
+)
+_NOTHING_DUE = TickResult((), ())
+
+TickAnswer = TickResult | Exception | Callable[[], Awaitable[TickResult]]
+
+
+class _ScriptedEngine:
+    """The worker's engine, scripted: each tick logs ``tick@<head>`` and the loop time, then gives the
+    next queued answer (a result, an exception to raise, or a coroutine to await), else nothing due."""
+
+    def __init__(self, events: list[str], answers: Sequence[TickAnswer]) -> None:
+        self.events = events
+        self.answers = list(answers)
+        self.tick_times: list[float] = []
+
+    async def observe(self, observation: PassObservation) -> PassEffect:
+        return _NO_EFFECT
+
+    async def tick(self, *, head: str) -> TickResult:
+        self.tick_times.append(asyncio.get_running_loop().time())
+        self.events.append(f'tick@{head}')
+        if not self.answers:
+            return _NOTHING_DUE
+        answer = self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        if isinstance(answer, TickResult):
+            return answer
+        return await answer()
+
+    def pinned_pass_ids(self) -> frozenset[str]:
+        return frozenset()
+
+
+class _LoopRig:
+    """A worker running numeric plus two generic commands ``q`` and ``r`` over a scripted engine.
+
+    ``head`` is what main reads now; ``during`` maps an event to a coroutine run while that event's seam runs.
+    """
+
+    def __init__(self, tmp_path: Path, answers: Sequence[TickAnswer]) -> None:
+        from orchestrator.config import LaneCommand
+
+        self.events: list[str] = []
+        self.head = 'HEAD1'
+        self.during: dict[str, Callable[[], Awaitable[None]]] = {}
+        self.engine = _ScriptedEngine(self.events, answers)
+        git_ops = MagicMock()
+        git_ops.get_main_sha = AsyncMock(side_effect=lambda: self.head)
+        git_ops.reset_persistent_offline_deep_worktree = AsyncMock(side_effect=self._reset)
+        config = _make_config(
+            tmp_path,
+            offline_lane_poll_interval_secs=_POLL_SECS,
+            offline_lane_commands=[LaneCommand(name='q', command='pytest q'), LaneCommand(name='r', command='pytest r')],
+        )
+        with patch('orchestrator.offline_lane.LaneEngine', return_value=self.engine):
+            self.worker = _make_worker(
+                tmp_path, git_ops=git_ops, config=config,
+                suite_runner=self._suite_runner, command_runner=self._command_runner,
+            )
+
+    async def _event(self, event: str) -> None:
+        self.events.append(event)
+        if (hook := self.during.pop(event, None)) is not None:
+            await hook()
+
+    async def _reset(self, head: str) -> Path:
+        await self._event(f'reset@{head}')
+        return Path('/tmp/_offline-deep')
+
+    async def _suite_runner(self, wt: Path, head: str, threads: int) -> tuple[int, str]:
+        await self._event(f'numeric@{head}')
+        return (0, '')
+
+    async def _command_runner(self, cmd, wt: Path, head: str) -> tuple[int, str]:
+        await self._event(f'{cmd.name}@{head}')
+        return (0, '')
+
+    async def run_for(self, seconds: float) -> None:
+        """Run the loop for *seconds* of loop time."""
+        task = asyncio.create_task(self.worker.run())
+        try:
+            await asyncio.sleep(seconds)
+            assert not task.done(), f'the loop died: {task.exception()!r}'
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def run_until(self, ticks: int) -> list[str]:
+        """Run the loop until the engine has been ticked *ticks* times; the events up to that tick."""
+        task = asyncio.create_task(self.worker.run())
+        try:
+            while len(self.engine.tick_times) < ticks:
+                assert not task.done(), f'the loop died: {task.exception()!r}'
+                await asyncio.sleep(_POLL_SECS / 4)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        tick_indexes = [i for i, event in enumerate(self.events) if event.startswith('tick@')]
+        return self.events[:tick_indexes[ticks - 1] + 1]
+
+
+def _due(*commands: str) -> TickResult:
+    return TickResult(commands, ())
+
+
+_FULL_PASS_AT_HEAD1 = ['reset@HEAD1', 'numeric@HEAD1', 'q@HEAD1', 'r@HEAD1']
+_FULL_PASS_AT_HEAD2 = ['reset@HEAD2', 'numeric@HEAD2', 'q@HEAD2', 'r@HEAD2']
+_FULL_PASS_AT_HEAD3 = ['reset@HEAD3', 'numeric@HEAD3', 'q@HEAD3', 'r@HEAD3']
+
+
+@pytest.mark.timeout(10)
+@_inline_thread_hops()
+@virtual_clock_test
+async def test_a_poll_timeout_ticks_the_engine_at_the_current_head(tmp_path: Path):
+    """Every poll interval that passes with no trigger ticks the engine once with main's head; a first
+    tick at a head never run is the backstop's, and runs one full pass."""
+    rig = _LoopRig(tmp_path, [])
+
+    events = await rig.run_until(ticks=3)
+
+    assert events == ['tick@HEAD1', *_FULL_PASS_AT_HEAD1, 'tick@HEAD1', 'tick@HEAD1']
+    assert rig.engine.tick_times == [_POLL_SECS, 2 * _POLL_SECS, 3 * _POLL_SECS]
+
+
+@pytest.mark.timeout(10)
+@_inline_thread_hops()
+@virtual_clock_test
+async def test_a_poll_timeout_with_no_main_head_neither_ticks_the_engine_nor_rechecks(tmp_path: Path):
+    """When main reads no head, the poll ticks nothing and runs nothing, however long the loop idles; the
+    first poll that reads a head ticks as usual."""
+    rig = _LoopRig(tmp_path, [_due('q')])
+    rig.head = ''
+
+    await rig.run_for(5 * _POLL_SECS)
+
+    assert rig.events == []
+    assert rig.engine.tick_times == []
+
+    rig.head = 'HEAD1'
+    events = await rig.run_until(ticks=1)
+
+    assert events == ['tick@HEAD1']
+
+
+@pytest.mark.timeout(10)
+@_inline_thread_hops()
+@virtual_clock_test
+async def test_a_due_command_gets_one_recheck_pass_and_a_merge_landing_during_it_still_runs_a_full_pass(
+    tmp_path: Path,
+):
+    """A tick naming a due command at an already-run head runs exactly one pass of that command at that
+    head, after the same worktree reset, and nothing else. The recheck leaves the trigger flag alone: a
+    merge landing during it runs as a full pass at the new head straight after, with no tick between."""
+    rig = _LoopRig(tmp_path, [])
+
+    async def _merge_lands() -> None:
+        rig.head = 'HEAD2'
+        await rig.worker.on_post_merge('task-9', 'HEAD1', 'HEAD2')
+
+    async def _due_with_a_merge_during_the_recheck() -> TickResult:
+        rig.during['q@HEAD1'] = _merge_lands
+        return _due('q')
+
+    rig.engine.answers = [_NOTHING_DUE, _due_with_a_merge_during_the_recheck]
+    events = await rig.run_until(ticks=3)
+
+    assert events == [
+        'tick@HEAD1', *_FULL_PASS_AT_HEAD1,
+        'tick@HEAD1', 'reset@HEAD1', 'q@HEAD1',
+        *_FULL_PASS_AT_HEAD2,
+        'tick@HEAD2',
+    ]
+
+
+@pytest.mark.timeout(10)
+@_inline_thread_hops()
+@virtual_clock_test
+async def test_a_recheck_leaves_a_missed_advance_to_the_backstop(tmp_path: Path):
+    """A recheck runs at the head its tick read, even when main moves during it with no trigger, and does
+    not take that head as run: the next tick sees the advance and runs a full pass there."""
+    rig = _LoopRig(tmp_path, [])
+
+    async def _main_moves_silently() -> None:
+        rig.head = 'HEAD2'
+
+    async def _due_with_a_silent_advance_during_the_recheck() -> TickResult:
+        rig.during['q@HEAD1'] = _main_moves_silently
+        return _due('q')
+
+    rig.engine.answers = [_NOTHING_DUE, _due_with_a_silent_advance_during_the_recheck]
+    events = await rig.run_until(ticks=4)
+
+    assert events == [
+        'tick@HEAD1', *_FULL_PASS_AT_HEAD1,
+        'tick@HEAD1', 'reset@HEAD1', 'q@HEAD1',
+        'tick@HEAD2', *_FULL_PASS_AT_HEAD2,
+        'tick@HEAD2',
+    ]
+
+
+@pytest.mark.timeout(10)
+@_inline_thread_hops()
+@virtual_clock_test
+async def test_a_moved_head_runs_a_full_pass_instead_of_the_recheck(tmp_path: Path):
+    """A tick naming a due command runs no recheck when main has moved since the last run, nor when a
+    trigger arrived during the tick: the full pass at the current head covers every due command."""
+    rig = _LoopRig(tmp_path, [])
+
+    async def _main_moves_silently() -> None:
+        rig.head = 'HEAD2'
+
+    async def _due_while_a_trigger_arrives() -> TickResult:
+        rig.head = 'HEAD3'
+        await rig.worker.on_post_merge('task-9', 'HEAD2', 'HEAD3')
+        return _due('q')
+
+    rig.during['r@HEAD1'] = _main_moves_silently
+    rig.engine.answers = [_NOTHING_DUE, _due('q'), _due_while_a_trigger_arrives]
+    events = await rig.run_until(ticks=4)
+
+    assert events == [
+        'tick@HEAD1', *_FULL_PASS_AT_HEAD1,
+        'tick@HEAD2', *_FULL_PASS_AT_HEAD2,
+        'tick@HEAD2', *_FULL_PASS_AT_HEAD3,
+        'tick@HEAD3',
+    ]
+
+
+@pytest.mark.timeout(10)
+@_inline_thread_hops()
+@virtual_clock_test
+async def test_a_raising_tick_costs_a_backoff_not_the_loop(tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    """A tick that raises is logged as a failed pass and backed off (60s); the loop then ticks again
+    and goes on working: one bad tick never kills the worker."""
+    rig = _LoopRig(tmp_path, [RuntimeError('tick boom')])
+
+    with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane'):
+        events = await rig.run_until(ticks=3)
+
+    assert events == ['tick@HEAD1', 'tick@HEAD1', *_FULL_PASS_AT_HEAD1, 'tick@HEAD1']
+    assert rig.engine.tick_times == [_POLL_SECS, 2 * _POLL_SECS + 60.0, 3 * _POLL_SECS + 60.0]
+    assert [r.getMessage() for r in caplog.records] == [
+        'offline-lane: run() pass failed (consecutive=1): RuntimeError: tick boom',
+    ]

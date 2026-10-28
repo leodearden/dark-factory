@@ -279,8 +279,14 @@ class TestGroupIdsFilterAgreement:
 # pair pins that the key and the filter agree, this row pins that a path-shaped
 # id is refused before any DB call, and the two are different claims.
 #
+# `enumerate_ranked_entity_nodes` (task 5662) joined for both reasons too: it
+# resolves a graph key via _graph_for AND filters on $group_id.
+#
 # `enumerate_valid_edges_mentioning` (task 4851) joined for the same reason as
 # enumerate_all_valid_edges, whose narrowed sibling it is.
+#
+# `get_edges_by_uuids` (task 6137) joined because it resolves a graph key via
+# _graph_for, as its single-edge sibling get_edge_text does.
 _ALL_GROUP_ARG_SWEEP_CASES = [
     ('get_episode_by_uuid', ('ep1',), {'group_id': _PATH_SHAPED}),
     ('remove_episode', ('ep1',), {'group_id': _PATH_SHAPED}),
@@ -309,6 +315,7 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('rename_entity_node', ('n1', 'NewName'), {'group_id': _PATH_SHAPED}),
     ('list_entity_nodes', (), {'group_id': _PATH_SHAPED}),
     ('enumerate_entity_nodes', (), {'group_id': _PATH_SHAPED}),
+    ('enumerate_ranked_entity_nodes', (), {'group_id': _PATH_SHAPED}),
     ('detect_stale_with_edges', (), {'group_id': _PATH_SHAPED}),
     ('detect_stale_dry_run', (), {'group_id': _PATH_SHAPED}),
     ('detect_stale_summaries', (), {'group_id': _PATH_SHAPED}),
@@ -317,6 +324,7 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('update_node_name', ('n1', 'Name'), {'group_id': _PATH_SHAPED}),
     ('get_edge_text', ('e1',), {'group_id': _PATH_SHAPED}),
     ('get_edge_invalid_at', ('e1',), {'group_id': _PATH_SHAPED}),
+    ('get_edges_by_uuids', (['e1'],), {'group_id': _PATH_SHAPED}),
     ('update_node_embedding', ('n1', [0.1]), {'group_id': _PATH_SHAPED}),
     ('update_edge_embedding', ('e1', [0.1]), {'group_id': _PATH_SHAPED}),
     ('list_indices', (), {'group_id': _PATH_SHAPED}),
@@ -331,8 +339,8 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('retrieve_episodes', (), {'group_ids': [_PATH_SHAPED]}),
 ]
 
-assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 43, (
-    'Sweep must cover exactly the 43 public group-arg GraphitiBackend methods '
+assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 45, (
+    'Sweep must cover exactly the 45 public group-arg GraphitiBackend methods '
     'this table claims: every one not covered by the step-1/3/5 positive-path '
     'tests, plus find_entity_nodes_by_name_substring, which is in both (see the '
     'comment above) — update this table if the decorated surface ever changes.'

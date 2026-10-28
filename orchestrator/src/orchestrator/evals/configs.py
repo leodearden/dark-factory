@@ -14,9 +14,9 @@ always loses to an existing ``config.prices`` entry).
 import logging
 import os
 from dataclasses import dataclass, field
-from enum import StrEnum
 
 from orchestrator.config import default_price_table
+from orchestrator.shadow_types import CostBasis
 
 logger = logging.getLogger(__name__)
 
@@ -714,13 +714,6 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
             base_url=KIMI_BASE_URL, auth_token_env=KIMI_AUTH_TOKEN_ENV,
         ),
     ]
-
-
-class CostBasis(StrEnum):
-    """How an arm is billed: the closed cost-basis vocabulary of live-shadow PRD decision 16."""
-
-    METERED = 'metered'
-    SUBSCRIPTION = 'subscription'
 
 
 @dataclass(frozen=True)

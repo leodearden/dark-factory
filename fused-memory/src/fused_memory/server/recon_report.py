@@ -16,8 +16,9 @@ import inspect
 import json
 import logging
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal
 
 from graphiti_core.errors import EdgeNotFoundError
@@ -29,6 +30,7 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.reconciliation import citation_repair
 from fused_memory.services.memory_service import MemoryNotFoundError
+from fused_memory.utils.clip_disclosure import clip_text
 from fused_memory.utils.validation import is_full_uuid
 
 logger = logging.getLogger(__name__)
@@ -304,21 +306,15 @@ _MAX_PURGED_TEXT_CHARS = 2_000
 _MAX_PURGED_FINDINGS = 20
 
 
-def _truncate_field(value: str, cap: int) -> tuple[str, bool]:
-    """Cap *value* to *cap* chars, appending ``_TRUNCATION_MARKER`` if truncated.
+def _truncate_field(value: str, cap: int, *, field: str) -> tuple[str, bool]:
+    """``(value cut by clip_text, was_truncated)``, marked with the uncounted ``_TRUNCATION_MARKER``.
 
-    Returns ``(possibly-truncated value, was_truncated)``.  A *value* whose
-    length is ``<= cap`` is returned unchanged with ``False``.
-
-    Note: the marker is appended AFTER slicing to *cap*, so a truncated
-    result is ``cap + len(_TRUNCATION_MARKER)`` chars long, not exactly
-    *cap* — harmless given today's generous ``_MAX_FINDING_TEXT_CHARS``
-    bound, but relevant if *cap* is ever tightened to a hard byte/char
-    budget.
+    The marker stays uncounted because truncated text is persisted and feeds the null-null description dedup hash.
     """
-    if len(value) > cap:
-        return value[:cap] + _TRUNCATION_MARKER, True
-    return value, False
+    clip = clip_text(value, cap, field=field)
+    if clip.fact is None:
+        return clip.text, False
+    return clip.text + _TRUNCATION_MARKER, True
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +753,13 @@ class ReconReportState:
         self._ttl_seconds = ttl_seconds
         self._clock_fn = clock
         self._reaper_interval = reaper_interval
-        self._state: dict[tuple[str, str], _ReportEntry] = {}
+        # Resident entries.  _state is a READ-ONLY view so that no caller can
+        # add an entry without registering it in _run_entries: entries enter
+        # only through _install_entry, and leave only by tick()'s eviction.
+        self._resident_entries: dict[tuple[str, str], _ReportEntry] = {}
+        self._state: Mapping[tuple[str, str], _ReportEntry] = MappingProxyType(
+            self._resident_entries
+        )
         self._active: dict[str, str] = {}  # run_id → current stage
         # Run-level O(1) indices so add_finding / _resolve_finding avoid scanning
         # all entries across every live run_id.  Populated on the miss path of
@@ -790,6 +792,10 @@ class ReconReportState:
         # see tick()'s docstring — released together, never torn down
         # per-entry.
         self._run_cited_task_index: dict[str, dict[str, str]] = {}
+        # run_id → {stage → that stage's latest entry, live or evicted}: the
+        # persist reach (see _reachable_run_entries).  Written only by
+        # _install_entry; same run-quiescence lifetime as the indices above.
+        self._run_entries: dict[str, dict[str, _ReportEntry]] = {}
         self._reaper_task: asyncio.Task | None = None
         # cite_* service injection (task β)
         self._memory_service = memory_service
@@ -818,63 +824,46 @@ class ReconReportState:
     def _reachable_run_entries(self, run_id: str) -> list[_ReportEntry]:
         """Every entry of *run_id* a mutation can still REACH, one per stage.
 
-        The union of this run's ``_state`` entries and the distinct entries
-        behind ``_run_finding_index[run_id]``.  The two differ because
-        :meth:`tick` evicts a completed entry from ``_state`` at its own TTL
-        but deliberately keeps it in ``_run_finding_index`` until the whole RUN
-        quiesces (see that method's docstring), so its findings stay citable —
-        and supersedable — from a still-live sibling stage.
+        ``_run_entries[run_id]``: every entry the run has installed through
+        :meth:`_install_entry`, live or evicted, until the run quiesces.  It
+        is wider than the run's ``_state`` rows because :meth:`tick` evicts a
+        completed entry from ``_state`` at its own TTL but keeps the run's
+        indices until the whole RUN quiesces (see that method's docstring), so
+        an evicted stage's findings stay citable — and supersedable — from a
+        still-live sibling stage.
 
         The invariant, named once here so the two scopes cannot drift apart:
-        an entry a mutation can reach through :meth:`_resolve_finding` is an
-        entry :meth:`_persist_run` must WRITE and :meth:`_purge_finding` must
-        SWEEP.  Before task 4653 both walked ``_state`` alone, so every
-        mutation of an evicted-but-indexed finding — the whole ``cite_*``
-        family as well as the ``supersedes`` stamp — was applied in memory and
-        then silently dropped on the way to the store.
+        every entry a mutation can reach is in the write reach — an entry
+        :meth:`_resolve_finding` can hand to a mutator is an entry
+        :meth:`_persist_run` must WRITE and :meth:`_purge_finding` must SWEEP.
+        Before task 4653 both walked ``_state`` alone, so every mutation of an
+        evicted-but-indexed finding — the whole ``cite_*`` family as well as
+        the ``supersedes`` stamp — was applied in memory and then silently
+        dropped on the way to the store.
 
-        Deduped by ``(run_id, stage)`` — the store's PRIMARY KEY — and NOT by
-        object identity, with the ``_state`` entry winning any collision.  Two
-        distinct entry objects can share one stage: :meth:`start_report`'s
-        docstring documents the evict-then-restart path (task 3988) where an
-        evicted-but-still-indexed entry is shadowed by a fresh same-name entry
-        in ``_state``.  Identity-deduping returned BOTH, and since
-        :meth:`_persist_run` upserts them in one ``executemany`` against
-        ``ON CONFLICT(run_id, stage) DO UPDATE``, the stale twin landed last and
-        overwrote the live stage's row — persisted state silently diverging from
-        memory, and :meth:`hydrate_from_store` resurrecting the dead entry while
-        dropping every finding the live stage had filed.  The live ``_state``
-        row is therefore the one persisted; the evicted twin's stamps are
-        unpersistable because the store has no key to hold them under.
+        The registry does not depend on which findings remain, so an evicted
+        entry stays in the reach after its LAST finding is purged.  That is
+        the case :meth:`cite_task`'s cross-stage fold creates (task 6025): it
+        purges the losing finding from its OWNING entry, which can be an
+        earlier, evicted stage, and that stage's row must be rewritten without
+        it or a restart hydrates the purged finding back.
+
+        Keyed by stage, so the store's PRIMARY KEY ``(run_id, stage)`` holds
+        structurally: one entry per stage, never two rows racing for one key
+        in :meth:`_persist_run`'s single upsert.  A same-stage fresh-create
+        overwrites the slot, so the live entry shadows an evicted twin
+        (task 3988, see :meth:`start_report`'s docstring); that twin is still
+        reachable through ``_run_finding_index`` for its old findings, but its
+        later stamps have no row to land in, since the store has no key to
+        hold them under.
 
         Deliberately NOT for READS.  :meth:`get_assembled_report` stays
         ``_state``-scoped on purpose: an evicted stage dropping out of the
         assembled report is that method's intended semantics, and widening it
         with this helper would change what the report CONTAINS — far beyond
         aligning write reach with mutation reach.
-
-        SCOPE CAVEAT, because the invariant above is only as wide as its inputs:
-        the evicted half of the union is derived from ``_run_finding_index``, so
-        an evicted entry is reachable only while it still OWNS at least one
-        indexed finding.  Purging its last finding therefore drops it out of
-        this set — and out of the next :meth:`_persist_run` — leaving its
-        persisted row carrying the purged finding until run quiescence GCs it,
-        or until a restart hydrates it back.  Not reachable today: an evicted
-        entry is by definition completed, :meth:`delete_finding` refuses a
-        completed owning entry, and :meth:`cite_task`'s fold purges only the
-        in-flight new finding, which its own live entry owns.  It is stated
-        rather than relied on silently: a future mutator that can purge from a
-        completed entry needs the write reach pinned some other way (e.g. a
-        per-run set of ``(run_id, stage)`` keys ever persisted) rather than
-        derived from the findings that happen to remain.
         """
-        by_key: dict[tuple[str, str], _ReportEntry] = {}
-        for entry in self._run_finding_index.get(run_id, {}).values():
-            by_key[(entry.run_id, entry.stage)] = entry
-        for (rid, stage), entry in self._state.items():
-            if rid == run_id:
-                by_key[(rid, stage)] = entry  # _state is authoritative
-        return list(by_key.values())
+        return list(self._run_entries.get(run_id, {}).values())
 
     def _persist_run(self, run_id: str) -> None:
         """Write every ``(run_id, *)`` entry through to the store.  No-op if
@@ -888,13 +877,14 @@ class ReconReportState:
         whole run is trivially correct where "persist only what changed" would
         need fragile per-method reasoning about which stage's row to write.
 
-        The entries written are :meth:`_reachable_run_entries`, NOT the run's
-        ``_state`` rows.  Task 4653's supersession stamp is what forced that
-        reach to widen: its target is routinely an earlier stage that completed
-        and then aged out of ``_state`` while the run stayed live, so writing
-        only ``_state`` dropped the stamp — and, identically, every ``cite_*``
-        citation recorded on an evicted entry's finding.  See that helper for
-        the invariant binding mutation reach and write reach together.
+        The entries written are :meth:`_reachable_run_entries` — the run's
+        registered entries, live or evicted — NOT just its ``_state`` rows.  A
+        mutation's target is routinely an earlier stage that completed and then
+        aged out of ``_state`` while the run stayed live: task 4653's
+        supersession stamp, every ``cite_*`` citation recorded on an evicted
+        entry's finding, and :meth:`cite_task`'s cross-stage fold purge
+        (task 6025).  See that helper for the invariant binding mutation reach
+        and write reach together.
 
         For each entry, computes its OWNED slice of the two run-level fold
         anchors (``_run_cited_task_index`` / the derived-signature entries in
@@ -1081,7 +1071,7 @@ class ReconReportState:
             # diagnostics-only (not used for eviction) and is NOT re-anchored.
             if entry.completed_at is not None:
                 entry.completed_at = self._clock()
-            self._state[(run_id, stage)] = entry
+            self._install_entry(entry)
             if row['is_active']:
                 self._active[run_id] = stage
             # Rebuild the four run-level dedup indices by unioning this entry's
@@ -1310,7 +1300,7 @@ class ReconReportState:
             project_id=project_id,
             created_at=self._clock(),
         )
-        self._state[(run_id, stage)] = entry
+        self._install_entry(entry)
         self._active[run_id] = stage
         self._persist_run(run_id)
         return {'run_id': run_id, 'stage': stage, 'already_started': False}
@@ -1574,15 +1564,19 @@ class ReconReportState:
         # its ordering relative to the dedup check below is not load-bearing
         # the way description's is.
         warnings: list[str] = []
-        description, description_truncated = _truncate_field(description, _MAX_FINDING_TEXT_CHARS)
+        description, description_truncated = _truncate_field(
+            description, _MAX_FINDING_TEXT_CHARS, field='description'
+        )
         if description_truncated:
             warnings.append(f'description truncated to {_MAX_FINDING_TEXT_CHARS} chars')
         suggested_action, suggested_action_truncated = _truncate_field(
-            suggested_action, _MAX_FINDING_TEXT_CHARS
+            suggested_action, _MAX_FINDING_TEXT_CHARS, field='suggested_action'
         )
         if suggested_action_truncated:
             warnings.append(f'suggested_action truncated to {_MAX_FINDING_TEXT_CHARS} chars')
-        category, category_truncated = _truncate_field(category, _MAX_FINDING_TEXT_CHARS)
+        category, category_truncated = _truncate_field(
+            category, _MAX_FINDING_TEXT_CHARS, field='category'
+        )
         if category_truncated:
             warnings.append(f'category truncated to {_MAX_FINDING_TEXT_CHARS} chars')
 
@@ -2204,6 +2198,13 @@ class ReconReportState:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _install_entry(self, entry: _ReportEntry) -> None:
+        """Make *entry* resident and its run's registered entry for its stage —
+        the only way into the read-only ``_state``, so every resident entry is
+        registered."""
+        self._resident_entries[(entry.run_id, entry.stage)] = entry
+        self._run_entries.setdefault(entry.run_id, {})[entry.stage] = entry
+
     def _resolve_entry(self, run_id: str) -> _ReportEntry | None:
         stage = self._active.get(run_id)
         if stage is None:
@@ -2249,12 +2250,12 @@ class ReconReportState:
         exactly the class of stale pointer this helper exists to prevent:
         left in place it would keep the superseded finding neutered forever,
         pointing at a row that no longer exists.  The sweep covers the run's
-        REACHABLE entries (:meth:`_reachable_run_entries`) — the same union
-        :meth:`_persist_run` writes — because a superseder routinely lives in
-        a later stage's entry than its target, and that target's stage has
-        routinely been EVICTED from ``_state`` by then while staying
-        resolvable and persisted.  Doing it here covers BOTH removal paths
-        for free, so they cannot drift apart.
+        REACHABLE entries (:meth:`_reachable_run_entries`) — the same
+        registered entries :meth:`_persist_run` writes — because a superseder
+        routinely lives in a later stage's entry than its target, and that
+        target's stage has routinely been EVICTED from ``_state`` by then while
+        staying resolvable and persisted.  Doing it here covers BOTH removal
+        paths for free, so they cannot drift apart.
 
         A target is restored to live-actionable only when NO superseder is left.
         Several findings can assert supersession of one target — the target
@@ -2327,13 +2328,14 @@ class ReconReportState:
                 run_sig_index.pop(derived_sig, None)
 
         # task-4653: repair every forward pointer AT this finding.  The reach is
-        # the run's REACHABLE entries — the same union _persist_run writes, not
-        # just its _state rows.  Entry-scoped would be too narrow because the
-        # superseder routinely lives in a later stage's entry than its target
-        # (see add_finding's supersedes); _state-scoped would be too narrow
-        # because that target's stage has routinely been evicted by then, and
-        # an evicted stage's finding is still resolvable and still persisted,
-        # so a pointer at it is still live and still able to dangle.
+        # the run's REACHABLE entries — the same registered entries
+        # _persist_run writes, not just its _state rows.  Entry-scoped would be
+        # too narrow because the superseder routinely lives in a later stage's
+        # entry than its target (see add_finding's supersedes); _state-scoped
+        # would be too narrow because that target's stage has routinely been
+        # evicted by then, and an evicted stage's finding is still resolvable
+        # and still persisted, so a pointer at it is still live and still able
+        # to dangle.
         #
         # Repair, not clear: a target can carry assertions from SEVERAL
         # superseders (each stamp moves its single effective pointer forward),
@@ -2446,14 +2448,12 @@ class ReconReportState:
         ``structural_copy`` field says whether this purge's copy was kept.
 
         *record_entry* is the CITING stage's entry (the one :meth:`cite_task`
-        resolved through ``_active``), not *owning_entry*. The citing entry
-        is resident in ``_state`` by construction, so it is always among
-        :meth:`_reachable_run_entries` and the fold branch's existing
-        :meth:`_persist_run` writes it. An owning entry from an EVICTED stage
-        is not: once this purge removes its last indexed finding it falls out
-        of that reach, and a record placed on it would never be persisted.
-        The record's ``owning_stage`` keeps it attributable; on a same-stage
-        fold the two entries coincide.
+        resolved through ``_active``), not *owning_entry*. The fold is an act
+        of the citing stage, so that stage's row is where its folds are
+        recorded, and the fold branch's existing :meth:`_persist_run` writes
+        it. The record's ``owning_stage`` keeps each record attributable to
+        the stage that filed the purged finding; on a same-stage fold the two
+        entries coincide.
 
         The record is structured: ``fold``, ``owning_stage``,
         ``surviving_finding_id``, ``attempted_citation`` (``{project_id,
@@ -2528,7 +2528,9 @@ class ReconReportState:
         snapshot = asdict(finding)
         truncated_fields: list[str] = []
         for name in ('description', 'suggested_action'):
-            snapshot[name], was_truncated = _truncate_field(snapshot[name], _MAX_PURGED_TEXT_CHARS)
+            snapshot[name], was_truncated = _truncate_field(
+                snapshot[name], _MAX_PURGED_TEXT_CHARS, field=name
+            )
             if was_truncated:
                 truncated_fields.append(name)
         record_entry.purged_findings.append({
@@ -3306,8 +3308,9 @@ class ReconReportState:
         NOT the same as the ``_ReportEntry`` object being garbage-collected
         immediately: while its run is still live, ``_run_finding_index``
         keeps a reference to the evicted entry (see below) so its findings
-        stay citable, and the object only becomes unreachable once the run's
-        indices are popped at quiescence.
+        stay citable, and ``_run_entries`` keeps it in the run's persist reach
+        (see :meth:`_reachable_run_entries`); the object only becomes
+        unreachable once both are popped at quiescence.
 
         The four shared run-level dedup indices (``_run_sig_index`` /
         ``_run_desc_index`` / ``_run_finding_index`` / ``_run_cited_task_index``)
@@ -3327,14 +3330,14 @@ class ReconReportState:
         (in-progress, or completed but not yet past its own TTL), all four
         indices for that run_id are preserved untouched, even for stages that
         have already been evicted. Only when a run's LAST entry evicts do we
-        release its four indices, wholesale via ``pop(rid, None)`` rather
-        than by walking the evicted entry's own signature/desc-hash/finding
-        maps — this correctly reclaims contributions from every stage of the
-        run in one shot and is robust to several same-run entries evicting
-        within the same tick() call. Do not reintroduce per-entry teardown
-        here; see test_eviction_partial_run_canonical_stage_cleared and the
-        sibling tests in TestReconReportReaper for the regression this
-        guards against.
+        release its four indices, together with its ``_run_entries`` registry,
+        wholesale via ``pop(rid, None)`` rather than by walking the evicted
+        entry's own signature/desc-hash/finding maps — this correctly reclaims
+        contributions from every stage of the run in one shot and is robust to
+        several same-run entries evicting within the same tick() call. Do not
+        reintroduce per-entry teardown here; see
+        test_eviction_partial_run_canonical_stage_cleared and the sibling tests
+        in TestReconReportReaper for the regression this guards against.
 
         Quiescence is computed ONCE per tick() call — the set of run_ids
         still present in ``_state`` after all of this sweep's deletions —
@@ -3349,7 +3352,8 @@ class ReconReportState:
         never expires on its own — it is immortal by design (PRD §9.4; see
         test_inprogress_not_evicted_by_ttl) — so a stalled or crashed stage
         that never calls complete() pins that run_id's four indices, and
-        every already-evicted sibling entry object kept reachable through
+        every already-evicted sibling entry object held in ``_run_entries``
+        (bounded by the run's stage count) or kept reachable through
         ``_run_finding_index``, for as long as the process keeps running.
         There is currently no separate max-lifetime sweep for in-progress
         entries to bound this. This is an accepted tradeoff for task-2088
@@ -3366,7 +3370,7 @@ class ReconReportState:
         evicted_run_ids: set[str] = set()
         for key in to_evict:
             rid, stage = key
-            del self._state[key]
+            del self._resident_entries[key]
             evicted_run_ids.add(rid)
             # Remove _active pointer only if it still points at this stage
             if self._active.get(rid) == stage:
@@ -3377,7 +3381,7 @@ class ReconReportState:
             # after all of this sweep's deletions, instead of rescanning
             # _state per evicted entry. A run_id that evicted this tick and
             # has no surviving entry is fully quiescent — release its four
-            # shared indices wholesale.
+            # shared indices and its entry registry wholesale.
             live_run_ids = {r for (r, _s) in self._state}
             for rid in evicted_run_ids:
                 if rid not in live_run_ids:
@@ -3385,6 +3389,7 @@ class ReconReportState:
                     self._run_finding_index.pop(rid, None)
                     self._run_desc_index.pop(rid, None)
                     self._run_cited_task_index.pop(rid, None)
+                    self._run_entries.pop(rid, None)
                     # GC the run's persisted rows at quiescence (task 2716) —
                     # "rows are GC'd with their run".  Best-effort: a shadow-store
                     # hiccup must not abort the reaper sweep or the in-memory

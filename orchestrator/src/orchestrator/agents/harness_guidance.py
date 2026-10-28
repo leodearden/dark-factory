@@ -33,10 +33,10 @@ from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
 from orchestrator.agents.grep_pattern_guidance import GREP_PATTERN_ESCAPING_GUIDANCE
 from orchestrator.agents.partial_failure_guidance import MULTI_PATH_PARTIAL_FAILURE_GUIDANCE
 from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
+from orchestrator.agents.pipeline_status_guidance import PIPELINE_EXIT_STATUS_GUIDANCE
 from orchestrator.agents.pkill_guidance import PKILL_SELF_MATCH_GUIDANCE
 from orchestrator.agents.premise_refutation_guidance import PREMISE_REFUTATION_GUIDANCE
 from orchestrator.agents.python_literal_guidance import PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
-from orchestrator.agents.sigpipe_guidance import SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
 
 # Task 2761. Spliced only through BACKGROUND_WAIT_GUIDANCE: its "~25-minute
 # threshold described below" resolves only inside that unit.
@@ -184,12 +184,11 @@ A killed run says NOTHING about the code under test: it is neither failing nor
 hanging. Never report it as a test failure or a hang. Say it was killed
 externally, and quote the raw code.
 
-Do NOT pipe a long run into `| tail`, `| head` or `| grep`. Bash here runs
-without `pipefail`, so a pipeline reports its LAST stage's status and the real
-exit code is thrown away. A kill that takes the process group also takes
-whatever was buffered in the pipe, leaving a code and no output. Redirect to a
-file and `Read` the file: a killed run then still leaves its partial output
-on disk.
+Do NOT pipe a long run into `| tail`, `| head` or `| grep`. A kill that takes
+the process group also takes whatever was buffered in the pipe, leaving a code
+and no output. Redirect to a file and `Read` the file: a killed run then still
+leaves its partial output on disk. For what a pipe does to the exit code
+itself, see the pipeline exit-status section below.
 
 To diagnose a 137, re-run it once, on ONE line:
 
@@ -250,8 +249,11 @@ reports several distinct shapes, and they do not share a fix:
 - "could not be parsed as JSON" means the call's SYNTAX is broken and no
   parameter VALUE is implicated. Re-emit the entire call from scratch; never
   copy the rejected call and edit one field. Catalogued sightings of this
-  shape all show a `Read` call whose echoed input carries an empty slot
-  between `offset` and `limit` — editing `limit` and resubmitting the same
+  shape are `Read` calls malformed in the `offset`/`limit` pagination
+  region — an empty slot, a stray extra value, a bare value with no key, or
+  the closing brace placed before `limit` — and the defect you see may be
+  none of these. Whatever the echo shows, the fix is the same re-emit from
+  scratch: editing a value such as `limit` and resubmitting the same
   malformed structure reproduces the identical rejection, because editing a
   value cannot fix a syntax error.
 - A rejection naming a parameter the schema does not have is the opposite
@@ -436,6 +438,6 @@ BASH_CAPABLE_ROLE_PREAMBLE = (
     + PATH_NOT_FOUND_GUIDANCE
     + BASH_CWD_ANCHOR_GUIDANCE
     + FILE_LOOKUP_GUIDANCE
-    + SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
+    + PIPELINE_EXIT_STATUS_GUIDANCE
     + PREMISE_REFUTATION_GUIDANCE
 )

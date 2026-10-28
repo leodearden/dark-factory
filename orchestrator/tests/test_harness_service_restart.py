@@ -233,7 +233,7 @@ class TestStartMergeWorkerBuildsCoordinatorList:
 
     async def test_coordinators_list_has_three_entries(self, harness: Harness):
         """_start_merge_worker populates _service_restart_coordinators with fused+dashboard+orchestrator."""
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker'), \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker'), \
              patch('asyncio.create_task'), \
              patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
@@ -254,7 +254,7 @@ class TestStartMergeWorkerBuildsCoordinatorList:
         self, harness: Harness, caplog
     ):
         """_start_merge_worker must not propagate liveness-check exceptions; list still built."""
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task') as mock_ct, \
              patch(
                  'orchestrator.merge_lane.liveness.check_merge_liveness_margin',
@@ -425,7 +425,7 @@ class TestStartMergeWorkerOnMergeLandedWiring:
         is what == checks (is would fail because each attribute access creates a
         fresh wrapper object).
         """
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
              patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
@@ -1034,7 +1034,7 @@ class TestOrchestratorCoordinatorEndToEnd:
         # second fire would be (correctly) throttled, masking the counter check.
         harness.config.orchestrator_restart_min_interval_secs = 0.0
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
              patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
@@ -1098,7 +1098,7 @@ class TestOrchestratorCoordinatorEndToEnd:
         harness.config.orchestrator_restart_on_merge_enabled = True
         harness.config.orchestrator_restart_debounce_secs = 0.0
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
              patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
@@ -1125,7 +1125,7 @@ class TestOrchestratorCoordinatorEndToEnd:
 
     async def test_disabled_config_never_arms(self, harness: Harness):
         """With orchestrator_restart_on_merge_enabled=False (fixture default), it never arms."""
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker'), \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker'), \
              patch('asyncio.create_task'), \
              patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()

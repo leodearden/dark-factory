@@ -3,15 +3,26 @@
 import asyncio
 import json
 import logging
+import sqlite3
 import uuid
-from datetime import UTC, datetime
+from contextlib import closing
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 import pytest_asyncio
+from _mem0_intent_fixtures import (
+    mem0_intent_row,
+    seed_mem0_intent,
+    set_mem0_intent_created_at,
+)
 
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
-from fused_memory.services.write_journal import OPERATOR_TELEMETRY_QUERY, WriteJournal
+from fused_memory.services.write_journal import (
+    OPERATOR_TELEMETRY_QUERY,
+    Mem0IntentStatus,
+    WriteJournal,
+)
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_verification import ReferentFinding
 
@@ -327,21 +338,21 @@ async def test_error_recording(journal):
         success=False,
         error='Connection refused',
     )
-    ops = await journal.get_ops_since('2000-01-01T00:00:00')
+    ops = await journal.get_stored_ops_since('2000-01-01T00:00:00')
     assert len(ops) == 1
     assert ops[0]['success'] == 0
     assert ops[0]['error'] == 'Connection refused'
 
 
 @pytest.mark.asyncio
-async def test_get_ops_since(journal):
+async def test_get_stored_ops_since(journal):
     for _i in range(5):
         await journal.log_write_op(
             write_op_id=str(uuid.uuid4()),
             operation='add_memory',
             project_id='test',
         )
-    ops = await journal.get_ops_since('2000-01-01T00:00:00', limit=3)
+    ops = await journal.get_stored_ops_since('2000-01-01T00:00:00', limit=3)
     assert len(ops) == 3
 
 
@@ -413,7 +424,7 @@ async def test_kind_column_persists(journal):
         kind='read',
         project_id='test',
     )
-    ops = await journal.get_ops_since('2000-01-01T00:00:00')
+    ops = await journal.get_stored_ops_since('2000-01-01T00:00:00')
     assert len(ops) == 1
     assert ops[0]['kind'] == 'read'
 
@@ -427,7 +438,7 @@ async def test_kind_defaults_to_write(journal):
         operation='add_memory',
         project_id='test',
     )
-    ops = await journal.get_ops_since('2000-01-01T00:00:00')
+    ops = await journal.get_stored_ops_since('2000-01-01T00:00:00')
     assert ops[0]['kind'] == 'write'
 
 
@@ -441,14 +452,14 @@ async def test_session_id_persists(journal):
         session_id='sess-abc',
         agent_id='claude-task-7',
     )
-    ops = await journal.get_ops_since('2000-01-01T00:00:00')
+    ops = await journal.get_stored_ops_since('2000-01-01T00:00:00')
     assert ops[0]['session_id'] == 'sess-abc'
     assert ops[0]['agent_id'] == 'claude-task-7'
 
 
 @pytest.mark.asyncio
-async def test_get_ops_since_kind_filter(journal):
-    """get_ops_since with kind filter returns only matching rows."""
+async def test_get_stored_ops_since_kind_filter(journal):
+    """get_stored_ops_since with kind filter returns only matching rows."""
     for _i in range(3):
         await journal.log_write_op(
             write_op_id=str(uuid.uuid4()),
@@ -463,8 +474,8 @@ async def test_get_ops_since_kind_filter(journal):
             kind='read',
             project_id='test',
         )
-    reads = await journal.get_ops_since('2000-01-01T00:00:00', kind='read')
-    writes = await journal.get_ops_since('2000-01-01T00:00:00', kind='write')
+    reads = await journal.get_stored_ops_since('2000-01-01T00:00:00', kind='read')
+    writes = await journal.get_stored_ops_since('2000-01-01T00:00:00', kind='write')
     assert len(reads) == 2
     assert len(writes) == 3
 
@@ -605,91 +616,6 @@ async def test_migration_adds_backend_ops_duration_ms_without_backfill(tmp_path)
         assert fresh_row['duration_ms'] == 12.5
     finally:
         await j.close()
-
-
-# ------------------------------------------------------------------
-# Stats methods
-# ------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_get_usage_stats(journal):
-    # 3 writes, 2 reads
-    for _ in range(3):
-        await journal.log_write_op(
-            write_op_id=str(uuid.uuid4()),
-            operation='add_memory',
-            kind='write',
-            project_id='proj',
-            agent_id='agent-a',
-        )
-    for _ in range(2):
-        await journal.log_write_op(
-            write_op_id=str(uuid.uuid4()),
-            operation='search',
-            kind='read',
-            project_id='proj',
-            agent_id='agent-b',
-        )
-
-    stats = await journal.get_usage_stats('2000-01-01T00:00:00')
-    assert stats['reads'] == 2
-    assert stats['writes'] == 3
-    assert stats['by_operation']['add_memory'] == 3
-    assert stats['by_operation']['search'] == 2
-    assert stats['by_agent']['agent-a'] == {'read': 0, 'write': 3}
-    assert stats['by_agent']['agent-b'] == {'read': 2, 'write': 0}
-
-
-@pytest.mark.asyncio
-async def test_get_usage_stats_project_filter(journal):
-    await journal.log_write_op(
-        write_op_id=str(uuid.uuid4()),
-        operation='add_memory',
-        project_id='alpha',
-    )
-    await journal.log_write_op(
-        write_op_id=str(uuid.uuid4()),
-        operation='add_memory',
-        project_id='beta',
-    )
-    stats = await journal.get_usage_stats('2000-01-01T00:00:00', project_id='alpha')
-    assert stats['writes'] == 1
-
-
-@pytest.mark.asyncio
-async def test_get_session_ops(journal):
-    for i in range(5):
-        await journal.log_write_op(
-            write_op_id=str(uuid.uuid4()),
-            operation='search' if i % 2 == 0 else 'add_memory',
-            kind='read' if i % 2 == 0 else 'write',
-            agent_id='target-agent',
-        )
-    await journal.log_write_op(
-        write_op_id=str(uuid.uuid4()),
-        operation='add_memory',
-        agent_id='other-agent',
-    )
-
-    ops = await journal.get_session_ops('target-agent')
-    assert len(ops) == 5
-    assert all(op['agent_id'] == 'target-agent' for op in ops)
-    # Most recent first
-    assert ops[0]['created_at'] >= ops[-1]['created_at']
-
-
-@pytest.mark.asyncio
-async def test_get_session_ops_with_limit(journal):
-    for _ in range(10):
-        await journal.log_write_op(
-            write_op_id=str(uuid.uuid4()),
-            operation='search',
-            kind='read',
-            agent_id='busy-agent',
-        )
-    ops = await journal.get_session_ops('busy-agent', limit=3)
-    assert len(ops) == 3
 
 
 # ------------------------------------------------------------------
@@ -914,6 +840,212 @@ async def test_prune_mem0_intents_never_raises(journal):
     assert await journal.prune_mem0_intents() == 0
 
 
+# The mem0_intents DDL as it stood before task 7397 added attempts and
+# next_attempt_at, copied literally so the migration is tested against the
+# shape a live pre-change journal actually has.
+_PRE_7397_MEM0_INTENTS_DDL = """
+CREATE TABLE IF NOT EXISTS mem0_intents (
+    id TEXT PRIMARY KEY,
+    write_op_id TEXT,
+    causation_id TEXT,
+    project_id TEXT,
+    agent_id TEXT,
+    session_id TEXT,
+    category TEXT,
+    payload_digest TEXT,
+    content TEXT,
+    metadata TEXT DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mi_status ON mem0_intents(status);
+CREATE INDEX IF NOT EXISTS idx_mi_write_op ON mem0_intents(write_op_id);
+"""
+
+
+class TestMem0IntentRetrySchedule:
+    """The journal surface for Mem0 writes deferred for server-side retry (task 7397)."""
+
+    def test_status_vocabulary(self):
+        assert {s.name: s.value for s in Mem0IntentStatus} == {
+            'PENDING': 'pending',
+            'RETRYING': 'retrying',
+            'COMPLETED': 'completed',
+            'FAILED': 'failed',
+            'DEAD': 'dead',
+        }
+
+    @pytest.mark.asyncio
+    async def test_fresh_intent_has_no_attempts_and_no_schedule(self, journal):
+        row = await mem0_intent_row(journal, await seed_mem0_intent(journal))
+        assert row['attempts'] == 0
+        assert row['next_attempt_at'] is None
+
+    @pytest.mark.asyncio
+    async def test_migration_adds_columns_to_a_pre_change_database(self, tmp_path):
+        data_dir = tmp_path / 'wj'
+        data_dir.mkdir()
+        with closing(sqlite3.connect(data_dir / 'write_journal.db')) as conn, conn:
+            conn.executescript(_PRE_7397_MEM0_INTENTS_DDL)
+            conn.execute(
+                "INSERT INTO mem0_intents (id, write_op_id, content, status, created_at) "
+                "VALUES ('old-1', 'wo-1', 'old content', 'pending', ?)",
+                (datetime.now(UTC).isoformat(),),
+            )
+        j = WriteJournal(data_dir)
+        await j.initialize()
+        try:
+            row = await mem0_intent_row(j, 'old-1')
+            assert row['attempts'] == 0
+            assert row['next_attempt_at'] is None
+            assert await j.schedule_mem0_retry(
+                'old-1', reason='rate_limited', retry_at=datetime.now(UTC)
+            )
+        finally:
+            await j.close()
+
+    @pytest.mark.asyncio
+    async def test_schedule_moves_pending_to_retrying_and_counts_attempts(self, journal):
+        intent_id = await seed_mem0_intent(journal)
+        first_at = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
+        reason = 'rate_limited: RateLimitError: 429'
+
+        assert await journal.schedule_mem0_retry(intent_id, reason=reason, retry_at=first_at)
+
+        row = await mem0_intent_row(journal, intent_id)
+        assert row['status'] == 'retrying'
+        assert row['attempts'] == 1
+        assert row['next_attempt_at'] == first_at.isoformat(timespec='microseconds')
+        assert row['reason'] == reason
+        assert row['resolved_at'] is None
+
+        second_at = first_at + timedelta(seconds=60)
+        assert await journal.schedule_mem0_retry(
+            intent_id, reason=reason, retry_at=second_at
+        )
+        row = await mem0_intent_row(journal, intent_id)
+        assert row['attempts'] == 2
+        assert row['next_attempt_at'] == second_at.isoformat(timespec='microseconds')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('terminal', ['completed', 'failed', 'dead'])
+    async def test_schedule_refuses_terminal_rows(self, journal, terminal):
+        intent_id = await seed_mem0_intent(journal)
+        await journal.resolve_mem0_intent(intent_id, terminal, reason='terminal')
+        before = await mem0_intent_row(journal, intent_id)
+
+        assert not await journal.schedule_mem0_retry(
+            intent_id, reason='late', retry_at=datetime.now(UTC)
+        )
+        assert await mem0_intent_row(journal, intent_id) == before
+
+    @pytest.mark.asyncio
+    async def test_schedule_refuses_unknown_id(self, journal):
+        assert not await journal.schedule_mem0_retry(
+            'no-such-intent', reason='r', retry_at=datetime.now(UTC)
+        )
+        assert await journal.get_mem0_intents() == []
+
+    @pytest.mark.asyncio
+    async def test_due_retries_are_the_retrying_rows_scheduled_by_now(self, journal):
+        now = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
+        due_later_first = await seed_mem0_intent(journal)
+        due_earlier_second = await seed_mem0_intent(journal)
+        due_third = await seed_mem0_intent(journal)
+        not_yet_due = await seed_mem0_intent(journal)
+        await seed_mem0_intent(journal)  # stays pending
+        schedule = {
+            due_later_first: now - timedelta(seconds=10),
+            due_earlier_second: now - timedelta(seconds=20),
+            due_third: now,
+            not_yet_due: now + timedelta(seconds=1),
+        }
+        for intent_id, retry_at in schedule.items():
+            assert await journal.schedule_mem0_retry(
+                intent_id, reason='r', retry_at=retry_at
+            )
+
+        due = await journal.get_due_mem0_retries(now=now, limit=10)
+        assert [r['id'] for r in due] == [due_earlier_second, due_later_first, due_third]
+
+        capped = await journal.get_due_mem0_retries(now=now, limit=2)
+        assert [r['id'] for r in capped] == [due_earlier_second, due_later_first]
+
+    @pytest.mark.asyncio
+    async def test_resolve_reports_whether_it_updated(self, journal):
+        intent_id = await seed_mem0_intent(journal)
+        assert await journal.resolve_mem0_intent(intent_id, Mem0IntentStatus.COMPLETED)
+        assert not await journal.resolve_mem0_intent(
+            'no-such-intent', Mem0IntentStatus.COMPLETED
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_with_expected_status_is_a_compare_and_set(self, journal):
+        completed_id = await seed_mem0_intent(journal)
+        await journal.resolve_mem0_intent(completed_id, 'completed', reason='landed')
+        failed_id = await seed_mem0_intent(journal)
+        await journal.resolve_mem0_intent(failed_id, 'failed', reason='429')
+        completed_before = await mem0_intent_row(journal, completed_id)
+
+        assert not await journal.resolve_mem0_intent(
+            completed_id,
+            Mem0IntentStatus.COMPLETED,
+            reason='replayed',
+            expected_status=Mem0IntentStatus.FAILED,
+        )
+        assert await mem0_intent_row(journal, completed_id) == completed_before
+
+        assert await journal.resolve_mem0_intent(
+            failed_id,
+            Mem0IntentStatus.COMPLETED,
+            reason='replayed',
+            expected_status=Mem0IntentStatus.FAILED,
+        )
+        failed_after = await mem0_intent_row(journal, failed_id)
+        assert failed_after['status'] == 'completed'
+        assert failed_after['reason'] == 'replayed'
+
+    @pytest.mark.asyncio
+    async def test_count_by_status_covers_only_the_window(self, journal):
+        since = datetime.now(UTC) - timedelta(minutes=5)
+        for status in [
+            Mem0IntentStatus.COMPLETED,
+            Mem0IntentStatus.COMPLETED,
+            Mem0IntentStatus.FAILED,
+            Mem0IntentStatus.RETRYING,
+            Mem0IntentStatus.PENDING,
+        ]:
+            await seed_mem0_intent(journal, status=status, retry_at=since)
+        await seed_mem0_intent(
+            journal,
+            status=Mem0IntentStatus.DEAD,
+            created_at=since - timedelta(hours=2),
+        )
+
+        counts = await journal.count_mem0_intents_by_status(since=since)
+
+        assert counts == {'completed': 2, 'failed': 1, 'pending': 1, 'retrying': 1}
+        assert list(counts) == sorted(counts)
+
+    @pytest.mark.asyncio
+    async def test_retrying_rows_are_never_pruned(self, journal):
+        intent_id = await seed_mem0_intent(journal)
+        await journal.schedule_mem0_retry(
+            intent_id, reason='r', retry_at=datetime.now(UTC)
+        )
+        set_mem0_intent_created_at(journal, intent_id, datetime(2000, 1, 1, tzinfo=UTC))
+
+        assert await journal.prune_mem0_intents(older_than_days=0) == 0
+        assert await journal.prune_mem0_intents(
+            older_than_days=0, statuses=('completed', 'failed', 'retrying')
+        ) == 0
+        row = await mem0_intent_row(journal, intent_id)
+        assert row['status'] == 'retrying'
+        assert row['resolved_at'] is None
+
+
 # ------------------------------------------------------------------
 # idempotent_ops: client-supplied idempotency keys (task 2712)
 # ------------------------------------------------------------------
@@ -993,21 +1125,13 @@ async def test_prune_idempotent_ops_never_raises(journal):
 # list or GROUP BY affects whether that constraint is seekable. It is the
 # shape-independent floor and it cannot drift.
 #
-# The two constants after it are copied VERBATIM from the dashboard's consumers
-# — `get_memory_timeseries` and `get_agent_breakdown` in
-# `dashboard/src/dashboard/data/write_journal.py` (cited by FUNCTION NAME, never
-# by line number: line numbers in another package go stale on the next edit
-# there, which is exactly how this comment's first version broke). The two
-# packages have separate venvs and cannot import each other, and the schema
-# under test is produced by fused-memory, so the copy is deliberate.
-#
-# KNOWN GAP: nothing here detects the dashboard changing its SQL (e.g. adding a
-# `project_id = ?` filter or a BETWEEN range) — these copies would keep testing
-# the old shape and stay green while the real endpoint regressed. The test that
-# would close it belongs on the dashboard side, where the real SQL is
-# importable; that file is outside this task's lock, so it is filed as
-# follow-up rather than faked here. PREDICATE_SQL bounds the damage: the index's
-# own contract stays pinned regardless of what the consumers do.
+# TIMESERIES_SQL after it is the unhinted hour/kind rollup shape of the
+# dashboard's former `get_memory_timeseries`, which task 5597 folded into
+# `get_memory_ops` in `dashboard/src/dashboard/data/write_journal.py`. That
+# function's real compound statement is pinned against this schema on the
+# dashboard side, by
+# dashboard/tests/test_write_journal.py::TestMemoryOpsQueryPlan, so no copy of
+# a dashboard query is kept here.
 
 PREDICATE_SQL = 'SELECT COUNT(*) FROM write_ops WHERE created_at >= ?'
 
@@ -1018,16 +1142,9 @@ TIMESERIES_SQL = (
     ' GROUP BY hour, kind'
 )
 
-AGENT_BREAKDOWN_SQL = (
-    "SELECT COALESCE(agent_id, 'unknown') AS agent, COUNT(*) AS cnt"
-    ' FROM write_ops WHERE created_at >= ?'
-    ' GROUP BY agent ORDER BY cnt DESC'
-)
-
 SEEKABLE_QUERIES = (
     ('predicate only', PREDICATE_SQL),
-    ('get_memory_timeseries', TIMESERIES_SQL),
-    ('get_agent_breakdown', AGENT_BREAKDOWN_SQL),
+    ('hourly kind rollup', TIMESERIES_SQL),
 )
 
 
@@ -1224,7 +1341,7 @@ async def test_write_ops_has_terminal_columns(journal):
         operation='add_episode',
         project_id='test-project',
     )
-    ops = await journal.get_ops_since('2000-01-01T00:00:00')
+    ops = await journal.get_stored_ops_since('2000-01-01T00:00:00')
     row = next(o for o in ops if o['id'] == op_id)
     # Terminal state is UNKNOWN at log time — NULL, not False.
     assert row['terminal_status'] is None
@@ -1459,7 +1576,7 @@ async def test_late_producer_log_write_op_preserves_terminal_outcome(journal):
     assert row['terminal_at'] is not None
 
     # And exactly one row exists — the upsert converged, it did not duplicate.
-    ops = [o for o in await journal.get_ops_since('2000-01-01T00:00:00')
+    ops = [o for o in await journal.get_stored_ops_since('2000-01-01T00:00:00')
            if o['id'] == op_id]
     assert len(ops) == 1
 
@@ -1515,21 +1632,26 @@ def _days_ago(days: float) -> str:
 
 
 async def _seed_write_op(journal, *, operation, kind, created_at=None) -> str:
+    """A historical write_ops row, inserted directly: since task 5405 a
+    successful non-search read logged through log_write_op is counted into
+    read_op_counts instead, so the journal API can no longer seed one."""
     op_id = str(uuid.uuid4())
-    await journal.log_write_op(
-        write_op_id=op_id,
-        source='mcp_tool',
-        operation=operation,
-        project_id='test-project',
-        kind=kind,
-        params={'query': 'q'},
-        result_summary={'count': 0},
-    )
-    if created_at is not None:
-        await journal._require_access().connection.execute(
-            'UPDATE write_ops SET created_at = ? WHERE id = ?', (created_at, op_id)
+    async with journal._require_access().write() as db:
+        await db.execute(
+            'INSERT INTO write_ops '
+            '(id, source, operation, project_id, kind, params, result_summary, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                op_id,
+                'mcp_tool',
+                operation,
+                'test-project',
+                kind,
+                json.dumps({'query': 'q'}),
+                json.dumps({'count': 0}),
+                created_at or datetime.now(UTC).isoformat(),
+            ),
         )
-        await journal._require_access().connection.commit()
     return op_id
 
 
@@ -2136,3 +2258,144 @@ async def test_an_empty_batch_touches_nothing(journal, tmp_path):
 
     assert await journal.get_referent_findings() == []
     assert uninitialized.journal_drop_stats()['dropped_total'] == 0
+
+
+# ------------------------------------------------------------------
+# Read rollup (task 5405): every read is journalled exactly once — a raw
+# write_ops row (search, failed reads) or a read_op_counts count.
+# ------------------------------------------------------------------
+
+
+def _hour_start(at: datetime) -> str:
+    return at.replace(minute=0, second=0, microsecond=0).isoformat()
+
+
+async def _read_op_counts_rows(journal) -> list[tuple]:
+    rows = await journal._require_access().read_all(
+        'SELECT hour_start, project_id, agent_id, operation, count FROM read_op_counts'
+    )
+    return [tuple(row) for row in rows]
+
+
+async def _write_ops_rows(journal) -> list[dict]:
+    rows = await journal._require_access().read_all('SELECT * FROM write_ops')
+    return [dict(row) for row in rows]
+
+
+async def _table_names(journal) -> set[str]:
+    rows = await journal._require_access().read_all(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    )
+    return {row[0] for row in rows}
+
+
+@pytest.mark.asyncio
+async def test_initialize_creates_read_op_counts_on_a_fresh_db(journal):
+    assert 'read_op_counts' in await _table_names(journal)
+
+
+@pytest.mark.asyncio
+async def test_migration_adds_read_op_counts_to_a_pre_rollup_db(tmp_path):
+    import aiosqlite
+
+    from fused_memory.services.write_journal import SCHEMA_SQL
+
+    db_dir = tmp_path / 'pre_rollup'
+    db_dir.mkdir()
+    async with aiosqlite.connect(str(db_dir / 'write_journal.db')) as db:
+        await db.executescript(SCHEMA_SQL)
+        await db.commit()
+
+    j = WriteJournal(db_dir)
+    await j.initialize()
+    try:
+        assert 'read_op_counts' in await _table_names(j)
+    finally:
+        await j.close()
+
+
+@pytest.mark.asyncio
+async def test_successful_non_search_read_is_counted_not_stored(journal):
+    before = datetime.now(UTC)
+    for _ in range(3):
+        await journal.log_write_op(
+            write_op_id=str(uuid.uuid4()),
+            operation='get_task',
+            kind='read',
+            project_id='p',
+            success=True,
+        )
+    after = datetime.now(UTC)
+
+    assert await _write_ops_rows(journal) == []
+    rows = await _read_op_counts_rows(journal)
+    assert len(rows) in (1, 2)
+    assert {row[0] for row in rows} <= {_hour_start(before), _hour_start(after)}
+    assert {row[1:4] for row in rows} == {('p', '', 'get_task')}
+    assert sum(row[4] for row in rows) == 3
+
+
+@pytest.mark.asyncio
+async def test_search_read_keeps_its_raw_row_and_is_not_counted(journal):
+    await journal.log_write_op(
+        write_op_id='search-1',
+        operation='search',
+        kind='read',
+        project_id='p',
+        params={'query': 'q'},
+        result_summary={'count': 4},
+    )
+
+    rows = await _write_ops_rows(journal)
+    assert [row['id'] for row in rows] == ['search-1']
+    assert json.loads(rows[0]['params']) == {'query': 'q'}
+    assert json.loads(rows[0]['result_summary']) == {'count': 4}
+    assert await _read_op_counts_rows(journal) == []
+
+
+@pytest.mark.asyncio
+async def test_a_search_given_another_kind_is_stored_once_as_a_read_and_not_counted(journal):
+    await journal.log_write_op(
+        write_op_id='search-as-write', operation='search', kind='write', project_id='p'
+    )
+
+    rows = await _write_ops_rows(journal)
+    assert [(row['id'], row['kind']) for row in rows] == [('search-as-write', 'read')]
+    assert await _read_op_counts_rows(journal) == []
+
+
+@pytest.mark.asyncio
+async def test_failed_read_keeps_its_raw_row_with_the_error_and_is_not_counted(journal):
+    await journal.log_write_op(
+        write_op_id='failed-1',
+        operation='get_entity',
+        kind='read',
+        success=False,
+        error='boom',
+    )
+
+    rows = await _write_ops_rows(journal)
+    assert [(row['id'], row['success'], row['error']) for row in rows] == [('failed-1', 0, 'boom')]
+    assert await _read_op_counts_rows(journal) == []
+
+
+@pytest.mark.asyncio
+async def test_writes_are_still_stored_per_row_and_not_counted(journal):
+    await journal.log_write_op(
+        write_op_id='write-1', operation='add_memory', kind='write', project_id='p'
+    )
+
+    rows = await _write_ops_rows(journal)
+    assert [(row['id'], row['kind']) for row in rows] == [('write-1', 'write')]
+    assert await _read_op_counts_rows(journal) == []
+
+
+@pytest.mark.asyncio
+async def test_count_only_read_on_a_closed_journal_never_raises_and_counts_a_drop(journal):
+    await journal.close()
+
+    await journal.log_write_op(
+        write_op_id=str(uuid.uuid4()), operation='get_task', kind='read', success=True
+    )
+
+    assert journal.journal_drop_stats()['by_operation'] == {'get_task': 1}

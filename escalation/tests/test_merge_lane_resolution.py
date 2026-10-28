@@ -35,7 +35,7 @@ from escalation.merge_lane_resolution import (
 # Cross-package orchestrator imports — mirrors test_merge_state_wiring.py's guard.
 # ---------------------------------------------------------------------------
 try:
-    from orchestrator.merge_queue import MERGE_LANES  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import MERGE_LANES
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
@@ -43,7 +43,7 @@ except ImportError:
 
 
 # MODULE-level, not per-class.  Both public functions do their
-# ``from orchestrator.merge_queue import ...`` INSIDE the function body (see
+# ``from orchestrator.merge_lane.worker import ...`` INSIDE the function body (see
 # that module's docstring for why the imports are runtime-only), so without
 # orchestrator installed EVERY test here raises ImportError rather than
 # skipping — a class-level guard on the one class that names ``MERGE_LANES``
@@ -151,6 +151,26 @@ class TestResolveMergeLanePrecedence:
         assert choice == LaneChoice(lane='normal', source='task_metadata')
 
 
+class TestUnavailableMetadataIsNotTheDefault:
+    """"We could not find out" is a different fact from "nothing asked"."""
+
+    def test_failed_read_reports_unavailable_and_still_fails_open(self):
+        choice = resolve_merge_lane(
+            requested=None, task_metadata={}, metadata_unavailable=True
+        )
+        assert choice == LaneChoice(lane='normal', source='unavailable')
+
+    def test_explicit_argument_outranks_the_unavailable_flag(self):
+        choice = resolve_merge_lane(
+            requested='high', task_metadata=None, metadata_unavailable=True
+        )
+        assert choice == LaneChoice(lane='high', source='argument')
+
+    def test_healthy_read_is_unaffected_by_the_flag_defaulting_false(self):
+        choice = resolve_merge_lane(requested=None, task_metadata={})
+        assert choice == LaneChoice(lane='normal', source='default')
+
+
 class TestLaneChoiceShape:
     def test_lane_choice_is_frozen(self):
         choice = resolve_merge_lane(requested='high', task_metadata=None)
@@ -198,5 +218,8 @@ class TestVocabularyIsNotForked:
             resolve_merge_lane(requested='high', task_metadata=None).source,
             resolve_merge_lane(requested=None, task_metadata={'merge_lane': 'high'}).source,
             resolve_merge_lane(requested=None, task_metadata={}).source,
+            resolve_merge_lane(
+                requested=None, task_metadata={}, metadata_unavailable=True
+            ).source,
         }
-        assert sources == {'argument', 'task_metadata', 'default'}
+        assert sources == {'argument', 'task_metadata', 'default', 'unavailable'}

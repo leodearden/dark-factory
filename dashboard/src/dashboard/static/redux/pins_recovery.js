@@ -43,30 +43,18 @@
 // decision arm — or adding one nobody asked for — fails a test instead of
 // nothing.
 //
-// ── (2) WHY NOT A DOM HARNESS (considered and rejected) ───────────────────
-// jsdom or a headless browser would cover the JSX seam this extraction leaves
-// open, and was the first thing considered. It does not fit this repo: there
-// is no package.json, lockfile or tracked node_modules anywhere in git; React
-// 18.3.1 and @babel/standalone 7.29.0 are unpkg CDN tags with SRI hashes,
-// transpiled in-browser with no build step. The ABSENCE of a package.json is
-// load-bearing — it is exactly what makes these static/redux/*.js files
-// resolve as CommonJS for the existing node --test suite, so adding one to
-// host jsdom would break that resolution model. The gate is
-// `cd dashboard && uv run pytest tests/`, so a DOM harness would need an
-// install at gate time or a skip-when-deps-missing guard — and a test that
-// silently skips is the same "passes but does not discriminate" hole these
-// modules exist to close, merely relocated. The settled precedent for this
-// trade is commit bea3edc34f, "GREEN — extract lockChipState helper, rewire
-// chips, drop meta-test" (scheduler_utils.jsx + test_lock_chip_state.py).
+// ── (2) THE JSX CALL SITES ────────────────────────────────────────────────
+// The roles are split. A render DECISION is extracted into a helper like
+// these and unit-tested; the thin JSX call site that consumes it is
+// render-tested by dashboard/tests/js/jsx_render.test.mjs, on the jsdom page
+// dashboard/tests/js/dom_harness.mjs builds.
 //
 // ── (3) WHAT IS OUT OF SCOPE ──────────────────────────────────────────────
 // Re-hardening the deleted tests with tightened regexes or comment-stripped
 // source fixtures is explicitly out of scope, by the reviewer guidance that
 // motivated 039e55c7ef: hardening the greps deepens the same hole rather than
-// closing it. The residual gap — deleting the thin surviving JSX call site
-// still fails no test, because nothing in this repo renders JSX — is measured
-// rather than assumed (see the mutation-verification step of task 4361) and
-// is filed as a browser-harness follow-up. Do not "restore" the greps.
+// closing it. The call sites are covered by (2), which asserts over rendered
+// DOM, never source text. Do not "restore" the greps.
 //
 // ── (4) NO BROWSER GLOBALS, IN ANY OF THE THREE ───────────────────────────
 // Nothing in these modules reads `window` or `document`: the

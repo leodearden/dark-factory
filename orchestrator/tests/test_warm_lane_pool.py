@@ -2927,26 +2927,27 @@ class TestAcquireWarmLaneReuse:
 
 
 # ===========================================================================
-# Step-23: RED — on-disk backstop: same-task plan.json survives restart
+# Step-23: on-disk backstop — same-task artifacts survive a restart
 #
-# Acquire 'A' fresh, write .task/plan.json with task_id 'A' + tracked WIP.
-# Construct a BRAND-NEW GitOps (simulating a process restart — empty
-# _assignments).  acquire_warm_lane('A', sha_main) should detect that
-# _lane-0's plan.json has task_id == 'A' and route to _reuse_warm_lane
-# (preserving .task/plan.json + rebasing).
+# Acquire 'A' fresh, seed the lane's meta root + tracked WIP.  Construct a
+# BRAND-NEW GitOps (simulating a process restart — empty _assignments).
+# acquire_warm_lane('A', sha_main) should detect that _lane-0's meta-root
+# metadata.json has task_id == 'A' and route to _reuse_warm_lane (preserving
+# the meta root's plan.json payload + rebasing).
 #
 # Contrast (fresh, different task): a new GitOps with the SAME registered
-# _lane-0 whose plan.json has task_id 'A' but we acquire for 'Z' → treated
-# FRESH → .task/plan.json is gone (git clean removed it) and target/ retained.
+# _lane-0 whose metadata.json has task_id 'A' but we acquire for 'Z' →
+# treated FRESH → plan.json is gone and target/ retained.
 #
-# Today the fresh-but-registered branch always calls _reset_warm_lane →
-# git clean -xfd -e target deletes .task/ even for the same task → RED.
+# The routing key is metadata.json (task 3154), NOT plan.json: plan.json is
+# kept here only as the PAYLOAD whose survival across the reuse route is
+# asserted.
 # ===========================================================================
 
 
 @pytest.mark.asyncio
 class TestAcquireWarmLaneOnDiskBackstop:
-    """On-disk backstop: plan.json task_id match restores REUSE across restart."""
+    """On-disk backstop: metadata.json task_id match restores REUSE across restart."""
 
     async def test_same_task_plan_preserved_after_restart(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
@@ -2960,12 +2961,14 @@ class TestAcquireWarmLaneOnDiskBackstop:
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
         assert isinstance(info1, WorktreeInfo)
 
-        # Simulate agent writing plan.json + tracked WIP
-        plan_file = (
-            TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
-            / 'plan.json'
+        # Simulate dispatch (metadata.json — the routing key) + an agent
+        # writing plan.json (the payload) + tracked WIP.
+        meta_root = TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(
+            '{"task_id": "task-A", "title": "task A work"}'
         )
-        plan_file.parent.mkdir(parents=True, exist_ok=True)
+        plan_file = meta_root / 'plan.json'
         plan_file.write_text('{"task_id": "task-A", "title": "task A work"}')
         (info1.path / 'task_work.txt').write_text('WIP after restart\n')
 
@@ -2978,12 +2981,12 @@ class TestAcquireWarmLaneOnDiskBackstop:
         # Reacquire same task on fresh GitOps — disk backstop should detect REUSE
         info2 = await git_ops2.acquire_warm_lane('task-A', sha_main)
 
-        # TODAY: fresh-but-registered → _reset_warm_lane → git clean → .task/ gone
-        # After step-24: reads plan.json, detects task_id match → _reuse_warm_lane
+        # Disk backstop reads metadata.json, detects the task_id match →
+        # _reuse_warm_lane, which preserves the meta root's plan.json payload.
         assert isinstance(info2, WorktreeInfo)
         assert info2.path == info1.path  # same _lane-0
 
-        assert plan_file.exists(), '.task/plan.json must be preserved by disk backstop'
+        assert plan_file.exists(), 'plan.json must be preserved by disk backstop'
         data = json.loads(plan_file.read_text())
         assert data['task_id'] == 'task-A', (
             f'plan.json was overwritten; got {data}'
@@ -2998,12 +3001,10 @@ class TestAcquireWarmLaneOnDiskBackstop:
         git_ops1 = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
         info1 = await git_ops1.acquire_warm_lane('task-A', sha_a)
         assert isinstance(info1, WorktreeInfo)
-        plan_file = (
-            TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
-            / 'plan.json'
-        )
-        plan_file.parent.mkdir(parents=True, exist_ok=True)
-        plan_file.write_text('{"task_id": "task-A"}')
+        meta_root = TaskArtifacts.meta_root_for(info1.path.parent, info1.path.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "task-A"}')
+        (meta_root / 'plan.json').write_text('{"task_id": "task-A"}')
         (info1.path / 'task_work.txt').write_text('WIP work\n')
 
         # Restart
@@ -4356,7 +4357,7 @@ class TestReleaseLaneForTerminalTask:
         assert freed is True
         assert pool.state(lane) == LaneState.FREE
 
-    async def test_release_resolves_via_plan_json_backstop(
+    async def test_release_resolves_via_metadata_backstop(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
         """ASSIGNED lane with empty _assignments → disk backstop finds and frees it.
@@ -4372,10 +4373,12 @@ class TestReleaseLaneForTerminalTask:
         lane = await pool.try_acquire()
         assert lane is not None
 
-        # Create the lane directory and write plan.json backstop
-        task_dir = lane / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+        # Create the lane dir (the scan only considers dirs that exist under
+        # worktree_base) and seed its meta root with the backstop key.
+        lane.mkdir(parents=True, exist_ok=True)
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "3459"}')
 
         freed = await git_ops.release_lane_for_terminal_task('3459', allow_disk_backstop=True)
 
@@ -4385,7 +4388,7 @@ class TestReleaseLaneForTerminalTask:
     async def test_release_returns_false_when_no_lane(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        """Unknown task id with no assignment and no plan.json → False, no raise."""
+        """Unknown task id with no assignment and no lane metadata.json → False, no raise."""
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
         freed = await git_ops.release_lane_for_terminal_task('99999')
@@ -4407,7 +4410,7 @@ class TestReleaseLaneForTerminalTask:
         assert first is True
         assert pool.state(lane) == LaneState.FREE
 
-        # Second call: no in-memory assignment, no plan.json on disk
+        # Second call: no in-memory assignment, no lane metadata.json on disk
         second = await git_ops.release_lane_for_terminal_task('3459')
         assert second is False, '2nd call (neither in-memory nor disk) must return False'
         assert pool.state(lane) == LaneState.FREE, 'lane must remain FREE after double-fire'
@@ -4445,7 +4448,7 @@ class TestReleaseLaneForTerminalTask:
 
         Simulates the common done-exit path where _maybe_cleanup_done_worktree
         already released the lane and dropped the in-memory assignment. A stale
-        plan.json remains on disk, but the default (allow_disk_backstop=False)
+        metadata.json remains on disk, but the default (allow_disk_backstop=False)
         call must be a true no-op — no disk scan, no redundant cleanup_worktree /
         git branch -D retry.
 
@@ -4467,8 +4470,13 @@ class TestReleaseLaneForTerminalTask:
         assert lane is not None
         assert pool.state(lane) == LaneState.ASSIGNED
 
-        # Write stale plan.json (as if task '3459' had previously used this lane;
-        # plan.json survives release_warm_lane since that only detaches + deletes branch)
+        # Stale metadata.json, as if task '3459' had previously used this lane
+        # (the meta root survives release_warm_lane). The leftover
+        # <lane>/.task/plan.json is inert state: it is no routing key.
+        lane.mkdir(parents=True, exist_ok=True)
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "3459"}')
         task_dir = lane / '.task'
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
@@ -4517,7 +4525,8 @@ class TestReleaseLaneForTerminalTask:
         """allow_disk_backstop=True: disk backstop resolves lane and frees it.
 
         Lost-map / post-restart path: the in-memory assignment was dropped but
-        the plan.json still carries the task id.  Explicit opt-in is required.
+        the lane's metadata.json still carries the task id.  Explicit opt-in is
+        required.
 
         RED: release_lane_for_terminal_task has no allow_disk_backstop param
         (TypeError on the call).
@@ -4530,9 +4539,10 @@ class TestReleaseLaneForTerminalTask:
         lane = await pool.try_acquire()
         assert lane is not None
 
-        task_dir = lane / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+        lane.mkdir(parents=True, exist_ok=True)
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "3459"}')
 
         freed = await git_ops.release_lane_for_terminal_task('3459', allow_disk_backstop=True)
 
@@ -4549,7 +4559,7 @@ class TestReleaseLaneForTerminalTask:
         """Theft guard: disk backstop resolves lane but it's held by a DIFFERENT live task.
 
         Race window: task '3459' completes → its lane freed → a concurrent
-        dispatch assigns _lane-0 to '9000' → before the stale plan.json is
+        dispatch assigns _lane-0 to '9000' → before the stale metadata.json is
         rewritten, a reconciler fires release_lane_for_terminal_task('3459',
         allow_disk_backstop=True).  The theft guard must detect that _lane-0 is
         now assigned to '9000' (holder != '3459') and refuse the release.
@@ -4563,11 +4573,13 @@ class TestReleaseLaneForTerminalTask:
         pool = git_ops.warm_lane_pool
         assert pool is not None
 
-        # Write stale plan.json for '3459' on _lane-0 (task 3459's old lane)
+        # Stale metadata.json for '3459' on _lane-0 (task 3459's old lane) —
+        # the scan's lane→task key, so the theft guard is genuinely reached.
         lane_0 = git_ops.worktree_base / '_lane-0'
-        task_dir = lane_0 / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text('{"task_id": "3459"}')
+        lane_0.mkdir(parents=True, exist_ok=True)
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane_0.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text('{"task_id": "3459"}')
 
         # A DIFFERENT live task acquires _lane-0 (the first FREE lane)
         result = await pool.acquire_for('9000')

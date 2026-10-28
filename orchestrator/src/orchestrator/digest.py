@@ -4,9 +4,12 @@ Task 1327: Every N escalation events the harness writes an append-only markdown
 digest summarising recent activity, and tracks an EWA of escalations/done that
 pauses the scheduler when it trips.
 
-All I/O in this module is fail-open: helpers return sentinels / zeros / None
-and log warnings rather than raising.  The digest is observability, not a
-correctness gate.
+The path-taking readers and writers in this module are fail-open: they return
+sentinels / zeros / None and log warnings rather than raising.  The digest is
+observability, not a correctness gate.  The connection-taking `query_*` forms
+beneath count_done_in_window and model_role_rollup raise sqlite3.Error instead,
+for a caller that must tell a failed read from a quiet window
+(scripts/sitting/fleet_state.py).
 
 Design decisions (see plan.json):
 - Pure, Harness-free helpers here; harness.py owns the trigger and state.
@@ -44,6 +47,7 @@ if TYPE_CHECKING:
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
 
+from orchestrator.chain_telemetry import ChainTelemetry, summarize_chain_telemetry
 from orchestrator.event_store import EventType
 from orchestrator.workflow import WorkflowOutcome
 
@@ -265,9 +269,8 @@ def aggregate_escalations(
 
 
 # ---------------------------------------------------------------------------
-# Shared read-only-events-DB scaffold (used by count_done_in_window and
-# merge_disposition_counts below — factored out so the fail-open contract
-# lives in exactly one place instead of being stamped out per query).
+# Shared read-only-events-DB scaffold: every events.db reader in this module
+# goes through it, so the fail-open contract lives in exactly one place.
 # ---------------------------------------------------------------------------
 
 
@@ -322,6 +325,26 @@ def _query_events_ro(
 # ---------------------------------------------------------------------------
 
 
+def query_count_done_in_window(
+    conn: sqlite3.Connection,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> int:
+    """Count done task_completed events in the window on *conn*.
+
+    sqlite3.Error propagates, and *conn* is neither opened nor closed here;
+    count_done_in_window is the fail-open form.
+    """
+    (count,) = conn.execute(
+        "SELECT COUNT(*) FROM events "
+        "WHERE event_type = 'task_completed' "
+        "  AND timestamp BETWEEN ? AND ? "
+        "  AND json_extract(data, '$.outcome') = ?",
+        (window_start_iso, window_end_iso, _DONE_OUTCOME),
+    ).fetchone()
+    return int(count)
+
+
 def count_done_in_window(
     events_db: Path,
     window_start_iso: str,
@@ -332,17 +355,10 @@ def count_done_in_window(
     Uses sqlite3 directly (read-only).  Fail-open: any exception returns 0.
     Missing DB returns 0 (DEBUG); other failures return 0 (WARNING).
     """
-    def _query(conn: sqlite3.Connection) -> int:
-        (count,) = conn.execute(
-            "SELECT COUNT(*) FROM events "
-            "WHERE event_type = 'task_completed' "
-            "  AND timestamp BETWEEN ? AND ? "
-            "  AND json_extract(data, '$.outcome') = ?",
-            (window_start_iso, window_end_iso, _DONE_OUTCOME),
-        ).fetchone()
-        return int(count)
-
-    return _query_events_ro(events_db, 'count_done_in_window', 0, _query)
+    return _query_events_ro(
+        events_db, 'count_done_in_window', 0,
+        lambda conn: query_count_done_in_window(conn, window_start_iso, window_end_iso),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +407,55 @@ def merge_disposition_counts(
         return {disp: int(count) for disp, count in rows}
 
     return _query_events_ro(events_db, 'merge_disposition_counts', {}, _query)
+
+
+# ---------------------------------------------------------------------------
+# Deep merge-ahead chain telemetry (task 3188, PRD ε of
+# plans/deep-merge-ahead-prd.md).  This module owns the window;
+# orchestrator/src/orchestrator/chain_telemetry.py owns the arithmetic.
+# ---------------------------------------------------------------------------
+
+
+def _parse_payload(raw: str | None) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def chain_telemetry_in_window(
+    events_db: Path,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> ChainTelemetry:
+    """Summarise merge_verify and merge_finalized events inside the window.
+
+    Both event types are windowed over the same run-agnostic
+    ``timestamp BETWEEN`` bounds, so the items-landed numerator and the
+    deep-verify denominator cover the same span across fleet redeploys.
+    A row whose ``data`` is not a JSON object is skipped.
+
+    Uses sqlite3 directly (read-only).  Fail-open: any exception returns
+    ``ChainTelemetry()``.
+    """
+    def _payloads(conn: sqlite3.Connection, event_type: EventType) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            'SELECT data FROM events '
+            'WHERE event_type = ? AND timestamp BETWEEN ? AND ? ORDER BY id',
+            (event_type.value, window_start_iso, window_end_iso),
+        ).fetchall()
+        return [_parse_payload(raw) for (raw,) in rows]
+
+    def _query(conn: sqlite3.Connection) -> ChainTelemetry:
+        return summarize_chain_telemetry(
+            _payloads(conn, EventType.merge_verify),
+            _payloads(conn, EventType.merge_finalized),
+        )
+
+    return _query_events_ro(
+        events_db, 'chain_telemetry_in_window', ChainTelemetry(), _query,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -548,15 +613,14 @@ def _compute_turn_cap_saturation(
     return saturation
 
 
-def model_role_rollup(
-    runs_db: Path,
+def query_model_role_rollup(
+    conn: sqlite3.Connection,
     window_start_iso: str,
     window_end_iso: str,
 ) -> ModelRoleRollup:
-    """Aggregate per-(model, role) invocation outcomes for a digest window.
+    """Aggregate per-(model, role) invocation outcomes for a window on *conn*.
 
-    Uses sqlite3 directly (read-only) via the shared `_query_events_ro`
-    scaffold on `runs_db` (the same file backing EventStore/CostStore/
+    *conn* is a runs.db connection (the file backing EventStore/CostStore/
     RunStore). One query LEFT JOINs `invocations` to `task_results` on
     (run_id, task_id) so module_tagger rows (task_id IS NULL, never matched)
     still contribute invocation_count/cost/cap-hit but count as neither done
@@ -565,68 +629,81 @@ def model_role_rollup(
     Rates are derived in Python with divide-by-zero guards; cost_per_done is
     None (not 0/inf) when a cell has zero distinct done tasks.
 
-    Fail-open: a missing/unreadable DB returns an empty ModelRoleRollup.
+    sqlite3.Error propagates, and *conn* is neither opened nor closed here;
+    model_role_rollup is the fail-open form.
     """
-    def _query(conn: sqlite3.Connection) -> ModelRoleRollup:
-        raw_rows = conn.execute(
-            'SELECT i.model, i.role, '
-            '       COUNT(*) AS invocation_count, '
-            '       SUM(i.capped) AS capped_count, '
-            '       SUM(i.cost_usd) AS total_cost_usd, '
-            '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS done_count, '
-            '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS blocked_count, '
-            '       COUNT(DISTINCT CASE WHEN tr.outcome = ? THEN i.task_id END) '
-            '           AS distinct_done_tasks '
-            'FROM invocations i '
-            'LEFT JOIN task_results tr '
-            '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
-            'WHERE i.completed_at BETWEEN ? AND ? '
-            'GROUP BY i.model, i.role',
-            (
-                _DONE_OUTCOME, _BLOCKED_OUTCOME, _DONE_OUTCOME,
-                window_start_iso, window_end_iso,
-            ),
-        ).fetchall()
+    raw_rows = conn.execute(
+        'SELECT i.model, i.role, '
+        '       COUNT(*) AS invocation_count, '
+        '       SUM(i.capped) AS capped_count, '
+        '       SUM(i.cost_usd) AS total_cost_usd, '
+        '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS done_count, '
+        '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS blocked_count, '
+        '       COUNT(DISTINCT CASE WHEN tr.outcome = ? THEN i.task_id END) '
+        '           AS distinct_done_tasks '
+        'FROM invocations i '
+        'LEFT JOIN task_results tr '
+        '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
+        'WHERE i.completed_at BETWEEN ? AND ? '
+        'GROUP BY i.model, i.role',
+        (
+            _DONE_OUTCOME, _BLOCKED_OUTCOME, _DONE_OUTCOME,
+            window_start_iso, window_end_iso,
+        ),
+    ).fetchall()
 
-        rows: list[ModelRoleRow] = []
-        for (
-            model, role, invocation_count, capped_count, total_cost_usd,
-            done_count, blocked_count, distinct_done_tasks,
-        ) in raw_rows:
-            invocation_count = int(invocation_count or 0)
-            capped_count = int(capped_count or 0)
-            total_cost_usd = float(total_cost_usd or 0.0)
-            done_count = int(done_count or 0)
-            blocked_count = int(blocked_count or 0)
-            distinct_done_tasks = int(distinct_done_tasks or 0)
+    rows: list[ModelRoleRow] = []
+    for (
+        model, role, invocation_count, capped_count, total_cost_usd,
+        done_count, blocked_count, distinct_done_tasks,
+    ) in raw_rows:
+        invocation_count = int(invocation_count or 0)
+        capped_count = int(capped_count or 0)
+        total_cost_usd = float(total_cost_usd or 0.0)
+        done_count = int(done_count or 0)
+        blocked_count = int(blocked_count or 0)
+        distinct_done_tasks = int(distinct_done_tasks or 0)
 
-            done_rate = (done_count / invocation_count) if invocation_count else 0.0
-            blocked_rate = (blocked_count / invocation_count) if invocation_count else 0.0
-            cap_hit_rate = (capped_count / invocation_count) if invocation_count else 0.0
-            cost_per_done = (
-                (total_cost_usd / distinct_done_tasks) if distinct_done_tasks > 0 else None
-            )
-
-            rows.append(ModelRoleRow(
-                model=model,
-                role=role,
-                invocation_count=invocation_count,
-                done_count=done_count,
-                blocked_count=blocked_count,
-                done_rate=done_rate,
-                blocked_rate=blocked_rate,
-                capped_count=capped_count,
-                cap_hit_rate=cap_hit_rate,
-                total_cost_usd=total_cost_usd,
-                cost_per_done=cost_per_done,
-            ))
-
-        turn_cap_saturation = _compute_turn_cap_saturation(
-            conn, window_start_iso, window_end_iso,
+        done_rate = (done_count / invocation_count) if invocation_count else 0.0
+        blocked_rate = (blocked_count / invocation_count) if invocation_count else 0.0
+        cap_hit_rate = (capped_count / invocation_count) if invocation_count else 0.0
+        cost_per_done = (
+            (total_cost_usd / distinct_done_tasks) if distinct_done_tasks > 0 else None
         )
-        return ModelRoleRollup(rows=rows, turn_cap_saturation=turn_cap_saturation)
 
-    return _query_events_ro(runs_db, 'model_role_rollup', ModelRoleRollup(), _query)
+        rows.append(ModelRoleRow(
+            model=model,
+            role=role,
+            invocation_count=invocation_count,
+            done_count=done_count,
+            blocked_count=blocked_count,
+            done_rate=done_rate,
+            blocked_rate=blocked_rate,
+            capped_count=capped_count,
+            cap_hit_rate=cap_hit_rate,
+            total_cost_usd=total_cost_usd,
+            cost_per_done=cost_per_done,
+        ))
+
+    turn_cap_saturation = _compute_turn_cap_saturation(
+        conn, window_start_iso, window_end_iso,
+    )
+    return ModelRoleRollup(rows=rows, turn_cap_saturation=turn_cap_saturation)
+
+
+def model_role_rollup(
+    runs_db: Path,
+    window_start_iso: str,
+    window_end_iso: str,
+) -> ModelRoleRollup:
+    """Fail-open form of query_model_role_rollup over a read-only `runs_db`.
+
+    A missing/unreadable DB returns an empty ModelRoleRollup.
+    """
+    return _query_events_ro(
+        runs_db, 'model_role_rollup', ModelRoleRollup(),
+        lambda conn: query_model_role_rollup(conn, window_start_iso, window_end_iso),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +857,8 @@ class DigestInputs:
     lifecycle_events_in_step: int = 0
     # Task 5311 — the '## Paused, waiting' section; defaulted and appended last.
     pause_visibility: PauseVisibility = field(default_factory=PauseVisibility)
+    # Task 3188 ε — the '## Deep merge-ahead chains' section; defaulted and appended last.
+    chain_telemetry: ChainTelemetry = field(default_factory=ChainTelemetry)
 
 
 def render_digest_markdown(inputs: DigestInputs) -> str:
@@ -914,6 +993,8 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
         lines.append('_none_')
     lines.append('')
 
+    lines.extend(_render_chain_telemetry_section(inputs.chain_telemetry))
+
     # Stale lane assignments (leaf γ, task 2891) — non-terminal warm-lane
     # records idle past lane_stale_report_days; surfaced for operator attention,
     # never auto-reclaimed (WIP-preserving invariant).
@@ -926,6 +1007,33 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
     lines.append('')
 
     return '\n'.join(lines)
+
+
+def _render_chain_telemetry_section(telemetry: ChainTelemetry) -> list[str]:
+    lines = ['## Deep merge-ahead chains']
+    if telemetry.chain_items_histogram:
+        lines.append('| chain items | verifies | passed | pass rate |')
+        lines.append('|-------------|----------|--------|-----------|')
+        for chain_items, bucket in sorted(telemetry.chain_items_histogram.items()):
+            rate = bucket.rate
+            rate_str = f'{rate * 100:.1f}%' if rate is not None else 'n/a'
+            lines.append(f'| {chain_items} | {bucket.total} | {bucket.passed} | {rate_str} |')
+    else:
+        lines.append('_none_')
+    per_verify = telemetry.items_landed_per_deep_verify
+    lines.append(
+        f'- Items landed per deep verify: {per_verify:.2f}'
+        if per_verify is not None else '- Items landed per deep verify: n/a'
+    )
+    fail_rate = telemetry.deep_fail_rate
+    lines.append(
+        f'- Deep-fail rate: {fail_rate * 100:.1f}% '
+        f'({telemetry.deep_failures}/{telemetry.deep_verifies})'
+        if fail_rate is not None else '- Deep-fail rate: n/a'
+    )
+    lines.append(f'- Excluded legacy depth>=2 events: {telemetry.excluded_legacy_depth}')
+    lines.append('')
+    return lines
 
 
 # ---------------------------------------------------------------------------

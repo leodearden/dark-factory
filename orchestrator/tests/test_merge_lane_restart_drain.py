@@ -15,7 +15,7 @@ import subprocess
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
@@ -34,7 +34,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import GroupMergeRequest, MergeLane, MergeRequest, QueuedBranch
 from orchestrator.merge_lane.types import TrainCallbacks
-from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
+from orchestrator.verify import merge_verify_command_budget_secs
 
 pytestmark = pytest.mark.asyncio
 
@@ -43,7 +43,6 @@ _GIT = GitConfig(
     push_after_advance=False,
 )
 _SEED = RepoSeed(files=(('README.md', '# Test\n'),), message='Initial commit')
-_TRAIN_VERIFY_TARGET = 'orchestrator.merge_lane.worker.run_scoped_verification'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,6 +76,7 @@ async def _request(scene: _Scene, name: str, *, lane: str = 'normal') -> MergeRe
         config=scene.config,
         result=asyncio.get_running_loop().create_future(),
         lane='high' if lane == 'high' else 'normal',
+        awaited_by_workflow=True,
     )
 
 
@@ -251,31 +251,26 @@ async def _stacked_train(scene: _Scene) -> GroupMergeRequest:
 async def test_a_train_verifying_in_the_merger_is_in_flight(scene: _Scene) -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
-
-    async def _held_verify(*_args: Any, **_kwargs: Any) -> VerifyResult:
-        entered.set()
-        await release.wait()
-        return VerifyResult(
-            passed=True, test_output='', lint_output='', type_output='', summary='ok',
-        )
-
     clock = _writing_clock()
     queue: asyncio.Queue[Any] = asyncio.Queue()
-    lane = make_lane(scene.git_ops, queue, clock=clock)
+    lane = make_lane(
+        scene.git_ops, queue,
+        verifier=FakeVerifier(scripts={_MEMBERS[-1]: hangs_until(release, entered=entered)}),
+        clock=clock,
+    )
     train = await _stacked_train(scene)
 
-    with patch(_TRAIN_VERIFY_TARGET, side_effect=_held_verify):
-        async with running_lane(lane) as run:
-            await queue.put(train)
-            await wait_responsive(entered.wait(), label='train verify under way')
+    async with running_lane(lane) as run:
+        await queue.put(train)
+        await wait_responsive(entered.wait(), label='train verify under way')
 
-            lane.halt_admission('restart drain test')
-            in_flight = _drain_view(lane)['verifies_in_flight']
-            captured_at = clock.time
-            occupancy = lane.snapshot()['occupancy']
+        lane.halt_admission('restart drain test')
+        in_flight = _drain_view(lane)['verifies_in_flight']
+        captured_at = clock.time
+        occupancy = lane.snapshot()['occupancy']
 
-            release.set()
-            outcome = await run.outcome(train)
+        release.set()
+        outcome = await run.outcome(train)
 
     _assert_one_in_flight(
         in_flight, task_id=_MEMBERS[-1], host='local', kind='train',
@@ -302,29 +297,6 @@ async def test_the_budget_is_the_longest_merge_command_timeout(tmp_path: Path) -
 
 
 
-def _green() -> VerifyResult:
-    return VerifyResult(
-        passed=True, test_output='', lint_output='', type_output='', summary='ok',
-    )
-
-
-class _HeldVerify:
-    """``run_scoped_verification`` stand-in for the verifies the lane runs
-    outside its injected ``VerifyPort`` (a train's, a gate re-verify): counts
-    its calls and holds each until released."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-        self.entered = asyncio.Event()
-        self.release = asyncio.Event()
-
-    async def run(self, *_args: Any, **_kwargs: Any) -> VerifyResult:
-        self.calls += 1
-        self.entered.set()
-        await self.release.wait()
-        return _green()
-
-
 async def test_a_train_parked_behind_its_predecessor_does_not_start_its_verify_under_a_halt(
     scene: _Scene,
 ) -> None:
@@ -338,37 +310,34 @@ async def test_a_train_parked_behind_its_predecessor_does_not_start_its_verify_u
     lane = MergeLane(scene.git_ops, queue, verifier=verifier)
     pred = await _request(scene, 'pred')
     train = await _stacked_train(scene)
-    train_verify = _HeldVerify()
-    train_verify.release.set()
 
-    with patch(_TRAIN_VERIFY_TARGET, side_effect=train_verify.run):
-        async with running_lane(lane) as run:
-            await queue.put(pred)
-            await wait_responsive(verifier.await_entry(1), label='predecessor verify under way')
-            await queue.put(train)
-            await wait_responsive(
-                _until(lambda: _state(lane, train) == 'merging'),
-                label='train dequeued and parked behind its predecessor',
-            )
+    async with running_lane(lane) as run:
+        await queue.put(pred)
+        await wait_responsive(verifier.await_entry(1), label='predecessor verify under way')
+        await queue.put(train)
+        await wait_responsive(
+            _until(lambda: _state(lane, train) == 'merging'),
+            label='train dequeued and parked behind its predecessor',
+        )
 
-            lane.halt_admission('restart drain test')
-            await wait_responsive(
-                _until(lambda: _state(lane, train) == 'queued'),
-                label='train requeued instead of verifying',
-            )
-            assert train_verify.calls == 0
-            in_flight = _drain_view(lane)['verifies_in_flight']
-            assert [(v['task_id'], v['kind']) for v in in_flight] == [('pred', 'verify')]
+        lane.halt_admission('restart drain test')
+        await wait_responsive(
+            _until(lambda: _state(lane, train) == 'queued'),
+            label='train requeued instead of verifying',
+        )
+        assert verifier.verified.count(_MEMBERS[-1]) == 0
+        in_flight = _drain_view(lane)['verifies_in_flight']
+        assert [(v['task_id'], v['kind']) for v in in_flight] == [('pred', 'verify')]
 
-            release_pred.set()
-            assert (await run.outcome(pred)).status == 'done'
-            assert train_verify.calls == 0
+        release_pred.set()
+        assert (await run.outcome(pred)).status == 'done'
+        assert verifier.verified.count(_MEMBERS[-1]) == 0
 
-            lane.resume_admission()
-            outcome = await run.outcome(train)
+        lane.resume_admission()
+        outcome = await run.outcome(train)
 
     assert outcome.status == 'done', outcome
-    assert train_verify.calls == 1
+    assert verifier.verified.count(_MEMBERS[-1]) == 1
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -390,37 +359,36 @@ async def test_a_gate_reverify_deadline_runs_from_the_reverify_start(tmp_path: P
         config=lane_scene_config(repo, _GIT, merge_verify_breadth='full'),
     )
     release_first = asyncio.Event()
+    release_gate = asyncio.Event()
     clock = _writing_clock()
-    verifier = FakeVerifier(scripts={'head': hangs_until(release_first)})
+    verifier = FakeVerifier(sequence=[hangs_until(release_first), hangs_until(release_gate)])
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(scene.git_ops, queue, verifier=verifier, clock=clock)
     head = await _request(scene, 'head')
     budget = merge_verify_command_budget_secs(scene.config, [])
-    reverify = _HeldVerify()
 
-    with patch(_TRAIN_VERIFY_TARGET, side_effect=reverify.run):
-        async with running_lane(lane) as run:
-            await queue.put(head)
-            await wait_responsive(verifier.await_entry(1), label='head verify under way')
-            (first,) = _drain_view(lane)['verifies_in_flight']
-            (repo / 'drift.txt').write_text('moved under the verify\n')
-            _git(repo, 'add', '--', 'drift.txt')
-            _git(repo, 'commit', '-m', 'drift: direct commit')
-            clock.time += 5_000.0
+    async with running_lane(lane) as run:
+        await queue.put(head)
+        await wait_responsive(verifier.await_entry(1), label='head verify under way')
+        (first,) = _drain_view(lane)['verifies_in_flight']
+        (repo / 'drift.txt').write_text('moved under the verify\n')
+        _git(repo, 'add', '--', 'drift.txt')
+        _git(repo, 'commit', '-m', 'drift: direct commit')
+        clock.time += 5_000.0
 
-            release_first.set()
-            await wait_responsive(reverify.entered.wait(), label='gate re-verify under way')
-            (gate,) = _drain_view(lane)['verifies_in_flight']
+        release_first.set()
+        await wait_responsive(verifier.await_entry(2), label='gate re-verify under way')
+        (gate,) = _drain_view(lane)['verifies_in_flight']
 
-            reverify.release.set()
-            outcome = await run.outcome(head)
+        release_gate.set()
+        outcome = await run.outcome(head)
 
     assert first['kind'] == 'verify'
     assert gate['kind'] == 'gate_reverify'
     assert gate['started_ts'] >= first['started_ts'] + 5_000.0
     assert gate['deadline_ts'] - gate['started_ts'] == budget
     assert outcome.status == 'done', outcome
-    assert reverify.calls == 1
+    assert verifier.verified == ['head', 'head']
 
 
 # ─── R6: a requeued predecessor is not waited for ───────────────────────────
@@ -439,41 +407,38 @@ async def test_a_train_does_not_park_on_a_predecessor_the_halt_sent_back_to_the_
     train = await _stacked_train(scene)
     head = await _request(scene, 'head')
     pred = await _request(scene, 'pred')
-    train_verify = _HeldVerify()
-    train_verify.release.set()
 
-    with patch(_TRAIN_VERIFY_TARGET, side_effect=train_verify.run):
-        async with running_lane(lane) as run:
-            await queue.put(head)
-            await wait_responsive(verifier.await_entry(1), label='head verify under way')
-            await queue.put(pred)
-            await wait_responsive(
-                _until(lambda: _state(lane, pred) in {'awaiting_verify', 'awaiting_host'}),
-                label='predecessor merged, waiting for the one host',
-            )
-            await queue.put(train)
-            await wait_responsive(
-                _until(lambda: _state(lane, train) == 'merging'),
-                label='train parked behind the predecessor',
-            )
+    async with running_lane(lane) as run:
+        await queue.put(head)
+        await wait_responsive(verifier.await_entry(1), label='head verify under way')
+        await queue.put(pred)
+        await wait_responsive(
+            _until(lambda: _state(lane, pred) in {'awaiting_verify', 'awaiting_host'}),
+            label='predecessor merged, waiting for the one host',
+        )
+        await queue.put(train)
+        await wait_responsive(
+            _until(lambda: _state(lane, train) == 'merging'),
+            label='train parked behind the predecessor',
+        )
 
-            lane.halt_admission('restart drain test')
-            release_head.set()
-            assert (await run.outcome(head)).status == 'done'
-            await wait_responsive(
-                _until(lambda: (_state(lane, train), _state(lane, pred)) == ('queued', 'queued')),
-                label='train and predecessor both requeued',
-            )
+        lane.halt_admission('restart drain test')
+        release_head.set()
+        assert (await run.outcome(head)).status == 'done'
+        await wait_responsive(
+            _until(lambda: (_state(lane, train), _state(lane, pred)) == ('queued', 'queued')),
+            label='train and predecessor both requeued',
+        )
 
-            lane.resume_admission()
-            train_outcome = await wait_responsive(
-                asyncio.shield(train.result), label='train lands without parking on pred',
-            )
-            pred_outcome = await run.outcome(pred)
+        lane.resume_admission()
+        train_outcome = await wait_responsive(
+            asyncio.shield(train.result), label='train lands without parking on pred',
+        )
+        pred_outcome = await run.outcome(pred)
 
     assert train_outcome.status == 'done', train_outcome
     assert pred_outcome.status == 'done', pred_outcome
-    assert train_verify.calls == 1
+    assert verifier.verified.count(_MEMBERS[-1]) == 1
 
 
 # ─── R7: the drain never strands a coalesce train's members ─────────────────
@@ -568,6 +533,38 @@ async def test_a_halt_dissolves_a_coalesce_train_waiting_in_its_buffer(
     assert sorted(hooks.redriven) == [(name, False, None) for name in _SINGLES]
 
 
+async def test_a_dissolved_coalesce_train_hands_members_back_on_their_pre_stack_tips(
+    coalesce_scene: _Scene,
+) -> None:
+    """Task 4953: main moves after the branches exist, so re-driving a member
+    from its stacked tip could not land it back where it was."""
+    hooks = _CoalesceHooks()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(coalesce_scene.git_ops, queue, train_callback_factory=hooks.factory)
+    singles = [await _request(coalesce_scene, name) for name in _SINGLES]
+    before = [_git(coalesce_scene.repo, 'rev-parse', f'task/{name}') for name in _SINGLES]
+    (coalesce_scene.repo / 'drift.txt').write_text('main moved\n')
+    _git(coalesce_scene.repo, 'add', '--', 'drift.txt')
+    _git(coalesce_scene.repo, 'commit', '-m', 'drift: direct commit')
+    lane.halt_lane('normal', 'hold the formed train in its buffer')
+    for single in singles:
+        await queue.put(single)
+
+    async with running_lane(lane):
+        await wait_responsive(
+            _until(lambda: all(single.result.done() for single in singles)),
+            label='singles coalesced into a buffered train',
+        )
+        lane.halt_admission('restart drain test')
+        await wait_responsive(
+            _until(lambda: len(hooks.redriven) == len(_SINGLES)),
+            label='train dissolved and its members re-driven',
+        )
+
+    after = [_git(coalesce_scene.repo, 'rev-parse', f'task/{name}') for name in _SINGLES]
+    assert after == before
+
+
 class _WaitWatchingQueue(asyncio.Queue[Any]):
     """The lane's input queue, noting when the merger starts its blocking get.
 
@@ -627,29 +624,26 @@ async def test_a_halt_dissolves_a_dequeued_coalesce_train_instead_of_requeuing_i
     )
     head = await _request(coalesce_scene, 'head', lane='high')
     singles = [await _request(coalesce_scene, name) for name in _SINGLES]
-    train_verify = _HeldVerify()
-    train_verify.release.set()
 
-    with patch(_TRAIN_VERIFY_TARGET, side_effect=train_verify.run):
-        async with running_lane(lane) as run:
-            for request in (head, *singles):
-                await queue.put(request)
-            await wait_responsive(verifier.await_entry(1), label='head verify under way')
-            await wait_responsive(
-                _until(lambda: (_SINGLES[-1], 'merging') in _entries(lane)),
-                label='coalesce train dequeued and parked behind the head',
-            )
+    async with running_lane(lane) as run:
+        for request in (head, *singles):
+            await queue.put(request)
+        await wait_responsive(verifier.await_entry(1), label='head verify under way')
+        await wait_responsive(
+            _until(lambda: (_SINGLES[-1], 'merging') in _entries(lane)),
+            label='coalesce train dequeued and parked behind the head',
+        )
 
-            lane.halt_admission('restart drain test')
-            await wait_responsive(
-                _until(lambda: len(hooks.redriven) == len(_SINGLES)),
-                label='dequeued train dissolved and its members re-driven',
-            )
-            assert _entries(lane) == [('head', 'verifying')]
-            assert lane.unfrozen_suffix() == ()
+        lane.halt_admission('restart drain test')
+        await wait_responsive(
+            _until(lambda: len(hooks.redriven) == len(_SINGLES)),
+            label='dequeued train dissolved and its members re-driven',
+        )
+        assert _entries(lane) == [('head', 'verifying')]
+        assert lane.unfrozen_suffix() == ()
 
-            release_head.set()
-            assert (await run.outcome(head)).status == 'done'
+        release_head.set()
+        assert (await run.outcome(head)).status == 'done'
 
     assert sorted(hooks.redriven) == [(name, False, None) for name in _SINGLES]
-    assert train_verify.calls == 0
+    assert _SINGLES[-1] not in verifier.verified

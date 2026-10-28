@@ -47,6 +47,22 @@ gate block out of each named task store, and ``run`` refuses ``--apply``
 unless the census covers every swept project.  A store the census could not
 read is a gap it names, never a silent "no gates here".
 
+A gated slug moves all-or-nothing; an ungated slug does not
+-----------------------------------------------------------
+When any member write of a GATED slug fails, ``rename_group`` undoes the
+members that moved, because a gate left on a vacated slug is uncloseable.
+
+An UNGATED slug gets no undo.  A partial failure leaves it split: the members
+that moved carry the new slug and those whose write did not land keep the
+legacy value.  The residue probe files ``legacy_slug_residue`` for it, and the
+report lists the group under ``ungated_partial_rename``.
+
+A plain re-run does NOT finish the move.  The collision guard sees the moved
+members as incumbents on the new slug and refuses the stragglers as
+``slug_collision``.  The remedy is by hand: once a straggler's failure is
+resolved, patch its ``metadata.topic`` to the new slug with a metadata-only
+``update_memory`` merge, the same patch this script issues.
+
 Dry run is the default — the operator runbook
 --------------------------------------------
 1. **Dry run**, from anywhere, naming the checkout of EACH swept corpus::
@@ -60,6 +76,9 @@ Dry run is the default — the operator runbook
    markdown.  Nothing is modified.  ``--project-root`` REPLACES the default
    (this checkout alone), so a swept corpus whose checkout is not named is a
    ``gate_census_incomplete`` gap: the dry run exits 1 and names it.
+   ``--topic <legacy value>`` (repeatable) narrows the write set to the named
+   legacy spellings; it is how one registry topic is normalized without
+   sweeping the whole project.
 
 2. **Read the refusal buckets and resolve them BY HAND.**  ``slug_collision``,
    ``canonical_collision``, ``topic_unfoldable`` and ``gate_ambiguous`` are
@@ -71,7 +90,9 @@ Dry run is the default — the operator runbook
    more than one consolidation gate, where moving one gate would strand the
    others.  Also check ``under_enumerated`` / ``scroll_budget_exhausted``: a
    run with either populated is a LOWER BOUND, and a clean residue probe over
-   it proves nothing.
+   it proves nothing.  After an ``--apply``, ``ungated_partial_rename`` lists
+   any slug left split across both values; it too is resolved by hand, as
+   described above.
 
 3. **Apply**, as an OPERATOR, with the same roots::
 
@@ -125,10 +146,7 @@ from fused_memory.backends.mem0_client import (
 )
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.topic_slug import derive_topic_slug, is_valid_topic_slug
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 # This script reports through ``print``; stdout carries its machine-read
 # markdown/JSON artifact, so the diagnoses that must not land there -- the
@@ -161,6 +179,7 @@ __all__ = [
     'WriteRejectedError',
     'assert_write_accepted',
     'census_consolidation_gates',
+    'describe_partial_ungated_group',
     'load_mcp_client_class',
     'load_mcp_client_module',
     'open_live_memory_service',
@@ -175,7 +194,6 @@ __all__ = [
     'Rename',
     'SKIP_BUCKETS',
     'ScrollPageBudgetExhausted',
-    'StoreMutationUnavailable',
     'assert_store_mutation_allowed',
     'census_categories',
     'derive_topic_slug',
@@ -190,6 +208,7 @@ __all__ = [
     'resolve_exit_code',
     'resolve_gate_roots',
     'resolve_projects',
+    'resolve_topics',
     'run',
     'run_live',
     'rename_one',
@@ -203,6 +222,7 @@ __all__ = [
 ERROR_OUTCOMES: frozenset[str] = frozenset({
     'slug_collision',
     'canonical_collision',
+    'topic_unfoldable',
     'under_enumerated',
     'scroll_budget_exhausted',
     'memory_not_found',
@@ -212,6 +232,7 @@ ERROR_OUTCOMES: frozenset[str] = frozenset({
     'gate_census_incomplete',
     'gate_ambiguous',
     'gate_lockstep_failed',
+    'ungated_partial_rename',
     'legacy_slug_residue',
 })
 
@@ -239,6 +260,8 @@ SKIP_BUCKETS: tuple[str, ...] = (
     'orphan_gate_topic',
     'gate_ambiguous',
     'gate_lockstep_failed',
+    # from describe_partial_ungated_group
+    'ungated_partial_rename',
     # from verify_old_slugs_drained
     'legacy_slug_residue',
 )
@@ -324,6 +347,16 @@ def census_categories() -> tuple[str, ...]:
 # The corpus boundary
 # ---------------------------------------------------------------------------
 
+def _is_non_conforming_topic(topic: object) -> bool:
+    """A PRESENT topic the slug rule rejects, whatever its type.
+
+    ``None`` is an absent topic (``retro_stamp_topics.py``'s job), never a
+    non-conforming one.  Both the corpus boundary and the planner ask this, so
+    the two cannot disagree about which records need attention.
+    """
+    return topic is not None and not is_valid_topic_slug(topic)
+
+
 async def enumerate_topic_bearing(
     memory_service: Any,
     project_id: str,
@@ -349,7 +382,8 @@ async def enumerate_topic_bearing(
     corpus.  It is also why ``CategoryCensus`` cannot be reused here — it
     deliberately retains no payloads at all, so it knows WHICH slugs are
     non-conforming but not WHICH RECORDS carry them, and a migration needs
-    the ids.
+    the ids.  A present topic that is not a string, or is empty, is
+    non-conforming too, and is retained so :func:`plan_renames` reports it.
 
     The backend is reached as ``memory_service.mem0`` (the
     ``consolidate_namespace_families.py`` pattern) so one injected service
@@ -404,18 +438,17 @@ async def enumerate_topic_bearing(
                 scrolled += 1
                 metadata = record.get('metadata') or {}
                 topic = metadata.get('topic')
-                if not isinstance(topic, str) or not topic:
-                    continue
-                occupied_topics.add(topic)
-                # ``is True``, not truthiness: metadata off a live store is
-                # not schema-enforced here, and ``canonical: 'false'`` would
-                # otherwise read as a canonical claim and escalate a mild
-                # collision into the severe bucket.
-                if metadata.get('canonical') is True:
-                    memory_id = record.get('id')
-                    if isinstance(memory_id, str) and memory_id:
-                        canonical_ids_by_topic.setdefault(topic, []).append(memory_id)
-                if is_valid_topic_slug(topic):
+                if isinstance(topic, str):
+                    occupied_topics.add(topic)
+                    # ``is True``, not truthiness: metadata off a live store is
+                    # not schema-enforced here, and ``canonical: 'false'`` would
+                    # otherwise read as a canonical claim and escalate a mild
+                    # collision into the severe bucket.
+                    if metadata.get('canonical') is True:
+                        memory_id = record.get('id')
+                        if isinstance(memory_id, str) and memory_id:
+                            canonical_ids_by_topic.setdefault(topic, []).append(memory_id)
+                if not _is_non_conforming_topic(topic):
                     continue
                 # The residue triple: the id to write to, the topic to fold,
                 # and whether this record claims canonical (which decides
@@ -537,12 +570,22 @@ class Rename:
 # Pure core — planning
 # ---------------------------------------------------------------------------
 
+def _in_selection(legacy_topic: object, topics: frozenset[str] | None) -> bool:
+    """Whether a ``--topic`` selection covers *legacy_topic*.
+
+    ``None`` is no selection and covers every value.  A selection holds only
+    strings, so a non-string topic (a ``topic_unfoldable`` entry) is never in one.
+    """
+    return topics is None or (isinstance(legacy_topic, str) and legacy_topic in topics)
+
+
 def plan_renames(
     records,
     *,
     project_id: str,
     occupied_topics=None,
     canonical_ids_by_topic=None,
+    topics: frozenset[str] | None = None,
 ) -> tuple[list[Rename], list[dict]]:
     """Decide what to rename in one project's records, and what to refuse.
 
@@ -582,6 +625,9 @@ def plan_renames(
     Args:
         records: Scroll-shaped record dicts for ONE project.
         project_id: The corpus they came from; stamped onto every row.
+        topics: The legacy values whose verdicts to return; ``None`` returns
+            every verdict.  It narrows the verdicts only: a selected value
+            that an unselected spelling contests is still refused.
 
     Returns:
         ``(renames, skips)`` — frozen :class:`Rename` rows, and report-ready
@@ -592,7 +638,9 @@ def plan_renames(
 
     # --- pass 1: what does the corpus already look like? -------------------
     # Built BEFORE any verdict, from the whole record set, so no decision can
-    # depend on the order the backend happened to page records back in.
+    # depend on the order the backend happened to page records back in.  It
+    # ignores *topics* for the same reason: the planner must see every legacy
+    # value to know which targets are contested.
     #
     #   observed_topics       every topic value present, conforming or not
     #   canonical_ids_by_topic  which records under a topic claim canonical
@@ -653,22 +701,19 @@ def plan_renames(
     collisions: dict[str, dict] = {}
     for record in records:
         metadata = record.get('metadata') or {}
-        if 'topic' not in metadata:
-            continue
-        topic = metadata['topic']
-        if topic is None:
-            continue
-        if is_valid_topic_slug(topic):
+        topic = metadata.get('topic')
+        if not _is_non_conforming_topic(topic) or not _in_selection(topic, topics):
             continue
 
         memory_id = record.get('id')
         folded = derive_topic_slug(topic)
-        if folded is None:
+        if not isinstance(topic, str) or folded is None:
             skips.append({
                 'reason': 'topic_unfoldable',
                 'project_id': project_id,
                 'memory_id': memory_id,
                 'topic': topic,
+                'topic_type': type(topic).__name__,
                 'note': (
                     'no honest fold exists for this value (it collapses to '
                     'empty, exceeds TOPIC_SLUG_MAX_LEN once folded, or is not '
@@ -1076,6 +1121,12 @@ async def census_consolidation_gates(client, roots) -> GateCensus:
     )
 
 
+def _gate_topic(task: dict) -> object:
+    """The ``topic`` of a gate task's block, or ``None`` when it carries no block."""
+    block = (task.get('metadata') or {}).get(GATE_METADATA_KEY)
+    return block.get('topic') if isinstance(block, dict) else None
+
+
 def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
     """Pair each slug's renames with the consolidation gate filed against it.
 
@@ -1119,11 +1170,7 @@ def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
     # every verdict below is a property of the corpus rather than of read order.
     gates_by_topic: dict[tuple[str, str], list[dict]] = {}
     for task in gate_tasks or ():
-        metadata = task.get('metadata') or {}
-        block = metadata.get(GATE_METADATA_KEY)
-        if not isinstance(block, dict):
-            continue
-        topic = block.get('topic')
+        topic = _gate_topic(task)
         if not isinstance(topic, str) or not topic:
             continue
         key = (str(task.get('project_id') or ''), topic)
@@ -1279,6 +1326,8 @@ async def rename_group(
 
     An UNGATED group is the common case and short-circuits after step 1: it
     needs no client, so a sweep that touches no gate never opens a socket.
+    It also gets no undo; see the module docstring's "A gated slug moves
+    all-or-nothing; an ungated slug does not".
     A GATED group with no client is the same verdict as a refused gate —
     unable to move it is not permission to leave it behind.
 
@@ -1295,8 +1344,7 @@ async def rename_group(
     if group.gate_task_id is None:
         return results, None
 
-    stood = {'renamed', 'would_rename', 'already_normalized'}
-    failed = [r for r in results if r.get('outcome') not in stood]
+    failed = [r for r in results if r.get('outcome') not in _STOOD_OUTCOMES]
     if failed:
         undo_failures = await _undo_group(memory_service, group, results)
         logger.warning(
@@ -1364,6 +1412,41 @@ async def rename_group(
     )
 
 
+def describe_partial_ungated_group(group: GateGroup, results: list[dict]) -> dict | None:
+    """The report entry for an ungated slug that only partly moved, else ``None``.
+
+    Pure.  A gated group is never described here: its gate row already reports
+    a held pair.  ``failed_outcomes`` has the gate row's key and shape, so the
+    two read the same way.  "Failed" means a member whose rename did not land
+    and so still carries the legacy value; a vanished or concurrently moved
+    member splits nothing and is reported only in its own bucket.
+    """
+    if group.gate_task_id is not None:
+        return None
+    stood = [r for r in results if r.get('outcome') in _STOOD_OUTCOMES]
+    failed = [r for r in results if r.get('outcome') in _LEFT_ON_LEGACY_OUTCOMES]
+    if not stood or not failed:
+        return None
+    return {
+        'reason': 'ungated_partial_rename',
+        'project_id': group.project_id,
+        'old_topic': group.old_topic,
+        'new_topic': group.new_topic,
+        'stood_memory_ids': sorted(r['memory_id'] for r in stood),
+        'failed_memory_ids': sorted(r['memory_id'] for r in failed),
+        'failed_outcomes': sorted({str(r.get('outcome')) for r in failed}),
+        'note': (
+            'this slug carries no consolidation gate, so members that move are '
+            'not rolled back when another fails and the slug is split across '
+            'both values (in a dry run the split is predicted, not yet made); '
+            'a plain re-run refuses the failed members still on the legacy '
+            'value as slug_collision, because the moved members occupy the new '
+            'slug — finish them by hand once their failure is resolved (see '
+            'the module docstring)'
+        ),
+    }
+
+
 def load_mcp_client_class() -> type:
     """Reuse ``FusedMemoryClient`` from ``strip_leaked_control_keys.py``.
 
@@ -1419,6 +1502,16 @@ _REHEARSED_OUTCOMES = frozenset({'would_rename'})
 #: Outcomes that actually moved (or intended to move) a slug.  Anything else
 #: never touched one, so there is nothing to drain and nothing to probe.
 _MOVED_OUTCOMES = frozenset({'renamed', 'would_rename', 'update_failed', 'rename_error'})
+
+#: Outcomes after which a member sits on the new slug, or would in a dry run.
+#: Every other outcome is a member that did not stand.
+_STOOD_OUTCOMES: frozenset[str] = frozenset({'renamed', 'would_rename', 'already_normalized'})
+
+#: Outcomes after which a member still carries the LEGACY value: its rename was
+#: attempted and did not land.  A record that is gone (``memory_not_found``) or
+#: that now carries a third value (``topic_moved_since_plan``) did not stand
+#: either, but it is not on the legacy slug, so it splits nothing.
+_LEFT_ON_LEGACY_OUTCOMES: frozenset[str] = _MOVED_OUTCOMES - _STOOD_OUTCOMES
 
 
 async def verify_old_slugs_drained(memory_service, results, skips) -> None:
@@ -1574,6 +1667,42 @@ class GateCensusIncomplete(RuntimeError):
         self.gaps = gaps
 
 
+def _selection_defect(topic: object) -> str | None:
+    """Why *topic* cannot be a selected legacy value, or ``None`` if it can."""
+    if not isinstance(topic, str):
+        return 'not a string'
+    if is_valid_topic_slug(topic):
+        return 'already conforms; name the legacy value that folds onto it'
+    if derive_topic_slug(topic) is None:
+        return 'has no fold'
+    return None
+
+
+def _refuse_invalid_selection(topics: frozenset[str] | None) -> None:
+    """Raise ``ValueError`` unless *topics* is ``None`` or names foldable legacy values.
+
+    Passing the target slug instead of its source is the likely typo.  Left
+    unrefused, it would plan nothing and exit 0, which reads as a clean run.
+    A legacy value no record carries is NOT refused: a re-run after a
+    successful ``--apply`` legitimately finds the value drained.
+    """
+    if topics is None:
+        return
+    if not topics:
+        raise ValueError(
+            'empty topic selection: name at least one legacy topic value, or '
+            'omit --topic to migrate every non-conforming value')
+    defects = sorted(
+        f'{topic!r} ({defect})'
+        for topic in topics
+        if (defect := _selection_defect(topic)) is not None
+    )
+    if defects:
+        raise ValueError(
+            'a topic selection names LEGACY source values, never target slugs; '
+            'refused: ' + ', '.join(defects))
+
+
 def _census_gaps(gates: GateCensus, projects) -> list[dict]:
     """Every reason this sweep cannot trust its gate pairing, as report entries.
 
@@ -1606,6 +1735,7 @@ async def run(
     client: Any = None,
     page_size: int = DEFAULT_PAGE_SIZE,
     max_pages: int = DEFAULT_MAX_PAGES,
+    topics: frozenset[str] | None = None,
 ) -> dict:
     """Enumerate, plan, pair, write, verify — and report all of it.
 
@@ -1633,11 +1763,20 @@ async def run(
             ``gate_census_incomplete`` instead.  Only the swept projects'
             gates are paired — another project's gate is neither this run's
             work nor its orphan.
+        topics: The legacy values to migrate.  ``None`` (default) migrates
+            every non-conforming value.  A selection narrows the renames, the
+            plan-time refusals and the gate pairing to these values, so an
+            unselected gate is neither paired nor an orphan.  Enumeration,
+            coverage, the collision index and ``baseline_delta`` stay
+            corpus-wide, so a selected value contested by an unselected
+            spelling is still refused.  An invalid selection raises
+            ``ValueError`` before anything is read.
 
     Returns:
         The report dict — rendered by :func:`render_json` /
         :func:`render_markdown` and graded by :func:`resolve_exit_code`.
     """
+    _refuse_invalid_selection(topics)
     gaps = _census_gaps(gates, projects)
 
     # Fail-CLOSED capability preflight: ONE probe per run, ABOVE the scroll.
@@ -1652,25 +1791,19 @@ async def run(
     # Emitted through the logger, never ``print``: stdout is reserved for the
     # machine-read artifact rendered at the end of ``main``.
     if apply:
-        try:
-            assert_store_mutation_allowed(operation='normalize_topic_slugs --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'normalize_topic_slugs: --apply NOT started (fail-closed) -- '
-                "this process cannot write mem0's history directory, so each "
-                'rename would patch a record and then fail to journal the '
-                'change, leaving the corpus HALF-RENAMED: one claim split '
-                'across two topic values, which is strictly worse for an '
-                "exact-match get_memories_by_metadata({'topic': T}) read -- "
-                'the way consolidation clusters and the canonical-uniqueness '
-                'probe address a topic -- than either uniform state. Nothing '
-                'was scrolled and no record was renamed. Route the migration '
-                'through the fused-memory MCP server (the unsandboxed owner '
-                'of the store), or re-run from an unsandboxed operator shell. '
-                'To obtain the sweep report safely from anywhere, re-run '
-                'without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='normalize_topic_slugs --apply',
+            logger=logger,
+            extra_detail=(
+                'each rename would patch a record and then fail to journal the '
+                'change, leaving the corpus HALF-RENAMED: one claim split across '
+                'two topic values, which is strictly worse for an exact-match '
+                "get_memories_by_metadata({'topic': T}) read -- the way "
+                'consolidation clusters and the canonical-uniqueness probe '
+                'address a topic -- than either uniform state. Nothing was '
+                'scrolled and no record was renamed.'
+            ),
+        )
         # The same shape and placement as the preflight: one decision per
         # run, above the scroll, through the logger.
         if gaps:
@@ -1723,8 +1856,11 @@ async def run(
         coverage[project_id] = enumerated['coverage']
         coverage_complete = coverage_complete and enumerated['complete']
         candidate_count += len(enumerated['records'])
+        # Keyed by ``str(topic)``, as census_memory_metadata.py::CategoryCensus.add
+        # keys topic values: the count stays comparable to the census, and an
+        # unhashable list or dict topic cannot raise.
         measured_by_project[project_id] = len({
-            (r.get('metadata') or {}).get('topic') for r in enumerated['records']
+            str((r.get('metadata') or {}).get('topic')) for r in enumerated['records']
         })
         _record_skips(enumerated['skips'])
 
@@ -1733,13 +1869,18 @@ async def run(
             project_id=project_id,
             occupied_topics=enumerated['occupied_topics'],
             canonical_ids_by_topic=enumerated['canonical_ids_by_topic'],
+            topics=topics,
         )
         _record_skips(plan_skips)
         all_renames.extend(renames)
 
     groups, gate_skips = pair_gate_blocks(
         all_renames,
-        [task for task in gates.tasks if task.get('project_id') in projects],
+        [
+            task for task in gates.tasks
+            if task.get('project_id') in projects
+            and _in_selection(_gate_topic(task), topics)
+        ],
     )
     _record_skips(gate_skips)
 
@@ -1751,6 +1892,9 @@ async def run(
         results.extend(group_results)
         if gate_row is not None:
             gate_results.append(gate_row)
+        partial = describe_partial_ungated_group(group, group_results)
+        if partial is not None:
+            _record_skips([partial])
 
     # Scope item 3, in the same run that did the writing.
     await verify_old_slugs_drained(memory_service, results, skips)
@@ -1758,8 +1902,11 @@ async def run(
     outcomes: dict[str, int] = {}
     renamed_by_topic: dict[str, int] = {}
     would_rename_by_topic: dict[str, int] = {}
-    for row in results:
+    for row in [*results, *gate_results]:
         outcome = str(row.get('outcome'))
+        if outcome in ERROR_OUTCOMES:
+            skips.setdefault(outcome, []).append(row)
+            continue
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
         if outcome == 'renamed':
             topic = str(row.get('new_topic'))
@@ -1767,17 +1914,15 @@ async def run(
         elif outcome == 'would_rename':
             topic = str(row.get('new_topic'))
             would_rename_by_topic[topic] = would_rename_by_topic.get(topic, 0) + 1
-    for row in gate_results:
-        outcome = str(row.get('outcome'))
-        outcomes[outcome] = outcomes.get(outcome, 0) + 1
 
-    # A skip that grades as an error must reach the exit code even when no
-    # RESULT row carries it: a collision is refused at plan time, so it never
-    # produces a rename row, and grading outcomes alone would exit 0 on a run
-    # that declined to migrate the most dangerous slug it found.
+    # The buckets are the ONLY source of error counts, so each failure is
+    # counted exactly once and every error outcome equals its bucket's length.
+    # That also grades a refusal no result row carries: a collision is refused
+    # at plan time, and grading result rows alone would exit 0 on a run that
+    # declined to migrate the most dangerous slug it found.
     for bucket, entries in skips.items():
         if entries and bucket in ERROR_OUTCOMES:
-            outcomes[bucket] = outcomes.get(bucket, 0) + len(entries)
+            outcomes[bucket] = len(entries)
 
     return {
         'apply': apply,
@@ -1789,6 +1934,7 @@ async def run(
             'listed project is enumerated by scroll, not addressed by id'
         ),
         'projects': list(projects),
+        'topic_selection': None if topics is None else sorted(topics),
         'coverage': coverage,
         'coverage_complete': coverage_complete,
         'candidate_count': candidate_count,
@@ -1851,17 +1997,10 @@ async def run(
 DEFAULT_JSON_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.json')
 DEFAULT_MD_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.md')
 
-#: The skip keys worth printing inline, in reading order.  A whitelist rather
-#: than a dump: rows that land in error buckets carry a whole ``response``
-#: envelope, which would bury the fields that identify the record.
-_SKIP_DETAIL_KEYS: tuple[str, ...] = (
-    'project_id', 'project_root', 'category', 'memory_id', 'memory_ids',
-    'gate_task_id', 'gate_task_ids', 'topic', 'raw_topic', 'old_topic',
-    'new_topic', 'gate_topic', 'legacy_topic', 'existing_topic',
-    'target_topic', 'source_topics', 'canonical_memory_ids', 'incumbent_ids',
-    'record_count', 'residue_count', 'expected', 'scrolled', 'recount',
-    'delta', 'half', 'error', 'error_type', 'undo_failures', 'note',
-)
+#: Keys a skip line leaves out.  The bucket heading already names the reason
+#: or outcome, and ``response`` is :func:`rename_one`'s whole write envelope,
+#: which the JSON keeps.
+_SKIP_LINE_OMITTED_KEYS: frozenset[str] = frozenset({'reason', 'outcome', 'response'})
 
 
 def render_json(report: dict) -> str:
@@ -1877,10 +2016,13 @@ def render_json(report: dict) -> str:
 
 
 def _render_skip_entry(entry: dict) -> str:
+    # The producer's dict is the single point of truth for which fields an
+    # entry carries, in reading order.  A drift in the omitted set can only
+    # SHOW a field, never hide one.
     parts = [
-        f'{key}={entry[key]!r}'
-        for key in _SKIP_DETAIL_KEYS
-        if entry.get(key) is not None
+        f'{key}={value!r}'
+        for key, value in entry.items()
+        if key not in _SKIP_LINE_OMITTED_KEYS and value is not None
     ]
     # An entry the renderer does not recognise is exactly the one worth
     # showing verbatim, rather than as a bare bullet.
@@ -1901,6 +2043,16 @@ def _render_gate_census(census: dict) -> str:
     )
 
 
+def _render_topic_selection(selection: list[str] | None) -> str:
+    if selection is None:
+        return '**Topic selection:** every non-conforming value'
+    return (
+        f'**Topic selection:** {", ".join(f"`{topic}`" for topic in selection)} '
+        '(renames, refusals and gate pairing are narrowed to these; enumeration '
+        'and the collision check stay corpus-wide)'
+    )
+
+
 def render_markdown(report: dict) -> str:
     """The human-readable artifact.
 
@@ -1916,6 +2068,7 @@ def render_markdown(report: dict) -> str:
         '',
         f'**Mode:** {mode}',
         f'**Projects:** {", ".join(report.get("projects") or [])}',
+        _render_topic_selection(report.get('topic_selection')),
         (
             '**Scope:** corpus-wide — every record in every census category '
             'of every listed project is enumerated by scroll, not addressed '
@@ -2069,6 +2222,15 @@ def resolve_gate_roots(args) -> tuple[str, ...]:
     return tuple(dict.fromkeys(args.project_roots))
 
 
+def resolve_topics(args) -> frozenset[str] | None:
+    """``--topic`` REPLACES "every value"; absent, it is ``None``, never empty.
+
+    The rule :func:`resolve_projects` follows: naming a legacy value narrows
+    the write set and never widens it.  :func:`run` validates the values.
+    """
+    return None if args.topics is None else frozenset(args.topics)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -2091,6 +2253,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f'Checkout whose task store the consolidation-gate census reads; '
              f'repeatable, one per swept project. Replaces the default '
              f'({", ".join(DEFAULT_GATE_ROOTS)}) rather than extending it.',
+    )
+    parser.add_argument(
+        '--topic', dest='topics', action='append', default=None,
+        help='Legacy (non-conforming) topic value to migrate; repeatable. '
+             'Replaces the default (every non-conforming value) rather than '
+             'extending it. Name the SOURCE value, never its target slug.',
     )
     parser.add_argument(
         '--server-url', default=None,
@@ -2161,6 +2329,7 @@ async def run_live(args, *, open_memory_service, open_client) -> dict:
                 apply=args.apply,
                 client=client,
                 gates=census,
+                topics=resolve_topics(args),
             )
 
 

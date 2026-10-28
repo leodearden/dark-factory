@@ -35,7 +35,7 @@ function loadMergeQueue() {
 
 const { api: mergeQueue, window: loadedWindow } = loadMergeQueue();
 const {
-  projectInQueue, inQueueOver, inQueueHistory, latencyCaption,
+  projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
 } = mergeQueue;
 const { isDatum, datumView, EM_DASH } = loadedWindow.DF_DATUM;
@@ -117,8 +117,8 @@ test('the module exposes its readers and assigns window.DF_MERGE_QUEUE', () => {
   assert.deepEqual(
     Object.keys(mergeQueue).sort(),
     [
-      'hitRateText', 'inQueueHistory', 'inQueueOver', 'latencyCaption', 'projectInQueue',
-      'projectSpeculative', 'queuedSince', 'recentTotal', 'speculativeOver',
+      'depthBucketCaption', 'hitRateText', 'inQueueHistory', 'inQueueOver', 'latencyCaption',
+      'projectInQueue', 'projectSpeculative', 'queuedSince', 'recentTotal', 'speculativeOver',
     ],
   );
   for (const name of Object.keys(mergeQueue)) {
@@ -294,6 +294,31 @@ test('latencyCaption: the centiles say how many attempts they were computed over
 test('latencyCaption: a latency block without the split states nothing rather than a zero', () => {
   assert.equal(latencyCaption({}), '');
   assert.equal(latencyCaption(undefined), '');
+});
+
+// ── depthBucketCaption: the width the server counted the depth series at ────
+
+test('depthBucketCaption: each width the server ladder serves today', () => {
+  assert.equal(depthBucketCaption({ bucket_minutes: 15 }), '15-min buckets');
+  assert.equal(depthBucketCaption({ bucket_minutes: 60 }), '1-h buckets');
+  assert.equal(depthBucketCaption({ bucket_minutes: 360 }), '6-h buckets');
+  assert.equal(depthBucketCaption({ bucket_minutes: 1440 }), '1-day buckets');
+});
+
+test('depthBucketCaption: a width outside the ladder is computed, not looked up', () => {
+  assert.equal(depthBucketCaption({ bucket_minutes: 90 }), '90-min buckets');
+  assert.equal(depthBucketCaption({ bucket_minutes: 120 }), '2-h buckets');
+  assert.equal(depthBucketCaption({ bucket_minutes: 2880 }), '2-day buckets');
+});
+
+test('depthBucketCaption: a depth naming no usable width states none', () => {
+  const holes = [
+    undefined, null, {}, { bucket_minutes: null }, { bucket_minutes: 0 },
+    { bucket_minutes: -15 }, { bucket_minutes: 7.5 }, { bucket_minutes: '15' },
+  ];
+  for (const depth of holes) {
+    assert.equal(depthBucketCaption(depth), EM_DASH, JSON.stringify(depth));
+  }
 });
 
 // ── queuedSince: when a queued row joined, from the probe instant and its age ─
