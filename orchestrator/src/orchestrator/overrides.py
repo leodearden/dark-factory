@@ -88,6 +88,13 @@ def _migrate_add_source_column(conn: sqlite3.Connection) -> None:
             raise
 
 
+def _require_aware_ttl(ttl_until: datetime | None) -> None:
+    if ttl_until is not None and ttl_until.tzinfo is None:
+        raise ValueError(
+            'ttl_until must be timezone-aware; got a naive datetime'
+        )
+
+
 class PinOrderCollision(Exception):
     """Raised when two tasks would share the same ``pin_order`` value.
 
@@ -161,14 +168,14 @@ class OverrideStore:
 
         Used by all read-path methods and write-path methods that rely on
         sqlite3's default isolation_level.  For the autocommit pattern used
-        by ``set_override`` see :meth:`_connect_autocommit`.
+        by the read-then-write writers see :meth:`_connect_autocommit`.
         """
         conn = sqlite3.connect(str(self.db_path))
         apply_full_durability_pragmas_sync(conn, busy_timeout_ms=5000)
         return conn
 
     def _connect_autocommit(self, *, timeout: float) -> sqlite3.Connection:
-        """Open an autocommit connection (isolation_level=None) for ``set_override``.
+        """Open an autocommit connection (isolation_level=None) for read-then-write writers.
 
         Pragmas are applied before returning; they are not transactional and
         are safe to set before ``BEGIN IMMEDIATE``.  The caller owns the
@@ -236,12 +243,13 @@ class OverrideStore:
         on update alike, so an operator touching a watchdog pin takes it over
         and :meth:`release_watchdog_pin` will no longer delete it.
 
-        **Concurrency note:** ``set_override`` is the only writer in this
-        class that opens its connection with ``isolation_level=None`` and an
-        explicit ``BEGIN IMMEDIATE``, because it performs a ``MAX(pin_order)``
-        read followed by an UPSERT and must serialize that pair against
-        concurrent callers.  All other writers (``clear_override``,
-        ``reorder_pin_queue``, ``clear_terminal``, ``clear_expired``) are
+        **Concurrency note:** ``set_override`` and ``create_watchdog_pin``
+        are the only writers in this class that open their connection with
+        ``isolation_level=None`` and an explicit ``BEGIN IMMEDIATE``, because
+        each performs a ``MAX(pin_order)`` read followed by a write and must
+        serialize that pair against concurrent callers.  All other writers
+        (``clear_override``, ``reorder_pin_queue``, ``release_watchdog_pin``,
+        ``clear_terminal``, ``clear_expired``) are
         single-statement or single-transaction batch operations with no
         read-then-write race, so they use sqlite3's default isolation_level.
         """
@@ -262,10 +270,7 @@ class OverrideStore:
                 f'got pin_order={pin_order!r} with pinned={pinned!r}'
             )
 
-        if ttl_until is not None and ttl_until.tzinfo is None:
-            raise ValueError(
-                'ttl_until must be timezone-aware; got a naive datetime'
-            )
+        _require_aware_ttl(ttl_until)
 
         now_iso = datetime.now(UTC).isoformat()
         # timeout=30: when BEGIN IMMEDIATE blocks (another writer holds the lock)
@@ -473,6 +478,94 @@ class OverrideStore:
                         'WHERE project_root=? AND task_id=?',
                         (idx, now_iso, project_root, tid),
                     )
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Starvation-watchdog pins
+    # ------------------------------------------------------------------
+
+    def create_watchdog_pin(
+        self,
+        project_root: str,
+        task_id: str,
+        *,
+        ttl_until: datetime,
+    ) -> int | None:
+        """Pin *task_id* at the tail of the queue on the watchdog's behalf.
+
+        Inserts only when the task has no overrides row at all, under the same
+        ``BEGIN IMMEDIATE`` serialisation as :meth:`set_override`, and returns
+        the assigned ``pin_order``.  Returns None, writing nothing, when any
+        row exists: an operator's override is never modified, and a TTL on an
+        operator row would later let :meth:`clear_expired` delete it.
+        """
+        _require_aware_ttl(ttl_until)
+        now_iso = datetime.now(UTC).isoformat()
+        conn = self._connect_autocommit(timeout=30)
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            try:
+                existing = conn.execute(
+                    'SELECT 1 FROM overrides WHERE project_root=? AND task_id=?',
+                    (project_root, task_id),
+                ).fetchone()
+                if existing is not None:
+                    conn.execute('ROLLBACK')
+                    return None
+                (pin_order,) = conn.execute(
+                    'SELECT COALESCE(MAX(pin_order), 0) + 1 '
+                    'FROM overrides WHERE project_root=? AND pinned=1',
+                    (project_root,),
+                ).fetchone()
+                conn.execute(
+                    'INSERT INTO overrides (project_root, task_id, pinned, '
+                    'pin_order, ttl_until, created_at, updated_at, source) '
+                    'VALUES (?, ?, 1, ?, ?, ?, ?, ?)',
+                    (
+                        project_root, task_id, pin_order,
+                        ttl_until.astimezone(UTC).isoformat(),
+                        now_iso, now_iso, OverrideSource.STARVATION_WATCHDOG,
+                    ),
+                )
+                conn.execute('COMMIT')
+                return pin_order
+            except Exception:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute('ROLLBACK')
+                raise
+        finally:
+            conn.close()
+
+    def release_watchdog_pin(self, project_root: str, task_id: str) -> bool:
+        """Delete *task_id*'s row only while the watchdog still owns it.
+
+        The ``source`` predicate inside the single DELETE is the ownership
+        check, so a concurrent operator write can never be lost to a
+        read-then-delete race.  Returns True iff a row was deleted.
+        """
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                'DELETE FROM overrides '
+                'WHERE project_root=? AND task_id=? AND source=?',
+                (project_root, task_id, OverrideSource.STARVATION_WATCHDOG),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def count_pins(self, project_root: str, source: OverrideSource) -> int:
+        """Count pinned rows owned by *source*."""
+        conn = self._connect()
+        try:
+            (count,) = conn.execute(
+                'SELECT COUNT(*) FROM overrides '
+                'WHERE project_root=? AND pinned=1 AND source=?',
+                (project_root, source),
+            ).fetchone()
+            return count
         finally:
             conn.close()
 
