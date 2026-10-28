@@ -29,6 +29,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
 
+from shared.project_id import fold_project_token
+
 # Bind scripts/ and orchestrator/ to THIS checkout, never an editable install's (tasks 2881/2882).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 for _path in (_REPO_ROOT / 'orchestrator' / 'src', _REPO_ROOT / 'scripts'):
@@ -44,7 +46,6 @@ from orchestrator.session_registry import (  # noqa: E402
     list_decisions,
     sessions_dir,
 )
-from shared.project_id import fold_project_token  # noqa: E402
 from sitting import brief, gates, inventory, ownership, payloads  # noqa: E402
 from sitting import ledger as ledgers  # noqa: E402
 from sitting import preparation as preparations  # noqa: E402

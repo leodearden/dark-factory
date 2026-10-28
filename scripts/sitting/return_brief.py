@@ -56,7 +56,7 @@ from sitting.fleet_state import (  # noqa: E402
     Window,
 )
 from sitting.inventory import Shortfall, parse_stamp  # noqa: E402
-from sitting.prepare_sitting import HandoverOverride, Sitting  # noqa: E402
+from sitting.prepare_sitting import Sitting  # noqa: E402
 
 DEFAULT_OUTPUT = _REPO_ROOT / 'data' / 'return-brief.md'
 DEFAULT_LEDGER_OUT = _REPO_ROOT / 'data' / 'sitting' / 'ledger-nightly.json'
@@ -102,7 +102,7 @@ def build(
     project_roots: Sequence[str],
     decisions_root: Path,
     sessions_root: Path,
-    handover_override: HandoverOverride | None,
+    handover_override: prepare_sitting.HandoverOverride | None,
     preparation_path: Path,
     previous_ledger: Path | None,
     window: Window,
