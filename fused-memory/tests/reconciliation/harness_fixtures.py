@@ -28,10 +28,10 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
 )
-from fused_memory.services.memory_service import MemoryService
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+    from fused_memory.services.memory_service import MemoryService
 
 _PIPELINE_STAGE_CLASSES = (MemoryConsolidator, TaskKnowledgeSync, IntegrityCheck)
 
@@ -67,13 +67,14 @@ def make_memory_service() -> AsyncMock:
     return service
 
 
+def make_reconciliation_config(**overrides: Any) -> ReconciliationConfig:
+    """The baseline reconciliation section; ``judge_enabled`` keeps its schema default unless overridden."""
+    return ReconciliationConfig(**{**_BASELINE_RECONCILIATION_FIELDS, **overrides})
+
+
 def make_harness_config(**reconciliation_overrides: Any) -> FusedMemoryConfig:
-    """The baseline reconciliation config; ``judge_enabled`` keeps its schema default unless overridden."""
-    return FusedMemoryConfig(
-        reconciliation=ReconciliationConfig(
-            **{**_BASELINE_RECONCILIATION_FIELDS, **reconciliation_overrides},
-        ),
-    )
+    """A ``FusedMemoryConfig`` whose only non-default section is ``make_reconciliation_config(...)``."""
+    return FusedMemoryConfig(reconciliation=make_reconciliation_config(**reconciliation_overrides))
 
 
 @asynccontextmanager

@@ -8,6 +8,7 @@ class cannot trip it.
 
 from __future__ import annotations
 
+from functools import cache
 from pathlib import Path
 
 from _ast_guard import calls_named, parse_python_module
@@ -18,7 +19,8 @@ FACTORY = 'reconciliation/harness_fixtures.py'
 CONSTRUCTOR = 'ReconciliationHarness'
 
 
-def _discover_constructing_modules() -> set[str]:
+@cache
+def _discover_constructing_modules() -> frozenset[str]:
     found: set[str] = set()
     for path in sorted(TESTS_ROOT.glob('**/*.py')):
         if path.resolve() == SELF:
@@ -27,23 +29,21 @@ def _discover_constructing_modules() -> set[str]:
             continue
         if calls_named(parse_python_module(path), CONSTRUCTOR):
             found.add(path.relative_to(TESTS_ROOT).as_posix())
-    return found
-
-
-CONSTRUCTING_MODULES = _discover_constructing_modules()
+    return frozenset(found)
 
 
 def test_discovery_finds_the_shared_factory():
-    assert FACTORY in CONSTRUCTING_MODULES, (
+    constructing_modules = _discover_constructing_modules()
+    assert FACTORY in constructing_modules, (
         f'discovery no longer finds {FACTORY} constructing {CONSTRUCTOR}(...) '
-        f'(found {sorted(CONSTRUCTING_MODULES) or "nothing"}). The discriminator has '
+        f'(found {sorted(constructing_modules) or "nothing"}). The discriminator has '
         f'gone stale; fix it, and do NOT weaken this floor, or the guard below '
         f'silently checks nothing.'
     )
 
 
 def test_only_the_shared_factory_constructs_the_harness():
-    offenders = sorted(CONSTRUCTING_MODULES - {FACTORY})
+    offenders = sorted(_discover_constructing_modules() - {FACTORY})
     assert not offenders, (
         f'{offenders} call {CONSTRUCTOR}(...) directly. Build it through '
         f'reconciliation.harness_fixtures.make_harness (or open_harness for a harness '

@@ -18,6 +18,7 @@ from reconciliation.harness_fixtures import (
     make_harness,
     make_harness_config,
     make_memory_service,
+    make_reconciliation_config,
     open_event_buffer,
     open_journal,
     stub_stage_runs,
@@ -295,9 +296,7 @@ def _make_config_927(project_root: str | None = '/abs/from/config'):
     from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
 
     taskmaster_cfg = TaskmasterConfig(project_root=project_root) if project_root is not None else None
-    return FusedMemoryConfig(
-        taskmaster=taskmaster_cfg, reconciliation=make_harness_config().reconciliation,
-    )
+    return FusedMemoryConfig(taskmaster=taskmaster_cfg, reconciliation=make_reconciliation_config())
 
 
 def _make_harness_927(journal, event_buffer, mock_memory_service, project_root: str | None = '/abs/from/config'):
@@ -3999,18 +3998,11 @@ async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_ser
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     # Wire a real judge with the project pre-halted
-    from fused_memory.config.schema import ReconciliationConfig
     from fused_memory.reconciliation.judge import Judge
 
-    judge_config = ReconciliationConfig(
-        enabled=True,
-        explore_codebase_root='/tmp/test',
-        agent_llm_provider='anthropic',
-        agent_llm_model='claude-sonnet-4-20250514',
-    )
     mock_j = AsyncMock()
     mock_j.get_run = AsyncMock(return_value=None)
-    harness.judge = Judge(config=judge_config, journal=mock_j)
+    harness.judge = Judge(config=make_reconciliation_config(), journal=mock_j)
     harness.judge._halted_projects.add('test-project')  # Pre-halt the project
 
     # Push enough events to trigger a cycle
@@ -13830,21 +13822,14 @@ async def test_project_loop_replays_before_releasing_lock_on_halt(
     Verification: pre-halt the project, spy both methods, drive _project_loop
     directly (it returns naturally when halted), assert order and lock state.
     """
-    from fused_memory.config.schema import ReconciliationConfig
     from fused_memory.reconciliation.judge import Judge
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     # Wire a judge with the project pre-halted
-    judge_config = ReconciliationConfig(
-        enabled=True,
-        explore_codebase_root='/tmp/test',
-        agent_llm_provider='anthropic',
-        agent_llm_model='claude-sonnet-4-20250514',
-    )
     mock_j = AsyncMock()
     mock_j.get_run = AsyncMock(return_value=None)
-    harness.judge = Judge(config=judge_config, journal=mock_j)
+    harness.judge = Judge(config=make_reconciliation_config(), journal=mock_j)
     harness.judge._halted_projects.add('test-project')
     harness._notify_judge_halt = AsyncMock()  # suppress escalation side effects
 
