@@ -23,8 +23,12 @@ READ-ONLY by default.  ``--adopt-confirmed`` is the sole write: it records a
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import dataclasses
+import json
 import re
+import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -32,7 +36,7 @@ from enum import StrEnum
 from pathlib import Path
 
 import _checkout as _checkout
-from _task_db_scan import connect_ro
+from _task_db_scan import UNREADABLE_STORE_ERRORS, connect_ro, tasks_db_path
 from orchestrator.branch_stack import (
     STACK_BASE_REF_NAMESPACE,
     StackBaseLedger,
@@ -41,6 +45,7 @@ from orchestrator.branch_stack import (
     foreign_commit_cut,
 )
 from shared.git_async import run_git
+from shared.project_layout import default_project_root
 from shared.task_statuses import TERMINAL
 
 TASK_BRANCH_PREFIX = 'task/'
@@ -607,3 +612,197 @@ def load_task_statuses(db_path: Path) -> dict[int, str]:
     finally:
         conn.close()
     return {int(task_id): str(status) for task_id, status in rows}
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+ACTIONABLE = (Verdict.CONFIRMED, Verdict.STRANDED_BASE, Verdict.UNADJUDICATED)
+_NOT_ACTIONABLE = (Verdict.ALREADY_CLEAN, Verdict.RECORDED, Verdict.INERT)
+
+
+def render_markdown(
+    report: CensusReport, outcomes: Sequence[AdoptOutcome] | None = None,
+) -> str:
+    """The census as a markdown report; *outcomes* is None unless adopting."""
+    lines = [
+        '# Legacy stack-base census',
+        '',
+        f'- main: `{report.main_branch}` at `{report.main_sha}`',
+        f'- unlanded task branches: {report.unlanded_branches}',
+        f'- findings: {len(report.findings)}',
+        f'- elapsed: {report.elapsed_secs:.1f}s',
+        '',
+        '| verdict | branches |',
+        '|---|---|',
+        *(f'| {verdict} | {len(_with(report, verdict))} |' for verdict in (
+            *ACTIONABLE, *_NOT_ACTIONABLE,
+        )),
+        '',
+        '## Actionable findings',
+        '',
+        *_actionable_sections(report),
+        '## Not actionable',
+        '',
+        *(_branch_list(verdict, _with(report, verdict)) for verdict in _NOT_ACTIONABLE),
+        *_adoption_section(outcomes),
+    ]
+    return '\n'.join(lines).rstrip('\n') + '\n'
+
+
+def _with(report: CensusReport, verdict: Verdict) -> tuple[BranchFinding, ...]:
+    return tuple(finding for finding in report.findings if finding.verdict is verdict)
+
+
+def _actionable_sections(report: CensusReport) -> list[str]:
+    actionable = [finding for finding in report.findings if finding.verdict in ACTIONABLE]
+    if not actionable:
+        return ['None.', '']
+    return [line for finding in actionable for line in _finding_section(report, finding)]
+
+
+def _finding_section(report: CensusReport, finding: BranchFinding) -> list[str]:
+    evidence = [f'- evidence: {finding.detail}'] if finding.detail else []
+    return [
+        f'### {finding.branch}: {finding.verdict}',
+        '',
+        f'- task status: {finding.task_status or "unknown, adjudicated as live"}',
+        f'- base: {_sha(finding.base)}',
+        f'- live owners of the base: {", ".join(finding.base_owners) or "none"}',
+        f'- cut: {_sha(finding.cut)}',
+        f'- contained siblings: {", ".join(finding.contained_siblings) or "none"}',
+        f'- stacking events, newest first: {_events(finding.events)}',
+        *evidence,
+        f'- remedy: {_remedy(report, finding)}',
+        '',
+    ]
+
+
+def _sha(sha: str | None) -> str:
+    return f'`{sha}`' if sha is not None else 'none'
+
+
+def _events(events: Sequence[StackingEvent]) -> str:
+    described = (
+        f'created on `{event.base}`' if event.prior_tip is None
+        else f'rebased from `{event.prior_tip}` onto `{event.base}`'
+        for event in events
+    )
+    return '; '.join(described) or 'none'
+
+
+def _remedy(report: CensusReport, finding: BranchFinding) -> str:
+    if finding.verdict is Verdict.CONFIRMED:
+        return (
+            'run `scripts/stack_base_census.py --adopt-confirmed` to record the base, so '
+            "task 5618's merge admission un-stacks the branch; by hand: "
+            f'`git rebase --onto {report.main_branch} {finding.cut} {finding.branch}`'
+        )
+    if finding.verdict is Verdict.STRANDED_BASE:
+        return (
+            'no live branch holds the base any more, so un-stacking would drop the only '
+            "copy of the base's commits. Decide first whether they must land; once "
+            'adjudicated, record the base with '
+            f'`git update-ref {STACK_BASE_REF_NAMESPACE}{finding.branch} {finding.base}`'
+        )
+    return (
+        'adjudicate by hand from the contained siblings, stacking events and evidence '
+        'above; record a base only once the direction of the stack is settled'
+    )
+
+
+def _branch_list(verdict: Verdict, findings: Sequence[BranchFinding]) -> str:
+    names = ', '.join(finding.branch for finding in findings) or 'none'
+    return f'- {verdict} ({len(findings)}): {names}'
+
+
+def _adoption_section(outcomes: Sequence[AdoptOutcome] | None) -> list[str]:
+    if outcomes is None:
+        return []
+    lines = [_adoption_line(outcome) for outcome in outcomes]
+    return ['', '## Adoption', '', *(lines or ['No CONFIRMED finding to adopt.'])]
+
+
+def _adoption_line(outcome: AdoptOutcome) -> str:
+    state = 'written' if outcome.written else 'NOT WRITTEN'
+    return f'adopt {outcome.branch} at {outcome.base}: {state} ({outcome.detail})'
+
+
+def render_json(report: CensusReport, outcomes: Sequence[AdoptOutcome] | None = None) -> str:
+    """The census as JSON; verdicts are their string values."""
+    payload = dataclasses.asdict(report)
+    if outcomes is not None:
+        payload['adoptions'] = [dataclasses.asdict(outcome) for outcome in outcomes]
+    return json.dumps(payload, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description='Census of task branches stacked on an unlanded sibling before task '
+        '5618 recorded stack bases. Read-only unless --adopt-confirmed.',
+    )
+    parser.add_argument(
+        '--project-root', type=Path, default=None,
+        help='repository to census (default: the main checkout)',
+    )
+    parser.add_argument('--main-branch', default='main')
+    parser.add_argument(
+        '--tasks-db', type=Path, default=None,
+        help='task store to read statuses from (default: <project-root>/.taskmaster/tasks/tasks.db)',
+    )
+    parser.add_argument('--json', action='store_true', help='print JSON instead of markdown')
+    parser.add_argument(
+        '--adopt-confirmed', action='store_true',
+        help='record a 5618 stack-base ref for every CONFIRMED finding (the only write)',
+    )
+    return parser
+
+
+def _statuses_or_warn(db_path: Path) -> dict[int, str]:
+    try:
+        return load_task_statuses(db_path)
+    except UNREADABLE_STORE_ERRORS as exc:
+        print(
+            f'warning: task store {db_path} is unreadable ({exc}); '
+            'every branch is adjudicated as live',
+            file=sys.stderr,
+        )
+        return {}
+
+
+async def _census_and_adopt(
+    project_root: Path, main_branch: str, statuses: Mapping[int, str], adopt: bool,
+) -> tuple[CensusReport, tuple[AdoptOutcome, ...] | None]:
+    report = await run_census(project_root, main_branch=main_branch, statuses=statuses)
+    outcomes = await adopt_confirmed(project_root, report) if adopt else None
+    return report, outcomes
+
+
+def main(argv: Sequence[str]) -> int:
+    """0 on success; 1 when an adopted record did not read back; 2 when git failed."""
+    args = _parser().parse_args(argv)
+    project_root: Path = args.project_root or default_project_root()
+    if not project_root.is_dir():
+        print(f'stack_base_census: {project_root} is not a directory', file=sys.stderr)
+        return 2
+    statuses = _statuses_or_warn(args.tasks_db or tasks_db_path(project_root))
+    try:
+        report, outcomes = asyncio.run(_census_and_adopt(
+            project_root, args.main_branch, statuses, args.adopt_confirmed,
+        ))
+    except CensusGitError as exc:
+        print(f'stack_base_census: {exc}', file=sys.stderr)
+        return 2
+    render = render_json if args.json else render_markdown
+    print(render(report, outcomes))
+    return 0 if all(outcome.written for outcome in outcomes or ()) else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv[1:]))
