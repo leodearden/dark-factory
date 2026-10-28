@@ -104,6 +104,9 @@ class AddMemoryResponse(BaseModel):
 
     memory_ids: list[str] = Field(default_factory=list)
     stores_written: list[SourceStore] = Field(default_factory=list)
+    # Stores whose leg hit a transient provider error and is durably queued for
+    # server-side retry; disjoint from stores_written, ids assigned when it lands.
+    stores_pending_retry: list[SourceStore] = Field(default_factory=list)
     category: MemoryCategory | None = None
     message: str = ''
     # Set when category was not supplied and the classifier returned a default

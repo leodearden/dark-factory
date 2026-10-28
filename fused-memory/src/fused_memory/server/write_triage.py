@@ -62,7 +62,7 @@ from shared.storm_counter import StormCounter
 
 from fused_memory.memory_metadata import normalize_supersedes
 from fused_memory.middleware._folded_escalation import file_folded_escalation
-from fused_memory.models.enums import MEM0_PRIMARY
+from fused_memory.models.enums import MEM0_PRIMARY, SourceStore
 from fused_memory.server.grouped_read import (
     CHILD_KINDS,
     CONTESTED_METADATA_KEY,
@@ -241,6 +241,20 @@ def attach_write_landed(result: Any) -> bool:
     """
     memory_ids = getattr(result, 'memory_ids', None)
     return not (isinstance(memory_ids, list | tuple) and not memory_ids)
+
+
+def attach_write_durable(result: Any) -> bool:
+    """Did the ATTACH child write persist, or is its Mem0 leg durably queued for retry?
+
+    :func:`attach_write_landed`, plus a Mem0 leg ``MemoryService.add_memory``
+    deferred for server-side retry: the queued intent already carries the
+    triage-stamped parent link, so the retry creates exactly the child the ack
+    names.
+    """
+    pending = getattr(result, 'stores_pending_retry', None)
+    return attach_write_landed(result) or (
+        isinstance(pending, list | tuple) and SourceStore.mem0 in pending
+    )
 
 
 # --- config defaults --------------------------------------------------------
@@ -765,9 +779,11 @@ _FAIL_OPEN_STORM_WINDOW_SECONDS = 3600.0
 
 _FAIL_OPEN_HINT = (
     'add_memory write triage failed open repeatedly: every write in this '
-    'window was stored WITHOUT triage, i.e. with the pre-triage behaviour. No '
-    'write was lost or blocked (contract C1), but no restatement was detected '
-    'either. Check candidate retrieval (MemoryService.search / mem0 '
+    'window proceeded WITHOUT triage, i.e. with the pre-triage behaviour. No '
+    'write was blocked (contract C1), but no restatement was detected either, '
+    "and whether each write's Mem0 leg landed is recorded in the mem0 intent "
+    "journal (write_journal.db's mem0_intents table), not by this alarm. "
+    'Check candidate retrieval (MemoryService.search / mem0 '
     'reachability) and the judge. To stop triage deliberately rather than '
     'letting it degrade silently, set write_triage.enabled: false — it is '
     'green-tier hot-reloadable via reload_config.'
@@ -1331,14 +1347,23 @@ def emit_triage_fail_open_storm_escalation(
         # honest and points at the co-affected queues, rather than blaming
         # whichever write happened to cross the threshold.
         f'projects_in_window={storm.get("projects")!r}',
+        f'mem0_intents_in_window={storm.get("mem0_intents_in_window")!r}',
         '',
         'add_memory write triage (PRD leaf beta, task 3127) FAILED OPEN '
-        'repeatedly inside one rolling window. This is a DEGRADATION, not a '
-        'data-loss incident, and the distinction decides the remediation:',
+        'repeatedly inside one rolling window. This is a DEGRADATION; data loss '
+        'is ruled out only when the counts above show no failed or dead Mem0 '
+        'intents, and the distinction decides the remediation:',
         '',
-        '  * Every write in the window still LANDED — stored WITHOUT triage, '
-        'i.e. with the pre-triage behaviour. No write was lost and no write '
-        'was blocked (contract C1 holds on every fail-open path).',
+        '  * Triage blocked no write (contract C1 holds on every fail-open '
+        'path): each one proceeded WITHOUT triage, i.e. with the pre-triage '
+        'behaviour. This alarm does not by itself prove each write LANDED: a '
+        "write's Mem0 leg can fail independently of triage, and the outage that "
+        'breaks candidate retrieval (embeddings) usually breaks the Mem0 write '
+        'too. mem0_intents_in_window counts every Mem0-primary write created in '
+        'the window by status, not only the fail-opens: completed = landed; '
+        'retrying = queued for server-side retry; pending = in flight; '
+        'failed/dead = did NOT land. None means the count was unavailable: '
+        "query write_journal.db's mem0_intents table by status and created_at.",
         '  * What was lost is DETECTION: no restatement was recognised, so '
         'writes that should have been attached as sightings of an existing '
         'memory were stored as new standalone entries instead. Nothing is '
