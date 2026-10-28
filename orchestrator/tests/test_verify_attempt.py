@@ -13,6 +13,7 @@ Test coverage:
   step-1: CheckRun — field exposure, .skipped() classmethod, .to_dict() schema
   step-3: VerifyAttempt — derived-property truth table (passed/any_timed_out/
           pure_timeout_failure) + .test/.lint/.type label accessors
+  task 5624: CheckRun.carried_over and VerifyAttempt.with_rerun/wall_secs
 """
 
 from __future__ import annotations
@@ -75,7 +76,7 @@ class TestCheckRun:
         d = run.to_dict()
         assert set(d) == {
             'label', 'cmd', 'rc', 'output', 'timed_out', 'started_at', 'duration_secs',
-            'segments', 'load', 'slot_wait_secs', 'admission',
+            'segments', 'load', 'slot_wait_secs', 'admission', 'carried_over',
         }
 
     def test_to_dict_started_at_passthrough_when_not_none(self):
@@ -118,7 +119,28 @@ class TestCheckRun:
             'load': None,
             'slot_wait_secs': None,
             'admission': None,
+            'carried_over': False,
         }
+
+    def test_carried_over_defaults_to_false(self):
+        """Task 5624: a check is this attempt's own run unless with_rerun says otherwise."""
+        from orchestrator.verify import CheckRun
+
+        run = CheckRun(
+            label='test', cmd='uv run pytest', rc=0, output='',
+            timed_out=False, started_at='ts', duration_secs=1.5,
+        )
+        assert run.carried_over is False
+        assert CheckRun.skipped('lint').carried_over is False
+
+    def test_a_check_that_never_ran_cannot_be_carried_over(self):
+        from orchestrator.verify import CheckRun
+
+        with pytest.raises(ValueError, match=r"'lint'.*never ran.*cannot be carried over"):
+            CheckRun(
+                label='lint', cmd=None, rc=0, output='', timed_out=False,
+                started_at=None, duration_secs=0.0, carried_over=True,
+            )
 
     def test_to_dict_serialises_the_admitted_leg(self):
         """Task 5628: the admitted leg the test leg's slot wait ended in."""
@@ -424,3 +446,102 @@ class TestVerifyAttempt:
         assert attempt.test is test_run
         assert attempt.lint is lint_run
         assert attempt.type is type_run
+
+
+def _first_pass(type_run=None):
+    """A first pass whose test leg failed: test rc=4, lint 3.0s green, type 5.0s green."""
+    from orchestrator.verify import LegSlot, VerifyAttempt
+
+    return VerifyAttempt(checks=[
+        _run(LegSlot.TEST, rc=4, output='usage error', started_at='t0', duration_secs=1.0),
+        _run(LegSlot.LINT, rc=0, output='lint ok', started_at='t1', duration_secs=3.0),
+        type_run or _run(LegSlot.TYPE, rc=0, output='type ok', started_at='t2', duration_secs=5.0),
+    ])
+
+
+class TestVerifyAttemptRerun:
+    """Task 5624: the env-recovery retry re-runs only the test leg, so the
+    attempt it produces marks lint/type as carried over from the first pass.
+
+    The verdict properties still read every check (a carried-over leg's result
+    is this attempt's result for that leg); only the attempt's own wall time
+    excludes the legs it did not run.
+    """
+
+    def test_with_rerun_returns_a_new_attempt_carrying_the_other_legs(self):
+        from orchestrator.verify import LegSlot
+
+        first = _first_pass()
+        new_test = _run(LegSlot.TEST, rc=0, started_at='t9', duration_secs=0.5)
+
+        rerun = first.with_rerun(new_test)
+
+        assert rerun is not first
+        assert first.lint.carried_over is False
+        assert first.type.carried_over is False
+        assert rerun.test is new_test
+        assert rerun.test.carried_over is False
+        for carried, original in ((rerun.lint, first.lint), (rerun.type, first.type)):
+            assert carried.carried_over is True
+            assert (carried.rc, carried.output, carried.started_at, carried.duration_secs) == (
+                original.rc, original.output, original.started_at, original.duration_secs,
+            )
+
+    def test_with_rerun_leaves_a_skipped_check_skipped(self):
+        from orchestrator.verify import CheckRun, LegSlot
+
+        first = _first_pass(type_run=CheckRun.skipped(LegSlot.TYPE))
+
+        rerun = first.with_rerun(_run(LegSlot.TEST, rc=0))
+
+        assert rerun.type.cmd is None
+        assert rerun.type.carried_over is False
+
+    def test_with_rerun_of_a_label_the_attempt_lacks_raises_keyerror(self):
+        from orchestrator.verify import LegSlot, VerifyAttempt
+
+        attempt = VerifyAttempt(checks=[_run(LegSlot.TEST, rc=4), _run(LegSlot.LINT)])
+
+        with pytest.raises(KeyError, match="no check labeled 'type'"):
+            attempt.with_rerun(_run(LegSlot.TYPE))
+
+    def test_a_carried_over_failure_still_fails_the_attempt(self):
+        from orchestrator.verify import LegSlot, VerifyAttempt
+
+        first = VerifyAttempt(checks=[
+            _run(LegSlot.TEST, rc=4), _run(LegSlot.LINT, rc=1), _run(LegSlot.TYPE, rc=0),
+        ])
+
+        rerun = first.with_rerun(_run(LegSlot.TEST, rc=0))
+
+        assert rerun.passed is False
+        assert rerun.pure_timeout_failure is False
+
+    def test_a_timed_out_rerun_over_green_carried_legs_is_a_pure_timeout(self):
+        from orchestrator.verify import LegSlot
+
+        rerun = _first_pass().with_rerun(_run(LegSlot.TEST, rc=1, timed_out=True))
+
+        assert rerun.any_timed_out is True
+        assert rerun.pure_timeout_failure is True
+
+    def test_a_green_rerun_over_green_carried_legs_passes(self):
+        from orchestrator.verify import LegSlot
+
+        rerun = _first_pass().with_rerun(_run(LegSlot.TEST, rc=0))
+
+        assert rerun.passed is True
+
+    def test_wall_secs_of_a_first_pass_is_max_concurrent_and_sum_serial(self):
+        first = _first_pass()
+
+        assert first.wall_secs(concurrent=True) == pytest.approx(5.0)
+        assert first.wall_secs(concurrent=False) == pytest.approx(9.0)
+
+    def test_wall_secs_after_a_rerun_excludes_the_carried_legs(self):
+        from orchestrator.verify import LegSlot
+
+        rerun = _first_pass().with_rerun(_run(LegSlot.TEST, rc=0, duration_secs=0.5))
+
+        assert rerun.wall_secs(concurrent=True) == pytest.approx(0.5)
+        assert rerun.wall_secs(concurrent=False) == pytest.approx(0.5)
