@@ -19,11 +19,6 @@ from _lane_episode_fakes import (
     _red,
     _run,
 )
-from orchestrator.offline_lane_ledger import (
-    INCONCLUSIVE_UNEXPLAINED,
-    NUMERIC_UNNAMED_CLEAR,
-    pass_suppressions,
-)
 
 from orchestrator.flake_ledger import (
     EvidenceKind,
@@ -40,6 +35,11 @@ from orchestrator.offline_lane_confirm import (
     UnconfirmableReason,
 )
 from orchestrator.offline_lane_episode_state import PassObservation, unconfirmable_node
+from orchestrator.offline_lane_ledger import (
+    INCONCLUSIVE_UNEXPLAINED,
+    NUMERIC_UNNAMED_CLEAR,
+    pass_suppressions,
+)
 from orchestrator.offline_lane_records import (
     LEGACY_NUMERIC_COMMAND,
     FailureRecord,
