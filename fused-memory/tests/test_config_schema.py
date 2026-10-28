@@ -1733,17 +1733,38 @@ class TestCuratorEntryCharCaps:
             f'field (measured p50 1813 vs 0).'
         )
 
-    def test_the_total_cap_is_unreachable_at_stock_stream_caps(self):
-        """FINDING 1, as an executable invariant rather than a comment.
+    @pytest.mark.parametrize('value', [0, -1])
+    @pytest.mark.parametrize('field', ['entry_description_chars', 'entry_details_chars'])
+    def test_a_non_positive_entry_cap_is_refused_at_load(self, field, value):
+        """A cap of 0 or less would make every curator prompt build raise in utils/clip_disclosure.py::TruncationFact, so it is refused when the config loads."""
+        with pytest.raises(ValidationError, match=field):
+            CuratorConfig(**{field: value})
 
-        A maximal pool is anchor(<=1) + module + embedding + dependency. With
-        stock values that is 29 against a total cap of 30, so ``_trim_pool``
-        short-circuits on every call and the STREAM caps are the binding
-        constraints. This is pinned so a future cap edit that silently
-        re-strands or un-strands the final trim is caught here, at the config
-        layer, rather than being discovered as a permanently-silent
-        ``pool_truncated`` census.
-        """
+
+class TestCuratorPoolCaps:
+    """The stock pool caps and the relationships the task-5397 census derivation set.
+
+    The measured figures live once, in the pool-cap comment block of
+    ``config/schema.py::CuratorConfig``; these tests pin what follows from
+    them and point there rather than restating them.
+    """
+
+    def test_stock_pool_caps(self):
+        cfg = CuratorConfig()
+        caps = (
+            cfg.pool_module_cap,
+            cfg.pool_embedding_cap,
+            cfg.pool_dependency_cap,
+            cfg.pool_total_cap,
+        )
+        assert caps == (20, 10, 3, 29), (
+            f'module/embedding/dependency/total pool caps are {caps}; the '
+            f'derivation for 20/10/3/29 is the pool-cap block in '
+            f'config/schema.py::CuratorConfig. Move a value only with a new '
+            f'derivation there.'
+        )
+
+    def test_the_total_cap_binds_when_every_stream_is_full(self):
         cfg = CuratorConfig()
         maximal_pool = (
             1
@@ -1751,21 +1772,33 @@ class TestCuratorEntryCharCaps:
             + cfg.pool_embedding_cap
             + cfg.pool_dependency_cap
         )
-        assert maximal_pool <= cfg.pool_total_cap, (
+        assert maximal_pool > cfg.pool_total_cap, (
             f'A maximal pool is {maximal_pool} entries against pool_total_cap '
-            f'{cfg.pool_total_cap}. If this ever flips, _trim_pool becomes '
-            f'reachable and the total_cap arm of the PoolWithheld census stops '
-            f'being dead weight — update the schema comment recording the '
-            f'arithmetic, and re-read whether the stream caps are still the '
-            f'binding constraints.'
+            f'{cfg.pool_total_cap}. _trim_pool is the live budget control; if '
+            f'it becomes unreachable again, the total_cap arm of the '
+            f'PoolWithheld census goes permanently silent.'
         )
 
-    @pytest.mark.parametrize('value', [0, -1])
-    @pytest.mark.parametrize('field', ['entry_description_chars', 'entry_details_chars'])
-    def test_a_non_positive_entry_cap_is_refused_at_load(self, field, value):
-        """A cap of 0 or less would make every curator prompt build raise in utils/clip_disclosure.py::TruncationFact, so it is refused when the config loads."""
-        with pytest.raises(ValidationError, match=field):
-            CuratorConfig(**{field: value})
+    def test_the_worst_case_pool_is_no_larger_than_before_the_retune(self):
+        cfg = CuratorConfig()
+        assert cfg.pool_total_cap <= 29, (
+            f'pool_total_cap is {cfg.pool_total_cap}; 29 is the pre-5397 '
+            f'reachable maximum. Raising it spends prompt tokens and batch '
+            f'fan-in under batch_token_threshold — restate that trade in the '
+            f'pool-cap block of config/schema.py::CuratorConfig before the '
+            f'value moves.'
+        )
+
+    def test_a_full_module_stream_leaves_the_embedding_head(self):
+        cfg = CuratorConfig()
+        embedding_left = cfg.pool_total_cap - 1 - cfg.pool_module_cap
+        assert embedding_left >= 5, (
+            f'A full module stream plus the anchor leaves {embedding_left} '
+            f'embedding slots. The embedding stream is the only '
+            f'relevance-ordered stream, and its ranks 1-5 held 41 of its 42 '
+            f'measured drop/combine targets; the trim must not cut it below '
+            f'that.'
+        )
 
 
 class TestCuratorConfigBudgetRaise:

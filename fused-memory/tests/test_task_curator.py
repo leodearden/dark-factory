@@ -3263,9 +3263,36 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
     """`_build_corpus` reports what each cap kept OUT of the pool.
 
     The census must count at every cap, not only at the final `_trim_pool`
-    pass: under stock config a maximal pool is 29 entries against a total cap
-    of 30, so a census keyed on the final trim alone never fires.
+    pass: a stream cap discards entries before `_trim_pool` ever sees them,
+    so a census keyed on the final trim alone would miss them.
     """
+
+    def _every_stream_overflowing(self, config) -> tuple[TaskCurator, CandidateTask, list[str]]:
+        """A curator whose four streams each hold more than their cap admits."""
+        cur = config.curator
+        anchor = self._anchor_task('100')
+        modules = [self._module_task(str(200 + i)) for i in range(cur.pool_module_cap + 5)]
+        deps = [
+            self._dependent_task(str(500 + i), '100')
+            for i in range(cur.pool_dependency_cap + 3)
+        ]
+        neighbor_ids = self._neighbor_ids(cur.pool_embedding_cap + 20)
+        neighbors = []
+        for tid in neighbor_ids:
+            t = self._module_task(tid)
+            t['files_to_modify'] = []
+            neighbors.append(t)
+        curator = TaskCurator(
+            config=config,
+            taskmaster=self._taskmaster([anchor, *modules, *deps, *neighbors]),
+        )
+        candidate = CandidateTask(
+            title='T', files_to_modify=[self.MODULE_FILE], spawned_from='100',
+        )
+        return curator, candidate, neighbor_ids
+
+    def _full_stream_pool(self, cur) -> int:
+        return 1 + cur.pool_module_cap + cur.pool_embedding_cap + cur.pool_dependency_cap
 
     @pytest.mark.asyncio
     async def test_module_cap_excess_is_counted(self):
@@ -3384,69 +3411,45 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
         }
 
     @pytest.mark.asyncio
-    async def test_a_full_pool_never_reaches_the_total_cap(self):
-        """FINDING 1: a census keyed only on `_trim_pool` would report nothing.
+    async def test_a_full_pool_is_trimmed_dependency_first_then_embedding_tail(self):
+        """Under stock caps a full pool overruns the total cap.
 
-        anchor(1) + module(15) + embedding(10) + dependency(3) = 29 <= 30, so
-        the final trim short-circuits even when every stream overflowed.
+        The trim spends the dependency stream first, then the embedding tail,
+        so the embedding head and the whole module stream survive.
         """
         config = _make_config()
-        anchor = self._anchor_task('100')
-        modules = [self._module_task(str(200 + i)) for i in range(20)]
-        deps = [self._dependent_task(str(500 + i), '100') for i in range(6)]
-        neighbor_ids = self._neighbor_ids(30)
-        neighbors = []
-        for tid in neighbor_ids:
-            t = self._module_task(tid)
-            t['files_to_modify'] = []
-            neighbors.append(t)
-        curator = TaskCurator(
-            config=config,
-            taskmaster=self._taskmaster([anchor, *modules, *deps, *neighbors]),
-        )
+        cur = config.curator
+        curator, candidate, neighbor_ids = self._every_stream_overflowing(config)
 
         pool, sizes, withheld = await self._corpus(
-            curator,
-            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE], spawned_from='100'),
-            neighbor_ids=neighbor_ids,
+            curator, candidate, neighbor_ids=neighbor_ids,
         )
 
-        assert len(pool) == 29
-        assert len(pool) <= config.curator.pool_total_cap
-        assert withheld.by_source['total_cap'] == 0
-        # ...and yet 28 eligible entries were withheld.
+        assert len(pool) == cur.pool_total_cap
+        assert withheld.by_source['total_cap'] == self._full_stream_pool(cur) - cur.pool_total_cap
+        assert sizes == {
+            'anchor': 1,
+            'module': cur.pool_module_cap,
+            'dependency': 0,
+            'embedding': cur.pool_total_cap - 1 - cur.pool_module_cap,
+        }
+        kept_embedding = [e.task_id for e in pool if e.source == 'embedding']
+        assert kept_embedding == neighbor_ids[:sizes['embedding']]
         assert withheld.by_source['module'] == 5
-        assert withheld.by_source['embedding'] == 20
         assert withheld.by_source['dependency'] == 3
-        assert withheld.total == 28
-        assert withheld.render() is not None
 
     @pytest.mark.asyncio
     async def test_total_cap_drops_are_counted_when_the_trim_does_fire(self):
         config = _make_config()
         config.curator.pool_total_cap = 20
-        anchor = self._anchor_task('100')
-        modules = [self._module_task(str(200 + i)) for i in range(20)]
-        deps = [self._dependent_task(str(500 + i), '100') for i in range(6)]
-        neighbor_ids = self._neighbor_ids(30)
-        neighbors = []
-        for tid in neighbor_ids:
-            t = self._module_task(tid)
-            t['files_to_modify'] = []
-            neighbors.append(t)
-        curator = TaskCurator(
-            config=config,
-            taskmaster=self._taskmaster([anchor, *modules, *deps, *neighbors]),
-        )
+        curator, candidate, neighbor_ids = self._every_stream_overflowing(config)
 
         pool, _sizes, withheld = await self._corpus(
-            curator,
-            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE], spawned_from='100'),
-            neighbor_ids=neighbor_ids,
+            curator, candidate, neighbor_ids=neighbor_ids,
         )
 
         assert len(pool) == 20
-        assert withheld.by_source['total_cap'] == 29 - 20
+        assert withheld.by_source['total_cap'] == self._full_stream_pool(config.curator) - 20
         assert withheld.caps['total_cap'] == 20
 
     @pytest.mark.asyncio
