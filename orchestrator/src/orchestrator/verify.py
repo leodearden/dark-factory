@@ -2769,6 +2769,12 @@ def _build_summary_payload(
     role-less. It is a required keyword so no writer can emit a record
     without it.
 
+    ``carried_over`` (task 5624) marks a leg whose started_at/duration_secs
+    come from the attempt's first pass, not this one; a reader computing
+    attempt timing must exclude it, never difference or sum across it. It is
+    read with ``.get`` like ``segments``, so a hand-built remote run reads
+    None: not recorded.
+
     A NEGATIVE rc is not a quiet outcome — it is asyncio reporting that the
     process was terminated by signal ``-rc`` and never got to exit at all, so
     it is the LOUDEST possible outcome and sorts above every non-negative rc
@@ -2794,6 +2800,7 @@ def _build_summary_payload(
         'cmd': worst['cmd'],
         'started_at': worst['started_at'],
         'duration_secs': worst['duration_secs'],
+        'carried_over': worst.get('carried_over'),
         'commands': [
             {
                 'label': r['label'],
@@ -2805,6 +2812,7 @@ def _build_summary_payload(
                 'segments': r.get('segments'),
                 'load': r.get('load'),
                 'slot_wait_secs': r.get('slot_wait_secs'),
+                'carried_over': r.get('carried_over'),
             }
             for r in active_runs
         ],
@@ -4336,21 +4344,6 @@ def _build_fallback_config(
     )
 
 
-def _verify_duration_secs(runs: list[dict]) -> float:
-    """Sum per-command ``duration_secs`` values from a verification runs list.
-
-    Each entry is expected to have a ``duration_secs`` key (float); entries
-    that are missing the key contribute 0.0.  Returns 0.0 for an empty list.
-
-    This is the correct wall-clock measure when commands were run **serially**
-    (sum of sequential durations).  For the **concurrent** branch (asyncio.gather
-    of test/lint/type) the caller should use ``max(...)`` of the individual
-    durations — mirroring the multi-module logic in ``_aggregate_results`` — to
-    avoid overstating wall-clock by ~3×.
-    """
-    return sum(r.get('duration_secs', 0.0) for r in runs)
-
-
 @dataclass
 class CheckRun:
     """The execution outcome of a single check (test/lint/type).
@@ -4438,7 +4431,7 @@ class CheckRun:
 
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
-        ``_build_summary_payload``/``_verify_duration_secs``/``_archive_merge_verify_logs``
+        ``_build_summary_payload``/``_archive_merge_verify_logs``
         (all take ``list[dict]``) — the exact 12-key shape (label/cmd/rc/output/
         timed_out/started_at/duration_secs/segments/load/slot_wait_secs/admission/
         carried_over), 7 of which were previously hand-built inline in
@@ -7817,18 +7810,10 @@ async def run_verification(
         )
         test_runs.append(new_test)
 
-        # Recompute pure-timeout consistency for the recovery run via a fresh
-        # VerifyAttempt: lint/type are unchanged from the first pass (only
-        # the test leg was re-run), so this reads the SAME
-        # VerifyAttempt.pure_timeout_failure property the loop above used —
-        # not a second hand-copied formula.  Without this, a recovery run
-        # that itself hits the wall-clock timeout would leave the stale
-        # timed_out=False from the first pass while category flips to
-        # 'infra_timeout' — an inconsistent VerifyResult that both wrongly
-        # marks the worktree warm (the "not result.timed_out" check below)
-        # and hides the timeout from callers that special-case
-        # result.timed_out (merge_queue.py, workflow.py).
-        attempt = VerifyAttempt([new_test, attempt.lint, attempt.type])
+        # Only the test leg was re-run, so lint/type are carried over; the same
+        # VerifyAttempt properties the loop above read recompute timed_out, so
+        # the 6-clause consistency holds for the recovery run too.
+        attempt = attempt.with_rerun(new_test)
         timed_out = (not attempt.passed) and attempt.pure_timeout_failure
 
         leg_categories = attempt.classify_failing_legs()
@@ -7994,13 +7979,8 @@ async def run_verification(
             ),
         )
 
-    # When the three verify commands ran concurrently (asyncio.gather) the
-    # true wall-clock cost is the longest single command, not their sum.
-    # Serial mode is rare (legacy / explicit opt-out) and sums correctly.
-    if concurrent:
-        _wall_secs = max(c.duration_secs for c in attempt.checks)
-    else:
-        _wall_secs = _verify_duration_secs(runs)
+    # Max for concurrent legs, sum for serial, carried-over legs excluded.
+    _wall_secs = attempt.wall_secs(concurrent=concurrent)
 
     # Task μ: parse the junit report written (if any) by the injection above.
     # None when the report does not attribute failures (not a full-breadth
