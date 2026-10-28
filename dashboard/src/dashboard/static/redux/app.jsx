@@ -1,6 +1,6 @@
 /* Main app — routes tabs, manages filter state, hosts tweaks */
 const { useState: uS, useEffect: uE } = React;
-const { Rail, StatStrip, Toolbar, DatumReading } = window.DF_SHELL;
+const { Rail, StatStrip, Toolbar, DatumReading, RenderFailureBoundary } = window.DF_SHELL;
 const { OverviewTab } = window.DF_OVERVIEW;
 const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, EscalationsTab, EscalationAnalyticsTab } = window.DF_TABS;
 const { TasksTab } = window.DF_TASKS;
@@ -61,30 +61,6 @@ function noticeBannerStyle(edgeColor) {
     fontFamily: 'var(--mono)',
     fontSize: 11,
   };
-}
-
-// A render throw would otherwise unmount the whole root. The keyed .body
-// remounts this boundary per tab, so switching tabs retries.
-class TabErrorBoundary extends React.Component {
-  state = { failed: false, thrown: undefined };
-
-  static getDerivedStateFromError(thrown) {
-    return { failed: true, thrown };
-  }
-
-  render() {
-    if (!this.state.failed) return this.props.children;
-    const notice = tabRenderFailureNotice(this.props.tabLabel, this.state.thrown);
-    return (
-      <div className="col-span-12"
-           data-testid="tab-render-failure-banner"
-           role="alert"
-           style={noticeBannerStyle('var(--bad)')}>
-        <div>{notice.text}</div>
-        <div>{notice.detail}</div>
-      </div>
-    );
-  }
 }
 
 function App() {
@@ -312,7 +288,11 @@ function App() {
               {loadingNotice.text}
             </div>
           )}
-          <TabErrorBoundary tabLabel={tabLabel}>{renderTab()}</TabErrorBoundary>
+          {/* The keyed .body remounts this boundary per tab, so switching tabs retries. */}
+          <RenderFailureBoundary describe={thrown => tabRenderFailureNotice(tabLabel, thrown)}
+                                 testId="tab-render-failure-banner"
+                                 className="col-span-12"
+                                 style={noticeBannerStyle('var(--bad)')}>{renderTab()}</RenderFailureBoundary>
         </div>
       </div>
 
