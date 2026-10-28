@@ -1302,13 +1302,17 @@ async def test_per_project_ticket_queues_do_not_serialise(
             assert submit_b.get('ticket', '').startswith('tkt_'), f'Got: {submit_b}'
             ticket_b = submit_b['ticket']
 
-            # (3) project-b resolves within timeout (1.0 s) while project-a is blocked
-            result_b = await asyncio.wait_for(
-                ti.resolve_ticket(ticket_b, project_root_b, timeout_seconds=None),
-                timeout=2.0,
+            # (3) project-b's ticket is terminal while project-a's is still pending
+            row_b = await _poll_ticket_resolved(
+                ticket_store, ticket_b, what='the project-b ticket',
             )
-            assert result_b.get('status') == 'created', (
-                f'project-b should resolve while project-a is blocked: {result_b!r}'
+            assert row_b['status'] == 'created', (
+                f'project-b should resolve while project-a is blocked: {row_b!r}'
+            )
+            row_a = await ticket_store.get(ticket_a)
+            assert row_a['status'] == 'pending', (
+                'project-a must still be blocked in curate() when project-b '
+                f'resolves: {row_a!r}'
             )
 
             # (4) Unblock project-a and wait for its resolution
