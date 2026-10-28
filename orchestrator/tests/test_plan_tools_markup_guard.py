@@ -1548,7 +1548,7 @@ class TestTheStormEscape:
                 'crossing_subject_agent_role': None,
                 'callers': [],
             },
-            plan_tools._MARKUP_SINK_SPEC,
+            plan_tools.MARKUP_SINK_SPEC,
         )
 
     def test_the_open_records_subject_reads_back_through_one_spelling(self):
@@ -1802,7 +1802,7 @@ class TestTheStormEscape:
                 'callers': [spoof],
             },
             'test-1',
-            plan_tools._MARKUP_SINK_SPEC,
+            plan_tools.MARKUP_SINK_SPEC,
         )
 
         assert spoof not in detail, 'the raw newline reached the body verbatim'

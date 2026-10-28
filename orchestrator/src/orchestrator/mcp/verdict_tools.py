@@ -181,7 +181,7 @@ _SINGLETON_ROLE_TOOLS = frozenset({'judge', 'triage', 'merger'})
 #: Every field is stated here rather than defaulted inside ``markup_sink``:
 #: adding a server to the shared channel must be a decision at every axis, not
 #: an inheritance of plan-tools' answers.
-_MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
+MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
     server_label='verdict-tools',
     agent_role='verdict-tools-markup-guard',
     residue_anchor_task_id='verdict-tools-markup-residue',
@@ -269,7 +269,7 @@ def _markup_fact_journal(
     """
     return markup_journal.make_fact_journal(
         worktree=artifacts.worktree,
-        server_label=_MARKUP_SINK_SPEC.server_label,
+        server_label=MARKUP_SINK_SPEC.server_label,
         subject_task_id=lambda: _markup_subject_task_id(artifacts),
         resolve_root=resolve_project_root,
     )
@@ -400,7 +400,7 @@ def create_server(
         fact_sink=_markup_fact_journal(artifacts, resolve_project_root),
         escalation_sink=markup_sink.make_escalation_sink(
             worktree=artifacts.worktree,
-            spec=_MARKUP_SINK_SPEC,
+            spec=MARKUP_SINK_SPEC,
             subject_task_id=lambda: _markup_subject_task_id(artifacts),
             resolve_root=resolve_project_root,
         ),
