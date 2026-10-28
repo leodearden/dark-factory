@@ -519,6 +519,17 @@ def _registered_project(word: str, registry: Mapping[str, str]) -> str | None:
     return registry.get(fold_project_token(word))
 
 
+# The word that opens a TASK_REF_RE match ('task', 'df'); a '#'-anchored match
+# has none.
+_TASK_REF_ANCHOR_RE: re.Pattern[str] = re.compile(r'[A-Za-z]+')
+
+
+def _anchor_project(match: re.Match[str], registry: Mapping[str, str]) -> str | None:
+    """The registered project a task ref's own anchor word names ('df 94'), else None."""
+    anchor = _TASK_REF_ANCHOR_RE.match(match.group(0))
+    return None if anchor is None else _registered_project(anchor.group(0), registry)
+
+
 def _qualifier(
     clause: str, start: int, registry: Mapping[str, str]
 ) -> tuple[int, str] | None:
@@ -559,10 +570,16 @@ def _ref_mentions(
 ) -> list[_RefMention]:
     """Every ticket, commit and task ref named in *clause*, in text order."""
 
-    def owned(match: re.Match[str], subject: ClaimSubject) -> _RefMention:
-        phrase_start, project = _qualifier(clause, match.start(), registry) or (
-            match.start(), default_project_id,
-        )
+    def owned(
+        match: re.Match[str], subject: ClaimSubject, named: str | None
+    ) -> _RefMention:
+        """Owned by the project the ref *named* itself, else its qualifier's, else the writer's."""
+        if named is not None:
+            phrase_start, project = match.start(), named
+        else:
+            phrase_start, project = _qualifier(clause, match.start(), registry) or (
+                match.start(), default_project_id,
+            )
         return _RefMention(
             phrase_start=phrase_start, start=match.start(), end=match.end(),
             subject=subject, ref=match.group(1), project_id=project,
@@ -575,8 +592,10 @@ def _ref_mentions(
         )
         for m in TICKET_REF_RE.finditer(clause)
     ]
-    mentions += [owned(m, 'commit') for m in COMMIT_REF_RE.finditer(clause)]
-    mentions += [owned(m, 'task') for m in TASK_REF_RE.finditer(clause)]
+    mentions += [owned(m, 'commit', None) for m in COMMIT_REF_RE.finditer(clause)]
+    mentions += [
+        owned(m, 'task', _anchor_project(m, registry)) for m in TASK_REF_RE.finditer(clause)
+    ]
     mentions += [
         _RefMention(
             phrase_start=m.start(), start=m.start(), end=m.end(),
