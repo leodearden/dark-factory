@@ -3,7 +3,7 @@
 Without an error boundary, one throw anywhere in a tab's render (datum.js's
 ``assertDatum`` throws on purpose) unmounts React's whole root and blanks the
 page. The BEHAVIOUR of the fallback text, including that it never throws itself,
-is executed in ``dashboard/tests/js/tab_render_failure.test.mjs``. What is left
+is executed in ``dashboard/tests/js/render_failure.test.mjs``. What is left
 here is the wiring that source text can settle, since app.jsx is
 ``type="text/babel"`` and cannot run under node (see test_datum_components.py's
 docstring). Every probe runs over comment-stripped code.
@@ -76,7 +76,7 @@ def test_tab_error_boundary_is_a_react_error_boundary_rendering_through_the_deci
         'the page.'
     )
     assert 'tabRenderFailureNotice(' in body, (
-        'TabErrorBoundary must render the text tab_render_failure.js decides, '
+        'TabErrorBoundary must render the text render_failure.js decides, '
         'via tabRenderFailureNotice.'
     )
     assert not re.search(r'\.\s*(message|name)\b', body), (
@@ -91,6 +91,6 @@ def test_tab_error_boundary_is_a_react_error_boundary_rendering_through_the_deci
 
 def test_app_destructures_the_failure_notice_without_fallback(app_jsx_body: str) -> None:
     assert_app_destructures_without_fallback(
-        app_jsx_body, 'DF_TAB_RENDER_FAILURE', 'tabRenderFailureNotice',
+        app_jsx_body, 'DF_RENDER_FAILURE', 'tabRenderFailureNotice',
         fallback_consequence='a silently uncontained page',
     )

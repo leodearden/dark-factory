@@ -1,6 +1,7 @@
-// tab_render_failure.js — decides the text shown in place of a tab whose render
-// threw: which tab failed, that the rest of the dashboard is still live, how to
-// retry, and what was thrown. app.jsx's TabErrorBoundary only renders it.
+// render_failure.js — decides the text shown in place of whatever part of the
+// page threw while rendering: a tab, a chrome region, or the whole page. Each
+// notice says what failed, what is still live, how to retry, and what was
+// thrown. shell.jsx's RenderFailureBoundary only renders it.
 //
 // IT MUST NEVER THROW, whatever was thrown. It runs while React recovers from
 // the tab's throw, and a second throw there escapes the boundary and unmounts
@@ -11,6 +12,10 @@ const LISTED_KEY_LIMIT = 10;
 
 function nameOfFailedTab(tabLabel) {
   return typeof tabLabel === 'string' && tabLabel !== '' ? tabLabel : 'current';
+}
+
+function nameOfFailedRegion(regionLabel) {
+  return typeof regionLabel === 'string' && regionLabel !== '' ? regionLabel : 'page chrome';
 }
 
 function describeError(error) {
@@ -39,7 +44,7 @@ function describeThrownValue(thrown) {
   }
 }
 
-// A function declaration, not a const: app.jsx destructures this name, Babel
+// Function declarations, not consts: app.jsx destructures these names, Babel
 // turns that destructure into a global `var`, and a `var` may share the classic
 // scripts' scope with a `function` but not with a `const`.
 function tabRenderFailureNotice(tabLabel, thrown) {
@@ -51,13 +56,29 @@ function tabRenderFailureNotice(tabLabel, thrown) {
   });
 }
 
+function chromeRenderFailureNotice(regionLabel, thrown) {
+  return Object.freeze({
+    text:
+      'The ' + nameOfFailedRegion(regionLabel) + ' failed to render. ' +
+      'The open tab is still live; reload the page to retry.',
+    detail: describeThrownValue(thrown),
+  });
+}
+
+function pageRenderFailureNotice(thrown) {
+  return Object.freeze({
+    text: 'The dashboard failed to render. Reload the page to retry.',
+    detail: describeThrownValue(thrown),
+  });
+}
+
 // Module-unique export const, never a bare `API` — the CANONICAL note in
 // datum.js's header, enforced at runtime by classic_script_scope.test.mjs.
-const TAB_RENDER_FAILURE_API = { tabRenderFailureNotice };
+const RENDER_FAILURE_API = { tabRenderFailureNotice, chromeRenderFailureNotice, pageRenderFailureNotice };
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = TAB_RENDER_FAILURE_API;
+  module.exports = RENDER_FAILURE_API;
 }
 if (typeof window !== 'undefined') {
-  window.DF_TAB_RENDER_FAILURE = TAB_RENDER_FAILURE_API;
+  window.DF_RENDER_FAILURE = RENDER_FAILURE_API;
 }
