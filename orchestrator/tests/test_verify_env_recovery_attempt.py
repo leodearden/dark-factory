@@ -21,29 +21,34 @@ import pytest
 _FAKE_PYTEST = """\
 #!/bin/sh
 case " $* " in
-  *" no:xdist "*) echo "1 passed in 0.01s"; exit 0;;
+  *" no:xdist "*) {serial_run};;
 esac
 echo "pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0" >&2
 exit 4
 """
+_SERIAL_PASSES = 'echo "1 passed in 0.01s"; exit 0'
+_SERIAL_HANGS = 'exec sleep 30'
 
 
-def _fake_pytest_bin(tmp_path: Path) -> Path:
-    """A `pytest` that fails with the vanished-xdist usage error unless run serial."""
+def _fake_pytest_bin(tmp_path: Path, serial_run: str) -> Path:
+    """A `pytest` that fails with the vanished-xdist usage error; run serial, it runs *serial_run*."""
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
     script = bin_dir / 'pytest'
-    script.write_text(_FAKE_PYTEST, encoding='utf-8')
+    script.write_text(_FAKE_PYTEST.format(serial_run=serial_run), encoding='utf-8')
     script.chmod(script.stat().st_mode | 0o100)
     return bin_dir
 
 
-async def _verify(tmp_path, *, concurrent, lint_command='true', type_command='sleep 1'):
+async def _verify(
+    tmp_path, *, concurrent, lint_command='true', type_command='sleep 1',
+    serial_run=_SERIAL_PASSES, timeout_secs=None,
+):
     from orchestrator import verify
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
     (tmp_path / '.task').mkdir()
-    bin_dir = _fake_pytest_bin(tmp_path)
+    bin_dir = _fake_pytest_bin(tmp_path, serial_run)
     config = OrchestratorConfig(
         project_root=tmp_path,
         verify_admission_enabled=False,
@@ -56,6 +61,8 @@ async def _verify(tmp_path, *, concurrent, lint_command='true', type_command='sl
         lint_command=lint_command,
         type_check_command=type_command,
         verify_env={'PATH': f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+        verify_command_timeout_secs=timeout_secs,
+        verify_cold_command_timeout_secs=timeout_secs,
     )
     result = await verify.run_verification(
         tmp_path, config, module_config, attempt_id=1, task_id='5624', max_retries=0,
@@ -121,3 +128,19 @@ async def test_a_green_top_level_names_the_recovery_run(tmp_path):
 
     assert summary['label'] == 'test'
     assert summary['carried_over'] is False
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_run_that_times_out_is_the_timed_out_leg_on_record(tmp_path):
+    result, summary = await _verify(
+        tmp_path, concurrent=True, type_command='true',
+        serial_run=_SERIAL_HANGS, timeout_secs=2.0,
+    )
+
+    assert (result.passed, result.timed_out) == (False, True)
+    assert result.summary == 'Verification timed out during env-recovery retry'
+    test = _entry(summary, 'test')
+    assert '-o addopts=' in test['cmd']
+    assert (test['timed_out'], test['carried_over']) == (True, False)
+    assert _entry(summary, 'lint')['carried_over'] is True
+    assert _entry(summary, 'type')['carried_over'] is True
