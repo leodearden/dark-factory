@@ -141,9 +141,9 @@ _READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
 _JCODEMUNCH_TOOLS = ['mcp__jcodemunch__*']
 
 # --- Escalation tools available to roles that can escalate ---
-_ESCALATE_INFO_TOOL = 'mcp__escalation__escalate_info'
-_ESCALATE_BLOCKER_TOOL = 'mcp__escalation__escalate_blocker'
-_ESCALATION_TOOLS = [_ESCALATE_INFO_TOOL, _ESCALATE_BLOCKER_TOOL]
+ESCALATE_INFO_TOOL = 'mcp__escalation__escalate_info'
+ESCALATE_BLOCKER_TOOL = 'mcp__escalation__escalate_blocker'
+_ESCALATION_TOOLS = [ESCALATE_INFO_TOOL, ESCALATE_BLOCKER_TOOL]
 
 # Spliced into ESCALATION_LADDER_CORE so every blocker-holding role, steward included, reads it.
 RESERVED_BOUND_ROUTING_RULE = """
@@ -2999,7 +2999,7 @@ or expired tickets as a follow-up escalation):
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Bash',
         *_DEEP_REVIEW_TOOLS,
-        _ESCALATE_INFO_TOOL,
+        ESCALATE_INFO_TOOL,
         *_JCODEMUNCH_TOOLS,
     ],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],

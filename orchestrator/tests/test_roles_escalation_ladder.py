@@ -59,10 +59,10 @@ import pytest
 from escalation.models import ACTION_KEEP_DRIVING, ACTION_TERMINATE_CLEANLY
 
 from orchestrator.agents.roles import (
-    _ESCALATE_BLOCKER_TOOL,
     _ESCALATION_INSTRUCTIONS,
     _ESCALATION_TOOLS,
     ESCALATE_BLOCKER_DECISION_ROUTE,
+    ESCALATE_BLOCKER_TOOL,
     ESCALATE_INFO_CONTRACT,
     ESCALATION_LADDER_CORE,
     EXTERNAL_KILL_GUIDANCE,
@@ -111,7 +111,7 @@ def _bare_tool_name(tool: str) -> str:
     return tool.rpartition('__')[2]
 
 
-def test_both_halves_are_nonempty() -> None:
+def test_escalation_constants_are_nonempty() -> None:
     """Sanity: no escalation constant is empty.
 
     An empty constant would make every containment assertion below pass
@@ -190,11 +190,8 @@ def test_role_prompt_names_only_held_escalation_tools(role_key: str) -> None:
     Scans BARE names because the fully-qualified sibling,
     test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names,
     cannot see a backticked `escalate_blocker`: that is how nine mentions of
-    it reached deep_reviewer, which cannot call it (task 6010).
-
-    This is not the banned prose pin, for the same reason as the task-5368
-    tokens in the module docstring: a tool name is a capability identifier,
-    not wording. Rewording passes; only naming a tool the role lacks fails.
+    it reached deep_reviewer, which cannot call it (task 6010). A tool name is
+    a capability identifier, like the task-5368 tokens in the module docstring.
     """
     role = ROLES[role_key]
     text = role.system_prompt
@@ -360,7 +357,7 @@ def test_escalation_tool_grant_matches_hand_classification() -> None:
     )
     info_only_by_tools = {
         name for name in escalating_by_tools
-        if _ESCALATE_BLOCKER_TOOL not in ROLES[name].allowed_tools
+        if ESCALATE_BLOCKER_TOOL not in ROLES[name].allowed_tools
     }
     assert info_only_by_tools == set(_INFO_ONLY_ESCALATING_ROLES), (
         f'Roles granted an escalation tool but not escalate_blocker '
@@ -456,13 +453,13 @@ def test_non_steward_gate_names_neither_filer_action_token() -> None:
     )
 
 
-def test_every_escalating_role_reads_both_filer_action_tokens() -> None:
+def test_every_blocker_holding_role_reads_both_filer_action_tokens() -> None:
     """(d) Derived coverage: the composed prompts, not just the constant.
 
     Iterates the hand-classified tuples rather than re-listing role names, and
     `test_escalation_tool_grant_matches_hand_classification` independently
     pins those tuples to `ROLES`' actual tool grants -- so a newly-wired
-    escalating role is covered here without editing this test. Checks the
+    blocker-holding role is covered here without editing this test. Checks the
     COMPOSED `system_prompt`, which is what an agent actually receives: a role
     spliced with some other escalation text, or with none, fails here even
     while the constant itself stays correct.
@@ -473,7 +470,7 @@ def test_every_escalating_role_reads_both_filer_action_tokens() -> None:
         or ACTION_KEEP_DRIVING not in ROLES[name].system_prompt
     )
     assert offenders == [], (
-        f'Escalating role(s) whose composed system_prompt is missing one or both '
+        f'Blocker-holding role(s) whose composed system_prompt is missing one or both '
         f'filer action tokens: {offenders}. Every role that can file a blocker '
         'receives the `action` key in its response and must be told how to read '
         'both of its values.'
@@ -490,13 +487,13 @@ def test_reserved_bound_rule_lives_in_the_ladder_core() -> None:
     )
 
 
-def test_every_escalating_role_reads_the_reserved_bound_rule() -> None:
+def test_every_blocker_holding_role_reads_the_reserved_bound_rule() -> None:
     """Derived coverage over the composed prompts each blocker-holding role receives."""
     offenders = sorted(
         name for name in _L1_FILER_ROLES + _NON_STEWARD_ESCALATING_ROLES
         if RESERVED_BOUND_ROUTING_RULE not in ROLES[name].system_prompt
     )
     assert offenders == [], (
-        f'Escalating role(s) whose composed system_prompt is missing '
+        f'Blocker-holding role(s) whose composed system_prompt is missing '
         f'RESERVED_BOUND_ROUTING_RULE: {offenders}.'
     )
