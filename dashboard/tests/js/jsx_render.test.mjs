@@ -386,3 +386,107 @@ for (const bucketMinutes of [60, null]) {
     assert.deepEqual(titles, [`Merge attempts · ${caption}`]);
   });
 }
+
+// ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
+// React's development build reports every throw a boundary catches on
+// console.error: jsdom's report of the replayed throw (its stack, or
+// 'undefined' for a non-Error), then a note naming the boundary that caught
+// it. So these tests cannot assert an empty console. They assert that every
+// report is of a throw RenderFailureBoundary caught, and nothing else.
+
+const CAUGHT_NOTE = 'using the error boundary you provided, ';
+const UNCAUGHT_NOTE = 'Consider adding an error boundary';
+
+function assertReportsOnlyContainedThrows(consoleErrors) {
+  const caughtNotes = consoleErrors.filter(entry => entry.includes(CAUGHT_NOTE));
+  assert.ok(caughtNotes.length > 0, `no throw was reported as caught by a boundary: ${JSON.stringify(consoleErrors)}`);
+  for (const note of caughtNotes) {
+    assert.ok(note.includes(`${CAUGHT_NOTE}RenderFailureBoundary.`), `a boundary other than RenderFailureBoundary caught: ${note}`);
+  }
+  for (const entry of consoleErrors) {
+    assert.ok(!entry.includes(UNCAUGHT_NOTE), `a throw escaped every boundary: ${entry}`);
+    assert.ok(!entry.startsWith('Warning:'), `React warned beside the contained throw: ${entry}`);
+  }
+}
+
+// Like openWindow, but the test asserts the window's reports itself.
+function openContainingWindow(t) {
+  const harness = buildDashboardWindow();
+  t.after(() => harness.close());
+  return harness;
+}
+
+function caughtFrom(fn) {
+  try {
+    fn();
+  } catch (thrown) {
+    return thrown;
+  }
+  throw new Error('expected the call to throw');
+}
+
+const UNIT_NOTICE_TESTID = 'unit-render-failure-banner';
+const SIBLING_TESTID = 'boundary-sibling';
+
+function noticeLines(notice) {
+  return [...notice.children].map(line => line.textContent);
+}
+
+// The boundary around `child`, beside a sibling that is outside it.
+function mountInsideBoundary(harness, child) {
+  const { React, DF_SHELL, DF_RENDER_FAILURE } = harness.window;
+  const describe = thrown => DF_RENDER_FAILURE.tabRenderFailureNotice('Overview', thrown);
+  const Page = () =>
+    React.createElement(
+      'div',
+      null,
+      React.createElement(DF_SHELL.RenderFailureBoundary, { describe, testId: UNIT_NOTICE_TESTID }, child),
+      React.createElement('span', { 'data-testid': SIBLING_TESTID }, 'outside the boundary'),
+    );
+  const { container } = harness.mount(Page);
+  return { container, describe };
+}
+
+function assertSiblingRenders(container) {
+  assert.equal(container.querySelector(`[data-testid="${SIBLING_TESTID}"]`)?.textContent, 'outside the boundary');
+}
+
+test('shell.jsx::RenderFailureBoundary contains a real DatumReading throw and renders its describe() notice', t => {
+  const harness = openContainingWindow(t);
+  const { React, DF_SHELL, DF_DATUM } = harness.window;
+  const { container, describe } = mountInsideBoundary(harness, React.createElement(DF_SHELL.DatumReading, { datum: 42 }));
+
+  const expected = describe(caughtFrom(() => DF_DATUM.datumView(42)));
+  const notices = container.querySelectorAll(`[data-testid="${UNIT_NOTICE_TESTID}"]`);
+  assert.equal(notices.length, 1, 'the boundary must render exactly one notice in place of the throwing child');
+  assert.equal(notices[0].getAttribute('role'), 'alert');
+  assert.deepEqual(noticeLines(notices[0]), [expected.text, expected.detail]);
+  assertSiblingRenders(container);
+  assertReportsOnlyContainedThrows(harness.consoleErrors);
+});
+
+test('shell.jsx::RenderFailureBoundary fails over on a thrown null, leaving describing it to describe()', t => {
+  const harness = openContainingWindow(t);
+  function ThrowsNull() {
+    throw null;
+  }
+  const { container, describe } = mountInsideBoundary(harness, harness.window.React.createElement(ThrowsNull));
+
+  const expected = describe(null);
+  const notices = container.querySelectorAll(`[data-testid="${UNIT_NOTICE_TESTID}"]`);
+  assert.equal(notices.length, 1, 'a falsy throw must still fail over to the notice');
+  assert.deepEqual(noticeLines(notices[0]), [expected.text, expected.detail]);
+  assertSiblingRenders(container);
+  assertReportsOnlyContainedThrows(harness.consoleErrors);
+});
+
+test('shell.jsx::RenderFailureBoundary renders a healthy child unchanged, with no notice', t => {
+  const harness = openContainingWindow(t);
+  const { React } = harness.window;
+  const { container } = mountInsideBoundary(harness, React.createElement('em', { 'data-testid': 'healthy' }, 'fine'));
+
+  assert.equal(container.querySelector('[data-testid="healthy"]')?.textContent, 'fine');
+  assert.equal(container.querySelector(`[data-testid="${UNIT_NOTICE_TESTID}"]`), null);
+  assertSiblingRenders(container);
+  assert.deepEqual(harness.consoleErrors, []);
+});
