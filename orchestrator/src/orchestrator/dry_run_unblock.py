@@ -18,7 +18,7 @@ import logging
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeGuard
 
 from shared.cli_invoke import (
     BUDGET_EXHAUSTED_SUBTYPE,
@@ -70,6 +70,7 @@ DRY_RUN_PROPOSAL_SCHEMA: dict[str, Any] = {
 
 _RISK_LABELS: frozenset[str] = frozenset({'low', 'medium', 'human-review-required'})
 _HUMAN_REVIEW_REQUIRED: str = 'human-review-required'
+_INFRA_FAILURE_STATUS: str = 'infra_failure'
 
 # Transient HOST infra wedges (e.g. a pre-turn-1 kill at the
 # UnblockAutoConfig.timeout ceiling -> empty stdout + timed_out) are
@@ -403,12 +404,16 @@ async def _capture_branch_patch_id(worktree: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _latest_proposal_covers(
-    proposals: Any, *, branch_patch_id: str | None, block_reason: str,
-) -> bool:
+    proposals: object, *, branch_patch_id: str | None, block_reason: str,
+    head_sha: str | None,
+) -> TypeGuard[list[Any]]:
     """Whether the latest entry already investigated this content and reason.
 
     Only the latest entry counts, because the briefing and b3_gate both read
-    ``dry_run_proposals[-1]``. An unknown identity never covers.
+    ``dry_run_proposals[-1]``. An unknown identity never covers. An
+    infra_failure entry never covers either: the wedge is retryable and
+    concluded nothing. A low-risk entry covers only at its own HEAD, because
+    b3_gate.check_proposal step 6 aborts once HEAD has moved.
     """
     if branch_patch_id is None or not isinstance(proposals, list) or not proposals:
         return False
@@ -418,11 +423,13 @@ def _latest_proposal_covers(
     return (
         latest.get('branch_patch_id') == branch_patch_id
         and latest.get('block_reason') == block_reason
+        and latest.get('status') != _INFRA_FAILURE_STATUS
+        and (latest.get('risk_label') != 'low' or latest.get('head_sha') == head_sha)
     )
 
 
 async def _reaffirm_latest_proposal(
-    scheduler: Any, task_id: str, proposals: list[dict[str, Any]],
+    scheduler: Any, task_id: str, proposals: list[Any],
 ) -> None:
     """Move the covering entry's ``timestamp`` to now. Best-effort.
 
@@ -556,6 +563,7 @@ async def run_dry_run_unblock(
         proposals = md.get('dry_run_proposals')
         if _latest_proposal_covers(
             proposals, branch_patch_id=branch_patch_id, block_reason=reason,
+            head_sha=head_sha,
         ):
             logger.info(
                 'dry_run_unblock: task %s re-blocked on unchanged content '
@@ -1030,7 +1038,7 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
                     f'wall / task is slow)'
                 )
             return {
-                'status': 'infra_failure',
+                'status': _INFRA_FAILURE_STATUS,
                 'proposal_text': proposal_text,
                 'risk_label': _HUMAN_REVIEW_REQUIRED,
                 'files_referenced': [],
@@ -1102,7 +1110,7 @@ def _cap_exhausted_entry(
     """
     now = _now_iso()
     return {
-        'status': 'infra_failure',
+        'status': _INFRA_FAILURE_STATUS,
         'proposal_text': (
             f'Infra wedge (retryable, not a human-review conclusion): '
             f'{_cap_wedge(exc, disp)} ({exc.elapsed_secs:.1f}s elapsed)'
