@@ -22,7 +22,8 @@ from shared.project_id import fold_project_token
 from sitting import ledger as ledger_mod
 from sitting import preparation as prep_mod
 from sitting import prepare_sitting as mod
-from sitting.inventory import escalation_key, key_str
+from sitting.inventory import ItemKey, escalation_key, key_str
+from sitting.ownership import ProbeResult
 from sitting.preparation import Manual, Standing
 
 NOW = '2026-09-26T09:00:00+00:00'
@@ -705,6 +706,98 @@ class TestProjectScope:
 
         assert 'esc-900-1' in _numbers(everything)
         assert set(_numbers(scoped)) == set(EXPECTED_NUMBERS)
+
+
+def _write_handover(root: Path, text: str) -> Path:
+    path = root / 'data' / 'escalations' / 'l2-handover.md'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def _queue_key(root: Path, esc_id: str) -> ItemKey:
+    return escalation_key(normalize_escalations_dir(root / 'data' / 'escalations'), esc_id)
+
+
+def _handover_probes(env: Env, roots: list[Path], override=None) -> dict[ItemKey, ProbeResult]:
+    now = datetime.fromisoformat(NOW)
+    sources = mod.read_sources(
+        project_roots=[str(root) for root in roots], decisions_root=env.fleet, sessions_root=env.sessions,
+        handover_override=override, preparation_path=env.preparation, project=None, now=now,
+    )
+    classified = mod.classify(sources, recommend_only=True, ledger_standing={}, now=now)
+    return {c.item.key: next(p for p in c.ownership.probes if p.probe == 'handover') for c in classified}
+
+
+class TestHandoverPerProject:
+    """Escalation ids are unique only within a queue, so each item reads its own project's handover."""
+
+    @pytest.fixture
+    def reify(self, env) -> Path:
+        reify = env.tmp / 'src' / 'reify'
+        _esc(reify / 'data' / 'escalations', id='esc-100-1')
+        _write_handover(env.df, '# handover\n\nesc-100-1 task 100: the dark-factory watcher holds this\n')
+        _write_handover(reify, '# handover\n\nesc-100-1 task 100: the reify watcher holds this\n')
+        return reify
+
+    @pytest.fixture
+    def third(self, env) -> Path:
+        third = env.tmp / 'src' / 'third'
+        _esc(third / 'data' / 'escalations', id='esc-950-1')
+        return third
+
+    @pytest.fixture
+    def elsewhere(self, env) -> Path:
+        path = env.tmp / 'elsewhere.md'
+        path.write_text('esc-100-1 task 100: read from the override\n')
+        return path
+
+    def test_each_item_reads_its_own_projects_handover(self, env, reify, third):
+        probes = _handover_probes(env, [env.df, reify, third])
+
+        df_probe, reify_probe = probes[_queue_key(env.df, 'esc-100-1')], probes[_queue_key(reify, 'esc-100-1')]
+        assert df_probe.status == reify_probe.status == 'mentions'
+        assert 'the dark-factory watcher' in df_probe.evidence
+        assert 'reify watcher' not in df_probe.evidence
+        assert 'the reify watcher' in reify_probe.evidence
+        assert 'dark-factory watcher' not in reify_probe.evidence
+        assert probes[_queue_key(third, 'esc-950-1')].status == 'unavailable'
+
+    def test_an_override_replaces_only_its_projects_handover(self, env, reify, elsewhere):
+        probes = _handover_probes(env, [env.df, reify], mod.HandoverOverride('reify', elsewhere))
+
+        assert 'read from the override' in probes[_queue_key(reify, 'esc-100-1')].evidence
+        assert 'the dark-factory watcher' in probes[_queue_key(env.df, 'esc-100-1')].evidence
+
+    def test_an_override_naming_a_missing_file_is_unavailable_and_names_it(self, env, reify):
+        absent = env.tmp / 'absent.md'
+
+        probes = _handover_probes(env, [env.df, reify], mod.HandoverOverride('reify', absent))
+
+        probe = probes[_queue_key(reify, 'esc-100-1')]
+        assert probe.status == 'unavailable'
+        assert str(absent) in probe.evidence
+
+    def test_override_project_must_be_folded(self, env):
+        with pytest.raises(ValueError, match='Reify'):
+            mod.HandoverOverride('Reify', env.tmp / 'x.md')
+        with pytest.raises(ValueError):
+            mod.HandoverOverride('', env.tmp / 'x.md')
+
+    def test_the_flag_takes_project_equals_path_and_folds_the_project(self, env, capsys, reify, elsewhere):
+        rc, out, _ = _run(
+            capsys, 'brief', *env.args(project_roots=[env.df, reify]), '--handover', f'Reify={elsewhere}',
+        )
+
+        assert rc == 0
+        assert 'read from the override' in out
+
+    def test_a_bare_path_is_refused_naming_the_form(self, env, capsys, elsewhere):
+        with pytest.raises(SystemExit) as exited:
+            mod.main(['brief', *env.args(), '--handover', str(elsewhere)])
+
+        assert exited.value.code == 2
+        assert 'PROJECT=PATH' in capsys.readouterr().err
 
 
 class TestMachineOutputs:
