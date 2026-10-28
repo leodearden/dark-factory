@@ -26,7 +26,7 @@ from _verify_boundary_ceilings import (
 # Task 4025 amendment -- drift detector for the ROW_WATCHDOG pin in
 # _verify_boundary_ceilings.py.  ROW_WATCHDOG_ENV is pinned to today's
 # production numbers but deliberately does not TRACK verify_cancel's constants
-# (see that module's ROW_WATCHDOG banner); that decoupling means nothing else
+# (see _verify_boundary_ceilings.py's ROW_WATCHDOG banner); that decoupling means nothing else
 # notices the day the two diverge.  This is the one test whose whole job is to
 # notice, so the import it performs (LOCAL to the test body, not module-level)
 # is a deliberate, narrow exception to that banner's "nothing here imports
