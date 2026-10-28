@@ -8636,6 +8636,7 @@ class Harness:
         *,
         summary: str,
         detail: str,
+        level: int = 0,
     ) -> None:
         """File a non-blocking INFO escalation for a scheduler-starved task.
 
@@ -8685,7 +8686,7 @@ class Harness:
             summary=summary[:200],
             detail=detail,
             suggested_action='manual_investigation',
-            level=0,
+            level=level,
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)

@@ -100,6 +100,8 @@ from orchestrator.starvation_watchdog import (
     CandidateFacts,
     Finding,
     LockRefusals,
+    ParkBlock,
+    StarvationDisposition,
     classify,
     escalation_text,
 )
@@ -702,6 +704,10 @@ class SchedulerCallbacks:
     bare-Scheduler unit-test contract is unaffected.  Frozen: the Harness
     builds one bundle at construction time; there is no post-hoc mutation or
     half-wired window.
+
+    ``on_starvation_warn(task_id, *, summary, detail, level=0)`` files the
+    watchdog's escalation at *level*: 0 for the pinning gates' info trail, 1
+    for a ``park_blocked`` firing, which only a human or the holder can clear.
     """
 
     on_park_stop_trip: Callable[[str], Any] | None = None
@@ -4622,6 +4628,7 @@ class Scheduler:
         cfg = self.config.starvation_watchdog
         if not cfg.enabled:
             return
+        parks = self.lock_table.snapshot_parks()
         findings: list[Finding] = []
         for tid, task in candidates.items():
             if self._streak_starvation.is_escalated(tid):
@@ -4631,7 +4638,7 @@ class Scheduler:
                 eligible_age_secs=self._eligibility.age_secs(tid, now),
                 skip_count=self._skip_count.get(tid, 0),
                 lock_refusals=self._lock_refusals.count(tid),
-                park_block=None,
+                park_block=self._park_blocked(tid, parks, now),
             )
             gate = classify(facts, cfg)
             if gate is not None:
@@ -4640,27 +4647,56 @@ class Scheduler:
         for finding in findings:
             await self._deliver_starvation_finding(finding)
 
+    def _park_blocked(
+        self, task_id: str, parks: Mapping[str, Mapping[str, Any]], now: datetime,
+    ) -> ParkBlock | None:
+        """The live holder *task_id*'s active park waits on, or None.
+
+        *parks* is this pass's ``snapshot_parks()``.  The holder test is the
+        lock table's own ``blocking_holders`` (INV-5).  An unreadable park age
+        yields None: the gate refuses rather than guess, as ``park_age_secs``
+        requires.
+        """
+        park = parks.get(task_id)
+        if park is None:
+            return None
+        held = self.lock_table.blocking_holders(list(park['modules']), exclude_task=task_id)
+        if not held:
+            return None
+        park_age = self.lock_table.park_age_secs(task_id, now=now)
+        if park_age is None:
+            return None
+        module = min(held)
+        return ParkBlock(
+            blocking_holder=held[module][0], blocking_module=module, park_age_secs=park_age,
+        )
+
     async def _deliver_starvation_finding(self, finding: Finding) -> None:
         """Emit ``starvation_detected`` and file the escalation trail for one finding."""
         facts, gate = finding.facts, finding.gate
+        data: dict[str, Any] = {
+            'gate': gate.value,
+            'eligible_age_secs': facts.eligible_age_secs,
+            'skip_count': facts.skip_count,
+            'lock_refusals': facts.lock_refusals,
+            'blockers': [b.as_payload() for b in finding.blockers],
+        }
+        if facts.park_block is not None:
+            data.update(
+                asdict(facts.park_block),
+                auto_pinned=False,
+                disposition=StarvationDisposition.ESCALATED_L1.value,
+            )
         if self.event_store:
             self.event_store.emit(
-                EventType.starvation_detected,
-                task_id=facts.task_id,
-                data={
-                    'gate': gate.value,
-                    'eligible_age_secs': facts.eligible_age_secs,
-                    'skip_count': facts.skip_count,
-                    'lock_refusals': facts.lock_refusals,
-                    'blockers': [b.as_payload() for b in finding.blockers],
-                },
+                EventType.starvation_detected, task_id=facts.task_id, data=data,
             )
         if self._callbacks.on_starvation_warn is not None:
             summary, detail = escalation_text(
                 facts, gate, self.config.starvation_watchdog, finding.blockers,
             )
             await self._callbacks.on_starvation_warn(
-                facts.task_id, summary=summary, detail=detail,
+                facts.task_id, summary=summary, detail=detail, level=gate.escalation_level,
             )
         self._streak_starvation.mark_escalated(facts.task_id)
 

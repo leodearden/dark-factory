@@ -47,6 +47,11 @@ class StarvationGate(StrEnum):
         """Whether a firing earns an auto-pin; a park-blocked task needs its holder to finish."""
         return self is not StarvationGate.PARK_BLOCKED
 
+    @property
+    def escalation_level(self) -> int:
+        """L0 info trail for a pinning gate; L1 when only a human or the holder can help."""
+        return 0 if self.pins else 1
+
 
 class StarvationDisposition(StrEnum):
     AUTO_PINNED = 'auto_pinned'
