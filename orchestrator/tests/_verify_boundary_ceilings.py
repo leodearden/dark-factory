@@ -47,9 +47,10 @@ from df_pytest_isolation import load_scaled_grace
 # HONEST CAVEAT: this MOVES the cliff from 1.0s to 10s, it does not remove
 # it.  The watchdog deadline is a wall-clock select() in
 # verify_cancel.run_stdin_watchdog -- LOAD-RIGID -- while the producer
-# (HeartbeatWriter._run) is an Event.wait(0.2) -- LOAD-ELASTIC.  Measured
-# producer inter-write gap at loadavg 113-178 was p999 0.386s / max 0.845s:
-# only ~1.2x real margin against a 1.0s deadline, but ~12x against 10.0s.
+# (_verify_boundary_harness.py::HeartbeatWriter._run) is an Event.wait(0.2)
+# -- LOAD-ELASTIC.  Measured producer inter-write gap at loadavg 113-178 was
+# p999 0.386s / max 0.845s: only ~1.2x real margin against a 1.0s deadline,
+# but ~12x against 10.0s.
 # Do not try to buy margin by pre-buffering heartbeats -- run_stdin_watchdog
 # drains with a single read(4096) per select, so a burst resets exactly one
 # window, not N.
@@ -82,13 +83,14 @@ ROW_WATCHDOG_ENV: dict[str, str] = {
 #: is already failing.
 ROW_TREE_KILL_CEILING_SECS: float = ROW_WATCHDOG_WINDOW_SECS + 15.0  # 30.0
 
-#: Ceiling for the marker waits (:func:`wait_for_marker` /
-#: :func:`wait_for_marker_stable`, whose bare defaults resolve to it).  Value
-#: unchanged from the literal it replaces; the point of naming it is that
-#: Row 5's budget below references the SAME symbol those helpers spend, so the
-#: two cannot drift.  NOT load-scaled: unlike descendant discovery, this waits
-#: on a single already-forked build shell reaching one ``touch``, and no
-#: measurement in this repo implicates it in a load flake.
+#: Ceiling for the marker waits (_verify_boundary_harness.py's
+#: :func:`wait_for_marker` / :func:`wait_for_marker_stable`, whose bare
+#: defaults resolve to it).  Value unchanged from the literal it replaces;
+#: the point of naming it is that Row 5's budget below references the SAME
+#: symbol those helpers spend, so the two cannot drift.  NOT load-scaled:
+#: unlike descendant discovery, this waits on a single already-forked build
+#: shell reaching one ``touch``, and no measurement in this repo implicates it
+#: in a load flake.
 ROW_MARKER_CEILING_SECS: float = 20.0
 
 #: Base ceiling for the two DISCOVERY waits every row runs BEFORE the
@@ -119,9 +121,10 @@ ROW_DISCOVERY_CEILING_UNPINNED_MAX_SECS: int = (
 
 #: Operator knob: pin the discovery ceiling outright (e.g. to reproduce a
 #: discovery timeout quickly instead of waiting out a load-scaled deadline).
-#: Namespaced ORCH_TEST_*, NOT bare ORCH_*: subprocess_env() copies
-#: os.environ into every spawned verify-merge, and the ORCH_* namespace there
-#: is production knobs the CLI actually reads.
+#: Namespaced ORCH_TEST_*, NOT bare ORCH_*:
+#: _verify_boundary_harness.py::subprocess_env copies os.environ into every
+#: spawned verify-merge, and the ORCH_* namespace there is production knobs
+#: the CLI actually reads.
 _DISCOVERY_CEILING_OVERRIDE_ENV: str = 'ORCH_TEST_DISCOVERY_CEILING_SECS'
 
 
