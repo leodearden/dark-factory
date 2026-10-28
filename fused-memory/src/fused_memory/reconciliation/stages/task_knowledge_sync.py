@@ -56,6 +56,7 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_snapshot_stat_edge_findings,
 )
 from fused_memory.reconciliation.flag_record_contract import STAGE1_FLAG_MARKER_KIND
+from fused_memory.reconciliation.known_projects_section import render_known_projects_section
 from fused_memory.reconciliation.live_workflow_section import (
     render_live_workflow_section,
 )
@@ -4378,7 +4379,9 @@ class TaskKnowledgeSync(BaseStage):
                 stale_ids,
             )
 
-        known_projects_section = self._format_known_projects_section()
+        known_projects_section = render_known_projects_section(
+            self.known_projects, current_project_id=self.project_id
+        )
 
         # Step 5 in the Your Task block below prescribes a PLAIN ADDITIVE
         # attach (append=True, metadata_mode OMITTED) for every task in the
@@ -4455,30 +4458,6 @@ FIRST** — if count > 0, skip the task entirely (no search, no write, no findin
 Use project_root="{self.project_root}" for tasks scoped to this project.
 For cross-project routing see "Known Projects" above.
 """
-
-    def _format_known_projects_section(self) -> str:
-        """Render the cross-project routing context for the Stage 2 LLM.
-
-        Emits a ``### Known Projects`` markdown section listing every
-        configured project_id and its project_root, marking the current
-        one.  Returns the empty string when fewer than two projects are
-        known — there is no "cross-project" dimension to surface in that
-        case, and the section would only add noise.
-        """
-        known = self.known_projects
-        if len(known) < 2:
-            return ''
-        # Stable ordering: current project first, then alphabetical.
-        ordered = [(self.project_id, known[self.project_id])] if self.project_id in known else []
-        for pid in sorted(p for p in known if p != self.project_id):
-            ordered.append((pid, known[pid]))
-        # Pad the project_id column to a consistent width for readability.
-        width = max(len(pid) for pid, _ in ordered)
-        lines = []
-        for pid, root in ordered:
-            marker = '  (current)' if pid == self.project_id else ''
-            lines.append(f'- {pid:<{width}}  → {root}{marker}')
-        return '\n### Known Projects (for cross-project routing)\n' + '\n'.join(lines) + '\n'
 
     async def _build_live_workflow_section(
         self, filtered: FilteredTaskTree, tree_read_at: datetime,
@@ -4768,6 +4747,9 @@ class IntegrityCheck(BaseStage):
             flagged.extend(stage2_report.items_flagged)
 
         flagged_text = _format_flagged(flagged, run_stage='stage3')
+        known_projects_section = render_known_projects_section(
+            self.known_projects, current_project_id=self.project_id
+        )
 
         return f"""## Stage 3: Cross-System Integrity Check
 ## Project: {self.project_id}
@@ -4779,7 +4761,7 @@ class IntegrityCheck(BaseStage):
 {_format_report(stage2_report)}
 
 ### Items Flagged for Cross-System Verification ({len(flagged)})
-{flagged_text}
+{flagged_text}{known_projects_section}
 
 ## Your Task
 Verify consistency across all three systems:

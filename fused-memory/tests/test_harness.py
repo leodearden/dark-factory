@@ -46,6 +46,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
+from fused_memory.reconciliation.known_projects_section import render_known_projects_section
 from fused_memory.reconciliation.task_count_snapshot_cadence import SNAPSHOT_WRITTEN_STAT_KEY
 
 
@@ -13289,9 +13290,18 @@ async def test_stage3_payload_for_reify_emits_reify_root(
         f'{expected_directive!r} (task 1143 step-12). '
         f'Payload (first 600 chars):\n{payload[:600]}'
     )
-    assert '/home/leo/src/dark-factory' not in payload or project_id == 'dark_factory', (
-        f'Stage 3 payload for project_id={project_id!r} must not contain '
-        f'dark-factory path — cross-contamination guard (task 1143)'
+    routing_section = render_known_projects_section(
+        _FIVE_PROJECT_MAP, current_project_id=project_id
+    )
+    assert routing_section in payload, (
+        f'Stage 3 payload for project_id={project_id!r} must render the '
+        f'Known Projects routing table (task 6109)'
+    )
+    outside_routing = payload.replace(routing_section, '')
+    assert '/home/leo/src/dark-factory' not in outside_routing or project_id == 'dark_factory', (
+        f'Stage 3 payload for project_id={project_id!r} must not contain the '
+        f'dark-factory path outside the Known Projects routing table — '
+        f'cross-contamination guard (task 1143)'
     )
 
 
