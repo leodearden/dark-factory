@@ -591,3 +591,22 @@ class TestPostMergeTailStartsNoStewardForInfoNotes:
         _submit(queue, severity='info')
 
         assert await _post_merge_tail(workflow, tmp_path) == ['started']
+
+    async def test_an_info_note_left_after_a_cleared_steward_does_not_hold_the_tail(
+        self, tmp_path: Path,
+    ):
+        """An earlier steward cycle left its outcome channel behind and was then
+        cleared; the only pending L0 is an info note the finalizer owns.  The
+        tail's idle gate must agree with its start gate and not wait out the
+        full completion timeout for a publish that cannot come."""
+        workflow, queue = _workflow(tmp_path, router_enabled=True)
+        workflow.config = workflow.config.model_copy(update={
+            'steward_completion_timeout': 900.0, 'timeouts': TimeoutsConfig(steward=900.0),
+        })
+        workflow._steward_outcome_channel = asyncio.Queue()
+        workflow._steward = None
+        _submit(queue, severity='info')
+
+        started = await asyncio.wait_for(_post_merge_tail(workflow, tmp_path), timeout=10.0)
+
+        assert started == []

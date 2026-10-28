@@ -18392,10 +18392,11 @@ class TaskWorkflow:
         wait ON — its ``skip_if_idle`` gate, used by the post-merge success
         tail (task 3170).
 
-        Two things count as outstanding: a pending level-0 escalation (the
-        steward does not un-pend a record while it works on one, so "pending"
-        covers both queued and in-flight), or an unread outcome already sitting
-        on the channel (instantly consumable).
+        Two things count as outstanding: a pending level-0 escalation that
+        would hold a steward wait (:meth:`_l0s_holding_the_wait` — an info note
+        the router owns does not, once no steward is live, so this gate agrees
+        with the post-merge tail's D7 start gate), or an unread outcome already
+        sitting on the channel (instantly consumable).
 
         With neither, the success tail would otherwise block for the FULL
         ``steward_completion_timeout`` — 900s on stock config — waiting for a
@@ -18413,9 +18414,7 @@ class TaskWorkflow:
         short-circuited this same call.  The success tail's contract is
         "give queued steward work a chance to finish", not "join the steward".
         """
-        if self.escalation_queue is not None and self.escalation_queue.get_by_task(
-            self.task_id, status='pending', level=0,
-        ):
+        if self._l0s_holding_the_wait():
             return True
         channel = self._steward_outcome_channel
         return channel is not None and not channel.empty()
