@@ -634,3 +634,100 @@ class TestOverrideSource:
         assert {s.value for s in OverrideSource} == {
             'operator', 'starvation_watchdog',
         }
+
+
+def _raw_row(db_path: Path, task_id: str) -> tuple[object, ...] | None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            'SELECT * FROM overrides WHERE project_root=? AND task_id=?',
+            ('proj', task_id),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+class TestWatchdogPin:
+    def test_create_appends_after_operator_pins(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideSource, OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'O1', pinned=True)
+        store.set_override('proj', 'O2', pinned=True)
+        ttl = datetime(2026, 10, 29, 12, 0, tzinfo=UTC)
+
+        assert store.create_watchdog_pin('proj', 'T', ttl_until=ttl) == 3
+
+        queue = dict(store.get_pin_queue('proj'))
+        assert [tid for tid, _ in store.get_pin_queue('proj')] == ['O1', 'O2', 'T']
+        assert queue['O1'].pin_order == 1
+        assert queue['O2'].pin_order == 2
+        watchdog_row = queue['T']
+        assert watchdog_row.pinned is True
+        assert watchdog_row.source is OverrideSource.STARVATION_WATCHDOG
+        assert watchdog_row.ttl_until == ttl
+
+    def test_create_never_touches_an_existing_row(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        db_path = tmp_path / 'scheduler_overrides.db'
+        store = OverrideStore(db_path)
+        store.set_override('proj', 'T', boost_tier='high')
+        before = _raw_row(db_path, 'T')
+
+        created = store.create_watchdog_pin(
+            'proj', 'T', ttl_until=datetime(2026, 10, 29, tzinfo=UTC),
+        )
+
+        assert created is None
+        assert _raw_row(db_path, 'T') == before
+
+    def test_create_rejects_naive_ttl(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        with pytest.raises(ValueError, match='timezone'):
+            store.create_watchdog_pin('proj', 'T', ttl_until=datetime(2026, 10, 29))
+
+    def test_release_deletes_only_watchdog_owned_rows(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        ttl = datetime(2026, 10, 29, tzinfo=UTC)
+        store.create_watchdog_pin('proj', 'W', ttl_until=ttl)
+        store.set_override('proj', 'O', pinned=True)
+
+        assert store.release_watchdog_pin('proj', 'W') is True
+        assert 'W' not in store.get_overrides('proj')
+
+        assert store.release_watchdog_pin('proj', 'O') is False
+        assert 'O' in store.get_overrides('proj')
+
+    def test_operator_write_takes_ownership_of_a_watchdog_pin(
+        self, tmp_path: Path
+    ) -> None:
+        from orchestrator.overrides import OverrideSource, OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.create_watchdog_pin(
+            'proj', 'W', ttl_until=datetime(2026, 10, 29, tzinfo=UTC),
+        )
+        store.set_override('proj', 'W', boost_tier='high')
+
+        assert store.get_overrides('proj')['W'].source is OverrideSource.OPERATOR
+        assert store.release_watchdog_pin('proj', 'W') is False
+        assert store.get_overrides('proj')['W'].pinned is True
+
+    def test_count_pins_counts_pinned_rows_of_one_source(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideSource, OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        ttl = datetime(2026, 10, 29, tzinfo=UTC)
+        store.create_watchdog_pin('proj', 'W1', ttl_until=ttl)
+        store.create_watchdog_pin('proj', 'W2', ttl_until=ttl)
+        store.set_override('proj', 'O1', pinned=True)
+        store.set_override('proj', 'B', boost_tier='low')
+        store.create_watchdog_pin('other', 'W3', ttl_until=ttl)
+
+        assert store.count_pins('proj', OverrideSource.STARVATION_WATCHDOG) == 2
+        assert store.count_pins('proj', OverrideSource.OPERATOR) == 1
