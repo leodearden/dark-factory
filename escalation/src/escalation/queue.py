@@ -712,6 +712,11 @@ def _append_amendment_capped(
     return True, dropped
 
 
+def amendment_room(esc: Escalation) -> int:
+    """How many more amendments *esc* takes before the cap sheds its oldest one."""
+    return max(0, _MAX_AMENDMENTS - len(esc.amendments))
+
+
 def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
     """Yield all ``esc-*.json`` paths from *escalations_dir* and its archive subtree.
 
@@ -1445,6 +1450,45 @@ class EscalationQueue:
         if category is not None:
             open_l1s = [esc for esc in open_l1s if esc.category == category]
         return bool(open_l1s)
+
+    def dismiss_if_covered(self, esc: Escalation, *, resolver: str) -> list[str]:
+        """Dismiss *esc* when an open L1 of its category covers its task.
+
+        Returns the ids of the covering L1s; when none covers it, nothing is
+        written and the list is empty.  Category-scoped, unlike
+        :meth:`has_open_l1`'s default: an L1 about another category does not
+        cover a new root cause (the unblock-4917 amendment).  An L1 covers only
+        once it carries an amendment naming *esc*, so the dismissal never
+        silences it.  The category is matched here rather than through
+        ``has_open_l1(category=)``, which raises for a legacy category.
+        """
+        covering = []
+        for l1 in self.get_by_task(esc.task_id, status='pending', level=1):
+            if l1.category != esc.category:
+                continue
+            amended = self.amend(
+                l1.id,
+                agent_role=resolver,
+                summary=f'Covered L0 {esc.id}: {esc.summary}',
+                detail=(
+                    f'{esc.id} ({esc.agent_role}, severity={esc.severity}) was dismissed '
+                    f'by {resolver} as covered by this open {esc.category} L1.\n\n{esc.detail}'
+                ),
+            )
+            if amended['status'] in ('amended', 'repeat_framing'):
+                covering.append(l1.id)
+        if covering:
+            self.resolve(
+                esc.id,
+                (
+                    f'Dismissed by {resolver} — open L1 already covers this task '
+                    f'(task_id={esc.task_id}, category={esc.category}, '
+                    f'covering={", ".join(covering)})'
+                ),
+                dismiss=True,
+                resolved_by=resolver,
+            )
+        return covering
 
     def find_terminal_by_citation(
         self, task_id: str, category: str, citation_sha: str | None,
@@ -3071,6 +3115,7 @@ class EscalationQueue:
         *,
         strand_age_secs: float | None = None,
         now: datetime | None = None,
+        keep: Callable[[Escalation], bool] | None = None,
     ) -> int:
         """Dismiss all pending L0 escalations with the given resolution message.
 
@@ -3100,6 +3145,12 @@ class EscalationQueue:
         loop, mirroring ``Harness._reap_orphan_l0_escalations``, so every
         record in one sweep is aged against the same instant.
 
+        ``keep``: an optional predicate over each pending level-0 record; a
+        record it returns True for is neither dismissed nor counted.  The
+        startup amnesty passes it so the info-L0 router's held or unrouted
+        notes survive for the orphan reaper
+        (plans/info-l0-disposition-router-prd.md boundary #16).
+
         Returns the number of escalations where resolve() returned non-None.
         This is an UPPER BOUND on the records this call dismissed, not an exact
         count.  Other processes, among them fused-memory's middlewares and
@@ -3115,7 +3166,7 @@ class EscalationQueue:
         now = now or datetime.now(UTC)
         count = 0
         strands = 0
-        for esc in (e for e in pending if e.level == 0):
+        for esc in (e for e in pending if e.level == 0 and not (keep and keep(e))):
             try:
                 # fallback=datetime.max: an unparseable timestamp sorts as
                 # NEWEST, never as infinitely stale (the dedupe.py sentinel

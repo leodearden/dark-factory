@@ -13,7 +13,7 @@ import string
 import sys
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -105,6 +105,7 @@ from orchestrator.delivered_checks import (
     gate_mark_done_on_delivered_checks,
 )
 from orchestrator.dry_run_unblock import run_dry_run_unblock
+from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, exit_kind_for, router_owns
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.exit_contract import (
     ExitStatusWriteFailure,
@@ -502,6 +503,7 @@ class _NoStewardApplicable(_HumanHandoff):
         )
 
 if TYPE_CHECKING:
+    from escalation.disposition import ExitKind
     from escalation.models import Escalation, TrainState
     from escalation.queue import EscalationQueue
 
@@ -3503,10 +3505,16 @@ class TaskWorkflow:
                 disposition=disp,
             )
 
-    def _on_terminal_cleanups(self) -> list[OnTerminalEntry]:
+    def _on_terminal_cleanups(
+        self, drive_outcomes: Sequence[WorkflowOutcome] = (),
+    ) -> list[OnTerminalEntry]:
         """Ordered, kind-aware terminal-cleanup list run by ``CancellationScope``
         on every exit from ``run()`` (normal return, soft-cancel, or
         hard-cancel — ``kind`` is ``None`` for a normal exit).
+
+        ``disposition_info_l0s`` routes the task's info notes once the steward
+        has stopped (:meth:`_disposition_info_l0s`); *drive_outcomes* is the
+        cell ``run()`` fills with ``_drive()``'s outcome, read at exit time.
 
         Replaces ``_drive()``'s old ``finally`` block (W9-θ): the same five
         cleanups, in the same order (``stop_claimant_heartbeat`` first —
@@ -3541,6 +3549,11 @@ class TaskWorkflow:
             if self._steward:
                 await self._steward.stop()
 
+        async def _disposition(kind: Literal['hard', 'soft'] | None) -> None:
+            await self._disposition_info_l0s(
+                exit_kind_for(kind, drive_outcomes[-1] if drive_outcomes else None),
+            )
+
         async def _cleanup_worktree(_kind: Literal['hard', 'soft'] | None) -> None:
             # Cleanup worktree (only if done AND branch is on main — preserve
             # otherwise so an agent's update_task(status='done') bypass
@@ -3567,6 +3580,7 @@ class TaskWorkflow:
         return [
             ('stop_claimant_heartbeat', _stop_heartbeat),
             ('stop_steward', _stop_steward),
+            ('disposition_info_l0s', _disposition),
             ('cleanup_done_worktree', _cleanup_worktree),
             ('release_lane', _release_lane),
             ('cleanup_config_dir', _cleanup_config),
@@ -3619,12 +3633,18 @@ class TaskWorkflow:
         :class:`WorkflowCancelled`, caught at this EXACTLY ONE site.
         """
         cancel_kind: Literal['hard', 'soft'] | None = None
+        drive_outcomes: list[WorkflowOutcome] = []
+
+        async def _drive_recorded() -> WorkflowOutcome:
+            drive_outcomes.append(await self._drive())
+            return drive_outcomes[-1]
+
         scope = CancellationScope(
-            self._cancel_event, self._on_terminal_cleanups(),
+            self._cancel_event, self._on_terminal_cleanups(drive_outcomes),
             cancel_grace_secs=self.config.terminal_cleanup_cancel_grace_secs,
         )
         try:
-            outcome = await scope.supervise(self._drive())
+            outcome = await scope.supervise(_drive_recorded())
         except WorkflowCancelled as wc:
             cancel_kind = wc.kind
             outcome = await self._finalise_cancellation(wc.kind)
@@ -3776,8 +3796,9 @@ class TaskWorkflow:
                 f'Task {self.task_id}: completion memory write failed '
                 f'(non-fatal): {e}'
             )
-        # Wait for steward to finish any pending work (suggestion triage, etc.)
-        await self._ensure_steward_started()
+        # Info leftovers are the exit finalizer's (_disposition_info_l0s), not a steward's.
+        if self._pending_steward_l0s():
+            await self._ensure_steward_started()
         await self._await_steward_completion(skip_if_idle=True)
         return await self._finalise_merged_done()
 
@@ -15169,7 +15190,8 @@ class TaskWorkflow:
         return self.escalation_queue.get_by_task(self.task_id, status='pending')
 
     async def _wait_for_resolution(self) -> str:
-        """Wait for all level-0 pending escalations to be resolved.
+        """Wait until no pending level-0 record holds the wait: every L0 while a
+        steward is live, else only the steward-owned ones.
 
         Pending escalations that :func:`_needs_human` selects (a born-at-L2
         severity, or a level≥2 queue handoff — never an info record) are
@@ -15347,9 +15369,7 @@ class TaskWorkflow:
         deadline = asyncio.get_event_loop().time() + window
         last_progress = self._steward_progress_counter()
         while True:
-            pending_l0 = self.escalation_queue.get_by_task(
-                self.task_id, status='pending', level=0,
-            )
+            pending_l0 = self._l0s_holding_the_wait()
             if not pending_l0:
                 break
             self._escalation_event.clear()
@@ -15412,22 +15432,34 @@ class TaskWorkflow:
                 # re-gates later).  The merge-entry gate must NOT — there is no
                 # later gate, and merging past a record that a backstop
                 # auto-dismissed rather than anyone ADJUDICATING would violate
-                # repend-PRD D4 stop-the-line.
-                self._steward_wait_expired = True
+                # repend-PRD D4 stop-the-line.  The flag is set only when the
+                # give-up dismissed something: a router-owned info note left
+                # pending for the exit finalizer (D10) was not auto-dismissed.
                 if self._steward is not None:
                     with contextlib.suppress(Exception):
                         await self._steward.stop()
                     self._steward = None
-                orphan_ids = [e.id for e in pending_l0]
+                orphans = self._pending_steward_l0s()
+                self._steward_wait_expired = bool(orphans)
+                orphan_ids = [e.id for e in orphans]
+                left_for_finalizer = [
+                    e.id for e in self.escalation_queue.get_by_task(
+                        self.task_id, status='pending', level=0,
+                    )
+                    if e.id not in orphan_ids
+                ]
                 logger.warning(
-                    'Task %s: steward did not resolve %d level-0 escalation(s) '
-                    'within the ESCALATED wait window (%.0fs = timeouts.steward '
-                    '%.0fs + steward_completion_timeout %.0fs) — dismissing the '
-                    'orphan(s) and unblocking the ESCALATED wait: %s',
-                    self.task_id, len(orphan_ids), window,
+                    'Task %s: steward did not settle the level-0 escalation(s) '
+                    'holding the ESCALATED wait within its window (%.0fs = '
+                    'timeouts.steward %.0fs + steward_completion_timeout %.0fs) '
+                    '— dismissing %d orphan(s) [%s], leaving %d router-owned '
+                    'info note(s) [%s] for the exit finalizer, and unblocking '
+                    'the ESCALATED wait',
+                    self.task_id, window,
                     self.config.timeouts.steward,
                     self.config.steward_completion_timeout,
-                    ', '.join(orphan_ids),
+                    len(orphan_ids), ', '.join(orphan_ids),
+                    len(left_for_finalizer), ', '.join(left_for_finalizer),
                 )
                 if self.event_store:
                     self.event_store.emit(
@@ -15442,7 +15474,7 @@ class TaskWorkflow:
                 # invariant fix A establishes on the producer side.  Leaving
                 # them pending would re-strand the NEXT ESCALATED entry on
                 # the same records for another full window.
-                for esc in pending_l0:
+                for esc in orphans:
                     self.escalation_queue.resolve(
                         esc.id,
                         'Auto-dismissed: steward did not resolve within the '
@@ -17513,9 +17545,7 @@ class TaskWorkflow:
                     #     esc-3576-234), and steward._dismiss_capped_l0
                     #     dismisses only the single record it was handed.
                     if self.escalation_queue:
-                        orphan_l0 = self.escalation_queue.get_by_task(
-                            self.task_id, status='pending', level=0,
-                        )
+                        orphan_l0 = self._pending_steward_l0s()
                         for esc in orphan_l0:
                             # WARNING, not INFO, and per-record rather than a
                             # count: a swallowed filing must be traceable to
@@ -17616,11 +17646,13 @@ class TaskWorkflow:
 
         Coverage is the stranded-blocked sweep's own veto, so a dismissal can
         never leave a blocked row unpinned.  An uncovered L0 stays pending,
-        named in a WARNING, for the orphan-L0 reaper to promote.
+        named in a WARNING, for the orphan-L0 reaper to promote.  An info note
+        the info-L0 router owns is never a candidate: the exit finalizer
+        routes it (:meth:`_pending_steward_l0s`).
         """
         assert self.escalation_queue is not None
         pending = self.escalation_queue.get_by_task(self.task_id, status='pending')
-        l0s = [e for e in pending if e.level == 0]
+        l0s = self._pending_steward_l0s()
         if not l0s:
             return
         handoffs = [e for e in pending if e.level >= 1]
@@ -18534,15 +18566,70 @@ class TaskWorkflow:
             return True
         return isinstance(outcome, StewardInterrupted) and outcome.wip_commits_present
 
+    def _pending_steward_l0s(self) -> list[Escalation]:
+        """The task's pending level-0 records whose exit consumer is a steward.
+
+        An info note the info-L0 router owns is left out: the router routes it
+        when the workflow exits (plans/info-l0-disposition-router-prd.md D10),
+        so a steward-side sweep never dismisses it unread.
+        """
+        if self.escalation_queue is None:
+            return []
+        return [
+            esc for esc in self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=0,
+            )
+            if not router_owns(esc, enabled=self.config.info_l0_router_enabled)
+        ]
+
+    def _l0s_holding_the_wait(self) -> list[Escalation]:
+        """Every pending L0 while a live steward may take it, else only the
+        steward-owned ones (plans/info-l0-disposition-router-prd.md D1/D10)."""
+        if self.escalation_queue is None:
+            return []
+        if self._steward is not None:
+            return self.escalation_queue.get_by_task(self.task_id, status='pending', level=0)
+        return self._pending_steward_l0s()
+
+    async def _disposition_info_l0s(self, exit_kind: ExitKind | None) -> None:
+        """Route every pending info note the router owns at this workflow's exit.
+
+        The exit finalizer of plans/info-l0-disposition-router-prd.md D7: one
+        bounded curator submit per note, no polling (INV-8); a held note is
+        left for the orphan reaper.
+        """
+        queue = self.escalation_queue
+        if exit_kind is None or not self.config.info_l0_router_enabled or queue is None:
+            return
+        sweep = InfoL0Sweep(
+            self._router_ports(queue), by='workflow-finalizer',
+            max_conversions=self.config.info_l0_router_max_conversions_per_sweep,
+        )
+        for esc in queue.get_by_task(self.task_id, status='pending', level=0):
+            if router_owns(esc, enabled=True):
+                await sweep.route(esc, exit_kind=exit_kind)
+        sweep.close()
+
+    def _router_ports(self, queue: EscalationQueue) -> RouterPorts:
+        """The I/O the info-L0 router may touch from this workflow."""
+        return RouterPorts(
+            queue=queue,
+            event_store=self.event_store,
+            dispatch_tool=self.scheduler.dispatch_tool,
+            project_root=str(self.config.project_root),
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
+
     def _steward_work_outstanding(self) -> bool:
         """Whether there is anything for :meth:`_await_steward_completion` to
         wait ON — its ``skip_if_idle`` gate, used by the post-merge success
         tail (task 3170).
 
-        Two things count as outstanding: a pending level-0 escalation (the
-        steward does not un-pend a record while it works on one, so "pending"
-        covers both queued and in-flight), or an unread outcome already sitting
-        on the channel (instantly consumable).
+        Two things count as outstanding: a pending level-0 escalation that
+        would hold a steward wait (:meth:`_l0s_holding_the_wait` — an info note
+        the router owns does not, once no steward is live, so this gate agrees
+        with the post-merge tail's D7 start gate), or an unread outcome already
+        sitting on the channel (instantly consumable).
 
         With neither, the success tail would otherwise block for the FULL
         ``steward_completion_timeout`` — 900s on stock config — waiting for a
@@ -18560,9 +18647,7 @@ class TaskWorkflow:
         short-circuited this same call.  The success tail's contract is
         "give queued steward work a chance to finish", not "join the steward".
         """
-        if self.escalation_queue is not None and self.escalation_queue.get_by_task(
-            self.task_id, status='pending', level=0,
-        ):
+        if self._l0s_holding_the_wait():
             return True
         channel = self._steward_outcome_channel
         return channel is not None and not channel.empty()
@@ -18855,9 +18940,7 @@ class TaskWorkflow:
                     # fall-through's dismissal loop — otherwise it strands
                     # for the orphan-L0 reaper to later promote into a
                     # duplicate L1.
-                    orphan_l0 = self.escalation_queue.get_by_task(
-                        self.task_id, status='pending', level=0,
-                    )
+                    orphan_l0 = self._pending_steward_l0s()
                     for esc in orphan_l0:
                         self.escalation_queue.resolve(
                             esc.id,

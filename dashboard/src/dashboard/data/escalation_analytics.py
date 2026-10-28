@@ -145,6 +145,10 @@ _PREDICTABLY_BENIGN_WINDOW_DAYS = 28
 _PREDICTABLY_BENIGN_MIN_N = 20
 _PREDICTABLY_BENIGN_MIN_RATE = 0.9
 
+# The resolution classes the info-L0 router closes records with
+# (plans/info-l0-disposition-router-prd.md D14).
+DISPOSITIONED_CLASSES = frozenset({'addressed', 'observation-consumed', 'converted', 'status-info'})
+
 
 def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
     """Per-source (``agent_role``) origin aggregates over *records*.
@@ -156,7 +160,8 @@ def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
     :func:`escalation.classify.effective_benign`. ``classes`` is keyed by
     every :data:`escalation.models.RESOLUTION_CLASSES` member, zero-filled,
     plus any stamp outside that vocabulary under its own key, so the parts
-    always sum to ``classified``.
+    always sum to ``classified``.  ``dispositioned`` is the part of
+    ``classes`` in :data:`DISPOSITIONED_CLASSES`, what the info-L0 router closed.
 
     ``predictably_benign`` is a separate, windowed computation — trailing
     ``_PREDICTABLY_BENIGN_WINDOW_DAYS`` days keyed by ``resolved_at`` — True
@@ -233,6 +238,7 @@ def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
             'filings': n_filings,
             'classes': source_classes,
             'classified': n_classified,
+            'dispositioned': sum(source_classes[cls] for cls in DISPOSITIONED_CLASSES),
             'stamped_share': stamped.get(source, 0) / n_classified if n_classified else 0.0,
             'benign_rate': n_benign / n_classified if n_classified else 0.0,
             'predictably_benign': (

@@ -1732,6 +1732,37 @@ class TestCompleteResolutionClasses:
         assert source['classified'] == sum(source['classes'].values()) == len(RESOLUTION_CLASSES) + 1
 
 
+_ROUTER_CLASSES = frozenset({'addressed', 'observation-consumed', 'converted', 'status-info'})
+
+
+class TestDispositionedBucket:
+    """origin.sources[].dispositioned counts what the info-L0 router closed
+    (plans/info-l0-disposition-router-prd.md D14), beside the per-class keys."""
+
+    def test_it_counts_the_four_router_classes_and_no_other(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _one_terminal_per_class(esc_dir, now)
+        strand = _terminal('esc-7-1', now=now, status='dismissed', resolution_class='stale-strand')
+        _write_escalation(esc_dir, {**strand, 'agent_role': 'steward'}, archived=True)
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        sources = {s['source']: s for s in entry['origin']['sources']}
+
+        implementer = sources['implementer']
+        assert implementer['dispositioned'] == 4
+        assert implementer['dispositioned'] == sum(implementer['classes'][c] for c in _ROUTER_CLASSES)
+        assert sources['steward']['dispositioned'] == 0
+        assert set(implementer['classes']) == set(RESOLUTION_CLASSES)
+        assert {row['class'] for row in entry['workflow']['flow_daily']} <= RESOLUTION_CLASSES
+
+    def test_the_bucket_is_drawn_from_the_resolution_vocabulary(self):
+        from dashboard.data.escalation_analytics import DISPOSITIONED_CLASSES
+
+        assert DISPOSITIONED_CLASSES == _ROUTER_CLASSES
+        assert DISPOSITIONED_CLASSES <= RESOLUTION_CLASSES
+
+
 class TestOneTerminalPopulation:
     """classes, action_mix and terminal count the same terminal records."""
 
