@@ -40,6 +40,8 @@ import contextlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -60,6 +62,14 @@ _LONG_RUN = 'A' * 70
 #: hold it and the sweep's PID-liveness guard is guaranteed to read it as dead.
 #: A merely "probably free" PID would make the sweep tests flaky by reuse.
 _DEAD_PID = 4194305
+
+#: A child that renames its own comm to bytes that are not UTF-8, then waits.
+_UNDECODABLE_COMM_SLEEPER = (
+    'import ctypes, time\n'
+    "ctypes.CDLL(None).prctl(15, b'\\xff\\xfe', 0, 0, 0)\n"
+    "print('ready', flush=True)\n"
+    'time.sleep(30)\n'
+)
 
 
 def _corpus_probe_run_ids() -> list[str]:
@@ -2014,3 +2024,41 @@ class TestRunExitGateIsWiredToTheExitShape:
                 assert wrong_shape not in run_exit, (
                     f'{wrong_shape!r} is an OBSERVATION field; exit provenance has none'
                 )
+
+
+class TestSampleProcReadsAnUndecodableComm:
+    """A comm that is not UTF-8 reads as U+FFFD, never as a raise or a lost child.
+
+    A process sets its own comm, so its bytes are arbitrary.  ``sample_proc`` is
+    total, and a live process whose name does not decode is still alive.
+    """
+
+    @pytest.mark.timeout(15)
+    def test_sample_proc_reads_an_undecodable_comm_as_replacement_characters(self):
+        with subprocess.Popen(
+            [sys.executable, '-c', _UNDECODABLE_COMM_SLEEPER],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ) as p:
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                sample = probe.sample_proc(p.pid)
+                assert (sample['alive'], sample['comm']) == (True, '\ufffd\ufffd')
+            finally:
+                p.kill()
+
+    @pytest.mark.timeout(15)
+    def test_sample_proc_lists_a_child_with_an_undecodable_comm(self):
+        with subprocess.Popen(
+            [sys.executable, '-c', _UNDECODABLE_COMM_SLEEPER],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ) as p:
+            try:
+                assert p.stdout is not None
+                assert p.stdout.readline().strip() == b'ready'
+                children = probe.sample_proc(os.getpid())['children']
+                assert {'pid': p.pid, 'comm': '\ufffd\ufffd'} in children
+            finally:
+                p.kill()
