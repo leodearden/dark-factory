@@ -16,11 +16,15 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from escalation.classify import INFO_L0_MECHANICAL_ROLES
+from escalation.disposition import ExitKind, StatusInfo, route_info_l0
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
 from orchestrator.run_store import RunStore
+from orchestrator.starvation_watchdog import STARVATION_WATCHDOG_ROLE
 
 # ---------------------------------------------------------------------------
 # Shared helper
@@ -345,3 +349,94 @@ class TestFleetScaleKnownAnswer:
             if e.agent_role == 'orchestrator-starvation-watchdog'
         ]
         assert [e.task_id for e in watchdog] == ['2']
+
+
+# ---------------------------------------------------------------------------
+# Harness consequences of the retuned watchdog (task 3821)
+# ---------------------------------------------------------------------------
+
+
+def _submit(queue: EscalationQueue, task_id: str, agent_role: str, level: int) -> None:
+    queue.submit(Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role=agent_role,
+        severity='info',
+        category='risk_identified',
+        summary=f'{agent_role} on {task_id}',
+        detail='detail',
+        suggested_action='manual_investigation',
+        level=level,
+    ))
+
+
+class TestWatchdogAlarmsAreNotEwaFaults:
+    @pytest.mark.asyncio
+    async def test_only_the_ordinary_submission_advances_the_ewa_numerator(
+        self, tmp_path: Path,
+    ) -> None:
+        harness, queue = _make_harness_with_queue(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=3,
+            digest_ewa_threshold=999.0,
+        )
+        queue.set_notify_callback(harness._on_escalation)
+
+        _submit(queue, 'W0', STARVATION_WATCHDOG_ROLE, level=0)
+        _submit(queue, 'W1', STARVATION_WATCHDOG_ROLE, level=1)
+        _submit(queue, 'T1', 'implementer', level=0)
+        await harness._maybe_write_digest()
+
+        [digest_file] = (tmp_path / 'data' / 'digests').glob('digest-*.md')
+        content = digest_file.read_text()
+        assert '- Submissions in step (EWA numerator): 1' in content, content
+        assert '- Lifecycle events in step (digest gate): 3' in content, content
+
+
+class TestParkBlockedFilesAnL1:
+    @pytest.mark.asyncio
+    async def test_a_level_1_warn_files_an_l1_info_alarm_that_resolve_closes(
+        self, tmp_path: Path,
+    ) -> None:
+        harness, queue = _make_harness_with_queue(tmp_path)
+        callbacks = harness.scheduler._callbacks
+        assert callbacks.on_starvation_warn is not None
+        assert callbacks.on_starvation_resolve is not None
+
+        await callbacks.on_starvation_warn(
+            'P', summary='STARVATION_WATCHDOG [park_blocked]: task P', detail='d', level=1,
+        )
+
+        [esc] = queue.get_by_task('P', status='pending')
+        assert (esc.level, esc.severity, esc.agent_role) == (1, 'info', STARVATION_WATCHDOG_ROLE)
+
+        await callbacks.on_starvation_resolve('P')
+
+        assert queue.get_by_task('P', status='pending') == []
+        assert not queue.has_open_l1('P')
+
+
+class TestInfoL0RouterKnowsTheWatchdogRole:
+    """Task 5223 routes info L0s by role; a role it does not know becomes a curator ticket."""
+
+    def test_the_role_is_a_registered_mechanical_role(self) -> None:
+        assert STARVATION_WATCHDOG_ROLE in INFO_L0_MECHANICAL_ROLES
+
+    @pytest.mark.asyncio
+    async def test_a_filed_watchdog_l0_routes_to_status_info(self, tmp_path: Path) -> None:
+        harness, queue = _make_harness_with_queue(tmp_path)
+        callbacks = harness.scheduler._callbacks
+        assert callbacks.on_starvation_warn is not None
+
+        await callbacks.on_starvation_warn(
+            'T', summary='STARVATION_WATCHDOG [dual]: task T', detail='d',
+        )
+
+        [esc] = queue.get_by_task('T', status='pending')
+        disposition = route_info_l0(
+            esc, task_status='pending', exit_kind=ExitKind.ORPHAN,
+            mechanical_roles=INFO_L0_MECHANICAL_ROLES,
+        )
+        assert disposition == StatusInfo(class_key=STARVATION_WATCHDOG_ROLE)
+

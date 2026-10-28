@@ -16,12 +16,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from escalation.models import Escalation
 from shared.cost_store import _SCHEMA as _COST_SCHEMA
 from shared.cost_store import CostStore
 
 import orchestrator.digest as digest
 from orchestrator.event_store import EventStore
 from orchestrator.run_store import RunStore
+from orchestrator.starvation_watchdog import STARVATION_WATCHDOG_ROLE
 
 
 class TestUpdateEwa:
@@ -1400,3 +1402,34 @@ class TestRenderDigestRollupSection:
         md = digest.render_digest_markdown(inputs)  # must not raise
         assert '## Per-(model×role) rollup' in md
         assert '_none_' in md
+
+
+# ---------------------------------------------------------------------------
+# Which escalations feed the EWA numerator (task 3821)
+# ---------------------------------------------------------------------------
+
+
+def _escalation_by(agent_role: str, level: int) -> Escalation:
+    return Escalation(
+        id=f'esc-T1-{level}',
+        task_id='T1',
+        agent_role=agent_role,
+        severity='info',
+        category='risk_identified',
+        summary='summary',
+        detail='detail',
+        suggested_action='manual_investigation',
+        level=level,
+    )
+
+
+class TestCountsTowardEwaNumerator:
+    @pytest.mark.parametrize('level', [0, 1])
+    def test_a_starvation_watchdog_alarm_is_an_observation_not_a_fault(self, level: int) -> None:
+        esc = _escalation_by(STARVATION_WATCHDOG_ROLE, level)
+        assert digest.counts_toward_ewa_numerator(esc) is False
+
+    @pytest.mark.parametrize('role', ['implementer', 'orchestrator-scheduler', 'steward'])
+    def test_every_other_role_counts(self, role: str) -> None:
+        assert digest.counts_toward_ewa_numerator(_escalation_by(role, 0)) is True
+
