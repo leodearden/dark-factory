@@ -18,9 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from escalation.queue import EscalationQueue
+from shared.psi import PsiSample
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask
 
 from orchestrator.config import LaneCommand, OrchestratorConfig
+from orchestrator.flake_debt_drain import DrainPassReport, run_drain_pass
+from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.guard_state import guard_path
 from orchestrator.offline_lane_confirm import (
     Confirmed,
@@ -66,6 +69,7 @@ T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
 LANE_COMMAND = LaneCommand(name=COMMAND, command='pytest -m integration tests', cwd='integration')
 SPACED = timedelta(minutes=30)
 POLICY = LanePolicy()
+HEALTHY_PSI = PsiSample(cpu_some10=7.5, mem_some10=0, mem_full10=0, io_some10=0, read_ok=True)
 
 
 class Clock:
@@ -335,10 +339,26 @@ class FakeAncestry:
         return self.answers.get((ancestor, descendant), True)
 
 
-class Lane:
-    """A lane command's passes, written as real run records and observed by a real engine."""
+def _reader(psi: PsiSample | Callable[[], PsiSample]) -> Callable[[], PsiSample]:
+    if isinstance(psi, PsiSample):
+        return lambda: psi
+    return psi
 
-    def __init__(self, tmp_path: Path, *, client: bool = True, queue: EscalationQueue | None | bool = True) -> None:
+
+class Lane:
+    """A lane command's passes, written as real run records and observed by a real engine.
+
+    *psi* is the host pressure the engine reads: a sample, or a reader passed through as is.
+    """
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        client: bool = True,
+        queue: EscalationQueue | None | bool = True,
+        psi: PsiSample | Callable[[], PsiSample] = HEALTHY_PSI,
+    ) -> None:
         self.tmp_path = tmp_path
         self.log: list[str] = []
         self.clock = Clock()
@@ -346,20 +366,37 @@ class Lane:
         self.ancestry = FakeAncestry()
         self.queue = EscalationQueue(tmp_path / 'queue') if queue is True else (queue or None)
         self.records = RunRecordStore(tmp_path, clock=self.clock)
+        self.config = OrchestratorConfig(project_root=tmp_path)
         self._with_client = client
+        self._read_psi = _reader(psi)
         self.engine = self.restarted()
 
     def restarted(self) -> LaneEngine:
         self.engine = LaneEngine(
-            OrchestratorConfig(project_root=self.tmp_path),
+            self.config,
             self.ancestry,
             task_client=self.client if self._with_client else None,
             escalation_queue=self.queue,
             now=self.clock,
+            read_psi=self._read_psi,
         )
         return self.engine
 
-    async def _observe(
+    @property
+    def ledger(self) -> Path:
+        return ledger_db_path(self.tmp_path)
+
+    @property
+    def project_id(self) -> str:
+        return self.config.fused_memory.project_id
+
+    async def drain(self) -> DrainPassReport:
+        """One pass of the ledger's drain, on its own wall clock: the due list is stamped with the wall clock."""
+        return await run_drain_pass(
+            self.ledger, self.project_id, task_client=self.client, git=self.ancestry, escalation_queue=self.queue,
+        )
+
+    async def pass_with(
         self,
         head: str,
         outcome: Confirmed | Unconfirmable | None,
@@ -370,12 +407,27 @@ class Lane:
         command: str = COMMAND,
         leg: str = 'generic',
     ) -> PassEffect:
+        observation = self.written_pass(head, outcome, detect, confirm, notes, command=command, leg=leg)
+        return await self.engine.observe(observation)
+
+    def written_pass(
+        self,
+        head: str,
+        outcome: Confirmed | Unconfirmable | None,
+        detect: RunRecord,
+        confirm: RunRecord | None,
+        notes: tuple[EvidenceNote, ...] = (),
+        *,
+        command: str = COMMAND,
+        leg: str = 'generic',
+    ) -> PassObservation:
+        """A pass written as run records, and the observation the engine is told of it."""
         lane_pass = self.records.allocate_pass(command, leg, head)
         detect = replace(detect, command=command, leg=leg)
         self.records.write_run(lane_pass, detect)
         if confirm is not None:
             self.records.write_run(lane_pass, replace(confirm, command=command, leg=leg))
-        observation = PassObservation(
+        return PassObservation(
             command=command,
             leg=leg,
             head=head,
@@ -388,7 +440,6 @@ class Lane:
             notes=notes,
             lane_command=LANE_COMMAND if leg == 'generic' else None,
         )
-        return await self.engine.observe(observation)
 
     async def red(
         self,
@@ -405,16 +456,16 @@ class Lane:
         detect = _run('detect', head, at, failing=(*reproduced, *cleared, *inconclusive), outcomes=outcomes)
         confirm = _run('confirm', head, at, failing=reproduced)
         outcome = Confirmed(ConfirmMode.NARROWED, reproduced, cleared, inconclusive)
-        return await self._observe(head, outcome, detect, confirm, command=command, leg=leg)
+        return await self.pass_with(head, outcome, detect, confirm, command=command, leg=leg)
 
     async def green(self, *, head: str = HEAD1) -> PassEffect:
-        return await self._observe(head, None, _run('detect', head, self.clock()), None)
+        return await self.pass_with(head, None, _run('detect', head, self.clock()), None)
 
     async def unconfirmable(self, *, head: str = HEAD1, notes: tuple[EvidenceNote, ...] = ()) -> PassEffect:
         at = self.clock()
         outcome = Unconfirmable(UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, '2')
         detect = _run('detect', head, at, failing=(A,))
-        return await self._observe(head, outcome, detect, _run('confirm', head, at, returncode=2), notes)
+        return await self.pass_with(head, outcome, detect, _run('confirm', head, at, returncode=2), notes)
 
     async def spaced_red(self, *nodes: str, minutes: float = 30, **fields: Any) -> PassEffect:
         self.clock.advance(minutes=minutes)
