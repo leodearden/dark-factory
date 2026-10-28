@@ -1042,6 +1042,12 @@ def test_measured_fleet_table_partitions_the_chain_it_measures() -> None:
             id='value-taking-flags',
         ),
         pytest.param(
+            'uv run --project shared pytest tests/scripts/ --junitxml out.xml '
+            '--color yes --log-level INFO',
+            {'tests/scripts'},
+            id='root-clause-value-flags-from-the-shared-set',
+        ),
+        pytest.param(
             'cd shared && uv run ruff check . && uv run pytest tests/',
             {'shared'},
             id='non-pytest-clause-ignored',
