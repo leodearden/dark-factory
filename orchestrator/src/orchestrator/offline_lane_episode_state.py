@@ -18,6 +18,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from shared.task_statuses import OwnerLiveness, owner_liveness
+
 from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.offline_lane_confirm import Confirmed, Outage, Unconfirmable, reproduce_line
 from orchestrator.offline_lane_filing import EvidenceNote
@@ -411,6 +413,25 @@ class PassReads:
     verdicts: Mapping[str, CoveringVerdict]
     terminal_task_ids: frozenset[str]
     previous_detect: RunRecord | None
+
+
+_TERMINAL_LIVENESS = frozenset({OwnerLiveness.DONE, OwnerLiveness.CLOSED})
+
+
+@dataclass(frozen=True)
+class CoveringStatuses:
+    """The pass's one batched status read of every bound covering task; *error* when it could not be read."""
+
+    statuses: Mapping[str, str]
+    error: str | None = None
+
+    @property
+    def terminal_task_ids(self) -> frozenset[str]:
+        if self.error is not None:
+            return frozenset()
+        return frozenset(
+            task_id for task_id, status in self.statuses.items() if owner_liveness(status) in _TERMINAL_LIVENESS
+        )
 
 
 class EndReason(StrEnum):
