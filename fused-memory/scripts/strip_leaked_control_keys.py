@@ -177,6 +177,11 @@ async def clean_one_project(
             print(f'  [skip] get_task failed for {project_root}#{task_id}: {exc}', file=sys.stderr)
             error_count += 1
             continue
+        unreadable = write_failure_reason(task)
+        if unreadable is not None:
+            print(f'  [skip] get_task refused for {project_root}#{task_id}: {unreadable}', file=sys.stderr)
+            error_count += 1
+            continue
 
         visited += 1
         meta = task.get('metadata')
