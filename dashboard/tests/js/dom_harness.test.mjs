@@ -173,6 +173,54 @@ test('close() leaves no live timer behind, though data.js starts polling on load
   assert.equal(liveTimerCount(), before, 'a timer outlived close(); it would hold `node --test` open');
 });
 
+// ── The whole page app.jsx bootstraps, on request ─────────────────────────
+
+test('mountPage() runs app.jsx into a #root element, as index.html does', t => {
+  const { window, consoleErrors, mountPage } = openWindow(t);
+
+  const root = mountPage();
+
+  assert.equal(root.id, 'root');
+  assert.equal(root.parentElement, window.document.body);
+  const app = root.querySelector('.app');
+  assert.ok(app, 'app.jsx rendered no .app into #root');
+  assert.ok(app.querySelectorAll('.rail-nav button').length > 0, 'the page renders no rail buttons');
+  for (const region of ['.stat-strip', '.toolbar', '.body']) {
+    assert.ok(app.querySelector(region), `the page renders no ${region}`);
+  }
+  assert.equal(app.querySelector('.crumbs .here')?.textContent, 'Overview', "App's initial tab is Overview");
+  assert.deepEqual(consoleErrors, []);
+});
+
+test('mountPage() refuses a second mount in one window, and leaves the first page intact', t => {
+  const { window, mountPage } = openWindow(t);
+  const root = mountPage();
+
+  assert.throws(() => mountPage(), /app\.jsx/);
+
+  assert.equal(window.document.querySelectorAll('#root').length, 1, 'a refused mount must add no second #root');
+  assert.equal(window.document.getElementById('root'), root);
+  assert.ok(root.querySelector('.app .rail-nav button'), 'a refused mount must leave the first page rendering');
+});
+
+test('close() after mountPage() leaves no live timer behind, though the page arms its own', () => {
+  const before = liveTimerCount();
+  const harness = buildDashboardWindow();
+  let loaded;
+  try {
+    loaded = liveTimerCount();
+    harness.mountPage();
+    assert.ok(
+      liveTimerCount() > loaded,
+      "the mounted page armed no timer of its own (App's LiveClock ticks every second), so the check below " +
+        'would prove nothing',
+    );
+  } finally {
+    harness.close();
+  }
+  assert.equal(liveTimerCount(), before, 'a timer outlived close(); it would hold `node --test` open');
+});
+
 // ── Seeding lands only what a poll could land ─────────────────────────────
 
 test('seeding refuses a key that no endpoint data.js polls serves', t => {
