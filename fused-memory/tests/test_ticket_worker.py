@@ -1293,7 +1293,9 @@ async def test_per_project_ticket_queues_do_not_serialise(
             ticket_a = submit_a['ticket']
 
             # Exact barrier: worker-a is inside the blocking curate() call
-            # before project-b is submitted.
+            # before project-b is submitted. A fixed sleep can end before
+            # worker-a is scheduled under xdist, silently weakening the test
+            # (task 3901 sweep).
             await poll_until(
                 curate_a_entered.is_set,
                 message='worker-a never entered curate()',
