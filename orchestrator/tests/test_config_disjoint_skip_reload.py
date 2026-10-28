@@ -78,7 +78,7 @@ class TestDisjointSkipBlockers:
         return cast('MergeRequest', SimpleNamespace(task_id='t', config=config))
 
     @pytest.mark.usefixtures("code_default_config")
-    def test_verified_drift_and_scoped_breadth_has_no_blockers(self):
+    def test_verified_drift_and_scoped_breadth_has_no_blockers(self, tmp_path):
         from orchestrator.merge_lane.gates import (
             _disjoint_skip_blockers,
             note_queue_verified_main_tip,
@@ -91,7 +91,7 @@ class TestDisjointSkipBlockers:
         ) == []
 
     @pytest.mark.usefixtures("code_default_config")
-    def test_unverified_drift_blocks(self):
+    def test_unverified_drift_blocks(self, tmp_path):
         from orchestrator.merge_lane.gates import _disjoint_skip_blockers
         cfg = OrchestratorConfig(merge_verify_breadth='scoped')
         blockers = _disjoint_skip_blockers(
@@ -100,7 +100,7 @@ class TestDisjointSkipBlockers:
         assert len(blockers) == 1 and 'unverified drift' in blockers[0]
 
     @pytest.mark.usefixtures("code_default_config")
-    def test_kill_switch_restores_legacy_trust(self):
+    def test_kill_switch_restores_legacy_trust(self, tmp_path):
         from orchestrator.merge_lane.gates import _disjoint_skip_blockers
         cfg = OrchestratorConfig(
             merge_verify_breadth='scoped',
@@ -111,7 +111,7 @@ class TestDisjointSkipBlockers:
         ) == []
 
     @pytest.mark.usefixtures("code_default_config")
-    def test_whole_tree_breadth_blocks_even_with_kill_switch_off(self):
+    def test_whole_tree_breadth_blocks_even_with_kill_switch_off(self, tmp_path):
         """A project that declares a whole-tree merge gate has declared the
         skip unsound outright, not merely expensive — so the P2 kill switch
         does not reach this arm."""
