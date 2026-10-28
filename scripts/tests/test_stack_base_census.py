@@ -226,6 +226,7 @@ async def test_a_rebase_onto_the_branchs_own_history_is_not_a_stacking_event(
 
 async def test_a_base_whose_patches_landed_on_main_has_no_finding(repo: Path) -> None:
     stacked_on_p(repo)
+    advance_main(repo, {'unrelated.txt': 'u\n'})  # a new parent, so the pick is a new SHA
     git(repo, 'cherry-pick', rev(repo, 'task/P'))
 
     report = await census_of(repo)
@@ -288,3 +289,61 @@ async def test_a_residual_older_base_is_unadjudicated(repo: Path) -> None:
     assert finding.verdict is census.Verdict.UNADJUDICATED
     assert finding.base == rev(repo, 'task/P2')
     assert p1_tip in finding.detail
+
+
+# ---------------------------------------------------------------------------
+# step-5: task-status gating and the store reader
+# ---------------------------------------------------------------------------
+
+
+async def test_a_stacked_branch_of_a_terminal_task_is_inert(repo: Path) -> None:
+    stacked_on_p(repo, member='101')
+
+    finding = findings_of(await census_of(repo, statuses={101: 'done'}))['task/101']
+
+    assert finding.verdict is census.Verdict.INERT
+    assert finding.cut is None
+    assert finding.base_owners == ()
+    assert finding.task_status == 'done'
+    assert finding.base == rev(repo, 'task/P')
+
+
+async def test_a_branch_without_a_task_row_is_adjudicated_as_live(repo: Path) -> None:
+    stacked_on_p(repo, member='101')
+
+    finding = findings_of(await census_of(repo, statuses={}))['task/101']
+
+    assert finding.verdict is census.Verdict.CONFIRMED
+    assert finding.task_status is None
+
+
+async def test_a_live_task_status_is_carried_on_its_finding(repo: Path) -> None:
+    stacked_on_p(repo, member='101')
+
+    finding = findings_of(await census_of(repo, statuses={101: 'pending'}))['task/101']
+
+    assert finding.verdict is census.Verdict.CONFIRMED
+    assert finding.task_status == 'pending'
+
+
+def test_load_task_statuses_reads_the_master_tag_read_only(make_tasks_db) -> None:
+    db_path = make_tasks_db([
+        {'id': 7, 'status': 'pending'},
+        {'id': 8, 'status': 'done'},
+        {'id': 9, 'tag': 'feature', 'status': 'cancelled'},
+    ])
+    before = db_path.read_bytes()
+
+    assert census.load_task_statuses(db_path) == {7: 'pending', 8: 'done'}
+    assert db_path.read_bytes() == before
+
+
+async def test_a_non_numeric_task_branch_has_no_task_id(repo: Path) -> None:
+    stacked_on_p(repo, member='foo')
+    add_member(repo, '102', rev(repo, 'task/P'), {'102.txt': '102\n'})
+
+    findings = findings_of(await census_of(repo, statuses={102: 'cancelled'}))
+
+    assert findings['task/foo'].task_status is None
+    assert findings['task/foo'].verdict is census.Verdict.CONFIRMED
+    assert findings['task/102'].verdict is census.Verdict.INERT
