@@ -692,7 +692,7 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 # sum(MEASURED_FLEET_SEGMENT_SECS) in tests/scripts/test_fallback_verify_config.py:
 # six of the nine suites, each a representative green run, so a lower bound on
 # the MEDIAN green chain and not a bound on any one run. Its orchestrator row is
-# derived from task 3353's census (test_module_verify_budgets.py::
+# derived from task 3353's census (tests/scripts/verify_budget_census_records.py::
 # ORCHESTRATOR_BUDGET_CENSUS); every other row carries dated provenance beside
 # the table. The three unmeasured suites are costed by estimate, not at zero.
 # As of the 2026-09-14 census:
