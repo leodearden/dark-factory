@@ -31,7 +31,6 @@ import contextlib
 import dataclasses
 import inspect
 import logging
-import traceback
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, TypeGuard
@@ -58,6 +57,11 @@ from _orch_helpers import (
     STOP_WORKER_JOIN_TIMEOUT,
     UNDER_LOAD_HEADROOM_FACTOR,
     wait_responsive,
+)
+from _verify_result_doubles import (
+    fail_open_records,
+    format_fail_open_records,
+    real_verify_result,
 )
 from _wait_hygiene_scan import (
     suppressed_result_wait_items,
@@ -338,144 +342,6 @@ def _make_config_with_runner(
 # ---------------------------------------------------------------------------
 
 
-def _mock_verify_result(passed: bool) -> VerifyResult:
-    """Return a VerifyResult with the given pass/fail status."""
-    return VerifyResult(
-        passed=passed,
-        test_output='ok' if passed else 'FAILED',
-        lint_output='',
-        type_output='',
-        summary='ok' if passed else 'fail',
-        category='' if passed else 'test_failure',
-    )
-
-
-_VERIFY_RESULT_FIELD_NAMES = {f.name for f in dataclasses.fields(VerifyResult)}
-
-
-def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
-    """Return a MagicMock(spec=VerifyResult) seeded from a REAL VerifyResult's
-    field defaults, with **overrides layered on top (task 3477).
-
-    Why not a bare ``MagicMock(passed=..., summary=..., ...)``: an
-    unconfigured attribute READ on a bare MagicMock auto-vivifies a truthy
-    child Mock rather than returning a real default. Every one of this
-    file's inline VerifyResult-shaped doubles omitted ``cause_hint``, so
-    merge_disposition.py's ``_extract_failing_tests_and_candidate_files``
-    (:218-221) joins ``verify_result.cause_hint`` and
-    ``verify_result.test_output`` via ``str.join`` — which raised
-    ``TypeError: sequence item 0: expected str instance, MagicMock found``
-    on every FAILING double. ``classify_merge_failure_disposition``
-    (:710-719) swallows that into a silent fail-open (WARNING +
-    INDETERMINATE), so the affected tests only APPEARED to exercise
-    disposition classification.
-
-    Why ``spec=VerifyResult``: it makes a future unknown-attribute READ
-    fail loudly (``AttributeError``) instead of auto-vivifying — the
-    root-cause fix, not just a ``cause_hint=''`` patch for today's one
-    known field. Seeding from ``dataclasses.fields(VerifyResult)`` (rather
-    than a hardcoded attr list) means a field added to VerifyResult in
-    future is picked up automatically, so this factory does not itself
-    drift out of sync the way the file's inline doubles did.
-
-    Why this stays a MagicMock and not a real VerifyResult instance: a real
-    dataclass would also make ``.failure_report()`` return a real string
-    instead of a Mock. merge_queue.py:703's ``isinstance(s, str)`` filter
-    currently discards the Mock; a real string would pass through and
-    append a ``## Test Failures`` block to the rendered ``reason`` at
-    merge_queue.py:3020/3041/3078 — assertion churn well beyond this
-    factory's fidelity-only scope. Seeding a MagicMock from real defaults
-    confines the behaviour delta to exactly the fields callers read.
-
-    Deliberately does NOT special-case a ``verify_skipped`` kwarg: that
-    field lives on MergeOutcome (merge_types.py:945), not VerifyResult, and
-    is never read off a VerifyResult anywhere in src/ — callers migrating
-    off the old inline doubles should simply drop it rather than pass it
-    through **overrides.
-
-    **overrides are validated against VerifyResult's real field names
-    before being applied (task 3477 amend). ``spec=`` alone only makes
-    unconfigured *reads* fail loudly; a ``spec=`` (not ``spec_set=``) mock
-    still accepts an unknown attribute WRITE via plain ``setattr`` — so a
-    typo'd override (or a leftover ``verify_skipped=``) would silently
-    produce a double whose real field keeps its seeded default instead of
-    raising, which is exactly the class of silent drift this factory
-    exists to eliminate.
-    """
-    if unknown := set(overrides) - _VERIFY_RESULT_FIELD_NAMES:
-        raise TypeError(
-            f'_fake_verify_result: not VerifyResult fields: {sorted(unknown)}'
-        )
-    real = _mock_verify_result(passed)
-    fake = MagicMock(spec=VerifyResult)
-    for f in dataclasses.fields(VerifyResult):
-        setattr(fake, f.name, getattr(real, f.name))
-    for key, value in overrides.items():
-        setattr(fake, key, value)
-    return fake
-
-
-# ---------------------------------------------------------------------------
-# Disposition fail-open predicate (task 3980 amendment) — the companion guard
-# to _fake_verify_result above, and deliberately colocated with it.
-#
-# The classifier has TWO fail-open sites, both emitting the same substring on
-# the lane's one logger, 'orchestrator.merge_lane':
-#   1. merge_lane/disposition.py — the classifier's own internal fail-open.
-#   2. merge_lane/worker.py::_classify_disposition_for_outcome — the
-#      belt-and-suspenders catch for anything site 1 re-raises past.
-# Keying on the shared substring catches both; filtering by any narrower
-# signal than that silently excludes one of them.
-#
-# Lives HERE rather than in test_merge_speculation.py so there is exactly one
-# predicate for one production invariant. Task 3980 first wrote a second copy
-# over there, and the two had already diverged before the amendment pass: this
-# file's older inline version keyed on a longer substring that matched only
-# site 1. Two copies of a drift-detector is how the drift gets back in.
-_FAIL_OPEN_SUBSTRING = 'degrading to INDETERMINATE (fail-open, I3)'
-_FAIL_OPEN_LOGGERS = ('orchestrator.merge_lane',)
-
-
-def _fail_open_records(
-    records: list[logging.LogRecord],
-) -> list[logging.LogRecord]:
-    """Return the disposition fail-open WARNINGs among *records* (both sites).
-
-    NOT symmetric with "the classifier ran": a classifier that SUCCEEDS emits
-    NOTHING at WARNING (it logs only on the degrade paths,
-    merge_disposition.py:695 and :711), so an empty return here means "no
-    fail-open", never "the classifier was reached". Proving the classifier was
-    reached needs a delegating SPY on the callable — see
-    test_merge_speculation.py's ``TestLateArrivalFailCascade`` for the live one
-    and ``TestDispositionDoubleFidelity`` for the isolated two-sided proof.
-    Do not read log silence here as evidence the classifier never ran: a
-    successful classification is precisely the silent case.
-
-    Deliberately does NOT match merge_disposition.py:695's *other* degrade
-    ('degrading implicated landings to INDETERMINATE (...)'), which is a
-    legitimate evidence-absent verdict rather than a swallowed exception.
-    """
-    return [
-        r for r in records
-        if r.name in _FAIL_OPEN_LOGGERS and _FAIL_OPEN_SUBSTRING in r.getMessage()
-    ]
-
-
-def _format_fail_open_records(records: list[logging.LogRecord]) -> str:
-    """Render fail-open records for an assertion message, naming the underlying
-    exception (the actionable part — the WARNING text alone never says WHY)."""
-    return '\n'.join(
-        f'  - [{r.name}] {r.getMessage()}'
-        + (
-            f'\n    underlying: {r.exc_info[1]!r}\n'
-            + ''.join(traceback.format_exception(*r.exc_info))
-            if r.exc_info
-            else ''
-        )
-        for r in records
-    )
-
-
 class _GatedVerifier(FakeVerifier):
     """``FakeVerifier`` plus the two things every gated test here needs.
 
@@ -547,7 +413,7 @@ def _gated_runner(
             if gate_entered is not None:
                 gate_entered.set()
             await gate_release.wait()
-        return _mock_verify_result(passed)
+        return real_verify_result(passed)
 
     runner = MagicMock()
     runner.name = name
@@ -568,7 +434,7 @@ def _make_fake_remote(name: str = 'laptop') -> MagicMock:
     fake = MagicMock()
     fake.name = name
     fake.is_local = False
-    fake.run_merge_verify = AsyncMock(return_value=_mock_verify_result(True))
+    fake.run_merge_verify = AsyncMock(return_value=real_verify_result(True))
     fake.cancel_verify = AsyncMock(return_value=0)  # 0 = clean cancel
     fake.probe_clean = AsyncMock(return_value=True)
     return fake
@@ -603,7 +469,7 @@ def _id_liveness_fake_runner(
         gate_entered.set()
         try:
             await gate_release.wait()
-            return _mock_verify_result(True)
+            return real_verify_result(True)
         finally:
             state['live'] = False
 
@@ -5348,7 +5214,7 @@ def _remote_whose_abort_raises(
         entered.set()
         try:
             await asyncio.Event().wait()
-            return _mock_verify_result(True)
+            return real_verify_result(True)
         finally:
             reaped.set()
 
@@ -5708,20 +5574,21 @@ class TestRedispatchSpeculativeConservation:
         # is what proves the (b) fidelity fix actually reached this call site —
         # any future double built without a real cause_hint re-trips it.
         #
-        # task 3980 amendment: routed through the shared `_fail_open_records`
-        # predicate above. The inline version this replaces keyed on a longer
-        # substring ('internal error; degrading to ...') that matched only
-        # merge_disposition.py:711, so the second fail-open site
-        # (worker.py::_classify_disposition_for_outcome) could swallow
-        # the same defect here undetected.
-        fail_open_records = _fail_open_records(caplog.records)
-        assert fail_open_records == [], (
+        # task 3980 amendment: routed through the shared
+        # `_verify_result_doubles.py::fail_open_records` predicate. The inline
+        # version this replaces keyed on a longer substring ('internal error;
+        # degrading to ...') that matched only the classifier's own fail-open
+        # (disposition.py::classify_merge_failure_disposition), so the second
+        # fail-open site (worker.py::_classify_disposition_for_outcome) could
+        # swallow the same defect here undetected.
+        fail_open = fail_open_records(caplog.records)
+        assert fail_open == [], (
             'classify_merge_failure_disposition degraded to the silent '
             'fail-open path while classifying A\'s failing verify — the '
             'VerifyResult double reached _extract_failing_tests_and_'
             'candidate_files and raised instead of returning a real '
             'disposition. Offending record(s):\n'
-            + _format_fail_open_records(fail_open_records)
+            + format_fail_open_records(fail_open)
         )
 
 

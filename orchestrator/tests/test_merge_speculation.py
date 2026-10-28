@@ -65,12 +65,14 @@ from _orch_helpers import (  # noqa: F401
     pydantic_spec,
     wait_responsive,
 )
+from _verify_result_doubles import (
+    FAIL_OPEN_LOGGERS,
+    fail_open_records,
+    fake_verify_result,
+    format_fail_open_records,
+)
 from test_merge_queue_concurrent_verify import (  # noqa: F401
-    _FAIL_OPEN_LOGGERS,
     HEAVY_BARRIER_TEST_TIMEOUT,
-    _fail_open_records,
-    _fake_verify_result,
-    _format_fail_open_records,
     _gated_runner,
     _id_liveness_fake_runner,
     _inject_two_host_allocator,
@@ -1856,8 +1858,8 @@ class TestLateArrivalFailCascade:
         # re-verify after the cascade) passes.  Real ``VerifyResult`` values,
         # not doubles: the injected port returns the dataclass the production
         # verifier returns, so no field can be missing or auto-vivified.
-        # ``category='test_failure'`` matches what the retired
-        # ``_fake_verify_result`` double seeded on the failing leg, and sits in
+        # ``category='test_failure'`` matches what the ``fake_verify_result``
+        # double this test used to build seeded on the failing leg, and sits in
         # the same policy bucket as the '' it replaced (in neither
         # INFRA_TRANSIENT_CATEGORIES nor PREEXISTING_BREAK_SKIP_CATEGORIES), so
         # no retry/skip path changes.
@@ -2930,7 +2932,7 @@ class TestJournalLandedThenAdvanceHelper:
 @pytest.mark.asyncio
 class TestDispositionDoubleFidelity:
     """Isolated, two-sided proof that a bare verify-result double silently
-    disables merge-disposition classification — and that ``_fake_verify_result``
+    disables merge-disposition classification — and that ``fake_verify_result``
     does not.
 
     WHY THIS EXISTS SEPARATELY from the live guard inside
@@ -2963,7 +2965,7 @@ class TestDispositionDoubleFidelity:
     async def test_fake_verify_result_double_lets_the_classifier_run(
         self, caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """POSITIVE leg: a ``_fake_verify_result`` double classifies normally.
+        """POSITIVE leg: a ``fake_verify_result`` double classifies normally.
 
         Asserts the ABSENCE of a fail-open and the PRESENCE of a real
         ``ClassificationResult`` — deliberately NOT the disposition VALUE. The
@@ -2971,10 +2973,10 @@ class TestDispositionDoubleFidelity:
         short-circuits to INDETERMINATE at the ambiguity clause), so pinning it
         would buy nothing and break on any future evidence-source change.
         """
-        for logger_name in _FAIL_OPEN_LOGGERS:
+        for logger_name in FAIL_OPEN_LOGGERS:
             caplog.set_level(logging.WARNING, logger=logger_name)
 
-        double = _fake_verify_result(
+        double = fake_verify_result(
             passed=False, summary='tests failed', test_output='FAIL',
         )
 
@@ -2982,11 +2984,11 @@ class TestDispositionDoubleFidelity:
             verify_result=cast(VerifyResult, double), **self._ARGS,
         )
 
-        fail_open = _fail_open_records(caplog.records)
+        fail_open = fail_open_records(caplog.records)
         assert not fail_open, (
-            'A _fake_verify_result double must classify cleanly, but the '
+            'A fake_verify_result double must classify cleanly, but the '
             'classifier FAILED OPEN:\n'
-            f'{_format_fail_open_records(fail_open)}\n'
+            f'{format_fail_open_records(fail_open)}\n'
             'If this leg is red, the factory has drifted from VerifyResult '
             '(a new field whose seeded default breaks '
             '_extract_failing_tests_and_candidate_files, most likely), and '
@@ -3020,7 +3022,7 @@ class TestDispositionDoubleFidelity:
         one site it sits above, and Rule B has no per-file baseline that could
         cover the rest (task 4354).
         """
-        for logger_name in _FAIL_OPEN_LOGGERS:
+        for logger_name in FAIL_OPEN_LOGGERS:
             caplog.set_level(logging.WARNING, logger=logger_name)
 
         # The pragma below is a per-SITE suppression — Rule B has no per-file
@@ -3043,7 +3045,7 @@ class TestDispositionDoubleFidelity:
             f'even on fail-open the classifier returns a result; got {result!r}'
         )
 
-        fail_open = _fail_open_records(caplog.records)
+        fail_open = fail_open_records(caplog.records)
         assert fail_open, (
             'MUTATION LEG IS DEAD: a bare MagicMock verify-result double no '
             'longer makes the classifier fail open, so the positive leg above '
@@ -3053,7 +3055,7 @@ class TestDispositionDoubleFidelity:
             'str.join, or the fail-open WARNING text/logger changed. Re-derive '
             'a mutation that DOES break classification and pin that instead — '
             'do NOT delete this leg, and do NOT relax it to a no-op.\n'
-            f'WARNINGs captured on {_FAIL_OPEN_LOGGERS}: '
+            f'WARNINGs captured on {FAIL_OPEN_LOGGERS}: '
             f'{[(r.name, r.getMessage()) for r in caplog.records]!r}'
         )
 
@@ -3064,7 +3066,7 @@ class TestDispositionDoubleFidelity:
         exc_infos = [r.exc_info for r in fail_open if r.exc_info]
         assert exc_infos, (
             'the fail-open WARNING must carry exc_info so an operator can see '
-            f'WHY it degraded; got records={_format_fail_open_records(fail_open)}'
+            f'WHY it degraded; got records={format_fail_open_records(fail_open)}'
         )
         excs = [info[1] for info in exc_infos]
         assert any(isinstance(exc, TypeError) for exc in excs), (
