@@ -31,7 +31,8 @@ from pathlib import Path
 try:
     import orchestrator_projects
     from dashboard.config import DashboardConfig
-    from legibility import census_trigger
+    from shared.mcp_post import mcp_server_base
+    from shared.mcp_session import SyncMcpSession
     from shared.project_layout import agent_transcripts_dir, default_project_root
     from shared.secret_env import secret_env_values
     from shared.secret_redaction import (
@@ -52,6 +53,7 @@ except ImportError as exc:
 
 AGENT_ROLE = 'transcript-secret-sweep'
 DEFAULT_MIN_AGE_SECS = 900.0
+ESCALATION_TIMEOUT_SECS = 30.0
 MAX_DETAIL_FILES = 200
 NO_SECRETS_CAUSE = 'no secret-bearing values in the environment'
 TRANSCRIPT_SUFFIXES = ('.jsonl', '.jsonl' + STAGING_SUFFIX)
@@ -253,7 +255,9 @@ def escalation_url() -> str:
 
 
 def _post_escalate_info(url: str | None, arguments: dict[str, object]) -> object:
-    return census_trigger.post_mcp_tool_call(url or escalation_url(), 'escalate_info', arguments)
+    base_url = mcp_server_base(url or escalation_url())
+    with SyncMcpSession(base_url, client_name='transcript-secret-sweep', timeout=ESCALATION_TIMEOUT_SECS) as session:
+        return session.call_tool('escalate_info', arguments)
 
 
 def _parser() -> argparse.ArgumentParser:
