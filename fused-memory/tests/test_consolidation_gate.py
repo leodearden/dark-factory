@@ -113,7 +113,12 @@ def _member(mid, *, canonical=None, topic=_TOPIC, supersedes=None, **extra_meta)
 
 
 def _uuid(n):
+    """Digits and dashes only, so `.upper()` is a no-op: a case-folding test
+    must use `_HEX_LETTERED_UUID`."""
     return f'00000000-0000-4000-8000-{n:012d}'
+
+
+_HEX_LETTERED_UUID = 'abcdef00-0000-4000-8000-00000000004a'
 
 
 def _closure(members, gate_block=None, **kwargs):
@@ -295,7 +300,8 @@ class TestClosureSupersedes:
         must not manufacture a false absorbed_member_still_live, nor hide a
         real one: is_full_uuid tolerates case because casing is a rendering
         choice, not a different identifier."""
-        absorbed = _uuid(4)
+        absorbed = _HEX_LETTERED_UUID
+        assert absorbed.upper() != absorbed
         members = [
             _member(_uuid(1), canonical=True, supersedes=[absorbed.upper()]),
             _member(absorbed),
@@ -419,7 +425,7 @@ class TestClosureRoutesProbeConfirmedClaims:
         assert 'absorbed_member_still_live' in codes
 
     def test_routing_is_case_insensitive(self):
-        mixed = 'abcdef00-0000-4000-8000-00000000004a'
+        mixed = _HEX_LETTERED_UUID
         assert mixed.upper() != mixed
         verdict = _closure(
             self._claiming([mixed.upper()]), unstamped_live_ids=[mixed]
@@ -916,7 +922,7 @@ class TestUnstampedCandidates:
         ) == ()
 
     def test_a_claim_and_an_observation_of_one_id_dedupe_case_insensitively(self):
-        mixed = 'abcdef00-0000-4000-8000-00000000004a'
+        mixed = _HEX_LETTERED_UUID
         assert mixed.upper() != mixed
         assert consolidation_gate.unstamped_candidates(
             _prov([mixed]), members=self._claiming([mixed.upper()])
@@ -943,10 +949,11 @@ class TestUnstampedCandidates:
     def test_scroll_matching_is_case_insensitive(self):
         """Mirrors `evaluate_closure`\'s own case-folded `live_ids`, so the two
         cannot disagree about what the scroll saw."""
-        members = [_member(_uuid(1).upper(), canonical=True)]
+        assert _HEX_LETTERED_UUID.upper() != _HEX_LETTERED_UUID
+        members = [_member(_HEX_LETTERED_UUID.upper(), canonical=True)]
         assert (
             consolidation_gate.unstamped_candidates(
-                _prov([_uuid(1)]), members=members
+                _prov([_HEX_LETTERED_UUID]), members=members
             )
             == ()
         )
@@ -960,7 +967,8 @@ class TestUnstampedCandidates:
 
     def test_the_original_id_spelling_is_returned_not_the_folded_one(self):
         """A refusal must name the id exactly as the gate recorded it."""
-        stray = _uuid(42).upper()
+        stray = _HEX_LETTERED_UUID.upper()
+        assert stray.lower() != stray
         assert consolidation_gate.unstamped_candidates(
             _prov([stray]), members=_well_formed_cluster(2)
         ) == (stray,)
