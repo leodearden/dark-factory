@@ -269,3 +269,78 @@ class TestHarnessStarvationWatchdogWiring:
         assert len(pending) == 0, (
             f'Expected no pending escalations after resolve callback; got {pending!r}'
         )
+
+
+class TestFleetScaleKnownAnswer:
+    """A deep, old backlog plus one genuinely stuck task files exactly one alarm (task 3821).
+
+    The 2026-09-07 storm filed 488 escalations in two minutes, all skip_count=0:
+    a backlog deeper than throughput, not starvation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_backlog_files_nothing_and_the_stuck_task_files_once(
+        self, tmp_path: Path
+    ) -> None:
+        from datetime import UTC, datetime, timedelta
+        from unittest.mock import AsyncMock
+
+        from orchestrator.config import StarvationWatchdogConfig
+        from orchestrator.eligibility_clock import EligibilityClockStore
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            starvation_watchdog=StarvationWatchdogConfig(skip_threshold=3),
+        )
+        config.fairness.skip_threshold = 9999
+        harness = Harness(config)
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = queue
+        harness._run_store = MagicMock(spec=RunStore)
+        harness._run_id = 'run-fleet-scale'
+        scheduler = harness.scheduler
+        scheduler.escalation_queue = queue
+
+        def task(tid: str, priority: str, path: str) -> dict:
+            return {
+                'id': tid, 'title': tid, 'status': 'pending', 'priority': priority,
+                'dependencies': [], 'metadata': {'files': [path]},
+            }
+
+        backlog = [task(str(1000 + i), 'low', f'free/l{i}.py') for i in range(400)]
+        backlog += [task(str(2000 + i), 'medium', f'free/m{i}.py') for i in range(300)]
+        stuck = task('2', 'high', 'hot/b.py')
+        seed = task('1', 'critical', 'hot/b.py')
+        tasks = [seed, stuck, *backlog]
+        hundred_hours_ago = datetime.now(UTC) - timedelta(hours=100)
+        EligibilityClockStore(config.eligibility_clock_db_path).stamp(
+            str(config.project_root),
+            {t['id']: hundred_hours_ago for t in [stuck, *backlog]},
+        )
+
+        async def get_tasks(*, statuses=None, **_):
+            return [dict(t) for t in tasks if statuses is None or t['status'] in set(statuses)]
+
+        async def get_statuses(ids=None):
+            return {t['id']: t['status'] for t in tasks if ids is None or t['id'] in ids}, None
+
+        scheduler._mcp_session = MagicMock()
+        # The Harness-wired already-landed gate forks git per candidate: ~9s a
+        # tick at this scale against a tmp_path that is no repository.
+        scheduler._already_landed_gate = None
+        scheduler.get_tasks = AsyncMock(side_effect=get_tasks)
+        scheduler.get_statuses = AsyncMock(side_effect=get_statuses)
+        scheduler.finish_startup()
+
+        for _ in range(8):
+            assignment = await scheduler.acquire_next()
+            assert assignment is not None and assignment.task_id != '2'
+            for t in tasks:
+                if t['id'] == assignment.task_id:
+                    t['status'] = 'in-progress'
+
+        watchdog = [
+            e for e in queue.get_pending()
+            if e.agent_role == 'orchestrator-starvation-watchdog'
+        ]
+        assert [e.task_id for e in watchdog] == ['2']
