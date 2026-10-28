@@ -46,12 +46,15 @@ class Env:
     df: Path
     fleet: Path
     sessions: Path
-    handover: Path
     state: Path
 
     @property
     def queue(self) -> Path:
         return self.df / 'data' / 'escalations'
+
+    @property
+    def handover(self) -> Path:
+        return self.queue / 'l2-handover.md'
 
     @property
     def preparation(self) -> Path:
@@ -76,7 +79,6 @@ class Env:
             *argv,
             '--decisions-root', str(decisions_root or self.fleet),
             '--sessions-root', str(sessions_root or self.sessions),
-            '--handover', str(self.handover),
             '--preparation', str(self.preparation),
             '--now', NOW,
         ]
@@ -124,13 +126,12 @@ def _held(evidence: str, source_kind: str = '') -> dict:
 @pytest.fixture
 def env(tmp_path, make_tasks_db) -> Env:
     df = tmp_path / 'src' / 'dark-factory'
-    e = Env(tmp_path, df, tmp_path / 'fleet', tmp_path / 'fleet' / 'sessions', tmp_path / 'handover.md',
-            tmp_path / 'state')
+    e = Env(tmp_path, df, tmp_path / 'fleet', tmp_path / 'fleet' / 'sessions', tmp_path / 'state')
     e.queue.mkdir(parents=True)
+    e.handover.write_text('# handover\n\nnothing relevant here\n')
     (df / '.taskmaster' / 'tasks').mkdir(parents=True)
     e.sessions.mkdir(parents=True)
     e.state.mkdir()
-    e.handover.write_text('# handover\n\nnothing relevant here\n')
     make_tasks_db([
         {'id': 100, 'status': 'blocked'},
         {'id': 200, 'status': 'deferred', 'metadata': {'x_coalesced_into': 201}},

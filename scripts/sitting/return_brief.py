@@ -56,7 +56,7 @@ from sitting.fleet_state import (  # noqa: E402
     Window,
 )
 from sitting.inventory import Shortfall, parse_stamp  # noqa: E402
-from sitting.prepare_sitting import Sitting  # noqa: E402
+from sitting.prepare_sitting import HandoverOverride, Sitting  # noqa: E402
 
 DEFAULT_OUTPUT = _REPO_ROOT / 'data' / 'return-brief.md'
 DEFAULT_LEDGER_OUT = _REPO_ROOT / 'data' / 'sitting' / 'ledger-nightly.json'
@@ -102,7 +102,7 @@ def build(
     project_roots: Sequence[str],
     decisions_root: Path,
     sessions_root: Path,
-    handover_path: Path | None,
+    handover_override: HandoverOverride | None,
     preparation_path: Path,
     previous_ledger: Path | None,
     window: Window,
@@ -111,7 +111,7 @@ def build(
     """Read every store once, number the open items as a recommend-only sitting seeded from *previous_ledger*, and measure the fleet."""
     sources = prepare_sitting.read_sources(
         project_roots=project_roots, decisions_root=decisions_root, sessions_root=sessions_root,
-        handover_path=handover_path, preparation_path=preparation_path, project=None, now=now,
+        handover_override=handover_override, preparation_path=preparation_path, project=None, now=now,
     )
     seed, unseeded = _previous_numbering(previous_ledger)
     sitting = prepare_sitting.compose(
@@ -163,7 +163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             project_roots=args.project_roots or discover_project_roots(),
             decisions_root=fleet_root(args.decisions_root),
             sessions_root=args.sessions_root if args.sessions_root is not None else sessions_dir(),
-            handover_path=prepare_sitting.handover_file(args.handover),
+            handover_override=args.handover,
             preparation_path=args.preparation,
             previous_ledger=args.ledger_out,
             window=Window.trailing(now, days=args.window_days),
@@ -393,7 +393,8 @@ def _parser() -> argparse.ArgumentParser:
                         help='repeatable; default: _task_db_scan.discover_project_roots()')
     parser.add_argument('--decisions-root', type=Path, help='fleet root holding decisions/ (default: fleet_root())')
     parser.add_argument('--sessions-root', type=Path, help='default: session_registry.sessions_dir()')
-    parser.add_argument('--handover', type=Path, help='default: this checkout\'s newest handover file')
+    parser.add_argument('--handover', type=prepare_sitting.parse_handover_override, metavar='PROJECT=PATH',
+                        help="read PATH as PROJECT's handover (default: each project root's own)")
     parser.add_argument('--preparation', type=Path, default=DEFAULT_PREPARATION)
     parser.add_argument('--window-days', type=_positive_days, default=1.0)
     parser.add_argument('--now', type=prepare_sitting.parse_instant, help='ISO-8601 instant to run at (default: now)')

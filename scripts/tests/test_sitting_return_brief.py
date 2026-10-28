@@ -49,13 +49,16 @@ class Env:
     df: Path
     fleet: Path
     sessions: Path
-    handover: Path
     preparation: Path
     out: Path
 
     @property
     def queue(self) -> Path:
         return self.df / 'data' / 'escalations'
+
+    @property
+    def handover(self) -> Path:
+        return self.queue / 'l2-handover.md'
 
     @property
     def output(self) -> Path:
@@ -70,7 +73,6 @@ class Env:
             *[arg for root in (roots or (self.df,)) for arg in ('--project-root', str(root))],
             '--decisions-root', str(self.fleet),
             '--sessions-root', str(self.sessions),
-            '--handover', str(self.handover),
             '--preparation', str(self.preparation),
             '--output', str(self.output),
             '--ledger-out', str(self.ledger_out),
@@ -82,7 +84,7 @@ class Env:
             project_roots=[str(root) for root in (roots or (self.df,))],
             decisions_root=self.fleet,
             sessions_root=self.sessions,
-            handover_path=self.handover,
+            handover_override=None,
             preparation_path=self.preparation,
             previous_ledger=self.ledger_out,
             window=fleet_state.Window.trailing(NOW, days=1),
@@ -148,7 +150,7 @@ def _runs_db(path: Path) -> None:
 @pytest.fixture
 def env(tmp_path, make_tasks_db, project_root_with_tasks_db) -> Env:
     df = tmp_path / 'src' / 'dark-factory'
-    e = Env(tmp_path, df, tmp_path / 'fleet', tmp_path / 'fleet' / 'sessions', tmp_path / 'handover.md',
+    e = Env(tmp_path, df, tmp_path / 'fleet', tmp_path / 'fleet' / 'sessions',
             tmp_path / 'state' / 'preparation.json', tmp_path / 'out')
     make_tasks_db([
         *({'id': n, 'status': 'blocked'} for n in range(101, 108)),
