@@ -29,12 +29,6 @@ from orchestrator.implementer_brief_variant import (
 )
 
 
-@pytest.fixture
-def isolated_config_env(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-
-
 class TestVocabulary:
     def test_members_are_the_stored_values(self):
         assert {m.value for m in ImplementerBriefVariant} == {'whole-plan', 'one-step'}
@@ -95,26 +89,28 @@ class TestInvocationBounds:
         assert invocation_bounds(MagicMock(), 'implementer', 10.0, 80) == (10.0, 80)
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestConfigKnob:
-    def test_code_default_is_whole_plan(self, isolated_config_env):
+    def test_code_default_is_whole_plan(self):
         variant = OrchestratorConfig().implementer_brief_variant
         assert variant is ImplementerBriefVariant.WHOLE_PLAN
 
-    def test_the_stored_value_parses_to_the_member(self, isolated_config_env):
+    def test_the_stored_value_parses_to_the_member(self):
         config = OrchestratorConfig.model_validate({'implementer_brief_variant': 'one-step'})
         assert config.implementer_brief_variant is ImplementerBriefVariant.ONE_STEP
 
-    def test_a_non_member_is_rejected_naming_the_field(self, isolated_config_env):
+    def test_a_non_member_is_rejected_naming_the_field(self):
         with pytest.raises(ValidationError) as excinfo:
             OrchestratorConfig.model_validate({'implementer_brief_variant': 'one_step'})
         assert 'implementer_brief_variant' in str(excinfo.value)
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestGreenTier:
     def test_field_is_reloadable(self):
         assert 'implementer_brief_variant' in RELOADABLE_FIELDS
 
-    def test_edit_lands_in_applied_candidates_not_restart_required(self, isolated_config_env):
+    def test_edit_lands_in_applied_candidates_not_restart_required(self):
         diff = diff_config(
             OrchestratorConfig(),
             OrchestratorConfig(implementer_brief_variant=ImplementerBriefVariant.ONE_STEP),
@@ -122,7 +118,7 @@ class TestGreenTier:
         assert 'implementer_brief_variant' in diff.applied_candidates
         assert 'implementer_brief_variant' not in diff.restart_required
 
-    def test_apply_reload_flips_the_live_object_in_place(self, isolated_config_env):
+    def test_apply_reload_flips_the_live_object_in_place(self):
         live = OrchestratorConfig()
         report = apply_reload(
             live, OrchestratorConfig(implementer_brief_variant=ImplementerBriefVariant.ONE_STEP),

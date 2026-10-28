@@ -100,12 +100,8 @@ class TestRefusal:
         assert repr(architect.role) in str(excinfo.value)
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestBuildEvalOrchConfig:
-    @pytest.fixture(autouse=True)
-    def _isolated_config_env(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-
     def test_a_one_step_candidate_sets_the_cells_knob(self, tmp_path):
         base = OrchestratorConfig(project_root=tmp_path)
         orch = build_eval_orch_config(named_eval_config(f'{BASE}@one-step'), {}, base_config=base)
