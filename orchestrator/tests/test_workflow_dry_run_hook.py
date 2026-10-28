@@ -7,9 +7,9 @@ Pins four contracts:
 2. merge_phase=True suppresses the hook entirely.
 3. unblock_auto.enabled=False suppresses the hook but does NOT suppress the
    real 'blocked' status write.
-4. spawn_dry_run=True with merge_phase=True is only valid for
-   POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX (ordering invariant: advance_main
-   has already moved main before this path runs).
+4. dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN with merge_phase=True is only
+   valid for POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX (ordering invariant:
+   advance_main has already moved main before this path runs).
 """
 
 from __future__ import annotations
@@ -339,7 +339,7 @@ class TestMarkBlockedDeduplicatesDryRun:
 
 
 # ---------------------------------------------------------------------------
-# step-1: merge_phase=True WITH spawn_dry_run=True opts in to the hook
+# step-1: merge_phase=True WITH DryRunSpawn.POST_MERGE_RED_MAIN opts in to the hook
 # ---------------------------------------------------------------------------
 
 class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
@@ -347,9 +347,9 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
     async def test_mark_blocked_spawns_dry_run_when_merge_phase_and_opt_in(
         self, tmp_path
     ):
-        """_mark_blocked(merge_phase=True, spawn_dry_run=True) must schedule
-        run_dry_run_unblock even though merge_phase suppresses the status
-        transition.
+        """_mark_blocked(merge_phase=True, dry_run_spawn=POST_MERGE_RED_MAIN)
+        must schedule run_dry_run_unblock even though merge_phase suppresses
+        the status transition.
 
         This is the post-merge red-main class: main is already advanced when
         _mark_blocked runs, so the SHA capture inside run_dry_run_unblock
@@ -375,7 +375,7 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
                 wf._mark_blocked(
                     _reason,
                     merge_phase=True,
-                    spawn_dry_run=True,
+                    dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN,
                 ),
                 timeout=2.0,
             )
@@ -407,11 +407,11 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
 
 
 # ---------------------------------------------------------------------------
-# Amendment 1: ordering invariant — spawn_dry_run=True only valid for
-# POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX (the post-advance class).
-# Pins the runtime assertion added to _mark_blocked's elif spawn_dry_run:
-# block so a future caller on a pre-advance path fails loudly rather than
-# silently producing a stale-SHA dry-run proposal.
+# Amendment 1: ordering invariant — DryRunSpawn.POST_MERGE_RED_MAIN only
+# valid for POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX (the post-advance class).
+# Pins the runtime assertion in _mark_blocked's POST_MERGE_RED_MAIN arm so
+# a future caller on a pre-advance path fails loudly rather than silently
+# producing a stale-SHA dry-run proposal.
 # ---------------------------------------------------------------------------
 
 class TestMarkBlockedSpawnDryRunOrderingInvariant:
@@ -419,11 +419,11 @@ class TestMarkBlockedSpawnDryRunOrderingInvariant:
     async def test_spawn_dry_run_wrong_prefix_raises_assertion_error(
         self, tmp_path
     ):
-        """_mark_blocked(merge_phase=True, spawn_dry_run=True) must raise
-        AssertionError when the reason does NOT start with
+        """_mark_blocked(merge_phase=True, dry_run_spawn=POST_MERGE_RED_MAIN)
+        must raise AssertionError when the reason does NOT start with
         POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
 
-        This pins the ordering invariant: spawn_dry_run=True is only safe
+        This pins the ordering invariant: POST_MERGE_RED_MAIN is only safe
         when advance_main has already moved refs/heads/main, which is
         guaranteed only for the POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
         class (_check_post_merge_pyright is called exclusively from
@@ -441,15 +441,15 @@ class TestMarkBlockedSpawnDryRunOrderingInvariant:
             await wf._mark_blocked(
                 'some-other-blocked-class: unexpected failure detail',
                 merge_phase=True,
-                spawn_dry_run=True,
+                dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN,
             )
 
     @pytest.mark.asyncio
     async def test_spawn_dry_run_correct_prefix_does_not_raise(
         self, tmp_path
     ):
-        """_mark_blocked(merge_phase=True, spawn_dry_run=True) must NOT
-        raise when the reason starts with POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
+        """_mark_blocked(merge_phase=True, dry_run_spawn=POST_MERGE_RED_MAIN)
+        must NOT raise when the reason starts with POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
 
         This is the counterpart to the wrong-prefix test: confirms the
         guard is a targeted prefix check, not an unconditional block.
@@ -467,7 +467,10 @@ class TestMarkBlockedSpawnDryRunOrderingInvariant:
 
         with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy):
             # Must not raise
-            await wf._mark_blocked(_reason, merge_phase=True, spawn_dry_run=True)
+            await wf._mark_blocked(
+                _reason, merge_phase=True,
+                dry_run_spawn=DryRunSpawn.POST_MERGE_RED_MAIN,
+            )
 
         await asyncio.sleep(0)
         await _drain_unblock_tasks(wf)
