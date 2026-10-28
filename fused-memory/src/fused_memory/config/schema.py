@@ -2875,8 +2875,10 @@ class WriteTriageConfig(BaseModel):
         ge=1,
         description=(
             'Per-field character cap applied to the new entry and to every '
-            'candidate before the judge sees them; a cut field is marked '
-            '`…[elided]` so the model knows it is reading a truncation. Why '
+            'candidate before the judge sees them; a cut field is marked with '
+            'how many characters were elided (utils/clip_disclosure.py::elide_text), '
+            'so the model knows it is reading a truncation and how much is '
+            'missing. Why '
             '4000 replaced 1,200 — the measured recall loss at the old cap and '
             'the call cost at the new one — is the decision record '
             'calibration/write_triage_judge_field_chars_report.md. Bounded ge=1 '

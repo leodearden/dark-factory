@@ -1257,22 +1257,12 @@ class WorktreeInfo:
     The base_commit is the SHA of main at worktree creation time, pinned to
     ensure stable diffs even if main advances during task execution.
 
-    stale_commits: how far local main was behind the remote at worktree creation
-    time.  None means either (a) the fetch was unavailable (no remote configured),
-    or (b) the worktree is train-stacked — branched from a sibling's tip rather
-    than from main, so the "behind remote" concept does not apply.  0 means
-    already current.  A positive stale_commits value means the remote was ahead by
-    N commits.  When local main has diverged (has unpushed commits), the worktree
-    is based on local main despite the positive count — check this field together
-    with base_commit to determine actual freshness.
-
     reify_debug_port: per-worktree reify-debug port allocated during provisioning
     by running scripts/setup-worktree-debug-port.sh in the worktree.  None when
     no such script is present (non-reify projects) or provisioning failed (fail-open).
     """
     path: Path
     base_commit: str
-    stale_commits: int | None = None
     reify_debug_port: int | None = None
 
 
@@ -4346,20 +4336,19 @@ class GitOps:
         )
         return False
 
-    async def _freshen_main(self) -> tuple[str, int | None]:
+    async def _freshen_main(self) -> str:
         """Fetch from remote and return the freshest ref to use as worktree base.
 
         Returns:
-            (ref, stale_commits) where:
-            - ref: the git ref to pass to ``git worktree add`` / ``git rev-parse``
-            - stale_commits: None  → fetch failed (no remote configured)
-                             0     → local main is already current with remote
-                             N > 0 → local main was N commits behind remote
+            The git ref to pass to ``git worktree add`` / ``git rev-parse``:
+            the remote-tracking ref when local main is strictly behind it,
+            otherwise local main.  The behind/ahead counts are logged here
+            and not returned.
 
         Design decisions:
         - Best-effort fetch: if fetch fails (no remote in tests), return
-          (main_branch, None) silently — matches the pattern in
-          _create_merge_worktree (line 578).
+          main_branch silently — matches the pattern in
+          ``_create_merge_worktree``.
         - No mutation of local main ref: advance_main() uses CAS on the local
           main ref; updating it here could cause spurious CAS failures.  We
           return the remote-tracking ref (origin/main) as the start-point
@@ -4381,7 +4370,7 @@ class GitOps:
                 '_freshen_main: fetch from %s failed — using local %s',
                 self.config.remote, self.config.main_branch,
             )
-            return self.config.main_branch, None
+            return self.config.main_branch
 
         # Count commits local main is BEHIND origin/main
         rc, behind_out, _ = await _run(
@@ -4394,17 +4383,17 @@ class GitOps:
                 '_freshen_main: rev-list (behind) failed (rc=%d) — using local %s',
                 rc, self.config.main_branch,
             )
-            return self.config.main_branch, None
+            return self.config.main_branch
         try:
             behind = int(behind_out.strip())
         except ValueError:
             logger.warning(
                 '_freshen_main: unexpected behind-count output: %r', behind_out,
             )
-            return self.config.main_branch, None
+            return self.config.main_branch
 
         if behind == 0:
-            return self.config.main_branch, 0
+            return self.config.main_branch
 
         # Check for divergence: count commits local main is AHEAD of origin/main
         rc, ahead_out, _ = await _run(
@@ -4417,15 +4406,14 @@ class GitOps:
                 '_freshen_main: rev-list (ahead) failed (rc=%d) — using local %s',
                 rc, self.config.main_branch,
             )
-            return self.config.main_branch, behind
+            return self.config.main_branch
         try:
             ahead = int(ahead_out.strip())
         except ValueError:
             logger.warning(
                 '_freshen_main: unexpected ahead-count output: %r', ahead_out,
             )
-            # Fall back to local main; report behind count as-is (ref is local, not remote)
-            return self.config.main_branch, behind
+            return self.config.main_branch
 
         if ahead > 0:
             logger.warning(
@@ -4433,14 +4421,14 @@ class GitOps:
                 '— using local ref to avoid losing advance_main commits',
                 self.config.main_branch, remote_ref, ahead, behind,
             )
-            return self.config.main_branch, behind
+            return self.config.main_branch
 
         # Strictly behind: use remote-tracking ref as worktree start-point
         logger.info(
             '_freshen_main: local %s is %d commits behind %s — using %s',
             self.config.main_branch, behind, remote_ref, remote_ref,
         )
-        return remote_ref, behind
+        return remote_ref
 
     async def _train_predecessor(self, train: TrainMembership) -> TrainPredecessor:
         """Resolve the predecessor for a train member with order > 0.
@@ -4622,7 +4610,6 @@ class GitOps:
             # as start_ref so the new worktree stacks directly on top.
             # Guard (raise RuntimeError on None) is in _resolve_predecessor_tip.
             start_ref, _ = await self._resolve_predecessor_tip(train, branch_name)
-            stale_commits = None  # "behind remote" does not apply to sibling branches
         else:
             # ── Freshen main from remote (best-effort) ────────────────────
             # If origin/main has advanced since session start, use the remote-
@@ -4630,11 +4617,8 @@ class GitOps:
             # code.  Falls back to local main silently when no remote is configured
             # (e.g. in test repos).  Never mutates the local main ref — that would
             # interfere with advance_main's CAS logic.
-            start_ref, stale_commits = await self._freshen_main()
-        logger.info(
-            'create_worktree: freshening result: ref=%s, stale_commits=%s',
-            start_ref, stale_commits,
-        )
+            start_ref = await self._freshen_main()
+        logger.info('create_worktree: start ref=%s', start_ref)
 
         # Capture the freshened ref's SHA (used as stable base for diffs)
         rc, base_sha, _ = await _run(
@@ -4683,13 +4667,7 @@ class GitOps:
                 branch_name, start_ref, expected_title=expected_title,
             )
             if isinstance(pool_info, WorktreeInfo):
-                # Carry stale_commits from the freshen result onto the pool info
-                return WorktreeInfo(
-                    path=pool_info.path,
-                    base_commit=pool_info.base_commit,
-                    stale_commits=stale_commits,
-                    reify_debug_port=pool_info.reify_debug_port,
-                )
+                return pool_info
             # β: pool is enabled — no cold-path fall-through.  Route discriminant
             # to the appropriate exception so callers get typed failure signals.
             if pool_info is WarmLaneUnavailable.EXHAUSTED:
@@ -4935,7 +4913,6 @@ class GitOps:
                 return WorktreeInfo(
                     path=worktree_path,
                     base_commit=actual_base,
-                    stale_commits=stale_commits,
                     reify_debug_port=port,
                 )
             elif worktree_path.exists():
@@ -5032,7 +5009,7 @@ class GitOps:
             # fresh-create unchanged.
             if not worktree_path.exists() and await self._orphan_has_commits(full_branch):
                 reattached = await self._reattach_cold_worktree(
-                    worktree_path, full_branch, stale_commits,
+                    worktree_path, full_branch,
                     branch_name=branch_name, expected_title=expected_title,
                 )
                 if reattached is not None:
@@ -5065,8 +5042,8 @@ class GitOps:
             )
 
         logger.info(
-            'Created worktree at %s on branch %s (base=%s, stale_commits=%s)',
-            worktree_path, full_branch, base_sha[:8], stale_commits,
+            'Created worktree at %s on branch %s (base=%s)',
+            worktree_path, full_branch, base_sha[:8],
         )
 
         # Re-capture base from the worktree's own merge-base after
@@ -5087,7 +5064,6 @@ class GitOps:
         return WorktreeInfo(
             path=worktree_path,
             base_commit=post_create_base,
-            stale_commits=stale_commits,
             reify_debug_port=port,
         )
 
@@ -5095,7 +5071,6 @@ class GitOps:
         self,
         worktree_path: Path,
         full_branch: str,
-        stale_commits: int | None,
         *,
         branch_name: str,
         expected_title: str | None = None,
@@ -5162,9 +5137,7 @@ class GitOps:
                 anything.
 
         Returns:
-            WorktreeInfo for the resumed worktree, with *stale_commits*
-            carried over from the freshen result (mirrors create_worktree's
-            reuse-existing path); or ``None`` if a confirmed identity
+            WorktreeInfo for the resumed worktree; or ``None`` if a confirmed identity
             mismatch caused the orphan to be quarantined — the caller must
             fall through to a fresh create.
         """
@@ -5236,13 +5209,7 @@ class GitOps:
                 await self._relocate_foreign_meta_root(worktree_path, dest)
                 return None
 
-        info = await self._reuse_warm_lane(worktree_path, full_branch)
-        return WorktreeInfo(
-            path=info.path,
-            base_commit=info.base_commit,
-            stale_commits=stale_commits,
-            reify_debug_port=info.reify_debug_port,
-        )
+        return await self._reuse_warm_lane(worktree_path, full_branch)
 
     async def create_interactive_worktree(
         self, slug: str, *, start_ref: str | None = None,

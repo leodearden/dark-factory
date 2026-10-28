@@ -12531,8 +12531,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         A commit passed here was failed/ejected/superseded/re-merged, so any
         speculative item whose ``base_sha`` points at it has a BROKEN chain
         (see :meth:`_chain_dead_link`).  Called at every invalidation site
-        (head-failure cascade, dispatch chain-invalidation discard,
-        RUNNER_UNAVAILABLE re-merge, rebased landing) so a built-awaiting-host
+        (head-failure cascade, dispatch chain-invalidation discard, adoption-time
+        void, RUNNER_UNAVAILABLE re-merge, rebased landing) so a built-awaiting-host
         straggler that the cascade missed is still caught at its next dispatch.
 
         Bounded FIFO (cap ``self._dead_base_commits_cap``): past the cap the
@@ -12551,6 +12551,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             while len(self._dead_base_order) > self._dead_base_commits_cap:
                 evicted = self._dead_base_order.popleft()
                 self._dead_base_commits.discard(evicted)
+
+    def _record_item_commit_dead(self, item: SpeculativeItem) -> None:
+        """Record *item*'s own merge commit as a dead base; a DecidedItem built none."""
+        if isinstance(item, RealMergeItem):
+            self._record_dead_base(item.merge_result.merge_commit or '')
 
     def _chain_dead_link(self, item: SpeculativeItem, main_sha: str) -> str | None:
         """Return the dead base link iff *item*'s chain is BROKEN, else None (INV-3).
@@ -17778,8 +17783,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # (enforcement (a)) instead of verifying against it.  Each
                     # downstream entry's OLD commit is recorded below, just before
                     # its own _remerge replaces the item.
-                    if isinstance(head.item, RealMergeItem):
-                        self._record_dead_base(head.item.merge_result.merge_commit or '')
+                    self._record_item_commit_dead(head.item)
 
                     # Detect whether the head failure was due to operator halt
                     # (REQUEUED sentinel).  In that case downstream tasks will
@@ -17935,10 +17939,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # is about to be re-merged away, so a straggler stacked
                             # on it now has a dangling successor edge.  Recording it
                             # dead makes that straggler catchable at dispatch.
-                            if isinstance(_entry.item, RealMergeItem):
-                                self._record_dead_base(
-                                    _entry.item.merge_result.merge_commit or ''
-                                )
+                            self._record_item_commit_dead(_entry.item)
                             _rid = _entry.item.request.request_id
                             _from_state = self._lifecycle.current(_rid)
                             if _from_state is not None:
@@ -20591,7 +20592,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         non-None result of :meth:`_chain_dead_link`) describes a tree that will
         never be on main, so it is neither adopted as a task block NOR advanced
         onto main.  Clean the verified worktree, emit ``verdict_voided`` naming
-        *dead_link*, re-merge the item against real main, and re-park it on
+        *dead_link*, record the voided verdict's own merge commit dead (so a
+        follower stacked on it is caught at its next dispatch even when no
+        head-failure cascade runs; parity with the dispatch-time void, task
+        2885), re-merge the item against real main, and re-park it on
         ``_redispatch`` for a fresh verify.  The request is left UNRESOLVED — a
         dead-base FAIL never blocks the task, and (because the re-merge resets
         base_sha to live real-main, not in the dead set) a subsequent GENUINE
@@ -20619,6 +20623,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             req.request_id, ItemLifecycleState.FINALIZING,
             ItemLifecycleState.MERGING, live_obj=entry,
         )
+        self._record_item_commit_dead(item)
         # §5.3 re-merge carve-out, consumer 2/5 — INV-3 adoption-time void
         # (PRD §5.3).  This site is also the reason §5.3 needs no dispatch-time
         # enforcement: it is where a verdict built on a known-dead base is
@@ -21664,8 +21669,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # record it dead so a straggler stacked on it is caught at
                 # dispatch (parity with the head-failure cascade + Mechanism-2
                 # discard remerge sites).
-                if isinstance(entry.item, RealMergeItem):
-                    self._record_dead_base(entry.item.merge_result.merge_commit or '')
+                self._record_item_commit_dead(entry.item)
                 self._note_transition(
                     req.request_id, ItemLifecycleState.FINALIZING,
                     ItemLifecycleState.MERGING, live_obj=entry,
@@ -22485,11 +22489,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # caught by this same dispatch-time re-check.  Parity with the three
             # other invalidation sites (head-failure cascade, RUNNER_UNAVAILABLE,
             # and the Mechanism-2 staleness discard just below), all of which
-            # record the old commit dead for the identical reason.  item is a
-            # RealMergeItem here (_chain_dead_link returned non-None), guarded
-            # for type-safety.
-            if isinstance(item, RealMergeItem):
-                self._record_dead_base(item.merge_result.merge_commit or '')
+            # record the old commit dead for the identical reason.
+            self._record_item_commit_dead(item)
             # §5.3 re-merge carve-out, consumer 4/5 — dead-base straggler at
             # dispatch (PRD §5.3).  This site is the CIRCULARITY argument in the
             # flesh: it exists to ESCAPE a base known dead, and
@@ -22623,11 +22624,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # INV-3 dangling-edge fix (task 2885 step-10, enforcement (c)):
                 # this stale merge is about to be re-merged away — record its
                 # now-orphaned commit dead so a straggler stacked on it is caught
-                # by the dispatch-time dead-base re-check.  item is always a
-                # RealMergeItem here (a DecidedItem returned via the passthrough
-                # above), guarded for type-safety.
-                if isinstance(item, RealMergeItem):
-                    self._record_dead_base(item.merge_result.merge_commit or '')
+                # by the dispatch-time dead-base re-check.
+                self._record_item_commit_dead(item)
                 # §5.3 re-merge carve-out, consumer 5/5 — Mechanism-2
                 # staleness / chain-invalidation: targets real main, not
                 # frozen_prefix_tip().  PRD §5.3.
