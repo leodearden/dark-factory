@@ -9,6 +9,7 @@ terminal exit, and the post-merge tail starts no steward for one (D7).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +25,7 @@ from _workflow_helpers import (
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from test_workflow_escalated_steward_stall import _wire_resolve_callback
 
 from orchestrator.config import GitConfig, OrchestratorConfig, TimeoutsConfig, UnblockAutoConfig
 from orchestrator.escalation_router import ROUTER_ID, hold_note, read_hold
@@ -150,7 +152,7 @@ async def _steward_wait_timeout(workflow: TaskWorkflow, queue: EscalationQueue, 
 
 
 async def _steward_wait_reentry(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:
-    """The next ESCALATED entry after a give-up waits on nothing the give-up left."""
+    """With no live steward, an info note a give-up left holds no later wait."""
     await _steward_wait_timeout(workflow, queue, tmp_path)
     await asyncio.wait_for(workflow._wait_for_resolution(), 10)
     assert not workflow._steward_wait_expired
@@ -195,6 +197,119 @@ class TestBlanketDismissalsSpareRouterOwnedNotes:
 
         assert _status(queue, blocking) == 'dismissed'
         assert _status(queue, info) == 'dismissed'
+
+
+def _info_note_status(queue: EscalationQueue) -> str:
+    (note,) = [e for e in queue.get_by_task(TASK_ID) if e.severity == 'info']
+    return note.status
+
+
+def _blocking_first_steward(queue: EscalationQueue, *, settles_info: bool, stops: list[str]) -> type:
+    """A live steward that settles the blocking L0 first, then the info note or nothing.
+
+    It has no ``metrics``, so the ESCALATED wait it runs under is a plain deadline.
+    ``stop()`` records the info note's status at the moment it is stopped.
+    """
+
+    class _Steward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002 — factory signature
+            self._loop: asyncio.Task | None = None
+
+        def set_outcome_channel(self, channel: asyncio.Queue) -> None:  # noqa: ARG002 — steward interface
+            pass
+
+        def set_wip_probe(self, probe) -> None:  # noqa: ARG002 — steward interface
+            pass
+
+        async def start(self) -> None:
+            self._loop = asyncio.create_task(self._handle_l0s())
+
+        async def _handle_l0s(self) -> None:
+            for esc in queue.get_by_task(TASK_ID, status='pending', level=0):
+                if esc.severity == 'blocking':
+                    queue.resolve(esc.id, 'steward settled it', resolved_by='steward')
+            await asyncio.sleep(0.05)
+            if not settles_info:
+                await asyncio.Event().wait()
+            for esc in queue.get_by_task(TASK_ID, status='pending', level=0):
+                queue.resolve(esc.id, 'steward settled the note', resolved_by='steward')
+
+        async def stop(self) -> None:
+            stops.append(_info_note_status(queue))
+            assert self._loop is not None
+            self._loop.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._loop
+
+    return _Steward
+
+
+async def _escalated_wait_beside_a_live_steward(
+    tmp_path: Path, *, router_enabled: bool, settles_info: bool,
+) -> tuple[TaskWorkflow, EscalationQueue, Escalation, Escalation, list[str]]:
+    """run()'s ESCALATED sequence: start the steward, then wait for the L0s to clear."""
+    workflow, queue = _workflow(tmp_path, router_enabled=router_enabled)
+    _wire_resolve_callback(queue, workflow)
+    blocking = _submit(queue, severity='blocking')
+    info = _submit(queue, severity='info')
+    stops: list[str] = []
+    worktree = tmp_path / 'wt'
+    worktree.mkdir()
+    workflow.worktree = worktree
+    workflow._steward_factory = _blocking_first_steward(queue, settles_info=settles_info, stops=stops)
+    await workflow._ensure_steward_started()
+    try:
+        await asyncio.wait_for(workflow._wait_for_resolution(), 10)
+    finally:
+        steward_still_live = workflow._steward
+        observed_stops = list(stops)
+        if steward_still_live is not None:
+            await steward_still_live.stop()
+    return workflow, queue, blocking, info, observed_stops
+
+
+@pytest.mark.asyncio
+class TestTheWaitHoldsWhileAStewardIsLive:
+    """A live steward takes any pending L0, info included, so it holds the wait (D1, D10)."""
+
+    async def test_the_wait_returns_only_after_the_live_steward_settles_the_info_note(
+        self, tmp_path: Path,
+    ):
+        workflow, queue, blocking, info, stops = await _escalated_wait_beside_a_live_steward(
+            tmp_path, router_enabled=True, settles_info=True,
+        )
+
+        assert _status(queue, info) == 'resolved'
+        assert _status(queue, blocking) == 'resolved'
+        assert stops == []
+        assert workflow._steward_wait_expired is False
+
+    async def test_a_steward_silent_on_the_info_note_is_stopped_before_the_wait_returns(
+        self, tmp_path: Path,
+    ):
+        workflow, queue, blocking, info, stops = await _escalated_wait_beside_a_live_steward(
+            tmp_path, router_enabled=True, settles_info=False,
+        )
+
+        assert stops == ['pending']
+        assert _status(queue, blocking) == 'resolved'
+        assert _status(queue, info) == 'pending'
+        assert workflow._steward_wait_expired is False
+
+    async def test_with_the_router_disabled_a_silent_steward_leaves_the_info_note_dismissed(
+        self, tmp_path: Path,
+    ):
+        workflow, queue, blocking, info, stops = await _escalated_wait_beside_a_live_steward(
+            tmp_path, router_enabled=False, settles_info=False,
+        )
+
+        current_info = queue.get(info.id)
+        assert current_info is not None
+        assert current_info.status == 'dismissed'
+        assert current_info.resolved_by == 'auto-dismissed'
+        assert _status(queue, blocking) == 'resolved'
+        assert stops == ['pending']
+        assert workflow._steward_wait_expired is True
 
 
 def _finalizer_workflow(
