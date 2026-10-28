@@ -7,15 +7,24 @@ recorder calls is ``test_offline_lane_ledger_scenarios.py``'s subject.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import timedelta
 
 import pytest
 from _lane_episode_fakes import (
     COMMAND,
+    HEAD0,
     HEAD1,
+    HEAD2,
+    SPACED,
+    T0,
     A,
     B,
     C,
+    _apply,
+    _covered,
+    _episode,
     _observation,
+    _record,
     _red,
     _run,
 )
@@ -34,11 +43,19 @@ from orchestrator.offline_lane_confirm import (
     Unconfirmable,
     UnconfirmableReason,
 )
-from orchestrator.offline_lane_episode_state import PassObservation, unconfirmable_node
+from orchestrator.offline_lane_episode_state import (
+    CommandRecord,
+    CoveringVerdict,
+    Episode,
+    PassObservation,
+    unconfirmable_node,
+)
 from orchestrator.offline_lane_ledger import (
     INCONCLUSIVE_UNEXPLAINED,
     NUMERIC_UNNAMED_CLEAR,
+    Recovery,
     pass_suppressions,
+    recoveries,
 )
 from orchestrator.offline_lane_records import (
     LEGACY_NUMERIC_COMMAND,
@@ -202,3 +219,96 @@ class TestNothingToRecord:
         observation = replace(_observation(), outcome=Outage(probe), probe=probe)
 
         assert _suppressions(observation) == ()
+
+
+def _green(head: str = HEAD1, *, at=T0 + SPACED, pass_id: str = 'p1') -> PassObservation:
+    return _observation(outcome=None, head=head, at=at, pass_id=pass_id, detect=_run('detect', head, at))
+
+
+def _recoveries(before: CommandRecord, observation: PassObservation, **reads) -> tuple[Recovery, ...]:
+    applied = _apply(before, observation, **reads)
+    return recoveries(before, applied.effect.episodes_ended, observation)
+
+
+def _held(node: str = A, **fields) -> Episode:
+    """An unbound episode held at one counted pass at HEAD1."""
+    return _episode(node, **{'first_red_head': HEAD1, 'reproduced_heads': (HEAD1,), **fields})
+
+
+class TestRecoveries:
+    def test_a_green_pass_at_a_reproduced_head_recovers_at_that_head(self) -> None:
+        before = _record(_held())
+
+        assert _recoveries(before, _green(HEAD1)) == (Recovery(A, HEAD1, before.episodes[A]),)
+
+    def test_a_green_pass_elsewhere_recovers_at_the_last_green_head_when_it_reproduced_there(self) -> None:
+        before = _record(_held(last_green_head=HEAD1))
+
+        (recovery,) = _recoveries(before, _green(HEAD2))
+
+        assert recovery.evidence_head == HEAD1
+
+    def test_a_test_that_never_passed_at_a_reproduced_head_does_not_recover(self) -> None:
+        before = _record(_held(last_green_head=HEAD0))
+
+        assert _recoveries(before, _green(HEAD2)) == ()
+
+    def test_a_passed_row_in_a_red_pass_recovers(self) -> None:
+        before = _record(_held())
+        observation = _red(reproduced=(B,), outcomes={A: 'passed', B: 'failed'}, head=HEAD1)
+
+        (recovery,) = _recoveries(before, observation)
+
+        assert (recovery.node, recovery.evidence_head) == (A, HEAD1)
+
+    @pytest.mark.parametrize(
+        'episode',
+        [
+            _covered(A, first_red_head=HEAD1, reproduced_heads=(HEAD1,)),
+            _held(had_outage_pass=True),
+        ],
+        ids=['fix_task_filed', 'saw_an_outage_pass'],
+    )
+    def test_an_episode_with_a_fix_task_or_an_outage_pass_does_not_recover(self, episode: Episode) -> None:
+        assert _recoveries(_record(episode), _green(HEAD1)) == ()
+
+    def test_an_expired_episode_does_not_recover(self) -> None:
+        before = _record(_held(last_counted_started_at=T0 - timedelta(hours=25)))
+        observation = _green(HEAD1)
+
+        assert [e.reason for e in _apply(before, observation).effect.episodes_ended] == ['expired']
+        assert _recoveries(before, observation) == ()
+
+    def test_a_cleared_episode_does_not_recover(self) -> None:
+        before = _record(_held())
+        observation = _red(reproduced=(), cleared=(A,), head=HEAD1)
+
+        assert [e.reason for e in _apply(before, observation).effect.episodes_ended] == ['cleared']
+        assert _recoveries(before, observation) == ()
+
+    def test_a_replaced_episode_does_not_recover(self) -> None:
+        before = _record(_covered(A, first_red_head=HEAD1, reproduced_heads=(HEAD1,)))
+        observation = _red((A,), head=HEAD1)
+        verdicts = {A: CoveringVerdict.DONE_CONTAINED}
+
+        assert [e.reason for e in _apply(before, observation, verdicts=verdicts).effect.episodes_ended] == ['replaced']
+        assert _recoveries(before, observation, verdicts=verdicts) == ()
+
+    def test_the_command_pseudo_test_does_not_recover(self) -> None:
+        before = _record(_held(unconfirmable_node(COMMAND)))
+        observation = _green(HEAD1)
+
+        assert [e.reason for e in _apply(before, observation).effect.episodes_ended] == ['passed']
+        assert _recoveries(before, observation) == ()
+
+    def test_an_uncounted_reproduction_head_is_evidence(self) -> None:
+        first = _red((A,), head=HEAD1, at=T0 + SPACED, pass_id='p1')
+        held = _apply(_record(), first).record
+        again = _red((A,), head=HEAD2, at=T0 + SPACED + timedelta(minutes=3), pass_id='p2')
+        applied = _apply(held, again)
+        before = applied.record
+
+        assert applied.effect.tests_counted == ()
+        assert before.episodes[A].reproduced_heads == (HEAD1, HEAD2)
+        (recovery,) = _recoveries(before, _green(HEAD2, at=T0 + SPACED + timedelta(minutes=10), pass_id='p3'))
+        assert recovery.evidence_head == HEAD2
