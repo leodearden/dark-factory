@@ -1927,13 +1927,14 @@ def read_proc_state(pid: int, *, _proc_root: Path = Path('/proc')) -> ProcState 
     ``OSError`` and a malformed one ``ValueError``, rather than reading as gone.
     Parsed after the LAST ``') '`` exactly as
     :func:`orchestrator.verify_cancel.read_ppid_map` does, since ``comm`` may
-    hold spaces or parens.  A stdlib port of
+    hold spaces or parens, and decoded with replacement as ``comm`` is arbitrary
+    bytes.  A stdlib port of
     ``shared/src/shared/proc_group.py::read_stat_fields`` (see the module
     docstring's import constraint); ``_proc_root`` is a test seam.
     """
     stat = _proc_root / str(pid) / 'stat'
     try:
-        raw = stat.read_text()
+        raw = stat.read_bytes().decode('utf-8', 'replace')
     except (FileNotFoundError, ProcessLookupError):
         return None
     try:
