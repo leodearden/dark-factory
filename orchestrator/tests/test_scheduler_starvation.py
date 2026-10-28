@@ -52,6 +52,7 @@ class _Rig:
     warn: AsyncMock
     resolve: AsyncMock
     events_db: Path
+    overrides: OverrideStore
     _low_seq: list[int] = field(default_factory=lambda: [1000])
 
     def advance(self, secs: float) -> None:
@@ -101,6 +102,9 @@ class _Rig:
     def warned_ids(self) -> list[str]:
         return [str(c.args[0]) for c in self.warn.call_args_list]
 
+    def override_rows(self) -> dict:
+        return self.overrides.get_overrides(str(self.scheduler.config.project_root))
+
 
 def _rig(
     tmp_path: Path,
@@ -131,13 +135,14 @@ def _rig(
     warn, resolve = AsyncMock(), AsyncMock()
     task_list: list[dict] = tasks if tasks is not None else []
     events_db = tmp_path / 'runs.db'
+    overrides = OverrideStore(tmp_path / 'scheduler_overrides.db')
     scheduler = Scheduler(
         config,
         event_store=EventStore(events_db, run_id='run-starvation'),
         callbacks=SchedulerCallbacks(on_starvation_warn=warn, on_starvation_resolve=resolve),
         time_source=lambda: mono[0],
         wall_time_source=lambda: wall[0],
-        override_store=OverrideStore(tmp_path / 'scheduler_overrides.db'),
+        override_store=overrides,
         eligibility_clock_store=EligibilityClockStore(tmp_path / 'scheduler_eligibility.db'),
     )
     scheduler._read_psi_sample = lambda: _IDLE_PSI
@@ -154,7 +159,7 @@ def _rig(
     scheduler.get_tasks = AsyncMock(side_effect=get_tasks)
     scheduler.get_statuses = AsyncMock(side_effect=get_statuses)
     scheduler.finish_startup()
-    return _Rig(scheduler, task_list, wall, mono, warn, resolve, events_db)
+    return _Rig(scheduler, task_list, wall, mono, warn, resolve, events_db, overrides)
 
 
 async def _contended(rig: _Rig, *extra: dict) -> None:
@@ -274,6 +279,57 @@ async def test_a_candidacy_gap_does_not_reset_the_eligibility_age(tmp_path: Path
     [event] = rig.detected('2')
     assert event['gate'] == 'dual'
     assert event['eligible_age_secs'] == FLOOR
+
+
+PARK_FLOOR = 14400.0
+
+
+async def _parked_behind_holder(rig: _Rig) -> None:
+    """H dispatches holding park/m2.py; P then parks over park/m1.py and park/m2.py."""
+    rig.set_tasks([_task('H', 'critical', 'park/m2.py')])
+    assert await rig.tick_id() == 'H'
+    rig.tasks.append(_task('P', 'medium', 'park/m1.py', 'park/m2.py'))
+
+
+@pytest.mark.asyncio
+async def test_park_blocked_fires_naming_the_live_holder(tmp_path: Path) -> None:
+    rig = _rig(tmp_path)
+    await _parked_behind_holder(rig)
+    rig.scheduler.lock_table.install_parks('P', ['park/m1.py', 'park/m2.py'], 'medium')
+    rig.advance(PARK_FLOOR)
+
+    for _ in range(3):
+        assert await rig.tick() is None
+
+    [event] = rig.detected('P')
+    assert event['gate'] == 'park_blocked'
+    assert event['blocking_holder'] == 'H'
+    assert event['blocking_module'] == 'park/m2.py'
+    assert event['park_age_secs'] >= PARK_FLOOR
+    assert event['auto_pinned'] is False
+    assert event['disposition'] == 'escalated_l1'
+    assert 'P' not in rig.override_rows()
+    rig.warn.assert_called_once()
+    assert rig.warn.call_args.args[0] == 'P'
+    assert rig.warn.call_args.kwargs['level'] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_young_park_suppresses_every_gate_even_when_dual_is_satisfied(
+    tmp_path: Path,
+) -> None:
+    rig = _rig(tmp_path)
+    await _parked_behind_holder(rig)
+    for _ in range(4):
+        assert await rig.tick() is None
+    rig.advance(FLOOR)
+    rig.scheduler.lock_table.install_parks('P', ['park/m1.py', 'park/m2.py'], 'medium')
+    rig.advance(PARK_FLOOR - 60)
+
+    await rig.tick()
+
+    assert rig.detected() == []
+    rig.warn.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
