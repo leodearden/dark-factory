@@ -1,9 +1,10 @@
 """Fakes and factories shared by the offline lane's episode tests.
 
 The injected clock, the fake task client and ancestry read the engine runs over, the
-observer of the episode file's writes, and the builders of run records, observations,
-episodes and command records.  Imported by bare module name
-(``from _lane_episode_fakes import ...``) by ``test_offline_lane_episode_state.py``
+observer of the episode file's writes, the builders of run records, observations,
+episodes and command records, and :class:`Lane`, the engine harness that writes real
+run records and observes them through a real ``LaneEngine``.  Imported by bare module
+name (``from _lane_episode_fakes import ...``) by ``test_offline_lane_episode_state.py``
 and ``test_offline_lane_episodes.py``.
 """
 
@@ -16,15 +17,17 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from escalation.queue import EscalationQueue
 from shared.task_submit import SubmitFailed, SubmitOutcome, SubmittedTask
 
-from orchestrator.config import LaneCommand
+from orchestrator.config import LaneCommand, OrchestratorConfig
 from orchestrator.guard_state import guard_path
 from orchestrator.offline_lane_confirm import (
     Confirmed,
     ConfirmMode,
     Outage,
     Unconfirmable,
+    UnconfirmableReason,
 )
 from orchestrator.offline_lane_episode_state import (
     EPISODES_FILE,
@@ -34,14 +37,18 @@ from orchestrator.offline_lane_episode_state import (
     Episode,
     EpisodeStore,
     LanePolicy,
+    PassEffect,
     PassObservation,
     PassReads,
     apply_pass,
 )
+from orchestrator.offline_lane_episodes import LaneEngine, TickResult
+from orchestrator.offline_lane_escalations import sentinel_task_id
 from orchestrator.offline_lane_filing import EvidenceNote
 from orchestrator.offline_lane_records import (
     FailureRecord,
     RunRecord,
+    RunRecordStore,
 )
 
 logger = logging.getLogger(__name__)
@@ -326,3 +333,118 @@ class FakeAncestry:
         if self.failure is not None:
             raise self.failure
         return self.answers.get((ancestor, descendant), True)
+
+
+class Lane:
+    """A lane command's passes, written as real run records and observed by a real engine."""
+
+    def __init__(self, tmp_path: Path, *, client: bool = True, queue: EscalationQueue | None | bool = True) -> None:
+        self.tmp_path = tmp_path
+        self.log: list[str] = []
+        self.clock = Clock()
+        self.client = FakeLedgerClient(self.log)
+        self.ancestry = FakeAncestry()
+        self.queue = EscalationQueue(tmp_path / 'queue') if queue is True else (queue or None)
+        self.records = RunRecordStore(tmp_path, clock=self.clock)
+        self._with_client = client
+        self.engine = self.restarted()
+
+    def restarted(self) -> LaneEngine:
+        self.engine = LaneEngine(
+            OrchestratorConfig(project_root=self.tmp_path),
+            self.ancestry,
+            task_client=self.client if self._with_client else None,
+            escalation_queue=self.queue,
+            now=self.clock,
+        )
+        return self.engine
+
+    async def _observe(
+        self,
+        head: str,
+        outcome: Confirmed | Unconfirmable | None,
+        detect: RunRecord,
+        confirm: RunRecord | None,
+        notes: tuple[EvidenceNote, ...] = (),
+        *,
+        command: str = COMMAND,
+        leg: str = 'generic',
+    ) -> PassEffect:
+        lane_pass = self.records.allocate_pass(command, leg, head)
+        detect = replace(detect, command=command, leg=leg)
+        self.records.write_run(lane_pass, detect)
+        if confirm is not None:
+            self.records.write_run(lane_pass, replace(confirm, command=command, leg=leg))
+        observation = PassObservation(
+            command=command,
+            leg=leg,
+            head=head,
+            pass_id=lane_pass.pass_id,
+            started_at=lane_pass.started_at,
+            detect=detect,
+            confirm=confirm,
+            outcome=outcome,
+            fix_task_priority='medium' if leg == 'generic' else 'high',
+            notes=notes,
+            lane_command=LANE_COMMAND if leg == 'generic' else None,
+        )
+        return await self.engine.observe(observation)
+
+    async def red(
+        self,
+        reproduced: tuple[str, ...] = (A,),
+        cleared: tuple[str, ...] = (),
+        inconclusive: tuple[str, ...] = (),
+        *,
+        head: str = HEAD1,
+        outcomes: dict[str, str] | None = None,
+        command: str = COMMAND,
+        leg: str = 'generic',
+    ) -> PassEffect:
+        at = self.clock()
+        detect = _run('detect', head, at, failing=(*reproduced, *cleared, *inconclusive), outcomes=outcomes)
+        confirm = _run('confirm', head, at, failing=reproduced)
+        outcome = Confirmed(ConfirmMode.NARROWED, reproduced, cleared, inconclusive)
+        return await self._observe(head, outcome, detect, confirm, command=command, leg=leg)
+
+    async def green(self, *, head: str = HEAD1) -> PassEffect:
+        return await self._observe(head, None, _run('detect', head, self.clock()), None)
+
+    async def unconfirmable(self, *, head: str = HEAD1, notes: tuple[EvidenceNote, ...] = ()) -> PassEffect:
+        at = self.clock()
+        outcome = Unconfirmable(UnconfirmableReason.CONFIRM_EXITED_NONZERO_NAMING_NO_TEST, '2')
+        detect = _run('detect', head, at, failing=(A,))
+        return await self._observe(head, outcome, detect, _run('confirm', head, at, returncode=2), notes)
+
+    async def spaced_red(self, *nodes: str, minutes: float = 30, **fields: Any) -> PassEffect:
+        self.clock.advance(minutes=minutes)
+        return await self.red(nodes or (A,), **fields)
+
+    def unobserved(
+        self, head: str, *, failing: tuple[str, ...] = (), outcomes: dict[str, str] | None = None,
+    ) -> None:
+        """A pass as a pre-cutover worker ran it: its run records are written and the engine is never told."""
+        lane_pass = self.records.allocate_pass(COMMAND, 'generic', head)
+        self.records.write_run(lane_pass, _run('detect', head, self.clock(), failing=failing, outcomes=outcomes))
+
+    async def tick(self, *, head: str = HEAD1) -> TickResult:
+        return await self.engine.tick(head=head)
+
+    def stored(self, command: str = COMMAND) -> CommandRecord:
+        return EpisodeStore(self.tmp_path, clock=self.clock).load(command)
+
+    def episode(self, node: str = A) -> Episode:
+        return self.stored().episodes[node]
+
+    def pending(self, category: str) -> list:
+        sentinel = sentinel_task_id(COMMAND)
+        return [e for e in self.queue.get_pending() if e.task_id == sentinel and e.category == category] if self.queue else []
+
+    def lane_metadata(self, index: int = -1) -> dict[str, Any]:
+        return self.client.submitted[index]['metadata']['x_offline_lane']
+
+    def watch_writes(self) -> StoreWrites:
+        writes = StoreWrites(self.tmp_path, self.clock, self.log)
+        self.clock.observers.append(writes.sample)
+        self.client.observers.append(writes.sample)
+        return writes
