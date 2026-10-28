@@ -464,6 +464,21 @@ class TestCrossProjectRefResolution:
             ('task', '3142', project),
         ], f'{text!r} -> {claims!r}'
 
+    @pytest.mark.parametrize(
+        ('text', 'project'),
+        [
+            pytest.param('df 3142 has landed', 'dark_factory', id='df-anchor'),
+            pytest.param('the fix was merged as DF#3142', 'dark_factory', id='df-hash-forward'),
+            pytest.param('task 3142 has landed', 'reify', id='task-anchor-is-not-a-project'),
+        ],
+    )
+    def test_task_ref_anchor_word_names_its_project(self, text, project):
+        claims = _extract(text, default_project_id='reify')
+
+        assert [(c.subject, c.ref, c.project_id) for c in claims] == [
+            ('task', '3142', project),
+        ], f'{text!r} -> {claims!r}'
+
     def test_word_folding_to_an_unregistered_id_is_not_a_qualifier(self):
         claims = _extract('dark-factory-side task 3142 has landed', default_project_id='reify')
 
