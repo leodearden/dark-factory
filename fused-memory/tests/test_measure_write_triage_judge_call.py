@@ -89,8 +89,10 @@ class TestWorstCaseSlate:
     def test_every_rendered_field_is_elided(self, width: int) -> None:
         entry, candidates = _mod().worst_case_slate(_TEXTS, width, 100)
         prompt = build_judge_prompt(entry, candidates, field_chars=100)
-        for field in [entry, *(c.content for c in candidates)]:
-            assert field[:100] + elision_marker(len(field) - 100) in prompt
+        fields = [entry, *(c.content for c in candidates)]
+        for field in fields:
+            cut = field[:100] + elision_marker(len(field) - 100)
+            assert prompt.count(cut) == fields.count(field)
 
     def test_no_text_to_build_from_is_refused(self) -> None:
         with pytest.raises(ValueError):

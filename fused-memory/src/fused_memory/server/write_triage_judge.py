@@ -342,7 +342,8 @@ _DEFAULT_JUDGE_FIELD_CHARS: int = WriteTriageConfig.model_fields['judge_field_ch
 #: cut, so the widest render grows by one char per field for each digit of
 #: that count. The measured worst case cuts every field by a six-digit count;
 #: each further digit adds 6 chars across the call, and the slack absorbs
-#: those up to a count no process could hold. The measured numbers are
+#: those up to a count no process could hold. That worst case is measured
+#: afresh on every run by
 #: fused-memory/tests/server/test_write_triage_judge.py::_worst_case_call_chars.
 JUDGE_PROMPT_CHAR_BUDGET = 27_100
 
