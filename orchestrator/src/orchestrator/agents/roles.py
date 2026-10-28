@@ -141,12 +141,11 @@ _READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
 _JCODEMUNCH_TOOLS = ['mcp__jcodemunch__*']
 
 # --- Escalation tools available to roles that can escalate ---
-_ESCALATION_TOOLS = [
-    'mcp__escalation__escalate_info',
-    'mcp__escalation__escalate_blocker',
-]
+ESCALATE_INFO_TOOL = 'mcp__escalation__escalate_info'
+ESCALATE_BLOCKER_TOOL = 'mcp__escalation__escalate_blocker'
+_ESCALATION_TOOLS = [ESCALATE_INFO_TOOL, ESCALATE_BLOCKER_TOOL]
 
-# Spliced into ESCALATION_LADDER_CORE so every escalating role, steward included, reads it.
+# Spliced into ESCALATION_LADDER_CORE so every blocker-holding role, steward included, reads it.
 RESERVED_BOUND_ROUTING_RULE = """
 **A bound reserved to a human makes the ruling blocking, even when the finding is not.**
 If your remedy must cross a bound whose own text reserves the change to a human
@@ -158,9 +157,12 @@ branch has already merged.
 """
 
 # The one statement of the escalate_info contract (plans/plan-deviation-recording-prd.md
-# D3; INV-5 no-lockstep-duplication). It is rendered once, into ESCALATION_LADDER_CORE;
-# every other site that mentions escalate_info points at "## Escalation" instead of
-# restating it. The reviewer/router disposition is plans/info-l0-disposition-router-prd.md.
+# D3; INV-5 no-lockstep-duplication). It is rendered once into each escalation section
+# (ESCALATION_LADDER_CORE and INFO_ONLY_ESCALATION_INSTRUCTIONS); every other site that
+# mentions escalate_info points at "## Escalation" instead of restating it. The decision
+# sentence lives in ESCALATE_BLOCKER_DECISION_ROUTE because it names a tool only
+# blocker-holding roles have (task 6010). The reviewer/router disposition is
+# plans/info-l0-disposition-router-prd.md.
 ESCALATE_INFO_CONTRACT = """
 ### What `escalate_info` files
 
@@ -171,13 +173,51 @@ ESCALATE_INFO_CONTRACT = """
 - Without it, it is an observation the reviewer dispositions in its verdict, or
   the router closes at workflow exit.
 
-A work item is `submit_task`. A decision you need before continuing is
-`escalate_blocker`.
+A work item is `submit_task`.
+"""
+
+ESCALATE_BLOCKER_DECISION_ROUTE = """A decision you need before continuing is `escalate_blocker`.
+"""
+
+_ESCALATION_SECTION_OPENING = """
+## Escalation
+
+If you encounter a problem you cannot solve at your scope, you can escalate:
+
+- **`escalate_info(...)`** — Report it and continue working. What it files is stated below.
+"""
+
+_ESCALATION_CATEGORIES = """
+Categories: scope_violation, design_concern, cleanup_needed, dependency_discovered,
+risk_identified, infra_issue.
+"""
+
+_OBSERVATIONS_VS_HYPOTHESES = """
+### Observations vs. hypotheses
+
+State OBSERVATIONS as fact; state causal diagnoses as clearly-marked hypotheses.
+The `summary`/`detail` and every structured `evidence` entry must record what you
+actually measured — a HEAD SHA, a rerun result, a raw exit code — never an
+unverified guess at the cause. Put any causal claim on a separate line prefixed
+`Hypothesis:` so a reviewer never reads a guess as fact. A single observation is
+never sufficient to recommend a destructive intervention (a ref move / rewind):
+re-run or re-measure first, and never name a "last-known-good" ref you have not
+re-verified is actually good right now (it may have failed too, or the tip may
+have moved since you measured).
+
+Beside any commit SHA you cite, also cite `task/<id>` and the commit's subject:
+rebasing a task branch onto main rewrites its SHAs, so the cited object may not
+be the one that landed.
+
+Each escalation tool you hold accepts an optional structured
+`evidence` list — each item a `{observation, measured_at, ref}` raw-observation
+entry (e.g. `{"observation": "main red, exit 134", "measured_at": "HEAD=abc123",
+"ref": "rerun#2"}`). Prefer it over prose when you have concrete measurements.
 """
 
 # Split (task 4169): the original single `_ESCALATION_INSTRUCTIONS` literal
 # ended with a paragraph telling every escalating role that `level=1` is "the
-# STEWARD's route, not yours" -- correct for the six non-steward escalating
+# STEWARD's route, not yours" -- correct for the non-steward blocker-holding
 # roles below, but wrong for STEWARD itself, whose own body mandates
 # `escalate_blocker(..., level=1)` re-escalation in four places (Rule 2
 # be-conservative, Rule 6 merge-halt categories, MAX_TURNS,
@@ -187,12 +227,14 @@ A work item is `submit_task`. A decision you need before continuing is
 #
 # ESCALATION_LADDER_CORE carries the mechanics (what escalate_info /
 # escalate_blocker do, severity policy, the level=0-vs-1 ladder) and goes to
-# EVERY escalating role, steward included -- it is what the steward's own
+# EVERY blocker-holding role, steward included -- it is what the steward's own
 # level=1 mandates depend on. NON_STEWARD_LEVEL_GATE carries the "level=1 is
-# not yours" framing and goes to every escalating role EXCEPT steward.
+# not yours" framing and goes to every blocker-holding role EXCEPT steward.
+# deep_reviewer, which holds escalate_info only, reads neither: it reads
+# INFO_ONLY_ESCALATION_INSTRUCTIONS (task 6010).
 #
 # `_ESCALATION_INSTRUCTIONS` (the pre-split name) is kept alive as their
-# concatenation rather than renamed: (1) it keeps the six non-steward splice
+# concatenation rather than renamed: (1) it keeps the non-steward splice
 # sites below byte-identical to before the split, and (2)
 # escalation/src/escalation/server.py cites `_ESCALATION_INSTRUCTIONS` BY
 # NAME in the docstring of its level-1 observability warning. Plain `+`
@@ -210,12 +252,7 @@ A work item is `submit_task`. A decision you need before continuing is
 # f-string, so the copy below must be updated with it, and
 # test_roles_escalation_ladder.py catches the drift after the fact rather than
 # preventing it structurally (task 5368).
-ESCALATION_LADDER_CORE = """
-## Escalation
-
-If you encounter a problem you cannot solve at your scope, you can escalate:
-
-- **`escalate_info(...)`** — Report it and continue working. What it files is stated below.
+ESCALATION_LADDER_CORE = _ESCALATION_SECTION_OPENING + """\
 - **`escalate_blocker(...)`** — Blocking problem. Report it, then read the `action` key
   of the response and do what it says.
   - `terminate_cleanly` (every normal branch) — commit any in-progress work, log your
@@ -232,37 +269,13 @@ If you encounter a problem you cannot solve at your scope, you can escalate:
     `critical`/`urgent` filing bypasses dedupe entirely — so on every other path each
     repeat mints a NEW record, and on that one a NEW page to the human. One retry
     buys a second chance at durability; a retry every iteration is a storm.
-""" + RESERVED_BOUND_ROUTING_RULE + """
-Categories: scope_violation, design_concern, cleanup_needed, dependency_discovered,
-risk_identified, infra_issue.
-
+""" + RESERVED_BOUND_ROUTING_RULE + _ESCALATION_CATEGORIES + """
 Use escalation when:
 - You need write access to files outside your module scope
 - A test failure's root cause is in code you can't modify
 - A design decision requires broader context than this task provides
 - The verify/debug loop won't converge due to an external dependency
-""" + ESCALATE_INFO_CONTRACT + """
-### Observations vs. hypotheses
-
-State OBSERVATIONS as fact; state causal diagnoses as clearly-marked hypotheses.
-The `summary`/`detail` and every structured `evidence` entry must record what you
-actually measured — a HEAD SHA, a rerun result, a raw exit code — never an
-unverified guess at the cause. Put any causal claim on a separate line prefixed
-`Hypothesis:` so a reviewer never reads a guess as fact. A single observation is
-never sufficient to recommend a destructive intervention (a ref move / rewind):
-re-run or re-measure first, and never name a "last-known-good" ref you have not
-re-verified is actually good right now (it may have failed too, or the tip may
-have moved since you measured).
-
-Beside any commit SHA you cite, also cite `task/<id>` and the commit's subject:
-rebasing a task branch onto main rewrites its SHAs, so the cited object may not
-be the one that landed.
-
-Both `escalate_info` and `escalate_blocker` accept an optional structured
-`evidence` list — each item a `{observation, measured_at, ref}` raw-observation
-entry (e.g. `{"observation": "main red, exit 134", "measured_at": "HEAD=abc123",
-"ref": "rerun#2"}`). Prefer it over prose when you have concrete measurements.
-
+""" + ESCALATE_INFO_CONTRACT + ESCALATE_BLOCKER_DECISION_ROUTE + _OBSERVATIONS_VS_HYPOTHESES + """
 ### Severity policy
 
 `escalate_blocker` defaults to severity `blocking` — the correct level for agent-filed
@@ -283,7 +296,7 @@ default) or `level=1` — anything else is rejected with an `{'error': ...}`
 response and nothing is filed.
 """
 
-# The "level=1 is not yours" framing. Correct for every escalating role
+# The "level=1 is not yours" framing. Correct for every blocker-holding role
 # EXCEPT steward -- see the comment above ESCALATION_LADDER_CORE. Splice
 # order is always core-then-gate; the two never appear reordered or split
 # across roles (test_roles_escalation_ladder.py::test_composite_is_core_plus_gate).
@@ -299,6 +312,13 @@ faster resolution, only an audit trail showing you bypassed your handler.
 """
 
 _ESCALATION_INSTRUCTIONS = ESCALATION_LADDER_CORE + NON_STEWARD_LEVEL_GATE
+
+# Each escalating role reads the section matching its filer grants: this one for a
+# role granted `escalate_info` only, the ladder above for one also granted
+# `escalate_blocker`. Enforced by orchestrator/tests/test_roles_escalation_ladder.py.
+INFO_ONLY_ESCALATION_INSTRUCTIONS = _ESCALATION_SECTION_OPENING + """
+You hold `escalate_info` only, so nothing you file blocks work or waits on a decision.
+""" + _ESCALATION_CATEGORIES + ESCALATE_INFO_CONTRACT + _OBSERVATIONS_VS_HYPOTHESES
 
 _MEMORY_TOOLS = [
     'mcp__fused-memory__add_memory',
@@ -2939,7 +2959,7 @@ For each finding, classify and act:
 | Classification | Criteria | Action |
 |---|---|---|
 | **create_task** | Unambiguous bug, missing wiring, unfilled stub, clear fix path | Call `submit_task` (single step) — see Creating tasks below |
-| **escalate** | Ambiguous, multiple valid approaches, architectural implications, design questions | Call `escalate_info` with category `design_concern` (architectural question) or `risk_identified` (potential issue) and a summary naming the options; its contract is under "## Escalation" |
+| **escalate** | Ambiguous, multiple valid approaches, architectural implications, design questions | Call `escalate_info` with category `design_concern` (architectural question) or `risk_identified` (potential issue) and a summary naming the options; its contract is under "## Escalation". The note gates nothing, reaches no steward, and may be closed without a human ever seeing it |
 | **dismiss** | Known gap in briefing, noise, style preference, intentionally incomplete | Skip |
 
 ### Creating tasks
@@ -2975,11 +2995,11 @@ or expired tickets as a follow-up escalation):
 3. **Be specific.** Every finding must have a file location and concrete description.
 4. **Don't flag cosmetics.** Formatting and layout preferences are noise. Naming and comments are NOT cosmetics: judge them under the code-quality heuristics below, which govern here.
 5. **Focus on the boundary.** The highest-value findings are at module boundaries where per-task reviews can't see.
-""" + CODE_QUALITY_GUIDANCE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + CODE_QUALITY_GUIDANCE + INFO_ONLY_ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Bash',
         *_DEEP_REVIEW_TOOLS,
-        'mcp__escalation__escalate_info',
+        ESCALATE_INFO_TOOL,
         *_JCODEMUNCH_TOOLS,
     ],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
