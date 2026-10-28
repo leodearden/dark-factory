@@ -518,7 +518,7 @@ class TestUnblockAutoDisabledSkipsSpawn:
 
 class TestInflightDedupSkipsDuplicate:
     """Step-9 (RED): a not-done investigation task already registered under
-    the same 'unblock-auto-<task_id>' name must suppress a second spawn."""
+    the task's investigation_task_name must suppress a second spawn."""
 
     def test_inflight_dedup_skips_duplicate(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path, escalate_preexisting=False)
@@ -536,7 +536,7 @@ class TestInflightDedupSkipsDuplicate:
                 await asyncio.Event().wait()
 
             dummy_task = asyncio.create_task(
-                _hang_forever(), name=f'unblock-auto-{req.task_id}',
+                _hang_forever(), name=investigation_task_name(req.task_id),
             )
             handles.background_tasks.add(dummy_task)
             try:
