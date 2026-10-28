@@ -52,21 +52,24 @@ def _mock_service(**config_overrides) -> AsyncMock:
     return mock_service
 
 
-def _server(
-    mock_service,
-    root: Path,
-    *,
-    statuses: dict | None = None,
-    known_projects: dict[str, str] | None = None,
-    get_statuses: AsyncMock | None = None,
+def _server(mock_service, root: Path, *, statuses: dict | None = None):
+    return _multi_project_server(
+        mock_service,
+        known_projects={_PROJECT_ID: str(root)},
+        get_statuses=AsyncMock(return_value=statuses or {}),
+    )
+
+
+def _multi_project_server(
+    mock_service, *, known_projects: dict[str, str], get_statuses: AsyncMock,
 ):
     task_interceptor = MagicMock()
-    task_interceptor.get_statuses = get_statuses or AsyncMock(return_value=statuses or {})
+    task_interceptor.get_statuses = get_statuses
     task_interceptor.get_ticket_row = AsyncMock(return_value=None)
     server = create_mcp_server(
         mock_service,
         task_interceptor=task_interceptor,
-        known_projects=known_projects or {_PROJECT_ID: str(root)},
+        known_projects=known_projects,
     )
     return server, task_interceptor
 
@@ -393,9 +396,8 @@ class TestForeignQualifiedRefIsAdjudicatedInItsOwnProject:
 
         get_statuses = AsyncMock(side_effect=statuses_by_root)
         mock_service = _mock_service()
-        server, _ = _server(
+        server, _ = _multi_project_server(
             mock_service,
-            df_root,
             known_projects={'dark_factory': str(df_root), 'solar_challenge': str(solar_root)},
             get_statuses=get_statuses,
         )
