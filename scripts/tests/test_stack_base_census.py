@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+import stack_base_census as census
 from committed_git_repo import committed_repo
 
 # ---------------------------------------------------------------------------
@@ -68,3 +69,99 @@ def rebase(wt: Path, *args: str) -> None:
 
 def rev(repo: Path, ref: str) -> str:
     return git(repo, 'rev-parse', '--verify', f'{ref}^{{commit}}')
+
+
+def advance_main(repo: Path, files: Mapping[str, str]) -> str:
+    """Commit *files* on main in the root checkout; return main's new tip."""
+    return commit(repo, files, 'main: advance')
+
+
+async def census_of(repo: Path, statuses: Mapping[int, str] | None = None):
+    return await census.run_census(repo, main_branch='main', statuses=statuses or {})
+
+
+def findings_of(report) -> dict[str, census.BranchFinding]:
+    return {finding.branch: finding for finding in report.findings}
+
+
+def stacked_on_p(repo: Path, member: str = 'M') -> tuple[Path, Path]:
+    """task/P and task/<member> branch from main; <member> is rebased onto P."""
+    p_wt = add_member(repo, 'P', 'main', {'p.txt': 'p\n'})
+    m_wt = add_member(repo, member, 'main', {f'{member.lower()}.txt': 'm\n'})
+    rebase(m_wt, 'task/P')
+    return p_wt, m_wt
+
+
+# ---------------------------------------------------------------------------
+# step-1: the core census
+# ---------------------------------------------------------------------------
+
+
+async def test_a_member_rebased_onto_an_unlanded_sibling_is_confirmed(repo: Path) -> None:
+    stacked_on_p(repo)
+    p_tip = rev(repo, 'task/P')
+
+    report = await census_of(repo)
+
+    finding = findings_of(report)['task/M']
+    assert finding.verdict is census.Verdict.CONFIRMED
+    assert finding.base == p_tip
+    assert finding.contained_siblings == ('task/P',)
+    assert 'task/P' in finding.base_owners
+    assert finding.cut == p_tip
+    assert report.main_sha == rev(repo, 'main')
+    assert report.unlanded_branches == 2
+
+
+async def test_a_member_created_on_a_siblings_tip_is_confirmed(repo: Path) -> None:
+    add_member(repo, 'P', 'main', {'p.txt': 'p\n'})
+    p_tip = rev(repo, 'task/P')
+    add_member(repo, 'C', p_tip, {'c.txt': 'c\n'})
+    assert git(repo, 'reflog', 'show', '--format=%gs', 'refs/heads/task/C').splitlines()[-1] == (
+        f'branch: Created from {p_tip}'
+    )
+
+    report = await census_of(repo)
+
+    finding = findings_of(report)['task/C']
+    assert finding.verdict is census.Verdict.CONFIRMED
+    assert finding.base == p_tip
+    assert finding.contained_siblings == ('task/P',)
+    assert report.unlanded_branches == 2
+
+
+async def test_a_member_only_ever_rebased_onto_main_has_no_finding(repo: Path) -> None:
+    add_member(repo, 'P', 'main', {'p.txt': 'p\n'})
+    m_wt = add_member(repo, 'M', 'main', {'m.txt': 'm\n'})
+    advance_main(repo, {'unrelated.txt': 'u\n'})
+    rebase(m_wt, 'main')
+
+    report = await census_of(repo)
+
+    assert 'task/M' not in findings_of(report)
+    assert report.findings == ()
+    assert report.unlanded_branches == 2
+
+
+async def test_a_member_whose_base_later_landed_has_no_finding(repo: Path) -> None:
+    stacked_on_p(repo)
+    git(repo, 'merge', '--ff-only', 'task/P')
+
+    report = await census_of(repo)
+
+    assert 'task/M' not in findings_of(report)
+    assert report.findings == ()
+    assert report.unlanded_branches == 1
+
+
+async def test_landed_branches_are_not_scanned(repo: Path) -> None:
+    add_member(repo, 'L', 'main', {'l.txt': 'l\n'})
+    git(repo, 'merge', '--ff-only', 'task/L')
+    add_member(repo, 'U', 'main', {'u.txt': 'u\n'})
+
+    report = await census_of(repo)
+
+    assert 'task/L' not in findings_of(report)
+    assert report.findings == ()
+    assert report.unlanded_branches == 1
+    assert report.main_sha == rev(repo, 'main')
