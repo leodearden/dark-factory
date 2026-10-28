@@ -43,10 +43,6 @@ from fused_memory.server.tools import (  # noqa: E402
 from fused_memory.server.wal_status import (  # noqa: E402
     CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
 )
-from fused_memory.services.mem0_write_retry import (  # noqa: E402
-    DEFAULT_MEM0_RETRY_POLICY,
-    run_periodic_mem0_retry,
-)
 from fused_memory.services.memory_service import MemoryService  # noqa: E402
 
 if TYPE_CHECKING:
@@ -577,6 +573,10 @@ async def run_server():
     await memory_service.initialize()
 
     # Initialize write journal
+    from fused_memory.services.mem0_write_retry import (
+        DEFAULT_MEM0_RETRY_POLICY,
+        run_periodic_mem0_retry,
+    )
     from fused_memory.services.write_journal import WriteJournal
     from fused_memory.services.write_ops_retention import (
         prune_write_ops_pass,
