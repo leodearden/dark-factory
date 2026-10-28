@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
-from shared.testing_mcp_stub import StubMcpServer
+from shared.testing_mcp_stub import StubAnswer, StubMcpServer
 
 from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
 
@@ -121,7 +121,9 @@ async def test_update_task_that_raises_is_an_error_not_a_clean(capsys):
     counts, _ = await _clean_2682(RuntimeError('update_task failed: boom'))
 
     assert counts == (1, 0, 1)
-    assert 'dropped' not in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert 'dropped' not in captured.out
+    assert 'boom' in captured.err
 
 
 _TASK_NOT_FOUND_REPLY = {
@@ -147,12 +149,26 @@ async def test_refused_get_task_is_an_error_not_a_noop(capsys, get_task_reply):
     assert get_task_reply['error_type'] in capsys.readouterr().err
 
 
+def _args_for(stub: StubMcpServer) -> argparse.Namespace:
+    return argparse.Namespace(
+        server_url=stub.url, project_roots=[_PROJECT_ROOT], task_ids='9999', dry_run=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_main_async_exits_nonzero_on_a_refused_reply():
     with StubMcpServer(stateful=False, payload=_TASK_NOT_FOUND_REPLY) as stub:
-        args = argparse.Namespace(
-            server_url=stub.url, project_roots=[_PROJECT_ROOT], task_ids='9999', dry_run=False,
-        )
-        exit_code = await _mod.main_async(args)
+        exit_code = await _mod.main_async(_args_for(stub))
 
     assert exit_code == 1
+
+
+@pytest.mark.asyncio
+async def test_main_async_exits_nonzero_on_an_is_error_tool_result(capsys):
+    with StubMcpServer(stateful=False, answer=StubAnswer.IS_ERROR) as stub:
+        exit_code = await _mod.main_async(_args_for(stub))
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert 'no-op' not in captured.out
+    assert 'scripted stub failure' in captured.err

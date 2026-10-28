@@ -129,6 +129,8 @@ class FusedMemoryClient:
             raise RuntimeError(f'{name} failed: {result["error"]}')
         # MCP tools/call returns content list; structuredContent is the parsed dict
         content = result.get('result', {})
+        if content.get('isError'):
+            raise RuntimeError(f'{name} failed: {content.get("content")}')
         if 'structuredContent' in content:
             return content['structuredContent']
         # Fall back to first text content
