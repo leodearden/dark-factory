@@ -281,17 +281,20 @@ class Question:
         return cls(text=data['text'], asked_at=data['asked_at'])
 
 
+def _is_json_integer(value: Any) -> bool:
+    """A JSON integer; bool is excluded because Python's ``True`` would otherwise pass as int 1."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _coerce_owner_pid(value: Any) -> int | None:
     """Read ``claude_owner_pid`` from a record body, tolerating junk.
 
-    A bool is rejected before the int check (``bool`` IS an ``int`` in
-    Python, and ``True`` would silently become pid 1). Anything else that is
-    not a positive int -- absent, null, a string, a float, 0, a negative --
-    reads as None, i.e. "no owner pid bound". Never raises: this is on
-    ``from_dict``'s path, and a hand-edited or older record body must not be
-    what breaks a session hook.
+    Anything that is not a positive ``_is_json_integer`` -- absent, null, a
+    bool, a string, a float, 0, a negative -- reads as None, i.e. "no owner
+    pid bound". Never raises: this is on ``from_dict``'s path, and a
+    hand-edited or older record body must not be what breaks a session hook.
     """
-    if isinstance(value, bool) or not isinstance(value, int):
+    if not _is_json_integer(value):
         return None
     return value if value > 0 else None
 
@@ -3967,7 +3970,9 @@ class LeaseHolder:
         Its ONLY two roles are (i) the ownership comparison in
         ``_check_lease_ownership`` and (ii) naming the holder in a
         human-readable contention/refusal message.
-    pid: the holder process's pid; liveness is checked via _pid_alive.
+    pid: the holder process's pid; liveness is checked via _pid_alive. Any int (0 is
+        resolve_session_pid's degraded provably-dead value); a non-int, bool included, is
+        rejected at construction, so such a body reads as unreadable to every lease reader.
     start_ts: ISO-8601 timestamp of when this holder claimed the lease.
     record_slug: the holder's session-registry record key, resolved at claim
         time from *pid*'s pointer (``resolve_session_slug_for_pid``). '' when
@@ -3979,6 +3984,10 @@ class LeaseHolder:
     pid: int
     start_ts: str
     record_slug: str = ''
+
+    def __post_init__(self) -> None:
+        if not _is_json_integer(self.pid):
+            raise TypeError(f'LeaseHolder.pid must be an int (not a bool), got {self.pid!r}')
 
     def to_dict(self) -> dict[str, Any]:
         return {
