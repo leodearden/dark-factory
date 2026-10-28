@@ -58,6 +58,7 @@ try:
         owner_from_record,
         owner_record,
     )
+    from shared.mcp_post import mcp_server_base
     from shared.mcp_session import SyncMcpSession
     from shared.project_layout import default_project_root
     from shared.safe_io import atomic_write_text
@@ -1136,11 +1137,6 @@ def _call_tool(base_url: str, tool: str, arguments: dict[str, object], *, timeou
         return session.call_tool(tool, arguments)
 
 
-def _server_base(endpoint_url: str) -> str:
-    """The server base of an MCP endpoint URL, the form the dashboard config and --escalation-url speak."""
-    return endpoint_url.rstrip('/').removesuffix('/mcp')
-
-
 def build_ports(project_root: Path, *, fused_memory_url: str | None, escalation_mcp_url: str | None) -> Ports:
     """Both MCP servers over the real transport; a URL left None takes its default."""
     fused_memory = fused_memory_url or os.environ.get(FUSED_MEMORY_URL_ENV, DEFAULT_FUSED_MEMORY_URLS[0])
@@ -1150,7 +1146,7 @@ def build_ports(project_root: Path, *, fused_memory_url: str | None, escalation_
         fused_memory=functools.partial(_call_tool, fused_memory, timeout=SUBMIT_RESOLVE_WAIT_SECS + 15),
         escalation=functools.partial(
             _call_tool,
-            _server_base(escalation_mcp_url or escalation_url(project_root)),
+            mcp_server_base(escalation_mcp_url or escalation_url(project_root)),
             timeout=ESCALATION_TIMEOUT_SECS,
         ),
     )
