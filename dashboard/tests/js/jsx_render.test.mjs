@@ -8,6 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { caughtFrom } from './_caught.mjs';
 import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
@@ -415,15 +416,6 @@ function openContainingWindow(t) {
   const harness = buildDashboardWindow();
   t.after(() => harness.close());
   return harness;
-}
-
-function caughtFrom(fn) {
-  try {
-    fn();
-  } catch (thrown) {
-    return thrown;
-  }
-  throw new Error('expected the call to throw');
 }
 
 const UNIT_NOTICE_TESTID = 'unit-render-failure-banner';

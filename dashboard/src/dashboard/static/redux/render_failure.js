@@ -4,18 +4,14 @@
 // thrown. shell.jsx's RenderFailureBoundary only renders it.
 //
 // IT MUST NEVER THROW, whatever was thrown. It runs while React recovers from
-// the tab's throw, and a second throw there escapes the boundary and unmounts
-// the whole page.
+// the throw, and a second throw there escapes its boundary and unmounts the
+// whole page.
 
 const UNDESCRIBABLE_THROW = 'an undescribable value was thrown';
 const LISTED_KEY_LIMIT = 10;
 
-function nameOfFailedTab(tabLabel) {
-  return typeof tabLabel === 'string' && tabLabel !== '' ? tabLabel : 'current';
-}
-
-function nameOfFailedRegion(regionLabel) {
-  return typeof regionLabel === 'string' && regionLabel !== '' ? regionLabel : 'page chrome';
+function nameOfFailedPart(label, fallback) {
+  return typeof label === 'string' && label !== '' ? label : fallback;
 }
 
 function describeError(error) {
@@ -50,7 +46,7 @@ function describeThrownValue(thrown) {
 function tabRenderFailureNotice(tabLabel, thrown) {
   return Object.freeze({
     text:
-      'The ' + nameOfFailedTab(tabLabel) + ' tab failed to render. ' +
+      'The ' + nameOfFailedPart(tabLabel, 'current') + ' tab failed to render. ' +
       'The rest of the dashboard is still live; switch tabs to retry this one.',
     detail: describeThrownValue(thrown),
   });
@@ -59,7 +55,7 @@ function tabRenderFailureNotice(tabLabel, thrown) {
 function chromeRenderFailureNotice(regionLabel, thrown) {
   return Object.freeze({
     text:
-      'The ' + nameOfFailedRegion(regionLabel) + ' failed to render. ' +
+      'The ' + nameOfFailedPart(regionLabel, 'page chrome') + ' failed to render. ' +
       'The open tab is still live; reload the page to retry.',
     detail: describeThrownValue(thrown),
   });

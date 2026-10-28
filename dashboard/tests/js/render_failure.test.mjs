@@ -20,6 +20,8 @@ import { createRequire } from 'node:module';
 // load — its window assignment is typeof-guarded.
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 
+import { caughtFrom } from './_caught.mjs';
+
 const SPECIFIER = '../../src/dashboard/static/redux/render_failure.js';
 const DATUM_SPECIFIER = '../../src/dashboard/static/redux/datum.js';
 
@@ -43,15 +45,6 @@ function loadDatumJs() {
 
 const { api: failureApi, window: loadedWindow } = loadRenderFailure();
 const { tabRenderFailureNotice, chromeRenderFailureNotice, pageRenderFailureNotice } = failureApi;
-
-function caughtFrom(fn) {
-  try {
-    fn();
-  } catch (thrown) {
-    return thrown;
-  }
-  throw new Error('expected the call to throw');
-}
 
 function assertNoticeShape(notice) {
   assert.equal(typeof notice.text, 'string');
