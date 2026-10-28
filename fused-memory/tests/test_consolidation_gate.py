@@ -300,7 +300,8 @@ class TestClosureSupersedes:
         must not manufacture a false absorbed_member_still_live, nor hide a
         real one: is_full_uuid tolerates case because casing is a rendering
         choice, not a different identifier."""
-        absorbed = _uuid(4)
+        absorbed = _HEX_LETTERED_UUID
+        assert absorbed.upper() != absorbed
         members = [
             _member(_uuid(1), canonical=True, supersedes=[absorbed.upper()]),
             _member(absorbed),
