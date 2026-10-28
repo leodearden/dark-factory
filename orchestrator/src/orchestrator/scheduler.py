@@ -65,7 +65,7 @@ from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.hold_history import HoldHistory
 from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call, tool_error_text
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
-from orchestrator.overrides import OverrideRow, OverrideStore
+from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.pending_age import AnchorReading, read_pending_age
 from orchestrator.pin_reservation import (
@@ -101,7 +101,9 @@ from orchestrator.starvation_watchdog import (
     Finding,
     LockRefusals,
     ParkBlock,
+    PinOutcome,
     StarvationDisposition,
+    cap_escalation,
     classify,
     escalation_text,
 )
@@ -4644,8 +4646,91 @@ class Scheduler:
             if gate is not None:
                 blockers = tuple(self.lock_table.blockers(tid, self._get_modules(task)))
                 findings.append(Finding(facts, gate, blockers))
-        for finding in findings:
-            await self._deliver_starvation_finding(finding)
+        await self._deliver_starvation_findings(ctx, findings, now)
+
+    async def _deliver_starvation_findings(
+        self, ctx: TickContext, findings: list[Finding], now: datetime,
+    ) -> None:
+        """Deliver this pass's findings oldest first, auto-pinning within the cap.
+
+        A pin-gate finding the cap turns away files no escalation of its own:
+        one sentinel L1 names the whole capped cohort.  A failure on one
+        finding is logged and leaves it un-escalated, to retry next tick
+        (PROPERTY 1).
+        """
+        cfg = self.config.starvation_watchdog
+        free_slots = cfg.auto_pin_max_concurrent - sum(
+            1 for row in ctx.overrides.values()
+            if row.pinned and row.source is OverrideSource.STARVATION_WATCHDOG
+        )
+        capped: list[Finding] = []
+        for finding in sorted(findings, key=lambda f: f.facts.eligible_age_secs, reverse=True):
+            tid = finding.facts.task_id
+            row = ctx.overrides.get(tid)
+            try:
+                store = self._override_store
+                if finding.gate.pins and store is not None:
+                    outcome = self._starvation_pin(store, tid, row, now, slot_free=free_slots > 0)
+                else:
+                    disposition = None if finding.gate.pins else StarvationDisposition.ESCALATED_L1
+                    outcome = PinOutcome.of_row(disposition, row)
+                if row is None and outcome.auto_pinned:
+                    free_slots -= 1
+                capped_now = outcome.disposition is StarvationDisposition.CAP_REACHED
+                await self._deliver_starvation_finding(finding, outcome, escalate=not capped_now)
+                if capped_now:
+                    capped.append(finding)
+            except Exception:
+                logger.warning(
+                    'Starvation watchdog delivery for %s raised; retrying next tick',
+                    tid, exc_info=True,
+                )
+        if capped:
+            file_sentinel_l1(self.escalation_queue, cap_escalation(capped, cfg))
+
+    def _starvation_pin(
+        self,
+        store: OverrideStore,
+        task_id: str,
+        row: OverrideRow | None,
+        now: datetime,
+        *,
+        slot_free: bool,
+    ) -> PinOutcome:
+        """Pin a pin-gate finding's task unless it has a row or the cap is full.
+
+        An existing row is never written: an operator's row wins, and a row the
+        watchdog already owns is reported as it stands.
+        """
+        if row is not None:
+            owned = row.source is OverrideSource.STARVATION_WATCHDOG
+            return PinOutcome.of_row(
+                StarvationDisposition.AUTO_PINNED if owned
+                else StarvationDisposition.OPERATOR_OVERRIDE,
+                row,
+            )
+        if not slot_free:
+            return PinOutcome(StarvationDisposition.CAP_REACHED)
+        ttl_until = now + timedelta(seconds=self.config.starvation_watchdog.auto_pin_ttl_secs)
+        pin_order = store.create_watchdog_pin(self._project_root, task_id, ttl_until=ttl_until)
+        if pin_order is None:
+            return PinOutcome(StarvationDisposition.OPERATOR_OVERRIDE)
+        return PinOutcome(
+            StarvationDisposition.AUTO_PINNED,
+            pin_order=pin_order,
+            source=OverrideSource.STARVATION_WATCHDOG,
+        )
+
+    def _release_watchdog_pin(self, task_id: str) -> None:
+        """Delete *task_id*'s watchdog-owned pin, if any; never an operator row, never raises."""
+        if self._override_store is None:
+            return
+        try:
+            self._override_store.release_watchdog_pin(self._project_root, task_id)
+        except Exception:
+            logger.warning(
+                'Starvation watchdog: releasing the pin of %s raised', task_id, exc_info=True,
+            )
 
     def _park_blocked(
         self, task_id: str, parks: Mapping[str, Mapping[str, Any]], now: datetime,
@@ -4671,8 +4756,10 @@ class Scheduler:
             blocking_holder=held[module][0], blocking_module=module, park_age_secs=park_age,
         )
 
-    async def _deliver_starvation_finding(self, finding: Finding) -> None:
-        """Emit ``starvation_detected`` and file the escalation trail for one finding."""
+    async def _deliver_starvation_finding(
+        self, finding: Finding, outcome: PinOutcome, *, escalate: bool,
+    ) -> None:
+        """Emit ``starvation_detected`` and, when *escalate*, file the task's escalation trail."""
         facts, gate = finding.facts, finding.gate
         data: dict[str, Any] = {
             'gate': gate.value,
@@ -4680,18 +4767,15 @@ class Scheduler:
             'skip_count': facts.skip_count,
             'lock_refusals': facts.lock_refusals,
             'blockers': [b.as_payload() for b in finding.blockers],
+            **outcome.as_payload(),
         }
         if facts.park_block is not None:
-            data.update(
-                asdict(facts.park_block),
-                auto_pinned=False,
-                disposition=StarvationDisposition.ESCALATED_L1.value,
-            )
+            data.update(asdict(facts.park_block))
         if self.event_store:
             self.event_store.emit(
                 EventType.starvation_detected, task_id=facts.task_id, data=data,
             )
-        if self._callbacks.on_starvation_warn is not None:
+        if escalate and self._callbacks.on_starvation_warn is not None:
             summary, detail = escalation_text(
                 facts, gate, self.config.starvation_watchdog, finding.blockers,
             )
@@ -4718,11 +4802,14 @@ class Scheduler:
 
         Resolves its open watchdog escalation, if any, and forgets its
         eligibility anchor and lock refusals: a later return to ``pending``
-        starts a fresh eligibility age.  Called at BOTH dispatch sites, each
+        starts a fresh eligibility age.  Releases its watchdog pin whether or
+        not this process escalated it, so a pin a previous process left is
+        released too.  Called at BOTH dispatch sites, each
         of which wraps it so a failure can NEVER abort a dispatch (PROPERTY 1).
         """
         self._eligibility.forget([task_id])
         self._lock_refusals.forget(task_id)
+        self._release_watchdog_pin(task_id)
         in_escalated = self._streak_starvation.is_escalated(task_id)
         if in_escalated and self._callbacks.on_starvation_resolve is not None:
             await self._callbacks.on_starvation_resolve(task_id)
@@ -4735,8 +4822,10 @@ class Scheduler:
         Harness-installed ``_on_starvation_resolve`` callback (task 2124).
         A no-op when no callback is installed (bare-Scheduler unit tests).
         ``StreakRegistry.gc`` already wraps this call in try/except, so no
-        additional fail-safety is needed here.
+        additional fail-safety is needed here.  Also releases the task's
+        watchdog pin.
         """
+        self._release_watchdog_pin(tid)
         if self._callbacks.on_starvation_resolve is not None:
             await self._callbacks.on_starvation_resolve(tid)
 
@@ -7422,9 +7511,10 @@ class Scheduler:
                 )
                 for tid in cleared_overrides:
                     current_overrides.pop(tid, None)
-            # TTL sweep: clear any rows whose ttl_until has elapsed.
+            # TTL sweep: clear any rows whose ttl_until has elapsed, on the
+            # same wall clock that stamps a watchdog pin's TTL.
             expired_overrides = self._override_store.clear_expired(
-                self._project_root, datetime.now(UTC)
+                self._project_root, self._wall_now()
             )
             for tid in expired_overrides:
                 current_overrides.pop(tid, None)

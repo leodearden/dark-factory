@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from orchestrator.config import StarvationWatchdogConfig
+from orchestrator.overrides import OverrideRow, OverrideSource
 from orchestrator.pin_reservation import Blocker
 from orchestrator.sentinel_l1 import SentinelL1
 
@@ -81,6 +82,37 @@ class Finding:
     facts: CandidateFacts
     gate: StarvationGate
     blockers: tuple[Blocker, ...]
+
+
+@dataclass(frozen=True)
+class PinOutcome:
+    """The pin consequence of one finding, and the task's override row after it.
+
+    ``disposition`` is None only when no consequence was attempted (no
+    override store is wired).
+    """
+
+    disposition: StarvationDisposition | None
+    pin_order: int | None = None
+    source: OverrideSource | None = None
+
+    @classmethod
+    def of_row(cls, disposition: StarvationDisposition | None, row: OverrideRow | None) -> PinOutcome:
+        if row is None:
+            return cls(disposition)
+        return cls(disposition, pin_order=row.pin_order, source=row.source)
+
+    @property
+    def auto_pinned(self) -> bool:
+        return self.source is OverrideSource.STARVATION_WATCHDOG
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            'auto_pinned': self.auto_pinned,
+            'pin_order': self.pin_order,
+            'source': None if self.source is None else self.source.value,
+            'disposition': None if self.disposition is None else self.disposition.value,
+        }
 
 
 def classify(facts: CandidateFacts, cfg: StarvationWatchdogConfig) -> StarvationGate | None:
