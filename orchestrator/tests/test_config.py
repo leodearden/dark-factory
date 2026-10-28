@@ -2372,7 +2372,7 @@ class TestStarvationWatchdogConfig:
     def test_consequence_knobs_reject_out_of_range(self, field: str, bad: float):
         from orchestrator.config import StarvationWatchdogConfig
         with pytest.raises(ValidationError, match=field):
-            StarvationWatchdogConfig(**{field: bad})
+            StarvationWatchdogConfig.model_validate({field: bad})
 
     def test_auto_pin_cap_zero_is_allowed(self):
         """A cap of 0 turns auto-pinning off while keeping events and the cap L1."""

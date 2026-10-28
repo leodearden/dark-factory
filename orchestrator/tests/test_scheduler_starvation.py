@@ -145,7 +145,7 @@ def _rig(
             enabled=enabled, skip_threshold=skip_threshold,
             idle_secs=idle_secs, idle_only_secs=idle_only_secs, **watchdog,
         ),
-        **({'psi_admission': psi} if psi is not None else {}),
+        psi_admission=psi if psi is not None else PsiAdmissionConfig(),
     )
     # Fairness parks would turn a top-skipped task into a parked one; these
     # scenes exercise the count gates, so parks stay out of the way.
