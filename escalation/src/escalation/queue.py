@@ -2240,6 +2240,8 @@ class EscalationQueue:
         not added again.  *new_member_ids* is also deduplicated internally via
         ``dict.fromkeys`` so passing ``['a', 'a', 'b']`` adds 'a' exactly once.
         New ids are appended in the order they first appear in *new_member_ids*.
+        Each appended id is stamped in ``member_folded_at`` with the same write
+        time as ``updated_at``; an id already present keeps its stamp.
 
         ``members`` is modified, and — when *severity_floor* is given —
         ``severity`` is additionally promoted UPWARD via ``max_severity``.
@@ -2433,13 +2435,16 @@ class EscalationQueue:
             # write condition rather than getting a write of its own — a fold
             # that ONLY re-spells the cause must still be durable.
             if appended or severity_changed or amendment_recorded or variant_added:
+                now = datetime.now(UTC).isoformat()
                 esc.members.extend(appended)
+                for member_id in appended:
+                    esc.member_folded_at[member_id] = now
                 esc.severity = new_severity
                 # Bump the "changed since triaged" signal — a member append, a
                 # severity promotion or a new framing amendment is exactly the
                 # re-assess trigger the watcher's stamp-then-skip protocol keys
                 # off (updated_at > triaged_at).
-                esc.updated_at = datetime.now(UTC).isoformat()
+                esc.updated_at = now
                 self._rewrite(escalation_id, esc)
                 logger.info(
                     'add_members_to_l2: added %d new member(s) to %s '
