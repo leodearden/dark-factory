@@ -125,10 +125,12 @@ from orchestrator.offline_lane_filing import (
 )
 from orchestrator.offline_lane_ledger import (
     DebtDecision,
+    Recovery,
     debt_context,
     debt_decision,
     pass_suppressions,
     recent_occurrences,
+    recoveries,
 )
 from orchestrator.offline_lane_records import (
     RECORD_RETENTION,
@@ -494,11 +496,31 @@ class LaneEngine:
     ) -> tuple[tuple[OfferedDebt, ...], tuple[str, ...]]:
         """D6: what this pass tells the flake ledger, written before the episodes' new state and any filing.
 
-        Returns the debts offered and the tests left undecided by an unreadable covering status.
+        A red pass's call comes first, so its rows land before any recovery's item.  Returns
+        the debts offered and the tests left undecided by an unreadable covering status.
         """
-        if not isinstance(observation.outcome, Confirmed | Unconfirmable):
-            return (), ()
-        return await self._red_recorded(before, observation, covering)
+        offered: tuple[OfferedDebt, ...] = ()
+        undecided: tuple[str, ...] = ()
+        if isinstance(observation.outcome, Confirmed | Unconfirmable):
+            offered, undecided = await self._red_recorded(before, observation, covering)
+        found = recoveries(before, applied.effect.episodes_ended, observation)
+        return (*offered, *await self._recoveries_recorded(found, observation, covering)), undecided
+
+    async def _recoveries_recorded(
+        self, found: Sequence[Recovery], observation: PassObservation, covering: CoveringStatuses,
+    ) -> tuple[OfferedDebt, ...]:
+        """One recorder call per evidence head, in first-seen order, carrying the recoveries that owe debt there."""
+        by_head: dict[str, dict[str, DebtContext]] = {}
+        for recovery in found:
+            node, episode = recovery.node, recovery.episode
+            if debt_decision(node, observation.command, episode, covering) is DebtDecision.ELIGIBLE:
+                context = await self._debt_context(node, DebtTrigger.recovered, observation, episode, current=None)
+                by_head.setdefault(recovery.evidence_head, {})[node] = context
+        for head, eligible in by_head.items():
+            await self._record((), eligible, head=head, observation=observation)
+        return tuple(
+            OfferedDebt(node, DebtTrigger.recovered, head) for head, eligible in by_head.items() for node in eligible
+        )
 
     async def _red_recorded(
         self, before: CommandRecord, observation: PassObservation, covering: CoveringStatuses,
@@ -546,9 +568,9 @@ class LaneEngine:
             episode = before.episodes.get(node)
             match debt_decision(node, observation.command, episode, covering):
                 case DebtDecision.ELIGIBLE:
-                    earlier = await self._counted_records(observation.command, episode)
-                    occurrences = recent_occurrences(node, earlier, observation)
-                    eligible[node] = debt_context(node, DebtTrigger.cleared, observation, episode, occurrences)
+                    eligible[node] = await self._debt_context(
+                        node, DebtTrigger.cleared, observation, episode, current=observation,
+                    )
                 case DebtDecision.COVERED:
                     logger.info('offline-lane: %s: %s cleared under its open fix task; owes no flake debt',
                                 observation.command, node)
@@ -562,6 +584,20 @@ class LaneEngine:
                 case DebtDecision.NEVER:
                     pass
         return eligible, tuple(undecided)
+
+    async def _debt_context(
+        self,
+        node: str,
+        trigger: DebtTrigger,
+        observation: PassObservation,
+        episode: Episode | None,
+        *,
+        current: PassObservation | None,
+    ) -> DebtContext:
+        """*node*'s debt context: its occurrences in *episode*'s counted passes, then in *current* when given."""
+        earlier = await self._counted_records(observation.command, episode)
+        occurrences = recent_occurrences(node, earlier, current)
+        return debt_context(node, trigger, observation, episode, occurrences)
 
     async def _counted_records(self, command: str, episode: Episode | None) -> list[PassRecord]:
         """The run records of *episode*'s counted passes, oldest first, read off the loop; unreadable ones skipped."""
