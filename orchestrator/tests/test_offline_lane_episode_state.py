@@ -38,6 +38,7 @@ from _lane_episode_fakes import (
 )
 from shared.lane_probe import OUTAGE_EXIT_STATUS
 
+from orchestrator.flake_ledger import DebtTrigger
 from orchestrator.guard_state import PersistentMap
 from orchestrator.offline_lane_confirm import (
     Outage,
@@ -52,6 +53,8 @@ from orchestrator.offline_lane_episode_state import (
     Episode,
     EpisodeStore,
     LanePolicy,
+    OfferedDebt,
+    PassEffect,
     PassObservation,
     apply_outage,
     recheck_due,
@@ -220,6 +223,34 @@ def test_covering_statuses_name_the_done_and_closed_tasks_terminal():
 
 def test_unreadable_covering_statuses_name_no_task_terminal():
     assert CoveringStatuses({'5': 'done'}, 'task store unreachable').terminal_task_ids == frozenset()
+
+
+def _effect(**debts) -> PassEffect:
+    return PassEffect(
+        tests_counted=(), episodes_started=(), episodes_extended=(), episodes_ended=(), threshold_reached=(),
+        stale_heads=(), no_decision=(), tasks_filed=(), escalations_raised=(), **debts,
+    )
+
+
+def test_a_pass_effect_built_without_debts_offers_none():
+    payload = _effect().to_json()
+
+    assert (payload['debts_offered'], payload['debts_undecided']) == ([], [])
+
+
+def test_the_pass_effect_names_the_debts_it_offered_and_left_undecided():
+    effect = _effect(
+        debts_offered=(OfferedDebt(node=A, trigger=DebtTrigger.cleared, head=HEAD1), OfferedDebt(B, DebtTrigger.recovered, HEAD0)),
+        debts_undecided=(C,),
+    )
+
+    payload = json.loads(json.dumps(effect.to_json()))
+
+    assert payload['debts_offered'] == [
+        {'node': A, 'trigger': 'cleared', 'head': HEAD1},
+        {'node': B, 'trigger': 'recovered', 'head': HEAD0},
+    ]
+    assert payload['debts_undecided'] == [C]
 
 
 # --- D5: what one pass does to a held test's episode -------------------------------
