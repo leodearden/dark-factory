@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _eval_config_lookup import named_eval_config
+from _implementer_action_oracle import ACTION_MARKER, TODAYS_ACTION
 from _workflow_helpers import (
     AgentStub,
     FakeMcp,
@@ -46,12 +47,6 @@ pytestmark = pytest.mark.usefixtures('code_default_config')
 
 TASK_ID = 'df_nu'
 TASK_MAX_EXECUTE_ITERATIONS = 4
-TODAYS_ACTION = (
-    'Execute the next pending steps in TDD order. Commit after each step. '
-    'Call `mark_step_done(step_id, commit_sha)` to record progress. '
-    'Stop at a logical boundary.\n'
-)
-ACTION_MARKER = '# Action\n\n'
 ONE_STEP_ACTION = IMPLEMENTER_ACTIONS[ImplementerBriefVariant.ONE_STEP]
 WHOLE_PLAN_ACTION = IMPLEMENTER_ACTIONS[ImplementerBriefVariant.WHOLE_PLAN]
 

@@ -1,9 +1,8 @@
 """The implementer brief's Action paragraph follows config.implementer_brief_variant
 (task 5385, plans/live-shadow-eval-prd.md decision 14) and nothing else does.
 
-The whole-plan sentence is pinned as a LITERAL below: "byte-identical to today"
-needs an oracle independent of the code under change, so do not derive it from
-production code.
+The whole-plan sentence is pinned by the literal oracle in
+_implementer_action_oracle.py, independent of the code under change.
 """
 
 from __future__ import annotations
@@ -11,18 +10,12 @@ from __future__ import annotations
 import itertools
 
 import pytest
+from _implementer_action_oracle import ACTION_MARKER, TODAYS_ACTION
 
 from orchestrator.agents import briefing
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
-
-TODAYS_ACTION = (
-    'Execute the next pending steps in TDD order. Commit after each step. '
-    'Call `mark_step_done(step_id, commit_sha)` to record progress. '
-    'Stop at a logical boundary.\n'
-)
-ACTION_MARKER = '# Action\n\n'
 
 REBASE_NOTICE = {
     'old_base': '07abf574a61c',
