@@ -58,6 +58,7 @@ from orchestrator.config import (
 from orchestrator.delivered_check_owner import derive_check_owner
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.dependency_verdict import DepKind, DepState, deps_verdict, task_external_deps
+from orchestrator.eligibility_clock import EligibilityClock, EligibilityClockStore
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.guard_state import PersistentMap, guard_path
@@ -96,7 +97,11 @@ from orchestrator.recovery_emission import (
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.sentinel_l1 import file_sentinel_l1
 from orchestrator.starvation_watchdog import (
-    STARVATION_WATCHDOG_MARKER as _STARVATION_WATCHDOG_MARKER,
+    CandidateFacts,
+    Finding,
+    LockRefusals,
+    classify,
+    escalation_text,
 )
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.strict_event_reads import task_ids_with_event
@@ -2349,6 +2354,7 @@ class Scheduler:
         state_snapshot_path: Path | None = None,
         jitter_source: Callable[[float, float], float] | None = None,
         branch_work_reader: Callable[[], Mapping[str, BranchWork]] | None = None,
+        eligibility_clock_store: EligibilityClockStore | None = None,
     ):
         self.config = config
         # Constructor-injected Harness callback bundle (task 2235).  Omitting
@@ -2498,6 +2504,11 @@ class Scheduler:
         self._merge_phase_at: dict[str, float] = {}
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
+        # Starvation watchdog inputs (task 3821): the durable eligibility age
+        # and the count of scans that refused a task its locks while a
+        # lower-ranked candidate dispatched.
+        self._eligibility = EligibilityClock(eligibility_clock_store, self._project_root)
+        self._lock_refusals = LockRefusals()
         # The continuity probe's one git child (task 3820, PRD C3); git.* is
         # restart-only, so binding the branch names at construction is correct.
         self._branch_work_reader: Callable[[], Mapping[str, BranchWork]] = branch_work_reader or partial(
@@ -2803,13 +2814,10 @@ class Scheduler:
         # _external_hold_streak / _external_hold_cause.
         # ALIASED to _streak_resolver_degraded.counts (task 2124).
         self._external_resolver_degraded_counts = self._streak_resolver_degraded.counts
-        # --- Starvation watchdog state (task 1880) ---
-        # Wall-clock timestamp (from _time_source) of the first tick a task appeared
-        # as a dispatch-eligible candidate.  Cleared when the task leaves the
-        # candidate pool for any tick (continuity reset) so idle measures uninterrupted
-        # dispatch-eligibility.  GC'd in the per-tick stale-id sweep.
-        # ALIASED to _streak_starvation.first_seen (task 2124).
-        self._starvation_first_seen = self._streak_starvation.first_seen
+        # --- Starvation watchdog state (tasks 1880, 3821) ---
+        # The eligibility age lives in self._eligibility (durable, wall clock)
+        # and the rank-relative lock refusals in self._lock_refusals; the
+        # streak counter holds only the escalated set.
         # Tasks for which a STARVATION_WATCHDOG INFO escalation is currently open.
         # Prevents re-filing per tick (belt-and-suspenders with the harness-side
         # get_by_task dedup).  Cleared when the task dispatches or is GC'd.
@@ -4598,162 +4606,90 @@ class Scheduler:
                 task_id, dep_id, check_name,
             )
 
-    async def _apply_starvation_watchdog(self, candidates: list[dict]) -> None:
-        """Per-tick starvation watchdog over the dispatch-eligible candidate list.
+    async def _apply_starvation_watchdog(self, ctx: TickContext) -> None:
+        """Per-tick starvation watchdog over the dispatch-eligible candidates.
 
-        Called ONCE per ``acquire_next`` tick right after the candidate list is
-        built and BEFORE ``if not candidates: return None``.  Any exception is
-        caught by the caller's try/except so a watchdog failure can NEVER abort
-        the tick or gate dispatch (PROPERTY 1 — mirrors the
-        ``_apply_external_dep_policy`` wrapper at the call site).
-
-        FULL IMPL (task 1880 step-6): skip-gate + idle-secs gate + enabled check.
-
-        Short-circuits immediately when ``starvation_watchdog.enabled`` is False.
-
-        For each candidate task:
-        1. Continuity reset — drop ``_starvation_first_seen`` for tasks whose tid
-           is no longer in the candidate id set (so idle measures CONTINUOUS
-           dispatch-eligibility; gaps reset the anchor).
-        2. Stamp ``_starvation_first_seen[tid]`` on the first tick the task
-           appears as a candidate.
-        3. Fire ``_on_starvation_warn`` when NOT already escalated, a callback
-           is installed, and EITHER gate is crossed (OR, not AND):
-           - dual gate — ``_skip_count[tid] >= skip_threshold`` AND
-             ``(now - first_seen) >= idle_secs`` (the original lock-contention
-             path, requires the task to have been the top-scored candidate); OR
-           - idle-only backstop — ``(now - first_seen) >= idle_only_secs``
-             regardless of skip_count (the never-top-scored path, reify-5166 /
-             task 2755: a task that can never outscore a higher-tier candidate
-             accrues zero skips and can never cross the dual gate).
+        Stamps every candidate's durable eligibility anchor, then classifies
+        each not-yet-escalated candidate with the predicate in
+        ``starvation_watchdog.py`` and delivers every finding.  Called once per
+        tick by ``_phase_starvation``, whose try/except keeps a watchdog
+        failure from ever aborting the tick (PROPERTY 1).
         """
+        now = self._wall_now()
+        candidates = {str(t.get('id', '')): t for t in ctx.candidates}
+        candidates.pop('', None)
+        self._eligibility.observe(candidates, now)
         cfg = self.config.starvation_watchdog
-
-        # Short-circuit: watchdog is administratively disabled.
         if not cfg.enabled:
             return
-
-        now = self._time_source()
-        candidate_ids: set[str] = set()
-
-        # Collect current candidate ids for continuity-reset step below.
-        for task in candidates:
-            tid = str(task.get('id', ''))
-            if tid:
-                candidate_ids.add(tid)
-
-        # Continuity reset: drop first_seen anchors for tasks that are no longer
-        # candidates this tick.  Gaps in candidacy mean the task was gated (deps
-        # became unsatisfied, cooldown re-armed, etc.) — the idle clock resets.
-        stale_anchors = [
-            tid for tid in list(self._starvation_first_seen)
-            if tid not in candidate_ids
-        ]
-        for tid in stale_anchors:
-            del self._starvation_first_seen[tid]
-
-        for task in candidates:
-            tid = str(task.get('id', ''))
-            if not tid:
+        findings: list[Finding] = []
+        for tid, task in candidates.items():
+            if self._streak_starvation.is_escalated(tid):
                 continue
+            facts = CandidateFacts(
+                task_id=tid,
+                eligible_age_secs=self._eligibility.age_secs(tid, now),
+                skip_count=self._skip_count.get(tid, 0),
+                lock_refusals=self._lock_refusals.count(tid),
+                park_block=None,
+            )
+            gate = classify(facts, cfg)
+            if gate is not None:
+                blockers = tuple(self.lock_table.blockers(tid, self._get_modules(task)))
+                findings.append(Finding(facts, gate, blockers))
+        for finding in findings:
+            await self._deliver_starvation_finding(finding)
 
-            # Stamp first_seen anchor on the first tick this task appears.
-            self._streak_starvation.touch(tid, now=now)
+    async def _deliver_starvation_finding(self, finding: Finding) -> None:
+        """Emit ``starvation_detected`` and file the escalation trail for one finding."""
+        facts, gate = finding.facts, finding.gate
+        if self.event_store:
+            self.event_store.emit(
+                EventType.starvation_detected,
+                task_id=facts.task_id,
+                data={
+                    'gate': gate.value,
+                    'eligible_age_secs': facts.eligible_age_secs,
+                    'skip_count': facts.skip_count,
+                    'lock_refusals': facts.lock_refusals,
+                    'blockers': [b.as_payload() for b in finding.blockers],
+                },
+            )
+        if self._callbacks.on_starvation_warn is not None:
+            summary, detail = escalation_text(
+                facts, gate, self.config.starvation_watchdog, finding.blockers,
+            )
+            await self._callbacks.on_starvation_warn(
+                facts.task_id, summary=summary, detail=detail,
+            )
+        self._streak_starvation.mark_escalated(facts.task_id)
 
-            skip = self._skip_count.get(tid, 0)
-            idle_elapsed = self._streak_starvation.age(tid, now)
+    def _forget_starvation_inputs(self, status_map: Mapping[str, str]) -> None:
+        """Drop the eligibility anchor and lock refusals of every task no longer pending.
 
-            # Two independent fire conditions (OR, not AND):
-            #  - dual_gate: the original lock-contention path — the task keeps
-            #    losing the lock race as the TOP-scored candidate (skip_count
-            #    bumps) AND has been eligible past idle_secs.
-            #  - idle_only: the never-top-scored backstop (reify-5166, task
-            #    2755).  A task that can never outscore a higher-tier candidate
-            #    is never the top-scored candidate, accrues ZERO skips, and so
-            #    can never cross the dual gate.  It fires on continuous
-            #    dispatch-eligibility ALONE once idle_only_secs is crossed,
-            #    regardless of skip_count.  With idle_only_secs default
-            #    == idle_secs (72h) it never trips on ordinary contention.
-            dual_gate = skip >= cfg.skip_threshold and idle_elapsed >= cfg.idle_secs
-            idle_only = idle_elapsed >= cfg.idle_only_secs
-
-            # Fire when EITHER gate is crossed AND not already escalated.
-            if (
-                (dual_gate or idle_only)
-                and not self._streak_starvation.is_escalated(tid)
-                and self._callbacks.on_starvation_warn is not None
-            ):
-                # Shared scaffolding single-sourced across both escalation paths
-                # so it cannot drift on future edits: the marker is the grep-anchor
-                # tests/classifiers key on, and the eligibility clause is identical
-                # verbatim.  Only the path-specific narrative and the (deliberately
-                # different) structured-facts tail branch below.
-                eligibility_note = '(all deps satisfied, no live claimant)'
-                if idle_only and not dual_gate:
-                    # Pure-idle backstop: never top-scored, so skip_count is
-                    # typically 0 — this is priority starvation (a low-priority
-                    # task perpetually outscored), NOT lock contention.  Carry
-                    # structured facts distinguishing this path from the dual
-                    # gate (design-invariants: structured-facts-at-failure).
-                    summary = (
-                        f'{_STARVATION_WATCHDOG_MARKER}: task {tid} dispatch-eligible '
-                        f'for {idle_elapsed:.0f}s (idle_only_secs={cfg.idle_only_secs}) '
-                        f'with skip_count={skip} — never top-scored '
-                        f'(continuous-eligibility backstop)'
-                    )
-                    detail = (
-                        f'Task {tid} has been continuously dispatch-eligible '
-                        f'{eligibility_note} for {idle_elapsed:.0f}s '
-                        f'yet has skip_count={skip} — it has never been the '
-                        f'highest-scored candidate, so the dual skip+idle gate '
-                        f'(skip_threshold={cfg.skip_threshold}, '
-                        f'idle_secs={cfg.idle_secs}) can never trip.  This is '
-                        f'priority starvation (e.g. a low-priority task '
-                        f'perpetually outscored by a stream of higher-tier '
-                        f'candidates on disjoint modules), NOT lock contention.  '
-                        f'The idle-only backstop fired on continuous '
-                        f'dispatch-eligibility alone.\n\n'
-                        f'skip_count={skip}, idle_elapsed={idle_elapsed:.0f}s, '
-                        f'idle_only_secs={cfg.idle_only_secs}'
-                    )
-                else:
-                    summary = (
-                        f'{_STARVATION_WATCHDOG_MARKER}: task {tid} skip_count={skip} '
-                        f'(threshold={cfg.skip_threshold}), dispatch-eligible for '
-                        f'{idle_elapsed:.0f}s (idle_secs={cfg.idle_secs}) — '
-                        f'unable to acquire locks'
-                    )
-                    detail = (
-                        f'Task {tid} has been dispatch-eligible {eligibility_note} '
-                        f'for {idle_elapsed:.0f}s and has '
-                        f'accumulated skip_count={skip} (tallied while this task is '
-                        f'the highest-scored candidate unable to acquire its module '
-                        f'locks; a task displaced by a higher-priority task retains '
-                        f'its accumulated count without incrementing).  This typically '
-                        f'indicates persistent lock contention (broad-footprint task '
-                        f'vs. a long-running narrow task) that has not been resolved '
-                        f'by the fairness parks.\n\n'
-                        f'skip_threshold={cfg.skip_threshold}, idle_secs={cfg.idle_secs}'
-                    )
-                await self._callbacks.on_starvation_warn(tid, summary=summary, detail=detail)
-                self._streak_starvation.mark_escalated(tid)
-
-    async def _resolve_starvation_escalation(self, task_id: str) -> None:
-        """Resolve the open starvation-watchdog INFO escalation for *task_id*.
-
-        Called at BOTH dispatch sites in ``acquire_next`` (pinned + scored paths)
-        right after the task is added to ``_dispatched``.  Idempotent: if the task
-        was never escalated (not in ``_starvation_escalated``), this is a no-op.
-        Always clears ``_starvation_escalated``/``_starvation_first_seen`` entries
-        unconditionally so state is bounded (PROPERTY 2 — no stale residue).
-
-        Callers wrap every call in try/except (log + continue) so a resolve
-        failure can NEVER abort a successful dispatch (PROPERTY 1).
+        Covers terminal tasks and tasks absent from this tick's active fetch as
+        well as live non-pending ones.  A pending task that merely sat out a
+        tick (cooldown, PSI hold) keeps both, so its age is never reset by a gap.
         """
+        tracked = self._eligibility.task_ids() | self._lock_refusals.task_ids()
+        gone = [tid for tid in tracked if status_map.get(tid) != 'pending']
+        self._eligibility.forget(gone)
+        for tid in gone:
+            self._lock_refusals.forget(tid)
+
+    async def _settle_starvation_on_dispatch(self, task_id: str) -> None:
+        """Close *task_id*'s watchdog state now that it is dispatching.
+
+        Resolves its open watchdog escalation, if any, and forgets its
+        eligibility anchor and lock refusals: a later return to ``pending``
+        starts a fresh eligibility age.  Called at BOTH dispatch sites, each
+        of which wraps it so a failure can NEVER abort a dispatch (PROPERTY 1).
+        """
+        self._eligibility.forget([task_id])
+        self._lock_refusals.forget(task_id)
         in_escalated = self._streak_starvation.is_escalated(task_id)
         if in_escalated and self._callbacks.on_starvation_resolve is not None:
             await self._callbacks.on_starvation_resolve(task_id)
-        # Unconditionally clear both dicts so no stale residue survives.
         self._streak_starvation.clear(task_id)
 
     async def _starvation_gc_resolve(self, tid: str) -> None:
@@ -6844,6 +6780,7 @@ class Scheduler:
                     departed_anchors[tid_str] = departed
                 stale_ids.add(tid_str)
         self._record_age_anchors(departed_anchors)
+        self._forget_starvation_inputs(ctx.status_map)
         starvation_non_eligible = {
             tid for tid in self._starvation_escalated
             if ctx.status_map.get(tid) in _STARVATION_NON_ELIGIBLE
@@ -7682,14 +7619,14 @@ class Scheduler:
     async def _phase_starvation(self, ctx: TickContext) -> object:
         """Starvation watchdog pass over dispatch-eligible candidates.
 
-        Reads: ``ctx.candidates``. Writes: none on ctx (side-effecting
+        Reads: ``ctx``. Writes: none on ctx (side-effecting
         scan; may emit escalation callbacks). Runs once per tick, wrapped
         in try/except so a watchdog/callback failure can NEVER abort the
         tick or gate dispatch (PROPERTY 1 — mirrors the
         ``_apply_external_dep_policy`` wrapper). Always continues.
         """
         try:
-            await self._apply_starvation_watchdog(ctx.candidates)
+            await self._apply_starvation_watchdog(ctx)
         except Exception:
             logger.warning(
                 'Starvation watchdog pass raised — continuing tick normally',
@@ -8033,12 +7970,10 @@ class Scheduler:
     async def _dispatch_pin(self, pin: _PinCandidate, modules: list[str]) -> TickOutcome:
         """Book a pin whose ``try_acquire`` just succeeded, and end the tick."""
         self._dispatched.add(pin.task_id)
-        # Starvation-watchdog resolve (task 1880): if a pinned task
-        # had an open INFO escalation, self-resolve it now.
-        # Wrapped in try/except so a resolve failure can NEVER abort
-        # a successful dispatch (PROPERTY 1).
+        # Starvation-watchdog settle (tasks 1880, 3821), wrapped so a
+        # failure can NEVER abort a successful dispatch (PROPERTY 1).
         try:
-            await self._resolve_starvation_escalation(pin.task_id)
+            await self._settle_starvation_on_dispatch(pin.task_id)
         except Exception:
             logger.warning(
                 'Starvation watchdog resolve for pin_tid=%s raised — '
@@ -8184,6 +8119,10 @@ class Scheduler:
         # dispatch ``return`` from inside the loop cannot leak a stale gap into
         # the next tick — the memo must never outlive the state it read.
         self._backfill_scan_cache = _BackfillScanCache()
+        # Candidates refused their locks above this scan's winner, for the
+        # starvation watchdog's lock_refused gate.  PSI-deferred candidates
+        # never tried, and a scan with no winner credits nobody.
+        refused: list[str] = []
         try:
             for _score, task_id, task, pri in scored:
                 if ctx.psi_hold and not self.is_deterministic(task):
@@ -8216,14 +8155,17 @@ class Scheduler:
                         )
                         if not acquired:
                             grant = None
+                if not acquired:
+                    refused.append(task_id)
                 if acquired:
                     self._dispatched.add(task_id)
-                    # Starvation-watchdog resolve (task 1880): if this scored task
-                    # had an open INFO escalation, self-resolve it now that it is
-                    # dispatching.  Wrapped in try/except so a resolve failure can
-                    # NEVER abort a successful dispatch (PROPERTY 1).
+                    self._lock_refusals.note_scan(refused)
+                    # Starvation-watchdog settle (tasks 1880, 3821): resolve any
+                    # open watchdog escalation and forget the task's watchdog
+                    # inputs.  Wrapped so a failure can NEVER abort a successful
+                    # dispatch (PROPERTY 1).
                     try:
-                        await self._resolve_starvation_escalation(task_id)
+                        await self._settle_starvation_on_dispatch(task_id)
                     except Exception:
                         logger.warning(
                             'Starvation watchdog resolve for task_id=%s raised — '

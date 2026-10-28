@@ -95,6 +95,7 @@ from orchestrator.deterministic_runner import (
     DeterministicRunner,
     build_milestone_gate_escalation_fields,
 )
+from orchestrator.eligibility_clock import EligibilityClockStore
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.flake_debt_drain import DRAIN_INTERVAL_SECS, run_drain_pass
 from orchestrator.flake_ledger import ledger_db_path
@@ -1785,6 +1786,7 @@ class Harness:
             ),
             override_store=OverrideStore.from_config(config),
             park_eviction_store=ParkEvictionRequestStore.from_config(config),
+            eligibility_clock_store=EligibilityClockStore.from_config(config),
         )
         # --- Action-teardown suppression (task 1620, β Pair F / C3.2) ---
         # Counter of task_ids currently undergoing action-teardown (park/restart/abandon).

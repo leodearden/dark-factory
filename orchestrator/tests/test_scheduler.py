@@ -12631,9 +12631,6 @@ class TestStreakRegistryMigration:
             '_external_resolver_degraded_counts must alias '
             '_streak_resolver_degraded.counts'
         )
-        assert scheduler._starvation_first_seen is (
-            scheduler._streak_starvation.first_seen
-        ), '_starvation_first_seen must alias _streak_starvation.first_seen'
         assert scheduler._starvation_escalated is scheduler._streak_starvation.escalated, (
             '_starvation_escalated must alias _streak_starvation.escalated'
         )
@@ -12678,7 +12675,7 @@ class TestStreakRegistryMigration:
         scheduler._external_hold_streak['T'] = 1
         scheduler._external_hold_cause['T'] = 'deps_live'
         scheduler._external_resolver_degraded_counts['T'] = 1
-        scheduler._starvation_first_seen['T'] = 0.0
+        scheduler._starvation_escalated.add('T')
 
         # Spine entry so 'T' enters _all_tracked -> _stale_ids once terminal.
         scheduler._skip_count['T'] = 0

@@ -664,6 +664,13 @@ class EventType(StrEnum):
     # when the pin becomes blocked, then at most once per
     # pin_blocked_emit_interval_secs while it stays blocked.
     pin_blocked = 'pin_blocked'
+    # The starvation watchdog fired on a task (task 3821).  Producer:
+    # scheduler.py::Scheduler._deliver_starvation_finding; predicate in
+    # starvation_watchdog.py::classify.  Emitted once per firing (deduped by
+    # the watchdog's escalated set, which survives restarts).  Payload:
+    # {gate: dual|lock_refused|park_blocked, eligible_age_secs, skip_count,
+    # lock_refusals, blockers: [{module, owner, kind: held|parked}]}.
+    starvation_detected = 'starvation_detected'
     # Emitted once per acquire_next tick when the fused-memory task read
     # FAILED (distinct from a genuinely empty project) and the park-eviction
     # drain was therefore SKIPPED (fail-safe, survey finding C3).

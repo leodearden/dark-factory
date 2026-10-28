@@ -293,13 +293,6 @@ class TestFleetScaleKnownAnswer:
             starvation_watchdog=StarvationWatchdogConfig(skip_threshold=3),
         )
         config.fairness.skip_threshold = 9999
-        harness = Harness(config)
-        queue = EscalationQueue(tmp_path / 'esc')
-        harness._escalation_queue = queue
-        harness._run_store = MagicMock(spec=RunStore)
-        harness._run_id = 'run-fleet-scale'
-        scheduler = harness.scheduler
-        scheduler.escalation_queue = queue
 
         def task(tid: str, priority: str, path: str) -> dict:
             return {
@@ -317,6 +310,14 @@ class TestFleetScaleKnownAnswer:
             str(config.project_root),
             {t['id']: hundred_hours_ago for t in [stuck, *backlog]},
         )
+
+        harness = Harness(config)
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = queue
+        harness._run_store = MagicMock(spec=RunStore)
+        harness._run_id = 'run-fleet-scale'
+        scheduler = harness.scheduler
+        scheduler.escalation_queue = queue
 
         async def get_tasks(*, statuses=None, **_):
             return [dict(t) for t in tasks if statuses is None or t['status'] in set(statuses)]
