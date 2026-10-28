@@ -17,6 +17,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.psi import PsiSample
 
@@ -25,7 +26,7 @@ from orchestrator.eligibility_clock import EligibilityClockStore
 from orchestrator.event_store import EventStore
 from orchestrator.overrides import OverrideSource, OverrideStore
 from orchestrator.scheduler import Scheduler, SchedulerCallbacks, TaskAssignment
-from orchestrator.starvation_watchdog import AUTO_PIN_CAP_SENTINEL
+from orchestrator.starvation_watchdog import AUTO_PIN_CAP_SENTINEL, STARVATION_WATCHDOG_ROLE
 
 T0 = datetime(2026, 10, 1, tzinfo=UTC)
 FLOOR = 259200.0
@@ -55,6 +56,8 @@ class _Rig:
     resolve: AsyncMock
     events_db: Path
     overrides: OverrideStore
+    live_status: dict[str, str]
+    status_faults: list[Exception]
     _low_seq: list[int] = field(default_factory=lambda: [1000])
 
     def advance(self, secs: float) -> None:
@@ -168,15 +171,28 @@ def _rig(
         wanted = None if statuses is None else set(statuses)
         return [dict(t) for t in task_list if wanted is None or t['status'] in wanted]
 
-    async def get_statuses(ids: list[str] | None = None) -> tuple[dict[str, str], None]:
-        return {
+    live_status: dict[str, str] = {}
+    status_faults: list[Exception] = []
+
+    async def get_statuses(
+        ids: list[str] | None = None,
+    ) -> tuple[dict[str, str], Exception | None]:
+        """The task list's statuses, with ``live_status`` overlaid; a queued fault fails one read."""
+        if status_faults:
+            return {}, status_faults.pop(0)
+        statuses = {
             str(t['id']): t['status'] for t in task_list if ids is None or str(t['id']) in ids
-        }, None
+        }
+        statuses.update({tid: st for tid, st in live_status.items() if tid in statuses})
+        return statuses, None
 
     scheduler.get_tasks = AsyncMock(side_effect=get_tasks)
     scheduler.get_statuses = AsyncMock(side_effect=get_statuses)
     scheduler.finish_startup()
-    return _Rig(scheduler, task_list, wall, mono, warn, resolve, events_db, overrides)
+    return _Rig(
+        scheduler, task_list, wall, mono, warn, resolve, events_db, overrides,
+        live_status, status_faults,
+    )
 
 
 async def _contended(rig: _Rig, *extra: dict) -> None:
@@ -600,6 +616,86 @@ async def test_dispatch_resolves_the_escalation_and_restarts_the_clock(tmp_path:
     for _ in range(4):
         await rig.tick()
     assert rig.warned_ids() == ['2'], 'the age restarts at dispatch, so no re-fire'
+
+
+# ---------------------------------------------------------------------------
+# Corroborate before acting; restart-safe dedup (task 3821)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('live', ['blocked', 'done'])
+async def test_a_finding_the_live_read_contradicts_is_not_delivered(
+    tmp_path: Path, live: str,
+) -> None:
+    rig = _rig(tmp_path)
+    await _top_skipped(rig, 3)
+    rig.advance(FLOOR)
+    rig.live_status['2'] = live
+
+    for _ in range(2):
+        await rig.tick()
+
+    assert rig.detected() == []
+    rig.warn.assert_not_called()
+    assert rig.override_rows() == {}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_live_read_delivers_nothing_and_retries_next_tick(tmp_path: Path) -> None:
+    rig = _rig(tmp_path)
+    await _top_skipped(rig, 3)
+    rig.advance(FLOOR)
+    rig.status_faults.append(RuntimeError('fused-memory unreachable'))
+
+    await rig.tick()
+    assert rig.detected() == []
+    rig.warn.assert_not_called()
+
+    await rig.tick()
+    [event] = rig.detected('2')
+    assert event['gate'] == 'dual'
+    assert rig.warned_ids() == ['2']
+
+
+def _previous_process_alarm(queue: EscalationQueue, task_id: str, level: int) -> Escalation:
+    esc = Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role=STARVATION_WATCHDOG_ROLE,
+        severity='info',
+        category='risk_identified',
+        summary=f'STARVATION_WATCHDOG [dual]: task {task_id}',
+        detail='filed before the restart',
+        suggested_action='manual_investigation',
+        level=level,
+    )
+    queue.submit(esc)
+    return esc
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('level', [0, 1])
+async def test_an_open_alarm_from_a_previous_process_is_not_refiled_and_is_gc_resolved(
+    tmp_path: Path, level: int,
+) -> None:
+    queue = EscalationQueue(tmp_path / 'esc')
+    _previous_process_alarm(queue, '2', level)
+    rig = _rig(tmp_path)
+    rig.scheduler.escalation_queue = queue
+    await _top_skipped(rig, 3)
+    rig.advance(FLOOR)
+
+    for _ in range(2):
+        await rig.tick()
+
+    assert rig.detected('2') == []
+    rig.warn.assert_not_called()
+
+    rig.set_status('2', 'blocked')
+    await rig.tick()
+
+    assert [str(c.args[0]) for c in rig.resolve.call_args_list] == ['2']
 
 
 @pytest.mark.asyncio
