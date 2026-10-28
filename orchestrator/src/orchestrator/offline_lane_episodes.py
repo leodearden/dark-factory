@@ -72,6 +72,8 @@ from orchestrator.flake_ledger import (
     FlakeLedgerTaskClient,
     FlakeSuppression,
     fix_contained,
+    ledger_db_path,
+    read_debt_many,
     resolving_commit,
 )
 from orchestrator.flake_recorder import record_call_site_observations
@@ -808,19 +810,24 @@ class LaneEngine:
         bound = sorted({e.covering_task_id for e in record.episodes.values() if e.covering_task_id is not None})
         if not bound:
             return CoveringStatuses({})
-        if self._tasks is None:
-            return CoveringStatuses({}, 'no task client')
-        try:
-            statuses, error = await self._tasks.get_statuses(bound)
-        except Exception as exc:
-            statuses, error = {}, exc
+        statuses, error = await self._read_statuses(bound)
         if error is not None:
             logger.error(
                 'offline-lane: %s: covering task statuses unreadable, every binding refreshed: %s',
                 record.command, error,
             )
-            return CoveringStatuses({}, str(error))
+            return CoveringStatuses({}, error)
         return CoveringStatuses({task_id: statuses[task_id] for task_id in bound if task_id in statuses})
+
+    async def _read_statuses(self, task_ids: list[str]) -> tuple[Mapping[str, str], str | None]:
+        """One batched status read; the statuses, or why they could not be read."""
+        if self._tasks is None:
+            return {}, 'no task client'
+        try:
+            statuses, error = await self._tasks.get_statuses(task_ids)
+        except Exception as exc:
+            statuses, error = {}, exc
+        return ({}, str(error)) if error is not None else (statuses, None)
 
     async def _read_task(self, task_id: str) -> _TaskRead:
         if self._tasks is None:
@@ -1056,7 +1063,30 @@ class LaneEngine:
         ]
         return build_lane_fix_task_arguments(
             command=record.command, leg=leg, priority=priority, tests=tests, reproduce=reproduce,
+            deflake_owners=await self._live_deflake_owners(nodes),
         )
+
+    async def _live_deflake_owners(self, nodes: Sequence[str]) -> dict[str, str]:
+        """Each of *nodes* owing open flake debt, mapped to its owner while that owner is open or deferred.
+
+        An unreadable owner status is named in the value.  No debt row with an owner, no task-client call.
+        """
+        rows = await asyncio.to_thread(read_debt_many, ledger_db_path(self._config.project_root), nodes)
+        owed = {
+            node: row.owner_task_id for node, row in rows.items()
+            if row.resolved_at is None and row.owner_task_id is not None
+        }
+        if not owed:
+            return {}
+        owners = sorted(set(owed.values()))
+        statuses, error = await self._read_statuses(owners)
+        if error is not None:
+            logger.error('offline-lane: de-flake owner statuses %s unreadable: %s', owners, error)
+            return {node: f'{owner} (status unreadable: {error})' for node, owner in owed.items()}
+        return {
+            node: owner for node, owner in owed.items()
+            if owner_liveness(statuses.get(owner)) in (OwnerLiveness.OPEN, OwnerLiveness.DEFERRED)
+        }
 
     async def _counted_evidence(
         self, command: str, episode: Episode, modes: Mapping[str, str],
