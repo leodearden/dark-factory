@@ -360,7 +360,9 @@ class TrainStackResult:
                anchor could not be un-stacked from an earlier unlanded base.
     ejected:   member ids that conflicted during stacking and were dropped;
                their branches are left clean (rebase aborted) so they can
-               merge solo.
+               merge solo.  Holds only the anchor when the anchor could not
+               be un-stacked from an earlier unlanded base; that branch is
+               left as found (a dirty tree stays dirty).
     pre_stack_tips: one restore point per stacked survivor, so a train that
                does not land can hand it back.  Never the anchor: it is not
                stacked onto anything, and un-stacking it is never undone.
@@ -10125,6 +10127,11 @@ class GitOps:
 
         anchor_id = member_ids[0]
         if not await self._shed_unlanded_base(f'{self.config.branch_prefix}{anchor_id}'):
+            logger.warning(
+                'stack_train_branches: abandoning formation — anchor %s is still '
+                'stacked on an unlanded base, so every member merges solo',
+                anchor_id,
+            )
             return TrainStackResult(survivors=[], ejected=[anchor_id])
         survivors: list[str] = [anchor_id]
         ejected: list[str] = []
@@ -10197,7 +10204,7 @@ class GitOps:
         earlier = await self.unstack_from_unlanded_base(branch)
         if earlier.stops_merge:
             logger.warning(
-                'stack_train_branches: ejecting %s — %s',
+                'stack_train_branches: cannot un-stack %s — %s',
                 branch, earlier.merge_block_reason(),
             )
             return False

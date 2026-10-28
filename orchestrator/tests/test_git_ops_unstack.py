@@ -303,6 +303,7 @@ class TestStackUnstacksTheAnchor:
         assert await repo.sha('task/X') == x_before
         assert await repo.sha('task/M') == m_before
         assert await repo.ledger.base_of('task/X') is None
+        assert await repo.ledger.base_of('task/M') == await repo.sha('task/P')
 
 
 # ---------------------------------------------------------------------------
