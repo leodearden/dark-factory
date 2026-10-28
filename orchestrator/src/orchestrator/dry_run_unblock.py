@@ -18,7 +18,7 @@ import logging
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NamedTuple, TypeGuard
+from typing import Any, NamedTuple
 
 from shared.cli_invoke import (
     BUDGET_EXHAUSTED_SUBTYPE,
@@ -35,6 +35,7 @@ from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
+from orchestrator.event_store import EventType
 from orchestrator.merge_lane.completion import merge_completion_eligible
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
@@ -341,8 +342,10 @@ def investigation_in_flight(task_id: str) -> bool:
 # SHA capture helper
 # ---------------------------------------------------------------------------
 
-async def _capture_worktree_shas(worktree: str) -> tuple[str | None, str | None]:
-    """Capture HEAD and main branch SHAs from the worktree via git.
+async def _capture_worktree_shas(
+    worktree: str, main_branch: str,
+) -> tuple[str | None, str | None]:
+    """Capture the HEAD and *main_branch* SHAs from the worktree via git.
 
     Fully defensive: any non-zero exit code, subprocess exception, or
     non-repo worktree yields None for that sha — never raises.
@@ -363,7 +366,7 @@ async def _capture_worktree_shas(worktree: str) -> tuple[str | None, str | None]
         except Exception:
             return None
 
-    head_sha, main_sha = await asyncio.gather(_rev_parse('HEAD'), _rev_parse('main'))
+    head_sha, main_sha = await asyncio.gather(_rev_parse('HEAD'), _rev_parse(main_branch))
     return head_sha, main_sha
 
 
@@ -378,21 +381,25 @@ def _git_failure(step: str, result: GitResult) -> RuntimeError:
     )
 
 
-async def _capture_branch_patch_id(worktree: str, *, task_id: str) -> str | None:
-    """Rebase-stable identity of the branch's committed change set relative to main.
+async def _capture_branch_patch_id(
+    worktree: str, *, main_branch: str, task_id: str,
+) -> str | None:
+    """Rebase-stable identity of the branch's committed change set relative to
+    *main_branch*.
 
     ``git patch-id --stable`` ignores line numbers and whitespace, so a clean
     rebase onto an advanced main keeps it. Any failure, a non-repo worktree or
-    a missing ``main`` ref included, yields None and is logged at WARNING,
+    a missing *main_branch* ref included, yields None and is logged at WARNING,
     because None turns coverage dedup off for the run.
     """
+    merge_base_range = f'{main_branch}...HEAD'
     try:
         diff = await run_git([
             'git', '-C', worktree, 'diff', '--binary', '--no-color',
-            '--no-ext-diff', '--no-textconv', 'main...HEAD',
+            '--no-ext-diff', '--no-textconv', merge_base_range,
         ])
         if not diff.ok:
-            raise _git_failure('git diff main...HEAD', diff)
+            raise _git_failure(f'git diff {merge_base_range}', diff)
         if not diff.stdout:
             return _EMPTY_BRANCH_PATCH_ID
         patch_id = await run_git(
@@ -418,9 +425,9 @@ async def _capture_branch_patch_id(worktree: str, *, task_id: str) -> str | None
 # ---------------------------------------------------------------------------
 
 def _latest_proposal_covers(
-    proposals: object, *, branch_patch_id: str | None, block_reason: str,
+    proposals: list[Any], *, branch_patch_id: str | None, block_reason: str,
     head_sha: str | None,
-) -> TypeGuard[list[Any]]:
+) -> bool:
     """Whether the latest entry already investigated this content and reason.
 
     Only the latest entry counts, because the briefing and b3_gate both read
@@ -429,7 +436,7 @@ def _latest_proposal_covers(
     concluded nothing. A low-risk entry covers only at its own HEAD, because
     b3_gate.check_proposal step 6 aborts once HEAD has moved.
     """
-    if branch_patch_id is None or not isinstance(proposals, list) or not proposals:
+    if branch_patch_id is None or not proposals:
         return False
     latest = proposals[-1]
     if not isinstance(latest, dict):
@@ -461,6 +468,37 @@ async def _reaffirm_latest_proposal(
             'dry_run_unblock: re-stamping the covering proposal failed for '
             'task %s (best-effort, continuing): %s',
             task_id, exc,
+        )
+
+
+async def _skip_covered_reblock(
+    *, scheduler: Any, event_store: Any, task_id: str, proposals: list[Any],
+    branch_patch_id: str | None, block_reason: str,
+) -> None:
+    """Record a re-block the latest proposal covers, in place of investigating it.
+
+    The ``phase_skipped`` row keeps each skip countable in runs.db, which is
+    where a re-block loop is measured from once the skip makes it cost nothing.
+    """
+    logger.info(
+        'dry_run_unblock: task %s re-blocked on unchanged content '
+        '(branch_patch_id=%s) for the same reason %r; the latest '
+        'proposal already covers it, skipping the investigation',
+        task_id, branch_patch_id, block_reason,
+    )
+    await _reaffirm_latest_proposal(scheduler, task_id, proposals)
+    if event_store:
+        event_store.emit(
+            EventType.phase_skipped,
+            task_id=task_id,
+            phase='blocked',
+            role='unblock_auto',
+            data={
+                'reason': 'dry_run_covered',
+                'block_reason': block_reason,
+                'branch_patch_id': branch_patch_id,
+                'covering_investigated_at': proposals[-1].get('investigated_at'),
+            },
         )
 
 
@@ -510,14 +548,17 @@ async def run_dry_run_unblock(
     import time
 
     ua_cfg = config.unblock_auto
+    main_branch = config.git.main_branch
     start_time = time.monotonic()
     project_id = getattr(getattr(config, 'fused_memory', None), 'project_id', '') or ''
     run_id = getattr(event_store, 'run_id', '') or ''
 
     # Capture worktree SHAs before invoke_agent so both the success and
     # exception paths can stamp the same anchor values.
-    head_sha, main_sha = await _capture_worktree_shas(worktree)
-    branch_patch_id = await _capture_branch_patch_id(worktree, task_id=task_id)
+    head_sha, main_sha = await _capture_worktree_shas(worktree, main_branch)
+    branch_patch_id = await _capture_branch_patch_id(
+        worktree, main_branch=main_branch, task_id=task_id,
+    )
 
     config_dir: TaskConfigDir | None = None
     preserve_config_dir = False
@@ -575,17 +616,15 @@ async def run_dry_run_unblock(
         md = raw_md if isinstance(raw_md, dict) else {}
 
         proposals = md.get('dry_run_proposals')
-        if _latest_proposal_covers(
+        if isinstance(proposals, list) and _latest_proposal_covers(
             proposals, branch_patch_id=branch_patch_id, block_reason=reason,
             head_sha=head_sha,
         ):
-            logger.info(
-                'dry_run_unblock: task %s re-blocked on unchanged content '
-                '(branch_patch_id=%s) for the same reason %r; the latest '
-                'proposal already covers it, skipping the investigation',
-                task_id, branch_patch_id, reason,
+            await _skip_covered_reblock(
+                scheduler=scheduler, event_store=event_store, task_id=task_id,
+                proposals=proposals, branch_patch_id=branch_patch_id,
+                block_reason=reason,
             )
-            await _reaffirm_latest_proposal(scheduler, task_id, proposals)
             return
 
         # Per-investigation isolated CLAUDE_CONFIG_DIR, named distinctly from
@@ -988,7 +1027,6 @@ async def run_dry_run_unblock(
 
     if event_store and result is not None:
         try:
-            from orchestrator.event_store import EventType
             event_store.emit(
                 EventType.invocation_end,
                 task_id=task_id,

@@ -115,8 +115,9 @@ def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
                  attended_b3_enabled=False, b3_merge_cap_per_24h=6,
                  b3_proposal_keep_last=5, working_idle_secs=1800.0,
                  invocation_timeout=7200.0, project_root=None,
-                 transcript_archive=None):
+                 transcript_archive=None, main_branch='main'):
     cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    cfg.git.main_branch = main_branch
     cfg.unblock_auto.enabled = enabled
     cfg.unblock_auto.budget_usd = budget_usd
     cfg.unblock_auto.timeout_seconds = timeout_seconds
@@ -3445,6 +3446,7 @@ def _proposal_result(risk_label: str = 'human-review-required'):
 async def _investigate(
     worktree: Path, scheduler, *, reason: str,
     risk_label: str = 'human-review-required', invoke: AsyncMock | None = None,
+    config=None, event_store=None,
 ) -> AsyncMock:
     from orchestrator.dry_run_unblock import run_dry_run_unblock
 
@@ -3458,7 +3460,8 @@ async def _investigate(
             detail='',
             scheduler=scheduler,
             mcp=MagicMock(),
-            config=_make_config(),
+            config=config if config is not None else _make_config(),
+            event_store=event_store,
         )
     return invoke
 
@@ -3470,6 +3473,33 @@ async def _proposals(scheduler) -> list[dict]:
 
 def _fresh_scheduler() -> _RecordingScheduler:
     return _RecordingScheduler({'dry_run_proposals': [], 'files': ['src/foo.py']})
+
+
+class _ReaffirmRejectingScheduler(_RecordingScheduler):
+    """Once armed, rejects the default-merge rewrite of dry_run_proposals.
+
+    That rewrite is the covered skip's re-stamp; the additive entry append
+    still lands, so an investigation_failed fallback would show up.
+    """
+
+    reject_reaffirm = False
+
+    async def update_task(self, task_id, metadata, *, append=False, metadata_mode=None):
+        is_rewrite = metadata_mode is None and not append and 'dry_run_proposals' in metadata
+        if self.reject_reaffirm and is_rewrite:
+            raise RuntimeError('scheduler rejected the re-stamp')
+        return await super().update_task(
+            task_id, metadata, append=append, metadata_mode=metadata_mode,
+        )
+
+
+def _phase_skipped_emits(event_store: MagicMock) -> list:
+    from orchestrator.event_store import EventType
+
+    return [
+        c for c in event_store.emit.call_args_list
+        if c.args and c.args[0] == EventType.phase_skipped
+    ]
 
 
 class TestPriorInvestigationCoversReblock:
@@ -3507,6 +3537,56 @@ class TestPriorInvestigationCoversReblock:
             > datetime.fromisoformat(first['timestamp'])
         )
         assert proposals[-1]['investigated_at'] == first['investigated_at']
+
+    @pytest.mark.asyncio
+    async def test_covered_skip_is_recorded_as_an_event(self, tmp_path):
+        """A skipped re-block costs nothing, so its event is what keeps a
+        re-block loop countable."""
+        repo = _feature_repo(tmp_path)
+        scheduler = _fresh_scheduler()
+        event_store = MagicMock()
+        event_store.run_id = 'run-3125'
+
+        await _investigate(
+            repo, scheduler, reason='verify exhausted', event_store=event_store,
+        )
+        assert _phase_skipped_emits(event_store) == []
+        covering = (await _proposals(scheduler))[-1]
+        await _investigate(
+            repo, scheduler, reason='verify exhausted', event_store=event_store,
+        )
+
+        skips = _phase_skipped_emits(event_store)
+        assert len(skips) == 1, skips
+        assert skips[0].kwargs['task_id'] == _COVER_TASK_ID
+        assert skips[0].kwargs['phase'] == 'blocked'
+        assert skips[0].kwargs['role'] == 'unblock_auto'
+        assert skips[0].kwargs['data'] == {
+            'reason': 'dry_run_covered',
+            'block_reason': 'verify exhausted',
+            'branch_patch_id': covering['branch_patch_id'],
+            'covering_investigated_at': covering['investigated_at'],
+        }
+
+    @pytest.mark.asyncio
+    async def test_failed_restamp_still_skips(self, tmp_path, caplog):
+        repo = _feature_repo(tmp_path)
+        scheduler = _ReaffirmRejectingScheduler(
+            {'dry_run_proposals': [], 'files': ['src/foo.py']},
+        )
+        invoke = AsyncMock(return_value=_proposal_result())
+
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+        before = await _proposals(scheduler)
+        scheduler.reject_reaffirm = True
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+
+        warnings = _dry_run_warnings(caplog)
+        assert len(warnings) == 1, warnings
+        assert 'scheduler rejected the re-stamp' in warnings[0], warnings[0]
+        assert invoke.await_count == 1
+        assert await _proposals(scheduler) == before
 
     @pytest.mark.asyncio
     async def test_rebase_onto_advanced_main_is_not_reinvestigated(self, tmp_path):
@@ -3715,3 +3795,26 @@ class TestBranchPatchIdFailureIsLoud:
 
         assert invoke.await_count == 2
         assert len(_dry_run_warnings(caplog)) == 2, _dry_run_warnings(caplog)
+
+    @pytest.mark.asyncio
+    async def test_configured_main_branch_is_the_base(self, tmp_path, caplog):
+        """A project whose trunk is not named `main` keeps coverage dedup on."""
+        repo = _trunk_only_repo(tmp_path)
+        trunk_sha = _git(repo, 'rev-parse', 'trunk')
+        scheduler = _fresh_scheduler()
+        invoke = AsyncMock(return_value=_proposal_result())
+        config = _make_config(main_branch='trunk')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
+            await _investigate(
+                repo, scheduler, reason='verify exhausted', invoke=invoke, config=config,
+            )
+            await _investigate(
+                repo, scheduler, reason='verify exhausted', invoke=invoke, config=config,
+            )
+
+        assert _dry_run_warnings(caplog) == []
+        latest = (await _proposals(scheduler))[-1]
+        assert latest['branch_patch_id'] is not None
+        assert latest['main_sha'] == trunk_sha
+        assert invoke.await_count == 1
