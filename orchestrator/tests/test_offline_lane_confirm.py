@@ -27,12 +27,14 @@ from orchestrator.offline_lane_confirm import (
     Confirmed,
     ConfirmMode,
     ConfirmTarget,
+    InconclusiveReason,
     Outage,
     PassOutcome,
     Unconfirmable,
     UnconfirmableReason,
     confirm,
     confirm_mode,
+    inconclusive_reason,
     outcome_from_json,
     outcome_to_json,
     partition,
@@ -347,6 +349,76 @@ class TestPartition:
         assert partition(detect, rerun) == (
             ('tests/t.py::test_c', 'tests/t.py::test_b'), ('tests/t.py::test_a',), (),
         )
+
+
+_A = 'tests/t.py::test_a'
+_PARTITION_CASES = {
+    'compatible_failure': (_run((_A, 'failed')), _rerun((_A, 'failed'))),
+    'error_after_failed': (_run((_A, 'failed')), _rerun((_A, 'error'), outcomes={_A: 'passed'})),
+    'passed_in_incomplete_session': (_run((_A, 'failed')), _rerun(outcomes={_A: 'passed'}, session_complete=False)),
+    'skipped_in_complete_session': (_run((_A, 'failed')), _rerun(outcomes={_A: 'skipped'}, session_complete=True)),
+    'absent_from_outcomes': (
+        _run(('tests/t.py::test_steady', 'failed'), ('tests/t.py::test_flaky', 'failed')),
+        _rerun(
+            ('tests/t.py::test_steady', 'failed'),
+            returncode=2,
+            outcomes={'tests/t.py::test_other': 'passed'},
+            session_complete=True,
+        ),
+    ),
+    'complete_session_unnamed': (_run((_A, 'failed')), _rerun(session_complete=True)),
+    'incomplete_session_unnamed': (_run((_A, 'failed')), _rerun(session_complete=False)),
+    'detection_order': (
+        _run(('tests/t.py::test_c', 'failed'), (_A, 'failed'), ('tests/t.py::test_b', 'failed'), (_A, 'error')),
+        _rerun(
+            ('tests/t.py::test_z', 'failed'),
+            ('tests/t.py::test_b', 'failed'),
+            ('tests/t.py::test_c', 'failed'),
+            outcomes={_A: 'passed'},
+        ),
+    ),
+}
+
+
+class TestInconclusiveReason:
+    """Why the confirm left a node it did not reproduce inconclusive; ``None`` when it cleared it."""
+
+    def test_a_confirm_naming_it_with_another_kind_differs(self) -> None:
+        assert inconclusive_reason(_A, _rerun((_A, 'error'))) is InconclusiveReason.CONFIRM_KIND_DIFFERS
+
+    def test_per_test_evidence_of_a_skip_did_not_pass(self) -> None:
+        rerun = _rerun(outcomes={_A: 'skipped'}, session_complete=True)
+        assert inconclusive_reason(_A, rerun) is InconclusiveReason.CONFIRM_DID_NOT_PASS
+
+    def test_per_test_evidence_without_the_node_did_not_pass(self) -> None:
+        rerun = _rerun(outcomes={'tests/t.py::test_other': 'passed'}, session_complete=True)
+        assert inconclusive_reason(_A, rerun) is InconclusiveReason.CONFIRM_DID_NOT_PASS
+
+    def test_no_evidence_and_an_incomplete_session_is_incomplete(self) -> None:
+        rerun = _rerun(session_complete=False)
+        assert inconclusive_reason(_A, rerun) is InconclusiveReason.CONFIRM_SESSION_INCOMPLETE
+
+    @pytest.mark.parametrize(
+        'rerun',
+        [_rerun(outcomes={_A: 'passed'}, session_complete=False), _rerun(session_complete=True)],
+        ids=['evidence_passed', 'complete_session_unnamed'],
+    )
+    def test_a_cleared_node_has_no_reason(self, rerun: RunRecord) -> None:
+        assert inconclusive_reason(_A, rerun) is None
+
+    def test_the_reasons_are_their_wire_names(self) -> None:
+        assert [reason.value for reason in InconclusiveReason] == [
+            'confirm_kind_differs', 'confirm_did_not_pass', 'confirm_session_incomplete',
+        ]
+
+    @pytest.mark.parametrize('case', list(_PARTITION_CASES))
+    def test_a_node_is_inconclusive_exactly_when_unreproduced_with_a_reason(self, case: str) -> None:
+        detect, rerun = _PARTITION_CASES[case]
+        reproduced, _, inconclusive = partition(detect, rerun)
+
+        for node in {failure.node for failure in detect.failures}:
+            expected = node not in reproduced and inconclusive_reason(node, rerun) is not None
+            assert (node in inconclusive) == expected, node
 
 
 class TestConfirmUnconfirmable:
