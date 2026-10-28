@@ -33,6 +33,7 @@ import uuid
 from collections.abc import MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -888,8 +889,8 @@ class TestBuildJudgePrompt:
     def test_a_non_string_field_is_rendered_as_its_text_then_cut(self) -> None:
         """A field that is not a string is coerced to its text before the cut."""
         prompt = build_judge_prompt(
-            None,  # type: ignore[arg-type]
-            [types.SimpleNamespace(id='m1', content=10**15)],  # type: ignore[arg-type]
+            cast(Any, None),
+            [cast(Any, types.SimpleNamespace(id='m1', content=10**15))],
             field_chars=10,
         )
         assert 'NEW ENTRY:\n\n' in prompt
