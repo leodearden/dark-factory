@@ -263,6 +263,7 @@ async def test_in_flight_follower_of_a_carried_head_is_not_cascaded(tmp_path: Pa
     assert head_outcome.merge_sha == head_merge_commit
     assert follower_outcome.status == 'done', follower_outcome
     remote.cancel_verify.assert_not_awaited()
+    assert [record for name, record in store.events if name == 'verdict_voided'] == []
     follower_verifies = [awaited.args[0] for awaited in remote.run_merge_verify.await_args_list]
     assert len(follower_verifies) == 2, follower_verifies
     assert follower_verifies[1] == follower_outcome.merge_sha != follower_verifies[0], (
