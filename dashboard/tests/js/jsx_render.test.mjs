@@ -19,6 +19,7 @@ import {
   receiptsFor,
   taskCensus,
   tasksSnapshotEntry,
+  wireDatum,
 } from './wire_fixtures.mjs';
 
 const PROJECT = 'p';
@@ -490,3 +491,139 @@ test('shell.jsx::RenderFailureBoundary renders a healthy child unchanged, with n
   assertSiblingRenders(container);
   assert.deepEqual(harness.consoleErrors, []);
 });
+
+// ── The page app.jsx bootstraps: each fault stays in its own region ──
+// Every fault lands as a malformed payload a poll could deliver, then App's
+// own re-render signal; nothing patches a component or writes DF_DATA directly.
+
+const NOTICE_SELECTOR = '[data-testid$="-render-failure-banner"]';
+
+// Lands `payloads` as one poll would: each key with its endpoint's receipt.
+function landPayloads(window, payloads) {
+  seedDashboardData(window, { ...payloads, __receipt: receiptsFor(window.DF_DATA_LOADER, Object.keys(payloads)) });
+}
+
+// The page mounted, after landing `seed` (if any) before the first render.
+function openPage(t, seed = null) {
+  const harness = openContainingWindow(t);
+  if (seed) landPayloads(harness.window, seed);
+  return { ...harness, root: harness.mountPage() };
+}
+
+// A poll landing on the mounted page, then App's re-render signal.
+function landPoll(window, payloads) {
+  landPayloads(window, payloads);
+  window.React.act(() => window.dispatchEvent(new window.Event('df-data-refresh')));
+}
+
+function railButton(root, label) {
+  const button = [...root.querySelectorAll('.rail-nav button')].find(candidate =>
+    [...candidate.children].some(part => part.textContent === label),
+  );
+  assert.ok(button, `the rail has no "${label}" button`);
+  return button;
+}
+
+function openTab(page, label) {
+  click(page.window, railButton(page.root, label));
+}
+
+function failureNotices(root) {
+  return [...root.querySelectorAll(NOTICE_SELECTOR)];
+}
+
+function crumb(root) {
+  return root.querySelector('.crumbs .here')?.textContent;
+}
+
+function assertOneNotice(page, testId, expectedText) {
+  const notices = failureNotices(page.root);
+  assert.deepEqual(notices.map(notice => notice.dataset.testid), [testId]);
+  const [text, detail] = noticeLines(notices[0]);
+  assert.equal(text, expectedText);
+  assert.ok(
+    page.consoleErrors.some(entry => entry.startsWith(detail)),
+    `the notice's detail "${detail}" heads none of the reported throws: ${JSON.stringify(page.consoleErrors)}`,
+  );
+  return detail;
+}
+
+function bodyHoldsTabContent(root) {
+  const body = root.querySelector('.body');
+  return !!body && [...body.children].some(child => !child.matches('[data-testid$="-banner"]'));
+}
+
+const CHROME_REGIONS = {
+  'navigation rail': root => root.querySelectorAll('.rail-nav button').length > 0,
+  'status strip': root => !!root.querySelector('.stat-strip'),
+  toolbar: root => {
+    const toolbar = root.querySelector('.toolbar');
+    return !!toolbar && !toolbar.matches(NOTICE_SELECTOR);
+  },
+};
+
+function assertChromeRenders(root, except = null) {
+  for (const [region, renders] of Object.entries(CHROME_REGIONS)) {
+    if (region !== except) assert.ok(renders(root), `the ${region} no longer renders`);
+  }
+}
+
+test('app.jsx contains a tab throw to the tab, and a fresh boundary retries it after a tab switch', t => {
+  const page = openPage(t, { ESCALATION_ANALYTICS: escalationAnalytics([{ project: PROJECT, openItems: [null] }]) });
+  const { tabRenderFailureNotice } = page.window.DF_RENDER_FAILURE;
+
+  openTab(page, 'Analytics');
+  const detail = assertOneNotice(page, 'tab-render-failure-banner', tabRenderFailureNotice('Analytics', undefined).text);
+  assert.ok(detail.startsWith('TypeError'), detail);
+  assertChromeRenders(page.root);
+
+  openTab(page, 'Costs');
+  assert.deepEqual(failureNotices(page.root), []);
+  assert.equal(crumb(page.root), 'Costs');
+
+  landPoll(page.window, { ESCALATION_ANALYTICS: escalationAnalytics([{ project: PROJECT, openItems: [] }]) });
+  openTab(page, 'Analytics');
+  assert.deepEqual(failureNotices(page.root), [], 'the fixed tab still shows the notice: no fresh boundary retried it');
+  assert.ok(bodyHoldsTabContent(page.root), 'the fixed tab rendered no content');
+  assertReportsOnlyContainedThrows(page.consoleErrors);
+});
+
+// One fault per chrome region, each a payload a poll could land, and each
+// reaching only that region's render on the Costs tab, which reads none of
+// the faulted keys.
+const CHROME_FAULTS = [
+  {
+    region: 'navigation rail',
+    testId: 'rail-render-failure-banner',
+    // An object where the pending count belongs.
+    payloads: () => ({ ESCALATIONS: { summary: { by_status: { pending: { count: 3 } } } } }),
+  },
+  {
+    region: 'status strip',
+    testId: 'status-strip-render-failure-banner',
+    // A fresh Datum with no value, which datum.py forbids: the topbar's write
+    // queue reading then throws inside DatumReading.
+    payloads: () => ({ MEMORY_STATUS: { queue: { stats: wireDatum(null) } } }),
+  },
+  {
+    region: 'toolbar',
+    testId: 'toolbar-render-failure-banner',
+    payloads: () => ({ PROJECTS: [null] }),
+  },
+];
+
+for (const { region, testId, payloads } of CHROME_FAULTS) {
+  test(`app.jsx contains a ${region} throw to the ${region}, and every other region renders on`, t => {
+    const page = openPage(t);
+    openTab(page, 'Costs');
+
+    landPoll(page.window, payloads());
+
+    const { chromeRenderFailureNotice } = page.window.DF_RENDER_FAILURE;
+    assertOneNotice(page, testId, chromeRenderFailureNotice(region, undefined).text);
+    assert.equal(crumb(page.root), 'Costs');
+    assert.ok(bodyHoldsTabContent(page.root), 'the open tab stopped rendering');
+    assertChromeRenders(page.root, region);
+    assertReportsOnlyContainedThrows(page.consoleErrors);
+  });
+}

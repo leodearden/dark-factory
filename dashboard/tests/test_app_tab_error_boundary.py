@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 
+import pytest
 from _app_jsx_source import app_body, assert_app_destructures_without_fallback
 
 _KEYED_BODY_TAG = '<div className="body" key={tab}>'
@@ -69,8 +70,9 @@ def test_the_notices_and_the_tab_retry_sit_outside_the_boundary(app_jsx_body: st
         )
 
 
-def test_app_destructures_the_failure_notice_without_fallback(app_jsx_body: str) -> None:
+@pytest.mark.parametrize('describer', ['tabRenderFailureNotice', 'chromeRenderFailureNotice'])
+def test_app_destructures_the_failure_notice_without_fallback(app_jsx_body: str, describer: str) -> None:
     assert_app_destructures_without_fallback(
-        app_jsx_body, 'DF_RENDER_FAILURE', 'tabRenderFailureNotice',
+        app_jsx_body, 'DF_RENDER_FAILURE', describer,
         fallback_consequence='a silently uncontained page',
     )
