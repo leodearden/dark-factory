@@ -3603,3 +3603,42 @@ class TestPriorInvestigationCoversReblock:
         await _investigate(tmp_path, scheduler, reason='verify exhausted', invoke=invoke)
 
         assert invoke.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_entry_does_not_cover(self, tmp_path):
+        """infra_failure is the producer's 'retryable, not a conclusion' shape."""
+        repo = _feature_repo(tmp_path)
+        scheduler = _fresh_scheduler()
+        rejected = AsyncMock(return_value=_make_agent_result(
+            success=False,
+            subtype='error_cli_input_rejected',
+            output='Agent produced no output',
+            cost_usd=0.0,
+            stderr='Error: Input must be provided either through stdin or as a prompt argument\n',
+            structured_output=None,
+        ))
+
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=rejected)
+        assert (await _proposals(scheduler))[-1]['status'] == 'infra_failure'
+        invoked_by_first_run = rejected.await_count
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=rejected)
+
+        assert rejected.await_count > invoked_by_first_run
+
+    @pytest.mark.asyncio
+    async def test_low_risk_entry_covers_only_the_same_head(self, tmp_path):
+        """b3_gate.check_proposal step 6 aborts when HEAD has moved, so a low
+        proposal has to be re-anchored after a rebase to stay consumable."""
+        repo = _feature_repo(tmp_path)
+        scheduler = _fresh_scheduler()
+        invoke = AsyncMock(return_value=_proposal_result('low'))
+
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+        assert (await _proposals(scheduler))[-1]['risk_label'] == 'low'
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+        assert invoke.await_count == 1
+
+        _advance_main_and_rebase(repo)
+        await _investigate(repo, scheduler, reason='verify exhausted', invoke=invoke)
+
+        assert invoke.await_count == 2
