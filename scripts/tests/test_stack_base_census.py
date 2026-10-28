@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 import stack_base_census as census
 from committed_git_repo import committed_repo
+from orchestrator.branch_stack import StackBaseLedger
+from shared.git_async import run_git
 
 # ---------------------------------------------------------------------------
 # Real-git fixture (sync helpers, local to this file)
@@ -82,6 +84,16 @@ async def census_of(repo: Path, statuses: Mapping[int, str] | None = None):
 
 def findings_of(report) -> dict[str, census.BranchFinding]:
     return {finding.branch: finding for finding in report.findings}
+
+
+async def _runner(cmd, cwd=None, **_kwargs) -> tuple[int, str, str]:
+    result = await run_git(cmd, cwd)
+    return result.returncode, result.stdout, result.stderr
+
+
+def ledger_of(repo: Path) -> StackBaseLedger:
+    """Task 5618's ledger over *repo*, through its public constructor."""
+    return StackBaseLedger(repo, _runner)
 
 
 def stacked_on_p(repo: Path, member: str = 'M') -> tuple[Path, Path]:
@@ -165,3 +177,114 @@ async def test_landed_branches_are_not_scanned(repo: Path) -> None:
     assert report.findings == ()
     assert report.unlanded_branches == 1
     assert report.main_sha == rev(repo, 'main')
+
+
+# ---------------------------------------------------------------------------
+# step-3: adjudication edges
+# ---------------------------------------------------------------------------
+
+
+async def test_a_stack_replayed_onto_main_is_confirmed_from_the_reflog_alone(repo: Path) -> None:
+    _, m_wt = stacked_on_p(repo)
+    p_tip = rev(repo, 'task/P')
+    advance_main(repo, {'unrelated.txt': 'u\n'})
+    rebase(m_wt, 'main')
+    own = {rev(repo, 'task/M')}
+    replayed = [sha for sha in git(repo, 'rev-list', 'main..task/M').split() if sha not in own]
+
+    finding = findings_of(await census_of(repo))['task/M']
+
+    assert finding.contained_siblings == ()
+    assert finding.verdict is census.Verdict.CONFIRMED
+    assert finding.base == p_tip
+    assert finding.cut == replayed[0]
+
+
+async def test_a_member_unstacked_by_hand_is_already_clean(repo: Path) -> None:
+    _, m_wt = stacked_on_p(repo)
+    rebase(m_wt, '--onto', 'main', rev(repo, 'task/P'), 'task/M')
+
+    finding = findings_of(await census_of(repo))['task/M']
+
+    assert finding.verdict is census.Verdict.ALREADY_CLEAN
+    assert finding.cut is None
+
+
+async def test_a_rebase_onto_the_branchs_own_history_is_not_a_stacking_event(
+    repo: Path,
+) -> None:
+    m_wt = add_member(repo, 'M', 'main', {'m1.txt': '1\n'})
+    m1 = rev(repo, 'task/M')
+    m2 = commit(m_wt, {'m2.txt': '2\n'}, 'M: second')
+    commit(m_wt, {'m3.txt': '3\n'}, 'M: third')
+    rebase(m_wt, '--onto', m1, m2)
+
+    report = await census_of(repo)
+
+    assert 'task/M' not in findings_of(report)
+
+
+async def test_a_base_whose_patches_landed_on_main_has_no_finding(repo: Path) -> None:
+    stacked_on_p(repo)
+    git(repo, 'cherry-pick', rev(repo, 'task/P'))
+
+    report = await census_of(repo)
+
+    assert report.findings == ()
+    assert report.unlanded_branches == 2
+
+
+async def test_a_base_with_no_live_carrier_is_stranded(repo: Path) -> None:
+    stacked_on_p(repo)
+    p_tip = rev(repo, 'task/P')
+    git(repo, 'worktree', 'remove', '--force', str(repo / '.worktrees' / 'P'))
+    git(repo, 'branch', '-D', 'task/P')
+
+    finding = findings_of(await census_of(repo))['task/M']
+
+    assert finding.verdict is census.Verdict.STRANDED_BASE
+    assert finding.base == p_tip
+    assert finding.base_owners == ()
+
+
+async def test_a_contained_sibling_without_a_reflog_stacking_event_is_unadjudicated(
+    repo: Path,
+) -> None:
+    m_wt = add_member(repo, 'M', 'main', {'m1.txt': '1\n'})
+    m1 = rev(repo, 'task/M')
+    commit(m_wt, {'m2.txt': '2\n'}, 'M: second')
+    git(repo, 'branch', 'task/S', m1)
+
+    finding = findings_of(await census_of(repo))['task/M']
+
+    assert finding.verdict is census.Verdict.UNADJUDICATED
+    assert finding.contained_siblings == ('task/S',)
+    assert 'task/S' in finding.detail
+
+
+async def test_a_branch_with_a_stack_base_record_is_recorded(repo: Path) -> None:
+    stacked_on_p(repo)
+    p_tip = rev(repo, 'task/P')
+    await ledger_of(repo).record('task/M', p_tip)
+
+    finding = findings_of(await census_of(repo))['task/M']
+
+    assert finding.verdict is census.Verdict.RECORDED
+    assert finding.base == p_tip
+
+
+async def test_a_residual_older_base_is_unadjudicated(repo: Path) -> None:
+    add_member(repo, 'P1', 'main', {'p1.txt': 'p1\n'})
+    m_wt = add_member(repo, 'M', 'main', {'m.txt': 'm\n'})
+    rebase(m_wt, 'task/P1')
+    advance_main(repo, {'unrelated.txt': 'u\n'})
+    rebase(m_wt, 'main')
+    add_member(repo, 'P2', 'main', {'p2.txt': 'p2\n'})
+    rebase(m_wt, 'task/P2')
+    p1_tip = rev(repo, 'task/P1')
+
+    finding = findings_of(await census_of(repo))['task/M']
+
+    assert finding.verdict is census.Verdict.UNADJUDICATED
+    assert finding.base == rev(repo, 'task/P2')
+    assert p1_tip in finding.detail
