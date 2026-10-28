@@ -30,6 +30,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
 from orchestrator.scheduler import BlastRadiusResult
 from orchestrator.workflow import TaskWorkflow
+from orchestrator.workflow_types import DryRunSpawn
 
 
 class _Scheduler:
@@ -619,6 +620,103 @@ class TestMarkBlockedStampPrecedesDryRunSpawn:
             '_spawn_dry_run_unblock is invoked, so a freshly-produced '
             f'proposal always compares as non-stale; got {call_order}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3125 guard (1): an architect verdict is itself the investigation, so
+# the block it produces spawns no dry-run.  The filter is the caller's typed
+# DryRunSpawn policy, not an escalate_to_human rule or a reason-prose sniff.
+# ---------------------------------------------------------------------------
+
+def _last_blocked_at_stamps(scheduler: _Scheduler) -> list[dict]:
+    return [
+        c for c in scheduler.update_calls
+        if isinstance(c['metadata'], dict) and 'last_blocked_at' in c['metadata']
+    ]
+
+
+class TestArchitectVerdictSkipsDryRun:
+    @pytest.mark.asyncio
+    async def test_unactionable_report_does_not_spawn(self, tmp_path):
+        wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='60', enabled=True)
+        assert wf.artifacts is not None
+        wf.artifacts.write_unactionable_task('filed in the wrong project tree', 'evidence text')
+
+        calls = []
+
+        async def _spy_dry_run(**kwargs):
+            calls.append(kwargs)
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._handle_unactionable_task_report()
+        await asyncio.sleep(0)
+        await _drain_unblock_tasks(wf)
+
+        assert calls == []
+        assert 'blocked' in scheduler.statuses.get('60', [])
+        assert len(_last_blocked_at_stamps(scheduler)) == 1
+
+    @pytest.mark.asyncio
+    async def test_false_premise_report_does_not_spawn(self, tmp_path):
+        wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='61', enabled=True)
+        assert wf.artifacts is not None
+        wf.artifacts.write_false_premise(
+            classification='numeric_bound', premise='p', evidence='e',
+            proposed_resolution='r',
+        )
+
+        calls = []
+
+        async def _spy_dry_run(**kwargs):
+            calls.append(kwargs)
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._handle_false_premise_report()
+        await asyncio.sleep(0)
+        await _drain_unblock_tasks(wf)
+
+        assert calls == []
+        assert 'blocked' in scheduler.statuses.get('61', [])
+        assert len(_last_blocked_at_stamps(scheduler)) == 1
+
+    @pytest.mark.asyncio
+    async def test_never_policy_suppresses_spawn(self, tmp_path):
+        wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='62', enabled=True)
+
+        calls = []
+
+        async def _spy_dry_run(**kwargs):
+            calls.append(kwargs)
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._mark_blocked('verify exhausted', dry_run_spawn=DryRunSpawn.NEVER)
+        await asyncio.sleep(0)
+        await _drain_unblock_tasks(wf)
+
+        assert calls == []
+        assert 'blocked' in scheduler.statuses.get('62', [])
+
+    @pytest.mark.asyncio
+    async def test_escalate_to_human_with_default_policy_still_spawns(self, tmp_path):
+        """The suppression belongs to the caller's policy: the post-merge
+        red-main path legitimately pairs escalate_to_human with an opt-in, and
+        the reason text below is deliberately the unactionable handler's own.
+        """
+        wf, _ = _make_workflow(tmp_path=tmp_path, task_id='63', enabled=True)
+
+        calls = []
+
+        async def _spy_dry_run(**kwargs):
+            calls.append(kwargs)
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._mark_blocked(
+                'Architect reported task unactionable: x', escalate_to_human=True,
+            )
+        await asyncio.sleep(0)
+        await _drain_unblock_tasks(wf)
+
+        assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
