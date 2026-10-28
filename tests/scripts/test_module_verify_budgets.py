@@ -1850,6 +1850,25 @@ def test_the_published_pair_reader_rejects_every_way_the_derivation_can_rot(
     )
 
 
+def test_the_ruled_census_is_the_shared_record_the_fleet_table_reads() -> None:
+    """The excepted branch reads the ONE census record, not a local copy of it.
+
+    Task 6172. ``RULED_BUDGET_CENSUS`` and
+    ``test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS`` both consume
+    task 3353's orchestrator census. Asserted by IDENTITY rather than equality:
+    a re-introduced local copy carrying equal values today is exactly the drift
+    a single home exists to prevent, and equality would pass it.
+    """
+    import verify_budget_census_records as census_records  # noqa: PLC0415
+
+    assert RULED_BUDGET_CENSUS['orchestrator'] is census_records.ORCHESTRATOR_BUDGET_CENSUS, (
+        "RULED_BUDGET_CENSUS['orchestrator'] is not the record at "
+        'tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS '
+        '(task 6172). That record is the single home the fleet table also reads; '
+        'import it, never copy it'
+    )
+
+
 class TestCensusBudgetFloor:
     """`census_budget_floor` — the family's ONE spelling of D17's derivation.
 

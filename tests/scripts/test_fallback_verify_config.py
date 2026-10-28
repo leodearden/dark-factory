@@ -41,6 +41,7 @@ import pytest
 import verify_command_invariants as vci
 import yaml
 from orchestrator.config import ModuleConfig, _discover_module_configs
+from verify_budget_census_records import ORCHESTRATOR_BUDGET_CENSUS
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
@@ -881,6 +882,34 @@ def test_every_measured_fleet_segment_carries_dated_provenance() -> None:
         f'orphaned provenance: {sorted(set(MEASURED_FLEET_SEGMENT_PROVENANCE) - set(MEASURED_FLEET_SEGMENT_SECS))}). '
         'Every segment figure must carry its date and sample, or the table goes '
         'back to being un-ageable — the defect task 4902 was filed to fix.'
+    )
+
+
+def test_orchestrator_fleet_row_derives_from_the_shared_census_record() -> None:
+    """The orchestrator row and its provenance follow task 3353's census record.
+
+    Task 6172. The record lives once, at
+    ``tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS``,
+    and ``test_module_verify_budgets.py::RULED_BUDGET_CENSUS`` reads the same
+    object. A re-literalised row here would agree with it today and drift from
+    it at the next re-measure.
+    """
+    home = 'tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS'
+    provenance = MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator']
+
+    assert MEASURED_FLEET_SEGMENT_SECS['orchestrator'] == round(ORCHESTRATOR_BUDGET_CENSUS.p50, 2), (
+        f"MEASURED_FLEET_SEGMENT_SECS['orchestrator'] is not {home}.p50 to 2 dp "
+        '(task 6172). The row is DERIVED from that record, never copied'
+    )
+    assert provenance.measured_at == ORCHESTRATOR_BUDGET_CENSUS.measured_at, (
+        f"MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator'].measured_at is not "
+        f'{home}.measured_at (task 6172). The provenance is DERIVED from that '
+        'record, never copied'
+    )
+    assert provenance.sample_size == ORCHESTRATOR_BUDGET_CENSUS.n, (
+        f"MEASURED_FLEET_SEGMENT_PROVENANCE['orchestrator'].sample_size is not "
+        f'{home}.n (task 6172). The provenance is DERIVED from that record, '
+        'never copied'
     )
 
 
