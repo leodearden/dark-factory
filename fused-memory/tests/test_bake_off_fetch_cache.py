@@ -36,8 +36,9 @@ from __future__ import annotations
 
 import functools
 import types
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from _fm_helpers import load_script_module
 
@@ -1120,22 +1121,27 @@ class TestTheFixtureDigestsAreVerifiedNotMerelyRecorded:
         assert mod.load_fetches(path, {'c_peers': seeded})
 
 
-REGISTRY_NAME = 'memory_eval_topic_registry.json'
+class _CorpusInputs(NamedTuple):
+    clusters: Mapping[str, Any]
+    topics: Mapping[str, Any]
+    claims: tuple[Any, ...]
+    distractors: tuple[Any, ...]
 
 
 @functools.cache
-def _committed_corpus_inputs() -> types.SimpleNamespace:
+def _committed_corpus_inputs() -> _CorpusInputs:
     """The committed default fixtures `materialize_arm` reads, loaded once.
 
     Through the public loaders, so a corpus anchored here is exactly the one
-    a default run materializes.  Read-only by contract: the result is cached.
+    a default run materializes.  Frozen because it is cached: a test that
+    tried to edit it would otherwise change what every later test reads.
     """
     mod = _mod()
-    return types.SimpleNamespace(
-        clusters=mod.load_calibration_clusters(),
-        topics=mod.load_registry_topics(),
-        claims=mod.load_arm_claims(),
-        distractors=mod.load_distractor_slab(),
+    return _CorpusInputs(
+        clusters=types.MappingProxyType(mod.load_calibration_clusters()),
+        topics=types.MappingProxyType(mod.load_registry_topics()),
+        claims=tuple(mod.load_arm_claims()),
+        distractors=tuple(mod.load_distractor_slab()),
     )
 
 
@@ -1168,7 +1174,7 @@ class TestTheRegistryIsPinnedByTheCorpusNotItsBytes:
             provenance=_provenance(mod, {'c_peers': records}),
         )
 
-        registry = _fixture_copy(tmp_path, REGISTRY_NAME)
+        registry = _fixture_copy(tmp_path, mod.DEFAULT_REGISTRY_PATH.name)
         doc = json.loads(registry.read_text(encoding='utf-8'))
         claimed_clusters = {claim.cluster_id for claim in corpus.claims}
         entry = next(
@@ -1586,7 +1592,7 @@ class TestReplayFetchesFlag:
         `TestTheRegistryIsPinnedByTheCorpusNotItsBytes`)."""
         mod = _mod()
         cache = tmp_path / 'cache.json'
-        registry = _fixture_copy(tmp_path, REGISTRY_NAME)
+        registry = _fixture_copy(tmp_path, mod.DEFAULT_REGISTRY_PATH.name)
         _install_driver_doubles(monkeypatch)
         assert mod.main(_argv(
             tmp_path, 'live', '--registry', str(registry),
@@ -1596,7 +1602,7 @@ class TestReplayFetchesFlag:
         dumped = json.loads(cache.read_text(encoding='utf-8'))
         assert [
             row for row in dumped['provenance']['fixtures']
-            if row['path'].endswith(REGISTRY_NAME)
+            if row['path'].endswith(registry.name)
         ] == []
 
         sha_before = hashlib.sha256(registry.read_bytes()).hexdigest()
