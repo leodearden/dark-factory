@@ -203,7 +203,16 @@ test('mountPage() refuses a second mount in one window, and leaves the first pag
   assert.ok(root.querySelector('.app .rail-nav button'), 'a refused mount must leave the first page rendering');
 });
 
-test('close() after mountPage() leaves no live timer behind, though the page arms its own', () => {
+// jsdom's window.postMessage (the tweaks panel posts on mount) delivers on a
+// one-shot node setTimeout(0) outside the window's own timers, which close()
+// cannot reach. It fires on the next turn, so each count waits that one turn:
+// the baseline too, since an earlier test's page may have posted.
+function nextTurn() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+test('close() after mountPage() leaves no live timer behind, though the page arms its own', async () => {
+  await nextTurn();
   const before = liveTimerCount();
   const harness = buildDashboardWindow();
   let loaded;
@@ -218,6 +227,7 @@ test('close() after mountPage() leaves no live timer behind, though the page arm
   } finally {
     harness.close();
   }
+  await nextTurn();
   assert.equal(liveTimerCount(), before, 'a timer outlived close(); it would hold `node --test` open');
 });
 
