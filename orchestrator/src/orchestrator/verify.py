@@ -4524,11 +4524,11 @@ class VerifyAttempt:
             and all(c.rc == 0 or c.timed_out for c in self.checks)
         )
 
-    def _by_label(self, slot: LegSlot) -> CheckRun:
-        found = next((c for c in self.checks if c.label == slot), None)
+    def _by_label(self, label: str) -> CheckRun:
+        found = next((c for c in self.checks if c.label == label), None)
         if found is None:
             raise KeyError(
-                f'no check labeled {slot.value!r} in {[str(c.label) for c in self.checks]}'
+                f'no check labeled {str(label)!r} in {[str(c.label) for c in self.checks]}'
             )
         return found
 
@@ -4550,10 +4550,14 @@ class VerifyAttempt:
 
     def with_rerun(self, run: CheckRun) -> 'VerifyAttempt':
         """This attempt with *run* replacing its same-label check and every
-        other check that ran carried over; skipped checks stay skipped."""
-        self._by_label(LegSlot(run.label))
+        other check that ran carried over; skipped checks stay skipped.
+
+        Raises ``KeyError`` when this attempt holds no check labeled
+        ``run.label``.
+        """
+        replaced = self._by_label(run.label)
         return VerifyAttempt([
-            run if c.label == run.label
+            run if c is replaced
             else (replace(c, carried_over=True) if c.cmd is not None else c)
             for c in self.checks
         ])

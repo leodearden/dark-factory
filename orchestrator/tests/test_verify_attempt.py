@@ -505,6 +505,10 @@ class TestVerifyAttemptRerun:
         with pytest.raises(KeyError, match="no check labeled 'type'"):
             attempt.with_rerun(_run(LegSlot.TYPE))
 
+    def test_with_rerun_of_a_label_outside_the_leg_vocabulary_raises_keyerror(self):
+        with pytest.raises(KeyError, match="no check labeled 'bogus'"):
+            _first_pass().with_rerun(_run('bogus'))
+
     def test_a_carried_over_failure_still_fails_the_attempt(self):
         from orchestrator.verify import LegSlot, VerifyAttempt
 
