@@ -975,6 +975,8 @@ class TestKeepLastNTrim:
         keep_last = 5
         num_runs = 6  # one more than keep_last
 
+        # Six DISTINCT blocks: HEAD == main gives every run the same
+        # branch_patch_id, and an identical re-block is deduplicated (task 3125).
         for i in range(num_runs):
             proposal_text = f'Proposal number {i}'
             structured = {
@@ -989,7 +991,7 @@ class TestKeepLastNTrim:
                 await run_dry_run_unblock(
                     task_id='trim-test',
                     worktree=str(repo_dir),
-                    reason='verify exhausted',
+                    reason=f'verify exhausted (block {i})',
                     detail='',
                     scheduler=scheduler,
                     mcp=MagicMock(),
