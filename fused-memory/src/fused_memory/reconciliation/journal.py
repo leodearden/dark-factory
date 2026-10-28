@@ -297,6 +297,10 @@ class ReconciliationJournal:
             await add_column_if_missing(db, 'runs', 'stage_cursor', 'TEXT')
             await add_column_if_missing(db, 'runs', 'attempt', 'INTEGER DEFAULT 0')
 
+            # Retired mutation-audit ledger (task 5890), dropped from DBs created
+            # before its DDL was removed; its idx_journal_run index goes with it.
+            await db.execute('DROP TABLE IF EXISTS journal_entries')
+
         logger.info(f'Reconciliation journal initialized at {db_path}')
 
     async def close(self) -> None:
