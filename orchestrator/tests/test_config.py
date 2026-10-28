@@ -1057,6 +1057,12 @@ class TestPathResolution:
         config = OrchestratorConfig(project_root=tmp_path)
         assert config.overrides_db_path == tmp_path / 'data' / 'orchestrator' / 'scheduler_overrides.db'
 
+    def test_eligibility_clock_db_path_default(self, tmp_path: Path) -> None:
+        from shared.project_layout import scheduler_eligibility_db
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.eligibility_clock_db_path == scheduler_eligibility_db(tmp_path)
+
 
 @pytest.mark.usefixtures("code_default_config")
 class TestStewardTimeoutInvariant:
