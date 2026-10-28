@@ -32,7 +32,13 @@ from enum import StrEnum
 from pathlib import Path
 
 import _checkout as _checkout
-from orchestrator.branch_stack import base_owners, foreign_commit_cut
+from orchestrator.branch_stack import (
+    STACK_BASE_REF_NAMESPACE,
+    StackBaseLedger,
+    StackInspectionError,
+    base_owners,
+    foreign_commit_cut,
+)
 from shared.git_async import run_git
 
 TASK_BRANCH_PREFIX = 'task/'
@@ -42,7 +48,18 @@ _CREATED_FROM = 'branch: Created from '
 
 
 class Verdict(StrEnum):
+    """What the census concluded about one unlanded task branch."""
+
+    RECORDED = 'recorded'
+    """A 5618 stack-base record exists, so merge admission un-stacks it."""
+    UNADJUDICATED = 'unadjudicated'
+    """The evidence is ambiguous; a human must read it."""
+    ALREADY_CLEAN = 'already_clean'
+    """Stacked once, but carries none of the base's commits any more."""
+    STRANDED_BASE = 'stranded_base'
+    """Carries an unlanded base that no live branch holds any more."""
     CONFIRMED = 'confirmed'
+    """Carries an unlanded base a live branch still holds: adopt the record."""
 
 
 class CensusGitError(RuntimeError):
@@ -114,6 +131,7 @@ class _Snapshot:
     tips: Mapping[str, str]
     dag: Mapping[str, tuple[str, ...]]
     reflogs: Mapping[str, tuple[ReflogEntry, ...]]
+    recorded: frozenset[str]
 
 
 async def _read(repo_root: Path, *args: str, input_text: str | None = None) -> str:
@@ -168,24 +186,46 @@ async def _reflog(repo_root: Path, branch: str) -> tuple[ReflogEntry, ...]:
     return tuple(ReflogEntry(sha=sha.strip(), subject=subject) for sha, _, subject in entries)
 
 
+async def _recorded_branches(repo_root: Path) -> frozenset[str]:
+    """Branches holding a 5618 stack-base record."""
+    out = await _read(repo_root, 'for-each-ref', '--format=%(refname)', STACK_BASE_REF_NAMESPACE)
+    return frozenset(line.removeprefix(STACK_BASE_REF_NAMESPACE) for line in out.split())
+
+
 async def _snapshot(repo_root: Path, main_branch: str) -> _Snapshot:
     main_sha = await _main_sha(repo_root, main_branch)
     tips = await _unlanded_tips(repo_root, main_sha)
     names = sorted(tips)
-    main_commits, dag, reflogs = await asyncio.gather(
+    main_commits, dag, reflogs, recorded = await asyncio.gather(
         _main_commits(repo_root, main_sha),
         _unlanded_dag(repo_root, main_sha, tips),
         asyncio.gather(*(_reflog(repo_root, name) for name in names)),
+        _recorded_branches(repo_root),
     )
     return _Snapshot(
         main_sha=main_sha, main_commits=main_commits, tips=tips, dag=dag,
-        reflogs=dict(zip(names, reflogs, strict=True)),
+        reflogs=dict(zip(names, reflogs, strict=True)), recorded=recorded,
     )
 
 
 # ---------------------------------------------------------------------------
 # Pure derivations from the snapshot
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Evidence:
+    """What stage 1 alone says about one branch."""
+
+    branch: str
+    tip: str
+    events: tuple[StackingEvent, ...]
+    contained: tuple[str, ...]
+    unexplained: tuple[str, ...]
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.events or self.contained)
 
 
 def _ancestry(dag: Mapping[str, tuple[str, ...]], start: str) -> frozenset[str]:
@@ -229,6 +269,22 @@ def _event_at(reflog: Sequence[ReflogEntry], index: int) -> StackingEvent | None
     return None
 
 
+def _evidence(snapshot: _Snapshot, branch: str) -> _Evidence:
+    """A contained sibling is explained when any stacking event's base reaches it."""
+    events = stacking_events(snapshot.reflogs[branch], snapshot.main_commits)
+    contained = contained_siblings(snapshot, branch)
+    explained: set[str] = set()
+    for event in events:
+        explained |= _ancestry(snapshot.dag, event.base)
+    return _Evidence(
+        branch=branch,
+        tip=snapshot.tips[branch],
+        events=events,
+        contained=contained,
+        unexplained=tuple(name for name in contained if snapshot.tips[name] not in explained),
+    )
+
+
 def _reflog_holders(snapshot: _Snapshot, sha: str) -> frozenset[str]:
     return frozenset(
         name for name, reflog in snapshot.reflogs.items()
@@ -237,37 +293,191 @@ def _reflog_holders(snapshot: _Snapshot, sha: str) -> frozenset[str]:
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: adjudication of one branch
+# Stage 2: per-branch git checks, for branches whose task can still merge
 # ---------------------------------------------------------------------------
 
 
-async def _live_owners(
-    repo_root: Path, snapshot: _Snapshot, branch: str, base: str,
+async def _checked(repo_root: Path, *args: str, answers: tuple[int, ...] = (0,)) -> int:
+    """Run git; any exit code outside *answers* is a failed inspection."""
+    command = ('git', *args)
+    rc, _, err = await _git(command, repo_root)
+    if rc not in answers:
+        raise StackInspectionError(command, err)
+    return rc
+
+
+async def _commit_exists(repo_root: Path, sha: str) -> bool:
+    rc, _, _ = await _git(['git', 'cat-file', '-e', f'{sha}^{{commit}}'], repo_root)
+    return rc == 0
+
+
+async def _is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
+    rc = await _checked(
+        repo_root, 'merge-base', '--is-ancestor', ancestor, descendant, answers=(0, 1),
+    )
+    return rc == 0
+
+
+async def _patch_landed(repo_root: Path, main_sha: str, base: str) -> bool:
+    """Every commit of *base* that main lacks has a patch-equivalent on main."""
+    command = ('git', 'cherry', main_sha, base)
+    rc, out, err = await _git(command, repo_root)
+    if rc != 0:
+        raise StackInspectionError(command, err)
+    return not any(line.startswith('+') for line in out.splitlines())
+
+
+class _LandedChecks:
+    """One ``git cherry`` per distinct base per census, however many branches share it."""
+
+    def __init__(self, repo_root: Path, main_sha: str) -> None:
+        self._repo_root = repo_root
+        self._main_sha = main_sha
+        self._checks: dict[str, asyncio.Future[bool]] = {}
+
+    async def landed(self, base: str) -> bool:
+        check = self._checks.get(base)
+        if check is None:
+            check = asyncio.ensure_future(_patch_landed(self._repo_root, self._main_sha, base))
+            self._checks[base] = check
+        return await check
+
+
+@dataclass(frozen=True)
+class _Stage2:
+    repo_root: Path
+    snapshot: _Snapshot
+    landed: _LandedChecks
+
+
+@dataclass(frozen=True)
+class _Adjudication:
+    """Stage 2's facts.  ``base`` is the newest surviving event's base."""
+
+    surviving: tuple[StackingEvent, ...] = ()
+    base: str | None = None
+    cut: str | None = None
+    residual: tuple[str, ...] = ()
+    owners: tuple[str, ...] = ()
+    error: str | None = None
+
+
+async def _survives(stage: _Stage2, event: StackingEvent) -> bool:
+    """A base that is gone, the branch's own history, or patch-landed stacks nothing."""
+    if not await _commit_exists(stage.repo_root, event.base):
+        return False
+    if event.prior_tip is not None and await _is_ancestor(
+        stage.repo_root, event.base, event.prior_tip,
+    ):
+        return False
+    return not await stage.landed.landed(event.base)
+
+
+async def _residual_bases(
+    stage: _Stage2, tip: str, cut: str | None, newest: str, older: Sequence[StackingEvent],
 ) -> tuple[str, ...]:
+    """Older bases whose commits still sit below the newest base's cut."""
+    main_ref = cut or stage.snapshot.main_sha
+    candidates = dict.fromkeys(event.base for event in older if event.base != newest)
+    return tuple([
+        base for base in candidates
+        if await foreign_commit_cut(
+            _git, stage.repo_root, tip=tip, main_ref=main_ref, base=base,
+        ) is not None
+    ])
+
+
+async def _live_owners(stage: _Stage2, branch: str, base: str) -> tuple[str, ...]:
     """Branches that still carry *base*: at their tip now, or once in their reflog."""
-    at_tip = await base_owners(_git, repo_root, base)
-    return tuple(sorted((set(at_tip) | _reflog_holders(snapshot, base)) - {branch}))
+    at_tip = await base_owners(_git, stage.repo_root, base)
+    held = _reflog_holders(stage.snapshot, base)
+    return tuple(sorted((set(at_tip) | held) - {branch}))
 
 
-async def _finding(repo_root: Path, snapshot: _Snapshot, branch: str) -> BranchFinding | None:
-    events = stacking_events(snapshot.reflogs[branch], snapshot.main_commits)
-    if not events:
+async def _adjudicate(stage: _Stage2, evidence: _Evidence) -> _Adjudication:
+    try:
+        surviving = tuple([event for event in evidence.events if await _survives(stage, event)])
+        if not surviving:
+            return _Adjudication()
+        base = surviving[0].base
+        cut = await foreign_commit_cut(
+            _git, stage.repo_root, tip=evidence.tip, main_ref=stage.snapshot.main_sha, base=base,
+        )
+        return _Adjudication(
+            surviving=surviving,
+            base=base,
+            cut=cut,
+            residual=await _residual_bases(stage, evidence.tip, cut, base, surviving[1:]),
+            owners=await _live_owners(stage, evidence.branch, base),
+        )
+    except StackInspectionError as exc:
+        newest = evidence.events[0].base if evidence.events else None
+        return _Adjudication(base=newest, error=str(exc))
+
+
+def _verdict(evidence: _Evidence, adjudication: _Adjudication) -> Verdict | None:
+    """Precedence after RECORDED, which needs no stage-2 fact and is decided first."""
+    if adjudication.error is None and not adjudication.surviving and not evidence.unexplained:
         return None
-    base = events[0].base
-    cut = await foreign_commit_cut(
-        _git, repo_root, tip=snapshot.tips[branch], main_ref=snapshot.main_sha, base=base,
+    if evidence.unexplained or adjudication.residual or adjudication.error is not None:
+        return Verdict.UNADJUDICATED
+    if adjudication.cut is None:
+        return Verdict.ALREADY_CLEAN
+    if not adjudication.owners:
+        return Verdict.STRANDED_BASE
+    return Verdict.CONFIRMED
+
+
+def _unadjudicated_detail(evidence: _Evidence, adjudication: _Adjudication) -> str:
+    clauses = [
+        f'contains {name} with no stacking event that explains it'
+        for name in evidence.unexplained
+    ]
+    clauses += [
+        f'older base {base} still sits below the cut' for base in adjudication.residual
+    ]
+    if adjudication.error is not None:
+        clauses.append(f'git inspection failed: {adjudication.error}')
+    return '; '.join(clauses)
+
+
+# ---------------------------------------------------------------------------
+# One finding per branch
+# ---------------------------------------------------------------------------
+
+
+async def _recorded_finding(stage: _Stage2, evidence: _Evidence) -> BranchFinding:
+    base = await StackBaseLedger(stage.repo_root, _git).base_of(evidence.branch)
+    return BranchFinding(
+        branch=evidence.branch, task_status=None, verdict=Verdict.RECORDED, base=base,
+        cut=None, contained_siblings=evidence.contained, base_owners=(),
+        events=evidence.events, detail='',
+    )
+
+
+async def _adjudicated_finding(stage: _Stage2, evidence: _Evidence) -> BranchFinding | None:
+    adjudication = await _adjudicate(stage, evidence)
+    verdict = _verdict(evidence, adjudication)
+    if verdict is None:
+        return None
+    detail = (
+        _unadjudicated_detail(evidence, adjudication)
+        if verdict is Verdict.UNADJUDICATED else ''
     )
     return BranchFinding(
-        branch=branch,
-        task_status=None,
-        verdict=Verdict.CONFIRMED,
-        base=base,
-        cut=cut,
-        contained_siblings=contained_siblings(snapshot, branch),
-        base_owners=await _live_owners(repo_root, snapshot, branch, base),
-        events=events,
-        detail='',
+        branch=evidence.branch, task_status=None, verdict=verdict, base=adjudication.base,
+        cut=adjudication.cut, contained_siblings=evidence.contained,
+        base_owners=adjudication.owners, events=evidence.events, detail=detail,
     )
+
+
+async def _finding(stage: _Stage2, branch: str) -> BranchFinding | None:
+    evidence = _evidence(stage.snapshot, branch)
+    if branch in stage.snapshot.recorded:
+        return await _recorded_finding(stage, evidence)
+    if evidence.is_empty:
+        return None
+    return await _adjudicated_finding(stage, evidence)
 
 
 async def run_census(
@@ -275,13 +485,13 @@ async def run_census(
 ) -> CensusReport:
     """Adjudicate every unlanded task branch of *repo_root* against *main_branch*.
 
-    Raises :class:`CensusGitError` when a stage-1 read fails.
+    Raises :class:`CensusGitError` when a stage-1 read fails.  A stage-2
+    failure makes only that branch UNADJUDICATED.
     """
     started = time.monotonic()
     snapshot = await _snapshot(repo_root, main_branch)
-    found = await asyncio.gather(
-        *(_finding(repo_root, snapshot, branch) for branch in sorted(snapshot.tips)),
-    )
+    stage = _Stage2(repo_root, snapshot, _LandedChecks(repo_root, snapshot.main_sha))
+    found = await asyncio.gather(*(_finding(stage, branch) for branch in sorted(snapshot.tips)))
     return CensusReport(
         main_branch=main_branch,
         main_sha=snapshot.main_sha,
