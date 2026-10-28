@@ -1,7 +1,8 @@
 """What one offline-lane pass tells the flake ledger.
 
 PRD ``plans/offline-lane-red-path-prd.md`` D6 and section 5.8: the flake suppressions a
-pass's outcome amounts to, at call site ``offline_lane``.  Pure; the I/O around it (the
+pass's outcome amounts to, at call site ``offline_lane``, and the tests it saw recover
+under the one-head rule.  Pure; the I/O around it (the
 host-pressure read, the run-record loads and the recorder calls) is
 ``orchestrator/src/orchestrator/offline_lane_episodes.py::LaneEngine``.
 """
@@ -25,7 +26,14 @@ from orchestrator.offline_lane_confirm import (
     Unconfirmable,
     inconclusive_reason,
 )
-from orchestrator.offline_lane_episode_state import PassObservation, unconfirmable_node
+from orchestrator.offline_lane_episode_state import (
+    CommandRecord,
+    EndedEpisode,
+    EndReason,
+    Episode,
+    PassObservation,
+    unconfirmable_node,
+)
 from orchestrator.offline_lane_records import FailureRecord, RunRecord
 
 LANE_RUNNER = 'local'
@@ -43,10 +51,13 @@ def _failure(node: str, detect: RunRecord | None, confirm: RunRecord | None) -> 
     return None
 
 
+def _names_no_test(node: str, observation: PassObservation) -> bool:
+    """The command's pseudo-test and the ledger's sentinel stand for a command, not a test."""
+    return node in (unconfirmable_node(observation.command), UNKNOWN_TEST_ID)
+
+
 def _named(nodes: Sequence[str], observation: PassObservation) -> tuple[str, ...]:
-    """*nodes* without the command's pseudo-test and the ledger's sentinel, which name no test."""
-    unnamed = {unconfirmable_node(observation.command), UNKNOWN_TEST_ID}
-    return tuple(node for node in nodes if node not in unnamed)
+    return tuple(node for node in nodes if not _names_no_test(node, observation))
 
 
 @dataclass(frozen=True)
@@ -122,3 +133,42 @@ def pass_suppressions(
     if isinstance(outcome, Confirmed):
         return tuple(_confirmed(outcome, stamp))
     return ()
+
+
+@dataclass(frozen=True)
+class Recovery:
+    """A test that failed and passed at one head with no fix filed; *episode* is as it was before the pass ended it."""
+
+    node: str
+    evidence_head: str
+    episode: Episode
+
+
+def _evidence_head(episode: Episode, observation: PassObservation) -> str | None:
+    """The head the episode both failed and passed at: this pass's, else the green head before it."""
+    if observation.head in episode.reproduced_heads:
+        return observation.head
+    if episode.last_green_head in episode.reproduced_heads:
+        return episode.last_green_head
+    return None
+
+
+def _recovery(episode: Episode, observation: PassObservation) -> Recovery | None:
+    if _names_no_test(episode.node, observation):
+        return None
+    if episode.covering_task_id is not None or episode.had_outage_pass:
+        return None
+    head = _evidence_head(episode, observation)
+    return None if head is None else Recovery(episode.node, head, episode)
+
+
+def recoveries(
+    before: CommandRecord, ended: Sequence[EndedEpisode], observation: PassObservation,
+) -> tuple[Recovery, ...]:
+    """The episodes *observation* ended by a pass that recover under the one-head rule, in *ended*'s order."""
+    found = (
+        _recovery(before.episodes[episode.node], observation)
+        for episode in ended
+        if episode.reason == EndReason.PASSED.value
+    )
+    return tuple(recovery for recovery in found if recovery is not None)
