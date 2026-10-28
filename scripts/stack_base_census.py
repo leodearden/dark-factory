@@ -32,6 +32,7 @@ from enum import StrEnum
 from pathlib import Path
 
 import _checkout as _checkout
+from _task_db_scan import connect_ro
 from orchestrator.branch_stack import (
     STACK_BASE_REF_NAMESPACE,
     StackBaseLedger,
@@ -40,6 +41,7 @@ from orchestrator.branch_stack import (
     foreign_commit_cut,
 )
 from shared.git_async import run_git
+from shared.task_statuses import TERMINAL
 
 TASK_BRANCH_PREFIX = 'task/'
 _HEADS = 'refs/heads/'
@@ -52,6 +54,8 @@ class Verdict(StrEnum):
 
     RECORDED = 'recorded'
     """A 5618 stack-base record exists, so merge admission un-stacks it."""
+    INERT = 'inert'
+    """Looks stacked, but its task is done or cancelled, so it never merges again."""
     UNADJUDICATED = 'unadjudicated'
     """The evidence is ambiguous; a human must read it."""
     ALREADY_CLEAN = 'already_clean'
@@ -87,6 +91,20 @@ class StackingEvent:
 
     base: str
     prior_tip: str | None
+
+
+@dataclass(frozen=True)
+class TaskBranch:
+    """An unlanded ``task/<id>`` branch; ``task_id`` is None unless ``<id>`` is a number."""
+
+    name: str
+    task_id: int | None
+
+    @classmethod
+    def parse(cls, name: str) -> TaskBranch:
+        suffix = name.removeprefix(TASK_BRANCH_PREFIX)
+        numeric = suffix.isascii() and suffix.isdigit()
+        return cls(name=name, task_id=int(suffix) if numeric else None)
 
 
 @dataclass(frozen=True)
@@ -217,7 +235,8 @@ async def _snapshot(repo_root: Path, main_branch: str) -> _Snapshot:
 class _Evidence:
     """What stage 1 alone says about one branch."""
 
-    branch: str
+    branch: TaskBranch
+    task_status: str | None
     tip: str
     events: tuple[StackingEvent, ...]
     contained: tuple[str, ...]
@@ -226,6 +245,11 @@ class _Evidence:
     @property
     def is_empty(self) -> bool:
         return not (self.events or self.contained)
+
+    @property
+    def can_still_merge(self) -> bool:
+        """An unknown status counts as live: the conservative reading."""
+        return self.task_status not in TERMINAL
 
 
 def _ancestry(dag: Mapping[str, tuple[str, ...]], start: str) -> frozenset[str]:
@@ -269,16 +293,18 @@ def _event_at(reflog: Sequence[ReflogEntry], index: int) -> StackingEvent | None
     return None
 
 
-def _evidence(snapshot: _Snapshot, branch: str) -> _Evidence:
+def _evidence(snapshot: _Snapshot, statuses: Mapping[int, str], name: str) -> _Evidence:
     """A contained sibling is explained when any stacking event's base reaches it."""
-    events = stacking_events(snapshot.reflogs[branch], snapshot.main_commits)
-    contained = contained_siblings(snapshot, branch)
+    branch = TaskBranch.parse(name)
+    events = stacking_events(snapshot.reflogs[name], snapshot.main_commits)
+    contained = contained_siblings(snapshot, name)
     explained: set[str] = set()
     for event in events:
         explained |= _ancestry(snapshot.dag, event.base)
     return _Evidence(
         branch=branch,
-        tip=snapshot.tips[branch],
+        task_status=None if branch.task_id is None else statuses.get(branch.task_id),
+        tip=snapshot.tips[name],
         events=events,
         contained=contained,
         unexplained=tuple(name for name in contained if snapshot.tips[name] not in explained),
@@ -344,9 +370,10 @@ class _LandedChecks:
 
 
 @dataclass(frozen=True)
-class _Stage2:
+class _CensusRun:
     repo_root: Path
     snapshot: _Snapshot
+    statuses: Mapping[int, str]
     landed: _LandedChecks
 
 
@@ -362,53 +389,53 @@ class _Adjudication:
     error: str | None = None
 
 
-async def _survives(stage: _Stage2, event: StackingEvent) -> bool:
+async def _survives(census_run: _CensusRun, event: StackingEvent) -> bool:
     """A base that is gone, the branch's own history, or patch-landed stacks nothing."""
-    if not await _commit_exists(stage.repo_root, event.base):
+    if not await _commit_exists(census_run.repo_root, event.base):
         return False
     if event.prior_tip is not None and await _is_ancestor(
-        stage.repo_root, event.base, event.prior_tip,
+        census_run.repo_root, event.base, event.prior_tip,
     ):
         return False
-    return not await stage.landed.landed(event.base)
+    return not await census_run.landed.landed(event.base)
 
 
 async def _residual_bases(
-    stage: _Stage2, tip: str, cut: str | None, newest: str, older: Sequence[StackingEvent],
+    census_run: _CensusRun, tip: str, cut: str | None, newest: str, older: Sequence[StackingEvent],
 ) -> tuple[str, ...]:
     """Older bases whose commits still sit below the newest base's cut."""
-    main_ref = cut or stage.snapshot.main_sha
+    main_ref = cut or census_run.snapshot.main_sha
     candidates = dict.fromkeys(event.base for event in older if event.base != newest)
     return tuple([
         base for base in candidates
         if await foreign_commit_cut(
-            _git, stage.repo_root, tip=tip, main_ref=main_ref, base=base,
+            _git, census_run.repo_root, tip=tip, main_ref=main_ref, base=base,
         ) is not None
     ])
 
 
-async def _live_owners(stage: _Stage2, branch: str, base: str) -> tuple[str, ...]:
+async def _live_owners(census_run: _CensusRun, branch: str, base: str) -> tuple[str, ...]:
     """Branches that still carry *base*: at their tip now, or once in their reflog."""
-    at_tip = await base_owners(_git, stage.repo_root, base)
-    held = _reflog_holders(stage.snapshot, base)
+    at_tip = await base_owners(_git, census_run.repo_root, base)
+    held = _reflog_holders(census_run.snapshot, base)
     return tuple(sorted((set(at_tip) | held) - {branch}))
 
 
-async def _adjudicate(stage: _Stage2, evidence: _Evidence) -> _Adjudication:
+async def _adjudicate(census_run: _CensusRun, evidence: _Evidence) -> _Adjudication:
     try:
-        surviving = tuple([event for event in evidence.events if await _survives(stage, event)])
+        surviving = tuple([event for event in evidence.events if await _survives(census_run, event)])
         if not surviving:
             return _Adjudication()
         base = surviving[0].base
         cut = await foreign_commit_cut(
-            _git, stage.repo_root, tip=evidence.tip, main_ref=stage.snapshot.main_sha, base=base,
+            _git, census_run.repo_root, tip=evidence.tip, main_ref=census_run.snapshot.main_sha, base=base,
         )
         return _Adjudication(
             surviving=surviving,
             base=base,
             cut=cut,
-            residual=await _residual_bases(stage, evidence.tip, cut, base, surviving[1:]),
-            owners=await _live_owners(stage, evidence.branch, base),
+            residual=await _residual_bases(census_run, evidence.tip, cut, base, surviving[1:]),
+            owners=await _live_owners(census_run, evidence.branch.name, base),
         )
     except StackInspectionError as exc:
         newest = evidence.events[0].base if evidence.events else None
@@ -416,7 +443,7 @@ async def _adjudicate(stage: _Stage2, evidence: _Evidence) -> _Adjudication:
 
 
 def _verdict(evidence: _Evidence, adjudication: _Adjudication) -> Verdict | None:
-    """Precedence after RECORDED, which needs no stage-2 fact and is decided first."""
+    """Precedence after RECORDED and INERT, which need no stage-2 fact (see _finding)."""
     if adjudication.error is None and not adjudication.surviving and not evidence.unexplained:
         return None
     if evidence.unexplained or adjudication.residual or adjudication.error is not None:
@@ -446,17 +473,27 @@ def _unadjudicated_detail(evidence: _Evidence, adjudication: _Adjudication) -> s
 # ---------------------------------------------------------------------------
 
 
-async def _recorded_finding(stage: _Stage2, evidence: _Evidence) -> BranchFinding:
-    base = await StackBaseLedger(stage.repo_root, _git).base_of(evidence.branch)
+async def _recorded_finding(census_run: _CensusRun, evidence: _Evidence) -> BranchFinding:
+    base = await StackBaseLedger(census_run.repo_root, _git).base_of(evidence.branch.name)
+    return _unchecked_finding(evidence, Verdict.RECORDED, base)
+
+
+def _inert_finding(evidence: _Evidence) -> BranchFinding:
+    newest = evidence.events[0].base if evidence.events else None
+    return _unchecked_finding(evidence, Verdict.INERT, newest)
+
+
+def _unchecked_finding(evidence: _Evidence, verdict: Verdict, base: str | None) -> BranchFinding:
+    """A finding decided without stage 2: it has no cut and no owners."""
     return BranchFinding(
-        branch=evidence.branch, task_status=None, verdict=Verdict.RECORDED, base=base,
-        cut=None, contained_siblings=evidence.contained, base_owners=(),
+        branch=evidence.branch.name, task_status=evidence.task_status, verdict=verdict,
+        base=base, cut=None, contained_siblings=evidence.contained, base_owners=(),
         events=evidence.events, detail='',
     )
 
 
-async def _adjudicated_finding(stage: _Stage2, evidence: _Evidence) -> BranchFinding | None:
-    adjudication = await _adjudicate(stage, evidence)
+async def _adjudicated_finding(census_run: _CensusRun, evidence: _Evidence) -> BranchFinding | None:
+    adjudication = await _adjudicate(census_run, evidence)
     verdict = _verdict(evidence, adjudication)
     if verdict is None:
         return None
@@ -465,19 +502,23 @@ async def _adjudicated_finding(stage: _Stage2, evidence: _Evidence) -> BranchFin
         if verdict is Verdict.UNADJUDICATED else ''
     )
     return BranchFinding(
-        branch=evidence.branch, task_status=None, verdict=verdict, base=adjudication.base,
+        branch=evidence.branch.name, task_status=evidence.task_status, verdict=verdict,
+        base=adjudication.base,
         cut=adjudication.cut, contained_siblings=evidence.contained,
         base_owners=adjudication.owners, events=evidence.events, detail=detail,
     )
 
 
-async def _finding(stage: _Stage2, branch: str) -> BranchFinding | None:
-    evidence = _evidence(stage.snapshot, branch)
-    if branch in stage.snapshot.recorded:
-        return await _recorded_finding(stage, evidence)
+async def _finding(census_run: _CensusRun, name: str) -> BranchFinding | None:
+    """RECORDED and INERT need no stage-2 fact, so they are decided before it runs."""
+    evidence = _evidence(census_run.snapshot, census_run.statuses, name)
+    if name in census_run.snapshot.recorded:
+        return await _recorded_finding(census_run, evidence)
     if evidence.is_empty:
         return None
-    return await _adjudicated_finding(stage, evidence)
+    if not evidence.can_still_merge:
+        return _inert_finding(evidence)
+    return await _adjudicated_finding(census_run, evidence)
 
 
 async def run_census(
@@ -490,8 +531,10 @@ async def run_census(
     """
     started = time.monotonic()
     snapshot = await _snapshot(repo_root, main_branch)
-    stage = _Stage2(repo_root, snapshot, _LandedChecks(repo_root, snapshot.main_sha))
-    found = await asyncio.gather(*(_finding(stage, branch) for branch in sorted(snapshot.tips)))
+    census_run = _CensusRun(
+        repo_root, snapshot, statuses, _LandedChecks(repo_root, snapshot.main_sha),
+    )
+    found = await asyncio.gather(*(_finding(census_run, branch) for branch in sorted(snapshot.tips)))
     return CensusReport(
         main_branch=main_branch,
         main_sha=snapshot.main_sha,
@@ -499,3 +542,13 @@ async def run_census(
         findings=tuple(finding for finding in found if finding is not None),
         elapsed_secs=time.monotonic() - started,
     )
+
+
+def load_task_statuses(db_path: Path) -> dict[int, str]:
+    """``{task id: status}`` for tag 'master', read through a read-only connection."""
+    conn = connect_ro(db_path)
+    try:
+        rows = conn.execute("SELECT id, status FROM tasks WHERE tag = 'master'").fetchall()
+    finally:
+        conn.close()
+    return {int(task_id): str(status) for task_id, status in rows}
