@@ -949,10 +949,11 @@ class TestUnstampedCandidates:
     def test_scroll_matching_is_case_insensitive(self):
         """Mirrors `evaluate_closure`\'s own case-folded `live_ids`, so the two
         cannot disagree about what the scroll saw."""
-        members = [_member(_uuid(1).upper(), canonical=True)]
+        assert _HEX_LETTERED_UUID.upper() != _HEX_LETTERED_UUID
+        members = [_member(_HEX_LETTERED_UUID.upper(), canonical=True)]
         assert (
             consolidation_gate.unstamped_candidates(
-                _prov([_uuid(1)]), members=members
+                _prov([_HEX_LETTERED_UUID]), members=members
             )
             == ()
         )
