@@ -70,7 +70,9 @@ def test_the_notices_and_the_tab_retry_sit_outside_the_boundary(app_jsx_body: st
         )
 
 
-@pytest.mark.parametrize('describer', ['tabRenderFailureNotice', 'chromeRenderFailureNotice'])
+@pytest.mark.parametrize(
+    'describer', ['tabRenderFailureNotice', 'chromeRenderFailureNotice', 'pageRenderFailureNotice'],
+)
 def test_app_destructures_the_failure_notice_without_fallback(app_jsx_body: str, describer: str) -> None:
     assert_app_destructures_without_fallback(
         app_jsx_body, 'DF_RENDER_FAILURE', describer,

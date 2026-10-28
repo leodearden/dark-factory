@@ -627,3 +627,23 @@ for (const { region, testId, payloads } of CHROME_FAULTS) {
     assertReportsOnlyContainedThrows(page.consoleErrors);
   });
 }
+
+test("app.jsx leaves a full-page notice naming the error when App's own body throws, not an empty #root", t => {
+  const harness = openContainingWindow(t);
+  // A malformed /orchestrators payload: App's body filters it while deriving
+  // the topbar summary, above every region boundary.
+  landPayloads(harness.window, { ORCHESTRATORS: {} });
+
+  let root;
+  assert.doesNotThrow(() => {
+    root = harness.mountPage();
+  });
+
+  const page = { ...harness, root };
+  const { pageRenderFailureNotice } = page.window.DF_RENDER_FAILURE;
+  const detail = assertOneNotice(page, 'page-render-failure-banner', pageRenderFailureNotice(undefined).text);
+  assert.equal(failureNotices(root)[0].getAttribute('role'), 'alert');
+  assert.ok(detail.startsWith('TypeError'), detail);
+  assert.equal(root.querySelector('.app'), null, 'the page that threw must not render beside its notice');
+  assertReportsOnlyContainedThrows(page.consoleErrors);
+});
