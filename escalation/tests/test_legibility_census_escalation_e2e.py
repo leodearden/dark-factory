@@ -17,7 +17,6 @@ to `shared`'s deps would invert the package dependency direction. Under
 
 from __future__ import annotations
 
-import importlib
 import logging
 import socket
 import subprocess
@@ -28,37 +27,26 @@ import pytest
 
 # --- scoped legibility-scripts path setup ---
 #
-# Deliberately HERE and not in this directory's conftest.py: the legibility
-# scripts dir contributes very generic flat top-level module names (`config`,
-# `inventory`, `sampling`, `digest`, `coder`, `codebook`), and putting those on
-# the path for every test in this suite would shadow any same-named module
-# for every one of them, failing as a confusing wrong-module import rather than
-# an ImportError. This module is the only consumer, so it does its own setup.
+# Deliberately HERE and not in this directory's conftest.py: this module is the
+# only consumer.
 #
 # APPEND, never insert(0, ...): repo and stdlib names must keep winning even
 # once this module has been imported (sys.path edits are process-global and
 # outlive collection of this file).
 #
-# `scripts/` provides the `legibility` PACKAGE; `scripts/legibility/` provides
-# the flat module names (`census`). The `shared` stub installed by conftest.py
-# is compatible: its `__path__` points at the real `shared/src/shared`.
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-for _p in (str(_REPO_ROOT / 'scripts'), str(_REPO_ROOT / 'scripts' / 'legibility')):
-    if _p not in sys.path:
-        sys.path.append(_p)
+# `scripts/` provides the `legibility` PACKAGE. `scripts/legibility/` is needed
+# only for a flat sibling name a transitively imported module still uses
+# (census -> coder -> `import codebook`). The `shared` stub installed by
+# conftest.py is compatible: its `__path__` points at the real
+# `shared/src/shared`.
+if (_SCRIPTS_DIR := str(Path(__file__).resolve().parents[2] / 'scripts')) not in sys.path:
+    sys.path.append(_SCRIPTS_DIR)
+if (_LEGIBILITY_DIR := str(Path(_SCRIPTS_DIR) / 'legibility')) not in sys.path:
+    sys.path.append(_LEGIBILITY_DIR)
 
-# Bound through importlib, not import statements: these names resolve only
-# through the paths appended above, which pyright (run from escalation/)
-# cannot see, so a statement would need an inline suppression.
-#
-# `legibility.alarm`, never a flat `alarm`: census, nightly and both probes
-# import that module object, and `own_endpoint`'s grant lives in it. A flat
-# `alarm` would be a second module whose grant none of them reads.
-alarm = importlib.import_module('legibility.alarm')
-census = importlib.import_module('census')
-check_transcript_persistence = importlib.import_module('check_transcript_persistence')
-check_trickle_health = importlib.import_module('check_trickle_health')
-nightly = importlib.import_module('nightly')
+# The package form keeps ONE `legibility.alarm` module object, the one that
+# holds `own_endpoint`'s grant.
+from legibility import alarm, census, check_transcript_persistence, check_trickle_health, nightly
 
 # WHY `with alarm.own_endpoint():` AROUND EVERY REAL POST BELOW.
 #
