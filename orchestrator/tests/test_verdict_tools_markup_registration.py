@@ -161,7 +161,7 @@ def queue_under(root: Path) -> EscalationQueue:
 def queued_residue(root: Path) -> list[Any]:
     """Every pending residue record a sink steered at *root* queued."""
     return queue_under(root).get_by_task(
-        verdict_tools._MARKUP_SINK_SPEC.residue_anchor_task_id, status='pending',
+        verdict_tools.MARKUP_SINK_SPEC.residue_anchor_task_id, status='pending',
     )
 
 
@@ -604,7 +604,7 @@ class TestUnrepairableResidueIsPreserved:
         await self._refuse(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         (filed,) = queued_residue(tmp_path)
-        assert verdict_tools._MARKUP_SINK_SPEC.refusal_consequence in filed.detail
+        assert verdict_tools.MARKUP_SINK_SPEC.refusal_consequence in filed.detail
         assert 'FORWARDED' not in filed.detail
 
     @pytest.mark.asyncio
@@ -1067,7 +1067,7 @@ class TestTheWidenedRepairVocabularyStaysContained:
         await self._submit(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         (residue,) = queued_residue(tmp_path)
-        assert verdict_tools._MARKUP_SINK_SPEC.refusal_consequence not in residue.detail
+        assert verdict_tools.MARKUP_SINK_SPEC.refusal_consequence not in residue.detail
         assert 'FORWARDED' in residue.detail
         assert 'swallowed tail' in residue.detail
 
@@ -1151,7 +1151,7 @@ async def file_an_unknown_kind(root: Path) -> _RecordingQueue:
     queue = _RecordingQueue()
     sink = markup_sink.make_escalation_sink(
         worktree=root,
-        spec=verdict_tools._MARKUP_SINK_SPEC,
+        spec=verdict_tools.MARKUP_SINK_SPEC,
         subject_task_id=lambda: '6083',
         resolve_root=lambda worktree: root,
         open_channel=lambda project_root: (Escalation, queue),
@@ -1181,14 +1181,15 @@ class TestVerdictToolsResidueChannelIsShared:
         """Not plan-tools' anchors, and not the middleware's defaults."""
         from orchestrator.mcp import plan_tools, verdict_tools
 
-        spec = verdict_tools._MARKUP_SINK_SPEC
+        spec = verdict_tools.MARKUP_SINK_SPEC
+        plan_tools_spec = plan_tools.MARKUP_SINK_SPEC
         assert spec.server_label == 'verdict-tools'
         assert spec.residue_anchor_task_id == 'verdict-tools-markup-residue'
         assert spec.storm_anchor_task_id == 'verdict-tools-markup-storm'
         # Distinct from plan-tools', so a reader can tell whose boundary spoke,
         # and so one server's open storm record cannot dedup the other's away.
-        assert spec.residue_anchor_task_id != plan_tools._MARKUP_RESIDUE_ANCHOR_TASK_ID
-        assert spec.storm_anchor_task_id != plan_tools._MARKUP_STORM_ANCHOR_TASK_ID
+        assert spec.residue_anchor_task_id != plan_tools_spec.residue_anchor_task_id
+        assert spec.storm_anchor_task_id != plan_tools_spec.storm_anchor_task_id
         # A NON-TASK anchor: at the level 2 the middleware declares, a pending
         # record under a live task id would halt the task whose verdict leaked.
         assert not spec.residue_anchor_task_id.isdigit()
@@ -1208,7 +1209,7 @@ class TestVerdictToolsResidueChannelIsShared:
         """
         from orchestrator.mcp import plan_tools
 
-        spec = verdict_tools._MARKUP_SINK_SPEC
+        spec = verdict_tools.MARKUP_SINK_SPEC
         assert (
             f'{markup_journal.MARKUP_JOURNAL_DIRNAME}/verdict-tools.jsonl'
             in spec.attribution_source
@@ -1222,7 +1223,7 @@ class TestVerdictToolsResidueChannelIsShared:
             'the unfollowable grep-the-logs sentence task 4744 retired must '
             'not come back'
         )
-        assert spec.attribution_source != plan_tools._MARKUP_SINK_SPEC.attribution_source
+        assert spec.attribution_source != plan_tools.MARKUP_SINK_SPEC.attribution_source
 
     def test_the_field_is_required_so_a_new_server_must_decide(self):
         """A DEFAULT is what would let the next server inherit silently.
@@ -1255,7 +1256,7 @@ class TestVerdictToolsResidueChannelIsShared:
 
         sink = markup_sink.make_escalation_sink(
             worktree=tmp_path,
-            spec=verdict_tools._MARKUP_SINK_SPEC,
+            spec=verdict_tools.MARKUP_SINK_SPEC,
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: tmp_path,
             open_channel=lambda root: (Escalation, queue),
@@ -1316,7 +1317,7 @@ class TestVerdictToolsResidueChannelIsShared:
         queue = await file_an_unknown_kind(tmp_path)
 
         (filed,) = queue.submitted
-        assert verdict_tools._MARKUP_SINK_SPEC.refusal_consequence not in filed.detail
+        assert verdict_tools.MARKUP_SINK_SPEC.refusal_consequence not in filed.detail
         assert UNKNOWN_KIND in filed.detail
         assert 'THE ONLY SURVIVING COPY' in filed.detail
 
@@ -1348,7 +1349,7 @@ class TestVerdictToolsResidueChannelIsShared:
         raw = 'THE ONLY SURVIVING COPY'
         sink = markup_sink.make_escalation_sink(
             worktree=tmp_path,
-            spec=verdict_tools._MARKUP_SINK_SPEC,
+            spec=verdict_tools.MARKUP_SINK_SPEC,
             subject_task_id=lambda: '3690',
             resolve_root=resolve_root,
             open_channel=open_channel,
@@ -1380,7 +1381,7 @@ class TestVerdictToolsResidueChannelIsShared:
         so its loss line must name the burst rather than a raw value."""
         sink = markup_sink.make_escalation_sink(
             worktree=tmp_path,
-            spec=verdict_tools._MARKUP_SINK_SPEC,
+            spec=verdict_tools.MARKUP_SINK_SPEC,
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: None,
             open_channel=lambda root: None,
@@ -1417,7 +1418,7 @@ class TestVerdictToolsResidueChannelIsShared:
 
         sink = markup_sink.make_escalation_sink(
             worktree=tmp_path,
-            spec=verdict_tools._MARKUP_SINK_SPEC,
+            spec=verdict_tools.MARKUP_SINK_SPEC,
             subject_task_id=lambda: '3690',
             resolve_root=lambda worktree: None,
             open_channel=lambda root: None,
@@ -1578,11 +1579,11 @@ class TestCreateServerTakesAProjectRootResolver:
                 })
         payload = json.loads(str(excinfo.value))
 
-        filed = sorted(escalation_queue_dir(main_checkout).rglob('esc-*.json'))
-        assert len(filed) == 1, f'expected exactly one residue record, got {filed!r}'
+        queued = queued_residue(main_checkout)
+        assert len(queued) == 1, f'expected exactly one residue record, got {queued!r}'
+        assert queued[0].id == payload['escalation_id']
         (line,) = journal_lines(main_checkout)
         assert line['outcome'] == 'unrepairable'
-        assert queue_under(main_checkout).get(payload['escalation_id']) is not None
 
     @pytest.mark.asyncio
     async def test_the_resolver_is_asked_lazily_with_the_servers_worktree(
@@ -1670,7 +1671,7 @@ class TestTheStormRecordNamesTheJournal:
                 'project': None,
             },
             'test-1',
-            verdict_tools._MARKUP_SINK_SPEC,
+            verdict_tools.MARKUP_SINK_SPEC,
         )
 
     def test_the_storm_detail_names_the_journal(self):
