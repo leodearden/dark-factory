@@ -206,16 +206,6 @@ def _pytest_segments(cmd: str) -> list[str]:
 #: close a subshell, whose ``cd`` does not leak past it.
 _SHELL_CLAUSE_ENDS = frozenset({'&&', '||', ';', '|', '(', ')'})
 
-#: pytest options whose value is a SEPARATE token, so that value is not read as
-#: a suite. This guard's own policy, handed to ``vci.positional_targets``; the
-#: ``--flag=value`` spelling needs no entry. An unlisted one donates its value
-#: as a phantom suite, which the partition guard reports as UNACCOUNTED.
-_PYTEST_VALUE_FLAGS = frozenset({
-    '-c', '-k', '-m', '-n', '-o', '-p', '-r', '-W',
-    '--basetemp', '--deselect', '--dist', '--durations', '--ignore',
-    '--ignore-glob', '--import-mode', '--maxfail', '--rootdir', '--tb', '--timeout',
-})
-
 
 def _shell_clauses(cmd: str) -> list[tuple[list[str], str | None]]:
     """*cmd* as ``(clause tokens, the operator that ended the clause)`` pairs, in order.
@@ -246,8 +236,11 @@ def _fleet_pytest_suite_names(cmd: str) -> set[str]:
     Walks the shell clauses, tracking cwd through ``cd`` clauses and keeping a
     subshell's ``cd`` inside it (the cockpit clause is a presence-guarded
     subshell). Each pytest clause's targets come from the shared
-    ``vci.positional_targets``, so flags before or between targets, value-taking
-    flags and a missing ``--timeout`` do not change the result.
+    ``vci.positional_targets`` given ``vci.PYTEST_VALUE_FLAGS``, so flags before
+    or between targets, value-taking flags and a missing ``--timeout`` do not
+    change the result. A value-taking flag missing from that set would donate
+    its value as a phantom suite, which the partition guard reports as
+    UNACCOUNTED.
     :func:`test_fleet_pytest_suite_names_reads_each_chain_shape` pins the shapes.
     """
     cwds = ['.']
@@ -257,7 +250,7 @@ def _fleet_pytest_suite_names(cmd: str) -> set[str]:
             cwds[-1] = posixpath.normpath(posixpath.join(cwds[-1], clause[1]))
         elif vci.PYTEST in clause:
             targets = vci.positional_targets(
-                shlex.join(clause), vci.PYTEST, value_flags=_PYTEST_VALUE_FLAGS
+                shlex.join(clause), vci.PYTEST, value_flags=vci.PYTEST_VALUE_FLAGS
             )
             cwd = cwds[-1]
             suites.update(cwd if cwd != '.' else posixpath.normpath(t) for t in targets)
