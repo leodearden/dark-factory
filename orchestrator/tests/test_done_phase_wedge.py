@@ -38,7 +38,7 @@ from orchestrator.workflow import WorkflowState
 pytestmark = pytest.mark.usefixtures(_derive_meta_root_like_production.__name__)
 
 TID = '42'
-GRACE = 3.0
+GRACE = 0.5
 BARRIER = 45.0
 
 
