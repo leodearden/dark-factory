@@ -67,9 +67,11 @@ import subprocess
 import textwrap
 import uuid
 import warnings
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import _verify_boundary_ceilings
 import pytest
 from _gate_fixtures import gated_remote_runner
 from _leader_stderr import assert_watchdog_fire_trigger, drain_exited_stderr
@@ -161,19 +163,48 @@ from orchestrator.verify_runner import (
 # @pytest.mark.timeout(120), was invisible to it.  Two 120s-capable waits
 # inside a 120s mark means a wedged Row 5 discovery gets truncated by
 # pytest-timeout's thread-mode os._exit() of the whole xdist worker instead of
-# raising this module's self-diagnosing AssertionError (leader rc taxonomy +
+# raising the harness's self-diagnosing AssertionError (leader rc taxonomy +
 # bounded stderr tail) -- the exact silent-truncation class the derivation
 # chain exists to prevent.
 #
-# The sweep is ENUMERATION-FREE: it derives its call-site list from this
-# module's own AST, so a future Row 6 registers itself with the guard simply
-# by calling the helper.  A hand-maintained row list would have the identical
-# failure mode the day one lands.  Self-parsing AST guards are an established
-# idiom in this suite (test_marker_registration_drift.py,
+# The sweep is ENUMERATION-FREE over call sites: it derives its call-site
+# list from the AST of every test module that drives the harness
+# (:data:`_HARNESS_DRIVING_TEST_MODULES`), so a future Row 6 or helper
+# self-test registers itself with the guard simply by calling the helper.  A
+# hand-maintained row list would have the identical failure mode the day one
+# lands.  The MODULE list is explicit, not a directory walk, which would turn
+# this guard into a whole-tree scanner; a new module that drives the harness
+# must be added to it.  Self-parsing AST guards are an established idiom in
+# this suite (test_marker_registration_drift.py,
 # test_git_repo_isolation_guard.py, test_lock_release_single_writer_guard.py,
 # test_event_loop_antipattern_guard.py) and cost nothing at runtime -- pure
 # parse, no subprocess, no timing.
+#
+# Both sweeps live here, beside the rows, because their sibling
+# test_row5_per_test_timeout_covers_its_own_bounded_work must read Row 5's
+# live pytestmark.  The matchers key on BARE-NAME (ast.Name) calls to the
+# harness helpers, so every swept module imports them by bare name and never
+# calls them as module attributes.
 # ---------------------------------------------------------------------------
+
+#: Every test module that drives the harness -- the modules both sweeps parse.
+#: A missing path raises FileNotFoundError, which is loud.
+_HARNESS_DRIVING_TEST_MODULES: tuple[Path, ...] = (
+    Path(__file__),
+    Path(__file__).with_name('test_verify_boundary_harness.py'),
+    Path(__file__).with_name('test_verify_merge_env_overrides.py'),
+)
+
+
+def _swept_test_functions() -> Iterator[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
+    """``(module filename, node)`` for every ``test_*`` function the sweeps cover."""
+    for path in _HARNESS_DRIVING_TEST_MODULES:
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name.startswith(
+                'test_'
+            ):
+                yield path.name, node
 
 #: The helpers whose ``timeout`` default now resolves to
 #: :func:`row_discovery_ceiling_secs`, i.e. can spend up to
@@ -198,7 +229,7 @@ _INHERITED_TIMEOUT_FALLBACK_SECS: float = 60.0
 
 
 def _inherited_timeout_budget_secs(config) -> float:
-    """The pytest-timeout budget an UNMARKED test in this module inherits.
+    """The pytest-timeout budget an UNMARKED swept test inherits.
 
     Read from ``config._env_timeout`` -- the plugin's OWN resolved value, i.e.
     literally what ``pytest_timeout._get_item_settings`` hands an item carrying
@@ -376,12 +407,15 @@ def test_row5_per_test_timeout_covers_its_own_bounded_work():
 def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark(request):
     """No test may perform more discovery waiting than its own mark allows.
 
-    Enumeration-free sweep of this module's own AST (see the banner above).
-    For every ``test_*`` function it counts the LOAD-SCALED discovery waits
-    the source actually contains, resolves the EFFECTIVE pytest-timeout
-    budget that test runs under -- from the LIVE config for unmarked tests,
-    never from a duplicated ini literal -- and asserts the budget covers those
-    waits at the widest ceiling they can reach.
+    Enumeration-free sweep of every :data:`_HARNESS_DRIVING_TEST_MODULES`
+    AST (see the banner above).  For every ``test_*`` function it counts the
+    LOAD-SCALED discovery waits the source actually contains, resolves the
+    EFFECTIVE pytest-timeout budget that test runs under -- from the LIVE
+    config for unmarked tests, never from a duplicated ini literal -- and
+    asserts the budget covers those waits at the widest ceiling they can
+    reach.  A mark naming a constant resolves against
+    _verify_boundary_ceilings.py, the one home of the derived budgets, so a
+    mark resolves the same way whichever swept module carries it.
 
     It additionally BANS a literal timeout mark on any test performing such a
     wait.  That kills the root cause directly rather than the symptom: task
@@ -389,35 +423,31 @@ def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark(request
     could reach into, which is precisely why task 4014's load-scaled
     discovery ceiling could not propagate to Row 5.
     """
-    tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
-    swept: dict[str, tuple[int, ast.AST]] = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            continue
-        if not node.name.startswith('test_'):
-            continue
+    swept: dict[tuple[str, str], tuple[int, ast.AST]] = {}
+    for module, node in _swept_test_functions():
         n_scaled = _scaled_discovery_call_count(node)
         if n_scaled:
-            swept[node.name] = (n_scaled, node)
+            swept[(module, node.name)] = (n_scaled, node)
 
-    missing = sorted(_KNOWN_DISCOVERY_ROWS - set(swept))
+    matched = {name for _, name in swept}
+    missing = sorted(_KNOWN_DISCOVERY_ROWS - matched)
     assert not missing, (
         f'the AST sweep matched no scaled discovery wait in {missing} -- a matcher '
         f'that silently stops matching is a guard reporting PASS while guarding '
-        f'nothing (matched: {sorted(swept)})'
+        f'nothing (matched: {sorted(matched)})'
     )
 
     inherited = _inherited_timeout_budget_secs(request.config)
     under_budget: list[str] = []
     literal_marked: list[str] = []
-    for name, (n_scaled, func_node) in sorted(swept.items()):
+    for (module, name), (n_scaled, func_node) in sorted(swept.items()):
         arg = _timeout_mark_argument(func_node)
         if arg is None:
             effective = inherited
-        elif isinstance(arg, ast.Name) and arg.id in globals():
-            effective = float(globals()[arg.id])
+        elif isinstance(arg, ast.Name) and hasattr(_verify_boundary_ceilings, arg.id):
+            effective = float(getattr(_verify_boundary_ceilings, arg.id))
         else:
-            literal_marked.append(f'{name}: @pytest.mark.timeout({ast.unparse(arg)})')
+            literal_marked.append(f'{module}::{name}: @pytest.mark.timeout({ast.unparse(arg)})')
             effective = (
                 float(arg.value)
                 if isinstance(arg, ast.Constant) and isinstance(arg.value, int | float)
@@ -426,7 +456,7 @@ def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark(request
         required = n_scaled * ROW_DISCOVERY_CEILING_MAX_SECS
         if effective < required:
             under_budget.append(
-                f'{name}: {n_scaled} scaled discovery wait(s) needing {required}s '
+                f'{module}::{name}: {n_scaled} scaled discovery wait(s) needing {required}s '
                 f'but running under a {effective}s budget'
             )
 
@@ -439,7 +469,8 @@ def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark(request
     assert not literal_marked, (
         'these tests perform a load-scaled discovery wait but pin their pytest '
         'timeout to a LITERAL, which no re-derivation of the discovery ceiling '
-        'can reach into -- use a module-level derived constant instead:\n  '
+        'can reach into -- use a budget derived in _verify_boundary_ceilings.py '
+        'instead:\n  '
         + '\n  '.join(literal_marked)
     )
 
@@ -584,7 +615,8 @@ def _untorn_down_holders(func_node, holder_names: set[str]) -> list[str]:
 def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
     """Every spawn_verify_merge-bound holder's teardown goes through kill_holder_tree.
 
-    Enumeration-free sweep of this module's own AST (see the banner above
+    Enumeration-free sweep of every :data:`_HARNESS_DRIVING_TEST_MODULES`
+    AST (see the banner above
     :func:`test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark`).
     For every ``test_*`` function, collects the local names bound from a
     bare ``X = spawn_verify_merge(...)`` call, then makes TWO independent
@@ -614,27 +646,27 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
     the sweep must always find a spawn_verify_merge-bound holder in,
     independent of whether their teardown currently passes or fails.
     """
-    tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
-    swept: dict[str, set[str]] = {}
+    swept: dict[tuple[str, str], set[str]] = {}
     offenders: list[str] = []
     untorn: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            continue
-        if not node.name.startswith('test_'):
-            continue
+    for module, node in _swept_test_functions():
         holder_names = _spawn_verify_merge_bound_names(node)
         if not holder_names:
             continue
-        swept[node.name] = holder_names
-        offenders.extend(_bare_kill_offenders(node, holder_names))
-        untorn.extend(_untorn_down_holders(node, holder_names))
+        swept[(module, node.name)] = holder_names
+        offenders.extend(
+            f'{module}::{finding}' for finding in _bare_kill_offenders(node, holder_names)
+        )
+        untorn.extend(
+            f'{module}::{finding}' for finding in _untorn_down_holders(node, holder_names)
+        )
 
-    missing = sorted(_KNOWN_HOLDER_TEARDOWN_ROWS - set(swept))
+    matched = {name for _, name in swept}
+    missing = sorted(_KNOWN_HOLDER_TEARDOWN_ROWS - matched)
     assert not missing, (
         f'the AST sweep matched no spawn_verify_merge-bound holder in {missing} '
         f'-- a matcher that silently stops matching is a guard reporting PASS '
-        f'while guarding nothing (matched: {sorted(swept)})'
+        f'while guarding nothing (matched: {sorted(matched)})'
     )
 
     assert not offenders, (
