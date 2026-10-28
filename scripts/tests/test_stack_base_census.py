@@ -18,7 +18,9 @@ from pathlib import Path
 import pytest
 import stack_base_census as census
 from committed_git_repo import committed_repo
-from orchestrator.branch_stack import StackBaseLedger
+from orchestrator.branch_stack import StackBaseLedger, UnstackOutcome
+from orchestrator.config import GitConfig
+from orchestrator.git_ops import GitOps
 from shared.git_async import run_git
 
 # ---------------------------------------------------------------------------
@@ -347,3 +349,88 @@ async def test_a_non_numeric_task_branch_has_no_task_id(repo: Path) -> None:
     assert findings['task/foo'].task_status is None
     assert findings['task/foo'].verdict is census.Verdict.CONFIRMED
     assert findings['task/102'].verdict is census.Verdict.INERT
+
+
+# ---------------------------------------------------------------------------
+# step-7: adoption
+# ---------------------------------------------------------------------------
+
+
+def stack_base_refs(repo: Path) -> list[str]:
+    return git(repo, 'for-each-ref', '--format=%(refname)', 'refs/dark-factory/stack-base/').split()
+
+
+def make_git_ops(repo: Path) -> GitOps:
+    """GitOps as orchestrator/tests/test_git_ops_unstack.py::_make_git_ops builds it."""
+    cfg = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+    return GitOps(cfg, repo)
+
+
+async def test_adopting_a_confirmed_finding_lets_5618_unstack_it(repo: Path) -> None:
+    stacked_on_p(repo)
+    p_tip = rev(repo, 'task/P')
+    report = await census_of(repo)
+
+    outcomes = await census.adopt_confirmed(repo, report)
+
+    assert [(o.branch, o.base, o.written) for o in outcomes] == [('task/M', p_tip, True)]
+    assert await ledger_of(repo).base_of('task/M') == p_tip
+
+    result = await make_git_ops(repo).unstack_from_unlanded_base('task/M')
+
+    assert result.outcome is UnstackOutcome.UNSTACKED
+    assert git(repo, 'diff', '--name-only', 'main...task/M').split() == ['m.txt']
+
+
+async def test_only_confirmed_findings_are_adopted(repo: Path) -> None:
+    add_member(repo, 'P', 'main', {'p.txt': 'p\n'})
+    p_tip = rev(repo, 'task/P')
+    confirmed_wt = add_member(repo, 'C', 'main', {'c.txt': 'c\n'})
+    rebase(confirmed_wt, 'task/P')
+    clean_wt = add_member(repo, 'K', 'main', {'k.txt': 'k\n'})
+    rebase(clean_wt, 'task/P')
+    rebase(clean_wt, '--onto', 'main', p_tip, 'task/K')
+    add_member(repo, 'Q', 'main', {'q.txt': 'q\n'})
+    stranded_wt = add_member(repo, 'S', 'main', {'s.txt': 's\n'})
+    rebase(stranded_wt, 'task/Q')
+    git(repo, 'worktree', 'remove', '--force', str(repo / '.worktrees' / 'Q'))
+    git(repo, 'branch', '-D', 'task/Q')
+    unadjudicated_wt = add_member(repo, 'U', 'main', {'u1.txt': '1\n'})
+    u1 = rev(repo, 'task/U')
+    commit(unadjudicated_wt, {'u2.txt': '2\n'}, 'U: second')
+    git(repo, 'update-ref', 'refs/heads/task/X', u1)
+    report = await census_of(repo)
+    assert {f.branch: f.verdict for f in report.findings} == {
+        'task/C': census.Verdict.CONFIRMED,
+        'task/K': census.Verdict.ALREADY_CLEAN,
+        'task/S': census.Verdict.STRANDED_BASE,
+        'task/U': census.Verdict.UNADJUDICATED,
+    }
+
+    outcomes = await census.adopt_confirmed(repo, report)
+
+    assert [(o.branch, o.written) for o in outcomes] == [('task/C', True)]
+    assert stack_base_refs(repo) == ['refs/dark-factory/stack-base/task/C']
+
+
+async def test_a_record_that_does_not_read_back_is_reported_unwritten(repo: Path) -> None:
+    stacked_on_p(repo)
+    p_tip = rev(repo, 'task/P')
+    report = await census_of(repo)
+    lock = repo / '.git' / 'refs' / 'dark-factory' / 'stack-base' / 'task' / 'M.lock'
+    lock.parent.mkdir(parents=True)
+    lock.write_text('')
+
+    outcomes = await census.adopt_confirmed(repo, report)
+
+    assert len(outcomes) == 1
+    assert outcomes[0].written is False
+    assert 'task/M' in outcomes[0].detail
+    assert p_tip in outcomes[0].detail
+    assert stack_base_refs(repo) == []
