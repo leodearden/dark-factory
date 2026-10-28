@@ -15,6 +15,7 @@ Pins four contracts:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ from shared.task_submit import SubmitFailed, SubmitOutcome
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
+from orchestrator.dry_run_unblock import investigation_task_name
 from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
 from orchestrator.scheduler import BlastRadiusResult
 from orchestrator.workflow import TaskWorkflow
@@ -141,20 +143,17 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '42',
 
 
 async def _drain_unblock_tasks(wf: TaskWorkflow) -> None:
-    """Await the dry-run investigation task(s) this workflow spawned.
+    """Await the dry-run investigation task(s) running for this workflow's task.
 
-    The hook names its background task ``unblock-auto-<task_id>``, and
-    production's own duplicate-spawn guard keys on exactly that name
-    (``orchestrator/workflow.py::TaskWorkflow._spawn_dry_run_unblock``), so the
-    name is a load-bearing public identity rather than an incidental label.
-    Reading the spawn back off ``asyncio.all_tasks()`` is therefore an honest
-    public observation of it, and it is what keeps pytest-asyncio from warning
-    "Task destroyed but it is pending".
+    The task name is the public identity
+    ``orchestrator.dry_run_unblock.investigation_task_name``; reading it back
+    off ``asyncio.all_tasks()`` keeps pytest-asyncio from warning "Task
+    destroyed but it is pending".
     """
     me = asyncio.current_task()
     spawned = [
         t for t in asyncio.all_tasks()
-        if t is not me and t.get_name() == f'unblock-auto-{wf.task_id}'
+        if t is not me and t.get_name() == investigation_task_name(wf.task_id)
     ]
     if spawned:
         await asyncio.gather(*spawned, return_exceptions=True)
@@ -720,6 +719,97 @@ class TestArchitectVerdictSkipsDryRun:
         await _drain_unblock_tasks(wf)
 
         assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# task 3125 guard (3): the in-flight check spans the whole event loop.  A
+# re-dispatch builds a fresh TaskWorkflow whose own background set is empty,
+# and the merge lane spawns investigations into a set no workflow sees, so a
+# per-instance scan would let either start a duplicate.
+# ---------------------------------------------------------------------------
+
+_REBLOCK_REASON = 'Steward re-escalated to human'
+
+
+class TestDryRunInFlightSurvivesReDispatch:
+    @pytest.mark.asyncio
+    async def test_second_workflow_instance_does_not_spawn_while_first_runs(
+        self, tmp_path,
+    ):
+        wf_a, _ = _make_workflow(tmp_path=tmp_path / 'a', task_id='70')
+        wf_b, _ = _make_workflow(tmp_path=tmp_path / 'b', task_id='70')
+
+        calls = []
+        release = asyncio.Event()
+
+        async def _hanging_dry_run(**kwargs):
+            calls.append(kwargs)
+            await release.wait()
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_hanging_dry_run):
+            await wf_a._mark_blocked(_REBLOCK_REASON, skip_escalation=True)
+            await asyncio.sleep(0)
+            await wf_b._mark_blocked(_REBLOCK_REASON, skip_escalation=True)
+            await asyncio.sleep(0)
+
+        release.set()
+        await _drain_unblock_tasks(wf_a)
+
+        assert len(calls) == 1, f'Expected 1 dry-run invocation, got {len(calls)}'
+
+    @pytest.mark.asyncio
+    async def test_re_dispatch_after_completion_spawns_again(self, tmp_path):
+        wf_a, _ = _make_workflow(tmp_path=tmp_path / 'a', task_id='70')
+        wf_b, _ = _make_workflow(tmp_path=tmp_path / 'b', task_id='70')
+        wf_c, _ = _make_workflow(tmp_path=tmp_path / 'c', task_id='70')
+
+        calls = []
+        release = asyncio.Event()
+
+        async def _hanging_dry_run(**kwargs):
+            calls.append(kwargs)
+            await release.wait()
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_hanging_dry_run):
+            await wf_a._mark_blocked(_REBLOCK_REASON, skip_escalation=True)
+            await asyncio.sleep(0)
+            await wf_b._mark_blocked(_REBLOCK_REASON, skip_escalation=True)
+            await asyncio.sleep(0)
+            release.set()
+            await _drain_unblock_tasks(wf_a)
+            assert len(calls) == 1, f'Expected 1 dry-run invocation, got {len(calls)}'
+
+            await wf_c._mark_blocked(_REBLOCK_REASON, skip_escalation=True)
+            await asyncio.sleep(0)
+            await _drain_unblock_tasks(wf_c)
+
+        assert len(calls) == 2, (
+            'A finished investigation must not keep suppressing spawns; '
+            f'got {len(calls)} invocations'
+        )
+
+    @pytest.mark.asyncio
+    async def test_investigation_started_elsewhere_suppresses_spawn(self, tmp_path):
+        wf, _ = _make_workflow(tmp_path=tmp_path, task_id='71')
+
+        calls = []
+
+        async def _spy_dry_run(**kwargs):
+            calls.append(kwargs)
+
+        elsewhere = asyncio.create_task(
+            asyncio.Event().wait(), name=investigation_task_name('71'),
+        )
+        try:
+            with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+                await wf._mark_blocked('verify exhausted')
+            await asyncio.sleep(0)
+        finally:
+            elsewhere.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await elsewhere
+
+        assert calls == []
 
 
 # ---------------------------------------------------------------------------
