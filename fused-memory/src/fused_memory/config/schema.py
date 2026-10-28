@@ -2315,25 +2315,52 @@ class CuratorConfig(BaseModel):
 
     # Corpus caps — see design notes in shared/docs (the four-stream pool).
     #
-    # pool_total_cap is UNREACHABLE at these stock values, and that is worth
-    # knowing before tuning any of them: a maximal pool is anchor(<=1) + 15 +
-    # 10 + 3 = 29 <= 30, so ``_trim_pool``'s ``len(pool) <= total_cap``
-    # short-circuits on every call. The binding constraints are the three
-    # STREAM caps, which is where a genuinely overlapping task is actually
-    # lost — the module stream especially, since it is ordered by status and
-    # priority rather than relevance (see the lock_depth note below).
-    # ``test_config_schema.py::TestCuratorEntryCharCaps`` pins this
-    # arithmetic so an edit that re-strands or un-strands the final trim is
-    # caught here rather than as a silent census.
+    # Re-tuned by task 5397 against the ``pool_truncated`` census
+    # (``curator_types.py::PoolWithheld``) and the decisions the curator took
+    # on it. Measured 2026-10-28 from archived curator transcripts
+    # (data/orchestrator/agent-transcripts/fm-curator-*, 2026-10-26..28): 435
+    # distinct candidates, 86 drop/combine decisions, at caps 15/10/3/30.
     #
-    # These four are deliberately NOT re-tuned by task 5364. Nothing measured
-    # how often they bind; the ``pool_truncated`` census that task installs
-    # (``curator_types.py::PoolWithheld``) IS that instrument, and tuning waits
-    # on what it reports rather than repeating the 2026-04 guess.
-    pool_module_cap: int = Field(default=15)
+    #   stream      capped on  withheld when capped   drop/combine targets
+    #   module      64.4%      p50 91, p90 575        31, spread over ranks 1-14
+    #   embedding   100%       17-20 (window floor)   42: 31 at rank 1, 40 in 1-3
+    #   dependency  10.1%      p50 2, max 7           0
+    #   total_cap   0%         unreachable: 1+15+10+3 = 29 <= 30
+    #
+    # The embedding stream is ordered by similarity and its tail is nearly
+    # dead: one target past rank 5, at rank 10. The module stream is ordered
+    # by status/priority/id, so its targets run flat to the cap (6 in ranks
+    # 11-15); in 165 of the 280 capped pools the cut fell among pending,
+    # combine-eligible tasks. The embedding count is no signal on its own: the
+    # qdrant window filled on every candidate, so it is always a floor.
+    #
+    # The re-tune moves slots instead of adding them: pool_module_cap 15 -> 20,
+    # and pool_total_cap 30 -> 29, the old reachable maximum, so ``_trim_pool``
+    # is the live control. With the module stream full, the trim takes
+    # dependency entries first, then the embedding tail, leaving at least
+    # 29 - 1 - 20 = 8 embedding entries; ranks 1-8 held 41 of its 42 targets.
+    # A pool whose module stream fits the old cap of 15 keeps every stream at
+    # its cap.
+    #
+    # The trade: the worst-case pool is unchanged, so cost and batch fan-in at
+    # the maximum are unchanged too. Input is ~4.7K + ~930 tokens per entry; a
+    # 28+-entry pool cost p50 $0.18 (max $0.36) against the flat $2.00
+    # single_call_budget_cap_usd. All 74 observed multi-candidate batches still
+    # fit batch_token_threshold; 25/10/3/35 would have split 62 of them. The
+    # mean pool grows 23.6 -> 24.9 entries.
+    #
+    # Limits: a larger module cap is not that stream's fix — at 20 it is still
+    # capped on 57% of candidates; its defect is the ordering. Embedding 10 and
+    # dependency 3 stay: neither tail showed targets worth more slots, and the
+    # trim already gives their slots to the module stream when it needs them.
+    # The sample is two days and 86 decisions, hence a token-neutral step. The
+    # module figures predate task 6708's active-only module stream.
+    #
+    # ``test_config_schema.py::TestCuratorPoolCaps`` pins these relationships.
+    pool_module_cap: int = Field(default=20)
     pool_embedding_cap: int = Field(default=10)
     pool_dependency_cap: int = Field(default=3)
-    pool_total_cap: int = Field(default=30)
+    pool_total_cap: int = Field(default=29)
 
     # COARSE FALLBACK ONLY — this is not the depth the curator normally uses.
     # Module-pool keys must match the *scheduler's* lock_depth to be
@@ -2436,9 +2463,10 @@ class CuratorConfig(BaseModel):
     #   budget = min(max_budget_usd + per_pool_entry_budget_usd * len(pool),
     #                single_call_budget_cap_usd)
     # Durable flat $2.00 ceiling (task 1980 / esc-task-curator-194): a full
-    # 30-entry pool (pool_total_cap=30) costs ~$0.30574 (esc-task-curator-191)
-    # — comfortably under $2.00 with no per-size tuning required. The prior
-    # scaled cap (0.75, derived from 0.30 + 0.0125*30 = $0.675) was raised
+    # 30-entry pool, measured when pool_total_cap was 30, cost ~$0.30574
+    # (esc-task-curator-191) — comfortably under $2.00 with no per-size tuning
+    # required. The prior scaled cap (0.75, derived from 0.30 + 0.0125*30 =
+    # $0.675) was raised
     # alongside max_budget_usd to the SAME $2.00 value: single_call_budget_cap_usd
     # must be >= max_budget_usd or it silently clamps the raised base back
     # down, defeating the durable raise (see TestCuratorConfigBudgetRaise in
