@@ -20,12 +20,12 @@ from fused_memory.server.write_triage import (
     TriageJudgeVerdict,
 )
 from fused_memory.server.write_triage_judge import (
-    _ELIDED_MARKER,
     build_judge_prompt,
     resolve_judge_candidate_count,
     resolve_judge_timeout,
     select_judge_candidates,
 )
+from fused_memory.utils.clip_disclosure import elision_marker
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 
@@ -89,7 +89,10 @@ class TestWorstCaseSlate:
     def test_every_rendered_field_is_elided(self, width: int) -> None:
         entry, candidates = _mod().worst_case_slate(_TEXTS, width, 100)
         prompt = build_judge_prompt(entry, candidates, field_chars=100)
-        assert prompt.count(_ELIDED_MARKER) == width + 1
+        fields = [entry, *(c.content for c in candidates)]
+        for field in fields:
+            cut = field[:100] + elision_marker(len(field) - 100)
+            assert prompt.count(cut) == fields.count(field)
 
     def test_no_text_to_build_from_is_refused(self) -> None:
         with pytest.raises(ValueError):
@@ -219,7 +222,7 @@ class TestLiveJudgeCall:
             await _mod().live_judge_call(service, entry, candidates)
         rendered = client.responses.create.call_args.kwargs['input']
         for field in [entry, *(c.content for c in candidates)]:
-            assert field[:50] + _ELIDED_MARKER in rendered
+            assert field[:50] + elision_marker(len(field) - 50) in rendered
             assert field[:51] not in rendered
 
     @pytest.mark.asyncio
