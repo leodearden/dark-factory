@@ -65,11 +65,7 @@ def _make_watermark() -> Watermark:
 
 
 def _make_config(**overrides: int) -> ReconciliationConfig:
-    return ReconciliationConfig(
-        token_budget=overrides.get('token_budget', 65_000),
-        context_search_limit=overrides.get('context_search_limit', 5),
-        context_fetch_batch_size=overrides.get('context_fetch_batch_size', 10),
-    )
+    return ReconciliationConfig.model_validate(overrides)
 
 
 @pytest_asyncio.fixture
@@ -149,7 +145,7 @@ async def test_budget_stops_accumulation(mock_memory):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('token_budget', [1_450, 65_000])
+@pytest.mark.parametrize('token_budget', [1_450, ReconciliationConfig().token_budget])
 async def test_payload_states_the_budget_it_was_assembled_under(mock_memory, token_budget):
     """Both the budget-stopped path and the all-fit path carry the budget value."""
     config = _make_config(token_budget=token_budget)
@@ -165,8 +161,7 @@ async def test_payload_states_the_budget_it_was_assembled_under(mock_memory, tok
 @pytest.mark.asyncio
 async def test_all_events_fit_when_under_budget(mock_memory):
     """When total tokens < budget, all events are included."""
-    config = _make_config(token_budget=65_000)
-    assembler = _make_assembler(memory_service=mock_memory, config=config)
+    assembler = _make_assembler(memory_service=mock_memory, config=_make_config())
 
     events = [_make_event() for _ in range(5)]
     watermark = _make_watermark()
