@@ -20622,12 +20622,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             req.request_id, ItemLifecycleState.FINALIZING,
             ItemLifecycleState.MERGING, live_obj=entry,
         )
+        if isinstance(item, RealMergeItem):
+            self._record_dead_base(item.merge_result.merge_commit or '')
         # §5.3 re-merge carve-out, consumer 2/5 — INV-3 adoption-time void
         # (PRD §5.3).  This site is also the reason §5.3 needs no dispatch-time
         # enforcement: it is where a verdict built on a known-dead base is
         # discarded, PASS or FAIL.  Replacement item targets real main.
-        if isinstance(item, RealMergeItem):
-            self._record_dead_base(item.merge_result.merge_commit or '')
         _remerged = await self._remerge(item.request, item.started_monotonic)
         self._note_transition(
             req.request_id, ItemLifecycleState.MERGING,
