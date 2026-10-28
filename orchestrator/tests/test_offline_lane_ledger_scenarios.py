@@ -492,3 +492,205 @@ async def test_scenario_40_a_clear_enqueued_before_the_fix_is_dropped_once_its_o
     after = read_debt(lane.ledger, A)
     assert after is not None and after.open_count == 1
     assert len(lane.client.submitted) == 1
+
+
+# --- a recovered test owes debt at the head of its evidence ------------------------------
+
+
+async def _outage(lane: Lane) -> PassEffect:
+    observation = lane.written_pass(HEAD1, None, _run('detect', HEAD1, lane.clock(), failing=(A,)), None)
+    return await lane.engine.observe(replace(observation, lane_command=PROBED, outcome=Outage(OUTAGE), probe=OUTAGE))
+
+
+@pytest.mark.asyncio
+async def test_scenario_27_a_red_then_green_at_one_head_owes_debt_at_that_head(tmp_path: Path):
+    lane = Lane(tmp_path)
+    await lane.red()
+    lane.clock.advance(minutes=10)
+
+    effect = await lane.green()
+
+    green = _current(lane)
+    assert effect.debts_offered == (OfferedDebt(A, DebtTrigger.recovered, HEAD1),)
+    (item,) = _due(lane)
+    assert (item.test_id, item.head, item.observed_at) == (A, HEAD1, green.started_at.isoformat())
+    context = due_item_context(item)
+    assert context is not None
+    assert (context.trigger, context.heads) == (DebtTrigger.recovered, (HEAD1,))
+    assert context.reproduce is not None and A in context.reproduce
+    assert [entry.first_line for entry in context.evidence] == [f'AssertionError in {A}']
+    assert [r.verdict for r in _rows(lane, A)] == ['fails_in_isolation']
+
+    await lane.drain()
+
+    (filed,) = lane.client.submitted
+    assert 'recovered on the offline lane (integration)' in filed['title']
+
+
+@pytest.mark.asyncio
+async def test_scenario_27_a_pass_at_another_head_owes_debt_at_the_earlier_green_head(tmp_path: Path):
+    lane = Lane(tmp_path)
+    await lane.green()
+    lane.clock.advance(minutes=10)
+    await lane.red()
+    assert lane.episode().last_green_head == HEAD1
+    lane.clock.advance(minutes=10)
+
+    effect = await lane.red(reproduced=(B,), outcomes={A: 'passed', B: 'failed'}, head=HEAD2)
+
+    assert effect.debts_offered == (OfferedDebt(A, DebtTrigger.recovered, HEAD1),)
+    assert [(item.test_id, item.head) for item in _due(lane)] == [(A, HEAD1)]
+    assert [r.merge_sha for r in _rows(lane, B)] == [HEAD2]
+
+
+@pytest.mark.asyncio
+async def test_two_recoveries_at_different_evidence_heads_make_two_items(tmp_path: Path):
+    lane = Lane(tmp_path)
+    await lane.green(head=HEAD1)
+    lane.clock.advance(minutes=10)
+    await lane.red((A,), head=HEAD1)
+    lane.clock.advance(minutes=10)
+    await lane.red((C,), head=HEAD2)
+    lane.clock.advance(minutes=10)
+
+    effect = await lane.green(head=HEAD2)
+
+    assert effect.debts_offered == (
+        OfferedDebt(A, DebtTrigger.recovered, HEAD1), OfferedDebt(C, DebtTrigger.recovered, HEAD2),
+    )
+    assert sorted((item.test_id, item.head) for item in _due(lane)) == [(A, HEAD1), (C, HEAD2)]
+
+
+@pytest.mark.asyncio
+async def test_an_uncounted_reproduction_head_is_the_recoverys_evidence_head(tmp_path: Path):
+    lane = Lane(tmp_path)
+    await lane.red(head=HEAD1)
+    lane.clock.advance(minutes=3)
+    await lane.red(head=HEAD2)
+    lane.clock.advance(minutes=3)
+
+    effect = await lane.green(head=HEAD2)
+
+    assert effect.debts_offered == (OfferedDebt(A, DebtTrigger.recovered, HEAD2),)
+    assert [(item.test_id, item.head) for item in _due(lane)] == [(A, HEAD2)]
+
+
+@pytest.mark.asyncio
+async def test_scenario_28_a_test_that_never_passed_at_a_reproduced_head_owes_nothing(tmp_path: Path):
+    lane = Lane(tmp_path)
+    await lane.red(head=HEAD1)
+    lane.clock.advance(minutes=10)
+
+    effect = await lane.green(head=HEAD2)
+
+    assert effect.debts_offered == ()
+    assert _due(lane) == []
+
+
+@pytest.mark.asyncio
+async def test_scenario_28_an_expired_episode_owes_nothing(tmp_path: Path):
+    lane = Lane(tmp_path)
+    await lane.red()
+    lane.clock.advance(hours=25)
+
+    effect = await lane.green()
+
+    assert [ended.reason for ended in effect.episodes_ended] == ['expired']
+    assert (effect.debts_offered, _due(lane)) == ((), [])
+
+
+@pytest.mark.asyncio
+async def test_scenario_28_an_episode_that_saw_an_outage_pass_owes_nothing(tmp_path: Path):
+    lane = Lane(tmp_path)
+    await lane.red()
+    lane.clock.advance(minutes=10)
+    await _outage(lane)
+    lane.clock.advance(minutes=10)
+
+    effect = await lane.green()
+
+    assert [ended.reason for ended in effect.episodes_ended] == ['passed']
+    assert (effect.debts_offered, _due(lane)) == ((), [])
+
+
+@pytest.mark.asyncio
+async def test_scenario_28_an_episode_whose_fix_task_was_filed_owes_nothing(tmp_path: Path):
+    lane = Lane(tmp_path)
+    await _fix_filed(lane)
+    lane.clock.advance(minutes=10)
+
+    effect = await lane.green()
+
+    assert [ended.reason for ended in effect.episodes_ended] == ['passed']
+    assert (effect.debts_offered, _due(lane)) == ((), [])
+
+
+@pytest.mark.asyncio
+async def test_scenario_28_a_cleared_episode_owes_debt_as_cleared_never_recovered(tmp_path: Path):
+    lane = Lane(tmp_path)
+    await lane.red()
+
+    effect = await _clear(lane)
+
+    assert effect.debts_offered == (OfferedDebt(A, DebtTrigger.cleared, HEAD1),)
+    (item,) = _due(lane)
+    context = due_item_context(item)
+    assert context is not None and context.trigger is DebtTrigger.cleared
+
+
+@pytest.mark.asyncio
+async def test_scenario_34_a_restart_between_the_recorder_and_the_store_files_one_owner(tmp_path: Path, monkeypatch):
+    lane = Lane(tmp_path)
+    await lane.red()
+    lane.clock.advance(minutes=10)
+
+    def unwritable(self, record):
+        raise OSError('episode file unwritable')
+
+    monkeypatch.setattr(EpisodeStore, 'save', unwritable)
+    with pytest.raises(OSError):
+        await lane.green()
+    monkeypatch.undo()
+
+    assert [item.test_id for item in _due(lane)] == [A]
+    assert lane.episode().live
+
+    lane.restarted()
+    await lane.drain()
+    debt = read_debt(lane.ledger, A)
+    assert debt is not None and debt.owner_task_id is not None
+
+    lane.clock.advance(minutes=10)
+    again = await lane.green()
+    assert again.debts_offered == (OfferedDebt(A, DebtTrigger.recovered, HEAD1),)
+    await lane.drain()
+
+    assert len(lane.client.submitted) == 1
+    assert _due(lane) == []
+
+
+@pytest.mark.asyncio
+async def test_scenario_40_a_recovery_is_judged_at_its_evidence_head_not_the_ending_passes(tmp_path: Path):
+    lane = Lane(tmp_path)
+    await lane.green(head=HEAD1)
+    await _clear(lane, head=HEAD1)
+    await lane.drain()
+    owner = read_debt(lane.ledger, A)
+    assert owner is not None and owner.owner_task_id is not None
+    _done(lane, owner.owner_task_id)
+    lane.ancestry.answers[(FIX_COMMIT, HEAD1)] = False
+    lane.clock.advance(minutes=10)
+    await lane.red((A,), head=HEAD1)
+    lane.clock.advance(minutes=10)
+
+    effect = await lane.green(head=HEAD2)
+    await lane.drain()
+
+    assert effect.debts_offered == (OfferedDebt(A, DebtTrigger.recovered, HEAD1),)
+    assert (FIX_COMMIT, HEAD1) in lane.ancestry.calls
+    assert (FIX_COMMIT, HEAD2) not in lane.ancestry.calls
+    assert _due(lane) == []
+    assert _pending(lane, EscalationCategory.REGRESSED_AFTER_RESOLUTION) == []
+    after = read_debt(lane.ledger, A)
+    assert after is not None and after.open_count == 1
+    assert len(lane.client.submitted) == 1
