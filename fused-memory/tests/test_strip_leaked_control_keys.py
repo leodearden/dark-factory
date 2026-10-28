@@ -4,16 +4,20 @@ Loaded via importlib so the script (not on PYTHONPATH) can be tested
 without sys.path pollution — mirrors the pattern in
 test_cleanup_count_snapshots.py / test_migrate_cross_graph_leak.py.
 
-This suite covers only the script's pure transform, ``correct_task_metadata``.
-The live httpx/JSON-RPC plumbing (modeled on
-scripts/migrate_metadata_modules_to_files.py) is exercised operationally,
-not unit-tested here — see the script's module docstring.
+The suite covers the script's pure transform, ``correct_task_metadata``, and
+drives the per-project sweep, ``clean_one_project``, with an injected fake
+client so a server's refusal of get_task or update_task is pinned as an error,
+never as a clean.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import pytest
 from _fm_helpers import load_script_module
+
+from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'strip_leaked_control_keys.py'
 
@@ -54,3 +58,65 @@ def test_correct_task_metadata_idempotent_on_already_corrected_dict():
     twice_cleaned, dropped_again = correct_task_metadata(cleaned)
     assert twice_cleaned == cleaned
     assert dropped_again == []
+
+
+class _ScriptedClient:
+    """Answers each tool from *replies*, raising a reply that is an exception."""
+
+    def __init__(self, replies: dict[str, object]) -> None:
+        self._replies = replies
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_tool(self, name: str, arguments: dict) -> object:
+        self.calls.append((name, arguments))
+        reply = self._replies[name]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+_DIRTY_DONE_METADATA = {
+    **_TASK_2682_SHAPED_METADATA,
+    'done_provenance': {'kind': 'merged', 'commit': 'abc1234'},
+}
+_DIRTY_DONE_TASK = {'id': '2682', 'status': 'done', 'metadata': _DIRTY_DONE_METADATA}
+_PROJECT_ROOT = '/tmp/df-6128-root'
+
+
+async def _clean_2682(update_task_reply: object) -> tuple[tuple[int, int, int], _ScriptedClient]:
+    client = _ScriptedClient({'get_task': _DIRTY_DONE_TASK, 'update_task': update_task_reply})
+    counts = await _mod.clean_one_project(client, _PROJECT_ROOT, ['2682'], dry_run=False)
+    return counts, client
+
+
+@pytest.mark.asyncio
+async def test_refused_update_task_is_an_error_not_a_clean(capsys):
+    counts, _ = await _clean_2682(done_provenance_via_update_task_error('2682'))
+
+    assert counts == (1, 0, 1)
+    captured = capsys.readouterr()
+    assert 'dropped' not in captured.out
+    assert 'done_provenance_via_update_task' in captured.err
+
+
+@pytest.mark.asyncio
+async def test_accepted_update_task_counts_a_clean(capsys):
+    accepted = {
+        'id': '2682', 'message': 'Task 2682 updated', 'updated': True, 'updated_task': {'id': '2682'},
+    }
+    counts, client = await _clean_2682(accepted)
+
+    assert counts == (1, 1, 0)
+    assert "dropped ['append']" in capsys.readouterr().out
+    [update_arguments] = [arguments for name, arguments in client.calls if name == 'update_task']
+    assert update_arguments['metadata_mode'] == 'replace'
+    expected = {k: v for k, v in _DIRTY_DONE_METADATA.items() if k != 'append'}
+    assert json.loads(update_arguments['metadata']) == expected
+
+
+@pytest.mark.asyncio
+async def test_update_task_that_raises_is_an_error_not_a_clean(capsys):
+    counts, _ = await _clean_2682(RuntimeError('update_task failed: boom'))
+
+    assert counts == (1, 0, 1)
+    assert 'dropped' not in capsys.readouterr().out
