@@ -332,6 +332,33 @@ def _timeout_mark_argument(func_node):
     return None
 
 
+def _timeout_mark_budget(arg, inherited: float) -> tuple[float, str | None]:
+    """The budget a swept test's timeout-mark argument *arg* grants, and the
+    offence that bans it (None for an allowed mark).
+
+    *arg* is :func:`_timeout_mark_argument`'s result.  Allowed: no mark (the
+    run's *inherited* budget), or the bare name of a budget defined in
+    _verify_boundary_ceilings.py -- the one home of the derived budgets, so a
+    mark resolves the same way whichever swept module carries it.  A banned
+    LITERAL still grants its own value, so an under-budget literal is
+    reported as such too; any other banned shape grants *inherited*.
+    """
+    if arg is None:
+        return inherited, None
+    if isinstance(arg, ast.Name):
+        if hasattr(_verify_boundary_ceilings, arg.id):
+            return float(getattr(_verify_boundary_ceilings, arg.id)), None
+        return inherited, (
+            f'names {arg.id}, which is not a budget defined in _verify_boundary_ceilings.py'
+        )
+    if isinstance(arg, ast.Constant):
+        granted = float(arg.value) if isinstance(arg.value, int | float) else inherited
+        return granted, (
+            'pins a LITERAL, which no re-derivation of the discovery ceiling can reach into'
+        )
+    return inherited, 'is not the bare name of a budget defined in _verify_boundary_ceilings.py'
+
+
 def test_row5_per_test_timeout_covers_its_own_bounded_work():
     """Row 5's pytest timeout must cover ITS bounded worst case, and be DERIVED.
 
@@ -392,12 +419,12 @@ def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark(request
     EFFECTIVE pytest-timeout budget that test runs under -- from the LIVE
     config for unmarked tests, never from a duplicated ini literal -- and
     asserts the budget covers those waits at the widest ceiling they can
-    reach.  A mark naming a constant resolves against
-    _verify_boundary_ceilings.py, the one home of the derived budgets, so a
-    mark resolves the same way whichever swept module carries it.
+    reach.
 
-    It additionally BANS a literal timeout mark on any test performing such a
-    wait.  That kills the root cause directly rather than the symptom: task
+    It additionally BANS, on any test performing such a wait, every mark that
+    is not the bare name of a budget defined in _verify_boundary_ceilings.py
+    (:func:`_timeout_mark_budget`) -- most pointedly a LITERAL.  That kills
+    the root cause directly rather than the symptom: task
     2921's ``@pytest.mark.timeout(120)`` was a literal that no re-derivation
     could reach into, which is precisely why task 4014's load-scaled
     discovery ceiling could not propagate to Row 5.
@@ -418,19 +445,13 @@ def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark(request
 
     inherited = _inherited_timeout_budget_secs(request.config)
     under_budget: list[str] = []
-    literal_marked: list[str] = []
+    banned_marks: list[str] = []
     for (module, name), (n_scaled, func_node) in sorted(swept.items()):
         arg = _timeout_mark_argument(func_node)
-        if arg is None:
-            effective = inherited
-        elif isinstance(arg, ast.Name) and hasattr(_verify_boundary_ceilings, arg.id):
-            effective = float(getattr(_verify_boundary_ceilings, arg.id))
-        else:
-            literal_marked.append(f'{module}::{name}: @pytest.mark.timeout({ast.unparse(arg)})')
-            effective = (
-                float(arg.value)
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, int | float)
-                else inherited
+        effective, offence = _timeout_mark_budget(arg, inherited)
+        if offence is not None:
+            banned_marks.append(
+                f'{module}::{name}: @pytest.mark.timeout({ast.unparse(arg)}) {offence}'
             )
         required = n_scaled * ROW_DISCOVERY_CEILING_MAX_SECS
         if effective < required:
@@ -445,13 +466,56 @@ def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark(request
         'thread-mode os._exit() of the xdist worker instead of raising the '
         'self-diagnosing AssertionError:\n  ' + '\n  '.join(under_budget)
     )
-    assert not literal_marked, (
-        'these tests perform a load-scaled discovery wait but pin their pytest '
-        'timeout to a LITERAL, which no re-derivation of the discovery ceiling '
-        'can reach into -- use a budget derived in _verify_boundary_ceilings.py '
-        'instead:\n  '
-        + '\n  '.join(literal_marked)
+    assert not banned_marks, (
+        'these tests perform a load-scaled discovery wait under a pytest timeout '
+        'mark that is not a budget derived in _verify_boundary_ceilings.py -- '
+        'name one defined there instead:\n  '
+        + '\n  '.join(banned_marks)
     )
+
+
+def test_timeout_mark_budget_names_the_offence_of_each_banned_mark():
+    """_timeout_mark_budget grants each mark shape its budget, and names what
+    is wrong with a banned one.
+
+    A Name that is not a budget defined in _verify_boundary_ceilings.py --
+    e.g. _orch_helpers' VERIFY_CLI_PER_TEST_TIMEOUT, which
+    test_verify_merge_env_overrides.py marks its tests with -- is a different
+    offence from a LITERAL and must not be reported as one, or the next author
+    hunts for a literal that is not there.
+    """
+
+    def mark_argument(source: str) -> ast.expr:
+        return ast.parse(source, mode='eval').body
+
+    inherited = 60.0
+    assert _timeout_mark_budget(None, inherited) == (inherited, None)
+    assert _timeout_mark_budget(mark_argument('ROW_PER_TEST_TIMEOUT_SECS'), inherited) == (
+        float(ROW_PER_TEST_TIMEOUT_SECS),
+        None,
+    )
+
+    budget, offence = _timeout_mark_budget(
+        mark_argument('VERIFY_CLI_PER_TEST_TIMEOUT'), inherited
+    )
+    assert budget == inherited
+    assert offence is not None
+    assert 'VERIFY_CLI_PER_TEST_TIMEOUT' in offence
+    assert '_verify_boundary_ceilings.py' in offence
+    assert 'LITERAL' not in offence
+
+    budget, offence = _timeout_mark_budget(
+        mark_argument('2 * ROW_PER_TEST_TIMEOUT_SECS'), inherited
+    )
+    assert budget == inherited
+    assert offence is not None
+    assert '_verify_boundary_ceilings.py' in offence
+    assert 'LITERAL' not in offence
+
+    budget, offence = _timeout_mark_budget(mark_argument('120'), inherited)
+    assert budget == 120.0
+    assert offence is not None
+    assert 'LITERAL' in offence
 
 
 #: Anti-vacuity floor for the sweep below: an AST matcher that silently stops
