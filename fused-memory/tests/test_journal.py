@@ -5,6 +5,7 @@ import json
 import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -25,6 +26,33 @@ from fused_memory.reconciliation.journal import (
     ReconciliationJournal,
 )
 from fused_memory.services.memory_service import MemoryService
+
+_LEGACY_JOURNAL_ENTRIES_DDL = """
+CREATE TABLE journal_entries (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    stage TEXT,
+    timestamp TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    target_system TEXT NOT NULL,
+    before_state TEXT,
+    after_state TEXT,
+    reasoning TEXT DEFAULT '',
+    evidence TEXT DEFAULT '[]'
+);
+CREATE INDEX idx_journal_run ON journal_entries(run_id);
+"""
+
+
+def _schema_names(db_path: Path, kind: str) -> set[str]:
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        rows = conn.execute(
+            'SELECT name FROM sqlite_master WHERE type = ?', (kind,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {name for (name,) in rows}
 
 
 @pytest_asyncio.fixture
@@ -100,13 +128,8 @@ async def test_fresh_schema_creates_exactly_this_table_set(journal):
     created by ReconLedgerStore, not by the journal.
     """
     db_path = journal.data_dir / 'reconciliation.db'
-    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
-    try:
-        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-    finally:
-        conn.close()
 
-    assert {name for (name,) in rows} == {
+    assert _schema_names(db_path, 'table') == {
         'watermarks',
         'runs',
         'judge_verdicts',
@@ -118,6 +141,31 @@ async def test_fresh_schema_creates_exactly_this_table_set(journal):
         'halt_state',
         'judge_pending',
     }
+
+
+@pytest.mark.asyncio
+async def test_initialize_drops_the_retired_journal_entries_table(journal, tmp_path):
+    """A reconciliation.db created before task 5890 loses the retired journal_entries table, and its index, on initialize."""
+    legacy_dir = tmp_path / 'legacy_recon'
+    legacy_dir.mkdir()
+    legacy_db = legacy_dir / 'reconciliation.db'
+    conn = sqlite3.connect(legacy_db)
+    try:
+        conn.executescript(_LEGACY_JOURNAL_ENTRIES_DDL)
+    finally:
+        conn.close()
+
+    legacy = ReconciliationJournal(legacy_dir)
+    try:
+        await legacy.initialize()
+    finally:
+        await legacy.close()
+
+    assert 'journal_entries' not in _schema_names(legacy_db, 'table')
+    assert 'idx_journal_run' not in _schema_names(legacy_db, 'index')
+    assert _schema_names(legacy_db, 'table') == _schema_names(
+        journal.data_dir / 'reconciliation.db', 'table',
+    )
 
 
 @pytest.mark.asyncio
