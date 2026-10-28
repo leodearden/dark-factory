@@ -562,3 +562,73 @@ class TestSeparateDB:
             reserve_now=False,
             ttl_until=None,
         )
+
+
+_LEGACY_OVERRIDES_SCHEMA = """\
+CREATE TABLE overrides (
+    project_root  TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    boost_tier    TEXT,
+    pinned        INTEGER NOT NULL DEFAULT 0,
+    pin_order     INTEGER,
+    reserve_now   INTEGER NOT NULL DEFAULT 0,
+    ttl_until     TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (project_root, task_id)
+);
+"""
+
+
+def _write_legacy_overrides_db(db_path: Path) -> None:
+    """A pre-``source`` overrides DB holding one pinned row for task 'L'."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(_LEGACY_OVERRIDES_SCHEMA)
+        conn.execute(
+            'INSERT INTO overrides (project_root, task_id, boost_tier, pinned, '
+            'pin_order, reserve_now, ttl_until, created_at, updated_at) '
+            "VALUES ('proj', 'L', NULL, 1, 7, 0, NULL, 'then', 'then')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestOverrideSource:
+    def test_operator_pin_reads_back_operator_owned(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideSource, OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'A', pinned=True)
+
+        assert store.get_overrides('proj')['A'].source is OverrideSource.OPERATOR
+        [(tid, row)] = store.get_pin_queue('proj')
+        assert tid == 'A'
+        assert row.source is OverrideSource.OPERATOR
+
+    def test_legacy_db_migrates_to_operator_source(self, tmp_path: Path) -> None:
+        from orchestrator.overrides import OverrideSource, OverrideStore
+
+        db_path = tmp_path / 'scheduler_overrides.db'
+        _write_legacy_overrides_db(db_path)
+
+        store = OverrideStore(db_path)
+        row = store.get_overrides('proj')['L']
+        assert row.source is OverrideSource.OPERATOR
+        assert row.pinned is True
+        assert row.pin_order == 7
+
+        OverrideStore(db_path)
+        assert OverrideStore(db_path).get_pin_queue('proj') == [('L', row)]
+
+    def test_source_vocabulary_is_closed(self) -> None:
+        from enum import StrEnum
+
+        from orchestrator.overrides import OverrideSource
+
+        assert issubclass(OverrideSource, StrEnum)
+        assert {s.value for s in OverrideSource} == {
+            'operator', 'starvation_watchdog',
+        }
