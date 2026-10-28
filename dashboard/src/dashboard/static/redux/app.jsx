@@ -14,7 +14,7 @@ const { inQueueOver } = window.DF_MERGE_QUEUE;
 const { writeQueue } = window.DF_MEMORY_READINGS;
 const { todaySpend, spendText } = window.DF_SPEND_READINGS;
 const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow, pendingWindow } = window.DF_WINDOW_CHIP;
-const { tabRenderFailureNotice, chromeRenderFailureNotice } = window.DF_RENDER_FAILURE;
+const { tabRenderFailureNotice, chromeRenderFailureNotice, pageRenderFailureNotice } = window.DF_RENDER_FAILURE;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -348,4 +348,12 @@ function App() {
 // Apply density / tweak side-effects via class
 const obs = new MutationObserver(() => {});
 const root = document.getElementById('root');
-ReactDOM.createRoot(root).render(<App />);
+// The last resort: App's own body (the summary and rail-count derivations) runs
+// above every region boundary, so the operator reads its error, not an empty #root.
+ReactDOM.createRoot(root).render(
+  <RenderFailureBoundary describe={pageRenderFailureNotice}
+                         testId="page-render-failure-banner"
+                         style={{ ...noticeBannerStyle('var(--bad)'), margin: 24 }}>
+    <App />
+  </RenderFailureBoundary>
+);
