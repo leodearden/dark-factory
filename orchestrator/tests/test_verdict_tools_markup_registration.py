@@ -28,13 +28,13 @@ from __future__ import annotations
 
 import json
 import logging
-import subprocess
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _git_checkouts import main_checkout_with_lane
 from _markup_helpers import LT, closer, type_alternatives
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -480,6 +480,42 @@ class TestCorpusReplayAgainstRealServer:
 UNREPAIRABLE_SPECIMEN = 'toolu_012YjuXbKZAMwNAo9WR4Pvjx'
 
 
+def unrepairable_value() -> str:
+    """The ``UNREPAIRABLE_SPECIMEN`` payload, its outcome asserted rather than assumed."""
+    record = specimen(UNREPAIRABLE_SPECIMEN)
+    assert record['expected_outcome'] == 'unrepairable'
+    assert record['expected_recovered'] == []
+    return record['value']
+
+
+async def refused_call(
+    artifacts: TaskArtifacts,
+    *,
+    resolve_project_root: Callable[[Path], Path | None] = (
+        markup_sink.resolve_project_root
+    ),
+) -> dict[str, Any]:
+    """Drive the specimen as ``submit_review_verdict.summary`` through the REAL
+    server, and return the refusal's payload.
+
+    Module level for the same reason as ``repaired_call``: two suites need it,
+    the refusal rows below and the resolver rows, which want the one outcome
+    where both injected channels fire.
+    """
+    server = create_server(
+        artifacts, REVIEWER_ROLE, resolve_project_root=resolve_project_root,
+    )
+    async with Client(server) as client:
+        with pytest.raises(ToolError) as excinfo:
+            await client.call_tool('submit_review_verdict', {
+                'reviewer': REVIEWER_ROLE,
+                'verdict': 'ISSUES_FOUND',
+                'issues': [],
+                'summary': unrepairable_value(),
+            })
+    return json.loads(str(excinfo.value))
+
+
 class TestUnrepairableResidueIsPreserved:
     """A refusal on THIS server must not destroy the payload it refuses.
 
@@ -493,35 +529,6 @@ class TestUnrepairableResidueIsPreserved:
     the caller is nonetheless told its payload is safely stored.
     """
 
-    @staticmethod
-    def _value() -> str:
-        record = specimen(UNREPAIRABLE_SPECIMEN)
-        assert record['expected_outcome'] == 'unrepairable'
-        assert record['expected_recovered'] == []
-        return record['value']
-
-    async def _refuse(
-        self,
-        artifacts: TaskArtifacts,
-        *,
-        resolve_project_root: Callable[[Path], Path | None] = (
-            markup_sink.resolve_project_root
-        ),
-    ) -> dict[str, Any]:
-        """Drive the specimen as ``submit_review_verdict.summary``."""
-        server = create_server(
-            artifacts, REVIEWER_ROLE, resolve_project_root=resolve_project_root,
-        )
-        async with Client(server) as client:
-            with pytest.raises(ToolError) as excinfo:
-                await client.call_tool('submit_review_verdict', {
-                    'reviewer': REVIEWER_ROLE,
-                    'verdict': 'ISSUES_FOUND',
-                    'issues': [],
-                    'summary': self._value(),
-                })
-        return json.loads(str(excinfo.value))
-
     @pytest.mark.asyncio
     async def test_the_call_is_refused(self, artifacts: TaskArtifacts):
         """(a) The boundary is a GUESS, so nothing is forwarded.
@@ -529,7 +536,7 @@ class TestUnrepairableResidueIsPreserved:
         Also the self-verifying half of the cross-tool specimen reuse: the
         observed outcome is asserted, not assumed.
         """
-        payload = await self._refuse(artifacts)
+        payload = await refused_call(artifacts)
 
         assert payload['error_type'] == 'mcp_markup_unrepairable'
         assert payload['outcome'] == 'unrepairable'
@@ -542,7 +549,7 @@ class TestUnrepairableResidueIsPreserved:
         """(b) The tool body never ran, so no half-written verdict envelope
         carrying the corrupted ``summary`` exists. Mirrors the escalation
         suite's ``test_nothing_partial_was_written_for_the_caller``."""
-        await self._refuse(artifacts)
+        await refused_call(artifacts)
 
         assert artifacts.read_verdict(REVIEWER_ROLE) is None
 
@@ -556,10 +563,10 @@ class TestUnrepairableResidueIsPreserved:
         Verbatim and entire, deliberately unlike ``build_markup_block``'s
         200-char excerpt: this is the only surviving copy.
         """
-        value = self._value()
+        value = unrepairable_value()
         assert len(value) == 3525
 
-        await self._refuse(artifacts, resolve_project_root=rooted_at(tmp_path))
+        await refused_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         queued = queued_residue(tmp_path)
         assert len(queued) == 1, f'expected exactly one residue record, got {queued!r}'
@@ -572,7 +579,7 @@ class TestUnrepairableResidueIsPreserved:
         """(d) A bounced reviewer must be able to point an operator at its own
         preserved data — an id it cannot look up is no better than none."""
 
-        payload = await self._refuse(artifacts, resolve_project_root=rooted_at(tmp_path))
+        payload = await refused_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         filed = queue_under(tmp_path).get(payload['escalation_id'])
         assert filed is not None
@@ -585,7 +592,7 @@ class TestUnrepairableResidueIsPreserved:
         """(e) INV-7: a machine-readable owner plus the standing L2 bound, and
         the flat fields locating the leak."""
 
-        await self._refuse(artifacts, resolve_project_root=rooted_at(tmp_path))
+        await refused_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         (filed,) = queued_residue(tmp_path)
         assert filed.category == 'mcp_markup_residue'
@@ -601,7 +608,7 @@ class TestUnrepairableResidueIsPreserved:
         """The guard row for the kind dispatch: a REFUSED call's record keeps
         saying what the refusal cost, and never that the call was forwarded."""
 
-        await self._refuse(artifacts, resolve_project_root=rooted_at(tmp_path))
+        await refused_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         (filed,) = queued_residue(tmp_path)
         assert verdict_tools.MARKUP_SINK_SPEC.refusal_consequence in filed.detail
@@ -614,7 +621,7 @@ class TestUnrepairableResidueIsPreserved:
         """(f) On this server preservation ACTUALLY happened, so the
         preserved variant of the hint is the true one."""
 
-        payload = await self._refuse(artifacts, resolve_project_root=rooted_at(tmp_path))
+        payload = await refused_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         assert 'preserved verbatim' in payload['hint']
 
@@ -629,7 +636,7 @@ class TestUnrepairableResidueIsPreserved:
         middleware and so bought the caller a preservation claim that was
         false. The caller still holds the payload, and must be told to keep it.
         """
-        payload = await self._refuse(artifacts, resolve_project_root=rooted_at(None))
+        payload = await refused_call(artifacts, resolve_project_root=rooted_at(None))
 
         assert payload['escalation_id'] is None
         assert 'nothing was preserved' in payload['hint'].lower()
@@ -655,7 +662,7 @@ class TestUnrepairableResidueIsPreserved:
         gone.init('test-1', 'Test task', 'A test')
         shutil.rmtree(worktree)
 
-        payload = await self._refuse(gone)
+        payload = await refused_call(gone)
 
         assert payload['escalation_id'] is None
         assert 'preserved verbatim' not in payload['hint']
@@ -691,7 +698,7 @@ class TestUnrepairableResidueIsPreserved:
         """
         seed_plan(artifacts)
 
-        await self._refuse(artifacts, resolve_project_root=rooted_at(tmp_path))
+        await refused_call(artifacts, resolve_project_root=rooted_at(tmp_path))
 
         facts = journal_lines(tmp_path)
         assert len(facts) == 1, f'expected exactly one fact, got {facts!r}'
@@ -1538,13 +1545,6 @@ class TestTheVerdictFactReachesADurableJournal:
 # ---------------------------------------------------------------------------
 
 
-def git(*args: str, cwd: Path) -> None:
-    """Run one git command in *cwd*, failing loudly."""
-    subprocess.run(
-        ['git', *args], cwd=str(cwd), check=True, capture_output=True, text=True,
-    )
-
-
 class TestCreateServerTakesAProjectRootResolver:
     """One resolver, passed to ``create_server``, decides where BOTH injected
     channels file: the residue escalation and the fact journal.
@@ -1561,23 +1561,11 @@ class TestCreateServerTakesAProjectRootResolver:
         """The unrepairable outcome is the one where both channels fire, so it
         is where a residue record and its journal line must meet."""
         main_checkout = tmp_path / 'main'
-        server = create_server(
-            artifacts, REVIEWER_ROLE,
-            resolve_project_root=lambda worktree: main_checkout,
-        )
         seed_plan(artifacts)
-        record = specimen(UNREPAIRABLE_SPECIMEN)
-        assert record['expected_outcome'] == 'unrepairable'
 
-        async with Client(server) as client:
-            with pytest.raises(ToolError) as excinfo:
-                await client.call_tool('submit_review_verdict', {
-                    'reviewer': REVIEWER_ROLE,
-                    'verdict': 'ISSUES_FOUND',
-                    'issues': [],
-                    'summary': record['value'],
-                })
-        payload = json.loads(str(excinfo.value))
+        payload = await refused_call(
+            artifacts, resolve_project_root=rooted_at(main_checkout),
+        )
 
         queued = queued_residue(main_checkout)
         assert len(queued) == 1, f'expected exactly one residue record, got {queued!r}'
@@ -1623,13 +1611,7 @@ class TestCreateServerTakesAProjectRootResolver:
     ):
         """With no resolver passed, a lane's journal line reaches its MAIN
         checkout — never the lane, which dies at ``git worktree remove``."""
-        checkout = tmp_path / 'repo'
-        checkout.mkdir()
-        git('init', cwd=checkout)
-        git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit',
-            '--allow-empty', '-m', 'root', cwd=checkout)
-        lane = tmp_path / 'lane'
-        git('worktree', 'add', str(lane), '-b', 'task/1', cwd=checkout)
+        checkout, lane = main_checkout_with_lane(tmp_path)
         lane_artifacts = TaskArtifacts(lane)
         lane_artifacts.init('test-1', 'Test task', 'A test')
         seed_plan(lane_artifacts)

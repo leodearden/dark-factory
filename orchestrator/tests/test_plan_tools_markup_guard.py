@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _git_checkouts import git, main_checkout_with_lane
 from _markup_helpers import (
     INVOKE_CLOSER,
     LT,
@@ -1914,13 +1915,6 @@ class TestTheStormEscape:
 # data exactly where this leaf promises none is lost.
 
 
-def _git(*args: str, cwd: Path) -> None:
-    """Run one git command in *cwd*, failing loudly."""
-    subprocess.run(
-        ['git', *args], cwd=str(cwd), check=True, capture_output=True, text=True,
-    )
-
-
 class TestWhereTheRecordLands:
     """``_markup_project_root`` decides which queue every record reaches."""
 
@@ -1932,7 +1926,7 @@ class TestWhereTheRecordLands:
         """
         checkout = tmp_path / 'repo'
         checkout.mkdir()
-        _git('init', cwd=checkout)
+        git('init', cwd=checkout)
 
         assert plan_tools._markup_project_root(checkout) == checkout.resolve()
 
@@ -1944,13 +1938,7 @@ class TestWhereTheRecordLands:
         would answer with the lane itself, filing each record into a directory
         that is deleted when the lane is reset.
         """
-        checkout = tmp_path / 'repo'
-        checkout.mkdir()
-        _git('init', cwd=checkout)
-        _git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit',
-             '--allow-empty', '-m', 'root', cwd=checkout)
-        lane = tmp_path / 'lane'
-        _git('worktree', 'add', str(lane), '-b', 'task/1', cwd=checkout)
+        checkout, lane = main_checkout_with_lane(tmp_path)
 
         assert plan_tools._markup_project_root(lane) == checkout.resolve()
         assert plan_tools._markup_project_root(lane) != lane.resolve()
