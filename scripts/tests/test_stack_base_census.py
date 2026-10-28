@@ -194,15 +194,15 @@ async def test_a_stack_replayed_onto_main_is_confirmed_from_the_reflog_alone(rep
     p_tip = rev(repo, 'task/P')
     advance_main(repo, {'unrelated.txt': 'u\n'})
     rebase(m_wt, 'main')
-    own = {rev(repo, 'task/M')}
-    replayed = [sha for sha in git(repo, 'rev-list', 'main..task/M').split() if sha not in own]
+    replayed_p = rev(repo, 'task/M~1')
 
     finding = findings_of(await census_of(repo))['task/M']
 
     assert finding.contained_siblings == ()
     assert finding.verdict is census.Verdict.CONFIRMED
     assert finding.base == p_tip
-    assert finding.cut == replayed[0]
+    assert replayed_p != p_tip
+    assert finding.cut == replayed_p
 
 
 async def test_a_member_unstacked_by_hand_is_already_clean(repo: Path) -> None:
